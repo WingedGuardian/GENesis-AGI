@@ -179,6 +179,14 @@ class CCInvoker:
         # The genesis_session_context.py hook skips identity injection when set,
         # preventing double injection (identity is in the system prompt arg).
         env["GENESIS_CC_SESSION"] = "1"
+        # Propagate Genesis session_id to child CC + MCP server processes
+        # so eval hooks can attribute recall events to specific sessions.
+        from genesis.observability.session_context import get_session_id
+        _sid = get_session_id()
+        if _sid:
+            env["GENESIS_SESSION_ID"] = _sid
+        else:
+            env.pop("GENESIS_SESSION_ID", None)
         if inv and inv.stream_idle_timeout_ms is not None:
             env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(inv.stream_idle_timeout_ms)
         if inv and inv.anthropic_base_url:

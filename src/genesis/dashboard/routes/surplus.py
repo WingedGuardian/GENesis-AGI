@@ -184,7 +184,14 @@ async def surplus_config():
                 SELECT dimension, metrics_json, sample_count, created_at
                 FROM eval_snapshots ORDER BY created_at DESC LIMIT 10
             """)
-            eval_metrics["j9"] = [dict(r) for r in await cursor.fetchall()]
+            j9_rows = []
+            for r in await cursor.fetchall():
+                row = dict(r)
+                if row.get("metrics_json"):
+                    row["metrics"] = json.loads(row["metrics_json"])
+                    del row["metrics_json"]
+                j9_rows.append(row)
+            eval_metrics["j9"] = j9_rows
         except Exception:
             logger.debug("eval_metrics query failed (tables may not exist yet)")
 

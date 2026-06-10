@@ -167,15 +167,20 @@ class J9EvalBatchExecutor:
 
         used_count = 0
         for session_id, events in by_session.items():
-            # Get memories extracted FROM this session (content created by the session)
+            if not session_id:
+                continue  # Skip events without session attribution
+            # Get memories extracted FROM this session via pending_embeddings
+            # which tracks source_session_id for each extracted memory.
             try:
                 cursor = await self._db.execute(
                     """SELECT content FROM memory_fts
                        WHERE memory_id IN (
-                           SELECT memory_id FROM memory_metadata
-                           WHERE created_at >= ? LIMIT 100
+                           SELECT memory_id FROM pending_embeddings
+                           WHERE source_session_id = ?
+                             AND status = 'embedded'
+                           LIMIT 100
                        )""",
-                    (since,),
+                    (session_id,),
                 )
                 session_content = " ".join(
                     (row[0] if isinstance(row, tuple) else row["content"])
