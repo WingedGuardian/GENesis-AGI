@@ -61,10 +61,9 @@ class Application:
         websocket_port = int(os.environ.get("WEBSOCKET_PORT", "8080"))
         websocket_host = os.environ.get("WEBSOCKET_HOST", "0.0.0.0")
 
-        # Get turn detection settings with defaults
-        vad_threshold = float(os.environ.get("VAD_THRESHOLD", "0.5"))
-        vad_prefix_padding_ms = int(os.environ.get("VAD_PREFIX_PADDING_MS", "300"))
-        vad_silence_duration_ms = int(os.environ.get("VAD_SILENCE_DURATION_MS", "500"))
+        # Semantic VAD eagerness (replaces old threshold-based server_vad)
+        # Options: "low" (less interrupts), "medium" (default), "high" (more responsive)
+        self.semantic_vad_eagerness = os.environ.get("SEMANTIC_VAD_EAGERNESS", "medium")
 
         # Get recording setting (optional, defaults to false)
         enable_recording = os.environ.get("ENABLE_RECORDING", "false").lower() == "true"
@@ -118,9 +117,6 @@ class Application:
 
         # Store configuration for session creation
         self.openai_api_key = openai_api_key
-        self.vad_threshold = vad_threshold
-        self.vad_prefix_padding_ms = vad_prefix_padding_ms
-        self.vad_silence_duration_ms = vad_silence_duration_ms
         self.instructions = instructions
 
         logger.info("✅ Application initialized - ready to accept WebSocket connections")
@@ -206,8 +202,10 @@ class Application:
                 AudioConfiguration,
                 AudioInput,
                 AudioOutput,
+                InputAudioNoiseReduction,
+                InputAudioTranscription,
+                SemanticTurnDetection,
                 SessionProperties,
-                TurnDetection,
             )
 
             # Collect tool definitions: disconnect + Genesis tools
@@ -218,14 +216,13 @@ class Application:
                 instructions=self.instructions,
                 audio=AudioConfiguration(
                     input=AudioInput(
-                        turn_detection=TurnDetection(
-                            type="server_vad",
-                            threshold=self.vad_threshold,
-                            prefix_padding_ms=self.vad_prefix_padding_ms,
-                            silence_duration_ms=self.vad_silence_duration_ms
-                        )
+                        turn_detection=SemanticTurnDetection(
+                            eagerness=self.semantic_vad_eagerness,
+                        ),
+                        noise_reduction=InputAudioNoiseReduction(type="near_field"),
+                        transcription=InputAudioTranscription(),
                     ),
-                    output=AudioOutput(voice="marin")
+                    output=AudioOutput(voice="ash")
                 ),
                 tools=all_tools
             )
@@ -235,7 +232,6 @@ class Application:
             # Create new service instance
             self.openai_service = OpenAIRealtimeLLMService(
                 api_key=self.openai_api_key,
-                model="gpt-realtime",
                 session_properties=session_properties,
                 start_audio_paused=False
             )
@@ -333,18 +329,10 @@ class Application:
                     await self.openai_service._disconnect()
                     logger.info("💤 OpenAI session closed — client disconnected")
 
-        # Function to get OpenAI service for a client
-        def get_openai_service_for_client(client_id: str) -> OpenAIRealtimeLLMService | None:
-            """Get OpenAI service for a specific client."""
-            if self.session_manager:
-                return self.session_manager.get_current_service(client_id)
-            return self.openai_service
-
         self.websocket_handler.setup_event_handlers(
             transport=self.websocket_transport,
             on_client_connected_callback=on_client_connected,
             on_client_disconnected_callback=on_client_disconnected,
-            openai_service_getter=get_openai_service_for_client
         )
 
         # Schedule deferred disconnect — runs concurrently with runner.run()
