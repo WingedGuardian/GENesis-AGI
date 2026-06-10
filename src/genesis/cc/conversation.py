@@ -153,6 +153,13 @@ class ConversationLoop:
             thread_id=thread_id,
         )
 
+        # Set session context so downstream code (CCInvoker, eval hooks)
+        # can attribute work to this session without explicit threading.
+        # Uses set/clear rather than session_scope() to avoid re-indenting
+        # the entire lock block; follows the pattern in direct_session.py.
+        from genesis.observability.session_context import set_session_id
+        set_session_id(session["id"])
+
         async with self._get_lock(session["id"]):
             await self._persist_overrides(session, model, effort)
 
@@ -351,6 +358,10 @@ class ConversationLoop:
             user_id=user_id, channel=channel, model=model, effort=effort,
             thread_id=thread_id,
         )
+
+        # Set session context for eval attribution (same as handle_message).
+        from genesis.observability.session_context import set_session_id as _set_sid
+        _set_sid(session["id"])
 
         async with self._get_lock(session["id"]):
             # Capture old values before persisting overrides (for change feedback)
