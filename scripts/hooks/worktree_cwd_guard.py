@@ -117,7 +117,7 @@ def _block_with_pids(target: str, pids: list[int]) -> int:
 def _block_no_direct_removal(target: str) -> int:
     """Print lifecycle-manager redirect and return exit code 2."""
     print(
-        f"BLOCKED: Direct worktree removal is disabled.",
+        "BLOCKED: Direct worktree removal is disabled.",
         file=sys.stderr,
     )
     print(
