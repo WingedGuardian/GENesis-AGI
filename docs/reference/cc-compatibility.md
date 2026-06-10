@@ -15,7 +15,7 @@
 
 ## Current CC Version
 
-**Installed:** Claude Code 2.1.170 (upgraded 2026-06-10 from 2.1.160 — adds Fable 5 access + inherited-env transcript fix)
+**Installed:** Claude Code 2.1.170 — **container + host VM** (both upgraded 2026-06-10 from 2.1.160 — adds Fable 5 access + inherited-env transcript fix). Container via npm (`--prefix /usr/local`); host via native installer (`claude install 2.1.170`).
 **Pin in scripts:** `CC_VERSION=2.1.170` in `scripts/install.sh` and `scripts/host-setup.sh`
 **Minimum required by Genesis:** Not yet formalized (all current code works with 2.0+).
 `requiredMinimumVersion`/`requiredMaximumVersion` (2.1.163) were evaluated as a way
@@ -206,19 +206,30 @@ Running `sudo npm install -g` without `--prefix /usr/local` lands in `/usr/lib/`
 does not update the `claude` binary on PATH. **`scripts/install.sh` now passes
 `--prefix /usr/local` automatically** — manual upgrades still need it.
 
-**Host VM variation:** The host VM uses CC's **native installer** (stores versioned
-binaries in `~/.local/share/claude/versions/`). On host VMs with this setup, install
-without `--prefix`:
+**Host VM variation (verified 2026-06-10):** The host VM uses CC's **native
+installer** — NOT npm. Versioned binaries live in `~/.local/share/claude/versions/`
+with `~/.local/bin/claude` a symlink to the active version. **Do NOT `npm install`
+on the host** — npm and the native installer conflict. Update to a specific version
+with the native installer's own command (use the full path, since `~/.local/bin` is
+usually not on the host's login/SSH PATH):
 ```bash
-sudo env "PATH=$PATH" npm install -g @anthropic-ai/claude-code@<version>
+"$HOME/.local/bin/claude" install <version>   # e.g. 2.1.170 — repoints the symlink, keeps old versions for rollback
+"$HOME/.local/bin/claude" --version           # verify
 ```
-The `env "PATH=$PATH"` is needed when npm is installed via nvm (not in sudo's secure
-PATH). If the native installer's postinstall fails to download the new binary,
-manually update the symlink:
+Rollback is just `claude install <old-version>` (prior versions remain in
+`versions/`). `DISABLE_AUTOUPDATER=1` is set on the host, so updates are manual.
+
+**Host CC reachability — important:** The host's login/SSH shell PATH does NOT
+include `~/.local/bin`, so a bare `claude --version` over SSH (and the Guardian
+gateway's `version` op) reports `"unavailable"` even when CC is installed and fine.
+What matters is that the **`genesis-guardian.service` systemd unit explicitly sets
+`PATH=$HOME/.local/bin:...`**, so Guardian diagnosis (`cc.path: "claude"`)
+resolves the binary correctly. Verify the real state with:
 ```bash
-ln -sf ~/.nvm/versions/node/<version>/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe \
-  ~/.local/bin/claude
+env -i PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" claude --version
 ```
+The host CC binary is managed separately from the Genesis→Guardian *code* sync
+(`redeploy`/`update` gateway verbs sync code only, never the CC binary).
 
 ### Auto-Updater Suppression Requires User-Level Settings
 
