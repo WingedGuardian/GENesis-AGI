@@ -7,6 +7,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Eval quality dashboard could stall** --- the nightly memory-scoring job
+  timed out and retried from scratch, so the compounding-intelligence
+  dashboard stopped getting fresh data and double-counted judgments. The job
+  now resumes where it left off, scores in parallel within provider rate
+  limits, and the aggregator ignores duplicate judgments --- metrics stay
+  accurate and update reliably.
+
+---
+
 ## [v3.0b14] - 2026-06-04
 
 ### Added
