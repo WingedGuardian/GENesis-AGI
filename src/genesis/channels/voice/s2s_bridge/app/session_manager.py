@@ -5,7 +5,7 @@ from typing import Optional
 
 from pipecat.frames.frames import Frame, LLMMessagesUpdateFrame, StartFrame
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 
@@ -205,7 +205,12 @@ class SessionManager:
             LLMContextAggregatorPair with cached or new context
         """
         context = self.create_context_for_new_session(client_id)
-        aggregator_pair = LLMContextAggregatorPair(context)
+        # Disable local turn strategies — we use server-side SemanticTurnDetection
+        # (avoids onnxruntime dependency which is incompatible with HA's Python)
+        aggregator_pair = LLMContextAggregatorPair(
+            context,
+            user_params=LLMUserAggregatorParams(user_turn_strategies=None),
+        )
         self.set_context_aggregator(client_id, aggregator_pair)
         return aggregator_pair
 
