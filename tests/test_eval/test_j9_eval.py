@@ -497,3 +497,44 @@ async def test_get_latest_subsystem_grades(db):
     assert len(latest) == 2
     subsystems = {g["subsystem"] for g in latest}
     assert subsystems == {"memory", "ego"}
+
+
+# ── aggregator dedup (defends metrics against duplicate judgments) ────────────
+
+
+def test_dedupe_by_pair_keeps_first():
+    from genesis.eval.j9_aggregator import _dedupe_by_pair
+
+    events = [
+        {"metrics": {"recall_event_id": "r1", "memory_id": "m1", "relevance": 1.0}},
+        {"metrics": {"recall_event_id": "r1", "memory_id": "m1", "relevance": 0.0}},
+        {"metrics": {"recall_event_id": "r1", "memory_id": "m2", "relevance": 0.5}},
+        {"metrics": {"foo": "bar"}},  # missing ids → kept as-is
+    ]
+    out = _dedupe_by_pair(events)
+    assert len(out) == 3
+    assert out[0]["metrics"]["relevance"] == 1.0  # first occurrence kept
+
+
+async def test_memory_quality_ignores_duplicate_relevance(db):
+    from genesis.eval.j9_aggregator import _compute_memory_quality
+
+    # Duplicate (r1, m1) relevant judgments + one non-relevant (r1, m2).
+    # Deduped precision for the recall = 1 relevant / 2 memories = 0.5
+    # (without dedup it would be 2/3 = 0.667).
+    for rel in (1.0, 1.0):
+        await j9_eval.insert_event(
+            db, dimension="memory", event_type="recall_relevance",
+            metrics={"recall_event_id": "r1", "memory_id": "m1", "relevance": rel},
+        )
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r1", "memory_id": "m2", "relevance": 0.0},
+    )
+
+    metrics, total_recalls = await _compute_memory_quality(
+        db, since="2000-01-01", until="2100-01-01",
+    )
+    assert total_recalls == 1
+    assert metrics["precision_at_5"] == 0.5
+    assert metrics["total_memories_judged"] == 2  # deduped, not 3
