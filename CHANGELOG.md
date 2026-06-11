@@ -17,6 +17,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   now resumes where it left off, scores in parallel within provider rate
   limits, and the aggregator ignores duplicate judgments --- metrics stay
   accurate and update reliably.
+- **Watchdog falsely reported failure after a slow restart** --- when a
+  server restart took longer than expected under load, the health watchdog
+  timed out waiting and marked itself failed even though the restart
+  succeeded. It now confirms the service is actually back up before reporting,
+  so a successful recovery no longer shows as a failed health check.
 
 ---
 
