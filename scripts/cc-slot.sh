@@ -12,6 +12,10 @@ set -euo pipefail
 # SSH RemoteCommand doesn't source .bashrc (interactive guard) — set PATH explicitly
 export PATH="$HOME/.n/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
 
+# SSH from Windows sends no locale, so tmux marks the client non-UTF-8 and
+# renders every non-ASCII glyph as "_". Force a UTF-8 locale for the client.
+export LANG="${LANG:-C.UTF-8}"
+
 GENESIS_ROOT="${HOME}/genesis"
 SESSION_PREFIX="cc"
 
@@ -79,7 +83,9 @@ chmod 700 "$TMPDIR"
 # Without this, intermittent ENOENT failures on /tmp break the Bash tool.
 export CLAUDE_CODE_TMPDIR="$HOME/.genesis/cc-tmp"
 
-exec tmux new-session -A -s "$SESSION_NAME" \
+# -u: force UTF-8 output even if a future client's locale detection fails
+exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
+    -e "LANG=$LANG" \
     "cd ${GENESIS_ROOT} && exec claude --dangerously-skip-permissions"

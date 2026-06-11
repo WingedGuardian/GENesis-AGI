@@ -9,14 +9,14 @@
 > through 8 evaluation lenses (see analyzer prompt for details). This document
 > is updated manually after each evaluation.
 >
-> Created: 2026-03-09 | Last updated: 2026-06-10
+> Created: 2026-03-09 | Last updated: 2026-06-11
 
 ---
 
 ## Current CC Version
 
-**Installed:** Claude Code 2.1.170 — **container + host VM** (both upgraded 2026-06-10 from 2.1.160 — adds Fable 5 access + inherited-env transcript fix). Container via npm (`--prefix /usr/local`); host via native installer (`claude install 2.1.170`).
-**Pin in scripts:** `CC_VERSION=2.1.170` in `scripts/install.sh` and `scripts/host-setup.sh`
+**Installed:** Claude Code 2.1.173 on the **container** (upgraded 2026-06-11 from 2.1.170 — Fable 5 `[1m]` model-ID normalization fix + 2.1.172 long-conversation render perf). The **currently running host VM** remains on 2.1.170 (Guardian is headless; nothing in 2.1.171–173 affects it — upgrade opportunistically on next host maintenance; a fresh `host-setup.sh` run installs the new 2.1.173 pin). Container via npm (user prefix or `--prefix /usr/local`); host via native installer.
+**Pin in scripts:** `CC_VERSION=2.1.173` in `scripts/install.sh` and `scripts/host-setup.sh`
 **Minimum required by Genesis:** Not yet formalized (all current code works with 2.0+).
 `requiredMinimumVersion`/`requiredMaximumVersion` (2.1.163) were evaluated as a way
 to enforce a floor, but they are **managed-settings-only** (read only from
@@ -146,7 +146,7 @@ When a new CC version is released, run through this:
 | 2.1.119 | — | PostToolUse/PostToolUseFailure hooks gain `duration_ms` field | Additive — no action needed |
 | 2.1.126 | — | `--dangerously-skip-permissions` extended to bypass `.claude/`, `.git/`, `.vscode/` writes | Additive — background sessions already use this flag |
 | 2.1.128 | — | `MCP: workspace` is a reserved server name | No Genesis conflict |
-| 2.1.132 | — | `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` env var lands — **scrollback fix** | Added to `CCInvoker._build_env()` and `settings.json` in PR #479 |
+| 2.1.132 | — | `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` env var lands — **partial scrollback mitigation** (residual clipping remained; see Known Issues) | Added to `CCInvoker._build_env()` and `settings.json` in PR #479; removed from settings 2026-06-11 (fullscreen renderer) |
 | 2.1.133 | — | All hooks gain `effort.level` JSON field + `$CLAUDE_EFFORT` env var | Additive — Genesis hooks only read fields they need |
 | 2.1.138 | — | Running version before 2026-06-01 upgrade | Proven stable in production |
 | 2.1.139 | — | Hooks run WITHOUT terminal access — terminal I/O silently suppressed | Safe — Genesis hooks only use stderr for logging |
@@ -166,24 +166,50 @@ When a new CC version is released, run through this:
 | 2.1.166 | 2026-06-10 | `fallbackModel` (up to 3 fallbacks); glob patterns in deny tool-name position; hardened cross-session `SendMessage` authority; thinking-disable on think-by-default models | `fallbackModel` deliberately **not** adopted — silent auto-degrade conflicts with "quality over cost." Glob deny redundant with `bash_safety_hook.sh`. |
 | 2.1.169 | 2026-06-10 | `--safe-mode`/`CLAUDE_CODE_SAFE_MODE`; `/cd`; `disableBundledSkills`; `--mcp-config` + managed-MCP enforcement fixes; background sessions preserve `--bare`/`--ide` across retire→wake; project-env (`ANTHROPIC_MODEL`) honored on pre-warmed workers | Fixes touch flags Genesis uses (`--mcp-config`, `--bare`). Smoke-tested post-upgrade. No config change. |
 | 2.1.170 | 2026-06-10 | **Claude Fable 5 (Mythos-class)** model access; fixed sessions not saving transcripts (and missing from `--resume`) when launched from a shell that inherited CC env vars | **Upgraded to this version.** Fable 5 → separate eval follow-up (background sessions pin `--model`, so no leak). Transcript fix benefits Genesis background sessions (inherited-env spawn path). |
+| 2.1.172 | 2026-06-11 | Nested sub-agents (5 levels); long-conversation render perf + idle CPU reduction; background-agent fixes (project settings cross-read, stale-version attach EAUTH); `[1M][1m]` doubled-suffix fix; mouse tracking disabled on limited Windows consoles | Additive/fixes — recon classified informational. Background-agent fixes benefit Genesis dispatch paths. |
+| 2.1.173 | 2026-06-11 | Fable 5 model IDs with `[1m]` suffix now normalized (1M context is default); Windows sandbox warning fix | **Upgraded to this version (container).** Settings had `"model": "claude-fable-5[1m]"` — normalization removes suffix-handling edge cases. |
 
 ---
 
 ## Known Issues
 
-### v2.1.89+ Scrollback Regression — RESOLVED (2026-06-01)
+### v2.1.89+ Scrollback Regression — RESOLVED via fullscreen renderer (2026-06-11)
 
 CC v2.1.89 changed default terminal rendering to an alt-screen mode that destroys
 terminal scrollback on Linux/tmux. Confirmed cross-platform regression (GitHub issues
 #41965, #41814, #42024, #42002, #42076, #42180).
 
-**Resolution:** CC 2.1.132 added `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`. This env
-var was added to `settings.json` and `CCInvoker._build_env()` in PR #479, which
-unblocked the version upgrade. Now running 2.1.160 with scrollback fully functional.
+**First mitigation (partial):** CC 2.1.132 added `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`,
+applied in PR #479 (`settings.json` + `CCInvoker._build_env()`), which unblocked the
+version upgrade. This stopped the catastrophic alt-screen corruption but NOT the
+classic renderer's residual clipping: repaints inside tmux intermittently drop chunks
+of output before tmux commits them to its history (e.g., the first item of a list
+missing from scrollback). Still open upstream as of 2.1.173: #52924, #46834, #60464,
+#62890. The earlier "fully functional" assessment (2026-06-01) was premature — drops
+are intermittent and survived light testing.
+
+**Resolution (2026-06-11):** Interactive sessions switched to the **fullscreen
+renderer** (`"tui": "fullscreen"` in user-level `~/.claude/settings.json`). The
+conversation lives in CC's virtualized in-app scrollback — nothing is dropped because
+tmux history is no longer the source of truth. Scroll with mouse wheel / PgUp; search
+via `Ctrl+O` then `/`; export the full transcript into tmux scrollback on demand with
+`Ctrl+O` then `[`. Revert with `/tui default`.
+
+Consequently `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` was **removed** from project
+and user `settings.json` — per CC docs it forces the classic renderer regardless of
+the `tui` setting, so leaving it set silently defeats fullscreen mode. It remains in
+`CCInvoker._build_env()` (`invoker.py`) as defense-in-depth for headless dispatch;
+CC docs state renderer settings don't apply to background-session rendering, so it is
+harmless there.
+
+**Known cosmetic issue (upstream):** the `/model` banner renders literal `[1m`/`[22m`
+(ESC-stripped SGR codes) around the model name — CC bug #66643, present in 2.1.173,
+not fixable locally. Do not "fix" with `NO_COLOR`/`TERM=dumb`; that degrades all output.
 
 **History:** Downgraded to v2.1.87 on 2026-04-01; ran on 2.1.138 (auto-updated before
 update controls were in place); upgraded to 2.1.159 on 2026-06-01; auto-updater bumped
-to 2.1.160 mid-session.
+to 2.1.160 mid-session; 2.1.170 on 2026-06-10; 2.1.173 + fullscreen renderer on
+2026-06-11.
 
 ### Install Method: npm Only (2026-04-01)
 
@@ -218,7 +244,7 @@ on the host** — npm and the native installer conflict. Update to a specific ve
 with the native installer's own command (use the full path, since `~/.local/bin` is
 usually not on the host's login/SSH PATH):
 ```bash
-"$HOME/.local/bin/claude" install <version>   # e.g. 2.1.170 — repoints the symlink, keeps old versions for rollback
+"$HOME/.local/bin/claude" install <version>   # e.g. 2.1.173 — repoints the symlink, keeps old versions for rollback
 "$HOME/.local/bin/claude" --version           # verify
 ```
 Rollback is just `claude install <old-version>` (prior versions remain in

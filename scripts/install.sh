@@ -21,7 +21,7 @@
 #   OLLAMA_EMBEDDING_MODEL — Ollama embedding model (default: qwen3-embedding:0.6b-fp16)
 #   GENESIS_ENABLE_OLLAMA  — Enable local Ollama (default: false; cloud is default)
 #   QDRANT_VERSION         — Qdrant version to install if missing (default: 1.14.0)
-#   CC_VERSION             — Claude Code version to install (default: 2.1.170)
+#   CC_VERSION             — Claude Code version to install (default: 2.1.173)
 #   GH_VERSION             — gh CLI version if pkg-mgr fails (default: 2.65.0)
 #   RIPGREP_VERSION        — ripgrep version if pkg-mgr fails (default: 14.1.1)
 #   NODE_MAJOR             — Node.js major version (default: 20)
@@ -1144,7 +1144,7 @@ echo ""
 # ══════════════════════════════════════════════════════════════
 #  Step 12 — Claude Code install + login
 # ══════════════════════════════════════════════════════════════
-CC_VERSION="${CC_VERSION:-2.1.170}"  # CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 fixes scrollback (added in PR #479)
+CC_VERSION="${CC_VERSION:-2.1.173}"  # Scrollback: fullscreen renderer (tui setting) — see docs/reference/cc-compatibility.md
 echo "  [12/$TOTAL_STEPS] Setting up Claude Code (v${CC_VERSION})..."
 
 if command -v claude &>/dev/null; then

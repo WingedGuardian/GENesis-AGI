@@ -1133,7 +1133,7 @@ if [ "$_host_node_ok" = "0" ]; then
     fi
 fi
 
-CC_VERSION="${CC_VERSION:-2.1.170}"  # CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 fixes scrollback (added in PR #479)
+CC_VERSION="${CC_VERSION:-2.1.173}"  # Scrollback: fullscreen renderer (tui setting) — see docs/reference/cc-compatibility.md
 if ! command -v claude &>/dev/null; then
     echo "  Installing Claude Code v${CC_VERSION} on host..."
     if command -v npm &>/dev/null; then
