@@ -29,6 +29,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   project settings, so sessions can use the fullscreen renderer
   (`/tui fullscreen`), which keeps the complete conversation scrollable
   in-app and exportable to tmux with `Ctrl+O` then `[`.
+- **UI icons rendered as underscores when connecting from Windows** ---
+  Windows SSH clients send no locale, so tmux treated the terminal as
+  non-UTF-8 and drew every icon and box-drawing glyph as `_`. The tmux
+  session launcher now forces a UTF-8 locale and passes `-u`, so the
+  Claude Code logo, checkmarks, and prompt glyphs render correctly.
+  Reconnect (detach + re-SSH) for the fix to take effect.
 
 ---
 
