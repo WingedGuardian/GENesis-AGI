@@ -95,6 +95,7 @@ class VoiceAssistantWebSocket : public Component {
   Trigger<> bot_stopped_speaking_trigger_{};
   bool was_bot_speaking_{false};  // For edge detection in loop()
   bool full_duplex_{false};  // Open-mic barge-in (set via Full Duplex Mode switch)
+  bool pending_interrupt_cleanup_{false};  // Set from websocket task; loop() drains audio_queue_
   
   // Audio buffers
   std::vector<uint8_t> input_buffer_;

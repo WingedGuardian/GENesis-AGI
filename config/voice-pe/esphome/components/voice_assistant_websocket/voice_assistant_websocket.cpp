@@ -57,7 +57,18 @@ void VoiceAssistantWebSocket::loop() {
     ESP_LOGI(TAG, "Voice Assistant WebSocket stopped");
     return;  // Skip other loop operations after disconnect
   }
-  
+
+  // Handle server-initiated interrupt cleanup (flag set from the websocket
+  // task — audio_queue_ must only be touched from the main loop task)
+  if (this->pending_interrupt_cleanup_) {
+    this->pending_interrupt_cleanup_ = false;
+    while (!this->audio_queue_.empty()) {
+      this->audio_queue_.pop();
+    }
+    this->interrupt_time_ = millis();
+    ESP_LOGI(TAG, "Cleared queued audio after server interrupt");
+  }
+
   // Try to process queued audio if speaker is running
   if (this->speaker_ != nullptr && this->speaker_->is_running() && !this->audio_queue_.empty()) {
     const std::vector<uint8_t> &queued_data = this->audio_queue_.front();
@@ -644,13 +655,16 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
           if (this->speaker_ != nullptr) {
             this->speaker_->stop();
           }
-          // Mirror the send-path interrupt cleanup (see interrupt()):
-          // clear queued audio so loop() doesn't resume stale playback,
-          // and briefly ignore in-flight audio from the server.
-          while (!this->audio_queue_.empty()) {
-            this->audio_queue_.pop();
+          // Debounce: when WE initiated the interrupt (send path), the
+          // server echoes it back — cleanup already ran, don't re-arm the
+          // ignore window.
+          if (this->interrupt_time_ == 0 ||
+              (millis() - this->interrupt_time_) >= INTERRUPT_IGNORE_AUDIO_MS) {
+            // Defer queue cleanup to loop(): audio_queue_ is not
+            // thread-safe and this handler runs on the websocket task
+            // (same pattern as pending_disconnect_).
+            this->pending_interrupt_cleanup_ = true;
           }
-          this->interrupt_time_ = millis();
         } else if (message.find("\"type\":\"disconnect\"") != std::string::npos ||
                    message.find("\"type\": \"disconnect\"") != std::string::npos) {
           ESP_LOGI(TAG, "Disconnect message received, stopping voice assistant and going to idle");

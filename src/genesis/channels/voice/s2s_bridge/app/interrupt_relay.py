@@ -39,6 +39,7 @@ class InterruptRelay(FrameProcessor):
             except Exception as exc:
                 logger.warning("Could not cancel OpenAI response: %s", exc)
             await self.broadcast_interruption()
+            return  # consume the control message — nothing downstream needs it
 
         await self.push_frame(frame, direction)
 
