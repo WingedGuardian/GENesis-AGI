@@ -230,6 +230,21 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
+  # Full Duplex Mode — experimental open-mic barge-in. When ON, mic audio
+  # streams to the server even while the bot speaks (semantic VAD + noise
+  # reduction must reject the speaker echo). ALWAYS_OFF: the experiment
+  # never survives a reboot.
+  - platform: template
+    id: full_duplex_mode
+    name: "Full Duplex Mode"
+    icon: "mdi:account-voice"
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: 'id(voice_assistant_ws).set_full_duplex(true);'
+    turn_off_action:
+      - lambda: 'id(voice_assistant_ws).set_full_duplex(false);'
   - platform: gpio
     pin: GPIO47
     id: internal_speaker_amp

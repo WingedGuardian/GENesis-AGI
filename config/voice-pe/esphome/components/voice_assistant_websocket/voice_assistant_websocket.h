@@ -45,6 +45,12 @@ class VoiceAssistantWebSocket : public Component {
   bool is_running() const { return this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING; }
   bool is_connected() const { return this->websocket_client_ != nullptr && esp_websocket_client_is_connected(this->websocket_client_); }
   bool is_bot_speaking() const;  // Check if bot is currently speaking (within 1500ms of last audio)
+
+  // Full-duplex mode: when enabled, microphone audio streams to the server
+  // even while the bot is speaking (experimental open-mic barge-in —
+  // relies on server-side semantic VAD + noise reduction to reject echo).
+  void set_full_duplex(bool enabled) { this->full_duplex_ = enabled; }
+  bool is_full_duplex() const { return this->full_duplex_; }
   
   void set_state_callback(std::function<void(VoiceAssistantWebSocketState)> &&callback) {
     this->state_callback_ = std::move(callback);
@@ -88,6 +94,7 @@ class VoiceAssistantWebSocket : public Component {
   Trigger<> bot_started_speaking_trigger_{};
   Trigger<> bot_stopped_speaking_trigger_{};
   bool was_bot_speaking_{false};  // For edge detection in loop()
+  bool full_duplex_{false};  // Open-mic barge-in (set via Full Duplex Mode switch)
   
   // Audio buffers
   std::vector<uint8_t> input_buffer_;

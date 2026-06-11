@@ -469,8 +469,16 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
     return;
   }
   
-  // Block microphone audio if bot is currently speaking
-  if (this->is_bot_speaking()) {
+  // Block microphone audio if bot is currently speaking — unless
+  // full-duplex mode is enabled (experimental open-mic barge-in).
+  //
+  // AEC experiment (2026-06-09): XMOS hardware AEC partially works
+  // (first ~7s clean) but is not robust — Voice PE lacks the I2S
+  // reference trace for proper hardware AEC, and the old threshold
+  // server_vad (0.5) triggered on residual echo + ambient noise,
+  // causing an interrupt cascade. Re-testing under SemanticTurnDetection
+  // + near_field noise reduction via the Full Duplex Mode switch.
+  if (!this->full_duplex_ && this->is_bot_speaking()) {
     return;  // Don't send microphone audio while bot is speaking
   }
   
@@ -636,6 +644,13 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
           if (this->speaker_ != nullptr) {
             this->speaker_->stop();
           }
+          // Mirror the send-path interrupt cleanup (see interrupt()):
+          // clear queued audio so loop() doesn't resume stale playback,
+          // and briefly ignore in-flight audio from the server.
+          while (!this->audio_queue_.empty()) {
+            this->audio_queue_.pop();
+          }
+          this->interrupt_time_ = millis();
         } else if (message.find("\"type\":\"disconnect\"") != std::string::npos ||
                    message.find("\"type\": \"disconnect\"") != std::string::npos) {
           ESP_LOGI(TAG, "Disconnect message received, stopping voice assistant and going to idle");
