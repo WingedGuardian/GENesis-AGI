@@ -19,6 +19,7 @@ from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.server import WebsocketServerParams, WebsocketServerTransport
 
 from app.audio_recording_service import AudioRecordingService
+from app.interrupt_relay import InterruptRelay
 from app.raw_audio_serializer import RawAudioSerializer
 from app.session_manager import SessionManager
 
@@ -158,9 +159,15 @@ class WebSocketHandler:
             context_aggregator = self.session_manager.create_context_aggregator(client_id)
             context_initializer = self.session_manager.create_context_initializer(client_id, context_aggregator)
 
+        # Relay firmware {"type":"interrupt"} messages into the pipeline
+        # (wake-word barge-in during bot speech). Placed right after
+        # transport input so interrupts act before anything else.
+        interrupt_relay = InterruptRelay(openai_service=openai_service)
+
         # Build pipeline components
         pipeline_components = [
             transport.input(),
+            interrupt_relay,
             input_activity_tracker,
         ]
 
