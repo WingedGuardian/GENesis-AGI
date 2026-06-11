@@ -178,13 +178,16 @@ class Application:
                         logger.info(f"✅ OpenAI session reset for client {client_id}")
                     except Exception as e:
                         logger.warning(f"⚠️ Session reset failed, reconnecting: {e}")
-                        # Fallback: just reconnect (session.created will re-send config)
+                        self.openai_service._llm_needs_conversation_setup = True
                         await self.openai_service._connect()
                 else:
                     # No context yet (first-ever client, or service was just created).
-                    # Just connect — session.created fires on every new WS connection
-                    # and triggers _update_settings() to send tools/instructions.
+                    # Reset conversation setup flag so instructions and tools are sent
+                    # after session.created → session.updated cycle completes.
+                    # Without this, _create_response() skips conversation setup and
+                    # OpenAI has no context to generate audio from → silence.
                     logger.info(f"🔗 Connecting OpenAI session for client {client_id}...")
+                    self.openai_service._llm_needs_conversation_setup = True
                     await self.openai_service._connect()
                     logger.info(f"✅ OpenAI session connected for client {client_id}")
 
