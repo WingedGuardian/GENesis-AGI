@@ -3,13 +3,13 @@
 # Override with: --build-arg BUILD_FROM=ghcr.io/home-assistant/aarch64-base:latest
 ARG BUILD_FROM=ghcr.io/home-assistant/aarch64-base:latest
 
-# Build stage - install dependencies with pip using pre-built wheels
+# Build stage - compile native deps then install Python packages
 FROM ${BUILD_FROM} AS builder
 
 # Set shell (use sh for Alpine, bash will be installed)
 SHELL ["/bin/sh", "-o", "pipefail", "-c"]
 
-# Install build dependencies + gcompat (enables manylinux wheel support on Alpine)
+# Install build dependencies (no LLVM — we skip numba/llvmlite, incompatible with Py3.14)
 RUN \
     apk add --no-cache \
         bash \
@@ -21,30 +21,62 @@ RUN \
         curl \
         gcc \
         g++ \
-        gcompat \
         libstdc++
 
 # Switch to bash after installation
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Install Poetry
-RUN \
-    pip3 install --no-cache-dir --break-system-packages poetry \
-    && poetry config virtualenvs.create false \
-    && poetry config virtualenvs.in-project false
-
-# Copy Poetry configuration files
-COPY pyproject.toml poetry.lock* /tmp/
+# Copy app for later staging
 RUN mkdir -p /tmp/genesis_voice_bridge
 COPY app/ /tmp/genesis_voice_bridge/app/
 
-# Install dependencies using Poetry (pre-built manylinux wheels via gcompat)
+# Install dependencies via pip — deterministic path that skips native deps.
+# numba/llvmlite/onnxruntime/resampy are incompatible with Python 3.14 in
+# HA base image and unused at runtime (we use server-side SemanticTurnDetection,
+# not local Silero VAD or resampy resampler).
 WORKDIR /tmp
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
-ENV POETRY_VIRTUALENVS_CREATE=false
-RUN poetry install --only=main --no-root --no-interaction --no-ansi \
-    && rm -f pyproject.toml \
-    && rm -rf genesis_voice_bridge/
+# Step 1: Install pipecat without dependencies
+RUN pip3 install --no-cache-dir --break-system-packages --no-deps \
+    "pipecat-ai[openai,websocket]==1.3.0"
+# Step 2: Install all runtime deps we actually need (excluding native-compiled ones)
+RUN pip3 install --no-cache-dir --break-system-packages \
+    openai "websockets>=13.0" "fastapi>=0.115.0" "uvicorn[standard]>=0.23.0" \
+    python-dotenv httpx \
+    aiohttp aiofiles pydantic loguru numpy Pillow protobuf \
+    nltk Markdown soxr pyloudnorm docstring_parser
+# Stub onnxruntime — pipecat imports it for local SmartTurn VAD but we use
+# server-side SemanticTurnDetection. No wheels exist for Alpine/musl.
+RUN PYTHON_SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") \
+    && mkdir -p "$PYTHON_SITE/onnxruntime" \
+    && cat > "$PYTHON_SITE/onnxruntime/__init__.py" << 'STUB'
+"""Stub onnxruntime — real package unavailable on Alpine musl.
+Local SmartTurn VAD is disabled; server-side SemanticTurnDetection is used instead.
+"""
+
+class _StubMeta(type):
+    """Metaclass that returns stubs for any class-level attribute access."""
+    def __getattr__(cls, name):
+        return _Stub()
+
+class _Stub(metaclass=_StubMeta):
+    """Callable stub that accepts any args and returns itself."""
+    def __init__(self, *args, **kwargs): pass
+    def __call__(self, *args, **kwargs): return self
+    def __getattr__(self, name): return _Stub()
+    def __iter__(self): return iter([])
+    def __bool__(self): return False
+    def __int__(self): return 0
+    def __str__(self): return ""
+
+InferenceSession = _Stub
+SessionOptions = _Stub
+GraphOptimizationLevel = _Stub
+ExecutionMode = _Stub
+get_available_providers = lambda: []
+STUB
+# Cleanup
+RUN rm -rf genesis_voice_bridge/
 
 # Stage installed packages into a known directory for clean COPY
 RUN mkdir -p /staging/site-packages /staging/bin \
@@ -59,7 +91,6 @@ FROM ${BUILD_FROM}
 SHELL ["/bin/sh", "-o", "pipefail", "-c"]
 
 # Install only runtime dependencies (bash first for compatibility)
-# gcompat enables manylinux wheel binaries (numba, onnxruntime, llvmlite)
 RUN \
     apk add --no-cache \
         bash \
@@ -69,7 +100,6 @@ RUN \
         ffmpeg \
         alsa-lib \
         alsa-utils \
-        gcompat \
         libstdc++
 
 # Switch to bash after installation

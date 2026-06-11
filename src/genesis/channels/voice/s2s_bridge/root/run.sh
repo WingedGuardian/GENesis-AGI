@@ -7,10 +7,8 @@ WEBSOCKET_PORT=$(bashio::config 'websocket_port')
 GENESIS_URL=$(bashio::config 'genesis_url')
 GENESIS_TOKEN=$(bashio::config 'genesis_token')
 
-# Turn detection settings
-VAD_THRESHOLD=$(bashio::config 'vad_threshold')
-VAD_PREFIX_PADDING_MS=$(bashio::config 'vad_prefix_padding_ms')
-VAD_SILENCE_DURATION_MS=$(bashio::config 'vad_silence_duration_ms')
+# Turn detection settings (semantic VAD — replaces old threshold-based server_vad)
+SEMANTIC_VAD_EAGERNESS=$(bashio::config 'semantic_vad_eagerness')
 
 # Session management
 SESSION_REUSE_TIMEOUT_SECONDS=$(bashio::config 'session_reuse_timeout_seconds')
@@ -30,9 +28,7 @@ export WEBSOCKET_PORT
 export GENESIS_URL
 export GENESIS_TOKEN
 
-export VAD_THRESHOLD
-export VAD_PREFIX_PADDING_MS
-export VAD_SILENCE_DURATION_MS
+export SEMANTIC_VAD_EAGERNESS
 
 export SESSION_REUSE_TIMEOUT_SECONDS
 export ENABLE_RECORDING
