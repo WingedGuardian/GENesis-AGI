@@ -286,8 +286,14 @@ class WebSocketHandler:
                     # output client connection (set_client_connection(None))
                     # for the OLD socket's disconnect — restore it for the
                     # live socket, and do NOT tear down the OpenAI session.
+                    # Only restore if the output is actually nulled:
+                    # set_client_connection() closes any socket it currently
+                    # holds, so restoring while the live socket is already
+                    # set would close it (rare interleaving, but fatal).
                     logger.info("🛡️ Ignoring stale-socket disconnect (client was replaced)")
-                    await transport.output().set_client_connection(self._active_websocket)
+                    output = transport.output()
+                    if getattr(output, "_websocket", None) is None:
+                        await output.set_client_connection(self._active_websocket)
                     return
                 self._active_websocket = None
                 client_id = self.extract_client_id(websocket)
