@@ -81,6 +81,10 @@ class WebSocketHandler:
         self.pipeline: Pipeline | None = None
         self.runner: PipelineRunner | None = None
         self.current_task: PipelineTask | None = None
+        # Tracks the most recently connected client websocket. Used to detect
+        # stale-socket disconnects when the ESP32 opens a replacement
+        # connection (pipecat allows one client; new connections evict old).
+        self._active_websocket = None
 
     def create_transport(self) -> WebsocketServerTransport:
         """
@@ -101,6 +105,12 @@ class WebSocketHandler:
             port=self.port,
             params=WebsocketServerParams(
                 serializer=serializer,
+                # CRITICAL: these default to False on TransportParams (inherited,
+                # not deprecated). When False, the input audio task is never
+                # created and all audio frames are silently dropped
+                # (base_input.py) and output audio is discarded (base_output.py).
+                audio_in_enabled=True,
+                audio_out_enabled=True,
             )
         )
 
@@ -251,14 +261,35 @@ class WebSocketHandler:
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport: WebsocketServerTransport, websocket):
             """Handle new WebSocket client connection."""
+            is_replacement = (
+                self._active_websocket is not None
+                and self._active_websocket is not websocket
+            )
+            self._active_websocket = websocket
             client_id = self.extract_client_id(websocket)
             logger.info(f"🔗 New WebSocket connection from IP: {client_id}")
+            if is_replacement:
+                # The previous socket's disconnect event will fire shortly —
+                # the stale-socket guard below ignores it. Reuse the live
+                # OpenAI session instead of resetting it mid-conversation.
+                logger.info("♻️ Connection replaced an existing client — keeping session")
+                return
             await on_client_connected_callback(client_id)
 
         if on_client_disconnected_callback:
             @transport.event_handler("on_client_disconnected")
             async def on_client_disconnected(transport: WebsocketServerTransport, websocket, *args, **kwargs):
                 """Handle client disconnection."""
+                if self._active_websocket is not None and self._active_websocket is not websocket:
+                    # Stale socket: this client was replaced by a newer
+                    # connection. Pipecat's transport already nulled the
+                    # output client connection (set_client_connection(None))
+                    # for the OLD socket's disconnect — restore it for the
+                    # live socket, and do NOT tear down the OpenAI session.
+                    logger.info("🛡️ Ignoring stale-socket disconnect (client was replaced)")
+                    await transport.output().set_client_connection(self._active_websocket)
+                    return
+                self._active_websocket = None
                 client_id = self.extract_client_id(websocket)
                 if client_id:
                     logger.info(f"🔌 Client {client_id} disconnected")
