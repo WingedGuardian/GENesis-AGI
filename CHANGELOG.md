@@ -22,6 +22,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   timed out waiting and marked itself failed even though the restart
   succeeded. It now confirms the service is actually back up before reporting,
   so a successful recovery no longer shows as a failed health check.
+- **Terminal scrollback dropped chunks of output in tmux** --- Claude Code's
+  classic renderer intermittently clipped output before tmux recorded it,
+  so scrolling up could show lists with missing items. The Claude Code pin
+  is now 2.1.173 and the forced-classic-renderer override was removed from
+  project settings, so sessions can use the fullscreen renderer
+  (`/tui fullscreen`), which keeps the complete conversation scrollable
+  in-app and exportable to tmux with `Ctrl+O` then `[`.
 
 ---
 

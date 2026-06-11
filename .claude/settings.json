@@ -1,8 +1,7 @@
 {
     "env": {
         "DISABLE_AUTOUPDATER": "1",
-        "DISABLE_UPDATES": "1",
-        "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1"
+        "DISABLE_UPDATES": "1"
     },
     "hooks": {
         "SessionStart": [
