@@ -4316,7 +4316,10 @@
                         x-text="'$' + ($store.genesisDashboard.egoStatus?.daily_cost_usd || 0).toFixed(2) + ' today'"></span>
                 </div>
               </div>
-              <div class="health-card-reason" x-text="$store.genesisDashboard.egoSemantic().reason"></div>
+              <div class="health-card-reason"
+                   :style="$store.genesisDashboard.egoSemantic().reason?.includes('proposals awaiting') ? 'cursor:pointer; text-decoration:underline;' : ''"
+                   @click="if ($store.genesisDashboard.egoSemantic().reason?.includes('proposals awaiting')) { location.hash = 'chat'; $store.genesisDashboard.commsTab = 'proposals'; $store.genesisDashboard.commsProposalFilter = 'pending'; $store.genesisDashboard.fetchComms(); }"
+                   x-text="$store.genesisDashboard.egoSemantic().reason"></div>
             </div>
           </template>
 
