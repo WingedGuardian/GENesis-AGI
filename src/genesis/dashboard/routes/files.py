@@ -68,6 +68,23 @@ def _deduplicate_filename(directory: Path, name: str) -> str:
     return f"{stem}-{counter}{suffix}"
 
 
+def _sanitize_relpath(relpath: str | None) -> list[str]:
+    """Split a client-supplied relative path into traversal-safe segments.
+
+    Used by folder uploads to preserve directory structure under the uploads
+    root. Each segment is reduced to its basename, run through the filename
+    charset filter, and stripped of leading/trailing dots/spaces — so empty,
+    ``.``, and ``..`` segments collapse away and can never escape the base
+    directory. Returns ``[]`` for empty/invalid input.
+    """
+    segments: list[str] = []
+    for raw in re.split(r"[\\/]+", relpath or ""):
+        seg = _SAFE_FILENAME_RE.sub("_", Path(raw).name).strip(". ")
+        if seg and len(seg) <= _MAX_FILENAME_LEN:
+            segments.append(seg)
+    return segments
+
+
 def _is_allowed(path: Path) -> bool:
     """Check that *path* resolves inside an allowed root and isn't blocked."""
     resolved = path.resolve()
@@ -354,31 +371,57 @@ def file_upload():
     if request.content_length and request.content_length > _MAX_UPLOAD_SIZE:
         return jsonify({"error": f"File too large (>{_MAX_UPLOAD_SIZE // (1024 * 1024)}MB)"}), 413
 
-    safe_name = _sanitize_filename(file.filename)
+    # Optional folder upload: ``relpath`` carries the file's path within a
+    # dropped directory (e.g. "Project/data/notes.txt"). All segments are
+    # sanitized to be traversal-safe; the leading ones become subdirectories
+    # under the uploads root, the last is the filename. Absent/flat uploads
+    # fall back to the file's own name (unchanged single-file behavior).
+    rel_segments = _sanitize_relpath(request.form.get("relpath"))
+    if rel_segments:
+        *subdirs, base_name = rel_segments
+    else:
+        subdirs, base_name = [], _sanitize_filename(file.filename)
+    # base_name is always non-empty here (_sanitize_relpath keeps only truthy
+    # segments; _sanitize_filename defaults to "unnamed").
 
-    # Ensure uploads directory exists
-    _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dest_dir = _UPLOAD_DIR.joinpath(*subdirs)
 
-    # Deduplicate filename
-    safe_name = _deduplicate_filename(_UPLOAD_DIR, safe_name)
-    dest = _UPLOAD_DIR / safe_name
-
-    # Security check
-    if not _is_allowed(dest):
+    # Validate BEFORE any filesystem write. Two guards: containment to the
+    # uploads root (defends even if sanitization ever regresses — resolve()
+    # works on not-yet-created paths) and the leaf/component guard (blocked
+    # names like secrets.env, "secret" in any path part, allowlist). Dedup
+    # only appends a numeric suffix, so checking the pre-dedup name is correct
+    # and avoids creating directories for a request we're about to reject.
+    candidate = dest_dir / base_name
+    if not dest_dir.resolve().is_relative_to(_UPLOAD_DIR.resolve()) or not _is_allowed(candidate):
         return jsonify({"error": "Path not allowed"}), 403
 
-    # Save and verify size (content_length can be spoofed, so double-check)
-    file.save(str(dest))
-    file_size = dest.stat().st_size
+    # Create the validated destination and write. Guard the filesystem ops: a
+    # relpath subdir can collide with an existing file (FileExistsError), and
+    # writes can fail (disk full, permissions) — return a clean error, not a
+    # 500 stack trace.
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = _deduplicate_filename(dest_dir, base_name)
+        dest = dest_dir / safe_name
+        # Save and verify size (content_length can be spoofed, so double-check)
+        file.save(str(dest))
+        file_size = dest.stat().st_size
+    except OSError as exc:
+        logger.warning(
+            "Upload failed for %r: %s", request.form.get("relpath") or file.filename, exc
+        )
+        return jsonify({"error": "Could not save file"}), 400
 
     if file_size > _MAX_UPLOAD_SIZE:
         dest.unlink()
         return jsonify({"error": f"File too large (>{_MAX_UPLOAD_SIZE // (1024 * 1024)}MB)"}), 413
 
-    logger.info("File uploaded: %s (%d bytes)", safe_name, file_size)
+    rel_display = "/".join([*subdirs, safe_name])
+    logger.info("File uploaded: %s (%d bytes)", rel_display, file_size)
 
     return jsonify({
         "path": str(dest),
-        "filename": safe_name,
+        "filename": rel_display,
         "size": file_size,
     })

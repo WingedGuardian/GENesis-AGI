@@ -11,6 +11,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Dropping a folder onto the dashboard uploader hung forever** --- dragging a
+  folder onto the Files-tab upload zone got stuck showing the folder's name and
+  never finished, because folders weren't expanded into their contents. Folder
+  drops now upload every file inside, preserving the folder structure under the
+  uploads directory. Single-file and multi-file uploads are unchanged.
+
 - **Eval quality dashboard could stall** --- the nightly memory-scoring job
   timed out and retried from scratch, so the compounding-intelligence
   dashboard stopped getting fresh data and double-counted judgments. The job
