@@ -9,38 +9,87 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+---
+
+## [v3.0b15] - 2026-06-12
+
+### Added
+
+- **Campaign subsystem** (#549, #556, #559, #600) --- Genesis can now run
+  autonomous outreach campaigns end to end: scheduled multi-step sequences
+  with a Discord webhook adapter and Discord voice pipeline, per-campaign
+  profiles, and category validation. Campaigns respect your timezone and
+  dedupe so the same target isn't contacted twice.
+- **Voice: wake word and proactive speech** (#569, #570, #581) --- say
+  "hey genesis" to start a conversation hands-free. Genesis can chime
+  proactively to get your attention, pre-announce before speaking, and ask
+  for approvals out loud with a spoken yes/no.
+- **Voice: tool use in conversation** (#580, #590) --- the speech-to-speech
+  bridge can call Genesis tools mid-conversation, so spoken requests trigger
+  real actions instead of just talk.
+- **Email thread tracking + autonomous replies** (#565) --- Genesis follows
+  email conversations as threads and can draft and send replies on its own,
+  with weekly-job resilience so long-running threads aren't dropped.
+- **Procedural learning** (#591) --- Genesis extracts reusable procedures
+  from your sessions through a three-stream pipeline, so repeated workflows
+  become things it knows how to do rather than re-derives each time.
+- **Memory immune system + self-correcting facts** (#545, #552) --- memory
+  defends against bad or contradictory writes with adversarial review, and a
+  supersession chain automatically replaces stale facts with newer ones so
+  recall reflects what's currently true.
+- **Inbox follow-ups and digests** (#544, #547) --- inbox evaluations produce
+  structured recommendations, can create tracked follow-ups, and surface a
+  digest, with a dashboard filter to focus the queue.
+- **Discord polls + morning-report anti-drift** (#560, #562) --- Discord
+  outreach supports polls, and the morning report carries an anti-drift
+  signal to keep autonomous activity aligned with your priorities.
+
 ### Fixed
 
-- **Dropping a folder onto the dashboard uploader hung forever** --- dragging a
-  folder onto the Files-tab upload zone got stuck showing the folder's name and
-  never finished, because folders weren't expanded into their contents. Folder
-  drops now upload every file inside, preserving the folder structure under the
-  uploads directory. Single-file and multi-file uploads are unchanged.
-
+- **Dropping a folder onto the dashboard uploader hung forever** --- folder
+  drops now upload every file inside, preserving the folder structure under
+  the uploads directory. Single-file and multi-file uploads are unchanged.
+- **Voice conversations fell a turn behind or got stuck** (#579, #596, #602)
+  --- fixed a turn-behind bug, stale-session recovery, and the audio path
+  after the pipecat 1.3.0 upgrade. Turn-taking is sharper and background
+  noise is reduced.
 - **Eval quality dashboard could stall** --- the nightly memory-scoring job
-  timed out and retried from scratch, so the compounding-intelligence
-  dashboard stopped getting fresh data and double-counted judgments. The job
   now resumes where it left off, scores in parallel within provider rate
-  limits, and the aggregator ignores duplicate judgments --- metrics stay
-  accurate and update reliably.
-- **Watchdog falsely reported failure after a slow restart** --- when a
-  server restart took longer than expected under load, the health watchdog
-  timed out waiting and marked itself failed even though the restart
-  succeeded. It now confirms the service is actually back up before reporting,
-  so a successful recovery no longer shows as a failed health check.
-- **Terminal scrollback dropped chunks of output in tmux** --- Claude Code's
-  classic renderer intermittently clipped output before tmux recorded it,
-  so scrolling up could show lists with missing items. The Claude Code pin
-  is now 2.1.173 and the forced-classic-renderer override was removed from
-  project settings, so sessions can use the fullscreen renderer
+  limits, and ignores duplicate judgments, so the compounding-intelligence
+  metrics stay accurate and update reliably.
+- **Dashboard white flash and file-browser glitches** (#575, #592) --- fixed
+  a white flash on load, a too-short file browser, post-upload UX, and
+  multi-file upload.
+- **Scheduled jobs could fire at the wrong time or not at all** (#548, #550,
+  #557) --- weekly jobs are spread across the week, all jobs use your
+  timezone, and interval jobs were converted to cron so they survive restarts
+  instead of silently never running.
+- **Watchdog falsely reported failure after a slow restart** --- it now
+  confirms the service is actually back up before reporting, so a successful
+  recovery no longer shows as a failed health check.
+- **Disk could fill from runaway logs** (#537) --- the systemd journal is
+  capped at 200MB to prevent disk bloat.
+- **Terminal scrollback dropped chunks of output in tmux** --- the Claude
+  Code pin is now 2.1.173 and the forced-classic-renderer override was
+  removed from project settings, so sessions can use the fullscreen renderer
   (`/tui fullscreen`), which keeps the complete conversation scrollable
   in-app and exportable to tmux with `Ctrl+O` then `[`.
-- **UI icons rendered as underscores when connecting from Windows** ---
-  Windows SSH clients send no locale, so tmux treated the terminal as
-  non-UTF-8 and drew every icon and box-drawing glyph as `_`. The tmux
-  session launcher now forces a UTF-8 locale and passes `-u`, so the
-  Claude Code logo, checkmarks, and prompt glyphs render correctly.
-  Reconnect (detach + re-SSH) for the fix to take effect.
+- **UI icons rendered as underscores when connecting from Windows** --- the
+  tmux session launcher now forces a UTF-8 locale and passes `-u`, so the
+  Claude Code logo, checkmarks, and prompt glyphs render correctly. Reconnect
+  (detach + re-SSH) for the fix to take effect.
+- **Install: npm prefix auto-detection** (#606) --- the installer detects
+  your npm prefix instead of hardcoding `/usr/local`, so setup works across
+  more environments.
+
+### Security
+
+- **Removed pickle from the embedding cache** (#536) --- the on-disk
+  embedding cache now uses JSON instead of pickle, closing a code-execution
+  risk from untrusted cache files (CVE-2025-69872).
+- **Cleared dependency vulnerabilities in the voice bridge** (#597) ---
+  updated the voice bridge lockfile, resolving 44 of 46 flagged dependency
+  advisories.
 
 ---
 
