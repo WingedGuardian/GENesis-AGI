@@ -66,13 +66,10 @@ jobs:
       - name: Portability scan (user-specific content)
         run: |
           set -euo pipefail
-          # Exclusions mirror prepare-public-release.sh SCAN_EXCLUDES.
+          # Exclude files that legitimately contain machine-specific
+          # patterns as data (scanner definitions, install scripts, etc.).
           SCAN_EXCLUDES=(
             --glob '!**/.git/**'
-            --glob '!**/prepare-public-release.sh'
-            --glob '!**/push-public-release.sh'
-            --glob '!**/public-release.yaml'
-            --glob '!**/release-script-guarantees.md'
             --glob '!**/src/genesis/contribution/sanitize.py'
             --glob '!**/tests/test_contribution/test_sanitize.py'
             --glob '!**/host-setup.sh'
@@ -107,7 +104,6 @@ jobs:
             rg -n --hidden \
               --glob '!**/.git/**' \
               --glob '!**/tests/**' \
-              --glob '!**/prepare-public-release.sh' \
               --glob '!**/readme-legacy.md' \
               --glob '!**/vendor/**' \
               -e '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' \
