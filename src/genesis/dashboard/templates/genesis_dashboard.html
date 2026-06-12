@@ -722,12 +722,13 @@
           }
 
           this.fileUpload.uploading = true;
-          // Build the work list of { file, relpath }. If any dropped entry is a
-          // folder, walk all entries (files + folders) preserving structure;
+          // Build the work list of { file, relpath }. If an actual folder was
+          // dropped, walk all entries (files + folders) preserving structure;
           // otherwise use the flat file list (drop or click-to-browse).
+          const droppedFolder = !!(dirEntries && dirEntries.some((e) => e && e.isDirectory));
           let items = [];
           try {
-            if (dirEntries && dirEntries.some((e) => e && e.isDirectory)) {
+            if (droppedFolder) {
               this.fileUpload.progress = "Reading folder…";
               items = await this._collectDroppedFiles(dirEntries);
             } else {
@@ -743,7 +744,7 @@
           if (items.length === 0) {
             this.fileUpload.progress = null;
             this.fileUpload.uploading = false;
-            if (dirEntries) this.fileUpload.error = "No files found in the dropped folder.";
+            if (droppedFolder) this.fileUpload.error = "No files found in the dropped folder.";
             if (event.target && event.target.value !== undefined) { event.target.value = ""; }
             return;
           }
@@ -751,6 +752,10 @@
           const uploaded = [];
           const failures = [];
           let lastDir = null;
+          // Uploads root (…/uploads), derived from the first success by stripping
+          // the returned relative path — used as the destination shown for
+          // folder / multi-file uploads instead of one file's deep subfolder.
+          let uploadRoot = null;
           // Upload each file sequentially via the single-file endpoint so every
           // file gets the backend's sanitize / dedup / size-cap checks. The
           // file's relative path (relpath) lets the backend recreate folder
@@ -769,6 +774,9 @@
                 const data = await resp.json();
                 uploaded.push(data.filename);
                 lastDir = data.path.substring(0, data.path.lastIndexOf("/"));
+                if (uploadRoot === null && typeof data.filename === "string") {
+                  uploadRoot = data.path.slice(0, data.path.length - data.filename.length).replace(/\/$/, "");
+                }
               } else {
                 const err = resp ? await resp.json() : {};
                 failures.push(`${relpath}: ${err.error || "failed"}`);
@@ -780,7 +788,8 @@
           this.fileUpload.progress = null;
           this.fileUpload.uploading = false;
           if (uploaded.length) {
-            const dest = lastDir || "~/.genesis/uploads";
+            // Single file → its own directory; multi/folder → the uploads root.
+            const dest = (uploaded.length === 1 ? lastDir : uploadRoot) || "~/.genesis/uploads";
             this.fileUpload.success = uploaded.length === 1
               ? `Uploaded ${uploaded[0]} → ${dest}`
               : `Uploaded ${uploaded.length} files → ${dest} (${uploaded.join(", ")})`;

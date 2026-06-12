@@ -381,27 +381,37 @@ def file_upload():
         *subdirs, base_name = rel_segments
     else:
         subdirs, base_name = [], _sanitize_filename(file.filename)
-    base_name = base_name or _sanitize_filename(file.filename)
+    # base_name is always non-empty here (_sanitize_relpath keeps only truthy
+    # segments; _sanitize_filename defaults to "unnamed").
 
     dest_dir = _UPLOAD_DIR.joinpath(*subdirs)
 
-    # Containment check BEFORE any filesystem write. The explicit
-    # is_relative_to(_UPLOAD_DIR) guard ensures a crafted relpath can never
-    # escape the uploads root (resolve() works on not-yet-created paths).
-    if not dest_dir.resolve().is_relative_to(_UPLOAD_DIR.resolve()):
+    # Validate BEFORE any filesystem write. Two guards: containment to the
+    # uploads root (defends even if sanitization ever regresses — resolve()
+    # works on not-yet-created paths) and the leaf/component guard (blocked
+    # names like secrets.env, "secret" in any path part, allowlist). Dedup
+    # only appends a numeric suffix, so checking the pre-dedup name is correct
+    # and avoids creating directories for a request we're about to reject.
+    candidate = dest_dir / base_name
+    if not dest_dir.resolve().is_relative_to(_UPLOAD_DIR.resolve()) or not _is_allowed(candidate):
         return jsonify({"error": "Path not allowed"}), 403
 
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = _deduplicate_filename(dest_dir, base_name)
-    dest = dest_dir / safe_name
-
-    # Leaf-level guard: blocked names (secrets.env, .env, …) and allowlist.
-    if not _is_allowed(dest):
-        return jsonify({"error": "Path not allowed"}), 403
-
-    # Save and verify size (content_length can be spoofed, so double-check)
-    file.save(str(dest))
-    file_size = dest.stat().st_size
+    # Create the validated destination and write. Guard the filesystem ops: a
+    # relpath subdir can collide with an existing file (FileExistsError), and
+    # writes can fail (disk full, permissions) — return a clean error, not a
+    # 500 stack trace.
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = _deduplicate_filename(dest_dir, base_name)
+        dest = dest_dir / safe_name
+        # Save and verify size (content_length can be spoofed, so double-check)
+        file.save(str(dest))
+        file_size = dest.stat().st_size
+    except OSError as exc:
+        logger.warning(
+            "Upload failed for %r: %s", request.form.get("relpath") or file.filename, exc
+        )
+        return jsonify({"error": "Could not save file"}), 400
 
     if file_size > _MAX_UPLOAD_SIZE:
         dest.unlink()

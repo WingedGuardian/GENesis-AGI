@@ -193,6 +193,26 @@ def test_upload_blocked_leaf_name(client, tmp_path):
     assert resp.status_code == 403
 
 
+def test_upload_subdir_collides_with_existing_file(client, tmp_path):
+    """A relpath subdir colliding with an existing file returns a clean 400, not 500."""
+    # Pre-create a regular file where the folder upload wants a directory.
+    uploads = tmp_path / "uploads"
+    uploads.mkdir(parents=True, exist_ok=True)
+    (uploads / "data").write_text("i am a file, not a dir")
+
+    resp = _post_upload(client, b"x", "x.txt", relpath="data/x.txt")
+    assert resp.status_code == 400
+    assert "save" in resp.get_json()["error"].lower()
+
+
+def test_upload_blocked_subdir_creates_no_orphan_dir(client, tmp_path):
+    """A relpath whose subdir is blocked is rejected WITHOUT creating the dir."""
+    resp = _post_upload(client, b"x", "x.txt", relpath="topsecret/x.txt")
+    assert resp.status_code == 403
+    # The rejected upload must not have created the directory on disk.
+    assert not (tmp_path / "uploads" / "topsecret").exists()
+
+
 def test_upload_too_large(client, tmp_path):
     """A file exceeding the upload size limit returns 413."""
     import genesis.dashboard.routes.files as files_mod
