@@ -722,9 +722,8 @@ if echo "$REPO_URL" | grep -q "github.com" && ! curl -sf "$REPO_URL" >/dev/null 
     echo "        incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID --cwd /home/ubuntu/genesis -t -- bash -l"
 fi
 
-# NOTE: The bash -c uses single quotes so /home/ubuntu paths survive the
-# prepare-public-release.sh sed replacement (which converts /home/ubuntu/ to
-# ${HOME}/ — that would break in double-quoted strings on a non-ubuntu host).
+# NOTE: The bash -c uses single quotes so /home/ubuntu paths are treated
+# literally rather than expanded against the host user's HOME.
 # BRANCH and REPO_URL are injected via --env instead.
 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
     --env "HOME=/home/ubuntu" \

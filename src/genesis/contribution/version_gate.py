@@ -110,10 +110,11 @@ after:
 def read_install_sha(repo_path: Path | None = None) -> str | None:
     """Read the install's source commit SHA.
 
-    Looks for `.genesis-source-commit` (written by
-    `scripts/prepare-public-release.sh` and shipped in the public
-    distribution). Falls back to `git rev-parse HEAD` if the file is
-    missing (developer / private-repo case).
+    Looks for a `.genesis-source-commit` marker file (a legacy artifact
+    from when the public distribution was a stripped tarball without git
+    history). Falls back to `git rev-parse HEAD` when the marker is
+    absent, which is the normal path now that the repo ships as a git
+    clone.
     """
     root = repo_path or Path.cwd()
     marker = root / ".genesis-source-commit"
