@@ -2,6 +2,12 @@
 
 Provides campaign_create, campaign_list, campaign_status, campaign_pause,
 campaign_resume, campaign_trigger, and campaign_update.
+
+When running inside the main Genesis server, these tools use the wired
+runner/db references.  When running as a CC child process (MCP server),
+they fall back to direct DB connections for read/write operations.
+Runner-dependent operations (trigger, schedule hot-reload) return
+informational messages in standalone mode.
 """
 
 from __future__ import annotations
@@ -11,7 +17,11 @@ import json
 import logging
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
+import aiosqlite
+
+from genesis.db.connection import BUSY_TIMEOUT_MS
 from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
@@ -20,13 +30,33 @@ logger = logging.getLogger(__name__)
 _runner = None
 _db = None
 
+# DB path for fallback connections (matches task_tools.py pattern)
+_DB_PATH = Path.home() / "genesis" / "data" / "genesis.db"
+
 
 def init_campaign_tools(*, runner, db) -> None:
-    """Wire campaign tools to their runtime dependencies."""
+    """Wire campaign tools to their runtime dependencies.
+
+    In runtime mode: both runner and db are provided.
+    In standalone MCP mode: runner=None, only db is provided.
+    """
     global _runner, _db
     _runner = runner
     _db = db
-    logger.info("Campaign MCP tools wired")
+    logger.info(
+        "Campaign MCP tools wired (db=%s, runner=%s)",
+        db is not None,
+        runner is not None,
+    )
+
+
+async def _get_db() -> aiosqlite.Connection:
+    """Open a direct DB connection for MCP fallback reads/writes."""
+    db = await aiosqlite.connect(str(_DB_PATH))
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    return db
 
 
 # ---------------------------------------------------------------------------
@@ -47,159 +77,245 @@ async def _impl_campaign_create(
     initial_state: dict | None = None,
 ) -> dict:
     """Create and activate a new campaign."""
-    if _db is None:
-        return {"error": "Database not available"}
+    db = _db
+    own_db = False
+    if db is None:
+        try:
+            db = await _get_db()
+            own_db = True
+        except Exception as exc:
+            logger.error("campaign_create DB connection failed", exc_info=True)
+            return {"error": f"Database unavailable: {type(exc).__name__}: {exc}"}
 
-    from genesis.db.crud import campaigns as crud
+    try:
+        from genesis.db.crud import campaigns as crud
 
-    existing = await crud.get_campaign_by_name(_db, name)
-    if existing:
-        return {"error": f"Campaign '{name}' already exists"}
+        existing = await crud.get_campaign_by_name(db, name)
+        if existing:
+            return {"error": f"Campaign '{name}' already exists"}
 
-    campaign_id = str(uuid.uuid4())
-    checks = json.dumps(pre_checks or ["rate_limit", "budget", "slots_available"])
-    state = json.dumps(initial_state or {})
+        campaign_id = str(uuid.uuid4())
+        checks = json.dumps(pre_checks or ["rate_limit", "budget", "slots_available"])
+        state = json.dumps(initial_state or {})
 
-    await crud.create_campaign(
-        _db,
-        id=campaign_id,
-        name=name,
-        strategy_doc_path=strategy_doc_path,
-        cron_cadence=cron_cadence,
-        model=model,
-        effort=effort,
-        session_profile=profile,
-        pre_checks=checks,
-        max_daily_cost_usd=max_daily_cost_usd,
-        state_json=state,
-        created_at=datetime.now(UTC).isoformat(),
-    )
+        await crud.create_campaign(
+            db,
+            id=campaign_id,
+            name=name,
+            strategy_doc_path=strategy_doc_path,
+            cron_cadence=cron_cadence,
+            model=model,
+            effort=effort,
+            session_profile=profile,
+            pre_checks=checks,
+            max_daily_cost_usd=max_daily_cost_usd,
+            state_json=state,
+            created_at=datetime.now(UTC).isoformat(),
+        )
 
-    # Schedule the campaign if runner is available
-    if _runner:
-        campaign = await crud.get_campaign(_db, campaign_id)
-        await _runner.add_campaign(campaign)
+        result: dict = {"id": campaign_id, "name": name, "status": "active"}
 
-    return {"id": campaign_id, "name": name, "status": "active"}
+        # Schedule the campaign if runner is available
+        if _runner:
+            campaign = await crud.get_campaign(db, campaign_id)
+            await _runner.add_campaign(campaign)
+        else:
+            result["note"] = (
+                "Campaign created in database. "
+                "Restart genesis-server to activate scheduling."
+            )
+
+        return result
+    finally:
+        if own_db:
+            await db.close()
 
 
 async def _impl_campaign_list(status_filter: str | None = None) -> dict:
     """List campaigns with status, last run, and health."""
-    if _db is None:
-        return {"error": "Database not available"}
+    db = _db
+    own_db = False
+    if db is None:
+        try:
+            db = await _get_db()
+            own_db = True
+        except Exception as exc:
+            logger.error("campaign_list DB connection failed", exc_info=True)
+            return {"error": f"Database unavailable: {type(exc).__name__}: {exc}"}
 
-    from genesis.db.crud import campaigns as crud
+    try:
+        from genesis.db.crud import campaigns as crud
 
-    campaigns = await crud.list_campaigns(_db, status_filter=status_filter)
-    items = []
-    for c in campaigns:
-        items.append({
-            "name": c["name"],
-            "status": c["status"],
-            "cadence": c["cron_cadence"],
-            "last_run": c.get("last_run_at"),
-            "total_runs": c["total_runs"],
-            "total_cost": f"${c['total_cost_usd']:.2f}",
-            "model": c["model"],
-        })
-    return {"campaigns": items, "count": len(items)}
+        campaigns = await crud.list_campaigns(db, status_filter=status_filter)
+        items = []
+        for c in campaigns:
+            items.append({
+                "name": c["name"],
+                "status": c["status"],
+                "cadence": c["cron_cadence"],
+                "last_run": c.get("last_run_at"),
+                "total_runs": c["total_runs"],
+                "total_cost": f"${c['total_cost_usd']:.2f}",
+                "model": c["model"],
+            })
+        return {"campaigns": items, "count": len(items)}
+    finally:
+        if own_db:
+            await db.close()
 
 
 async def _impl_campaign_status(name: str) -> dict:
     """Detailed status for a single campaign."""
-    if _db is None:
-        return {"error": "Database not available"}
+    db = _db
+    own_db = False
+    if db is None:
+        try:
+            db = await _get_db()
+            own_db = True
+        except Exception as exc:
+            logger.error("campaign_status DB connection failed", exc_info=True)
+            return {"error": f"Database unavailable: {type(exc).__name__}: {exc}"}
 
-    from genesis.db.crud import campaigns as crud
+    try:
+        from genesis.db.crud import campaigns as crud
 
-    campaign = await crud.get_campaign_by_name(_db, name)
-    if not campaign:
-        return {"error": f"Campaign '{name}' not found"}
+        campaign = await crud.get_campaign_by_name(db, name)
+        if not campaign:
+            return {"error": f"Campaign '{name}' not found"}
 
-    runs = await crud.list_runs(_db, campaign["id"], limit=5)
-    state = {}
-    with contextlib.suppress(json.JSONDecodeError, TypeError):
-        state = json.loads(campaign["state_json"])
+        runs = await crud.list_runs(db, campaign["id"], limit=5)
+        state = {}
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            state = json.loads(campaign["state_json"])
 
-    # Filter internal keys from state display
-    visible_state = {k: v for k, v in state.items() if not k.startswith("_")}
+        # Filter internal keys from state display
+        visible_state = {k: v for k, v in state.items() if not k.startswith("_")}
 
-    return {
-        "name": campaign["name"],
-        "status": campaign["status"],
-        "cadence": campaign["cron_cadence"],
-        "model": campaign["model"],
-        "effort": campaign["effort"],
-        "profile": campaign["session_profile"],
-        "max_daily_cost": f"${campaign['max_daily_cost_usd']:.2f}",
-        "state": visible_state,
-        "last_run": campaign.get("last_run_at"),
-        "total_runs": campaign["total_runs"],
-        "total_cost": f"${campaign['total_cost_usd']:.2f}",
-        "recent_runs": [
-            {
-                "started": r["started_at"],
-                "outcome": r["outcome"],
-                "summary": r.get("summary", ""),
-                "cost": f"${r['cost_usd']:.2f}",
-            }
-            for r in runs
-        ],
-    }
+        return {
+            "name": campaign["name"],
+            "status": campaign["status"],
+            "cadence": campaign["cron_cadence"],
+            "model": campaign["model"],
+            "effort": campaign["effort"],
+            "profile": campaign["session_profile"],
+            "max_daily_cost": f"${campaign['max_daily_cost_usd']:.2f}",
+            "state": visible_state,
+            "last_run": campaign.get("last_run_at"),
+            "total_runs": campaign["total_runs"],
+            "total_cost": f"${campaign['total_cost_usd']:.2f}",
+            "recent_runs": [
+                {
+                    "started": r["started_at"],
+                    "outcome": r["outcome"],
+                    "summary": r.get("summary", ""),
+                    "cost": f"${r['cost_usd']:.2f}",
+                }
+                for r in runs
+            ],
+        }
+    finally:
+        if own_db:
+            await db.close()
 
 
 async def _impl_campaign_pause(name: str) -> dict:
     """Pause a campaign."""
-    if _db is None:
-        return {"error": "Database not available"}
+    db = _db
+    own_db = False
+    if db is None:
+        try:
+            db = await _get_db()
+            own_db = True
+        except Exception as exc:
+            logger.error("campaign_pause DB connection failed", exc_info=True)
+            return {"error": f"Database unavailable: {type(exc).__name__}: {exc}"}
 
-    from genesis.db.crud import campaigns as crud
+    try:
+        from genesis.db.crud import campaigns as crud
 
-    campaign = await crud.get_campaign_by_name(_db, name)
-    if not campaign:
-        return {"error": f"Campaign '{name}' not found"}
+        campaign = await crud.get_campaign_by_name(db, name)
+        if not campaign:
+            return {"error": f"Campaign '{name}' not found"}
 
-    await crud.update_campaign(
-        _db, campaign["id"],
-        status="paused",
-        paused_at=datetime.now(UTC).isoformat(),
-    )
+        await crud.update_campaign(
+            db, campaign["id"],
+            status="paused",
+            paused_at=datetime.now(UTC).isoformat(),
+        )
 
-    if _runner:
-        await _runner.remove_campaign(name)
+        if _runner:
+            await _runner.remove_campaign(name)
 
-    return {"name": name, "status": "paused"}
+        result: dict = {"name": name, "status": "paused"}
+        if not _runner:
+            result["note"] = (
+                "Paused in database. "
+                "Restart genesis-server for schedule changes to take effect."
+            )
+        return result
+    finally:
+        if own_db:
+            await db.close()
 
 
 async def _impl_campaign_resume(name: str) -> dict:
     """Resume a paused campaign."""
-    if _db is None:
-        return {"error": "Database not available"}
+    db = _db
+    own_db = False
+    if db is None:
+        try:
+            db = await _get_db()
+            own_db = True
+        except Exception as exc:
+            logger.error("campaign_resume DB connection failed", exc_info=True)
+            return {"error": f"Database unavailable: {type(exc).__name__}: {exc}"}
 
-    from genesis.db.crud import campaigns as crud
+    try:
+        from genesis.db.crud import campaigns as crud
 
-    campaign = await crud.get_campaign_by_name(_db, name)
-    if not campaign:
-        return {"error": f"Campaign '{name}' not found"}
+        campaign = await crud.get_campaign_by_name(db, name)
+        if not campaign:
+            return {"error": f"Campaign '{name}' not found"}
 
-    await crud.update_campaign(
-        _db, campaign["id"],
-        status="active",
-        paused_at=None,
-    )
+        await crud.update_campaign(
+            db, campaign["id"],
+            status="active",
+            paused_at=None,
+        )
 
-    if _runner:
-        campaign = await crud.get_campaign(_db, campaign["id"])
-        await _runner.add_campaign(campaign)
+        if _runner:
+            campaign = await crud.get_campaign(db, campaign["id"])
+            await _runner.add_campaign(campaign)
 
-    return {"name": name, "status": "active"}
+        result: dict = {"name": name, "status": "active"}
+        if not _runner:
+            result["note"] = (
+                "Resumed in database. "
+                "Restart genesis-server for schedule changes to take effect."
+            )
+        return result
+    finally:
+        if own_db:
+            await db.close()
 
 
 async def _impl_campaign_trigger(name: str) -> dict:
-    """Manually trigger a campaign tick."""
-    if _db is None or _runner is None:
-        return {"error": "Campaign runner not available"}
+    """Manually trigger a campaign tick.
 
+    Requires the main Genesis server — the campaign runner is not
+    available in standalone MCP mode.
+    """
+    if _runner is None:
+        return {
+            "error": (
+                "Campaign trigger requires the main Genesis server. "
+                "The campaign runner is not available in standalone MCP mode. "
+                "Use campaign_status to check campaign state, or restart "
+                "genesis-server to run campaigns on schedule."
+            ),
+        }
+
+    # When _runner is set, _db is guaranteed set (both wired by init_campaign_tools)
     from genesis.db.crud import campaigns as crud
 
     campaign = await crud.get_campaign_by_name(_db, name)
@@ -219,35 +335,54 @@ async def _impl_campaign_update(
     max_daily_cost_usd: float | None = None,
 ) -> dict:
     """Update campaign configuration."""
-    if _db is None:
-        return {"error": "Database not available"}
+    db = _db
+    own_db = False
+    if db is None:
+        try:
+            db = await _get_db()
+            own_db = True
+        except Exception as exc:
+            logger.error("campaign_update DB connection failed", exc_info=True)
+            return {"error": f"Database unavailable: {type(exc).__name__}: {exc}"}
 
-    from genesis.db.crud import campaigns as crud
+    try:
+        from genesis.db.crud import campaigns as crud
 
-    campaign = await crud.get_campaign_by_name(_db, name)
-    if not campaign:
-        return {"error": f"Campaign '{name}' not found"}
+        campaign = await crud.get_campaign_by_name(db, name)
+        if not campaign:
+            return {"error": f"Campaign '{name}' not found"}
 
-    updates = {}
-    if cron_cadence is not None:
-        updates["cron_cadence"] = cron_cadence
-    if model is not None:
-        updates["model"] = model
-    if effort is not None:
-        updates["effort"] = effort
-    if max_daily_cost_usd is not None:
-        updates["max_daily_cost_usd"] = max_daily_cost_usd
+        updates = {}
+        if cron_cadence is not None:
+            updates["cron_cadence"] = cron_cadence
+        if model is not None:
+            updates["model"] = model
+        if effort is not None:
+            updates["effort"] = effort
+        if max_daily_cost_usd is not None:
+            updates["max_daily_cost_usd"] = max_daily_cost_usd
 
-    if updates:
-        await crud.update_campaign(_db, campaign["id"], **updates)
+        if updates:
+            await crud.update_campaign(db, campaign["id"], **updates)
 
-        # Reschedule if cadence changed
-        if cron_cadence and _runner:
-            await _runner.remove_campaign(name)
-            updated = await crud.get_campaign(_db, campaign["id"])
-            await _runner.add_campaign(updated)
+            # Reschedule if cadence changed
+            if cron_cadence and _runner:
+                await _runner.remove_campaign(name)
+                updated = await crud.get_campaign(db, campaign["id"])
+                await _runner.add_campaign(updated)
 
-    return {"name": name, "updated": list(updates.keys())}
+        result: dict = {"name": name, "updated": list(updates.keys())}
+
+        if cron_cadence and not _runner:
+            result["note"] = (
+                "Cadence updated in database. "
+                "Restart genesis-server for schedule changes to take effect."
+            )
+
+        return result
+    finally:
+        if own_db:
+            await db.close()
 
 
 # ---------------------------------------------------------------------------

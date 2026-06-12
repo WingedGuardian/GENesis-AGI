@@ -63,6 +63,17 @@ async def outreach_send(
     used for delivery.
     """
     if not _pipeline:
+        # Validate category before enqueuing (same check the pipeline path does)
+        from genesis.outreach.types import OutreachCategory
+
+        try:
+            OutreachCategory(category)
+        except ValueError:
+            valid = ", ".join(c.value for c in OutreachCategory)
+            return json.dumps({
+                "error": f"Invalid category '{category}'. Valid categories: {valid}",
+            })
+
         # Queue for genesis-server to pick up on next cycle
         if _db is not None:
             from genesis.db.crud import pending_outreach
