@@ -1,6 +1,6 @@
 [project]
 name = "genesis-v3"
-version = "3.0.0b14"
+version = "3.0.0b15"
 requires-python = ">=3.12"
 dependencies = [
     "aiosqlite",
