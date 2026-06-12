@@ -15,76 +15,76 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
-- **Campaign subsystem** (#549, #556, #559, #600) --- Genesis can now run
+- **Campaign subsystem** (#549, #556, #559, #600) — Genesis can now run
   autonomous outreach campaigns end to end: scheduled multi-step sequences
   with a Discord webhook adapter and Discord voice pipeline, per-campaign
   profiles, and category validation. Campaigns respect your timezone and
   dedupe so the same target isn't contacted twice.
-- **Voice: wake word and proactive speech** (#569, #570, #581) --- say
+- **Voice: wake word and proactive speech** (#569, #570, #581) — say
   "hey genesis" to start a conversation hands-free. Genesis can chime
   proactively to get your attention, pre-announce before speaking, and ask
   for approvals out loud with a spoken yes/no.
-- **Voice: tool use in conversation** (#580, #590) --- the speech-to-speech
+- **Voice: tool use in conversation** (#580, #590) — the speech-to-speech
   bridge can call Genesis tools mid-conversation, so spoken requests trigger
   real actions instead of just talk.
-- **Email thread tracking + autonomous replies** (#565) --- Genesis follows
+- **Email thread tracking + autonomous replies** (#565) — Genesis follows
   email conversations as threads and can draft and send replies on its own,
   with weekly-job resilience so long-running threads aren't dropped.
-- **Procedural learning** (#591) --- Genesis extracts reusable procedures
+- **Procedural learning** (#591) — Genesis extracts reusable procedures
   from your sessions through a three-stream pipeline, so repeated workflows
   become things it knows how to do rather than re-derives each time.
-- **Memory immune system + self-correcting facts** (#545, #552) --- memory
+- **Memory immune system + self-correcting facts** (#545, #552) — memory
   defends against bad or contradictory writes with adversarial review, and a
   supersession chain automatically replaces stale facts with newer ones so
   recall reflects what's currently true.
-- **Inbox follow-ups and digests** (#544, #547) --- inbox evaluations produce
+- **Inbox follow-ups and digests** (#544, #547) — inbox evaluations produce
   structured recommendations, can create tracked follow-ups, and surface a
   digest, with a dashboard filter to focus the queue.
-- **Discord polls + morning-report anti-drift** (#560, #562) --- Discord
+- **Discord polls + morning-report anti-drift** (#560, #562) — Discord
   outreach supports polls, and the morning report carries an anti-drift
   signal to keep autonomous activity aligned with your priorities.
 
 ### Fixed
 
-- **Dropping a folder onto the dashboard uploader hung forever** --- folder
+- **Dropping a folder onto the dashboard uploader hung forever** — folder
   drops now upload every file inside, preserving the folder structure under
   the uploads directory. Single-file and multi-file uploads are unchanged.
 - **Voice conversations fell a turn behind or got stuck** (#579, #596, #602)
-  --- fixed a turn-behind bug, stale-session recovery, and the audio path
+  — fixed a turn-behind bug, stale-session recovery, and the audio path
   after the pipecat 1.3.0 upgrade. Turn-taking is sharper and background
   noise is reduced.
-- **Eval quality dashboard could stall** --- the nightly memory-scoring job
+- **Eval quality dashboard could stall** — the nightly memory-scoring job
   now resumes where it left off, scores in parallel within provider rate
   limits, and ignores duplicate judgments, so the compounding-intelligence
   metrics stay accurate and update reliably.
-- **Dashboard white flash and file-browser glitches** (#575, #592) --- fixed
+- **Dashboard white flash and file-browser glitches** (#575, #592) — fixed
   a white flash on load, a too-short file browser, post-upload UX, and
   multi-file upload.
 - **Scheduled jobs could fire at the wrong time or not at all** (#548, #550,
-  #557) --- weekly jobs are spread across the week, all jobs use your
+  #557) — weekly jobs are spread across the week, all jobs use your
   timezone, and interval jobs were converted to cron so they survive restarts
   instead of silently never running.
-- **Watchdog falsely reported failure after a slow restart** --- it now
+- **Watchdog falsely reported failure after a slow restart** — it now
   confirms the service is actually back up before reporting, so a successful
   recovery no longer shows as a failed health check.
-- **Disk could fill from runaway logs** (#537) --- the systemd journal is
+- **Disk could fill from runaway logs** (#537) — the systemd journal is
   capped at 200MB to prevent disk bloat.
-- **Terminal scrollback dropped chunks of output in tmux** --- the Claude
+- **Terminal scrollback dropped chunks of output in tmux** — the Claude
   Code pin is now 2.1.173 and the forced-classic-renderer override was
   removed from project settings, so sessions can use the fullscreen renderer
   (`/tui fullscreen`), which keeps the complete conversation scrollable
   in-app and exportable to tmux with `Ctrl+O` then `[`.
-- **UI icons rendered as underscores when connecting from Windows** --- the
+- **UI icons rendered as underscores when connecting from Windows** — the
   tmux session launcher now forces a UTF-8 locale and passes `-u`, so the
   Claude Code logo, checkmarks, and prompt glyphs render correctly. Reconnect
   (detach + re-SSH) for the fix to take effect.
-- **Install: npm prefix auto-detection** (#606) --- the installer detects
+- **Install: npm prefix auto-detection** (#606) — the installer detects
   your npm prefix instead of hardcoding `/usr/local`, so setup works across
   more environments.
 
 ### Security
 
-- **Removed pickle from the embedding cache** (#536) --- the on-disk
+- **Removed pickle from the embedding cache** (#536) — the on-disk
   embedding cache now uses JSON instead of pickle, closing a code-execution
   risk from untrusted cache files (CVE-2025-69872).
 - **Cleared dependency vulnerabilities in the voice bridge** (#597) ---
@@ -97,44 +97,44 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
-- **Voice S2S pipeline** (#524, #525, #530, #532, #535) --- speech-to-
+- **Voice S2S pipeline** (#524, #525, #530, #532, #535) — speech-to-
   speech voice conversations via Wyoming protocol and GPT-Realtime API.
   Includes conciseness nudge, audio output fix, and 30-minute idle
   timeout.
-- **Ego notification pipeline** (#531) --- proposals deliver through
+- **Ego notification pipeline** (#531) — proposals deliver through
   outreach with dedup, rate limiting, and quiet hours. Content firewall
   prevents information leakage in dispatched content sessions.
-- **Ego domain separation** (#529) --- user ego and genesis ego operate
+- **Ego domain separation** (#529) — user ego and genesis ego operate
   with distinct information boundaries. Domain-aware realist catches
   cross-domain proposals before delivery.
-- **Verified autonomy** (#521, #522) --- ECE calibration metric and
+- **Verified autonomy** (#521, #522) — ECE calibration metric and
   quality scorer for autonomous execution. Adversarial review layer
   validates dispatch outcomes.
-- **Dispatch gate** (#516) --- ego proposals route through the autonomy
+- **Dispatch gate** (#516) — ego proposals route through the autonomy
   approval pipeline before execution.
-- **Life domain model** (#539) --- memory system supports life domain
+- **Life domain model** (#539) — memory system supports life domain
   tags (employment, personal, genesis). User profile structured around
   life dimensions.
-- **Essential knowledge: active work** (#509) --- real-time active work
+- **Essential knowledge: active work** (#509) — real-time active work
   section in the ego's essential context window.
-- **Dashboard contribution toggle** (#533) --- contribution offers can
+- **Dashboard contribution toggle** (#533) — contribution offers can
   be enabled or disabled from the dashboard Settings tab.
-- **Hook pipeline wiring** (#518) --- outcome verification, skill
+- **Hook pipeline wiring** (#518) — outcome verification, skill
   injection, and feedback audit connected to the hook system.
 
 ### Fixed
 
-- **Ego reactive spinning** (#538) --- reactive signal threshold raised
+- **Ego reactive spinning** (#538) — reactive signal threshold raised
   from WARNING to ERROR, eliminating thousands of noise-driven ego
   cycles per week. Infrastructure escalations filtered from user ego
   context. Dispatch verification fuzzy-matches similar filenames
   instead of false-failing.
-- **Contribution hook in worktrees** (#538) --- config gate resolves
+- **Contribution hook in worktrees** (#538) — config gate resolves
   from the main repo root instead of the worktree path.
-- **Dream cycle OOM** (#517, #528) --- entity resolution OOM guard
+- **Dream cycle OOM** (#517, #528) — entity resolution OOM guard
   prevents unbounded Qdrant searches. Chunked dedup handles large
   memory buckets without memory exhaustion.
-- **DeepSeek V4 cost tracking** (#526) --- custom cost entries for
+- **DeepSeek V4 cost tracking** (#526) — custom cost entries for
   models not in litellm's registry. Dream cycle hardening for edge
   cases.
 
@@ -144,47 +144,47 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
-- **Provider failure escalation** (#512) --- circuit breaker trips that
+- **Provider failure escalation** (#512) — circuit breaker trips that
   cycle 5+ times without recovery now auto-create high-priority
   observations. The ego picks them up naturally instead of relying on
   manual investigation. Recovery clears the escalation state.
-- **Investigation model override** (#512) --- ego proposal dispatches
+- **Investigation model override** (#512) — ego proposal dispatches
   respect per-action-type model configuration (`dispatch_model_overrides`
   in ego.yaml). Investigations default to Opus for deeper reasoning.
-- **Dashboard circuit breaker visibility** (#512) --- LLM provider cards
+- **Dashboard circuit breaker visibility** (#512) — LLM provider cards
   in operational vitals show breaker state (OPEN/HALF-OPEN badges),
   trip count, and last failure category.
-- **Goal decomposition** (#501) --- ego goals support subgoals,
+- **Goal decomposition** (#501) — ego goals support subgoals,
   cascade tracking, goal_type, and cadence scheduling.
-- **Goal-driven behavior** (#494) --- staleness signals, deep context
+- **Goal-driven behavior** (#494) — staleness signals, deep context
   injection, and assessment for ego goal management.
-- **Reflection corpus recording** (#503) --- captures deep reflection
+- **Reflection corpus recording** (#503) — captures deep reflection
   observations for quality measurement and prompt optimization.
-- **Content validation hooks** (#500) --- gitleaks rules and commit-msg
+- **Content validation hooks** (#500) — gitleaks rules and commit-msg
   hook for automated content validation.
 
 ### Fixed
 
-- **Surplus restart flooding** (#504) --- restart-resilient scheduling
+- **Surplus restart flooding** (#504) — restart-resilient scheduling
   with completed_at cooldown prevents re-enqueuing on server restart.
   Watchdog heartbeat refresh prevents false staleness detection.
-- **Morning report staleness** (#506) --- inbox count from DB instead
+- **Morning report staleness** (#506) — inbox count from DB instead
   of filesystem, observation surfacing lifecycle respected, standing
   items use proper datetime comparison.
-- **Ego domain boundaries** (#506) --- user ego no longer sees
+- **Ego domain boundaries** (#506) — user ego no longer sees
   infrastructure observations that belong to the Genesis ego's domain.
-- **Light reflection duplicates** (#502, #505) --- eliminated duplicate
+- **Light reflection duplicates** (#502, #505) — eliminated duplicate
   observations and injected prior context for continuity.
-- **Routing config cleanup** (#510) --- removed stale model entries
+- **Routing config cleanup** (#510) — removed stale model entries
   from routing chains after upstream model availability changes.
-- **Bookmark search** (#511) --- bookmarks searched via SQL instead
+- **Bookmark search** (#511) — bookmarks searched via SQL instead
   of memory retriever for reliability.
 
 ### Changed
 
-- **Realist gate tightened** (#504) --- bypass threshold raised from
+- **Realist gate tightened** (#504) — bypass threshold raised from
   high to critical-only priority.
-- **CODEOWNERS + PR discussion** (#508) --- require discussion
+- **CODEOWNERS + PR discussion** (#508) — require discussion
   before PRs on the public repo.
 
 ---
@@ -193,98 +193,98 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
-- **Reflection quality rubric** (#493) --- LLM-as-judge rubric scoring
+- **Reflection quality rubric** (#493) — LLM-as-judge rubric scoring
   deep reflection observations on specificity, actionability, novelty,
   and grounding. Foundation for DSPy prompt optimization. Calibrated at
   98% agreement on 50 hand-graded cases.
-- **Golden set generator** --- one-shot script to bootstrap rubric
+- **Golden set generator** — one-shot script to bootstrap rubric
   calibration data from existing deep reflection observations.
-- **Standalone calibration runner** --- validates the rubric outside the
+- **Standalone calibration runner** — validates the rubric outside the
   full Genesis runtime using a lightweight litellm router wrapper.
-- **Voyage AI reranking** (#489) --- post-retrieval reranking via
+- **Voyage AI reranking** (#489) — post-retrieval reranking via
   Voyage rerank-2.5 for memory recall precision.
-- **Memory recall defaults** (#492) --- rerank enabled by default with
+- **Memory recall defaults** (#492) — rerank enabled by default with
   opt-out for latency-sensitive callers.
-- **Ego realist upgrade** (#491) --- realist gate now uses Opus with
+- **Ego realist upgrade** (#491) — realist gate now uses Opus with
   domain boundary enforcement.
-- **User job timezone fix** (#490) --- scheduler respects user timezone
+- **User job timezone fix** (#490) — scheduler respects user timezone
   for job scheduling.
-- **Ego CycleType removal** (#486) --- legacy run_cycle() enum removed.
-- **PageIndex document indexing** (#487) --- tree-based vectorless RAG
+- **Ego CycleType removal** (#486) — legacy run_cycle() enum removed.
+- **PageIndex document indexing** (#487) — tree-based vectorless RAG
   for structured PDFs via PageIndex cloud API.
-- **Dream cycle entity resolution** (#483) --- graph enrichment during
+- **Dream cycle entity resolution** (#483) — graph enrichment during
   dream cycles with entity resolution and relationship extraction.
 
 ### Fixed
 
-- **CodeQL security alerts** (#485) --- resolved all 8 open alerts.
+- **CodeQL security alerts** (#485) — resolved all 8 open alerts.
 
 ---
 
 ## [v3.0b11] - 2026-05-23
 
-48 PRs merged. Proposal lifecycle redesigned --- ego's focus board
+48 PRs merged. Proposal lifecycle redesigned — ego's focus board
 decoupled from user approval queue. Ego reliability hardened across
 resolution UX, realist gate, and sovereignty guards. Reflection goes
 event-driven. Dashboard gains observations tab and eval metrics.
 
 ### Added
 
-- **Board/queue separation** (#412) --- ego's 0-3 focus board is now
+- **Board/queue separation** (#412) — ego's 0-3 focus board is now
   independent of the user's pending approval queue. New `unboard` action
   rotates ego focus without destroying user approvals. 14-day auto-table
   for stale proposals.
-- **Unified proposal resolution** (#411) --- natural language approval
+- **Unified proposal resolution** (#411) — natural language approval
   ("ok", "yes", "sounds good") recognized across Telegram, MCP tool,
   and CC sessions. Re-validate path for withdrawn proposals.
-- **User directives** (#399) --- direct instructions to the ego with
+- **User directives** (#399) — direct instructions to the ego with
   rich goal context and MCP tools for goal/directive management.
-- **Goal-proposal linking** (#390, #403) --- proposals advance specific
+- **Goal-proposal linking** (#390, #403) — proposals advance specific
   user goals with progress tracking and Opus-quality dispatch.
-- **Critical observation alerting** (#369, #370) --- automatic Telegram
+- **Critical observation alerting** (#369, #370) — automatic Telegram
   alerts for critical observations with delivery gating and dedup.
-- **Observations tab** (#367) --- browse and resolve observations on
+- **Observations tab** (#367) — browse and resolve observations on
   the dashboard.
-- **J-9 eval metrics** (#378, #383) --- evaluation dimensions and
+- **J-9 eval metrics** (#378, #383) — evaluation dimensions and
   meta-health heartbeat surfaced on dashboard.
-- **Workflow visibility** (#380) --- phase timeline with linked
+- **Workflow visibility** (#380) — phase timeline with linked
   follow-ups on dashboard.
-- **TinyFish Browser API** (#388) --- Layer 4 CDP option for browser
+- **TinyFish Browser API** (#388) — Layer 4 CDP option for browser
   automation.
-- **Model assessment framework** (#372) --- activated scheduler for
+- **Model assessment framework** (#372) — activated scheduler for
   provider evaluation.
-- **Weekly models.md synthesis** (#410) --- recon pipeline auto-generates
+- **Weekly models.md synthesis** (#410) — recon pipeline auto-generates
   model intelligence report.
 
 ### Changed
 
-- **Event-driven reflection** (#408) --- anomaly focus with delta-only
+- **Event-driven reflection** (#408) — anomaly focus with delta-only
   Light prompts. No re-reporting known conditions.
-- **Silent micro ticks** (#404) --- perception runs without LLM unless
+- **Silent micro ticks** (#404) — perception runs without LLM unless
   critical signal detected.
-- **Jurisdiction separation** (#387) --- user ego and genesis ego
+- **Jurisdiction separation** (#387) — user ego and genesis ego
   operate in distinct domains.
-- **Update polling** --- state-based silent-death detection replaces
+- **Update polling** — state-based silent-death detection replaces
   wall-clock timeout with 30-second startup grace period.
 
 ### Fixed
 
-- **24h sovereignty guard** (#411, #412) --- tabling and withdrawal
+- **24h sovereignty guard** (#411, #412) — tabling and withdrawal
   blocked for proposals delivered less than 24 hours ago.
-- **Realist confabulation** (#412) --- realist gate can no longer
+- **Realist confabulation** (#412) — realist gate can no longer
   fabricate system state claims from failure patterns in history.
-- **Observation TTL tuning** (#407) --- infrastructure types expire
+- **Observation TTL tuning** (#407) — infrastructure types expire
   faster to prevent stale belief errors.
-- **Ego outcome visibility** (#391) --- clear FAILED/OK outcomes in
+- **Ego outcome visibility** (#391) — clear FAILED/OK outcomes in
   proposal history context.
-- **Reactive event dedup** (#397) --- content-dedup prevents 30-minute
+- **Reactive event dedup** (#397) — content-dedup prevents 30-minute
   spam from repeated signals.
-- **Guardian depth checks** (#377) --- health API probes with 503 retry.
-- **Sentinel stale heartbeat** (#376) --- detects and reports on
+- **Guardian depth checks** (#377) — health API probes with 503 retry.
+- **Sentinel stale heartbeat** (#376) — detects and reports on
   dashboard.
-- **Inbox re-evaluation** (#402) --- previously evaluated items no
+- **Inbox re-evaluation** (#402) — previously evaluated items no
   longer re-processed.
-- **Dashboard UX** (#364, #394, #396) --- approvals, ego badges, work
+- **Dashboard UX** (#364, #394, #396) — approvals, ego badges, work
   tab, timezone handling, silent-death detection.
 
 ---
@@ -298,23 +298,23 @@ against VM crashes.
 
 ### Added
 
-- **Dream cycle** (#359) --- retroactive episodic memory consolidation.
+- **Dream cycle** (#359) — retroactive episodic memory consolidation.
   Background process reviews recent memories, identifies clusters and
   patterns, and synthesizes higher-order observations.
-- **Ego attribution** (#362) --- proposals display which ego (User CEO
+- **Ego attribution** (#362) — proposals display which ego (User CEO
   vs Genesis COO) created them, on both Telegram digests and the
   dashboard.
-- **Surplus→reflection pipeline** (#362) --- promoted surplus insights
+- **Surplus→reflection pipeline** (#362) — promoted surplus insights
   feed into deep reflection context. After routing, insights are marked
   consumed so they don't re-appear.
 
 ### Fixed
 
-- **Ego dispatch pipeline** (#358) --- timeout handling, double-dispatch
+- **Ego dispatch pipeline** (#358) — timeout handling, double-dispatch
   prevention, and message persistence for proposal execution.
-- **Dream cycle safety** (#363) --- bucket chunking, memory preflight
+- **Dream cycle safety** (#363) — bucket chunking, memory preflight
   validation, and async yielding to prevent runaway consolidation.
-- **Guardian VM crash hardening** (#361) --- kernel OOM tuning, MCP
+- **Guardian VM crash hardening** (#361) — kernel OOM tuning, MCP
   process isolation, and preflight health checks before diagnosis.
 
 ---
@@ -330,31 +330,31 @@ off volatile `/tmp` to prevent intermittent session-breaking failures.
 
 ### Added
 
-- **Ego layers 3--6** (#333, #335, #346) --- realist gate for proposal
+- **Ego layers 3--6** (#333, #335, #346) — realist gate for proposal
   quality control, cross-ego isolation (user ego and Genesis ego run
   independently), capability map for self-awareness, reactive cycles
   that respond to environmental changes, and model tiering for
   cost-appropriate execution.
-- **Intelligence intake pipeline** (#349) --- surplus engine atomizes
+- **Intelligence intake pipeline** (#349) — surplus engine atomizes
   incoming intelligence signals, scores them for relevance, and routes
   to the appropriate processing lane.
-- **Stealth browser skill** (#338) --- VNC trusted-input technique for
+- **Stealth browser skill** (#338) — VNC trusted-input technique for
   bypassing anti-bot protections like Cloudflare Turnstile.
-- **VNC Turnstile auto-bypass** (#348) --- wires VNC trusted input into
+- **VNC Turnstile auto-bypass** (#348) — wires VNC trusted input into
   the browser automation layer for hands-free CAPTCHA solving.
-- **Medium self-healing login** (#342) --- `MediumDistributor` recovers
+- **Medium self-healing login** (#342) — `MediumDistributor` recovers
   from expired sessions without manual intervention.
-- **Ego Opus dispatch** (#347) --- interact-profile sessions use Opus
+- **Ego Opus dispatch** (#347) — interact-profile sessions use Opus
   for higher-quality output.
-- **Voice-master quick mode** (#341) --- lightweight voice application
+- **Voice-master quick mode** (#341) — lightweight voice application
   with anti-AI audit rules.
-- **Ego publish profile type** (#339) --- adds `publish` to the interact
+- **Ego publish profile type** (#339) — adds `publish` to the interact
   profile types for content distribution dispatch.
-- **Evolution proposal review tool** (#316) --- MCP tool for triaging
+- **Evolution proposal review tool** (#316) — MCP tool for triaging
   ego proposals.
-- **DB migration auto-apply at startup** (#302) --- pending migrations
+- **DB migration auto-apply at startup** (#302) — pending migrations
   run automatically on server start.
-- **Memory lifecycle GC** (#352) --- garbage collection for
+- **Memory lifecycle GC** (#352) — garbage collection for
   `pending_embeddings`, events rotation, and `retrieved_count` tracking.
 
 ### Changed
@@ -447,7 +447,7 @@ off volatile `/tmp` to prevent intermittent session-breaking failures.
   existing rows tagged with `reflection_observation` /
   `reflection_summary` in FTS5. Other subsystems are tagged
   forward-only on new writes.
-- **LLM-as-judge eval primitive** --- new `LLMJudgeScorer`
+- **LLM-as-judge eval primitive** — new `LLMJudgeScorer`
   (`ScorerType.LLM_JUDGE`), versioned `Rubric` registry, and a
   calibration job that grades a rubric against a hand-graded golden
   set and refuses to promote it below 80% agreement. The judge runs
@@ -471,7 +471,7 @@ off volatile `/tmp` to prevent intermittent session-breaking failures.
   true`; at the realistic event-driven frequency of this call site,
   the spend is negligible.
 - **`judge` call site is in the L2 / tmp-pressure-high skip lists**
-  --- when Genesis is degraded or disk-pressured, judge calls back
+  — when Genesis is degraded or disk-pressured, judge calls back
   off automatically, in line with the existing rules for non-critical
   background work.
 - **Confusable call-site IDs renamed.** Three IDs previously shared
@@ -519,55 +519,55 @@ off volatile `/tmp` to prevent intermittent session-breaking failures.
   shows the call site with a red **NO API KEY CONFIGURED** badge plus
   a banner naming the env vars (`API_KEY_<TYPE>`) that would enable
   it. Partial API-key configuration is the normal install state, not
-  a bug --- it should be discoverable. Sentinel does not alert on
+  a bug — it should be discoverable. Sentinel does not alert on
   these sites (existing filter for `wired:False`/`disabled`/no
   `last_run_at` covers it).
-- **Approval system overhauled** (#323, #329, #351) --- removes
+- **Approval system overhauled** (#323, #329, #351) — removes
   subsystem scoping, adds instant wake on approval, startup recovery
   for pending approvals, and staleness guard for approvals blocking the
   inbox monitor indefinitely.
-- **Ego self-suppression eliminated** (#331) --- removes root causes
+- **Ego self-suppression eliminated** (#331) — removes root causes
   of ego cycles suppressing their own output, plus fixes deep reflection
   floor bug.
-- **Sentinel alarm flapping cooldown** (#340) --- 15-minute cooldown
+- **Sentinel alarm flapping cooldown** (#340) — 15-minute cooldown
   prevents repeated alarm/clear cycles from spamming notifications.
   Adds `MemAvailable` metric.
-- **CC Bash sandbox moved off volatile `/tmp`** (#357) --- sets
+- **CC Bash sandbox moved off volatile `/tmp`** (#357) — sets
   `CLAUDE_CODE_TMPDIR` to persistent disk (`~/.genesis/cc-tmp`),
   eliminating intermittent ENOENT failures that broke the Bash tool
   for 7+ sessions.
-- **Inbox startup wake delay** (#354, #355) --- uses
+- **Inbox startup wake delay** (#354, #355) — uses
   `asyncio.call_later` for reliable startup wake instead of immediate
   wake that raced with event loop bootstrap.
-- **Migration 0017 transaction fix** (#350) --- removes erroneous
+- **Migration 0017 transaction fix** (#350) — removes erroneous
   `db.commit()` since the migration runner manages transactions.
-- **Inbox content hash normalization** (#330) --- prevents duplicate
+- **Inbox content hash normalization** (#330) — prevents duplicate
   processing. Strengthens YouTube fallback instructions.
-- **Learning pipeline structural fixes** (#332) --- 5 fixes for the
+- **Learning pipeline structural fixes** (#332) — 5 fixes for the
   procedural learning pipeline.
 - **Memory tagging and recall fixes** (#324, #325, #326, #327) ---
   separate episodic/knowledge stores, Qdrant collection tagging, drift
   null safety, CBM hook, and curated KB migration.
-- **Contribution gate force-with-lease** (#320) --- explicit expected
+- **Contribution gate force-with-lease** (#320) — explicit expected
   SHA prevents accidental overwrites.
-- **Cloud-only install Ollama exclusion** (#328) --- `probe_ollama`
+- **Cloud-only install Ollama exclusion** (#328) — `probe_ollama`
   excluded from critical failure on cloud-only installs.
-- **Runtime config path fix** (#344) --- corrects config path in
+- **Runtime config path fix** (#344) — corrects config path in
   runtime/init modules.
-- **Surplus operational fixes** (#343) --- zombie approvals, backup
+- **Surplus operational fixes** (#343) — zombie approvals, backup
   verification, failure visibility.
-- **Surplus cognitive context enrichment** (#345) --- enriches task
+- **Surplus cognitive context enrichment** (#345) — enriches task
   context for higher-quality surplus output.
 
 ### Migrations
 
-- **0014_eval_results_metadata** --- adds `metadata_json` to
+- **0014_eval_results_metadata** — adds `metadata_json` to
   `eval_results` for structured judge output.
-- **0015_rename_confusable_call_sites** --- renames overloaded call-site
+- **0015_rename_confusable_call_sites** — renames overloaded call-site
   IDs in `call_site_last_run` and `deferred_work_queue`.
-- **0016_source_subsystem** --- backfills `source_subsystem` column on
+- **0016_source_subsystem** — backfills `source_subsystem` column on
   `memory_metadata` for subsystem content filtering.
-- **0017_ego_tables** --- ego world model, proposal, and session tables.
+- **0017_ego_tables** — ego world model, proposal, and session tables.
 
 ---
 
@@ -580,21 +580,21 @@ gains an autonomous research pipeline.
 
 ### Added
 
-- **TinyFish web tools provider** (#292) --- new `web_search`,
+- **TinyFish web tools provider** (#292) — new `web_search`,
   `web_fetch`, and `web_agent` adapters under `genesis.providers`.
   TinyFish is the new primary in `web_search` / `web_fetch` auto chains
   (gated on `API_KEY_TINYFISH`), with SearXNG / Brave / Scrapling /
   Crawl4AI retained as fallbacks. `web_fetch` gains a `urls` parameter
   for parallel multi-URL retrieval (1--10 URLs).
-- **Anticipatory research pipeline** (#291) --- 2-step pipeline
+- **Anticipatory research pipeline** (#291) — 2-step pipeline
   generating search queries from observation context and synthesizing
   TinyFish-fetched results with source URLs, scheduled every 12h via
   the analytical lane.
-- **`SELF_UNBLOCK` brainstorm category** (#291) --- third daily
+- **`SELF_UNBLOCK` brainstorm category** (#291) — third daily
   brainstorm alongside `BRAINSTORM_USER` and `BRAINSTORM_SELF`,
   focused on identifying internal blockers Genesis can clear without
   user input.
-- **User-recency cadence tiers for ego** (#287) --- ego's max
+- **User-recency cadence tiers for ego** (#287) — ego's max
   cycle interval now adapts to time-since-last-foreground-session
   (5 tiers from 240m at <24h to 4320m at >14d). Adaptive backoff still
   operates within each tier; only the ceiling moves.
@@ -602,13 +602,13 @@ gains an autonomous research pipeline.
 ### Changed
 
 - **Ego output contracts now include `communication_decision`** (#286)
-  --- both user and Genesis ego JSON contracts now expose the
+  — both user and Genesis ego JSON contracts now expose the
   `send_digest` / `stay_quiet` / `urgent_notify` field that was
   previously described in narrative only. The default flips from
   `stay_quiet` to `send_digest`, so proposals are no longer silently
   swallowed when the field is omitted.
 - **MCP code-intelligence tools auto-upgrade on install/bootstrap**
-  (#299) --- `scripts/bootstrap.sh` and `scripts/install.sh` now re-run
+  (#299) — `scripts/bootstrap.sh` and `scripts/install.sh` now re-run
   the codebase-memory-mcp installer unconditionally (idempotent, pulls
   latest) and call `uv tool upgrade serena-agent` when Serena is
   already present. Existing installs get the latest versions on the
@@ -617,7 +617,7 @@ gains an autonomous research pipeline.
 
 ### Fixed
 
-- **Mergeable check actually fires now** (#290) --- the
+- **Mergeable check actually fires now** (#290) — the
   UNKNOWN/CONFLICTING block from PR #270 lived in
   `bash_safety_hook.sh`, which was never wired into `settings.json`.
   Moved the check into the actually-deployed `git_push_guard.py`, so
@@ -634,54 +634,54 @@ option.
 
 ### Added
 
-- **Ego causal intervention journal** (#284) --- every proposal now
+- **Ego causal intervention journal** (#284) — every proposal now
   tracks its lifecycle (proposed → approved/rejected → executed →
   outcome) in a queryable journal. Ego can correlate decisions with
   outcomes to learn from past judgments.
-- **Ego self-model capability map** (#288) --- Genesis maintains a
+- **Ego self-model capability map** (#288) — Genesis maintains a
   live capability inventory aggregated from MCP tools, channels,
   modules, and memory wings. Ego references this when proposing
   actions to avoid suggesting things it can't do.
-- **Email outbound channel** (#289) --- Genesis can now send email
+- **Email outbound channel** (#289) — Genesis can now send email
   via the configured outbound provider. Third outreach lane alongside
   Telegram and dashboard.
-- **GitHub star tracking** (#289) --- recon source captures
+- **GitHub star tracking** (#289) — recon source captures
   GENesis-AGI repo stargazer activity. Surfaces in morning reports.
-- **xhigh effort tier** (#297) --- Claude Code 2.1.111's xhigh tier
+- **xhigh effort tier** (#297) — Claude Code 2.1.111's xhigh tier
   for Opus 4.7 is now recognized everywhere Genesis hands off effort
   level (CC invoker, Telegram `/effort`, `session_set_effort` MCP,
   dashboard). Defaults remain at `high`; xhigh is opt-in.
-- **Morning report observations** (#285) --- recent unresolved
+- **Morning report observations** (#285) — recent unresolved
   observations are surfaced alongside the usual morning digest, so
   operators see what Genesis is paying attention to.
-- **Follow-up retention cleanup** (#293) --- completed and failed
+- **Follow-up retention cleanup** (#293) — completed and failed
   follow-ups older than 30 days are now purged daily at 02:30 UTC.
   Pinned items are preserved.
 
 ### Changed
 
-- **Reference storage migrates to episodic memory** (#296) --- 52
+- **Reference storage migrates to episodic memory** (#296) — 52
   reference vectors move from `knowledge_base` to `episodic_memory`
   via SQLite migration 0013 + Qdrant init-time migration (idempotent).
   References now surface naturally via all memory recall paths.
   `reference_lookup` continues to work; only the storage collection
   changed.
-- **Disk alert threshold** (#295) --- `health_alerts` now fires
+- **Disk alert threshold** (#295) — `health_alerts` now fires
   WARNING at <15% free disk (was CRITICAL-only at <10%). The 10–15%
   gap is no longer a blind spot.
 
 ### Fixed
 
-- **Ego self-reinforcing holdback loop** (#283) --- ego could spiral
+- **Ego self-reinforcing holdback loop** (#283) — ego could spiral
   into withdrawing its own proposals based on its own prior
   decisions. The holdback heuristic now considers proposal age and
   user signal correctly.
-- **Heartbeat cleanup not wired** (#281) --- subsystem heartbeats
+- **Heartbeat cleanup not wired** (#281) — subsystem heartbeats
   weren't being aged out, leaving stale records in the dashboard.
-- **Surplus task double-enqueue** (#281) --- `active_by_type` check
+- **Surplus task double-enqueue** (#281) — `active_by_type` check
   now matches the dispatch loop's filter, so scheduled surplus jobs
   don't double-enqueue.
-- **Outreach metric mislabels** (#289) --- corrected mislabeled
+- **Outreach metric mislabels** (#289) — corrected mislabeled
   outreach counters in the dashboard.
 
 ---
@@ -693,30 +693,30 @@ and better observability.
 
 ### Added
 
-- **NetworkX graph engine** (#279) --- in-memory graph over 43K+ memory
+- **NetworkX graph engine** (#279) — in-memory graph over 43K+ memory
   links replaces recursive SQL queries. Enables centrality scoring and
   shortest-path queries. Falls back to SQL if NetworkX is unavailable.
-- **DRIFT retrieval mode** (#279) --- `memory_recall` gains a `mode`
+- **DRIFT retrieval mode** (#279) — `memory_recall` gains a `mode`
   parameter: `"auto"` (default, unchanged behavior), `"standard"`
   (no drift fallback), `"drift"` (direct 3-phase retrieval).
-- **Recall instrumentation** (#279) --- every `memory_recall` call now
+- **Recall instrumentation** (#279) — every `memory_recall` call now
   logs which pipeline was used (standard, drift, auto→drift) for
   retrieval quality analysis.
 
 ### Fixed
 
-- **Knowledge re-ingestion creates duplicates** (#279) --- the
+- **Knowledge re-ingestion creates duplicates** (#279) — the
   orchestrator now uses idempotent upsert with stale Qdrant cleanup
   instead of raw insert. Re-ingesting a URL no longer creates orphaned
   vectors.
-- **DB resilience** (#273) --- awareness tick survives transient SQLite
+- **DB resilience** (#273) — awareness tick survives transient SQLite
   connection failures with automatic recovery and alert deduplication.
 
 ### Changed
 
-- **Dashboard call site badges** (#278) --- parallelization indicator
+- **Dashboard call site badges** (#278) — parallelization indicator
   shows which call sites run concurrently.
-- **Routing updates** (#274, #277) --- DeepSeek V4 Flash added, GLM 5.1
+- **Routing updates** (#274, #277) — DeepSeek V4 Flash added, GLM 5.1
   renamed, call site descriptions added to routing config.
 
 ---
@@ -728,44 +728,44 @@ observation spam gets silenced at the source.
 
 ### Changed
 
-- **Sentinel upgraded to Opus** (#245) --- the container-side health
+- **Sentinel upgraded to Opus** (#245) — the container-side health
   guardian now runs on the strongest available model. Both Sentinel and
   Guardian prompts gain planning directives, tenacity rules, known
   pitfalls from production incidents, and live operational context
   injection from essential knowledge.
-- **Ego domain boundaries** (#248) --- User Ego no longer tracks
+- **Ego domain boundaries** (#248) — User Ego no longer tracks
   operational costs or opines on config values. Genesis Ego stays in its
   infrastructure lane. Both egos receive explicit rules separating user
   career goals from Genesis marketing goals.
 
 ### Fixed
 
-- **Observation spam eliminated** (#248) --- micro-reflection dedup
+- **Observation spam eliminated** (#248) — micro-reflection dedup
   was hashing LLM-generated summary text, which varies each tick. Now
   hashes structural properties (tags, anomaly flag, signal names).
   Stops the 21+ duplicate `user_goal_staleness` observations per day.
-- **Approval gate restored** (#245) --- PR #240 accidentally set the
+- **Approval gate restored** (#245) — PR #240 accidentally set the
   live config to `manual_approval_required: false`. Fixed with
   three-layer config separation: code default (True, safe fallback),
   repo YAML (false, friction-free installs), local overlay (user
   preference, gitignored).
-- **Telegram polling reconnected** (#245) --- adapter_v2 was stuck in
+- **Telegram polling reconnected** (#245) — adapter_v2 was stuck in
   a stall loop (26 consecutive 900s stalls). Server restart
   reinitialized the connection cleanly.
-- **Files tab fills viewport** (#245) --- the 1400px max-width
+- **Files tab fills viewport** (#245) — the 1400px max-width
   constraint lifts when the Files tab is active. File content viewer
   now resizable in both directions (#247).
-- **Download button visible** (#245) --- enlarged with text label.
+- **Download button visible** (#245) — enlarged with text label.
 
 ### Removed
 
-- **CC version watcher deactivated** (#248) --- the automatic Claude
+- **CC version watcher deactivated** (#248) — the automatic Claude
   Code update signal was generating noise. Genesis version watcher
   (upstream update detection) stays active.
 
 ### Infrastructure
 
-- **Ubuntu/noble portability** (#248) --- `scripts/host-setup.sh` now
+- **Ubuntu/noble portability** (#248) — `scripts/host-setup.sh` now
   accepts `GENESIS_CONTAINER_IMAGE` env var override instead of
   hardcoding `images:ubuntu/noble`.
 
@@ -778,32 +778,32 @@ and memory recall learns to try harder when results are thin.
 
 ### Added
 
-- **Dashboard PWA support** (#242) --- manifest + service worker make
+- **Dashboard PWA support** (#242) — manifest + service worker make
   the dashboard installable as a standalone mobile app. Memory tab gains
   a 30-day growth sparkline and wing distribution badges.
-- **File download** (#232) --- Files tab gets a download button with
+- **File download** (#232) — Files tab gets a download button with
   50MB cap, path traversal protection, and symlink-aware security.
-- **Drift recall fallback** (#233) --- when `memory_recall` returns
+- **Drift recall fallback** (#233) — when `memory_recall` returns
   sparse results (<3), the 3-phase drift retrieval algorithm
   (global scan → cluster drill-down → weighted RRF) fires automatically.
   Silent degradation on failure.
-- **Query term expansion** (#234) --- `expand_query_terms` parameter
+- **Query term expansion** (#234) — `expand_query_terms` parameter
   exposed on the `memory_recall` MCP tool, enabling tag co-occurrence
   query expansion for ambiguous searches.
 
 ### Changed
 
-- **Settings consolidation** (#240) --- all per-subsystem timezone
+- **Settings consolidation** (#240) — all per-subsystem timezone
   fields replaced by `genesis.env.user_timezone()`. Dashboard settings
   tab gets domain ordering, expanded form domains, and descriptions
   for all 18 settings groups.
-- **Inbox retry dedup** (#243) --- scanner reuses existing failed rows
+- **Inbox retry dedup** (#243) — scanner reuses existing failed rows
   instead of creating duplicates on retry. CC invoker captures stderr
   on timeout for diagnostics. Evaluation timeout raised to 900s.
 
 ### Fixed
 
-- **Ego deadlock** (#241) --- approval blocks no longer trip the circuit
+- **Ego deadlock** (#241) — approval blocks no longer trip the circuit
   breaker (new `CycleBlockedError` exception). Approval requests get
   timeouts (1h CLI, 2h sentinel). Telegram proposals split at 4096 chars
   instead of failing silently. Proposal field truncation limits raised
@@ -819,38 +819,38 @@ SSH dispatch enables cross-machine module communication.
 
 ### Added
 
-- **SSH IPC adapter** (#225) --- external modules can now dispatch
+- **SSH IPC adapter** (#225) — external modules can now dispatch
   prompts to remote Claude Code instances over SSH. Two modes: CC
   (structured JSON) and SHELL (raw commands). Enables module
   communication without standing up HTTP services.
-- **Protected paths guard** (#226) --- PreToolUse hook blocks accidental
+- **Protected paths guard** (#226) — PreToolUse hook blocks accidental
   deletion of session transcripts, backups, snapshots, browser profiles,
   and the production database.
 
 ### Changed
 
-- **Web tools exposed via MCP** (#229) --- `web_fetch` and `web_search`
+- **Web tools exposed via MCP** (#229) — `web_fetch` and `web_search`
   are now MCP tools on genesis-health, making Scrapling, Crawl4AI,
   SearXNG, and the paid search backends accessible to background
   sessions, ego, and subagents (previously required Bash/Python imports).
   Behavioral nudges steer sessions toward these over CC's built-in
   WebFetch/WebSearch.
-- **Ego proposal flow** (#228) --- proposals now route through the
+- **Ego proposal flow** (#228) — proposals now route through the
   approval gate correctly. Auto-promote removed; all proposals require
   explicit approval before execution.
-- **Sentinel alarm clearing** (#227) --- auto-clear fires only when the
+- **Sentinel alarm clearing** (#227) — auto-clear fires only when the
   specific pending alarm resolves, not all alarms indiscriminately.
-- **Temp file conventions** (#226) --- `~/tmp/` documented as the
+- **Temp file conventions** (#226) — `~/tmp/` documented as the
   standard transient path. `/tmp/` (512MB tmpfs) is off-limits.
 
 ### Fixed
 
-- **Migration runner compatibility** (#230) --- migration 0010 handles
+- **Migration runner compatibility** (#230) — migration 0010 handles
   databases that lack the `memory_metadata` table (test fixtures, fresh
   installs before DDL runs).
-- **Dashboard memory bar** --- uses correct anonymization percentage for
+- **Dashboard memory bar** — uses correct anonymization percentage for
   status assessment.
-- **Drift recall and step dispatcher** --- critical bugs in recall
+- **Drift recall and step dispatcher** — critical bugs in recall
   query, bi-temporal column migration, and dispatcher routing.
 
 ---
@@ -864,60 +864,60 @@ documentation that reflects what the system actually is.
 
 ### Added
 
-- **Ego memory surfacing** (#207) --- the ego now pulls relevant memories
+- **Ego memory surfacing** (#207) — the ego now pulls relevant memories
   before proposing actions, grounds proposals in evidence, and flags
   recurring observation patterns (Hapax-style proactive discovery).
-- **Planning-first direct sessions** (#207) --- background CC sessions
+- **Planning-first direct sessions** (#207) — background CC sessions
   receive a planning instruction so they structure work before executing.
-- **Voice identity layer** (#207) --- `VOICE.md` defines output taste
+- **Voice identity layer** (#207) — `VOICE.md` defines output taste
   (tone, rhythm, vocabulary) injected into content generation and ego
   sessions.
-- **Deep research for task blockers** (#216) --- when the task executor
+- **Deep research for task blockers** (#216) — when the task executor
   hits an unresolvable blocker, it spawns a deep-research session and
   uses the findings to construct an exit gate, rather than spinning.
-- **Architecture Decision Records** (#217) --- seven ADRs documenting
+- **Architecture Decision Records** (#217) — seven ADRs documenting
   load-bearing choices (ego ephemeral sessions, surplus routing, memory
   wings, no silent timeouts, router dead-letter, LLM-first judgment).
-- **Memory DRIFT recall** (#217) --- bi-temporal columns on memory
+- **Memory DRIFT recall** (#217) — bi-temporal columns on memory
   metadata enable time-aware retrieval and staleness detection.
-- **Medium distribution** (#210) --- publish to Medium via Camoufox
+- **Medium distribution** (#210) — publish to Medium via Camoufox
   browser automation with voice-calibrated formatting.
-- **Code intelligence bootstrap** (#222) --- `bootstrap.sh` and
+- **Code intelligence bootstrap** (#222) — `bootstrap.sh` and
   `install.sh` now install and configure codebase-memory-mcp, GitNexus,
   and Serena automatically on fresh machines. Includes MCP registration
   and initial indexing.
-- **Architecture deep-dives and case studies** (#213) --- three
+- **Architecture deep-dives and case studies** (#213) — three
   subsystem deep-dives (routing, memory, autonomy) and four case studies
   showing Genesis in practice.
-- **Positioning and taxonomy docs** (#217) --- "Genesis vs. CLAUDE.md"
+- **Positioning and taxonomy docs** (#217) — "Genesis vs. CLAUDE.md"
   differentiator and the Four C's external vocabulary.
 
 ### Changed
 
-- **Approval staleness guard** (#208) --- stale approval records are now
+- **Approval staleness guard** (#208) — stale approval records are now
   pruned on each cycle. Infrastructure monitor respects disable flag.
-- **Ego interact profile expanded** (#215) --- the interact safety
+- **Ego interact profile expanded** (#215) — the interact safety
   profile now permits content publishing dispatch.
-- **README primitives section** (#223) --- updated to reflect
+- **README primitives section** (#223) — updated to reflect
   genesis-router and genesis-memory as the two extractable libraries.
 
 ### Fixed
 
-- **Surplus scoring collapse** (#209) --- scoring function no longer
+- **Surplus scoring collapse** (#209) — scoring function no longer
   collapses to zero when all candidates tie. Watchgod /tmp protection
   and surplus routing corrected.
-- **Telegram polling** (#211) --- retry logic on polling timeout,
+- **Telegram polling** (#211) — retry logic on polling timeout,
   reduced alert noise from transient failures, morning report
   completeness improved.
-- **Knowledge source pipeline default** (#206) --- new knowledge sources
+- **Knowledge source pipeline default** (#206) — new knowledge sources
   default to `knowledge_ingest` pipeline instead of `recon`.
-- **Browser keystroke typing** (#221) --- CDP remote sessions now type
+- **Browser keystroke typing** (#221) — CDP remote sessions now type
   per-keystroke instead of bulk-setting input values, fixing sites that
   validate on keypress.
-- **CI stability** (#219) --- fixed lint errors (unused imports,
+- **CI stability** (#219) — fixed lint errors (unused imports,
   f-string prefixes), duplicate migration prefix detection, and test
   isolation for migration runner.
-- **STEERING.md write protection** (#214) --- autonomous learning
+- **STEERING.md write protection** (#214) — autonomous learning
   pipelines can no longer modify steering rules without user approval.
 
 ---
@@ -932,48 +932,48 @@ context instead of flooding one with infrastructure noise.
 
 ### Added
 
-- **Ego module** (#26, #27) --- two autonomous egos with ephemeral
+- **Ego module** (#26, #27) — two autonomous egos with ephemeral
   sessions, model selection, proposal board, and tiered execution.
   User Ego (CEO, Opus) focuses on user goals; Genesis Ego (COO, Sonnet)
   handles system health. Both dispatch CC sessions with approval gates.
-- **Reflection rebalancing** (#196) --- observations now carry relevance
+- **Reflection rebalancing** (#196) — observations now carry relevance
   tags (`:user`, `:genesis`, `:both`). Each ego sees what it needs
   instead of everything. Two new signal collectors track user goal
   staleness and session activity patterns.
-- **Ego context enrichment** (#205) --- User Ego now sees an activity
+- **Ego context enrichment** (#205) — User Ego now sees an activity
   pulse (goal staleness, session rhythm, conversation count), model
   freshness warnings, and backlog depth (inbox, recon, follow-ups).
   Genesis Ego gets signal trend arrows across ticks. Both egos see
   recent proposal outcomes for self-calibration.
-- **Sequential task execution** (#193) --- tasks execute one at a time
+- **Sequential task execution** (#193) — tasks execute one at a time
   with per-step approval skipping for trusted subsystems.
-- **Task intake gate** (#199) --- SQLite trigger rejects malformed task
+- **Task intake gate** (#199) — SQLite trigger rejects malformed task
   submissions before they reach the executor.
-- **Pinned follow-ups** (#185) --- follow-up items can be pinned so they
+- **Pinned follow-ups** (#185) — follow-up items can be pinned so they
   survive batch resolution.
 
 ### Changed
 
-- **Approval gate redesign** (#198) --- stable approval keys for
+- **Approval gate redesign** (#198) — stable approval keys for
   recurring dispatches (ego cycles, inbox evaluation). One approval per
   request, no reuse of stale approvals. Pass 3 content-blind matching
   removed entirely.
-- **Repetitive micro reflections reduced** (#195) --- consecutive
+- **Repetitive micro reflections reduced** (#195) — consecutive
   identical micro observations are suppressed.
 
 ### Fixed
 
-- **Genesis Ego crash** (#198) --- `signals_json` stored as a list, not
+- **Genesis Ego crash** (#198) — `signals_json` stored as a list, not
   a dict. Every genesis ego cycle hit `AttributeError` on `.items()`.
-- **Approval notifications** (#29) --- per-tick notifications are now
+- **Approval notifications** (#29) — per-tick notifications are now
   idempotent; duplicate approvals filtered (#33).
-- **Executor worktree persistence** (#188) --- worktree paths survive
+- **Executor worktree persistence** (#188) — worktree paths survive
   server restarts.
-- **Dashboard memory gauge** (#202) --- displays anonymous memory
+- **Dashboard memory gauge** (#202) — displays anonymous memory
   percentage instead of used percentage.
-- **Resilience metrics** (#201) --- correct memory metric source, /tmp
+- **Resilience metrics** (#201) — correct memory metric source, /tmp
   pressure axis, phantom L2 autonomy level.
-- **Ego dashboard controls** (#192) --- column names, model override,
+- **Ego dashboard controls** (#192) — column names, model override,
   budget cap fixes.
 
 ---
