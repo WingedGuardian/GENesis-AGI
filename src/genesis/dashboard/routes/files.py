@@ -68,6 +68,23 @@ def _deduplicate_filename(directory: Path, name: str) -> str:
     return f"{stem}-{counter}{suffix}"
 
 
+def _sanitize_relpath(relpath: str | None) -> list[str]:
+    """Split a client-supplied relative path into traversal-safe segments.
+
+    Used by folder uploads to preserve directory structure under the uploads
+    root. Each segment is reduced to its basename, run through the filename
+    charset filter, and stripped of leading/trailing dots/spaces — so empty,
+    ``.``, and ``..`` segments collapse away and can never escape the base
+    directory. Returns ``[]`` for empty/invalid input.
+    """
+    segments: list[str] = []
+    for raw in re.split(r"[\\/]+", relpath or ""):
+        seg = _SAFE_FILENAME_RE.sub("_", Path(raw).name).strip(". ")
+        if seg and len(seg) <= _MAX_FILENAME_LEN:
+            segments.append(seg)
+    return segments
+
+
 def _is_allowed(path: Path) -> bool:
     """Check that *path* resolves inside an allowed root and isn't blocked."""
     resolved = path.resolve()
@@ -354,16 +371,31 @@ def file_upload():
     if request.content_length and request.content_length > _MAX_UPLOAD_SIZE:
         return jsonify({"error": f"File too large (>{_MAX_UPLOAD_SIZE // (1024 * 1024)}MB)"}), 413
 
-    safe_name = _sanitize_filename(file.filename)
+    # Optional folder upload: ``relpath`` carries the file's path within a
+    # dropped directory (e.g. "Project/data/notes.txt"). All segments are
+    # sanitized to be traversal-safe; the leading ones become subdirectories
+    # under the uploads root, the last is the filename. Absent/flat uploads
+    # fall back to the file's own name (unchanged single-file behavior).
+    rel_segments = _sanitize_relpath(request.form.get("relpath"))
+    if rel_segments:
+        *subdirs, base_name = rel_segments
+    else:
+        subdirs, base_name = [], _sanitize_filename(file.filename)
+    base_name = base_name or _sanitize_filename(file.filename)
 
-    # Ensure uploads directory exists
-    _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dest_dir = _UPLOAD_DIR.joinpath(*subdirs)
 
-    # Deduplicate filename
-    safe_name = _deduplicate_filename(_UPLOAD_DIR, safe_name)
-    dest = _UPLOAD_DIR / safe_name
+    # Containment check BEFORE any filesystem write. The explicit
+    # is_relative_to(_UPLOAD_DIR) guard ensures a crafted relpath can never
+    # escape the uploads root (resolve() works on not-yet-created paths).
+    if not dest_dir.resolve().is_relative_to(_UPLOAD_DIR.resolve()):
+        return jsonify({"error": "Path not allowed"}), 403
 
-    # Security check
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = _deduplicate_filename(dest_dir, base_name)
+    dest = dest_dir / safe_name
+
+    # Leaf-level guard: blocked names (secrets.env, .env, …) and allowlist.
     if not _is_allowed(dest):
         return jsonify({"error": "Path not allowed"}), 403
 
@@ -375,10 +407,11 @@ def file_upload():
         dest.unlink()
         return jsonify({"error": f"File too large (>{_MAX_UPLOAD_SIZE // (1024 * 1024)}MB)"}), 413
 
-    logger.info("File uploaded: %s (%d bytes)", safe_name, file_size)
+    rel_display = "/".join([*subdirs, safe_name])
+    logger.info("File uploaded: %s (%d bytes)", rel_display, file_size)
 
     return jsonify({
         "path": str(dest),
-        "filename": safe_name,
+        "filename": rel_display,
         "size": file_size,
     })
