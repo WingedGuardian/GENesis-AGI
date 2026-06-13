@@ -8,6 +8,7 @@ Endpoints called:
 - ``POST /v1/voice/tool_call`` — dispatch ask_genesis, web_search, approve_pending
 - ``GET /v1/voice/system_prompt`` — fetch Genesis persona + context
 - ``GET /v1/voice/tool_declarations`` — fetch tool schemas for session config
+- ``POST /api/t/memory_store`` — persist conversation transcripts (Phase 3D)
 """
 
 from __future__ import annotations
@@ -63,3 +64,48 @@ class GenesisToolService:
             )
             resp.raise_for_status()
             return resp.json().get("tools", [])
+
+    async def store_conversation(
+        self, messages: list, satellite_id: str = "s2s-default",
+    ) -> dict | None:
+        """Persist a voice conversation transcript to Genesis memory.
+
+        Matches the format used by ``S2SSessionManager.close()``
+        (s2s_session.py) — same source, tags, wing, room — so all voice
+        conversations appear in the same memory namespace regardless of
+        which pipeline produced them.
+        """
+        turns: list[str] = []
+        for msg in messages:
+            role = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "role", "")
+            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+            if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                label = "User" if role == "user" else "Genesis"
+                turns.append(f"{label}: {content}")
+
+        if not turns:
+            logger.debug("No user/assistant turns to persist")
+            return None
+
+        transcript = f"Voice conversation [{satellite_id}]:\n" + "\n".join(turns)
+        logger.info(
+            "Persisting voice conversation (%d turns, %d chars)",
+            len(turns), len(transcript),
+        )
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{self._url}/api/t/memory_store",
+                headers=self._headers,
+                json={
+                    "content": transcript,
+                    "source": "voice_s2s",
+                    "memory_type": "episodic",
+                    "tags": ["voice", "s2s", "conversation"],
+                    "confidence": 0.5,
+                    "wing": "channels",
+                    "room": "voice",
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()
