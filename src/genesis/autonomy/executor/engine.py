@@ -1177,6 +1177,11 @@ class CCSessionExecutor:
             topic=f"Task {task_id[:8]}",
             context=message,
             salience_score=0.9 if cat == OutreachCategory.BLOCKER else 0.5,
+            # signal_type makes task notifications a toggleable voice menu
+            # item (voice_alert_ids -> OutreachPipeline._should_voice matches
+            # this). source_id identifies the task in outreach history.
+            signal_type="task_notification",
+            source_id=f"task:{task_id}",
         )
 
         try:

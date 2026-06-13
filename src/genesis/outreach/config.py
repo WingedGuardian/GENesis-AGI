@@ -41,14 +41,26 @@ class OutreachConfig:
         "awareness:tick_overdue",
         "service:health_data_uninitialized",
     )
-    # Voice proactive chiming — spoken alerts via HA TTS
+    # Voice proactive chiming — the spoken-aloud allowlist. This IS the menu:
+    # a request is spoken only if its signal_type or a source_id part matches
+    # one of these by prefix (see OutreachPipeline._should_voice). Everything
+    # still goes to Telegram regardless; this only controls what interrupts
+    # the user out loud during voice_hours. Mirror lives in config/outreach.yaml
+    # (voice.alert_ids), which overrides this default when present.
     voice_alert_ids: tuple[str, ...] = (
+        # Memory-system + resource emergencies (matched via source_id)
         "infra:disk_low",
         "infra:container_memory_high",
-        "cc:quota_exhausted",
-        "provider:credit_exhaustion",
         "provider:embedding_failing",
         "provider:qdrant_unreachable",
+        "awareness:tick_overdue",
+        # Autonomous system needs your decision (matched via signal_type)
+        "sentinel_escalation",
+        "sentinel_approval",
+        "sentinel_action_approval",
+        # Autonomous task hit a blocker/alert — signal_type set in
+        # autonomy/executor/engine.py _notify (keep these two in sync).
+        "task_notification",
     )
     voice_hours: tuple[int, int] = (9, 2)  # 9am–2am local (wraps midnight)
     # Delivery routing: per-category target — "supergroup", "dm", or "both".
