@@ -273,15 +273,18 @@ class WebSocketHandler:
                 and self._active_websocket is not websocket
             )
             self._active_websocket = websocket
-            client_id = self.extract_client_id(websocket)
-            logger.info(f"🔗 New WebSocket connection from IP: {client_id}")
+            client_ip = self.extract_client_id(websocket)
+            logger.info(f"🔗 New WebSocket connection from IP: {client_ip}")
             if is_replacement:
                 # The previous socket's disconnect event will fire shortly —
                 # the stale-socket guard below ignores it. Reuse the live
                 # OpenAI session instead of resetting it mid-conversation.
                 logger.info("♻️ Connection replaced an existing client — keeping session")
                 return
-            await on_client_connected_callback(client_id)
+            # Use "server" as the logical client_id — pipecat only allows
+            # one active client, and the pipeline + context aggregators
+            # are registered under "server" at startup (main.py).
+            await on_client_connected_callback("server")
 
         if on_client_disconnected_callback:
             @transport.event_handler("on_client_disconnected")
@@ -303,10 +306,9 @@ class WebSocketHandler:
                         await output.set_client_connection(self._active_websocket)
                     return
                 self._active_websocket = None
-                client_id = self.extract_client_id(websocket)
-                if client_id:
-                    logger.info(f"🔌 Client {client_id} disconnected")
-                    await on_client_disconnected_callback(client_id)
+                client_ip = self.extract_client_id(websocket)
+                logger.info(f"🔌 Client {client_ip} disconnected")
+                await on_client_disconnected_callback("server")
 
     async def cleanup(self):
         """Cleanup WebSocket handler resources."""
