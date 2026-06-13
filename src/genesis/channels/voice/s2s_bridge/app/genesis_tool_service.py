@@ -93,7 +93,7 @@ class GenesisToolService:
             len(turns), len(transcript),
         )
 
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
                 f"{self._url}/api/t/memory_store",
                 headers=self._headers,

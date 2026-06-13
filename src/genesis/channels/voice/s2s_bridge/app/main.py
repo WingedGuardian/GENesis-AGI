@@ -384,7 +384,7 @@ class Application:
                             if result:
                                 logger.info("💾 Voice conversation persisted to Genesis memory")
                         except Exception as e:
-                            logger.warning("⚠️ Failed to persist voice conversation: %s", e)
+                            logger.warning("⚠️ Failed to persist voice conversation: %s: %s", type(e).__name__, e)
 
             if self.audio_recording_service:
                 self.audio_recording_service.stop_recording()
