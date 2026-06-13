@@ -67,10 +67,11 @@ async def test_settings_list_includes_metadata():
         assert "dedicated_tool" in item
 
 
-async def test_settings_list_marks_outreach_as_dedicated():
+async def test_settings_list_outreach_is_writable():
     result = await _impl_settings_list()
     outreach = next(d for d in result if d["domain"] == "outreach")
-    assert outreach["dedicated_tool"] == "outreach_preferences"
+    assert outreach["dedicated_tool"] is None
+    assert outreach["readonly"] is False
 
 
 # ── settings_get ───────────────────────────────────────────────────────
@@ -97,12 +98,11 @@ async def test_settings_get_readonly_domain(config_dir: Path):
     assert result["config"]["defaults"]["direct_session"] == 1
 
 
-async def test_settings_get_dedicated_tool_redirect():
+async def test_settings_get_outreach_returns_config():
     result = await _impl_settings_get("outreach")
-    assert "note" in result
-    assert "outreach_preferences" in result["note"]
-    assert result["dedicated_tool"] == "outreach_preferences"
-    assert "config" not in result  # No config returned for redirects
+    assert "config" in result
+    assert result["readonly"] is False
+    assert result["domain"] == "outreach"
 
 
 async def test_settings_get_unknown_domain():
@@ -214,10 +214,11 @@ async def test_settings_update_readonly_rejected():
     assert "read-only" in result["error"]
 
 
-async def test_settings_update_dedicated_tool_rejected():
+async def test_settings_update_outreach_applies(config_dir: Path):
+    _write_config(config_dir, "outreach.yaml", {"quiet_hours": {"start": "22:00", "end": "08:00"}})
     result = await _impl_settings_update("outreach", {"quiet_hours": {"start": "23:00"}})
-    assert "error" in result
-    assert "outreach_preferences" in result["error"]
+    assert result.get("status") == "applied"
+    assert result["changes_applied"]["quiet_hours"]["start"] == "23:00"
 
 
 async def test_settings_update_unknown_domain():
