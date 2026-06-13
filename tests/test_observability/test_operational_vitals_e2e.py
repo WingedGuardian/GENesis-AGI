@@ -130,6 +130,109 @@ class TestAlertConditions:
             health_mcp._service = old_service
 
     @pytest.mark.asyncio
+    async def test_qdrant_alert_fires_at_50pct_boundary(self):
+        """Threshold lowered from ==100% to >=50% (2026-06-13). 1/2 failures
+        (50%) must fire, and the message must report the actual rate."""
+        from genesis.mcp import health_mcp
+
+        tracker = ProviderActivityTracker()
+        tracker.record("qdrant.search", latency_ms=5000, success=False)
+        tracker.record("qdrant.search", latency_ms=10, success=True)  # 1/2 = 50%
+
+        old_tracker = health_mcp._activity_tracker
+        old_service = health_mcp._service
+        try:
+            health_mcp._activity_tracker = tracker
+            health_mcp._service = MagicMock()
+            health_mcp._service.snapshot = AsyncMock(return_value={
+                "call_sites": {}, "queues": {}, "cc_sessions": {},
+                "infrastructure": {}, "services": {}, "awareness": {},
+            })
+            alerts = await health_mcp._impl_health_alerts()
+            q = [a for a in alerts if a["id"] == "provider:qdrant_unreachable"]
+            assert len(q) == 1
+            assert "50%" in q[0]["message"]
+        finally:
+            health_mcp._activity_tracker = old_tracker
+            health_mcp._service = old_service
+
+    @pytest.mark.asyncio
+    async def test_qdrant_alert_silent_below_50pct(self):
+        """1/3 failures (~33%) is below the new >=50% boundary — no alert."""
+        from genesis.mcp import health_mcp
+
+        tracker = ProviderActivityTracker()
+        tracker.record("qdrant.search", latency_ms=5000, success=False)
+        tracker.record("qdrant.search", latency_ms=10, success=True)
+        tracker.record("qdrant.search", latency_ms=10, success=True)  # 1/3 = 33%
+
+        old_tracker = health_mcp._activity_tracker
+        old_service = health_mcp._service
+        try:
+            health_mcp._activity_tracker = tracker
+            health_mcp._service = MagicMock()
+            health_mcp._service.snapshot = AsyncMock(return_value={
+                "call_sites": {}, "queues": {}, "cc_sessions": {},
+                "infrastructure": {}, "services": {}, "awareness": {},
+            })
+            alerts = await health_mcp._impl_health_alerts()
+            q = [a for a in alerts if a["id"] == "provider:qdrant_unreachable"]
+            assert len(q) == 0
+        finally:
+            health_mcp._activity_tracker = old_tracker
+            health_mcp._service = old_service
+
+    @pytest.mark.asyncio
+    async def test_container_memory_critical_in_86_to_90_band(self):
+        """Container memory CRITICAL threshold lowered >90% -> >85% (2026-06-13).
+        The 86-90% band must now be CRITICAL (was WARNING)."""
+        from genesis.mcp import health_mcp
+
+        tracker = ProviderActivityTracker()  # no provider calls -> no provider alerts
+        old_tracker = health_mcp._activity_tracker
+        old_service = health_mcp._service
+        try:
+            health_mcp._activity_tracker = tracker
+            health_mcp._service = MagicMock()
+            health_mcp._service.snapshot = AsyncMock(return_value={
+                "call_sites": {}, "queues": {}, "cc_sessions": {},
+                "infrastructure": {"container_memory": {
+                    "anon_pct": 87, "current_gb": 28, "limit_gb": 32}},
+                "services": {}, "awareness": {},
+            })
+            alerts = await health_mcp._impl_health_alerts()
+            mem = [a for a in alerts if a["id"] == "infra:container_memory_high"]
+            assert len(mem) == 1
+            assert mem[0]["severity"] == "CRITICAL"
+        finally:
+            health_mcp._activity_tracker = old_tracker
+            health_mcp._service = old_service
+
+    @pytest.mark.asyncio
+    async def test_container_memory_silent_at_or_below_85(self):
+        """Container memory at 84% (<=85) fires no alert."""
+        from genesis.mcp import health_mcp
+
+        tracker = ProviderActivityTracker()
+        old_tracker = health_mcp._activity_tracker
+        old_service = health_mcp._service
+        try:
+            health_mcp._activity_tracker = tracker
+            health_mcp._service = MagicMock()
+            health_mcp._service.snapshot = AsyncMock(return_value={
+                "call_sites": {}, "queues": {}, "cc_sessions": {},
+                "infrastructure": {"container_memory": {
+                    "anon_pct": 84, "current_gb": 27, "limit_gb": 32}},
+                "services": {}, "awareness": {},
+            })
+            alerts = await health_mcp._impl_health_alerts()
+            mem = [a for a in alerts if a["id"] == "infra:container_memory_high"]
+            assert len(mem) == 0
+        finally:
+            health_mcp._activity_tracker = old_tracker
+            health_mcp._service = old_service
+
+    @pytest.mark.asyncio
     async def test_job_quarantine_alert(self):
         from genesis.mcp import health_mcp
 
