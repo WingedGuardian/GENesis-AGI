@@ -534,11 +534,14 @@ class TestS2SSessionManager:
 class TestVoiceHours:
     """Test _in_voice_hours midnight-wrap logic and _should_voice filtering."""
 
-    def _make_pipeline(self, *, voice_hours=(9, 2), has_voice=True):
+    def _make_pipeline(self, *, voice_hours=(9, 2), has_voice=True, voice_alert_ids=None):
         """Build a minimal pipeline with voice config for testing."""
         from genesis.outreach.config import OutreachConfig, QuietHours
         from genesis.outreach.pipeline import OutreachPipeline
 
+        # When voice_alert_ids is None, use the dataclass default (the
+        # shipped 9-item menu) so tests exercise the real allowlist.
+        extra = {} if voice_alert_ids is None else {"voice_alert_ids": tuple(voice_alert_ids)}
         config = OutreachConfig(
             quiet_hours=QuietHours(start="22:00", end="07:00"),
             channel_preferences={"default": "telegram"},
@@ -551,6 +554,7 @@ class TestVoiceHours:
             engagement_timeout_hours=24,
             engagement_poll_minutes=60,
             voice_hours=voice_hours,
+            **extra,
         )
         channels = {}
         if has_voice:
@@ -605,41 +609,133 @@ class TestVoiceHours:
         req = OutreachRequest(
             category=OutreachCategory.ALERT,
             topic="test", context="test", salience_score=1.0,
-        )
-        assert not pipe._should_voice(req)
-
-    def test_should_voice_wrong_category(self):
-        """_should_voice returns False for non-alert categories."""
-        from genesis.outreach.types import OutreachCategory, OutreachRequest
-
-        pipe = self._make_pipeline()
-        req = OutreachRequest(
-            category=OutreachCategory.SURPLUS,
-            topic="test", context="test", salience_score=1.0,
+            source_id="infra:disk_low",
         )
         with patch.object(pipe, "_in_voice_hours", return_value=True):
             assert not pipe._should_voice(req)
 
-    def test_should_voice_alert_in_hours(self):
-        """_should_voice returns True for ALERT category during voice hours."""
+    def test_should_voice_unlisted_is_silent_any_category(self):
+        """Pure allowlist: a request with no allowlisted signal_type/source_id
+        is silent on voice REGARDLESS of category (the old category gate is
+        gone). Covers the behavior change from category-based gating."""
         from genesis.outreach.types import OutreachCategory, OutreachRequest
 
         pipe = self._make_pipeline()
-        req = OutreachRequest(
-            category=OutreachCategory.ALERT,
-            topic="test", context="test", salience_score=1.0,
-        )
-        with patch.object(pipe, "_in_voice_hours", return_value=True):
-            assert pipe._should_voice(req)
+        for cat in (
+            OutreachCategory.SURPLUS,
+            OutreachCategory.ALERT,
+            OutreachCategory.BLOCKER,
+            OutreachCategory.APPROVAL,
+        ):
+            req = OutreachRequest(
+                category=cat, topic="t", context="t", salience_score=1.0,
+            )
+            with patch.object(pipe, "_in_voice_hours", return_value=True):
+                assert not pipe._should_voice(req), f"category={cat}"
 
-    def test_should_voice_blocker_in_hours(self):
-        """_should_voice returns True for BLOCKER category during voice hours."""
+    def test_should_voice_allowlisted_source_id(self):
+        """A health alert whose source_id is on the allowlist voices."""
         from genesis.outreach.types import OutreachCategory, OutreachRequest
 
         pipe = self._make_pipeline()
         req = OutreachRequest(
             category=OutreachCategory.BLOCKER,
-            topic="test", context="test", salience_score=1.0,
+            topic="t", context="t", salience_score=1.0,
+            signal_type="health_alert", source_id="infra:disk_low",
         )
         with patch.object(pipe, "_in_voice_hours", return_value=True):
             assert pipe._should_voice(req)
+
+    def test_should_voice_batched_envelope_any_match(self):
+        """Comma-joined batched source_id voices if ANY part is allowlisted."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        pipe = self._make_pipeline()
+        req = OutreachRequest(
+            category=OutreachCategory.BLOCKER,
+            topic="t", context="t", salience_score=1.0,
+            signal_type="health_alert",
+            source_id="queue:stale_dead_letters,infra:disk_low",
+        )
+        with patch.object(pipe, "_in_voice_hours", return_value=True):
+            assert pipe._should_voice(req)
+
+    def test_should_voice_signal_type_match(self):
+        """Non-health signals opt in via signal_type (e.g. sentinel)."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        pipe = self._make_pipeline()
+        req = OutreachRequest(
+            category=OutreachCategory.BLOCKER,
+            topic="t", context="t", salience_score=1.0,
+            signal_type="sentinel_escalation",
+            source_id="sentinel-escalation:mem:123",
+        )
+        with patch.object(pipe, "_in_voice_hours", return_value=True):
+            assert pipe._should_voice(req)
+
+    def test_should_voice_task_notification(self):
+        """task_notification signal_type is on the default allowlist."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        pipe = self._make_pipeline()
+        req = OutreachRequest(
+            category=OutreachCategory.BLOCKER,
+            topic="t", context="t", salience_score=1.0,
+            signal_type="task_notification", source_id="task:abc123",
+        )
+        with patch.object(pipe, "_in_voice_hours", return_value=True):
+            assert pipe._should_voice(req)
+
+    def test_should_voice_critical_observation_silent(self):
+        """Critical observations (obs UUIDs, not allowlisted) stay silent."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        pipe = self._make_pipeline()
+        req = OutreachRequest(
+            category=OutreachCategory.BLOCKER,
+            topic="t", context="t", salience_score=1.0,
+            signal_type="critical_observation",
+            source_id="obs-uuid-1,obs-uuid-2",
+        )
+        with patch.object(pipe, "_in_voice_hours", return_value=True):
+            assert not pipe._should_voice(req)
+
+    def test_should_voice_cli_approval_off(self):
+        """cli_approval was removed from the allowlist — stays silent."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        pipe = self._make_pipeline()
+        req = OutreachRequest(
+            category=OutreachCategory.APPROVAL,
+            topic="t", context="t", salience_score=1.0,
+            signal_type="cli_approval", source_id="cli-approval:42",
+        )
+        with patch.object(pipe, "_in_voice_hours", return_value=True):
+            assert not pipe._should_voice(req)
+
+    def test_should_voice_prefix_match_family(self):
+        """Prefix matching: a family entry matches suffixed produced ids."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        pipe = self._make_pipeline(voice_alert_ids=("provider:credit_exhaustion",))
+        req = OutreachRequest(
+            category=OutreachCategory.BLOCKER,
+            topic="t", context="t", salience_score=1.0,
+            source_id="provider:credit_exhaustion:deepinfra",
+        )
+        with patch.object(pipe, "_in_voice_hours", return_value=True):
+            assert pipe._should_voice(req)
+
+    def test_should_voice_out_of_hours(self):
+        """An allowlisted alert outside voice hours is silent."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        pipe = self._make_pipeline()
+        req = OutreachRequest(
+            category=OutreachCategory.BLOCKER,
+            topic="t", context="t", salience_score=1.0,
+            source_id="infra:disk_low",
+        )
+        with patch.object(pipe, "_in_voice_hours", return_value=False):
+            assert not pipe._should_voice(req)

@@ -296,9 +296,14 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
     anon_pct = container_mem.get("anon_pct", container_mem.get("used_pct", 0))
     if anon_pct > 85:
         alert_id = "infra:container_memory_high"
+        # CRITICAL at >85% (lowered from >90% on 2026-06-13). This is a
+        # deliberate escalation-threshold expansion, not a cleanup: it moves
+        # both the Telegram alert AND the voice chime earlier. anon_pct is
+        # non-reclaimable memory, so >85% is genuine pressure (the box idles
+        # ~76-79%). 6h dedup prevents repeat spam.
         alerts.append({
             "id": alert_id,
-            "severity": "CRITICAL" if anon_pct > 90 else "WARNING",
+            "severity": "CRITICAL",
             "message": f"Container memory at {anon_pct}% anon+kernel ({container_mem.get('current_gb', '?')}/{container_mem.get('limit_gb', '?')}GB total)",
         })
         current_ids.add(alert_id)
@@ -412,15 +417,23 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         if (
             isinstance(qdrant_summary, dict)
             and qdrant_summary.get("calls", 0) > 0
-            and qdrant_summary.get("error_rate", 0) == 1.0
+            and qdrant_summary.get("error_rate", 0) >= 0.5
         ):
+            # Fire at >=50% failure (lowered from ==100% on 2026-06-13) to
+            # match provider:embedding_failing and warn on partial memory-
+            # search degradation, not just total outage. Id keeps the
+            # "unreachable" name (referenced by config lists); message shows
+            # the actual rate.
             alert_id = "provider:qdrant_unreachable"
+            _qdrant_rate = qdrant_summary.get("error_rate", 0)
+            _qdrant_errors = qdrant_summary.get("errors", 0)
+            _qdrant_calls = qdrant_summary.get("calls", 0)
             alerts.append({
                 "id": alert_id,
                 "severity": "CRITICAL",
                 "message": (
-                    f"Qdrant search 100% failure rate "
-                    f"({qdrant_summary['errors']} consecutive failures)"
+                    f"Qdrant search {_qdrant_rate:.0%} failure rate "
+                    f"({_qdrant_errors}/{_qdrant_calls} calls failed)"
                 ),
             })
             current_ids.add(alert_id)

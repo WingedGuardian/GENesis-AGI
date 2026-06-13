@@ -453,24 +453,44 @@ class OutreachPipeline:
         )
 
     def _should_voice(self, request: OutreachRequest) -> bool:
-        """Check if this request qualifies for voice secondary delivery.
+        """Check if this request qualifies for voice (spoken-aloud) delivery.
 
-        Matches on category (BLOCKER, ALERT, APPROVAL) rather than
-        signal_type because health alerts use generic signal_type.
-        APPROVAL included so pending approval requests are spoken
-        aloud — the user can then say "hey genesis, approve it".
+        Pure allowlist: ``config.voice_alert_ids`` IS the menu of what gets
+        spoken. A request voices only if its ``signal_type`` or any part of
+        its ``source_id`` matches an allowlist entry by prefix — the same
+        matching convention as the immediate-escalation list in
+        ``health_outreach.py``. There is no category-based fallback, so
+        nothing is voiced by an invisible rule: every spoken alert is one
+        editable line in ``voice_alert_ids`` (config.py / outreach.yaml).
+        Everything still reaches Telegram regardless; this gate only
+        controls what interrupts the user out loud.
+
+        Matching notes:
+        - ``source_id`` is comma-split to handle the batched health-alert
+          envelope (``scheduler.py`` joins ids with commas).
+        - prefix match (``startswith``) lets a family entry like
+          ``provider:credit_exhaustion`` match ``…:<provider>``; keep
+          entries specific to avoid unintended prefix hits.
+        - ``signal_type`` matching is how non-health signals opt in
+          (e.g. ``sentinel_escalation``; ``task_notification`` is set in
+          ``autonomy/executor/engine.py`` ``_notify``).
         """
         if not self._channels.get("voice"):
             return False
         if not self._config:
             return False
-        if request.category not in (
-            OutreachCategory.BLOCKER,
-            OutreachCategory.ALERT,
-            OutreachCategory.APPROVAL,
-        ):
+        if not self._in_voice_hours():
             return False
-        return self._in_voice_hours()
+        # Pre-strip allowlist entries so a stray space in hand-edited
+        # outreach.yaml doesn't silently break a match.
+        allow = [aid.strip() for aid in self._config.voice_alert_ids if aid.strip()]
+        candidates = [request.signal_type or "", *(request.source_id or "").split(",")]
+        return any(
+            cand.strip().startswith(aid)
+            for cand in candidates
+            if cand.strip()
+            for aid in allow
+        )
 
     def _in_voice_hours(self) -> bool:
         """Check if current time is within voice notification hours."""

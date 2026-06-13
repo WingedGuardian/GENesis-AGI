@@ -70,3 +70,27 @@ health_alerts:
     - "provider:embedding_failing"
     - "provider:qdrant_unreachable"
     - "awareness:tick_overdue"
+
+# Voice proactive chiming — the spoken-aloud allowlist (THE menu).
+# A request is spoken through the Voice PE only if its signal_type or a
+# source_id part matches one of these by prefix (OutreachPipeline._should_voice).
+# Everything still goes to Telegram regardless — this only controls what
+# interrupts the user out loud during `hours`. This block is authoritative;
+# editing it changes behavior on next server restart. Keep entries specific
+# (prefix match) and keep `task_notification` in sync with the signal_type
+# set in src/genesis/autonomy/executor/engine.py _notify.
+voice:
+  alert_ids:
+    # Memory-system + resource emergencies (matched via source_id)
+    - "infra:disk_low"
+    - "infra:container_memory_high"
+    - "provider:embedding_failing"
+    - "provider:qdrant_unreachable"
+    - "awareness:tick_overdue"
+    # Autonomous system needs your decision (matched via signal_type)
+    - "sentinel_escalation"
+    - "sentinel_approval"
+    - "sentinel_action_approval"
+    # Autonomous task hit a blocker/alert
+    - "task_notification"
+  hours: [9, 2]   # 9am-2am local (wraps midnight); end hour exclusive

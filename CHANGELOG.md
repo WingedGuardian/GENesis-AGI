@@ -9,6 +9,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **Voice: you now choose exactly which alerts are spoken aloud** — the
+  Voice PE only speaks alerts on an allowlist you control (`voice.alert_ids`
+  in `outreach.yaml`) instead of chiming for every blocker, alert, and
+  approval. The default set covers what's worth interrupting you for: disk
+  and memory emergencies, memory-system failures (embeddings, vector
+  search), a stalled awareness loop, Sentinel decisions that need your
+  approval, and blocked autonomous tasks. CLI approval prompts and generic
+  provider credit-exhaustion no longer chime by default. Everything still
+  arrives on Telegram regardless — this only controls what's spoken out loud.
+- **Earlier memory and memory-search alerts** — the container-memory alert
+  now fires at 85% (was 90%) and the vector-search-failure alert at 50%
+  failure (was 100% only), so you hear about pressure and degradation
+  sooner, on both Telegram and voice.
+
 ---
 
 ## [v3.0b15] - 2026-06-12
