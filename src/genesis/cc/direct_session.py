@@ -155,9 +155,12 @@ PROFILES: dict[str, list[str]] = {
     ),
     # ── Discord monitor profile ─────────────────────────────────
     # Reads Discord channels and responds via bot token API.
-    # MCP config loads discord-bot + health + outreach.
+    # MCP config loads discord-bot + health + outreach (no memory server).
+    # Belt-and-suspenders: block memory writes at tool level too, in case
+    # MCP config generation fails and falls back to full config.
     "discord-monitor": (
         _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION
+        + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS
     ),
     # ── Perimeter profile ────────────────────────────────────────
     # For sessions that process untrusted inbound content (email

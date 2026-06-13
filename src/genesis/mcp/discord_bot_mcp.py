@@ -71,7 +71,7 @@ def _chunk_text(text: str, limit: int = _MAX_MESSAGE_LENGTH) -> list[str]:
             break
         # Find last newline before limit
         idx = text.rfind("\n", 0, limit)
-        if idx == -1:
+        if idx <= 0:
             idx = limit
         chunks.append(text[:idx])
         text = text[idx:].lstrip("\n")

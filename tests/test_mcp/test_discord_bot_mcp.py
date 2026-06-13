@@ -11,6 +11,7 @@ import genesis.mcp.discord_bot_mcp as bot_mod
 from genesis.mcp.discord_bot_mcp import mcp
 
 
+@pytest.mark.asyncio
 async def test_all_tools_registered():
     """All three Discord tools should be registered."""
     tools = await mcp.get_tools()
