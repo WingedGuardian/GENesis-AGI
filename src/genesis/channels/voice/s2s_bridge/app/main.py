@@ -371,6 +371,21 @@ class Application:
             _cancel_rotation_timer()
             if self.session_manager:
                 self.session_manager.handle_client_disconnect(client_id, self.openai_service)
+
+            # Persist conversation transcript to Genesis memory (Phase 3D).
+            # Must run AFTER handle_client_disconnect caches the context.
+            if self.genesis_tool_service and self.session_manager:
+                cached = self.session_manager.get_cached_context(client_id)
+                if cached:
+                    messages = cached.get_messages()
+                    if messages:
+                        try:
+                            result = await self.genesis_tool_service.store_conversation(messages)
+                            if result:
+                                logger.info("💾 Voice conversation persisted to Genesis memory")
+                        except Exception as e:
+                            logger.warning("⚠️ Failed to persist voice conversation: %s: %s", type(e).__name__, e)
+
             if self.audio_recording_service:
                 self.audio_recording_service.stop_recording()
             # Disconnect from OpenAI to stop the 60-min session clock.
