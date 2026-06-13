@@ -114,11 +114,10 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
     ),
     "outreach": SettingsDomain(
         name="outreach",
-        description="Outreach preferences (quiet hours, rate limits, channels)",
+        description="Outreach preferences (quiet hours, rate limits, channels, voice alert IDs)",
         config_filename="outreach.yaml",
         readonly=False,
         needs_restart=False,
-        dedicated_tool="outreach_preferences",
     ),
     "recon_schedules": SettingsDomain(
         name="recon_schedules",
