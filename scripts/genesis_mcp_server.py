@@ -28,7 +28,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_VALID_SERVERS = {"health", "memory", "outreach", "recon"}
+_VALID_SERVERS = {"health", "memory", "outreach", "recon", "discord-bot"}
 _DEFAULT_FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _DEFAULT_STATUS = Path.home() / ".genesis" / "status.json"
 
@@ -50,6 +50,7 @@ _DEFAULT_PORTS = {
     "memory": 8101,
     "outreach": 8102,
     "recon": 8103,
+    "discord-bot": 8104,
 }
 
 
@@ -349,11 +350,32 @@ def _bootstrap_outreach(transport_kwargs: dict) -> None:
     _run_mcp(mcp, transport_kwargs)
 
 
+def _bootstrap_discord_bot(transport_kwargs: dict) -> None:
+    """Bootstrap and run the discord-bot MCP server.
+
+    Provides read/write Discord access via bot token for campaign
+    sessions. No DB connection needed — fully stateless.
+    """
+    import os
+
+    from genesis.mcp.discord_bot_mcp import init_discord_bot, mcp
+
+    bot_token = os.environ.get("DISCORD_BOT_TOKEN", "")
+    if not bot_token:
+        logger.error("DISCORD_BOT_TOKEN not set — discord-bot cannot start")
+        return
+
+    init_discord_bot(bot_token=bot_token)
+    clear_mcp_crash("discord-bot")
+    _run_mcp(mcp, transport_kwargs)
+
+
 _BOOTSTRAPPERS = {
     "health": _bootstrap_health,
     "memory": _bootstrap_memory,
     "outreach": _bootstrap_outreach,
     "recon": _bootstrap_recon,
+    "discord-bot": _bootstrap_discord_bot,
 }
 
 
@@ -447,6 +469,8 @@ def main(argv: list[str] | None = None) -> None:
         "GENESIS_ENABLE_OLLAMA", "OLLAMA_EMBEDDING_MODEL",
         # HTTP transport auth
         "GENESIS_MCP_HTTP_TOKEN",
+        # Discord bot (used by discord-bot MCP server)
+        "DISCORD_BOT_TOKEN",
     }
     import os
 
