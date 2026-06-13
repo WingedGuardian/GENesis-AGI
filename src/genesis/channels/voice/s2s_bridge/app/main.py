@@ -53,6 +53,12 @@ class Application:
         self.session_manager: SessionManager | None = None
         self.current_task: PipelineTask | None = None
         self._pipeline_lock: asyncio.Lock | None = None
+        self._rotation_task: asyncio.Task | None = None
+        # Session rotation interval in seconds. OpenAI Realtime sessions
+        # expire at 60 minutes — rotate at 55 to leave margin for the
+        # reconnect handshake + context replay. Configurable via env for
+        # testing (e.g. SESSION_ROTATION_SECONDS=30).
+        self._rotation_interval: float = 55 * 60
 
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -64,6 +70,11 @@ class Application:
         # Semantic VAD eagerness (replaces old threshold-based server_vad)
         # Options: "low" (less interrupts), "medium" (default), "high" (more responsive)
         self.semantic_vad_eagerness = os.environ.get("SEMANTIC_VAD_EAGERNESS", "medium")
+
+        # Session rotation interval (override for testing)
+        self._rotation_interval = float(
+            os.environ.get("SESSION_ROTATION_SECONDS", str(55 * 60))
+        )
 
         # Get recording setting (optional, defaults to false)
         enable_recording = os.environ.get("ENABLE_RECORDING", "false").lower() == "true"
@@ -310,15 +321,54 @@ class Application:
                     return
             logger.warning("⚠️ Deferred disconnect: service never connected (pipeline may not have started)")
 
-        # Setup WebSocket event handlers
+        # ── Session rotation ──────────────────────────────────────────
+        async def _session_rotation_loop():
+            """Proactively rotate the OpenAI session before the 60-min expiry.
+
+            Runs while a client is connected. Each cycle sleeps for
+            ``_rotation_interval`` seconds (default 55 min), then calls
+            ``reset_conversation()`` which disconnects the WebSocket,
+            reconnects (new 60-min clock), and replays cached context.
+            The user hears ~1-2 s of silence during the handshake.
+            """
+            while True:
+                await asyncio.sleep(self._rotation_interval)
+                async with self._pipeline_lock:
+                    if not (self.openai_service and self.openai_service._websocket):
+                        # Client disconnected while we slept — stop rotating
+                        logger.info("⏰ Rotation timer fired but no active session — skipping")
+                        return
+                    logger.info("🔄 Session rotation — resetting OpenAI conversation (%.0f min interval)",
+                                self._rotation_interval / 60)
+                    try:
+                        await self.openai_service.reset_conversation()
+                        logger.info("✅ Session rotated — new 60-min clock started")
+                    except Exception as e:
+                        logger.warning("⚠️ Session rotation failed: %s — will retry next interval", e)
+
+        def _start_rotation_timer():
+            """Start (or restart) the rotation background task."""
+            if self._rotation_task and not self._rotation_task.done():
+                self._rotation_task.cancel()
+            self._rotation_task = asyncio.create_task(_session_rotation_loop())
+
+        def _cancel_rotation_timer():
+            """Cancel the rotation timer (client disconnected)."""
+            if self._rotation_task and not self._rotation_task.done():
+                self._rotation_task.cancel()
+                self._rotation_task = None
+
+        # ── WebSocket event handlers ──────────────────────────────────
         async def on_client_connected(client_id: str):
             """Handle new client connection."""
             await self._ensure_openai_service(client_id=client_id)
             if self.audio_recording_service:
                 self.audio_recording_service.start_new_session(client_id)
+            _start_rotation_timer()
 
         async def on_client_disconnected(client_id: str):
             """Handle client disconnection."""
+            _cancel_rotation_timer()
             if self.session_manager:
                 self.session_manager.handle_client_disconnect(client_id, self.openai_service)
             if self.audio_recording_service:
