@@ -43,6 +43,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   casing mismatch), so a failing provider got retried immediately instead of
   serving out its backoff. Breaker state is now also written atomically, and
   MCP helper processes no longer overwrite the shared state file.
+- **Dashboard settings changes now actually take effect.** Overrides you saved
+  from the dashboard (or the settings tool) are written to `~/.genesis/config/`,
+  but several subsystems (inbox, surplus, resilience, voice/TTS, perception
+  confidence, and more) still read their `.local.yaml` overlay from the repo's
+  `config/` dir — so your changes were silently ignored, even after a restart.
+  Loaders now read the user-config overlay first (falling back to the repo path
+  for older installs), and the settings tool reports the correct saved path.
 
 ### Security
 
