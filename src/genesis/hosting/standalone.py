@@ -157,30 +157,16 @@ class StandaloneAdapter:
         logger.info("Shutdown requested")
         self._shutdown_event.set()
 
-        # Voice "last breath" — play the HA built-in chime (3-ding) via
-        # assist_satellite.announce before services stop.  No TTS needed —
-        # the chime alone signals "going away."  4s drain lets the device
-        # finish playing before Wyoming shuts down.
-        ha_url = os.environ.get("HA_URL", "")
-        ha_token = os.environ.get("HA_LONG_LIVED_TOKEN", "")
-        if ha_url and ha_token:
+        # Voice "last breath" — speak via the held VoiceChannelAdapter, which
+        # uses media_player.play_media + tts.speak (the path that actually
+        # plays on the device). assist_satellite.announce silently no-ops when
+        # the satellite entity is 'unavailable', so it was a dead chime
+        # (2026-06-13). Reusing the adapter inherits its entity config and
+        # failure-surfacing. 4s drain lets playback finish.
+        voice_adapter = self._app.config.get("VOICE_ADAPTER") if self._app else None
+        if voice_adapter is not None:
             try:
-                import httpx
-                async with httpx.AsyncClient(timeout=10) as client:
-                    await client.post(
-                        f"{ha_url.rstrip('/')}/api/services/assist_satellite/announce",
-                        headers={
-                            "Authorization": f"Bearer {ha_token}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "entity_id": os.environ.get(
-                                "HA_ASSIST_SATELLITE_ENTITY",
-                                "assist_satellite.home_assistant_voice_0a2841_assist_satellite",
-                            ),
-                            "message": "",
-                        },
-                    )
+                await voice_adapter.send_message("", "Genesis going offline.")
                 await asyncio.sleep(4)
             except Exception:
                 logger.debug("Shutdown chime failed", exc_info=True)

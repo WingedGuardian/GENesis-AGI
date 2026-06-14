@@ -207,15 +207,17 @@ class TestVoiceChannelAdapter:
             assert adapter._tts_entity == "tts.explicit"
             assert adapter._media_player == "media_player.explicit"
 
-    def test_entity_fallback_without_env(self):
-        """Without env vars or explicit params, falls back to hardcoded defaults."""
+    def test_media_player_empty_without_config(self):
+        """No device-specific default: without env/param, media_player is empty
+        (proactive voice disabled) — a hardcoded device id silently broke when
+        the device was renamed. tts keeps the generic piper default."""
         # Scrub any HA_ env vars that might be set in the test environment
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("HA_")}
         with patch.dict("os.environ", env, clear=True):
             adapter = VoiceChannelAdapter()
             assert adapter._tts_entity == "tts.piper"
-            assert "home_assistant_voice_0a2841" in adapter._media_player
+            assert adapter._media_player == ""
 
     @pytest.mark.asyncio
     async def test_send_typing_noop(self):
@@ -241,6 +243,7 @@ class TestVoiceChannelAdapter:
         adapter = VoiceChannelAdapter(
             ha_url="http://ha.local:8123",
             ha_token="test-token",
+            media_player_entity="media_player.test",
         )
         payloads = []
 
@@ -278,6 +281,7 @@ class TestVoiceChannelAdapter:
         adapter = VoiceChannelAdapter(
             ha_url="http://ha.local:8123",
             ha_token="test-token",
+            media_player_entity="media_player.test",
         )
         calls = []
 
@@ -305,6 +309,7 @@ class TestVoiceChannelAdapter:
         adapter = VoiceChannelAdapter(
             ha_url="http://ha.local:8123",
             ha_token="test-token",
+            media_player_entity="media_player.test",
         )
         calls = []
 
@@ -335,6 +340,7 @@ class TestVoiceChannelAdapter:
         adapter = VoiceChannelAdapter(
             ha_url="http://ha.local:8123",
             ha_token="test-token",
+            media_player_entity="media_player.test",
         )
         calls = []
 
@@ -354,6 +360,66 @@ class TestVoiceChannelAdapter:
 
             assert len(calls) == 1
             assert "tts/speak" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_send_message_no_media_player_skips(self):
+        """No media_player entity configured → send_message skips delivery
+        entirely (no HA calls), instead of POSTing to a nonexistent entity."""
+        adapter = VoiceChannelAdapter(
+            ha_url="http://ha.local:8123",
+            ha_token="test-token",
+            media_player_entity="",
+        )
+        posted = []
+
+        async def mock_post_fn(url, **kwargs):
+            posted.append(url)
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        with patch("genesis.channels.voice.adapter.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(
+                return_value=MagicMock(post=AsyncMock(side_effect=mock_post_fn)),
+            )
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await adapter.send_message("ch-1", "hello")
+            assert result == ""
+            assert posted == []
+
+    @pytest.mark.asyncio
+    async def test_tts_empty_changed_states_warns(self, caplog):
+        """tts.speak returning [] (no entity matched → no audio) logs a WARNING
+        rather than a false 'delivered'. Guards the silent-chime failure mode
+        (HA 200 + empty changed-states) from 2026-06-13."""
+        import logging
+
+        adapter = VoiceChannelAdapter(
+            ha_url="http://ha.local:8123",
+            ha_token="test-token",
+            media_player_entity="media_player.bogus",
+        )
+
+        async def mock_post_fn(url, **kwargs):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json = MagicMock(return_value=[])  # HA: zero states changed
+            return resp
+
+        with (
+            patch("genesis.channels.voice.adapter.httpx.AsyncClient") as mock_client,
+            patch("genesis.channels.voice.adapter.asyncio.sleep", new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger="genesis.channels.voice.adapter"),
+        ):
+            mock_client.return_value.__aenter__ = AsyncMock(
+                return_value=MagicMock(post=AsyncMock(side_effect=mock_post_fn)),
+            )
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await adapter.send_message("ch-1", "hello")
+            assert result  # still returns a delivery id (best-effort)
+            assert any("changed no states" in r.getMessage() for r in caplog.records)
 
 
 # ── Voice API Endpoint ───────────────────────────────────────────────
