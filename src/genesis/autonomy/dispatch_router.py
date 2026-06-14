@@ -118,12 +118,17 @@ class AutonomousDispatchRouter:
             )
 
         if request.api_call_site_id:
-            # Suppress the chain_exhausted dead letter on the API attempt when a
-            # CLI (Claude Code) fallback will run — the CC background session
-            # backstops the work, so a dead letter here would be a cosmetic
-            # false positive. In dispatch=api mode no fallback runs, so a real
-            # exhaustion must still be recorded.
-            suppress_dl = request.cli_fallback_allowed and dispatch_mode != "api"
+            # Suppress the chain_exhausted dead letter on the API attempt ONLY
+            # when a Claude Code fallback will actually run, so the dead letter
+            # isn't a cosmetic false positive for CC-backstopped work. That
+            # requires: not api-only mode, the caller allows CLI fallback, AND
+            # the system policy has CLI fallback enabled — if the policy
+            # disables it, no fallback runs and a real exhaustion must still be
+            # recorded. Policy is loaded only on this candidate path (not on
+            # every dispatch) to keep the success path free of the YAML read.
+            suppress_dl = False
+            if dispatch_mode != "api" and request.cli_fallback_allowed:
+                suppress_dl = self._policy_loader().autonomous_cli_fallback_enabled
             result = await self._router.route_call(
                 request.api_call_site_id, request.messages,
                 suppress_dead_letter=suppress_dl,

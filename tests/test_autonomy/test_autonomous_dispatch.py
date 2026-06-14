@@ -294,7 +294,10 @@ async def test_dispatch_router_suppresses_dead_letter_with_cli_fallback(approval
     cosmetic false positive (the reflection still completes via CC)."""
     router = AsyncMock()
     router.route_call = AsyncMock(return_value=SimpleNamespace(success=False, error="exhausted"))
-    dispatch = AutonomousDispatchRouter(router=router, approval_gate=approval_gate)
+    policy = SimpleNamespace(autonomous_cli_fallback_enabled=True, manual_approval_required=False)
+    dispatch = AutonomousDispatchRouter(
+        router=router, approval_gate=approval_gate, policy_loader=lambda: policy,
+    )
 
     await dispatch.route(AutonomousDispatchRequest(
         subsystem="reflection",
@@ -309,6 +312,33 @@ async def test_dispatch_router_suppresses_dead_letter_with_cli_fallback(approval
 
     _, kwargs = router.route_call.call_args
     assert kwargs.get("suppress_dead_letter") is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_router_records_dead_letter_when_policy_disables_cli(approval_gate):
+    """Dual dispatch + cli_fallback_allowed, but the SYSTEM POLICY disables CLI
+    fallback → no CC fallback runs, so the dead letter must NOT be suppressed.
+    Suppressing here would silently drop a real, unhandled exhaustion."""
+    router = AsyncMock()
+    router.route_call = AsyncMock(return_value=SimpleNamespace(success=False, error="exhausted"))
+    policy = SimpleNamespace(autonomous_cli_fallback_enabled=False, manual_approval_required=False)
+    dispatch = AutonomousDispatchRouter(
+        router=router, approval_gate=approval_gate, policy_loader=lambda: policy,
+    )
+
+    await dispatch.route(AutonomousDispatchRequest(
+        subsystem="reflection",
+        policy_id="reflection_light",
+        action_label="light reflection",
+        messages=[{"role": "user", "content": "x"}],
+        cli_invocation=_invocation(),
+        api_call_site_id="4_light_reflection",
+        dispatch_mode="dual",
+        cli_fallback_allowed=True,
+    ))
+
+    _, kwargs = router.route_call.call_args
+    assert kwargs.get("suppress_dead_letter") is False
 
 
 @pytest.mark.asyncio
