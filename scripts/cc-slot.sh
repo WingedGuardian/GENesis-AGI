@@ -84,8 +84,12 @@ chmod 700 "$TMPDIR"
 export CLAUDE_CODE_TMPDIR="$HOME/.genesis/cc-tmp"
 
 # -u: force UTF-8 output even if a future client's locale detection fails
+# Interactive dev console (a human attaches over SSH), so use auto mode: it
+# auto-approves common ops but still prompts on deny/ask rules, which the
+# operator can answer in the tmux session. Headless/autonomous CC sessions
+# keep --dangerously-skip-permissions (no human present to answer a prompt).
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
     -e "LANG=$LANG" \
-    "cd ${GENESIS_ROOT} && exec claude --dangerously-skip-permissions"
+    "cd ${GENESIS_ROOT} && exec claude --permission-mode auto"

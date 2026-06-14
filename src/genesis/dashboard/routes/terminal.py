@@ -211,7 +211,11 @@ _TERMINAL_PAGE_HTML = """\
       const dims = fit.proposeDimensions();
       if (dims) ws.send(JSON.stringify({ resize: { rows: dims.rows, cols: dims.cols } }));
       // Prefill Claude Code launch command; user chooses when to execute.
-      setTimeout(() => ws.send("claude --dangerously-skip-permissions"), 500);
+      // Interactive terminal (a human drives it), so use auto mode: it
+      // auto-approves common ops but still prompts on deny/ask rules, which
+      // the operator can answer here. Headless/autonomous sessions keep
+      // --dangerously-skip-permissions (no human to answer a prompt).
+      setTimeout(() => ws.send("claude --permission-mode auto"), 500);
     };
 
     ws.onmessage = (evt) => {
