@@ -286,6 +286,54 @@ async def test_dispatch_router_blocks_pending_cli_fallback(approval_gate):
     assert "approval" in decision.reason
 
 
+@pytest.mark.asyncio
+async def test_dispatch_router_suppresses_dead_letter_with_cli_fallback(approval_gate):
+    """Dual dispatch WITH a CLI fallback: the API attempt must pass
+    suppress_dead_letter=True. The Claude Code background session backstops the
+    work, so a chain_exhausted dead letter for the failed API attempt is a
+    cosmetic false positive (the reflection still completes via CC)."""
+    router = AsyncMock()
+    router.route_call = AsyncMock(return_value=SimpleNamespace(success=False, error="exhausted"))
+    dispatch = AutonomousDispatchRouter(router=router, approval_gate=approval_gate)
+
+    await dispatch.route(AutonomousDispatchRequest(
+        subsystem="reflection",
+        policy_id="reflection_light",
+        action_label="light reflection",
+        messages=[{"role": "user", "content": "x"}],
+        cli_invocation=_invocation(),
+        api_call_site_id="4_light_reflection",
+        dispatch_mode="dual",
+        cli_fallback_allowed=True,
+    ))
+
+    _, kwargs = router.route_call.call_args
+    assert kwargs.get("suppress_dead_letter") is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_router_records_dead_letter_when_api_only(approval_gate):
+    """dispatch=api has NO CLI fallback, so the API attempt must NOT suppress
+    the dead letter — exhaustion is a real failure that must be recorded (not
+    silently dropped)."""
+    router = AsyncMock()
+    router.route_call = AsyncMock(return_value=SimpleNamespace(success=False, error="exhausted"))
+    dispatch = AutonomousDispatchRouter(router=router, approval_gate=approval_gate)
+
+    await dispatch.route(AutonomousDispatchRequest(
+        subsystem="ego",
+        policy_id="ego_cycle",
+        action_label="ego cycle",
+        messages=[{"role": "user", "content": "x"}],
+        cli_invocation=_invocation(),
+        api_call_site_id="7_ego_cycle",
+        dispatch_mode="api",
+    ))
+
+    _, kwargs = router.route_call.call_args
+    assert kwargs.get("suppress_dead_letter") is False
+
+
 def test_load_autonomous_cli_policy_from_yaml(tmp_path: Path):
     path = tmp_path / "autonomous_cli_policy.yaml"
     path.write_text(

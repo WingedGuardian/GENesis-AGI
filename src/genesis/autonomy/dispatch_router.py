@@ -118,8 +118,15 @@ class AutonomousDispatchRouter:
             )
 
         if request.api_call_site_id:
+            # Suppress the chain_exhausted dead letter on the API attempt when a
+            # CLI (Claude Code) fallback will run — the CC background session
+            # backstops the work, so a dead letter here would be a cosmetic
+            # false positive. In dispatch=api mode no fallback runs, so a real
+            # exhaustion must still be recorded.
+            suppress_dl = request.cli_fallback_allowed and dispatch_mode != "api"
             result = await self._router.route_call(
                 request.api_call_site_id, request.messages,
+                suppress_dead_letter=suppress_dl,
             )
             # Success is only a real success if the provider actually
             # produced content.  Free-tier providers (notably gemini-free)
