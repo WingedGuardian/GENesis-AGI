@@ -10,6 +10,26 @@ from datetime import UTC, datetime
 import aiosqlite
 
 
+def _safe_details_json(details: dict | None) -> str | None:
+    """Serialize event details to JSON, degrading gracefully (OBS-002).
+
+    ``default=str`` lets common non-JSON values (datetimes, Paths, enums)
+    serialize as strings instead of raising; a last-resort marker guarantees a
+    single un-serializable event can never abort a whole ``insert_batch``.
+    """
+    if not details:
+        return None
+    try:
+        return json.dumps(details, default=str)
+    except (TypeError, ValueError):
+        try:
+            return json.dumps(
+                {"_unserializable": True, "keys": sorted(str(k) for k in details)}
+            )
+        except Exception:
+            return json.dumps({"_unserializable": True})
+
+
 async def insert(
     db: aiosqlite.Connection,
     *,
@@ -36,7 +56,7 @@ async def insert(
             severity,
             event_type,
             message,
-            json.dumps(details) if details else None,
+            _safe_details_json(details),
             session_id,
             ts,
         ),
@@ -59,7 +79,7 @@ async def insert_batch(
             e["severity"],
             e["event_type"],
             e["message"],
-            json.dumps(e["details"]) if e.get("details") else None,
+            _safe_details_json(e.get("details")),
             e.get("session_id"),
             e.get("timestamp") or datetime.now(UTC).isoformat(),
         ))
