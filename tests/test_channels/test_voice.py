@@ -238,8 +238,12 @@ class TestVoiceChannelAdapter:
         assert result == ""
 
     @pytest.mark.asyncio
-    async def test_send_message_with_chime(self):
-        """Default path: chime via media_player.play_media, then tts.speak."""
+    async def test_send_message_with_chime(self, caplog):
+        """Default path: chime via media_player.play_media, then tts.speak.
+        tts.speak returns a non-empty changed-states list (success), so the
+        delivered path runs and NO 'changed no states' warning is emitted."""
+        import logging
+
         adapter = VoiceChannelAdapter(
             ha_url="http://ha.local:8123",
             ha_token="test-token",
@@ -251,11 +255,16 @@ class TestVoiceChannelAdapter:
             payloads.append((url, kwargs.get("json", {})))
             resp = MagicMock()
             resp.raise_for_status = MagicMock()
+            # tts.speak returns the changed tts entity state on success;
+            # a non-empty list exercises the "delivered" branch (not the
+            # empty-list warning).
+            resp.json = MagicMock(return_value=[{"entity_id": "tts.piper"}])
             return resp
 
         with (
             patch("genesis.channels.voice.adapter.httpx.AsyncClient") as mock_client,
             patch("genesis.channels.voice.adapter.asyncio.sleep", new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger="genesis.channels.voice.adapter"),
         ):
             mock_client.return_value.__aenter__ = AsyncMock(
                 return_value=MagicMock(post=AsyncMock(side_effect=mock_post_fn)),
@@ -274,6 +283,8 @@ class TestVoiceChannelAdapter:
             assert "tts/speak" in payloads[1][0]
             # No assist_satellite calls
             assert not any("assist_satellite" in p[0] for p in payloads)
+            # Success path: non-empty changed-states → no false-failure warning
+            assert not any("changed no states" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_send_message_no_preannounce(self):
@@ -333,33 +344,6 @@ class TestVoiceChannelAdapter:
             assert result  # Still returns delivery ID
             # Chime failed but tts.speak still called
             assert any("tts/speak" in c for c in calls)
-
-    @pytest.mark.asyncio
-    async def test_send_message_no_preannounce_skips_chime(self):
-        """preannounce=False skips chime even with chime configured."""
-        adapter = VoiceChannelAdapter(
-            ha_url="http://ha.local:8123",
-            ha_token="test-token",
-            media_player_entity="media_player.test",
-        )
-        calls = []
-
-        async def mock_post_fn(url, **kwargs):
-            calls.append(url)
-            resp = MagicMock()
-            resp.raise_for_status = MagicMock()
-            return resp
-
-        with patch("genesis.channels.voice.adapter.httpx.AsyncClient") as mock_client:
-            mock_client.return_value.__aenter__ = AsyncMock(
-                return_value=MagicMock(post=AsyncMock(side_effect=mock_post_fn)),
-            )
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            await adapter.send_message("ch-1", "direct tts", preannounce=False)
-
-            assert len(calls) == 1
-            assert "tts/speak" in calls[0]
 
     @pytest.mark.asyncio
     async def test_send_message_no_media_player_skips(self):
