@@ -6,11 +6,13 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 from pathlib import Path
 from typing import Protocol
 
 import httpx
 
+from genesis.cc.types import CCModel, EffortLevel
 from genesis.modules.external.config import IPCConfig
 
 logger = logging.getLogger(__name__)
@@ -200,6 +202,41 @@ class SshIPCAdapter:
         cmd.extend([self._ssh_host, remote_command])
         return cmd
 
+    def _build_remote_command(self, model: str, effort: str) -> str:
+        """Build the remote ``cd … && claude -p …`` string with every value quoted.
+
+        The command runs in the REMOTE shell (it relies on ``cd`` and ``&&``), so
+        caller-supplied ``model``/``effort`` MUST be shell-quoted or they could
+        inject arbitrary commands on the remote host (WS-1 / R2-001). ``shlex.quote``
+        leaves valid enum values (e.g. ``sonnet``/``high``) untouched and wraps
+        anything containing shell metacharacters as a single safe token.
+        """
+        model = str(model)
+        effort = str(effort)
+        valid_models = {m.value for m in CCModel}
+        valid_efforts = {m.value for m in EffortLevel}
+        if model not in valid_models:
+            logger.warning(
+                "SSH CC dispatch: unrecognized model %r (quoted and passed through)", model
+            )
+        if effort not in valid_efforts:
+            logger.warning(
+                "SSH CC dispatch: unrecognized effort %r (quoted and passed through)", effort
+            )
+
+        parts: list[str] = []
+        if self._remote_working_dir:
+            parts.append(f"cd {shlex.quote(self._remote_working_dir)} &&")
+        parts.append(
+            f"{shlex.quote(self._remote_claude_path)} -p"
+            f" --model {shlex.quote(model)}"
+            f" --output-format json"
+            f" --effort {shlex.quote(effort)}"
+            f" --max-turns 25"
+            f" --dangerously-skip-permissions"
+        )
+        return " ".join(parts)
+
     async def send(self, path: str, data: dict | None = None, method: str = "GET") -> dict:
         method_upper = method.upper()
         if method_upper == "CC":
@@ -218,19 +255,9 @@ class SshIPCAdapter:
         effort = data.get("effort", "high")
         timeout_s = data.get("timeout_s", self._timeout)
 
-        # Build remote command: cd to working dir, run claude -p
-        parts = []
-        if self._remote_working_dir:
-            parts.append(f"cd {self._remote_working_dir} &&")
-        parts.append(
-            f"{self._remote_claude_path} -p"
-            f" --model {model}"
-            f" --output-format json"
-            f" --effort {effort}"
-            f" --max-turns 25"
-            f" --dangerously-skip-permissions"
-        )
-        remote_cmd = " ".join(parts)
+        # Build the remote command with every interpolated value shell-quoted
+        # (it is re-parsed by the remote shell). See _build_remote_command.
+        remote_cmd = self._build_remote_command(model, effort)
         ssh_args = self._build_ssh_args(remote_cmd)
 
         try:
@@ -267,7 +294,13 @@ class SshIPCAdapter:
         return self._parse_cc_output(stdout)
 
     async def _send_shell(self, command: str) -> dict:
-        """Run a raw shell command on the remote machine."""
+        """Run a raw shell command on the remote machine.
+
+        ``command`` is forwarded verbatim to the remote shell — this is the raw
+        SHELL escape hatch by design. Callers are responsible for shell-quoting
+        any interpolated/untrusted values before passing them here (see
+        ``_build_remote_command`` and ``health_check`` for the quoting pattern).
+        """
         ssh_args = self._build_ssh_args(command)
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -327,7 +360,9 @@ class SshIPCAdapter:
 
     async def health_check(self, endpoint: str, expected_status: int) -> bool:
         """Check remote connectivity by running a simple SSH command."""
-        result = await self._send_shell(f"{self._remote_claude_path} --version")
+        result = await self._send_shell(
+            f"{shlex.quote(self._remote_claude_path)} --version"
+        )
         return result.get("exit_code") == 0
 
 
