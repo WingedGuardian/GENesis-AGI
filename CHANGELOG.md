@@ -34,6 +34,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   dead-lettered work during provider outages, and adversarial review and
   reflections keep running when free-tier providers are down (extra free
   fallbacks added, plus a paid last-resort for the dream-cycle challenge).
+- **Job health no longer shows a permanent failure after a job recovers.**
+  A scheduled job that failed once kept that failure timestamp in the health
+  view forever, even after it started succeeding again; recovery now clears
+  the stale failure and error so job health reflects reality.
 
 ---
 
