@@ -73,6 +73,41 @@ Recommendations:
 - Use a non-root user account.
 - Restrict network egress to required endpoints (LLM APIs, Qdrant, Ollama).
 
+### Network Exposure & Management Ports
+
+Genesis exposes a local dashboard over HTTP (and, optionally, a remote-desktop
+/ noVNC console). So it can be reached through a reverse proxy or a private
+overlay network, the bundled service unit binds the dashboard to all interfaces
+(`0.0.0.0`) by default rather than to loopback. The dashboard's `/api` and
+`/v1` surfaces are intentionally **not** gated by the optional dashboard
+password — that password protects the web UI, not the programmatic API.
+
+This is safe **only under the assumed deployment model: the host is not
+publicly exposed.** The dashboard is meant to be reachable through one of:
+
+- a **private overlay network** (e.g., Tailscale / WireGuard), where only your
+  own devices can reach the port; and/or
+- a **host-side reverse proxy** that forwards to the container.
+
+The threat model is **public exposure — not your LAN or private overlay.** If
+you run Genesis on a host reachable from the public internet, you must restrict
+the management ports yourself; Genesis does not assume an authenticating
+gateway in front of them.
+
+**Operator checklist:**
+- Do **not** port-forward the dashboard or console ports from a public router.
+- Bind or firewall the management ports to your private/overlay network — e.g.
+  restrict the dashboard port to your overlay's address range (Tailscale uses
+  the `100.64.0.0/10` CGNAT range) with `nftables`/`ufw`, or change the service
+  unit to bind a specific private interface instead of `0.0.0.0`.
+- Treat the dashboard API (`/api`, `/v1`), the built-in web terminal, and the
+  noVNC console as **unauthenticated administrative access**: anyone who can
+  reach the port can drive Genesis. Network isolation is the control.
+
+Security audits should verify this network restriction (firewall / overlay)
+rather than re-flagging the `0.0.0.0` bind, which is intentional for the
+proxy/overlay deployment model.
+
 ### Tool-Level Guards (PreToolUse Hooks)
 
 Genesis uses PreToolUse hooks to enforce tool-level security policies at
