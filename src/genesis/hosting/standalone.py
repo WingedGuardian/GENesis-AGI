@@ -146,44 +146,35 @@ class StandaloneAdapter:
         await self._shutdown_event.wait()
         heartbeat_task.cancel()
 
+    async def _voice_last_breath(self) -> None:
+        """Best-effort spoken shutdown notice via the held VoiceChannelAdapter.
+
+        Uses the adapter's media_player.play_media + tts.speak path (which
+        actually plays on the device); assist_satellite.announce silently
+        no-ops when the satellite entity is 'unavailable'. No-op when no
+        voice adapter is configured. 4s drain lets playback finish.
+        """
+        voice_adapter = self._app.config.get("VOICE_ADAPTER") if self._app else None
+        if voice_adapter is None:
+            return
+        try:
+            await voice_adapter.send_message("", "Genesis going offline.")
+            await asyncio.sleep(4)
+        except Exception:
+            logger.debug("Shutdown chime failed", exc_info=True)
+
     async def shutdown(self) -> None:
         """Graceful shutdown.
 
-        Speaks "Server restarting" via HA TTS before stopping services.
-        If HA is unreachable, the TTS call may block up to 15s (httpx
-        timeout) before shutdown continues.  This is within systemd's
-        default TimeoutStopSec=90s.
+        Speaks a brief shutdown notice via HA TTS (the held voice adapter)
+        before stopping services. If HA is unreachable, the call may block
+        up to ~15s (httpx timeout) before shutdown continues — within
+        systemd's default TimeoutStopSec=90s.
         """
         logger.info("Shutdown requested")
         self._shutdown_event.set()
 
-        # Voice "last breath" — play the HA built-in chime (3-ding) via
-        # assist_satellite.announce before services stop.  No TTS needed —
-        # the chime alone signals "going away."  4s drain lets the device
-        # finish playing before Wyoming shuts down.
-        ha_url = os.environ.get("HA_URL", "")
-        ha_token = os.environ.get("HA_LONG_LIVED_TOKEN", "")
-        if ha_url and ha_token:
-            try:
-                import httpx
-                async with httpx.AsyncClient(timeout=10) as client:
-                    await client.post(
-                        f"{ha_url.rstrip('/')}/api/services/assist_satellite/announce",
-                        headers={
-                            "Authorization": f"Bearer {ha_token}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "entity_id": os.environ.get(
-                                "HA_ASSIST_SATELLITE_ENTITY",
-                                "assist_satellite.home_assistant_voice_0a2841_assist_satellite",
-                            ),
-                            "message": "",
-                        },
-                    )
-                await asyncio.sleep(4)
-            except Exception:
-                logger.debug("Shutdown chime failed", exc_info=True)
+        await self._voice_last_breath()
 
         if self._runtime and self._runtime.awareness_loop is not None:
             self._runtime.awareness_loop.request_stop()
