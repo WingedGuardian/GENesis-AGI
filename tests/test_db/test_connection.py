@@ -161,3 +161,43 @@ async def test_error_does_not_corrupt_connection(sconn):
     cur = await sconn.execute("SELECT count(*) as cnt FROM t")
     row = await cur.fetchone()
     assert row["cnt"] == 2  # seed + good_writer
+
+
+# ── WS-15: shared raw-connection helper for ad-hoc / standalone opens ──
+
+async def test_get_raw_db_sets_standard_pragmas(tmp_path):
+    """get_raw_db must apply WAL + NORMAL sync + busy_timeout + Row factory so
+    ad-hoc/subprocess opens can't fail immediately on a concurrent write lock."""
+    from genesis.db.connection import BUSY_TIMEOUT_MS, get_raw_db
+
+    db_path = tmp_path / "raw.db"
+    async with get_raw_db(db_path) as db:
+        assert db.row_factory is aiosqlite.Row
+
+        cur = await db.execute("PRAGMA busy_timeout")
+        assert (await cur.fetchone())[0] == BUSY_TIMEOUT_MS
+
+        cur = await db.execute("PRAGMA journal_mode")
+        assert (await cur.fetchone())[0].lower() == "wal"
+
+        cur = await db.execute("PRAGMA synchronous")
+        assert (await cur.fetchone())[0] == 1  # 1 == NORMAL
+
+        # usable for a real round-trip
+        await db.execute("CREATE TABLE x (id INTEGER PRIMARY KEY, v TEXT)")
+        await db.execute("INSERT INTO x VALUES (1, 'ok')")
+        await db.commit()
+        cur = await db.execute("SELECT v FROM x WHERE id = 1")
+        assert (await cur.fetchone())["v"] == "ok"
+
+
+async def test_get_raw_db_closes_on_exit(tmp_path):
+    """The connection is closed when the context manager exits."""
+    from genesis.db.connection import get_raw_db
+
+    db_path = tmp_path / "raw2.db"
+    async with get_raw_db(db_path) as db:
+        captured = db
+        assert captured._running is True  # alive inside the context
+    # After exit the background thread is stopped — connection is closed.
+    assert captured._running is False

@@ -57,6 +57,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `config/` dir — so your changes were silently ignored, even after a restart.
   Loaders now read the user-config overlay first (falling back to the repo path
   for older installs), and the settings tool reports the correct saved path.
+- **Fewer "database is locked" errors under heavy concurrent load.** Several
+  standalone database connections (the ego tools, web-agent cost tracking, the
+  contribution gate, and two hooks) opened without a busy-timeout, so a brief
+  write lock made them fail immediately instead of waiting their turn. They now
+  share one connection helper (WAL + a bounded wait), so transient contention
+  is ridden out rather than surfaced as an error.
 
 ### Security
 

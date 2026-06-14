@@ -581,12 +581,11 @@ async def web_agent(
 
     # Budget check before execution — agent calls cost $0.015/step
     try:
-        import aiosqlite
-
+        from genesis.db.connection import get_raw_db
         from genesis.env import genesis_db_path
         from genesis.routing.cost_tracker import CostTracker
 
-        async with aiosqlite.connect(genesis_db_path()) as db:
+        async with get_raw_db(genesis_db_path()) as db:
             tracker = CostTracker(db)
             status = await tracker.check_budget()
             if hasattr(status, "value"):
@@ -617,14 +616,13 @@ async def web_agent(
                 import uuid
                 from datetime import datetime
 
-                import aiosqlite
-
+                from genesis.db.connection import get_raw_db
                 from genesis.db.crud import cost_events
                 from genesis.env import genesis_db_path
 
                 num_steps = data.get("num_of_steps", 0)
                 cost_usd = round(num_steps * COST_PER_STEP_USD, 4)
-                async with aiosqlite.connect(genesis_db_path()) as db:
+                async with get_raw_db(genesis_db_path()) as db:
                     await cost_events.create(
                         db,
                         id=str(uuid.uuid4()),

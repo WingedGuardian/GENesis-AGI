@@ -71,6 +71,7 @@ async def _get_db() -> aiosqlite.Connection:
     """Open a direct DB connection for MCP fallback reads/writes."""
     db = await aiosqlite.connect(str(_DB_PATH))
     db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA journal_mode=WAL")
     await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     return db
 
