@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from genesis.routing.circuit_breaker import (
     _MAX_OPEN_S,
     CircuitBreaker,
@@ -30,6 +32,70 @@ def test_starts_closed():
     cb = CircuitBreaker(_provider())
     assert cb.state == ProviderState.CLOSED
     assert cb.is_available()
+
+
+def test_registry_persists_breaker_state_on_trip(tmp_path):
+    """Default registry writes breaker state to disk when a breaker trips."""
+    state_file = tmp_path / "cb_state.json"
+    reg = CircuitBreakerRegistry({"p": _provider("p")}, state_file=state_file)
+    cb = reg.get("p")
+    for _ in range(3):  # default failure_threshold trips on the 3rd
+        cb.record_failure(ErrorCategory.TRANSIENT)
+    assert state_file.exists()
+    data = json.loads(state_file.read_text())
+    assert data["p"]["state"] == "open"
+    # The atomic tmp+rename must leave no stray temp files.
+    assert list(state_file.parent.glob("*.tmp")) == []
+
+
+def test_standalone_registry_is_read_only(tmp_path):
+    """A persist=False registry (MCP children) must never write the shared state file."""
+    state_file = tmp_path / "cb_state.json"
+    reg = CircuitBreakerRegistry({"p": _provider("p")}, state_file=state_file, persist=False)
+    cb = reg.get("p")
+    for _ in range(5):
+        cb.record_failure(ErrorCategory.TRANSIENT)
+    assert cb.state == ProviderState.OPEN  # breaker still works in-memory
+    assert not state_file.exists()  # but nothing was written to the shared file
+
+
+def test_read_only_registry_still_loads_existing_state(tmp_path):
+    """persist=False must still LOAD server-written state at construction."""
+    state_file = tmp_path / "cb_state.json"
+    server = CircuitBreakerRegistry({"p": _provider("p")}, state_file=state_file)
+    sb = server.get("p")
+    for _ in range(3):
+        sb.record_failure(ErrorCategory.TRANSIENT)
+    assert state_file.exists()
+
+    child = CircuitBreakerRegistry(
+        {"p": _provider("p")}, state_file=state_file, persist=False
+    )
+    assert child.get("p").state == ProviderState.OPEN
+
+
+def test_load_state_restores_open_after_restart(tmp_path):
+    """Regression: a persisted OPEN breaker must reload as OPEN.
+
+    save_state writes ProviderState.OPEN.value ('open'); load_state previously
+    compared against the literal 'OPEN', so a tripped provider silently came back
+    CLOSED on every restart.
+    """
+    state_file = tmp_path / "cb_state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "p": {
+                    "state": "open",
+                    "consecutive_failures": 0,
+                    "trip_count": 1,
+                    "last_failure_category": "transient",
+                }
+            }
+        )
+    )
+    reg = CircuitBreakerRegistry({"p": _provider("p")}, state_file=state_file)
+    assert reg.get("p").state == ProviderState.OPEN
 
 
 def test_consecutive_failures_trip():
@@ -389,10 +455,12 @@ def test_trip_count_capped_on_restore(tmp_path):
     original_path = cb_mod._STATE_FILE
     cb_mod._STATE_FILE = tmp_path / "cb_state.json"
     try:
-        # Write state with high trip_count (simulating weeks of restarts)
+        # Write state with high trip_count (simulating weeks of restarts).
+        # Note: the persisted value is the StrEnum value "open" (what save_state
+        # writes) — the literal "OPEN" never appears on disk.
         state = {
             "x": {
-                "state": "OPEN",
+                "state": "open",
                 "trip_count": 90,
                 "consecutive_failures": 5,
             }

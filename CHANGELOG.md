@@ -25,6 +25,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   failure (was 100% only), so you hear about pressure and degradation
   sooner, on both Telegram and voice.
 
+### Fixed
+
+- **Circuit-breaker trips now survive a restart.** A provider that tripped
+  open was silently coming back available on every restart (a saved-state
+  casing mismatch), so a failing provider got retried immediately instead of
+  serving out its backoff. Breaker state is now also written atomically, and
+  MCP helper processes no longer overwrite the shared state file.
+
 ---
 
 ## [v3.0b15] - 2026-06-12

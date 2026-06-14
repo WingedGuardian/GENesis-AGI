@@ -77,7 +77,9 @@ def create_standalone_router() -> None:
 
         # 3. Construct router-lite
         delegate = LiteLLMDelegate(config)
-        breakers = CircuitBreakerRegistry(config.providers)
+        # Read-only: MCP child processes load the server's breaker state but must
+        # not write the shared state file (only the server owns it) — WS-3c.
+        breakers = CircuitBreakerRegistry(config.providers, persist=False)
         degradation = DegradationTracker(resilience_state=None)
         cost_tracker = NullCostTracker()
 
