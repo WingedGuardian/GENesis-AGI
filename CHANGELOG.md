@@ -63,6 +63,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   unauthenticated administrative access — so operators know to keep those ports
   on a private overlay (e.g., Tailscale) or behind a reverse proxy and never
   expose them publicly.
+- **Interactive Claude Code consoles no longer skip all permission checks.**
+  The dashboard web terminal and the SSH dev-console slot now launch Claude
+  Code in auto-permission mode instead of `--dangerously-skip-permissions`:
+  common operations still run without prompting, but risky ones ask for your
+  approval right there in the session (you're present to answer). Headless,
+  autonomous sessions are unchanged — they have no one to answer a prompt.
 
 ---
 
