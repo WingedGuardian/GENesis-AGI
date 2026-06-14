@@ -43,6 +43,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   casing mismatch), so a failing provider got retried immediately instead of
   serving out its backoff. Breaker state is now also written atomically, and
   MCP helper processes no longer overwrite the shared state file.
+- **The error log no longer silently under-counts during incident storms.**
+  When the event-persistence queue filled up, events were dropped without a
+  trace — so the dashboard and health views under-reported errors exactly when
+  things were worst. Dropped events are now counted and made visible (an
+  "event queue overflow" warning in the same error views, plus a live counter
+  on the health snapshot), the buffer is 10× larger (500 → 5000) to absorb
+  bursts, and a single un-serializable event can no longer drop a whole batch.
 - **Dashboard settings changes now actually take effect.** Overrides you saved
   from the dashboard (or the settings tool) are written to `~/.genesis/config/`,
   but several subsystems (inbox, surplus, resilience, voice/TTS, perception
@@ -57,6 +64,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   module adapter now shell-quotes the model, effort, and path values it sends
   to a remote host, so a crafted value can no longer run arbitrary commands
   there. Normal dispatch is unchanged.
+- **Documented the dashboard's network-exposure model.** `SECURITY.md` now
+  spells out that the dashboard binds all interfaces for proxy/overlay reach
+  and that its `/api`, `/v1`, web terminal, and noVNC console are
+  unauthenticated administrative access — so operators know to keep those ports
+  on a private overlay (e.g., Tailscale) or behind a reverse proxy and never
+  expose them publicly.
+- **Interactive Claude Code consoles no longer skip all permission checks.**
+  The dashboard web terminal and the SSH dev-console slot now launch Claude
+  Code in auto-permission mode instead of `--dangerously-skip-permissions`:
+  common operations still run without prompting, but risky ones ask for your
+  approval right there in the session (you're present to answer). Headless,
+  autonomous sessions are unchanged — they have no one to answer a prompt.
 
 ---
 

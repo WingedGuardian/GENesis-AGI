@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import aiosqlite
 
+    from genesis.observability.events import GenesisEventBus
     from genesis.observability.provider_health import ProviderHealthChecker
     from genesis.resilience.cc_budget import CCBudgetTracker
     from genesis.resilience.deferred_work import DeferredWorkQueue
@@ -54,6 +55,7 @@ class HealthDataService:
         resilience_state_machine: ResilienceStateMachine | None = None,
         activity_tracker: object | None = None,
         provider_health_checker: ProviderHealthChecker | None = None,
+        event_bus: GenesisEventBus | None = None,
     ) -> None:
         self._breakers = circuit_breakers
         self._routing_config = routing_config
@@ -67,6 +69,7 @@ class HealthDataService:
         self._state_machine = resilience_state_machine
         self._activity_tracker = activity_tracker
         self._provider_health = provider_health_checker
+        self._event_bus = event_bus
 
     async def snapshot(self) -> dict:
         """Return full system health state as a dict."""
@@ -113,7 +116,9 @@ class HealthDataService:
             "infrastructure": await infrastructure(
                 self._db, self._routing_config, self._learning_scheduler, self._state_machine
             ),
-            "queues": await queues(self._db, self._deferred_queue, self._dead_letter),
+            "queues": await queues(
+                self._db, self._deferred_queue, self._dead_letter, self._event_bus
+            ),
             "surplus": await surplus_status(self._db, self._surplus),
             "cost": await cost(self._db, self._cost_tracker, self._cc_budget),
             "awareness": await awareness(self._db),
