@@ -24,6 +24,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   now fires at 85% (was 90%) and the vector-search-failure alert at 50%
   failure (was 100% only), so you hear about pressure and degradation
   sooner, on both Telegram and voice.
+- **Voice: the assistant's spoken voice is now a configurable add-on option**
+  — pick the conversational voice in the Genesis Voice Bridge add-on settings
+  (default "ash"); changing it no longer needs a code edit. No change to how
+  you talk to it — only which preset voice answers.
 
 ---
 

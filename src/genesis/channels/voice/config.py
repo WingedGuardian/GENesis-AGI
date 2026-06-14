@@ -25,8 +25,12 @@ def s2s_model() -> str:
 
 
 def s2s_voice() -> str:
-    """Voice name for the S2S model's TTS output."""
-    return os.environ.get("VOICE_S2S_VOICE", "alloy")
+    """Voice name for the S2S model's spoken output (preset).
+
+    Default "ash" matches the s2s_bridge add-on default so both the active
+    (add-on) and fallback (in-server Wyoming) paths use the same voice.
+    """
+    return os.environ.get("VOICE_S2S_VOICE", "ash")
 
 
 def wyoming_stt_port() -> int:

@@ -1,5 +1,5 @@
 name: Genesis Voice Bridge
-version: "0.3.0"
+version: "0.3.1"
 slug: genesis_voice_bridge
 description: Bidirectional voice bridge using OpenAI Realtime API — connects Voice PE to Genesis via WebSocket
 url: https://github.com/WingedGuardian/GENesis-AGI
@@ -17,6 +17,8 @@ options:
   genesis_token: ""
   # Semantic VAD eagerness: low (fewer interrupts), medium (default), high (more responsive)
   semantic_vad_eagerness: "medium"
+  # OpenAI Realtime spoken voice (preset). Default "ash".
+  voice: "ash"
   # Session management
   session_reuse_timeout_seconds: 300
   # Audio recording (optional, for debugging)
@@ -27,5 +29,6 @@ schema:
   genesis_url: str
   genesis_token: password  # pragma: allowlist secret
   semantic_vad_eagerness: "list(low|medium|high)"
+  voice: "list(alloy|ash|ballad|coral|echo|sage|shimmer|verse|cedar|marin)"
   session_reuse_timeout_seconds: int(0,3600)
   enable_recording: bool

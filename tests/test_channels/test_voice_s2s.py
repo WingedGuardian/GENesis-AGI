@@ -29,7 +29,7 @@ class TestVoiceConfig:
         with patch.dict("os.environ", {}, clear=True):
             assert s2s_provider() == "openai"
             assert s2s_model() == "gpt-realtime-1.5"
-            assert s2s_voice() == "alloy"
+            assert s2s_voice() == "ash"
             assert wyoming_stt_port() == 10300
             assert wyoming_tts_port() == 10301
 
@@ -41,6 +41,10 @@ class TestVoiceConfig:
     def test_custom_model(self):
         with patch.dict("os.environ", {"VOICE_S2S_MODEL": "gpt-realtime-2"}):
             assert s2s_model() == "gpt-realtime-2"
+
+    def test_custom_voice(self):
+        with patch.dict("os.environ", {"VOICE_S2S_VOICE": "cedar"}):
+            assert s2s_voice() == "cedar"
 
     def test_s2s_enabled_openai(self):
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test"}):
@@ -56,6 +60,60 @@ class TestVoiceConfig:
             "GOOGLE_API_KEY": "test",
         }):
             assert s2s_enabled()
+
+
+class TestS2SSessionVoiceConfig:
+    """The in-server fallback (Wyoming) S2S path must send the configured
+    voice preset in session.update — wiring the previously-unused s2s_voice()
+    knob. (The device's active path is the s2s_bridge add-on, configured
+    separately via the VOICE_S2S_VOICE add-on option.)"""
+
+    async def test_connect_sends_configured_voice(self):
+        from types import SimpleNamespace
+
+        from genesis.channels.voice.s2s_session import (
+            S2SSession,
+            S2SSessionManager,
+        )
+
+        class _FakeConn:
+            def __init__(self):
+                self.session = MagicMock()
+                self.session.update = AsyncMock()
+                self._events = [SimpleNamespace(type="session.updated")]
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._events:
+                    return self._events.pop(0)
+                raise StopAsyncIteration
+
+        class _FakeConnMgr:
+            def __init__(self, conn):
+                self._conn = conn
+
+            async def __aenter__(self):
+                return self._conn
+
+            async def __aexit__(self, *exc):
+                return False
+
+        conn = _FakeConn()
+        bridge = MagicMock()
+        bridge.get_system_prompt.return_value = "system prompt"
+        mgr = S2SSessionManager(bridge=bridge)
+        mgr._client = MagicMock()
+        mgr._client.realtime.connect = MagicMock(return_value=_FakeConnMgr(conn))
+
+        session = S2SSession(session_id="s", satellite_id="sat")
+        with patch.dict("os.environ", {"VOICE_S2S_VOICE": "verse"}):
+            await mgr.connect(session)
+
+        conn.session.update.assert_awaited_once()
+        sent = conn.session.update.await_args.kwargs["session"]
+        assert sent["voice"] == "verse"
 
 
 # ─── GenesisBridge tests ─────────────────────────────────────────────────

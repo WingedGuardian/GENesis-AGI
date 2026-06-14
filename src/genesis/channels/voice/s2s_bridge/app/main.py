@@ -59,6 +59,9 @@ class Application:
         # reconnect handshake + context replay. Configurable via env for
         # testing (e.g. SESSION_ROTATION_SECONDS=30).
         self._rotation_interval: float = 55 * 60
+        # OpenAI Realtime voice (preset). Configurable via the VOICE_S2S_VOICE
+        # add-on option; default "ash". Re-read from env in initialize().
+        self.s2s_voice: str = "ash"
 
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -70,6 +73,9 @@ class Application:
         # Semantic VAD eagerness (replaces old threshold-based server_vad)
         # Options: "low" (less interrupts), "medium" (default), "high" (more responsive)
         self.semantic_vad_eagerness = os.environ.get("SEMANTIC_VAD_EAGERNESS", "medium")
+
+        # OpenAI Realtime voice preset (configurable add-on option; default "ash")
+        self.s2s_voice = os.environ.get("VOICE_S2S_VOICE", "ash")
 
         # Session rotation interval (override for testing)
         self._rotation_interval = float(
@@ -236,7 +242,7 @@ class Application:
                         noise_reduction=InputAudioNoiseReduction(type="near_field"),
                         transcription=InputAudioTranscription(),
                     ),
-                    output=AudioOutput(voice="ash")
+                    output=AudioOutput(voice=self.s2s_voice)
                 ),
                 tools=all_tools
             )

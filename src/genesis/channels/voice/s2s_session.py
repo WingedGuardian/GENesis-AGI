@@ -145,13 +145,15 @@ class S2SSessionManager:
         session.connection = conn
         session._conn_mgr = conn_mgr
 
-        # Minimal config — defaults give us audio output (alloy voice),
-        # server VAD, 24kHz PCM. We use conversation.item.create for audio
-        # input so VAD doesn't interfere with bulk utterances from Wyoming.
+        # Minimal config — server VAD, 24kHz PCM. We use
+        # conversation.item.create for audio input so VAD doesn't interfere
+        # with bulk utterances from Wyoming. Voice preset is configurable via
+        # VOICE_S2S_VOICE (default "ash") so this fallback matches the add-on.
         system_prompt = self._bridge.get_system_prompt()
         await conn.session.update(session={
             "type": "realtime",
             "instructions": system_prompt,
+            "voice": voice_config.s2s_voice(),
             "tools": TOOL_DECLARATIONS,
         })
 

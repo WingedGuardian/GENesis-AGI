@@ -10,6 +10,9 @@ GENESIS_TOKEN=$(bashio::config 'genesis_token')
 # Turn detection settings (semantic VAD — replaces old threshold-based server_vad)
 SEMANTIC_VAD_EAGERNESS=$(bashio::config 'semantic_vad_eagerness')
 
+# OpenAI Realtime spoken voice preset
+VOICE_S2S_VOICE=$(bashio::config 'voice')
+
 # Session management
 SESSION_REUSE_TIMEOUT_SECONDS=$(bashio::config 'session_reuse_timeout_seconds')
 
@@ -29,6 +32,7 @@ export GENESIS_URL
 export GENESIS_TOKEN
 
 export SEMANTIC_VAD_EAGERNESS
+export VOICE_S2S_VOICE
 
 export SESSION_REUSE_TIMEOUT_SECONDS
 export ENABLE_RECORDING
