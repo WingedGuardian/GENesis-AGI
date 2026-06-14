@@ -34,10 +34,11 @@ but operates at the infrastructure level:
 
 | Error Type | Examples | Action |
 |-----------|---------|--------|
-| **Transient** | HTTP 429, 503, connection timeout, socket reset | Retry with backoff |
+| **Transient** | HTTP 429, 503, connection error, socket reset | Retry with backoff |
+| **Timeout** | HTTP 408, `litellm.Timeout`, "timed out" | Do NOT retry the same provider — fail fast to the next provider in the chain (a hung provider won't un-hang on retry). Circuit breaker still records the failure. |
 | **Degraded** | Partial response, malformed JSON, truncated output | Retry once; if repeated, route to fallback provider |
 | **Permanent** | HTTP 401 (auth), 404, invalid model name, quota exhausted | Do NOT retry. Log error, route to fallback provider or surface to user |
-| **Provider down** | Consecutive transient failures from same provider | Open circuit breaker, route all traffic to fallback |
+| **Provider down** | Consecutive failures (including timeouts) from same provider | Open circuit breaker, route all traffic to fallback |
 
 **Why this matters:** Retrying a permanent error wastes budget and delays fallback.
 Not retrying a transient error causes unnecessary failures. The classification

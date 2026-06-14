@@ -27,6 +27,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Provider hangs no longer stall reflections and the dream cycle** — when a
+  model provider hangs (accepts the connection but never responds), Genesis
+  now fails over to the next provider within its timeout instead of blocking
+  for minutes. Reflections and the nightly dream cycle stop piling up
+  dead-lettered work during provider outages, and adversarial review and
+  reflections keep running when free-tier providers are down (extra free
+  fallbacks added, plus a paid last-resort for the dream-cycle challenge).
 - **Job health no longer shows a permanent failure after a job recovers.**
   A scheduled job that failed once kept that failure timestamp in the health
   view forever, even after it started succeeding again; recovery now clears
