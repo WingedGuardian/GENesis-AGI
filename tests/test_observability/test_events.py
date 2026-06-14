@@ -1,5 +1,7 @@
 """Tests for GenesisEventBus."""
 
+import asyncio
+
 import pytest
 
 from genesis.observability.events import GenesisEventBus, _at_or_above
@@ -213,3 +215,104 @@ class TestSeverityOrdering:
         assert _at_or_above(Severity.CRITICAL, Severity.INFO)
         assert not _at_or_above(Severity.INFO, Severity.WARNING)
         assert not _at_or_above(Severity.DEBUG, Severity.INFO)
+
+
+class TestDroppedEventVisibility:
+    """WS-17: dropped events are counted (non-blocking) and surfaced."""
+
+    @pytest.mark.asyncio
+    async def test_emit_increments_dropped_count_when_queue_full(self, bus):
+        # Force a full persistence queue deterministically (no writer draining).
+        bus._write_queue = asyncio.Queue(maxsize=1)
+        bus._write_queue.put_nowait({"filler": True})
+        assert bus.dropped_event_count() == 0
+
+        # emit() must neither block nor raise even though the queue is full.
+        event = await bus.emit(Subsystem.ROUTING, Severity.ERROR, "drop_me", "boom")
+
+        assert isinstance(event, GenesisEvent)  # emit still returns the event
+        assert bus.dropped_event_count() == 1
+        # The in-memory ring still captured it even though the DB queue dropped it.
+        assert any(e.event_type == "drop_me" for e in bus._ring)
+
+    @pytest.mark.asyncio
+    async def test_enable_persistence_uses_large_queue(self):
+        from unittest.mock import AsyncMock
+
+        bus = GenesisEventBus(db=AsyncMock())
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("genesis.db.crud.events.insert_batch", AsyncMock())
+            bus.enable_persistence(AsyncMock())
+            try:
+                assert bus._write_queue.maxsize == 5000
+            finally:
+                await bus.stop()
+
+    @pytest.mark.asyncio
+    async def test_flush_dropped_notice_persists_rate_limited_overflow_event(self, db):
+        from datetime import UTC, datetime
+
+        from genesis.db.crud import events as events_crud
+
+        frozen = datetime(2026, 6, 14, tzinfo=UTC)
+        bus = GenesisEventBus(clock=lambda: frozen, db=db)
+        bus._dropped_count = 7
+
+        await bus._flush_dropped_notice()
+        rows = await events_crud.query(db, event_type="event_queue_overflow")
+        assert len(rows) == 1
+        assert "7" in rows[0]["message"]
+        assert rows[0]["severity"] == "warning"
+
+        # No new drops since the last notice → no second row.
+        await bus._flush_dropped_notice()
+        rows = await events_crud.query(db, event_type="event_queue_overflow")
+        assert len(rows) == 1
+
+        # New drops, but within the rate-limit window (same frozen clock) → suppressed.
+        bus._dropped_count = 12
+        await bus._flush_dropped_notice()
+        rows = await events_crud.query(db, event_type="event_queue_overflow")
+        assert len(rows) == 1
+
+
+class TestQueuesSnapshotEventsDropped:
+    """WS-17: the queues snapshot surfaces the dropped-event counter."""
+
+    @pytest.mark.asyncio
+    async def test_queues_surfaces_dropped_count(self):
+        from genesis.observability.snapshots.queues import queues
+
+        bus = GenesisEventBus()
+        bus._dropped_count = 3
+        result = await queues(None, None, None, event_bus=bus)
+        assert result["events_dropped"] == 3
+
+    @pytest.mark.asyncio
+    async def test_queues_dropped_defaults_zero_without_bus(self):
+        from genesis.observability.snapshots.queues import queues
+
+        result = await queues(None, None, None)
+        assert result["events_dropped"] == 0
+
+
+class TestEventSerialization:
+    """OBS-002: one un-serializable event must not drop the whole batch."""
+
+    @pytest.mark.asyncio
+    async def test_insert_batch_survives_unserializable_detail(self, db):
+        from genesis.db.crud import events as events_crud
+
+        batch = [
+            {"subsystem": "routing", "severity": "info",
+             "event_type": "ok", "message": "fine", "details": {"a": 1}},
+            {"subsystem": "routing", "severity": "error",
+             "event_type": "weird", "message": "bad detail",
+             "details": {"obj": object()}},  # not JSON-serializable
+        ]
+        n = await events_crud.insert_batch(db, batch)
+        assert n == 2
+
+        rows = await events_crud.query(db, limit=10)
+        types = {r["event_type"] for r in rows}
+        assert {"ok", "weird"} <= types  # the un-serializable event survived

@@ -43,6 +43,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   casing mismatch), so a failing provider got retried immediately instead of
   serving out its backoff. Breaker state is now also written atomically, and
   MCP helper processes no longer overwrite the shared state file.
+- **The error log no longer silently under-counts during incident storms.**
+  When the event-persistence queue filled up, events were dropped without a
+  trace — so the dashboard and health views under-reported errors exactly when
+  things were worst. Dropped events are now counted and made visible (an
+  "event queue overflow" warning in the same error views, plus a live counter
+  on the health snapshot), the buffer is 10× larger (500 → 5000) to absorb
+  bursts, and a single un-serializable event can no longer drop a whole batch.
 
 ### Security
 
