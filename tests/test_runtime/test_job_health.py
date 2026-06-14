@@ -134,7 +134,7 @@ async def test_clear_stale_failures_clears_persisted_failure():
         assert cleared == 1
 
         row = await _fetch(db, "job_z")
-        last_success, last_failure, last_error, consec = row[0], row[1], row[2], row[3]
+        last_failure, last_error, consec = row[1], row[2], row[3]
         assert last_failure is None, "clear_stale must NULL persisted last_failure (WS-3b)"
         assert last_error is None
         assert consec == 0
