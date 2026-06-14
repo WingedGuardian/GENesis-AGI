@@ -39,6 +39,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   view forever, even after it started succeeding again; recovery now clears
   the stale failure and error so job health reflects reality.
 
+### Security
+
+- **Hardened remote Claude Code dispatch against shell injection.** The SSH
+  module adapter now shell-quotes the model, effort, and path values it sends
+  to a remote host, so a crafted value can no longer run arbitrary commands
+  there. Normal dispatch is unchanged.
+
 ---
 
 ## [v3.0b15] - 2026-06-12
