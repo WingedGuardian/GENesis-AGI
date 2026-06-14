@@ -277,8 +277,14 @@ Estimated ~2-4 API fallback calls/month, adding ~$0.50-1.00.
 All background LLM calls are **idempotent** — they analyze input and produce
 output with no stateful transactions.
 
-- **Timeout per call:** 60s for micro reflection, 120s for heavier work
-- **On timeout:** Retry once on the next fallback in the chain
+- **Timeout per call:** hard 120s wall-clock cap (`_DEFAULT_TIMEOUT_S`),
+  enforced via `asyncio.wait_for` with `num_retries=0` so litellm's internal
+  retries cannot stack past it (they previously did — ~361s on a 120s
+  timeout). Callers may override per call.
+- **On timeout:** classified `TIMEOUT` and failed fast to the next provider in
+  the chain — a hung provider is NOT retried in place (retrying a hung
+  provider only multiplies the wall-clock). The circuit breaker still records
+  the failure, so a repeatedly-hanging provider trips OPEN and is skipped.
 - **Awareness Loop 5-min tick:** Pings GPU health endpoint
 - **On failure:** Mark GPU as "potentially down." Stop sending tasks until
   the next health check passes
