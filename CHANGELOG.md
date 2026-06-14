@@ -38,6 +38,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   A scheduled job that failed once kept that failure timestamp in the health
   view forever, even after it started succeeding again; recovery now clears
   the stale failure and error so job health reflects reality.
+- **Circuit-breaker trips now survive a restart.** A provider that tripped
+  open was silently coming back available on every restart (a saved-state
+  casing mismatch), so a failing provider got retried immediately instead of
+  serving out its backoff. Breaker state is now also written atomically, and
+  MCP helper processes no longer overwrite the shared state file.
 
 ### Security
 
