@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -148,6 +149,11 @@ class LiteLLMDelegate:
         call_kwargs = {**kwargs}
         if "timeout" not in call_kwargs:
             call_kwargs["timeout"] = _DEFAULT_TIMEOUT_S
+        # Genesis's router owns retry + provider fallback. litellm must make
+        # exactly ONE attempt — its internal retries stack on top of the
+        # per-attempt timeout (observed: 3 retries × 120s ≈ 361s on a 120s
+        # timeout, PR #582). Caller can still override.
+        call_kwargs.setdefault("num_retries", 0)
         if api_key:
             call_kwargs["api_key"] = api_key
         if cfg.base_url:
@@ -155,12 +161,20 @@ class LiteLLMDelegate:
         if cfg.keep_alive is not None and cfg.provider_type == "ollama":
             call_kwargs["keep_alive"] = cfg.keep_alive
 
+        # Hard wall-clock ceiling around the whole call. litellm's own
+        # ``timeout`` param has been observed not to fire (PR #582); this
+        # asyncio.wait_for cap guarantees the call is cancelled even if
+        # litellm/httpx ignore it. Belt-and-suspenders with num_retries=0.
+        hard_timeout = call_kwargs["timeout"]
         try:
-            response = await litellm.acompletion(
-                model=model_string,
-                messages=messages,
-                drop_params=True,
-                **call_kwargs,
+            response = await asyncio.wait_for(
+                litellm.acompletion(
+                    model=model_string,
+                    messages=messages,
+                    drop_params=True,
+                    **call_kwargs,
+                ),
+                timeout=hard_timeout,
             )
             content = response.choices[0].message.content
             usage = getattr(response, "usage", None)
@@ -195,6 +209,20 @@ class LiteLLMDelegate:
                 cache_read_tokens=cache_read,
                 cost_usd=cost,
                 cost_known=cost_known,
+            )
+        except TimeoutError:
+            # Hard wall-clock cap fired — the provider hung past hard_timeout.
+            # Returned as 408 so the router classifies it TIMEOUT and fails
+            # fast to the next provider (no same-provider retry).
+            if _should_log_failure(provider):
+                logger.warning(
+                    "Provider %s hard-timed out after %ss (asyncio.wait_for cap)",
+                    provider, hard_timeout,
+                )
+            return CallResult(
+                success=False,
+                error=f"litellm call exceeded hard timeout of {hard_timeout}s",
+                status_code=408,
             )
         except litellm.RateLimitError as e:
             if _should_log_failure(provider):
