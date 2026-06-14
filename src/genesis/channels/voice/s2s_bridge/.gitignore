@@ -1,2 +1,0 @@
-# Override root .gitignore: the addon needs poetry.lock for reproducible Docker builds
-!poetry.lock
