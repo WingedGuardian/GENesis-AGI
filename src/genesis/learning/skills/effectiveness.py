@@ -25,7 +25,15 @@ class SkillEffectivenessAnalyzer:
             "SELECT * FROM cc_sessions WHERE metadata LIKE ? ORDER BY started_at DESC",
             (f'%"{skill_name}"%',),
         )
-        rows = [dict(r) for r in await cursor.fetchall()]
+        # The LIKE is a cheap prefilter; on its own it also matches the skill
+        # name appearing in OTHER metadata fields (e.g. a `profile` value —
+        # "research" is both a profile and a skill name). Keep only sessions
+        # that actually list this skill in `skill_tags`.
+        rows = [
+            r
+            for r in (dict(row) for row in await cursor.fetchall())
+            if skill_name in _parse_metadata(r.get("metadata")).get("skill_tags", [])
+        ]
 
         success_count = sum(1 for r in rows if r["status"] == "completed")
         failure_count = sum(1 for r in rows if r["status"] == "failed")
@@ -137,12 +145,19 @@ class SkillEffectivenessAnalyzer:
 
         placeholders = ",".join("?" * len(session_types))
         cursor = await db.execute(
-            f"SELECT status FROM cc_sessions "  # noqa: S608
-            f"WHERE session_type IN ({placeholders}) "
-            f"AND (metadata IS NULL OR metadata NOT LIKE ?)",
-            (*session_types, f'%"{skill_name}"%'),
+            f"SELECT status, metadata FROM cc_sessions "  # noqa: S608
+            f"WHERE session_type IN ({placeholders})",
+            (*session_types,),
         )
-        baseline_rows = await cursor.fetchall()
+        # Baseline = same-type sessions that do NOT use this skill. Match on
+        # skill_tags membership (not a loose substring) for the same reason as
+        # analyze() — a session whose `profile` equals the skill name is not a
+        # user of the skill.
+        baseline_rows = [
+            r
+            for r in await cursor.fetchall()
+            if skill_name not in _parse_metadata(r[1]).get("skill_tags", [])
+        ]
         if not baseline_rows:
             return None
 

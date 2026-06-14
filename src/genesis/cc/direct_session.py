@@ -456,6 +456,10 @@ class DirectSessionRunner:
             source_tag=request.source_tag,
             dispatch_mode="direct",
             profile=request.profile,
+            # Record the skills resolved for this session so the
+            # skill-evolution effectiveness analyzer has usage signal.
+            # (Same resolution used for prompt injection in _build_invocation.)
+            skill_tags=_resolve_skills(request),
         )
         session_id = session["id"]
 
