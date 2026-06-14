@@ -146,30 +146,35 @@ class StandaloneAdapter:
         await self._shutdown_event.wait()
         heartbeat_task.cancel()
 
+    async def _voice_last_breath(self) -> None:
+        """Best-effort spoken shutdown notice via the held VoiceChannelAdapter.
+
+        Uses the adapter's media_player.play_media + tts.speak path (which
+        actually plays on the device); assist_satellite.announce silently
+        no-ops when the satellite entity is 'unavailable'. No-op when no
+        voice adapter is configured. 4s drain lets playback finish.
+        """
+        voice_adapter = self._app.config.get("VOICE_ADAPTER") if self._app else None
+        if voice_adapter is None:
+            return
+        try:
+            await voice_adapter.send_message("", "Genesis going offline.")
+            await asyncio.sleep(4)
+        except Exception:
+            logger.debug("Shutdown chime failed", exc_info=True)
+
     async def shutdown(self) -> None:
         """Graceful shutdown.
 
-        Speaks "Server restarting" via HA TTS before stopping services.
-        If HA is unreachable, the TTS call may block up to 15s (httpx
-        timeout) before shutdown continues.  This is within systemd's
-        default TimeoutStopSec=90s.
+        Speaks a brief shutdown notice via HA TTS (the held voice adapter)
+        before stopping services. If HA is unreachable, the call may block
+        up to ~15s (httpx timeout) before shutdown continues — within
+        systemd's default TimeoutStopSec=90s.
         """
         logger.info("Shutdown requested")
         self._shutdown_event.set()
 
-        # Voice "last breath" — speak via the held VoiceChannelAdapter, which
-        # uses media_player.play_media + tts.speak (the path that actually
-        # plays on the device). assist_satellite.announce silently no-ops when
-        # the satellite entity is 'unavailable', so it was a dead chime
-        # (2026-06-13). Reusing the adapter inherits its entity config and
-        # failure-surfacing. 4s drain lets playback finish.
-        voice_adapter = self._app.config.get("VOICE_ADAPTER") if self._app else None
-        if voice_adapter is not None:
-            try:
-                await voice_adapter.send_message("", "Genesis going offline.")
-                await asyncio.sleep(4)
-            except Exception:
-                logger.debug("Shutdown chime failed", exc_info=True)
+        await self._voice_last_breath()
 
         if self._runtime and self._runtime.awareness_loop is not None:
             self._runtime.awareness_loop.request_stop()

@@ -650,3 +650,44 @@ class TestVoiceAPI:
             assert "ask_genesis" in tool_names
             assert "web_search" in tool_names
             assert "approve_pending" in tool_names
+
+
+# ── Standalone shutdown chime ────────────────────────────────────────
+
+
+class TestShutdownVoiceLastBreath:
+    """StandaloneAdapter._voice_last_breath delegates the shutdown notice to
+    the held VoiceChannelAdapter (media_player path), not the dead
+    assist_satellite path; no-op when no adapter is configured."""
+
+    @pytest.mark.asyncio
+    async def test_calls_held_adapter(self):
+        from types import SimpleNamespace
+
+        from genesis.hosting.standalone import StandaloneAdapter
+
+        adapter = AsyncMock()
+        srv = SimpleNamespace(_app=SimpleNamespace(config={"VOICE_ADAPTER": adapter}))
+        with patch("genesis.hosting.standalone.asyncio.sleep", new_callable=AsyncMock):
+            await StandaloneAdapter._voice_last_breath(srv)
+        adapter.send_message.assert_awaited_once()
+        args, _ = adapter.send_message.call_args
+        assert args[0] == ""  # channel_id
+
+    @pytest.mark.asyncio
+    async def test_noop_without_adapter(self):
+        from types import SimpleNamespace
+
+        from genesis.hosting.standalone import StandaloneAdapter
+
+        srv = SimpleNamespace(_app=SimpleNamespace(config={}))
+        await StandaloneAdapter._voice_last_breath(srv)  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_app(self):
+        from types import SimpleNamespace
+
+        from genesis.hosting.standalone import StandaloneAdapter
+
+        srv = SimpleNamespace(_app=None)
+        await StandaloneAdapter._voice_last_breath(srv)  # must not raise
