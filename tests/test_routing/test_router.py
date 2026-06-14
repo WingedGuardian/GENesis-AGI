@@ -73,6 +73,41 @@ async def test_fallback_on_failure(sample_config, breakers, cost_tracker, degrad
 
 
 @pytest.mark.asyncio
+async def test_timeout_fails_fast_no_same_provider_retry(
+    sample_config, breakers, cost_tracker, degradation,
+):
+    """A timeout (408) must NOT be retried against the same provider.
+
+    A hung provider won't un-hang on an immediate retry — retrying just
+    multiplies the timeout wall-clock (the 30-min dream-cycle hangs). The
+    router fails fast to the next provider, but the circuit breaker still
+    records the failure so a repeatedly-hanging provider trips OPEN.
+    """
+    delegate = MockDelegate(responses={
+        "free-1": CallResult(
+            success=False,
+            error="litellm.Timeout: request timed out",
+            status_code=408,
+        ),
+    })
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+    result = await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+
+    # Failed fast to the next provider
+    assert result.success is True
+    assert result.provider_used == "free-2"
+    assert "free-1" in result.failed_providers
+    # free-1 called exactly ONCE — not retried despite default max_retries=1
+    free1_calls = [c for c in delegate.calls if c["provider"] == "free-1"]
+    assert len(free1_calls) == 1
+    # The timeout is still recorded against free-1's circuit breaker
+    assert breakers.get("free-1").consecutive_failures == 1
+
+
+@pytest.mark.asyncio
 async def test_never_pays_skips_paid(sample_config, breakers, cost_tracker, degradation):
     delegate = MockDelegate(responses={
         "free-1": CallResult(success=False, error="down", status_code=503),

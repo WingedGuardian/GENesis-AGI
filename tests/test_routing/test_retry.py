@@ -27,11 +27,20 @@ def test_transient_codes():
         assert classify_error(code, "") == ErrorCategory.TRANSIENT
 
 
+def test_timeout_code():
+    # 408 Request Timeout means the provider hung (litellm.Timeout maps to 408
+    # in litellm_delegate). Retrying the same hung provider is futile — classify
+    # as TIMEOUT so the router fails fast to the next provider in the chain.
+    assert classify_error(408, "") == ErrorCategory.TIMEOUT
+
+
 def test_timeout_message():
-    assert classify_error(None, "request timeout") == ErrorCategory.TRANSIENT
+    assert classify_error(None, "request timeout") == ErrorCategory.TIMEOUT
 
 
 def test_connection_message():
+    # Connection errors are fast (not a hang) and may be a transient blip —
+    # keep them retryable.
     assert classify_error(None, "Connection refused") == ErrorCategory.TRANSIENT
 
 
