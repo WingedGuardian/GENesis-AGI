@@ -40,7 +40,7 @@ async def user_job_create(
             Examples: "0 2 * * 0" (Sunday 2am), "0 9 * * *" (daily 9am)
         dispatch_prompt: The prompt to run in the background CC session
         description: Optional description of what the job does
-        job_type: Job category (e.g., "generic", "install_test")
+        job_type: Job category (e.g., "generic", "maintenance")
         profile: CC session profile — observe, interact, or research
         model: CC model — sonnet, opus, or haiku
         effort: CC effort level — low, medium, high
