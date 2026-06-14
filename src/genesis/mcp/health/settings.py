@@ -744,7 +744,7 @@ async def _impl_settings_update(
         "domain": domain,
         "status": "applied",
         "changes_applied": changes,
-        "local_override_file": f"config/{local_file}",
+        "local_override_file": f"~/.genesis/config/{local_file}",
         "needs_restart": entry.needs_restart,
     }
     if entry.needs_restart:
