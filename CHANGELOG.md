@@ -27,11 +27,29 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Provider hangs no longer stall reflections and the dream cycle** — when a
+  model provider hangs (accepts the connection but never responds), Genesis
+  now fails over to the next provider within its timeout instead of blocking
+  for minutes. Reflections and the nightly dream cycle stop piling up
+  dead-lettered work during provider outages, and adversarial review and
+  reflections keep running when free-tier providers are down (extra free
+  fallbacks added, plus a paid last-resort for the dream-cycle challenge).
+- **Job health no longer shows a permanent failure after a job recovers.**
+  A scheduled job that failed once kept that failure timestamp in the health
+  view forever, even after it started succeeding again; recovery now clears
+  the stale failure and error so job health reflects reality.
 - **Circuit-breaker trips now survive a restart.** A provider that tripped
   open was silently coming back available on every restart (a saved-state
   casing mismatch), so a failing provider got retried immediately instead of
   serving out its backoff. Breaker state is now also written atomically, and
   MCP helper processes no longer overwrite the shared state file.
+
+### Security
+
+- **Hardened remote Claude Code dispatch against shell injection.** The SSH
+  module adapter now shell-quotes the model, effort, and path values it sends
+  to a remote host, so a crafted value can no longer run arbitrary commands
+  there. Normal dispatch is unchanged.
 
 ---
 

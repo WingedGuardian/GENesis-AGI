@@ -127,8 +127,11 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
                    ON CONFLICT(job_name) DO UPDATE SET
                        last_run = excluded.last_run,
                        last_success = COALESCE(excluded.last_success, last_success),
-                       last_failure = COALESCE(excluded.last_failure, last_failure),
-                       last_error = COALESCE(excluded.last_error, last_error),
+                       -- NOT COALESCE: record_job_success / clear_stale_job_failures
+                       -- carry NULL here to intentionally clear stale failure state on
+                       -- recovery; the failure path always supplies both (WS-3b).
+                       last_failure = excluded.last_failure,
+                       last_error = excluded.last_error,
                        consecutive_failures = excluded.consecutive_failures,
                        total_runs = total_runs + 1,
                        total_successes = total_successes + CASE WHEN excluded.last_success IS NOT NULL THEN 1 ELSE 0 END,

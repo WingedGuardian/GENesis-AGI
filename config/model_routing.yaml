@@ -241,6 +241,14 @@ call_sites:
     - mistral-large-free
     - groq-free
     - gemini-free
+    # Additional free providers so an essential reflection (3_micro_reflection
+    # is in degradation._L3_KEEP) survives a broad free-tier outage without
+    # paid fallback. Healthy OpenRouter-free models first; NIM last (shared
+    # 40 RPM pool, currently flaky).
+    - openrouter-gemma4
+    - openrouter-trinity-free
+    - nvidia-nim-kimi
+    - nvidia-nim-deepseek
     retry_profile: background
   4_light_reflection:
     chain:
@@ -371,6 +379,10 @@ call_sites:
     chain:
     - nvidia-nim-kimi
     - groq-free
+    # Paid Kimi via OpenRouter as last-resort fallback — same model family as
+    # the free NIM primary, so the Kimi-challenges-DeepSeek independence holds
+    # even when both free tiers are down. Only billed during a free-tier outage.
+    - kimi-k2.5
     retry_profile: background
   dream_cycle_entity_check:
     chain:
@@ -378,6 +390,12 @@ call_sites:
     - groq-free
     - mistral-small-free
     - openrouter-free
+    # More free, NON-DeepSeek providers so the entity check stays independent
+    # from the DeepSeek entity_challenge while surviving a free-tier outage.
+    - gemini-free
+    - mistral-large-free
+    - openrouter-gemma4
+    - openrouter-trinity-free
     retry_profile: background
   # Adversarial challenge of entity "duplicate" verdicts. Flipped pairing:
   # DeepSeek challenges Kimi's entity judgments.

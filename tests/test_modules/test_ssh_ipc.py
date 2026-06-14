@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -257,3 +258,98 @@ class TestIPCFactory:
         config = IPCConfig(method="ssh", ssh_host="user@host")
         adapter = create_ipc_adapter(config)
         assert isinstance(adapter, SshIPCAdapter)
+
+
+class TestSshIPCAdapterCommandInjection:
+    """WS-1: caller-supplied model/effort must not inject shell syntax on the remote.
+
+    The remote command is run by the remote shell (it uses `cd ... && claude ...`),
+    so every interpolated value must be shell-quoted. These tests assert behaviour:
+    after shlex.split (what the remote shell does), a hostile value remains a SINGLE
+    token rather than splitting into extra commands/arguments.
+    """
+
+    @staticmethod
+    def _adapter(working_dir="/home/user/project", claude_path="claude"):
+        config = IPCConfig(
+            method="ssh",
+            ssh_host="user@host",
+            remote_working_dir=working_dir,
+            remote_claude_path=claude_path,
+        )
+        return SshIPCAdapter(config)
+
+    @staticmethod
+    def _token_after(cmd: str, flag: str) -> str:
+        toks = shlex.split(cmd)
+        return toks[toks.index(flag) + 1]
+
+    def test_benign_model_effort_unchanged(self):
+        cmd = self._adapter()._build_remote_command("sonnet", "high")
+        assert self._token_after(cmd, "--model") == "sonnet"
+        assert self._token_after(cmd, "--effort") == "high"
+
+    def test_malicious_model_stays_single_token(self):
+        payload = "sonnet; touch /tmp/pwned"
+        cmd = self._adapter()._build_remote_command(payload, "high")
+        assert self._token_after(cmd, "--model") == payload
+
+    def test_malicious_effort_stays_single_token(self):
+        payload = "high$(rm -rf /)"
+        cmd = self._adapter()._build_remote_command("sonnet", payload)
+        assert self._token_after(cmd, "--effort") == payload
+
+    def test_backticks_and_substitution_neutralized(self):
+        cmd = self._adapter()._build_remote_command("`id`", "$(whoami)")
+        assert self._token_after(cmd, "--model") == "`id`"
+        assert self._token_after(cmd, "--effort") == "$(whoami)"
+
+    def test_malicious_working_dir_quoted(self):
+        cmd = self._adapter(working_dir="/tmp/x; rm -rf /")._build_remote_command(
+            "sonnet", "high"
+        )
+        toks = shlex.split(cmd)
+        assert toks[0] == "cd"
+        assert toks[1] == "/tmp/x; rm -rf /"
+
+    @pytest.mark.asyncio
+    async def test_send_cc_passes_safely_quoted_command_to_ssh(self):
+        """End-to-end: a malicious model reaches ssh as a single quoted argument."""
+        adapter = self._adapter()
+        payload = "sonnet; rm -rf /"
+        cc_output = json.dumps({
+            "type": "result", "result": "ok", "session_id": "s",
+            "total_cost_usd": 0.0, "duration_ms": 1, "usage": {},
+            "modelUsage": {}, "is_error": False,
+        })
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (cc_output.encode(), b"")
+        mock_proc.returncode = 0
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                    return_value=mock_proc) as mock_exec:
+            await adapter.send(
+                "dispatch", data={"prompt": "hi", "model": payload}, method="CC"
+            )
+        remote_cmd = mock_exec.call_args[0][-1]  # last ssh arg = remote command
+        assert self._token_after(remote_cmd, "--model") == payload
+
+    @pytest.mark.asyncio
+    async def test_health_check_quotes_remote_claude_path(self):
+        """health_check builds a remote command from the config path — quote it too.
+
+        Same injection class as _send_cc: an operator-set remote_claude_path with
+        shell metacharacters must not execute on the remote host.
+        """
+        payload = "claude; rm -rf /"
+        config = IPCConfig(method="ssh", ssh_host="user@host", remote_claude_path=payload)
+        adapter = SshIPCAdapter(config)
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"2.1.0\n", b"")
+        mock_proc.returncode = 0
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                    return_value=mock_proc) as mock_exec:
+            await adapter.health_check("/version", 200)
+        remote_cmd = mock_exec.call_args[0][-1]
+        toks = shlex.split(remote_cmd)
+        assert toks[0] == payload  # whole path stays a single token
+        assert toks[1] == "--version"

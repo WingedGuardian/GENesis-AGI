@@ -18,6 +18,11 @@ class ErrorCategory(StrEnum):
     DEGRADED = "degraded"
     PERMANENT = "permanent"
     QUOTA_EXHAUSTED = "quota_exhausted"
+    # A provider that hung past its timeout. NOT retried against the same
+    # provider (a hung provider won't un-hang on immediate retry) — the router
+    # fails fast to the next provider in the chain, but the circuit breaker
+    # still records the failure so a repeatedly-hanging provider trips OPEN.
+    TIMEOUT = "timeout"
 
 
 class DegradationLevel(StrEnum):
