@@ -50,6 +50,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   module adapter now shell-quotes the model, effort, and path values it sends
   to a remote host, so a crafted value can no longer run arbitrary commands
   there. Normal dispatch is unchanged.
+- **Documented the dashboard's network-exposure model.** `SECURITY.md` now
+  spells out that the dashboard binds all interfaces for proxy/overlay reach
+  and that its `/api`, `/v1`, web terminal, and noVNC console are
+  unauthenticated administrative access — so operators know to keep those ports
+  on a private overlay (e.g., Tailscale) or behind a reverse proxy and never
+  expose them publicly.
 - **Interactive Claude Code consoles no longer skip all permission checks.**
   The dashboard web terminal and the SSH dev-console slot now launch Claude
   Code in auto-permission mode instead of `--dangerously-skip-permissions`:
