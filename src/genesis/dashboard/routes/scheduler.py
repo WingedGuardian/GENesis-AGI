@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 
 from flask import jsonify, request
 
@@ -62,6 +63,48 @@ def _extract_apscheduler_jobs(component, subsystem: str) -> list[dict]:
         logger.debug("Failed to extract jobs from %s", subsystem, exc_info=True)
 
     return jobs
+
+
+def _trigger_system_job(rt, job_id: str) -> bool:
+    """Reschedule a system APScheduler job to run immediately.
+
+    Walks the system scheduler components (surplus/learning/outreach/reflection),
+    finds the one owning ``job_id``, and sets its next_run_time to now. Returns
+    True if the job was found and triggered. APScheduler's per-job max_instances
+    guards against double-running a job that's already in progress.
+    """
+    for attr_name in _SCHEDULER_SUBSYSTEMS:
+        component = getattr(rt, attr_name, None)
+        if component is None:
+            continue
+        scheduler = getattr(component, "_scheduler", None)
+        if scheduler is None and hasattr(component, "get_jobs"):
+            scheduler = component
+        if scheduler is None or not getattr(scheduler, "running", False):
+            continue
+        try:
+            if scheduler.get_job(job_id) is not None:
+                scheduler.modify_job(job_id, next_run_time=datetime.now(UTC))
+                return True
+        except Exception:
+            logger.debug("Failed to trigger job %s on %s", job_id, attr_name, exc_info=True)
+    return False
+
+
+@blueprint.route("/api/genesis/scheduler/system/<job_id>/run", methods=["POST"])
+@_async_route
+async def system_job_run_endpoint(job_id: str):
+    """Trigger a system job (e.g. dream_cycle) to run immediately."""
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped:
+        return jsonify({"error": "Runtime not bootstrapped"}), 503
+
+    if _trigger_system_job(rt, job_id):
+        logger.info("System job '%s' triggered via run-now endpoint", job_id)
+        return jsonify({"success": True, "job_id": job_id, "action": "run_now"})
+    return jsonify({"success": False, "error": f"System job '{job_id}' not found"}), 404
 
 
 @blueprint.route("/api/genesis/scheduler/system")
