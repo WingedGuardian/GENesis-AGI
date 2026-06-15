@@ -58,6 +58,11 @@ def _async_route(f=None, *, timeout: float | None = None):
                 try:
                     return future.result(timeout=timeout)
                 except FuturesTimeoutError:
+                    # Cancel the coroutine so it doesn't keep running on the loop
+                    # after we've returned — otherwise repeated polling stacks
+                    # concurrent snapshots (run_coroutine_threadsafe futures
+                    # schedule task cancellation on the loop thread-safely).
+                    future.cancel()
                     logger.warning(
                         "async route %s exceeded %.1fs timeout — returning 503",
                         getattr(fn, "__name__", "?"), timeout or 0.0,
