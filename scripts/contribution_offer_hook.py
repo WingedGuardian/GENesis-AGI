@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 6 — UserPromptSubmit hook that surfaces pending contribution offers.
+"""UserPromptSubmit hook that surfaces pending contribution offers.
 
 Runs on every user prompt via .claude/settings.json. Hot path:
 
@@ -60,7 +60,7 @@ def _format_reminder(marker_data: dict) -> str:
     subject = str(marker_data.get("subject", "<unknown subject>"))
     return (
         f"[Contribution] A 'fix:' commit just landed ({sha} \"{subject}\"). "
-        f"Per the Phase 6 contribution pipeline, proactively offer the user "
+        f"Per the contribution pipeline, proactively offer the user "
         f"the option to contribute this fix upstream to the public Genesis "
         f"repo. Ask conversationally; do not run the pipeline without explicit "
         f"user approval. If the user declines or ignores, do nothing."
