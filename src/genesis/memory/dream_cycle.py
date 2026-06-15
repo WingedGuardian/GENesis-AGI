@@ -280,16 +280,25 @@ async def run(
         report["errors"].append({"phase": "link_repair", "error": str(exc)})
         logger.warning("Dream phase link_repair failed: %s", exc, exc_info=True)
 
-    # Phase 6 — Entity resolution (dedup + contradiction detection)
-    try:
-        from genesis.memory.dream_entity_scan import run_entity_resolution
-
-        report["entity_resolution"] = await run_entity_resolution(
-            **phase_kwargs, buckets=buckets,
+    # Phase 6 — Entity resolution (dedup + contradiction detection).
+    # Skip when synthesis aborted on capacity: entity resolution is LLM-heavy
+    # and would just hammer the same saturated providers (Phases 5/7/8 are
+    # non-LLM SQL/graph work and run regardless).
+    if report["aborted_capacity"]:
+        logger.info(
+            "Dream cycle %s: skipping entity resolution — synthesis aborted on capacity",
+            run_id[:8],
         )
-    except Exception as exc:
-        report["errors"].append({"phase": "entity_resolution", "error": str(exc)})
-        logger.warning("Dream phase entity_resolution failed: %s", exc, exc_info=True)
+    else:
+        try:
+            from genesis.memory.dream_entity_scan import run_entity_resolution
+
+            report["entity_resolution"] = await run_entity_resolution(
+                **phase_kwargs, buckets=buckets,
+            )
+        except Exception as exc:
+            report["errors"].append({"phase": "entity_resolution", "error": str(exc)})
+            logger.warning("Dream phase entity_resolution failed: %s", exc, exc_info=True)
 
     # Phase 7 — Orphan detection
     try:
