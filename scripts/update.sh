@@ -790,6 +790,41 @@ print(cfg.get('host_user', 'ubuntu'))
         else
             echo "--- No Guardian-relevant changes — skipping host redeploy ---"
         fi
+
+        # ── Sync host Claude Code to the pinned version (WS-16) ──
+        # Independent of code redeploys: keeps host CC == container pin so one is
+        # never forgotten. Idempotent (acts only on drift), non-fatal, and
+        # graceful with an old gateway that lacks `update-cc`.
+        _cc_env="$SCRIPT_DIR/lib/cc_version.sh"
+        if [ -f "$_cc_env" ]; then
+            # update.sh must sync the host to the REPO pin, never an inherited
+            # CC_VERSION override — unset it so cc_version.sh's default wins.
+            unset CC_VERSION
+            # shellcheck source=/dev/null
+            source "$_cc_env"
+        else
+            echo "  WARNING: $_cc_env missing — skipping host CC sync"
+        fi
+        if printf '%s' "${CC_VERSION:-}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            HOST_CC_RAW="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
+            HOST_CC="$(printf '%s' "$HOST_CC_RAW" \
+                | grep -oE '"cc_version": "[0-9]+\.[0-9]+\.[0-9]+' \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+            if [ -z "$HOST_CC" ]; then
+                echo "  Host CC version unknown (gateway unreachable or pre-update-cc) — skipping CC sync (non-fatal)"
+            elif [ "$HOST_CC" = "$CC_VERSION" ]; then
+                echo "  Host Claude Code already at pin ($CC_VERSION) — no CC sync needed"
+            else
+                echo "--- Host Claude Code drift: $HOST_CC → syncing to $CC_VERSION ---"
+                if timeout 300 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=30 \
+                    "${HOST_USER}@${HOST_IP}" "update-cc $CC_VERSION" 2>&1; then
+                    echo "  Host Claude Code updated to $CC_VERSION"
+                else
+                    echo "  Host Claude Code sync failed (non-fatal) — host remains on $HOST_CC"
+                fi
+            fi
+        fi
         echo ""
     fi
 fi

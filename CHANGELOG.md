@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **`update.sh` now keeps Claude Code in sync on your host VM too** — if you run
+  Genesis with a Guardian on a separate host VM, updates previously only touched
+  the container's Claude Code, letting the host drift behind. `update.sh` now
+  checks the host's version against a single pin (`scripts/lib/cc_version.sh`)
+  and updates the host to match when it has drifted, so container and host never
+  fall out of step. It's skipped when already in sync and never fails your update
+  if the host is unreachable.
 - **Voice: you now choose exactly which alerts are spoken aloud** — the
   Voice PE only speaks alerts on an allowlist you control (`voice.alert_ids`
   in `outreach.yaml`) instead of chiming for every blocker, alert, and

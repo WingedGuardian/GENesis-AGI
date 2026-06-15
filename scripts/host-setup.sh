@@ -1132,7 +1132,15 @@ if [ "$_host_node_ok" = "0" ]; then
     fi
 fi
 
-CC_VERSION="${CC_VERSION:-2.1.173}"  # Scrollback: fullscreen renderer (tui setting) — see docs/reference/cc-compatibility.md
+# CC version pin — single source of truth: scripts/lib/cc_version.sh
+# (2.1.173 = scrollback fullscreen-renderer fix — see docs/reference/cc-compatibility.md)
+_cc_env="$_SCRIPT_DIR/lib/cc_version.sh"
+if [ ! -f "$_cc_env" ]; then
+    echo "ERROR: missing CC version pin: $_cc_env" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$_cc_env"
 if ! command -v claude &>/dev/null; then
     echo "  Installing Claude Code v${CC_VERSION} on host..."
     if command -v npm &>/dev/null; then
