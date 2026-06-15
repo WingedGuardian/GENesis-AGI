@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 
 from flask import jsonify, request
@@ -19,6 +20,16 @@ logger = logging.getLogger(__name__)
 # backstop, well under browser/proxy timeouts.
 _HEALTH_SNAPSHOT_TIMEOUT_S = 15.0
 
+# Snapshot cache — the full snapshot is ~2s; cache it briefly so frequent
+# dashboard/Guardian polls are served instantly without recomputing every time.
+# Defense-in-depth atop the call_sites + gather speedups: even if the snapshot
+# ever regresses, the cache (plus the route timeout) keeps /health responsive
+# and cuts repeated load. Bridge status and the healthy/unhealthy verdict are
+# still computed fresh per request; only the expensive snapshot() is cached.
+_snapshot_cache: dict | None = None
+_snapshot_cache_ts: float = 0.0
+_SNAPSHOT_CACHE_TTL_S = 30.0
+
 
 @blueprint.route("/api/genesis/health")
 @_async_route(timeout=_HEALTH_SNAPSHOT_TIMEOUT_S)
@@ -30,7 +41,15 @@ async def health_snapshot():
     if not rt.is_bootstrapped or rt.health_data is None:
         return jsonify({"status": "unhealthy", "error": "not bootstrapped"}), 503
 
-    snapshot = await rt.health_data.snapshot()
+    global _snapshot_cache, _snapshot_cache_ts
+    now_mono = time.monotonic()
+    if _snapshot_cache is not None and (now_mono - _snapshot_cache_ts) < _SNAPSHOT_CACHE_TTL_S:
+        snapshot = dict(_snapshot_cache)
+    else:
+        fresh = await rt.health_data.snapshot()
+        _snapshot_cache = fresh
+        _snapshot_cache_ts = now_mono
+        snapshot = dict(fresh)
 
     status_path = Path.home() / ".genesis" / "status.json"
     bridge_health = None
