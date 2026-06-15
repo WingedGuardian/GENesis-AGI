@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import email.message
 import logging
 import smtplib
@@ -68,10 +69,17 @@ class EmailAdapter(ChannelAdapter):
         msg["Subject"] = subject
         msg.set_content(text)
 
-        try:
+        def _send_sync() -> None:
+            # Synchronous smtplib runs in a worker thread (asyncio.to_thread) so
+            # the SMTP round-trip — connect, TLS, login, send — never blocks the
+            # event loop. A blocking send here froze heartbeats/health/awareness
+            # while the recovery worker retried failed sends (incident 2026-06-14).
             with smtplib.SMTP_SSL(self._host, self._port, timeout=30) as smtp:
                 smtp.login(self._username, self._password)
                 smtp.send_message(msg)
+
+        try:
+            await asyncio.to_thread(_send_sync)
         except smtplib.SMTPException:
             logger.exception("Failed to send email to %s", recipient)
             raise

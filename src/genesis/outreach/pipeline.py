@@ -321,39 +321,50 @@ class OutreachPipeline:
                 self._config.delivery_routing.get("default", "supergroup"),
             )
 
-        # Resolve forum topic for this outreach category
+        # Resolve forum topic + supergroup routing.
+        #
+        # Forum topics and the supergroup ``forum_chat_id`` are TELEGRAM-ONLY
+        # concepts (``forum_chat_id``/``topic_manager`` are wired solely from
+        # the Telegram startup paths). They must never touch email/discord/voice
+        # delivery: doing so overwrote prospect email recipients with the
+        # Telegram forum chat id (a large negative integer), which Gmail rejects
+        # as an invalid RFC 5321 address — the deferred-queue poison + blocking
+        # SMTP that starved the event loop on 2026-06-14. Gate ALL forum routing
+        # on the Telegram channel; other channels deliver to their own recipient
+        # with no thread_id.
         thread_id = None
         topic_cat: str | None = None
-        if routing in ("supergroup", "both") and self._topic_manager is not None:
-            topic_cat = self._topic_manager.resolve_outreach_category(
-                request.category.value,
-            )
-            thread_id = await self._topic_manager.get_or_create_persistent(topic_cat)
-
-        # Primary delivery — supergroup if available, fallback to DM
         delivery_recipient = recipient
-        if routing in ("supergroup", "both") and thread_id is not None and self._forum_chat_id:
-            delivery_recipient = self._forum_chat_id
-        else:
-            # DM delivery — never pass thread_id to non-forum chats.
-            # If we WANTED the topic but couldn't resolve a thread_id,
-            # surface the fallback so operators know messages are landing
-            # in DM instead of silently disappearing from the forum topic.
-            # (This is the "where did my approval go?" signal that was
-            # missing on 2026-04-10 when 7 approvals routed to DM.)
-            if (
-                routing in ("supergroup", "both")
-                and self._forum_chat_id
-                and self._topic_manager is not None
-            ):
-                logger.info(
-                    "outreach category=%s wanted supergroup topic "
-                    "routing but thread_id is None — falling back to DM "
-                    "(target category=%s); check earlier ERROR logs from "
-                    "TopicManager for the underlying cause",
-                    request.category.value, topic_cat or "?",
+        if channel == "telegram":
+            if routing in ("supergroup", "both") and self._topic_manager is not None:
+                topic_cat = self._topic_manager.resolve_outreach_category(
+                    request.category.value,
                 )
-            thread_id = None
+                thread_id = await self._topic_manager.get_or_create_persistent(topic_cat)
+
+            # Primary delivery — supergroup if available, fallback to DM
+            if routing in ("supergroup", "both") and thread_id is not None and self._forum_chat_id:
+                delivery_recipient = self._forum_chat_id
+            else:
+                # DM delivery — never pass thread_id to non-forum chats.
+                # If we WANTED the topic but couldn't resolve a thread_id,
+                # surface the fallback so operators know messages are landing
+                # in DM instead of silently disappearing from the forum topic.
+                # (This is the "where did my approval go?" signal that was
+                # missing on 2026-04-10 when 7 approvals routed to DM.)
+                if (
+                    routing in ("supergroup", "both")
+                    and self._forum_chat_id
+                    and self._topic_manager is not None
+                ):
+                    logger.info(
+                        "outreach category=%s wanted supergroup topic "
+                        "routing but thread_id is None — falling back to DM "
+                        "(target category=%s); check earlier ERROR logs from "
+                        "TopicManager for the underlying cause",
+                        request.category.value, topic_cat or "?",
+                    )
+                thread_id = None
 
         # Scan outbound email content for sensitive data patterns
         if channel == "email":

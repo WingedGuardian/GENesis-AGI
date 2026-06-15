@@ -33,6 +33,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Outreach emails actually send now** — email (and Discord/voice) outreach was
+  being misaddressed to the Telegram forum chat for any category that routes to
+  the supergroup, so every such send failed and silently piled up as retries.
+  Forum/topic routing is now correctly Telegram-only; other channels deliver to
+  their own recipient.
+- **A slow or failed email can no longer stall Genesis** — SMTP sending now runs
+  off the event loop, so a hung or rejected send no longer freezes heartbeats,
+  health checks, or the awareness loop.
 - **Provider hangs no longer stall reflections and the dream cycle** — when a
   model provider hangs (accepts the connection but never responds), Genesis
   now fails over to the next provider within its timeout instead of blocking
