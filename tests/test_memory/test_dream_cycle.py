@@ -11,7 +11,6 @@ from genesis.memory.dream_cycle import (
     _CAPACITY_ABORT_THRESHOLD,
     MAX_BUCKET_SIZE,
     MAX_CLUSTER_SIZE,
-    ProvidersExhaustedError,
     _build_synthesis_prompt,
     _CapacityBreaker,
     _parse_synthesis_response,
