@@ -42,7 +42,7 @@ def init_outreach_mcp(*, pipeline, engagement, config, db, activity_tracker=None
     if activity_tracker is not None:
         from genesis.observability.mcp_middleware import InstrumentationMiddleware
 
-        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "outreach"))
+        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "outreach", db=db))
 
 
 @mcp.tool()

@@ -57,7 +57,7 @@ def init_recon_mcp(
     if activity_tracker is not None:
         from genesis.observability.mcp_middleware import InstrumentationMiddleware
 
-        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "recon"))
+        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "recon", db=db))
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
