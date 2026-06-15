@@ -70,13 +70,7 @@ async def init(rt: GenesisRuntime) -> None:
         # on boot so it reflects references added by paths that don't trigger it
         # live (e.g. the extraction job, bulk imports). reference_store/delete/export
         # keep it fresh during a session; this catches everything else each restart.
-        try:
-            from genesis.memory.reference_mirror import regenerate_mirror
-            await regenerate_mirror(rt._db)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning("reference mirror boot refresh failed", exc_info=True)
+        await _refresh_reference_mirror(rt._db)
 
         # Split embedding chains: storage (Ollama first) vs recall (cloud first).
         # Both share the same L2 diskcache — cache keys are text-based, not
@@ -228,6 +222,23 @@ async def init(rt: GenesisRuntime) -> None:
         )
         from genesis.runtime._degradation import record_init_degradation
         await record_init_degradation(rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error")
+
+
+async def _refresh_reference_mirror(db: aiosqlite.Connection) -> None:
+    """Regenerate the reference mirror on boot — best-effort, non-fatal.
+
+    Surfaces references added by paths that don't refresh the mirror live
+    (extraction job, bulk imports). The mirror is a derived view, not a source
+    of truth, so a failure is logged and swallowed — but a mid-boot cancel must
+    still propagate so shutdown isn't blocked.
+    """
+    try:
+        from genesis.memory.reference_mirror import regenerate_mirror
+        await regenerate_mirror(db)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("reference mirror boot refresh failed", exc_info=True)
 
 
 async def _migrate_reference_vectors(
