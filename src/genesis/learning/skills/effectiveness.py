@@ -6,6 +6,7 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
+from genesis.db.crud import cc_sessions
 from genesis.learning.skills.types import SkillReport, SkillTrend
 
 if TYPE_CHECKING:
@@ -21,17 +22,15 @@ class SkillEffectivenessAnalyzer:
 
     async def analyze(self, db: aiosqlite.Connection, skill_name: str) -> SkillReport:
         """Analyze effectiveness of a single skill."""
-        cursor = await db.execute(
-            "SELECT * FROM cc_sessions WHERE metadata LIKE ? ORDER BY started_at DESC",
-            (f'%"{skill_name}"%',),
-        )
-        # The LIKE is a cheap prefilter; on its own it also matches the skill
-        # name appearing in OTHER metadata fields (e.g. a `profile` value —
-        # "research" is both a profile and a skill name). Keep only sessions
-        # that actually list this skill in `skill_tags`.
+        # query_by_skill_tag does the cheap `metadata LIKE '%"skill"%'`
+        # prefilter; on its own that also matches the skill name appearing in
+        # OTHER metadata fields (e.g. a `profile` value — "research" is both a
+        # profile and a skill name). Keep only sessions that actually list this
+        # skill in `skill_tags`.
+        candidate_rows = await cc_sessions.query_by_skill_tag(db, skill_tag=skill_name)
         rows = [
             r
-            for r in (dict(row) for row in await cursor.fetchall())
+            for r in candidate_rows
             if skill_name in _parse_metadata(r.get("metadata")).get("skill_tags", [])
         ]
 
@@ -143,25 +142,20 @@ class SkillEffectivenessAnalyzer:
         if not session_types:
             return None
 
-        placeholders = ",".join("?" * len(session_types))
-        cursor = await db.execute(
-            f"SELECT status, metadata FROM cc_sessions "  # noqa: S608
-            f"WHERE session_type IN ({placeholders})",
-            (*session_types,),
-        )
+        same_type_rows = await cc_sessions.get_by_session_types(db, session_types)
         # Baseline = same-type sessions that do NOT use this skill. Match on
         # skill_tags membership (not a loose substring) for the same reason as
         # analyze() — a session whose `profile` equals the skill name is not a
         # user of the skill.
         baseline_rows = [
             r
-            for r in await cursor.fetchall()
-            if skill_name not in _parse_metadata(r[1]).get("skill_tags", [])
+            for r in same_type_rows
+            if skill_name not in _parse_metadata(r.get("metadata")).get("skill_tags", [])
         ]
         if not baseline_rows:
             return None
 
-        completed = sum(1 for r in baseline_rows if r[0] == "completed")
+        completed = sum(1 for r in baseline_rows if r.get("status") == "completed")
         return completed / len(baseline_rows)
 
 
