@@ -198,6 +198,8 @@ async def test_get_raw_db_closes_on_exit(tmp_path):
     db_path = tmp_path / "raw2.db"
     async with get_raw_db(db_path) as db:
         captured = db
-        assert captured._running is True  # alive inside the context
-    # After exit the background thread is stopped — connection is closed.
-    assert captured._running is False
+        await captured.execute("SELECT 1")  # usable inside the context
+    # After exit the connection is closed — reusing it raises (behavior, not
+    # a private attribute).
+    with pytest.raises(ValueError):
+        await captured.execute("SELECT 1")

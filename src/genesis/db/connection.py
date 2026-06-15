@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -251,7 +251,9 @@ async def get_db(path: str | Path = DEFAULT_DB_PATH) -> SerializedConnection:
 
 
 @asynccontextmanager
-async def get_raw_db(path: str | Path = DEFAULT_DB_PATH):
+async def get_raw_db(
+    path: str | Path = DEFAULT_DB_PATH,
+) -> AsyncIterator[aiosqlite.Connection]:
     """Open a plain aiosqlite connection with Genesis's standard pragmas.
 
     For short-lived, **standalone** opens — MCP fallback paths and one-shot

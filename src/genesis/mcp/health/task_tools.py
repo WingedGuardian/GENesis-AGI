@@ -69,9 +69,13 @@ def init_task_tools(dispatcher, executor, *, db=None) -> None:
 
 async def _get_db() -> aiosqlite.Connection:
     """Open a direct DB connection for MCP fallback reads/writes."""
+    # Standalone fallback connection. Not routed through get_raw_db() because
+    # callers hold this connection across awaits (it's returned, not scoped to
+    # a context manager); it sets the same pragmas get_raw_db() applies.
     db = await aiosqlite.connect(str(_DB_PATH))
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA synchronous=NORMAL")
     await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     return db
 
