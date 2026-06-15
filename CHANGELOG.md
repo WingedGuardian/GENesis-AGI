@@ -24,6 +24,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   now fires at 85% (was 90%) and the vector-search-failure alert at 50%
   failure (was 100% only), so you hear about pressure and degradation
   sooner, on both Telegram and voice.
+- **Voice runs from its own repo now** — the Voice PE device firmware and the
+  voice bridges (the conversational OpenAI Realtime bridge, plus a new
+  ambient-listening capture service) have moved to the separate
+  [GENesis-Voice](https://github.com/WingedGuardian/GENesis-Voice) repo, which
+  documents the full setup. Genesis keeps its internal voice integration; if you
+  flash the device or run a voice bridge, get them from GENesis-Voice.
 
 ### Fixed
 
