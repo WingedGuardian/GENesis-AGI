@@ -151,6 +151,46 @@ class TestCheckSynthesisFaithfulness:
         )
         assert result.passed is False
 
+    @pytest.mark.asyncio
+    async def test_exhaustion_marks_verdict_exhausted(self):
+        """When the review can't run (route_call exhausts all providers OR
+        raises), the verdict is FAIL AND flagged exhausted=True — a capacity
+        failure, not a quality verdict — so the dream-cycle breaker can tell
+        them apart."""
+        # route_call returns failure (all providers exhausted)
+        router = AsyncMock()
+        router.route_call = AsyncMock(return_value=MagicMock(
+            success=False, error="All providers exhausted",
+        ))
+        result = await check_synthesis_faithfulness(
+            router=router, originals=[{"content": "x"}], synthesis_text="y",
+        )
+        assert result.passed is False
+        assert result.exhausted is True
+
+        # route_call raises (infra error) — also exhausted
+        router2 = AsyncMock()
+        router2.route_call = AsyncMock(side_effect=RuntimeError("connection refused"))
+        result2 = await check_synthesis_faithfulness(
+            router=router2, originals=[{"content": "x"}], synthesis_text="y",
+        )
+        assert result2.exhausted is True
+
+    @pytest.mark.asyncio
+    async def test_quality_fail_is_not_exhausted(self):
+        """A genuine quality FAIL (review ran, found missing info) is NOT
+        flagged exhausted — the breaker must not abort on real quality blocks."""
+        router = AsyncMock()
+        router.route_call = AsyncMock(return_value=MagicMock(
+            success=True,
+            content=json.dumps({"verdict": "FAIL", "missing": ["a date"]}),
+        ))
+        result = await check_synthesis_faithfulness(
+            router=router, originals=[{"content": "x"}], synthesis_text="y",
+        )
+        assert result.passed is False
+        assert result.exhausted is False
+
 
 class TestCheckEntityDuplicate:
     """Tests for entity duplicate second opinion."""

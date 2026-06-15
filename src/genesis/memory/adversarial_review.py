@@ -71,9 +71,17 @@ Lean toward "distinct" — it is safer to keep both than to lose information."""
 class SynthesisBlockedError(Exception):
     """Raised when adversarial review blocks a synthesis."""
 
-    def __init__(self, missing: list[str] | None = None, error: str | None = None):
+    def __init__(
+        self,
+        missing: list[str] | None = None,
+        error: str | None = None,
+        exhausted: bool = False,
+    ):
         self.missing = missing or []
         self.error = error
+        # True when the block was caused by provider-chain exhaustion (capacity)
+        # rather than a genuine quality failure. Drives the capacity breaker.
+        self.exhausted = exhausted
         detail = ", ".join(self.missing) if self.missing else (error or "unknown")
         super().__init__(f"Synthesis blocked by adversarial review: {detail}")
 
@@ -85,6 +93,11 @@ class AdversarialVerdict:
     missing: list[str] = field(default_factory=list)
     raw_response: str = ""
     error: str | None = None
+    # True when the review could not run because the provider chain was
+    # exhausted / errored (capacity failure), as opposed to a review that ran
+    # and legitimately failed on quality. The dream-cycle capacity breaker uses
+    # this to abort early on saturation without aborting on real quality blocks.
+    exhausted: bool = False
 
 
 def _parse_verdict(raw: str) -> AdversarialVerdict:
@@ -140,17 +153,18 @@ async def check_synthesis_faithfulness(
         result = await router.route_call(
             CALL_SITE_SYNTHESIS,
             [{"role": "user", "content": prompt}],
+            suppress_dead_letter=True,
         )
     except Exception as exc:
         logger.error("Adversarial review call failed: %s", exc)
         return AdversarialVerdict(
-            passed=False, error=f"router error: {exc}",
+            passed=False, error=f"router error: {exc}", exhausted=True,
         )
 
     if not result.success:
         logger.warning("Adversarial review LLM call failed: %s", result.error)
         return AdversarialVerdict(
-            passed=False, error=f"LLM error: {result.error}",
+            passed=False, error=f"LLM error: {result.error}", exhausted=True,
         )
 
     return _parse_verdict(result.content or "")
@@ -176,6 +190,7 @@ async def check_entity_duplicate(
         result = await router.route_call(
             CALL_SITE_ENTITY,
             [{"role": "user", "content": prompt}],
+            suppress_dead_letter=True,
         )
     except Exception as exc:
         logger.error("Entity adversarial review failed: %s", exc)
