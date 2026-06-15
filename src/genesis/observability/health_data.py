@@ -6,6 +6,7 @@ for cleaner organization. Each function takes explicit dependencies as parameter
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -104,35 +105,58 @@ class HealthDataService:
                     logger.warning("Provider health probe failed", exc_info=True)
             probe_results = self._provider_health.results
 
-        return {
-            "timestamp": now,
-            "call_sites": await call_sites(
+        # Run the independent async sub-snapshots CONCURRENTLY. Serial execution
+        # summed to ~9s (and ballooned to 20s+ under load), hanging the dashboard
+        # and the Guardian's health probe. gather makes the total ≈ max(sub-call)
+        # instead of the sum: aiosqlite serializes DB queries on the single
+        # connection (safe), while network-bound calls (memory_health/Qdrant,
+        # mcp_status) overlap with them and each other.
+        (
+            r_call_sites, r_cc_sessions, r_infrastructure, r_queues, r_surplus,
+            r_cost, r_awareness, r_outreach, r_mcp, r_provider_activity,
+            r_memory_health, r_eval_staleness, r_vcr,
+        ) = await asyncio.gather(
+            call_sites(
                 self._db, self._routing_config, self._breakers,
-                probe_results=probe_results,
-                state_machine=self._state_machine,
+                probe_results=probe_results, state_machine=self._state_machine,
             ),
-            "cc_sessions": await cc_sessions(self._db, self._cc_budget, self._state_machine),
-            "resilience": self._resilience_state(),
-            "infrastructure": await infrastructure(
+            cc_sessions(self._db, self._cc_budget, self._state_machine),
+            infrastructure(
                 self._db, self._routing_config, self._learning_scheduler, self._state_machine
             ),
-            "queues": await queues(
-                self._db, self._deferred_queue, self._dead_letter, self._event_bus
-            ),
-            "surplus": await surplus_status(self._db, self._surplus),
-            "cost": await cost(self._db, self._cost_tracker, self._cc_budget),
-            "awareness": await awareness(self._db),
-            "outreach_stats": await outreach_stats(self._db),
+            queues(self._db, self._deferred_queue, self._dead_letter, self._event_bus),
+            surplus_status(self._db, self._surplus),
+            cost(self._db, self._cost_tracker, self._cc_budget),
+            awareness(self._db),
+            outreach_stats(self._db),
+            mcp_status(),
+            provider_activity(self._activity_tracker),
+            memory_health(self._db),
+            eval_staleness(self._db),
+            self._vcr_snapshot(),
+        )
+
+        return {
+            "timestamp": now,
+            "call_sites": r_call_sites,
+            "cc_sessions": r_cc_sessions,
+            "resilience": self._resilience_state(),
+            "infrastructure": r_infrastructure,
+            "queues": r_queues,
+            "surplus": r_surplus,
+            "cost": r_cost,
+            "awareness": r_awareness,
+            "outreach_stats": r_outreach,
             "services": services(),
             "api_keys": api_key_health(self._routing_config, breakers=self._breakers),
-            "mcp_servers": await mcp_status(),
+            "mcp_servers": r_mcp,
             "conversation": conversation_activity(),
-            "provider_activity": await provider_activity(self._activity_tracker),
+            "provider_activity": r_provider_activity,
             "proactive_memory": proactive_memory_metrics(),
-            "memory_health": await memory_health(self._db),
+            "memory_health": r_memory_health,
             "provider_health": self._serialize_provider_health(),
-            "eval_staleness": await eval_staleness(self._db),
-            "vcr": await self._vcr_snapshot(),
+            "eval_staleness": r_eval_staleness,
+            "vcr": r_vcr,
         }
 
     async def _vcr_snapshot(self) -> dict:

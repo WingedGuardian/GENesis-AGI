@@ -12,9 +12,16 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 
 logger = logging.getLogger(__name__)
 
+# Bound the health snapshot so a slow/contended snapshot returns 503 fast
+# instead of hanging the Flask worker — which previously made the dashboard
+# spin forever and failed the host Guardian's health probe. The snapshot is
+# ~2s after the call_sites + gather fixes; 15s is a generous never-hang
+# backstop, well under browser/proxy timeouts.
+_HEALTH_SNAPSHOT_TIMEOUT_S = 15.0
+
 
 @blueprint.route("/api/genesis/health")
-@_async_route
+@_async_route(timeout=_HEALTH_SNAPSHOT_TIMEOUT_S)
 async def health_snapshot():
     """Return system health snapshot with bridge status from status.json."""
     from genesis.runtime import GenesisRuntime
