@@ -104,6 +104,28 @@ class TestRegenerateMirror:
         assert "### Custom" in content
 
     @pytest.mark.asyncio
+    async def test_mistagged_non_reference_domain_excluded(self, db, tmp_path, monkeypatch):
+        """A project_type='reference' row whose domain is NOT reference.* (e.g.
+        bulk-curated knowledge mis-tagged as a reference) must not leak into the
+        human reference mirror — only genuine reference kinds belong there."""
+        mirror_path = tmp_path / "known-to-genesis.md"
+        monkeypatch.setattr(
+            "genesis.memory.reference_mirror._MIRROR_PATH", mirror_path,
+        )
+        await _insert_ref(
+            db, domain="reference.url", concept="RealRef", body="real ref body",
+        )
+        await _insert_ref(
+            db, domain="cloud_architecture", concept="MistaggedKnowledge",
+            body="curated knowledge, not a reference",
+        )
+        await regenerate_mirror(db)
+        content = mirror_path.read_text()
+        assert "### RealRef" in content  # genuine reference still rendered
+        assert "MistaggedKnowledge" not in content  # mis-tagged row excluded
+        assert "Cloud Architecture" not in content  # and no heading for it
+
+    @pytest.mark.asyncio
     async def test_non_credential_value_not_redacted(self, db, tmp_path, monkeypatch):
         mirror_path = tmp_path / "known-to-genesis.md"
         monkeypatch.setattr(
