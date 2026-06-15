@@ -1,7 +1,10 @@
 """Markdown mirror of the reference store at ~/.genesis/known-to-genesis.md.
 
 Read-only human view. Regenerated on reference_store / reference_delete /
-reference_export operations. NOT a source of truth — the database is.
+reference_export operations and once at memory init (boot) so references added
+by non-triggering paths (extraction job, bulk imports) still surface. Only
+genuine reference kinds (``domain`` like ``reference.*``) are rendered. NOT a
+source of truth — the database is.
 """
 
 from __future__ import annotations
@@ -80,8 +83,14 @@ async def regenerate_mirror(db: aiosqlite.Connection) -> Path:
         for entry in entries:
             lines.extend(_render_entry(entry, domain_key))
 
-    # Any domains not in _DOMAIN_ORDER (future-proofing).
+    # Any reference.* domains not in _DOMAIN_ORDER (future-proofing). Only
+    # genuine reference kinds (domain "reference.*") belong in the human
+    # reference view — skip anything else so a row mis-tagged
+    # project_type='reference' with a non-reference domain (e.g. bulk-curated
+    # knowledge) can't leak into the mirror.
     for domain_key, entries in sorted(grouped.items()):
+        if not domain_key.startswith("reference."):
+            continue
         total += len(entries)
         heading = domain_key.removeprefix("reference.").replace("_", " ").title()
         lines.append(f"## {heading}")

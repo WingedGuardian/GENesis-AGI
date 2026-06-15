@@ -66,6 +66,18 @@ async def init(rt: GenesisRuntime) -> None:
         # URLs, IPs) that belong alongside episodic memories.
         await _migrate_reference_vectors(qdrant, rt._db)
 
+        # Refresh the human-readable reference mirror (~/.genesis/known-to-genesis.md)
+        # on boot so it reflects references added by paths that don't trigger it
+        # live (e.g. the extraction job, bulk imports). reference_store/delete/export
+        # keep it fresh during a session; this catches everything else each restart.
+        try:
+            from genesis.memory.reference_mirror import regenerate_mirror
+            await regenerate_mirror(rt._db)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("reference mirror boot refresh failed", exc_info=True)
+
         # Split embedding chains: storage (Ollama first) vs recall (cloud first).
         # Both share the same L2 diskcache — cache keys are text-based, not
         # provider-dependent, so a write cached via Ollama is instantly
