@@ -13,6 +13,9 @@ sleep.
 - Dry-run mode is the default until manually reviewed
 - Max 100 cluster merges per run (configurable)
 - Clusters > 10 memories flagged for manual review, not auto-merged
+- Capacity breaker: the synthesis sweep aborts after N consecutive provider
+  exhaustions and defers the rest, so a run during a provider outage fails
+  fast instead of grinding every cluster (bounds attempts, not just successes)
 
 Spec: docs/superpowers/specs/2026-05-14-dream-cycle-design.md
 """
@@ -50,6 +53,38 @@ MIN_AVAILABLE_MB: int = 256
 _YIELD_EVERY: int = 50  # yield to event loop every N search calls
 CALL_SITE_ID: str = "dream_cycle_synthesis"
 COLLECTION: str = "episodic_memory"
+# Abort the synthesis loop after this many CONSECUTIVE provider-exhaustion
+# failures. Prevents a run during a provider outage from grinding every cluster
+# into a saturated chain (root cause of the 2026-06-14 near-total failure:
+# the loop bounded successes, not attempts, so a degraded run attempted ~782
+# clusters). Genuine quality blocks reset the streak.
+_CAPACITY_ABORT_THRESHOLD: int = 5
+
+
+class ProvidersExhaustedError(Exception):
+    """A dream-cycle LLM call exhausted its entire provider chain — a capacity
+    failure (not a logic error). Drives the capacity breaker; counted as a run
+    error, distinct from a genuine quality block."""
+
+
+class _CapacityBreaker:
+    """Tracks consecutive provider-exhaustion failures and trips once the
+    threshold is hit. Any progress (a success or a genuine quality block)
+    resets the streak, so only sustained saturation aborts the run."""
+
+    def __init__(self, threshold: int) -> None:
+        self._threshold = threshold
+        self._consecutive = 0
+
+    def record_exhaustion(self) -> None:
+        self._consecutive += 1
+
+    def record_progress(self) -> None:
+        self._consecutive = 0
+
+    @property
+    def tripped(self) -> bool:
+        return self._consecutive >= self._threshold
 
 # ── Union-Find ───────────────────────────────────────────────────────────
 
@@ -134,6 +169,7 @@ async def run(
         "adversarial_blocked": 0,
         "shrink_gate_blocked": 0,
         "rollback_flagged": False,
+        "aborted_capacity": False,
         "errors": [],
     }
 
@@ -216,75 +252,17 @@ async def run(
 
     # Phase 3+4 — Synthesize and deprecate (live mode only)
     if not dry_run:
-        all_clusters.sort(key=len, reverse=True)
-        merged = 0
-
-        for cluster in all_clusters:
-            if merged >= max_merges:
-                break
-
-            if len(cluster) > max_cluster_size:
-                report["clusters_skipped_large"] += 1
-                logger.info(
-                    "Dream cycle %s: skipping cluster of %d in %s/%s (too large)",
-                    run_id[:8], len(cluster),
-                    cluster[0].get("wing", "?"), cluster[0].get("room", "?"),
-                )
-                continue
-
-            try:
-                result = await _synthesize_and_deprecate(
-                    cluster=cluster,
-                    run_id=run_id,
-                    qdrant=qdrant,
-                    db=db,
-                    router=router,
-                    store=store,
-                )
-                merged += 1
-                report["memories_deprecated"] += result["deprecated_count"]
-            except SynthesisBlockedError as exc:
-                # Adversarial review or shrink gate blocked this cluster.
-                # Not an error — a quality gate working as intended.
-                if "catastrophic shrink" in str(exc):
-                    report["shrink_gate_blocked"] += 1
-                else:
-                    report["adversarial_blocked"] += 1
-                logger.info(
-                    "Dream cycle %s: cluster of %d blocked: %s",
-                    run_id[:8], len(cluster), exc,
-                )
-            except Exception as exc:
-                report["errors"].append({
-                    "cluster_size": len(cluster),
-                    "error": str(exc),
-                })
-                logger.warning(
-                    "Dream cycle %s: synthesis failed for cluster of %d: %s",
-                    run_id[:8], len(cluster), exc, exc_info=True,
-                )
-
-        report["clusters_merged"] = merged
-        logger.info(
-            "Dream cycle %s: merged %d clusters, deprecated %d memories, %d errors",
-            run_id[:8], merged, report["memories_deprecated"], len(report["errors"]),
+        await _synthesize_clusters(
+            all_clusters,
+            run_id=run_id,
+            qdrant=qdrant,
+            db=db,
+            router=router,
+            store=store,
+            max_merges=max_merges,
+            max_cluster_size=max_cluster_size,
+            report=report,
         )
-
-        # ── Rollback flagging ──
-        # If >50% of synthesis attempts were blocked, flag the run for
-        # manual review. Do NOT auto-rollback.
-        total_blocked = report["adversarial_blocked"] + report["shrink_gate_blocked"]
-        total_attempted = merged + total_blocked
-        if total_attempted > 0:
-            block_rate = total_blocked / total_attempted
-            if block_rate > 0.50:
-                report["rollback_flagged"] = True
-                logger.critical(
-                    "Dream cycle %s: %.0f%% of syntheses blocked (%d/%d). "
-                    "Manual review recommended. Run rollback('%s') if needed.",
-                    run_id[:8], block_rate * 100,
-                    total_blocked, total_attempted, run_id,
-                )
 
     # ── Sprint 2 phases (each handles dry_run internally) ──────────────
 
@@ -628,6 +606,126 @@ def _get_vector(qdrant: QdrantClient, point_id: str) -> list[float]:
 # ── Phase 3+4: Synthesize and Deprecate ──────────────────────────────────
 
 
+async def _synthesize_clusters(
+    all_clusters: list[list[dict]],
+    *,
+    run_id: str,
+    qdrant: QdrantClient,
+    db: aiosqlite.Connection,
+    router: Router,
+    store: MemoryStore,
+    max_merges: int,
+    max_cluster_size: int,
+    report: dict[str, Any],
+) -> None:
+    """Synthesize/deprecate clusters with a capacity breaker (mutates report).
+
+    Aborts early (``report['aborted_capacity']=True``) after
+    ``_CAPACITY_ABORT_THRESHOLD`` CONSECUTIVE provider-exhaustion failures, so a
+    run during a provider outage fails fast instead of grinding every cluster
+    into a saturated chain. Genuine quality blocks reset the streak and never
+    trip the breaker.
+    """
+    all_clusters.sort(key=len, reverse=True)
+    merged = 0
+    breaker = _CapacityBreaker(_CAPACITY_ABORT_THRESHOLD)
+
+    for cluster in all_clusters:
+        if merged >= max_merges:
+            break
+
+        if breaker.tripped:
+            report["aborted_capacity"] = True
+            logger.error(
+                "Dream cycle %s: aborting synthesis — provider chains exhausted "
+                "(%d consecutive). Deferring remaining clusters to a future run.",
+                run_id[:8], _CAPACITY_ABORT_THRESHOLD,
+            )
+            break
+
+        if len(cluster) > max_cluster_size:
+            report["clusters_skipped_large"] += 1
+            logger.info(
+                "Dream cycle %s: skipping cluster of %d in %s/%s (too large)",
+                run_id[:8], len(cluster),
+                cluster[0].get("wing", "?"), cluster[0].get("room", "?"),
+            )
+            continue
+
+        try:
+            result = await _synthesize_and_deprecate(
+                cluster=cluster,
+                run_id=run_id,
+                qdrant=qdrant,
+                db=db,
+                router=router,
+                store=store,
+            )
+            merged += 1
+            report["memories_deprecated"] += result["deprecated_count"]
+            breaker.record_progress()
+        except SynthesisBlockedError as exc:
+            # Adversarial review or shrink gate blocked this cluster.
+            if exc.exhausted:
+                # Block caused by provider exhaustion (capacity), not quality.
+                report["adversarial_blocked"] += 1
+                breaker.record_exhaustion()
+            else:
+                # Genuine quality gate working as intended — resets the breaker.
+                if "catastrophic shrink" in str(exc):
+                    report["shrink_gate_blocked"] += 1
+                else:
+                    report["adversarial_blocked"] += 1
+                breaker.record_progress()
+            logger.info(
+                "Dream cycle %s: cluster of %d blocked: %s",
+                run_id[:8], len(cluster), exc,
+            )
+        except ProvidersExhaustedError as exc:
+            report["errors"].append({
+                "cluster_size": len(cluster),
+                "error": str(exc),
+            })
+            breaker.record_exhaustion()
+            logger.warning(
+                "Dream cycle %s: synthesis exhausted for cluster of %d: %s",
+                run_id[:8], len(cluster), exc,
+            )
+        except Exception as exc:
+            # Non-capacity error — record it but do NOT trip the capacity breaker.
+            report["errors"].append({
+                "cluster_size": len(cluster),
+                "error": str(exc),
+            })
+            breaker.record_progress()
+            logger.warning(
+                "Dream cycle %s: synthesis failed for cluster of %d: %s",
+                run_id[:8], len(cluster), exc, exc_info=True,
+            )
+
+    report["clusters_merged"] = merged
+    logger.info(
+        "Dream cycle %s: merged %d clusters, deprecated %d memories, %d errors",
+        run_id[:8], merged, report["memories_deprecated"], len(report["errors"]),
+    )
+
+    # ── Rollback flagging ──
+    # If >50% of synthesis attempts were blocked, flag for manual review.
+    # Skip when we aborted on capacity — the abort is the signal, and a small
+    # "all blocked" count from an early abort is not a quality problem.
+    if not report["aborted_capacity"]:
+        total_blocked = report["adversarial_blocked"] + report["shrink_gate_blocked"]
+        total_attempted = merged + total_blocked
+        if total_attempted > 0 and (total_blocked / total_attempted) > 0.50:
+            report["rollback_flagged"] = True
+            logger.critical(
+                "Dream cycle %s: %.0f%% of syntheses blocked (%d/%d). "
+                "Manual review recommended. Run rollback('%s') if needed.",
+                run_id[:8], (total_blocked / total_attempted) * 100,
+                total_blocked, total_attempted, run_id,
+            )
+
+
 async def _synthesize_and_deprecate(
     *,
     cluster: list[dict],
@@ -646,10 +744,12 @@ async def _synthesize_and_deprecate(
     prompt = _build_synthesis_prompt(cluster, wing, room)
     messages = [{"role": "user", "content": prompt}]
 
-    # LLM synthesis via router
-    result = await router.route_call(CALL_SITE_ID, messages)
+    # LLM synthesis via router. suppress_dead_letter: dream-cycle ops re-cluster
+    # fresh each run, so dead-lettering exhausted syntheses is pointless and
+    # floods the queue (it tripled the backlog on 2026-06-14).
+    result = await router.route_call(CALL_SITE_ID, messages, suppress_dead_letter=True)
     if not result.success:
-        raise RuntimeError(f"LLM synthesis failed: {result.error}")
+        raise ProvidersExhaustedError(f"LLM synthesis failed: {result.error}")
 
     synthesis = _parse_synthesis_response(result.content, wing, room)
 
@@ -670,6 +770,7 @@ async def _synthesize_and_deprecate(
         raise SynthesisBlockedError(
             missing=adversarial_verdict.missing,
             error=adversarial_verdict.error,
+            exhausted=adversarial_verdict.exhausted,
         )
 
     # ── Catastrophic-shrink gate ──

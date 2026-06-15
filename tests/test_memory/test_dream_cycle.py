@@ -8,15 +8,37 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from genesis.memory.dream_cycle import (
+    _CAPACITY_ABORT_THRESHOLD,
     MAX_BUCKET_SIZE,
     MAX_CLUSTER_SIZE,
+    ProvidersExhaustedError,
     _build_synthesis_prompt,
+    _CapacityBreaker,
     _parse_synthesis_response,
     _read_mem_available_mb,
     _size_distribution,
+    _synthesize_clusters,
     _UnionFind,
     run,
 )
+
+
+def _fake_cluster(n: int = 2, wing: str = "memory", room: str = "store"):
+    """A minimal cluster of n memory points for synthesis-loop tests."""
+    return [
+        {"id": f"{wing}-{room}-{i}", "wing": wing, "room": room,
+         "payload": {"content": f"fact {i}", "confidence": 0.8}}
+        for i in range(n)
+    ]
+
+
+def _fresh_report():
+    return {
+        "clusters_merged": 0, "clusters_skipped_large": 0,
+        "memories_deprecated": 0, "adversarial_blocked": 0,
+        "shrink_gate_blocked": 0, "rollback_flagged": False,
+        "aborted_capacity": False, "errors": [],
+    }
 
 # All Qdrant functions are imported inside function bodies, so we patch
 # at the source (genesis.qdrant.collections.*) not at dream_cycle.*.
@@ -25,6 +47,82 @@ _SEARCH = "genesis.qdrant.collections.search"
 _UPDATE = "genesis.qdrant.collections.update_payload"
 _DELETE = "genesis.qdrant.collections.delete_point"
 _BATCH_VEC = "genesis.memory.dream_cycle._batch_get_vectors"
+
+
+# ── Capacity breaker ─────────────────────────────────────────────────────
+
+
+class TestCapacityBreaker:
+    def test_trips_after_threshold_consecutive_exhaustions(self):
+        b = _CapacityBreaker(threshold=3)
+        assert b.tripped is False
+        b.record_exhaustion()
+        b.record_exhaustion()
+        assert b.tripped is False
+        b.record_exhaustion()
+        assert b.tripped is True
+
+    def test_progress_resets_the_streak(self):
+        b = _CapacityBreaker(threshold=3)
+        b.record_exhaustion()
+        b.record_exhaustion()
+        b.record_progress()
+        b.record_exhaustion()
+        b.record_exhaustion()
+        assert b.tripped is False
+
+
+class TestSynthesizeClustersBreaker:
+    @pytest.mark.asyncio
+    async def test_aborts_on_consecutive_exhaustion(self):
+        """Provider-chain exhaustion aborts the loop after the threshold instead
+        of grinding every cluster (the 2026-06-14 pathology)."""
+        clusters = [_fake_cluster() for _ in range(_CAPACITY_ABORT_THRESHOLD + 3)]
+        router = AsyncMock()
+        router.route_call = AsyncMock(return_value=MagicMock(
+            success=False, error="All providers exhausted",
+        ))
+        report = _fresh_report()
+        await _synthesize_clusters(
+            clusters, run_id="t", qdrant=MagicMock(), db=AsyncMock(),
+            router=router, store=AsyncMock(),
+            max_merges=100, max_cluster_size=10, report=report,
+        )
+        assert report["aborted_capacity"] is True
+        assert report["clusters_merged"] == 0
+        # Aborted after ~threshold attempts, NOT all clusters
+        assert len(report["errors"]) == _CAPACITY_ABORT_THRESHOLD
+        # rollback flag must NOT fire on a capacity abort
+        assert report["rollback_flagged"] is False
+
+    @pytest.mark.asyncio
+    async def test_quality_blocks_do_not_abort(self):
+        """Genuine adversarial quality blocks do NOT trip the capacity breaker —
+        every cluster is processed."""
+        n = _CAPACITY_ABORT_THRESHOLD + 3
+        clusters = [_fake_cluster() for _ in range(n)]
+        synthesis_json = json.dumps({
+            "content": "consolidated " * 20, "tags": ["t"], "confidence": 0.9,
+            "memory_class": "fact", "wing": "memory", "room": "store",
+            "synthesis_notes": "x",
+        })
+        challenge_fail = json.dumps({"verdict": "FAIL", "missing": ["a detail"]})
+
+        async def _call(call_site, messages, **kw):
+            if call_site == "dream_cycle_synthesis":
+                return MagicMock(success=True, content=synthesis_json)
+            return MagicMock(success=True, content=challenge_fail)
+        router = AsyncMock()
+        router.route_call = AsyncMock(side_effect=_call)
+        report = _fresh_report()
+        await _synthesize_clusters(
+            clusters, run_id="t", qdrant=MagicMock(), db=AsyncMock(),
+            router=router, store=AsyncMock(),
+            max_merges=100, max_cluster_size=10, report=report,
+        )
+        assert report["aborted_capacity"] is False
+        assert report["adversarial_blocked"] == n
+        assert report["clusters_merged"] == 0
 
 
 # ── Union-Find ───────────────────────────────────────────────────────────
