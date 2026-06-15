@@ -371,6 +371,10 @@ class AwarenessLoop:
         self._interval = interval_minutes
         self._scheduler = AsyncIOScheduler()
         self._tick_lock = asyncio.Lock()
+        # Single-flight guard for the session observer, which now runs
+        # out-of-band (no longer serialized by _tick_lock). Prevents
+        # overlapping runs from racing the .jsonl→.processing file renames.
+        self._session_observer_lock = asyncio.Lock()
         self._event_bus = event_bus
         self._reflection_engine = reflection_engine
         self._cc_reflection_bridge = cc_reflection_bridge
@@ -739,20 +743,29 @@ class AwarenessLoop:
                 except Exception:
                     logger.warning("Sentinel fire alarm check failed", exc_info=True)
 
-            # Session observer — process pending tool observations into memories
-            if self._session_observer_fn:
-                try:
-                    obs_result = await self._session_observer_fn()
-                    if obs_result and obs_result.notes_stored > 0:
-                        logger.info(
-                            "Session observer: %d notes from %d observations",
-                            obs_result.notes_stored, obs_result.observations_read,
-                        )
-                except Exception:
-                    logger.warning("Session observer processing failed", exc_info=True)
+            # NOTE: the session observer used to run here, awaited inside the
+            # tick lock. It made an LLM call that, under provider exhaustion,
+            # held the lock for 16+ min and starved the heartbeat. It is now
+            # dispatched OUT-OF-BAND below (single-flight guarded).
 
         if result is None:
             return
+
+        from genesis.util.tasks import tracked_task
+
+        # Session observer: process tool observations into memories. Dispatched
+        # OUT-OF-BAND (previously awaited inside the tick lock) so the heartbeat
+        # fires on cadence even when its LLM call grinds through an exhausted
+        # provider chain. Single-flight (_session_observer_lock) prevents
+        # overlapping ticks from racing the observation-file renames. Runs
+        # regardless of the pause kill-switch (internal memory work, no external
+        # dispatch) — matching the prior in-lock behavior.
+        if self._session_observer_fn:
+            tracked_task(
+                self._run_session_observer(),
+                name=f"session-observer-{result.tick_id[:8]}",
+                subsystem=Subsystem.AWARENESS,
+            )
 
         # Kill switch — tick/heartbeats still run but no dispatches when paused
         try:
@@ -762,8 +775,6 @@ class AwarenessLoop:
                 return
         except Exception:
             pass
-
-        from genesis.util.tasks import tracked_task
 
         if result.classified_depth is not None:
             tracked_task(
@@ -788,6 +799,32 @@ class AwarenessLoop:
                 name=f"sentinel-resume-{result.tick_id[:8]}",
                 subsystem=Subsystem.AWARENESS,
             )
+
+    async def _run_session_observer(self) -> None:
+        """Run the session observer with single-flight (out-of-band of the tick).
+
+        If a prior run is still in progress (e.g. its LLM call is grinding
+        through an exhausted provider chain), skip this tick's run rather than
+        overlap — overlapping runs would race the observer's atomic
+        ``.jsonl→.processing`` file renames. The ``locked()`` check followed by
+        ``async with`` is safe in asyncio: there is no ``await`` between them, so
+        no other coroutine can acquire the lock in the gap.
+        """
+        if self._session_observer_fn is None:
+            return
+        if self._session_observer_lock.locked():
+            logger.debug("Session observer still running from a prior tick — skipping")
+            return
+        async with self._session_observer_lock:
+            try:
+                obs_result = await self._session_observer_fn()
+                if obs_result and obs_result.notes_stored > 0:
+                    logger.info(
+                        "Session observer: %d notes from %d observations",
+                        obs_result.notes_stored, obs_result.observations_read,
+                    )
+            except Exception:
+                logger.warning("Session observer processing failed", exc_info=True)
 
     async def _dispatch_reflection(self, result: TickResult) -> None:
         depth = result.classified_depth

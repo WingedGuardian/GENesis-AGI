@@ -289,84 +289,91 @@ async def process_pending_observations(
     for _path, observations in all_observations:
         batch.extend(observations)
 
-    # Split into LLM-sized batches
-    for batch_start in range(0, len(batch), MAX_OBS_PER_LLM_CALL):
-        if time.monotonic() - start > MAX_PROCESSING_TIME_S:
-            logger.info("Session observer hit time budget, stopping")
-            break
+    # Split into LLM-sized batches. The whole loop is wrapped in try/finally so
+    # that if it's cancelled mid-flight (e.g. server shutdown cancels this
+    # out-of-band task while an LLM call is in progress), the renamed
+    # `.processing` files are still restored to `.jsonl` and reprocessed next
+    # tick — otherwise they'd be orphaned (the finder only scans `.jsonl`) and
+    # those observations lost. CancelledError is a BaseException, so the inner
+    # per-batch `except Exception` does not swallow it; it reaches this finally.
+    try:
+        for batch_start in range(0, len(batch), MAX_OBS_PER_LLM_CALL):
+            if time.monotonic() - start > MAX_PROCESSING_TIME_S:
+                logger.info("Session observer hit time budget, stopping")
+                break
 
-        batch_slice = batch[batch_start:batch_start + MAX_OBS_PER_LLM_CALL]
-        obs_text = _format_observations_for_prompt(batch_slice)
-        prompt = OBSERVER_PROMPT.replace("{observations_text}", obs_text)
+            batch_slice = batch[batch_start:batch_start + MAX_OBS_PER_LLM_CALL]
+            obs_text = _format_observations_for_prompt(batch_slice)
+            prompt = OBSERVER_PROMPT.replace("{observations_text}", obs_text)
 
-        try:
-            # 21_session_observer — session-observer-driven memory writes.
-            # Routes via the free chain for opportunistic context capture.
-            response = await router.route_call(
-                call_site_id="21_session_observer",
-                messages=[{"role": "user", "content": prompt}],
-            )
-            result.llm_calls += 1
-
-            if not response.success:
-                logger.warning("Session observer LLM call failed: %s", response.error)
-                result.errors += 1
-                continue
-
-            notes = _parse_notes(response.content)
-            result.notes_extracted += len(notes)
-
-            # Store each note as a memory
-            for note in notes:
-                try:
-                    content = f"[{note.note_type}] {note.title}\n{note.narrative}"
-                    tags = ["session_note", note.note_type]
-                    tags.extend(note.concepts[:3])
-
-                    wing = _infer_wing_from_files(note.files)
-
-                    await store.store(
-                        content=content,
-                        source="session_observer",
-                        memory_type="episodic",
-                        tags=tags,
-                        confidence=0.6,
-                        source_pipeline="session_observer",
-                        wing=wing,
-                    )
-                    result.notes_stored += 1
-                except Exception:
-                    logger.warning("Failed to store session note: %s", note.title, exc_info=True)
-                    result.errors += 1
-
-        except Exception:
-            logger.warning("Session observer batch processing failed", exc_info=True)
-            result.errors += 1
-
-    # Clean up processing files — already fully read, safe to remove
-    for processing_path, _observations in all_observations:
-        try:
-            processing_path.unlink(missing_ok=True)
-        except OSError:
-            logger.warning("Failed to remove %s", processing_path, exc_info=True)
-
-    # Also clean up any processing files we didn't read (budget exceeded)
-    for _original, processing_path in processing_files:
-        if processing_path.exists():
             try:
-                # These had observations we didn't process — rename back
-                # so they're picked up next tick
-                original = processing_path.with_suffix(".jsonl")
-                if original.exists():
-                    # Original was recreated by hook — append our unprocessed
-                    # data to the new file
-                    with open(original, "a") as dst, open(processing_path) as src:
-                        dst.write(src.read())
-                    processing_path.unlink(missing_ok=True)
-                else:
-                    os.rename(processing_path, original)
+                # 21_session_observer — session-observer-driven memory writes.
+                # Routes via the free chain for opportunistic context capture.
+                response = await router.route_call(
+                    call_site_id="21_session_observer",
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                result.llm_calls += 1
+
+                if not response.success:
+                    logger.warning("Session observer LLM call failed: %s", response.error)
+                    result.errors += 1
+                    continue
+
+                notes = _parse_notes(response.content)
+                result.notes_extracted += len(notes)
+
+                # Store each note as a memory
+                for note in notes:
+                    try:
+                        content = f"[{note.note_type}] {note.title}\n{note.narrative}"
+                        tags = ["session_note", note.note_type]
+                        tags.extend(note.concepts[:3])
+
+                        wing = _infer_wing_from_files(note.files)
+
+                        await store.store(
+                            content=content,
+                            source="session_observer",
+                            memory_type="episodic",
+                            tags=tags,
+                            confidence=0.6,
+                            source_pipeline="session_observer",
+                            wing=wing,
+                        )
+                        result.notes_stored += 1
+                    except Exception:
+                        logger.warning("Failed to store session note: %s", note.title, exc_info=True)
+                        result.errors += 1
+
+            except Exception:
+                logger.warning("Session observer batch processing failed", exc_info=True)
+                result.errors += 1
+
+        # Clean up processing files — already fully read, safe to remove
+        for processing_path, _observations in all_observations:
+            try:
+                processing_path.unlink(missing_ok=True)
             except OSError:
-                logger.warning("Failed to restore %s", processing_path, exc_info=True)
+                logger.warning("Failed to remove %s", processing_path, exc_info=True)
+    finally:
+        # Restore any `.processing` files still on disk. On normal completion
+        # these are the budget-exceeded/unread ones; on cancellation this
+        # restores everything not yet consumed so it's reprocessed next tick.
+        for _original, processing_path in processing_files:
+            if processing_path.exists():
+                try:
+                    original = processing_path.with_suffix(".jsonl")
+                    if original.exists():
+                        # Original was recreated by hook — append our unprocessed
+                        # data to the new file.
+                        with open(original, "a") as dst, open(processing_path) as src:
+                            dst.write(src.read())
+                        processing_path.unlink(missing_ok=True)
+                    else:
+                        os.rename(processing_path, original)
+                except OSError:
+                    logger.warning("Failed to restore %s", processing_path, exc_info=True)
 
     result.files_processed = len(all_observations)
     result.elapsed_s = time.monotonic() - start
