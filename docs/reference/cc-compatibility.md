@@ -15,14 +15,37 @@
 
 ## Current CC Version
 
-**Installed:** Claude Code 2.1.173 on the **container** (upgraded 2026-06-11 from 2.1.170 — Fable 5 `[1m]` model-ID normalization fix + 2.1.172 long-conversation render perf). The **currently running host VM** remains on 2.1.170 (Guardian is headless; nothing in 2.1.171–173 affects it — upgrade opportunistically on next host maintenance; a fresh `host-setup.sh` run installs the new 2.1.173 pin). Container via npm (user prefix or `--prefix /usr/local`); host via native installer.
-**Pin in scripts:** `CC_VERSION=2.1.173` in `scripts/install.sh` and `scripts/host-setup.sh`
-**Minimum required by Genesis:** Not yet formalized (all current code works with 2.0+).
-`requiredMinimumVersion`/`requiredMaximumVersion` (2.1.163) were evaluated as a way
-to enforce a floor, but they are **managed-settings-only** (read only from
-`/etc/claude-code/managed-settings.json` on Linux — never from user/project
-`settings.json`). Formalizing a floor would require a system-level managed-settings
-file + install-script automation; deferred as a separate follow-up.
+**Installed:** Claude Code 2.1.173 on the **container** (upgraded 2026-06-11 from 2.1.170 — Fable 5 `[1m]` model-ID normalization fix + 2.1.172 long-conversation render perf). The **host VM** runs **2.1.87** — deliberately held there after the 2.1.90 Linux scrollback regression (see the 2.1.90 row below). 2.1.173 (the fullscreen-renderer scrollback fix) is the version the host is now being moved to via the unified updater. **Both** container and host install Claude Code **via npm-global** (`npm install -g @anthropic-ai/claude-code@<version>` — the container auto-detects its npm prefix, the host uses `sudo npm install -g`). There is no native-installer path.
+**Pin (single source of truth):** `CC_VERSION` in `scripts/lib/cc_version.sh`, sourced by `scripts/install.sh`, `scripts/host-setup.sh`, and `scripts/update.sh`. Bump it in one place; the next `update.sh` run syncs the host (see "Updating Claude Code" below).
+**Minimum required by Genesis:** intentionally **not enforced** at runtime (all current code works with 2.0+). A managed-settings `requiredMinimumVersion` floor (`/etc/claude-code/managed-settings.json`, Linux-only — never read from user/project `settings.json`) was evaluated and **deliberately rejected**: a hard floor removes the incident-recovery downgrade path the project has actually used (the 2.1.90→2.1.87 scrollback rollback) and can brick CC if the floor is written above the installed version. Drift is prevented instead by the npm pin + the unified `update-cc` updater + `DISABLE_AUTOUPDATER`/`DISABLE_UPDATES` (so CC never self-bumps).
+
+---
+
+## Updating Claude Code (host + container)
+
+One pin, both machines, no drift:
+
+1. Edit `CC_VERSION` in `scripts/lib/cc_version.sh` (one line).
+2. Merge to `main`.
+3. Run `scripts/update.sh`. It updates the container, redeploys the Guardian
+   (carrying the new gateway script), then queries the host's CC version and —
+   **only if it differs from the pin** — dispatches `update-cc <pin>` to the
+   Guardian gateway on the host. The dispatch is idempotent (acts only on drift)
+   and non-fatal (a failed host update leaves the previous working CC in place).
+
+The host install runs through the gateway's `update-cc <semver>` op
+(`scripts/guardian-gateway.sh`): it validates the argument as a bare semver,
+installs `@anthropic-ai/claude-code@<version>` using the npm that owns the in-use
+`claude` (so the global prefix matches the binary the Guardian resolves via its
+baked `command -v claude` path), and verifies `claude --version` afterward.
+
+To move the host by hand:
+`ssh -i ~/.ssh/genesis_guardian_ed25519 <host_user>@<host_ip> "update-cc 2.1.173"`
+
+**Incident downgrade:** because there is no `requiredMinimumVersion` floor, the
+host (or container) can be rolled back to an older known-good version the same way
+(`update-cc <older>`) if a release regresses — exactly what the 2.1.90→2.1.87
+rollback needed.
 
 ---
 
@@ -237,30 +260,34 @@ npm install -g @anthropic-ai/claude-code@<version>
 ```
 If your prefix requires root (`/usr/local`), add `sudo --prefix /usr/local`.
 
-**Host VM variation (verified 2026-06-10):** The host VM uses CC's **native
-installer** — NOT npm. Versioned binaries live in `~/.local/share/claude/versions/`
-with `~/.local/bin/claude` a symlink to the active version. **Do NOT `npm install`
-on the host** — npm and the native installer conflict. Update to a specific version
-with the native installer's own command (use the full path, since `~/.local/bin` is
-usually not on the host's login/SSH PATH):
-```bash
-"$HOME/.local/bin/claude" install <version>   # e.g. 2.1.173 — repoints the symlink, keeps old versions for rollback
-"$HOME/.local/bin/claude" --version           # verify
-```
-Rollback is just `claude install <old-version>` (prior versions remain in
-`versions/`). `DISABLE_AUTOUPDATER=1` is set on the host, so updates are manual.
+**Host VM (verified 2026-06-15):** The host installs Claude Code the **same way as
+the container — npm-global**, not the native installer. On this host the npm prefix
+is `/usr`, so the package lives in `/usr/lib/node_modules/@anthropic-ai/claude-code`
+with the binary at `/usr/bin/claude` (on the default PATH). There is no
+`~/.local/share/claude/versions/` tree and no `claude install` subcommand.
+> An earlier revision of this section described a native-installer layout under
+> `~/.local/` ("do not npm install on the host"); that was **stale** — the live host
+> migrated to npm-global. Always trust `type -a claude` + `npm ls -g
+> @anthropic-ai/claude-code` over this doc.
 
-**Host CC reachability — important:** The host's login/SSH shell PATH does NOT
-include `~/.local/bin`, so a bare `claude --version` over SSH (and the Guardian
-gateway's `version` op) reports `"unavailable"` even when CC is installed and fine.
-What matters is that the **`genesis-guardian.service` systemd unit explicitly sets
-`PATH=$HOME/.local/bin:...`**, so Guardian diagnosis (`cc.path: "claude"`)
-resolves the binary correctly. Verify the real state with:
+Update the host with the Guardian gateway's `update-cc` op (see "Updating Claude
+Code" above), which runs — under `sudo` — the same npm install the container uses,
+resolving npm next to the in-use `claude` so the global prefix matches. By hand:
 ```bash
-env -i PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" claude --version
+sudo npm install -g @anthropic-ai/claude-code@<version>   # e.g. 2.1.173
+claude --version                                          # verify
 ```
-The host CC binary is managed separately from the Genesis→Guardian *code* sync
-(`redeploy`/`update` gateway verbs sync code only, never the CC binary).
+`DISABLE_AUTOUPDATER=1`/`DISABLE_UPDATES=1` are set in the host's user-level
+`~/.claude/settings.json`, so updates are manual/controlled. Rollback is the same
+command with an older version (there is no `requiredMinimumVersion` floor blocking it).
+
+**Host CC reachability:** `/usr/bin/claude` is on the default PATH, so the Guardian
+gateway's `version` op resolves it and reports the real version over SSH (confirmed:
+`2.1.87`). Guardian diagnosis resolves the binary via `command -v claude`
+(`install_guardian.sh` bakes the resolved path into `guardian.yaml`). The host CC
+binary used to be managed entirely separately from the Genesis→Guardian *code* sync
+(`redeploy`/`update` sync code only) — but `scripts/update.sh` now keeps the host CC
+in step with the pin automatically via `update-cc`, so the two no longer drift.
 
 ### Auto-Updater Suppression Requires User-Level Settings
 

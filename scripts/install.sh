@@ -21,7 +21,7 @@
 #   OLLAMA_EMBEDDING_MODEL — Ollama embedding model (default: qwen3-embedding:0.6b-fp16)
 #   GENESIS_ENABLE_OLLAMA  — Enable local Ollama (default: false; cloud is default)
 #   QDRANT_VERSION         — Qdrant version to install if missing (default: 1.14.0)
-#   CC_VERSION             — Claude Code version to install (default: 2.1.173)
+#   CC_VERSION             — Claude Code version to install (default from scripts/lib/cc_version.sh)
 #   GH_VERSION             — gh CLI version if pkg-mgr fails (default: 2.65.0)
 #   RIPGREP_VERSION        — ripgrep version if pkg-mgr fails (default: 14.1.1)
 #   NODE_MAJOR             — Node.js major version (default: 20)
@@ -1144,7 +1144,15 @@ echo ""
 # ══════════════════════════════════════════════════════════════
 #  Step 12 — Claude Code install + login
 # ══════════════════════════════════════════════════════════════
-CC_VERSION="${CC_VERSION:-2.1.173}"  # Scrollback: fullscreen renderer (tui setting) — see docs/reference/cc-compatibility.md
+# CC version pin — single source of truth: scripts/lib/cc_version.sh
+# (2.1.173 = scrollback fullscreen-renderer fix — see docs/reference/cc-compatibility.md)
+_cc_env="$SCRIPT_DIR/lib/cc_version.sh"
+if [ ! -f "$_cc_env" ]; then
+    echo "ERROR: missing CC version pin: $_cc_env" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$_cc_env"
 echo "  [12/$TOTAL_STEPS] Setting up Claude Code (v${CC_VERSION})..."
 
 if command -v claude &>/dev/null; then

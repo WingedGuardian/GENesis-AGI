@@ -10,11 +10,13 @@
 #   version        — report CC, code, and Node versions
 #   update         — pull latest code + self-update gateway script
 #   redeploy <hash> — receive tar archive on stdin, deploy to install dir
+#   update-cc <ver> — install a pinned Claude Code version (validated semver)
+#   ping            — liveness check
 #
 # SSH authorized_keys entry (replace CONTAINER_IP with your container's IP):
 #   command="~/.local/bin/guardian-gateway.sh",from="CONTAINER_IP" ssh-ed25519 ...
 #
-# This gives Genesis exactly 8 operations on the host. Nothing else.
+# This gives Genesis a fixed allowlist of 10 operations on the host. Nothing else.
 
 set -euo pipefail
 
@@ -279,6 +281,51 @@ PYEOF
 
         # Clean up backup on success
         rm -rf "$BACKUP_DIR"
+        ;;
+    update-cc\ *)
+        # Controlled Claude Code version update on the host (WS-16).
+        # Installs a single pinned version using the SAME npm that owns the
+        # in-use `claude`, so the global prefix matches the binary that Guardian's
+        # baked path (guardian.yaml, set by install_guardian.sh via
+        # `command -v claude`) resolves — then verifies the result.
+        VERSION="${SSH_ORIGINAL_COMMAND#update-cc }"
+        # Strict allowlist on the arg: it is interpolated into a privileged
+        # `npm install` under sudo, so accept ONLY a bare semver X.Y.Z
+        # (anchored — mirrors the `redeploy` hash check above).
+        if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo '{"ok": false, "action": "update-cc", "error": "invalid version (expected X.Y.Z)"}' >&2
+            exit 1
+        fi
+        # Resolve npm next to the in-use claude (fall back to PATH npm).
+        CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+        if [ -n "$CLAUDE_BIN" ] && [ -x "$(dirname "$CLAUDE_BIN")/npm" ]; then
+            NPM_BIN="$(dirname "$CLAUDE_BIN")/npm"
+        else
+            NPM_BIN="$(command -v npm 2>/dev/null || true)"
+        fi
+        if [ -z "$NPM_BIN" ]; then
+            echo '{"ok": false, "action": "update-cc", "error": "npm not found"}' >&2
+            exit 1
+        fi
+        if ! sudo -n true 2>/dev/null; then
+            echo '{"ok": false, "action": "update-cc", "error": "passwordless sudo unavailable"}' >&2
+            exit 1
+        fi
+        # Package name is hardcoded — never derived from input. PATH is passed
+        # through sudo because npm is often nvm-managed (matches host-setup.sh).
+        if ! sudo -n env "PATH=$PATH" "$NPM_BIN" install -g "@anthropic-ai/claude-code@${VERSION}" >/dev/null 2>&1; then
+            echo '{"ok": false, "action": "update-cc", "error": "npm install failed"}' >&2
+            exit 1
+        fi
+        # Verify: the in-use claude must now report exactly the requested version.
+        INSTALLED="$(claude --version 2>/dev/null || echo unknown)"
+        INSTALLED_VER="$(printf '%s' "$INSTALLED" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)"
+        if [ "$INSTALLED_VER" = "$VERSION" ]; then
+            printf '{"ok": true, "action": "update-cc", "version": "%s", "installed": "%s"}\n' "$VERSION" "$INSTALLED"
+        else
+            printf '{"ok": false, "action": "update-cc", "error": "version mismatch after install", "requested": "%s", "installed": "%s"}\n' "$VERSION" "$INSTALLED" >&2
+            exit 1
+        fi
         ;;
     ping)
         echo '{"ok": true, "action": "ping"}'
