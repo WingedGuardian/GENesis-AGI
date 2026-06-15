@@ -68,6 +68,27 @@ async def call_sites(
         return {}
 
     result = {}
+
+    # Pre-fetch recent routing-failure events ONCE, then bucket by call site in
+    # memory below. Previously this ran a per-site `message LIKE '%site_id%'`
+    # query — ~one non-indexable full scan of `events` PER call site (~30 scans
+    # per snapshot). That was the dominant cost making /api/genesis/health take
+    # 4-5s and hang under DB contention. One scan instead of N.
+    failure_events: list[tuple] = []
+    if db:
+        try:
+            cutoff = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+            async with db.execute(
+                "SELECT message, created_at FROM events "
+                "WHERE event_type IN "
+                "('all_exhausted', 'provider.fallback', 'breaker.tripped') "
+                "AND created_at >= ?",
+                (cutoff,),
+            ) as cursor:
+                failure_events = await cursor.fetchall()
+        except sqlite3.Error:
+            logger.debug("routing-failure events pre-fetch failed", exc_info=True)
+
     for site_id, site_cfg in routing_config.call_sites.items():
         chain_health = []
         first_closed = None
@@ -133,25 +154,15 @@ async def call_sites(
 
         recent_failures = 0
         last_failure_at: str | None = None
-        if db and status in ("healthy", "degraded"):
-            try:
-                cutoff = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
-                async with db.execute(
-                    "SELECT COUNT(*), MAX(created_at) FROM events "
-                    "WHERE event_type IN "
-                    "('all_exhausted', 'provider.fallback', 'breaker.tripped') "
-                    "AND message LIKE ? "
-                    "AND created_at >= ?",
-                    (f"%{site_id}%", cutoff),
-                ) as cursor:
-                    row = await cursor.fetchone()
-                    if row and row[0] > 0:
-                        recent_failures = row[0]
-                        last_failure_at = row[1]
-                        if status == "healthy" and last_failure_at:
-                            status = "warning"
-            except sqlite3.Error:
-                logger.debug("DB query failed for failure check on %s", site_id, exc_info=True)
+        if status in ("healthy", "degraded") and failure_events:
+            # Bucket the pre-fetched events by site_id — same substring match as
+            # the old per-site LIKE, done in memory (no per-site DB query).
+            matched = [c for (m, c) in failure_events if site_id in (m or "")]
+            if matched:
+                recent_failures = len(matched)
+                last_failure_at = max(matched)
+                if status == "healthy":
+                    status = "warning"
 
         site_data: dict = {
             "status": status,
