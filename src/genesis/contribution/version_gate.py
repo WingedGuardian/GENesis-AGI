@@ -350,8 +350,7 @@ async def _call_llm(prompt: str, model: str) -> str:
 async def _record_to_monitor(model: str, response_text: str | None, *, success: bool) -> None:
     """Best-effort recording to neural monitor. Never raises."""
     try:
-        import aiosqlite
-
+        from genesis.db.connection import get_raw_db
         from genesis.env import genesis_db_path
         from genesis.observability.call_site_recorder import record_last_run
 
@@ -359,7 +358,7 @@ async def _record_to_monitor(model: str, response_text: str | None, *, success: 
         provider = model.split("/", 1)[0] if "/" in model else model
         model_id = model.split("/", 1)[1] if "/" in model else model
 
-        async with aiosqlite.connect(str(genesis_db_path())) as db:
+        async with get_raw_db(str(genesis_db_path())) as db:
             await record_last_run(
                 db, _CALL_SITE_ID,
                 provider=provider, model_id=model_id,

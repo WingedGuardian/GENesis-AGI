@@ -10,7 +10,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -247,6 +248,40 @@ async def get_db(path: str | Path = DEFAULT_DB_PATH) -> SerializedConnection:
         return conn
 
     return SerializedConnection(db, reconnect_fn=_reconnect)
+
+
+@asynccontextmanager
+async def get_raw_db(
+    path: str | Path = DEFAULT_DB_PATH,
+) -> AsyncIterator[aiosqlite.Connection]:
+    """Open a plain aiosqlite connection with Genesis's standard pragmas.
+
+    For short-lived, **standalone** opens — MCP fallback paths and one-shot
+    reads/writes that own their own connection lifetime. Applies the same
+    contention-safe pragmas every connection should have: WAL, ``synchronous=
+    NORMAL`` (safe + standard with WAL), ``busy_timeout`` (so a concurrent write
+    lock waits instead of failing immediately with "database is locked"), and a
+    ``Row`` factory.
+
+    Unlike :func:`get_db` this is **not** a :class:`SerializedConnection` — it
+    has no cross-coroutine lock, so use it only for connections that are not
+    shared across coroutines. Yields the connection and closes it on exit.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = await aiosqlite.connect(str(path))
+    try:
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA synchronous=NORMAL")
+        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # NOTE: intentionally NOT setting `foreign_keys=ON` here (get_db does).
+        # These standalone sites never enforced FKs before, and none touch
+        # FK-cascading tables. If a future caller needs cascade deletes, enable
+        # it explicitly rather than relying on this helper.
+        yield db
+    finally:
+        await db.close()
 
 
 async def init_db(path: str | Path = DEFAULT_DB_PATH) -> SerializedConnection:

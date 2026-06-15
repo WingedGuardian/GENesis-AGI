@@ -243,7 +243,7 @@ def main() -> None:
             _db_path_l0 = Path.home() / "genesis" / "data" / "genesis.db"
             if _db_path_l0.exists():
                 async def _load_l0():
-                    async with aiosqlite.connect(str(_db_path_l0)) as db:
+                    async with aiosqlite.connect(str(_db_path_l0), timeout=2) as db:
                         db.row_factory = aiosqlite.Row
                         cursor = await db.execute(
                             "SELECT package, COUNT(*) as modules, SUM(loc) as loc "
