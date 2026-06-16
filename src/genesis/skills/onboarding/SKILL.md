@@ -195,7 +195,16 @@ are, not asking for keys. Let the user choose their comfort level.
 
 4. Write `GENESIS_BACKUP_REPO=<user>/genesis-backups` to `secrets.env`.
 
-5. Verify backup script can reach it: `git ls-remote https://github.com/<user>/genesis-backups.git`
+5. **Set the backup passphrase** (required for encryption):
+   - Check if `GENESIS_BACKUP_PASSPHRASE` is already set in `secrets.env`.
+   - If not set, generate one: `openssl rand -base64 32`
+   - Write the output as `GENESIS_BACKUP_PASSPHRASE=<value>` to `secrets.env`.
+   - **Critical: store this passphrase in a password manager off-machine.**
+     Backups are AES-256 encrypted with this key. If this machine dies and
+     the passphrase only lives in `secrets.env`, the backups cannot be
+     decrypted. There is no recovery without it.
+
+6. Verify backup script can reach it: `git ls-remote https://github.com/<user>/genesis-backups.git`
 
 ---
 
