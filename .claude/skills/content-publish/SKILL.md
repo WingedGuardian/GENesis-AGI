@@ -184,6 +184,13 @@ Store the outcome in memory:
 - `memory_store` with tags: `["content", "published", "medium"]`
 - Content: topic, URL, date, any engagement data later
 
+Append to the Discord campaign showcase pool so the next campaign tick
+can reference this article:
+- File: `~/.genesis/campaigns/discord-engagement/showcase-pool.md`
+- Append under `## Published Medium Articles` with today's date, title,
+  and a 2-3 line summary of the article's argument/angle
+- The campaign session uses this as safe public content to share
+
 ## Error Handling
 
 | Error | Action |
