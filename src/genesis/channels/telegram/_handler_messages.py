@@ -18,6 +18,7 @@ from genesis.channels import stt
 from genesis.channels.telegram._handler_helpers import (
     _format_error,
     _reply_formatted,
+    interrupt_key,
 )
 from genesis.channels.telegram.transport.streaming import DraftStreamer, generate_draft_id
 from genesis.channels.telegram.transport.update_dedupe import message_key
@@ -234,6 +235,7 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
             channel=ChannelType.TELEGRAM,
             on_event=on_event,
             thread_id=tid,
+            session_key=interrupt_key(*ikey),
         )
         log.info("Response to %s (%d chars)", user.id, len(response or ""))
 
@@ -416,6 +418,7 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
             channel=ChannelType.TELEGRAM,
             on_event=on_event,
             thread_id=tid,
+            session_key=interrupt_key(*ikey),
         )
         log.info("Voice response to %s (%d chars)", user.id, len(response or ""))
 
@@ -603,6 +606,7 @@ async def _handle_media_inner(
             channel=ChannelType.TELEGRAM,
             on_event=on_event,
             thread_id=tid,
+            session_key=interrupt_key(*ikey),
         )
         log.info("Media response to %s (%d chars)", user.id, len(response or ""))
 

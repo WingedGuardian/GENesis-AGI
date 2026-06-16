@@ -70,9 +70,14 @@ class ConversationLoop:
         self._default_effort = default_effort
         self._session_locks: dict[str, asyncio.Lock] = {}
 
-    async def interrupt(self) -> None:
-        """Send interrupt (SIGINT) to the active CC subprocess, if any."""
-        await self._invoker.interrupt()
+    async def interrupt(self, key: str | None = None) -> None:
+        """Send interrupt (SIGINT) to a session's CC subprocess, if any.
+
+        With ``key``, targets that session's proc (so `/stop` hits the user's
+        session, not a concurrent background one); without it, the invoker
+        targets the most-recently-spawned live proc (back-compat).
+        """
+        await self._invoker.interrupt(key)
 
     def _get_lock(self, session_id: str) -> asyncio.Lock:
         """Return (or create) the per-session serialization lock.
@@ -301,8 +306,13 @@ class ConversationLoop:
         channel: ChannelType,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
         thread_id: str | None = None,
+        session_key: str | None = None,
     ) -> str:
-        """Like handle_message but uses streaming for live progress."""
+        """Like handle_message but uses streaming for live progress.
+
+        ``session_key`` (opaque) is stamped on the CC invocation so a caller's
+        interrupt (Telegram /stop) targets this session's subprocess (cc-loop-01).
+        """
         try:
             from genesis.runtime import GenesisRuntime
             rt = GenesisRuntime.instance()
@@ -448,6 +458,7 @@ class ConversationLoop:
                 resume_session_id=resume_id,
                 skip_permissions=True,
                 append_system_prompt=True,
+                session_key=session_key,
             )
 
             try:
@@ -594,7 +605,7 @@ class ConversationLoop:
             )
             fresh_inv = await self._build_fresh_invocation(
                 prompt_text, model=model, effort=effort,
-                session_id=session["id"],
+                session_id=session["id"], session_key=invocation.session_key,
             )
             # Retry — if this also fails, the exception propagates to caller
             output = await self._invoker.run(fresh_inv)
@@ -629,7 +640,7 @@ class ConversationLoop:
             )
             fresh_inv = await self._build_fresh_invocation(
                 prompt_text, model=model, effort=effort,
-                session_id=session["id"],
+                session_id=session["id"], session_key=invocation.session_key,
             )
             output = await self._invoker.run_streaming(fresh_inv, on_event=on_event)
             return output, session
@@ -641,6 +652,7 @@ class ConversationLoop:
         model: CCModel,
         effort: EffortLevel,
         session_id: str | None = None,
+        session_key: str | None = None,
     ) -> CCInvocation:
         """Build a fresh invocation (with system prompt, no resume)."""
         system_prompt = await self._assembler.assemble(
@@ -656,6 +668,7 @@ class ConversationLoop:
             resume_session_id=None,
             skip_permissions=True,
             append_system_prompt=True,
+            session_key=session_key,  # cc-loop-01: keep /stop working on retry
         )
 
     async def _recover_stale_resume(

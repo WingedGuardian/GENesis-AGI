@@ -27,10 +27,21 @@ Here are recent triage-related observations from the last 24 hours:
 Current calibration file:
 {current_calibration}
 
+## Bias Correction (mandatory — keep this principle in EVERY regeneration)
+Corrections, frustration, and identified mistakes are MORE valuable for learning than
+smooth interactions. A user correction or expressed frustration is WORTH_THINKING (2) or
+higher. Smooth, happy interactions are QUICK_NOTE (1) unless they contain genuinely novel
+technical information. Do NOT inflate depth because the user praised the response — praise
+signals satisfaction, not learning value.
+
 Your task:
 1. Review the observations for under-classification (depth too low) and over-classification (depth too high).
 2. Generate updated few-shot examples and calibration rules.
 3. You MUST produce at least 5 examples covering depths 0 through 4.
+4. You MUST include at least one example of user PRAISE/satisfaction scored as depth 1 (not
+   inflated) AND at least one example of a user CORRECTION or FRUSTRATION scored as depth 2 or
+   higher. Include one rule beginning "BIAS RULE:" stating that praise alone does not raise
+   depth and that corrections/frustration are depth 2 or higher.
 
 Respond with ONLY a JSON object (no markdown fencing) with this structure:
 {{
@@ -45,6 +56,15 @@ Respond with ONLY a JSON object (no markdown fencing) with this structure:
 
 _MIN_EXAMPLES = 5
 _REQUIRED_DEPTHS = {0, 1, 2, 3, 4}
+
+# Fixed bias-correction invariant (mirrors the classifier's hardcoded bias block).
+# Injected into a regenerated calibration's rules when the model omits it, so the
+# principle is always present without rejecting valid adaptive output.
+_CANONICAL_BIAS_RULE = (
+    "BIAS RULE: User frustration or correction = WORTH_THINKING (2) minimum. "
+    "User praise or satisfaction = QUICK_NOTE (1) unless genuinely novel "
+    "information is present."
+)
 
 
 class TriageCalibrator:
@@ -174,6 +194,14 @@ class TriageCalibrator:
         rules = data.get("rules", [])
         source_model = data.get("source_model", "unknown")
 
+        # Defensive: the model returns arbitrary JSON. Guard against non-list
+        # examples/rules (e.g. null) so a malformed response fails gracefully
+        # (skip + keep the current file) rather than raising into the daily job.
+        if not isinstance(examples, list) or not isinstance(rules, list):
+            logger.warning("Calibration JSON had non-list examples/rules — skipping")
+            return None
+        rules = [r for r in rules if isinstance(r, str)]
+
         if len(examples) < _MIN_EXAMPLES:
             logger.warning("Too few examples: %d < %d", len(examples), _MIN_EXAMPLES)
             return None
@@ -183,6 +211,18 @@ class TriageCalibrator:
             missing = _REQUIRED_DEPTHS - depths_covered
             logger.warning("Missing depth coverage: %s", missing)
             return None
+
+        # The bias-correction rule is a fixed invariant we own (it mirrors the
+        # classifier's hardcoded bias block). Don't reject otherwise-valid adaptive
+        # output for omitting it — guarantee it by appending the canonical rule when
+        # the model didn't supply one, so the daily example-tuning still lands.
+        has_bias_rule = any(
+            isinstance(r, str) and r.strip().lower().startswith("bias rule")
+            for r in rules
+        )
+        if not has_bias_rule:
+            rules = [*rules, _CANONICAL_BIAS_RULE]
+            logger.info("Calibration lacked a BIAS RULE — injected the canonical rule")
 
         return CalibrationRules(
             examples=examples,
@@ -198,6 +238,8 @@ class TriageCalibrator:
 
         lines = [
             "---",
+            # TODO(triage-calibration C): derive/bump the version instead of hardcoding
+            # "1.0" so a regeneration doesn't silently reset a curated version bump.
             'version: "1.0"',
             "description: >",
             "  Few-shot calibration examples for the triage classifier.",

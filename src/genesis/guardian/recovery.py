@@ -131,6 +131,7 @@ class RecoveryEngine:
             snapshot = await collect_all_signals(self._config)
             if snapshot.all_alive:
                 self._sm.set_recovered()
+                self._sm.clear_down_alert_sent()  # GUARD-R2-01: episode over
                 await self._dispatcher.send(Alert(
                     severity=AlertSeverity.INFO,
                     title=f"Recovery successful: {action.value}",

@@ -69,6 +69,7 @@ class StateData:
     sentinel_state: str = ""  # Latest Sentinel state from dialogue response
     cc_unavailable_since: str | None = None
     last_cc_unavailable_alert_at: str | None = None
+    down_alert_sent: bool = False  # GUARD-R2-01: one "down" alert per episode (no storm)
     auto_reset_count: int = 0  # Oscillation guard for confirmed_dead timeout
     last_recovery_at: str | None = None  # ISO8601 timestamp of last recovery attempt
     io_triage_attempts: int = 0  # Separate counter for IO_TRIAGE (low-risk, repeatable)
@@ -93,6 +94,7 @@ class StateData:
             "sentinel_state": self.sentinel_state,
             "cc_unavailable_since": self.cc_unavailable_since,
             "last_cc_unavailable_alert_at": self.last_cc_unavailable_alert_at,
+            "down_alert_sent": self.down_alert_sent,
             "auto_reset_count": self.auto_reset_count,
             "last_recovery_at": self.last_recovery_at,
             "io_triage_attempts": self.io_triage_attempts,
@@ -123,6 +125,7 @@ class StateData:
             sentinel_state=data.get("sentinel_state", ""),
             cc_unavailable_since=data.get("cc_unavailable_since"),
             last_cc_unavailable_alert_at=data.get("last_cc_unavailable_alert_at"),
+            down_alert_sent=data.get("down_alert_sent", False),
             auto_reset_count=data.get("auto_reset_count", 0),
             last_recovery_at=data.get("last_recovery_at"),
             io_triage_attempts=data.get("io_triage_attempts", 0),
@@ -705,6 +708,20 @@ class ConfirmationStateMachine:
     def record_cc_unavailable_alert(self) -> None:
         """Record that we sent a CC-unavailable alert."""
         self._state.last_cc_unavailable_alert_at = datetime.now(UTC).isoformat()
+
+    def mark_down_alert_sent(self) -> None:
+        """Record that the one-per-episode 'down' alert has been sent (GUARD-R2-01).
+
+        Gates re-diagnosis/re-alert in CONFIRMED_DEAD so a downed-and-stays-down
+        container produces ONE down notification, not a 30s storm. Persisted in
+        state.json (each tick is a fresh oneshot process). Cleared only on genuine
+        recovery — NOT in _reset_to_healthy, which auto-reset also calls.
+        """
+        self._state.down_alert_sent = True
+
+    def clear_down_alert_sent(self) -> None:
+        """Clear the down-alert flag — called by check.py on genuine recovery only."""
+        self._state.down_alert_sent = False
 
     def should_escalate(self) -> bool:
         """Check if we've exceeded max recovery attempts."""

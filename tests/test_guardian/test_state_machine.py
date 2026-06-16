@@ -16,6 +16,7 @@ from genesis.guardian.health_signals import (
 from genesis.guardian.state_machine import (
     ConfirmationStateMachine,
     GuardianState,
+    StateData,
 )
 
 
@@ -393,3 +394,43 @@ class TestCCUnavailabilityTracking:
         sm2.load_state(state_file)
         assert sm2.state.cc_unavailable_since == sm.state.cc_unavailable_since
         assert sm2.state.last_cc_unavailable_alert_at == sm.state.last_cc_unavailable_alert_at
+
+
+class TestDownAlertFlag:
+    """GUARD-R2-01 — the per-episode 'down alert already sent' flag (alert once)."""
+
+    def test_defaults_false(self, sm: ConfirmationStateMachine) -> None:
+        assert sm.state.down_alert_sent is False
+
+    def test_mark_and_clear(self, sm: ConfirmationStateMachine) -> None:
+        sm.mark_down_alert_sent()
+        assert sm.state.down_alert_sent is True
+        sm.clear_down_alert_sent()
+        assert sm.state.down_alert_sent is False
+
+    def test_persists_across_save_load(
+        self, config: GuardianConfig, tmp_path: Path,
+    ) -> None:
+        """The flag MUST survive between oneshot invocations (state.json)."""
+        sm = ConfirmationStateMachine(config)
+        sm.mark_down_alert_sent()
+        state_file = tmp_path / "state.json"
+        sm.save_state(state_file)
+
+        sm2 = ConfirmationStateMachine(config)
+        sm2.load_state(state_file)
+        assert sm2.state.down_alert_sent is True
+
+    def test_defaults_false_for_legacy_state(self) -> None:
+        """Old state.json without the key loads as False (backward compatible)."""
+        sd = StateData.from_dict({"current_state": "confirmed_dead"})
+        assert sd.down_alert_sent is False
+
+    def test_not_cleared_by_reset_to_healthy(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        """_reset_to_healthy (shared by auto-reset) must NOT clear the flag —
+        that would let auto-reset oscillation re-enable the storm."""
+        sm.mark_down_alert_sent()
+        sm._reset_to_healthy("2026-06-16T00:00:00+00:00")
+        assert sm.state.down_alert_sent is True

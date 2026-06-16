@@ -91,6 +91,23 @@ class TestRecoveryRestart:
         assert result.action == RecoveryAction.RESTART_SERVICES
 
     @pytest.mark.asyncio
+    async def test_successful_recovery_clears_down_alert_flag(
+        self, engine: RecoveryEngine
+    ) -> None:
+        """GUARD-R2-01: a successful recovery clears the down-alert flag so the
+        next down-episode is not suppressed."""
+        engine._sm.mark_down_alert_sent()
+        with (
+            patch("genesis.guardian.recovery._run_subprocess", _mock_subprocess(0, "")),
+            patch("genesis.guardian.recovery.collect_all_signals", return_value=_healthy_snapshot()),
+            patch.object(engine._snapshots, "take", return_value="pre-recovery"),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = await engine.execute(_diagnosis(RecoveryAction.RESTART_SERVICES))
+        assert result.success is True
+        assert engine._sm.state.down_alert_sent is False
+
+    @pytest.mark.asyncio
     async def test_restart_services_failure(self, engine: RecoveryEngine) -> None:
         with (
             patch("genesis.guardian.recovery._run_subprocess", _mock_subprocess(1, "", "failed")),
