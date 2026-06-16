@@ -102,10 +102,17 @@ curate) × **whose voice** (user's [default] / stealth, see Stealth Mode).
 2. **Load voice** — run the User Calibration Overlay resolution; pick 3-5
    exemplars by medium + tone + formality + domain. (Quick Mode skips this and
    uses internalized markers.)
-3. **Generate** — use exemplars as stylistic reference: match sentence
-   structure, vocabulary level, directness, and rough edges; do not copy their
-   content. Register scales with audience (see table); drop profanity at
-   formality 3 and above.
+3. **Generate** — use exemplars as a *stylistic* reference only: match sentence
+   structure, vocabulary level, directness, and rough edges. **Never copy their
+   content** — not sentences, claims, phrasings, or specifics; lift the rhythm,
+   never the substance. **On-topic trap:** if an exemplar happens to share the
+   task's topic, that is the single highest-risk case for accidental copying —
+   take its cadence and nothing else, because its facts are stale and not yours.
+   **Facts, numbers, dates, and durations come ONLY from the task input** — never
+   invent stale-able specifics (elapsed time like "four months building",
+   star/line/version counts, adoption stats); if a number isn't given, omit it.
+   Register scales with audience (see table); drop profanity at formality 3 and
+   above.
 4. **Hand off to medium skill** — if a downstream skill exists for the medium
    (e.g., linkedin-post-writer), hand the voice-loaded content off for
    medium-specific formatting.
