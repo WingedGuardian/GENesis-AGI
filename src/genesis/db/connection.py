@@ -237,6 +237,7 @@ async def get_db(path: str | Path = DEFAULT_DB_PATH) -> SerializedConnection:
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA foreign_keys=ON")
     await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
 
     # Build reconnect closure (SQLite-specific; replace for PostgreSQL)
     async def _reconnect() -> aiosqlite.Connection:
@@ -245,6 +246,7 @@ async def get_db(path: str | Path = DEFAULT_DB_PATH) -> SerializedConnection:
         await conn.execute("PRAGMA journal_mode=WAL")
         await conn.execute("PRAGMA foreign_keys=ON")
         await conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        await conn.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
         return conn
 
     return SerializedConnection(db, reconnect_fn=_reconnect)
@@ -275,6 +277,7 @@ async def get_raw_db(
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
         await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
         # NOTE: intentionally NOT setting `foreign_keys=ON` here (get_db does).
         # These standalone sites never enforced FKs before, and none touch
         # FK-cascading tables. If a future caller needs cascade deletes, enable

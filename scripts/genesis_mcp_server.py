@@ -149,6 +149,7 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
         try:
 
             # Bootstrap standalone router for LLM-dependent tools
@@ -237,6 +238,7 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
 
         try:
 
@@ -279,6 +281,7 @@ def _bootstrap_recon(transport_kwargs: dict) -> None:
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
 
         try:
 
@@ -324,6 +327,7 @@ def _bootstrap_outreach(transport_kwargs: dict) -> None:
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
 
         try:
             # Standalone: pipeline=None means outreach_send returns "not initialized".
