@@ -74,7 +74,7 @@ async def test_bogus_status_still_rejected(tmp_path) -> None:
         await mod.up(conn)
         await conn.commit()
 
-        with pytest.raises(Exception):
+        with pytest.raises(aiosqlite.IntegrityError):
             await conn.execute("""
                 INSERT INTO update_history
                     (id, old_tag, new_tag, old_commit, new_commit, status,
