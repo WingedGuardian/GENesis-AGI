@@ -51,7 +51,8 @@ def init_health_mcp(
     if activity_tracker is not None:
         from genesis.observability.mcp_middleware import InstrumentationMiddleware
 
-        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "health"))
+        # service._db is the long-lived health connection (set in init_health_mcp's caller)
+        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "health", db=service._db))
 
     logger.info("Health MCP wired to HealthDataService")
 

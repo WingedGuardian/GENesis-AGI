@@ -203,3 +203,30 @@ async def test_get_raw_db_closes_on_exit(tmp_path):
     # a private attribute).
     with pytest.raises(ValueError):
         await captured.execute("SELECT 1")
+
+
+# ── get_db foreign_keys param (WS-15 follow-up: long-lived MCP connections) ──
+
+async def test_get_db_enforces_foreign_keys_by_default(tmp_path):
+    """get_db() defaults to FK enforcement — runtime behavior unchanged."""
+    from genesis.db.connection import get_db
+
+    db = await get_db(tmp_path / "fk_on.db")
+    try:
+        cur = await db.execute("PRAGMA foreign_keys")
+        assert (await cur.fetchone())[0] == 1
+    finally:
+        await db.close()
+
+
+async def test_get_db_foreign_keys_opt_out(tmp_path):
+    """get_db(foreign_keys=False) leaves FK off — preserves the legacy behavior
+    of the long-lived MCP connections, which never enforced FK."""
+    from genesis.db.connection import get_db
+
+    db = await get_db(tmp_path / "fk_off.db", foreign_keys=False)
+    try:
+        cur = await db.execute("PRAGMA foreign_keys")
+        assert (await cur.fetchone())[0] == 0
+    finally:
+        await db.close()

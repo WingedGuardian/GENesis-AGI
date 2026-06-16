@@ -141,15 +141,12 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
 
     @asynccontextmanager
     async def _lifespan(server) -> AsyncIterator[None]:
-        import aiosqlite
+        from genesis.db.connection import get_db
 
-        from genesis.db.connection import BUSY_TIMEOUT_MS
-
-        db = await aiosqlite.connect(str(_DEFAULT_DB))
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
+        # Long-lived shared connection: use the SerializedConnection (get_db) so
+        # concurrent tool calls can't interleave-wedge the transaction state.
+        # foreign_keys=False preserves the prior raw-connection behavior.
+        db = await get_db(_DEFAULT_DB, foreign_keys=False)
         try:
 
             # Bootstrap standalone router for LLM-dependent tools
@@ -227,18 +224,15 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
 
     @asynccontextmanager
     async def _lifespan(server) -> AsyncIterator[None]:
-        import aiosqlite
         from qdrant_client import QdrantClient
 
-        from genesis.db.connection import BUSY_TIMEOUT_MS
+        from genesis.db.connection import get_db
         from genesis.mcp.memory_mcp import init
         from genesis.memory.embeddings import EmbeddingProvider
+        from genesis.observability.provider_activity import ProviderActivityTracker
 
-        db = await aiosqlite.connect(str(_DEFAULT_DB))
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
+        # Long-lived shared connection via SerializedConnection (see _bootstrap_health).
+        db = await get_db(_DEFAULT_DB, foreign_keys=False)
 
         try:
 
@@ -252,7 +246,14 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
 
             qdrant = QdrantClient(url=qdrant_url(), timeout=5)
             embedding = EmbeddingProvider()
-            init(db=db, qdrant_client=qdrant, embedding_provider=embedding)
+            # The activity tracker enables InstrumentationMiddleware, which also
+            # runs the per-call commit/rollback boundary that releases read
+            # snapshots (WS-15 follow-up). Without a tracker the middleware — and
+            # thus the boundary — never attaches.
+            tracker = ProviderActivityTracker()
+            tracker.set_db(db)
+            init(db=db, qdrant_client=qdrant, embedding_provider=embedding,
+                 activity_tracker=tracker)
             clear_mcp_crash("memory")
             yield
         finally:
@@ -272,16 +273,12 @@ def _bootstrap_recon(transport_kwargs: dict) -> None:
 
     @asynccontextmanager
     async def _lifespan(server) -> AsyncIterator[None]:
-        import aiosqlite
-
-        from genesis.db.connection import BUSY_TIMEOUT_MS
+        from genesis.db.connection import get_db
         from genesis.mcp.recon_mcp import init_recon_mcp
+        from genesis.observability.provider_activity import ProviderActivityTracker
 
-        db = await aiosqlite.connect(str(_DEFAULT_DB))
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
+        # Long-lived shared connection via SerializedConnection (see _bootstrap_health).
+        db = await get_db(_DEFAULT_DB, foreign_keys=False)
 
         try:
 
@@ -293,7 +290,11 @@ def _bootstrap_recon(transport_kwargs: dict) -> None:
             else:
                 create_standalone_router()
 
-            init_recon_mcp(db=db)
+            # Tracker enables InstrumentationMiddleware + its read-snapshot
+            # boundary (WS-15 follow-up) — see _bootstrap_memory.
+            tracker = ProviderActivityTracker()
+            tracker.set_db(db)
+            init_recon_mcp(db=db, activity_tracker=tracker)
             clear_mcp_crash("recon")
             yield
         finally:
@@ -318,16 +319,12 @@ def _bootstrap_outreach(transport_kwargs: dict) -> None:
 
     @asynccontextmanager
     async def _lifespan(server) -> AsyncIterator[None]:
-        import aiosqlite
-
-        from genesis.db.connection import BUSY_TIMEOUT_MS
+        from genesis.db.connection import get_db
         from genesis.mcp.outreach_mcp import init_outreach_mcp
+        from genesis.observability.provider_activity import ProviderActivityTracker
 
-        db = await aiosqlite.connect(str(_DEFAULT_DB))
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
+        # Long-lived shared connection via SerializedConnection (see _bootstrap_health).
+        db = await get_db(_DEFAULT_DB, foreign_keys=False)
 
         try:
             # Standalone: pipeline=None means outreach_send returns "not initialized".
@@ -340,7 +337,14 @@ def _bootstrap_outreach(transport_kwargs: dict) -> None:
             else:
                 create_standalone_router()
 
-            init_outreach_mcp(pipeline=None, engagement=None, config=None, db=db)
+            # Tracker enables InstrumentationMiddleware + its read-snapshot
+            # boundary (WS-15 follow-up) — see _bootstrap_memory.
+            tracker = ProviderActivityTracker()
+            tracker.set_db(db)
+            init_outreach_mcp(
+                pipeline=None, engagement=None, config=None, db=db,
+                activity_tracker=tracker,
+            )
             clear_mcp_crash("outreach")
             yield
         finally:

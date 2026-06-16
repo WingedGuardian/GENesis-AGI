@@ -222,31 +222,40 @@ class SerializedConnection:
         pass
 
 
-async def get_db(path: str | Path = DEFAULT_DB_PATH) -> SerializedConnection:
+async def get_db(
+    path: str | Path = DEFAULT_DB_PATH,
+    *,
+    foreign_keys: bool = True,
+) -> SerializedConnection:
     """Open a connection to the Genesis SQLite database.
 
-    Enables WAL mode and foreign keys.  Returns a SerializedConnection
-    that prevents concurrent coroutine interleaving.
+    Enables WAL mode and (by default) foreign keys.  Returns a
+    SerializedConnection that prevents concurrent coroutine interleaving.
     Caller is responsible for closing.
+
+    Set ``foreign_keys=False`` for the long-lived MCP server connections, which
+    historically opened raw connections without FK enforcement — keeping FK off
+    avoids surprising them with newly-enforced constraints (turning it on is a
+    deliberate, separate decision).
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    async def _configure(conn: aiosqlite.Connection) -> None:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode=WAL")
+        if foreign_keys:
+            await conn.execute("PRAGMA foreign_keys=ON")
+        await conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        await conn.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
+
     db = await aiosqlite.connect(str(path))
-    db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA journal_mode=WAL")
-    await db.execute("PRAGMA foreign_keys=ON")
-    await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-    await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
+    await _configure(db)
 
     # Build reconnect closure (SQLite-specific; replace for PostgreSQL)
     async def _reconnect() -> aiosqlite.Connection:
         conn = await aiosqlite.connect(str(path))
-        conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA journal_mode=WAL")
-        await conn.execute("PRAGMA foreign_keys=ON")
-        await conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        await conn.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
+        await _configure(conn)
         return conn
 
     return SerializedConnection(db, reconnect_fn=_reconnect)

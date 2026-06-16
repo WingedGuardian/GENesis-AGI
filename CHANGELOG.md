@@ -56,6 +56,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Memory storage no longer gets wedged on "database is locked"** — a
+  long-lived MCP database connection left read transactions open after read-only
+  tool calls, which pinned the SQLite write-ahead log (it could grow to
+  gigabytes on disk) and made `memory_store` / `reference_store` fail until a
+  restart. MCP tool calls now release their database snapshot at each call
+  boundary, and the MCP connections are serialized to prevent transaction-state
+  corruption — so writes keep working and the WAL stays bounded.
 - **Outreach emails actually send now** — email (and Discord/voice) outreach was
   being misaddressed to the Telegram forum chat for any category that routes to
   the supergroup, so every such send failed and silently piled up as retries.

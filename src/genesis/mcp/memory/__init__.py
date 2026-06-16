@@ -115,7 +115,7 @@ def init(
     if activity_tracker is not None:
         from genesis.observability.mcp_middleware import InstrumentationMiddleware
 
-        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "memory"))
+        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "memory", db=db))
 
 
 def _require_init() -> None:
