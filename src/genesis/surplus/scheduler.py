@@ -1189,7 +1189,7 @@ class SurplusScheduler:
     async def run_gitnexus_reindex(self) -> None:
         """Reindex the GitNexus code graph (Mon & Thu 5am UTC).
 
-        Runs ``gitnexus analyze --index-only`` as a subprocess.
+        Runs ``gitnexus analyze`` as a subprocess.
         CPU-only AST parsing, no ONNX/GPU (embeddings off by default).
         Incremental since GitNexus 1.6.5 — fast on unchanged repos.
         """
@@ -1213,12 +1213,27 @@ class SurplusScheduler:
         try:
             repo_root = str(Path.home() / "genesis")
             proc = await asyncio.create_subprocess_exec(
-                gitnexus, "analyze", "--index-only",
+                gitnexus, "analyze",
                 cwd=repo_root,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            try:
+                # 2-hour cap: gitnexus analyze is AST-only (no ONNX), but a
+                # cold full-repo pass can take minutes. Hanging indefinitely
+                # blocks the job slot (max_instances=1) forever.
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=7200
+                )
+            except TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                logger.error("GitNexus reindex timed out after 2h — killed")
+                with contextlib.suppress(Exception):
+                    GenesisRuntime.instance().record_job_failure(
+                        "gitnexus_reindex", "timed out after 2h",
+                    )
+                return
             if proc.returncode == 0:
                 logger.info("GitNexus reindex complete")
                 with contextlib.suppress(Exception):

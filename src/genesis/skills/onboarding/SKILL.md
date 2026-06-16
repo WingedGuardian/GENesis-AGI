@@ -195,7 +195,39 @@ are, not asking for keys. Let the user choose their comfort level.
 
 4. Write `GENESIS_BACKUP_REPO=<user>/genesis-backups` to `secrets.env`.
 
-5. Verify backup script can reach it: `git ls-remote https://github.com/<user>/genesis-backups.git`
+5. **Set the backup passphrase** (required for encryption):
+   - Check if `GENESIS_BACKUP_PASSPHRASE` is already set to a non-empty value in `secrets.env`.
+   - If not set, generate one: `openssl rand -base64 32`
+   - Write the output as `GENESIS_BACKUP_PASSPHRASE=<value>` to `secrets.env`.
+   - **Critical: store this passphrase in a password manager off-machine.**
+     Backups are AES-256 encrypted with this key. If this machine dies and
+     the passphrase only lives in `secrets.env`, the backups cannot be
+     decrypted. There is no recovery without it.
+
+6. Verify backup script can reach it: `git ls-remote https://github.com/<user>/genesis-backups.git`
+
+7. **Configure Tier 2 (large data).** GitHub (Tier 1) holds only small encrypted
+   text — memory, config, secrets. The large binaries (SQLite DB, Qdrant
+   snapshots, transcripts) are gitignored from GitHub and need a separate
+   target, or they stay **local-only (no off-machine backup)**. Ask the user:
+   - **NAS (SMB):** set `GENESIS_BACKUP_NAS=//host/share`,
+     `GENESIS_BACKUP_NAS_USER`, `GENESIS_BACKUP_NAS_PASS` in `secrets.env`
+     (requires `smbclient`).
+   - **No NAS:** allowed, but say so explicitly — the DB/Qdrant/transcripts will
+     NOT be replicated off-machine until a Tier 2 target is set. (A cloud option
+     via rclone is planned but not yet wired.)
+
+8. **Run one verify backup and confirm it succeeded** (do NOT proceed if it
+   fails): `bash "$HOME/genesis/scripts/backup.sh"`, then check
+   `~/.genesis/backup_status.json` shows `"success": true` (and
+   `"tier2_status": "ok"` if a NAS was configured).
+
+9. **Install the 6h backup cron — only after the verify run passed.** Add it if
+   absent (`crontab -l 2>/dev/null | grep -q 'backup\.sh'`):
+   `0 */6 * * * $HOME/genesis/scripts/backup.sh >> $HOME/genesis/logs/backup.log 2>&1`
+   (`mkdir -p $HOME/genesis/logs` first). This is done HERE, deliberately —
+   never auto-installed at bootstrap — so backups are an opt-in, verified setup,
+   not a switch flipped for every install.
 
 ---
 

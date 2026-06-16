@@ -410,3 +410,68 @@ async def test_surplus_submit_no_system_prompt(config, db, mock_drafter, mock_fo
     draft_request = mock_drafter.draft.call_args[0][0]
     assert draft_request.system_prompt is None
     assert draft_request.tone == "conversational"
+
+
+@pytest.mark.asyncio
+async def test_submit_to_email_scrubs_em_dash_end_to_end(config, db, mock_drafter):
+    """E2E through the pipeline: a send to an external channel (email) arrives
+    with the spaced em dash collapsed by the egress gate."""
+    email_adapter = AsyncMock()
+    email_adapter.send_message.return_value = "email-123"
+    formatter = MagicMock()
+    formatter.format.return_value = FormattedContent(
+        text="ship it — now", target=FormatTarget.EMAIL,
+    )
+    pipeline = OutreachPipeline(
+        governance=GovernanceGate(config, db),
+        drafter=mock_drafter,
+        formatter=formatter,
+        channels={"email": email_adapter},
+        db=db,
+        config=config,
+        recipients={"email": "prospect@example.com"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="t",
+        context="c",
+        salience_score=0.9,
+        signal_type="surplus_insight",
+        channel="email",
+    )
+    result = await pipeline.submit(req)
+    assert result.status == OutreachStatus.DELIVERED
+    sent_text = email_adapter.send_message.call_args.args[1]
+    assert sent_text == "ship it—now"  # em dash collapsed by the egress gate
+
+
+@pytest.mark.asyncio
+async def test_submit_to_email_quarantines_secret_end_to_end(config, db, mock_drafter):
+    """E2E: an external send carrying a secret is quarantined, never delivered."""
+    email_adapter = AsyncMock()
+    formatter = MagicMock()
+    formatter.format.return_value = FormattedContent(
+        text="the key is sk-abcdefghij1234567890ABCDXYZ",
+        target=FormatTarget.EMAIL,
+    )
+    pipeline = OutreachPipeline(
+        governance=GovernanceGate(config, db),
+        drafter=mock_drafter,
+        formatter=formatter,
+        channels={"email": email_adapter},
+        db=db,
+        config=config,
+        recipients={"email": "prospect@example.com"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="t",
+        context="c",
+        salience_score=0.9,
+        signal_type="surplus_insight",
+        channel="email",
+    )
+    result = await pipeline.submit(req)
+    assert result.status == OutreachStatus.FAILED
+    assert "quarantine" in (result.error or "").lower()
+    email_adapter.send_message.assert_not_called()

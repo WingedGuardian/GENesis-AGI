@@ -118,6 +118,25 @@ in any medium. Tier 1 words include "delve", "tapestry", "testament",
 "fostering", "garner", "interplay", "enduring", "vibrant", "crucial",
 "enhance".
 
+### Em dashes (hard rule)
+
+A spaced em dash (` — `) is the #1 AI punctuation tell. **Hard fail:** if
+` — ` appears anywhere in output, the audit failed. Never put spaces around an
+em dash. Prefer restructuring to a comma, period, colon, or semicolon; if an
+em dash is genuinely needed, use it unspaced (`word—word`). Max 1–2 per page,
+not per paragraph. Stacking them is an AI fingerprint.
+
+### Structural tells
+
+- Opening the first sentence with "I".
+- Three-part lists whose items share the exact same grammatical structure.
+- Uniform sentence length — vary it. Favor sentences under ~16 words but keep
+  the user's natural longer reasoning chains; don't flatten everything to one
+  rhythm.
+- Sycophantic acknowledgments before answering ("Great question", "Certainly",
+  "Absolutely").
+- Hedging openers ("It's worth considering that…", "It's important to note…").
+
 ---
 
 ## Professional / LinkedIn
