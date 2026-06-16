@@ -49,6 +49,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Claude Code hooks work from a git worktree again** — the hook launcher
+  located the Python venv via a `git worktree list | head` pipeline that, with
+  many worktrees, died on SIGPIPE under `set -o pipefail` and **silently
+  disabled every hook** (session activity capture, file/edit audit logging) when
+  you ran Claude Code from a worktree. It now resolves the main repo with
+  `git rev-parse --git-common-dir` (no pipe), so hooks fire reliably everywhere.
 - **Memory storage no longer gets wedged on "database is locked"** — a
   long-lived MCP database connection left read transactions open after read-only
   tool calls, which pinned the SQLite write-ahead log (it could grow to
