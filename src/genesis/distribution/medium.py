@@ -253,6 +253,14 @@ class MediumDistributor:
         title = _extract_title(content)
         body = _extract_body(content)
 
+        # Defense-in-depth: deterministic anti-slop scrub before publishing.
+        # The live Medium path is the content-publish CC skill (which scrubs at
+        # draft time); this guards the distributor if it is ever driven directly.
+        from genesis.content.antislop import scrub
+
+        title = scrub(title).cleaned_text
+        body = scrub(body).cleaned_text
+
         try:
             # Step 2: Navigate to new story
             result = await self._browser.navigate("https://medium.com/new-story")

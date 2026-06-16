@@ -195,17 +195,6 @@ def scrub(text: str, *, is_voiced: bool = True) -> ScrubResult:
     return ScrubResult(cleaned_text=cleaned, fixes_applied=fixes, flags=flags)
 
 
-def _render(text: str) -> str:
-    result = scrub(text)
-    lines = [
-        "fixes: " + (", ".join(result.fixes_applied) or "none"),
-        "flags: " + (", ".join(result.flags) or "none"),
-        "--- cleaned ---",
-        result.cleaned_text,
-    ]
-    return "\n".join(lines)
-
-
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
@@ -216,4 +205,9 @@ if __name__ == "__main__":
     else:
         with open(src, encoding="utf-8") as _fh:
             data = _fh.read()
-    print(_render(data))
+    result = scrub(data)
+    # Report to stderr; cleaned text to stdout so callers can pipe the result
+    # (e.g. `python -m genesis.content.antislop draft.md > draft.clean.md`).
+    print(f"fixes: {', '.join(result.fixes_applied) or 'none'}", file=sys.stderr)
+    print(f"flags: {', '.join(result.flags) or 'none'}", file=sys.stderr)
+    sys.stdout.write(result.cleaned_text)
