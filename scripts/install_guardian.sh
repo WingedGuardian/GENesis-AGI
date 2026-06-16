@@ -401,11 +401,35 @@ if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
     # tries to merge the repo's container CLAUDE.md over the Guardian version.
     if [ -d "$INSTALL_DIR/.git" ]; then
         cd "$INSTALL_DIR" && git update-index --skip-worktree CLAUDE.md 2>/dev/null || true
+    else
+        echo "  NOTE: $INSTALL_DIR/.git not found — CLAUDE.md skip-worktree not set"
+        echo "        (ok for a non-git deploy; a future 'git pull' here could overwrite CLAUDE.md)"
     fi
+
+    # D16: the diagnostic CC runs with cwd = cc.work_dir (see diagnosis.py), so the
+    # Guardian CLAUDE.md must live there to be auto-loaded as project context — the
+    # install-dir copy is never seen by that CC session. Symlink so it tracks every
+    # regeneration of the install-dir CLAUDE.md (install + gateway update/redeploy).
+    _gd_work_dir="/var/lib/guardian-snapshots/cc-sessions"   # = guardian.yaml cc.work_dir default
+    if [ ! -d "$_gd_work_dir" ]; then
+        if sudo -n true 2>/dev/null; then
+            sudo mkdir -p "$_gd_work_dir" \
+                && sudo chown "$(id -un):$(id -gn)" "$_gd_work_dir" "$(dirname "$_gd_work_dir")" 2>/dev/null || true
+        else
+            mkdir -p "$_gd_work_dir" 2>/dev/null || true
+        fi
+    fi
+    if [ -d "$_gd_work_dir" ]; then
+        ln -sf "$INSTALL_DIR/CLAUDE.md" "$_gd_work_dir/CLAUDE.md" \
+            && echo "  + Guardian CLAUDE.md linked into work_dir ($_gd_work_dir)" \
+            || echo "  WARN: could not link CLAUDE.md into $_gd_work_dir"
+    else
+        echo "  WARN: work_dir $_gd_work_dir absent — diagnostic CC won't load the Guardian CLAUDE.md"
+    fi
+    echo "  CLAUDE.md generated"
 else
     echo "  WARNING: config/guardian-claude.md not found — CLAUDE.md not generated"
 fi
-echo "  CLAUDE.md generated"
 
 # ── Step 8: Install systemd units ─────────────────────────────────────
 
