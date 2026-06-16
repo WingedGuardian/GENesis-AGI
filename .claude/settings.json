@@ -251,6 +251,11 @@
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_stop_hook.py",
                         "timeout": 2000
+                    },
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/deliverable_gate_guard.py",
+                        "timeout": 2000
                     }
                 ]
             }
