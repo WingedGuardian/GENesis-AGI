@@ -183,6 +183,21 @@ async def outreach_poll(
         except Exception:
             logger.debug("Poll dedup check failed, proceeding", exc_info=True)
 
+    # Egress gate (Discord = external audience): this path posts straight to the
+    # webhook, bypassing OutreachPipeline._deliver, so scrub anti-slop + PII-scan
+    # here too. Em-dash auto-fixed; quarantine if the question leaks secrets.
+    from genesis.content.egress import gate as _egress_gate
+
+    q_eg = _egress_gate(question, channel="discord", category="content")
+    if q_eg.quarantined:
+        return json.dumps(
+            {"error": f"Poll content scan quarantine: {q_eg.scan.detected}"}
+        )
+    question = q_eg.text
+    answers = [
+        _egress_gate(a, channel="discord", category="content").text for a in answers
+    ]
+
     url = f"{webhook_url}?wait=true"
     payload = {
         "poll": {
