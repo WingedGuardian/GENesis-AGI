@@ -188,15 +188,17 @@ async def outreach_poll(
     # here too. Em-dash auto-fixed; quarantine if the question leaks secrets.
     from genesis.content.egress import gate as _egress_gate
 
-    q_eg = _egress_gate(question, channel="discord", category="content")
-    if q_eg.quarantined:
-        return json.dumps(
-            {"error": f"Poll content scan quarantine: {q_eg.scan.detected}"}
-        )
-    question = q_eg.text
-    answers = [
-        _egress_gate(a, channel="discord", category="content").text for a in answers
+    gated = [
+        _egress_gate(t, channel="discord", category="content")
+        for t in (question, *answers)
     ]
+    for g in gated:
+        if g.quarantined:
+            return json.dumps(
+                {"error": f"Poll content scan quarantine: {g.scan.detected}"}
+            )
+    question = gated[0].text
+    answers = [g.text for g in gated[1:]]
 
     url = f"{webhook_url}?wait=true"
     payload = {

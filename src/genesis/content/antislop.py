@@ -174,12 +174,20 @@ def scrub(text: str, *, is_voiced: bool = True) -> ScrubResult:
     isn't flagged.
     """
     fixes: list[str] = []
-    n_em = len(_FIX_EMDASH.findall(_prose_only(text)))
-    if n_em:
-        cleaned = _map_prose(text, lambda s: _FIX_EMDASH.sub("—", s))
-        fixes.append(f"spaced_em_dash:{n_em}")
-    else:
-        cleaned = text
+    em_count = 0
+
+    def _fix_dashes(span: str) -> str:
+        # Count during the per-span rewrite so fixes_applied always equals what
+        # was actually changed (counting on _prose_only would over-report em
+        # dashes that abut code-region boundaries and never get rewritten).
+        nonlocal em_count
+        new, n = _FIX_EMDASH.subn("—", span)
+        em_count += n
+        return new
+
+    cleaned = _map_prose(text, _fix_dashes)
+    if em_count:
+        fixes.append(f"spaced_em_dash:{em_count}")
 
     flags: list[str] = []
     if is_voiced:

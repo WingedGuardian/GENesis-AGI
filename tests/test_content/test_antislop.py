@@ -75,6 +75,15 @@ class TestCodeRegionsExcluded:
         assert r.cleaned_text == f"intro{EM}here\n```\ncode -- block\n```"
         assert r.fixes_applied == ["spaced_em_dash:1"]
 
+    def test_em_dash_abutting_inline_code_not_falsely_reported(self):
+        # An em dash directly against inline code can't be collapsed at the span
+        # boundary; fixes_applied must equal what was actually rewritten (0), not
+        # over-report from a code-blanked count.
+        text = f"see {EM}`x` now"
+        r = scrub(text)
+        assert r.fixes_applied == []
+        assert r.cleaned_text == text
+
     def test_banned_word_inside_code_not_flagged(self):
         r = scrub("call `navigate()` to move", is_voiced=True)
         assert not any("banned_words" in f for f in r.flags)
