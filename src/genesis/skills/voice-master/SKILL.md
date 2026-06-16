@@ -126,7 +126,12 @@ curate) × **whose voice** (user's [default] / stealth, see Stealth Mode).
    specific feedback; max 2 passes, then surface the best version with
    remaining flags noted. Final gut check — read it aloud: if it sounds like a
    polished AI response, rewrite it; if it sounds like a person thinking on the
-   page, it's right.
+   page, it's right. **Mechanical backstop:** the spaced-em-dash and banned-word
+   tells are also enforced in code — run `python -m genesis.content.antislop
+   <file>` (cleaned text to stdout, fixes/flags to stderr) to auto-fix spaced em
+   dashes and flag banned words deterministically. Content sent through Genesis's
+   external channels (email, Discord) and Medium drafts passes through this
+   scrubber automatically; your audit is the first line, not the only one.
 
 **Modes** beyond the default generate:
 
