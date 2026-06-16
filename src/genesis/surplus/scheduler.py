@@ -1218,7 +1218,22 @@ class SurplusScheduler:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            try:
+                # 2-hour cap: gitnexus analyze is AST-only (no ONNX), but a
+                # cold full-repo pass can take minutes. Hanging indefinitely
+                # blocks the job slot (max_instances=1) forever.
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=7200
+                )
+            except TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                logger.error("GitNexus reindex timed out after 2h — killed")
+                with contextlib.suppress(Exception):
+                    GenesisRuntime.instance().record_job_failure(
+                        "gitnexus_reindex", "timed out after 2h",
+                    )
+                return
             if proc.returncode == 0:
                 logger.info("GitNexus reindex complete")
                 with contextlib.suppress(Exception):

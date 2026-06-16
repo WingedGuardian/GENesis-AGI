@@ -20,7 +20,7 @@ async def up(db: aiosqlite.Connection) -> None:
     )
     row = await cursor.fetchone()
     if not row:
-        return  # Table doesn't exist — fresh install creates it correctly via 0001
+        return  # Table absent — defensive guard for non-sequential edge cases
 
     ddl = row[0] or ""
     if "'conflicts_pending'" in ddl:
