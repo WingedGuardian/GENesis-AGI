@@ -342,6 +342,22 @@ class TestProposalWorkflow:
         batch_id, _, _ = await wf.create_batch(_sample_proposals(1))
         assert await wf.send_digest(batch_id) is None
 
+    async def test_send_digest_delivers_regardless_of_quality_verdict(
+        self, workflow, db, mock_topic_manager,
+    ):
+        """Regression: the removed LLM quality gate must not creep back.
+
+        A proposal carrying a legacy realist_verdict='quality_hold' is still
+        delivered — send_digest no longer filters on it. The Opus realist is the
+        sole proposal gate; pre-removal this batch was silently dropped (None)."""
+        props = _sample_proposals(2)
+        for p in props:
+            p["_realist_verdict"] = "quality_hold"
+        batch_id, _, _ = await workflow.create_batch(props)
+        delivery = await workflow.send_digest(batch_id)
+        assert delivery == "msg12345"  # delivered, not dropped
+        mock_topic_manager.send_to_category.assert_called_once()
+
     async def test_correction_stored_on_reject_with_reason(
         self, workflow, db, mock_memory_store,
     ):

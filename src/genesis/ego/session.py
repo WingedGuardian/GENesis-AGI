@@ -989,83 +989,14 @@ class EgoSession:
             logger.warning("Realist filter failed, passing through", exc_info=True)
             filtered = proposals  # fail-open: use unfiltered list
 
-        # Quality gate (Verified Autonomy L3) — runs AFTER realist gate.
-        # Placed outside the realist try-except so a quality gate failure
-        # cannot accidentally undo realist rejections. _quality_gate has
-        # its own fail-open error handling.
-        filtered = await self._quality_gate(filtered)
+        # The realist (Opus) is the sole proposal quality gate. A separate
+        # LLM-judge "quality gate" used to run here, but it was an eval-harness
+        # primitive mis-applied as a realist-for-the-realist: redundant with the
+        # Opus realist, it only filtered digest visibility (never execution), and
+        # on a fragile judge chain it silently quarantined every proposal during a
+        # provider outage. Removed. The eval harness still uses that judge; the
+        # proposal pipeline does not. Do NOT re-add a judge gate here.
         return filtered
-
-    async def _quality_gate(self, proposals: list[dict]) -> list[dict]:
-        """Score proposals for coherence/relevance/completeness.
-
-        Proposals below threshold get ``_realist_verdict = "quality_hold"``
-        and stay in the list (stored in DB) but ``send_digest()`` skips them.
-        Fails open: any error passes all proposals through.
-        """
-        if not proposals or not self._router:
-            return proposals
-
-        try:
-            from genesis.eval.scorers import (
-                _JUDGE_CALL_FAIL,
-                _JUDGE_PARSE_FAIL,
-                get_scorer,
-            )
-            from genesis.eval.types import ScorerType
-
-            scorer = get_scorer(ScorerType.OUTPUT_QUALITY)
-            scorer.set_router(self._router)
-
-            held_count = 0
-            judge_unavailable = 0
-            for p in proposals:
-                try:
-                    passed, score, detail = await scorer.score_async(
-                        actual=(
-                            f"{p.get('content', '')}\n\n"
-                            f"Rationale: {p.get('rationale', '')}"
-                        ),
-                        expected="autonomous proposal",
-                        config={"rubric_name": "output_quality"},
-                    )
-                    if passed:
-                        continue
-                    # Fail OPEN on judge INFRASTRUCTURE errors (providers
-                    # exhausted / unparseable response) — a scoring failure is
-                    # not a quality failure. Quarantining proposals because the
-                    # judge was down is exactly how the proposal stream went
-                    # silent during the Jun 2026 provider outage. Only a genuine
-                    # below-threshold score holds a proposal.
-                    try:
-                        judge_error = json.loads(detail).get("error")
-                    except (json.JSONDecodeError, ValueError, TypeError):
-                        judge_error = None
-                    if judge_error in (_JUDGE_CALL_FAIL, _JUDGE_PARSE_FAIL):
-                        judge_unavailable += 1
-                        continue
-                    p["_realist_verdict"] = "quality_hold"
-                    p["_realist_reasoning"] = (
-                        f"Quality score {score:.2f} below threshold. {detail[:300]}"
-                    )
-                    held_count += 1
-                except Exception:
-                    logger.debug("Quality scoring failed for proposal, passing", exc_info=True)
-
-            if judge_unavailable:
-                logger.warning(
-                    "Quality gate: judge unavailable for %d/%d proposal(s) — "
-                    "passed through (fail-open), NOT held",
-                    judge_unavailable, len(proposals),
-                )
-            if held_count:
-                logger.info(
-                    "Quality gate: held %d/%d proposals", held_count, len(proposals),
-                )
-        except Exception:
-            logger.warning("Quality gate failed, passing all proposals", exc_info=True)
-
-        return proposals
 
     # Genesis ego allowed action categories (infrastructure/operations only)
     _GENESIS_EGO_ALLOWED_CATEGORIES = frozenset({
