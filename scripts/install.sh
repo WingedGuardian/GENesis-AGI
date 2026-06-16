@@ -53,13 +53,20 @@ should_prompt() {
     return 1
 }
 
-# Write a key=value to secrets.env without sed metacharacter risk
+# Write a key=value to secrets.env atomically (no sed metacharacter risk, and no
+# lost/duplicated key on interruption). Builds the full new content in a temp file
+# in the same dir, then a single atomic rename. mktemp creates the temp 0600, so
+# the secret is never world-readable mid-write; perms are matched to the original.
+# NOTE: `key` is used as a grep BRE anchor (`^${key}=`); all callers pass literal
+# [A-Z_]+ enum keys, so there is no regex metacharacter in the key name.
 set_secret() {
-    local key="$1" value="$2" file="$3"
-    if grep -q "^${key}=" "$file" 2>/dev/null; then
-        grep -v "^${key}=" "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
-    fi
-    echo "${key}=${value}" >> "$file"
+    local key="$1" value="$2" file="$3" tmp
+    tmp="$(mktemp "${file}.XXXXXX")" || return 1
+    # All existing lines except this key, then the (single) new line.
+    { grep -v "^${key}=" "$file" 2>/dev/null || true; printf '%s=%s\n' "$key" "$value"; } > "$tmp" \
+        || { rm -f "$tmp"; return 1; }
+    [ -f "$file" ] && chmod --reference="$file" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
 }
 
 # ── HOME guard ───────────────────────────────────────────────

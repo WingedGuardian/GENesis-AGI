@@ -1206,6 +1206,81 @@ PYEOF
     fi
 fi
 
+# ── Shared user-level CLAUDE.md on the host (D16) ──────────────
+# Auto-loaded by every `claude` session on the host (operator + Guardian
+# diagnostic). Common "this is a Genesis install" facts inherited by the
+# operator-project and Guardian-project CLAUDE.mds. Managed blocks are rebuilt
+# each run from a quoted heredoc (no shell expansion → backticks safe) with
+# placeholders filled by sed; the hand-editable "Personal Notes" is preserved.
+_host_claude="$_host_home/.claude/CLAUDE.md"
+_hostname="$(hostname 2>/dev/null || echo unknown)"
+_host_tz="${_final_tz:-$(timedatectl show -p Timezone --value 2>/dev/null || echo unknown)}"
+_ctr_ip="${CONTAINER_IPV4:-unknown}"
+_hc_notes=""
+[ -f "$_host_claude" ] && _hc_notes="$(sed -n '/^## Personal Notes$/,$p' "$_host_claude")"
+[ -z "$_hc_notes" ] && _hc_notes='## Personal Notes
+
+(Install scripts preserve this section. Add machine-specific reminders here.)'
+cat > "$_host_claude" <<'HCDOC'
+# Genesis Host VM — Shared Context
+
+This machine is a **Genesis install host**. Genesis (the autonomous agent) runs inside an Incus
+container; a host-side **Guardian** systemd timer watches it and can recover it. This file is shared
+context auto-loaded by every `claude` session on this host (operator and Guardian-diagnostic).
+
+<!-- begin:host-identity -->
+## Host
+- **User**: __HOST_USER__
+- **Hostname**: __HOSTNAME__
+- **Timezone**: __HOST_TZ__
+<!-- end:host-identity -->
+
+<!-- begin:container-reference -->
+## Container
+- **Name**: __CONTAINER_NAME__
+- **IP**: __CONTAINER_IP__  (dashboard: http://__CONTAINER_IP__:5000)
+- **Enter it**: `genesis` alias, or `incus exec __CONTAINER_NAME__ --user __UBUNTU_UID__ --env HOME=/home/ubuntu -- bash -l`
+<!-- end:container-reference -->
+
+<!-- begin:guardian-paths -->
+## Guardian (host-side watcher)
+- **Install**: `~/.local/share/genesis-guardian`  ·  **State**: `~/.local/state/genesis-guardian`
+- **Pause**: `touch /var/lib/guardian-snapshots/.guardian-maintenance` (stands down each tick; `rm` to resume)
+- **Hard stop**: `systemctl --user stop genesis-guardian.timer genesis-guardian-watchman.timer`
+- **Status**: `systemctl --user status genesis-guardian.timer`
+<!-- end:guardian-paths -->
+
+HCDOC
+printf '%s\n' "$_hc_notes" >> "$_host_claude"
+sed -i \
+    -e "s|__HOST_USER__|$_host_user|g" \
+    -e "s|__HOSTNAME__|$_hostname|g" \
+    -e "s|__HOST_TZ__|$_host_tz|g" \
+    -e "s|__CONTAINER_NAME__|$CONTAINER_NAME|g" \
+    -e "s|__CONTAINER_IP__|$_ctr_ip|g" \
+    -e "s|__UBUNTU_UID__|$UBUNTU_UID|g" \
+    "$_host_claude"
+chown "$_host_user:" "$_host_claude" 2>/dev/null || true
+echo "  + Shared user-level CLAUDE.md written to $_host_claude"
+
+# ── Operator-project CLAUDE.md in the host SSH-landing dir (D16) ──
+# A human who SSHes in cold lands in their home dir; `claude` there auto-loads
+# this project file (orients the operator, not the Guardian). Static template
+# + container-name fill. Guard: never clobber an unrelated ~/CLAUDE.md.
+_operator_src="$(dirname "$_SCRIPT_DIR")/config/operator-claude.md"
+_operator_dst="$_host_home/CLAUDE.md"
+if [ -f "$_operator_src" ]; then
+    if [ ! -f "$_operator_dst" ] || grep -q "Operator — You're on a Genesis Host VM" "$_operator_dst" 2>/dev/null; then
+        sed -e "s|__CONTAINER_NAME__|$CONTAINER_NAME|g" -e "s|__UBUNTU_UID__|$UBUNTU_UID|g" "$_operator_src" > "$_operator_dst"
+        chown "$_host_user:" "$_operator_dst" 2>/dev/null || true
+        echo "  + Operator CLAUDE.md written to $_operator_dst"
+    else
+        echo "  . $_operator_dst exists and isn't ours — leaving it untouched"
+    fi
+else
+    echo "  WARNING: $_operator_src not found — operator CLAUDE.md not placed"
+fi
+
 # ── Convenience alias on host ─────────────────────────────────
 # The full incus exec command is long and easy to get wrong. Add a 'genesis'
 # alias that sets HOME, XDG_RUNTIME_DIR, and cwd correctly.
