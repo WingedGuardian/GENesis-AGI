@@ -606,20 +606,25 @@ def test_classify_error_thinking_block_from_stdout(invoker):
 # --- interrupt() tests ---
 
 
+def _live_proc():
+    p = MagicMock()
+    p.returncode = None
+    return p
+
+
 @pytest.mark.asyncio
 async def test_interrupt_sends_sigint():
     inv = CCInvoker()
-    mock_proc = MagicMock()
-    mock_proc.returncode = None
-    inv._active_proc = mock_proc
-    await inv.interrupt()
+    mock_proc = _live_proc()
+    inv._register_proc("k", mock_proc)
+    await inv.interrupt()  # no key → most-recent live
     mock_proc.send_signal.assert_called_once_with(signal.SIGINT)
 
 
 @pytest.mark.asyncio
 async def test_interrupt_noop_when_idle():
     inv = CCInvoker()
-    await inv.interrupt()  # Should not raise
+    await inv.interrupt()  # empty registry — should not raise
 
 
 @pytest.mark.asyncio
@@ -627,9 +632,153 @@ async def test_interrupt_noop_when_finished():
     inv = CCInvoker()
     mock_proc = MagicMock()
     mock_proc.returncode = 0  # Already exited
-    inv._active_proc = mock_proc
+    inv._active_procs["k"] = mock_proc  # bypass prune to assert no-signal
     await inv.interrupt()
     mock_proc.send_signal.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_targets_keyed_proc_not_others():
+    """cc-loop-01: /stop with a session key hits THAT proc, not a concurrent one."""
+    inv = CCInvoker()
+    proc_a, proc_b = _live_proc(), _live_proc()
+    inv._register_proc("session-a", proc_a)
+    inv._register_proc("session-b", proc_b)
+    await inv.interrupt("session-a")
+    proc_a.send_signal.assert_called_once_with(signal.SIGINT)
+    proc_b.send_signal.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_no_key_targets_most_recent_live():
+    inv = CCInvoker()
+    proc_a, proc_b = _live_proc(), _live_proc()
+    inv._register_proc("background", proc_a)
+    inv._register_proc("foreground", proc_b)  # registered last
+    await inv.interrupt()
+    proc_b.send_signal.assert_called_once_with(signal.SIGINT)
+    proc_a.send_signal.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_unknown_key_is_noop():
+    inv = CCInvoker()
+    inv._register_proc("session-a", _live_proc())
+    await inv.interrupt("does-not-exist")  # no matching proc — no raise, no signal
+    assert inv._active_procs["session-a"].send_signal.call_count == 0
+
+
+def test_register_prunes_dead_entries():
+    """The registry only ever holds live procs (safety net for un-popped keys)."""
+    inv = CCInvoker()
+    dead = MagicMock()
+    dead.returncode = 1
+    inv._active_procs["stale"] = dead
+    inv._register_proc("fresh", _live_proc())
+    assert "stale" not in inv._active_procs
+    assert "fresh" in inv._active_procs
+
+
+@pytest.mark.asyncio
+async def test_run_registers_under_session_key_and_clears(invoker):
+    """End-to-end: run() registers the proc under invocation.session_key while
+    executing, and unregisters it in finally (cc-loop-01)."""
+    result_line = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "ok", "session_id": "s", "total_cost_usd": 0.0,
+        "duration_ms": 1, "usage": {
+            "input_tokens": 1, "output_tokens": 1,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        },
+    })
+    captured: dict = {}
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.pid = 4242
+
+    async def _capture(*_a, **_k):
+        captured["keys"] = list(invoker._active_procs.keys())
+        return (result_line.encode(), b"")
+
+    mock_proc.communicate = _capture
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        await invoker.run(CCInvocation(prompt="hi", session_key="tg:7:9"))
+
+    assert captured["keys"] == ["tg:7:9"]  # registered under the session key mid-run
+    assert invoker._active_procs == {}  # unregistered in finally
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_registers_under_session_key_and_clears(invoker):
+    """run_streaming registers under session_key during streaming and clears in finally."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "ok", "session_id": "s1", "total_cost_usd": 0.0,
+            "duration_ms": 1, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {"claude-sonnet-4-6": {}},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.pid = 5555
+
+    captured: dict = {}
+
+    async def on_event(_ev):
+        captured.setdefault("keys", list(invoker._active_procs.keys()))
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        await invoker.run_streaming(
+            CCInvocation(prompt="hi", session_key="tg:3:4"), on_event=on_event,
+        )
+
+    assert captured["keys"] == ["tg:3:4"]  # registered during streaming
+    assert invoker._active_procs == {}  # cleared in finally
+
+
+@pytest.mark.asyncio
+async def test_interrupt_real_procs_targets_correct_one():
+    """E2E with REAL subprocesses + REAL signals: interrupt(keyA) kills A, B survives.
+
+    Proves the per-session registry delivers SIGINT to the user's proc, not a
+    concurrent one (cc-loop-01). (systemd-run scope propagation is unchanged by
+    this fix — same signal path, different target — and verified at deploy.)
+    """
+    import os as _os
+
+    inv = CCInvoker()
+    procs: dict[str, object] = {}
+    try:
+        for key in ("session-a", "session-b"):
+            p = await asyncio.create_subprocess_exec(
+                "sleep", "30",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                preexec_fn=_os.setpgrp,
+            )
+            inv._register_proc(key, p)
+            procs[key] = p
+
+        await inv.interrupt("session-a")
+
+        try:
+            await asyncio.wait_for(procs["session-a"].wait(), timeout=5)
+        except TimeoutError:
+            pytest.fail("proc A did not exit after interrupt('session-a')")
+        assert procs["session-a"].returncode is not None  # A got SIGINT
+        assert procs["session-b"].returncode is None  # B untouched
+    finally:
+        for p in procs.values():
+            if p.returncode is None:
+                p.kill()
+                await p.wait()
 
 
 # --- AgentProvider protocol conformance ---

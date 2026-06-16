@@ -8,6 +8,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from genesis.cc.types import CCModel, ChannelType, EffortLevel
+from genesis.channels.telegram._handler_helpers import interrupt_key
 from genesis.db.crud import cc_sessions
 
 if TYPE_CHECKING:
@@ -61,7 +62,9 @@ async def cmd_stop(ctx: HandlerContext, update: Update, context: ContextTypes.DE
     if interrupt_event and not interrupt_event.is_set():
         interrupt_event.set()
         try:
-            await ctx.loop.interrupt()
+            # cc-loop-01: target THIS conversation's subprocess, not whichever
+            # CC proc happened to start last.
+            await ctx.loop.interrupt(interrupt_key(*ikey))
         except Exception:
             log.warning("Failed to send interrupt to invoker", exc_info=True)
         await update.message.reply_text("Stopping...")

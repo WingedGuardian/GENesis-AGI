@@ -18,6 +18,16 @@ log = logging.getLogger(__name__)
 _TG_MAX_LEN = 4096
 
 
+def interrupt_key(user_id: int, chat_id: int) -> str:
+    """Stable per-conversation key for the CC invoker's interrupt registry.
+
+    cc-loop-01: derived identically at stream-start and at `/stop` from the
+    same ``(user_id, chat_id)``, so `/stop` interrupts the user's session's
+    subprocess — not a concurrent background CC task.
+    """
+    return f"tg:{user_id}:{chat_id}"
+
+
 def _format_error(error: Exception) -> str:
     """Format a CC exception into a user-facing Telegram message."""
     from genesis.cc.exceptions import (

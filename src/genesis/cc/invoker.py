@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -92,7 +93,11 @@ class CCInvoker:
     ):
         self._claude_path = claude_path
         self._working_dir = working_dir
-        self._active_proc: asyncio.subprocess.Process | None = None
+        # cc-loop-01: per-session subprocess registry (keyed by CCInvocation.
+        # session_key, else "pid:<pid>"). Replaces a single _active_proc slot
+        # so concurrent sessions don't clobber each other and `/stop` can
+        # interrupt the RIGHT proc. Single-threaded asyncio → no lock needed.
+        self._active_procs: dict[str, asyncio.subprocess.Process] = {}
         self._on_cc_status_change = on_cc_status_change
         self._on_model_downgrade = on_model_downgrade
         self._last_was_error = False
@@ -204,10 +209,38 @@ class CCInvoker:
         env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] = "1"
         return env
 
-    async def interrupt(self) -> None:
-        """Send SIGINT to active subprocess. No-op if nothing running."""
-        proc = self._active_proc
-        if proc and proc.returncode is None:
+    def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:
+        """Register a live subprocess under a session key.
+
+        Prunes dead entries first — a safety net so the registry only ever
+        holds live procs even if a path fails to unregister. Assumes at most one
+        live proc per key at a time: foreground keys (``tg:user:chat``) are
+        serialized by the Telegram chat lock + the per-session conversation lock,
+        and background keys (``pid:<pid>``) are unique. A live-proc clobber under
+        the same key would orphan the prior proc — keep that invariant if the
+        locking model changes.
+        """
+        for dead in [k for k, p in self._active_procs.items() if p.returncode is not None]:
+            self._active_procs.pop(dead, None)
+        self._active_procs[key] = proc
+
+    def _unregister_proc(self, key: str) -> None:
+        self._active_procs.pop(key, None)
+
+    async def interrupt(self, key: str | None = None) -> None:
+        """Send SIGINT to a session's subprocess. No-op if none match.
+
+        With ``key``, targets that session's proc; without it, targets the
+        most-recently-registered LIVE proc (back-compat). Concurrent sessions
+        each register under their own key, so a Telegram `/stop` interrupts the
+        user's session — not a background task that started later (cc-loop-01).
+        """
+        if key is not None:
+            proc = self._active_procs.get(key)
+        else:
+            live = [p for p in self._active_procs.values() if p.returncode is None]
+            proc = live[-1] if live else None
+        if proc is not None and proc.returncode is None:
             proc.send_signal(signal.SIGINT)
 
     @staticmethod
@@ -321,6 +354,7 @@ class CCInvoker:
         )
 
         proc = None
+        reg_key: str | None = None
         try:
             scope_args = _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
@@ -332,7 +366,8 @@ class CCInvoker:
                 cwd=invocation.working_dir or self._working_dir,
                 preexec_fn=os.setpgrp,
             )
-            self._active_proc = proc
+            reg_key = invocation.session_key or f"pid:{proc.pid}"
+            self._register_proc(reg_key, proc)
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
             set_oom_score_adj(proc.pid, 500)
             if invocation.on_spawn is not None:
@@ -386,7 +421,13 @@ class CCInvoker:
             )
             raise CCTimeoutError(f"Timeout after {invocation.timeout_s}s") from None
         finally:
-            self._active_proc = None
+            if reg_key is not None:
+                self._unregister_proc(reg_key)
+                # Don't leak a still-running proc on an abnormal exit (e.g. task
+                # cancellation); communicate() reaps it on the normal path.
+                if proc is not None and proc.returncode is None:
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        proc.kill()
 
         elapsed = int((time.monotonic() - start) * 1000)
         logger.info(
@@ -469,22 +510,33 @@ class CCInvoker:
                 f"Ensure @anthropic-ai/claude-code is installed via npm "
                 f"and ~/.npm-global/bin is on PATH."
             ) from None
-        self._active_proc = proc
         logger.info("CC streaming subprocess spawned (PID %s)", proc.pid)
         set_oom_score_adj(proc.pid, 500)
-        if invocation.on_spawn is not None:
-            try:
-                await invocation.on_spawn(proc.pid)
-            except Exception:
-                logger.warning(
-                    "on_spawn callback failed for PID %s",
-                    proc.pid, exc_info=True,
-                )
-        # Feed prompt via stdin, then close to signal EOF
-        if proc.stdin is not None:
-            proc.stdin.write(invocation.prompt.encode())
-            await proc.stdin.drain()
-            proc.stdin.close()
+        # cc-loop-01: register immediately (before the stdin feed) so the proc is
+        # interruptible from spawn. If on_spawn or the stdin feed fails (broken
+        # pipe, task cancellation), reap the proc and drop the registry entry —
+        # don't leak either. The streaming `try` below unregisters on its paths.
+        reg_key = invocation.session_key or f"pid:{proc.pid}"
+        self._register_proc(reg_key, proc)
+        try:
+            if invocation.on_spawn is not None:
+                try:
+                    await invocation.on_spawn(proc.pid)
+                except Exception:
+                    logger.warning(
+                        "on_spawn callback failed for PID %s",
+                        proc.pid, exc_info=True,
+                    )
+            # Feed prompt via stdin, then close to signal EOF
+            if proc.stdin is not None:
+                proc.stdin.write(invocation.prompt.encode())
+                await proc.stdin.drain()
+                proc.stdin.close()
+        except BaseException:
+            self._unregister_proc(reg_key)
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.kill()
+            raise
 
         result_data: dict | None = None
         collected_text: list[str] = []
@@ -552,9 +604,10 @@ class CCInvoker:
                 os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, ValueError, TypeError):
                 proc.kill()
+        finally:
+            self._unregister_proc(reg_key)
 
         await proc.wait()
-        self._active_proc = None
         elapsed = int((time.monotonic() - start) * 1000)
 
         # Read stderr for diagnostics

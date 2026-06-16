@@ -18,6 +18,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Telegram `/stop` now stops your session, not a background task** — when a
+  background task (reflection, inbox, an ego session, etc.) was running at the
+  same time as your chat, `/stop` could interrupt the wrong one. Each session's
+  Claude Code subprocess is now tracked separately, so `/stop` always targets
+  the generation in your conversation.
+
 - **Memory writes no longer get stuck behind a database lock** — under heavy load
   or a provider outage, a cancelled database read could leave a stale lock that
   made saving to memory (`reference_store` / `memory_store`) fail with "database
