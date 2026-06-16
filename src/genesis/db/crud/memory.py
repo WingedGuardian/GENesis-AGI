@@ -428,4 +428,4 @@ async def count(
     else:
         rows = await db.execute_fetchall("SELECT COUNT(*) FROM memory_metadata")
     row = rows[0] if rows else None
-    return row[0]
+    return row[0] if row else 0

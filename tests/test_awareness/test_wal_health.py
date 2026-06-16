@@ -108,3 +108,12 @@ async def test_swallows_create_errors(tmp_path, monkeypatch, _tiny_thresholds):
 
     # Must not raise into the tick.
     await loop._check_wal_health(object())
+
+
+def test_infrastructure_alert_type_is_registered():
+    """The alert type must be in _TTL_BY_TYPE so creating one doesn't emit a
+    spurious 'unknown observation type' warning (also covers the dead-letter
+    monitor, which uses the same type)."""
+    from genesis.db.crud import observations
+
+    assert "infrastructure_alert" in observations._TTL_BY_TYPE
