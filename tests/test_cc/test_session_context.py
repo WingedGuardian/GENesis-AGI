@@ -64,6 +64,25 @@ class TestSessionContextHook:
         assert "outreach" in result.stdout.lower()
         assert result.returncode == 0
 
+    def test_session_config_block_carries_header_directive(self, flag_dir: Path) -> None:
+        """The top Session Configuration block must instruct the first-reply header.
+
+        Regression guard: the `[<model> / <effort>]` header is specified in
+        CONVERSATION.md but fired unreliably when only that deep spec existed.
+        The hook now echoes the directive into the high-salience top block — if
+        that echo is dropped, the header silently stops appearing again.
+        """
+        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
+        result = subprocess.run(
+            [_PYTHON, str(_CONTEXT_SCRIPT)],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        assert "## Session Configuration" in result.stdout
+        assert "status header" in result.stdout
+        # Effort defaults to "high" with no session_config.json present.
+        assert "[<model> / high]" in result.stdout
+        assert result.returncode == 0
+
     def test_writes_session_start_file(self, flag_dir: Path) -> None:
         """Hook should write session start timestamp for urgent-alerts hook."""
         env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
