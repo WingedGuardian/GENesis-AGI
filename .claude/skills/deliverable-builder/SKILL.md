@@ -64,9 +64,9 @@ CSV), polished decks beyond pandoc-basic, and the `enterprise-ai-skills` / `hall
 Foreground, document formats (PDF/DOCX), one deliverable at a time.
 
 ## Example
-**User:** "Turn my phData analysis into the submission packet it should have been."
+**User:** "Turn my take-home analysis into the submission packet it should have been."
 **You:** Intake (audience = FDE hiring team; format = PDF; what_leads = the pipeline decision +
 benchmark results; freeze the brief's asks into AC1…ACn) → Gate 1 → Draft → Structure (answer
 first, methodology to appendix, action-title headings) → voice-master → humanizer → render PDF
-via pandoc/make-pdf → Gate 2 (fresh reviewer re-reads the original brief, `file`-checks the PDF,
+via pandoc/make-pdf → Gate 2 (fresh reviewer re-reads the original brief, byte-checks the PDF is real,
 per-criterion verdict) → Gate 3 sign-off → ship.

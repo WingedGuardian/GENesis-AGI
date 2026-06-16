@@ -12,8 +12,9 @@ The spec lives in this session's existing per-session dir so the Stop-hook gate
 ```bash
 PREFIX="dc22f977"   # <-- the 8 chars from the [Session: ...] line in your context
 SID=$(ls -1 ~/.genesis/sessions/ 2>/dev/null | grep -E "^${PREFIX}" | head -1)
-# fallback: most-recently-written transcript for this project
-[ -z "$SID" ] && SID=$(ls -t ~/.claude/projects/-home-ubuntu-genesis/*.jsonl 2>/dev/null \
+# fallback: newest transcript across all projects (= this session). The glob avoids
+# hardcoding the home path / username, which Claude Code encodes into the project dir name.
+[ -z "$SID" ] && SID=$(ls -t ~/.claude/projects/*/*.jsonl 2>/dev/null \
   | head -1 | xargs -r -n1 basename | sed 's/\.jsonl$//')
 echo "$SID"   # full uuid; the spec marker is ~/.genesis/sessions/$SID/deliverable.json
 ```
@@ -50,7 +51,7 @@ Establish, and write into the spec:
   any AI fingerprint undercuts it), or is *AI-assisted / polished* fine, or even expected? This
   is **not cosmetic** — it sets how hard the Voice and Anti-slop stages push and what Gate 2
   fails on. A take-home where the team knows AI was used wants maximal polish; a personal note
-  under the user's name does not. **Ask — never assume "human-made."** (The phData packet was
+  under the user's name does not. **Ask — never assume "human-made."** (A recent job take-home was
   *correctly* polished because AI-assisted was fine there; the identical polish on a personal
   piece would be the wrong shape.)
 - **visual_style** — cut-and-dry (plain, black-and-white, minimal) or designed (color, branded,

@@ -82,7 +82,7 @@ Flag and fix accordingly:
 - [ ] **Effort artifacts a human wouldn't hand-make** (a tell *only* when `authenticity_target`
       = human-made) — elaborate formatted tables, exhaustive specs, rich per-row descriptors,
       dense formatting. They take real work a person rarely does by hand, so their *presence*
-      reads as AI even when every sentence is clean. The phData packet's biggest tell wasn't the
+      reads as AI even when every sentence is clean. A recent take-home packet's biggest tell wasn't the
       prose; it was the polished tables and descriptors. For an AI-assisted-OK target they're
       fine, often desirable; for a human-made target, cut them or replace with what the user
       would actually produce by hand.

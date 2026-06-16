@@ -60,6 +60,7 @@ def _decide(data: dict, sessions_root: Path) -> int:
 
 
 def main() -> int:
+    """Read hook stdin, run the gate decision, and return the exit code (0 allow / 2 block)."""
     try:
         raw = sys.stdin.read()
         data = json.loads(raw) if raw.strip() else {}
