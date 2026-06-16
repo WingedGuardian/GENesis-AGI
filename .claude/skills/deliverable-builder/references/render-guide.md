@@ -26,8 +26,11 @@ docxtpl, python-docx, python-pptx, xlsxwriter, openpyxl.
 Write the shaped+voiced draft to `draft_path` (a `.md`), then render:
 
 ```bash
-# PDF (default for documents) — clean, headless, math-capable
-pandoc "$DRAFT" --pdf-engine=pdflatex -V geometry:margin=1in -o "$OUT.pdf"
+# PDF (default for documents) — use a UNICODE-CAPABLE engine.
+# pdflatex FAILS on common Unicode (− × ÷ ✓ → curly quotes), which real technical/data
+# deliverables contain, so default to xelatex (or lualatex). Both are installed.
+pandoc "$DRAFT" --pdf-engine=xelatex -V geometry:margin=1in -o "$OUT.pdf"
+# pdflatex is acceptable ONLY for known-ASCII content. For branded/designed output use /make-pdf.
 
 # PDF (branded / designed one-pager) — richer typography, needs browse daemon
 #   via the Skill tool:  /make-pdf   (input: the markdown draft)

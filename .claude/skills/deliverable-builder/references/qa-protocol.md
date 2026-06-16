@@ -23,8 +23,11 @@ that wouldn't survive the recipient. Default to FAIL when uncertain.
 Do these IN ORDER:
 1. Read the ORIGINAL brief at: {spec.brief_path}    (the real source, not a summary)
 2. Read the frozen acceptance criteria + audit trail at: {spec_path}
-3. Run `file {spec.rendered_path}` — confirm it is actually a {spec.format} file
-   (not markdown with a .pdf name). If not, that alone is a FAIL:render.
+3. Confirm {spec.rendered_path} is REALLY a {spec.format} file (not markdown with a
+   .pdf name) by checking its bytes — do NOT rely on `file`, which isn't always installed.
+   Portable checks: PDF starts with `%PDF` (`head -c4`), or `pdfinfo <path>` / Python
+   `import fitz; fitz.open(path).page_count`; DOCX/PPTX/XLSX are ZIP (`PK` magic). If the
+   bytes don't match the claimed format, that alone is a FAIL:render.
 4. Open and read {spec.rendered_path} in full.
 
 Then judge, with EVIDENCE (a quote/line ref from the artifact) for every verdict:
