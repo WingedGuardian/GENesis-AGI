@@ -26,29 +26,12 @@ logger = logging.getLogger(__name__)
 
 _ESSENTIAL_KNOWLEDGE_PATH = Path.home() / ".genesis" / "essential_knowledge.md"
 
-# Tool declarations for the S2S model session config
+# Tool declarations for the S2S model session config.
+# NOTE: ask_genesis is intentionally DISABLED here pending the voice-memory
+# refactor — the raw-snippet dump it returned was poor input for the S2S model.
+# Its dispatch in handle_tool_call() and the _ask_genesis() implementation are
+# kept below, so re-enabling is just restoring its schema to this list.
 TOOL_DECLARATIONS = [
-    {
-        "type": "function",
-        "name": "ask_genesis",
-        "description": (
-            "REQUIRED for any question about: conversations, past events, "
-            "what we discussed, what we worked on, memories, personal context, "
-            "projects, tasks, or anything the user has told you before. "
-            "You do NOT have this information yourself — you MUST call this "
-            "tool to access the user's history. Genesis has full memory."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The user's question, rephrased as a query",
-                },
-            },
-            "required": ["query"],
-        },
-    },
     {
         "type": "function",
         "name": "web_search",
@@ -95,16 +78,18 @@ TOOL_DECLARATIONS = [
 # System instructions for the S2S model
 SYSTEM_INSTRUCTIONS = """\
 You are Genesis, a cognitive AI partner, speaking through a voice interface.
-You have two tools. Use them.
+You have two tools — web search and approvals. Use them.
 
 TOOL RULES (important — follow these strictly):
-- "what did we do / work on / discuss" → ALWAYS call ask_genesis. Never guess.
 - "what time is it / what's the date / what day is it" → answer from the \
 Current time in your context. No tool call needed.
 - "search / look up / what's the weather / news" → ALWAYS call web_search.
 - "can you search the web" or similar capability questions → call web_search \
 with a relevant query to demonstrate the capability.
-- Questions about the user's personal context, projects, history → call ask_genesis.
+- You do NOT currently have access to past conversations, stored memories, or \
+the user's history. If asked what you discussed or worked on before, or for \
+personal context you weren't given here, say plainly that you don't have that \
+available right now — never invent it.
 - General knowledge you're confident about → answer directly, no tool call.
 - When in doubt between answering directly and calling a tool → call the tool. \
 Better to be thorough than to guess wrong.
@@ -120,7 +105,7 @@ they can always ask for more.
 caveats, or "here's why" — over voice that's just noise. Don't restate the \
 question; no filler openers or closers ("let me know if you need anything"). \
 Lead with the answer.
-- For a dense tool result (memory, search), give only the 1-3 points that matter \
+- For a dense tool result (a web search), give only the 1-3 points that matter \
 for what they asked, then offer "Want me to go deeper?" — and only if there's \
 genuinely more worth hearing.
 - Never use markdown, bullet points, or formatting. Speak naturally, like someone \
