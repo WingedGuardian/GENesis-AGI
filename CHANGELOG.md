@@ -19,12 +19,33 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reviewer checks the finished artifact against the original requirements before it reaches you.
   The session won't quietly end with an unverified deliverable.
 
+- **Content Genesis sends to other people is auto-cleaned before it goes out** —
+  email, Discord, and the article/post drafts you review now pass through a
+  deterministic check that fixes the most common AI giveaway (a spaced em dash,
+  `like — this`) and scans for accidentally-included secrets (API keys,
+  credentials) before the message leaves Genesis. Messages to *you* (Telegram,
+  voice) are left exactly as written.
+
 - **Genesis now watches its own database journal size** — if SQLite's
   write-ahead log grows abnormally large (the sign of a stuck database reader
   holding the file open), Genesis raises a high/critical alert on Telegram and in
   the morning report, instead of letting it balloon silently for days.
 
 ### Fixed
+
+- **Telegram `/stop` now stops your session, not a background task** — when a
+  background task (reflection, inbox, an ego session, etc.) was running at the
+  same time as your chat, `/stop` could interrupt the wrong one. Each session's
+  Claude Code subprocess is now tracked separately, so `/stop` always targets
+  the generation in your conversation.
+
+- **The Guardian alerts once when Genesis goes down — and once when it's back** —
+  previously, if Genesis went down and its diagnosis couldn't reach Claude Code,
+  the host Guardian re-ran a full investigation and re-sent a critical Telegram
+  alert every 30 seconds until recovery — an alert storm. It now sends a single
+  "down" alert per outage (no repeats, however long it lasts), and when Genesis
+  comes back on its own it sends a single "restored" notification — which it
+  never did before.
 
 - **Memory writes no longer get stuck behind a database lock** — under heavy load
   or a provider outage, a cancelled database read could leave a stale lock that

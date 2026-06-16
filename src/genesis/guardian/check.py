@@ -236,6 +236,23 @@ async def _check_cycle(
 
     # Step 3: Act based on state
     if state == GuardianState.HEALTHY:
+        # GUARD-R2-01: on GENUINE recovery from a down-episode we alerted about,
+        # send ONE "restored" ping and clear the flag. Gate on snapshot.all_alive
+        # so auto-reset (routes CONFIRMED_DEAD→HEALTHY while STILL down,
+        # all_alive=False) neither pings nor clears — the storm stays suppressed.
+        if sm.state.down_alert_sent and snapshot.all_alive:
+            if transition.old_state == GuardianState.CONFIRMED_DEAD:
+                # Autonomous recovery (container returned on its own — process()
+                # detected all_alive). The recovery-engine / CC-resolved /
+                # approval / self-heal paths clear the flag at their own
+                # recovery point + emit their own success alert, so
+                # down_alert_sent is already False here for them — no double-ping.
+                await dispatcher.send(Alert(
+                    severity=AlertSeverity.INFO,
+                    title="Genesis recovered",
+                    body="Genesis is back online — all health signals passing.",
+                ))
+            sm.clear_down_alert_sent()
         await _handle_healthy(config, snapshots)
 
     elif state == GuardianState.SIGNAL_DROPPED:
@@ -493,6 +510,9 @@ async def _proceed_to_diagnosis(
         body="Genesis could not be contacted or could not self-heal. "
              "Running full diagnostics...",
     ))
+    # GUARD-R2-01: this episode's "down" alert has now fired — subsequent
+    # CONFIRMED_DEAD ticks must NOT re-diagnose/re-alert (no 30s storm).
+    sm.mark_down_alert_sent()
 
     diagnostic = await collect_diagnostics(config)
     signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
@@ -561,6 +581,7 @@ async def _handle_cc_resolved(
 
     if sm.current_state == GuardianState.HEALTHY:
         logger.info("CC-driven recovery verified — Genesis is healthy")
+        sm.clear_down_alert_sent()  # GUARD-R2-01: episode over (CC auto-resolved)
         await dispatcher.send(Alert(
             severity=AlertSeverity.INFO,
             title="Genesis recovered (CC auto-resolved)",
@@ -616,9 +637,31 @@ async def _handle_confirmed_dead(
     recovery_engine: RecoveryEngine,
 ) -> None:
     """Handle confirmed dead state — re-diagnose and attempt recovery."""
-    diagnostic = await collect_diagnostics(config)
-    signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
-    diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
+    # GUARD-R2-01: alert once per down-episode. If we already notified the user
+    # this episode, stay quiet — no re-diagnosis (the expensive Opus run), no
+    # recovery retry, no re-alert — until genuine recovery (which clears the flag
+    # and sends a single "restored" ping). Recovery detection is unaffected: it
+    # happens in state_machine.process() via the cheap signal probes, not here.
+    if sm.state.down_alert_sent:
+        logger.info(
+            "Down alert already sent this episode — staying quiet until recovery "
+            "(no re-diagnosis/re-alert)",
+        )
+        return
+    # First handler for this episode (e.g. reached CONFIRMED_DEAD via the
+    # self-heal-escalation path that skips _proceed_to_diagnosis): own it now so
+    # the next tick skips.
+    sm.mark_down_alert_sent()
+
+    try:
+        diagnostic = await collect_diagnostics(config)
+        signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
+        diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
+    except Exception:
+        # Diagnosis failed before any alert fired — un-mark so the next tick
+        # retries instead of silently muting this episode.
+        sm.clear_down_alert_sent()
+        raise
 
     # Persist re-diagnosis to shared mount
     first_failure = sm.state.first_failure_at or datetime.now(UTC).isoformat()
@@ -729,6 +772,7 @@ async def _execute_recovery_with_approval(
                         "All signals healthy at approval time — skipping recovery"
                     )
                     sm.process(recheck)  # Transitions to HEALTHY
+                    sm.clear_down_alert_sent()  # GUARD-R2-01: episode over
                     await dispatcher.send(Alert(
                         severity=AlertSeverity.INFO,
                         title="Recovery cancelled — Genesis recovered",

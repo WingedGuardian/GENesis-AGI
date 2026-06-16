@@ -133,6 +133,10 @@ class CCInvocation:
     append_system_prompt: bool = False
     stream_idle_timeout_ms: int | None = None
     anthropic_base_url: str | None = None  # Proxy URL override (ANTHROPIC_BASE_URL)
+    # cc-loop-01: opaque per-session key for the invoker's proc registry, so an
+    # interrupt (e.g. Telegram /stop) targets THIS session's subprocess and not
+    # a concurrent background one. None → keyed by pid (never cross-fired).
+    session_key: str | None = None
     on_spawn: Callable[[int], Awaitable[None]] | None = field(
         default=None, compare=False, repr=False,
     )

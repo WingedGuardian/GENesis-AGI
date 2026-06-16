@@ -109,14 +109,17 @@ def main() -> None:
         _SESSION_START_FILE.parent.mkdir(parents=True, exist_ok=True)
         _SESSION_START_FILE.write_text(datetime.now(UTC).isoformat())
 
-        # 0.5. Session Configuration — inject effort level for the LLM's
-        # status header. Model is NOT injected here because the LLM can
-        # derive it from CC's "You are powered by..." system text, which
-        # is always accurate. The sidecar file goes stale when CC's native
-        # /model command is used (it doesn't call Genesis MCP tools).
-        # Effort is injected because CC doesn't expose it in its system
-        # prompt — the sidecar (written by session_config MCP) is the
-        # best-available signal.
+        # 0.5. Session Configuration — inject the effort level AND the
+        # first-reply status-header directive into the highest-salience slot
+        # (the very top of the injection). The header itself
+        # (`[<model> / <effort>]`) is fully specified in CONVERSATION.md →
+        # "Session Start", but that spec sits hundreds of lines deep in the
+        # identity block and gets buried under the user's first task, so it
+        # fired unreliably. Echoing the directive here — where the LLM reads it
+        # first — is what actually makes it emit. Model is NOT injected: it is
+        # derived from CC's always-accurate "You are powered by..." system text
+        # (the sidecar's model goes stale on a native /model switch). Effort
+        # comes from the sidecar (written by the session_config MCP tool).
         effort = "high"  # default — user's preferred effort level
         if _SESSION_CONFIG.exists():
             import json
@@ -126,7 +129,15 @@ def main() -> None:
                 effort = cfg.get("effort", "high")
             except Exception as exc:
                 print(f"[session_context] Failed to read session config: {exc}", file=sys.stderr)
-        _emit(f"## Session Configuration\n\neffort: {effort}\n")
+        _emit(
+            "## Session Configuration\n\n"
+            f"- Thinking effort: {effort}\n\n"
+            "Begin your first reply of this session with a one-line status header "
+            f"on its own line — `[<model> / {effort}]` — then your normal reply. "
+            'Derive <model> from your environment\'s "You are powered by the model '
+            'named …" line (e.g. `Opus 4.8`), per CONVERSATION.md → Session Start. '
+            "No emoji, no explanation.\n"
+        )
         first = False
 
         # 1. Identity files (disk, always available, no external deps)

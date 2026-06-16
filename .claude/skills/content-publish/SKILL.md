@@ -108,21 +108,36 @@ Write the content following voice-master rules:
 
 ### Step 5 — Quality check
 
-Before submitting for approval, verify:
-- [ ] No banned AI-tell words or phrases
+First, run the **deterministic anti-slop scrubber** on the draft. The model's
+own em-dash audit is unreliable (it leaks spaced em dashes despite the rule), so
+this mechanical pass is mandatory and runs in code:
+
+```bash
+# write the draft to ~/tmp first, then:
+python -m genesis.content.antislop ~/tmp/draft.md > ~/tmp/draft.clean.md
+# stdout = cleaned text (spaced em dashes auto-fixed); stderr = fixes + flags
+```
+
+**Use `draft.clean.md` as the canonical draft** for both approval (Step 6) and
+publish (Step 7) — never paste the pre-scrub text. Then address the scrubber's
+stderr `flags` (banned words, contrast cadence — it flags but does not delete
+these) and verify by eye:
+- [ ] Resolved the scrubber's flagged banned words / cadence
 - [ ] No three-part lists with identical grammatical structure
 - [ ] No sycophantic openers or hedging
-- [ ] Em-dash count ≤ 2 for the whole post
 - [ ] Reads like a person thinking, not a polished AI response
 - [ ] Title is specific and interesting, not generic
 - [ ] Content matches the narrative framing (genesis-narrative.md)
 
-If any check fails, rewrite the failing section.
+If any check fails, rewrite the failing section and re-run the scrubber.
 
 ### Step 6 — Submit for approval
 
 Send the draft to the user via Telegram (outreach_send MCP) with:
-- The full draft text
+- The full draft text (the **cleaned** draft from Step 5)
+- `category="content"` — routes to the Content Review topic and runs the egress
+  anti-slop scrub on the review copy, so the version under review matches what
+  publishes
 - Platform: Medium
 - Ask: "Approve to publish? Reply 'yes', 'no', or send edits."
 
@@ -168,6 +183,13 @@ Send the published URL to the user via Telegram.
 Store the outcome in memory:
 - `memory_store` with tags: `["content", "published", "medium"]`
 - Content: topic, URL, date, any engagement data later
+
+Append to the Discord campaign showcase pool so the next campaign tick
+can reference this article:
+- File: `~/.genesis/campaigns/discord-engagement/showcase-pool.md`
+- Append under `## Published Medium Articles` with today's date, title,
+  and a 2-3 line summary of the article's argument/angle
+- The campaign session uses this as safe public content to share
 
 ## Error Handling
 
