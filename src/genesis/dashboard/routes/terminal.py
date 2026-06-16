@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from typing import TYPE_CHECKING
 
@@ -166,12 +167,27 @@ def vendor_xterm_static(filename):
     return send_from_directory(str(xterm_dir), filename)
 
 
+def _cc_launch_command() -> str:
+    """Claude Code launch command prefilled in the interactive web terminal.
+
+    Defaults to ``--permission-mode auto`` (auto-approve common ops, still
+    prompt on deny/ask rules the operator answers here — keeps deny-rule
+    safety). Set ``GENESIS_CC_PERMISSION_MODE=bypass`` in the dashboard process
+    environment to prefill ``--dangerously-skip-permissions`` instead, for
+    friction-free interactive sessions.
+    """
+    mode = os.environ.get("GENESIS_CC_PERMISSION_MODE", "auto").strip().lower()
+    if mode in ("bypass", "dangerous", "skip"):
+        return "claude --dangerously-skip-permissions"
+    return "claude --permission-mode auto"
+
+
 @blueprint.route("/genesis/terminal")
 def terminal_page():
     """Standalone terminal page — opened in a new window from the Chat tab."""
     from flask import render_template_string
 
-    return render_template_string(_TERMINAL_PAGE_HTML)
+    return render_template_string(_TERMINAL_PAGE_HTML, launch_cmd=_cc_launch_command())
 
 
 _TERMINAL_PAGE_HTML = """\
@@ -211,11 +227,12 @@ _TERMINAL_PAGE_HTML = """\
       const dims = fit.proposeDimensions();
       if (dims) ws.send(JSON.stringify({ resize: { rows: dims.rows, cols: dims.cols } }));
       // Prefill Claude Code launch command; user chooses when to execute.
-      // Interactive terminal (a human drives it), so use auto mode: it
-      // auto-approves common ops but still prompts on deny/ask rules, which
-      // the operator can answer here. Headless/autonomous sessions keep
-      // --dangerously-skip-permissions (no human to answer a prompt).
-      setTimeout(() => ws.send("claude --permission-mode auto"), 500);
+      // Defaults to auto mode (auto-approves common ops, still prompts on
+      // deny/ask rules the operator answers here — keeps deny-rule safety).
+      // Set GENESIS_CC_PERMISSION_MODE=bypass in the dashboard environment to
+      // prefill --dangerously-skip-permissions. Headless/autonomous sessions
+      // keep bypass separately (no human to answer a prompt).
+      setTimeout(() => ws.send("{{ launch_cmd | e }}"), 500);
     };
 
     ws.onmessage = (evt) => {
