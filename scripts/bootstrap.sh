@@ -633,6 +633,22 @@ if [ -f "$GENESIS_ROOT/secrets.env" ]; then
     fi
 fi
 
+# Install 6h backup cron if GENESIS_BACKUP_REPO is configured (idempotent).
+# The config (repo + passphrase) is intentionally user-gated in onboarding;
+# this only wires the mechanical scheduler once the user has completed setup.
+if [ -f "$GENESIS_ROOT/secrets.env" ] && \
+        grep -q '^GENESIS_BACKUP_REPO=[^[:space:]]' "$GENESIS_ROOT/secrets.env" 2>/dev/null; then
+    if ! crontab -l 2>/dev/null | grep -q 'backup\.sh'; then
+        # || true guards against empty crontab exit-1 under set -euo pipefail
+        ( crontab -l 2>/dev/null || true; \
+          echo "0 */6 * * * $GENESIS_ROOT/scripts/backup.sh >> $GENESIS_ROOT/logs/backup.log 2>&1" \
+        ) | crontab -
+        echo "  Backup cron installed (every 6h → genesis-backups)"
+    else
+        echo "  Backup cron already installed — skipping"
+    fi
+fi
+
 # --- VNC stack (collaborative browser mode) ---
 echo "--- Setting up VNC stack ---"
 if bash "$GENESIS_ROOT/scripts/setup-vnc.sh" 2>&1 | sed 's/^/  /'; then
