@@ -23,6 +23,12 @@ hard Stop-hook backstop for this run (the in-pipeline Gate 2 still runs).
 
 ## Step 2 — Interview (one decision at a time)
 
+In foreground, this is a **real interview** — ask the user, one question at a time, and let
+their answers drive the spec. Do NOT auto-decide and skip ahead. A deliverable going out under
+someone's name needs their input on audience, format, and emphasis; guessing these is how you
+ship the wrong thing politely. (Only an autonomous run reads these from a task spec instead of
+asking — v2.)
+
 Establish, and write into the spec:
 
 - **brief_path** — absolute path to the *original* brief/requirements (the take-home
@@ -31,10 +37,15 @@ Establish, and write into the spec:
 - **audience** — who receives this, and what they already know.
 - **purpose** — the job it does for them.
 - **win_condition** — one sentence: what makes this a success in *their* eyes.
-- **format** — chosen deliberately from `references/format-guide.md` by audience+purpose.
-  **Never markdown for an external/under-the-user's-name deliverable.**
+- **format** — a deliberate decision, **not a default**. Use `references/format-guide.md` to form
+  a recommendation from audience+purpose, then **put it to the user with the alternatives.** The
+  most common fork is **PDF (final, fixed) vs DOCX (they'll edit or comment on it)**; decks, XLSX,
+  etc. live in the matrix. Confirm before drafting. **Never markdown for an external /
+  under-the-user's-name deliverable.**
 - **what_leads** — one sentence: the single strongest claim the reader sees first
   (the answer, not the setup). This is the altitude decision, made up front.
+- **output_location** — where the finished artifact and working files go (see "Output location"
+  below). Part of the Gate-1 confirm.
 
 ## Step 3 — Freeze the brief into acceptance criteria
 
@@ -83,13 +94,29 @@ The gate blocks session-end **only** in `rendered_unverified`. Set `rendered_unv
 right after Render; set `verified` only after a Gate-2 PASS; set `shipped` after Gate 3.
 If the user abandons the deliverable, set `status: "cancelled"` so the gate releases.
 
+## Output location
+
+All deliverable files go under `~/.genesis/output/` (never the repo). Decide the shape at intake:
+
+- **Single self-contained file the user just wants handed over** → the final artifact sits
+  directly in `~/.genesis/output/<slug>.<ext>`; keep the working set (spec.json, draft) in a
+  sibling scratch folder `~/.genesis/output/<slug>-work/` so it doesn't clutter the output dir.
+- **A packet / multi-file deliverable** (report + appendix, deck + speaker notes, embedded
+  diagrams, a data export alongside the doc) → its own subfolder `~/.genesis/output/<slug>/`
+  holds the final artifact(s) and working files together.
+- **Unsure → default to a subfolder.** If the user wants the final file to ultimately land
+  somewhere specific (a Desktop path, an attachment folder), capture that too. Confirm at Gate 1.
+
 ## Gate 1 — Frame & Format (interactive)
 
-Before drafting, confirm with the user, in one message:
+Before drafting, confirm with the user, in one message — and treat **format** and **output
+location** as *their* call, not yours:
 
-> Audience **X**, format **PDF**, leading with **"<what_leads>"**, success = **<win_condition>**.
-> Acceptance criteria: AC1…ACn. Good to draft?
+> Audience **X**. Recommend **PDF** (final/fixed); say if you'd rather **DOCX** (editable) or
+> another format. Output goes to **<output_location>**. Leading with **"<what_leads>"**,
+> success = **<win_condition>**. Acceptance criteria: AC1…ACn. Anything to change before I draft?
 
 On approval set `audit_trail.intake.gate1_approved = true` and proceed to Draft.
 If the user revises, update the spec and re-confirm. Gate 1 is the cheap place to catch a
-wrong frame — do not skip it to "save a step."
+wrong frame, format, or location — do not skip it to "save a step." In a real run, expect this
+to take real back-and-forth; that is the point, not friction.
