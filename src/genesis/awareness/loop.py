@@ -107,6 +107,9 @@ async def _check_wal_health(db) -> None:
 
     mb = size / (1024 * 1024)
     priority = "critical" if size >= _WAL_SIZE_CRIT_BYTES else "high"
+    # Set the cooldown BEFORE the write so a failed create (e.g. DB locked — the
+    # very scenario this alerts on) still suppresses per-tick retries for an hour.
+    _last_wal_alert_at = now
     try:
         await observations.create(
             db,
@@ -124,7 +127,6 @@ async def _check_wal_health(db) -> None:
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),
         )
-        _last_wal_alert_at = now
         logger.warning("WAL health alert: %.0f MB (%s)", mb, priority)
     except Exception:
         logger.debug("Failed to create WAL health alert observation", exc_info=True)

@@ -42,7 +42,7 @@ async def count_links(db: aiosqlite.Connection, memory_id: str) -> int:
         (memory_id, memory_id),
     )
     row = rows[0] if rows else None
-    return row[0]
+    return row[0] if row else 0
 
 
 async def batch_link_counts(
