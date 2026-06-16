@@ -73,6 +73,12 @@ def test_allows_foreign_session_marker(tmp_path):
     assert mod._decide({"session_id": "s1"}, tmp_path) == 0
 
 
+def test_allows_marker_without_session_id_field(tmp_path):
+    # ambiguous ownership (no session_id in the marker) -> never block
+    _write_marker(tmp_path, "s1", {"status": "rendered_unverified"})
+    assert mod._decide({"session_id": "s1"}, tmp_path) == 0
+
+
 def test_allows_malformed_marker_json(tmp_path):
     d = tmp_path / "s1"
     d.mkdir()
@@ -85,7 +91,7 @@ def test_allows_missing_status_field(tmp_path):
     assert mod._decide({"session_id": "s1"}, tmp_path) == 0
 
 
-@pytest.mark.parametrize("bad", ["../evil", "a/b", "..", "/abs", ""])
+@pytest.mark.parametrize("bad", ["../evil", "a/b", "..", "/abs", "", "\x00bad"])
 def test_allows_path_unsafe_session_id(tmp_path, bad):
     assert mod._decide({"session_id": bad}, tmp_path) == 0
 

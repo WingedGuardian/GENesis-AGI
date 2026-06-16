@@ -42,15 +42,15 @@ def _decide(data: dict, sessions_root: Path) -> int:
     try:
         sid = data.get("session_id")
         # Falsy or path-unsafe session id -> allow (never touch arbitrary paths).
-        if not sid or "/" in sid or ".." in sid:
+        if not sid or "/" in sid or ".." in sid or "\x00" in sid:
             return 0
         marker = sessions_root / sid / "deliverable.json"
         if not marker.is_file():
             return 0
         spec = json.loads(marker.read_text())
-        # A marker that names a different session is stale/foreign -> never block.
-        marker_sid = spec.get("session_id")
-        if marker_sid and marker_sid != sid:
+        # Block only when the marker EXPLICITLY claims this session. A marker that names a
+        # different session, or names none at all (ambiguous ownership), never blocks.
+        if spec.get("session_id") != sid:
             return 0
         if spec.get("status") == _BLOCK_STATUS:
             return 2
