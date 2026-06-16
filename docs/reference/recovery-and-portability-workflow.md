@@ -21,13 +21,13 @@ documentation.
 4. Use `GENESIS_ENABLE_OLLAMA=false` when validating the cloud-first path.
 5. Run `./scripts/check_portability.sh` before claiming the branch is portable.
 
-## Release-Staging Validation
+## Release Validation
 
-1. Run `./scripts/prepare-public-release.sh`.
-2. Confirm the secret scan result.
-3. Confirm the portability scan result.
-4. Validate the staged tree on a fresh environment instead of relying on the
-   private development VM.
+The public repo (`GENesis-AGI`) is the primary repo, so there is no separate
+"strip and stage" step. Leak protection is enforced on every PR by the
+`leak-detector` job in `.github/workflows/ci.yml` (detect-secrets + portability
++ email scans). Releases are cut by tagging `vX.Y` on `main` and publishing a
+GitHub Release from the matching `CHANGELOG.md` section.
 
 ## Current Recovery Anchors
 

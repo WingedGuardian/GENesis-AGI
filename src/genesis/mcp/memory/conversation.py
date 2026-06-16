@@ -39,13 +39,12 @@ async def conversation_history(
         if search:
             return await telegram_messages.search_all(memory_mod._db, search, limit=limit)
         if thread_id is not None:
-            cursor = await memory_mod._db.execute(
+            rows = await memory_mod._db.execute_fetchall(
                 """SELECT * FROM telegram_messages
                    WHERE thread_id = ?
                    ORDER BY timestamp DESC LIMIT ?""",
                 (thread_id, limit),
             )
-            rows = await cursor.fetchall()
             return [dict(r) for r in reversed(rows)]
         return await telegram_messages.query_all_recent(memory_mod._db, limit=limit)
 

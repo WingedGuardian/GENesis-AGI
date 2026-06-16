@@ -64,10 +64,18 @@ class VoiceChannelAdapter(ChannelAdapter):
         self._tts_entity = tts_entity or os.environ.get(
             "HA_TTS_ENTITY", "tts.piper",
         )
+        # No device-specific default — entity IDs are install-specific and a
+        # hardcoded default silently breaks when the device is renamed (a
+        # firmware reflash added a "_media_player" suffix on 2026-06-13,
+        # silently killing the chime). Require explicit config.
         self._media_player = media_player_entity or os.environ.get(
-            "HA_MEDIA_PLAYER_ENTITY",
-            "media_player.home_assistant_voice_0a2841",
+            "HA_MEDIA_PLAYER_ENTITY", "",
         )
+        if not self._media_player:
+            logger.warning(
+                "Voice adapter: HA_MEDIA_PLAYER_ENTITY is not set — proactive "
+                "voice (chime/TTS) is disabled until it is configured."
+            )
 
     async def start(self) -> None:
         """No-op — adapter is stateless, HA handles transport."""
@@ -99,6 +107,12 @@ class VoiceChannelAdapter(ChannelAdapter):
         if not self._ha_url or not self._ha_token:
             logger.warning("Voice adapter: HA not configured, skipping TTS")
             return ""
+        if not self._media_player:
+            logger.warning(
+                "Voice adapter: no media_player entity (set HA_MEDIA_PLAYER_ENTITY) "
+                "— skipping proactive voice delivery"
+            )
+            return ""
 
         delivery_id = str(uuid.uuid4())
         headers = {
@@ -111,7 +125,7 @@ class VoiceChannelAdapter(ChannelAdapter):
                 # Play pre-announce chime via media player (not voice assistant)
                 if preannounce and self._chime_media_id:
                     try:
-                        await client.post(
+                        chime_resp = await client.post(
                             f"{self._ha_url}/api/services/media_player/play_media",
                             headers=headers,
                             json={
@@ -121,6 +135,9 @@ class VoiceChannelAdapter(ChannelAdapter):
                                 "announce": True,
                             },
                         )
+                        # play_media returns [] even on success, so HTTP
+                        # status is the only reliable failure signal here.
+                        chime_resp.raise_for_status()
                         await asyncio.sleep(self.CHIME_DELAY_S)
                     except Exception:
                         logger.warning("Pre-announce chime failed", exc_info=True)
@@ -149,6 +166,22 @@ class VoiceChannelAdapter(ChannelAdapter):
             },
         )
         response.raise_for_status()
+        # HA returns the list of states changed by the service call. An empty
+        # list means tts.speak matched no target (wrong/unavailable entity)
+        # and produced NO audio — surface it instead of reporting a false
+        # success. This is the failure mode that hid a silent chime (HA 200
+        # + []) on 2026-06-13.
+        try:
+            changed = response.json()
+        except Exception:
+            changed = None
+        if isinstance(changed, list) and not changed:
+            logger.warning(
+                "Voice TTS changed no states — tts '%s' / media_player '%s' "
+                "may not exist or be unavailable; no audio delivered",
+                self._tts_entity, self._media_player,
+            )
+            return
         logger.info(
             "Voice TTS delivered: %d chars → %s",
             len(text), self._media_player,

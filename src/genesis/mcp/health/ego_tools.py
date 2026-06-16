@@ -38,8 +38,7 @@ async def _impl_ego_focus_reset(
     If new_focus is provided, sets it as the new focus.
     Otherwise clears to a neutral default.
     """
-    import aiosqlite
-
+    from genesis.db.connection import get_raw_db
     from genesis.db.crud import ego as ego_crud
 
     default_focus = "general system awareness"
@@ -52,7 +51,7 @@ async def _impl_ego_focus_reset(
     results = {}
     db_path = _get_db_path()
 
-    async with aiosqlite.connect(str(db_path)) as db:
+    async with get_raw_db(db_path) as db:
         for key in ("ego_focus_summary", "genesis_ego_focus_summary"):
             old_val = await ego_crud.get_state(db, key)
             if old_val is not None:
@@ -121,13 +120,11 @@ async def ego_directive(
     if ego_target not in _VALID_EGO_TARGETS:
         return {"status": "error", "reason": f"Invalid ego_target: {ego_target!r}. Must be one of: {sorted(_VALID_EGO_TARGETS)}"}
 
-    import aiosqlite
-
+    from genesis.db.connection import get_raw_db
     from genesis.db.crud import ego as ego_crud
 
     db_path = _get_db_path()
-    async with aiosqlite.connect(str(db_path)) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_raw_db(db_path) as db:
         directive_id = await ego_crud.create_directive(
             db,
             content=content,
@@ -181,13 +178,11 @@ async def ego_goal_create(
     if goal_type not in _VALID_GOAL_TYPES:
         return {"status": "error", "reason": f"Invalid goal_type: {goal_type!r}. Must be 'milestone' or 'continuous'"}
 
-    import aiosqlite
-
+    from genesis.db.connection import get_raw_db
     from genesis.db.crud import user_goals
 
     db_path = _get_db_path()
-    async with aiosqlite.connect(str(db_path)) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_raw_db(db_path) as db:
 
         # Validate parent exists if specified
         if parent_goal_id:
@@ -222,13 +217,11 @@ async def ego_goal_create(
 @mcp.tool()
 async def ego_goal_list() -> dict:
     """List all active user goals in the ego system."""
-    import aiosqlite
-
+    from genesis.db.connection import get_raw_db
     from genesis.db.crud import user_goals
 
     db_path = _get_db_path()
-    async with aiosqlite.connect(str(db_path)) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_raw_db(db_path) as db:
         goals = await user_goals.list_active(db, limit=20)
 
     return {
@@ -283,13 +276,11 @@ async def ego_goal_update(
     if goal_type and goal_type not in _VALID_GOAL_TYPES:
         return {"status": "error", "reason": f"Invalid goal_type: {goal_type!r}. Must be 'milestone' or 'continuous'"}
 
-    import aiosqlite
-
+    from genesis.db.connection import get_raw_db
     from genesis.db.crud import user_goals
 
     db_path = _get_db_path()
-    async with aiosqlite.connect(str(db_path)) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_raw_db(db_path) as db:
 
         if status == "achieved":
             await user_goals.mark_achieved(db, goal_id)
@@ -387,13 +378,11 @@ async def ego_goal_progress(
     if not note.strip():
         return {"status": "error", "reason": "Note cannot be empty"}
 
-    import aiosqlite
-
+    from genesis.db.connection import get_raw_db
     from genesis.db.crud import user_goals
 
     db_path = _get_db_path()
-    async with aiosqlite.connect(str(db_path)) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_raw_db(db_path) as db:
         goal = await user_goals.get_by_id(db, goal_id)
         if not goal:
             return {"status": "error", "reason": f"Goal {goal_id} not found"}
@@ -433,8 +422,7 @@ async def ego_proposal_resolve(
             "reason": f"action must be 'approve' or 'reject', got {action!r}",
         }
 
-    import aiosqlite
-
+    from genesis.db.connection import get_raw_db
     from genesis.db.crud import ego as ego_crud
 
     status = "approved" if action == "approve" else "rejected"
@@ -442,8 +430,7 @@ async def ego_proposal_resolve(
     results: dict[str, str] = {}
     batch_id = None
 
-    async with aiosqlite.connect(str(db_path)) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_raw_db(db_path) as db:
 
         # Find most recent pending batch (prefer user_ego_cycle)
         pending = await ego_crud.list_pending_proposals(

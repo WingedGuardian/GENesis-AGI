@@ -115,19 +115,73 @@ class TestModelSelectionLogic:
         assert self._select_model("outreach", {}) == CCModel.OPUS
         assert self._select_model("dispatch", {}) == CCModel.OPUS
         assert self._select_model("publish", {}) == CCModel.OPUS
+        assert self._select_model("code_change", {}) == CCModel.OPUS
+        assert self._select_model("refactor", {}) == CCModel.OPUS
+        assert self._select_model("maintenance", {}) == CCModel.OPUS
+        assert self._select_model("email", {}) == CCModel.OPUS
+        assert self._select_model("content", {}) == CCModel.OPUS
 
     def test_interact_override_to_sonnet(self):
         # An explicit override can downgrade interact types
         assert self._select_model("outreach", {"outreach": "sonnet"}) == CCModel.SONNET
 
-    def test_observe_defaults_to_sonnet(self):
+    def test_research_types_default_to_sonnet(self):
         assert self._select_model("monitor", {}) == CCModel.SONNET
+        assert self._select_model("research", {}) == CCModel.SONNET
+        assert self._select_model("analyze", {}) == CCModel.SONNET
+        assert self._select_model("diagnose", {}) == CCModel.SONNET
 
-    def test_observe_with_override(self):
+    def test_research_with_override(self):
         assert self._select_model("monitor", {"monitor": "opus"}) == CCModel.OPUS
 
-    def test_empty_action_type(self):
+    def test_unknown_action_type_defaults_to_research_sonnet(self):
+        # Unknown types now default to research (not observe), still Sonnet
         assert self._select_model("", {}) == CCModel.SONNET
+        assert self._select_model("unknown_action", {}) == CCModel.SONNET
 
     def test_override_haiku(self):
         assert self._select_model("investigate", {"investigate": "haiku"}) == CCModel.HAIKU
+
+
+class TestInferProfile:
+    """Direct tests for _infer_profile — covers all action types from
+    ACTION_TYPE_DOMAIN_MAP in autonomy/classification.py."""
+
+    def test_interact_profile_for_self_modify(self):
+        assert _infer_profile("code_change") == "interact"
+        assert _infer_profile("refactor") == "interact"
+
+    def test_interact_profile_for_internal_write(self):
+        assert _infer_profile("maintenance") == "interact"
+        assert _infer_profile("config") == "interact"
+        assert _infer_profile("optimize") == "interact"
+
+    def test_interact_profile_for_represent_user(self):
+        assert _infer_profile("outreach") == "interact"
+        assert _infer_profile("email") == "interact"
+        assert _infer_profile("apply") == "interact"
+
+    def test_interact_profile_for_external_write(self):
+        assert _infer_profile("publish") == "interact"
+        assert _infer_profile("content") == "interact"
+        assert _infer_profile("post") == "interact"
+
+    def test_interact_profile_for_notify_user(self):
+        assert _infer_profile("notification") == "interact"
+        assert _infer_profile("alert") == "interact"
+
+    def test_interact_profile_for_dispatch(self):
+        assert _infer_profile("dispatch") == "interact"
+
+    def test_research_profile_for_external_read(self):
+        assert _infer_profile("investigate") == "research"
+        assert _infer_profile("research") == "research"
+        assert _infer_profile("analyze") == "research"
+
+    def test_research_profile_for_observe(self):
+        assert _infer_profile("diagnose") == "research"
+        assert _infer_profile("monitor") == "research"
+
+    def test_unknown_defaults_to_research(self):
+        assert _infer_profile("") == "research"
+        assert _infer_profile("something_new") == "research"

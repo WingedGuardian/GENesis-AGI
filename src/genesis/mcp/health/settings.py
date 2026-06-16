@@ -114,11 +114,10 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
     ),
     "outreach": SettingsDomain(
         name="outreach",
-        description="Outreach preferences (quiet hours, rate limits, channels)",
+        description="Outreach preferences (quiet hours, rate limits, channels, voice alert IDs)",
         config_filename="outreach.yaml",
         readonly=False,
         needs_restart=False,
-        dedicated_tool="outreach_preferences",
     ),
     "recon_schedules": SettingsDomain(
         name="recon_schedules",
@@ -745,7 +744,7 @@ async def _impl_settings_update(
         "domain": domain,
         "status": "applied",
         "changes_applied": changes,
-        "local_override_file": f"config/{local_file}",
+        "local_override_file": f"~/.genesis/config/{local_file}",
         "needs_restart": entry.needs_restart,
     }
     if entry.needs_restart:

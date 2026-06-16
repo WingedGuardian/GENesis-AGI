@@ -83,9 +83,30 @@ chmod 700 "$TMPDIR"
 # Without this, intermittent ENOENT failures on /tmp break the Bash tool.
 export CLAUDE_CODE_TMPDIR="$HOME/.genesis/cc-tmp"
 
+# Permission mode for this interactive dev console. Default: auto — auto-approves
+# common ops but still prompts on deny/ask rules, which the operator answers in
+# the tmux session (keeps deny-rule safety). To launch friction-free with
+# --dangerously-skip-permissions, set GENESIS_CC_PERMISSION_MODE=bypass. SSH
+# RemoteCommand does not source .bashrc, so this script also reads an optional
+# ~/.genesis/cc-slot.env (e.g. a single line: GENESIS_CC_PERMISSION_MODE=bypass).
+# Headless/autonomous CC sessions (CCInvoker -p) keep bypass separately — no
+# human is present to answer a prompt.
+if [ -f "${HOME}/.genesis/cc-slot.env" ]; then
+    # Don't let a malformed override file kill the session under `set -e` (the
+    # sourced file is the final command of an && chain, so a non-zero exit would
+    # abort the script and drop the SSH session with no diagnostic).
+    . "${HOME}/.genesis/cc-slot.env" \
+        || echo "cc-slot: warning: ~/.genesis/cc-slot.env sourced with errors (continuing)" >&2
+fi
+case "${GENESIS_CC_PERMISSION_MODE:-auto}" in
+    bypass|dangerous|skip) CC_PERM_FLAG="--dangerously-skip-permissions" ;;
+    *)                     CC_PERM_FLAG="--permission-mode auto" ;;
+esac
+
 # -u: force UTF-8 output even if a future client's locale detection fails
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
+    -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
     -e "LANG=$LANG" \
-    "cd ${GENESIS_ROOT} && exec claude --dangerously-skip-permissions"
+    "cd ${GENESIS_ROOT} && exec claude ${CC_PERM_FLAG}"

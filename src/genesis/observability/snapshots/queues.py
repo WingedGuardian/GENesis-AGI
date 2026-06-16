@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import aiosqlite
 
+    from genesis.observability.events import GenesisEventBus
     from genesis.resilience.deferred_work import DeferredWorkQueue
     from genesis.routing.dead_letter import DeadLetterQueue
 
@@ -66,6 +67,7 @@ async def queues(
     db: aiosqlite.Connection | None,
     deferred_queue: DeferredWorkQueue | None,
     dead_letter: DeadLetterQueue | None,
+    event_bus: GenesisEventBus | None = None,
 ) -> dict:
     errors: list[str] = []
 
@@ -248,6 +250,13 @@ async def queues(
         "deferred_items": deferred_items,
         "discarded_count": discarded_count,
         "discarded_items": discarded_items,
+        # WS-17: cumulative count of events dropped because the event-bus
+        # persistence queue was full (0 when persistence/bus is unavailable).
+        # NOTE: a cumulative counter, not an instantaneous depth — deliberately
+        # NOT in errors.py:_QUEUE_DEPTH_FIELDS (which alerts on depth > 100).
+        "events_dropped": (
+            event_bus.dropped_event_count() if event_bus is not None else 0
+        ),
     }
     if errors:
         result["errors"] = errors

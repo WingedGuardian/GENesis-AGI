@@ -722,9 +722,8 @@ if echo "$REPO_URL" | grep -q "github.com" && ! curl -sf "$REPO_URL" >/dev/null 
     echo "        incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID --cwd /home/ubuntu/genesis -t -- bash -l"
 fi
 
-# NOTE: The bash -c uses single quotes so /home/ubuntu paths survive the
-# prepare-public-release.sh sed replacement (which converts /home/ubuntu/ to
-# ${HOME}/ — that would break in double-quoted strings on a non-ubuntu host).
+# NOTE: The bash -c uses single quotes so /home/ubuntu paths are treated
+# literally rather than expanded against the host user's HOME.
 # BRANCH and REPO_URL are injected via --env instead.
 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
     --env "HOME=/home/ubuntu" \
@@ -1133,7 +1132,15 @@ if [ "$_host_node_ok" = "0" ]; then
     fi
 fi
 
-CC_VERSION="${CC_VERSION:-2.1.173}"  # Scrollback: fullscreen renderer (tui setting) — see docs/reference/cc-compatibility.md
+# CC version pin — single source of truth: scripts/lib/cc_version.sh
+# (2.1.173 = scrollback fullscreen-renderer fix — see docs/reference/cc-compatibility.md)
+_cc_env="$_SCRIPT_DIR/lib/cc_version.sh"
+if [ ! -f "$_cc_env" ]; then
+    echo "ERROR: missing CC version pin: $_cc_env" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$_cc_env"
 if ! command -v claude &>/dev/null; then
     echo "  Installing Claude Code v${CC_VERSION} on host..."
     if command -v npm &>/dev/null; then

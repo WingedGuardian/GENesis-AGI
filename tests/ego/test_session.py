@@ -450,8 +450,8 @@ class TestProcessExecutionBriefs:
         assert req.profile == "research"
         assert req.model.value == "haiku"
 
-    async def test_invalid_profile_defaults_observe(self, ego_with_runner, mock_direct_runner, db):
-        """Invalid profile falls back to observe."""
+    async def test_invalid_profile_infers_from_action_type(self, ego_with_runner, mock_direct_runner, db):
+        """Invalid profile falls back to action_type inference (research default)."""
         await self._insert_proposal(db, "prop_008")
 
         briefs = [{"proposal_id": "prop_008", "prompt": "Do it",
@@ -459,7 +459,7 @@ class TestProcessExecutionBriefs:
         await ego_with_runner._process_execution_briefs(briefs)
 
         req = mock_direct_runner.spawn.call_args[0][0]
-        assert req.profile == "observe"
+        assert req.profile == "research"
 
     async def test_interact_profile_accepted(self, ego_with_runner, mock_direct_runner, db):
         """Interact profile is valid and passes through to the request."""

@@ -1276,10 +1276,16 @@ class EgoSession:
             # catches information that slips through the ego's own judgment.
             prompt = f"{prompt}\n\n{_CONTENT_FIREWALL_RULES}"
 
-            # Map profile and model from brief
-            profile = brief.get("profile", "observe")
-            if profile not in VALID_PROFILES:
-                profile = "observe"
+            # Map profile from brief, falling back to action_type inference.
+            # The ego may omit profile from the brief; defaulting to
+            # "observe" silently killed code-change dispatches (6 instances).
+            brief_profile = brief.get("profile", "")
+            if brief_profile in VALID_PROFILES:
+                profile = brief_profile
+            else:
+                # Infer from proposal action_type if available
+                brief_action = brief.get("action_type", "")
+                profile = _infer_profile(brief_action)
             model_str = brief.get("model", "sonnet")
             if model_str == "opus":
                 model = CCModel.OPUS
@@ -2208,17 +2214,33 @@ _VALID_URGENCIES = frozenset({"low", "normal", "high", "critical"})
 # as defense-in-depth for the essential knowledge injection path.
 
 
-_INTERACT_TYPES = frozenset({"outreach", "dispatch", "publish"})
-_RESEARCH_TYPES = frozenset({"investigate"})
+_INTERACT_TYPES = frozenset({
+    "outreach", "dispatch", "publish",
+    "code_change", "refactor",
+    "maintenance", "config", "optimize",
+    "email", "apply",
+    "notification", "alert",
+    "content", "post",
+    "purchase", "payment",
+})
+_RESEARCH_TYPES = frozenset({
+    "investigate", "research", "analyze",
+    "diagnose", "monitor",
+})
 
 
 def _infer_profile(action_type: str) -> str:
-    """Map proposal action_type to a DirectSession profile."""
+    """Map proposal action_type to a DirectSession profile.
+
+    Covers all action_types from autonomy/classification.py's
+    ACTION_TYPE_DOMAIN_MAP.  Defaults to ``research`` (not ``observe``)
+    so unrecognized types can at least write findings.
+    """
     if action_type in _INTERACT_TYPES:
         return "interact"
     if action_type in _RESEARCH_TYPES:
         return "research"
-    return "observe"
+    return "research"
 
 
 def _validate_output(data: dict) -> dict | None:

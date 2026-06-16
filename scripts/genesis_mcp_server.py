@@ -28,7 +28,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_VALID_SERVERS = {"health", "memory", "outreach", "recon"}
+_VALID_SERVERS = {"health", "memory", "outreach", "recon", "discord-bot"}
 _DEFAULT_FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _DEFAULT_STATUS = Path.home() / ".genesis" / "status.json"
 
@@ -50,6 +50,7 @@ _DEFAULT_PORTS = {
     "memory": 8101,
     "outreach": 8102,
     "recon": 8103,
+    "discord-bot": 8104,
 }
 
 
@@ -140,14 +141,12 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
 
     @asynccontextmanager
     async def _lifespan(server) -> AsyncIterator[None]:
-        import aiosqlite
+        from genesis.db.connection import get_db
 
-        from genesis.db.connection import BUSY_TIMEOUT_MS
-
-        db = await aiosqlite.connect(str(_DEFAULT_DB))
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # Long-lived shared connection: use the SerializedConnection (get_db) so
+        # concurrent tool calls can't interleave-wedge the transaction state.
+        # foreign_keys=False preserves the prior raw-connection behavior.
+        db = await get_db(_DEFAULT_DB, foreign_keys=False)
         try:
 
             # Bootstrap standalone router for LLM-dependent tools
@@ -225,17 +224,15 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
 
     @asynccontextmanager
     async def _lifespan(server) -> AsyncIterator[None]:
-        import aiosqlite
         from qdrant_client import QdrantClient
 
-        from genesis.db.connection import BUSY_TIMEOUT_MS
+        from genesis.db.connection import get_db
         from genesis.mcp.memory_mcp import init
         from genesis.memory.embeddings import EmbeddingProvider
+        from genesis.observability.provider_activity import ProviderActivityTracker
 
-        db = await aiosqlite.connect(str(_DEFAULT_DB))
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # Long-lived shared connection via SerializedConnection (see _bootstrap_health).
+        db = await get_db(_DEFAULT_DB, foreign_keys=False)
 
         try:
 
@@ -249,7 +246,14 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
 
             qdrant = QdrantClient(url=qdrant_url(), timeout=5)
             embedding = EmbeddingProvider()
-            init(db=db, qdrant_client=qdrant, embedding_provider=embedding)
+            # The activity tracker enables InstrumentationMiddleware, which also
+            # runs the per-call commit/rollback boundary that releases read
+            # snapshots (WS-15 follow-up). Without a tracker the middleware — and
+            # thus the boundary — never attaches.
+            tracker = ProviderActivityTracker()
+            tracker.set_db(db)
+            init(db=db, qdrant_client=qdrant, embedding_provider=embedding,
+                 activity_tracker=tracker)
             clear_mcp_crash("memory")
             yield
         finally:
@@ -269,15 +273,12 @@ def _bootstrap_recon(transport_kwargs: dict) -> None:
 
     @asynccontextmanager
     async def _lifespan(server) -> AsyncIterator[None]:
-        import aiosqlite
-
-        from genesis.db.connection import BUSY_TIMEOUT_MS
+        from genesis.db.connection import get_db
         from genesis.mcp.recon_mcp import init_recon_mcp
+        from genesis.observability.provider_activity import ProviderActivityTracker
 
-        db = await aiosqlite.connect(str(_DEFAULT_DB))
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # Long-lived shared connection via SerializedConnection (see _bootstrap_health).
+        db = await get_db(_DEFAULT_DB, foreign_keys=False)
 
         try:
 
@@ -289,7 +290,11 @@ def _bootstrap_recon(transport_kwargs: dict) -> None:
             else:
                 create_standalone_router()
 
-            init_recon_mcp(db=db)
+            # Tracker enables InstrumentationMiddleware + its read-snapshot
+            # boundary (WS-15 follow-up) — see _bootstrap_memory.
+            tracker = ProviderActivityTracker()
+            tracker.set_db(db)
+            init_recon_mcp(db=db, activity_tracker=tracker)
             clear_mcp_crash("recon")
             yield
         finally:
@@ -314,15 +319,12 @@ def _bootstrap_outreach(transport_kwargs: dict) -> None:
 
     @asynccontextmanager
     async def _lifespan(server) -> AsyncIterator[None]:
-        import aiosqlite
-
-        from genesis.db.connection import BUSY_TIMEOUT_MS
+        from genesis.db.connection import get_db
         from genesis.mcp.outreach_mcp import init_outreach_mcp
+        from genesis.observability.provider_activity import ProviderActivityTracker
 
-        db = await aiosqlite.connect(str(_DEFAULT_DB))
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # Long-lived shared connection via SerializedConnection (see _bootstrap_health).
+        db = await get_db(_DEFAULT_DB, foreign_keys=False)
 
         try:
             # Standalone: pipeline=None means outreach_send returns "not initialized".
@@ -335,7 +337,14 @@ def _bootstrap_outreach(transport_kwargs: dict) -> None:
             else:
                 create_standalone_router()
 
-            init_outreach_mcp(pipeline=None, engagement=None, config=None, db=db)
+            # Tracker enables InstrumentationMiddleware + its read-snapshot
+            # boundary (WS-15 follow-up) — see _bootstrap_memory.
+            tracker = ProviderActivityTracker()
+            tracker.set_db(db)
+            init_outreach_mcp(
+                pipeline=None, engagement=None, config=None, db=db,
+                activity_tracker=tracker,
+            )
             clear_mcp_crash("outreach")
             yield
         finally:
@@ -349,11 +358,32 @@ def _bootstrap_outreach(transport_kwargs: dict) -> None:
     _run_mcp(mcp, transport_kwargs)
 
 
+def _bootstrap_discord_bot(transport_kwargs: dict) -> None:
+    """Bootstrap and run the discord-bot MCP server.
+
+    Provides read/write Discord access via bot token for campaign
+    sessions. No DB connection needed — fully stateless.
+    """
+    import os
+
+    from genesis.mcp.discord_bot_mcp import init_discord_bot, mcp
+
+    bot_token = os.environ.get("DISCORD_BOT_TOKEN", "")
+    if not bot_token:
+        logger.error("DISCORD_BOT_TOKEN not set — discord-bot cannot start")
+        return
+
+    init_discord_bot(bot_token=bot_token)
+    clear_mcp_crash("discord-bot")
+    _run_mcp(mcp, transport_kwargs)
+
+
 _BOOTSTRAPPERS = {
     "health": _bootstrap_health,
     "memory": _bootstrap_memory,
     "outreach": _bootstrap_outreach,
     "recon": _bootstrap_recon,
+    "discord-bot": _bootstrap_discord_bot,
 }
 
 
@@ -447,6 +477,8 @@ def main(argv: list[str] | None = None) -> None:
         "GENESIS_ENABLE_OLLAMA", "OLLAMA_EMBEDDING_MODEL",
         # HTTP transport auth
         "GENESIS_MCP_HTTP_TOKEN",
+        # Discord bot (used by discord-bot MCP server)
+        "DISCORD_BOT_TOKEN",
     }
     import os
 

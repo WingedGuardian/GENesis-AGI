@@ -13,6 +13,7 @@ from genesis.routing.types import (
     ProviderConfig,
     ProviderState,
 )
+from genesis.util.atomic import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -166,11 +167,16 @@ class CircuitBreakerRegistry:
         clock: object = None,
         state_file: Path | str | None = None,
         on_recovery: object = None,
+        persist: bool = True,
     ) -> None:
         self._providers = providers
         self._clock = clock
         self._state_file = Path(state_file) if state_file else _STATE_FILE
         self._on_recovery = on_recovery
+        # persist=False → read-only registry (MCP child processes): load shared
+        # state at construction but never write it, so only the server owns the
+        # file and concurrent children can't clobber it (WS-3c).
+        self._persist = persist
         self._breakers: dict[str, CircuitBreaker] = {}
         self.load_state()
 
@@ -186,13 +192,20 @@ class CircuitBreakerRegistry:
                 provider=cfg,
                 open_duration_s=cfg.open_duration_s,
                 clock=self._clock,
-                on_state_change=self.save_state,
+                on_state_change=self.save_state if self._persist else None,
                 on_recovery=self._on_recovery,
             )
         return self._breakers[provider]
 
     def save_state(self) -> None:
-        """Persist breaker states to disk so they survive restarts."""
+        """Persist breaker states to disk so they survive restarts.
+
+        No-op for read-only (persist=False) registries — MCP children must not
+        write the shared file. Uses an atomic write so a concurrent reader never
+        observes a truncated file (which load_state would silently discard).
+        """
+        if not self._persist:
+            return
         data = {}
         for name, cb in self._breakers.items():
             data[name] = {
@@ -202,8 +215,7 @@ class CircuitBreakerRegistry:
                 "last_failure_category": cb._last_failure_category.value if cb._last_failure_category else None,
             }
         try:
-            self._state_file.parent.mkdir(parents=True, exist_ok=True)
-            self._state_file.write_text(json.dumps(data, indent=2))
+            atomic_write_text(self._state_file, json.dumps(data, indent=2))
         except Exception:
             logger.error("Failed to save circuit breaker state", exc_info=True)
 
@@ -217,7 +229,7 @@ class CircuitBreakerRegistry:
                 if name in self._providers:
                     cb = self.get(name)
                     saved_state = info.get("state", "CLOSED")
-                    if saved_state == "OPEN":
+                    if saved_state == ProviderState.OPEN.value:
                         cb._state = ProviderState.OPEN
                         cb._opened_at = cb._clock()
                     cb._consecutive_failures = info.get("consecutive_failures", 0)
@@ -225,7 +237,7 @@ class CircuitBreakerRegistry:
                     # Cap backoff on restart — escalating backoff is for consecutive
                     # failures within a session, not across restarts spanning weeks.
                     # Cap=3 → max backoff = min(120*2^2, 1800) = 480s (8 min).
-                    if saved_state == "OPEN":
+                    if saved_state == ProviderState.OPEN.value:
                         cb._trip_count = min(cb._trip_count, 3)
                     saved_cat = info.get("last_failure_category")
                     cb._last_failure_category = ErrorCategory(saved_cat) if saved_cat else None

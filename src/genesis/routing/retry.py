@@ -6,7 +6,8 @@ import random
 
 from genesis.routing.types import ErrorCategory, RetryPolicy
 
-_TRANSIENT_CODES = {408, 429, 500, 502, 503, 504}
+_TRANSIENT_CODES = {429, 500, 502, 503, 504}
+_TIMEOUT_CODES = {408}  # 408 Request Timeout — litellm.Timeout maps here
 _PERMANENT_CODES = {401, 404}
 _QUOTA_CODES = {402}  # 402 Payment Required is always quota
 _MAYBE_QUOTA_CODES = {403}  # 403 is quota only if message contains keywords
@@ -27,11 +28,15 @@ def classify_error(status_code: int | None, error_msg: str) -> ErrorCategory:
             return ErrorCategory.PERMANENT
         if status_code in _PERMANENT_CODES:
             return ErrorCategory.PERMANENT
+        if status_code in _TIMEOUT_CODES:
+            return ErrorCategory.TIMEOUT
         if status_code in _TRANSIENT_CODES:
             return ErrorCategory.TRANSIENT
 
     msg = error_msg.lower()
-    if "timeout" in msg or "connection" in msg:
+    if "timeout" in msg:
+        return ErrorCategory.TIMEOUT
+    if "connection" in msg:
         return ErrorCategory.TRANSIENT
     if "malformed" in msg or "partial" in msg or "truncated" in msg:
         return ErrorCategory.DEGRADED

@@ -141,7 +141,7 @@ The daily drivers for professional productivity and general intelligence.
 - **Intelligence Tier:** A/S (Thoughtful reasoning)
 - **SWE-Bench:** ~62%
 - **Cost:** $1.00/$4.00 per MTok (input/output)
-- **Free Tier:** Available on Nvidia NIM (5,000 credits, 40 RPM). OpenRouter `:free` variant (`moonshotai/kimi-k2.6:free`) removed June 2026.
+- **Free Tier:** Available on Nvidia NIM (5,000 credits, 40 RPM); OpenRouter `:free` variant (`moonshotai/kimi-k2.6:free`) removed June 2026
 
 **Best At:**
 1. Needle in a Haystack: Specialized architecture for searching its own memory — king of long-context retrieval.
@@ -464,7 +464,8 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - **Base rate limits:** 20 RPM, 200 RPD (shared across all free models)
 - **With $10 balance:** 1,000 RPD (5x increase, balance is not consumed by free models)
 - Includes Llama 4 Scout, DeepSeek-R1, Gemma 4 31B, Qwen3-Coder 480B, Nemotron 3 Ultra 550B, various community models
-- Note: DeepSeek V4 Flash free variant removed as of June 2026; Kimi K2.6 (`moonshotai/kimi-k2.6:free`) and GLM 4.5 Air (`z-ai/glm-4.5-air:free`) free variants removed June 2026
+- Note: DeepSeek V4 Flash free variant removed as of June 2026; Kimi K2.6 and
+  GLM-4.5-Air free variants removed June 2026
 - Use as overflow when other free sources are exhausted, or as primary diversity source
 - Free models use `pricing.prompt == "0"` in API — detectable programmatically
 
@@ -652,12 +653,12 @@ High for adversarial review (#20) — without changing application code.
 ---
 
 ## Last Reviewed
-**2026-06-14** — Free-tier inventory scan: OpenRouter free model count 26 (was
-~27); removed Kimi K2.6 (`moonshotai/kimi-k2.6:free`) and GLM 4.5 Air
-(`z-ai/glm-4.5-air:free`) free variants (both delisted June 2026); corrected
-Kimi 2.6 entry to drop the now-removed OpenRouter `:free` variant. New scan-only
-model Nex AGI Nex-N2-Pro (262k, `nex-agi/nex-n2-pro:free`) noted but not
-rostered — minor provider, no benchmark data, fills no gap.
+**2026-06-14** — OpenRouter free model count 27→26 (automated inventory:
+26 free, +1 new, −2 removed); removed Kimi K2.6 (`moonshotai/kimi-k2.6:free`)
+and GLM-4.5-Air (`z-ai/glm-4.5-air:free`) free variants (delisted June 2026);
+updated Kimi 2.6 entry to drop the now-removed OpenRouter `:free` variant (NIM
+still available); detected new free model Nex-N2-Pro (`nex-agi/nex-n2-pro:free`,
+262k context) — not promoted (unknown provider, no roster gap, no benchmarks).
 2026-06-07 — Updated Kimi 2.6 free tier (added OpenRouter `:free` variant,
 262k context); updated OpenRouter free model count (~27, was ~29); noted
 DeepSeek V4 Flash free variant removal; added Nemotron 3 Ultra 550B to

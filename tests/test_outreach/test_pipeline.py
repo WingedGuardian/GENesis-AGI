@@ -288,6 +288,103 @@ async def test_alert_submit_passes_system_prompt(config, db, mock_drafter, mock_
     assert draft_request.tone == "urgent"
 
 
+@pytest.fixture
+def supergroup_topic_manager():
+    """A TopicManager that resolves a forum thread_id (as in production)."""
+    tm = MagicMock()
+    tm.resolve_outreach_category.return_value = "general"
+    tm.get_or_create_persistent = AsyncMock(return_value=42)
+    return tm
+
+
+@pytest.mark.asyncio
+async def test_email_delivery_uses_email_recipient_not_forum_chat_id(
+    config, db, mock_drafter, mock_formatter, supergroup_topic_manager
+):
+    """Email sends must NOT have their recipient overwritten with the Telegram
+    forum chat id when the category routes to 'supergroup'.
+
+    Regression for the incident where notification-category follow-up emails
+    were addressed to the Telegram forum chat id (-1003741378738), which Gmail
+    rejects as an invalid RFC 5321 address — poisoning the deferred queue and,
+    via blocking SMTP, starving the event loop. The supergroup/forum routing
+    override is Telegram-only.
+    """
+    email_adapter = AsyncMock()
+    email_adapter.send_message.return_value = "<msgid@example.com>"
+
+    pipeline = OutreachPipeline(
+        governance=GovernanceGate(config, db),
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={"email": email_adapter},
+        db=db,
+        config=config,
+        recipients={"email": "prospect@example.com"},
+    )
+    pipeline.set_forum_chat_id(-1003741378738)
+    pipeline.set_topic_manager(supergroup_topic_manager)
+
+    request = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION,  # routes to supergroup by default
+        topic="Follow-up",
+        context="Following up on my note about Genesis",
+        salience_score=0.6,
+        signal_type="campaign_follow_up",
+        channel="email",
+    )
+
+    result = await pipeline.submit_raw("Following up on my note", request)
+
+    assert result.status == OutreachStatus.DELIVERED
+    recipient_arg = email_adapter.send_message.call_args[0][0]
+    assert recipient_arg == "prospect@example.com"
+    # message_thread_id is a Telegram concept and must not leak to email
+    assert email_adapter.send_message.call_args[1].get("message_thread_id") is None
+
+
+@pytest.mark.asyncio
+async def test_telegram_supergroup_routing_still_uses_forum_chat_id(
+    config, db, mock_drafter, mock_formatter, supergroup_topic_manager
+):
+    """Regression guard: the channel-gating fix must NOT break Telegram.
+
+    A supergroup-routed category on the Telegram channel must still deliver to
+    the forum chat id with the resolved thread_id (the original 2026-04-10
+    approval-routing behavior).
+    """
+    telegram_adapter = AsyncMock()
+    telegram_adapter.send_message.return_value = "tg-123"
+
+    pipeline = OutreachPipeline(
+        governance=GovernanceGate(config, db),
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={"telegram": telegram_adapter},
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    pipeline.set_forum_chat_id(-1003741378738)
+    pipeline.set_topic_manager(supergroup_topic_manager)
+
+    request = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION,  # routes to supergroup
+        topic="Approval",
+        context="Approve pending action",
+        salience_score=0.6,
+        signal_type="approval",
+        channel="telegram",
+    )
+
+    result = await pipeline.submit_raw("Approve pending action", request)
+
+    assert result.status == OutreachStatus.DELIVERED
+    # Telegram supergroup routing intact: delivered to forum chat id + thread
+    assert telegram_adapter.send_message.call_args[0][0] == "-1003741378738"
+    assert telegram_adapter.send_message.call_args[1].get("message_thread_id") == 42
+
+
 @pytest.mark.asyncio
 async def test_surplus_submit_no_system_prompt(config, db, mock_drafter, mock_formatter, mock_channel):
     """Non-urgent categories should NOT get the alert system prompt."""

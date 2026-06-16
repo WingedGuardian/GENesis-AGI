@@ -110,10 +110,11 @@ after:
 def read_install_sha(repo_path: Path | None = None) -> str | None:
     """Read the install's source commit SHA.
 
-    Looks for `.genesis-source-commit` (written by
-    `scripts/prepare-public-release.sh` and shipped in the public
-    distribution). Falls back to `git rev-parse HEAD` if the file is
-    missing (developer / private-repo case).
+    Looks for a `.genesis-source-commit` marker file (a legacy artifact
+    from when the public distribution was a stripped tarball without git
+    history). Falls back to `git rev-parse HEAD` when the marker is
+    absent, which is the normal path now that the repo ships as a git
+    clone.
     """
     root = repo_path or Path.cwd()
     marker = root / ".genesis-source-commit"
@@ -349,8 +350,7 @@ async def _call_llm(prompt: str, model: str) -> str:
 async def _record_to_monitor(model: str, response_text: str | None, *, success: bool) -> None:
     """Best-effort recording to neural monitor. Never raises."""
     try:
-        import aiosqlite
-
+        from genesis.db.connection import get_raw_db
         from genesis.env import genesis_db_path
         from genesis.observability.call_site_recorder import record_last_run
 
@@ -358,7 +358,7 @@ async def _record_to_monitor(model: str, response_text: str | None, *, success: 
         provider = model.split("/", 1)[0] if "/" in model else model
         model_id = model.split("/", 1)[1] if "/" in model else model
 
-        async with aiosqlite.connect(str(genesis_db_path())) as db:
+        async with get_raw_db(str(genesis_db_path())) as db:
             await record_last_run(
                 db, _CALL_SITE_ID,
                 provider=provider, model_id=model_id,

@@ -236,6 +236,7 @@ async def check_semantic_overlap(
         result = await router.route_call(
             CALL_SITE_ID,
             [{"role": "user", "content": prompt}],
+            suppress_dead_letter=True,
         )
         if not result.success:
             logger.warning("Entity check LLM call failed: %s", result.error)

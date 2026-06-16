@@ -321,39 +321,50 @@ class OutreachPipeline:
                 self._config.delivery_routing.get("default", "supergroup"),
             )
 
-        # Resolve forum topic for this outreach category
+        # Resolve forum topic + supergroup routing.
+        #
+        # Forum topics and the supergroup ``forum_chat_id`` are TELEGRAM-ONLY
+        # concepts (``forum_chat_id``/``topic_manager`` are wired solely from
+        # the Telegram startup paths). They must never touch email/discord/voice
+        # delivery: doing so overwrote prospect email recipients with the
+        # Telegram forum chat id (a large negative integer), which Gmail rejects
+        # as an invalid RFC 5321 address — the deferred-queue poison + blocking
+        # SMTP that starved the event loop on 2026-06-14. Gate ALL forum routing
+        # on the Telegram channel; other channels deliver to their own recipient
+        # with no thread_id.
         thread_id = None
         topic_cat: str | None = None
-        if routing in ("supergroup", "both") and self._topic_manager is not None:
-            topic_cat = self._topic_manager.resolve_outreach_category(
-                request.category.value,
-            )
-            thread_id = await self._topic_manager.get_or_create_persistent(topic_cat)
-
-        # Primary delivery — supergroup if available, fallback to DM
         delivery_recipient = recipient
-        if routing in ("supergroup", "both") and thread_id is not None and self._forum_chat_id:
-            delivery_recipient = self._forum_chat_id
-        else:
-            # DM delivery — never pass thread_id to non-forum chats.
-            # If we WANTED the topic but couldn't resolve a thread_id,
-            # surface the fallback so operators know messages are landing
-            # in DM instead of silently disappearing from the forum topic.
-            # (This is the "where did my approval go?" signal that was
-            # missing on 2026-04-10 when 7 approvals routed to DM.)
-            if (
-                routing in ("supergroup", "both")
-                and self._forum_chat_id
-                and self._topic_manager is not None
-            ):
-                logger.info(
-                    "outreach category=%s wanted supergroup topic "
-                    "routing but thread_id is None — falling back to DM "
-                    "(target category=%s); check earlier ERROR logs from "
-                    "TopicManager for the underlying cause",
-                    request.category.value, topic_cat or "?",
+        if channel == "telegram":
+            if routing in ("supergroup", "both") and self._topic_manager is not None:
+                topic_cat = self._topic_manager.resolve_outreach_category(
+                    request.category.value,
                 )
-            thread_id = None
+                thread_id = await self._topic_manager.get_or_create_persistent(topic_cat)
+
+            # Primary delivery — supergroup if available, fallback to DM
+            if routing in ("supergroup", "both") and thread_id is not None and self._forum_chat_id:
+                delivery_recipient = self._forum_chat_id
+            else:
+                # DM delivery — never pass thread_id to non-forum chats.
+                # If we WANTED the topic but couldn't resolve a thread_id,
+                # surface the fallback so operators know messages are landing
+                # in DM instead of silently disappearing from the forum topic.
+                # (This is the "where did my approval go?" signal that was
+                # missing on 2026-04-10 when 7 approvals routed to DM.)
+                if (
+                    routing in ("supergroup", "both")
+                    and self._forum_chat_id
+                    and self._topic_manager is not None
+                ):
+                    logger.info(
+                        "outreach category=%s wanted supergroup topic "
+                        "routing but thread_id is None — falling back to DM "
+                        "(target category=%s); check earlier ERROR logs from "
+                        "TopicManager for the underlying cause",
+                        request.category.value, topic_cat or "?",
+                    )
+                thread_id = None
 
         # Scan outbound email content for sensitive data patterns
         if channel == "email":
@@ -453,24 +464,44 @@ class OutreachPipeline:
         )
 
     def _should_voice(self, request: OutreachRequest) -> bool:
-        """Check if this request qualifies for voice secondary delivery.
+        """Check if this request qualifies for voice (spoken-aloud) delivery.
 
-        Matches on category (BLOCKER, ALERT, APPROVAL) rather than
-        signal_type because health alerts use generic signal_type.
-        APPROVAL included so pending approval requests are spoken
-        aloud — the user can then say "hey genesis, approve it".
+        Pure allowlist: ``config.voice_alert_ids`` IS the menu of what gets
+        spoken. A request voices only if its ``signal_type`` or any part of
+        its ``source_id`` matches an allowlist entry by prefix — the same
+        matching convention as the immediate-escalation list in
+        ``health_outreach.py``. There is no category-based fallback, so
+        nothing is voiced by an invisible rule: every spoken alert is one
+        editable line in ``voice_alert_ids`` (config.py / outreach.yaml).
+        Everything still reaches Telegram regardless; this gate only
+        controls what interrupts the user out loud.
+
+        Matching notes:
+        - ``source_id`` is comma-split to handle the batched health-alert
+          envelope (``scheduler.py`` joins ids with commas).
+        - prefix match (``startswith``) lets a family entry like
+          ``provider:credit_exhaustion`` match ``…:<provider>``; keep
+          entries specific to avoid unintended prefix hits.
+        - ``signal_type`` matching is how non-health signals opt in
+          (e.g. ``sentinel_escalation``; ``task_notification`` is set in
+          ``autonomy/executor/engine.py`` ``_notify``).
         """
         if not self._channels.get("voice"):
             return False
         if not self._config:
             return False
-        if request.category not in (
-            OutreachCategory.BLOCKER,
-            OutreachCategory.ALERT,
-            OutreachCategory.APPROVAL,
-        ):
+        if not self._in_voice_hours():
             return False
-        return self._in_voice_hours()
+        # Pre-strip allowlist entries so a stray space in hand-edited
+        # outreach.yaml doesn't silently break a match.
+        allow = [aid.strip() for aid in self._config.voice_alert_ids if aid.strip()]
+        candidates = [request.signal_type or "", *(request.source_id or "").split(",")]
+        return any(
+            cand.strip().startswith(aid)
+            for cand in candidates
+            if cand.strip()
+            for aid in allow
+        )
 
     def _in_voice_hours(self) -> bool:
         """Check if current time is within voice notification hours."""

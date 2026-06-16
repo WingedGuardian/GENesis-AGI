@@ -248,6 +248,46 @@ async def test_call_allows_timeout_override():
         assert call_kwargs["timeout"] == 300
 
 
+async def test_call_hard_timeout_cancels_hung_provider():
+    """A provider that hangs past the timeout must be hard-cancelled and
+    returned as a 408 — not allowed to run unbounded.
+
+    litellm's own ``timeout`` param has been observed NOT to fire (PR #582;
+    production hangs of ~361s on a 120s timeout because litellm retries
+    internally). A hard ``asyncio.wait_for`` cap guarantees the ceiling.
+    """
+    import asyncio
+    import time as _t
+
+    config = _config()
+    delegate = LiteLLMDelegate(config)
+
+    async def _hang(*args, **kwargs):
+        await asyncio.sleep(2.0)  # longer than the 0.2s cap below
+        return _mock_response()
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
+        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
+        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
+        mock_litellm.Timeout = type("Timeout", (Exception,), {})
+        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        mock_litellm.acompletion = _hang
+
+        start = _t.monotonic()
+        result = await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+            timeout=0.2,
+        )
+        elapsed = _t.monotonic() - start
+
+    assert result.success is False
+    assert result.status_code == 408
+    # Cancelled promptly at the cap — did not wait the full 2s hang
+    assert elapsed < 1.5
+
+
 # ── Error classification ───────────────────────────────────────────────────
 
 

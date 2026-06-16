@@ -274,6 +274,65 @@ class TestProviderHealth:
         assert _provider_health({"state": "open", "probe_status": "not_configured"}) == "disabled"
 
 
+class TestCallSiteRecentFailures:
+    """Recent-failure bucketing from the events table (single-query path)."""
+
+    @pytest.mark.asyncio
+    async def test_recent_failures_bucketed_with_one_events_query(self):
+        from datetime import UTC, datetime
+
+        import aiosqlite
+
+        from genesis.db.schema import create_all_tables
+        from genesis.observability.snapshots.call_sites import call_sites
+
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        await create_all_tables(db)
+        now = datetime.now(UTC).isoformat()
+        for eid, et, msg in [
+            ("e1", "all_exhausted", "All providers exhausted for judge"),
+            ("e2", "provider.fallback", "Call site judge: primary failed"),
+            ("e3", "breaker.tripped", "Circuit breaker tripped for other_site"),
+        ]:
+            await db.execute(
+                "INSERT INTO events (id, timestamp, subsystem, severity, event_type, "
+                "message, created_at) VALUES (?,?,?,?,?,?,?)",
+                (eid, now, "routing", "warning", et, msg, now),
+            )
+        await db.commit()
+
+        providers = {"a": _make_provider("a")}
+        config = _make_config(providers, {
+            "judge": CallSiteConfig(id="judge", chain=["a"]),
+            "other_site": CallSiteConfig(id="other_site", chain=["a"]),
+        })
+        registry = _mock_registry({"a": _mock_breaker(ProviderState.CLOSED)})
+
+        # Count `FROM events` queries to prove the N+1 collapse: exactly ONE
+        # pre-fetch regardless of call-site count (was one-per-site before).
+        orig_execute = db.execute
+        n_events_q = {"n": 0}
+
+        def _counting(sql, *a, **k):
+            if "FROM events" in sql:
+                n_events_q["n"] += 1
+            return orig_execute(sql, *a, **k)
+
+        db.execute = _counting  # type: ignore[assignment]
+        result = await call_sites(
+            db=db, routing_config=config, breakers=registry, probe_results=None,
+        )
+        db.execute = orig_execute  # type: ignore[assignment]
+
+        assert result["judge"]["recent_failures"] == 2
+        assert result["judge"]["status"] == "warning"
+        assert result["judge"]["last_failure_at"] == now
+        assert result["other_site"]["recent_failures"] == 1
+        assert n_events_q["n"] == 1, f"expected 1 events query, got {n_events_q['n']} (N+1?)"
+        await db.close()
+
+
 class TestDisabledChainSemantics:
     """Disabled providers must be filtered, not treated as failures.
 

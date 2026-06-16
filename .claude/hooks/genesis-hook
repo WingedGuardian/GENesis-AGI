@@ -17,8 +17,17 @@ GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Find the Python venv. In a worktree, .venv lives in the main repo, not here.
 PYTHON="$GENESIS_ROOT/.venv/bin/python"
 if [[ ! -x "$PYTHON" ]]; then
-    # Worktree detection: resolve the main worktree via git
-    MAIN_ROOT="$(cd "$GENESIS_ROOT" && git worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')"
+    # Worktree: .venv lives in the MAIN repo. Resolve the main worktree root via
+    # `git rev-parse --git-common-dir` (the main repo's .git; its parent is the
+    # main worktree root). Do NOT use `git worktree list | head` here: head closes
+    # the pipe after one line, so with many worktrees git gets SIGPIPE, and under
+    # `set -euo pipefail` that silently kills this launcher (exit 141, no stderr),
+    # breaking every hook in the worktree.
+    _common_dir="$(cd "$GENESIS_ROOT" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null)" || _common_dir=""
+    MAIN_ROOT=""
+    if [[ -n "$_common_dir" ]]; then
+        MAIN_ROOT="$(cd "$GENESIS_ROOT" 2>/dev/null && cd "$(dirname "$_common_dir")" 2>/dev/null && pwd)" || MAIN_ROOT=""
+    fi
     if [[ -n "$MAIN_ROOT" && -x "$MAIN_ROOT/.venv/bin/python" ]]; then
         PYTHON="$MAIN_ROOT/.venv/bin/python"
     else

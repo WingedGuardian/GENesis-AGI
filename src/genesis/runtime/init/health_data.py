@@ -43,6 +43,7 @@ def init(rt: GenesisRuntime) -> None:
             resilience_state_machine=rt._resilience_state_machine,
             activity_tracker=rt._activity_tracker,
             provider_health_checker=provider_health_checker,
+            event_bus=rt._event_bus,
         )
 
         from genesis.mcp.health_mcp import init_health_mcp

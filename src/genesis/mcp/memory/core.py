@@ -587,8 +587,8 @@ async def memory_stats() -> dict:
         memory_mod._db, type="user_model_delta", resolved=False, limit=100000
     )
 
-    total_links_cursor = await memory_mod._db.execute("SELECT COUNT(*) FROM memory_links")
-    total_links_row = await total_links_cursor.fetchone()
+    total_links_rows = await memory_mod._db.execute_fetchall("SELECT COUNT(*) FROM memory_links")
+    total_links_row = total_links_rows[0] if total_links_rows else None
     total_links = total_links_row[0] if total_links_row else 0
 
     # Structural data from memory_health snapshot queries

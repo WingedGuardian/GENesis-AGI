@@ -153,6 +153,15 @@ PROFILES: dict[str, list[str]] = {
     "campaign": (
         _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION
     ),
+    # ── Discord monitor profile ─────────────────────────────────
+    # Reads Discord channels and responds via bot token API.
+    # MCP config loads discord-bot + health + outreach (no memory server).
+    # Belt-and-suspenders: block memory writes at tool level too, in case
+    # MCP config generation fails and falls back to full config.
+    "discord-monitor": (
+        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION
+        + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS
+    ),
     # ── Perimeter profile ────────────────────────────────────────
     # For sessions that process untrusted inbound content (email
     # replies, future Discord inbound). Maximally restricted: only
@@ -219,6 +228,20 @@ Your final message IS your deliverable. Write files to `~/.genesis/output/`.
 
 {_MISSION_INJECTION}
 """,
+    "discord-monitor": f"""
+
+## Session Profile: discord-monitor
+
+You have: discord-bot MCP tools (fetch_messages, fetch_forum_threads, send_reply), outreach_send, web tools.
+You do NOT have: Edit, Bash, NotebookEdit, browser tools, memory tools.
+Your final message IS your deliverable.
+
+You are a reactive community responder. Read Discord channels and respond
+to unanswered messages using send_reply. Do NOT post proactive content —
+that is the discord-engagement campaign's job.
+
+{_MISSION_INJECTION}
+""",
     "mail": """
 
 ## Session Profile: mail
@@ -240,6 +263,7 @@ _PROFILE_SKILLS: dict[str, list[str]] = {
     "research": [],
     "observe": [],
     "campaign": ["voice-master"],
+    "discord-monitor": ["genesis-voice"],
     "mail": ["genesis-voice"],
 }
 
@@ -432,6 +456,10 @@ class DirectSessionRunner:
             source_tag=request.source_tag,
             dispatch_mode="direct",
             profile=request.profile,
+            # Record the skills resolved for this session so the
+            # skill-evolution effectiveness analyzer has usage signal.
+            # (Same resolution used for prompt injection in _build_invocation.)
+            skill_tags=_resolve_skills(request),
         )
         session_id = session["id"]
 
@@ -784,6 +812,7 @@ class DirectSessionRunner:
             "research": "reflection",
             "interact": "sentinel",
             "campaign": "campaign",
+            "discord-monitor": "discord-monitor",
             "mail": "mail",
         }
         mcp_profile = _PROFILE_TO_MCP.get(request.profile, "reflection")

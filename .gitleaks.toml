@@ -43,7 +43,6 @@ tags = ["infrastructure", "genesis"]
 [allowlist]
 paths = [
     '''tests/''',
-    '''scripts/prepare-public-release\.sh''',
     '''\.github/workflows/''',
     '''src/genesis/contribution/sanitize\.py''',
     '''\.gitleaks\.toml''',

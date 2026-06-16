@@ -228,6 +228,7 @@ async def test_memory_stats_returns_dict(mock_deps, tools):
         cursor_mock = AsyncMock()
         cursor_mock.fetchone = AsyncMock(return_value=(5,))
         db_mock.execute = AsyncMock(return_value=cursor_mock)
+        db_mock.execute_fetchall = AsyncMock(return_value=[(5,)])
 
         result = await tools["memory_stats"].fn()
 

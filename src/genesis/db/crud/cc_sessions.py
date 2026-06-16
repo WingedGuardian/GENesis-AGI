@@ -238,6 +238,26 @@ async def query_by_skill_tag(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def get_by_session_types(
+    db: aiosqlite.Connection,
+    session_types: set[str],
+) -> list[dict]:
+    """Return all sessions whose session_type is in the given set.
+
+    Used by the skill-effectiveness baseline computation, which then filters
+    in Python on skill_tags membership. Returns [] for an empty input.
+    """
+    types = list(session_types)
+    if not types:
+        return []
+    placeholders = ",".join("?" * len(types))
+    cursor = await db.execute(
+        f"SELECT * FROM cc_sessions WHERE session_type IN ({placeholders})",  # noqa: S608
+        (*types,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def update_rate_limit(
     db: aiosqlite.Connection,
     id: str,

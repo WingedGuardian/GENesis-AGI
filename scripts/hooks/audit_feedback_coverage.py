@@ -63,7 +63,7 @@ def _load_db_rules() -> list[dict]:
     if not _GENESIS_DB.exists():
         return []
     try:
-        with sqlite3.connect(str(_GENESIS_DB)) as db:
+        with sqlite3.connect(str(_GENESIS_DB), timeout=2) as db:
             db.row_factory = sqlite3.Row
             rows = db.execute(
                 """
@@ -94,7 +94,7 @@ def _load_procedures() -> list[dict]:
     if not _GENESIS_DB.exists():
         return []
     try:
-        with sqlite3.connect(str(_GENESIS_DB)) as db:
+        with sqlite3.connect(str(_GENESIS_DB), timeout=2) as db:
             db.row_factory = sqlite3.Row
             rows = db.execute(
                 """

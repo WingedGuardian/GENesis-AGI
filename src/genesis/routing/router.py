@@ -390,8 +390,14 @@ class Router:
             last_result = result
             category = classify_error(result.status_code, result.error or "")
 
-            # Permanent errors: stop retrying
-            if category == ErrorCategory.PERMANENT:
+            # Stop retrying THIS provider for:
+            #  - PERMANENT: the error won't change on retry.
+            #  - TIMEOUT: the provider hung past its timeout and won't un-hang
+            #    on an immediate retry. Retrying just multiplies the timeout
+            #    wall-clock (this is what produced the ~30-min dream-cycle
+            #    hangs). Fail fast — route_call advances to the next provider,
+            #    and the circuit breaker still records this failure.
+            if category in (ErrorCategory.PERMANENT, ErrorCategory.TIMEOUT):
                 return result
 
             # Transient/degraded: retry with delay (skip delay on last attempt)

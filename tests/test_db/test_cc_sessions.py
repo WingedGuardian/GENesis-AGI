@@ -149,3 +149,22 @@ async def test_cc_session_id_null_by_default(db, sess_fields):
     await cc_sessions.create(db, **sess_fields)
     row = await cc_sessions.get_by_id(db, "sess-1")
     assert row["cc_session_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_by_session_types(db, sess_fields):
+    """Filters to the requested session_types; empty input returns []."""
+    await cc_sessions.create(db, **sess_fields)  # foreground
+    await cc_sessions.create(
+        db, **{**sess_fields, "id": "sess-2", "session_type": "background_task"})
+    await cc_sessions.create(
+        db, **{**sess_fields, "id": "sess-3", "session_type": "background_task"})
+
+    bg = await cc_sessions.get_by_session_types(db, {"background_task"})
+    assert {r["id"] for r in bg} == {"sess-2", "sess-3"}
+
+    both = await cc_sessions.get_by_session_types(
+        db, {"background_task", "foreground"})
+    assert {r["id"] for r in both} == {"sess-1", "sess-2", "sess-3"}
+
+    assert await cc_sessions.get_by_session_types(db, set()) == []
