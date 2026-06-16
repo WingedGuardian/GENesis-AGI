@@ -128,7 +128,7 @@ async def test_resolve_outreach_category(manager):
     assert manager.resolve_outreach_category("alert") == "alert"
     assert manager.resolve_outreach_category("surplus") == "surplus"
     assert manager.resolve_outreach_category("recon") == "recon"
-    assert manager.resolve_outreach_category("unknown") == "surplus"
+    assert manager.resolve_outreach_category("unknown") == "conversation"
 
 
 @pytest.mark.asyncio
