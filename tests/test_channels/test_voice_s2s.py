@@ -63,9 +63,13 @@ class TestVoiceConfig:
 
 class TestGenesisBridge:
     def test_tool_declarations_structure(self):
-        assert len(TOOL_DECLARATIONS) == 3
+        # ask_genesis is disabled until the voice-memory refactor. Only
+        # web_search + approve_pending are advertised; the dispatch and
+        # _ask_genesis implementation stay in place for easy re-enable.
+        assert len(TOOL_DECLARATIONS) == 2
         names = {t["name"] for t in TOOL_DECLARATIONS}
-        assert names == {"ask_genesis", "web_search", "approve_pending"}
+        assert names == {"web_search", "approve_pending"}
+        assert "ask_genesis" not in names
 
     def test_system_prompt_has_placeholders(self):
         assert "{voice_context}" in SYSTEM_INSTRUCTIONS
@@ -155,7 +159,7 @@ class TestGenesisBridge:
         bridge = GenesisBridge()
         prompt = bridge.get_system_prompt()
         assert "Genesis" in prompt
-        assert "ask_genesis" in prompt
+        assert "ask_genesis" not in prompt  # disabled until the memory refactor
         assert "approve_pending" in prompt or "APPROVAL" in prompt
 
     async def test_approve_pending_no_gate(self):
