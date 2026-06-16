@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import aiosqlite
@@ -179,6 +180,18 @@ class TestMediumDistributor:
 
         js_calls = [c for c in browser.calls if c[0] == "run_js"]
         assert len(js_calls) >= 2  # title + body insertText
+
+    @pytest.mark.asyncio
+    async def test_publish_scrubs_spaced_em_dash_before_paste(self):
+        # Defense-in-depth gate: a spaced em dash in the draft must be collapsed
+        # before it is pasted. medium.py pastes via json.dumps(...), so build the
+        # expected fragments the same way to stay representation-agnostic.
+        browser = MockBrowser(logged_in=True)
+        dist = MediumDistributor(browser=browser, username="testuser")
+        await dist.publish("# Title\n\nalpha — beta gamma.")
+        blob = "".join(c[1][0] for c in browser.calls if c[0] == "run_js")
+        assert json.dumps("alpha—beta")[1:-1] in blob          # collapsed (scrubbed)
+        assert json.dumps("alpha — beta")[1:-1] not in blob     # spaced form gone
 
     @pytest.mark.asyncio
     async def test_publish_handles_browser_error(self):

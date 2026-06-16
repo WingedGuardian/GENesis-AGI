@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Content Genesis sends to other people is auto-cleaned before it goes out** —
+  email, Discord, and the article/post drafts you review now pass through a
+  deterministic check that fixes the most common AI giveaway (a spaced em dash,
+  `like — this`) and scans for accidentally-included secrets (API keys,
+  credentials) before the message leaves Genesis. Messages to *you* (Telegram,
+  voice) are left exactly as written.
+
 - **Genesis now watches its own database journal size** — if SQLite's
   write-ahead log grows abnormally large (the sign of a stuck database reader
   holding the file open), Genesis raises a high/critical alert on Telegram and in

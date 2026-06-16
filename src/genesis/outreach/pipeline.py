@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
 
 from genesis.content.drafter import ContentDrafter
+from genesis.content.egress import gate
 from genesis.content.formatter import ContentFormatter
 from genesis.content.types import DraftRequest, FormatTarget, FormattedContent
 from genesis.db.crud import outreach as outreach_crud
@@ -366,23 +368,36 @@ class OutreachPipeline:
                     )
                 thread_id = None
 
-        # Scan outbound email content for sensitive data patterns
-        if channel == "email":
-            from genesis.security.output_scanner import scan_outbound
-
-            scan = scan_outbound(formatted.text)
-            if not scan.safe:
+        # Outbound egress gate — deterministic anti-slop scrub (+ PII scan for
+        # external-delivery channels). Fires for external channels (email/
+        # discord) and CONTENT review drafts; user-facing channels (telegram/
+        # voice) are left untouched. The spaced-em-dash fix is applied to the
+        # delivered text; non-fixable tells are logged. PII on an external send
+        # quarantines (don't leak secrets to a third party).
+        egress = gate(
+            formatted.text, channel=channel, category=request.category.value,
+        )
+        if egress.applied:
+            if egress.fixes_applied or egress.flags:
+                logger.info(
+                    "Egress gate [%s/%s]: fixes=%s flags=%s",
+                    channel, request.category.value,
+                    egress.fixes_applied, egress.flags,
+                )
+            if egress.quarantined:
                 logger.warning(
-                    "Outbound email quarantined: %s patterns %s",
-                    scan.risk_level, scan.detected,
+                    "Outbound %s quarantined: %s patterns %s",
+                    channel, egress.scan.risk_level, egress.scan.detected,
                 )
                 return OutreachResult(
                     outreach_id=outreach_id,
                     status=OutreachStatus.FAILED,
                     channel=channel,
                     message_content=formatted.text,
-                    error=f"Content scan quarantine: {scan.detected}",
+                    error=f"Content scan quarantine: {egress.scan.detected}",
                 )
+            if egress.fixes_applied:
+                formatted = replace(formatted, text=egress.text)
 
         try:
             delivery_id = await adapter.send_message(
