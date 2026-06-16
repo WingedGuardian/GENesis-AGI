@@ -639,6 +639,7 @@ fi
 if [ -f "$GENESIS_ROOT/secrets.env" ] && \
         grep -q '^GENESIS_BACKUP_REPO=[^[:space:]]' "$GENESIS_ROOT/secrets.env" 2>/dev/null; then
     if ! crontab -l 2>/dev/null | grep -q 'backup\.sh'; then
+        mkdir -p "$GENESIS_ROOT/logs"
         # || true guards against empty crontab exit-1 under set -euo pipefail
         ( crontab -l 2>/dev/null || true; \
           echo "0 */6 * * * $GENESIS_ROOT/scripts/backup.sh >> $GENESIS_ROOT/logs/backup.log 2>&1" \

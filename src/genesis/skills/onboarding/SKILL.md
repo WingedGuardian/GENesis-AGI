@@ -196,7 +196,7 @@ are, not asking for keys. Let the user choose their comfort level.
 4. Write `GENESIS_BACKUP_REPO=<user>/genesis-backups` to `secrets.env`.
 
 5. **Set the backup passphrase** (required for encryption):
-   - Check if `GENESIS_BACKUP_PASSPHRASE` is already set in `secrets.env`.
+   - Check if `GENESIS_BACKUP_PASSPHRASE` is already set to a non-empty value in `secrets.env`.
    - If not set, generate one: `openssl rand -base64 32`
    - Write the output as `GENESIS_BACKUP_PASSPHRASE=<value>` to `secrets.env`.
    - **Critical: store this passphrase in a password manager off-machine.**
