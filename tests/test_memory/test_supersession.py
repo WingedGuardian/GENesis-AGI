@@ -250,15 +250,13 @@ async def test_search_ranked_excludes_deprecated_by_default():
     import aiosqlite
 
     db = AsyncMock(spec=aiosqlite.Connection)
-    cursor = AsyncMock()
-    cursor.fetchall = AsyncMock(return_value=[])
-    db.execute = AsyncMock(return_value=cursor)
+    db.execute_fetchall = AsyncMock(return_value=[])
 
     from genesis.db.crud.memory import search_ranked
     await search_ranked(db, query="test query")
 
     # Verify the SQL includes the deprecated filter
-    sql = db.execute.call_args[0][0]
+    sql = db.execute_fetchall.call_args[0][0]
     assert "deprecated" in sql
     assert "deprecated = 0" in sql or "deprecated IS NULL" in sql
 
@@ -269,15 +267,13 @@ async def test_search_ranked_includes_deprecated_when_requested():
     import aiosqlite
 
     db = AsyncMock(spec=aiosqlite.Connection)
-    cursor = AsyncMock()
-    cursor.fetchall = AsyncMock(return_value=[])
-    db.execute = AsyncMock(return_value=cursor)
+    db.execute_fetchall = AsyncMock(return_value=[])
 
     from genesis.db.crud.memory import search_ranked
     await search_ranked(db, query="test query", include_deprecated=True)
 
     # Verify the SQL does NOT include the deprecated filter
-    sql = db.execute.call_args[0][0]
+    sql = db.execute_fetchall.call_args[0][0]
     assert "deprecated = 0" not in sql
 
 
