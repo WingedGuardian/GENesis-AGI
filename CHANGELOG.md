@@ -11,6 +11,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **A new "deliverable-builder" skill produces send-ready work, not raw markdown** — when you
+  ask Genesis to build a job take-home, client report, one-pager, or deck, it runs a gated
+  pipeline: it frames the deliverable with you (audience, format, what leads), drafts and
+  structures it to lead with the strongest point, writes it in your voice, strips AI tells,
+  renders it to the right file format (PDF or DOCX, never a raw `.md`), and a fresh-context
+  reviewer checks the finished artifact against the original requirements before it reaches you.
+  The session won't quietly end with an unverified deliverable.
+
 - **Genesis now watches its own database journal size** — if SQLite's
   write-ahead log grows abnormally large (the sign of a stuck database reader
   holding the file open), Genesis raises a high/critical alert on Telegram and in
