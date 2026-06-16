@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **Interactive Claude Code consoles can run friction-free again, when you want
+  them to** — the SSH/tmux dev-console slot and the dashboard web terminal still
+  default to `--permission-mode auto` (auto-approves common operations, but still
+  prompts you on deny/ask rules), but you can now opt a session back into
+  `--dangerously-skip-permissions` by setting `GENESIS_CC_PERMISSION_MODE=bypass`.
+  For the SSH slot, put that line in `~/.genesis/cc-slot.env` (SSH sessions don't
+  read your shell profile); for the dashboard terminal, set it in the dashboard's
+  environment. Headless autonomous sessions are unaffected.
+
 - **`update.sh` now keeps Claude Code in sync on your host VM too** — if you run
   Genesis with a Guardian on a separate host VM, updates previously only touched
   the container's Claude Code, letting the host drift behind. `update.sh` now
