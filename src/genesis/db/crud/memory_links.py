@@ -28,20 +28,20 @@ async def create(
 
 async def get_links_for(db: aiosqlite.Connection, memory_id: str) -> list[dict]:
     """Get all links where memory_id is source or target."""
-    cursor = await db.execute(
+    rows = await db.execute_fetchall(
         "SELECT * FROM memory_links WHERE source_id = ? OR target_id = ?",
         (memory_id, memory_id),
     )
-    return [dict(r) for r in await cursor.fetchall()]
+    return [dict(r) for r in rows]
 
 
 async def count_links(db: aiosqlite.Connection, memory_id: str) -> int:
     """Count links where memory_id is source or target."""
-    cursor = await db.execute(
+    rows = await db.execute_fetchall(
         "SELECT COUNT(*) FROM memory_links WHERE source_id = ? OR target_id = ?",
         (memory_id, memory_id),
     )
-    row = await cursor.fetchone()
+    row = rows[0] if rows else None
     return row[0]
 
 
@@ -74,7 +74,7 @@ async def batch_link_counts(
         ph = ",".join("?" * len(chunk))
 
         # Bidirectional counts (replaces per-ID count_links loop)
-        cursor = await db.execute(
+        total_rows = await db.execute_fetchall(
             f"SELECT id, COUNT(*) FROM ("
             f"  SELECT source_id AS id FROM memory_links WHERE source_id IN ({ph})"
             f"  UNION ALL"
@@ -82,16 +82,16 @@ async def batch_link_counts(
             f") GROUP BY id",
             chunk + chunk,
         )
-        for row in await cursor.fetchall():
+        for row in total_rows:
             total_map[row[0]] = total_map.get(row[0], 0) + row[1]
 
         # Inbound-only counts (for graph-boosted retrieval)
-        cursor = await db.execute(
+        inbound_rows = await db.execute_fetchall(
             f"SELECT target_id, COUNT(*) FROM memory_links"
             f" WHERE target_id IN ({ph}) GROUP BY target_id",
             chunk,
         )
-        for row in await cursor.fetchall():
+        for row in inbound_rows:
             inbound_map[row[0]] = inbound_map.get(row[0], 0) + row[1]
 
     return {
@@ -115,12 +115,12 @@ async def inter_candidate_links(
     if len(memory_ids) > 499:
         memory_ids = memory_ids[:499]
     ph = ",".join("?" * len(memory_ids))
-    cursor = await db.execute(
+    rows = await db.execute_fetchall(
         f"SELECT source_id, target_id FROM memory_links"
         f" WHERE source_id IN ({ph}) AND target_id IN ({ph})",
         memory_ids + memory_ids,
     )
-    return [(row[0], row[1]) for row in await cursor.fetchall()]
+    return [(row[0], row[1]) for row in rows]
 
 
 async def get_bidirectional(db: aiosqlite.Connection, memory_id: str) -> list[dict]:

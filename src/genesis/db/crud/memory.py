@@ -99,14 +99,14 @@ async def find_exact_duplicate(
 
     # Pre-filter: match on length and first 200 chars to narrow candidates
     prefix = content[:200]
-    cursor = await db.execute(
+    rows = await db.execute_fetchall(
         "SELECT memory_id, content FROM memory_fts "
         "WHERE length(content) = ? "
         "AND substr(content, 1, 200) = ? "
         "LIMIT 200",
         (len(content), prefix),
     )
-    for row in await cursor.fetchall():
+    for row in rows:
         if row[1] == content:
             return row[0]
 
@@ -135,8 +135,7 @@ async def search(
         params.append(collection)
     sql += " LIMIT ?"
     params.append(limit)
-    cursor = await db.execute(sql, params)
-    rows = await cursor.fetchall()
+    rows = await db.execute_fetchall(sql, params)
     return [
         {"memory_id": r[0], "content": r[1], "source_type": r[2], "collection": r[3]}
         for r in rows
@@ -218,8 +217,7 @@ async def search_ranked(
         params.extend(include_only_subsystems)
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
-    cursor = await db.execute(sql, params)
-    rows = await cursor.fetchall()
+    rows = await db.execute_fetchall(sql, params)
     return [
         {
             "memory_id": r[0], "content": r[1], "source_type": r[2],
@@ -322,13 +320,13 @@ async def get_metadata(
     memory_id: str,
 ) -> dict | None:
     """Return metadata row for a memory_id, or None if not found."""
-    cursor = await db.execute(
+    rows = await db.execute_fetchall(
         "SELECT memory_id, collection, embedding_status, deprecated, "
         "superseded_by, superseded_at FROM memory_metadata "
         "WHERE memory_id = ?",
         (memory_id,),
     )
-    row = await cursor.fetchone()
+    row = rows[0] if rows else None
     if not row:
         return None
     return {
@@ -352,7 +350,7 @@ async def delete_metadata(db: aiosqlite.Connection, *, memory_id: str) -> bool:
 
 async def get_by_id(db: aiosqlite.Connection, memory_id: str) -> dict | None:
     """Get a single memory by ID, joining FTS5 content with metadata."""
-    cursor = await db.execute(
+    rows = await db.execute_fetchall(
         "SELECT f.memory_id, f.content, f.source_type, f.tags, f.collection, "
         "       m.created_at, m.confidence, m.embedding_status, "
         "       m.valid_at, m.invalid_at "
@@ -361,7 +359,7 @@ async def get_by_id(db: aiosqlite.Connection, memory_id: str) -> dict | None:
         "WHERE f.memory_id = ?",
         (memory_id,),
     )
-    row = await cursor.fetchone()
+    row = rows[0] if rows else None
     if not row:
         return None
     return {
@@ -399,8 +397,7 @@ async def list_recent(
         params.append(collection)
     sql += "ORDER BY m.created_at DESC LIMIT ? OFFSET ?"
     params.extend([limit, offset])
-    cursor = await db.execute(sql, params)
-    rows = await cursor.fetchall()
+    rows = await db.execute_fetchall(sql, params)
     return [
         {
             "memory_id": r[0],
@@ -424,11 +421,11 @@ async def count(
 ) -> int:
     """Count memories in memory_metadata (optionally by collection)."""
     if collection:
-        cursor = await db.execute(
+        rows = await db.execute_fetchall(
             "SELECT COUNT(*) FROM memory_metadata WHERE collection = ?",
             (collection,),
         )
     else:
-        cursor = await db.execute("SELECT COUNT(*) FROM memory_metadata")
-    row = await cursor.fetchone()
+        rows = await db.execute_fetchall("SELECT COUNT(*) FROM memory_metadata")
+    row = rows[0] if rows else None
     return row[0]

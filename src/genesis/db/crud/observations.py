@@ -283,13 +283,13 @@ async def exists_by_hash(
     if unresolved_only:
         sql += " AND resolved = 0"
     sql += " LIMIT 1"
-    cursor = await db.execute(sql, (source, content_hash))
-    return (await cursor.fetchone()) is not None
+    rows = await db.execute_fetchall(sql, (source, content_hash))
+    return len(rows) > 0
 
 
 async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
-    cursor = await db.execute("SELECT * FROM observations WHERE id = ?", (id,))
-    row = await cursor.fetchone()
+    rows = await db.execute_fetchall("SELECT * FROM observations WHERE id = ?", (id,))
+    row = rows[0] if rows else None
     return dict(row) if row else None
 
 
@@ -338,8 +338,8 @@ async def query(
         params.extend(exclude_types)
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(limit)
-    cursor = await db.execute(sql, params)
-    return [dict(r) for r in await cursor.fetchall()]
+    rows = await db.execute_fetchall(sql, params)
+    return [dict(r) for r in rows]
 
 
 async def resolve(
@@ -477,14 +477,14 @@ async def exists_recent_by_type(
     comparison works correctly with ISO 8601 timestamps stored in created_at.
     """
     cutoff = (datetime.now(UTC) - timedelta(minutes=window_minutes)).isoformat()
-    cursor = await db.execute(
+    rows = await db.execute_fetchall(
         "SELECT 1 FROM observations "
         "WHERE source = ? AND type = ? AND resolved = 0 "
         "AND created_at > ? "
         "LIMIT 1",
         (source, type, cutoff),
     )
-    return (await cursor.fetchone()) is not None
+    return len(rows) > 0
 
 
 async def delete(db: aiosqlite.Connection, id: str) -> bool:
@@ -570,10 +570,10 @@ async def get_unsurfaced(
         " created_at DESC "
         f" LIMIT {limit}"
     )
-    cursor = await db.execute(sql, params)
-    rows = await cursor.fetchall()
-    cols = [d[0] for d in cursor.description]
-    return [dict(zip(cols, r, strict=False)) for r in rows]
+    async with db.execute(sql, params) as cursor:
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, r, strict=False)) for r in rows]
 
 
 async def mark_surfaced(
@@ -632,8 +632,7 @@ async def get_standing(
         "LIMIT ?"
     )
     params.append(limit)
-    cursor = await db.execute(sql, params)
-    rows = await cursor.fetchall()
+    rows = await db.execute_fetchall(sql, params)
     return [
         {
             "id": r[0], "source": r[1], "type": r[2], "category": r[3],
@@ -646,12 +645,11 @@ async def get_standing(
 
 async def unsurfaced_counts_by_priority(db: aiosqlite.Connection) -> dict[str, int]:
     """Count unsurfaced, unresolved observations grouped by priority."""
-    cursor = await db.execute(
+    rows = await db.execute_fetchall(
         "SELECT priority, COUNT(*) FROM observations "
         "WHERE surfaced_at IS NULL AND resolved = 0 "
         "GROUP BY priority"
     )
-    rows = await cursor.fetchall()
     return {row[0]: row[1] for row in rows}
 
 
@@ -667,8 +665,8 @@ async def count_unresolved(
         placeholders = ",".join("?" for _ in exclude_types)
         sql += f" AND type NOT IN ({placeholders})"
         params.extend(exclude_types)
-    cursor = await db.execute(sql, params)
-    row = await cursor.fetchone()
+    rows = await db.execute_fetchall(sql, params)
+    row = rows[0] if rows else None
     return row[0] if row else 0
 
 
@@ -681,10 +679,10 @@ async def count_unresolved_by_types(
     if not types:
         return 0
     placeholders = ",".join("?" for _ in types)
-    cursor = await db.execute(
+    rows = await db.execute_fetchall(
         f"SELECT COUNT(*) FROM observations "
         f"WHERE resolved = 0 AND type IN ({placeholders})",
         tuple(types),
     )
-    row = await cursor.fetchone()
+    row = rows[0] if rows else None
     return row[0] if row else 0
