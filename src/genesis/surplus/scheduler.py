@@ -1189,7 +1189,7 @@ class SurplusScheduler:
     async def run_gitnexus_reindex(self) -> None:
         """Reindex the GitNexus code graph (Mon & Thu 5am UTC).
 
-        Runs ``gitnexus analyze --index-only`` as a subprocess.
+        Runs ``gitnexus analyze`` as a subprocess.
         CPU-only AST parsing, no ONNX/GPU (embeddings off by default).
         Incremental since GitNexus 1.6.5 — fast on unchanged repos.
         """
@@ -1213,7 +1213,7 @@ class SurplusScheduler:
         try:
             repo_root = str(Path.home() / "genesis")
             proc = await asyncio.create_subprocess_exec(
-                gitnexus, "analyze", "--index-only",
+                gitnexus, "analyze",
                 cwd=repo_root,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
