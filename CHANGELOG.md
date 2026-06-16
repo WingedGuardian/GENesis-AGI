@@ -27,6 +27,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **Interactive Claude Code consoles can run friction-free again, when you want
+  them to** — the SSH/tmux dev-console slot and the dashboard web terminal still
+  default to `--permission-mode auto` (auto-approves common operations, but still
+  prompts you on deny/ask rules), but you can now opt a session back into
+  `--dangerously-skip-permissions` by setting `GENESIS_CC_PERMISSION_MODE=bypass`.
+  For the SSH slot, put that line in `~/.genesis/cc-slot.env` (SSH sessions don't
+  read your shell profile); for the dashboard terminal, set it in the dashboard's
+  environment. Headless autonomous sessions are unaffected.
+
 - **`update.sh` now keeps Claude Code in sync on your host VM too** — if you run
   Genesis with a Guardian on a separate host VM, updates previously only touched
   the container's Claude Code, letting the host drift behind. `update.sh` now
@@ -56,6 +65,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Claude Code hooks work from a git worktree again** — the hook launcher
+  located the Python venv via a `git worktree list | head` pipeline that, with
+  many worktrees, died on SIGPIPE under `set -o pipefail` and **silently
+  disabled every hook** (session activity capture, file/edit audit logging) when
+  you ran Claude Code from a worktree. It now resolves the main repo with
+  `git rev-parse --git-common-dir` (no pipe), so hooks fire reliably everywhere.
 - **Memory storage no longer gets wedged on "database is locked"** — a
   long-lived MCP database connection left read transactions open after read-only
   tool calls, which pinned the SQLite write-ahead log (it could grow to
