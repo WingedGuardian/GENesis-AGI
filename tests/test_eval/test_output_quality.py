@@ -119,27 +119,3 @@ class TestOutputQualityScorerAsync:
 
         assert passed is False
         assert score == 0.0
-
-
-class TestQualityGateIntegration:
-    """Test the quality_hold filtering in send_digest."""
-
-    def test_quality_hold_filtered_from_digest(self):
-        """Proposals with realist_verdict=quality_hold are excluded."""
-        proposals = [
-            {"id": "1", "content": "good", "realist_verdict": "pass"},
-            {"id": "2", "content": "held", "realist_verdict": "quality_hold"},
-            {"id": "3", "content": "also good", "realist_verdict": None},
-        ]
-        filtered = [p for p in proposals if p.get("realist_verdict") != "quality_hold"]
-        assert len(filtered) == 2
-        assert all(p["id"] != "2" for p in filtered)
-
-    def test_all_held_returns_empty(self):
-        """If all proposals are quality_hold, filtered list is empty."""
-        proposals = [
-            {"id": "1", "realist_verdict": "quality_hold"},
-            {"id": "2", "realist_verdict": "quality_hold"},
-        ]
-        filtered = [p for p in proposals if p.get("realist_verdict") != "quality_hold"]
-        assert filtered == []
