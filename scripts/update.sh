@@ -271,7 +271,7 @@ echo ""
 # Records an entry in update_history. Silently no-ops if the table
 # doesn't exist yet (first update before migration 0001 has run).
 _record_update_history() {
-    local status="$1"           # success | failed | rolled_back
+    local status="$1"           # success | failed | rolled_back | conflicts_pending
     local reason="${2:-}"
     local degraded="${3:-}"
     local db_path="$GENESIS_ROOT/data/genesis.db"
