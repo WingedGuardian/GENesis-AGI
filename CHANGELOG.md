@@ -18,6 +18,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The Guardian alerts once when Genesis goes down — and once when it's back** —
+  previously, if Genesis went down and its diagnosis couldn't reach Claude Code,
+  the host Guardian re-ran a full investigation and re-sent a critical Telegram
+  alert every 30 seconds until recovery — an alert storm. It now sends a single
+  "down" alert per outage (no repeats, however long it lasts), and when Genesis
+  comes back on its own it sends a single "restored" notification — which it
+  never did before.
+
 - **Memory writes no longer get stuck behind a database lock** — under heavy load
   or a provider outage, a cancelled database read could leave a stale lock that
   made saving to memory (`reference_store` / `memory_store`) fail with "database
