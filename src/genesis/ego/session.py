@@ -1007,13 +1007,18 @@ class EgoSession:
             return proposals
 
         try:
-            from genesis.eval.scorers import get_scorer
+            from genesis.eval.scorers import (
+                _JUDGE_CALL_FAIL,
+                _JUDGE_PARSE_FAIL,
+                get_scorer,
+            )
             from genesis.eval.types import ScorerType
 
             scorer = get_scorer(ScorerType.OUTPUT_QUALITY)
             scorer.set_router(self._router)
 
             held_count = 0
+            judge_unavailable = 0
             for p in proposals:
                 try:
                     passed, score, detail = await scorer.score_async(
@@ -1024,15 +1029,35 @@ class EgoSession:
                         expected="autonomous proposal",
                         config={"rubric_name": "output_quality"},
                     )
-                    if not passed:
-                        p["_realist_verdict"] = "quality_hold"
-                        p["_realist_reasoning"] = (
-                            f"Quality score {score:.2f} below threshold. {detail[:300]}"
-                        )
-                        held_count += 1
+                    if passed:
+                        continue
+                    # Fail OPEN on judge INFRASTRUCTURE errors (providers
+                    # exhausted / unparseable response) — a scoring failure is
+                    # not a quality failure. Quarantining proposals because the
+                    # judge was down is exactly how the proposal stream went
+                    # silent during the Jun 2026 provider outage. Only a genuine
+                    # below-threshold score holds a proposal.
+                    try:
+                        judge_error = json.loads(detail).get("error")
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        judge_error = None
+                    if judge_error in (_JUDGE_CALL_FAIL, _JUDGE_PARSE_FAIL):
+                        judge_unavailable += 1
+                        continue
+                    p["_realist_verdict"] = "quality_hold"
+                    p["_realist_reasoning"] = (
+                        f"Quality score {score:.2f} below threshold. {detail[:300]}"
+                    )
+                    held_count += 1
                 except Exception:
                     logger.debug("Quality scoring failed for proposal, passing", exc_info=True)
 
+            if judge_unavailable:
+                logger.warning(
+                    "Quality gate: judge unavailable for %d/%d proposal(s) — "
+                    "passed through (fail-open), NOT held",
+                    judge_unavailable, len(proposals),
+                )
             if held_count:
                 logger.info(
                     "Quality gate: held %d/%d proposals", held_count, len(proposals),
@@ -1237,6 +1262,14 @@ class EgoSession:
                 )
                 if delivery:
                     logger.info("Ego digest sent (delivery_id=%s)", delivery)
+                else:
+                    logger.warning(
+                        "Ego digest NOT delivered for batch %s (send_digest "
+                        "returned None): proposals stored but undelivered — "
+                        "check for all-quality_held, digest rate-limit, or a "
+                        "topic-send failure.",
+                        batch_id,
+                    )
             else:
                 logger.info(
                     "Ego decided stay_quiet — batch %s stored only",
@@ -1518,6 +1551,13 @@ class EgoSession:
             if not isinstance(notif, dict):
                 continue
             content = notif.get("content", "").strip()
+            # Strip one layer of matched wrapping quotes (straight or smart) —
+            # the ego LLM sometimes wraps its whole message in literal quote
+            # characters, which then render verbatim in the user's DM.
+            if len(content) >= 2 and (content[0], content[-1]) in (
+                ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"),
+            ):
+                content = content[1:-1].strip()
             if not content:
                 continue
             # Cap content length to prevent runaway LLM output from

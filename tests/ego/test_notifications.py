@@ -135,6 +135,23 @@ class TestProcessNotifications:
         assert len(request.topic) == 100
         assert request.context == long_content
 
+    @pytest.mark.asyncio
+    async def test_wrapping_quotes_stripped(self, session):
+        """One layer of matched wrapping quotes (straight or smart) is
+        stripped; non-wrapped content is left untouched."""
+        cases = [
+            ('"Hello there"', "Hello there"),
+            ("'Single quoted'", "Single quoted"),
+            ("“Smart quoted”", "Smart quoted"),
+            ("No quotes here", "No quotes here"),
+            ('She said "hi"', 'She said "hi"'),  # not fully wrapped — untouched
+        ]
+        for raw, expected in cases:
+            session._outreach_pipeline.submit.reset_mock()
+            await session._process_notifications([{"content": raw}])
+            request = session._outreach_pipeline.submit.call_args[0][0]
+            assert request.context == expected, f"{raw!r} -> {request.context!r}"
+
 
 # ---------------------------------------------------------------------------
 # NOTIFICATION governance config tests
@@ -169,6 +186,14 @@ class TestNotificationGovernance:
         # Load from repo config
         config = load_outreach_config()
         assert config.thresholds.get("notification") == 0.0
+
+    def test_notification_routes_to_dm(self):
+        """Ego notifications route to the private DM, not a supergroup topic
+        (they are the ego talking to the user, not an official proposal)."""
+        from genesis.outreach.config import load_outreach_config
+
+        config = load_outreach_config()
+        assert config.delivery_routing.get("notification") == "dm"
 
 
 # ---------------------------------------------------------------------------
