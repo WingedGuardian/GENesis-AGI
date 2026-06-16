@@ -80,7 +80,9 @@ _WAL_SIZE_WARN_BYTES = 100 * 1024 * 1024   # 100 MB → "high" (morning report)
 _WAL_SIZE_CRIT_BYTES = 500 * 1024 * 1024   # 500 MB → "critical" (Telegram now)
 _WAL_ALERT_COOLDOWN_S = 3600               # one alert per hour max
 _WAL_TRUNCATE_EVERY_N_TICKS = 12           # hourly TRUNCATE (tick ≈ 5 min)
-_last_wal_alert_at: float = 0.0
+# None = "never alerted". Must NOT be 0.0: time.monotonic() is since boot, so on a
+# freshly-booted host `now - 0.0` is small and would wrongly suppress the first alert.
+_last_wal_alert_at: float | None = None
 
 
 async def _check_wal_health(db) -> None:
@@ -102,7 +104,7 @@ async def _check_wal_health(db) -> None:
     if size < _WAL_SIZE_WARN_BYTES or db is None:
         return
     now = time.monotonic()
-    if now - _last_wal_alert_at < _WAL_ALERT_COOLDOWN_S:
+    if _last_wal_alert_at is not None and now - _last_wal_alert_at < _WAL_ALERT_COOLDOWN_S:
         return
 
     mb = size / (1024 * 1024)

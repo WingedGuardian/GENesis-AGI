@@ -22,9 +22,9 @@ def _make_wal(tmp_path, size_bytes: int):
 
 @pytest.fixture(autouse=True)
 def _reset_cooldown():
-    loop._last_wal_alert_at = 0.0
+    loop._last_wal_alert_at = None
     yield
-    loop._last_wal_alert_at = 0.0
+    loop._last_wal_alert_at = None
 
 
 @pytest.fixture
@@ -117,3 +117,22 @@ def test_infrastructure_alert_type_is_registered():
     from genesis.db.crud import observations
 
     assert "infrastructure_alert" in observations._TTL_BY_TYPE
+
+
+@pytest.mark.asyncio
+async def test_first_alert_fires_on_fresh_boot_small_monotonic(
+    tmp_path, monkeypatch, _tiny_thresholds
+):
+    """Regression: time.monotonic() is since-boot, so on a freshly-booted host it
+    is small. With a 0.0 sentinel, `now - 0.0 < cooldown` wrongly suppressed the
+    FIRST alert (it passed only on a long-uptime host). The None sentinel must fire
+    the first alert regardless of the monotonic value."""
+    db_path = _make_wal(tmp_path, 600)
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: str(db_path))
+    monkeypatch.setattr(loop.time, "monotonic", lambda: 5.0)  # fresh boot, ~5s uptime
+    spy = AsyncMock()
+    monkeypatch.setattr(loop.observations, "create", spy)
+
+    await loop._check_wal_health(object())
+
+    spy.assert_called_once()  # must NOT be suppressed by the cooldown on first run
