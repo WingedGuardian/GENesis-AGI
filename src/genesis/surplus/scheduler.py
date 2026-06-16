@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,6 +32,31 @@ if TYPE_CHECKING:
     from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
+
+
+# `gitnexus analyze` injects a `<!-- gitnexus:start --> … <!-- gitnexus:end -->`
+# block into BOTH CLAUDE.md and AGENTS.md, with no per-file flag. We keep it in
+# AGENTS.md (read by cross-tool agents — Codex/Cursor/etc.) but strip it from
+# CLAUDE.md so Claude Code's instructions file stays clean.
+_GITNEXUS_BLOCK_RE = re.compile(
+    r"\n*<!-- gitnexus:start -->.*?<!-- gitnexus:end -->[^\n]*\n?",
+    re.DOTALL,
+)
+
+
+def _strip_gitnexus_block(path: Path) -> bool:
+    """Remove GitNexus's auto-injected block from a file. Returns True if removed."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    stripped = _GITNEXUS_BLOCK_RE.sub("", text)
+    if stripped == text:
+        return False
+    if stripped and not stripped.endswith("\n"):
+        stripped += "\n"
+    path.write_text(stripped)
+    return True
 
 
 class SurplusScheduler:
@@ -1236,6 +1262,11 @@ class SurplusScheduler:
                 return
             if proc.returncode == 0:
                 logger.info("GitNexus reindex complete")
+                # Keep the gitnexus block in AGENTS.md (cross-tool agents) but
+                # strip it from CLAUDE.md — analyze injects both with no per-file flag.
+                with contextlib.suppress(Exception):
+                    if _strip_gitnexus_block(Path(repo_root) / "CLAUDE.md"):
+                        logger.info("Stripped GitNexus block from CLAUDE.md (kept in AGENTS.md)")
                 with contextlib.suppress(Exception):
                     GenesisRuntime.instance().record_job_success("gitnexus_reindex")
             else:
