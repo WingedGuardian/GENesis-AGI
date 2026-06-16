@@ -633,6 +633,12 @@ if [ -f "$GENESIS_ROOT/secrets.env" ]; then
     fi
 fi
 
+# NOTE: Backups are NOT auto-enabled here. Backup is a deliberate setup step
+# (both tiers + passphrase + a verify run) handled in the onboarding skill —
+# auto-installing a 6h cron on bootstrap just because GENESIS_BACKUP_REPO is set
+# gives a false sense of safety (large data is local-only until Tier 2/NAS is
+# configured) and isn't a switch to flip for every new user.
+
 # --- VNC stack (collaborative browser mode) ---
 echo "--- Setting up VNC stack ---"
 if bash "$GENESIS_ROOT/scripts/setup-vnc.sh" 2>&1 | sed 's/^/  /'; then
