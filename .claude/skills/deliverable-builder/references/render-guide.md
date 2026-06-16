@@ -46,8 +46,11 @@ pandoc "$DRAFT" -t beamer --pdf-engine=pdflatex -o "$OUT.pdf"  # present
 
 **Quality check (do not skip):** open the rendered file and look. A bare
 `pandoc --pdf-engine=pdflatex` PDF has a recognizable LaTeX-article look — if it reads as
-templated for the audience, re-render with `/make-pdf` or a styled reference doc. The point of
-this skill is a deliverable that looks *made by a person*; a default-styled PDF is its own tell.
+templated for the audience, re-render to match the spec's `visual_style`: *cut-and-dry* → plain `xelatex`; *designed* →
+`/make-pdf` or `/design-html`→PDF. `visual_style` (how it looks) and `authenticity_target`
+(human-made vs AI-assisted-OK) are separate Gate-1 calls. See `structure-altitude.md` for the
+effort-artifact tells (elaborate tables, dense formatting) that read as AI *only* when the
+target is human-made. Match what the user asked for; do not impose a one-size "looks human" default.
 
 ## After rendering — update the spec
 

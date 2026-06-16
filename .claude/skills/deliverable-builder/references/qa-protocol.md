@@ -37,9 +37,13 @@ A. ACCEPTANCE CRITERIA — for EACH criterion in the spec: PASS or FAIL + the ev
 B. QUALITY BARS (grade each Green / Yellow / Red):
    - Format correct for the audience (no raw markdown for external work)
    - Leads with the answer (first ¶/slide states the conclusion; ghost-deck test passes)
-   - No document-level AI tells (see structure-altitude.md: meta-narration, equal-length
-     sections, exhaustive-coverage, table overload, absent point of view, formulaic open/close)
-   - Voice applied (reads as the user, per audit_trail.voice) and anti-slop pass ran
+   - Authenticity — CALIBRATE to spec.authenticity_target, do not apply a universal "human-made" bar:
+       * "human-made" → enforce hard: voice applied (per audit_trail.voice) AND no document-level
+         AI tells (structure-altitude.md: meta-narration, equal-length sections, exhaustive-
+         coverage, table overload, absent point of view, formulaic open/close). Any tell = FAIL.
+       * "ai-assisted-ok" → do NOT fail for reading polished or AI-assisted; that may be exactly
+         right. Still require it on-voice where it matters and free of obvious slop, but polish is
+         acceptable, even desirable. Judge it on substance, format, altitude, and fidelity.
    - Every claim supported; numbers specific; NO hallucinated facts, sources, or citations
      (spot-check any citation against the brief/source — if a cite can't be grounded, FAIL)
 

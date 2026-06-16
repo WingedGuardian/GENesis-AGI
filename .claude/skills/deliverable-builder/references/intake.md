@@ -46,6 +46,15 @@ Establish, and write into the spec:
   (the answer, not the setup). This is the altitude decision, made up front.
 - **output_location** — where the finished artifact and working files go (see "Output location"
   below). Part of the Gate-1 confirm.
+- **authenticity_target** — must this read as *fully human-made* (the user personally wrote it;
+  any AI fingerprint undercuts it), or is *AI-assisted / polished* fine, or even expected? This
+  is **not cosmetic** — it sets how hard the Voice and Anti-slop stages push and what Gate 2
+  fails on. A take-home where the team knows AI was used wants maximal polish; a personal note
+  under the user's name does not. **Ask — never assume "human-made."** (The phData packet was
+  *correctly* polished because AI-assisted was fine there; the identical polish on a personal
+  piece would be the wrong shape.)
+- **visual_style** — cut-and-dry (plain, black-and-white, minimal) or designed (color, branded,
+  visual polish), and how polished overall? Drives the render tool and styling (`render-guide.md`).
 
 ## Step 3 — Freeze the brief into acceptance criteria
 
@@ -76,6 +85,8 @@ Write the marker to `~/.genesis/sessions/$SID/deliverable.json` with `status: "d
   ],
   "format": "pdf",
   "what_leads": "the first claim the reader sees",
+  "authenticity_target": "human-made | ai-assisted-ok",
+  "visual_style": "cut-and-dry | designed (note colour/polish level)",
   "draft_path": "", "rendered_path": "",
   "audit_trail": {
     "intake":    {"ran": true,  "gate1_approved": false},
@@ -107,16 +118,27 @@ All deliverable files go under `~/.genesis/output/` (never the repo). Decide the
 - **Unsure → default to a subfolder.** If the user wants the final file to ultimately land
   somewhere specific (a Desktop path, an attachment folder), capture that too. Confirm at Gate 1.
 
-## Gate 1 — Frame & Format (interactive)
+## Gate 1 — Frame the deliverable (robust interview, every time)
 
-Before drafting, confirm with the user, in one message — and treat **format** and **output
-location** as *their* call, not yours:
+This is the most important stage. A vague Gate 1 is how you ship a technically-correct
+deliverable in the wrong *shape*. In foreground, run it as a **real interview using the
+`AskUserQuestion` tool — every time, not optionally** — until you could describe the finished
+artifact precisely, both visually and substantially. Recommend, then let the user decide; do
+not settle for checking boxes off a list.
 
-> Audience **X**. Recommend **PDF** (final/fixed); say if you'd rather **DOCX** (editable) or
-> another format. Output goes to **<output_location>**. Leading with **"<what_leads>"**,
-> success = **<win_condition>**. Acceptance criteria: AC1…ACn. Anything to change before I draft?
+Get explicit clarity on all of these (recommend an option, but it's the user's call):
 
-On approval set `audit_trail.intake.gate1_approved = true` and proceed to Draft.
-If the user revises, update the spec and re-confirm. Gate 1 is the cheap place to catch a
-wrong frame, format, or location — do not skip it to "save a step." In a real run, expect this
-to take real back-and-forth; that is the point, not friction.
+- **Format** — the *actual* artifact type. Whatever the deliverable genuinely is (PDF, DOCX,
+  deck, spreadsheet, …), never a guess and never defaulted.
+- **Authenticity target** — must it read as *fully human-made*, or is *AI-assisted / polished*
+  fine or expected? Routinely missed, routinely wrong by default. Ask it outright; it changes
+  how hard Voice and Anti-slop push and what Gate 2 fails on.
+- **Visual style / polish** — cut-and-dry vs designed; colour vs black-and-white; how polished
+  overall.
+- **Substance** — audience, win condition, what leads, and the acceptance criteria.
+
+Prefer one multi-question `AskUserQuestion` call so the user sets these *directly* rather than
+reacting to your guesses. Write every answer into the spec, then set
+`audit_trail.intake.gate1_approved = true` and proceed to Draft. If anything stays fuzzy, ask
+again — real back-and-forth here is the point, not friction. (Autonomous runs read these from
+the task spec instead — v2.)

@@ -58,7 +58,12 @@ on their own. If they read as a table of contents ("Background", "Approach", "Re
 ## Document-level AI-tell checklist (structural)
 
 These are the *structural* fingerprints of machine authorship — the things that mark a document
-as AI-made even when every sentence is clean. Flag and fix:
+as AI-made even when every sentence is clean.
+
+**Calibrate to `spec.authenticity_target` first.** For an *AI-assisted-OK* deliverable, polish
+and effort artifacts are acceptable or even desired — apply this list with a light hand. For a
+*human-made* deliverable, enforce it hard. These are tells only *against* a human-made target.
+Flag and fix accordingly:
 
 - [ ] **Meta-narration** — "In this section, we will explore…", "Let's dive into…", "Having
       established X, we now turn to Y." Cut it; just say the thing.
@@ -74,6 +79,13 @@ as AI-made even when every sentence is clean. Flag and fix:
       professional deliverable commits: it says what to do and why, and owns the tradeoff.
 - [ ] **Formulaic open/close** — "This document presents…" / "In conclusion, …". Open on the
       answer; close on the ask or the next step, not a summary of what was just said.
+- [ ] **Effort artifacts a human wouldn't hand-make** (a tell *only* when `authenticity_target`
+      = human-made) — elaborate formatted tables, exhaustive specs, rich per-row descriptors,
+      dense formatting. They take real work a person rarely does by hand, so their *presence*
+      reads as AI even when every sentence is clean. The phData packet's biggest tell wasn't the
+      prose; it was the polished tables and descriptors. For an AI-assisted-OK target they're
+      fine, often desirable; for a human-made target, cut them or replace with what the user
+      would actually produce by hand.
 
 ## After shaping — update the spec
 
