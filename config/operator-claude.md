@@ -20,8 +20,8 @@ The Guardian checks for a maintenance flag on every tick and stands down if it i
 
 ## Work inside Genesis (the container)
 
-- `genesis`  — alias added to your `~/.bashrc`, or
-- `incus exec __CONTAINER_NAME__ --user __UBUNTU_UID__ --env HOME=/home/ubuntu --cwd /home/ubuntu/genesis -t -- bash -l`
+- `genesis`  — alias added to your `~/.bashrc` (drops you straight into the repo), or
+- `incus exec __CONTAINER_NAME__ --user __UBUNTU_UID__ --env HOME=/home/ubuntu -t -- bash -l`, then `cd genesis`
 
 ## Don't
 
