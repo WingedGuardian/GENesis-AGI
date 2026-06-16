@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
 
 from genesis.content.drafter import ContentDrafter
+from genesis.content.egress import gate
 from genesis.content.formatter import ContentFormatter
 from genesis.content.types import DraftRequest, FormatTarget, FormattedContent
 from genesis.db.crud import outreach as outreach_crud
@@ -372,11 +374,7 @@ class OutreachPipeline:
         # voice) are left untouched. The spaced-em-dash fix is applied to the
         # delivered text; non-fixable tells are logged. PII on an external send
         # quarantines (don't leak secrets to a third party).
-        from dataclasses import replace as _dc_replace
-
-        from genesis.content.egress import gate as _egress_gate
-
-        egress = _egress_gate(
+        egress = gate(
             formatted.text, channel=channel, category=request.category.value,
         )
         if egress.applied:
@@ -399,7 +397,7 @@ class OutreachPipeline:
                     error=f"Content scan quarantine: {egress.scan.detected}",
                 )
             if egress.fixes_applied:
-                formatted = _dc_replace(formatted, text=egress.text)
+                formatted = replace(formatted, text=egress.text)
 
         try:
             delivery_id = await adapter.send_message(

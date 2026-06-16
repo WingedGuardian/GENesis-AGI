@@ -6,7 +6,7 @@ from genesis.content.egress import EgressResult, gate, should_gate
 
 EM = "—"
 # A high-confidence secret the output scanner flags (api_key_openai -> critical).
-SECRET = "sk-abcdefghij1234567890ABCDXYZ"
+SECRET = "sk-abcdefghij1234567890ABCDXYZ"  # pragma: allowlist secret
 
 
 class TestShouldGate:
