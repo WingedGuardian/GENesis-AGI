@@ -247,6 +247,7 @@ async def get_db(
         if foreign_keys:
             await conn.execute("PRAGMA foreign_keys=ON")
         await conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        await conn.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
 
     db = await aiosqlite.connect(str(path))
     await _configure(db)
@@ -285,6 +286,7 @@ async def get_raw_db(
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
         await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
         # NOTE: intentionally NOT setting `foreign_keys=ON` here (get_db does).
         # These standalone sites never enforced FKs before, and none touch
         # FK-cascading tables. If a future caller needs cascade deletes, enable

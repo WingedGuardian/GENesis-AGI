@@ -81,14 +81,14 @@ async def insert(
 
 async def get(db: aiosqlite.Connection, unit_id: str) -> dict | None:
     """Get a knowledge unit by id."""
-    cursor = await db.execute(
+    async with db.execute(
         "SELECT * FROM knowledge_units WHERE id = ?", (unit_id,)
-    )
-    row = await cursor.fetchone()
-    if row is None:
-        return None
-    columns = [desc[0] for desc in cursor.description]
-    return dict(zip(columns, row, strict=False))
+    ) as cursor:
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        columns = [desc[0] for desc in cursor.description]
+        return dict(zip(columns, row, strict=False))
 
 
 async def find_by_unique_key(
@@ -104,16 +104,16 @@ async def find_by_unique_key(
     that stale Qdrant points for replaced content can be cleaned up before
     writing the new version.
     """
-    cursor = await db.execute(
+    async with db.execute(
         "SELECT * FROM knowledge_units WHERE project_type = ? "
         "AND domain = ? AND concept = ?",
         (project_type, domain, concept),
-    )
-    row = await cursor.fetchone()
-    if row is None:
-        return None
-    columns = [desc[0] for desc in cursor.description]
-    return dict(zip(columns, row, strict=False))
+    ) as cursor:
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        columns = [desc[0] for desc in cursor.description]
+        return dict(zip(columns, row, strict=False))
 
 
 async def upsert(
@@ -203,12 +203,12 @@ async def upsert(
     # unique key (different id).  This matters because callers passing
     # id=None on an UPSERT conflict would otherwise get back a brand-new
     # UUID that points at nothing.
-    cursor = await db.execute(
+    rows = await db.execute_fetchall(
         "SELECT id FROM knowledge_units WHERE project_type = ? "
         "AND domain = ? AND concept = ?",
         (project_type, domain, concept),
     )
-    row = await cursor.fetchone()
+    row = rows[0] if rows else None
     actual_id = row[0] if row else unit_id
     inserted = actual_id == unit_id
 
@@ -261,8 +261,7 @@ async def search_fts(
         params.append(domain)
     sql += " ORDER BY f.rank LIMIT ?"
     params.append(limit)
-    cursor = await db.execute(sql, params)
-    rows = await cursor.fetchall()
+    rows = await db.execute_fetchall(sql, params)
     return [
         {
             "unit_id": r[0], "concept": r[1], "body": r[2],
@@ -282,22 +281,22 @@ async def stats(
     where = "WHERE project_type = ?" if project else ""
     params: tuple = (project,) if project else ()
 
-    cursor = await db.execute(
+    rows = await db.execute_fetchall(
         f"SELECT COUNT(*), MIN(ingested_at), MAX(ingested_at) FROM knowledge_units {where}",
         params,
     )
-    row = await cursor.fetchone()
+    row = rows[0] if rows else None
     total, oldest, newest = row
 
     # Domain breakdown
-    cursor = await db.execute(
+    domain_rows = await db.execute_fetchall(
         f"SELECT domain, COUNT(*) FROM knowledge_units {where} GROUP BY domain",
         params,
     )
-    domains = {r[0]: r[1] for r in await cursor.fetchall()}
+    domains = {r[0]: r[1] for r in domain_rows}
 
     # Tier breakdown (curated vs recon vs other)
-    cursor = await db.execute(
+    tier_rows = await db.execute_fetchall(
         f"""SELECT
                 CASE
                     WHEN source_pipeline = 'curated' THEN 'curated'
@@ -310,7 +309,7 @@ async def stats(
             GROUP BY tier""",
         params,
     )
-    by_tier = {r[0]: r[1] for r in await cursor.fetchall()}
+    by_tier = {r[0]: r[1] for r in tier_rows}
 
     return {
         "total": total,
@@ -331,13 +330,12 @@ async def list_by_domain(
     Used by the mirror generator. Returns ``{domain: [{id, concept, body,
     ingested_at, tags}, ...]}`` sorted by domain then ingested_at desc.
     """
-    cursor = await db.execute(
+    rows = await db.execute_fetchall(
         "SELECT id, domain, concept, body, ingested_at, tags "
         "FROM knowledge_units WHERE project_type = ? "
         "ORDER BY domain, ingested_at DESC",
         (project_type,),
     )
-    rows = await cursor.fetchall()
     result: dict[str, list[dict]] = {}
     for uid, domain, concept, body, ingested_at, tags in rows:
         result.setdefault(domain, []).append({

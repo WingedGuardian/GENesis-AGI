@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -40,17 +41,97 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _sqlite_wal_checkpoint(db) -> None:
-    """Attempt a non-blocking WAL checkpoint. SQLite-specific."""
+async def _sqlite_wal_checkpoint(db) -> None:
+    """Run a non-blocking PASSIVE WAL checkpoint via the async API.
+
+    MUST go through ``db.execute`` (the aiosqlite worker thread). Reaching into
+    ``db._conn._conn`` and calling it synchronously from the event-loop thread
+    raises ``ProgrammingError`` (sqlite3 connections are thread-bound) — which a
+    bare ``except`` silently swallows, making the checkpoint a no-op (this was a
+    latent bug). ``execute_fetchall`` consumes+closes the cursor (cancellation-
+    safe). SQLite-specific; best-effort."""
+    with contextlib.suppress(Exception):  # best-effort; failure is harmless
+        await db.execute_fetchall("PRAGMA wal_checkpoint(PASSIVE)")
+
+
+async def _sqlite_wal_truncate(db) -> None:
+    """Run a TRUNCATE WAL checkpoint via the async API to reclaim WAL *file* space.
+
+    PASSIVE checkpoints recycle WAL frames in place but never shrink the file;
+    TRUNCATE resets it to zero bytes once all readers have caught up. No-op
+    (busy) if a reader still holds a snapshot — that case is surfaced by
+    :func:`_check_wal_health`. Run on a slow cadence (not every tick) so it
+    doesn't needlessly contend with active readers. Goes through ``db.execute``
+    (worker thread); ``execute_fetchall`` is cancellation-safe. SQLite-specific;
+    best-effort."""
     try:
-        import sqlite3
-        # Access the raw connection for synchronous PRAGMA
-        if hasattr(db, '_conn') and hasattr(db._conn, '_conn'):
-            raw = db._conn._conn
-            if isinstance(raw, sqlite3.Connection):
-                raw.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        rows = await db.execute_fetchall("PRAGMA wal_checkpoint(TRUNCATE)")
+        if rows and rows[0][0] == 1:
+            logger.debug("WAL TRUNCATE checkpoint blocked by an active reader")
     except Exception:
         pass  # Best-effort; failure is harmless
+
+
+# WAL-health detection: a pinned checkpoint (e.g. a long-lived connection holding
+# a read snapshot from an unclosed/cancelled cursor) makes the WAL file grow
+# unbounded. Alert on abnormal WAL size so a stuck reader is caught in minutes,
+# not days. Surfaces via the critical-observations job (Telegram) + morning report.
+_WAL_SIZE_WARN_BYTES = 100 * 1024 * 1024   # 100 MB → "high" (morning report)
+_WAL_SIZE_CRIT_BYTES = 500 * 1024 * 1024   # 500 MB → "critical" (Telegram now)
+_WAL_ALERT_COOLDOWN_S = 3600               # one alert per hour max
+_WAL_TRUNCATE_EVERY_N_TICKS = 12           # hourly TRUNCATE (tick ≈ 5 min)
+# None = "never alerted". Must NOT be 0.0: time.monotonic() is since boot, so on a
+# freshly-booted host `now - 0.0` is small and would wrongly suppress the first alert.
+_last_wal_alert_at: float | None = None
+
+
+async def _check_wal_health(db) -> None:
+    """Create a high/critical observation when the SQLite WAL file is abnormally
+    large — the direct symptom of a pinned checkpoint or chronic under-checkpointing.
+    Best-effort; never raises into the tick."""
+    global _last_wal_alert_at
+    try:
+        from pathlib import Path
+
+        from genesis.env import genesis_db_path
+        wal_path = Path(f"{genesis_db_path()}-wal")
+        if not wal_path.exists():
+            return
+        size = wal_path.stat().st_size
+    except Exception:
+        return  # can't stat — nothing to alert on
+
+    if size < _WAL_SIZE_WARN_BYTES or db is None:
+        return
+    now = time.monotonic()
+    if _last_wal_alert_at is not None and now - _last_wal_alert_at < _WAL_ALERT_COOLDOWN_S:
+        return
+
+    mb = size / (1024 * 1024)
+    priority = "critical" if size >= _WAL_SIZE_CRIT_BYTES else "high"
+    # Set the cooldown BEFORE the write so a failed create (e.g. DB locked — the
+    # very scenario this alerts on) still suppresses per-tick retries for an hour.
+    _last_wal_alert_at = now
+    try:
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="wal_health_monitor",
+            type="infrastructure_alert",
+            content=(
+                f"SQLite WAL file is {mb:.0f} MB (warn at "
+                f"{_WAL_SIZE_WARN_BYTES // 1024 // 1024} MB). Likely cause: a long-lived "
+                f"connection holding a read snapshot (unclosed/cancelled read cursor) "
+                f"pinning the WAL checkpoint, or chronic under-checkpointing. Find the "
+                f"stuck reader/MCP; a wal_checkpoint(TRUNCATE) reclaims the space once "
+                f"it is gone."
+            ),
+            priority=priority,
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        logger.warning("WAL health alert: %.0f MB (%s)", mb, priority)
+    except Exception:
+        logger.debug("Failed to create WAL health alert observation", exc_info=True)
 
 
 # Micro ticks are silent by default (counted for cascade, no LLM call).
@@ -675,7 +756,12 @@ class AwarenessLoop:
             # external scripts or concurrent writers. PASSIVE is non-blocking.
             # (SQLite-specific; remove when migrating to PostgreSQL.)
             if result is not None and result.db_available:
-                _sqlite_wal_checkpoint(self._db)
+                await _sqlite_wal_checkpoint(self._db)
+                # Hourly TRUNCATE reclaims WAL *file* space (PASSIVE can't), and a
+                # WAL-size check alerts if a stuck reader is pinning the checkpoint.
+                if self._tick_count % _WAL_TRUNCATE_EVERY_N_TICKS == 0:
+                    await _sqlite_wal_truncate(self._db)
+                await _check_wal_health(self._db)
 
             # Status file writes are handled by a dedicated loop in
             # runtime/init/memory.py (status-writer-loop). Decoupled from

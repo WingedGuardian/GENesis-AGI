@@ -9,6 +9,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **Genesis now watches its own database journal size** — if SQLite's
+  write-ahead log grows abnormally large (the sign of a stuck database reader
+  holding the file open), Genesis raises a high/critical alert on Telegram and in
+  the morning report, instead of letting it balloon silently for days.
+
+### Fixed
+
+- **Memory writes no longer get stuck behind a database lock** — under heavy load
+  or a provider outage, a cancelled database read could leave a stale lock that
+  made saving to memory (`reference_store` / `memory_store`) fail with "database
+  is locked" while the write-ahead log ballooned (it reached ~2 GB). Database
+  reads are now cancellation-safe and the journal is size-bounded, so the lock
+  can't get stuck and the file can't run away.
+
 ### Changed
 
 - **Interactive Claude Code consoles can run friction-free again, when you want
