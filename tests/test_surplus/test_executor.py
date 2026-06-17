@@ -59,6 +59,25 @@ async def test_insights_list_populated():
 
 
 @pytest.mark.asyncio
+async def test_post_to_telegram_keeps_quotes_raw():
+    """Regression: surplus content quotes/apostrophes must stay raw (Telegram HTML
+    renders &quot;/&#x27; literally), while &/</> stay escaped for HTML safety."""
+    ex = object.__new__(SurplusLLMExecutor)
+    ex._topic_manager = AsyncMock()
+    content = "{\"title\": \"Jay's plan & <next> steps\"}"
+    await ex._post_to_telegram(_make_task(), content)
+
+    ex._topic_manager.send_to_category.assert_called_once()
+    category, sent_text = ex._topic_manager.send_to_category.call_args[0][:2]
+    assert category == "surplus"
+    # quotes/apostrophes preserved, NOT entity-escaped
+    assert '"' in sent_text and "'" in sent_text
+    assert "&quot;" not in sent_text and "&#x27;" not in sent_text
+    # &, <, > still escaped (HTML-safe so the <b> label parses)
+    assert "&amp;" in sent_text and "&lt;next&gt;" in sent_text
+
+
+@pytest.mark.asyncio
 async def test_no_error():
     result = await StubExecutor().execute(_make_task())
     assert result.error is None
