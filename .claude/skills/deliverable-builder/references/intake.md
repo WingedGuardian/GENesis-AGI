@@ -3,6 +3,55 @@
 The Intake stage produces the **deliverable-spec** (`spec`), the small state object every
 later stage reads and updates. Nothing gets drafted until Gate 1 passes.
 
+## Autonomous mode (v2 — running as a Genesis task-executor step)
+
+If you were dispatched as an executor **step** (your prompt names this skill and there is no
+live user to talk to), you are in autonomous mode. The Gate-1 frame was already captured at
+`/task` intake — your job is to read it and execute, not to interview. The whole foreground flow
+below (Steps 1–4, Gate 1) is replaced by this:
+
+1. **Read the COMPLETE skill first — by absolute path, NOT the `Skill` tool.** The injected copy
+   is truncated (~2000 chars, `SKILL.md` only), and the `Skill` tool will NOT find this skill
+   (an executor step runs outside the project, so the project skill isn't registered — verified).
+   Instead Read `SKILL.md` and its `references/` files from the **absolute skill directory** given
+   in your injected resources (the `### Skill: deliverable-builder (full skill dir: ...)` line)
+   before doing anything else.
+2. **Read the frame from the plan; do NOT interview.** The full task plan is embedded in this
+   step's description (under `## Full task plan`); its `## Deliverable Frame` section is the
+   frame. Map it into the spec: `format`,
+   `visual_style`, `authenticity_target`, `audience`, `what_leads`, `acceptance`. The brief =
+   the plan's `## Requirements` + `## Success Criteria`; freeze those into `acceptance_criteria`.
+   **Never call `AskUserQuestion`** — there is no user. If a frame field is missing, use the
+   conservative default (`visual_style=modern`, `authenticity_target=ai-assisted-ok`) and **record
+   the assumption in `qa_summary.md`** so the user can correct it at Gate 3 — never block to ask.
+3. **Run the pipeline** — Structure → Voice → Anti-slop → Render (font follows `visual_style`;
+   default Lato). The Voice (`voice-master`) and Anti-slop (`humanizer`) stages are themselves
+   skills — and the `Skill` tool may NOT load them here (same out-of-project limit). Read them by
+   absolute path and apply their rules yourself: `voice-master` at the repo's
+   `.claude/skills/voice-master/` (+ the user companion `~/.claude/skills/voice-master/`),
+   `humanizer` at `~/.claude/skills/humanizer/`. **Hard final check before emitting — do it
+   IN-SESSION, never assume a skill did it: the rendered artifact must contain ZERO spaced
+   em-dashes (` — `; replace each with a comma, period, or colon) and none of the banned AI-tell
+   words.** Spaced em-dashes are the #1 tell and a hard fail; verify the SOURCE before you render.
+4. **Gate 2 is still YOURS — run it IN-SESSION.** The `Task` subagent tool is NOT available in an
+   executor step (verified), so do not try to spawn a fresh-context reviewer. Instead re-open your
+   rendered file yourself (Bash `pdftotext`/`pdfinfo`, or `python -m fitz`) and verify it against
+   the frozen acceptance criteria using the `qa-protocol.md` bar — the executor's text-only
+   verifier cannot open your PDF, so this in-session check is the real check on the rendered file.
+   The executor's `VERIFYING` phase then runs a fresh adversarial pass over the `qa_summary.md` you
+   emit (next step), which is the closest thing to the foreground fresh-context Gate 2.
+5. **Emit two artifacts** (the executor's review loop reads text, not PDF bytes): the rendered
+   deliverable file **and** a `qa_summary.md` beside it, capturing the Gate-2 verdict,
+   per-criterion PASS/FAIL, and any assumptions made. Return a **compact** step result — the
+   rendered file path + a one-line PASS/FAIL — because step results are truncated to ~2000 chars
+   on persist; verbose detail belongs in `qa_summary.md`.
+6. **Gate 3 and the Stop-hook do NOT apply here.** Sign-off is the executor's job (a
+   `VERIFYING`-phase Telegram approval — see `approval-gates.md`), and the Stop-hook is a
+   foreground-only backstop. Do not write the `rendered_unverified` marker and do not wait on a
+   Stop-hook in autonomous mode.
+
+Everything below is the **foreground** flow.
+
 ## Step 1 — Resolve the session id and open the spec
 
 The spec lives in this session's existing per-session dir so the Stop-hook gate

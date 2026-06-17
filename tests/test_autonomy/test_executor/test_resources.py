@@ -206,3 +206,34 @@ class TestLoadStepResources:
             step = {"idx": 0, "skills": ["nonexistent-skill"]}
             result = await load_step_resources(None, step)
             assert result is None
+
+    async def test_injection_includes_absolute_skill_dir(self, tmp_path: Path) -> None:
+        """The injected resource carries the absolute skill dir, so a dispatched
+        step (which can't load the skill via the Skill tool from outside the
+        project) can Read the full skill + references by absolute path."""
+        skill_dir = tmp_path / "deliverable-builder"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("# Deliverable Builder\nbody", encoding="utf-8")
+        with patch(
+            "genesis.autonomy.executor.resources._find_skill_path",
+            return_value=skill_dir,
+        ):
+            result = await load_step_resources(None, {"skills": ["deliverable-builder"]})
+        assert result is not None
+        assert f"full skill dir: {skill_dir}" in result
+
+
+class TestRepoRoot:
+    """Regression: _REPO_ROOT must be the repo root, not src/.
+
+    The four-.parent form landed on src/, so _find_skill_path resolved
+    src/.claude/skills/... (nonexistent) and load_step_resources silently
+    injected nothing for every skill.
+    """
+
+    def test_repo_root_is_repo_not_src(self) -> None:
+        from genesis.autonomy.executor import resources as R
+
+        assert (R._REPO_ROOT / "src" / "genesis" / "__init__.py").is_file()
+        assert (R._REPO_ROOT / "pyproject.toml").is_file()
+        assert R._REPO_ROOT.name != "src"

@@ -58,10 +58,21 @@ advances to Gate 3.
 Set `rendered_unverified` right after Render, `verified` only after a Gate-2 PASS, `shipped`
 after Gate 3. If the user abandons it, set `cancelled`.
 
-## What v1 does NOT do
-Autonomous/task-executor mode (v2 — `approval-gates.md` stub), XLSX (needs `xlsxwriter`; offer
-CSV), polished decks beyond pandoc-basic, and the `enterprise-ai-skills` / `hallmark` extras.
-Foreground, document formats (PDF/DOCX), one deliverable at a time.
+## Modes
+- **Foreground** (default): interactive Gates 1 & 3, the Gate-2 policeman, and the Stop-hook
+  backstop. Triggered when the user asks you directly.
+- **Autonomous** (v2): runs as a Genesis **task-executor step** (the decomposer assigns this
+  skill when the task plan has a `## Deliverable Frame`). Gate 1 is read from that frame — no
+  interview; Gate 2 is still this skill's own check (run in-session — the `Task` tool isn't
+  available to an executor step); Gate 3 is a Telegram approval
+  handled by the executor (a `VERIFYING`-phase blocker); escalation is executor-native; the
+  Stop-hook does NOT apply. See `references/intake.md` → "Autonomous mode" and
+  `references/approval-gates.md`.
+
+## What this does NOT do (yet)
+XLSX (needs `xlsxwriter`; offer CSV), polished decks beyond pandoc-basic, real Telegram file
+*attachment* for autonomous Gate 3 (sends path + summary for now — fast-follow), and the
+`enterprise-ai-skills` / `hallmark` extras. One deliverable at a time.
 
 ## Example
 **User:** "Turn my take-home analysis into the submission packet it should have been."
