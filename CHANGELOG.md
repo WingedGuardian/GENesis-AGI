@@ -33,6 +33,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Guardian host updates no longer silently stall** — on hosts where the
+  Guardian's `CLAUDE.md` had been pinned with git's skip-worktree flag, the
+  Guardian's self-update (`git pull`) would abort the moment that file changed
+  upstream, quietly leaving the host Guardian stuck on old code. The update now
+  clears the flag first, so existing installs self-heal and stay current.
+
 - **Telegram `/stop` now stops your session, not a background task** — when a
   background task (reflection, inbox, an ego session, etc.) was running at the
   same time as your chat, `/stop` could interrupt the wrong one. Each session's

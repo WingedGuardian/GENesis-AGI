@@ -382,29 +382,11 @@ echo "[7/14] Generating CLAUDE.md for diagnostic CC..."
 if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
     cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
 
-    # Append per-machine network identity (no hardcoded IPs in the template)
-    _host_v4="${TS_IP:-$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo '')}"
-    _host_v6="$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' | head -1 || echo '')"
-    {
-        echo ""
-        echo "## Network"
-        echo ""
-        echo "- **Container**: $CONTAINER_NAME at $CONTAINER_IP"
-        echo "- **Host VM**: $_host_v4 (this machine)"
-        [ -n "$_host_v6" ] && echo "- **Host IPv6**: $_host_v6"
-        echo "- **Dashboard**: http://$CONTAINER_IP:5000 (direct, container network)"
-        [ -n "$_host_v4" ] && echo "               http://$_host_v4:5000 (via proxy device)"
-    } >> "$INSTALL_DIR/CLAUDE.md"
-
-    # Tell git to ignore local CLAUDE.md changes. The file is tracked but the
-    # host uses guardian-claude.md instead. Without skip-worktree, git pull
-    # tries to merge the repo's container CLAUDE.md over the Guardian version.
-    if [ -d "$INSTALL_DIR/.git" ]; then
-        cd "$INSTALL_DIR" && git update-index --skip-worktree CLAUDE.md 2>/dev/null || true
-    else
-        echo "  NOTE: $INSTALL_DIR/.git not found — CLAUDE.md skip-worktree not set"
-        echo "        (ok for a non-git deploy; a future 'git pull' here could overwrite CLAUDE.md)"
-    fi
+    # No network block is appended: shared host/container facts live in the
+    # user-level ~/.claude/CLAUDE.md (D16). CLAUDE.md is also deliberately NOT
+    # marked --skip-worktree — that wedges the gateway's `git pull` once upstream
+    # touches the tracked CLAUDE.md ("local changes would be overwritten"). The
+    # gateway regenerates CLAUDE.md via checkout+cp on every update instead.
 
     # D16: the diagnostic CC runs with cwd = cc.work_dir (see diagnosis.py), so the
     # Guardian CLAUDE.md must live there to be auto-loaded as project context — the

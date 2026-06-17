@@ -100,6 +100,10 @@ PYEOF
             # repo's version would overwrite with the wrong content (container
             # dev instructions vs Guardian diagnostic instructions). We
             # regenerate it from config/guardian-claude.md after every pull.
+            # Clear skip-worktree first: legacy installs marked CLAUDE.md
+            # --skip-worktree, which wedges `git pull` ("local changes would be
+            # overwritten") the moment upstream touches the tracked CLAUDE.md.
+            git update-index --no-skip-worktree CLAUDE.md 2>/dev/null || true
             git checkout -- CLAUDE.md 2>/dev/null || true
             # Stash remaining local config changes (container_ip, etc.)
             STASHED=0
@@ -117,27 +121,11 @@ PYEOF
                         CONFIG_RESET=1
                     fi
                 fi
-                # Regenerate Guardian CLAUDE.md from template (never use repo version)
+                # Regenerate Guardian CLAUDE.md from template (never use repo
+                # version). Shared host/container facts live in the user-level
+                # ~/.claude/CLAUDE.md (D16), so nothing is appended here.
                 if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
                     cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
-                    # Append per-machine network identity from guardian.yaml
-                    _cfg="$INSTALL_DIR/config/guardian.yaml"
-                    if [ -f "$_cfg" ]; then
-                        _cname=$(grep 'container_name:' "$_cfg" | awk '{print $2}' | tr -d '"' || true)
-                        _cip=$(grep 'container_ip:' "$_cfg" | awk '{print $2}' | tr -d '"' || true)
-                        _hip=$(grep 'host_ip:' "$_cfg" | awk '{print $2}' | tr -d '"' || true)
-                        _hv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' | head -1 || echo '')
-                        {
-                            echo ""
-                            echo "## Network"
-                            echo ""
-                            echo "- **Container**: ${_cname} at ${_cip}"
-                            echo "- **Host VM**: ${_hip} (this machine)"
-                            [ -n "$_hv6" ] && echo "- **Host IPv6**: $_hv6"
-                            echo "- **Dashboard**: http://${_cip}:5000 (direct, container network)"
-                            [ -n "$_hip" ] && echo "               http://${_hip}:5000 (via proxy device)"
-                        } >> "$INSTALL_DIR/CLAUDE.md"
-                    fi
                 fi
                 # Self-update: copy gateway script from pulled repo to ~/.local/bin/
                 # Safe mid-execution: Linux preserves old inode while this process holds fd.
@@ -244,24 +232,11 @@ OOMSYSCTL
             mv "$HOME/.local/bin/guardian-gateway.sh.new" "$HOME/.local/bin/guardian-gateway.sh"
         fi
 
-        # Regenerate CLAUDE.md from template (never use repo version on host)
+        # Regenerate CLAUDE.md from template (never use repo version on host).
+        # Shared host/container facts live in the user-level ~/.claude/CLAUDE.md
+        # (D16), so nothing is appended here.
         if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
             cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
-            _cfg="$INSTALL_DIR/config/guardian.yaml"
-            if [ -f "$_cfg" ]; then
-                # || true: guardian.yaml is host-specific; some fields may be absent
-                _cname=$(grep 'container_name:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
-                _cip=$(grep 'container_ip:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
-                _hip=$(grep 'host_ip:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
-                {
-                    echo ""
-                    echo "## Network"
-                    echo ""
-                    [ -n "$_cname" ] && echo "- **Container**: ${_cname} at ${_cip}"
-                    [ -n "$_hip" ] && echo "- **Host VM**: ${_hip} (this machine)"
-                    [ -n "$_cip" ] && echo "- **Dashboard**: http://${_cip}:5000"
-                } >> "$INSTALL_DIR/CLAUDE.md"
-            fi
         fi
 
         # Record deployed commit (separate file — state.json is overwritten by Guardian ticks)
