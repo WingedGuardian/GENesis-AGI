@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now detects and auto-heals a stalled Guardian updater** — it watches whether the
+  Guardian's *deployed* updater script on the host matches the code it has actually pulled. If
+  the updater silently froze (the failure that left it ~2 months stale), Genesis notices within
+  a few checks, automatically redeploys the current updater once, and re-verifies — escalating
+  to you only if the self-heal doesn't resolve it. Closes the blind spot where the host kept
+  pulling new code while its updater quietly stopped refreshing.
+
 - **A new "deliverable-builder" skill produces send-ready work, not raw markdown** — when you
   ask Genesis to build a job take-home, client report, one-pager, or deck, it runs a gated
   pipeline: it frames the deliverable with you (audience, format, what leads), drafts and

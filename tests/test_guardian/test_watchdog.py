@@ -208,3 +208,150 @@ class TestStuckDetection:
             await watchdog.check_and_recover()
         remote.reset_state.assert_not_called()
         assert watchdog._consecutive_stuck == 0
+
+
+# sha256 hexdigests are 64 chars; values are arbitrary for the staleness logic.
+_EXPECTED_GW_SHA = "a" * 64
+_STALE_GW_SHA = "b" * 64
+_THRESHOLD = GuardianWatchdog.DRIFT_ALERT_THRESHOLD
+
+
+def _gw_watchdog(sync_ok: bool = True):
+    """Watchdog wired with mock remote/event_bus/outreach and a stubbed
+    expected-gateway-sha (so tests don't touch the real container git)."""
+    r = AsyncMock()
+    r.sync_gateway = AsyncMock(return_value={"ok": sync_ok})
+    event_bus = AsyncMock()
+    outreach = AsyncMock()
+    wd = GuardianWatchdog(r, event_bus=event_bus, outreach_queue=outreach)
+    wd._expected_gateway_sha = AsyncMock(return_value=_EXPECTED_GW_SHA)
+    return wd, r, event_bus, outreach
+
+
+def _emitted_events(event_bus) -> list[str]:
+    return [c.args[2] for c in event_bus.emit.call_args_list]
+
+
+class TestGatewayStaleness:
+    """Deployed-gateway staleness detection + guarded sync-gateway self-heal."""
+
+    @pytest.mark.asyncio
+    async def test_match_no_action(self):
+        wd, r, eb, outreach = _gw_watchdog()
+        await wd._check_gateway_staleness(
+            {"gateway_sha": _EXPECTED_GW_SHA, "code_version": "abc1234"})
+        r.sync_gateway.assert_not_called()
+        eb.emit.assert_not_called()
+        assert wd._gateway_drift_count == 0
+
+    @pytest.mark.asyncio
+    async def test_unknown_gateway_sha_skips(self):
+        """Host gateway too old to report gateway_sha → never alarm."""
+        wd, r, _, _ = _gw_watchdog()
+        await wd._check_gateway_staleness(
+            {"gateway_sha": "unknown", "code_version": "abc1234"})
+        r.sync_gateway.assert_not_called()
+        assert wd._gateway_drift_count == 0
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_expected_skips(self):
+        """Container can't resolve the host's commit (host ahead) → no false alarm."""
+        wd, r, _, _ = _gw_watchdog()
+        wd._expected_gateway_sha = AsyncMock(return_value=None)
+        await wd._check_gateway_staleness(
+            {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"})
+        r.sync_gateway.assert_not_called()
+        assert wd._gateway_drift_count == 0
+
+    @pytest.mark.asyncio
+    async def test_stale_below_threshold_no_resync(self):
+        wd, r, _, _ = _gw_watchdog()
+        vi = {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"}
+        for _ in range(_THRESHOLD - 1):
+            await wd._check_gateway_staleness(vi)
+        r.sync_gateway.assert_not_called()
+        assert wd._gateway_drift_count == _THRESHOLD - 1
+
+    @pytest.mark.asyncio
+    async def test_threshold_triggers_single_resync(self):
+        wd, r, eb, outreach = _gw_watchdog()
+        vi = {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"}
+        for _ in range(_THRESHOLD):
+            await wd._check_gateway_staleness(vi)
+        r.sync_gateway.assert_called_once()
+        assert any("gateway_resync" in e for e in _emitted_events(eb))
+        outreach.enqueue.assert_not_called()  # not escalated yet
+
+    @pytest.mark.asyncio
+    async def test_still_stale_after_resync_escalates_once(self):
+        wd, r, eb, _ = _gw_watchdog()
+        vi = {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"}
+        for _ in range(_THRESHOLD):
+            await wd._check_gateway_staleness(vi)   # → one resync
+        await wd._check_gateway_staleness(vi)        # still stale → escalate (event bus)
+        await wd._check_gateway_staleness(vi)        # quiet — no second escalation
+        stale_events = [e for e in _emitted_events(eb) if "gateway_stale" in e]
+        assert len(stale_events) == 1               # escalated exactly once
+        r.sync_gateway.assert_called_once()          # resync attempted exactly once
+
+    @pytest.mark.asyncio
+    async def test_resolved_after_resync_resets_state(self):
+        wd, r, _, _ = _gw_watchdog()
+        vi_stale = {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"}
+        for _ in range(_THRESHOLD):
+            await wd._check_gateway_staleness(vi_stale)
+        r.sync_gateway.assert_called_once()
+        # Next tick: sync worked → deployed sha now matches expected.
+        await wd._check_gateway_staleness(
+            {"gateway_sha": _EXPECTED_GW_SHA, "code_version": "abc1234"})
+        assert wd._gateway_drift_count == 0
+        assert wd._gateway_resync_attempted is False
+        assert wd._gateway_escalated is False
+
+    @pytest.mark.asyncio
+    async def test_rearms_after_resolution(self):
+        """After a resolved episode, a fresh staleness episode must self-heal
+        again (the most safety-critical transition — no 'quiet forever')."""
+        wd, r, _, _ = _gw_watchdog()
+        vi_stale = {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"}
+        vi_ok = {"gateway_sha": _EXPECTED_GW_SHA, "code_version": "abc1234"}
+        for _ in range(_THRESHOLD):
+            await wd._check_gateway_staleness(vi_stale)   # episode 1 → resync
+        await wd._check_gateway_staleness(vi_ok)           # resolved → reset
+        assert r.sync_gateway.call_count == 1
+        for _ in range(_THRESHOLD):
+            await wd._check_gateway_staleness(vi_stale)   # episode 2 → re-armed
+        assert r.sync_gateway.call_count == 2
+
+
+class TestExpectedGatewaySha:
+    """Direct coverage of the git-show + sha256 helper (stubbed in the staleness
+    tests). A wrong repo path / git failure silently disables detection, so the
+    skip paths matter."""
+
+    @pytest.mark.asyncio
+    async def test_success_returns_sha(self):
+        import hashlib
+        from unittest.mock import MagicMock
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None)
+        content = b"#!/usr/bin/env bash\n# gateway\n"
+        fake = MagicMock(returncode=0, stdout=content)
+        with patch("genesis.guardian.watchdog.subprocess.run", return_value=fake):
+            sha = await wd._expected_gateway_sha("abc1234")
+        assert sha == hashlib.sha256(content).hexdigest()
+
+    @pytest.mark.asyncio
+    async def test_nonzero_returncode_returns_none(self):
+        from unittest.mock import MagicMock
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None)
+        fake = MagicMock(returncode=128, stdout=b"")
+        with patch("genesis.guardian.watchdog.subprocess.run", return_value=fake):
+            assert await wd._expected_gateway_sha("deadbeef") is None
+
+    @pytest.mark.asyncio
+    async def test_empty_stdout_returns_none(self):
+        from unittest.mock import MagicMock
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None)
+        fake = MagicMock(returncode=0, stdout=b"")
+        with patch("genesis.guardian.watchdog.subprocess.run", return_value=fake):
+            assert await wd._expected_gateway_sha("abc1234") is None

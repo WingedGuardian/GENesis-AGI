@@ -127,3 +127,31 @@ class TestPauseResume:
     async def test_resume(self, remote):
         with patch.object(remote, "_ssh_command", return_value=(True, '{"ok": true}')):
             assert await remote.resume() is True
+
+
+class TestSyncGateway:
+    @pytest.mark.asyncio
+    async def test_parses_json(self, remote):
+        with patch.object(
+            remote, "_ssh_command",
+            return_value=(True,
+                          '{"ok": true, "action": "sync-gateway", '
+                          '"old_sha": "aaa", "new_sha": "bbb"}'),
+        ):
+            result = await remote.sync_gateway()
+        assert result["ok"] is True
+        assert result["new_sha"] == "bbb"
+
+    @pytest.mark.asyncio
+    async def test_non_json_success(self, remote):
+        with patch.object(remote, "_ssh_command", return_value=(True, "not json")):
+            result = await remote.sync_gateway()
+        assert result["ok"] is True
+        assert "raw" in result
+
+    @pytest.mark.asyncio
+    async def test_ssh_failure(self, remote):
+        with patch.object(remote, "_ssh_command", return_value=(False, "timeout")):
+            result = await remote.sync_gateway()
+        assert result["ok"] is False
+        assert "error" in result
