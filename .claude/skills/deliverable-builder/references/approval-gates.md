@@ -44,9 +44,32 @@ normal interaction never trips it.
 If the user abandons a deliverable, set `status: "cancelled"` in the marker (or delete it). The
 gate releases immediately. Always give the user this exit when surfacing a blocked stop.
 
-## Autonomous mode — v2 stub (not built)
-Same stages, different surfaces: Gate 1 reads the frame from the task spec
-(`task_states.description` + plan); Gate 3 becomes a persisted draft + Telegram approval via
-`outreach_send_and_wait(category="approval")`; the Stop-hook gains a max-block→escalate so an
-unattended session can't wedge. Models to mirror: `executor/engine.py` (bounded review loop +
-`_persist_blocker`), `executor/review.py` (tool-capable verify chain). Do not build in v1.
+## Autonomous mode (v2 — running under the task executor)
+
+Same stages, different surfaces. The skill runs as the **terminal step** of an executor task
+(the decomposer assigns it when the plan has a `## Deliverable Frame`). The three gates map onto
+the executor's own machinery — the skill does NOT re-implement them:
+
+- **Gate 1** moved to `/task` intake: the frame is read from the plan's `## Deliverable Frame`
+  (see `intake.md` → "Autonomous mode"). No interview at execution time.
+- **Gate 2** is still the skill's own fresh-subagent check (`qa-protocol.md`), run inside the
+  step. The executor's `VERIFYING` phase is a *secondary* criteria check that reads the
+  `qa_summary.md` text artifact you emit (it cannot open the PDF). Stop-hook does not apply.
+- **Gate 3 = a `VERIFYING`-phase approval, handled by the executor, not the skill.** After the
+  step produces the verified deliverable, the engine (`executor/gate.py`) creates an
+  `approval_request` carrying the `task_id`, sends the deliverable (path + summary in v2.0; the
+  real file attachment is follow-up #2) to the user over Telegram, and transitions the task to
+  `BLOCKED`. The dispatcher resumes the task when an approved-and-unconsumed `approval_request`
+  for it appears (`dispatcher.py:271-305`); on resume the engine marks it consumed, skips
+  re-blocking, and proceeds `VERIFYING → SYNTHESIZING → DELIVERING → COMPLETED`. "Request changes"
+  (rejected/with-feedback) loops back via the existing fixup path.
+
+**Why a blocker, not an in-step wait:** human sign-off can take hours — longer than any step
+timeout — so the task must release its resources while waiting. The `BLOCKED` phase + dispatcher
+resume is exactly that pattern; an in-step `outreach_send_and_wait` would hold the session open
+and time out.
+
+**Escalation is executor-native.** If Gate 2 / `VERIFYING` fails twice
+(`MAX_REVIEW_ITERATIONS=2`, `engine.py:41`), the executor escalates to the user via the normal
+blocker path. There is no Stop-hook block-counter in autonomous mode — that was a foreground
+construct and is not used here.

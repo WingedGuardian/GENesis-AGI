@@ -3,6 +3,41 @@
 The Intake stage produces the **deliverable-spec** (`spec`), the small state object every
 later stage reads and updates. Nothing gets drafted until Gate 1 passes.
 
+## Autonomous mode (v2 — running as a Genesis task-executor step)
+
+If you were dispatched as an executor **step** (your prompt names this skill and there is no
+live user to talk to), you are in autonomous mode. The Gate-1 frame was already captured at
+`/task` intake — your job is to read it and execute, not to interview. The whole foreground flow
+below (Steps 1–4, Gate 1) is replaced by this:
+
+1. **Read the full skill first.** The skill copy injected into your step prompt is truncated
+   (~2000 chars, `SKILL.md` only). Read `~/.claude/skills/deliverable-builder/SKILL.md` and the
+   `references/` files it points to before doing anything else.
+2. **Read the frame from the plan; do NOT interview.** The task plan (in your step context, or at
+   the plan path) has a `## Deliverable Frame` section. Map it into the spec: `format`,
+   `visual_style`, `authenticity_target`, `audience`, `what_leads`, `acceptance`. The brief =
+   the plan's `## Requirements` + `## Success Criteria`; freeze those into `acceptance_criteria`.
+   **Never call `AskUserQuestion`** — there is no user. If a frame field is missing, use the
+   conservative default (`visual_style=modern`, `authenticity_target=ai-assisted-ok`) and **record
+   the assumption in `qa_summary.md`** so the user can correct it at Gate 3 — never block to ask.
+3. **Run the pipeline normally** — Structure → Voice → Anti-slop → Render. The render font follows
+   `visual_style` (`render-guide.md`; default Lato).
+4. **Gate 2 is still YOURS.** Run the fresh-subagent verification (`qa-protocol.md`). The
+   executor's own verifier is text-only and cannot open your PDF, so your Gate 2 is the real
+   check on the rendered file. (If the `Task` subagent tool is unavailable in this step session,
+   fall back to an in-session Gate-2 read of the rendered file — still verify, never skip.)
+5. **Emit two artifacts** (the executor's review loop reads text, not PDF bytes): the rendered
+   deliverable file **and** a `qa_summary.md` beside it, capturing the Gate-2 verdict,
+   per-criterion PASS/FAIL, and any assumptions made. Return a **compact** step result — the
+   rendered file path + a one-line PASS/FAIL — because step results are truncated to ~2000 chars
+   on persist; verbose detail belongs in `qa_summary.md`.
+6. **Gate 3 and the Stop-hook do NOT apply here.** Sign-off is the executor's job (a
+   `VERIFYING`-phase Telegram approval — see `approval-gates.md`), and the Stop-hook is a
+   foreground-only backstop. Do not write the `rendered_unverified` marker and do not wait on a
+   Stop-hook in autonomous mode.
+
+Everything below is the **foreground** flow.
+
 ## Step 1 — Resolve the session id and open the spec
 
 The spec lives in this session's existing per-session dir so the Stop-hook gate
