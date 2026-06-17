@@ -158,3 +158,19 @@ class GuardianRemote:
                 return {"ok": False, "raw": output[:200]}
         logger.error("Guardian update failed: %s", output[:200])
         return {"ok": False, "error": output[:200]}
+
+    async def sync_gateway(self) -> dict:
+        """Redeploy the gateway script from the install dir, without a git pull.
+
+        Recovery lever for a stale/frozen deployed gateway when the `update`
+        self-update path is unavailable. Returns old/new sha on success.
+        """
+        ok, output = await self._ssh_command("sync-gateway")
+        if ok:
+            try:
+                return json.loads(output)
+            except json.JSONDecodeError:
+                logger.warning("Guardian sync-gateway returned non-JSON: %s", output[:200])
+                return {"ok": True, "raw": output[:200]}
+        logger.error("Guardian sync-gateway failed: %s", output[:200])
+        return {"ok": False, "error": output[:200]}

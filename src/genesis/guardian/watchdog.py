@@ -62,6 +62,11 @@ class GuardianWatchdog:
         self._last_reset_at: datetime | None = None
         self._consecutive_stuck: int = 0
         self._drift_count: int = 0
+        # Deployed-gateway staleness: the install-dir code can be current while
+        # ~/.local/bin/guardian-gateway.sh lags (the bug that froze it ~2 months).
+        self._gateway_drift_count: int = 0
+        self._gateway_resync_attempted: bool = False
+        self._gateway_escalated: bool = False
 
     def _in_cooldown(self) -> bool:
         if self._last_recovery_at is None:
@@ -254,6 +259,14 @@ class GuardianWatchdog:
         version_info = await self._remote.version()
         if not isinstance(version_info, dict):
             return
+
+        # Deployed-gateway staleness check reuses this same version() payload.
+        # Isolated in its own suppress so a failure here can't skip the
+        # code-drift logic below.
+        import contextlib
+        with contextlib.suppress(Exception):
+            await self._check_gateway_staleness(version_info)
+
         host_hash = version_info.get("deployed_commit", "unknown")
 
         if not isinstance(host_hash, str) or host_hash == "unknown":
@@ -290,4 +303,107 @@ class GuardianWatchdog:
                     "Check update logs or run install_guardian.sh --non-interactive on host.",
                     priority="high",
                     source="guardian_watchdog",
+                )
+
+    async def _expected_gateway_sha(self, code_version: str) -> str | None:
+        """sha256 of the gateway script at the host's install-dir commit.
+
+        Returns None if the container's git can't resolve that commit (e.g. the
+        host is ahead of the container) — the caller then skips, never
+        false-alarms. Split out so tests can stub the expected value.
+        """
+        import asyncio
+        import hashlib
+
+        show = await asyncio.to_thread(
+            subprocess.run,
+            ["git", "-C", str(Path.home() / "genesis"),
+             "show", f"{code_version}:scripts/guardian-gateway.sh"],
+            capture_output=True, timeout=5,
+        )
+        if show.returncode != 0 or not show.stdout:
+            return None
+        return hashlib.sha256(show.stdout).hexdigest()
+
+    async def _check_gateway_staleness(self, version_info: dict) -> None:
+        """Detect (and self-heal) a stale DEPLOYED gateway script.
+
+        The `update` self-update can fail while the git pull succeeds, leaving
+        ``~/.local/bin/guardian-gateway.sh`` frozen while the install dir
+        advances — the bug that froze the host gateway ~2 months. We compare the
+        host's reported ``gateway_sha`` against the sha of the gateway script at
+        the host's install-dir commit. On a confirmed mismatch we attempt ONE
+        guarded ``sync-gateway`` self-heal per episode, then escalate if still
+        unresolved. Best-effort (invoked under _check_code_drift's suppress).
+        """
+        host_gw_sha = version_info.get("gateway_sha", "unknown")
+        host_code_ver = version_info.get("code_version", "unknown")
+        if not isinstance(host_gw_sha, str) or host_gw_sha in ("", "unknown"):
+            return  # host gateway predates gateway_sha, or unreadable
+        if not isinstance(host_code_ver, str) or host_code_ver in ("", "unknown"):
+            return
+
+        expected = await self._expected_gateway_sha(host_code_ver)
+        if expected is None:
+            return  # can't determine expected sha — don't false-alarm
+
+        if host_gw_sha == expected:
+            if self._gateway_drift_count > 0:
+                logger.info("Guardian deployed-gateway staleness resolved (sha=%s)",
+                            host_gw_sha[:12])
+            self._gateway_drift_count = 0
+            self._gateway_resync_attempted = False
+            self._gateway_escalated = False
+            return
+
+        # Deployed gateway does not match the install-dir's gateway → stale.
+        self._gateway_drift_count += 1
+        if self._gateway_drift_count < self.DRIFT_ALERT_THRESHOLD:
+            return
+
+        if not self._gateway_resync_attempted:
+            # One guarded self-heal attempt per episode: redeploy from install dir.
+            self._gateway_resync_attempted = True
+            logger.warning(
+                "Guardian deployed gateway stale (deployed=%s expected=%s @ %s) "
+                "— auto-running sync-gateway",
+                host_gw_sha[:12], expected[:12], host_code_ver,
+            )
+            try:
+                res = await self._remote.sync_gateway()
+            except Exception:
+                logger.exception("sync-gateway self-heal raised")
+                res = {"ok": False}
+            if self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+                ok = res.get("ok")
+                await self._event_bus.emit(
+                    Subsystem.GUARDIAN, Severity.WARNING,
+                    "guardian.gateway_resync",
+                    f"Deployed gateway was stale (sha {host_gw_sha[:12]} vs "
+                    f"{expected[:12]} @ {host_code_ver}); auto sync-gateway "
+                    f"ok={ok}. Re-verifying next tick.",
+                )
+            return
+
+        # Self-heal already attempted and it's STILL stale → escalate once via
+        # the event bus (ERROR surfaces in health/observability). NOTE: a
+        # user-facing outreach (Telegram) path for Guardian watchdog escalations
+        # is not yet wired — init builds the watchdog without an outreach_queue,
+        # the same gap as the code-drift escalation above. Tracked as a follow-up.
+        if not self._gateway_escalated:
+            self._gateway_escalated = True
+            logger.error(
+                "Guardian deployed gateway STILL stale after auto sync-gateway "
+                "(deployed=%s expected=%s @ %s)",
+                host_gw_sha[:12], expected[:12], host_code_ver,
+            )
+            if self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+                await self._event_bus.emit(
+                    Subsystem.GUARDIAN, Severity.ERROR,
+                    "guardian.gateway_stale",
+                    f"Deployed gateway still stale after auto-resync (sha "
+                    f"{host_gw_sha[:12]} vs expected {expected[:12]} @ "
+                    f"{host_code_ver}). Manual check needed.",
                 )
