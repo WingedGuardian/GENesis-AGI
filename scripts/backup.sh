@@ -299,7 +299,12 @@ _T2_STATUS="skipped"
 if [ -n "$_NAS_TARGET" ]; then
     _NAS_USER="${GENESIS_BACKUP_NAS_USER:-}"
     _NAS_PASS="${GENESIS_BACKUP_NAS_PASS:-}"
-    _NAS_DIR="Genesis/$(hostname)"
+    _NAS_HOST_DIR="Genesis/$(hostname)"
+    # Per-run DATED snapshot dir — a consistent point-in-time copy that
+    # restore.sh selects the latest of and GFS retention prunes (replaces the
+    # old fixed filenames that were overwritten every run).
+    _NAS_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+    _NAS_DIR="${_NAS_HOST_DIR}/${_NAS_STAMP}"
 
     if ! command -v smbclient >/dev/null 2>&1; then
         log "WARNING: smbclient not installed — Tier 2 backup skipped"
@@ -313,8 +318,9 @@ if [ -n "$_NAS_TARGET" ]; then
 
         _smb() { smbclient "$_NAS_TARGET" -A "$_SMB_CREDS" "$@"; }
 
-        # Create directory structure on NAS
-        _smb -c "mkdir Genesis; mkdir \"${_NAS_DIR}\"; mkdir \"${_NAS_DIR}/qdrant\"; mkdir \"${_NAS_DIR}/data\"" \
+        # Create the snapshot directory tree (smbclient mkdir is non-recursive,
+        # so each level is created; pre-existing levels fail harmlessly).
+        _smb -c "mkdir \"Genesis\"; mkdir \"${_NAS_HOST_DIR}\"; mkdir \"${_NAS_DIR}\"; mkdir \"${_NAS_DIR}/data\"; mkdir \"${_NAS_DIR}/qdrant\"; mkdir \"${_NAS_DIR}/transcripts\"" \
             2>/dev/null || true
 
         _T2_OK=true
@@ -341,11 +347,23 @@ if [ -n "$_NAS_TARGET" ]; then
             fi
         fi
 
+        # Upload transcripts (previously local-only — now part of the off-site snapshot)
+        for f in transcripts/*.gpg; do
+            [ -f "$f" ] || continue
+            fname=$(basename "$f")
+            if _smb -c "cd \"${_NAS_DIR}/transcripts\"; put \"$f\" \"$fname\"" 2>/dev/null; then
+                log "  NAS: uploaded transcripts/$fname"
+            else
+                log "WARNING: NAS upload failed for transcripts/$fname"
+                _T2_OK=false
+            fi
+        done
+
         rm -f "$_SMB_CREDS"
 
         if [ "$_T2_OK" = true ]; then
             _T2_STATUS="ok"
-            log "Tier 2 backup copied to NAS ($_NAS_TARGET)"
+            log "Tier 2 backup copied to NAS snapshot ${_NAS_STAMP}"
         else
             _T2_STATUS="partial"
             log "WARNING: Tier 2 backup partially failed"
