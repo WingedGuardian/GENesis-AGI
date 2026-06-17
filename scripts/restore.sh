@@ -79,6 +79,26 @@ log()  { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 warn() { log "WARNING: $*"; _FAILURES+=("$*"); }
 die()  { log "FATAL: $*"; _FAILURES+=("$*"); exit 1; }
 
+# Quiesce the live writer before swapping the SQLite DB — a live WAL connection
+# would corrupt the restore. Guarded for fresh-box DR (no systemctl / no unit /
+# no user session → no-op). Intentionally does NOT restart: the operator
+# verifies the restored DB first, then starts the server.
+_SERVER_WAS_STOPPED=false
+_quiesce_genesis_server() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if systemctl --user is-active --quiet genesis-server 2>/dev/null; then
+        log "Stopping genesis-server before SQLite restore (will NOT auto-restart)..."
+        # Only record "stopped" if the stop actually succeeded — otherwise the
+        # end-of-run note would tell the operator to restart a server that never
+        # stopped (and is still holding the DB).
+        if systemctl --user stop genesis-server 2>/dev/null; then
+            _SERVER_WAS_STOPPED=true
+        else
+            warn "could not stop genesis-server — proceeding (a live writer may still hold the DB; verify before trusting the restore)"
+        fi
+    fi
+}
+
 _BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
 
 # decrypt_file <src.gpg> <dst>
@@ -176,12 +196,23 @@ if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
                 if [ -f "$DB_FILE" ]; then
                     cp "$DB_FILE" "${DB_FILE}.pre-restore.$(date +%s)"
                 fi
-                # Fresh DB from the SQL dump.
-                rm -f "$DB_FILE"
+                # Fresh DB from the SQL dump. Stop the live writer first, and
+                # clear stale WAL/SHM sidecars — a leftover -wal would replay
+                # onto the new DB and corrupt it.
+                _quiesce_genesis_server
+                rm -f "$DB_FILE" "$DB_FILE-wal" "$DB_FILE-shm"
                 if command -v sqlite3 >/dev/null; then
                     if sqlite3 "$DB_FILE" ".read $_SQL_TMP"; then
                         _SQLITE_RESTORED=true
                         log "SQLite: restored → $DB_FILE"
+                        # Verify the restored DB is structurally sound — loud on failure.
+                        # 2>&1 so a sqlite3 error (can't open, etc.) surfaces in the warn.
+                        _ic=$(sqlite3 "$DB_FILE" "PRAGMA integrity_check;" 2>&1 | head -1)
+                        if [ "$_ic" = "ok" ]; then
+                            log "SQLite: integrity_check ok"
+                        else
+                            warn "SQLite: integrity_check FAILED (${_ic:-no output}) — restored DB may be corrupt; inspect ${DB_FILE}.pre-restore.*"
+                        fi
                     else
                         warn "SQLite .read failed — inspect ${DB_FILE}.pre-restore.*"
                     fi
@@ -412,6 +443,10 @@ else
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────
+if $_SERVER_WAS_STOPPED; then
+    log "NOTE: genesis-server was stopped for the restore and left stopped."
+    log "      Verify the restored DB, then: systemctl --user start genesis-server"
+fi
 if [ ${#_FAILURES[@]} -eq 0 ]; then
     _SUCCESS=true
     log "Restore complete"

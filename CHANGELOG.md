@@ -48,6 +48,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Restoring a backup is now safe against corruption** — `restore.sh` now stops
+  the running Genesis server before swapping the SQLite database (so a live
+  connection can't corrupt the restore), clears stale write-ahead-log sidecars
+  that would otherwise replay onto and corrupt the restored DB, and runs an
+  integrity check on the result — warning loudly if it's not sound. It
+  deliberately leaves the server stopped afterward so you can verify the restore
+  before bringing Genesis back up.
+
 - **Guardian host updates no longer silently stall** — on hosts where the
   Guardian's `CLAUDE.md` had been pinned with git's skip-worktree flag, the
   Guardian's self-update (`git pull`) would abort the moment that file changed
