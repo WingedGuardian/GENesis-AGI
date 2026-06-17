@@ -52,7 +52,7 @@ def backup_env(tmp_path):
     _git("config", "user.email", "t@t.t", cwd=seed)
     _git("config", "user.name", "t", cwd=seed)
     (seed / "README").write_text("seed\n")
-    _git("add", "-A", cwd=seed)
+    _git("add", "README", cwd=seed)
     _git("commit", "-qm", "init", cwd=seed)
     _git("push", "-q", "origin", "main", cwd=seed)
     (home / "backups").mkdir(parents=True)
@@ -98,22 +98,25 @@ def _run(backup_env, *, smb_rc: int = 0, nas: bool = True, remove_db: bool = Fal
 
 
 def test_offsite_confirmed_true_when_nas_ok(backup_env):
+    """NAS upload succeeds → offsite_confirmed:true and no alert."""
     proc, status, tg = _run(backup_env, smb_rc=0, nas=True)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     assert status["success"] is True, status
     assert status["tier2_status"] == "ok", status
     assert status["offsite_confirmed"] is True, status
-    assert "api.telegram.org" not in tg, f"unexpected alert on a fully-successful backup:\n{tg}"
+    # The curl stub only logs on a Telegram send → empty log == no alert.
+    assert not tg.strip(), f"unexpected alert on a fully-successful backup:\n{tg}"
 
 
 def test_offsite_failure_alerts_but_local_succeeds(backup_env):
+    """NAS configured but the upload fails → offsite_confirmed:false, the LOCAL
+    backup still succeeds, and a distinct off-site alert fires."""
     proc, status, tg = _run(backup_env, smb_rc=1, nas=True)  # NAS upload fails
-    # The LOCAL backup is still successful — only the off-site copy is missing.
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"  # off-site miss is not a hard failure
     assert status["success"] is True, status
     assert status["offsite_confirmed"] is False, status
     assert status["tier2_status"] != "ok", status
-    assert "api.telegram.org" in tg, f"off-site replication failure did not alert:\n{tg}"
+    assert tg.strip(), f"off-site replication failure did not alert:\n{tg}"
     assert "replication" in tg.lower() or "off-site" in tg.lower(), tg
 
 
@@ -136,8 +139,10 @@ def test_offsite_alert_deduplicated(backup_env):
 
 
 def test_local_only_not_configured_no_alert(backup_env):
+    """No NAS configured → offsite_confirmed:false, but local-only is a valid
+    choice (not a failure), so no alert."""
     proc, status, tg = _run(backup_env, nas=False)
     assert status["success"] is True, status
     assert status["tier2_status"] == "not_configured", status
     assert status["offsite_confirmed"] is False, status
-    assert "api.telegram.org" not in tg, f"local-only must not alert:\n{tg}"
+    assert not tg.strip(), f"local-only must not alert:\n{tg}"
