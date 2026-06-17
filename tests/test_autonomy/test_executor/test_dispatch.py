@@ -11,6 +11,7 @@ from genesis.autonomy.executor.dispatch import (
     create_fixup_step,
     dominant_step_type,
     parse_step_output,
+    select_deliverable_artifacts,
     synthesize_deliverable,
 )
 from genesis.autonomy.executor.types import StepResult
@@ -207,3 +208,47 @@ class TestCreateFixupStep:
 
         assert fixup["idx"] == 3
         assert "Address review feedback" in fixup["description"]
+
+
+class TestSelectDeliverableArtifacts:
+    """Split a deliverable task's artifacts into (rendered files, qa summaries)."""
+
+    def test_splits_rendered_and_qa(self) -> None:
+        results = [
+            StepResult(
+                idx=0, status="completed", result="...",
+                artifacts=["/o/report.pdf", "/o/qa_summary.md"],
+            ),
+        ]
+        rendered, qa = select_deliverable_artifacts(results)
+        assert rendered == ["/o/report.pdf"]
+        assert qa == ["/o/qa_summary.md"]
+
+    def test_ignores_authoring_and_unrelated_files(self) -> None:
+        # draft.md / notes.txt are authoring artifacts, never the deliverable.
+        results = [
+            StepResult(
+                idx=0, status="completed", result="x",
+                artifacts=["/o/notes.txt", "/o/draft.md"],
+            ),
+        ]
+        rendered, qa = select_deliverable_artifacts(results)
+        assert rendered == []
+        assert qa == []
+
+    def test_collects_across_steps_and_formats(self) -> None:
+        results = [
+            StepResult(idx=0, status="completed", result="a", artifacts=["/o/data.csv"]),
+            StepResult(
+                idx=1, status="completed", result="b",
+                artifacts=["/o/deck.pptx", "/o/qa_summary.md"],
+            ),
+        ]
+        rendered, qa = select_deliverable_artifacts(results)
+        assert set(rendered) == {"/o/data.csv", "/o/deck.pptx"}
+        assert qa == ["/o/qa_summary.md"]
+
+    def test_empty(self) -> None:
+        rendered, qa = select_deliverable_artifacts([])
+        assert rendered == []
+        assert qa == []

@@ -622,7 +622,7 @@ class CCSessionExecutor:
 
             # --- DELIVERING ---
             await self._transition(task_id, TaskPhase.DELIVERING)
-            await self._deliver(task_id, deliverable, steps)
+            await self._deliver(task_id, deliverable, steps, step_results)
 
             # --- RETROSPECTIVE ---
             await self._transition(task_id, TaskPhase.RETROSPECTIVE)
@@ -1201,8 +1201,22 @@ class CCSessionExecutor:
         task_id: str,
         deliverable: str,
         steps: list[dict],
+        step_results: list[StepResult],
     ) -> None:
-        """Deliver task output. Pushes branch for code tasks."""
+        """Deliver task output.
+
+        Deliverable-frame tasks (a deliverable-builder step is present) hand the
+        user the rendered file + the skill's Gate-2 verdict. Code tasks push a
+        branch. v2.0 delivery is a notification with the file path/summary; the
+        real Telegram file attachment + a blocking sign-off gate are fast-follows.
+        """
+        is_deliverable_task = any(
+            "deliverable-builder" in (s.get("skills") or []) for s in steps
+        )
+        if is_deliverable_task:
+            await self._deliver_artifact(task_id, step_results)
+            return
+
         has_code = any(s.get("type") == "code" for s in steps)
         wt_path = self._worktree_paths.get(task_id)
 
@@ -1228,6 +1242,54 @@ class CCSessionExecutor:
                 logger.error(
                     "Delivery failed for task %s", task_id, exc_info=True,
                 )
+
+    async def _deliver_artifact(
+        self, task_id: str, step_results: list[StepResult]
+    ) -> None:
+        """Hand a finished deliverable to the user (v2 autonomous mode).
+
+        The deliverable-builder step renders the document and runs its own
+        Gate-2; here we surface the verified file. v2.0 sends the path + verdict
+        via the normal notification channel — the real Telegram file attachment
+        and a blocking sign-off gate are fast-follows. Fail-open: a delivery
+        problem must not crash the task at the finish line.
+        """
+        try:
+            rendered, qa = _dispatch.select_deliverable_artifacts(step_results)
+        except Exception:
+            logger.error(
+                "Artifact selection failed for task %s", task_id, exc_info=True,
+            )
+            rendered, qa = [], []
+
+        if not rendered:
+            logger.warning(
+                "Deliverable task %s produced no rendered artifact", task_id,
+            )
+            await self._notify(
+                task_id,
+                "Deliverable task finished, but no rendered file was found — "
+                "check the task output.",
+                "alert",
+            )
+            return
+
+        primary = rendered[0]
+        await self._set_output(task_id, "deliverable_file", primary)
+        if qa:
+            await self._set_output(task_id, "deliverable_qa", qa[0])
+
+        others = (
+            f"\nAlso produced: {', '.join(rendered[1:])}"
+            if len(rendered) > 1 else ""
+        )
+        qa_line = f"\nGate-2 summary: {qa[0]}" if qa else ""
+        await self._notify(
+            task_id,
+            f"Deliverable ready and Gate-2 verified:\n{primary}{others}{qa_line}\n"
+            "Review it and reply if you want changes.",
+            "alert",
+        )
 
     # =================================================================
     # Public API

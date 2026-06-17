@@ -163,6 +163,33 @@ def synthesize_deliverable(step_results: list[StepResult]) -> str:
     return "\n\n".join(parts) if parts else ""
 
 
+# Final-deliverable document formats (markdown is authoring, never the artifact).
+_DELIVERABLE_DOC_EXTS = (".pdf", ".docx", ".pptx", ".xlsx", ".html", ".csv")
+
+
+def select_deliverable_artifacts(
+    step_results: list[StepResult],
+) -> tuple[list[str], list[str]]:
+    """Split a deliverable task's artifacts into (rendered files, qa summaries).
+
+    Used by the executor's frame-aware delivery (v2): the deliverable-builder
+    step emits the rendered document plus a ``qa_summary.md`` (its Gate-2
+    verdict). Returns ``(rendered, qa)`` where *rendered* is the produced
+    document(s) and *qa* is any ``qa_summary*.md``. Authoring artifacts
+    (``draft.md``, scratch ``.txt``) are intentionally excluded.
+    """
+    rendered: list[str] = []
+    qa: list[str] = []
+    for r in step_results:
+        for path_str in (r.artifacts or []):
+            low = path_str.lower()
+            if "qa_summary" in low and low.endswith(".md"):
+                qa.append(path_str)
+            elif low.endswith(_DELIVERABLE_DOC_EXTS):
+                rendered.append(path_str)
+    return rendered, qa
+
+
 def dominant_step_type(steps: list[dict]) -> str:
     """Return the most common step type."""
     types = [s.get("type", "code") for s in steps]
