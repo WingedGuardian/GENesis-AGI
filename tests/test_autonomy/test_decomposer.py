@@ -274,6 +274,97 @@ class TestDecompose:
         assert steps[0]["mcp_guidance"] == []
 
 
+FRAME_PLAN = """# Task
+
+## Requirements
+Produce a one-page brief.
+
+## Deliverable Frame
+- format: PDF
+- visual_style: modern
+- authenticity_target: AI-assisted-OK
+- audience: hiring team
+- acceptance: leads with the recommendation
+
+## Steps
+Draft and render.
+"""
+
+TWO_STEPS_JSON = json.dumps([
+    {"idx": 0, "type": "research", "description": "Research"},
+    {"idx": 1, "type": "code", "description": "Draft"},
+])
+
+
+@pytest.mark.asyncio
+class TestDeliverableStepAppend:
+    """Deterministic deliverable-builder step append (v2). Frame-gated."""
+
+    async def test_frame_present_appends_terminal_deliverable_step(self) -> None:
+        router = _make_router(TWO_STEPS_JSON)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose(FRAME_PLAN, "Make a brief")
+
+        last = steps[-1]
+        assert last["type"] == "synthesis"
+        assert "deliverable-builder" in last["skills"]
+        # exactly one deliverable-builder step, and it is terminal
+        assert sum("deliverable-builder" in (s.get("skills") or []) for s in steps) == 1
+
+    async def test_strips_trailing_autoverification(self) -> None:
+        # _validate_steps appends a generic verification; the deliverable
+        # append must strip it so the deliverable step is terminal.
+        router = _make_router(TWO_STEPS_JSON)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose(FRAME_PLAN, "Make a brief")
+
+        descs = [s["description"] for s in steps]
+        assert "Verify deliverable against success criteria" not in descs
+        assert steps[-1]["skills"] == ["deliverable-builder"]
+
+    async def test_no_frame_no_append(self) -> None:
+        router = _make_router(TWO_STEPS_JSON)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose("plan without a frame", "Do something")
+
+        assert all("deliverable-builder" not in (s.get("skills") or []) for s in steps)
+        # unchanged behavior: trailing generic verification still appended
+        assert steps[-1]["type"] == "verification"
+
+    async def test_no_double_append_when_llm_already_placed_it_last(self) -> None:
+        steps_with_db = json.dumps([
+            {"idx": 0, "type": "research", "description": "Research"},
+            {"idx": 1, "type": "synthesis", "description": "Build deliverable",
+             "skills": ["deliverable-builder"]},
+        ])
+        router = _make_router(steps_with_db)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose(FRAME_PLAN, "Make a brief")
+
+        assert sum("deliverable-builder" in (s.get("skills") or []) for s in steps) == 1
+        assert steps[-1]["skills"] == ["deliverable-builder"]
+
+    async def test_appended_step_instructs_full_skill_read(self) -> None:
+        router = _make_router(TWO_STEPS_JSON)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose(FRAME_PLAN, "Make a brief")
+
+        last = steps[-1]
+        assert "deliverable-builder" in last["description"].lower()
+        # must tell the session the injected copy is partial -> read the full skill
+        assert ("full skill" in last["description"].lower()
+                or "SKILL.md" in last["description"])
+        assert last["dependencies"] == [len(steps) - 2]  # depends on prior step
+
+    async def test_fallback_path_also_appends_when_frame_present(self) -> None:
+        # Total decomposition failure -> single_step_fallback; frame still present.
+        router = _make_router(None, success=False)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose(FRAME_PLAN, "Make a brief")
+
+        assert any("deliverable-builder" in (s.get("skills") or []) for s in steps)
+
+
 @pytest.mark.asyncio
 class TestDecomposeDB:
     """Tests for task_steps and task_states CRUD additions."""
