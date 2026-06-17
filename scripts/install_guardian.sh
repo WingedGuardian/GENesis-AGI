@@ -309,11 +309,6 @@ snapshots:
   retention: 5
   prefix: "guardian-"
 
-approval:
-  port: 8888
-  token_expiry_s: 86400
-  bind_host: "${TS_IP:-}"
-
 briefing:
   enabled: true
   shared_subdir: "shared"

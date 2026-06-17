@@ -35,10 +35,6 @@ confirmation:
   bootstrap_grace_s: 300
   pause_reminder_hours: 24
 
-approval:
-  port: 8888
-  token_expiry_s: 86400
-
 cc:
   enabled: true
   model: opus

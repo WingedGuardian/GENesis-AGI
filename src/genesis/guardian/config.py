@@ -66,15 +66,6 @@ class AlertConfig:
 
 
 @dataclass
-class ApprovalConfig:
-    """Approval HTTP handler settings."""
-
-    port: int = 8888
-    token_expiry_s: int = 86400
-    bind_host: str = ""  # empty = auto-detect Tailscale IP
-
-
-@dataclass
 class CCConfig:
     """Claude Code diagnosis engine settings.
 
@@ -146,7 +137,6 @@ class GuardianConfig:
     suspicious: SuspiciousChecksConfig = field(default_factory=SuspiciousChecksConfig)
     confirmation: ConfirmationConfig = field(default_factory=ConfirmationConfig)
     alert: AlertConfig = field(default_factory=AlertConfig)
-    approval: ApprovalConfig = field(default_factory=ApprovalConfig)
     cc: CCConfig = field(default_factory=CCConfig)
     briefing: BriefingConfig = field(default_factory=BriefingConfig)
     snapshots: SnapshotConfig = field(default_factory=SnapshotConfig)
@@ -311,7 +301,6 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         suspicious=_build_sub(SuspiciousChecksConfig, raw, "suspicious"),
         confirmation=_build_sub(ConfirmationConfig, raw, "confirmation"),
         alert=_build_sub(AlertConfig, raw, "alert"),
-        approval=_build_sub(ApprovalConfig, raw, "approval"),
         cc=_build_sub(CCConfig, raw, "cc"),
         briefing=_build_sub(BriefingConfig, raw, "briefing"),
         snapshots=_build_sub(SnapshotConfig, raw, "snapshots"),

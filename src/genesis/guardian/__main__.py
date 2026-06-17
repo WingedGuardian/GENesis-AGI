@@ -1,9 +1,10 @@
 """Guardian entry point — HOST-SIDE. Invoked by systemd timer.
 
 Usage:
-    python -m genesis.guardian              # run a single check cycle
-    python -m genesis.guardian --test       # test alert channels
-    python -m genesis.guardian --check-only # one-shot health check (no recovery)
+    python -m genesis.guardian               # run a single check cycle
+    python -m genesis.guardian --test        # test alert channels
+    python -m genesis.guardian --check-only  # one-shot health check (no recovery)
+    python -m genesis.guardian --test-approval  # E2E test the keyword-reply gate
 """
 
 from __future__ import annotations
@@ -24,6 +25,10 @@ def main() -> None:
 
     if "--check-only" in sys.argv:
         asyncio.run(_check_only())
+        return
+
+    if "--test-approval" in sys.argv:
+        asyncio.run(_test_approval())
         return
 
     asyncio.run(run_check())
@@ -54,6 +59,52 @@ async def _test_alerts() -> None:
         body="This is a test alert from the Guardian. If you see this, alerts are working.",
     ))
     print("  Test alert sent")
+
+
+async def _test_approval() -> None:
+    """E2E self-test of the keyword-reply approval gate (no recovery).
+
+    Sends a test gate prompt, then long-polls getUpdates for an APPROVE/DENY
+    reply for ~120s. Lets a host operator verify the full
+    send-prompt → reply → read-reply loop via the gateway without faking an
+    outage. Prints what keyword it read, or a timeout notice.
+    """
+    import time
+
+    from genesis.guardian.alert.telegram import CONFLICT_SENTINEL, TelegramAlertChannel
+    from genesis.guardian.check import _build_dispatcher, _find_telegram_channel
+    from genesis.guardian.config import load_config
+
+    config = load_config()
+    dispatcher = _build_dispatcher(config)
+    channel: TelegramAlertChannel | None = _find_telegram_channel(dispatcher)
+
+    if channel is None:
+        print("  No Telegram channel configured — cannot test the approval gate")
+        return
+
+    gate_msg_id = await channel.send_text(
+        "Guardian approval self-test — reply APPROVE or DENY"
+    )
+    if gate_msg_id is None:
+        print("  Failed to send the test gate prompt")
+        return
+    print(f"  Sent test gate prompt (message_id={gate_msg_id}). "
+          "Reply APPROVE or DENY within ~120s…")
+
+    keywords = frozenset({"APPROVE", "DENY"})
+    deadline = time.monotonic() + 120.0
+    while time.monotonic() < deadline:
+        kw = await channel.poll_for_keyword(gate_msg_id, keywords, timeout_s=25)
+        if kw == CONFLICT_SENTINEL:
+            print("  getUpdates 409 Conflict — main bot is polling the same "
+                  "token (it is alive). Retrying…")
+            await asyncio.sleep(5)
+            continue
+        if kw in ("APPROVE", "DENY"):
+            print(f"  Read keyword: {kw}")
+            return
+    print("  Timeout — no APPROVE/DENY reply read within ~120s")
 
 
 async def _check_only() -> None:

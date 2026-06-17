@@ -121,6 +121,14 @@ class TestBriefingIntegration:
         prompt_default = _build_diagnosis_prompt(snap, "", "genesis")
         assert prompt_none == prompt_default
 
+    def test_prompt_is_propose_only(self) -> None:
+        """Propose-only firewall: the CC diagnosis prompt must forbid acting and
+        instruct CC to propose via recommended_action only."""
+        from genesis.guardian.diagnosis import _build_diagnosis_prompt
+        snap = _snap(container_status="Stopped")
+        prompt = _build_diagnosis_prompt(snap, "signal data", "genesis")
+        assert "DO NOT execute" in prompt
+
 
 # ── CC response parsing ─────────────────────────────────────────────────
 
@@ -183,6 +191,22 @@ class TestCCResponseParsing:
         result = engine._parse_cc_response(raw)
         assert result is not None
         assert result.likely_cause == "test"
+
+    def test_parse_defaults_outcome_to_proposed(self, engine: DiagnosisEngine) -> None:
+        """Propose-only: a CC response with no explicit `outcome` parses as
+        'proposed' (CC investigates and proposes; it never self-resolves)."""
+        raw = json.dumps({
+            "result": json.dumps({
+                "likely_cause": "bridge crash",
+                "confidence_pct": 70,
+                "evidence": [],
+                "recommended_action": "RESTART_SERVICES",
+                "reasoning": "crash loop",
+            }),
+        })
+        result = engine._parse_cc_response(raw)
+        assert result is not None
+        assert result.outcome == "proposed"
 
 
 # ── Full diagnosis flow ──────────────────────────────────────────────────
