@@ -183,7 +183,10 @@ def select_deliverable_artifacts(
     for r in step_results:
         for path_str in (r.artifacts or []):
             low = path_str.lower()
-            if "qa_summary" in low and low.endswith(".md"):
+            # qa_summary is the skill's reserved Gate-2 output name — route it to
+            # qa regardless of extension, so a qa_summary.html/.pdf is never
+            # mistaken for the deliverable itself.
+            if "qa_summary" in low:
                 qa.append(path_str)
             elif low.endswith(_DELIVERABLE_DOC_EXTS):
                 rendered.append(path_str)

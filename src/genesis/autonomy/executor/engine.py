@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from genesis.autonomy.decomposer import has_deliverable_frame
 from genesis.autonomy.executor import dispatch as _dispatch
 from genesis.autonomy.executor import observe as _observe
 from genesis.autonomy.executor import worktree_mgr as _worktree
@@ -139,6 +140,11 @@ class CCSessionExecutor:
             return False
 
         description = task.get("description", "")
+
+        # Deliverable-frame tasks route delivery differently (hand the user the
+        # rendered file, not a git branch). Keyed on plan_content so it survives
+        # resume, where reconstructed step dicts have no `skills` key.
+        is_deliverable = has_deliverable_frame(plan_content)
 
         # Determine recovery phase from DB
         db_phase_str = task.get("current_phase", "pending")
@@ -622,7 +628,9 @@ class CCSessionExecutor:
 
             # --- DELIVERING ---
             await self._transition(task_id, TaskPhase.DELIVERING)
-            await self._deliver(task_id, deliverable, steps, step_results)
+            await self._deliver(
+                task_id, deliverable, steps, step_results, is_deliverable,
+            )
 
             # --- RETROSPECTIVE ---
             await self._transition(task_id, TaskPhase.RETROSPECTIVE)
@@ -1202,18 +1210,21 @@ class CCSessionExecutor:
         deliverable: str,
         steps: list[dict],
         step_results: list[StepResult],
+        is_deliverable: bool = False,
     ) -> None:
         """Deliver task output.
 
-        Deliverable-frame tasks (a deliverable-builder step is present) hand the
-        user the rendered file + the skill's Gate-2 verdict. Code tasks push a
-        branch. v2.0 delivery is a notification with the file path/summary; the
-        real Telegram file attachment + a blocking sign-off gate are fast-follows.
+        Deliverable-frame tasks (``is_deliverable``, derived from the plan's
+        ``## Deliverable Frame``) hand the user the rendered file + the skill's
+        Gate-2 verdict. Code tasks push a branch. v2.0 delivery is a
+        notification with the file path/summary; the real Telegram file
+        attachment + a blocking sign-off gate are fast-follows.
+
+        ``is_deliverable`` is passed by the caller (computed from plan_content)
+        rather than sniffed from ``steps`` here, because on the resume path the
+        reconstructed step dicts have no ``skills`` key.
         """
-        is_deliverable_task = any(
-            "deliverable-builder" in (s.get("skills") or []) for s in steps
-        )
-        if is_deliverable_task:
+        if is_deliverable:
             await self._deliver_artifact(task_id, step_results)
             return
 

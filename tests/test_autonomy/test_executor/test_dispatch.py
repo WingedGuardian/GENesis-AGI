@@ -252,3 +252,16 @@ class TestSelectDeliverableArtifacts:
         rendered, qa = select_deliverable_artifacts([])
         assert rendered == []
         assert qa == []
+
+    def test_qa_summary_nonmd_routes_to_qa_not_rendered(self) -> None:
+        # An HTML-format deliverable emits qa_summary.html; it must NOT be
+        # mistaken for the rendered deliverable.
+        results = [
+            StepResult(
+                idx=0, status="completed", result="x",
+                artifacts=["/o/report.html", "/o/qa_summary.html"],
+            ),
+        ]
+        rendered, qa = select_deliverable_artifacts(results)
+        assert rendered == ["/o/report.html"]
+        assert qa == ["/o/qa_summary.html"]

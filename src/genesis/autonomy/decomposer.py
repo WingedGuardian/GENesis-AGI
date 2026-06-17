@@ -60,6 +60,17 @@ _DELIVERABLE_STEP_DESC = (
 )
 
 
+def has_deliverable_frame(plan_content: str) -> bool:
+    """True if the plan declares a ``## Deliverable Frame`` heading.
+
+    This is the single v2 trigger — used by the decomposer to attach the
+    deliverable-builder step AND by the executor to route delivery. It keys on
+    ``plan_content`` (always available) so it survives task resume, where the
+    reconstructed step dicts lack the ``skills`` key.
+    """
+    return bool(_FRAME_RE.search(plan_content or ""))
+
+
 class _Router(Protocol):
     async def route_call(
         self, call_site_id: str, messages: list[dict[str, Any]], **kwargs: Any
@@ -344,7 +355,8 @@ class TaskDecomposer:
             validated.append({
                 "idx": len(validated),
                 "type": "verification",
-                "description": "Verify deliverable against success criteria",
+                # Same constant _ensure_deliverable_step strips by — keep coupled.
+                "description": _AUTO_VERIFY_DESC,
                 "required_tools": [],
                 "complexity": "medium",
                 "dependencies": [len(validated) - 1],
@@ -367,7 +379,7 @@ class TaskDecomposer:
         last, leave it; otherwise strip the generic auto-verification tail (which
         ``_validate_steps`` adds) and append the canonical step.
         """
-        if not _FRAME_RE.search(plan_content or ""):
+        if not has_deliverable_frame(plan_content):
             return steps
 
         result = list(steps)
@@ -381,15 +393,23 @@ class TaskDecomposer:
         ):
             result = result[:-1]
 
-        # Already terminal (LLM placed it / TASK_DECOMPOSE.md hint worked)? Done.
-        if result and _DELIVERABLE_SKILL in (result[-1].get("skills") or []):
+        # Idempotent: if a deliverable-builder step already exists ANYWHERE,
+        # don't append a second (which would run the skill twice). If the LLM
+        # mis-placed it (not terminal), leave it — its artifact is still
+        # captured at synthesis — but warn, since terminal is the invariant.
+        if any(_DELIVERABLE_SKILL in (s.get("skills") or []) for s in result):
+            if _DELIVERABLE_SKILL not in (result[-1].get("skills") or []):
+                logger.warning(
+                    "Plan has a deliverable-builder step that is not terminal; "
+                    "leaving as-is (artifact still captured at synthesis)",
+                )
             return result
 
         new_idx = len(result)
         if new_idx >= _MAX_STEPS:
             # The deliverable step is essential; allow one over the soft cap
-            # rather than dropping real work. Log so it's visible.
-            logger.info(
+            # rather than dropping real work. Warn so it's visible in ops.
+            logger.warning(
                 "Appending deliverable-builder step beyond _MAX_STEPS=%d "
                 "(deliverable frame present)",
                 _MAX_STEPS,

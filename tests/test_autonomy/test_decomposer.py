@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from genesis.autonomy.decomposer import TaskDecomposer
+from genesis.autonomy.decomposer import TaskDecomposer, has_deliverable_frame
 from genesis.db.crud.task_states import create_intake_token
 
 
@@ -352,8 +352,9 @@ class TestDeliverableStepAppend:
         last = steps[-1]
         assert "deliverable-builder" in last["description"].lower()
         # must tell the session the injected copy is partial -> read the full skill
-        assert ("full skill" in last["description"].lower()
-                or "SKILL.md" in last["description"])
+        # (both signals present; not an either-or tautology)
+        assert "full skill" in last["description"].lower()
+        assert "SKILL.md" in last["description"]
         assert last["dependencies"] == [len(steps) - 2]  # depends on prior step
 
     async def test_fallback_path_also_appends_when_frame_present(self) -> None:
@@ -363,6 +364,36 @@ class TestDeliverableStepAppend:
         steps = await d.decompose(FRAME_PLAN, "Make a brief")
 
         assert any("deliverable-builder" in (s.get("skills") or []) for s in steps)
+
+    async def test_no_double_append_when_llm_placed_it_mid_plan(self) -> None:
+        # LLM mis-places the deliverable step in the MIDDLE. The idempotency
+        # guard must still prevent a second append (skill would run twice).
+        steps_mid = json.dumps([
+            {"idx": 0, "type": "research", "description": "Research"},
+            {"idx": 1, "type": "synthesis", "description": "Build deliverable",
+             "skills": ["deliverable-builder"]},
+            {"idx": 2, "type": "code", "description": "More work after it"},
+        ])
+        router = _make_router(steps_mid)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose(FRAME_PLAN, "Make a brief")
+
+        assert sum("deliverable-builder" in (s.get("skills") or []) for s in steps) == 1
+
+
+class TestHasDeliverableFrame:
+    def test_detects_heading_any_level(self) -> None:
+        assert has_deliverable_frame("# T\n## Deliverable Frame\n- format: PDF")
+        assert has_deliverable_frame("### deliverable frame\nstuff")  # case-insensitive
+
+    def test_absent(self) -> None:
+        assert not has_deliverable_frame("# Task\n## Requirements\nstuff")
+        assert not has_deliverable_frame("")
+        assert not has_deliverable_frame(None)  # type: ignore[arg-type]
+
+    def test_ignores_prose_mention(self) -> None:
+        # A casual prose mention is not a heading -> no false positive.
+        assert not has_deliverable_frame("We discussed the deliverable frame in the call.")
 
 
 @pytest.mark.asyncio
