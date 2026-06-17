@@ -37,9 +37,12 @@ _write_status() {
     # Escape failure reason for JSON safety (quotes, backslashes, newlines)
     local _safe_reason
     _safe_reason=$(printf '%s' "$_FAILURE_REASON" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g')
+    # offsite_confirmed: true only when the off-site (NAS) copy fully succeeded.
+    local _offsite_confirmed=false
+    if [ "${_T2_STATUS:-}" = "ok" ]; then _offsite_confirmed=true; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}"}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed}
 STATUSEOF
 }
 trap '_write_status' EXIT
@@ -65,6 +68,18 @@ fi
 log() { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 
 die() { _FAILURE_REASON="$*"; log "FATAL: $*"; exit 1; }
+
+# Send a Telegram message (no-op unless bot token + chat id are configured).
+# Shared by the backup-failed and off-site-replication-failed alerts.
+_send_telegram() {
+    [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || return 0
+    [ -n "${TELEGRAM_FORUM_CHAT_ID:-}" ] || return 0
+    curl -sf -X POST \
+        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        -H "Content-Type: application/json" \
+        -d "{\"chat_id\":\"${TELEGRAM_FORUM_CHAT_ID}\",\"text\":$(printf '%s' "$1" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"parse_mode\":\"Markdown\"}" \
+        > /dev/null 2>&1 || log "WARNING: Telegram alert failed to send"
+}
 
 # ── Encryption helpers ───────────────────────────────────────────────
 # All PII-bearing payloads (SQLite dump, transcripts, memory) use the
@@ -386,18 +401,31 @@ fi
 
 # --- Alert on failure via Telegram ---
 if [ "$_SUCCESS" != "true" ]; then
-    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_FORUM_CHAT_ID:-}" ]; then
-        _TG_MSG="🚨 *Backup failed*
+    _send_telegram "🚨 *Backup failed*
 
 Reason: ${_FAILURE_REASON:-unknown}
 Time: $(date -Is)
 SQLite lines: $_SQLITE_LINES
 Duration: $(( $(date +%s) - _STARTED_AT ))s"
-        curl -sf -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -H "Content-Type: application/json" \
-            -d "{\"chat_id\":\"${TELEGRAM_FORUM_CHAT_ID}\",\"text\":$(printf '%s' "$_TG_MSG" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"parse_mode\":\"Markdown\"}" \
-            > /dev/null 2>&1 || log "WARNING: Telegram alert failed to send"
+fi
+
+# --- Alert on off-site (NAS) replication failure (local backup still OK) ---
+# Distinct from a backup failure: the local + Tier-1 backup succeeded, but the
+# off-site copy did not fully land. Local-only installs (NAS not configured) are
+# a valid choice and do NOT alert.
+if [ -n "$_NAS_TARGET" ] && [ "$_T2_STATUS" != "ok" ]; then
+    # Dedup: alert only on the transition INTO off-site failure. The status file
+    # still holds the PREVIOUS run's state at this point (the EXIT trap rewrites
+    # it after). This avoids a 6-hourly alert while a NAS stays down; it re-alerts
+    # once off-site recovers (offsite_confirmed flips true) and then fails again.
+    _prev_offsite=$(python3 -c "import json; print(json.load(open('$_STATUS_FILE')).get('offsite_confirmed', True))" 2>/dev/null || echo "True")
+    if [ "$_prev_offsite" != "False" ]; then
+        _send_telegram "⚠️ *Off-site replication failed*
+
+The local backup is OK, but it was NOT replicated off-site.
+Tier-2 status: ${_T2_STATUS}
+Time: $(date -Is)
+Off-site copies are missing — check the NAS target."
     fi
 fi
 log "Backup complete (success=$_SUCCESS)"
