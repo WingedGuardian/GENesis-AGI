@@ -80,7 +80,8 @@ def _seed_repo(home: Path) -> Path:
     (seed / "config").mkdir()
     (seed / "config" / "guardian-claude.md").write_text(_GUARDIAN_MD)
     (seed / "config" / "guardian.yaml").write_text(_GUARDIAN_YAML)
-    _git("add", "-A", cwd=seed)
+    _git("add", "CLAUDE.md", "config/guardian-claude.md", "config/guardian.yaml",
+         cwd=seed)
     _git("commit", "-qm", "init", cwd=seed)
     _git("push", "-q", "origin", "main", cwd=seed)
 
