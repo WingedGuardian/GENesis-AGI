@@ -350,11 +350,13 @@ class TestDeliverableStepAppend:
         steps = await d.decompose(FRAME_PLAN, "Make a brief")
 
         last = steps[-1]
-        assert "deliverable-builder" in last["description"].lower()
-        # must tell the session the injected copy is partial -> read the full skill
-        # (both signals present; not an either-or tautology)
-        assert "full skill" in last["description"].lower()
-        assert "SKILL.md" in last["description"]
+        desc = last["description"]
+        assert "deliverable-builder" in desc.lower()
+        # must tell the session the injected copy is partial -> read the complete
+        # skill files (SKILL.md + references), since the Skill tool can't load it
+        assert "complete skill" in desc.lower()
+        assert "SKILL.md" in desc
+        assert "references" in desc.lower()
         assert last["dependencies"] == [len(steps) - 2]  # depends on prior step
 
     async def test_fallback_path_also_appends_when_frame_present(self) -> None:
@@ -379,6 +381,18 @@ class TestDeliverableStepAppend:
         steps = await d.decompose(FRAME_PLAN, "Make a brief")
 
         assert sum("deliverable-builder" in (s.get("skills") or []) for s in steps) == 1
+
+    async def test_full_plan_embedded_in_step_description(self) -> None:
+        # build_step_prompt doesn't pass the plan to steps, so the frame +
+        # requirements must be embedded in the deliverable step's description.
+        router = _make_router(TWO_STEPS_JSON)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose(FRAME_PLAN, "Make a brief")
+
+        desc = steps[-1]["description"]
+        assert "## Deliverable Frame" in desc
+        assert "visual_style: modern" in desc
+        assert "## Requirements" in desc  # substance reaches the session too
 
 
 class TestHasDeliverableFrame:

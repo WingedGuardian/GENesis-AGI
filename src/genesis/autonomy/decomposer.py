@@ -48,15 +48,24 @@ _FRAME_RE = re.compile(r"(?im)^#{1,6}\s*deliverable\s+frame\b")
 _AUTO_VERIFY_DESC = "Verify deliverable against success criteria"
 _DELIVERABLE_STEP_DESC = (
     "Produce the final send-ready deliverable using the deliverable-builder skill. "
-    "The skill copy injected into this prompt is TRUNCATED — you MUST read the full "
-    "skill first (use the Skill tool, or read "
-    "~/.claude/skills/deliverable-builder/SKILL.md and the files it references) before "
-    "proceeding. Read the '## Deliverable Frame' section of the task plan for the format, "
-    "visual_style, authenticity_target, audience, and acceptance criteria. Run the full "
-    "pipeline (structure -> voice -> anti-slop -> render to the framed format) and the "
-    "skill's own Gate-2 verification. Emit two artifacts: the rendered deliverable file "
-    "and a qa_summary.md capturing the Gate-2 verdict. Return a compact result: the "
-    "rendered file path plus a one-line PASS/FAIL."
+    "The skill copy injected into your resources is TRUNCATED, and the `Skill` tool will "
+    "NOT find it (this step runs outside the project). You MUST first Read the COMPLETE "
+    "skill — SKILL.md and its references/ — from the absolute skill directory shown in your "
+    "injected resources (the '### Skill: deliverable-builder (full skill dir: ...)' line). "
+    "Read the '## Deliverable Frame' section of the task plan for the format, visual_style, "
+    "authenticity_target, audience, and acceptance criteria. Run the full pipeline "
+    "(structure -> voice -> anti-slop -> render to the framed format). The `Task` subagent "
+    "tool is NOT available here, so run Gate-2 IN-SESSION: re-open your rendered file (Bash "
+    "pdftotext/pdfinfo, or `python -m fitz`) and verify it against the acceptance criteria "
+    "yourself. Emit two artifacts: the rendered deliverable file and a qa_summary.md "
+    "capturing the Gate-2 verdict + any assumptions. Return a compact result: the rendered "
+    "file path plus a one-line PASS/FAIL. Apply anti-slop in-session before rendering (do not "
+    "rely on loading other skills): the artifact MUST have zero spaced em-dashes (' — ') — the "
+    "#1 AI tell.\n\n"
+    "The FULL task plan is appended below as your source of truth (step prompts do not "
+    "otherwise include it): read its '## Deliverable Frame' for format / visual_style / "
+    "authenticity_target / audience / acceptance, and its '## Requirements' + "
+    "'## Success Criteria' for the substance to produce."
 )
 
 
@@ -415,10 +424,19 @@ class TaskDecomposer:
                 _MAX_STEPS,
             )
 
+        # Embed the full plan in the step description: build_step_prompt does
+        # NOT pass the plan to steps, so this is the only way the frame +
+        # requirements reach the deliverable session.
+        description = _DELIVERABLE_STEP_DESC
+        if plan_content:
+            description = (
+                f"{_DELIVERABLE_STEP_DESC}\n\n"
+                f"## Full task plan (your source of truth)\n\n{plan_content}"
+            )
         result.append({
             "idx": new_idx,
             "type": "synthesis",
-            "description": _DELIVERABLE_STEP_DESC,
+            "description": description,
             "required_tools": [],
             "complexity": "high",
             "dependencies": [new_idx - 1] if new_idx > 0 else [],

@@ -52,9 +52,11 @@ the executor's own machinery — the skill does NOT re-implement them:
 
 - **Gate 1** moved to `/task` intake: the frame is read from the plan's `## Deliverable Frame`
   (see `intake.md` → "Autonomous mode"). No interview at execution time.
-- **Gate 2** is still the skill's own fresh-subagent check (`qa-protocol.md`), run inside the
-  step. The executor's `VERIFYING` phase is a *secondary* criteria check that reads the
-  `qa_summary.md` text artifact you emit (it cannot open the PDF). Stop-hook does not apply.
+- **Gate 2** is still the skill's own check (`qa-protocol.md`), run **in-session** — the `Task`
+  subagent tool is NOT available to an executor step (verified), so it's an in-session re-read of
+  the rendered file, not a fresh subagent. The executor's `VERIFYING` phase then adds a *fresh*
+  adversarial pass over the `qa_summary.md` text artifact you emit (it cannot open the PDF). The
+  Stop-hook does not apply.
 - **Gate 3 = a `VERIFYING`-phase approval, handled by the executor, not the skill.** After the
   step produces the verified deliverable, the engine (`executor/gate.py`) creates an
   `approval_request` carrying the `task_id`, sends the deliverable (path + summary in v2.0; the

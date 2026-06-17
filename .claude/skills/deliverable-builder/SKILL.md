@@ -63,7 +63,8 @@ after Gate 3. If the user abandons it, set `cancelled`.
   backstop. Triggered when the user asks you directly.
 - **Autonomous** (v2): runs as a Genesis **task-executor step** (the decomposer assigns this
   skill when the task plan has a `## Deliverable Frame`). Gate 1 is read from that frame — no
-  interview; Gate 2 is still this skill's fresh-subagent check; Gate 3 is a Telegram approval
+  interview; Gate 2 is still this skill's own check (run in-session — the `Task` tool isn't
+  available to an executor step); Gate 3 is a Telegram approval
   handled by the executor (a `VERIFYING`-phase blocker); escalation is executor-native; the
   Stop-hook does NOT apply. See `references/intake.md` → "Autonomous mode" and
   `references/approval-gates.md`.

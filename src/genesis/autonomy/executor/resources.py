@@ -24,7 +24,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _CATALOG_PATH = Path.home() / ".genesis" / "skill_catalog.json"
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+# resources.py lives at <repo>/src/genesis/autonomy/executor/ — five levels deep.
+# parents[4] is the repo root; parents[3] is src/. Catalog skill paths are
+# repo-root-relative (e.g. ".claude/skills/<name>"), so this MUST be the repo
+# root. The previous four-.parent form landed on src/, so _find_skill_path
+# never resolved any skill and load_step_resources silently injected nothing.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 
 # Budget caps to prevent prompt bloat
 _MAX_PAST_EXECUTIONS = 5
@@ -319,9 +324,21 @@ async def load_step_resources(
             if md_file.exists():
                 try:
                     content = md_file.read_text(encoding="utf-8", errors="replace")
+                    # Include the ABSOLUTE skill dir: a dispatched step runs
+                    # outside the project, so the `Skill` tool can't load this
+                    # skill — but it CAN Read these files by absolute path. The
+                    # injected copy is truncated; the full skill + its
+                    # references/ live at skill_path.
                     if len(content) > _MAX_SKILL_CONTENT_CHARS:
-                        content = content[:_MAX_SKILL_CONTENT_CHARS] + "\n[truncated]"
-                    parts.append(f"### Skill: {skill_name}\n\n{content}")
+                        content = (
+                            content[:_MAX_SKILL_CONTENT_CHARS]
+                            + f"\n\n[TRUNCATED — read the COMPLETE skill (SKILL.md "
+                            f"and its references/) from: {skill_path}]"
+                        )
+                    parts.append(
+                        f"### Skill: {skill_name} (full skill dir: {skill_path})\n\n"
+                        f"{content}"
+                    )
                 except OSError:
                     logger.debug("Failed to read skill file %s", md_file)
                 break
