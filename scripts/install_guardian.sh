@@ -439,8 +439,8 @@ _host_mem_gb=$(( ${_host_mem_kb:-0} / 1048576 ))
 if [ "$_host_mem_gb" -gt 0 ] 2>/dev/null; then
     # Scale min_free_kbytes to ~1% of host RAM (floor 128MB, cap 1024MB)
     _min_free_mb=$(( _host_mem_gb * 10 ))  # ~1% in MB
-    [ "$_min_free_mb" -lt 128 ] && _min_free_mb=128
-    [ "$_min_free_mb" -gt 1024 ] && _min_free_mb=1024
+    if [ "$_min_free_mb" -lt 128 ]; then _min_free_mb=128; fi
+    if [ "$_min_free_mb" -gt 1024 ]; then _min_free_mb=1024; fi
     _min_free_kb=$(( _min_free_mb * 1024 ))
 
     # Idempotency: don't downgrade if someone already set a higher value.
@@ -448,14 +448,17 @@ if [ "$_host_mem_gb" -gt 0 ] 2>/dev/null; then
     if [ "${_current_min_free:-0}" -ge "$_min_free_kb" ]; then
         echo "  OOM tuning already adequate (min_free_kbytes=${_current_min_free})"
     elif sudo -n true 2>/dev/null; then
-        sudo tee /etc/sysctl.d/99-genesis-oom-tuning.conf > /dev/null << SYSCTL
+        # Best-effort tuning: guard each sudo command so a failure can't abort
+        # the install under `set -euo pipefail` (the WARN branch below is the
+        # intended fallback when tuning can't be applied).
+        sudo tee /etc/sysctl.d/99-genesis-oom-tuning.conf > /dev/null << SYSCTL || true
 # Genesis — kernel OOM protection (installed by install_guardian.sh)
 # Prevents VM freeze under memory pressure. Safe to customize.
 vm.min_free_kbytes = $_min_free_kb
 vm.watermark_scale_factor = 50
 vm.oom_kill_allocating_task = 1
 SYSCTL
-        sudo sysctl --system > /dev/null 2>&1
+        sudo sysctl --system > /dev/null 2>&1 || true
         echo "  + OOM tuning applied (min_free=${_min_free_mb}MB for ${_host_mem_gb}GB host)"
     else
         echo "  WARN  Cannot apply OOM tuning (no passwordless sudo)"
@@ -475,8 +478,10 @@ fi
 # Reference configs: config/99-container-host.conf, config/60-ioscheduler.rules
 
 if sudo -n true 2>/dev/null; then
+    # Best-effort tuning: guard each sudo command so a failure can't abort the
+    # install under `set -euo pipefail` (the SKIP branch below is the fallback).
     # I/O sysctl — always overwrite to pick up value changes on update
-    sudo tee /etc/sysctl.d/99-genesis-io-tuning.conf > /dev/null << 'SYSCTL'
+    sudo tee /etc/sysctl.d/99-genesis-io-tuning.conf > /dev/null << 'SYSCTL' || true
 # Genesis — I/O pressure reduction (installed by install_guardian.sh)
 # Reduces dirty page cache to prevent I/O death spirals under sustained write load.
 vm.swappiness = 10
@@ -484,12 +489,12 @@ vm.dirty_ratio = 10
 vm.dirty_background_ratio = 3
 vm.vfs_cache_pressure = 50
 SYSCTL
-    sudo sysctl --system > /dev/null 2>&1
+    sudo sysctl --system > /dev/null 2>&1 || true
     echo "  + I/O tuning applied (swappiness=10, dirty_ratio=10)"
 
     # BFQ I/O scheduler — always refresh from repo
     if [ -d "$INSTALL_DIR/config" ] && [ -f "$INSTALL_DIR/config/60-ioscheduler.rules" ]; then
-        sudo cp "$INSTALL_DIR/config/60-ioscheduler.rules" /etc/udev/rules.d/
+        sudo cp "$INSTALL_DIR/config/60-ioscheduler.rules" /etc/udev/rules.d/ || true
         sudo udevadm control --reload-rules 2>/dev/null || true
         echo "  + BFQ I/O scheduler rule installed"
     fi

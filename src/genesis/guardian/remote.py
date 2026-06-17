@@ -8,7 +8,8 @@ script via an authorized_keys ``command=`` directive — even if this code
 tried to run arbitrary commands, the host would reject them. OpenSSH
 enforces this restriction, not our code.
 
-Seven operations: restart-timer, pause, resume, status, reset-state, version, update.
+Gateway allowlist: restart-timer, pause, resume, status, reset-state, version,
+update, sync-gateway, redeploy, update-cc, test-approval, ping.
 """
 
 from __future__ import annotations
