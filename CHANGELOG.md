@@ -48,6 +48,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A backup that can't reach off-site storage no longer fails silently** — if
+  you've configured an off-site (NAS) backup target and a run captures your data
+  locally but can't replicate it off-site, Genesis now sends a distinct alert
+  ("off-site replication failed — local backup OK") and records `offsite_confirmed`
+  in the backup status. The backup still counts as successful (your local copy is
+  intact); only the off-site replica is flagged as missing. Local-only setups (no
+  off-site target) are unaffected.
+
 - **Restoring a backup is now safe against corruption** — `restore.sh` now stops
   the running Genesis server before swapping the SQLite database (so a live
   connection can't corrupt the restore), clears stale write-ahead-log sidecars
