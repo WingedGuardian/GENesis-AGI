@@ -751,9 +751,13 @@ class SurplusLLMExecutor:
             from html import escape
 
             label = task.task_type.replace("_", " ").title()
+            # quote=False: keep &/</> escaped (needed so the <b> label parses under
+            # parse_mode=HTML) but leave " and ' raw. With quote=True, html.escape turns
+            # them into &quot;/&#x27;, which Telegram's HTML parser renders LITERALLY in
+            # text content — surplus JSON/findings showed raw entities to the user.
             text = (
                 f"<b>Surplus: {escape(label)}</b>\n\n"
-                f"{escape(content[:2000])}"
+                f"{escape(content[:2000], quote=False)}"
             )
             await self._topic_manager.send_to_category("surplus", text)
             logger.info("Posted surplus insight to Telegram (task=%s)", task.task_type)
