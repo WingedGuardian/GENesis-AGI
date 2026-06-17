@@ -39,6 +39,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   upstream, quietly leaving the host Guardian stuck on old code. The update now
   clears the flag first, so existing installs self-heal and stay current.
 
+- **Guardian host self-updates are now reliable on hosts with passwordless sudo**
+  — an unguarded step while refreshing kernel tuning could make the Guardian's
+  self-update abort partway, so it reported a failure (and could leave its own
+  updater script frozen on old code) even though the code pull had already
+  succeeded. Kernel tuning is now strictly best-effort and can't derail the
+  update; the update reliably refreshes the updater first and records what it
+  deployed; and there's a new one-step recovery path to refresh a stalled updater.
+
 - **Telegram `/stop` now stops your session, not a background task** — when a
   background task (reflection, inbox, an ego session, etc.) was running at the
   same time as your chat, `/stop` could interrupt the wrong one. Each session's
