@@ -11,12 +11,13 @@
 #   update         — pull latest code + self-update gateway script
 #   redeploy <hash> — receive tar archive on stdin, deploy to install dir
 #   update-cc <ver> — install a pinned Claude Code version (validated semver)
+#   test-approval   — E2E test the keyword-reply approval gate (no recovery)
 #   ping            — liveness check
 #
 # SSH authorized_keys entry (replace CONTAINER_IP with your container's IP):
 #   command="~/.local/bin/guardian-gateway.sh",from="CONTAINER_IP" ssh-ed25519 ...
 #
-# This gives Genesis a fixed allowlist of 10 operations on the host. Nothing else.
+# This gives Genesis a fixed allowlist of operations on the host. Nothing else.
 
 set -euo pipefail
 
@@ -301,6 +302,22 @@ PYEOF
             printf '{"ok": false, "action": "update-cc", "error": "version mismatch after install", "requested": "%s", "installed": "%s"}\n' "$VERSION" "$INSTALLED" >&2
             exit 1
         fi
+        ;;
+    test-approval)
+        # E2E self-test of the keyword-reply approval gate. Sends a test
+        # prompt and polls getUpdates for an APPROVE/DENY reply (~120s).
+        # No recovery is performed. Timeout-guarded just above the self-test's
+        # internal 120s budget so a hung poll can't wedge this SSH session.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "test-approval", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+        GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
+            timeout 130 "$VENV_PY" -m genesis.guardian --test-approval
         ;;
     ping)
         echo '{"ok": true, "action": "ping"}'

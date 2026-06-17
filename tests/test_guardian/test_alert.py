@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
+import urllib.error
+import urllib.request
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from genesis.guardian.alert.base import Alert, AlertChannel, AlertSeverity
 from genesis.guardian.alert.dispatcher import AlertDispatcher
-from genesis.guardian.alert.telegram import TelegramAlertChannel
+from genesis.guardian.alert.telegram import CONFLICT_SENTINEL, TelegramAlertChannel
 
 # ── Alert Dataclass ─────────────────────────────────────────────────────
 
@@ -76,7 +79,9 @@ class TestTelegramChannel:
         assert "2m" in text  # 120s = 2m
         assert "OOM kill" in text
         assert "RESTART_CONTAINER" in text
-        assert "Click to approve" in text
+        # Approval is now a keyword-reply Telegram gate (host-side getUpdates),
+        # not a clickable localhost link — the link must NOT be in the alert.
+        assert "Click to approve" not in text
 
     def test_format_info_alert(self, channel: TelegramAlertChannel) -> None:
         alert = Alert(
@@ -216,3 +221,111 @@ class TestAlertDispatcher:
         dispatcher = AlertDispatcher([ch1])
         results = await dispatcher.test_all()
         assert "AsyncMock" in str(results) or len(results) == 1
+
+
+# ── Keyword-reply recovery-approval gate ─────────────────────────────────
+
+
+def _urlopen_returning(payload: dict) -> MagicMock:
+    """Fake urlopen() context manager whose .read() yields `payload` as JSON."""
+    resp = MagicMock()
+    resp.read.return_value = json.dumps(payload).encode("utf-8")
+    resp.__enter__ = lambda s: s
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
+
+
+class TestTelegramKeywordGate:
+    """The recovery gate sends a reply-target prompt, then reads the keyword reply.
+
+    Shared-token safety is the load-bearing property: the Guardian must NOT
+    advance the getUpdates offset (that would consume updates the main bot needs)
+    and must only honour replies to its OWN gate message.
+    """
+
+    @pytest.fixture
+    def channel(self) -> TelegramAlertChannel:
+        return TelegramAlertChannel(
+            bot_token="test-token", chat_id="12345", thread_id="67890",
+        )
+
+    # --- _send_message returns the message_id (the reply target) ---
+
+    def test_send_message_returns_message_id(self, channel: TelegramAlertChannel) -> None:
+        resp = _urlopen_returning({"ok": True, "result": {"message_id": 4242}})
+        with patch.object(urllib.request, "urlopen", return_value=resp):
+            assert channel._send_message("hi") == 4242
+
+    def test_send_message_returns_none_when_not_ok(
+        self, channel: TelegramAlertChannel,
+    ) -> None:
+        resp = _urlopen_returning({"ok": False, "description": "bad request"})
+        with patch.object(urllib.request, "urlopen", return_value=resp):
+            assert channel._send_message("hi") is None
+
+    # --- _poll_for_keyword_sync: reply-to filter + keyword match + 409 sentinel ---
+
+    def test_poll_matches_keyword_reply_to_gate(
+        self, channel: TelegramAlertChannel,
+    ) -> None:
+        """A keyword reply to OUR gate message is returned, upper-cased."""
+        updates = {"ok": True, "result": [
+            {"message": {"text": "approve", "reply_to_message": {"message_id": 100}}},
+        ]}
+        with patch.object(urllib.request, "urlopen", return_value=_urlopen_returning(updates)):
+            kw = channel._poll_for_keyword_sync(100, frozenset({"APPROVE", "DENY"}))
+        assert kw == "APPROVE"
+
+    def test_poll_ignores_reply_to_other_message(
+        self, channel: TelegramAlertChannel,
+    ) -> None:
+        """A keyword reply to a DIFFERENT message is not ours — ignore it."""
+        updates = {"ok": True, "result": [
+            {"message": {"text": "APPROVE", "reply_to_message": {"message_id": 999}}},
+        ]}
+        with patch.object(urllib.request, "urlopen", return_value=_urlopen_returning(updates)):
+            kw = channel._poll_for_keyword_sync(100, frozenset({"APPROVE", "DENY"}))
+        assert kw is None
+
+    def test_poll_ignores_non_reply_keyword(
+        self, channel: TelegramAlertChannel,
+    ) -> None:
+        """A bare keyword that is NOT a reply (e.g. someone chatting) is ignored."""
+        updates = {"ok": True, "result": [{"message": {"text": "APPROVE"}}]}
+        with patch.object(urllib.request, "urlopen", return_value=_urlopen_returning(updates)):
+            kw = channel._poll_for_keyword_sync(100, frozenset({"APPROVE", "DENY"}))
+        assert kw is None
+
+    def test_poll_ignores_non_keyword_reply(
+        self, channel: TelegramAlertChannel,
+    ) -> None:
+        """A reply to the gate that isn't an allowed keyword is ignored."""
+        updates = {"ok": True, "result": [
+            {"message": {"text": "maybe later", "reply_to_message": {"message_id": 100}}},
+        ]}
+        with patch.object(urllib.request, "urlopen", return_value=_urlopen_returning(updates)):
+            kw = channel._poll_for_keyword_sync(100, frozenset({"APPROVE", "DENY"}))
+        assert kw is None
+
+    def test_poll_returns_conflict_sentinel_on_409(
+        self, channel: TelegramAlertChannel,
+    ) -> None:
+        """HTTP 409 → CONFLICT_SENTINEL (main bot alive on same token), not None."""
+        err = urllib.error.HTTPError("url", 409, "Conflict", {}, None)
+        with patch.object(urllib.request, "urlopen", side_effect=err):
+            kw = channel._poll_for_keyword_sync(100, frozenset({"APPROVE", "DENY"}))
+        assert kw == CONFLICT_SENTINEL
+
+    def test_poll_never_sends_offset(self, channel: TelegramAlertChannel) -> None:
+        """SAFETY: with a shared token, advancing the offset would drop the main
+        bot's updates. The gate must NEVER send an 'offset' to getUpdates."""
+        captured: dict = {}
+
+        def _fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return _urlopen_returning({"ok": True, "result": []})
+
+        with patch.object(urllib.request, "urlopen", side_effect=_fake_urlopen):
+            channel._poll_for_keyword_sync(100, frozenset({"APPROVE"}))
+        assert "offset" not in captured["body"]
+        assert captured["body"]["allowed_updates"] == ["message"]
