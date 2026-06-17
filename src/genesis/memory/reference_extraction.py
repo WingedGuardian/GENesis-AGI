@@ -10,10 +10,12 @@ the reference store via :func:`ingest_knowledge_unit`.
 This is the SILENT AUTO-CAPTURE path — no user prompt, no explicit flag.
 Runs on the existing extraction cadence with zero new LLM calls.
 
-Classification errs on the side of capturing more:
-- False positives are harmless (unused entries sit idle). False negatives
-  lose credentials permanently. Multiple overlapping patterns are
-  intentional — if any one fires, we capture.
+Classification balances recall against precision:
+- Genuine references are captured broadly, but the credential/network kinds
+  require precise signals (an explicit separator after a credential label;
+  a network context word adjacent to the IP). They run over LLM-generated
+  prose, where a loose match fabricates a misleading value rather than
+  sitting idle harmlessly.
 - The primary capture path is the LLM calling ``reference_store`` in
   real-time. This background path is a safety net that catches things
   the primary path missed.
@@ -40,10 +42,13 @@ logger = logging.getLogger(__name__)
 
 
 # ─── Classification patterns ─────────────────────────────────────────────────
-# Strategy: ERR ON THE SIDE OF CAPTURING MORE. False positives in the
-# reference store are harmless (unused entries sit idle). False negatives
-# lose credentials permanently. Multiple overlapping patterns are
-# intentional — if any one fires, we capture.
+# Strategy: capture genuine references broadly, but require PRECISION for the
+# credential/network kinds — these run over LLM-generated prose, where a loose
+# match fabricates a misleading value (e.g. "can pin checkpoints" -> a fake
+# credential "checkpoints"). So credential labels require an explicit separator
+# (: = is), not a bare space, and IP/network matches require a context word
+# adjacent to the match. Other kinds (known key prefixes, labeled API tokens,
+# URLs) stay broad — their formats are self-validating.
 
 # A. Credential pair — broadened. Any credential-label word near a value.
 # Doesn't require BOTH user+pass — a single "password: X" is enough.
@@ -52,7 +57,7 @@ _CREDENTIAL_PAIR_PATTERN = re.compile(
     r"\b(?:username|user|login)\s*(?:is\s+|[:=]\s*|\s+)"
     rf"(?P<user>(?!{_LABEL_WORDS}\b)[^\s,;]+)"
     r".{0,200}?"
-    r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*|\s+)"
+    r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
     rf"(?P<pass>(?!{_LABEL_WORDS}\b)[^\s,;]+)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -61,7 +66,7 @@ _CREDENTIAL_PAIR_PATTERN = re.compile(
 # "password: Z", "account u/Name", etc. without requiring a pair.
 _SINGLE_CREDENTIAL_PATTERN = re.compile(
     r"\b(?:password|pass(?:word)?|pwd|passphrase|passcode|pin)"
-    r"\s*(?:is\s+|[:=]\s*|\s+)"
+    r"\s*(?:is\s+|[:=]\s*)"
     r"(?P<value>[^\s,;]{4,})",
     re.IGNORECASE,
 )
@@ -72,7 +77,7 @@ _EMAIL_PASSWORD_PATTERN = re.compile(
     r"\b(?:e-?mail)\s*(?:is\s+|[:=]\s*|\s+)"
     r"(?P<email>[^\s,;]+@[^\s,;]+)"
     r".{0,200}?"
-    r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*|\s+)"
+    r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
     r"(?P<pass>[^\s,;]{4,})",
     re.IGNORECASE | re.DOTALL,
 )
@@ -97,7 +102,7 @@ _CREDENTIAL_TOKEN_PATTERN = re.compile(
     r"\b(?:api[_\s-]?key|access[_\s-]?token|bearer[_\s-]?token|"
     r"secret[_\s-]?key|auth[_\s-]?token|refresh[_\s-]?token|"
     r"api[_\s-]?secret|private[_\s-]?key)"
-    r"\s*(?:is\s*|[:=]\s*|\s+)(?P<token>[A-Za-z0-9_\-\.]{16,})",
+    r"\s*(?:is\s+|[:=]\s*)(?P<token>[A-Za-z0-9_\-\.]{16,})",
     re.IGNORECASE,
 )
 
@@ -121,7 +126,7 @@ _ACCOUNT_LIFECYCLE_PATTERN = re.compile(
     r"(?:for\s+|named?\s+|called?\s+)?"
     r"(?P<account>[^\s,;]{2,})"
     r".{0,200}?"
-    r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*|\s+)"
+    r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
     r"(?P<pass>[^\s,;]{4,})",
     re.IGNORECASE | re.DOTALL,
 )
@@ -151,6 +156,11 @@ _NETWORK_CONTEXT_WORDS = frozenset({
     "proxy", "gateway", "router", "port", "bind", "listen",
     "database", "db", "backend", "upstream",
 })
+
+# How far (chars) from the IP/env-var match to look for a context word. The
+# word must be NEAR the match, not just anywhere in the content — otherwise a
+# far-away "container"/"ip" promotes incidental-IP prose to a network ref.
+_NETWORK_CONTEXT_WINDOW = 40
 
 # Phrases that signal generic ephemeral examples — if content contains
 # any of these, don't auto-capture. Reduces false positives on
@@ -375,11 +385,20 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
     env_match = _ENV_VAR_PATTERN.search(content) if not ip_match else None
     net_match = ip_match or env_match
     if net_match:
-        # For env-var matches, strip the match itself before checking context
-        # to avoid false positives from defaults like "localhost" containing "host".
-        ctx = content if ip_match else content.replace(net_match.group(0), "")
-        lower = ctx.lower()
-        if any(word in lower for word in _NETWORK_CONTEXT_WORDS):
+        # Require a network context word NEAR the match (windowed) with word
+        # boundaries — not anywhere in the content by substring. Prose that
+        # merely mentions an IP (code analysis, planning notes) with a far-away
+        # "container"/"ip" must NOT become a network reference. Word boundaries
+        # also stop the match itself (${CONTAINER_IP}, localhost) from
+        # supplying its own context.
+        start, end = net_match.span()
+        window = content[
+            max(0, start - _NETWORK_CONTEXT_WINDOW): end + _NETWORK_CONTEXT_WINDOW
+        ].lower()
+        if any(
+            re.search(rf"\b{re.escape(word)}\b", window)
+            for word in _NETWORK_CONTEXT_WORDS
+        ):
             return {
                 "kind": "network",
                 "identifier": _derive_identifier(
