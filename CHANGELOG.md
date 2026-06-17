@@ -19,6 +19,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reviewer checks the finished artifact against the original requirements before it reaches you.
   The session won't quietly end with an unverified deliverable.
 
+- **Background tasks can now produce those deliverables on their own** — when a `/task` you
+  submit will produce a send-ready artifact (report, deck, take-home, one-pager), the intake now
+  captures how it should look and read (format, visual style, whether it must pass as fully
+  human-written, audience), and the autonomous executor runs the deliverable-builder pipeline as
+  the final step — handing you the finished, verified file instead of a raw dump. Rendered
+  documents now default to a clean modern font (so they read like a real document, not a LaTeX
+  paper); set the visual style to `formal` or `academic` to change it.
+
 - **Content Genesis sends to other people is auto-cleaned before it goes out** —
   email, Discord, and the article/post drafts you review now pass through a
   deterministic check that fixes the most common AI giveaway (a spaced em dash,
