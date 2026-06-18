@@ -315,6 +315,7 @@ if [ -n "$_NAS_TARGET" ]; then
         _SMB_CREDS=$(mktemp)
         chmod 600 "$_SMB_CREDS"
         printf 'username=%s\npassword=%s\n' "$_NAS_USER" "$_NAS_PASS" > "$_SMB_CREDS"
+        _SMB_COMPLETE=$(mktemp)  # empty marker, uploaded only after a full snapshot
 
         _smb() { smbclient "$_NAS_TARGET" -A "$_SMB_CREDS" "$@"; }
 
@@ -359,7 +360,13 @@ if [ -n "$_NAS_TARGET" ]; then
             fi
         done
 
-        rm -f "$_SMB_CREDS"
+        # Mark the snapshot COMPLETE only when every upload succeeded, so restore
+        # never picks a half-uploaded snapshot (it selects the latest COMPLETE one).
+        if [ "$_T2_OK" = true ]; then
+            _smb -c "cd \"${_NAS_DIR}\"; put \"$_SMB_COMPLETE\" COMPLETE" 2>/dev/null || true
+        fi
+
+        rm -f "$_SMB_CREDS" "$_SMB_COMPLETE"
 
         if [ "$_T2_OK" = true ]; then
             _T2_STATUS="ok"

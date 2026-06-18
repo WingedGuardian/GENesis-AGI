@@ -13,6 +13,10 @@
 #   GENESIS_DIR                — target Genesis root (default: ~/genesis)
 #   QDRANT_URL                 — target Qdrant server (default: http://localhost:6333)
 #   SECRETS_PATH               — target secrets file (default: $GENESIS_DIR/secrets.env)
+#   GENESIS_BACKUP_NAS         — SMB share for the off-site pull (e.g. //nas/share);
+#                                the DB/Qdrant/transcripts live ONLY here (not git)
+#   GENESIS_BACKUP_NAS_USER    — SMB username for the off-site pull
+#   GENESIS_BACKUP_NAS_PASS    — SMB password for the off-site pull
 #
 # Behavior:
 #   - Skips destinations that already exist AND are newer than the backup
@@ -168,19 +172,35 @@ _pull_from_nas() {
     [ -n "$nas" ] || return 0
     if $DRY_RUN; then log "NAS: (dry-run) would pull latest off-site snapshot from $nas"; return 0; fi
     command -v smbclient >/dev/null 2>&1 || { log "NAS: smbclient not installed — skipping off-site pull"; return 0; }
+    # Don't clobber a payload already staged locally (same-box re-run) unless
+    # forced — the NAS pull is for fresh-box DR.
+    if [ -f "$BACKUP_DIR/data/genesis.sql.gpg" ] && ! $FORCE; then
+        log "NAS: local payload already present — skipping off-site pull (use --force to override)"
+        return 0
+    fi
 
-    local host_dir creds latest snap fname
+    local host_dir creds latest snap fname dst stamp
     host_dir="Genesis/$(hostname)"
     creds=$(mktemp); chmod 600 "$creds"
+    trap 'rm -f "$creds"' RETURN   # clean up creds on ANY exit from this function
     printf 'username=%s\npassword=%s\n' "${GENESIS_BACKUP_NAS_USER:-}" "${GENESIS_BACKUP_NAS_PASS:-}" > "$creds"
     _nsmb() { smbclient "$nas" -A "$creds" "$@"; }
 
-    # Latest dated snapshot: grep the stamp pattern out of the listing (robust to
-    # smbclient's ls format/locale), newest first.
-    latest=$(_nsmb -c "cd \"$host_dir\"; ls" 2>/dev/null | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -ru | head -1 || true)
+    # Pick the latest snapshot that is COMPLETE — a marker backup.sh writes only
+    # after every file uploaded — so a half-uploaded snapshot from a crashed
+    # backup is never selected. Newest first; grep the stamp pattern out of the
+    # listing (robust to smbclient ls format/locale).
+    latest=""
+    while read -r stamp; do
+        [ -n "$stamp" ] || continue
+        if _nsmb -c "cd \"$host_dir/$stamp\"; ls COMPLETE" 2>/dev/null | grep -q "COMPLETE"; then
+            latest="$stamp"; break
+        fi
+        log "NAS: snapshot $stamp is incomplete (no COMPLETE marker) — trying the previous one"
+    done < <(_nsmb -c "cd \"$host_dir\"; ls" 2>/dev/null | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -ru)
     if [ -z "$latest" ]; then
-        log "NAS: no dated snapshots under $host_dir — skipping off-site pull"
-        rm -f "$creds"; return 0
+        log "NAS: no COMPLETE dated snapshot under $host_dir — skipping off-site pull"
+        return 0
     fi
     log "NAS: pulling latest off-site snapshot $latest"
     snap="$host_dir/$latest"
@@ -189,13 +209,15 @@ _pull_from_nas() {
     mkdir -p "$BACKUP_DIR/data"
     if _nsmb -c "cd \"$snap/data\"; get genesis.sql.gpg \"$BACKUP_DIR/data/genesis.sql.gpg\"" 2>/dev/null; then
         log "  NAS: pulled data/genesis.sql.gpg"
+    else
+        warn "NAS: failed to pull genesis.sql.gpg from snapshot $latest — the database will not be restored from off-site"
     fi
     # Qdrant snapshots + transcripts: list the subdir, then get each *.gpg. The
     # staging dir is created only when there's actually something to pull, so an
     # empty set doesn't make the restore sections below run (and e.g. warn that
     # Qdrant isn't reachable yet → spurious failure).
     for sub in qdrant transcripts; do
-        local dst="$BACKUP_DIR/data/qdrant"
+        dst="$BACKUP_DIR/data/qdrant"
         [ "$sub" = transcripts ] && dst="$BACKUP_DIR/transcripts"
         # `|| true`: an empty subdir makes `grep` exit non-zero → pipefail would
         # otherwise abort the whole restore.
@@ -206,7 +228,6 @@ _pull_from_nas() {
             fi
         done || true
     done
-    rm -f "$creds"
 }
 _pull_from_nas
 
