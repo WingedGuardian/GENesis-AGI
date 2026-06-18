@@ -9,6 +9,7 @@ Sandboxed (HOME + GENESIS_DIR → tmp). Real sqlite3/gpg/git; the smbclient stub
 LOGS every ``-c`` command so we can assert the upload paths.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -113,3 +114,46 @@ def test_snapshot_dir_is_created(backup_env):
     # All three payload subdirs under the snapshot.
     for sub in ("data", "qdrant", "transcripts"):
         assert sub in blob, f"snapshot subdir '{sub}' not created:\n{blob}"
+
+
+def _run_local(backup_env, offsite_root: Path):
+    """Run backup.sh through the `local` Tier-2 backend (no smbclient stub)."""
+    env = dict(os.environ)
+    env.update(
+        HOME=str(backup_env["home"]), GENESIS_DIR=str(backup_env["gd"]),
+        GENESIS_BACKUP_PASSPHRASE="testpass", QDRANT_URL="http://127.0.0.1:1",
+        GENESIS_BACKUP_TIER2_BACKEND="local",
+        GENESIS_BACKUP_LOCAL_PATH=str(offsite_root),
+        PATH=f'{backup_env["bind"]}:{os.environ["PATH"]}',
+    )
+    for k in ("GENESIS_BACKUP_NAS", "GENESIS_BACKUP_NAS_USER", "GENESIS_BACKUP_NAS_PASS",
+              "TELEGRAM_BOT_TOKEN", "TELEGRAM_FORUM_CHAT_ID"):
+        env.pop(k, None)
+    return subprocess.run(["bash", str(_BACKUP)], env=env,
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+
+def test_local_backend_writes_dated_snapshot_to_real_fs(backup_env, tmp_path):
+    """End-to-end through the `local` backend (no stub): backup.sh writes a REAL
+    dated snapshot tree to GENESIS_BACKUP_LOCAL_PATH with the encrypted SQL dump +
+    a COMPLETE marker, and reports offsite_confirmed. Proves the Tier-2 abstraction
+    is not smb-only — the `local` backend is the regression anchor for the whole
+    backup path.
+    """
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    # Exactly one host dir, one dated snapshot, COMPLETE-marked, with the SQL dump.
+    host_dirs = list((offsite / "Genesis").iterdir())
+    assert len(host_dirs) == 1, f"expected one host dir, got {[d.name for d in host_dirs]}"
+    snaps = [d for d in host_dirs[0].iterdir() if _STAMP_RE.fullmatch(d.name)]
+    assert len(snaps) == 1, f"expected one dated snapshot, got {[d.name for d in snaps]}"
+    snap = snaps[0]
+    assert (snap / "data" / "genesis.sql.gpg").is_file(), "SQL dump missing from local snapshot"
+    assert (snap / "COMPLETE").is_file(), "COMPLETE marker not written for a full snapshot"
+
+    status = json.loads((backup_env["home"] / ".genesis" / "backup_status.json").read_text())
+    assert status["tier2_status"] == "ok", status
+    assert status["offsite_confirmed"] is True, status

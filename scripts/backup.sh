@@ -19,6 +19,12 @@
 #   SECRETS_PATH               — Path to secrets.env (default: $GENESIS_DIR/secrets.env)
 set -euo pipefail
 
+# Pluggable Tier-2 (off-site) backend interface — selects none/local/smb at runtime
+# (backward-compat: a configured GENESIS_BACKUP_NAS with no selector → smb).
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/backup_backends.sh
+source "$_SCRIPT_DIR/lib/backup_backends.sh"
+
 # ── Status tracking ──────────────────────────────────────────────────
 _STATUS_FILE="$HOME/.genesis/backup_status.json"
 _STARTED_AT=$(date +%s)
@@ -37,7 +43,7 @@ _write_status() {
     # Escape failure reason for JSON safety (quotes, backslashes, newlines)
     local _safe_reason
     _safe_reason=$(printf '%s' "$_FAILURE_REASON" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g')
-    # offsite_confirmed: true only when the off-site (NAS) copy fully succeeded.
+    # offsite_confirmed: true only when the off-site copy fully succeeded.
     local _offsite_confirmed=false
     if [ "${_T2_STATUS:-}" = "ok" ]; then _offsite_confirmed=true; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
@@ -45,7 +51,7 @@ _write_status() {
 {"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed}
 STATUSEOF
 }
-trap '_write_status' EXIT
+trap '_write_status; backend_cleanup' EXIT
 
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
 BACKUP_DIR="$HOME/backups/genesis-backups"
@@ -293,105 +299,105 @@ else
     log "WARNING: secrets file not found at $SECRETS_FILE"
 fi
 
-# --- Tier 2: Upload large files to NAS (Qdrant, SQL, transcripts) ---
-_NAS_TARGET="${GENESIS_BACKUP_NAS:-}"
+# --- Tier 2: upload large files to the off-site backend (pluggable) ---
+# Destination is selectable (none/local/smb) via GENESIS_BACKUP_TIER2_BACKEND —
+# the public repo prescribes no provider. The dated snapshot tree
+# (Genesis/<host>/<UTC-stamp>/{data,qdrant,transcripts}/ + COMPLETE marker) is
+# written through the backend interface, not a backend binary directly. The
+# _T2_STATUS value strings (ok/partial/not_configured/no_smbclient) are unchanged
+# — they're read by the dashboard + health alerts.
 _T2_STATUS="skipped"
-if [ -n "$_NAS_TARGET" ]; then
-    _NAS_USER="${GENESIS_BACKUP_NAS_USER:-}"
-    _NAS_PASS="${GENESIS_BACKUP_NAS_PASS:-}"
-    _NAS_HOST_DIR="Genesis/$(hostname)"
-    # Per-run DATED snapshot dir — a consistent point-in-time copy that
-    # restore.sh selects the latest of and GFS retention prunes (replaces the
-    # old fixed filenames that were overwritten every run).
-    _NAS_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-    _NAS_DIR="${_NAS_HOST_DIR}/${_NAS_STAMP}"
-
-    if ! command -v smbclient >/dev/null 2>&1; then
+backend_init
+_T2_BACKEND="$(backend_name)"
+if [ "$_T2_BACKEND" = "none" ]; then
+    log "Tier 2 backup target not configured — large files are local-only"
+    _T2_STATUS="not_configured"
+elif ! backend_available; then
+    if [ "$_T2_BACKEND" = "smb" ]; then
         log "WARNING: smbclient not installed — Tier 2 backup skipped"
         _T2_STATUS="no_smbclient"
     else
-        # Write credentials to a temp file instead of passing on command line
-        # (avoids exposure in /proc/*/cmdline and ps output)
-        _SMB_CREDS=$(mktemp)
-        chmod 600 "$_SMB_CREDS"
-        printf 'username=%s\npassword=%s\n' "$_NAS_USER" "$_NAS_PASS" > "$_SMB_CREDS"
-        _SMB_COMPLETE=$(mktemp)  # empty marker, uploaded only after a full snapshot
-
-        _smb() { smbclient "$_NAS_TARGET" -A "$_SMB_CREDS" "$@"; }
-
-        # Create the snapshot directory tree (smbclient mkdir is non-recursive,
-        # so each level is created; pre-existing levels fail harmlessly).
-        _smb -c "mkdir \"Genesis\"; mkdir \"${_NAS_HOST_DIR}\"; mkdir \"${_NAS_DIR}\"; mkdir \"${_NAS_DIR}/data\"; mkdir \"${_NAS_DIR}/qdrant\"; mkdir \"${_NAS_DIR}/transcripts\"" \
-            2>/dev/null || true
-
-        _T2_OK=true
-
-        # Upload Qdrant snapshots
-        for f in data/qdrant/*.gpg; do
-            [ -f "$f" ] || continue
-            fname=$(basename "$f")
-            if _smb -c "cd \"${_NAS_DIR}/qdrant\"; put \"$f\" \"$fname\"" 2>/dev/null; then
-                log "  NAS: uploaded $fname"
-            else
-                log "WARNING: NAS upload failed for $fname"
-                _T2_OK=false
-            fi
-        done
-
-        # Upload SQL dump
-        if [ -f data/genesis.sql.gpg ]; then
-            if _smb -c "cd \"${_NAS_DIR}/data\"; put data/genesis.sql.gpg genesis.sql.gpg" 2>/dev/null; then
-                log "  NAS: uploaded genesis.sql.gpg"
-            else
-                log "WARNING: NAS upload failed for genesis.sql.gpg"
-                _T2_OK=false
-            fi
-        fi
-
-        # Upload transcripts (previously local-only — now part of the off-site snapshot)
-        for f in transcripts/*.gpg; do
-            [ -f "$f" ] || continue
-            fname=$(basename "$f")
-            if _smb -c "cd \"${_NAS_DIR}/transcripts\"; put \"$f\" \"$fname\"" 2>/dev/null; then
-                log "  NAS: uploaded transcripts/$fname"
-            else
-                log "WARNING: NAS upload failed for transcripts/$fname"
-                _T2_OK=false
-            fi
-        done
-
-        # Mark the snapshot COMPLETE only when every upload succeeded, so restore
-        # never picks a half-uploaded snapshot (it selects the latest COMPLETE one).
-        # If the marker itself fails to upload, the snapshot is unusable for
-        # restore — treat that as an off-site failure (partial + alert), not ok.
-        if [ "$_T2_OK" = true ]; then
-            if ! _smb -c "cd \"${_NAS_DIR}\"; put \"$_SMB_COMPLETE\" COMPLETE" 2>/dev/null; then
-                log "WARNING: NAS upload failed for COMPLETE marker — snapshot unusable for restore"
-                _T2_OK=false
-            fi
-        fi
-
-        rm -f "$_SMB_CREDS" "$_SMB_COMPLETE"
-
-        if [ "$_T2_OK" = true ]; then
-            _T2_STATUS="ok"
-            log "Tier 2 backup copied to NAS snapshot ${_NAS_STAMP}"
-        else
-            _T2_STATUS="partial"
-            log "WARNING: Tier 2 backup partially failed"
-        fi
+        log "WARNING: Tier 2 backend '$_T2_BACKEND' is not available — Tier 2 backup skipped"
+        _T2_STATUS="not_configured"
     fi
 else
-    log "Tier 2 backup target not configured — large files are local-only"
-    _T2_STATUS="not_configured"
+    _T2_HOST_DIR="Genesis/$(hostname)"
+    # Per-run DATED snapshot dir — a consistent point-in-time copy that restore.sh
+    # selects the latest COMPLETE of (and GFS retention prunes).
+    _T2_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+    _T2_DIR="${_T2_HOST_DIR}/${_T2_STAMP}"
+
+    # Create the snapshot directory tree (backend_mkdir creates ancestors;
+    # pre-existing levels are idempotent).
+    backend_mkdir "${_T2_DIR}/data"
+    backend_mkdir "${_T2_DIR}/qdrant"
+    backend_mkdir "${_T2_DIR}/transcripts"
+
+    _T2_OK=true
+
+    # Upload Qdrant snapshots
+    for f in data/qdrant/*.gpg; do
+        [ -f "$f" ] || continue
+        fname=$(basename "$f")
+        if backend_put "$f" "${_T2_DIR}/qdrant/$fname"; then
+            log "  off-site: uploaded $fname"
+        else
+            log "WARNING: off-site upload failed for $fname"
+            _T2_OK=false
+        fi
+    done
+
+    # Upload SQL dump
+    if [ -f data/genesis.sql.gpg ]; then
+        if backend_put "data/genesis.sql.gpg" "${_T2_DIR}/data/genesis.sql.gpg"; then
+            log "  off-site: uploaded genesis.sql.gpg"
+        else
+            log "WARNING: off-site upload failed for genesis.sql.gpg"
+            _T2_OK=false
+        fi
+    fi
+
+    # Upload transcripts (part of the off-site snapshot)
+    for f in transcripts/*.gpg; do
+        [ -f "$f" ] || continue
+        fname=$(basename "$f")
+        if backend_put "$f" "${_T2_DIR}/transcripts/$fname"; then
+            log "  off-site: uploaded transcripts/$fname"
+        else
+            log "WARNING: off-site upload failed for transcripts/$fname"
+            _T2_OK=false
+        fi
+    done
+
+    # Mark the snapshot COMPLETE only when every upload succeeded, so restore never
+    # picks a half-uploaded snapshot (it selects the latest COMPLETE one). If the
+    # marker itself fails to upload, the snapshot is unusable for restore — treat
+    # that as an off-site failure (partial + alert), not ok.
+    if [ "$_T2_OK" = true ]; then
+        _T2_MARKER=$(mktemp)  # empty marker, uploaded only after a full snapshot
+        if ! backend_put "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
+            log "WARNING: off-site upload failed for COMPLETE marker — snapshot unusable for restore"
+            _T2_OK=false
+        fi
+        rm -f "$_T2_MARKER"
+    fi
+
+    if [ "$_T2_OK" = true ]; then
+        _T2_STATUS="ok"
+        log "Tier 2 backup copied to off-site snapshot ${_T2_STAMP} (backend: ${_T2_BACKEND})"
+    else
+        _T2_STATUS="partial"
+        log "WARNING: Tier 2 backup partially failed"
+    fi
 fi
+backend_cleanup
 
 # --- Ensure .gitignore excludes Tier 2 files ---
 # Tier 1 (git): memory/, config_overrides/, secrets/
-# Tier 2 (NAS): data/, transcripts/
+# Tier 2 (off-site): data/, transcripts/
 if ! grep -q '^data/$' .gitignore 2>/dev/null; then
     cat >> .gitignore << 'GITIGNORE'
-# Tier 2 files — backed up to NAS, not GitHub
+# Tier 2 files — backed up off-site, not GitHub
 data/
 transcripts/
 GITIGNORE
@@ -439,14 +445,14 @@ SQLite lines: $_SQLITE_LINES
 Duration: $(( $(date +%s) - _STARTED_AT ))s"
 fi
 
-# --- Alert on off-site (NAS) replication failure (local backup still OK) ---
+# --- Alert on off-site replication failure (local backup still OK) ---
 # Distinct from a backup failure: the local + Tier-1 backup succeeded, but the
-# off-site copy did not fully land. Local-only installs (NAS not configured) are
+# off-site copy did not fully land. Local-only installs (no off-site backend) are
 # a valid choice and do NOT alert.
-if [ -n "$_NAS_TARGET" ] && [ "$_T2_STATUS" != "ok" ]; then
+if [ "${_T2_BACKEND:-none}" != "none" ] && [ "$_T2_STATUS" != "ok" ]; then
     # Dedup: alert only on the transition INTO off-site failure. The status file
     # still holds the PREVIOUS run's state at this point (the EXIT trap rewrites
-    # it after). This avoids a 6-hourly alert while a NAS stays down; it re-alerts
+    # it after). This avoids a 6-hourly alert while the off-site target stays down; it re-alerts
     # once off-site recovers (offsite_confirmed flips true) and then fails again.
     _prev_offsite=$(python3 -c "import json; print(json.load(open('$_STATUS_FILE')).get('offsite_confirmed', True))" 2>/dev/null || echo "True")
     if [ "$_prev_offsite" != "False" ]; then
@@ -455,7 +461,7 @@ if [ -n "$_NAS_TARGET" ] && [ "$_T2_STATUS" != "ok" ]; then
 The local backup is OK, but it was NOT replicated off-site.
 Tier-2 status: ${_T2_STATUS}
 Time: $(date -Is)
-Off-site copies are missing — check the NAS target."
+Off-site copies are missing — check the off-site target."
     fi
 fi
 log "Backup complete (success=$_SUCCESS)"
