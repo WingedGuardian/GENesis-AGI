@@ -258,6 +258,30 @@ _pull_from_offsite() {
             fi
         done || true
     done
+
+    # memory / config overlays / secrets — previously only in the Tier-1 git clone. Pull
+    # them from the snapshot too so a no-git fresh box can rehydrate them (the §4/§6/§7
+    # restore sections read from these BACKUP_DIR subdirs). memory is flat; config overlays
+    # are plaintext .local.yaml; secrets is the encrypted blob. Staging dirs are created
+    # only when there's something to pull (mirrors the qdrant/transcripts loop above).
+    backend_list "$snap/memory" | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u | while read -r fname; do
+        mkdir -p "$BACKUP_DIR/memory"
+        if backend_get "$snap/memory/$fname" "$BACKUP_DIR/memory/$fname"; then
+            log "  off-site: pulled memory/$fname"
+        fi
+    done || true
+    backend_list "$snap/config_overrides" | grep -oE '[A-Za-z0-9._-]+\.local\.yaml' | sort -u | while read -r fname; do
+        mkdir -p "$BACKUP_DIR/config_overrides"
+        if backend_get "$snap/config_overrides/$fname" "$BACKUP_DIR/config_overrides/$fname"; then
+            log "  off-site: pulled config_overrides/$fname"
+        fi
+    done || true
+    if backend_exists "$snap/secrets/secrets.env.gpg"; then
+        mkdir -p "$BACKUP_DIR/secrets"
+        if backend_get "$snap/secrets/secrets.env.gpg" "$BACKUP_DIR/secrets/secrets.env.gpg"; then
+            log "  off-site: pulled secrets/secrets.env.gpg"
+        fi
+    fi
 }
 _pull_from_offsite
 

@@ -369,6 +369,49 @@ else
         fi
     done
 
+    # Upload memory / config overlays / secrets — previously git-Tier-1 only. Including
+    # them here makes the off-site snapshot a COMPLETE copy, so a no-git fresh-box DR can
+    # rehydrate everything (restore.sh §4/§6/§7 read them from the pulled snapshot). Memory
+    # is flat (MEMORY_DIR has no subdirs); config overlays ship as-is (plaintext, mirroring
+    # the existing Tier-1 + private-repo posture); secrets is the encrypted blob. A failed
+    # upload of a present file flips _T2_OK so COMPLETE is gated on these landing too.
+    backend_mkdir "${_T2_DIR}/memory"
+    for f in memory/*.gpg; do
+        [ -f "$f" ] || continue
+        fname=$(basename "$f")
+        if backend_put "$f" "${_T2_DIR}/memory/$fname"; then
+            log "  off-site: uploaded memory/$fname"
+        else
+            log "WARNING: off-site upload failed for memory/$fname"
+            _T2_OK=false
+        fi
+    done
+
+    backend_mkdir "${_T2_DIR}/config_overrides"
+    for f in config_overrides/*.local.yaml; do
+        [ -f "$f" ] || continue
+        fname=$(basename "$f")
+        if backend_put "$f" "${_T2_DIR}/config_overrides/$fname"; then
+            log "  off-site: uploaded config_overrides/$fname"
+        else
+            log "WARNING: off-site upload failed for config_overrides/$fname"
+            _T2_OK=false
+        fi
+    done
+
+    # Secrets is best-effort: a MISSING payload (no passphrase → no .gpg) is not an
+    # off-site failure (that path already fails the backup via _SQLITE_LINES=0); only a
+    # failed upload of a PRESENT payload flips _T2_OK.
+    if [ -f secrets/secrets.env.gpg ]; then
+        backend_mkdir "${_T2_DIR}/secrets"
+        if backend_put "secrets/secrets.env.gpg" "${_T2_DIR}/secrets/secrets.env.gpg"; then
+            log "  off-site: uploaded secrets/secrets.env.gpg"
+        else
+            log "WARNING: off-site upload failed for secrets/secrets.env.gpg"
+            _T2_OK=false
+        fi
+    fi
+
     # Mark the snapshot COMPLETE only when every upload succeeded, so restore never
     # picks a half-uploaded snapshot (it selects the latest COMPLETE one). If the
     # marker itself fails to upload, the snapshot is unusable for restore — treat

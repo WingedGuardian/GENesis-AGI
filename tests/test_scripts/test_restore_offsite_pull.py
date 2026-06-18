@@ -53,15 +53,37 @@ def sandbox(tmp_path):
                     "--passphrase", "testpass", "--symmetric", "--cipher-algo", "AES256",
                     "-o", str(dump_gpg), str(sql)], check=True, capture_output=True)
 
+    def _enc(text: str, name: str) -> Path:
+        plain = tmp_path / f"{name}.plain"
+        plain.write_text(text)
+        out = tmp_path / name
+        subprocess.run(["gpg", "--batch", "--yes", "--homedir", str(home / ".gnupg"),
+                        "--passphrase", "testpass", "--symmetric", "--cipher-algo", "AES256",
+                        "-o", str(out), str(plain)], check=True, capture_output=True)
+        return out
+
+    # A2a extra payloads: memory + secrets encrypted, config plaintext.
+    mem_gpg = _enc("remembered\n", "note.md.gpg")
+    sec_gpg = _enc("SECRET=xyz\n", "secrets.env.gpg")
+
     return {"home": home, "gd": gd, "backup": backup, "offsite": offsite,
-            "bind": bind, "dump_gpg": dump_gpg}
+            "bind": bind, "dump_gpg": dump_gpg, "mem_gpg": mem_gpg, "sec_gpg": sec_gpg}
 
 
-def _snapshot(sandbox, host: str, stamp: str, *, complete: bool = True) -> None:
+def _snapshot(sandbox, host: str, stamp: str, *, complete: bool = True,
+              with_extras: bool = False) -> None:
     """Create an off-site dated snapshot on the real filesystem."""
     snap = sandbox["offsite"] / "Genesis" / host / stamp
     (snap / "data").mkdir(parents=True)
     (snap / "data" / "genesis.sql.gpg").write_bytes(sandbox["dump_gpg"].read_bytes())
+    if with_extras:
+        # A2a: memory/ (flat .gpg), config_overrides/ (plaintext yaml), secrets/ (encrypted).
+        (snap / "memory").mkdir()
+        (snap / "memory" / "note.md.gpg").write_bytes(sandbox["mem_gpg"].read_bytes())
+        (snap / "config_overrides").mkdir()
+        (snap / "config_overrides" / "sample.local.yaml").write_text("key: val\n")
+        (snap / "secrets").mkdir()
+        (snap / "secrets" / "secrets.env.gpg").write_bytes(sandbox["sec_gpg"].read_bytes())
     if complete:
         (snap / "COMPLETE").write_text("")
 
@@ -162,3 +184,24 @@ def test_no_backend_configured_skips_pull(sandbox):
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     # nothing pulled → restore finds no SQL payload
     assert "no backup payload" in proc.stdout.lower() or _db_value(sandbox) != "99"
+
+
+def test_pulls_and_rehydrates_memory_config_secrets(sandbox):
+    """A2a: on a no-git fresh box, restore must pull memory/config/secrets from the
+    off-site snapshot (not just data/qdrant/transcripts) and rehydrate them — so DR
+    works without the Tier-1 git clone."""
+    _snapshot(sandbox, "sourcebox", _NEW, with_extras=True)
+    proc = _run(sandbox, host_override="sourcebox")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    cc_id = str(sandbox["gd"]).replace("/", "-")
+    mem_file = sandbox["home"] / ".claude" / "projects" / cc_id / "memory" / "note.md"
+    assert mem_file.is_file() and mem_file.read_text() == "remembered\n", \
+        f"memory not rehydrated from off-site:\n{proc.stdout}"
+    cfg_file = sandbox["gd"] / "config" / "sample.local.yaml"
+    assert cfg_file.is_file() and cfg_file.read_text() == "key: val\n", \
+        f"config overlay not rehydrated from off-site:\n{proc.stdout}"
+    sec_file = sandbox["gd"] / "secrets.env"
+    assert sec_file.is_file() and sec_file.read_text() == "SECRET=xyz\n", \
+        f"secrets not rehydrated from off-site:\n{proc.stdout}"
+    assert oct(sec_file.stat().st_mode)[-3:] == "600", "secrets not chmod 0600"
