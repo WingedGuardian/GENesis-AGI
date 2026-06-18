@@ -111,20 +111,31 @@ PYEOF
             # --skip-worktree, which wedges `git pull` ("local changes would be
             # overwritten") the moment upstream touches the tracked CLAUDE.md.
             git update-index --no-skip-worktree CLAUDE.md 2>/dev/null || true
-            git checkout -- CLAUDE.md 2>/dev/null || true
+            git checkout -- CLAUDE.md >/dev/null 2>&1 || true
             # Stash remaining local config changes (container_ip, etc.)
             STASHED=0
             if ! git diff --quiet 2>/dev/null; then
-                git stash --quiet 2>/dev/null && STASHED=1
+                git stash --quiet >/dev/null 2>&1 && STASHED=1
             fi
-            if git pull --ff-only 2>/dev/null; then
+            # NOTE: every git command in this verb redirects stdout to /dev/null.
+            # The verb's contract is "JSON on stdout ONLY" (the container parses the
+            # whole stdout with json.loads); git's diffstat / "Updating.."/ conflict
+            # chatter on stdout would otherwise corrupt the response into a parse
+            # failure (a successful update misread as {"ok": false}).
+            if git pull --ff-only >/dev/null 2>&1; then
                 # Restore local config changes
                 CONFIG_RESET=0
                 if [ "$STASHED" -eq 1 ]; then
-                    if ! git stash pop --quiet 2>/dev/null; then
-                        # Conflict — drop the stash and warn (config can be re-set)
-                        git checkout -- . 2>/dev/null || true
-                        git stash drop --quiet 2>/dev/null || true
+                    if ! git stash pop --quiet >/dev/null 2>&1; then
+                        # Conflict applying local config onto the freshly pulled
+                        # tree. Reset the worktree to a clean post-pull state so the
+                        # gateway stays functional, but DO NOT `git stash drop` — the
+                        # local config (container_ip, etc.) stays recoverable via
+                        # `git stash list`. Dropping it here silently destroyed the
+                        # operator's config (the bug this fixes). Stashes may
+                        # accumulate across repeated conflicts — that is benign and
+                        # recoverable, unlike silent loss.
+                        git reset --hard --quiet HEAD >/dev/null 2>&1 || git checkout -- . >/dev/null 2>&1 || true
                         CONFIG_RESET=1
                     fi
                 fi
@@ -212,12 +223,12 @@ with open(sf, "w") as f:
     json.dump(d, f, indent=2)
 PYEOF
                 if [ "$CONFIG_RESET" -eq 1 ]; then
-                    printf '{"ok": true, "action": "update", "old": "%s", "new": "%s", "warning": "local config changes were discarded due to merge conflict — re-run install_guardian.sh to regenerate"}\n' "$OLD" "$NEW"
+                    printf '{"ok": true, "action": "update", "old": "%s", "new": "%s", "warning": "local config changes conflicted with the update and were preserved in git stash (recover with: git stash list); or re-run install_guardian.sh to regenerate"}\n' "$OLD" "$NEW"
                 else
                     printf '{"ok": true, "action": "update", "old": "%s", "new": "%s"}\n' "$OLD" "$NEW"
                 fi
             else
-                [ "$STASHED" -eq 1 ] && git stash pop --quiet 2>/dev/null || true
+                [ "$STASHED" -eq 1 ] && git stash pop --quiet >/dev/null 2>&1 || true
                 printf '{"ok": false, "action": "update", "error": "git pull failed"}\n' >&2
                 exit 1
             fi
