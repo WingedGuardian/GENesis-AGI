@@ -222,9 +222,12 @@ def test_large_temp_goes_to_dedicated_dir_not_inherited_tmpdir(backup_env, tmp_p
     policed ~/.genesis/cc-tmp 'oxygen' folder. Regression for the 2026-06-18 incident:
     a 269MB dump via bare `mktemp` filled cc-tmp and the watchgod killed CC sessions.
     The seeded `tmp_filesystem_limit` procedure already mandates ~/tmp for large temp."""
-    offsite = tmp_path / "offsite"; offsite.mkdir()
-    cctmp = tmp_path / "cc-tmp-sentinel"; cctmp.mkdir()      # stand-in for the oxygen folder
-    bigtmp = tmp_path / "dedicated-big-tmp"; bigtmp.mkdir()
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    cctmp = tmp_path / "cc-tmp-sentinel"   # stand-in for the watchgod "oxygen" folder
+    cctmp.mkdir()
+    bigtmp = tmp_path / "dedicated-big-tmp"
+    bigtmp.mkdir()
     env = dict(os.environ)
     env.update(
         HOME=str(backup_env["home"]), GENESIS_DIR=str(backup_env["gd"]),
