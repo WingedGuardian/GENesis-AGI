@@ -61,6 +61,10 @@ class OutreachScheduler:
         # fallback when the DB query fails (e.g., lock contention).
         self._cached_critical_obs: list[dict] = []
         self._cached_critical_obs_at: float = 0.0  # monotonic time of cache
+        # Ambient-capture health — last-known status (state-change dedup) and
+        # last-alert time (hourly re-alert of a persistent bad state).
+        self._ambient_health_status: str = "ok"
+        self._ambient_health_last_alert: float = 0.0  # monotonic time
 
     @property
     def is_running(self) -> bool:
@@ -129,6 +133,15 @@ class OutreachScheduler:
             "interval",
             minutes=5,
             id="outreach_critical_observations",
+            replace_existing=True,
+        )
+        # Ambient capture health — alert if the edge ambient bridge goes dark.
+        # No-op when ~/.genesis/ambient_remote.yaml is absent (other installs).
+        self._scheduler.add_job(
+            self._ambient_health_job,
+            "interval",
+            minutes=10,
+            id="outreach_ambient_health",
             replace_existing=True,
         )
         self._scheduler.start()
@@ -477,6 +490,75 @@ class OutreachScheduler:
         except Exception as exc:
             logger.exception("Critical observations outreach job failed")
             await self._record_job_result("critical_observations", error=str(exc))
+
+    async def _ambient_health_job(self) -> None:
+        """Alert when the edge ambient-capture bridge goes dark.
+
+        SSH-reads the edge health file, evaluates it, and alerts the user
+        (Telegram) on a transition into a bad state, with a recovery note when it
+        comes back. No-op if ~/.genesis/ambient_remote.yaml is not configured.
+        Runs even when paused (observability, not a dispatch). A single "unknown"
+        (transient SSH failure) does not flip the alert state.
+        """
+        try:
+            import time
+
+            from genesis.observability.ambient_health import (
+                evaluate_ambient_health,
+                load_ambient_remote_config,
+                read_edge_health,
+            )
+
+            cfg = load_ambient_remote_config()
+            if cfg is None:
+                return  # no ambient edge on this install — silent no-op
+
+            verdict = evaluate_ambient_health(await read_edge_health(cfg))
+            prev = self._ambient_health_status
+            now_mono = time.monotonic()
+            _REALERT_S = 60 * 60  # re-alert a persistent bad state at most hourly
+
+            if verdict.status in ("down", "degraded"):
+                entered_bad = prev not in ("down", "degraded")
+                if entered_bad or (now_mono - self._ambient_health_last_alert) > _REALERT_S:
+                    emoji = "\U0001f534" if verdict.status == "down" else "\U0001f7e1"
+                    text = (
+                        f"{emoji} Ambient capture {verdict.status.upper()}\n"
+                        + "\n".join(f"• {r}" for r in verdict.reasons)
+                        + "\n\n(toggle Ambient Mode off→on to reconnect the device)"
+                    )
+                    envelope = OutreachRequest(
+                        category=OutreachCategory.BLOCKER,
+                        topic="Ambient Capture Health",
+                        context=text,
+                        salience_score=1.0,
+                        signal_type="ambient_health",
+                        source_id=f"ambient_health:{verdict.status}",
+                    )
+                    result = await self._pipeline.submit_raw(text, envelope)
+                    logger.info("Ambient health alert (%s): %s", verdict.status, result.status.value)
+                    self._ambient_health_last_alert = now_mono
+                self._ambient_health_status = verdict.status
+            elif verdict.status == "ok":
+                if prev in ("down", "degraded"):
+                    text = "\U0001f7e2 Ambient capture recovered (healthy)."
+                    envelope = OutreachRequest(
+                        category=OutreachCategory.BLOCKER,
+                        topic="Ambient Capture Health",
+                        context=text,
+                        salience_score=0.7,
+                        signal_type="ambient_health",
+                        source_id="ambient_health:ok",
+                    )
+                    await self._pipeline.submit_raw(text, envelope)
+                    logger.info("Ambient health recovered")
+                self._ambient_health_status = "ok"
+            # status == "unknown": transient — leave _ambient_health_status as-is
+
+            await self._record_job_result("ambient_health")
+        except Exception as exc:
+            logger.exception("Ambient health monitor job failed")
+            await self._record_job_result("ambient_health", error=str(exc))
 
     async def _calibration_job(self) -> None:
         """Reconcile predictions and recompute calibration curves."""
