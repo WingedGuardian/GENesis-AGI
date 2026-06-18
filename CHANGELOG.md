@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Browse and manage your reference store from the dashboard** — a new **References** tab
+  lists every credential, URL, IP, and account handle Genesis has stored, grouped by kind, with
+  search and a per-entry badge showing whether you saved it (verified) or Genesis auto-captured
+  it. Secret values stay hidden until you click reveal, then you can copy or delete any entry.
+  This replaces the old `~/.genesis/known-to-genesis.md` text file (now retired) with a single,
+  always-current, access-controlled view — no more stale or secret-leaking flat file.
+
 - **Genesis now detects and auto-heals a stalled Guardian updater** — it watches whether the
   Guardian's *deployed* updater script on the host matches the code it has actually pulled. If
   the updater silently froze (the failure that left it ~2 months stale), Genesis notices within
