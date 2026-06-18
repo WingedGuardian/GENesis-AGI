@@ -78,6 +78,25 @@ def test_local_full_roundtrip(tmp_path):
     assert not (root / "Genesis/host/STAMP").exists()
 
 
+def test_local_list_dirs_excludes_files(tmp_path):
+    """backend_list_dirs returns DIRECTORY names only — a stray file is excluded
+    (so the restore host/stamp auto-detect can't be fooled by a stray file)."""
+    root = tmp_path / "offsite"
+    (root / "Genesis" / "hostA").mkdir(parents=True)
+    (root / "Genesis" / "hostB").mkdir(parents=True)
+    (root / "Genesis" / "stray.txt").write_text("junk")
+    env = {"GENESIS_BACKUP_TIER2_BACKEND": "local", "GENESIS_BACKUP_LOCAL_PATH": str(root)}
+    body = ('backend_init\n'
+            'echo "DIRS_START"; backend_list_dirs "Genesis"; echo "DIRS_END"\n'
+            'echo "ALL_START"; backend_list "Genesis"; echo "ALL_END"\n')
+    proc = _run_bash(body, env)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    dirs = set(proc.stdout.split("DIRS_START")[1].split("DIRS_END")[0].split())
+    assert dirs == {"hostA", "hostB"}, dirs
+    allnames = set(proc.stdout.split("ALL_START")[1].split("ALL_END")[0].split())
+    assert "stray.txt" in allnames, "plain backend_list should still include files"
+
+
 def test_local_unavailable_when_root_missing(tmp_path):
     """A local target whose directory does not exist is NOT available (so the
     caller treats it like an unusable/unconfigured backend, not silent success)."""
@@ -169,6 +188,7 @@ def test_smb_command_shapes_and_list_parsing(tmp_path):
         backend_put "{src}" "Genesis/host/STAMP/data/f.gpg"
         backend_get "Genesis/host/STAMP/data/f.gpg" "{tmp_path}/out.gpg"
         echo "LIST_START"; backend_list "Genesis/host/STAMP"; echo "LIST_END"
+        echo "DIRS_START"; backend_list_dirs "Genesis/host/STAMP"; echo "DIRS_END"
         backend_exists "Genesis/host/STAMP/COMPLETE" && echo "COMPLETE=present"
         backend_delete "Genesis/host/STAMP"
         backend_cleanup
@@ -189,6 +209,9 @@ def test_smb_command_shapes_and_list_parsing(tmp_path):
     # list parsing extracted real entries only (no ./.. and no "blocks" summary)
     listed = set(proc.stdout.split("LIST_START")[1].split("LIST_END")[0].split())
     assert listed == {"20260617T180000Z", "20260618T180000Z", "COMPLETE"}, listed
+    # backend_list_dirs excludes COMPLETE (a file, attr "A") — dirs only.
+    dirs = set(proc.stdout.split("DIRS_START")[1].split("DIRS_END")[0].split())
+    assert dirs == {"20260617T180000Z", "20260618T180000Z"}, dirs
     assert "COMPLETE=present" in proc.stdout
 
 

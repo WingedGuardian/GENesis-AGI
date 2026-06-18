@@ -184,6 +184,9 @@ fi
 # can find them. Destination is the pluggable backend (none/local/smb).
 _pull_from_offsite() {
     backend_init
+    # Clean the backend's transient creds when this function returns (tighter than
+    # the script-wide EXIT trap, which also calls it — backend_cleanup is idempotent).
+    trap 'backend_cleanup' RETURN
     local be
     be="$(backend_name)"
     [ "$be" = "none" ] && return 0
@@ -206,7 +209,7 @@ _pull_from_offsite() {
         while read -r st; do
             [ -n "$st" ] || continue
             backend_exists "$hd/$st/COMPLETE" && { echo "$st"; return 0; }
-        done < <(backend_list "$hd" | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -ru)
+        done < <(backend_list_dirs "$hd" | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -ru)
         return 1
     }
 
@@ -217,7 +220,7 @@ _pull_from_offsite() {
     host_dir="Genesis/$off_host"
     latest="$(_latest_complete "$host_dir" || true)"
     if [ -z "$latest" ]; then
-        hosts=$(backend_list "Genesis" || true)
+        hosts=$(backend_list_dirs "Genesis" || true)
         n=$(printf '%s' "$hosts" | grep -c . || true)
         if [ "$n" = 1 ]; then
             host_dir="Genesis/$hosts"

@@ -25,6 +25,7 @@
 #   backend_put    <local-file> <remote-path>
 #   backend_get    <remote-path> <local-file>
 #   backend_list   <remote-dir>              emit child NAMES (files+dirs), one/line
+#   backend_list_dirs <remote-dir>           emit child DIRECTORY names only, one/line
 #   backend_exists <remote-path>             exit 0 if present, else 1
 #   backend_delete <remote-path-or-dir>      recursive delete
 #   backend_available                        exit 0 if the backend tool/config is usable
@@ -125,6 +126,15 @@ _smb_list() {
         | awk '$1!="." && $1!=".." && $2 ~ /^[DAHSRN]+$/ {print $1}' || true
 }
 
+_smb_list_dirs() {
+    # Like _smb_list but DIRECTORIES only — a directory's attribute column contains
+    # D (e.g. "D", "DH"), a file's never does. Used for host/stamp discovery so a
+    # stray file under Genesis/ can't be mistaken for a host dir (would corrupt the
+    # sole-host auto-detect on a fresh DR box).
+    _smb_run -c "cd \"$1\"; ls" 2>/dev/null \
+        | awk '$1!="." && $1!=".." && $2 ~ /D/ {print $1}' || true
+}
+
 _smb_exists() {
     local p="$1" b
     b="$(basename "$p")"
@@ -140,6 +150,7 @@ _local_mkdir()  { mkdir -p "$_BACKEND_LOCAL_ROOT/$1" 2>/dev/null; }
 _local_put()    { mkdir -p "$(dirname "$_BACKEND_LOCAL_ROOT/$2")" 2>/dev/null && cp "$1" "$_BACKEND_LOCAL_ROOT/$2"; }
 _local_get()    { cp "$_BACKEND_LOCAL_ROOT/$1" "$2"; }
 _local_list()   { ls -1A "$_BACKEND_LOCAL_ROOT/$1" 2>/dev/null || true; }
+_local_list_dirs() { find "$_BACKEND_LOCAL_ROOT/$1" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null || true; }
 _local_exists() { [ -e "$_BACKEND_LOCAL_ROOT/$1" ]; }
 _local_delete() { rm -rf "${_BACKEND_LOCAL_ROOT:?}/$1"; }
 
@@ -169,6 +180,13 @@ backend_list() {
     case "$_BACKEND" in
         smb)   _smb_list "$1" ;;
         local) _local_list "$1" ;;
+        *)     return 0 ;;
+    esac
+}
+backend_list_dirs() {
+    case "$_BACKEND" in
+        smb)   _smb_list_dirs "$1" ;;
+        local) _local_list_dirs "$1" ;;
         *)     return 0 ;;
     esac
 }

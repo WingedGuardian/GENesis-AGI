@@ -141,6 +141,20 @@ def test_autodetects_sole_host(sandbox):
     assert _db_value(sandbox) == "99"
 
 
+def test_autodetect_ignores_stray_file_under_genesis(sandbox):
+    """A stray FILE under Genesis/ must NOT be mistaken for a host dir — the
+    sole-host auto-detect must still find the one real host. (Regression: the
+    generic backend_list returned files+dirs, corrupting the host count; the fix
+    uses a dir-only listing.)"""
+    _snapshot(sandbox, "onlyhost", _NEW)
+    (sandbox["offsite"] / "Genesis" / "stray.txt").write_text("junk")
+    proc = _run(sandbox, host_override="ghost")  # 'ghost' has no snapshots
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "using the only host: onlyhost" in proc.stdout, (
+        f"stray file under Genesis/ broke sole-host auto-detect:\n{proc.stdout}")
+    assert _db_value(sandbox) == "99"
+
+
 def test_no_backend_configured_skips_pull(sandbox):
     """backend=none → no off-site pull, no payload, no crash."""
     _snapshot(sandbox, "sourcebox", _NEW)
