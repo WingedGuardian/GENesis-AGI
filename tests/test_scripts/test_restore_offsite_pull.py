@@ -205,3 +205,20 @@ def test_pulls_and_rehydrates_memory_config_secrets(sandbox):
     assert sec_file.is_file() and sec_file.read_text() == "SECRET=xyz\n", \
         f"secrets not rehydrated from off-site:\n{proc.stdout}"
     assert oct(sec_file.stat().st_mode)[-3:] == "600", "secrets not chmod 0600"
+
+
+def test_failed_memory_pull_warns_and_fails(sandbox):
+    """A failed off-site pull of a memory payload must WARN (→ non-zero restore), not be
+    silent — silent DR data-loss is the footgun this PR exists to prevent. The pull loop
+    runs in this shell (process substitution), so warn's _FAILURES append survives. We
+    force a get failure by staging the 'file' as a directory (the local backend's `cp`
+    without -r fails on a directory)."""
+    snap = sandbox["offsite"] / "Genesis" / "sourcebox" / _NEW
+    (snap / "data").mkdir(parents=True)
+    (snap / "data" / "genesis.sql.gpg").write_bytes(sandbox["dump_gpg"].read_bytes())
+    (snap / "memory" / "note.md.gpg").mkdir(parents=True)  # a dir → backend_get (cp) fails
+    (snap / "COMPLETE").write_text("")
+    proc = _run(sandbox, host_override="sourcebox")
+    assert proc.returncode != 0, f"failed memory pull must fail the restore:\n{proc.stdout}"
+    assert "failed to pull memory/note.md.gpg" in proc.stdout, \
+        f"failed memory pull was silent (no warn):\n{proc.stdout}"
