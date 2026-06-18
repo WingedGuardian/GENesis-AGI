@@ -37,6 +37,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from genesis.util.tmp import big_tmp_dir
+
 from .findings import (
     InstallInfo,
     ReviewResult,
@@ -382,7 +384,7 @@ def _prepare_and_push_branch(
         cwd=str(repo_path), timeout=10, check=False,
     )
 
-    wt_dir = Path(tempfile.mkdtemp(prefix="genesis-contrib-"))
+    wt_dir = Path(tempfile.mkdtemp(prefix="genesis-contrib-", dir=big_tmp_dir()))
     worktree_added = False
     try:
         # 1. detached worktree at upstream HEAD
