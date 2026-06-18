@@ -327,23 +327,29 @@ async def list_by_domain(
 ) -> dict[str, list[dict]]:
     """Return all units for a project_type grouped by domain.
 
-    Used by the mirror generator. Returns ``{domain: [{id, concept, body,
-    ingested_at, tags}, ...]}`` sorted by domain then ingested_at desc.
+    Returns ``{domain: [{id, concept, body, ingested_at, tags,
+    source_pipeline, confidence}, ...]}`` sorted by domain then ingested_at
+    desc. Used by the dashboard reference browser — ``source_pipeline`` and
+    ``confidence`` drive the provenance badge (manual/verified vs
+    auto-captured/unverified).
     """
     rows = await db.execute_fetchall(
-        "SELECT id, domain, concept, body, ingested_at, tags "
+        "SELECT id, domain, concept, body, ingested_at, tags, "
+        "source_pipeline, confidence "
         "FROM knowledge_units WHERE project_type = ? "
         "ORDER BY domain, ingested_at DESC",
         (project_type,),
     )
     result: dict[str, list[dict]] = {}
-    for uid, domain, concept, body, ingested_at, tags in rows:
+    for uid, domain, concept, body, ingested_at, tags, source_pipeline, confidence in rows:
         result.setdefault(domain, []).append({
             "id": uid,
             "concept": concept,
             "body": body,
             "ingested_at": ingested_at,
             "tags": tags,
+            "source_pipeline": source_pipeline,
+            "confidence": confidence,
         })
     return result
 

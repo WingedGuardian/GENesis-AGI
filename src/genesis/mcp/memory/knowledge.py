@@ -6,7 +6,15 @@ import json
 import logging
 from datetime import UTC, datetime
 
-from genesis.memory.reference_mirror import regenerate_mirror
+from genesis.memory.reference_ops import (
+    REFERENCE_KINDS as _REFERENCE_KINDS,
+)
+from genesis.memory.reference_ops import (
+    REFERENCE_PROJECT as _REFERENCE_PROJECT,
+)
+from genesis.memory.reference_ops import (
+    delete_reference_entry,
+)
 
 from ..memory import mcp
 
@@ -40,19 +48,6 @@ def _apply_authority_boost(merged: list[dict]) -> list[dict]:
         item["score"] = item.get("score", 0.0) * boost
     merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     return merged
-
-
-async def _refresh_mirror_safe() -> None:
-    """Regenerate the markdown mirror, absorbing any failure."""
-    try:
-        memory_mod = _memory_mod()
-        if memory_mod._db is not None:
-            await regenerate_mirror(memory_mod._db)
-    except Exception:
-        logger.warning(
-            "reference_mirror: write failed — mirror may be stale",
-            exc_info=True,
-        )
 
 
 @mcp.tool()
@@ -266,18 +261,6 @@ async def knowledge_status(
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
-_REFERENCE_KINDS = frozenset({
-    "credentials",
-    "url",
-    "network",
-    "persona_pointer",
-    "account",
-    "fact",
-})
-
-_REFERENCE_PROJECT = "reference"
-
-
 def _format_reference_body(
     *,
     kind: str,
@@ -414,7 +397,6 @@ async def reference_store(
         collection="episodic_memory",
         memory_type="episodic",
     )
-    await _refresh_mirror_safe()
     return unit_id
 
 
@@ -604,43 +586,22 @@ async def reference_delete(unit_id: str) -> bool:
     assert memory_mod._store is not None
     assert memory_mod._db is not None
 
-    # Fetch the row first so we have the qdrant_id for cleanup.
-    row = await memory_mod.knowledge.get(memory_mod._db, unit_id)
-    if row is None:
-        return False
-
-    # Only delete reference entries via this tool — refuse to use it as a
-    # generic knowledge_unit delete path, which could break external callers.
-    if row.get("project_type") != _REFERENCE_PROJECT:
-        raise ValueError(
-            f"reference_delete: unit {unit_id} is not a reference entry "
-            f"(project_type={row.get('project_type')!r})"
-        )
-
-    qdrant_id = row.get("qdrant_id")
-    if qdrant_id:
-        try:
-            await memory_mod._store.delete(qdrant_id)
-        except Exception:
-            logger.error(
-                "reference_delete: Qdrant cleanup failed for unit %s "
-                "(qdrant_id=%s)", unit_id, qdrant_id, exc_info=True,
-            )
-
-    deleted = await memory_mod.knowledge.delete(memory_mod._db, unit_id)
-    logger.info("Reference entry %s deleted: %s", unit_id, deleted)
-    await _refresh_mirror_safe()
-    return deleted
+    # Shared delete path (SQLite row + FTS + Qdrant across both collections),
+    # also used by the dashboard reference browser. Raises ValueError if the
+    # unit is not a reference entry.
+    return await delete_reference_entry(
+        memory_mod._db, memory_mod._store, unit_id,
+    )
 
 
 @mcp.tool()
 async def reference_export() -> dict:
-    """Export a summary of the reference store and regenerate the markdown mirror.
+    """Export a summary of the reference store.
 
     Returns counts per domain plus the total entry count. Use for manual
     inspection from a CC session — answers "what do I have stored?" without
-    exposing values. Use ``reference_lookup`` to retrieve actual entries.
-    Also regenerates ``~/.genesis/known-to-genesis.md``.
+    exposing values. Use ``reference_lookup`` to retrieve actual entries, or
+    browse the reference store live on the dashboard References tab.
     Does NOT return values/bodies — use ``reference_lookup`` or
     ``knowledge_recall`` for that.
     """
@@ -651,7 +612,6 @@ async def reference_export() -> dict:
     stats_result = await memory_mod.knowledge.stats(
         memory_mod._db, project=_REFERENCE_PROJECT,
     )
-    await _refresh_mirror_safe()
     return {
         "project_type": _REFERENCE_PROJECT,
         "total": stats_result["total"],
