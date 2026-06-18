@@ -87,6 +87,16 @@ _send_telegram() {
         > /dev/null 2>&1 || log "WARNING: Telegram alert failed to send"
 }
 
+# Large intermediate files (the multi-hundred-MB SQLite .dump) must NOT land in the
+# inherited TMPDIR: for a CC-launched run that is ~/.genesis/cc-tmp (the watchgod-policed
+# "oxygen" folder — filling it kills CC sessions); for the 6h cron it is /tmp (tmpfs/RAM).
+# Route them to a dedicated on-disk dir, per the tmp_filesystem_limit procedure ("use ~/tmp
+# for large temporary files"). We do NOT export TMPDIR — only the big files move; everything
+# else (and Claude Code) keeps its normal TMPDIR.
+GENESIS_BIG_TMP="${GENESIS_BACKUP_TMPDIR:-$HOME/tmp}"
+mkdir -p "$GENESIS_BIG_TMP"
+log "big-temp dir: $GENESIS_BIG_TMP"
+
 # ── Encryption helpers ───────────────────────────────────────────────
 # All PII-bearing payloads (SQLite dump, transcripts, memory) use the
 # same GPG symmetric passphrase as secrets. If the passphrase is unset,
@@ -147,7 +157,7 @@ if [ -f "$DB_FILE" ]; then
     if ! $_ENCRYPT_READY; then
         log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping SQLite backup (refusing plaintext)"
     else
-        _SQL_TMP=$(mktemp)
+        _SQL_TMP=$(mktemp -p "$GENESIS_BIG_TMP")  # ~269MB dump — keep off cc-tmp/RAM
         if sqlite3 "$DB_FILE" .dump > "$_SQL_TMP" 2>/dev/null; then
             _SQLITE_LINES=$(wc -l < "$_SQL_TMP")
             if encrypt_file "$_SQL_TMP" data/genesis.sql.gpg; then

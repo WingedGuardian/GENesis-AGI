@@ -97,6 +97,14 @@ log()  { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 warn() { log "WARNING: $*"; _FAILURES+=("$*"); }
 die()  { log "FATAL: $*"; _FAILURES+=("$*"); exit 1; }
 
+# Large intermediate files (the ~269MB decrypted SQLite .dump, decrypted Qdrant snapshots)
+# must NOT land in the inherited TMPDIR (cc-tmp = the watchgod "oxygen" folder for a CC run;
+# /tmp tmpfs/RAM otherwise). Route them to a dedicated on-disk dir per the tmp_filesystem_limit
+# procedure. NOT an `export TMPDIR` — only the big files move.
+GENESIS_BIG_TMP="${GENESIS_BACKUP_TMPDIR:-$HOME/tmp}"
+mkdir -p "$GENESIS_BIG_TMP"
+log "big-temp dir: $GENESIS_BIG_TMP"
+
 # Quiesce the live writer before swapping the SQLite DB — a live WAL connection
 # would corrupt the restore. Guarded for fresh-box DR (no systemctl / no unit /
 # no user session → no-op). Intentionally does NOT restart: the operator
@@ -322,7 +330,7 @@ if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
             log "SQLite: would restore from $src → $DB_FILE"
         elif confirm "Restore SQLite from $(basename "$src") into $DB_FILE?"; then
             mkdir -p "$(dirname "$DB_FILE")"
-            _SQL_TMP=$(mktemp)
+            _SQL_TMP=$(mktemp -p "$GENESIS_BIG_TMP")  # ~269MB dump — keep off cc-tmp/RAM
             if $__PAYLOAD_NEEDS_DECRYPT; then
                 decrypt_file "$src" "$_SQL_TMP" || { warn "SQLite decrypt failed"; rm -f "$_SQL_TMP"; }
             else
@@ -421,7 +429,7 @@ if [ -d "$BACKUP_DIR/data/qdrant" ]; then
                     warn "Qdrant: '$coll' is encrypted but GENESIS_BACKUP_PASSPHRASE unset — skipping"
                     continue
                 fi
-                _QDRANT_TMP=$(mktemp --suffix=.snapshot)
+                _QDRANT_TMP=$(mktemp -p "$GENESIS_BIG_TMP" --suffix=.snapshot)  # large — keep off cc-tmp/RAM
                 if ! decrypt_file "$snap" "$_QDRANT_TMP"; then
                     warn "Qdrant: decrypt failed for '$coll'"
                     rm -f "$_QDRANT_TMP"

@@ -28,9 +28,16 @@ reflection) → Services (routing, memory, outreach, autonomy, surplus) → Data
 - **Env scrub**: `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` is NOT used — Genesis
   hooks and MCP servers require inherited API keys (DeepInfra, Qwen, etc.).
 - **Setup**: `./scripts/bootstrap.sh` (venv, config, services, memory)
-- **Temp files**: `~/tmp/` for transient downloads (media, audio, exports).
-  NEVER use `/tmp/` — it shares the root filesystem and competes with all
-  CC sessions.  Clean up after use.
+- **Temp files**: `~/tmp/` for transient files and any LARGE temp (downloads,
+  media, DB dumps, exports). NEVER write large files to `/tmp/` (a small
+  tmpfs/RAM) or `~/.genesis/cc-tmp/` — the latter is Claude Code's working temp
+  ("oxygen"), policed by the `genesis-tmp-watchgod` service, which **kills CC
+  sessions** when it fills. A CC session's `TMPDIR` points at `cc-tmp` by design;
+  do NOT override `TMPDIR` in scripts or service files (breaks CC — see the
+  `tmp_filesystem_limit` procedure). Code that creates large temp must pass an
+  explicit dir (`mktemp -p ~/tmp` / `tempfile(dir=…)`), never the default. For a
+  heavy one-off you run interactively, prefix `TMPDIR=~/tmp/job <cmd>`. Clean up
+  after use.
 
 ## Process Management
 
