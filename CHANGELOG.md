@@ -72,6 +72,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   deliberately leaves the server stopped afterward so you can verify the restore
   before bringing Genesis back up.
 
+- **The host Guardian's self-update no longer throws away your local config on a
+  conflict** — when it pulls new code and a local setting (e.g. the container IP)
+  clashes with an upstream change to the same lines, the update used to silently
+  discard those local changes. It now preserves them in a recoverable git stash
+  (and tells you they're recoverable) instead of dropping them. The update also
+  reports its result reliably, so a successful update that pulled changes is no
+  longer misread as a failure.
+
 - **Guardian host updates no longer silently stall** — on hosts where the
   Guardian's `CLAUDE.md` had been pinned with git's skip-worktree flag, the
   Guardian's self-update (`git pull`) would abort the moment that file changed

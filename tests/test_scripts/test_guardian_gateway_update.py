@@ -232,6 +232,82 @@ def test_update_writes_deployed_commit(stub_bin, tmp_path):
     assert json.loads(ds.read_text())["deployed_commit"] == _short_head(install)
 
 
+def test_update_conflict_preserves_local_config_in_stash(stub_bin, tmp_path):
+    """On a `git stash pop` CONFLICT, the operator's local config must be PRESERVED
+    in the stash (recoverable), NOT silently `git stash drop`ped.
+
+    The bug: when a local config change (e.g. container_ip) conflicts with an
+    upstream change to the same line, `update` used to `git checkout -- .` +
+    `git stash drop`, destroying the local config. The fix resets the worktree to a
+    clean post-pull state (gateway stays functional) but keeps the stash, and the
+    JSON reports a *recoverable* warning.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    install = _seed_repo(home)
+
+    # Local uncommitted config change in the install dir → becomes the stash.
+    (install / "config" / "guardian.yaml").write_text(
+        'container_name: genesis\ncontainer_ip: "LOCAL-ONLY-VALUE"\n')
+
+    # Upstream changes the SAME line differently → `git stash pop` will conflict.
+    pusher2 = home / "pusher2"
+    _git("clone", "-q", str(home / "remote.git"), str(pusher2), cwd=home)
+    _git("config", "user.email", "t@t.t", cwd=pusher2)
+    _git("config", "user.name", "t", cwd=pusher2)
+    (pusher2 / "config" / "guardian.yaml").write_text(
+        'container_name: genesis\ncontainer_ip: "UPSTREAM-VALUE"\n')
+    _git("commit", "-aqm", "upstream guardian.yaml change", cwd=pusher2)
+    _git("push", "-q", "origin", "main", cwd=pusher2)
+
+    proc = _run_update(home, stub_bin)
+
+    # update still succeeds and reports the *recoverable* (not discarded) warning.
+    # The ENTIRE stdout must parse as JSON even on this path — a conflicted
+    # `git stash pop` is the noisiest case, so this is the strongest JSON-purity guard.
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    data = json.loads(proc.stdout)
+    assert data["ok"] is True, data
+    assert "preserved in git stash" in data["warning"], (
+        f"conflict warning must say the config is recoverable, not discarded:\n{data}")
+
+    # The stash was NOT dropped — the operator's local config is recoverable.
+    stash_list = subprocess.run(["git", "stash", "list"], cwd=str(install),
+                                capture_output=True, text=True).stdout
+    assert stash_list.strip(), "stash was dropped — local config silently lost (the bug)"
+    stash_show = subprocess.run(["git", "stash", "show", "-p"], cwd=str(install),
+                                capture_output=True, text=True).stdout
+    assert "LOCAL-ONLY-VALUE" in stash_show, (
+        f"stash does not contain the operator's local config value:\n{stash_show}")
+
+    # guardian.yaml is reset cleanly to the upstream state — no leftover conflict
+    # markers (the gateway worktree stays functional for the next pull).
+    gy = (install / "config" / "guardian.yaml").read_text()
+    assert "<<<<<<<" not in gy and "UPSTREAM-VALUE" in gy, (
+        f"guardian.yaml left in conflict / not reset to upstream:\n{gy!r}")
+
+
+def test_update_response_is_pure_json(stub_bin, tmp_path):
+    """The `update` verb's stdout contract is JSON-ONLY: the container
+    (`remote.py`) parses the whole stdout with `json.loads`. A real-change pull
+    emits git's diffstat ("Updating.. / Fast-forward / <stats>") to STDOUT; if that
+    leaks before the JSON, `json.loads` throws and a SUCCESSFUL update is misread as
+    {"ok": false}. Every git command in the verb must suppress stdout so the
+    response stays pure JSON.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    _seed_repo(home)  # upstream advances CLAUDE.md → `git pull` produces a diffstat
+
+    proc = _run_update(home, stub_bin)
+
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    # The ENTIRE stdout must be valid JSON — no git diffstat/chatter prefix.
+    data = json.loads(proc.stdout)  # raises if polluted → guards the contract
+    assert data["ok"] is True, data
+    assert data["action"] == "update", data
+
+
 def test_sync_gateway_redeploys_from_install_dir(stub_bin, tmp_path):
     """`sync-gateway` copies the install-dir gateway to ~/.local/bin WITHOUT a
     pull — the recovery lever when the update self-update path is unavailable."""
