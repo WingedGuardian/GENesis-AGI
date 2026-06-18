@@ -171,10 +171,13 @@ clean_cc_red() {
     find "$CC_TMP_DIR" -type d \( -name "claude-skills" -o -name "tsx-*" \) \
         -exec rm -rf {} + 2>/dev/null || true
 
-    # Kill ALL idle CC sessions
+    # Kill ALL idle CC sessions (log each — so it's clear which terminals were reaped)
     while IFS= read -r sname; do
         [[ -z "$sname" ]] && continue
-        [[ "$sname" =~ ^cc- ]] && tmux kill-session -t "$sname" 2>/dev/null || true
+        if [[ "$sname" =~ ^cc- ]]; then
+            log WARN "RED killing idle CC session: $sname"
+            tmux kill-session -t "$sname" 2>/dev/null || true
+        fi
     done < <(tmux list-sessions -F '#{session_name}:#{session_attached}' 2>/dev/null \
              | grep ':0$' | cut -d: -f1 || true)
 
@@ -182,6 +185,28 @@ clean_cc_red() {
     mkdir -p "$ALERT_DIR"
     touch "$ALERT_DIR/tmp_emergency"
     log WARN "Zone A RED — nuclear cleanup complete"
+}
+
+# Record cc-tmp pressure + top consumers BEFORE a cleanup runs — so a filled-folder
+# incident is diagnosable afterward (the nuclear cleanup erases the evidence otherwise).
+# The snapshot goes under the log dir (NOT cc-tmp), so it survives the cleanup.
+_log_cc_pressure() {
+    local tier="$1" used="$2" free="$3"
+    local stamp snap top
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    snap="$(dirname "$LOG_FILE")/cc_tmp_top_${stamp}.txt"
+    # `|| true` inside the substitution: an empty cc-tmp (e.g. the sacred-ground RED path,
+    # disk-full but cc-tmp empty) makes the glob literal → du fails → set -e would abort the
+    # whole daemon. Tolerate it; `top` is just empty then.
+    top=$(du -sm "$CC_TMP_DIR"/* 2>/dev/null | sort -rn | head -8 || true)
+    {
+        echo "# cc-tmp pressure ${stamp}  tier=${tier} used=${used}MB free=${free}MB budget=${CC_TMP_BUDGET_MB}MB"
+        echo "$top"
+    } > "$snap" 2>/dev/null || true
+    log WARN "cc-tmp ${tier^^}: used=${used}MB free=${free}MB budget=${CC_TMP_BUDGET_MB}MB — top consumers → ${snap}"
+    # Bound the snapshot count — a sustained ORANGE/RED episode would otherwise accumulate
+    # these unbounded on the very filesystem we're protecting. Keep the 20 most recent.
+    ls -1t "$(dirname "$LOG_FILE")"/cc_tmp_top_*.txt 2>/dev/null | tail -n +21 | xargs -r rm -f 2>/dev/null || true
 }
 
 check_cc_tmp() {
@@ -199,12 +224,15 @@ check_cc_tmp() {
 
     if (( used_mb > threshold_red )) || (( free_mb < SACRED_GROUND_MB )); then
         tier="red"
+        _log_cc_pressure red "$used_mb" "$free_mb"   # capture BEFORE the nuclear cleanup erases it
         clean_cc_red
     elif (( used_mb > threshold_orange )); then
         tier="orange"
+        _log_cc_pressure orange "$used_mb" "$free_mb"
         clean_cc_orange
     elif (( used_mb > threshold_yellow )); then
         tier="yellow"
+        log INFO "cc-tmp YELLOW: used=${used_mb}MB free=${free_mb}MB budget=${CC_TMP_BUDGET_MB}MB"
         clean_cc_yellow
     fi
 
@@ -309,4 +337,8 @@ main() {
     done
 }
 
-main "$@"
+# Run the poll loop only when executed directly — sourcing (e.g. from tests) loads the
+# functions without starting the daemon.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
