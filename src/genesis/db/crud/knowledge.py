@@ -344,6 +344,7 @@ async def list_by_domain(
     for uid, domain, concept, body, ingested_at, tags, source_pipeline, confidence in rows:
         result.setdefault(domain, []).append({
             "id": uid,
+            "domain": domain,  # self-describing rows (consumers derive kind from this)
             "concept": concept,
             "body": body,
             "ingested_at": ingested_at,

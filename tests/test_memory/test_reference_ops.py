@@ -165,3 +165,16 @@ async def test_delete_store_none_sqlite_only(_db):
     deleted = await delete_reference_entry(_db, None, unit_id)
     assert deleted is True
     assert await kc.get(_db, unit_id) is None
+
+
+async def test_list_by_domain_rows_are_self_describing(_db):
+    # The dashboard summary derives `kind` and the provenance badge from these
+    # fields; list_by_domain rows must carry domain/source_pipeline/confidence
+    # (a missing `domain` silently broke kind detection + credential redaction).
+    await _insert_ref(_db)
+    grouped = await kc.list_by_domain(_db, project_type=REFERENCE_PROJECT)
+    rows = grouped["reference.credentials"]
+    assert rows
+    assert {"domain", "source_pipeline", "confidence"} <= set(rows[0].keys())
+    assert rows[0]["domain"] == "reference.credentials"
+    assert rows[0]["source_pipeline"] == "reference_store"

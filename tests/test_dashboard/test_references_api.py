@@ -104,6 +104,52 @@ def test_list_503_when_not_bootstrapped(client):
     assert resp.status_code == 503
 
 
+def test_credential_value_in_description_is_masked(client):
+    # A credential whose secret also appears in the free-text description must
+    # be masked in the non-reveal summary (the pre-existing mirror-redaction gap).
+    body = (
+        "[reference.credentials] Junk\n\n"
+        "the password pw / secret was seen in prose\n\n"
+        "Value: pw / secret\n"
+        "Tags: x"
+    )
+    row = _ref_row(body=body, domain="reference.credentials")
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch(
+            "genesis.db.crud.knowledge.list_by_domain",
+            new=AsyncMock(return_value={"reference.credentials": [row]}),
+        ),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        resp = client.get("/api/genesis/references/list")
+    assert resp.status_code == 200
+    assert "pw / secret" not in resp.get_data(as_text=True)  # secret masked in description
+    entry = resp.get_json()["by_kind"]["credentials"][0]
+    assert "[hidden" in entry["description"]
+
+
+def test_network_value_in_description_not_masked(client):
+    # IPs/URLs are identifiers, not secrets — left readable in their own description.
+    body = (
+        "[reference.network] Host\n\n"
+        "Lab host at 203.0.113.10 on the subnet\n\n"
+        "Value: 203.0.113.10"
+    )
+    row = _ref_row(body=body, domain="reference.network", source_pipeline="extraction_job")
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch(
+            "genesis.db.crud.knowledge.list_by_domain",
+            new=AsyncMock(return_value={"reference.network": [row]}),
+        ),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        resp = client.get("/api/genesis/references/list")
+    entry = resp.get_json()["by_kind"]["network"][0]
+    assert "203.0.113.10" in entry["description"]
+
+
 # ── search ──────────────────────────────────────────────────────────────────
 
 

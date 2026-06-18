@@ -37,6 +37,15 @@ logger = logging.getLogger(__name__)
 
 _DOMAIN_PREFIX = "reference."
 
+# Kinds whose value is a genuine secret (a password/token). For these, if the
+# value string also appears in the free-text description, mask it there too so
+# the secret never shows in a non-reveal payload — closing the gap the old
+# markdown mirror had (it only redacted the structured ``Value:`` line). Other
+# kinds (network IPs, URLs, account handles) are identifiers, not secrets, and
+# naturally recur in their own descriptions, so they're left readable.
+_SENSITIVE_KINDS = frozenset({"credentials"})
+_MASK = "[hidden — reveal to view]"
+
 
 def _auth_or_403():
     """Return a 403 response tuple if not authenticated, else None."""
@@ -66,17 +75,27 @@ def _parse_tags(tags) -> list[str]:
 
 
 def _summary(row: dict) -> dict:
-    """Build a value-free summary dict for list/search/detail views."""
+    """Build a value-free summary dict for list/search/detail views.
+
+    parse_reference_body excludes the structured value; for sensitive kinds we
+    additionally mask any occurrence of the value inside the free-text
+    description, so a secret never appears in a non-reveal payload.
+    """
+    kind = _kind_of(row.get("domain"))
+    parsed = parse_reference_body(row.get("body"))
+    description = parsed.get("description", "")
+    value = parsed.get("value", "")
+    if kind in _SENSITIVE_KINDS and value and value in description:
+        description = description.replace(value, _MASK)
     return {
         "id": row.get("id") or row.get("unit_id"),
         "concept": row.get("concept"),
-        "kind": _kind_of(row.get("domain")),
+        "kind": kind,
         "tags": _parse_tags(row.get("tags")),
         "ingested_at": row.get("ingested_at"),
         "source_pipeline": row.get("source_pipeline"),
         "confidence": row.get("confidence"),
-        # description ONLY — parse_reference_body fails closed, value excluded
-        "description": parse_reference_body(row.get("body")).get("description", ""),
+        "description": description,
     }
 
 
