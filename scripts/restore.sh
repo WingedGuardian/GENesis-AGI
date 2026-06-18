@@ -13,6 +13,14 @@
 #   GENESIS_DIR                — target Genesis root (default: ~/genesis)
 #   QDRANT_URL                 — target Qdrant server (default: http://localhost:6333)
 #   SECRETS_PATH               — target secrets file (default: $GENESIS_DIR/secrets.env)
+#   GENESIS_BACKUP_NAS         — SMB share for the off-site pull (e.g. //nas/share);
+#                                the DB/Qdrant/transcripts live ONLY here (not git)
+#   GENESIS_BACKUP_NAS_USER    — SMB username for the off-site pull
+#   GENESIS_BACKUP_NAS_PASS    — SMB password for the off-site pull
+#   GENESIS_BACKUP_NAS_HOST    — SOURCE host name the snapshot was backed up under
+#                                (default: this host; set it on a fresh DR box
+#                                whose hostname differs — or rely on auto-detect
+#                                when only one host exists on the NAS)
 #
 # Behavior:
 #   - Skips destinations that already exist AND are newer than the backup
@@ -158,6 +166,89 @@ fi
 if [ -d "$BACKUP_DIR/.git" ]; then
     (cd "$BACKUP_DIR" && git pull --rebase --quiet 2>/dev/null) || log "git pull failed, continuing with local backup state"
 fi
+
+# ── Off-site (NAS) pull ──────────────────────────────────────────────
+# The large binaries (SQLite dump, Qdrant snapshots, transcripts) live ONLY on
+# the NAS — gitignored from Tier-1 — so on a fresh DR box they must be pulled
+# from the latest dated snapshot before the restore sections below can find them.
+_pull_from_nas() {
+    local nas="${GENESIS_BACKUP_NAS:-}"
+    [ -n "$nas" ] || return 0
+    if $DRY_RUN; then log "NAS: (dry-run) would pull latest off-site snapshot from $nas"; return 0; fi
+    command -v smbclient >/dev/null 2>&1 || { log "NAS: smbclient not installed — skipping off-site pull"; return 0; }
+    # Don't clobber a payload already staged locally (same-box re-run) unless
+    # forced — the NAS pull is for fresh-box DR.
+    if [ -f "$BACKUP_DIR/data/genesis.sql.gpg" ] && ! $FORCE; then
+        log "NAS: local payload already present — skipping off-site pull (use --force to override)"
+        return 0
+    fi
+
+    local host_dir nas_host creds latest snap fname dst hosts n
+    creds=$(mktemp); chmod 600 "$creds"
+    trap 'rm -f "$creds"' RETURN   # clean up creds on ANY exit from this function
+    printf 'username=%s\npassword=%s\n' "${GENESIS_BACKUP_NAS_USER:-}" "${GENESIS_BACKUP_NAS_PASS:-}" > "$creds"
+    _nsmb() { smbclient "$nas" -A "$creds" "$@"; }
+
+    # Latest snapshot under host dir $1 that is COMPLETE — a marker backup.sh
+    # writes only after every file uploaded — so a half-uploaded snapshot from a
+    # crashed backup is never selected. Echoes the stamp; returns 1 if none.
+    # Newest first; grep the stamp pattern out of the listing (robust to format).
+    _latest_complete() {
+        local hd="$1" st
+        while read -r st; do
+            [ -n "$st" ] || continue
+            _nsmb -c "cd \"$hd/$st\"; ls COMPLETE" 2>/dev/null | grep -q "COMPLETE" && { echo "$st"; return 0; }
+        done < <(_nsmb -c "cd \"$hd\"; ls" 2>/dev/null | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -ru)
+        return 1
+    }
+
+    # The snapshot was written under the SOURCE host's name. On a fresh DR box the
+    # hostname differs, so honour an explicit override, and otherwise fall back to
+    # the sole host dir on the NAS when there's exactly one (the common case).
+    nas_host="${GENESIS_BACKUP_NAS_HOST:-$(hostname)}"
+    host_dir="Genesis/$nas_host"
+    latest="$(_latest_complete "$host_dir" || true)"
+    if [ -z "$latest" ]; then
+        hosts=$(_nsmb -c "cd \"Genesis\"; ls" 2>/dev/null | awk '$2=="D" && $1!="." && $1!=".."{print $1}' || true)
+        n=$(printf '%s' "$hosts" | grep -c . || true)
+        if [ "$n" = 1 ]; then
+            host_dir="Genesis/$hosts"
+            log "NAS: no snapshots under host '$nas_host' — using the only host on the NAS: $hosts"
+            latest="$(_latest_complete "$host_dir" || true)"
+        fi
+    fi
+    if [ -z "$latest" ]; then
+        log "NAS: no COMPLETE dated snapshot found (set GENESIS_BACKUP_NAS_HOST to the source host name) — skipping off-site pull"
+        return 0
+    fi
+    log "NAS: pulling latest off-site snapshot $latest"
+    snap="$host_dir/$latest"
+
+    # SQLite dump.
+    mkdir -p "$BACKUP_DIR/data"
+    if _nsmb -c "cd \"$snap/data\"; get genesis.sql.gpg \"$BACKUP_DIR/data/genesis.sql.gpg\"" 2>/dev/null; then
+        log "  NAS: pulled data/genesis.sql.gpg"
+    else
+        warn "NAS: failed to pull genesis.sql.gpg from snapshot $latest — the database will not be restored from off-site"
+    fi
+    # Qdrant snapshots + transcripts: list the subdir, then get each *.gpg. The
+    # staging dir is created only when there's actually something to pull, so an
+    # empty set doesn't make the restore sections below run (and e.g. warn that
+    # Qdrant isn't reachable yet → spurious failure).
+    for sub in qdrant transcripts; do
+        dst="$BACKUP_DIR/data/qdrant"
+        [ "$sub" = transcripts ] && dst="$BACKUP_DIR/transcripts"
+        # `|| true`: an empty subdir makes `grep` exit non-zero → pipefail would
+        # otherwise abort the whole restore.
+        _nsmb -c "cd \"$snap/$sub\"; ls" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u | while read -r fname; do
+            mkdir -p "$dst"
+            if _nsmb -c "cd \"$snap/$sub\"; get \"$fname\" \"$dst/$fname\"" 2>/dev/null; then
+                log "  NAS: pulled $sub/$fname"
+            fi
+        done || true
+    done
+}
+_pull_from_nas
 
 # Check encrypted payloads exist without passphrase → fail fast.
 _has_encrypted=false

@@ -48,6 +48,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Off-site backups can now actually be restored** — the large data (the
+  database, vector memory, and transcripts) is stored only on your off-site
+  (NAS) target, but the restore tool had no way to fetch it — so a from-scratch
+  recovery silently couldn't bring back your database or memory. Restore now
+  pulls the latest off-site snapshot before restoring, and backups are written
+  as dated point-in-time snapshots (so you can recover a *specific* run, not just
+  the last one) with transcripts included off-site too.
+
 - **A backup that can't reach off-site storage no longer fails silently** — if
   you've configured an off-site (NAS) backup target and a run captures your data
   locally but can't replicate it off-site, Genesis now sends a distinct alert

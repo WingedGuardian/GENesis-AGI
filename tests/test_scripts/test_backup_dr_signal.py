@@ -73,10 +73,15 @@ def backup_env(tmp_path):
     return {"home": home, "gd": gd, "bind": bind, "tg": tg, "tmp": tmp_path}
 
 
-def _run(backup_env, *, smb_rc: int = 0, nas: bool = True, remove_db: bool = False):
+def _run(backup_env, *, smb_rc: int = 0, nas: bool = True, remove_db: bool = False,
+         fail_complete: bool = False):
     if remove_db:  # force _SUCCESS=false (no SQLite data) for the failure-alert path
         (backup_env["gd"] / "data" / "genesis.db").unlink(missing_ok=True)
-    _make_stub(backup_env["bind"] / "smbclient", f'#!/usr/bin/env bash\nexit {smb_rc}\n')
+    if fail_complete:  # payloads upload OK, only the COMPLETE marker fails
+        _make_stub(backup_env["bind"] / "smbclient",
+                   '#!/usr/bin/env bash\ncase "$*" in *COMPLETE*) exit 1 ;; esac\nexit 0\n')
+    else:
+        _make_stub(backup_env["bind"] / "smbclient", f'#!/usr/bin/env bash\nexit {smb_rc}\n')
     env = dict(os.environ)
     env.update(
         HOME=str(backup_env["home"]), GENESIS_DIR=str(backup_env["gd"]),
@@ -146,3 +151,13 @@ def test_local_only_not_configured_no_alert(backup_env):
     assert status["tier2_status"] == "not_configured", status
     assert status["offsite_confirmed"] is False, status
     assert not tg.strip(), f"local-only must not alert:\n{tg}"
+
+
+def test_complete_marker_failure_is_offsite_failure(backup_env):
+    """If payloads upload but the COMPLETE marker fails, restore would skip the
+    snapshot — so it must report partial + offsite_confirmed:false + alert, not ok."""
+    proc, status, tg = _run(backup_env, fail_complete=True, nas=True)
+    assert status["success"] is True, status          # local backup is still fine
+    assert status["tier2_status"] == "partial", status
+    assert status["offsite_confirmed"] is False, status
+    assert "replication" in tg.lower() or "off-site" in tg.lower(), tg
