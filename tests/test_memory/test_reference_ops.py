@@ -178,3 +178,11 @@ async def test_list_by_domain_rows_are_self_describing(_db):
     assert {"domain", "source_pipeline", "confidence"} <= set(rows[0].keys())
     assert rows[0]["domain"] == "reference.credentials"
     assert rows[0]["source_pipeline"] == "reference_store"
+
+
+async def test_search_fts_returns_provenance_fields(_db):
+    # The reference search badge needs source_pipeline + ingested_at + confidence.
+    await _insert_ref(_db)
+    rows = await kc.search_fts(_db, "ctx", project=REFERENCE_PROJECT)
+    assert rows
+    assert {"source_pipeline", "ingested_at", "confidence"} <= set(rows[0].keys())

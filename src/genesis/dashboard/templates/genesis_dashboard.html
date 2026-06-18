@@ -1178,6 +1178,7 @@
             await fetchApi(`/api/genesis/references/${id}`, { method: "DELETE" });
             this.referenceDetail = null;
             this.hideReference(id);
+            this.referenceSearchResults = this.referenceSearchResults.filter(r => r.id !== id);
             await this.fetchReferenceList();
             await this.fetchReferenceStats();
           } catch (e) { console.warn("Reference delete failed:", e); }
