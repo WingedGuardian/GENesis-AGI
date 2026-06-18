@@ -75,6 +75,8 @@ def nas_sandbox(tmp_path):
         '      for s in ${COMPLETE_STAMPS:-}; do case "$cmd" in *"$s"*) echo "  COMPLETE  A  0  x"; break ;; esac; done ;;\n'
         '  *"/qdrant"*) [ "${SERVE_QDRANT:-0}" = 1 ] && echo "  qsnap.gpg  A  10  x" || : ;;\n'
         '  *"/transcripts"*) : ;;\n'
+        '  *"Genesis/ghost\\"; ls"*) : ;;\n'                       # host \'ghost\' has no snapshots
+        '  *"cd \\"Genesis\\"; ls"*) echo "  realhost  D  0  x" ;;\n'  # host listing (auto-detect)
         f'  *ls*) printf "  {_OLD_STAMP}  D  0  x\\n  {_NEW_STAMP}  D  0  x\\n" ;;\n'
         'esac\n'
         'exit 0\n',
@@ -83,7 +85,8 @@ def nas_sandbox(tmp_path):
             "smb_log": smb_log, "tmp": tmp_path}
 
 
-def _run(nas_sandbox, *, nas=True, complete=(_OLD_STAMP, _NEW_STAMP), serve_qdrant=False):
+def _run(nas_sandbox, *, nas=True, complete=(_OLD_STAMP, _NEW_STAMP),
+         serve_qdrant=False, nas_host=None):
     env = dict(os.environ)
     env.update(
         HOME=str(nas_sandbox["home"]), GENESIS_DIR=str(nas_sandbox["gd"]),
@@ -91,6 +94,8 @@ def _run(nas_sandbox, *, nas=True, complete=(_OLD_STAMP, _NEW_STAMP), serve_qdra
         COMPLETE_STAMPS=" ".join(complete), SERVE_QDRANT="1" if serve_qdrant else "0",
         PATH=f'{nas_sandbox["bind"]}:{os.environ["PATH"]}',
     )
+    if nas_host is not None:
+        env["GENESIS_BACKUP_NAS_HOST"] = nas_host
     if nas:
         env.update(GENESIS_BACKUP_NAS="//nas/share",
                    GENESIS_BACKUP_NAS_USER="u", GENESIS_BACKUP_NAS_PASS="p")
@@ -144,6 +149,30 @@ def test_no_complete_snapshot_skips_pull(nas_sandbox):
     proc = _run(nas_sandbox, complete=())  # none complete
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     assert "no complete dated snapshot" in proc.stdout.lower()
+
+
+def test_restore_uses_explicit_nas_host_override(nas_sandbox):
+    """Fresh box with a different hostname: GENESIS_BACKUP_NAS_HOST points the
+    pull at the SOURCE host's snapshots (the P1 the restore host was using its
+    own hostname)."""
+    proc = _run(nas_sandbox, complete=(_OLD_STAMP, _NEW_STAMP), nas_host="sourcebox")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "Genesis/sourcebox/" in _smb_cmds(nas_sandbox), "did not use the override host"
+    db = nas_sandbox["gd"] / "data" / "genesis.db"
+    assert subprocess.run(["sqlite3", str(db), "SELECT x FROM t;"],
+                          capture_output=True, text=True).stdout.strip() == "99"
+
+
+def test_restore_autodetects_sole_nas_host(nas_sandbox):
+    """Hostname has no snapshots but exactly one host dir exists on the NAS → the
+    pull auto-detects it, so fresh-box DR works without setting the host name."""
+    proc = _run(nas_sandbox, complete=(_OLD_STAMP, _NEW_STAMP), nas_host="ghost")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "Genesis/realhost/" in _smb_cmds(nas_sandbox), "did not auto-detect the sole host"
+    assert "using the only host" in proc.stdout.lower()
+    db = nas_sandbox["gd"] / "data" / "genesis.db"
+    assert subprocess.run(["sqlite3", str(db), "SELECT x FROM t;"],
+                          capture_output=True, text=True).stdout.strip() == "99"
 
 
 def test_no_nas_configured_skips_pull(nas_sandbox):

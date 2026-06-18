@@ -17,6 +17,10 @@
 #                                the DB/Qdrant/transcripts live ONLY here (not git)
 #   GENESIS_BACKUP_NAS_USER    — SMB username for the off-site pull
 #   GENESIS_BACKUP_NAS_PASS    — SMB password for the off-site pull
+#   GENESIS_BACKUP_NAS_HOST    — SOURCE host name the snapshot was backed up under
+#                                (default: this host; set it on a fresh DR box
+#                                whose hostname differs — or rely on auto-detect
+#                                when only one host exists on the NAS)
 #
 # Behavior:
 #   - Skips destinations that already exist AND are newer than the backup
@@ -179,27 +183,42 @@ _pull_from_nas() {
         return 0
     fi
 
-    local host_dir creds latest snap fname dst stamp
-    host_dir="Genesis/$(hostname)"
+    local host_dir nas_host creds latest snap fname dst hosts n
     creds=$(mktemp); chmod 600 "$creds"
     trap 'rm -f "$creds"' RETURN   # clean up creds on ANY exit from this function
     printf 'username=%s\npassword=%s\n' "${GENESIS_BACKUP_NAS_USER:-}" "${GENESIS_BACKUP_NAS_PASS:-}" > "$creds"
     _nsmb() { smbclient "$nas" -A "$creds" "$@"; }
 
-    # Pick the latest snapshot that is COMPLETE — a marker backup.sh writes only
-    # after every file uploaded — so a half-uploaded snapshot from a crashed
-    # backup is never selected. Newest first; grep the stamp pattern out of the
-    # listing (robust to smbclient ls format/locale).
-    latest=""
-    while read -r stamp; do
-        [ -n "$stamp" ] || continue
-        if _nsmb -c "cd \"$host_dir/$stamp\"; ls COMPLETE" 2>/dev/null | grep -q "COMPLETE"; then
-            latest="$stamp"; break
-        fi
-        log "NAS: snapshot $stamp is incomplete (no COMPLETE marker) — trying the previous one"
-    done < <(_nsmb -c "cd \"$host_dir\"; ls" 2>/dev/null | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -ru)
+    # Latest snapshot under host dir $1 that is COMPLETE — a marker backup.sh
+    # writes only after every file uploaded — so a half-uploaded snapshot from a
+    # crashed backup is never selected. Echoes the stamp; returns 1 if none.
+    # Newest first; grep the stamp pattern out of the listing (robust to format).
+    _latest_complete() {
+        local hd="$1" st
+        while read -r st; do
+            [ -n "$st" ] || continue
+            _nsmb -c "cd \"$hd/$st\"; ls COMPLETE" 2>/dev/null | grep -q "COMPLETE" && { echo "$st"; return 0; }
+        done < <(_nsmb -c "cd \"$hd\"; ls" 2>/dev/null | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -ru)
+        return 1
+    }
+
+    # The snapshot was written under the SOURCE host's name. On a fresh DR box the
+    # hostname differs, so honour an explicit override, and otherwise fall back to
+    # the sole host dir on the NAS when there's exactly one (the common case).
+    nas_host="${GENESIS_BACKUP_NAS_HOST:-$(hostname)}"
+    host_dir="Genesis/$nas_host"
+    latest="$(_latest_complete "$host_dir" || true)"
     if [ -z "$latest" ]; then
-        log "NAS: no COMPLETE dated snapshot under $host_dir — skipping off-site pull"
+        hosts=$(_nsmb -c "cd \"Genesis\"; ls" 2>/dev/null | awk '$2=="D" && $1!="." && $1!=".."{print $1}' || true)
+        n=$(printf '%s' "$hosts" | grep -c . || true)
+        if [ "$n" = 1 ]; then
+            host_dir="Genesis/$hosts"
+            log "NAS: no snapshots under host '$nas_host' — using the only host on the NAS: $hosts"
+            latest="$(_latest_complete "$host_dir" || true)"
+        fi
+    fi
+    if [ -z "$latest" ]; then
+        log "NAS: no COMPLETE dated snapshot found (set GENESIS_BACKUP_NAS_HOST to the source host name) — skipping off-site pull"
         return 0
     fi
     log "NAS: pulling latest off-site snapshot $latest"

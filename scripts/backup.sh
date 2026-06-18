@@ -362,8 +362,13 @@ if [ -n "$_NAS_TARGET" ]; then
 
         # Mark the snapshot COMPLETE only when every upload succeeded, so restore
         # never picks a half-uploaded snapshot (it selects the latest COMPLETE one).
+        # If the marker itself fails to upload, the snapshot is unusable for
+        # restore — treat that as an off-site failure (partial + alert), not ok.
         if [ "$_T2_OK" = true ]; then
-            _smb -c "cd \"${_NAS_DIR}\"; put \"$_SMB_COMPLETE\" COMPLETE" 2>/dev/null || true
+            if ! _smb -c "cd \"${_NAS_DIR}\"; put \"$_SMB_COMPLETE\" COMPLETE" 2>/dev/null; then
+                log "WARNING: NAS upload failed for COMPLETE marker — snapshot unusable for restore"
+                _T2_OK=false
+            fi
         fi
 
         rm -f "$_SMB_CREDS" "$_SMB_COMPLETE"
