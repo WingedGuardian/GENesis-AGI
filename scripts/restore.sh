@@ -159,6 +159,57 @@ if [ -d "$BACKUP_DIR/.git" ]; then
     (cd "$BACKUP_DIR" && git pull --rebase --quiet 2>/dev/null) || log "git pull failed, continuing with local backup state"
 fi
 
+# ── Off-site (NAS) pull ──────────────────────────────────────────────
+# The large binaries (SQLite dump, Qdrant snapshots, transcripts) live ONLY on
+# the NAS — gitignored from Tier-1 — so on a fresh DR box they must be pulled
+# from the latest dated snapshot before the restore sections below can find them.
+_pull_from_nas() {
+    local nas="${GENESIS_BACKUP_NAS:-}"
+    [ -n "$nas" ] || return 0
+    if $DRY_RUN; then log "NAS: (dry-run) would pull latest off-site snapshot from $nas"; return 0; fi
+    command -v smbclient >/dev/null 2>&1 || { log "NAS: smbclient not installed — skipping off-site pull"; return 0; }
+
+    local host_dir creds latest snap fname
+    host_dir="Genesis/$(hostname)"
+    creds=$(mktemp); chmod 600 "$creds"
+    printf 'username=%s\npassword=%s\n' "${GENESIS_BACKUP_NAS_USER:-}" "${GENESIS_BACKUP_NAS_PASS:-}" > "$creds"
+    _nsmb() { smbclient "$nas" -A "$creds" "$@"; }
+
+    # Latest dated snapshot: grep the stamp pattern out of the listing (robust to
+    # smbclient's ls format/locale), newest first.
+    latest=$(_nsmb -c "cd \"$host_dir\"; ls" 2>/dev/null | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -ru | head -1 || true)
+    if [ -z "$latest" ]; then
+        log "NAS: no dated snapshots under $host_dir — skipping off-site pull"
+        rm -f "$creds"; return 0
+    fi
+    log "NAS: pulling latest off-site snapshot $latest"
+    snap="$host_dir/$latest"
+
+    # SQLite dump.
+    mkdir -p "$BACKUP_DIR/data"
+    if _nsmb -c "cd \"$snap/data\"; get genesis.sql.gpg \"$BACKUP_DIR/data/genesis.sql.gpg\"" 2>/dev/null; then
+        log "  NAS: pulled data/genesis.sql.gpg"
+    fi
+    # Qdrant snapshots + transcripts: list the subdir, then get each *.gpg. The
+    # staging dir is created only when there's actually something to pull, so an
+    # empty set doesn't make the restore sections below run (and e.g. warn that
+    # Qdrant isn't reachable yet → spurious failure).
+    for sub in qdrant transcripts; do
+        local dst="$BACKUP_DIR/data/qdrant"
+        [ "$sub" = transcripts ] && dst="$BACKUP_DIR/transcripts"
+        # `|| true`: an empty subdir makes `grep` exit non-zero → pipefail would
+        # otherwise abort the whole restore.
+        _nsmb -c "cd \"$snap/$sub\"; ls" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u | while read -r fname; do
+            mkdir -p "$dst"
+            if _nsmb -c "cd \"$snap/$sub\"; get \"$fname\" \"$dst/$fname\"" 2>/dev/null; then
+                log "  NAS: pulled $sub/$fname"
+            fi
+        done || true
+    done
+    rm -f "$creds"
+}
+_pull_from_nas
+
 # Check encrypted payloads exist without passphrase → fail fast.
 _has_encrypted=false
 for candidate in "$BACKUP_DIR"/data/genesis.sql.gpg "$BACKUP_DIR"/secrets/secrets.env.gpg; do
