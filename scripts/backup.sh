@@ -375,9 +375,13 @@ else
     # is flat (MEMORY_DIR has no subdirs); config overlays ship as-is (plaintext, mirroring
     # the existing Tier-1 + private-repo posture); secrets is the encrypted blob. A failed
     # upload of a present file flips _T2_OK so COMPLETE is gated on these landing too.
+    #
+    # Enumerate with `find` (not a `*.gpg` shell glob): §4/§6 stage these via `find`, which
+    # includes DOTFILES (e.g. a transient .consolidate-lock), so a glob would silently drop
+    # leading-dot names and leave the off-site copy short of Tier-1. Process substitution
+    # (not `find | while`) keeps the loop in THIS shell so the _T2_OK flip survives.
     backend_mkdir "${_T2_DIR}/memory"
-    for f in memory/*.gpg; do
-        [ -f "$f" ] || continue
+    while IFS= read -r -d '' f; do
         fname=$(basename "$f")
         if backend_put "$f" "${_T2_DIR}/memory/$fname"; then
             log "  off-site: uploaded memory/$fname"
@@ -385,11 +389,10 @@ else
             log "WARNING: off-site upload failed for memory/$fname"
             _T2_OK=false
         fi
-    done
+    done < <(find memory -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
 
     backend_mkdir "${_T2_DIR}/config_overrides"
-    for f in config_overrides/*.local.yaml; do
-        [ -f "$f" ] || continue
+    while IFS= read -r -d '' f; do
         fname=$(basename "$f")
         if backend_put "$f" "${_T2_DIR}/config_overrides/$fname"; then
             log "  off-site: uploaded config_overrides/$fname"
@@ -397,7 +400,7 @@ else
             log "WARNING: off-site upload failed for config_overrides/$fname"
             _T2_OK=false
         fi
-    done
+    done < <(find config_overrides -maxdepth 1 -type f -name '*.local.yaml' -print0 2>/dev/null)
 
     # Secrets is best-effort: a MISSING payload (no passphrase → no .gpg) is not an
     # off-site failure (that path already fails the backup via _SQLITE_LINES=0); only a
