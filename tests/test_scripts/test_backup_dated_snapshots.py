@@ -46,6 +46,9 @@ def backup_env(tmp_path):
     mem_dir = home / ".claude" / "projects" / cc_id / "memory"
     mem_dir.mkdir(parents=True)
     (mem_dir / "note.md").write_text("remembered\n")
+    # A dotfile (e.g. a transient consolidate lock) — §4 stages it via `find`, so the
+    # off-site upload must mirror it too (a shell glob would silently skip leading-dot names).
+    (mem_dir / ".consolidate-lock").write_text("12345\n")
     (gd / "config").mkdir(parents=True)
     (gd / "config" / "sample.local.yaml").write_text("key: val\n")
     (gd / "secrets.env").write_text("FOO=bar\n")  # sourced by backup.sh; innocuous
@@ -194,3 +197,20 @@ def test_local_backend_snapshot_includes_memory_config_secrets(backup_env, tmp_p
         f"secrets payload missing from off-site snapshot: {[d.name for d in snap.iterdir()]}"
     # COMPLETE still written (and only because all three landed too).
     assert (snap / "COMPLETE").is_file(), "COMPLETE marker not written"
+
+
+def test_offsite_memory_includes_dotfiles(backup_env, tmp_path):
+    """The off-site memory upload must include DOTFILES (e.g. .consolidate-lock.gpg) so the
+    snapshot is a faithful mirror of Tier-1 (§4 stages dotfiles via `find`). A shell glob
+    `memory/*.gpg` silently skips leading-dot names; the upload must enumerate like §4."""
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    host = next((offsite / "Genesis").iterdir())
+    snaps = [d for d in host.iterdir() if _STAMP_RE.fullmatch(d.name)]
+    assert len(snaps) == 1, [d.name for d in snaps]
+    mem = snaps[0] / "memory"
+    assert (mem / ".consolidate-lock.gpg").is_file(), \
+        f"dotfile dropped from off-site memory mirror: {sorted(p.name for p in mem.iterdir())}"
+    assert (mem / "note.md.gpg").is_file()  # regular file still mirrored (no regression)
