@@ -214,3 +214,32 @@ def test_offsite_memory_includes_dotfiles(backup_env, tmp_path):
     assert (mem / ".consolidate-lock.gpg").is_file(), \
         f"dotfile dropped from off-site memory mirror: {sorted(p.name for p in mem.iterdir())}"
     assert (mem / "note.md.gpg").is_file()  # regular file still mirrored (no regression)
+
+
+def test_large_temp_goes_to_dedicated_dir_not_inherited_tmpdir(backup_env, tmp_path):
+    """The big SQLite .dump must be created in a dedicated dir (GENESIS_BACKUP_TMPDIR,
+    default ~/tmp) — NOT the inherited TMPDIR, which in a CC session is the watchgod-
+    policed ~/.genesis/cc-tmp 'oxygen' folder. Regression for the 2026-06-18 incident:
+    a 269MB dump via bare `mktemp` filled cc-tmp and the watchgod killed CC sessions.
+    The seeded `tmp_filesystem_limit` procedure already mandates ~/tmp for large temp."""
+    offsite = tmp_path / "offsite"; offsite.mkdir()
+    cctmp = tmp_path / "cc-tmp-sentinel"; cctmp.mkdir()      # stand-in for the oxygen folder
+    bigtmp = tmp_path / "dedicated-big-tmp"; bigtmp.mkdir()
+    env = dict(os.environ)
+    env.update(
+        HOME=str(backup_env["home"]), GENESIS_DIR=str(backup_env["gd"]),
+        GENESIS_BACKUP_PASSPHRASE="testpass", QDRANT_URL="http://127.0.0.1:1",
+        GENESIS_BACKUP_TIER2_BACKEND="local", GENESIS_BACKUP_LOCAL_PATH=str(offsite),
+        TMPDIR=str(cctmp),                  # inherited — MUST NOT be used for the big dump
+        GENESIS_BACKUP_TMPDIR=str(bigtmp),  # the dedicated dir the dump MUST use
+        PATH=f'{backup_env["bind"]}:{os.environ["PATH"]}',
+    )
+    for k in ("GENESIS_BACKUP_NAS", "GENESIS_BACKUP_NAS_USER", "GENESIS_BACKUP_NAS_PASS",
+              "TELEGRAM_BOT_TOKEN", "TELEGRAM_FORUM_CHAT_ID"):
+        env.pop(k, None)
+    proc = subprocess.run(["bash", str(_BACKUP)], env=env, capture_output=True,
+                          text=True, stdin=subprocess.DEVNULL)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    # The script announces where large temp goes; it must be the dedicated dir, not cc-tmp.
+    assert f"big-temp dir: {bigtmp}" in proc.stdout, (
+        f"backup did not route large temp to the dedicated dir (expected {bigtmp}):\n{proc.stdout}")
