@@ -258,6 +258,41 @@ _pull_from_offsite() {
             fi
         done || true
     done
+
+    # memory / config overlays / secrets — previously only in the Tier-1 git clone. Pull
+    # them from the snapshot too so a no-git fresh box can rehydrate them (the §4/§6/§7
+    # restore sections read from these BACKUP_DIR subdirs). memory is flat; config overlays
+    # are plaintext .local.yaml; secrets is the encrypted blob. Staging dirs are created
+    # only when there's something to pull.
+    #
+    # Process substitution (not a `… | while`) is deliberate: a failed pull of these
+    # payloads is the silent DR footgun this PR exists to prevent, so a failed get must
+    # `warn` (→ _FAILURES → non-zero restore). A pipe-into-while runs the body in a
+    # SUBSHELL where _FAILURES appends are lost; `done < <(…)` runs it in THIS shell.
+    while read -r fname; do
+        mkdir -p "$BACKUP_DIR/memory"
+        if backend_get "$snap/memory/$fname" "$BACKUP_DIR/memory/$fname"; then
+            log "  off-site: pulled memory/$fname"
+        else
+            warn "off-site: failed to pull memory/$fname from snapshot $latest"
+        fi
+    done < <(backend_list "$snap/memory" | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
+    while read -r fname; do
+        mkdir -p "$BACKUP_DIR/config_overrides"
+        if backend_get "$snap/config_overrides/$fname" "$BACKUP_DIR/config_overrides/$fname"; then
+            log "  off-site: pulled config_overrides/$fname"
+        else
+            warn "off-site: failed to pull config_overrides/$fname from snapshot $latest"
+        fi
+    done < <(backend_list "$snap/config_overrides" | grep -oE '[A-Za-z0-9._-]+\.local\.yaml' | sort -u)
+    if backend_exists "$snap/secrets/secrets.env.gpg"; then
+        mkdir -p "$BACKUP_DIR/secrets"
+        if backend_get "$snap/secrets/secrets.env.gpg" "$BACKUP_DIR/secrets/secrets.env.gpg"; then
+            log "  off-site: pulled secrets/secrets.env.gpg"
+        else
+            warn "off-site: failed to pull secrets.env.gpg from snapshot $latest — secrets will not be restored"
+        fi
+    fi
 }
 _pull_from_offsite
 

@@ -40,6 +40,15 @@ def backup_env(tmp_path):
     subprocess.run(["sqlite3", str(gd / "data" / "genesis.db"),
                     "CREATE TABLE t(x); INSERT INTO t VALUES(1);"],
                    check=True, capture_output=True)
+    # A2a inputs: auto-memory (flat), a config overlay, and a secrets file — so the
+    # off-site snapshot can include them alongside data/qdrant/transcripts.
+    cc_id = str(gd).replace("/", "-")
+    mem_dir = home / ".claude" / "projects" / cc_id / "memory"
+    mem_dir.mkdir(parents=True)
+    (mem_dir / "note.md").write_text("remembered\n")
+    (gd / "config").mkdir(parents=True)
+    (gd / "config" / "sample.local.yaml").write_text("key: val\n")
+    (gd / "secrets.env").write_text("FOO=bar\n")  # sourced by backup.sh; innocuous
     bare = tmp_path / "remote.git"
     _git("init", "-q", "--bare", str(bare), cwd=tmp_path)
     _git("symbolic-ref", "HEAD", "refs/heads/main", cwd=bare)
@@ -157,3 +166,31 @@ def test_local_backend_writes_dated_snapshot_to_real_fs(backup_env, tmp_path):
     status = json.loads((backup_env["home"] / ".genesis" / "backup_status.json").read_text())
     assert status["tier2_status"] == "ok", status
     assert status["offsite_confirmed"] is True, status
+
+
+def test_local_backend_snapshot_includes_memory_config_secrets(backup_env, tmp_path):
+    """A2a: the off-site snapshot must ALSO contain memory/, config_overrides/, and
+    secrets/ (previously git-Tier-1 only), so the destination is a COMPLETE copy and a
+    no-git fresh-box DR works. Real `local` backend, real fs."""
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    host_dirs = list((offsite / "Genesis").iterdir())
+    assert len(host_dirs) == 1, f"expected one host dir, got {[d.name for d in host_dirs]}"
+    snaps = [d for d in host_dirs[0].iterdir() if _STAMP_RE.fullmatch(d.name)]
+    assert len(snaps) == 1, f"expected one dated snapshot, got {[d.name for d in snaps]}"
+    snap = snaps[0]
+
+    # memory: at least one flat .gpg under the snapshot's memory/.
+    mem_gpgs = list((snap / "memory").glob("*.gpg")) if (snap / "memory").is_dir() else []
+    assert mem_gpgs, f"no memory/*.gpg in the off-site snapshot: {[d.name for d in snap.iterdir()]}"
+    # config_overrides: the overlay shipped as-is (plaintext, mirrors Tier-1).
+    assert (snap / "config_overrides" / "sample.local.yaml").is_file(), \
+        f"config overlay missing from off-site snapshot: {[d.name for d in snap.iterdir()]}"
+    # secrets: the encrypted secrets payload.
+    assert (snap / "secrets" / "secrets.env.gpg").is_file(), \
+        f"secrets payload missing from off-site snapshot: {[d.name for d in snap.iterdir()]}"
+    # COMPLETE still written (and only because all three landed too).
+    assert (snap / "COMPLETE").is_file(), "COMPLETE marker not written"
