@@ -16,6 +16,14 @@ Classification balances recall against precision:
   a network context word adjacent to the IP). They run over LLM-generated
   prose, where a loose match fabricates a misleading value rather than
   sitting idle harmlessly.
+- **Gated to the USER's own words.** ``classify_as_reference`` /
+  ``extract_references_from_chunk`` accept ``user_text`` (the chunk's
+  user-authored content); a match is only captured if its raw value appears
+  there. This stops the dominant noise source — mining Genesis's OWN analysis
+  prose ("HybridRetriever.recall() -> password: rerank") for references.
+- **Marked distinctly.** Auto-captured entries get the ``auto_captured`` tag
+  and confidence 0.60 (vs 0.85 for real-time ``reference_store`` captures), so
+  manual/verified vs auto/unverified is separable everywhere downstream.
 - The primary capture path is the LLM calling ``reference_store`` in
   real-time. This background path is a safety net that catches things
   the primary path missed.
@@ -221,15 +229,36 @@ def _derive_identifier(extraction: Extraction, *, default_prefix: str) -> str:
     return content[:80].strip() or default_prefix
 
 
-def classify_as_reference(extraction: Extraction) -> dict | None:
+def _user_shared(token: str | None, user_text: str | None) -> bool:
+    """True if a captured value is attributable to the USER's own words.
+
+    ``user_text`` is the concatenation of the user-authored messages in the
+    chunk. When None the gate is DISABLED (back-compat for direct callers and
+    unit tests). The check is a case-insensitive substring on the RAW matched
+    token (password/IP/URL/key) — concrete strings the LLM preserves verbatim —
+    so the auto-capture path can't mine Genesis's OWN analysis prose for
+    references.
+    """
+    if user_text is None:
+        return True
+    if not token:
+        return False
+    return token.lower() in user_text.lower()
+
+
+def classify_as_reference(
+    extraction: Extraction, user_text: str | None = None,
+) -> dict | None:
     """Attempt to classify an Extraction as a reference entry.
 
     Returns a dict shaped like the ``reference_store`` input
     (``kind``, ``identifier``, ``value``, ``description``, ``tags``) if
     the extraction looks like persistent reference data, otherwise None.
 
-    Errs on the side of capturing more — false positives are harmless,
-    false negatives lose credentials permanently.
+    When ``user_text`` is provided (the chunk's user-authored content), a match
+    is only returned if its raw value appears in the user's own words — so the
+    auto-capture path doesn't fabricate references from Genesis's analysis
+    prose. ``user_text=None`` disables the gate (direct callers / unit tests).
     """
     content = extraction.content or ""
     if len(content) < _MIN_CONTENT_LENGTH:
@@ -244,7 +273,10 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
     if pair:
         user = pair.group("user")
         password = pair.group("pass")
-        if user and password and len(password) >= 4:
+        if (
+            user and password and len(password) >= 4
+            and _user_shared(password, user_text)
+        ):
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
@@ -260,7 +292,10 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
     if email_pass:
         email = email_pass.group("email")
         password = email_pass.group("pass")
-        if email and password and len(password) >= 4:
+        if (
+            email and password and len(password) >= 4
+            and _user_shared(password, user_text)
+        ):
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
@@ -276,7 +311,10 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
     if acct:
         account = acct.group("account")
         password = acct.group("pass")
-        if account and password and len(password) >= 4:
+        if (
+            account and password and len(password) >= 4
+            and _user_shared(password, user_text)
+        ):
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
@@ -291,7 +329,10 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
     single = _SINGLE_CREDENTIAL_PATTERN.search(content)
     if single:
         password = single.group("value")
-        if password and len(password) >= 4:
+        if (
+            password and len(password) >= 4
+            and _user_shared(password, user_text)
+        ):
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
@@ -306,29 +347,31 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
     known_key = _KNOWN_KEY_PREFIX_PATTERN.search(content)
     if known_key:
         tok_value = known_key.group("token")
-        return {
-            "kind": "credentials",
-            "identifier": _derive_identifier(
-                extraction, default_prefix="api_key",
-            ),
-            "value": f"token: {tok_value}",
-            "description": content,
-            "tags": tags,
-        }
+        if _user_shared(tok_value, user_text):
+            return {
+                "kind": "credentials",
+                "identifier": _derive_identifier(
+                    extraction, default_prefix="api_key",
+                ),
+                "value": f"token: {tok_value}",
+                "description": content,
+                "tags": tags,
+            }
 
     # 3. Standalone token / API key (labeled)
     token = _CREDENTIAL_TOKEN_PATTERN.search(content)
     if token:
         tok_value = token.group("token")
-        return {
-            "kind": "credentials",
-            "identifier": _derive_identifier(
-                extraction, default_prefix="token",
-            ),
-            "value": f"token: {tok_value}",
-            "description": content,
-            "tags": tags,
-        }
+        if _user_shared(tok_value, user_text):
+            return {
+                "kind": "credentials",
+                "identifier": _derive_identifier(
+                    extraction, default_prefix="token",
+                ),
+                "value": f"token: {tok_value}",
+                "description": content,
+                "tags": tags,
+            }
 
     # 3b. .env format — UPPER_SNAKE=value
     env = _ENV_ASSIGNMENT_PATTERN.search(content)
@@ -337,7 +380,9 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
         val = env.group("val")
         # Only capture if the key name suggests a credential
         _CRED_KEY_WORDS = {"KEY", "SECRET", "TOKEN", "PASSWORD", "PASS", "AUTH", "API"}
-        if any(w in key.upper() for w in _CRED_KEY_WORDS):
+        if any(w in key.upper() for w in _CRED_KEY_WORDS) and _user_shared(
+            val, user_text,
+        ):
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
@@ -352,15 +397,16 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
     ssh = _SSH_PATTERN.search(content)
     if ssh:
         userhost = ssh.group("userhost")
-        return {
-            "kind": "network",
-            "identifier": _derive_identifier(
-                extraction, default_prefix=f"ssh {userhost}",
-            ),
-            "value": f"ssh {userhost}",
-            "description": content,
-            "tags": tags,
-        }
+        if _user_shared(userhost, user_text):
+            return {
+                "kind": "network",
+                "identifier": _derive_identifier(
+                    extraction, default_prefix=f"ssh {userhost}",
+                ),
+                "value": f"ssh {userhost}",
+                "description": content,
+                "tags": tags,
+            }
 
     # 3. URL with context
     url_match = _URL_PATTERN.search(content)
@@ -369,7 +415,9 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
         # Require meaningful context around the URL — bare "https://..."
         # with no explanation is ephemeral.
         context_remainder = content.replace(url_str, "").strip()
-        if len(context_remainder) >= _MIN_URL_CONTEXT_LENGTH:
+        if len(context_remainder) >= _MIN_URL_CONTEXT_LENGTH and _user_shared(
+            url_str, user_text,
+        ):
             return {
                 "kind": "url",
                 "identifier": _derive_identifier(
@@ -395,9 +443,12 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
         window = content[
             max(0, start - _NETWORK_CONTEXT_WINDOW): end + _NETWORK_CONTEXT_WINDOW
         ].lower()
-        if any(
-            re.search(rf"\b{re.escape(word)}\b", window)
-            for word in _NETWORK_CONTEXT_WORDS
+        if (
+            any(
+                re.search(rf"\b{re.escape(word)}\b", window)
+                for word in _NETWORK_CONTEXT_WORDS
+            )
+            and _user_shared(net_match.group(0), user_text)
         ):
             return {
                 "kind": "network",
@@ -458,15 +509,20 @@ async def ingest_reference_from_extraction(
     db: aiosqlite.Connection,
     source_session_id: str | None = None,
     force_fts5_only: bool = False,
+    user_text: str | None = None,
 ) -> str | None:
     """Classify an Extraction and ingest it as a reference entry if matched.
+
+    ``user_text`` (the chunk's user-authored content) gates auto-capture to
+    values the USER actually shared; auto-captured entries are marked with the
+    ``auto_captured`` tag and a lower confidence (0.60 vs reference_store 0.85).
 
     Returns the unit_id on success, or None if the extraction was not
     classified as persistent reference data. Never raises — a classifier
     or ingestion failure logs a warning and returns None.
     """
     try:
-        ref = classify_as_reference(extraction)
+        ref = classify_as_reference(extraction, user_text=user_text)
     except Exception:
         logger.warning(
             "reference extractor classification failed", exc_info=True,
@@ -491,7 +547,7 @@ async def ingest_reference_from_extraction(
         session_id=source_session_id,
     )
 
-    all_tags = ["reference", kind, *tags]
+    all_tags = ["reference", kind, *tags, "auto_captured"]
     tags_json = json.dumps(all_tags)
 
     provenance: dict = {
@@ -517,6 +573,7 @@ async def ingest_reference_from_extraction(
             force_fts5_only=force_fts5_only,
             collection="episodic_memory",
             memory_type="episodic",
+            confidence=0.60,  # auto-captured: lower than reference_store (0.85)
         )
     except Exception:
         logger.warning(
@@ -539,6 +596,7 @@ async def extract_references_from_chunk(
     db: aiosqlite.Connection,
     source_session_id: str | None = None,
     force_fts5_only: bool = False,
+    user_text: str | None = None,
 ) -> int:
     """Run the classifier over a chunk of extractions, ingesting references.
 
@@ -554,6 +612,7 @@ async def extract_references_from_chunk(
             db=db,
             source_session_id=source_session_id,
             force_fts5_only=force_fts5_only,
+            user_text=user_text,
         )
         if unit_id:
             count += 1

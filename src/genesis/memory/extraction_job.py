@@ -212,6 +212,12 @@ async def run_extraction_cycle(
             # modes — this is the dominant path that populates the
             # reference store from historical conversations.
             try:
+                # Gate reference auto-capture to the USER's own words — the
+                # classifier must not mine Genesis's analysis prose (the
+                # dominant source of junk refs) for credentials/IPs/URLs.
+                chunk_user_text = "\n".join(
+                    m.text for m in chunk if m.role == "user"
+                )
                 ref_count = await extract_references_from_chunk(
                     result.extractions,
                     store=store,
@@ -220,6 +226,7 @@ async def run_extraction_cycle(
                     # Normal: queue for paced embedding; history mining: embed
                     # inline (one-shot CLI won't have recovery worker running)
                     force_fts5_only=not reference_only_mode,
+                    user_text=chunk_user_text,
                 )
                 summary["references_captured"] += ref_count
             except Exception:
