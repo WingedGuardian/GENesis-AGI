@@ -71,3 +71,16 @@ def test_check_cc_tmp_red_logs_pressure_before_cleanup(tmp_path):
     assert out.stdout.strip().startswith("red:"), out.stdout
     snaps = list((home / ".genesis" / "logs").glob("cc_tmp_top_*.txt"))
     assert snaps, "RED did not write a pressure snapshot before cleanup"
+
+
+def test_pressure_snapshots_are_bounded(tmp_path):
+    """A sustained ORANGE/RED episode must not accumulate snapshots unbounded — the
+    helper keeps only the most recent ~20 so it can't fill the fs it's protecting."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    logs = home / ".genesis" / "logs"
+    for i in range(25):  # pre-seed 25 stale snapshots
+        (logs / f"cc_tmp_top_20260101T0000{i:02d}Z.txt").write_text("old")
+    proc = _run(home, bind, "_log_cc_pressure orange 400 200")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    remaining = list(logs.glob("cc_tmp_top_*.txt"))
+    assert len(remaining) <= 20, f"snapshots not bounded: {len(remaining)} remain"

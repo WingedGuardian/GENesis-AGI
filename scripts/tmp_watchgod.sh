@@ -195,12 +195,18 @@ _log_cc_pressure() {
     local stamp snap top
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
     snap="$(dirname "$LOG_FILE")/cc_tmp_top_${stamp}.txt"
-    top=$(du -sm "$CC_TMP_DIR"/* 2>/dev/null | sort -rn | head -8)
+    # `|| true` inside the substitution: an empty cc-tmp (e.g. the sacred-ground RED path,
+    # disk-full but cc-tmp empty) makes the glob literal → du fails → set -e would abort the
+    # whole daemon. Tolerate it; `top` is just empty then.
+    top=$(du -sm "$CC_TMP_DIR"/* 2>/dev/null | sort -rn | head -8 || true)
     {
         echo "# cc-tmp pressure ${stamp}  tier=${tier} used=${used}MB free=${free}MB budget=${CC_TMP_BUDGET_MB}MB"
         echo "$top"
     } > "$snap" 2>/dev/null || true
     log WARN "cc-tmp ${tier^^}: used=${used}MB free=${free}MB budget=${CC_TMP_BUDGET_MB}MB — top consumers → ${snap}"
+    # Bound the snapshot count — a sustained ORANGE/RED episode would otherwise accumulate
+    # these unbounded on the very filesystem we're protecting. Keep the 20 most recent.
+    ls -1t "$(dirname "$LOG_FILE")"/cc_tmp_top_*.txt 2>/dev/null | tail -n +21 | xargs -r rm -f 2>/dev/null || true
 }
 
 check_cc_tmp() {
