@@ -8,6 +8,8 @@ from pathlib import Path
 
 import httpx
 
+from genesis.util.tmp import big_tmp_dir
+
 log = logging.getLogger(__name__)
 
 _GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -24,7 +26,7 @@ async def transcribe(audio_bytes: bytes, model_name: str = "whisper-large-v3") -
         return ""
 
     # Write to temp file — Groq API needs a file upload
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False, dir=big_tmp_dir()) as f:
         f.write(audio_bytes)
         tmp_path = f.name
 
