@@ -107,7 +107,7 @@ async def test_format_health_cost_line_grounded(db, mock_health, mock_drafter):
             "monthly_usd": 3.79,
             "budget_status": "UNDER_LIMIT",
             "budget_monthly_limit": 30.0,
-            "budget_pct_used": 12.6,
+            "budget_pct_used": 12.6,  # renders as "13%" via :.0f rounding (pins the format)
             "forecast_monthly_usd": 622.0,  # projection — must NOT appear
             "cost_by_provider": [{"provider": "x", "month_usd": 2.0}],
         },
@@ -115,7 +115,7 @@ async def test_format_health_cost_line_grounded(db, mock_health, mock_drafter):
         "awareness": {}, "cc_sessions": {},
     })
     assert "Spend: $3.79 MTD" in section
-    assert "13% of $30 cap" in section
+    assert "13% of $30 cap" in section  # 12.6% → "13%" (.0f); pins the rendered format
     assert "622" not in section            # no projection leaked
     assert "today" not in section.lower()  # MTD only — no daily figure
     assert "Top cost drivers" not in section

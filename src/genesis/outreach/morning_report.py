@@ -262,6 +262,8 @@ class MorningReportGenerator:
             return "- Spend: unavailable"
         cap = cost.get("budget_monthly_limit")
         pct = cost.get("budget_pct_used")
+        # A falsy cap (None when the budget query failed, or a nonsensical $0)
+        # drops the cap clause rather than printing a misleading "$0 cap".
         if cap:
             pct_txt = f"{pct:.0f}% of " if pct is not None else ""
             return f"- Spend: ${spend:.2f} MTD, {pct_txt}${cap:.0f} cap"

@@ -644,8 +644,11 @@ class TestEnrichFromDB:
         # budget_status computed from the real $30 cap ($1.23 << $30) — never "unknown".
         assert cost["budget_status"] not in ("unknown", "error")
         assert cost.get("budget_monthly_limit") == pytest.approx(30.0)
+        # budget_monthly_limit is only produced by the real cost() path — the old
+        # shadow wiring never set it, so its presence proves we're on the real path.
         # Shadow remains AVAILABLE but isolated under cc_sessions, never as cost.
         assert "shadow_cost_month" in snap["cc_sessions"]
+        assert "shadow_cost" not in str(snap["cost"])  # shadow must never bleed into cost
 
 
 class TestReflectionHeartbeatEmission:
