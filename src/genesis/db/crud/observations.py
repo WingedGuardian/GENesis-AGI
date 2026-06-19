@@ -153,6 +153,10 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "quarantined_reflection": timedelta(days=14),
     "code_audit": timedelta(days=14),
     "cc_memory_staleness": timedelta(days=14),
+    # provider_failure resolves on breaker recovery (ProviderEscalation); the
+    # explicit TTL is only a backstop for a provider that never comes back
+    # (= the previous implicit default, made explicit to silence the warning).
+    "provider_failure": timedelta(days=14),
 }
 _TTL_PREFIX: list[tuple[str, timedelta]] = [
     ("triage_depth_", timedelta(days=30)),
