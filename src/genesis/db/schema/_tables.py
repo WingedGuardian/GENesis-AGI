@@ -523,6 +523,30 @@ TABLES = {
             matched_at        TEXT
         )
     """,
+    "outcome_events": """
+        CREATE TABLE IF NOT EXISTS outcome_events (
+            id                TEXT PRIMARY KEY,
+            source            TEXT NOT NULL,
+            ref_type          TEXT NOT NULL,
+            ref_id            TEXT NOT NULL,
+            domain            TEXT,
+            signal_type       TEXT NOT NULL,
+            signal_class      TEXT NOT NULL DEFAULT 'implicit'
+                                  CHECK (signal_class IN ('implicit', 'explicit')),
+            signal_tier       INTEGER NOT NULL CHECK (signal_tier IN (1, 2, 3)),
+            polarity          TEXT CHECK (polarity IN ('positive', 'negative', 'neutral')),
+            value             REAL,
+            stated_confidence REAL,
+            prediction_error  REAL,
+            reason            TEXT,
+            reason_text       TEXT,
+            metadata          TEXT,
+            harvested_from    TEXT,
+            occurred_at       TEXT NOT NULL,
+            created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (source, ref_type, ref_id, signal_type)
+        )
+    """,
     "events": """
         CREATE TABLE IF NOT EXISTS events (
             id               TEXT PRIMARY KEY,
@@ -1441,6 +1465,16 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_predictions_domain ON predictions(domain)",
     "CREATE INDEX IF NOT EXISTS idx_predictions_bucket ON predictions(confidence_bucket)",
     "CREATE INDEX IF NOT EXISTS idx_predictions_unmatched ON predictions(outcome) WHERE outcome IS NULL",
+    # outcome bus (self-improvement ledger)
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_domain ON outcome_events(domain)",
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_source ON outcome_events(source)",
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_tier ON outcome_events(signal_tier)",
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_signal_type ON outcome_events(signal_type)",
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_ref ON outcome_events(ref_type, ref_id)",
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_occurred ON outcome_events(occurred_at)",
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_calibration "
+    "ON outcome_events(domain, signal_tier) "
+    "WHERE stated_confidence IS NOT NULL AND value IS NOT NULL",
     # approval requests (Phase 9)
     "CREATE INDEX IF NOT EXISTS idx_approval_status ON approval_requests(status)",
     "CREATE INDEX IF NOT EXISTS idx_approval_class ON approval_requests(action_class)",

@@ -571,6 +571,41 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        async def _run_outcome_harvest() -> None:
+            # Fold existing siloed outcome signals into the outcome_events
+            # ledger. DARK: nothing consumes the ledger yet, so this is
+            # behaviour-neutral — it only populates a new table. The one-shot
+            # backfill (guarded by an ego_state marker) runs once; run() keeps
+            # the recent window fresh thereafter.
+            if rt._db is None:
+                return
+            try:
+                from genesis.feedback.harvest import OutcomeHarvester
+
+                harvester = OutcomeHarvester(rt._db)
+                backfill = await harvester.run_backfill()
+                incremental = await harvester.run()
+                rt.record_job_success("outcome_harvest")
+                if not backfill.get("skipped"):
+                    logger.info("Outcome backfill: %s", backfill)
+                if any(incremental.values()):
+                    logger.info("Outcome harvest: %s", incremental)
+            except Exception as exc:
+                rt.record_job_failure("outcome_harvest", str(exc))
+                logger.exception("Outcome harvest failed")
+
+        rt._learning_scheduler.add_job(
+            _run_outcome_harvest,
+            # 30 min before capability_map_refresh (9:15/21:15) in CLOCK time —
+            # APScheduler fires by trigger time, not registration order — so the
+            # map step (a future PR) reads a fresh harvest. Avoids the loaded
+            # 0-6h windows (calibration, reapers, dream cycle, user-model).
+            CronTrigger(hour="8,20", minute=45, timezone=user_timezone()),
+            id="outcome_harvest",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         async def _reap_activity_log() -> None:
             if rt._activity_tracker is None:
                 return
