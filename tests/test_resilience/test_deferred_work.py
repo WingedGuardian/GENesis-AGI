@@ -66,6 +66,20 @@ class TestEnqueueDequeue:
         item2 = await queue.next_pending(max_priority=5)
         assert item2 is None
 
+    @pytest.mark.asyncio
+    async def test_next_pending_filters_by_work_type(self, queue):
+        # WS-6 head-of-line: a higher-priority outreach item (20) sits ahead of
+        # a reflection (30). Without a filter the consumer is blocked by it.
+        await queue.enqueue("outreach_delivery", None, 20, "{}", "reason")
+        await queue.enqueue("reflection", None, REFLECTION, "{}", "reason")
+
+        top = await queue.next_pending(max_priority=40)
+        assert top["work_type"] == "outreach_delivery"  # head-of-line blocker
+
+        refl = await queue.next_pending(work_type="reflection", max_priority=40)
+        assert refl is not None
+        assert refl["work_type"] == "reflection"  # reached past the blocker
+
 
 class TestMarkStatus:
     @pytest.mark.asyncio

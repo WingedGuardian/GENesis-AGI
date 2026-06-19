@@ -1196,8 +1196,8 @@ class AwarenessLoop:
             logger.debug("Skipping deferred reflection retry — loop is stopping")
             return
 
-        item = await self._deferred_queue.next_pending(max_priority=40)
-        if not item or item.get("work_type") != "reflection":
+        item = await self._deferred_queue.next_pending(work_type="reflection", max_priority=40)
+        if not item:
             return
 
         item_id = item["id"]

@@ -108,6 +108,31 @@ class TestEmailAdapter:
         assert progressed >= 5, f"event loop appears blocked during send (ticks={progressed})"
 
     @pytest.mark.anyio
+    async def test_send_message_sets_real_message_id(self, adapter: EmailAdapter) -> None:
+        """WS-9a: outbound mail must carry a real RFC Message-ID, not a fake email-<id>.
+
+        Without it, recipients can't thread and our reply-poller can't match replies.
+        """
+        mock_smtp = MagicMock()
+        with patch("genesis.channels.email_adapter.smtplib.SMTP_SSL") as smtp_cls:
+            smtp_cls.return_value.__enter__ = MagicMock(return_value=mock_smtp)
+            smtp_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+            delivery_id = await adapter.send_message(
+                "recipient@example.com", "body", subject="S",
+            )
+
+            sent_msg = mock_smtp.send_message.call_args[0][0]
+            mid = sent_msg["Message-ID"]
+            assert mid, "no Message-ID header on the sent email"
+            assert mid.startswith("<") and mid.endswith(">") and "@" in mid, \
+                f"not an RFC-shaped Message-ID: {mid}"
+            assert not mid.startswith("<email-"), "fabricated id leaked into the header"
+            assert delivery_id == mid, "returned delivery id must equal the real Message-ID"
+            assert mid.rstrip(">").endswith("@gmail.com"), \
+                f"Message-ID domain not from from_address: {mid}"
+
+    @pytest.mark.anyio
     async def test_engagement_signals_neutral(self, adapter: EmailAdapter) -> None:
         result = await adapter.get_engagement_signals("any-id")
         assert result["signal"] == "neutral"

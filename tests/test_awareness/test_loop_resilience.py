@@ -172,6 +172,9 @@ async def test_retry_deferred_reflection_success_marks_completed(db):
 
     dq.mark_completed.assert_awaited_once_with("item-1")
     dq.reset_to_pending.assert_not_awaited()
+    # WS-6 head-of-line: the consumer must filter by work_type so a higher-priority
+    # non-reflection item at the head can't block reflection retries.
+    dq.next_pending.assert_awaited_once_with(work_type="reflection", max_priority=40)
 
 
 async def test_retry_deferred_reflection_failure_resets_to_pending(db):

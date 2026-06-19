@@ -84,10 +84,17 @@ class DeferredWorkQueue:
         )
         return item_id
 
-    async def next_pending(self, max_priority: int = 100) -> dict | None:
-        """Return the highest-priority pending item, or None."""
+    async def next_pending(
+        self, work_type: str | None = None, max_priority: int = 100
+    ) -> dict | None:
+        """Return the highest-priority pending item, or None.
+
+        Pass ``work_type`` to filter to a single type — without it, a higher-priority
+        item of another type head-of-line-blocks the caller (WS-6: a failed outreach
+        item at priority 20 was blocking reflection retries at priority 30).
+        """
         items = await crud.query_pending(
-            self._db, max_priority=max_priority, limit=1,
+            self._db, work_type=work_type, max_priority=max_priority, limit=1,
         )
         return items[0] if items else None
 

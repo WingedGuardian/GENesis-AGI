@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import email.message
+import email.utils
 import logging
 import smtplib
 from typing import Any
@@ -67,6 +68,11 @@ class EmailAdapter(ChannelAdapter):
         msg["From"] = f"{self._from_name} <{self._from_address}>"
         msg["To"] = recipient
         msg["Subject"] = subject
+        # Real RFC 5322 Message-ID so recipients can thread and our reply-poller can
+        # match replies (WS-9a). EmailMessage() sets no Message-ID by default, so the
+        # sent mail previously had none and the returned id was a fabricated placeholder.
+        domain = self._from_address.rsplit("@", 1)[-1] if "@" in self._from_address else None
+        msg["Message-ID"] = email.utils.make_msgid(domain=domain)
         msg.set_content(text)
 
         def _send_sync() -> None:
@@ -84,7 +90,7 @@ class EmailAdapter(ChannelAdapter):
             logger.exception("Failed to send email to %s", recipient)
             raise
 
-        message_id = msg["Message-ID"] or f"email-{id(msg)}"
+        message_id = msg["Message-ID"]
         logger.info("Email sent to %s (Message-ID: %s)", recipient, message_id)
         return message_id
 
