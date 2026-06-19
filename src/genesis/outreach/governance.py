@@ -192,12 +192,17 @@ class GovernanceGate:
             return False
         window_spec = f"-{window_hours} hours"
 
-        # Primary key: (signal_type, topic, category) within the window
+        # Primary key: (signal_type, topic, category) within the window.
+        # NB: wrap delivered_at in datetime(). Stored values are ISO-8601 with a
+        # 'T' separator (datetime.now(UTC).isoformat()); a raw string compare
+        # against SQLite's space-separated datetime('now', ?) is wrong because
+        # 'T' (0x54) > ' ' (0x20), which made the window never expire within a
+        # UTC day. datetime() parses both sides before comparing.
         cursor = await self._db.execute(
             "SELECT COUNT(*) FROM outreach_history "
             "WHERE signal_type = ? AND topic = ? AND category = ? "
             "AND delivered_at IS NOT NULL "
-            "AND delivered_at >= datetime('now', ?)",
+            "AND datetime(delivered_at) >= datetime('now', ?)",
             (request.signal_type, request.topic, request.category.value, window_spec),
         )
         row = await cursor.fetchone()
@@ -210,13 +215,14 @@ class GovernanceGate:
             )
             return True
 
-        # Secondary: content-hash match (catches near-duplicate topics with same body)
+        # Secondary: content-hash match (catches near-duplicate topics with same
+        # body). Same datetime(delivered_at) normalization as the primary query.
         chash = content_hash(request.context)
         cursor = await self._db.execute(
             "SELECT COUNT(*) FROM outreach_history "
             "WHERE signal_type = ? AND category = ? AND content_hash = ? "
             "AND delivered_at IS NOT NULL "
-            "AND delivered_at >= datetime('now', ?)",
+            "AND datetime(delivered_at) >= datetime('now', ?)",
             (request.signal_type, request.category.value, chash, window_spec),
         )
         row = await cursor.fetchone()
