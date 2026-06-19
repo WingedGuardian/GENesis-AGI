@@ -60,6 +60,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Cost reporting now shows your real spend, not a phantom figure** — the health
+  tool that Genesis's reflections consult was reporting a *notional* "if Claude Code
+  were billed by the API" number (hundreds of dollars a month) as if it were actual
+  cost, with no budget context. That phantom figure drove false "cost is accelerating"
+  alerts in reflections and the morning report. Genesis now reports true spend from
+  recorded cost events against your configured budget. The morning report shows a
+  single grounded line — month-to-date spend versus your cap — with no projections or
+  spike alarms, and reflections no longer analyze cost at all.
+
 - **Genesis can now detect replies to the emails it sends** — outbound email
   was going out without a real Message-ID header, so mail clients couldn't thread
   it and Genesis couldn't match incoming replies back to the original message.
