@@ -319,13 +319,12 @@ async def init(rt: GenesisRuntime) -> None:
                 try:
                     report = await rt._recovery_orchestrator.run_recovery()
                     rt.record_job_success("recovery_orchestrator")
-                    if (report.dead_letters_replayed or report.embeddings_recovered
-                            or report.items_drained):
+                    if report.dead_letters_replayed or report.embeddings_recovered:
                         logger.info(
-                            "Recovery: replayed=%d embeddings=%d drained=%d",
+                            "Recovery: replayed=%d embeddings=%d pending=%d",
                             report.dead_letters_replayed,
                             report.embeddings_recovered,
-                            report.items_drained,
+                            report.items_pending,
                         )
                 except Exception:
                     rt.record_job_failure("recovery_orchestrator", "recovery failed")

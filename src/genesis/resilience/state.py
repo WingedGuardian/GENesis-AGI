@@ -151,15 +151,22 @@ class ResilienceStateMachine:
     def current(self) -> ResilienceState:
         return self._state
 
-    def is_any_degraded(self) -> bool:
-        """Return True if any axis is below NORMAL."""
-        return (
+    def is_any_degraded(self, *, include_tmp_pressure: bool = True) -> bool:
+        """Return True if any axis is below NORMAL.
+
+        Pass ``include_tmp_pressure=False`` to ignore cc-tmp pressure — useful for
+        gating work that cc-tmp pressure does not actually impair (e.g. recovery
+        re-dispatch into Qdrant / LLM providers).
+        """
+        degraded = (
             self._state.cloud != CloudStatus.NORMAL
             or self._state.memory != MemoryStatus.NORMAL
             or self._state.embedding != EmbeddingStatus.NORMAL
             or self._state.cc != CCStatus.NORMAL
-            or self._state.tmp_pressure != TmpPressureStatus.NORMAL
         )
+        if include_tmp_pressure:
+            degraded = degraded or self._state.tmp_pressure != TmpPressureStatus.NORMAL
+        return degraded
 
     def update_cloud(self, status: CloudStatus) -> list[StateTransition]:
         return self._update("cloud", status)
