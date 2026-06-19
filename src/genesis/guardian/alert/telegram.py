@@ -207,6 +207,14 @@ class TelegramAlertChannel(AlertChannel):
         only replies to our own gate prompt — which the main bot's handlers
         ignore — so we never need to ack.
 
+        SHARED-TOKEN SAFETY (offset's sibling): ``allowed_updates`` is *also*
+        sticky and bot-global, so we must NEVER narrow it here. Sending
+        ["message"] once silently disabled the main bot's ``callback_query``
+        (inline-button) delivery for ~5 days (#666 regression). We send an empty
+        list, which Telegram treats as the default set (message + callback_query
+        + …) — never narrowing it; our reply filter still ignores non-message
+        updates.
+
         Returns:
             - the matched keyword (uppercased) if a reply matches,
             - CONFLICT_SENTINEL on HTTP 409 (main bot is long-polling the same
@@ -216,7 +224,11 @@ class TelegramAlertChannel(AlertChannel):
         url = f"{self._api_base}/getUpdates"
         payload: dict[str, Any] = {
             "timeout": timeout_s,
-            "allowed_updates": ["message"],
+            # Empty list = Telegram's default update set (includes message AND
+            # callback_query). Do NOT narrow this to ["message"]: allowed_updates
+            # is sticky + bot-global and this token is shared with the main bot,
+            # so narrowing it disables the main bot's inline-button callbacks (#666).
+            "allowed_updates": [],
         }
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(

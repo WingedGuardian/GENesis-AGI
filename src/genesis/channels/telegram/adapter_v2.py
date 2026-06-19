@@ -213,7 +213,7 @@ class TelegramAdapterV2(ChannelAdapter):
             self._app.updater._last_update_id = stored_offset
             log.info("Restored polling offset %d for bot %s", stored_offset, bot_id)
 
-        await self._app.updater.start_polling(drop_pending_updates=False)
+        await self._start_updater_polling()
         self._watchdog.start()
 
     async def stop(self) -> None:
@@ -365,6 +365,24 @@ class TelegramAdapterV2(ChannelAdapter):
             log.warning("Failed to query engagement signals for %s", delivery_id, exc_info=True)
             return {"signal": "neutral", "details": {}}
 
+    async def _start_updater_polling(self) -> None:
+        """Start PTB getUpdates polling with a non-narrowing ``allowed_updates``.
+
+        ``allowed_updates`` is a STICKY, bot-global Telegram setting: once any
+        getUpdates call narrows it, the bot keeps dropping the excluded update
+        types until a later call explicitly resets it. A secondary poller sharing
+        this token (the Guardian recovery gate, ``guardian/alert/telegram.py``)
+        narrowed it to ["message"], silently killing all ``callback_query``
+        (inline-button) delivery for ~5 days. Sending ``[]`` — Telegram's default
+        update set, which includes message + callback_query — resets and never
+        narrows it (PTB sends the empty list; only ``None`` is dropped). Both the
+        initial start and every stall-restart call this, so neither call site can
+        diverge or inherit a narrowed filter.
+        """
+        await self._app.updater.start_polling(
+            allowed_updates=[], drop_pending_updates=False,
+        )
+
     async def _handle_polling_stall(self) -> None:
         """Called by watchdog when polling stalls — force restart polling."""
         log.warning("Polling stall detected — restarting updater")
@@ -388,7 +406,7 @@ class TelegramAdapterV2(ChannelAdapter):
         # leaves polling dead for the full stall-backoff period (up to 15 min).
         for attempt in range(2):
             try:
-                await self._app.updater.start_polling(drop_pending_updates=False)
+                await self._start_updater_polling()
                 log.info("Polling restarted successfully after stall")
                 return
             except Exception:
