@@ -129,7 +129,8 @@ class TestEmailAdapter:
                 f"not an RFC-shaped Message-ID: {mid}"
             assert not mid.startswith("<email-"), "fabricated id leaked into the header"
             assert delivery_id == mid, "returned delivery id must equal the real Message-ID"
-            assert mid.rstrip(">").endswith("@gmail.com"), \
+            expected_domain = adapter._from_address.rsplit("@", 1)[-1]
+            assert mid.rstrip(">").endswith("@" + expected_domain), \
                 f"Message-ID domain not from from_address: {mid}"
 
     @pytest.mark.anyio

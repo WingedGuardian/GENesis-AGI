@@ -70,6 +70,19 @@ class TestBasicTransitions:
         assert sm.current.cloud == CloudStatus.NORMAL
         assert not sm.is_any_degraded()
 
+    def test_is_any_degraded_excludes_tmp_pressure_when_requested(self):
+        from genesis.resilience.state import TmpPressureStatus
+        sm = ResilienceStateMachine()
+        sm.update_tmp_pressure(TmpPressureStatus.MODERATE)
+        # cc-tmp pressure counts as degraded by default...
+        assert sm.is_any_degraded() is True
+        # ...but is excluded when the caller opts out (e.g. recovery re-dispatch gating —
+        # cc-tmp pressure doesn't impair Qdrant/providers).
+        assert sm.is_any_degraded(include_tmp_pressure=False) is False
+        # a real axis still registers even with tmp_pressure excluded.
+        sm.update_cloud(CloudStatus.FALLBACK)
+        assert sm.is_any_degraded(include_tmp_pressure=False) is True
+
     def test_transitions_recorded(self):
         sm = ResilienceStateMachine()
         sm.update_cloud(CloudStatus.FALLBACK)
