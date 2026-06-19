@@ -129,17 +129,19 @@ def evaluate_ambient_health(
 ) -> AmbientVerdict:
     """Turn an ``ambient_health.json`` snapshot into a verdict. Pure + testable.
 
+    Policy: alert ONLY on a SOFTWARE failure, NEVER on the device being absent.
     - ``data is None`` (read failed / edge unreachable) -> ``unknown`` (transient;
       the caller should not flip alert state on a single unknown).
     - heartbeat ``ts`` missing or older than ``_HEARTBEAT_STALE_S`` -> ``down``
-      (bridge process dead/hung).
-    - ``active_connections == 0`` -> ``down`` (device disconnected; ``0`` is a
-      reliable negative).
-    - ``diar_worker_alive`` False while ``diar_enabled`` -> ``degraded``.
-    - otherwise -> ``ok``.
+      (the bridge process is dead/hung — it stopped writing the health file).
+    - ``diar_worker_alive`` False while ``diar_enabled`` -> ``degraded`` (the
+      diarization worker crashed).
+    - otherwise -> ``ok`` — INCLUDING when the device is offline
+      (``active_connections == 0``): an absent device is not a software bug.
 
-    Deliberately does NOT consider ``last_ts`` (last captured utterance): a quiet
-    room naturally has an old ``last_ts``, which is not a fault.
+    Deliberately does NOT consider ``active_connections`` or ``last_ts``: a device
+    that is unplugged/idle, or a quiet room with no recent utterance, is normal —
+    not a fault to alert on.
     """
     if data is None:
         return AmbientVerdict("unknown", ["edge health unreachable / unreadable"])
@@ -159,10 +161,6 @@ def evaluate_ambient_health(
                 f"heartbeat stale ({age:.0f}s > {_HEARTBEAT_STALE_S:.0f}s) — bridge dead/hung",
             )
             status = "down"
-
-    if data.get("active_connections", 0) == 0:
-        reasons.append("device not connected (active_connections=0)")
-        status = "down"
 
     if data.get("diar_enabled") and not data.get("diar_worker_alive", False):
         reasons.append("diarization worker not alive")
