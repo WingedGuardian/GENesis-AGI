@@ -397,6 +397,30 @@ class TestUserEgoContextBuilder:
         assert "[high]" in result
 
     @pytest.mark.asyncio
+    async def test_escalations_record_read_receipt(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Building user-ego context increments retrieved_count on escalations (B2)."""
+        await db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, category, content, priority, resolved, "
+            " retrieved_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            (
+                "esc_rr", "genesis_ego", "escalation_to_user_ego", "outreach",
+                "Outreach pipeline needs your decision", "high", 0, 0,
+            ),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        await builder.build()
+        cur = await db.execute(
+            "SELECT retrieved_count FROM observations WHERE id = 'esc_rr'"
+        )
+        assert (await cur.fetchone())[0] == 1
+
+    @pytest.mark.asyncio
     async def test_escalations_infra_filtered(self, db, mock_health_data, capabilities):
         """Pure infrastructure escalations are filtered from user ego context."""
         await db.execute(

@@ -315,6 +315,55 @@ class TestGenesisEgoContextBuilder:
         assert "CPU spike detected" in result
 
     @pytest.mark.asyncio
+    async def test_observations_records_read_receipt(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Building the context increments retrieved_count on surfaced obs (B2)."""
+        await db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, category, content, priority, resolved, "
+            " retrieved_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            ("rr1", "sentinel", "finding", "routine", "needs a read receipt",
+             "medium", 0, 0),
+        )
+        builder = GenesisEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        await builder.build()
+        cur = await db.execute(
+            "SELECT retrieved_count FROM observations WHERE id = 'rr1'"
+        )
+        assert (await cur.fetchone())[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_observations_unread_sorted_before_read(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Within a priority tier, unread (retrieved_count=0) sorts before read (B2)."""
+        await db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, category, content, priority, resolved, "
+            " retrieved_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            ("read1", "sentinel", "finding", "routine", "ALREADY_SEEN_ITEM",
+             "medium", 0, 5),
+        )
+        await db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, category, content, priority, resolved, "
+            " retrieved_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            ("unread1", "sentinel", "finding", "routine", "BRAND_NEW_ITEM",
+             "medium", 0, 0),
+        )
+        builder = GenesisEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert result.index("BRAND_NEW_ITEM") < result.index("ALREADY_SEEN_ITEM")
+
+    @pytest.mark.asyncio
     async def test_observations_excludes_user_world(
         self, db, mock_health_data, capabilities,
     ):
