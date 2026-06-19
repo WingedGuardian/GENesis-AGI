@@ -13,6 +13,7 @@ import pytest
 
 from genesis.learning.skills.applicator import SkillApplicator
 from genesis.learning.skills.effectiveness import SkillEffectivenessAnalyzer
+from genesis.learning.skills.pipeline import SkillEvolutionPipeline
 from genesis.learning.skills.refiner import SkillRefiner
 from genesis.learning.skills.types import (
     ChangeSize,
@@ -21,6 +22,7 @@ from genesis.learning.skills.types import (
     SkillTrend,
     SkillType,
 )
+from genesis.learning.skills.validator import SkillValidator
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -395,6 +397,56 @@ class TestRefiner:
         assert result is not None
         assert result.proposed_content == "improved"
         router.route_call.assert_awaited_once()
+
+
+class TestWS10ContentLoss:
+    """WS-10 / LRN-01: never overwrite a SKILL.md from a truncated view.
+    (1) the refiner must prompt with the FULL content; (2) the pipeline must thread
+    current_content so the consistency check runs; (3) a MINOR auto-apply that drops
+    most of the file must be BLOCKED (falls through to staging), not silently applied."""
+
+    def test_build_prompt_includes_full_content_no_truncation(self):
+        refiner = SkillRefiner()
+        report = SkillReport(skill_name="big", usage_count=10, success_count=8,
+                             failure_count=2, success_rate=0.8)
+        content = ("filler content line\n" * 300) + "UNIQUE_TAIL_MARKER\n"  # >3000 chars; marker past 3000
+        assert len(content) > 3000
+        prompt = refiner._build_prompt(report, content)
+        assert "UNIQUE_TAIL_MARKER" in prompt, \
+            "refiner truncated the skill content — the LLM refines from a partial view and drops the tail"
+
+    def test_consistency_blocks_large_content_loss_for_minor(self):
+        validator = SkillValidator()
+        failures: list[str] = []
+        warnings: list[str] = []
+        current = "real content line\n" * 200  # the full file
+        proposal = SkillProposal(skill_name="x", proposed_content="real content line\n" * 20,  # 10% — content loss
+                                 rationale="r", change_size=ChangeSize.MINOR)
+        validator._test_consistency(proposal, current, failures, warnings)
+        assert any("content" in f.lower() and "loss" in f.lower() for f in failures), \
+            f"a MINOR proposal dropping most of the file must be a BLOCKING failure; failures={failures} warnings={warnings}"
+
+    @pytest.mark.asyncio
+    async def test_pipeline_threads_current_content_to_applicator(self, db):
+        pipeline = SkillEvolutionPipeline(db=db, router=MagicMock())
+        report = SkillReport(skill_name="s", usage_count=5, success_count=2,
+                             failure_count=3, success_rate=0.4)
+        pipeline._analyzer.analyze_all = AsyncMock(return_value=[report])
+        pipeline._analyzer.needs_review = lambda r: True
+        pipeline._refiner.propose = AsyncMock(return_value=SkillProposal(
+            skill_name="s", proposed_content="new", rationale="r", change_size=ChangeSize.MINOR))
+        pipeline._applicator.apply = AsyncMock(return_value={"action": "applied"})
+        import genesis.learning.skills.pipeline as pipeline_mod
+        original_load = pipeline_mod.load_skill
+        pipeline_mod.load_skill = lambda name: "the full current SKILL.md content"
+        try:
+            await pipeline.run()
+        finally:
+            pipeline_mod.load_skill = original_load
+        pipeline._applicator.apply.assert_awaited_once()
+        _, kwargs = pipeline._applicator.apply.await_args
+        assert kwargs.get("current_content") == "the full current SKILL.md content", \
+            f"pipeline must pass current_content so the consistency check can run; kwargs={kwargs}"
 
 
 # ---------------------------------------------------------------------------

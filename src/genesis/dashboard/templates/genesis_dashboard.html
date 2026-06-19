@@ -3995,7 +3995,7 @@
       </template>
       <!-- Resilience degradation banner -->
       <template x-if="$store.genesisDashboard.health.resilience?.level && $store.genesisDashboard.health.resilience.level !== 'L0' && $store.genesisDashboard.health.resilience.level !== 'not configured'">
-        <div :style="`background: ${['L3', 'L4', 'L5', 'error'].includes($store.genesisDashboard.health.resilience.level) ? '#d9534f' : '#f0ad4e'}; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;`"
+        <div :style="`background: ${['L3', 'L4', 'L5', 'error'].includes($store.genesisDashboard.health.resilience.level) ? '#d9534f' : '#f0ad4e'}; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center; overflow-wrap: break-word; white-space: normal; line-height: 1.3;`"
              x-text="'Resilience: ' + $store.genesisDashboard.health.resilience.level + ' — ' + ($store.genesisDashboard.health.resilience.summary || 'system is operating in degraded mode')">
         </div>
       </template>
@@ -4041,6 +4041,14 @@
                     <span class="status-dot"
                           :style="`background: ${$store.genesisDashboard.probeStatusColor(probe)}`"></span>
                     <span x-text="name" style="font-size: 0.82rem"></span>
+                    <template x-if="probe.wal_mb != null">
+                      <span style="margin-left: 0.4rem; font-size: 0.72rem; opacity: 0.75;"
+                            :title="'SQLite WAL sidecar size — green < 100MB, yellow ≥ 100MB, red ≥ 500MB'">
+                        <span class="status-dot"
+                              :style="`background: ${$store.genesisDashboard.probeStatusColor({status: probe.wal_status})}`"></span>
+                        <span x-text="'WAL: ' + probe.wal_mb + ' MB'"></span>
+                      </span>
+                    </template>
                     <template x-if="probe.total_points != null">
                       <span style="opacity: 0.6; font-size: 0.72rem;" x-text="'(' + probe.total_points + ' pts)'"></span>
                     </template>

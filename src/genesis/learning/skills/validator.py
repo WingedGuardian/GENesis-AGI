@@ -20,6 +20,13 @@ _SIZE_WARN = 150
 _SIZE_MAX = 300
 _SIZE_MIN = 20
 
+# Below this fraction of the original CHARACTER count, a MINOR proposal is
+# treated as content loss (likely a truncated-view overwrite) and BLOCKED —
+# see WS-10. Note: _SIZE_MIN/_SIZE_MAX above are line-based; this gate is
+# char-based and intentionally more conservative (chars capture long-line loss
+# that a line count misses). The two checks cover different axes, not 1:1.
+_CONTENT_LOSS_FLOOR = 0.5
+
 
 class SkillValidator:
     """Validates proposed SKILL.md content before auto-application.
@@ -219,6 +226,19 @@ class SkillValidator:
 
         if proposal.change_size != ChangeSize.MINOR:
             return "SKIP: only checks MINOR claims"
+
+        # Content-loss guard (WS-10): a MINOR proposal that shrinks the file
+        # below _CONTENT_LOSS_FLOOR of its original size is almost certainly a
+        # truncated-view overwrite. Block it (route to staging for human review)
+        # rather than silently overwriting a fuller file with a much shorter one.
+        cur_chars = len(current_content)
+        if cur_chars > 0 and len(proposal.proposed_content) < _CONTENT_LOSS_FLOOR * cur_chars:
+            pct = len(proposal.proposed_content) / cur_chars
+            failures.append(
+                f"content_loss: MINOR proposal is {pct:.0%} of the original SKILL.md "
+                f"size — refusing to auto-overwrite a fuller file with a much shorter one."
+            )
+            return f"FAIL: content_loss ({pct:.0%} of original)"
 
         current_lines = current_content.splitlines()
         proposed_lines = proposal.proposed_content.splitlines()

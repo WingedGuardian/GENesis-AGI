@@ -1,7 +1,7 @@
 """Tests for health probes."""
 
 from datetime import UTC, datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -11,8 +11,9 @@ from genesis.observability.health import (
     probe_ollama,
     probe_qdrant,
     probe_scheduler,
+    probe_wal,
 )
-from genesis.observability.types import ProbeStatus
+from genesis.observability.types import ProbeResult, ProbeStatus
 
 FROZEN_CLOCK = lambda: datetime(2026, 3, 4, tzinfo=UTC)  # noqa: E731
 
@@ -141,3 +142,93 @@ class TestProbeDisk:
         with patch("os.statvfs", side_effect=OSError("read-only")):
             result = await probe_disk(clock=FROZEN_CLOCK)
         assert result.status == ProbeStatus.DOWN
+
+
+_MB = 1024 * 1024
+
+
+def _make_wal(tmp_path, size_bytes):
+    """Create a sparse <db>-wal file of the given size (near-zero real disk)."""
+    wal = tmp_path / "genesis.db-wal"
+    with open(wal, "wb") as f:
+        f.truncate(size_bytes)
+    return wal
+
+
+class TestProbeWal:
+    @pytest.mark.asyncio
+    async def test_healthy_small(self, tmp_path):
+        wal = _make_wal(tmp_path, 50 * _MB)
+        result = await probe_wal(wal_path=wal, clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.HEALTHY
+        assert result.name == "wal"
+        assert result.details["wal_mb"] == 50.0
+
+    @pytest.mark.asyncio
+    async def test_degraded_at_warn(self, tmp_path):
+        wal = _make_wal(tmp_path, 150 * _MB)
+        result = await probe_wal(wal_path=wal, clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.DEGRADED
+        assert result.details["wal_mb"] == 150.0
+
+    @pytest.mark.asyncio
+    async def test_down_at_critical(self, tmp_path):
+        wal = _make_wal(tmp_path, 600 * _MB)
+        result = await probe_wal(wal_path=wal, clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.DOWN
+        assert result.details["wal_mb"] == 600.0
+        assert "MB" in result.message
+
+    @pytest.mark.asyncio
+    async def test_missing_wal_is_healthy_zero(self, tmp_path):
+        result = await probe_wal(
+            wal_path=tmp_path / "nonexistent.db-wal", clock=FROZEN_CLOCK
+        )
+        assert result.status == ProbeStatus.HEALTHY
+        assert result.details["wal_mb"] == 0.0
+
+
+class TestInfrastructureWalPlumbing:
+    """The WAL probe result must attach to the genesis.db entry in the
+    infrastructure snapshot the dashboard health payload reads."""
+
+    @pytest.mark.asyncio
+    async def test_wal_attached_to_genesis_db(self, db):
+        wal_probe = ProbeResult(
+            name="wal",
+            status=ProbeStatus.DEGRADED,
+            latency_ms=0.1,
+            details={"wal_mb": 150.0},
+        )
+        with patch(
+            "genesis.observability.snapshots.infrastructure.probe_wal",
+            new_callable=AsyncMock,
+            return_value=wal_probe,
+        ):
+            from genesis.observability.snapshots.infrastructure import infrastructure
+
+            infra = await infrastructure(
+                db=db,
+                routing_config=None,
+                learning_scheduler=None,
+                state_machine=None,
+            )
+
+        assert infra["genesis.db"]["wal_mb"] == 150.0
+        assert infra["genesis.db"]["wal_status"] == "degraded"
+
+    @pytest.mark.asyncio
+    async def test_wal_not_attached_when_db_none(self):
+        """No DB connection → no WAL readout (a green 0 MB next to a DB-error
+        row would mislead operators)."""
+        from genesis.observability.snapshots.infrastructure import infrastructure
+
+        infra = await infrastructure(
+            db=None,
+            routing_config=None,
+            learning_scheduler=None,
+            state_machine=None,
+        )
+
+        assert "wal_mb" not in infra["genesis.db"]
+        assert "wal_status" not in infra["genesis.db"]
