@@ -103,8 +103,9 @@ def format_calibration_section(snapshot: dict | None, *, depth: str = "deep") ->
         "rescale; keep your own judgment. Small-n buckets are directional only:",
     ]
     for c in snapshot.get("curve", []):
-        pred = round(c.get("predicted_confidence", 0.0) * 100)
-        actual = round(c.get("actual_success_rate", 0.0) * 100)
+        # half-up rounding (avoid banker's rounding misrepresenting .5 boundaries)
+        pred = int(c.get("predicted_confidence", 0.0) * 100 + 0.5)
+        actual = int(c.get("actual_success_rate", 0.0) * 100 + 0.5)
         nb = c.get("sample_count", 0)
         lines.append(
             f"  - When you report ~{pred}% confidence, "

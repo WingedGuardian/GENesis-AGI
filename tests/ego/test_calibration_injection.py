@@ -143,6 +143,22 @@ class TestSection:
         assert full.index("Confidence Calibration") < full.index("Output Contract")
 
     @pytest.mark.asyncio
+    async def test_null_flag_stays_on(self, db, monkeypatch):
+        # YAML null / unexpected value must NOT silently disable (default-ON;
+        # only an explicit False disables).
+        from genesis.ego.types import EgoConfig
+
+        cfg = EgoConfig()
+        cfg.calibration_injection_enabled = None  # simulate YAML null
+        monkeypatch.setattr("genesis.ego.config.load_ego_config", lambda *a, **k: cfg)
+        await cal_crud.record_snapshot(
+            db, domain="ego", ece=0.116, mce=0.45, sample_count=47,
+            bucket_count=5, low_confidence=False, curve=_snapshot()["curve"],
+        )
+        out = await _builder(db)._confidence_calibration_section()
+        assert "Confidence Calibration" in out  # stayed ON
+
+    @pytest.mark.asyncio
     async def test_section_absent_from_build_when_flag_off(self, db, monkeypatch):
         _set_flag(monkeypatch, False)
         await cal_crud.record_snapshot(

@@ -599,7 +599,9 @@ class GenesisEgoContextBuilder:
             from genesis.ego.config import load_ego_config
 
             cfg = load_ego_config()
-            if not getattr(cfg, "calibration_injection_enabled", True):
+            # Default ON: disable ONLY on an explicit False (a YAML null / missing
+            # key / truthy value all keep it on, so it can't be silently disabled).
+            if getattr(cfg, "calibration_injection_enabled", True) is False:
                 return ""
 
             from genesis.db.crud import ego_calibration as cal_crud
