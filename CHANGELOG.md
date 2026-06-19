@@ -60,6 +60,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **No more false "CRITICAL / degraded" alarm when a paid provider runs out of
+  credits** — health now judges degradation by whether your *essential* work is
+  covered, not by how many paid providers are down. If OpenRouter (or any paid
+  provider) goes down but your free providers still cover the essentials,
+  Genesis stays NORMAL instead of flashing a system-wide CRITICAL. The alarm
+  now fires only when an essential capability genuinely has no working provider.
+
+- **Clearer API-key colors on the dashboard** — the API Keys panel now shows
+  🟡 yellow for a key that's missing/unconfigured, 🔴 red for a key that's set
+  but not working (circuit breaker open, including out-of-credits), and 🟢 green
+  for working. A paid provider that's down now shows up red on the API-keys card
+  (e.g. "openrouter — out of credits") without raising a system-wide alarm.
+
 - **Genesis can now detect replies to the emails it sends** — outbound email
   was going out without a real Message-ID header, so mail clients couldn't thread
   it and Genesis couldn't match incoming replies back to the original message.

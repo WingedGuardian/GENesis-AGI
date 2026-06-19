@@ -36,8 +36,12 @@ def init(rt: GenesisRuntime) -> None:
         from genesis.routing.escalation import ProviderEscalation
 
         escalation = ProviderEscalation(db=rt._db, event_bus=rt._event_bus)
+        from genesis.routing.essential import build_essential_provider_map
+
         breakers = CircuitBreakerRegistry(
-            config.providers, on_recovery=escalation.record_recovery,
+            config.providers,
+            on_recovery=escalation.record_recovery,
+            essential_sites=build_essential_provider_map(config),
         )
         escalation.attach()
 
