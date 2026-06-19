@@ -11,6 +11,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The dashboard's Observations panel shows where each item stands** — every observation
+  now carries a colour-coded stage badge: **new** (unread, still needs attention), **read**
+  (Genesis has seen it), **acted** (it drove a proposal or follow-up), or **resolved**.
+  Already-seen items stop blaring, so the panel — and Genesis's own thinking — surface what's
+  genuinely new instead of a wall of stale alerts.
+
 - **Browse and manage your reference store from the dashboard** — a new **References** tab
   lists every credential, URL, IP, and account handle Genesis has stored, grouped by kind, with
   search and a per-entry badge showing whether you saved it (verified) or Genesis auto-captured
@@ -59,6 +65,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   building before it ever trips an alert.
 
 ### Fixed
+
+- **Recovered providers stop alarming once they come back** — when a model provider's
+  circuit breaker reopens after an outage, Genesis now clears that provider's "failing"
+  alert instead of leaving it lingering for days until it expired. Per-session conversation
+  telemetry no longer floods the Observations panel either, so the panel reflects current
+  state rather than a backlog of stale entries.
 
 - **Genesis can now detect replies to the emails it sends** — outbound email
   was going out without a real Message-ID header, so mail clients couldn't thread
