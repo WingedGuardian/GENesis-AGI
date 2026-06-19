@@ -60,13 +60,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
-- **No more false "crisis" alarms from drained queues or quiet periods** — two
-  stale-data sources were reporting problems that had already cleared. A
-  dead-letter-queue alert kept surfacing its old count long after the queue
-  drained; it now clears automatically when the queue empties. And the reflection
-  subsystem was flagged "dark" during legitimately quiet stretches (when nothing
-  needed reflecting); it now sends a lightweight "still alive" signal while idle,
-  so health reporting stays honest without crying wolf.
+- **No more false "reflection dark" alarms during quiet periods** — the
+  reflection subsystem was flagged "dark" during legitimately quiet stretches
+  (when no signals warranted a reflection for hours), even though it was healthy.
+  It now sends a lightweight "still alive" signal while idle, so health reporting
+  stays honest without crying wolf.
 
 - **Genesis can now detect replies to the emails it sends** — outbound email
   was going out without a real Message-ID header, so mail clients couldn't thread

@@ -22,11 +22,6 @@ _DEAD_LETTER_ALERT_THRESHOLD = 50
 # Cooldown prevents alert spam — one observation per hour max.
 _DEAD_LETTER_ALERT_COOLDOWN_S = 3600
 _last_dead_letter_alert_at: float = 0.0
-# One-time eager resolve per process: a restart resets the in-memory cooldown,
-# so a stale open alert from a previous run (queue already drained) would never
-# be resolved by the cooldown-guarded path. Clear it once on the first
-# below-threshold tick after start.
-_startup_resolve_done: bool = False
 
 
 async def _alert_dead_letter_accumulation(db: aiosqlite.Connection | None, count: int) -> None:
@@ -34,14 +29,7 @@ async def _alert_dead_letter_accumulation(db: aiosqlite.Connection | None, count
     global _last_dead_letter_alert_at
 
     now = time.monotonic()
-    # _last == 0.0 means "no active alert" (initial value / post-drain reset) —
-    # fire immediately. A bare ``now - 0.0`` comparison spuriously suppresses the
-    # alert when the monotonic clock (since-boot) is itself < cooldown, i.e. in
-    # the first hour of uptime and in fresh CI containers.
-    if (
-        _last_dead_letter_alert_at > 0.0
-        and now - _last_dead_letter_alert_at < _DEAD_LETTER_ALERT_COOLDOWN_S
-    ):
+    if now - _last_dead_letter_alert_at < _DEAD_LETTER_ALERT_COOLDOWN_S:
         return  # Cooldown active
 
     if db is None:
@@ -75,45 +63,6 @@ async def _alert_dead_letter_accumulation(db: aiosqlite.Connection | None, count
         logger.debug("Failed to create dead letter alert observation", exc_info=True)
 
 
-async def _resolve_dead_letter_alert(db: aiosqlite.Connection | None) -> None:
-    """Resolve the open dead-letter alert once the queue has drained.
-
-    The accumulation alert is never cleared on its own, so a long-since-drained
-    queue keeps surfacing a stale "DLQ N pending" critical observation in the
-    morning report. Resolve it when depth falls back below threshold, and reset
-    the cooldown so a genuine re-accumulation re-alerts promptly.
-    """
-    global _last_dead_letter_alert_at, _startup_resolve_done
-
-    # Mark the one-time startup resolve done regardless of outcome — we only
-    # need to sweep stale pre-restart alerts once per process.
-    _startup_resolve_done = True
-
-    if db is None:
-        return
-
-    try:
-        from genesis.db.crud import observations as obs_crud
-
-        resolved = await obs_crud.resolve_by_source_and_type(
-            db,
-            source="dead_letter_monitor",
-            type="infrastructure_alert",
-            resolved_at=datetime.now(UTC).isoformat(),
-            resolution_notes="auto-resolved: dead letter queue drained below threshold",
-        )
-        _last_dead_letter_alert_at = 0.0
-        if resolved:
-            logger.info(
-                "Dead letter queue drained — resolved %d stale alert observation(s)",
-                resolved,
-            )
-        else:
-            logger.debug("Dead letter resolve: no open alert observation to clear")
-    except Exception:
-        logger.debug("Failed to resolve dead letter alert observation", exc_info=True)
-
-
 async def queues(
     db: aiosqlite.Connection | None,
     deferred_queue: DeferredWorkQueue | None,
@@ -136,16 +85,9 @@ async def queues(
     if dead_letter:
         try:
             dead = await dead_letter.get_pending_count()
-            # Alert via observation when dead letters accumulate; resolve the
-            # alert when the queue drains so a stale count stops surfacing as a
-            # crisis in the morning report.
-            if dead is not None:
-                if dead >= _DEAD_LETTER_ALERT_THRESHOLD:
-                    await _alert_dead_letter_accumulation(db, dead)
-                elif _last_dead_letter_alert_at > 0.0 or not _startup_resolve_done:
-                    # Resolve on in-process drain, OR once at startup to clear a
-                    # stale alert left open by a restart while already drained.
-                    await _resolve_dead_letter_alert(db)
+            # Alert via observation when dead letters accumulate
+            if dead is not None and dead >= _DEAD_LETTER_ALERT_THRESHOLD:
+                await _alert_dead_letter_accumulation(db, dead)
         except Exception:
             errors.append("dead_letters: query failed")
             logger.error("Failed to query dead letter queue", exc_info=True)
