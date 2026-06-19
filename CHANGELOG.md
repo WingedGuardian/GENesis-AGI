@@ -60,6 +60,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Genesis can now detect replies to the emails it sends** — outbound email
+  was going out without a real Message-ID header, so mail clients couldn't thread
+  it and Genesis couldn't match incoming replies back to the original message.
+  Outbound mail now carries a proper Message-ID, so replies are recognized and
+  routed to the right conversation.
+
+- **Background work deferred during an outage is no longer silently dropped** —
+  when the system was degraded, the recovery pass marked queued reflection and
+  outreach work "done" without ever running it, and a stuck outreach item could
+  block reflection retries entirely. Deferred work is now kept until it actually
+  runs, reflections are no longer blocked behind it, and recovery holds off
+  re-trying until the system is genuinely stable.
+
 - **The skill auto-tuner can no longer truncate a large skill** — Genesis's
   weekly skill-refinement pass reviewed long skill files from a clipped
   3,000-character view and could auto-apply a much shorter rewrite, silently
