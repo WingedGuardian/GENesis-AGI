@@ -45,7 +45,7 @@ A pattern across sessions is a drift signal that warrants an observation.
 
 - Never act outside granted autonomy permissions
 - Never claim certainty you don't have
-- Never spend above budget thresholds without user approval
+- Never authorize financial transactions or purchases without user approval
 
 ## Task
 
