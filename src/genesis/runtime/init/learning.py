@@ -606,6 +606,38 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        async def _run_ego_calibration() -> None:
+            # Compute the ego's confidence calibration from the Outcome Bus T1
+            # rows and snapshot it (ECE-over-time trend). MEASURE-ONLY / DARK:
+            # writes only ego_calibration_snapshots (no cognitive-path reader),
+            # never injects back into the ego. Runs 15 min after outcome_harvest
+            # (8:45/20:45) so it reads a fresh harvest, 15 min before
+            # capability_map_refresh (9:15/21:15) — a clean WAL gap.
+            if rt._db is None:
+                return
+            try:
+                from genesis.feedback.calibration import compute_ego_calibration
+
+                snap = await compute_ego_calibration(rt._db)
+                rt.record_job_success("ego_calibration")
+                if snap is not None:
+                    logger.info(
+                        "Ego calibration: ECE=%.4f n=%d%s",
+                        snap["ece"], snap["sample_count"],
+                        " (low-confidence)" if snap["low_confidence"] else "",
+                    )
+            except Exception as exc:
+                rt.record_job_failure("ego_calibration", str(exc))
+                logger.exception("Ego calibration failed")
+
+        rt._learning_scheduler.add_job(
+            _run_ego_calibration,
+            CronTrigger(hour="9,21", minute=0, timezone=user_timezone()),
+            id="ego_calibration",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         async def _reap_activity_log() -> None:
             if rt._activity_tracker is None:
                 return
