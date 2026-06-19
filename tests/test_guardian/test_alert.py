@@ -328,4 +328,8 @@ class TestTelegramKeywordGate:
         with patch.object(urllib.request, "urlopen", side_effect=_fake_urlopen):
             channel._poll_for_keyword_sync(100, frozenset({"APPROVE"}))
         assert "offset" not in captured["body"]
-        assert captured["body"]["allowed_updates"] == ["message"]
+        # SAFETY: allowed_updates is sticky + bot-global on a shared token. The
+        # gate must NOT narrow it (e.g. to ["message"]) or it disables the main
+        # bot's callback_query (inline-button) delivery (#666 regression). An
+        # empty list = Telegram's default set, which includes callback_query.
+        assert captured["body"]["allowed_updates"] == []

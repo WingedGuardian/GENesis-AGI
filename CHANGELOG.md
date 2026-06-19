@@ -55,6 +55,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Telegram approval buttons work again** — tapping the inline **Approve** / **Approve all**
+  buttons (and any inline-keyboard button) had silently stopped doing anything for several days.
+  Telegram was dropping every button press before Genesis received it, because the Guardian's
+  recovery-approval check had narrowed the bot's update filter to text messages only. Genesis now
+  always requests Telegram's default update set (which includes button presses) — and the Guardian
+  check no longer narrows it — so button presses are delivered and resolve immediately again.
+
 - **Off-site backups can now actually be restored** — the large data (the
   database, vector memory, and transcripts) is stored only on your off-site
   (NAS) target, but the restore tool had no way to fetch it — so a from-scratch
