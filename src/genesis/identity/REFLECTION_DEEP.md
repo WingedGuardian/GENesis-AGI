@@ -136,11 +136,6 @@ For each, evaluate:
 This sweep prevents important-but-untracked insights from silently falling
 off the ego's radar after the 7-day active context window.
 
-### Cost Reconciliation (if cost summary is provided)
-
-Note any concerning budget consumption patterns. Flag if daily/weekly/monthly
-spend is above 80% of budget thresholds.
-
 ### Cognitive State Regeneration
 
 Regenerate the cognitive state summary. This is shown to every CC session — the

@@ -29,8 +29,9 @@ class TestDetectPendingWork:
     async def test_no_pending_work_empty_db(self, db, gatherer):
         pending = await gatherer.detect_pending_work(db)
         assert not pending.memory_consolidation
-        assert pending.cost_reconciliation  # always true
-        assert not pending.has_any_work or pending.cost_reconciliation
+        # Cost reconciliation removed (2026-06): cost is observability, not a
+        # reflection job — the field no longer exists on PendingWorkSummary.
+        assert not hasattr(pending, "cost_reconciliation")
 
     @pytest.mark.asyncio
     async def test_memory_consolidation_below_threshold(self, db, gatherer):
