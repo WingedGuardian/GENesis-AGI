@@ -93,7 +93,7 @@ class SkillRefiner:
             f"- Tools used: {', '.join(report.tools_used) or 'none'}\n"
             f"- Tools declared: {', '.join(report.tools_declared) or 'none'}\n"
             f"{notes_block}\n\n"
-            f"## Current Content ({lines} lines)\n```\n{current_content[:3000]}\n```\n\n"
+            f"## Current Content ({lines} lines)\n```\n{current_content}\n```\n\n"
             f"Respond with JSON:\n"
             f'{{"proposed_content": "...", "rationale": "...", '
             f'"change_size": "minor|moderate|major", '

@@ -33,6 +33,12 @@ _guardian_remote_config_checked: bool = False
 _guardian_ssh_cache: dict[str, tuple[float, ProbeResult]] = {}
 _GUARDIAN_SSH_TTL = 60.0
 
+# WAL size thresholds — mirror awareness/loop.py's _check_wal_health. Kept local
+# to avoid an observability→awareness import cycle (awareness imports
+# observability, not the reverse). 100 MB → DEGRADED, 500 MB → DOWN.
+_WAL_SIZE_WARN_BYTES = 100 * 1024 * 1024
+_WAL_SIZE_CRIT_BYTES = 500 * 1024 * 1024
+
 
 def _load_guardian_remote_from_config() -> object | None:
     """Lazy-load a GuardianRemote from ~/.genesis/guardian_remote.yaml.
@@ -280,6 +286,69 @@ async def probe_disk(
             message=f"Cannot stat {mount_path}: {exc}",
             checked_at=_clock().isoformat(),
         )
+
+
+async def probe_wal(
+    wal_path: str | Path | None = None,
+    *,
+    clock=None,
+) -> ProbeResult:
+    """Probe the SQLite WAL sidecar file size.
+
+    A bloated WAL is an early signal of DB-lock pressure: a long-lived
+    reader/MCP pinning an old snapshot prevents checkpoint, so the ``-wal``
+    file grows. Thresholds mirror the awareness loop's ``_check_wal_health``:
+    100 MB → DEGRADED, 500 MB → DOWN.
+
+    Returns ``details={"wal_mb": float}``. A missing WAL (DB in DELETE mode or
+    freshly checkpointed) is HEALTHY with ``wal_mb=0.0``.
+    """
+    from genesis.env import genesis_db_path
+
+    _clock = clock or (lambda: datetime.now(UTC))
+    start = time.monotonic()
+    path = Path(wal_path) if wal_path else Path(f"{genesis_db_path()}-wal")
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        latency = (time.monotonic() - start) * 1000
+        return ProbeResult(
+            name="wal",
+            status=ProbeStatus.HEALTHY,
+            latency_ms=round(latency, 2),
+            checked_at=_clock().isoformat(),
+            details={"wal_mb": 0.0},
+        )
+    except OSError as exc:
+        latency = (time.monotonic() - start) * 1000
+        return ProbeResult(
+            name="wal",
+            status=ProbeStatus.DOWN,
+            latency_ms=round(latency, 2),
+            message=f"Cannot stat WAL: {exc}",
+            checked_at=_clock().isoformat(),
+        )
+
+    latency = (time.monotonic() - start) * 1000
+    wal_mb = round(size / (1024 * 1024), 1)
+    if size >= _WAL_SIZE_CRIT_BYTES:
+        status = ProbeStatus.DOWN
+        msg = f"WAL is {wal_mb} MB (>{_WAL_SIZE_CRIT_BYTES // 1024 // 1024} MB)"
+    elif size >= _WAL_SIZE_WARN_BYTES:
+        status = ProbeStatus.DEGRADED
+        msg = f"WAL is {wal_mb} MB"
+    else:
+        status = ProbeStatus.HEALTHY
+        msg = ""
+
+    return ProbeResult(
+        name="wal",
+        status=status,
+        latency_ms=round(latency, 2),
+        message=msg,
+        checked_at=_clock().isoformat(),
+        details={"wal_mb": wal_mb},
+    )
 
 
 async def probe_guardian(

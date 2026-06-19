@@ -53,7 +53,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   holding the file open), Genesis raises a high/critical alert on Telegram and in
   the morning report, instead of letting it balloon silently for days.
 
+- **The dashboard shows your database journal (WAL) size at a glance** — the
+  Infrastructure health panel now displays the SQLite WAL size next to the
+  database probe, colored green / amber / red, so you can spot DB-lock pressure
+  building before it ever trips an alert.
+
 ### Fixed
+
+- **The skill auto-tuner can no longer truncate a large skill** — Genesis's
+  weekly skill-refinement pass reviewed long skill files from a clipped
+  3,000-character view and could auto-apply a much shorter rewrite, silently
+  dropping most of the content. It now reviews the full skill, and any
+  auto-applied edit that would shrink a skill below half its size is held for
+  review instead of overwriting the file.
+
+- **The dashboard's degraded-mode banner no longer overflows** — a long
+  "providers down" summary now wraps instead of spilling past the edge on
+  narrow windows.
 
 - **Telegram approval buttons work again** — tapping the inline **Approve** / **Approve all**
   buttons (and any inline-keyboard button) had silently stopped doing anything for several days.
