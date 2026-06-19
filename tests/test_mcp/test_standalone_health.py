@@ -718,9 +718,10 @@ class TestReflectionHeartbeatEmission:
         loop._topic_manager = None
 
         # A routine (non-critical) signal → silent micro tick → idle alive-pulse,
-        # and NO LLM reflection runs.
+        # and NO LLM reflection runs. value=0.0 keeps it structurally non-critical
+        # even if its name is ever added to _MICRO_CRITICAL_SIGNALS.
         routine_signal = SignalReading(
-            name="container_memory_pct", value=0.4,
+            name="container_memory_pct", value=0.0,
             source="test", collected_at="2026-01-01T00:00:00Z",
         )
         tick = MagicMock(spec=TickResult)
@@ -767,4 +768,5 @@ class TestReflectionHeartbeatThreshold:
         result = await _impl_subsystem_heartbeats()
         # 30 min < the 4h overdue threshold → alive (was "overdue" at the old 20m).
         assert result["reflection"]["status"] == "alive"
-        assert result["reflection"]["age_seconds"] > 1200  # older than the OLD threshold
+        # ~30 min old: older than the OLD 1200s threshold, well under the new 4h.
+        assert 1700 < result["reflection"]["age_seconds"] < 1900

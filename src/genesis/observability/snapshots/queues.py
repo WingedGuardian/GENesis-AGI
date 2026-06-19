@@ -22,6 +22,11 @@ _DEAD_LETTER_ALERT_THRESHOLD = 50
 # Cooldown prevents alert spam — one observation per hour max.
 _DEAD_LETTER_ALERT_COOLDOWN_S = 3600
 _last_dead_letter_alert_at: float = 0.0
+# One-time eager resolve per process: a restart resets the in-memory cooldown,
+# so a stale open alert from a previous run (queue already drained) would never
+# be resolved by the cooldown-guarded path. Clear it once on the first
+# below-threshold tick after start.
+_startup_resolve_done: bool = False
 
 
 async def _alert_dead_letter_accumulation(db: aiosqlite.Connection | None, count: int) -> None:
@@ -71,7 +76,11 @@ async def _resolve_dead_letter_alert(db: aiosqlite.Connection | None) -> None:
     morning report. Resolve it when depth falls back below threshold, and reset
     the cooldown so a genuine re-accumulation re-alerts promptly.
     """
-    global _last_dead_letter_alert_at
+    global _last_dead_letter_alert_at, _startup_resolve_done
+
+    # Mark the one-time startup resolve done regardless of outcome — we only
+    # need to sweep stale pre-restart alerts once per process.
+    _startup_resolve_done = True
 
     if db is None:
         return
@@ -92,6 +101,8 @@ async def _resolve_dead_letter_alert(db: aiosqlite.Connection | None) -> None:
                 "Dead letter queue drained — resolved %d stale alert observation(s)",
                 resolved,
             )
+        else:
+            logger.debug("Dead letter resolve: no open alert observation to clear")
     except Exception:
         logger.debug("Failed to resolve dead letter alert observation", exc_info=True)
 
@@ -124,7 +135,9 @@ async def queues(
             if dead is not None:
                 if dead >= _DEAD_LETTER_ALERT_THRESHOLD:
                     await _alert_dead_letter_accumulation(db, dead)
-                elif _last_dead_letter_alert_at > 0.0:
+                elif _last_dead_letter_alert_at > 0.0 or not _startup_resolve_done:
+                    # Resolve on in-process drain, OR once at startup to clear a
+                    # stale alert left open by a restart while already drained.
                     await _resolve_dead_letter_alert(db)
         except Exception:
             errors.append("dead_letters: query failed")

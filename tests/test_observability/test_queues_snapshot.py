@@ -19,10 +19,12 @@ queues_mod = importlib.import_module("genesis.observability.snapshots.queues")
 
 @pytest.fixture(autouse=True)
 def _reset_alert_state():
-    """The accumulation cooldown is module-global; isolate it per test."""
+    """The accumulation cooldown + startup-resolve flag are module-global."""
     queues_mod._last_dead_letter_alert_at = 0.0
+    queues_mod._startup_resolve_done = False
     yield
     queues_mod._last_dead_letter_alert_at = 0.0
+    queues_mod._startup_resolve_done = False
 
 
 def _mock_dead_letter(count: int) -> AsyncMock:
@@ -71,5 +73,39 @@ async def test_dead_letter_alert_resolved_on_drain(db):
 
 async def test_no_resolve_when_never_alerted(db):
     # Below threshold from the start, no prior alert → no-op, no observation
+    await queues_mod.queues(db, None, _mock_dead_letter(0))
+    assert await _open_alerts(db) == []
+
+
+async def test_startup_resolve_clears_stale_alert_after_restart(db):
+    """A stale alert left open by a prior run is cleared on the first
+    below-threshold tick — not stuck until the queue crosses threshold again.
+
+    A restart resets the in-memory cooldown, so without a one-time startup
+    resolve the pre-restart observation would keep surfacing in the morning
+    report indefinitely.
+    """
+    import uuid
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations as obs
+
+    # An alert created before a restart, still unresolved in the DB.
+    await obs.create(
+        db,
+        id=str(uuid.uuid4()),
+        source="dead_letter_monitor",
+        type="infrastructure_alert",
+        content="Dead letter queue has 471 pending items (threshold: 50).",
+        priority="critical",
+        created_at=datetime.now(UTC).isoformat(),
+    )
+    assert len(await _open_alerts(db)) == 1
+
+    # Post-restart in-memory state: cooldown reset, startup resolve not yet done.
+    queues_mod._last_dead_letter_alert_at = 0.0
+    queues_mod._startup_resolve_done = False
+
+    # The first below-threshold tick clears the stale alert.
     await queues_mod.queues(db, None, _mock_dead_letter(0))
     assert await _open_alerts(db) == []
