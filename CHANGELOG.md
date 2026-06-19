@@ -72,6 +72,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   but not working (circuit breaker open, including out-of-credits), and 🟢 green
   for working. A paid provider that's down now shows up red on the API-keys card
   (e.g. "openrouter — out of credits") without raising a system-wide alarm.
+- **Approving a light reflection's Claude Code fallback now actually runs it** —
+  when all of light reflection's free model providers were down at once, Genesis
+  would ask you to approve a Claude Code fallback, but approving it did nothing:
+  the reflection was never resumed (only deep and strategic reflections were).
+  Light reflections are now resumed on approval like the others, and a deferred
+  reflection is logged instead of silently dropped.
 
 - **Genesis can now detect replies to the emails it sends** — outbound email
   was going out without a real Message-ID header, so mail clients couldn't thread

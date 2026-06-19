@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from datetime import UTC, datetime, timedelta
@@ -22,15 +23,47 @@ _DEAD_LETTER_ALERT_THRESHOLD = 50
 # Cooldown prevents alert spam — one observation per hour max.
 _DEAD_LETTER_ALERT_COOLDOWN_S = 3600
 _last_dead_letter_alert_at: float = 0.0
+# The band that was last actually alerted. A same-band re-alert respects the
+# cooldown; a band change is an escalation-worthy transition that bypasses it.
+_last_dead_letter_band: str = ""
+
+
+def _dlq_band(count: int) -> str:
+    """Bucket the dead-letter count into a stable band.
+
+    The alert's content_hash is derived from the band (not the raw count) so
+    minor count drift (310 -> 319 -> 326) does not defeat dedup and produce a
+    new observation row per tick. The exact count still appears in the content.
+    """
+    if count < 100:
+        return "50-99"
+    if count < 200:
+        return "100-199"
+    if count < 500:
+        return "200-499"
+    return "500+"
 
 
 async def _alert_dead_letter_accumulation(db: aiosqlite.Connection | None, count: int) -> None:
-    """Create a critical observation when dead letters accumulate."""
-    global _last_dead_letter_alert_at
+    """Create a critical observation when dead letters accumulate.
+
+    Dedup is band-based and DB-backed (skip_if_duplicate): while an unresolved
+    alert exists for the current band, repeated ticks do not create new rows.
+    Once the queue drains and _resolve_dead_letter_alerts() resolves them, a
+    fresh spike re-alerts.
+    """
+    global _last_dead_letter_alert_at, _last_dead_letter_band
 
     now = time.monotonic()
-    if now - _last_dead_letter_alert_at < _DEAD_LETTER_ALERT_COOLDOWN_S:
-        return  # Cooldown active
+    band = _dlq_band(count)
+    # Same-band re-alerts respect the cooldown; a band change (the count crossed
+    # a boundary — a worsening or improving transition) is escalation-worthy and
+    # bypasses the cooldown so it is not swallowed for up to an hour.
+    if (
+        now - _last_dead_letter_alert_at < _DEAD_LETTER_ALERT_COOLDOWN_S
+        and band == _last_dead_letter_band
+    ):
+        return  # Cooldown active for the same band
 
     if db is None:
         return
@@ -40,10 +73,10 @@ async def _alert_dead_letter_accumulation(db: aiosqlite.Connection | None, count
 
         from genesis.db.crud import observations as obs_crud
 
-        obs_id = str(uuid.uuid4())
-        await obs_crud.create(
+        content_hash = hashlib.sha256(f"dead_letter_alert:{band}".encode()).hexdigest()
+        created = await obs_crud.create(
             db,
-            id=obs_id,
+            id=str(uuid.uuid4()),
             source="dead_letter_monitor",
             type="infrastructure_alert",
             content=(
@@ -54,13 +87,60 @@ async def _alert_dead_letter_accumulation(db: aiosqlite.Connection | None, count
             ),
             priority="critical",
             created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
         )
+        if created is None:
+            return  # An unresolved alert for this band already exists.
         _last_dead_letter_alert_at = now
+        _last_dead_letter_band = band
         logger.warning(
             "Dead letter alert: %d pending items (critical observation created)", count
         )
     except Exception:
         logger.debug("Failed to create dead letter alert observation", exc_info=True)
+
+
+async def _resolve_dead_letter_alerts(db: aiosqlite.Connection | None, count: int) -> None:
+    """Resolve outstanding dead-letter alerts once the queue drains.
+
+    The observation pipeline is otherwise write-only: _alert_dead_letter_accumulation
+    creates infrastructure_alert rows when the queue grows, but nothing resolved
+    them when it recovered, so stale "DLQ at 319" alerts lingered for days (3-day
+    TTL) and poisoned the morning report. This is the compensating recovery path.
+    """
+    global _last_dead_letter_alert_at, _last_dead_letter_band
+
+    if db is None:
+        return
+
+    # Intentionally unconditional (no in-memory "is an alert active?" guard):
+    # such a guard would be lost on restart and reintroduce the write-only
+    # staleness. The UPDATE is a cheap no-op when no resolved=0 rows match.
+    try:
+        from genesis.db.crud import observations as obs_crud
+
+        resolved = await obs_crud.resolve_by_source_and_type(
+            db,
+            source="dead_letter_monitor",
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=(
+                f"auto-resolved: dead-letter queue drained to {count} "
+                f"(< {_DEAD_LETTER_ALERT_THRESHOLD})"
+            ),
+        )
+        if resolved:
+            # Genuine recovery — allow an immediate re-alert if it spikes again.
+            _last_dead_letter_alert_at = 0.0
+            _last_dead_letter_band = ""
+            logger.info(
+                "Auto-resolved %d dead-letter alert observation(s) on drain (count=%d)",
+                resolved,
+                count,
+            )
+    except Exception:
+        logger.debug("Failed to resolve dead letter alert observations", exc_info=True)
 
 
 async def queues(
@@ -85,9 +165,13 @@ async def queues(
     if dead_letter:
         try:
             dead = await dead_letter.get_pending_count()
-            # Alert via observation when dead letters accumulate
+            # Alert when dead letters accumulate; resolve the alert when the
+            # queue drains. Without the resolve, the observation pipeline is
+            # write-only and stale "DLQ at N" alerts linger until TTL.
             if dead is not None and dead >= _DEAD_LETTER_ALERT_THRESHOLD:
                 await _alert_dead_letter_accumulation(db, dead)
+            elif dead is not None:
+                await _resolve_dead_letter_alerts(db, dead)
         except Exception:
             errors.append("dead_letters: query failed")
             logger.error("Failed to query dead letter queue", exc_info=True)
