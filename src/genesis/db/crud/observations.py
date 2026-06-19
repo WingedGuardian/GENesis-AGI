@@ -537,6 +537,33 @@ async def resolve_by_source_and_type(
     return cursor.rowcount
 
 
+async def resolve_by_content_hash(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    content_hash: str,
+    resolved_at: str,
+    resolution_notes: str,
+) -> int:
+    """Resolve all unresolved observations matching a source + content_hash pair.
+
+    Used for condition-recheck resolution where the writer derives a stable,
+    subject-specific content_hash (e.g. one per provider): the recovery signal
+    resolves exactly that subject's row and nothing else. Idempotent — a cheap
+    no-op when no unresolved row matches.
+
+    Returns the number of rows resolved.
+    """
+    cursor = await db.execute(
+        "UPDATE observations SET resolved = 1, resolved_at = ?, "
+        "resolution_notes = ? "
+        "WHERE source = ? AND content_hash = ? AND resolved = 0",
+        (resolved_at, resolution_notes, source, content_hash),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 # -- Surfacing ----------------------------------------------------------------
 
 
