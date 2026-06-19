@@ -2002,7 +2002,7 @@ deferred from V3's "Basic Autonomy" scope. They need wiring before V4.
 
 | Tag | File | Target Version |
 |-----|------|---------------|
-| `v4-executor` | `cc/reflection_bridge.py` | V4 |
+| `v4-executor` | `cc/reflection_bridge/_bridge.py` | V4 |
 | `cross-vendor-review` | `autonomy/disagreement.py` | V4 |
 | `outreach-voice` | `outreach/pipeline.py` | V4 |
 | `observation-feedback-loop` | `db/crud/observations.py` | V4 |
