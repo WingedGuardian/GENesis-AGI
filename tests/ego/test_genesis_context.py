@@ -364,6 +364,28 @@ class TestGenesisEgoContextBuilder:
         assert result.index("BRAND_NEW_ITEM") < result.index("ALREADY_SEEN_ITEM")
 
     @pytest.mark.asyncio
+    async def test_observations_redirect_triggers_investigation(
+        self, db, mock_health_data, capabilities,
+    ):
+        """A redirect-type observation fires the in-cycle investigation prompt.
+
+        Guards the column index of the redirect_count check (type is row[2]
+        once id is prepended to the SELECT).
+        """
+        await db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, category, content, priority, resolved, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            ("redir1", "realist", "cross_domain_redirect", None,
+             "Investigate memory drift across domains", "high", 0),
+        )
+        builder = GenesisEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "require in-cycle investigation" in result
+
+    @pytest.mark.asyncio
     async def test_observations_excludes_user_world(
         self, db, mock_health_data, capabilities,
     ):

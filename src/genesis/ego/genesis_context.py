@@ -333,10 +333,11 @@ class GenesisEgoContextBuilder:
                 f"- [{priority}] **{source}{cat_str}** ({obs_type}): {short}"
             )
 
-        # Count redirect observations requiring in-cycle investigation
+        # Count redirect observations requiring in-cycle investigation.
+        # row[2] is the observation type (id=row[0], source=row[1], type=row[2]).
         redirect_count = sum(
             1 for row in rows
-            if row[1] in ("cross_domain_redirect", "realist_redirect")
+            if row[2] in ("cross_domain_redirect", "realist_redirect")
         )
         if redirect_count:
             lines.append(
