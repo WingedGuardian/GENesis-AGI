@@ -237,7 +237,7 @@ class MorningReportGenerator:
         bg_active = bg.get("active", 0) if isinstance(bg, dict) else bg
         lines = [
             "## System Health",
-            f"- Cost: ${cost.get('daily_usd', 0):.2f} today, ${cost.get('monthly_usd', 0):.2f} month",
+            self._format_cost_line(cost),
             f"- Infrastructure: DB={infra.get('genesis.db', {}).get('status', '?')}, Qdrant={infra.get('qdrant', {}).get('status', '?')}",
             f"- Queues: deferred={queues.get('deferred_work', 0)}, dead_letters={queues.get('dead_letters', 0)}, pending_embeddings={queues.get('pending_embeddings', 0)}",
             f"- Surplus: {surplus.get('status', '?')}, queue_depth={surplus.get('queue_depth', 0)}",
@@ -247,17 +247,25 @@ class MorningReportGenerator:
         pending_embed = queues.get('pending_embeddings', 0)
         if pending_embed and pending_embed > 100:
             lines.append(f"- **Embedding queue elevated**: {pending_embed} pending")
-        # Top cost drivers (data already in the snapshot, just not displayed)
-        by_provider = cost.get("cost_by_provider", [])
-        if by_provider:
-            top = [
-                f"{p['provider']}: ${p['month_usd']:.2f}"
-                for p in by_provider[:3]
-                if p.get("month_usd", 0) > 0.01
-            ]
-            if top:
-                lines.append(f"- Top cost drivers (month): {', '.join(top)}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_cost_line(cost: dict) -> str:
+        """One neutral, grounded cost line: month-to-date spend against the
+        monthly cap. Real numbers only — no projection, no daily figure, no
+        spike alarm. Cost is observability, not control; the user decides
+        tradeoffs. The budget system (cost_tracker events) owns alarms, not
+        this report.
+        """
+        spend = cost.get("monthly_usd")
+        if spend is None:
+            return "- Spend: unavailable"
+        cap = cost.get("budget_monthly_limit")
+        pct = cost.get("budget_pct_used")
+        if cap:
+            pct_txt = f"{pct:.0f}% of " if pct is not None else ""
+            return f"- Spend: ${spend:.2f} MTD, {pct_txt}${cap:.0f} cap"
+        return f"- Spend: ${spend:.2f} MTD"
 
     async def _get_activity_summary(self) -> str:
         from genesis.db.crud import cc_sessions as sessions_crud

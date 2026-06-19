@@ -25,7 +25,13 @@ def mock_health():
     health = AsyncMock()
     health.snapshot.return_value = {
         "timestamp": "2026-03-12T07:00:00Z",
-        "cost": {"daily_usd": 1.23, "monthly_usd": 15.0, "budget_status": "ok"},
+        "cost": {
+            "daily_usd": 1.23,
+            "monthly_usd": 15.0,
+            "budget_status": "UNDER_LIMIT",
+            "budget_monthly_limit": 30.0,
+            "budget_pct_used": 50.0,
+        },
         "cc_sessions": {"foreground": 0, "background": {"active": 0}},
         "queues": {"deferred_work": 0, "dead_letters": 0},
         "infrastructure": {
@@ -85,7 +91,47 @@ async def test_generate_includes_health_in_context(db, mock_health, mock_drafter
     gen = MorningReportGenerator(mock_health, db, mock_drafter)
     await gen.generate()
     call_args = mock_drafter.draft.call_args[0][0]
-    assert "1.23" in call_args.context
+    # Month-to-date spend (grounded against the cap) appears in the context.
+    assert "15.00" in call_args.context
+
+
+@pytest.mark.asyncio
+async def test_format_health_cost_line_grounded(db, mock_health, mock_drafter):
+    """Cost is ONE neutral grounded line: month-to-date spend against the cap,
+    real numbers only — no projection, no daily figure, no spike alarm, no
+    provider breakdown. Cost is observability, not control."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health({
+        "cost": {
+            "daily_usd": 0.14,
+            "monthly_usd": 3.79,
+            "budget_status": "UNDER_LIMIT",
+            "budget_monthly_limit": 30.0,
+            "budget_pct_used": 12.6,
+            "forecast_monthly_usd": 622.0,  # projection — must NOT appear
+            "cost_by_provider": [{"provider": "x", "month_usd": 2.0}],
+        },
+        "queues": {}, "infrastructure": {}, "surplus": {},
+        "awareness": {}, "cc_sessions": {},
+    })
+    assert "Spend: $3.79 MTD" in section
+    assert "13% of $30 cap" in section
+    assert "622" not in section            # no projection leaked
+    assert "today" not in section.lower()  # MTD only — no daily figure
+    assert "Top cost drivers" not in section
+
+
+@pytest.mark.asyncio
+async def test_format_health_cost_line_without_budget(db, mock_health, mock_drafter):
+    """When no budget cap is configured, fall back to a bare MTD spend line."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health({
+        "cost": {"monthly_usd": 3.79, "budget_status": "unknown"},
+        "queues": {}, "infrastructure": {}, "surplus": {},
+        "awareness": {}, "cc_sessions": {},
+    })
+    assert "Spend: $3.79 MTD" in section
+    assert "cap" not in section.lower()
 
 
 @pytest.mark.asyncio
