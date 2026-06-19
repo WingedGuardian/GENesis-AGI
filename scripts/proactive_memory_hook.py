@@ -104,7 +104,10 @@ _STOP_WORDS = frozenset({
 _TRAIL_DIR = Path.home() / ".genesis" / "sessions"
 _PIVOT_SIMILARITY_THRESHOLD = 0.3
 _PIVOT_DEBOUNCE_MSGS = 3
-_MAX_TRAIL_DISPLAY = 8  # Show at most this many pivots in injected line
+_MAX_TRAIL_DISPLAY = 50  # Show up to this many pivots — the full session arc for
+# typical sessions. Was 8; the small window dropped early-session topics across long
+# multi-phase sessions (e.g. an audit phase scrolling off before a later backup phase),
+# leaving only the recent tail visible after compaction.
 _GENESIS_PREFIX = str(Path.home() / "genesis") + "/"
 
 
