@@ -41,10 +41,19 @@ def test_missing_ts_is_down():
     assert evaluate_ambient_health(_snapshot(ts=None), now=NOW).status == "down"
 
 
-def test_no_connection_is_down():
-    verdict = evaluate_ambient_health(_snapshot(active_connections=0), now=NOW)
-    assert verdict.status == "down"
-    assert any("not connected" in r for r in verdict.reasons)
+def test_device_offline_is_not_a_fault():
+    # Device absent (active_connections=0) with a fresh heartbeat + live worker is
+    # NOT a software bug — must NOT alert (policy: only software failures alert).
+    assert evaluate_ambient_health(_snapshot(active_connections=0), now=NOW).status == "ok"
+
+
+def test_device_offline_does_not_mask_software_failure():
+    # A real software failure (dead diar worker) still fires even if the device
+    # happens to be offline at the same time.
+    verdict = evaluate_ambient_health(
+        _snapshot(active_connections=0, diar_worker_alive=False), now=NOW,
+    )
+    assert verdict.status == "degraded"
 
 
 def test_dead_diar_worker_is_degraded():

@@ -61,10 +61,8 @@ class OutreachScheduler:
         # fallback when the DB query fails (e.g., lock contention).
         self._cached_critical_obs: list[dict] = []
         self._cached_critical_obs_at: float = 0.0  # monotonic time of cache
-        # Ambient-capture health — last-known status (state-change dedup) and
-        # last-alert time (hourly re-alert of a persistent bad state).
+        # Ambient-capture health — last-known status (alert only on a state change).
         self._ambient_health_status: str = "ok"
-        self._ambient_health_last_alert: float = 0.0  # monotonic time
 
     @property
     def is_running(self) -> bool:
@@ -501,8 +499,6 @@ class OutreachScheduler:
         (transient SSH failure) does not flip the alert state.
         """
         try:
-            import time
-
             from genesis.observability.ambient_health import (
                 evaluate_ambient_health,
                 load_ambient_remote_config,
@@ -515,17 +511,15 @@ class OutreachScheduler:
 
             verdict = evaluate_ambient_health(await read_edge_health(cfg))
             prev = self._ambient_health_status
-            now_mono = time.monotonic()
-            _REALERT_S = 60 * 60  # re-alert a persistent bad state at most hourly
 
             if verdict.status in ("down", "degraded"):
-                entered_bad = prev not in ("down", "degraded")
-                if entered_bad or (now_mono - self._ambient_health_last_alert) > _REALERT_S:
+                # Alert ONCE on entering a bad state — no nagging, no periodic re-alert.
+                if prev not in ("down", "degraded"):
                     emoji = "\U0001f534" if verdict.status == "down" else "\U0001f7e1"
                     text = (
                         f"{emoji} Ambient capture {verdict.status.upper()}\n"
                         + "\n".join(f"• {r}" for r in verdict.reasons)
-                        + "\n\n(toggle Ambient Mode off→on to reconnect the device)"
+                        + "\n\n(ambient bridge process down/hung — check/restart ambient-bridge.service)"
                     )
                     envelope = OutreachRequest(
                         category=OutreachCategory.BLOCKER,
@@ -537,7 +531,6 @@ class OutreachScheduler:
                     )
                     result = await self._pipeline.submit_raw(text, envelope)
                     logger.info("Ambient health alert (%s): %s", verdict.status, result.status.value)
-                    self._ambient_health_last_alert = now_mono
                 self._ambient_health_status = verdict.status
             elif verdict.status == "ok":
                 if prev in ("down", "degraded"):
