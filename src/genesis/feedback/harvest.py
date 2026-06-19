@@ -99,18 +99,42 @@ class OutcomeHarvester:
         }
 
     async def run_backfill(self) -> dict:
-        """One-shot harvest of ALL history, guarded so it runs exactly once."""
+        """One-shot harvest of ALL history, guarded so it runs exactly once.
+
+        The guard marker is set ONLY when every source completed without an
+        exception — so a transient failure (e.g. a startup DB race) cannot
+        permanently lock the backfill gate and silently lose the historical
+        rows. A clean run over genuinely-empty tables (0 rows, no error) DOES
+        set the marker — there is nothing to backfill.
+        """
         if await ego_crud.get_state(self._db, BACKFILL_MARKER):
             return {"skipped": True}
-        result = {
-            "skipped": False,
-            "proposals": await self._safe(self._harvest_proposals, None),
-            "outreach": await self._safe(self._harvest_outreach, None),
-        }
-        await ego_crud.set_state(
-            self._db, key=BACKFILL_MARKER, value=datetime.now(UTC).isoformat()
-        )
-        logger.info("Outcome backfill complete: %s", result)
+
+        failures = 0
+        counts: dict[str, int] = {}
+        for name, fn in (
+            ("proposals", self._harvest_proposals),
+            ("outreach", self._harvest_outreach),
+        ):
+            try:
+                counts[name] = await fn(None)
+            except Exception:
+                logger.exception("Outcome backfill: source %r failed", name)
+                counts[name] = 0
+                failures += 1
+
+        result = {"skipped": False, **counts}
+        if failures == 0:
+            await ego_crud.set_state(
+                self._db, key=BACKFILL_MARKER, value=datetime.now(UTC).isoformat()
+            )
+            logger.info("Outcome backfill complete: %s", result)
+        else:
+            result["incomplete"] = True
+            logger.warning(
+                "Outcome backfill incomplete (%d source failure(s)) — marker NOT "
+                "set; will retry next tick. %s", failures, result,
+            )
         return result
 
     # -- per-source harvesters --------------------------------------------- #
@@ -173,10 +197,12 @@ class OutcomeHarvester:
                     polarity="negative", reason_text=r["user_response"],
                 )
             elif status == "approved":
-                reason = None if suffix else r["user_response"]
+                # user_response on an approved (not-yet-executed) proposal is an
+                # optional approval note — execution suffixes only appear once a
+                # proposal is `executed` (handled above).
                 eid = await record_outcome(
                     self._db, **common, signal_type=SignalType.USER_DECISION,
-                    polarity="positive", reason_text=reason,
+                    polarity="positive", reason_text=r["user_response"],
                 )
             elif status == "tabled":
                 eid = await record_outcome(
@@ -186,6 +212,14 @@ class OutcomeHarvester:
             elif status == "withdrawn":
                 eid = await record_outcome(
                     self._db, **common, signal_type=SignalType.LIFECYCLE_WITHDRAWN,
+                    polarity="neutral",
+                )
+            elif status == "expired":
+                # The user let the proposal time out. Per the signal-quality
+                # design a timeout is NOT disapproval — coverage only (T3),
+                # kept out of any quality denominator.
+                eid = await record_outcome(
+                    self._db, **common, signal_type=SignalType.LIFECYCLE_EXPIRED,
                     polarity="neutral",
                 )
             else:
@@ -201,7 +235,7 @@ class OutcomeHarvester:
             "SELECT id, engagement_outcome, user_response, category, "
             "       prediction_error, delivered_at, created_at "
             "FROM outreach_history "
-            "WHERE engagement_outcome IS NOT NULL AND engagement_outcome != ''"
+            "WHERE engagement_outcome IS NOT NULL AND trim(engagement_outcome) != ''"
         )
         params: list = []
         if cutoff is not None:

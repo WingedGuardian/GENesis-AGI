@@ -154,6 +154,16 @@ class TestHarvestProposals:
         await OutcomeHarvester(db).run_backfill()
         assert await oe.count(db) == 0
 
+    @pytest.mark.asyncio
+    async def test_expired_is_lifecycle_t3(self, db):
+        # A timeout is NOT disapproval — coverage only.
+        await _add_proposal(db, pid="pe", status="expired")
+        await OutcomeHarvester(db).run_backfill()
+        row = (await oe.recent(db, limit=1))[0]
+        assert row["signal_type"] == "lifecycle_expired"
+        assert row["signal_tier"] == 3
+        assert row["polarity"] == "neutral"
+
 
 # --------------------------------------------------------------------------- #
 # Outreach harvest
@@ -221,6 +231,21 @@ class TestIdempotencyAndScheduling:
         second = await OutcomeHarvester(db).run_backfill()
         assert second["skipped"] is True
         assert await oe.count(db) == 1
+
+    @pytest.mark.asyncio
+    async def test_backfill_marker_not_set_when_a_source_fails(self, db):
+        # Reliability guard: a source exception must NOT lock the backfill gate,
+        # else the historical rows are lost forever. (Reproduce by dropping a
+        # source table — the startup-race / missing-table scenario.)
+        await _add_proposal(
+            db, pid="p1", status="executed", user_response="s|completed:x",
+        )
+        await db.execute("DROP TABLE outreach_history")
+        await db.commit()
+        result = await OutcomeHarvester(db).run_backfill()
+        assert result.get("incomplete") is True
+        assert result["proposals"] == 1  # per-source isolation: proposals still ran
+        assert await ego_crud.get_state(db, BACKFILL_MARKER) is None  # NOT locked
 
     @pytest.mark.asyncio
     async def test_incremental_run_is_idempotent_on_unique_key(self, db):

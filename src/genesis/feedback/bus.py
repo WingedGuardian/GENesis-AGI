@@ -49,6 +49,7 @@ class SignalType:
     DISPATCH = "dispatch"
     LIFECYCLE_TABLED = "lifecycle_tabled"
     LIFECYCLE_WITHDRAWN = "lifecycle_withdrawn"
+    LIFECYCLE_EXPIRED = "lifecycle_expired"
     OUTREACH_IMPLICIT = "outreach_implicit"
     MEMORY_INFLUENCE = "memory_influence"
 
@@ -64,6 +65,7 @@ _DEFAULT_TIER: dict[str, int] = {
     SignalType.DISPATCH: 3,
     SignalType.LIFECYCLE_TABLED: 3,
     SignalType.LIFECYCLE_WITHDRAWN: 3,
+    SignalType.LIFECYCLE_EXPIRED: 3,
     SignalType.OUTREACH_IMPLICIT: 3,
     SignalType.MEMORY_INFLUENCE: 3,
 }

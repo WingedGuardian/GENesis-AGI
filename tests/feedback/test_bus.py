@@ -37,6 +37,7 @@ class TestTaxonomy:
         assert default_tier(SignalType.TRIAGE_CORRECTION) == 2
         assert default_tier(SignalType.DISPATCH) == 3
         assert default_tier(SignalType.OUTREACH_IMPLICIT) == 3
+        assert default_tier(SignalType.LIFECYCLE_EXPIRED) == 3
 
     def test_unknown_defaults_to_coverage(self):
         assert default_tier("something_new") == 3
