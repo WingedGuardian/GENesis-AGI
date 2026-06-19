@@ -35,6 +35,9 @@ INTERNAL_OBS_TYPES: frozenset[str] = frozenset({
     "light_escalation_pending",
     "light_escalation_resolved",
     "light_reflection_candidate",
+    # Session/conversation telemetry — per-session pivots; consumed internally
+    # by L1 essential-knowledge (queried by type directly), never user-facing.
+    "conversation_pivot",
     # Memory internals
     "memory_operation_executed",
     "memory_operation",
