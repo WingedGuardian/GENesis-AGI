@@ -34,7 +34,14 @@ async def _alert_dead_letter_accumulation(db: aiosqlite.Connection | None, count
     global _last_dead_letter_alert_at
 
     now = time.monotonic()
-    if now - _last_dead_letter_alert_at < _DEAD_LETTER_ALERT_COOLDOWN_S:
+    # _last == 0.0 means "no active alert" (initial value / post-drain reset) —
+    # fire immediately. A bare ``now - 0.0`` comparison spuriously suppresses the
+    # alert when the monotonic clock (since-boot) is itself < cooldown, i.e. in
+    # the first hour of uptime and in fresh CI containers.
+    if (
+        _last_dead_letter_alert_at > 0.0
+        and now - _last_dead_letter_alert_at < _DEAD_LETTER_ALERT_COOLDOWN_S
+    ):
         return  # Cooldown active
 
     if db is None:

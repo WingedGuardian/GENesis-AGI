@@ -49,6 +49,19 @@ async def test_dead_letter_alert_created_on_accumulation(db):
     assert rows[0]["priority"] == "critical"
 
 
+async def test_alert_fires_with_small_monotonic_clock(db, monkeypatch):
+    """The alert must fire even when the monotonic clock is small (fresh boot or
+    CI container). _last == 0.0 means 'no active alert', not 'cooldown active' —
+    a bare ``monotonic() - 0.0`` comparison would suppress it when uptime < 1h.
+    """
+    monkeypatch.setattr(queues_mod.time, "monotonic", lambda: 10.0)
+    queues_mod._last_dead_letter_alert_at = 0.0  # no prior alert this process
+
+    await queues_mod.queues(db, None, _mock_dead_letter(60))
+
+    assert len(await _open_alerts(db)) == 1
+
+
 async def test_dead_letter_alert_resolved_on_drain(db):
     # Accumulate → alert created
     await queues_mod.queues(db, None, _mock_dead_letter(60))
