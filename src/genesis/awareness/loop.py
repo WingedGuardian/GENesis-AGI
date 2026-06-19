@@ -991,6 +991,18 @@ class AwarenessLoop:
                     "Micro tick %s silent (no critical signals active)",
                     tick_id[:8],
                 )
+                # Idle alive-pulse: a calm tick correctly ran no reflection.
+                # Emit a heartbeat so subsystem_heartbeats does not falsely
+                # report reflection "dark" during legitimately quiet periods.
+                # This fires ONLY on the silent path — a tick that ATTEMPTS and
+                # fails a reflection does not pulse, so a real outage still ages
+                # out and alarms.
+                if self._event_bus:
+                    with contextlib.suppress(Exception):
+                        await self._event_bus.emit(
+                            Subsystem.REFLECTION, Severity.DEBUG,
+                            "heartbeat", "reflection idle (no critical signals)",
+                        )
 
             # Always mark dispatched — cascade counting works on ticks
             try:
