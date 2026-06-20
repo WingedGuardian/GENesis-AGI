@@ -8,6 +8,7 @@ import aiosqlite
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
+from genesis.memory.provenance import provenance_descriptor
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +40,6 @@ async def memory_search():
             return jsonify({"error": "Memory retriever not initialized"}), 503
 
         results = await rt.hybrid_retriever.recall(query=query, limit=limit)
-
-        from genesis.memory.provenance import provenance_descriptor
 
         items = []
         for r in results:

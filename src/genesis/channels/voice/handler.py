@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from genesis.channels.tts_config import sanitize_for_speech
 from genesis.channels.voice.sessions import VoiceSessionManager
+from genesis.memory.provenance import is_external
 
 if TYPE_CHECKING:
     from genesis.memory.retrieval import HybridRetriever
@@ -92,7 +93,6 @@ class VoiceConversationHandler:
         try:
             results = await self._retriever.recall(transcript, limit=5, rerank=False)
             if results:
-                from genesis.memory.provenance import is_external
                 snippets = []
                 for r in results[:5]:
                     content = getattr(r, "content", str(r))
