@@ -6,7 +6,9 @@ import random
 
 from genesis.routing.types import ErrorCategory, RetryPolicy
 
-_TRANSIENT_CODES = {429, 500, 502, 503, 504}
+_TRANSIENT_CODES = {500, 502, 503, 504}
+_RATE_LIMITED_CODES = {429}  # provider backpressure — fail fast, do NOT trip the breaker
+_BAD_REQUEST_CODES = {400, 422}  # deterministic client errors — no retry, no trip
 _TIMEOUT_CODES = {408}  # 408 Request Timeout — litellm.Timeout maps here
 _PERMANENT_CODES = {401, 404}
 _QUOTA_CODES = {402}  # 402 Payment Required is always quota
@@ -28,6 +30,10 @@ def classify_error(status_code: int | None, error_msg: str) -> ErrorCategory:
             return ErrorCategory.PERMANENT
         if status_code in _PERMANENT_CODES:
             return ErrorCategory.PERMANENT
+        if status_code in _BAD_REQUEST_CODES:
+            return ErrorCategory.BAD_REQUEST
+        if status_code in _RATE_LIMITED_CODES:
+            return ErrorCategory.RATE_LIMITED
         if status_code in _TIMEOUT_CODES:
             return ErrorCategory.TIMEOUT
         if status_code in _TRANSIENT_CODES:

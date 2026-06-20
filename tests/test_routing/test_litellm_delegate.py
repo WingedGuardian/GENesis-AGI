@@ -49,6 +49,18 @@ def _mock_response(content="Hello", prompt_tokens=10, completion_tokens=5):
     return SimpleNamespace(choices=[choice], usage=usage)
 
 
+def _install_litellm_exceptions(mock_litellm):
+    """Install real exception classes on a MagicMock'd litellm so the delegate's
+    ``except litellm.X`` chain evaluates. An un-set Mock attribute used in an
+    ``except`` clause raises ``TypeError: catching classes that do not inherit
+    from BaseException``."""
+    for _name in (
+        "RateLimitError", "AuthenticationError", "NotFoundError", "Timeout",
+        "ServiceUnavailableError", "BadRequestError", "UnprocessableEntityError",
+    ):
+        setattr(mock_litellm, _name, type(_name, (Exception,), {}))
+
+
 # ── Model string construction ──────────────────────────────────────────────
 
 
@@ -267,11 +279,7 @@ async def test_call_hard_timeout_cancels_hung_provider():
         return _mock_response()
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = _hang
 
         start = _t.monotonic()
@@ -296,11 +304,7 @@ async def test_call_rate_limit_error():
     delegate = LiteLLMDelegate(config)
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=mock_litellm.RateLimitError("rate limited"),
         )
@@ -319,11 +323,7 @@ async def test_call_auth_error():
     delegate = LiteLLMDelegate(config)
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=mock_litellm.AuthenticationError("bad key"),
         )
@@ -342,11 +342,7 @@ async def test_call_timeout_error():
     delegate = LiteLLMDelegate(config)
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=mock_litellm.Timeout("timed out"),
         )
@@ -365,11 +361,7 @@ async def test_call_generic_error():
     delegate = LiteLLMDelegate(config)
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=RuntimeError("something broke"),
         )
@@ -382,6 +374,58 @@ async def test_call_generic_error():
     assert result.success is False
     assert result.status_code == 500
     assert "something broke" in result.error
+
+
+async def test_call_bad_request_error():
+    """litellm.BadRequestError (and its ContextWindowExceeded / ContentPolicy
+    subclasses) must map to status 400 so the router classifies it BAD_REQUEST
+    and fails fast without same-provider retries or a breaker trip."""
+    config = _config()
+    delegate = LiteLLMDelegate(config)
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        _install_litellm_exceptions(mock_litellm)
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=mock_litellm.BadRequestError("context window exceeded"),
+        )
+
+        result = await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+    assert result.success is False
+    assert result.status_code == 400
+
+
+async def test_call_unprocessable_entity_error():
+    """litellm.UnprocessableEntityError must map to status 422 (→ BAD_REQUEST)."""
+    config = _config()
+    delegate = LiteLLMDelegate(config)
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        _install_litellm_exceptions(mock_litellm)
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=mock_litellm.UnprocessableEntityError("unprocessable"),
+        )
+
+        result = await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+    assert result.success is False
+    assert result.status_code == 422
+
+
+def test_litellm_badrequest_subclasses_are_stable():
+    """Regression guard against a litellm upgrade: the delegate catches
+    litellm.BadRequestError to map context-overflow + content-policy errors to
+    400. That relies on these being BadRequestError subclasses — assert it
+    against the INSTALLED litellm so a hierarchy change fails loudly here."""
+    import litellm
+    assert issubclass(litellm.ContextWindowExceededError, litellm.BadRequestError)
+    assert issubclass(litellm.ContentPolicyViolationError, litellm.BadRequestError)
 
 
 # ── Cost extraction fallback ───────────────────────────────────────────────
@@ -493,11 +537,7 @@ async def test_auth_error_logs_warning():
         patch("genesis.routing.litellm_delegate.litellm") as mock_litellm,
         patch("genesis.routing.litellm_delegate.logger") as mock_logger,
     ):
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=mock_litellm.AuthenticationError("bad key"),
         )
@@ -523,11 +563,7 @@ async def test_rate_limit_logs_warning():
         patch("genesis.routing.litellm_delegate.litellm") as mock_litellm,
         patch("genesis.routing.litellm_delegate.logger") as mock_logger,
     ):
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=mock_litellm.RateLimitError("rate limited"),
         )
@@ -583,11 +619,7 @@ async def test_failure_logging_rate_limited():
         patch("genesis.routing.litellm_delegate.litellm") as mock_litellm,
         patch("genesis.routing.litellm_delegate.logger") as mock_logger,
     ):
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=mock_litellm.AuthenticationError("bad key"),
         )

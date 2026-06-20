@@ -311,18 +311,26 @@ class Router:
                     cost_usd=result.cost_usd,
                 )
             else:
-                # Record CB failure
                 failed_providers.append(provider_name)
                 category = classify_error(result.status_code, result.error or "")
-                tripped = cb.record_failure(category)
-                if tripped and self._event_bus:
-                    await self._event_bus.emit(
-                        Subsystem.ROUTING, Severity.WARNING,
-                        "breaker.tripped",
-                        f"Circuit breaker tripped for {provider_name}",
-                        provider=provider_name,
-                        call_site=call_site_id,
-                    )
+                # RATE_LIMITED (429) and BAD_REQUEST (400/422) are NOT provider-
+                # health signals: a 429 is expected backpressure (the rate gate
+                # is the brake) and a 400/422 is our payload's fault. Tripping
+                # the breaker on these would wrongly take a reachable provider
+                # offline for every other call site — fail through to the next
+                # chain member WITHOUT recording a breaker failure.
+                if category not in (
+                    ErrorCategory.RATE_LIMITED, ErrorCategory.BAD_REQUEST,
+                ):
+                    tripped = cb.record_failure(category)
+                    if tripped and self._event_bus:
+                        await self._event_bus.emit(
+                            Subsystem.ROUTING, Severity.WARNING,
+                            "breaker.tripped",
+                            f"Circuit breaker tripped for {provider_name}",
+                            provider=provider_name,
+                            call_site=call_site_id,
+                        )
 
         # All exhausted
         if self._event_bus:
@@ -397,7 +405,15 @@ class Router:
             #    wall-clock (this is what produced the ~30-min dream-cycle
             #    hangs). Fail fast — route_call advances to the next provider,
             #    and the circuit breaker still records this failure.
-            if category in (ErrorCategory.PERMANENT, ErrorCategory.TIMEOUT):
+            #  - RATE_LIMITED: a 429 won't clear on an immediate same-provider
+            #    retry — fall through to the next chain member instead of
+            #    burning more of this provider's rate quota.
+            #  - BAD_REQUEST: a 400/422 is deterministic (our payload) — the
+            #    same provider with the same payload fails identically.
+            if category in (
+                ErrorCategory.PERMANENT, ErrorCategory.TIMEOUT,
+                ErrorCategory.RATE_LIMITED, ErrorCategory.BAD_REQUEST,
+            ):
                 return result
 
             # Transient/degraded: retry with delay (skip delay on last attempt)

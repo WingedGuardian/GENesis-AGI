@@ -108,6 +108,90 @@ async def test_timeout_fails_fast_no_same_provider_retry(
 
 
 @pytest.mark.asyncio
+async def test_rate_limited_fails_fast_no_retry_no_breaker_trip(
+    sample_config, breakers, cost_tracker, degradation,
+):
+    """A 429 (RATE_LIMITED) must fail fast to the next provider WITHOUT a
+    same-provider retry AND WITHOUT tripping the breaker. A rate limit is
+    expected backpressure (the rate gate is the right brake) — tripping the
+    breaker would wrongly take a reachable provider offline for every other
+    call site that uses it.
+    """
+    delegate = MockDelegate(responses={
+        "free-1": CallResult(success=False, error="rate limited", status_code=429),
+    })
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+    result = await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+
+    assert result.success is True
+    assert result.provider_used == "free-2"
+    assert "free-1" in result.failed_providers
+    # Called exactly ONCE — not retried despite default max_retries=1
+    free1_calls = [c for c in delegate.calls if c["provider"] == "free-1"]
+    assert len(free1_calls) == 1
+    # The breaker must NOT record the rate-limit as a failure
+    assert breakers.get("free-1").consecutive_failures == 0
+    assert breakers.get("free-1").trip_count == 0
+
+
+@pytest.mark.asyncio
+async def test_bad_request_fails_fast_no_retry_no_breaker_trip(
+    sample_config, breakers, cost_tracker, degradation,
+):
+    """A 400 (BAD_REQUEST: context overflow / content policy / malformed) must
+    fail fast WITHOUT a same-provider retry AND WITHOUT tripping the breaker —
+    the error is our payload's fault, not the provider being unhealthy.
+    """
+    delegate = MockDelegate(responses={
+        "free-1": CallResult(
+            success=False, error="context window exceeded", status_code=400,
+        ),
+    })
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+    result = await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+
+    assert result.success is True
+    assert result.provider_used == "free-2"
+    free1_calls = [c for c in delegate.calls if c["provider"] == "free-1"]
+    assert len(free1_calls) == 1
+    assert breakers.get("free-1").consecutive_failures == 0
+    assert breakers.get("free-1").trip_count == 0
+
+
+@pytest.mark.asyncio
+async def test_transient_still_retries_and_records_breaker_failure(
+    sample_config, breakers, cost_tracker, degradation,
+):
+    """Contrast guard: a 503 (TRANSIENT) is STILL retried on the same provider
+    (default max_retries=1 → 2 calls) and STILL recorded against the breaker —
+    proving the RATE_LIMITED/BAD_REQUEST no-trip gating did not disable real
+    health failures.
+    """
+    delegate = MockDelegate(responses={
+        "free-1": CallResult(success=False, error="service unavailable", status_code=503),
+    })
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+    result = await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+
+    assert result.success is True
+    assert result.provider_used == "free-2"
+    # Retried once on free-1 (2 calls total) since 503 is transient
+    free1_calls = [c for c in delegate.calls if c["provider"] == "free-1"]
+    assert len(free1_calls) == 2
+    # And the breaker recorded the failure (one record per provider per route_call)
+    assert breakers.get("free-1").consecutive_failures == 1
+
+
+@pytest.mark.asyncio
 async def test_timeout_failover_end_to_end(sample_config, breakers, cost_tracker, degradation):
     """E2E: a hung provider routed through the REAL LiteLLMDelegate is
     hard-capped by asyncio.wait_for and the router fails fast to the next

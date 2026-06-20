@@ -306,6 +306,19 @@ class LiteLLMDelegate:
             if _should_log_failure(provider):
                 logger.warning("Provider %s unavailable: %s", provider, e)
             return CallResult(success=False, error=str(e), status_code=503)
+        except litellm.BadRequestError as e:
+            # 400-family: context-window-exceeded, content-policy, malformed
+            # request. ContextWindowExceededError + ContentPolicyViolationError
+            # subclass BadRequestError, so this catches them too. Deterministic:
+            # the router classifies BAD_REQUEST, fails fast to the next provider,
+            # and does NOT trip the breaker (it's our payload, not the provider).
+            if _should_log_failure(provider):
+                logger.warning("Provider %s bad request: %s", provider, e)
+            return CallResult(success=False, error=str(e), status_code=400)
+        except litellm.UnprocessableEntityError as e:
+            if _should_log_failure(provider):
+                logger.warning("Provider %s unprocessable request: %s", provider, e)
+            return CallResult(success=False, error=str(e), status_code=422)
         except Exception as e:
             raw_status = getattr(e, "status_code", None)
             status = raw_status if raw_status is not None else 500
