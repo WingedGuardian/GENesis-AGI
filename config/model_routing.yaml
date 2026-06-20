@@ -465,6 +465,7 @@ call_sites:
     chain:
     - openrouter-deepseek-v4
     - groq-free
+    - mistral-large-free
     default_paid: true
     description: Judge + store procedures from struggle detection and extraction
       pipeline candidates
