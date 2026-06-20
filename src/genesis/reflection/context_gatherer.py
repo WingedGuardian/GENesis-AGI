@@ -23,6 +23,14 @@ logger = logging.getLogger(__name__)
 _MIN_OBSERVATIONS_FOR_CONSOLIDATION = 10
 _COGNITIVE_STATE_STALE_HOURS = 24
 
+# Reflection-quality metric: an age-fair maturity cohort. Observations created
+# in this window are old enough to have had a fair chance to be retrieved, yet
+# recent enough to reflect current quality. Below _MIN_REFLECTION_COHORT rows
+# the dimension abstains (data_available=False) instead of scoring on noise.
+_REFLECTION_MATURITY_MIN_DAYS = 3
+_REFLECTION_MATURITY_MAX_DAYS = 10
+_MIN_REFLECTION_COHORT = 5
+
 
 class ContextGatherer:
     """Assembles comprehensive context for deep reflection from multiple DB sources."""
@@ -110,13 +118,40 @@ class ContextGatherer:
         week_ago = (now - timedelta(days=7)).isoformat()
         two_weeks_ago = (now - timedelta(days=14)).isoformat()
 
-        # Dimension 1: Reflection quality
-        # Note: NOT incrementing retrieved_count here — this query is for
-        # analysis/metrics, not for feeding content into an LLM prompt.
-        # Incrementing would inflate the quality metric this code measures.
-        recent_obs = await observations.query(db, source="cc_reflection_deep", limit=50)
-        obs_with_retrievals = [o for o in recent_obs if o.get("retrieved_count", 0) > 0]
-        obs_with_influence = [o for o in recent_obs if o.get("influenced_action", 0) > 0]
+        # Dimension 1: Reflection quality — age-fair maturity cohort.
+        # Count retrieval/influence on deep-reflection observations created
+        # 3-10 days ago. The previous metric counted a cumulative
+        # retrieved_count over the 50 MOST-RECENT observations, so the rate
+        # mechanically fell as new (not-yet-retrieved) observations entered the
+        # window — a measurement artifact, not a real quality change. Filtering
+        # to a fixed maturity window makes the reading age-fair.
+        # NOT incrementing retrieved_count here (metric read, not prompt input).
+        mature_lo = (now - timedelta(days=_REFLECTION_MATURITY_MAX_DAYS)).isoformat()
+        mature_hi = (now - timedelta(days=_REFLECTION_MATURITY_MIN_DAYS)).isoformat()
+        deep_obs = await observations.query(db, source="cc_reflection_deep", limit=200)
+        cohort = [
+            o for o in deep_obs
+            if mature_lo <= o.get("created_at", "") < mature_hi
+        ]
+        if not cohort and len(deep_obs) >= 200:
+            # The 200-row fetch was saturated by rows newer than the window, so
+            # the maturity cohort is empty for capacity reasons, not quality.
+            # Far off at current volume, but log it so a future saturation is
+            # diagnosable rather than a silent permanent abstention.
+            logger.debug(
+                "reflection_quality maturity cohort empty — 200-row "
+                "cc_reflection_deep fetch saturated by newer rows",
+            )
+        # Influence counted ONLY among retrieved observations: an observation
+        # can be flagged influenced via a memory-op target without ever being
+        # retrieved into context (nothing enforces influence ⊆ retrieved),
+        # which otherwise yields impossible influenced > retrieved ratios that
+        # drag the score down.
+        cohort_retrieved = [o for o in cohort if o.get("retrieved_count", 0) > 0]
+        cohort_influenced = [
+            o for o in cohort
+            if o.get("influenced_action", 0) > 0 and o.get("retrieved_count", 0) > 0
+        ]
 
         # Dimension 2: Procedure effectiveness
         proc_stats = await self._procedure_stats(db)
@@ -147,9 +182,15 @@ class ContextGatherer:
 
         return {
             "reflection_quality": {
-                "total_observations": len(recent_obs),
-                "retrieved_count": len(obs_with_retrievals),
-                "influenced_count": len(obs_with_influence),
+                "maturity_window_days": f"{_REFLECTION_MATURITY_MIN_DAYS}-{_REFLECTION_MATURITY_MAX_DAYS}",
+                "cohort_size": len(cohort),
+                "retrieved_count": len(cohort_retrieved),
+                "influenced_count": len(cohort_influenced),
+                # Honest abstention: deep-reflection volume is low (~one
+                # cohort's worth per week), so the cohort is frequently too
+                # small to score. The assessor must mark data_available=false
+                # rather than infer a decline from noise.
+                "data_available": len(cohort) >= _MIN_REFLECTION_COHORT,
             },
             "procedure_effectiveness": {
                 "total_active": proc_stats.total_active,

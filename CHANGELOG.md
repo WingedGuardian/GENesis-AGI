@@ -112,6 +112,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Genesis stops false-alarming about its own reflection quality declining** — its weekly
+  self-assessment scored "reflection quality" from how often its recent reflections had been
+  retrieved, but counted a running total over the 50 newest reflections. Because brand-new
+  reflections haven't had time to be referenced yet, that score drifted downward purely as new
+  reflections were created — a measurement artifact that looked like an alarming "quality crater"
+  and fed scary (but baseless) warnings into the morning report. The score is now measured over a
+  fair, fixed age window (reflections that are 3-10 days old), counts a reflection as influential
+  only if it was actually retrieved first, and honestly reports "insufficient data" when there are
+  too few mature reflections to judge — rather than inventing a decline.
+
 - **Memory-quality self-evaluation got more honest** — every time Genesis searches its memory it
   logs an internal "recall" event that feeds the self-graded memory-quality metrics (the
   precision / MRR figures in its J-9 eval and morning report). It was logging that event *twice*
