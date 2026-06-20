@@ -232,6 +232,44 @@ async def emit_recall_diagnostics(
         logger.debug("eval: failed to emit recall_diagnostics", exc_info=True)
 
 
+async def emit_recall_corrected(
+    db: aiosqlite.Connection,
+    *,
+    recall_event_id: str | None,
+    bucket: str,
+    grades: list[float | None],
+    action_taken: str,
+    result_count_before: int,
+    result_count_after: int,
+    latency_ms: float,
+) -> None:
+    """Log a selective-corrective-retrieval (CRAG) decision for calibration.
+
+    Fired by ``genesis.memory.corrective.maybe_correct_recall`` for every graded
+    recall — including the dark ``Ambiguous`` branch that takes no action — so the
+    grader's bucket thresholds can be calibrated against real recalls before the
+    corrective loop is widened beyond the conservative ``Incorrect``-only action.
+    Linked to the originating recall via ``subject_id=recall_event_id``.
+    """
+    try:
+        await j9_eval.insert_event(
+            db,
+            dimension="memory",
+            event_type="recall_corrected",
+            subject_id=recall_event_id,
+            metrics={
+                "bucket": bucket,
+                "grades": [round(g, 3) if g is not None else None for g in grades],
+                "action_taken": action_taken,
+                "count_before": result_count_before,
+                "count_after": result_count_after,
+                "latency_ms": round(latency_ms, 1),
+            },
+        )
+    except Exception:
+        logger.debug("eval: failed to emit recall_corrected", exc_info=True)
+
+
 async def emit_recall_used(
     db: aiosqlite.Connection,
     *,

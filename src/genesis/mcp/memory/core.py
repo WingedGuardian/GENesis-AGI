@@ -57,6 +57,7 @@ async def memory_recall(
     only_subsystem: str | list[str] | None = None,
     rerank: bool = True,
     include_deprecated: bool = False,
+    corrective: bool = True,
 ) -> list[dict]:
     """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
 
@@ -249,9 +250,10 @@ async def memory_recall(
         ]
 
     # MCP-layer instrumentation: emit with mode and pipeline attribution
+    recall_event_id: str | None = None
     try:
         from genesis.eval.j9_hooks import emit_recall_fired
-        await emit_recall_fired(
+        recall_event_id = await emit_recall_fired(
             memory_mod._db,
             query=query,
             result_count=len(results),
@@ -307,6 +309,23 @@ async def memory_recall(
                     "Graph enrichment failed for %s", r.memory_id, exc_info=True,
                 )
         enriched.append(d)
+
+    # Selective corrective retrieval (CRAG) — high-stakes explicit recall path.
+    # Default ON; gated + fail-fast so a confident/healthy recall is untouched.
+    # NOTE: only the full (non-compact) path runs corrective — the compact branch
+    # above returns truncated previews with no gradeable content; those callers
+    # expand later via memory_expand. (compact-corrective: deferred follow-up.)
+    if corrective:
+        from genesis.memory.corrective import maybe_correct_recall
+        enriched = await maybe_correct_recall(
+            query=query,
+            results=enriched,
+            retriever=memory_mod._retriever,
+            db=memory_mod._db,
+            path="memory",
+            pipeline_used=pipeline_used,
+            recall_event_id=recall_event_id,
+        )
     return enriched
 
 
