@@ -228,16 +228,49 @@ _stop_genesis_server() {
     sleep 1
 }
 
+_ensure_server_down() {
+    # Guarantee genesis-server is stopped AND stays stopped before mutating the
+    # repo/DB. systemd's Restart=on-failure can resurrect the server after a
+    # kill-based stop (the kill reads as a failure, arming a RestartSec timer); an
+    # explicit `systemctl stop` transitions the unit to inactive/dead and DISARMS
+    # that timer (on-failure only fires from active/running). Without this, an
+    # auto-restarted STALE-code process runs during the merge + migration window —
+    # the bug that shipped a deploy whose running process never loaded the new code.
+    systemctl --user stop genesis-server.service 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        if ! systemctl --user is-active --quiet genesis-server.service 2>/dev/null \
+           && ! pgrep -f "python -m genesis serve" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    # The restart timer may have fired between the stop and the poll — stop again,
+    # then hard-kill as a last resort.
+    systemctl --user stop genesis-server.service 2>/dev/null || true
+    pkill -KILL -f "python -m genesis serve" 2>/dev/null || true
+    sleep 1
+    if pgrep -f "python -m genesis serve" >/dev/null 2>&1; then
+        echo "  ERROR: genesis-server could not be stopped"
+        return 1
+    fi
+    return 0
+}
+
 _start_genesis_server() {
-    # Try systemctl first (preferred — enables health monitoring + auto-restart)
-    if systemctl --user start genesis-server.service 2>&1; then
+    # Use `restart` (NOT `start`): systemd's Restart=on-failure can resurrect a
+    # STALE-code instance mid-update (a kill-based stop is seen as a failure and
+    # arms a RestartSec timer). `start` is a no-op on that already-running instance
+    # and would silently leave the OLD code live after the update. `restart` always
+    # stop+starts from the current on-disk code, and still starts the unit cleanly
+    # when it is already stopped.
+    if systemctl --user restart genesis-server.service 2>&1; then
         echo "  Started genesis-server via systemd"
         return 0
     fi
     # Fallback: start directly — DEGRADED MODE
     # This bypasses systemd monitoring, so health dashboard will show red.
-    echo "  WARNING: systemctl --user start failed — falling back to direct start (degraded)"
-    echo "  Health monitoring will not work correctly. Run: systemctl --user start genesis-server.service"
+    echo "  WARNING: systemctl --user restart failed — falling back to direct start (degraded)"
+    echo "  Health monitoring will not work correctly. Run: systemctl --user restart genesis-server.service"
     nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
         >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
     echo "  Started genesis-server in degraded mode (pid $!)"
@@ -266,6 +299,15 @@ WERE_RUNNING=()
 if systemctl --user is-active --quiet genesis-server.service 2>/dev/null || \
    pgrep -f "python -m genesis serve" >/dev/null 2>&1; then
     _stop_genesis_server
+    # Disarm systemd's on-failure auto-restart so a stale-code instance can't come
+    # back during the merge/migration window. The ERR-trap rollback is not armed
+    # yet, so aborting here leaves the repo/DB untouched — safe to exit.
+    if ! _ensure_server_down; then
+        echo "  Aborting update — could not stop genesis-server; refusing to merge over a live process."
+        echo "  genesis-server has been stopped and was NOT restarted. Bring it back with:"
+        echo "    systemctl --user restart genesis-server.service"
+        exit 1
+    fi
     WERE_RUNNING+=("genesis-server")
 fi
 
@@ -381,8 +423,11 @@ _do_rollback() {
     echo "  UPDATE FAILED — $reason"
     echo "  Rolling back to $ROLLBACK_TAG..."
 
-    # Stop any running services first
+    # Stop any running services first. _ensure_server_down also disarms the
+    # on-failure restart timer so a stale instance can't come back mid-rollback
+    # (best-effort here — the rollback continues even if it can't fully stop).
     _stop_genesis_server
+    _ensure_server_down || echo "  WARNING: genesis-server may still be running during rollback"
     systemctl --user stop genesis-bridge 2>/dev/null || true
 
     # Restore the original branch, then reset it to the rollback tag.
