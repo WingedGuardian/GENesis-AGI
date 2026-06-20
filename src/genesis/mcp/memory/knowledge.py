@@ -57,6 +57,7 @@ async def knowledge_recall(
     domain: str | None = None,
     limit: int = 5,
     min_score: float = 0.15,
+    corrective: bool = True,
 ) -> list[dict]:
     """Search the knowledge base (ingested authoritative sources like docs, APIs, papers).
 
@@ -118,7 +119,39 @@ async def knowledge_recall(
             })
 
     boosted = _apply_authority_boost(merged)
-    return [r for r in boosted if r.get("score", 0.0) >= min_score][:limit]
+    final = [r for r in boosted if r.get("score", 0.0) >= min_score][:limit]
+
+    # Selective corrective retrieval (CRAG). Default ON; gated + fail-fast.
+    # path="knowledge" → web fallback is permitted on an Incorrect verdict
+    # (external knowledge is legitimately on the web; episodic memory is not).
+    if corrective:
+        # Emit recall_fired first so the recall_corrected calibration event can
+        # link back to it (subject_id) — matches memory_recall's behavior.
+        recall_event_id: str | None = None
+        try:
+            from genesis.eval.j9_hooks import emit_recall_fired
+            recall_event_id = await emit_recall_fired(
+                memory_mod._db,
+                query=query,
+                result_count=len(final),
+                top_scores=[r.get("score", 0.0) for r in final[:5]],
+                memory_ids=[r.get("unit_id", "") for r in final[:10]],
+                latency_ms=0.0,
+                source="knowledge",
+            )
+        except Exception:
+            pass  # instrumentation must never break recall
+
+        from genesis.memory.corrective import maybe_correct_recall
+        final = await maybe_correct_recall(
+            query=query,
+            results=final,
+            retriever=memory_mod._retriever,
+            db=memory_mod._db,
+            path="knowledge",
+            recall_event_id=recall_event_id,
+        )
+    return final
 
 
 async def _ingest_knowledge_unit(

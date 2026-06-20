@@ -330,6 +330,12 @@ _CALL_SITE_META: dict[str, dict] = {
         "frequency": "Per J9 eval scoring",
         "model_tier": "frontier",
     },
+    "crag_grade": {
+        "description": "CRAG retrieval grader — scores topical relevance of recalled memories to the query for selective corrective retrieval (memory_recall/knowledge_recall), reusing the memory_recall_grounding_runtime rubric. Gated (only borderline/low recalls) + fail-fast (returns original results if slow/down). In routing/degradation._L2_SKIP so it sheds under REDUCED degradation. Caller: memory/corrective.py.",
+        "category": "assessment",
+        "frequency": "Per corrective recall (gated)",
+        "model_tier": "slm",
+    },
     "voice_conversation": {
         "description": "Realtime voice S2S conversational-turn generation. Free API chain (Groq/Gemini/Mistral) with user-facing retry profile (latency-sensitive). Caller: channels/voice/handler.py.",
         "category": "reasoning",

@@ -77,3 +77,62 @@ MEMORY_RECALL_GROUNDING = Rubric(
 
 
 register_rubric(MEMORY_RECALL_GROUNDING)
+
+
+# Runtime variant for selective corrective retrieval (W-CRAG). Identical relevance
+# rules, but DROPS the eval-only {expected} placeholder (a dataset label with no
+# runtime equivalent). Kept under a SEPARATE rubric name so runtime CRAG grading
+# traces never mix with eval-harness calibration history. See genesis.memory.corrective.
+_RUNTIME_PROMPT = """\
+You are grading the *topical relevance* of a recalled memory to a query.
+You are NOT grading the memory's truthfulness, its overall quality, its
+freshness, or whether it should exist — only whether it is topically
+related enough to the query that a downstream consumer (a human or
+another LLM) COULD draw on it while responding.
+
+Three rules, applied in order:
+
+1. **Topic overlap is the bar, not keyword overlap.** A memory that
+   shares the query's topic counts as relevant even if the wording
+   differs. A memory that shares only surface keywords (same noun, same
+   tool name) without addressing the query's actual subject is NOT
+   relevant.
+
+2. **You do not assess truth.** If the memory makes a claim that is
+   wrong, biased, outdated, or self-contradictory, that does NOT make
+   it irrelevant. A wrong-but-on-topic memory still scores as relevant.
+
+3. **Procedural / investigation / decision memories count as relevant**
+   if they record activity or reasoning about the query's topic.
+
+Query the user asked:
+{query}
+
+Memory that was recalled:
+{actual}
+
+Score the topical relevance from 0.0 (off-topic / unrelated) through
+0.5 (tangential but on-topic) to 1.0 (directly on-topic, clearly
+related). Brief rationale required.
+
+Respond with ONLY a JSON object, no markdown fences, no prose:
+{{"score": <float 0.0-1.0>, "rationale": "<one sentence>"}}"""
+
+
+MEMORY_RECALL_GROUNDING_RUNTIME = Rubric(
+    name="memory_recall_grounding_runtime",
+    version="1.0.0",
+    description=(
+        "Runtime CRAG grader — topical relevance of a recalled memory to a "
+        "query, for selective corrective retrieval (genesis.memory.corrective). "
+        "Same relevance rules as memory_recall_grounding but without the "
+        "eval-only {expected} placeholder, so runtime grading traces stay "
+        "separate from eval-harness calibration history."
+    ),
+    prompt_template=_RUNTIME_PROMPT,
+    pass_threshold=0.6,
+    extra_placeholders=("query",),
+)
+
+
+register_rubric(MEMORY_RECALL_GROUNDING_RUNTIME)

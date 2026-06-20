@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from genesis.resilience.state import ResilienceStateMachine
 
 # L2 (Reduced) skips these call sites
-_L2_SKIP = {"12_surplus_brainstorm", "13_morning_report", "judge"}
+_L2_SKIP = {"12_surplus_brainstorm", "13_morning_report", "judge", "crag_grade"}
 
 # L3 (Essential) only keeps these call sites.
 # Note: "2_triage" removed from this set 2026-05-10 alongside its removal from
@@ -25,7 +25,7 @@ _TMP_MODERATE_SKIP = {"12_surplus_brainstorm", "13_morning_report"}
 _TMP_HIGH_SKIP = _TMP_MODERATE_SKIP | {
     "5_deep_reflection", "6_strategic_reflection", "7_ego_cycle",
     "14_weekly_self_assessment", "16_quality_calibration",
-    "28_observation_sweep", "judge",
+    "28_observation_sweep", "judge", "crag_grade",
 }
 
 

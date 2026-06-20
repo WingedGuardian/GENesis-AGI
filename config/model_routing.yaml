@@ -615,6 +615,20 @@ call_sites:
     default_paid: true
     description: "Contribution pipeline \u2014 evaluates whether a code change is\
       \ already fixed upstream"
+  crag_grade:
+    chain:
+    - openrouter-haiku
+    - mistral-small-free
+    - groq-free
+    - gemini-free
+    default_paid: true
+    retry_profile: user_facing
+    dispatch: api
+    description: "CRAG retrieval grader — scores topical relevance of a recalled\
+      \ memory to the query for selective corrective retrieval\
+      \ (memory_recall/knowledge_recall). Fast cross-vendor chain; the corrective\
+      \ pass fail-fasts (bounded grade step — returns original results if the\
+      \ grader is slow/down) and sheds under REDUCED degradation."
   judge:
     chain:
     - openrouter-deepseek-v4

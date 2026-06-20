@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis self-corrects a bad memory recall instead of running with it** — on high-stakes
+  lookups (the explicit memory and knowledge recall tools), Genesis now grades whether the
+  recalled results are actually on-topic, and when a recall comes back clearly irrelevant it
+  automatically tries again — broadening the search, drawing on the knowledge base, and (for
+  knowledge queries only) the web — rather than feeding itself off-topic context. Conservative
+  by design: confident recalls are left untouched, grading is skipped when results are already
+  strong, and it fails fast so it never slows a recall if the grader is unavailable. Latency-
+  sensitive paths (the proactive hook, voice, in-session context injection) are unaffected.
+
 - **The dashboard's Observations panel shows where each item stands** — every observation
   now carries a colour-coded stage badge: **new** (unread, still needs attention), **read**
   (Genesis has seen it), **acted** (it drove a proposal or follow-up), or **resolved**.
