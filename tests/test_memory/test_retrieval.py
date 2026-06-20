@@ -161,6 +161,69 @@ async def test_recall_knowledge_only(mock_qdrant, mock_crud, mock_links, _):
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_threads_collection_episodic(mock_qdrant, mock_crud, mock_links, _):
+    """A Qdrant hit from episodic_memory → result.collection == 'episodic_memory'
+    (the authoritative first-party/external discriminator, audit D12)."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.9)]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    _setup_link_mocks(mock_links)
+
+    results = await retriever.recall(
+        "test", source="episodic", limit=5, min_activation=0.0, rerank=False,
+    )
+    assert results
+    assert results[0].collection == "episodic_memory"
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_threads_collection_knowledge(mock_qdrant, mock_crud, mock_links, _):
+    """A Qdrant hit from knowledge_base → result.collection == 'knowledge_base'."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.9)]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    _setup_link_mocks(mock_links)
+
+    results = await retriever.recall(
+        "test", source="knowledge", limit=5, min_activation=0.0, rerank=False,
+    )
+    assert results
+    assert results[0].collection == "knowledge_base"
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_threads_collection_fts_only(mock_qdrant, mock_crud, mock_links, _):
+    """An FTS5-only hit (no Qdrant vector) must still carry its collection from
+    the FTS row — this is exactly the path where the old payload['scope'] signal
+    was absent, so the collection discriminator must cover it (audit D12)."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = []  # no vector hits → FTS-only
+    mock_crud.search_ranked = AsyncMock(return_value=[
+        {**_make_fts_row("mem-kb", -5.0), "collection": "knowledge_base"},
+    ])
+    _setup_link_mocks(mock_links)
+
+    results = await retriever.recall(
+        "test", source="both", limit=5, min_activation=0.0, rerank=False,
+    )
+    assert results
+    assert results[0].memory_id == "mem-kb"
+    assert results[0].collection == "knowledge_base"
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
 async def test_recall_both_sources(mock_qdrant, mock_crud, mock_links, _):
     retriever, _, _, _ = _build_retriever()
 
