@@ -730,3 +730,82 @@ class TestReflectionHeartbeatEmission:
         await loop._dispatch_reflection(tick)
 
         mock_bus.emit.assert_not_awaited()
+
+    async def test_idle_pulse_emitted_on_silent_tick(self) -> None:
+        """A calm Micro tick (no critical signals) emits an idle alive-pulse.
+
+        Without it, legitimately quiet periods (no reflection-worthy signals for
+        hours) made subsystem_heartbeats falsely report reflection "dark". The
+        pulse fires only on the silent path, so a tick that ATTEMPTS and fails a
+        reflection still does not pulse — a real outage ages out and alarms.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from genesis.awareness.loop import AwarenessLoop
+        from genesis.awareness.types import Depth, SignalReading, TickResult
+        from genesis.observability.types import Severity, Subsystem
+
+        mock_engine = AsyncMock()
+        mock_bus = AsyncMock()
+
+        loop = AwarenessLoop.__new__(AwarenessLoop)
+        loop._reflection_engine = mock_engine
+        loop._event_bus = mock_bus
+        loop._cc_reflection_bridge = None
+        loop._deferred_queue = None
+        loop._db = AsyncMock()
+        loop._topic_manager = None
+
+        # A routine (non-critical) signal → silent micro tick → idle alive-pulse,
+        # and NO LLM reflection runs. value=0.0 keeps it structurally non-critical
+        # even if its name is ever added to _MICRO_CRITICAL_SIGNALS.
+        routine_signal = SignalReading(
+            name="container_memory_pct", value=0.0,
+            source="test", collected_at="2026-01-01T00:00:00Z",
+        )
+        tick = MagicMock(spec=TickResult)
+        tick.classified_depth = Depth.MICRO
+        tick.tick_id = "test-tick-idle"
+        tick.signals = [routine_signal]
+
+        await loop._dispatch_reflection(tick)
+
+        mock_engine.reflect.assert_not_awaited()
+        mock_bus.emit.assert_awaited_once_with(
+            Subsystem.REFLECTION, Severity.DEBUG,
+            "heartbeat", "reflection idle (no critical signals)",
+        )
+
+
+class TestReflectionHeartbeatThreshold:
+    """The reflection overdue threshold tolerates quiet periods.
+
+    Reflections only fire when signals warrant; with the idle alive-pulse a
+    healthy system stays fresh, and a 30-minute gap must read 'alive', not the
+    false 'dark' the old 20-minute threshold produced.
+    """
+
+    async def test_reflection_alive_at_30_minutes(self, db, monkeypatch) -> None:
+        import types as _types
+        from datetime import UTC, datetime, timedelta
+
+        import genesis.mcp.health as health_mod
+        from genesis.mcp.health.manifest import _impl_subsystem_heartbeats
+
+        ts = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+        await db.execute(
+            "INSERT INTO events (id, timestamp, subsystem, severity, event_type, "
+            "message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ev-refl-hb", ts, "reflection", "DEBUG", "heartbeat",
+             "reflection idle (no critical signals)", ts),
+        )
+        await db.commit()
+
+        monkeypatch.setattr(health_mod, "_service", _types.SimpleNamespace(_db=db))
+        monkeypatch.setattr(health_mod, "_event_bus", None)
+
+        result = await _impl_subsystem_heartbeats()
+        # 30 min < the 4h overdue threshold → alive (was "overdue" at the old 20m).
+        assert result["reflection"]["status"] == "alive"
+        # ~30 min old: older than the OLD 1200s threshold, well under the new 4h.
+        assert 1700 < result["reflection"]["age_seconds"] < 1900

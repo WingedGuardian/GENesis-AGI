@@ -60,6 +60,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **No more false "reflection dark" alarms during quiet periods** — the
+  reflection subsystem was flagged "dark" during legitimately quiet stretches
+  (when no signals warranted a reflection for hours), even though it was healthy.
+  It now sends a lightweight "still alive" signal while idle, so health reporting
+  stays honest without crying wolf.
+
 - **Cost reporting now shows your real spend, not a phantom figure** — the health
   tool that Genesis's reflections consult was reporting a *notional* "if Claude Code
   were billed by the API" number (hundreds of dollars a month) as if it were actual
