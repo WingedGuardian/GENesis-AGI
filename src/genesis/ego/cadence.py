@@ -370,7 +370,9 @@ class EgoCadenceManager:
             return
 
         try:
+            from genesis.db.crud import ego as ego_crud
             from genesis.db.crud import user_goals
+            from genesis.ego.types import GOAL_STUCK_EXECUTED_THRESHOLD
 
             goals = await user_goals.list_active(self._session._db)
             if not goals:
@@ -402,14 +404,38 @@ class EgoCadenceManager:
                 if days_stale < threshold_days:
                     continue
 
+                # Distinguish "stuck" (effort spent, no progress) from "stale"
+                # (untouched): a still-active goal with >= N executed proposals
+                # has been worked on without advancing. Stuck goals get a
+                # higher-priority signal so the ego replans rather than nudges.
+                # Best-effort — a query failure yields {} → treated as stale.
+                summary_counts = await ego_crud.get_goal_proposal_summary(
+                    self._session._db, g["id"],
+                )
+                executed = summary_counts.get("executed", 0)
+                is_stuck = executed >= GOAL_STUCK_EXECUTED_THRESHOLD
+
                 title = (g.get("title") or "?")[:80]
+                if is_stuck:
+                    sig_summary = (
+                        f"Goal stuck ({days_stale}d, {executed} executed, "
+                        f"not advancing): {title}"
+                    )
+                    sig_priority = "high"
+                else:
+                    sig_summary = f"Goal stale ({days_stale}d): {title}"
+                    sig_priority = "medium"
+
                 signal = EgoSignal(
                     signal_type="timer",
                     focus_category="goal_review",
-                    summary=f"Goal stale ({days_stale}d): {title}",
-                    priority="medium",
+                    summary=sig_summary,
+                    priority=sig_priority,
                     focus_id=g["id"],
-                    metadata={},
+                    metadata={
+                        "mode": "stuck" if is_stuck else "stale",
+                        "executed_proposals": executed,
+                    },
                 )
                 if self._signal_queue.push(signal):
                     pushed += 1
