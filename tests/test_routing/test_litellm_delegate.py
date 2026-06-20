@@ -388,9 +388,80 @@ async def test_call_generic_error():
 
 
 async def test_call_cost_extraction_fallback():
-    """If completion_cost raises on a paid provider, cost_usd should be 0.0 and cost_known False."""
+    """Graceful-degrade path: when completion_cost raises on a paid provider that
+    has NO model_profiles entry (cfg.profile is unset here), cost_usd stays 0.0
+    and cost_known False. The profile-PRESENT path is covered by
+    test_call_cost_profile_fallback_when_litellm_unknown."""
     config = _config(is_free=False)
     delegate = LiteLLMDelegate(config)
+    mock_resp = _mock_response()
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+        mock_litellm.completion_cost.side_effect = Exception("unknown model")
+
+        result = await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+    assert result.success is True
+    assert result.cost_usd == 0.0
+    assert result.cost_known is False
+
+
+async def test_call_cost_profile_fallback_when_litellm_unknown():
+    """When litellm.completion_cost raises (aggregator model not in litellm's DB)
+    but the provider has a model_profiles entry, cost is computed from the
+    profile's cost_per_mtok and cost_known is True — closing the blind-spend gap
+    (ROUTE-03 / ROUT-03). Visibility only; never gates routing or budget.
+    """
+    from types import SimpleNamespace
+
+    class _FakeRegistry:
+        def get(self, name):
+            if name == "glm-5.1":
+                return SimpleNamespace(cost_per_mtok_in=0.80, cost_per_mtok_out=2.56)
+            return None
+
+    config = RoutingConfig(
+        providers={
+            "glm51": ProviderConfig(
+                name="glm51", provider_type="zenmux", model_id="z-ai/glm-5.1",
+                is_free=False, rpm_limit=None, open_duration_s=120, profile="glm-5.1",
+            ),
+        },
+        call_sites={},
+        retry_profiles={},
+    )
+    delegate = LiteLLMDelegate(config, profile_registry=_FakeRegistry())
+    # 1M in + 1M out → cost = 1*0.80 + 1*2.56 = 3.36 (clean arithmetic).
+    mock_resp = _mock_response(prompt_tokens=1_000_000, completion_tokens=1_000_000)
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+        mock_litellm.completion_cost.side_effect = Exception("This model isn't mapped yet")
+
+        result = await delegate.call(
+            "glm51", "z-ai/glm-5.1", [{"role": "user", "content": "Hi"}],
+        )
+
+    assert result.success is True
+    assert result.cost_known is True
+    assert result.cost_usd == pytest.approx(3.36)
+
+
+async def test_call_cost_profile_fallback_missing_profile_stays_unknown():
+    """Paid provider whose profile is absent from the registry → graceful
+    degrade: cost 0.0, cost_known False (logged, not silent)."""
+    from types import SimpleNamespace  # noqa: F401
+
+    class _EmptyRegistry:
+        def get(self, name):
+            return None
+
+    config = _config(is_free=False)
+    delegate = LiteLLMDelegate(config, profile_registry=_EmptyRegistry())
     mock_resp = _mock_response()
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:

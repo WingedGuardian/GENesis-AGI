@@ -277,3 +277,103 @@ async def test_scan_dlq_orphans_no_dlq_wired_returns_zero():
     )
 
     assert await router.scan_dlq_orphans_after_reload() == 0
+
+
+@pytest.mark.asyncio
+async def test_scan_dlq_orphans_preserves_all_sentinel():
+    """Chain-exhausted items enqueue with target_provider='all' (router.py) — a
+    SENTINEL meaning 'retry the whole chain', NOT a removed provider. The orphan
+    scan must NOT expire them on config reload.
+
+    Regression (routing-dlq-orphan-nukes-all): 'all' is never in the active
+    provider set, so the NOT IN filter expired 100% of chain-exhausted items on
+    EVERY config reload — before the 6-hourly redispatch job could replay them.
+    """
+    import aiosqlite
+
+    from genesis.db.schema import create_all_tables
+    from genesis.routing.dead_letter import DeadLetterQueue
+    from genesis.routing.router import Router
+
+    async with aiosqlite.connect(":memory:") as db:
+        db.row_factory = aiosqlite.Row
+        await create_all_tables(db)
+
+        dlq = DeadLetterQueue(db)
+        # Chain-exhausted sentinel item — must SURVIVE reload.
+        all_id = await dlq.enqueue(
+            operation_type="chain_exhausted:site_1",
+            payload={"call_site_id": "site_1", "messages": []},
+            target_provider="all",
+            failure_reason="All providers exhausted",
+        )
+        # A genuine orphan for a provider about to be dropped — must expire.
+        orphan_id = await dlq.enqueue(
+            operation_type="route_call",
+            payload={"call_site_id": "site_1", "messages": []},
+            target_provider="prov_b",
+            failure_reason="provider down",
+        )
+
+        old_config = _make_config()
+        breakers = CircuitBreakerRegistry(old_config.providers)
+        router = Router(
+            config=old_config,
+            breakers=breakers,
+            cost_tracker=MagicMock(),
+            degradation=MagicMock(),
+            delegate=AsyncMock(),
+            dead_letter=dlq,
+        )
+
+        # Reload dropping prov_b (prov_a only).
+        router.reload_config(_make_config(providers={
+            "prov_a": ProviderConfig(
+                name="prov_a", provider_type="test", model_id="m1",
+                is_free=True, rpm_limit=None, open_duration_s=60,
+            ),
+        }))
+
+        count = await router.scan_dlq_orphans_after_reload()
+
+        from genesis.db.crud import dead_letter as dl_crud
+        pending_ids = {p["id"] for p in await dl_crud.query_pending(db)}
+        assert all_id in pending_ids, "the 'all' sentinel item must NOT be expired on reload"
+        assert orphan_id not in pending_ids, "the dropped-provider orphan should expire"
+        assert count == 1, "only the genuine provider-removed orphan should expire"
+
+
+@pytest.mark.asyncio
+async def test_expire_orphans_preserves_all_when_active_set_empty():
+    """The empty-active-set branch (no providers in config) must STILL preserve
+    the 'all' sentinel — only real-provider orphans expire."""
+    import aiosqlite
+
+    from genesis.db.crud import dead_letter as dl_crud
+    from genesis.db.schema import create_all_tables
+    from genesis.routing.dead_letter import DeadLetterQueue
+
+    async with aiosqlite.connect(":memory:") as db:
+        db.row_factory = aiosqlite.Row
+        await create_all_tables(db)
+
+        dlq = DeadLetterQueue(db)
+        all_id = await dlq.enqueue(
+            operation_type="chain_exhausted:site_1",
+            payload={"call_site_id": "site_1", "messages": []},
+            target_provider="all",
+            failure_reason="exhausted",
+        )
+        await dlq.enqueue(
+            operation_type="route_call",
+            payload={"call_site_id": "site_1", "messages": []},
+            target_provider="prov_x",
+            failure_reason="down",
+        )
+
+        expired = await dl_crud.expire_orphans_by_provider(db, active_providers=[])
+        expired_targets = {t for _, t in expired}
+        assert "all" not in expired_targets
+        assert "prov_x" in expired_targets
+        pending_ids = {p["id"] for p in await dl_crud.query_pending(db)}
+        assert all_id in pending_ids

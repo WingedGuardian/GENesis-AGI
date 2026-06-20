@@ -128,6 +128,35 @@ for _model, _cost in _CUSTOM_MODEL_COSTS.items():
         litellm.model_cost[_model] = _cost
 
 
+# Module-level cache for the cost-fallback profile registry: loaded ONCE and
+# shared across all delegate constructions. The production delegate is built once
+# at startup, but the standalone/MCP, eval, and test paths build many — don't
+# re-read the YAML (or re-warn) each time. Injected registries (tests) bypass it.
+_PROFILE_REGISTRY = None
+_PROFILE_REGISTRY_LOADED = False
+
+
+def _load_profile_registry():
+    """Load (once, cached) the model-profile registry for the cost-visibility
+    fallback. Defensive: a missing/unreadable file caches None (cost stays
+    "unknown"), never a delegate-construction failure."""
+    global _PROFILE_REGISTRY, _PROFILE_REGISTRY_LOADED
+    if _PROFILE_REGISTRY_LOADED:
+        return _PROFILE_REGISTRY
+    try:
+        from genesis.env import repo_root
+        from genesis.routing.model_profiles import ModelProfileRegistry
+
+        registry = ModelProfileRegistry(repo_root() / "config" / "model_profiles.yaml")
+        registry.load()
+        _PROFILE_REGISTRY = registry
+    except Exception:
+        logger.warning("Could not load model_profiles for cost fallback", exc_info=True)
+        _PROFILE_REGISTRY = None
+    _PROFILE_REGISTRY_LOADED = True
+    return _PROFILE_REGISTRY
+
+
 class LiteLLMDelegate:
     """CallDelegate implementation using litellm.acompletion().
 
@@ -135,8 +164,34 @@ class LiteLLMDelegate:
     at startup via python-dotenv.
     """
 
-    def __init__(self, config: RoutingConfig) -> None:
+    def __init__(self, config: RoutingConfig, *, profile_registry: object = None) -> None:
         self._config = config
+        # Model-profile registry for the cost fallback (ROUTE-03 / ROUT-03):
+        # when litellm.completion_cost can't price an aggregator model (the
+        # OpenAI-compat-prefixed glm/minimax/qwen strings raise "model isn't
+        # mapped yet"), compute cost from the provider's profile cost_per_mtok
+        # instead of silently recording $0. Injected in tests; self-loaded from
+        # config/model_profiles.yaml in production. Visibility ONLY — never
+        # gates routing or budget ("cost tracking is observability, not control").
+        self._profiles = (
+            profile_registry if profile_registry is not None else _load_profile_registry()
+        )
+
+    def _cost_from_profile(self, cfg, usage) -> tuple[float, bool]:
+        """Fallback cost from model_profiles cost_per_mtok when litellm can't
+        price the model. Returns ``(cost_usd, cost_known)``."""
+        if not getattr(cfg, "profile", None) or usage is None or self._profiles is None:
+            return 0.0, False
+        profile = self._profiles.get(cfg.profile)
+        if profile is None:
+            return 0.0, False
+        in_tok = getattr(usage, "prompt_tokens", 0) or 0
+        out_tok = getattr(usage, "completion_tokens", 0) or 0
+        cost = (
+            (in_tok / 1_000_000) * profile.cost_per_mtok_in
+            + (out_tok / 1_000_000) * profile.cost_per_mtok_out
+        )
+        return cost, True
 
     async def call(
         self, provider: str, model_id: str, messages: list[dict], **kwargs
@@ -194,9 +249,16 @@ class LiteLLMDelegate:
                         completion_response=response, model=model_string,
                     )
                 except Exception:
-                    cost = 0.0
-                    cost_known = False
-                    if _should_log_failure(provider):
+                    # litellm can't price this model (aggregator strings not in
+                    # its DB). Fall back to the provider's model_profiles cost so
+                    # spend stays visible, not silently $0 (ROUTE-03 / ROUT-03).
+                    cost, cost_known = self._cost_from_profile(cfg, usage)
+                    if cost_known:
+                        logger.debug(
+                            "litellm couldn't price %s/%s; used model_profiles "
+                            "fallback: $%.6f", provider, model_string, cost,
+                        )
+                    elif _should_log_failure(provider):
                         logger.warning(
                             "Cost calculation failed for %s/%s — recording as $0.00",
                             provider, model_string, exc_info=True,
