@@ -15,6 +15,11 @@ write the DB, but only on Write/Edit; a ``.*`` matcher fires far more often).
 
 Budget: <50ms (JSON parse + locked file append). No LLM, no network, no SQLite.
 Honors ``GENESIS_SPANS_INCOMING_DIR`` (test override).
+
+Registration: NOT via the repo ``.claude/settings.json`` — dispatched sessions
+run with a cwd outside any git repo, so CC never discovers project settings
+there. ``CCInvoker`` injects this hook per-dispatch via ``--settings`` pointing
+at a generated minimal file (``cc_span_settings_path`` in ``genesis.cc.invoker``).
 """
 
 from __future__ import annotations
