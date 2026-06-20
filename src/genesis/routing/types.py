@@ -97,6 +97,13 @@ class RetryPolicy:
     max_delay_ms: int = 30000
     backoff_multiplier: float = 2.0
     jitter_pct: float = 0.25
+    # Aggregate wall-clock ceiling (seconds) across the whole route_call chain
+    # walk — retries x chain length. None = no aggregate cap (today's behavior).
+    # A GATE checked only BETWEEN attempts/providers: it never interrupts an
+    # in-flight call (the delegate's per-attempt timeout owns that). It bounds
+    # the retry-multiplier on a SINGLE completion, NOT Genesis's cognition (a
+    # reflection is many bounded completions).
+    max_total_s: float | None = None
 
 
 @dataclass(frozen=True)

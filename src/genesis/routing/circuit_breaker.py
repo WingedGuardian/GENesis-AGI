@@ -40,6 +40,7 @@ class CircuitBreaker:
         failure_threshold: int = 3,
         open_duration_s: int = 120,
         success_threshold: int = 2,
+        probe_success_threshold: int = 3,
         clock: object = None,
         on_state_change: object = None,
         on_recovery: object = None,
@@ -48,6 +49,10 @@ class CircuitBreaker:
         self._failure_threshold = failure_threshold
         self._open_duration_s = open_duration_s
         self._success_threshold = success_threshold
+        # Stricter than success_threshold: a free /v1/models probe (used by
+        # record_probe_success) is weaker evidence than a real completion, so a
+        # HALF_OPEN provider needs MORE consecutive clean probes to heal.
+        self._probe_success_threshold = probe_success_threshold
         self._clock = clock or time.monotonic
         self._on_state_change = on_state_change
         self._on_recovery = on_recovery
@@ -135,6 +140,34 @@ class CircuitBreaker:
             self._notify_change()
             return True
         return False
+
+    def record_probe_success(self) -> None:
+        """A free health probe (GET /v1/models returned 200 with this provider's
+        model listed) confirmed reachability while the breaker is HALF_OPEN.
+
+        Advances toward recovery with the STRICTER ``probe_success_threshold``
+        (a probe is weaker evidence than a real completion), so a low/no-traffic
+        fallback provider can heal instead of being stuck in HALF_OPEN forever.
+        No-op outside HALF_OPEN (uses the ``state`` property so an OPEN breaker
+        whose window has expired transitions to HALF_OPEN first). On full
+        recovery it fires ``on_recovery`` — exactly like ``record_success`` — so
+        the provider's lingering ``provider_failure`` observation auto-resolves.
+        """
+        if self.state != ProviderState.HALF_OPEN:
+            return
+        was_tripped = self._trip_count > 0
+        self._consecutive_successes += 1
+        if self._consecutive_successes >= self._probe_success_threshold:
+            old = self._state
+            self._state = ProviderState.CLOSED
+            self._consecutive_successes = 0
+            self._consecutive_failures = 0
+            self._last_failure_category = None
+            self._trip_count = 0  # recovered — reset backoff
+            if self._state != old:
+                self._notify_change()
+            if was_tripped and self._on_recovery:
+                self._on_recovery(self._provider.name)
 
     def record_failure(self, category: ErrorCategory) -> bool:
         """Record a failed call. Returns True if this failure caused the breaker to trip OPEN."""

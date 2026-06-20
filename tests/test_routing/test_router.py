@@ -505,3 +505,130 @@ async def test_failed_providers_tracked_on_open_breaker(sample_config, breakers,
     assert result.success is True
     assert result.provider_used == "free-2"
     assert "free-1" in result.failed_providers
+
+
+# ── Aggregate wall-clock deadline (RetryPolicy.max_total_s) ───────────────────
+
+
+def _three_free_config(max_total_s, max_retries=0):
+    from genesis.routing.types import CallSiteConfig, ProviderConfig, RetryPolicy, RoutingConfig
+    providers = {
+        f"free-{i}": ProviderConfig(
+            name=f"free-{i}", provider_type="test", model_id="m",
+            is_free=True, rpm_limit=None, open_duration_s=120,
+        ) for i in range(1, 4)
+    }
+    return RoutingConfig(
+        providers=providers,
+        call_sites={"site": CallSiteConfig(id="site", chain=["free-1", "free-2", "free-3"])},
+        retry_profiles={"default": RetryPolicy(
+            max_retries=max_retries, base_delay_ms=0, jitter_pct=0.0, max_total_s=max_total_s,
+        )},
+    )
+
+
+def _clock_advancing_delegate(clock, per_call=0.1):
+    """A MockDelegate that fails every provider and advances `clock` per call."""
+    delegate = MockDelegate(responses={
+        f"free-{i}": CallResult(success=False, status_code=503, error="down")
+        for i in range(1, 4)
+    })
+    orig = delegate.call
+
+    async def _timed(provider, model_id, messages, **kwargs):
+        r = await orig(provider, model_id, messages, **kwargs)
+        clock[0] += per_call
+        return r
+
+    delegate.call = _timed
+    return delegate
+
+
+@pytest.mark.asyncio
+async def test_aggregate_deadline_stops_chain_walk(cost_tracker, degradation):
+    """With max_total_s set, route_call stops walking the chain once the
+    aggregate wall-clock budget is exceeded — it does NOT try every remaining
+    provider. The gate is checked BETWEEN providers (never interrupts a call).
+    """
+    from unittest.mock import patch
+
+    config = _three_free_config(max_total_s=0.15)
+    breakers = CircuitBreakerRegistry(config.providers)
+    clock = [0.0]
+    delegate = _clock_advancing_delegate(clock)
+    router = Router(
+        config=config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+
+    with patch("genesis.routing.router.time.monotonic", lambda: clock[0]):
+        result = await router.route_call("site", [{"role": "user", "content": "hi"}])
+
+    assert result.success is False
+    # free-1 (0.0→0.1) + free-2 (0.1→0.2); at the top of free-3 the elapsed
+    # (0.2) already exceeds max_total_s (0.15) → free-3 is never attempted.
+    called = [c["provider"] for c in delegate.calls]
+    assert called == ["free-1", "free-2"]
+    assert "free-3" not in called
+
+
+@pytest.mark.asyncio
+async def test_no_aggregate_deadline_tries_full_chain(cost_tracker, degradation):
+    """max_total_s=None (default) keeps today's behavior — the whole chain is
+    attempted no matter how long the cumulative wall-clock is.
+    """
+    from unittest.mock import patch
+
+    config = _three_free_config(max_total_s=None)
+    breakers = CircuitBreakerRegistry(config.providers)
+    clock = [0.0]
+    delegate = _clock_advancing_delegate(clock, per_call=10.0)  # huge per-call
+    router = Router(
+        config=config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+
+    with patch("genesis.routing.router.time.monotonic", lambda: clock[0]):
+        result = await router.route_call("site", [{"role": "user", "content": "hi"}])
+
+    assert result.success is False
+    called = [c["provider"] for c in delegate.calls]
+    assert called == ["free-1", "free-2", "free-3"]
+
+
+@pytest.mark.asyncio
+async def test_aggregate_deadline_stops_inner_retries(cost_tracker, degradation):
+    """The deadline also bounds same-provider RETRIES: a single provider with a
+    long retry budget stops retrying once the aggregate deadline passes (never
+    interrupting an in-flight attempt — checked between attempts).
+    """
+    from unittest.mock import patch
+
+    from genesis.routing.types import CallSiteConfig, ProviderConfig, RetryPolicy, RoutingConfig
+
+    providers = {"free-1": ProviderConfig(
+        name="free-1", provider_type="test", model_id="m",
+        is_free=True, rpm_limit=None, open_duration_s=120,
+    )}
+    config = RoutingConfig(
+        providers=providers,
+        call_sites={"site": CallSiteConfig(id="site", chain=["free-1"])},
+        retry_profiles={"default": RetryPolicy(
+            max_retries=5, base_delay_ms=0, jitter_pct=0.0, max_total_s=0.25,
+        )},
+    )
+    breakers = CircuitBreakerRegistry(providers)
+    clock = [0.0]
+    delegate = _clock_advancing_delegate(clock)  # advances 0.1 per call
+
+    router = Router(
+        config=config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+    with patch("genesis.routing.router.time.monotonic", lambda: clock[0]):
+        result = await router.route_call("site", [{"role": "user", "content": "hi"}])
+
+    assert result.success is False
+    # attempt0(0.0→0.1) attempt1(0.1→0.2) attempt2(0.2→0.3); attempt3 sees
+    # 0.3 >= 0.25 and stops — 3 calls, NOT the full 6 (max_retries+1).
+    assert len(delegate.calls) == 3
