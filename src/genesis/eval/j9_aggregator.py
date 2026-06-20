@@ -170,7 +170,11 @@ async def _compute_memory_quality(
     total_recalls = len(by_recall)
 
     for _rid, memories in by_recall.items():
-        # Sort by original position (memory_ids order in recall_fired)
+        # Sort by retrieval rank (the memory's memory_ids[:5] position, persisted
+        # in each event's metrics by j9_batch). Events arrive in concurrent-insert /
+        # timestamp-DESC order, so list order is NOT the rank — without this sort
+        # MRR is meaningless. Pre-fix historical events lack a rank → sort last.
+        memories.sort(key=lambda m: m.get("rank", 1 << 30))
         relevant_count = sum(1 for m in memories if m.get("relevance", 0) >= 0.5)
         precisions.append(relevant_count / max(len(memories), 1))
 

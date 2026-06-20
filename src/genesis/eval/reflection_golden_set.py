@@ -208,7 +208,11 @@ async def _grade_observation(
 
     try:
         parsed = json.loads(text)
-        score = float(parsed.get("score", 0.0))
+        if "score" not in parsed:
+            # Valid JSON but no 'score' — raise so the caller counts it as an
+            # error rather than mislabeling the golden case with a silent 0.0.
+            raise ValueError("judge response missing required 'score' key")
+        score = float(parsed["score"])
         score = max(0.0, min(1.0, score))
         rationale = str(parsed.get("rationale", ""))
         return score, rationale, used_model or "unknown"

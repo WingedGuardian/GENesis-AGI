@@ -125,6 +125,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   brainstorm ideas posted to the Telegram "Surplus" topic now render as clean bulleted text
   (idea, detail, and why it matters) instead of the raw ```json``` code block the model
   produces. Plain-text and non-JSON messages are unaffected.
+- **Genesis's self-quality metrics are trustworthy again.** Three bugs were corrupting the
+  numbers Genesis uses to judge its own competence (the J9 readiness grades and the quality
+  gate that decides which self-improvements ship): the memory retrieval-quality metric (MRR)
+  was computed against database arrival order instead of the actual retrieval rank, making it
+  meaningless; and when the LLM judge returned a malformed verdict (valid JSON but missing the
+  score), it was silently recorded as a confident "0 / fail" instead of an error — quietly
+  polluting the quality gate and calibration. Both now reflect reality, so the readiness grades
+  and ship-gate are honest.
 
 - **The neural monitor labels every cognitive call site honestly.** Eight call sites
   that previously showed blank (the eval judge, voice conversation, session observer,

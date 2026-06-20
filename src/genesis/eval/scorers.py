@@ -353,7 +353,12 @@ class LLMJudgeScorer(Scorer):
         extracted = _extract_json(raw)
         try:
             parsed = json.loads(extracted)
-            score_val = float(parsed.get("score", 0.0))
+            if "score" not in parsed:
+                # Valid JSON but no top-level 'score' — route to the parse-fail
+                # sentinel (below) instead of silently recording a confident 0.0,
+                # which calibration would miscount as a disagreement, not an error.
+                raise ValueError("judge response missing required 'score' key")
+            score_val = float(parsed["score"])
             rationale = str(parsed.get("rationale", ""))
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             logger.debug(

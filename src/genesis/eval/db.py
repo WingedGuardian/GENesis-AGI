@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import aiosqlite
 
-from genesis.eval.types import EvalRunSummary
+from genesis.eval.types import EvalRunSummary, ScorerType
 
 
 async def insert_run(
@@ -51,8 +51,8 @@ async def insert_run(
             """INSERT INTO eval_results
                (id, run_id, case_id, input_text, expected_output, actual_output,
                 score, passed, skipped, scorer_type, scorer_detail, latency_ms,
-                input_tokens, output_tokens, cost_usd, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                input_tokens, output_tokens, cost_usd, created_at, metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 uuid.uuid4().hex,
                 run_id,
@@ -70,6 +70,15 @@ async def insert_run(
                 result.output_tokens,
                 result.cost_usd,
                 now,
+                # migration 0014's documented dual-write: the structurally-
+                # queryable JSON view. ONLY the LLM-judge scorer packs JSON into
+                # scorer_detail; other scorers put a plain string there, which
+                # must NOT land in a column whose value is JSON-queryability.
+                (
+                    result.scorer_detail
+                    if result.scorer_type == ScorerType.LLM_JUDGE
+                    else None
+                ),
             ),
         )
 
