@@ -1,4 +1,4 @@
-"""Schema tests for the otel_spans tracing table (migration 0027).
+"""Schema tests for the otel_spans tracing table (migration 0028).
 
 Verifies the migration path and the fresh-install path (db/schema/_tables.py)
 produce the SAME otel_spans schema — the two must never drift — plus the
