@@ -8,6 +8,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from genesis.learning.cognitive_ledger import record_file_modification
 from genesis.learning.skills.types import ChangeSize, SkillProposal
 from genesis.learning.skills.validator import SkillValidator
 
@@ -72,8 +73,6 @@ class SkillApplicator:
 
             # Route the overwrite through the cognitive self-mod ledger so the
             # pre-image is captured and a degrading skill edit can be rolled back.
-            from genesis.learning.cognitive_ledger import record_file_modification
-
             await record_file_modification(
                 db,
                 actor="skill_evolution",
