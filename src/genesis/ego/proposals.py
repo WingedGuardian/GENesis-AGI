@@ -530,6 +530,20 @@ class ProposalWorkflow:
                         "earnback resolution hook failed for %s",
                         prop.get("id"), exc_info=True,
                     )
+                # Goal status change: apply pause/deprioritize on approval.
+                try:
+                    from genesis.ego.goal_actions import (
+                        handle_goal_status_change_resolution,
+                    )
+
+                    await handle_goal_status_change_resolution(
+                        self._db, prop, status,
+                    )
+                except Exception:
+                    logger.warning(
+                        "goal status-change hook failed for %s",
+                        prop.get("id"), exc_info=True,
+                    )
             else:
                 logger.warning(
                     "Proposal %s not updated (already resolved?)",

@@ -344,6 +344,19 @@ async def ego_proposal_resolve(proposal_id: str):
             "earnback resolution hook failed for %s", proposal_id,
         )
 
+    # Goal status change: apply pause/deprioritize on approval.
+    try:
+        from genesis.ego.goal_actions import handle_goal_status_change_resolution
+
+        prop = await ego_crud.get_proposal(rt._db, proposal_id)
+        if prop:
+            await handle_goal_status_change_resolution(rt._db, prop, status)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "goal status-change hook failed for %s", proposal_id,
+        )
+
     return jsonify({"ok": True, "id": proposal_id, "status": status})
 
 

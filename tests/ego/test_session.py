@@ -690,3 +690,85 @@ class TestGoalAssessmentOutput:
         assert "goal_assessment" in contract
         assert "goal_status_recommendation" in contract
         assert "continue|pause|deprioritize|close" in contract
+
+
+class TestGoalStatusRecommendationRouting:
+    """_surface_goal_recommendation: reversible recs → approvable proposal;
+    terminal (close) → passive observation. Recommend-only — no goal writes."""
+
+    @pytest.fixture
+    async def goals_db(self, db):
+        await db.execute(TABLES["user_goals"])
+        await db.execute(TABLES["observations"])
+        await db.commit()
+        return db
+
+    @staticmethod
+    async def _insert_goal(conn, *, gid, status="active", priority="high"):
+        await conn.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, status, priority, created_at, updated_at) "
+            "VALUES (?, 'My Goal', 'project', ?, ?, '2026-06-01', '2026-06-01')",
+            (gid, status, priority),
+        )
+        await conn.commit()
+
+    async def test_pause_creates_status_change_proposal(self, ego_session, goals_db):
+        ego_session._source_tag = "user_ego_cycle"
+        await self._insert_goal(goals_db, gid="gA", priority="high")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="gA", recommendation="pause", assessment="stuck for weeks",
+        )
+
+        ego_session._proposals.create_batch.assert_awaited_once()
+        props = ego_session._proposals.create_batch.call_args[0][0]
+        assert len(props) == 1
+        p = props[0]
+        assert p["action_type"] == "goal_status_change"
+        assert p["goal_id"] == "gA"
+        assert p["expected_outputs"] == {"change": "status", "value": "paused"}
+        ego_session._proposals.send_digest.assert_awaited_once()
+
+    async def test_deprioritize_lowers_priority_one_notch(self, ego_session, goals_db):
+        ego_session._source_tag = "user_ego_cycle"
+        await self._insert_goal(goals_db, gid="gB", priority="high")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="gB", recommendation="deprioritize", assessment="lower it",
+        )
+
+        p = ego_session._proposals.create_batch.call_args[0][0][0]
+        assert p["expected_outputs"] == {"change": "priority", "value": "medium"}
+
+    async def test_close_creates_observation_not_proposal(self, ego_session, goals_db):
+        ego_session._source_tag = "user_ego_cycle"
+        await self._insert_goal(goals_db, gid="gC")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="gC", recommendation="close", assessment="done with it",
+        )
+
+        ego_session._proposals.create_batch.assert_not_awaited()
+        cursor = await goals_db.execute(
+            "SELECT type, category FROM observations WHERE source = 'user_ego'",
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["type"] == "goal_recommendation"
+
+    async def test_antispam_skips_when_proposal_open(self, ego_session, goals_db):
+        ego_session._source_tag = "user_ego_cycle"
+        await self._insert_goal(goals_db, gid="gD")
+        await goals_db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, content, status, goal_id, created_at) "
+            "VALUES ('open1', 'goal_status_change', 'x', 'pending', 'gD', '2026-06-01')",
+        )
+        await goals_db.commit()
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="gD", recommendation="pause", assessment="again",
+        )
+
+        ego_session._proposals.create_batch.assert_not_awaited()

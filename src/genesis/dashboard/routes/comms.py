@@ -209,6 +209,16 @@ async def comms_resolve_proposal(proposal_id: str):
     except Exception:
         logger.warning("earnback resolution hook failed for %s", proposal_id)
 
+    # Goal status change: apply pause/deprioritize on approval.
+    try:
+        from genesis.ego.goal_actions import handle_goal_status_change_resolution
+
+        prop = await ego.get_proposal(rt.db, proposal_id)
+        if prop:
+            await handle_goal_status_change_resolution(rt.db, prop, status)
+    except Exception:
+        logger.warning("goal status-change hook failed for %s", proposal_id)
+
     # Trigger delayed sweep on approval — same 5-min grace as Telegram,
     # so the user can revoke before dispatch fires.
     if status == "approved" and rt.ego_session:

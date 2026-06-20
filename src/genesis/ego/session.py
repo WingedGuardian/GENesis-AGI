@@ -462,12 +462,23 @@ class EgoSession:
         recommendation: str,
         assessment: str,
     ) -> None:
-        """Surface a goal status recommendation as an observation.
+        """Route the ego's goal status recommendation to the user.
 
-        The ego assesses; the user decides. Recommendations appear in the
-        user's morning report and may trigger Telegram notifications via
-        the outreach pipeline.
+        Recommend-only — nothing is applied autonomously. The reversible
+        recommendations (``pause`` / ``deprioritize``) become an *approvable*
+        ``goal_status_change`` proposal applied ONLY on user approval (see
+        ``ego/goal_actions.py``). Terminal/other recommendations (``close`` →
+        achieve vs abandon) stay a passive observation — that call is genuinely
+        the user's. The ego assesses; the user decides.
         """
+        if recommendation in ("pause", "deprioritize"):
+            await self._propose_goal_status_change(
+                goal_id=goal_id,
+                recommendation=recommendation,
+                assessment=assessment,
+            )
+            return
+
         import uuid
 
         from genesis.db.crud import observations as obs_crud
@@ -500,6 +511,85 @@ class EgoSession:
         except Exception:
             logger.warning(
                 "Failed to surface goal recommendation", exc_info=True,
+            )
+
+    async def _propose_goal_status_change(
+        self,
+        *,
+        goal_id: str,
+        recommendation: str,
+        assessment: str,
+    ) -> None:
+        """Create an approvable ``goal_status_change`` proposal (recommend-only).
+
+        Delivered out-of-band via the proposal workflow (``create_batch`` +
+        ``send_digest``), bypassing the realist gate — mirrors how autonomy
+        earn-back proposals are surfaced. The change is applied ONLY when the
+        user approves the proposal (``ego/goal_actions.py``), never here.
+        """
+        try:
+            from genesis.db.crud import user_goals
+
+            # Anti-spam: don't stack a second status-change proposal on a goal
+            # that already has one open (pending or awaiting dispatch-approval).
+            cursor = await self._db.execute(
+                "SELECT 1 FROM ego_proposals WHERE goal_id = ? "
+                "AND action_type = 'goal_status_change' "
+                "AND status IN ('pending', 'approved') LIMIT 1",
+                (goal_id,),
+            )
+            if await cursor.fetchone():
+                logger.info(
+                    "goal_status_change already open for %s — skipping",
+                    goal_id[:12],
+                )
+                return
+
+            goal = await user_goals.get_by_id(self._db, goal_id)
+            title = (goal.get("title") or "?") if goal else "?"
+
+            if recommendation == "pause":
+                change, value, verb = "status", "paused", "Pause"
+            else:  # deprioritize — drop priority one notch (reversible)
+                current = (goal.get("priority") or "medium") if goal else "medium"
+                lower = {
+                    "critical": "high", "high": "medium",
+                    "medium": "low", "low": "low",
+                }
+                value, change, verb = lower.get(current, "low"), "priority", "Deprioritize"
+
+            prop = {
+                "action_type": "goal_status_change",
+                "action_category": "goal_management",
+                "content": (
+                    f"{verb} goal '{title}'.\n\n"
+                    f"Assessment: {assessment[:400]}\n\n"
+                    f"Approve to apply ({change} → {value}); reject to keep as-is."
+                ),
+                "rationale": (
+                    "Goal-review recommendation on a stale/stuck goal. "
+                    "Recommend-only — applied only if you approve."
+                ),
+                "confidence": 0.7,
+                "urgency": "low",
+                "goal_id": goal_id,
+                "expected_outputs": {"change": change, "value": value},
+            }
+
+            batch_id, ids, _ = await self._proposals.create_batch(
+                [prop], ego_source=self._source_tag,
+            )
+            if ids:
+                await self._proposals.send_digest(
+                    batch_id, ego_source=self._source_tag,
+                )
+                logger.info(
+                    "Goal status-change proposal surfaced: %s %s→%s",
+                    goal_id[:12], change, value,
+                )
+        except Exception:
+            logger.warning(
+                "Failed to surface goal status-change proposal", exc_info=True,
             )
 
     # -- Output processing --------------------------------------------------
@@ -1688,10 +1778,13 @@ class EgoSession:
 
         dispatched: list[str] = []
         for prop in approved:
-            # Autonomy earn-back proposals are resolved (promoted + marked
-            # executed) at approval time and must NEVER be dispatched as a
-            # session. Defense-in-depth in case one is still 'approved' here.
-            if prop.get("action_type") == "autonomy_earnback":
+            # Autonomy earn-back and goal-status-change proposals are resolved
+            # (applied + marked executed) at approval time and must NEVER be
+            # dispatched as a session. Defense-in-depth in case one is still
+            # 'approved' here.
+            if prop.get("action_type") in (
+                "autonomy_earnback", "goal_status_change",
+            ):
                 continue
             # Staleness guard — skip proposals approved more than 7 days ago.
             # Proposals go stale by clock only as a safety net; semantic
