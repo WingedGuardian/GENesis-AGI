@@ -18,7 +18,9 @@ def init(rt: GenesisRuntime) -> None:
             GenesisEventBus,
             configure_logging,
         )
+        from genesis.observability import spans as _spans
         from genesis.observability.provider_activity import ProviderActivityTracker
+        from genesis.observability.span_writer import SpanWriter
 
         configure_logging(level=logging.INFO)
         rt._event_bus = GenesisEventBus()
@@ -27,6 +29,13 @@ def init(rt: GenesisRuntime) -> None:
         rt._activity_tracker = ProviderActivityTracker()
         if rt._db is not None:
             rt._activity_tracker.set_db(rt._db)
+        # Tracing backbone: wire the span writer + activate capture. Honors
+        # GENESIS_SPANS_DISABLED (kill switch read inside set_writer). Dark until
+        # a later phase instruments route_call / operation boundaries.
+        rt._span_writer = SpanWriter()
+        if rt._db is not None:
+            rt._span_writer.set_db(rt._db, process="server")
+        _spans.set_writer(rt._span_writer)
         logger.info("Genesis observability initialized")
     except ImportError:
         logger.warning("genesis.observability not available")
