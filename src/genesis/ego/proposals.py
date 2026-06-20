@@ -214,10 +214,18 @@ class ProposalWorkflow:
                 except (ValueError, TypeError):
                     rank_val = None
 
-            # Validate goal_id — drop if not a real active goal.
-            # If validation is degraded (valid_goal_ids is None), pass through.
+            # Validate goal_id — drop if not a real active goal (guards against
+            # hallucinated LLM goal_ids). If validation is degraded
+            # (valid_goal_ids is None), pass through.
+            # EXCEPT goal_status_change: its goal_id is code-generated for a
+            # specific (possibly just-paused, hence non-active) goal, never
+            # hallucinated — dropping it would silently no-op the approval.
             raw_goal_id = p.get("goal_id") or None
-            if raw_goal_id and valid_goal_ids is not None:
+            if (
+                raw_goal_id
+                and valid_goal_ids is not None
+                and p.get("action_type") != "goal_status_change"
+            ):
                 goal_id = raw_goal_id if raw_goal_id in valid_goal_ids else None
                 if not goal_id:
                     logger.warning(
@@ -528,6 +536,20 @@ class ProposalWorkflow:
                 except Exception:
                     logger.warning(
                         "earnback resolution hook failed for %s",
+                        prop.get("id"), exc_info=True,
+                    )
+                # Goal status change: apply pause/deprioritize on approval.
+                try:
+                    from genesis.ego.goal_actions import (
+                        handle_goal_status_change_resolution,
+                    )
+
+                    await handle_goal_status_change_resolution(
+                        self._db, prop, status,
+                    )
+                except Exception:
+                    logger.warning(
+                        "goal status-change hook failed for %s",
                         prop.get("id"), exc_info=True,
                     )
             else:

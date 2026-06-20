@@ -1333,6 +1333,33 @@ class UserEgoContextBuilder:
                 "### Goal-Linked Proposals\n*No proposals for this goal.*\n"
             )
 
+        # Stuck diagnosis: effort spent (>= N executed proposals) but the goal
+        # is still active and hasn't advanced. Prompt the ego to diagnose WHY
+        # rather than propose more of the same — framed as a hypothesis, NOT a
+        # verdict, and explicitly NOT "just close it" (anti-timidity guardrail).
+        # Count via the unbounded per-status summary (NOT the capped display
+        # rows above) so this matches the cadence scanner's classification.
+        from genesis.db.crud import ego as _ego_crud
+        from genesis.ego.types import GOAL_STUCK_EXECUTED_THRESHOLD
+
+        _summary = await _ego_crud.get_goal_proposal_summary(self._db, focus_id)
+        executed_count = _summary.get("executed", 0)
+        if (
+            executed_count >= GOAL_STUCK_EXECUTED_THRESHOLD
+            and goal.get("status") == "active"
+        ):
+            lines.append(
+                "### ⚠ Stuck Signal\n"
+                f"This goal has **{executed_count} executed proposals** but is "
+                "still `active` and hasn't advanced (last updated "
+                f"{(goal.get('updated_at') or '?')[:10]}). Effort is being spent "
+                "without progress. **Diagnose WHY** before proposing more of the "
+                "same: wrong strategy? an unaddressed blocker? does it need "
+                "decomposing into subgoals, or a fundamentally different "
+                "approach? Do NOT simply recommend closing it to clear this "
+                "signal — that avoids the problem rather than solving it.\n"
+            )
+
         # Subgoals: show children if this is a parent goal
         try:
             from genesis.db.crud import user_goals as ug_crud

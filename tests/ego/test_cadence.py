@@ -888,10 +888,13 @@ class TestGoalStaleness:
 
     @pytest.fixture
     async def goal_db(self):
-        """DB with user_goals table."""
+        """DB with user_goals + ego_proposals tables (proposals for stuck-detection)."""
         async with aiosqlite.connect(":memory:") as conn:
             conn.row_factory = aiosqlite.Row
-            for table in ("ego_cycles", "ego_state", "cc_sessions", "user_goals"):
+            for table in (
+                "ego_cycles", "ego_state", "cc_sessions",
+                "user_goals", "ego_proposals",
+            ):
                 await conn.execute(TABLES[table])
             await conn.commit()
             yield conn
@@ -1015,3 +1018,67 @@ class TestGoalStaleness:
         await goal_cadence._check_stale_goals()
         # Should NOT trigger: 8 days < global 30
         assert goal_cadence._signal_queue.empty()
+
+    async def test_stuck_goal_high_priority_signal(self, goal_cadence, goal_db):
+        """Stale goal with >= threshold executed proposals → stuck/high-priority."""
+        old = (datetime.now(UTC) - timedelta(days=20)).isoformat()
+        await goal_db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("goal-stuck", "Stuck Goal", "project", "high", "active", old, old),
+        )
+        for i in range(2):  # GOAL_STUCK_EXECUTED_THRESHOLD
+            await goal_db.execute(
+                "INSERT INTO ego_proposals "
+                "(id, action_type, content, status, goal_id, created_at) "
+                "VALUES (?, 'investigate', 'x', 'executed', ?, ?)",
+                (f"p-stuck-{i}", "goal-stuck", datetime.now(UTC).isoformat()),
+            )
+        await goal_db.commit()
+
+        await goal_cadence._check_stale_goals()
+
+        signals = goal_cadence._signal_queue.drain()
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.priority == "high"
+        assert sig.metadata["mode"] == "stuck"
+        assert sig.metadata["executed_proposals"] == 2
+        assert "stuck" in sig.summary.lower()
+
+    async def test_worked_but_below_threshold_is_stale(self, goal_cadence, goal_db):
+        """Stale goal with < threshold executed proposals stays stale/medium.
+
+        Also asserts non-executed (pending) proposals do NOT count as effort.
+        """
+        old = (datetime.now(UTC) - timedelta(days=20)).isoformat()
+        await goal_db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("goal-onep", "One Proposal", "project", "medium", "active", old, old),
+        )
+        await goal_db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, content, status, goal_id, created_at) "
+            "VALUES (?, 'investigate', 'x', 'executed', ?, ?)",
+            ("p-onep-0", "goal-onep", datetime.now(UTC).isoformat()),
+        )
+        # A pending proposal must NOT count toward "executed" effort.
+        await goal_db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, content, status, goal_id, created_at) "
+            "VALUES (?, 'investigate', 'x', 'pending', ?, ?)",
+            ("p-onep-1", "goal-onep", datetime.now(UTC).isoformat()),
+        )
+        await goal_db.commit()
+
+        await goal_cadence._check_stale_goals()
+
+        signals = goal_cadence._signal_queue.drain()
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.priority == "medium"
+        assert sig.metadata["mode"] == "stale"
+        assert sig.metadata["executed_proposals"] == 1

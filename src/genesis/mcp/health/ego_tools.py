@@ -531,6 +531,17 @@ async def ego_proposal_resolve(
                     )
                 except Exception:
                     logger.debug("earnback resolution hook failed", exc_info=True)
+                # Goal status change: apply pause/deprioritize on approval.
+                try:
+                    from genesis.ego.goal_actions import (
+                        handle_goal_status_change_resolution,
+                    )
+
+                    await handle_goal_status_change_resolution(db, prop, status)
+                except Exception:
+                    logger.debug(
+                        "goal status-change hook failed", exc_info=True,
+                    )
 
     resolved = sum(1 for v in results.values() if v in ("approved", "rejected"))
     return {

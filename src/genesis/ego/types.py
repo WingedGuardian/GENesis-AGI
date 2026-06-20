@@ -102,6 +102,14 @@ class EgoCycle:
     ego_source: str = ""  # 'user_ego_cycle' or 'genesis_ego_cycle'
 
 
+# Goal-pursuit (Phase 6): a still-active goal that is stale AND has accumulated
+# this many *executed* proposals is "stuck" (effort spent, no progress) rather
+# than merely "stale" (untouched). Drives a higher-priority goal_review signal
+# + a stuck-diagnosis prompt. A heuristic — framed to the ego as a hypothesis to
+# diagnose, not a verdict. Single source for both cadence + context-builder.
+GOAL_STUCK_EXECUTED_THRESHOLD = 2
+
+
 @dataclass
 class EgoConfig:
     """Runtime configuration for the ego subsystem.
