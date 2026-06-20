@@ -128,7 +128,10 @@ async def ingest_knowledge_unit(
         section_title=provenance.get("section_title") if provenance else None,
         source_date=provenance.get("source_date") if provenance else None,
         embedding_model=embedding_model,
-        source_pipeline=provenance.get("source_pipeline") if provenance else None,
+        # Mirror the Qdrant write's default (audit D12): never leave the SQLite
+        # knowledge_units pipeline NULL while the vector payload has a value —
+        # provenance must be consistent across both stores.
+        source_pipeline=source_pipeline_val,
         purpose=json.dumps(purpose) if purpose else None,
         ingestion_source=ingestion_source,
     )

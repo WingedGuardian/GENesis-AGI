@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 from genesis.memory.activation import compute_activation
 from genesis.memory.graph import traverse as graph_traverse
+from genesis.memory.provenance import is_external, provenance_descriptor
 
 from ..memory import mcp
 
@@ -231,6 +232,7 @@ async def memory_recall(
                         activation_score=0.0,
                         payload=row,
                         source_pipeline="event_calendar",
+                        collection=row.get("collection", "episodic_memory"),
                     ))
             except Exception:
                 logger.warning(
@@ -242,11 +244,14 @@ async def memory_recall(
     # to knowledge_base results to suppress low-relevance bulk intelligence.
     # Episodic results are unfiltered. Score floor matches knowledge_recall's
     # min_score=0.15 (post-authority-boost) as a conservative baseline.
+    # Keyed on the authoritative ``collection`` discriminator (audit D12), not
+    # payload["scope"] — the latter is absent on FTS5-only / pre-scope rows, so
+    # the old check silently let low-relevance KB through that path.
     _KB_MIN_SCORE = 0.15
     if source == "both":
         results = [
             r for r in results
-            if r.payload.get("scope") != "external" or r.score >= _KB_MIN_SCORE
+            if not is_external(r.collection) or r.score >= _KB_MIN_SCORE
         ]
 
     # MCP-layer instrumentation: emit with mode and pipeline attribution
@@ -279,6 +284,13 @@ async def memory_recall(
                 "room": r.payload.get("room", ""),
                 "source": r.source,
                 "source_pipeline": r.source_pipeline or "",
+                # Provenance (audit D12): first-party memory vs external-world KB,
+                # so the model never treats ingested content as its own truth.
+                "provenance": provenance_descriptor(
+                    collection=r.collection,
+                    source_pipeline=r.source_pipeline,
+                    source_doc=r.source,
+                ),
             }
             for r in results
         ]
@@ -288,6 +300,13 @@ async def memory_recall(
     graph_elapsed_ms = 0.0
     for r in results:
         d = asdict(r)
+        # Provenance label (audit D12) — asdict already carries the raw
+        # ``collection``; add the human/LLM-readable first-party-vs-external tag.
+        d["provenance"] = provenance_descriptor(
+            collection=r.collection,
+            source_pipeline=r.source_pipeline,
+            source_doc=r.source,
+        )
         if include_graph and graph_elapsed_ms < graph_budget_ms:
             try:
                 traversal = await graph_traverse(
@@ -342,15 +361,22 @@ async def memory_expand(
     memory_mod._require_init()
     assert memory_mod._qdrant is not None and memory_mod._db is not None
 
-    # Batch retrieve from all collections (episodic_memory + knowledge_base)
+    # Batch retrieve from all collections (episodic_memory + knowledge_base).
+    # Track which collection each point came from — it's the authoritative
+    # first-party/external discriminator (audit D12) and is otherwise lost once
+    # the per-collection results are flattened into one list.
     points: list = []
+    point_collection: dict[str, str] = {}
     for coll in ("episodic_memory", "knowledge_base"):
         try:
-            points.extend(memory_mod._qdrant.retrieve(
+            got = memory_mod._qdrant.retrieve(
                 collection_name=coll,
                 ids=memory_ids,
                 with_payload=True,
-            ))
+            )
+            for p in got:
+                point_collection[str(p.id)] = coll
+            points.extend(got)
         except Exception:
             logger.warning("Qdrant retrieve from %s failed", coll, exc_info=True)
 
@@ -377,6 +403,7 @@ async def memory_expand(
     for point in points:
         mid = str(point.id)
         payload = point.payload or {}
+        _collection = point_collection.get(mid, "episodic_memory")
 
         d = {
             "memory_id": mid,
@@ -391,6 +418,13 @@ async def memory_expand(
             "source_pipeline": payload.get("source_pipeline", ""),
             "source_session_id": payload.get("source_session_id"),
             "created_at": payload.get("created_at"),
+            # Provenance (audit D12): first-party memory vs external-world KB.
+            "collection": _collection,
+            "provenance": provenance_descriptor(
+                collection=_collection,
+                source_pipeline=payload.get("source_pipeline"),
+                source_doc=payload.get("source"),
+            ),
         }
 
         # Graph enrichment
