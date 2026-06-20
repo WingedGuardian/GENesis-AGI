@@ -224,6 +224,44 @@ def rank_by_intent(
 # Query expansion via tag co-occurrence
 # ---------------------------------------------------------------------------
 
+# Tag prefixes excluded from the co-occurrence index. ``obs:`` are per-event
+# observation tags (unique, noisy). The structural taxonomy tags
+# (``class:``/``wing:``/``life_domain:``) are appended to EVERY memory at store
+# time (see store.py), so they co-occur with all content tags and would
+# dominate expansion — admitting documents that match only a broad structural
+# tag and collapsing FTS5 precision (audit MEM-001). None makes a useful
+# expansion term.
+_INDEX_EXCLUDED_TAG_PREFIXES = ("obs:", "class:", "wing:", "life_domain:")
+
+
+def _build_expanded_query(keywords: list[str], expansions: list[str]) -> str:
+    """Compose an FTS5 boolean query from original keywords + expansion terms.
+
+    Precision-preserving structure (audit MEM-001): expansion terms may only
+    BOOST documents that already match an original keyword — never surface a
+    document that matches an expansion alone (the old flat ``... OR exp1 OR
+    exp2`` form did, which is the precision collapse this fixes).
+
+    Multi-keyword:  ``(k1 AND k2 …) OR ((k1 OR k2 …) AND (e1 OR e2 …))``
+    Single-keyword: ``(k1) OR e1 OR e2 …`` — one keyword has nothing to AND
+        against, so the gate is degenerate; the flat form is kept (mitigated
+        by structural tags being excluded from the index, so the remaining
+        expansions are genuine content tags).
+
+    The result is fed to FTS5 with ``boolean=True``; ``_prepare_fts5`` preserves
+    the ``AND``/``OR``/parentheses (balanced by construction here).
+    """
+    original_and = " AND ".join(keywords)
+    if not expansions:
+        return f"({original_and})" if len(keywords) > 1 else original_and
+    if len(keywords) >= 2:
+        kw_or = " OR ".join(keywords)
+        exp_or = " OR ".join(expansions)
+        return f"({original_and}) OR (({kw_or}) AND ({exp_or}))"
+    # Single keyword: no AND-gate possible — keep the flat boost form.
+    return " OR ".join([f"({original_and})", *expansions])
+
+
 @dataclass
 class TagCooccurrenceIndex:
     """Lazily-built, cached index of tag co-occurrence from Qdrant payloads.
@@ -257,8 +295,13 @@ class TagCooccurrenceIndex:
             # Skip trivial tag lists
             if len(tags) < 2:
                 continue
-            # Normalize and deduplicate
-            normalized = list({t.lower() for t in tags if t and not t.startswith("obs:")})
+            # Normalize and deduplicate, excluding non-semantic prefixes
+            # (obs: event tags + structural taxonomy tags that co-occur with
+            # everything — see _INDEX_EXCLUDED_TAG_PREFIXES / MEM-001).
+            normalized = list({
+                t.lower() for t in tags
+                if t and not t.startswith(_INDEX_EXCLUDED_TAG_PREFIXES)
+            })
             for i, tag_a in enumerate(normalized):
                 if tag_a not in cooc:
                     cooc[tag_a] = {}
@@ -389,13 +432,11 @@ async def expand_query(
         if not expansions:
             return query
 
-        # Build boolean FTS5 query: original terms AND'd, expansions OR'd
-        # e.g. "configure routing" + expansions [setup, deploy] →
-        #   "(configure AND routing) OR setup OR deploy"
-        # This broadens recall without losing the original intent.
-        original_and = " AND ".join(keywords)
-        parts = [f"({original_and})"] + expansions
-        expanded = " OR ".join(parts)
+        # Compose the precision-preserving boolean FTS5 query (MEM-001):
+        # expansion terms only boost documents already matching an original
+        # keyword, never surface an expansion-only match. See
+        # _build_expanded_query.
+        expanded = _build_expanded_query(keywords, expansions)
         logger.debug("Query expanded: %r → %r", query, expanded)
         return expanded
 

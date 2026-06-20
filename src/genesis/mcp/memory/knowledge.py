@@ -18,6 +18,7 @@ from genesis.memory.reference_ops import (
 )
 
 from ..memory import mcp
+from ._scoring import DEFAULT_KB_FLOOR_RATIO, relative_kb_floor
 
 
 def _memory_mod():
@@ -57,7 +58,7 @@ async def knowledge_recall(
     project: str | None = None,
     domain: str | None = None,
     limit: int = 5,
-    min_score: float = 0.15,
+    min_score: float = DEFAULT_KB_FLOOR_RATIO,
     corrective: bool = True,
 ) -> list[dict]:
     """Search the knowledge base (ingested authoritative sources like docs, APIs, papers).
@@ -65,9 +66,15 @@ async def knowledge_recall(
     For personal/experiential memories, use memory_recall instead.
     For stored references (credentials, URLs), use reference_lookup.
 
-    Returns fewer results than ``memory_recall`` by default (5 vs 10)
-    and applies a post-authority-boost relevance floor (``min_score``)
-    to suppress low-relevance noise from bulk-ingested content.
+    Returns fewer results than ``memory_recall`` by default (5 vs 10) and
+    applies a post-authority-boost relevance floor to suppress low-relevance
+    noise from bulk-ingested content. ``min_score`` is a RELATIVE floor (audit
+    MEM-004): a result survives only if its boosted score is at least
+    ``min_score`` × the top result's boosted score (default 0.2 = within 20% of
+    the strongest hit). Being relative makes it scale-invariant, so the single
+    best hit always survives regardless of retrieval mode (the old absolute
+    floor could drop most/all results when their scores landed on a different
+    scale). Pass ``min_score=0`` to disable the floor.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -121,7 +128,14 @@ async def knowledge_recall(
             })
 
     boosted = _apply_authority_boost(merged)
-    final = [r for r in boosted if r.get("score", 0.0) >= min_score][:limit]
+    # Relative floor over the (all-KB) result set (audit MEM-004): keep results
+    # within ``min_score`` × the top boosted score, then trim to the limit.
+    final = relative_kb_floor(
+        boosted,
+        ratio=min_score,
+        score_of=lambda r: r.get("score", 0.0),
+        is_kb=lambda r: True,
+    )[:limit]
 
     # Selective corrective retrieval (CRAG). Default ON; gated + fail-fast.
     # path="knowledge" → web fallback is permitted on an Incorrect verdict
