@@ -61,14 +61,63 @@ async def test_delete_nonexistent(db):
     assert await memory_links.delete(db, source_id="nope1", target_id="nope2") is False
 
 
-async def test_duplicate_pk_raises(db):
+async def test_same_triplet_raises(db):
+    """The same (source, target, link_type) twice still violates the PK."""
     await memory_links.create(
         db, source_id="g1", target_id="g2", link_type="supports", created_at="2026-01-01",
     )
     with pytest.raises(IntegrityError):
         await memory_links.create(
-            db, source_id="g1", target_id="g2", link_type="contradicts", created_at="2026-01-02",
+            db, source_id="g1", target_id="g2", link_type="supports", created_at="2026-01-02",
         )
+
+
+async def test_different_link_type_same_pair_persists(db):
+    """DLI-04: a 2nd link of a DIFFERENT type between the same pair must persist.
+
+    The old PK (source_id, target_id) silently dropped this; the fixed PK
+    (source_id, target_id, link_type) keeps both edges.
+    """
+    await memory_links.create(
+        db, source_id="g1", target_id="g2", link_type="supports", created_at="2026-01-01",
+    )
+    await memory_links.create(
+        db, source_id="g1", target_id="g2", link_type="contradicts", created_at="2026-01-02",
+    )
+    links = await memory_links.get_links_for(db, "g1")
+    types = sorted(link["link_type"] for link in links)
+    assert types == ["contradicts", "supports"]
+
+
+async def test_inter_candidate_links_dedupes_multi_type_pairs(db):
+    """Adjacency boost is binary per pair — a multi-type pair counts once."""
+    await memory_links.create(
+        db, source_id="a", target_id="b", link_type="supports", created_at="2026-01-01",
+    )
+    await memory_links.create(
+        db, source_id="a", target_id="b", link_type="contradicts", created_at="2026-01-02",
+    )
+    edges = await memory_links.inter_candidate_links(db, ["a", "b"])
+    assert edges == [("a", "b")]  # deduped, not [("a","b"), ("a","b")]
+
+
+async def test_delete_by_link_type(db):
+    """delete(link_type=...) removes only that type; without it, all types go."""
+    await memory_links.create(
+        db, source_id="a", target_id="b", link_type="supports", created_at="2026-01-01",
+    )
+    await memory_links.create(
+        db, source_id="a", target_id="b", link_type="contradicts", created_at="2026-01-02",
+    )
+    # Targeted delete removes only the typed link.
+    assert await memory_links.delete(
+        db, source_id="a", target_id="b", link_type="supports",
+    ) is True
+    remaining = await memory_links.get_links_for(db, "a")
+    assert [link["link_type"] for link in remaining] == ["contradicts"]
+    # Untyped delete removes whatever is left for the pair.
+    assert await memory_links.delete(db, source_id="a", target_id="b") is True
+    assert await memory_links.get_links_for(db, "a") == []
 
 
 # --- Batch link count tests ---
