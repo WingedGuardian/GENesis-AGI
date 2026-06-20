@@ -729,17 +729,22 @@ class HybridRetriever:
             qdrant_hit = qdrant_by_id.get(mid)
             fts_hit = fts_by_id.get(mid)
 
-            # Determine content and metadata
+            # Determine content and metadata. ``_collection`` is the
+            # authoritative first-party/external discriminator (audit D12):
+            # the Qdrant collection on a vector hit (set at recall time, ~L367),
+            # or the FTS row's collection tag for an FTS5-only hit.
             if qdrant_hit:
                 payload = qdrant_hit.get("payload", {})
                 content = payload.get("content", "")
                 src = payload.get("source", "")
                 mem_type = payload.get("memory_type", "")
+                _collection = qdrant_hit.get("_collection", "episodic_memory")
             elif fts_hit:
                 content = fts_hit.get("content", "")
                 src = fts_hit.get("source_type", "")
                 mem_type = fts_hit.get("collection", "")
                 payload = fts_hit
+                _collection = fts_hit.get("collection", "episodic_memory")
             else:
                 continue
 
@@ -779,6 +784,7 @@ class HybridRetriever:
                     memory_class=_p.get("memory_class", "fact"),
                     query_intent=intent.category,
                     intent_confidence=intent.confidence,
+                    collection=_collection,
                 ),
             )
 

@@ -32,6 +32,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Genesis proposes restoring it and asks you to approve — it never silently re-grants authority,
   and it won't nag while the lower level is genuinely warranted. Previously a demoted category
   had no path back up.
+- **Genesis tells its own memories apart from what it read on the world** — every recalled
+  knowledge-base item (ingested docs, and the new corrective web results) is now labeled
+  "external-world knowledge (source: …)" wherever it reaches Genesis's context: explicit
+  recall, the proactive memory hook, voice, and the dashboard memory search. First-party
+  memories (Genesis's own observations and your conversations) stay labeled as such, so the
+  model never mistakes an ingested document — or a web snippet — for its own ground truth.
+  The knowledge-base relevance floor that keeps low-quality bulk content out of answers now
+  applies reliably (it previously slipped past keyword-only matches).
 
 - **Genesis self-corrects a bad memory recall instead of running with it** — on high-stakes
   lookups (the explicit memory and knowledge recall tools), Genesis now grades whether the

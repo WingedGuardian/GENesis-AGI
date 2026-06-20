@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import UTC, datetime
 
+from genesis.memory.provenance import label_result_dicts
 from genesis.memory.reference_ops import (
     REFERENCE_KINDS as _REFERENCE_KINDS,
 )
@@ -94,6 +95,7 @@ async def knowledge_recall(
             "unit_id": r.memory_id,
             "content": r.content,
             "source": r.source,
+            "source_doc": r.source,
             "score": r.score,
             "origin": "vector",
             "source_pipeline": r.source_pipeline,
@@ -151,6 +153,10 @@ async def knowledge_recall(
             path="knowledge",
             recall_event_id=recall_event_id,
         )
+    # Provenance pass (audit D12): every knowledge_recall result is external-world
+    # — label original + any CRAG-augmented / web-fallback items. Runs regardless
+    # of `corrective` so the contract is uniform.
+    label_result_dicts(final, default_collection="knowledge_base")
     return final
 
 

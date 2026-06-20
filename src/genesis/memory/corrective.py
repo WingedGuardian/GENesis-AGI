@@ -374,6 +374,11 @@ def _retrieval_to_dict(rr: Any) -> dict:
         "content": getattr(rr, "content", ""),
         "score": getattr(rr, "score", 0.0),
         "payload": getattr(rr, "payload", {}) or {},
+        # Preserve the provenance discriminator (audit D12) so augmented items
+        # are labeled first-party vs external-world at the MCP return pass —
+        # the relaxed/raw-KB re-retrieve can legitimately pull KB content.
+        "collection": getattr(rr, "collection", "episodic_memory"),
+        "source_pipeline": getattr(rr, "source_pipeline", None),
     }
 
 

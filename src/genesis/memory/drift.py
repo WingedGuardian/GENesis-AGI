@@ -408,6 +408,7 @@ async def drift_recall(
                 memory_class=row.get("memory_class", "fact"),
                 query_intent=intent.category,
                 intent_confidence=intent.confidence,
+                collection=row.get("collection", "episodic_memory"),
             )
         )
 

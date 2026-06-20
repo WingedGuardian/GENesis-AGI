@@ -634,6 +634,9 @@ async def _search_qdrant(
                         "_retrieved_count": payload.get("retrieved_count", 0),
                         "_wing": payload.get("wing"),
                         "collection": collection,
+                        # Provenance source tier for KB results (audit D12) — the
+                        # label needs it; memory_metadata doesn't carry it.
+                        "source_pipeline": payload.get("source_pipeline"),
                     })
                 return results
     except Exception as exc:
@@ -832,7 +835,13 @@ def _format_results(results: list[dict]) -> str:
         wing = r.get("_wing") or ""
 
         is_kb = r.get("collection") == "knowledge_base"
-        parts = ["KB" if is_kb else "Memory"]
+        if is_kb:
+            # Name the external source tier so the model treats KB content as
+            # external-world info, not its own first-party memory (audit D12).
+            from genesis.memory.provenance import short_source
+            parts = [f"KB·{short_source(r.get('source_pipeline'))}"]
+        else:
+            parts = ["Memory"]
         if age != "?" and not is_kb:
             parts.append(age)
         if wing and wing != "memory":
