@@ -105,6 +105,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Genesis no longer loses contradicting or superseding links between memories** — its memory
+  graph could only hold one relationship between any two memories, so recording a second kind
+  (for example marking a pair as "contradicts" when they were already linked as "supports", or
+  "succeeded_by" when one memory replaces another) was silently dropped. Different relationship
+  types between the same two memories are now all kept, so Genesis reasons over a fuller, more
+  honest picture of how its memories relate.
+
 - **Procedure learning survives a two-provider outage** — the routine that captures reusable
   procedures from Genesis's own struggles ran on only two free model providers; when both were
   down at once it exhausted its chain and silently stopped learning. A third independent free

@@ -115,8 +115,11 @@ async def inter_candidate_links(
     if len(memory_ids) > 499:
         memory_ids = memory_ids[:499]
     ph = ",".join("?" * len(memory_ids))
+    # DISTINCT: adjacency is a binary "are these two linked" signal. Since
+    # link_type joined the PK (DLI-04), a pair with multiple types yields
+    # multiple rows — collapse them so the adjacency boost isn't inflated.
     rows = await db.execute_fetchall(
-        f"SELECT source_id, target_id FROM memory_links"
+        f"SELECT DISTINCT source_id, target_id FROM memory_links"
         f" WHERE source_id IN ({ph}) AND target_id IN ({ph})",
         memory_ids + memory_ids,
     )
@@ -133,12 +136,26 @@ async def delete(
     *,
     source_id: str,
     target_id: str,
+    link_type: str | None = None,
 ) -> bool:
-    """Delete a memory link. Returns True if deleted."""
-    cursor = await db.execute(
-        "DELETE FROM memory_links WHERE source_id = ? AND target_id = ?",
-        (source_id, target_id),
-    )
+    """Delete memory link(s) between a pair. Returns True if any row deleted.
+
+    With ``link_type`` set, deletes only that typed link. Without it, deletes
+    ALL link types between the pair — be deliberate, since ``link_type`` joined
+    the PK (DLI-04) a pair can now hold several edges and the untyped form
+    removes every one of them.
+    """
+    if link_type is not None:
+        cursor = await db.execute(
+            "DELETE FROM memory_links "
+            "WHERE source_id = ? AND target_id = ? AND link_type = ?",
+            (source_id, target_id, link_type),
+        )
+    else:
+        cursor = await db.execute(
+            "DELETE FROM memory_links WHERE source_id = ? AND target_id = ?",
+            (source_id, target_id),
+        )
     await db.commit()
     return cursor.rowcount > 0
 

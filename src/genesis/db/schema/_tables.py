@@ -464,7 +464,11 @@ TABLES = {
             ),
             strength    REAL NOT NULL DEFAULT 0.5,
             created_at  TEXT NOT NULL,
-            PRIMARY KEY (source_id, target_id)
+            -- link_type is part of the PK (audit DLI-04 / D15): distinct
+            -- relationship types between the same pair (e.g. supports AND
+            -- contradicts) must coexist, not silently overwrite. Migration
+            -- 0029 brings existing DBs to this shape.
+            PRIMARY KEY (source_id, target_id, link_type)
         )
     """,
     "deferred_work_queue": """
