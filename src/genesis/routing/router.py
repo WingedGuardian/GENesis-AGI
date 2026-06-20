@@ -196,7 +196,22 @@ class Router:
         first_provider = chain[0]
         failed_providers: list[str] = []
 
+        # Aggregate wall-clock deadline across the whole chain walk (retries x
+        # chain length). A GATE only — checked between providers/attempts, never
+        # interrupts an in-flight call (the delegate's per-attempt timeout owns
+        # that). None = no cap (today's behavior).
+        route_start = time.monotonic()
+        deadline = (
+            (route_start + policy.max_total_s)
+            if policy.max_total_s is not None
+            else None
+        )
+
         for provider_name in chain:
+            # Out of aggregate budget — stop walking the chain. The primary
+            # provider always gets a shot; later providers are gated.
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             provider_cfg = self.config.providers[provider_name]
 
             # Skip providers with no API key — treat as down-by-config.
@@ -228,7 +243,8 @@ class Router:
             # Try with retry (timed for activity tracking)
             t0 = time.monotonic()
             result = await self._try_with_retry(
-                provider_name, provider_cfg.model_id, messages, policy, **kwargs,
+                provider_name, provider_cfg.model_id, messages, policy,
+                deadline=deadline, **kwargs,
             )
             latency_ms = (time.monotonic() - t0) * 1000
             attempts += 1
@@ -384,13 +400,20 @@ class Router:
         return list(site.chain)
 
     async def _try_with_retry(
-        self, provider: str, model_id: str, messages: list[dict], policy, **kwargs,
+        self, provider: str, model_id: str, messages: list[dict], policy,
+        *, deadline: float | None = None, **kwargs,
     ) -> CallResult:
         """Try calling a provider with retries. Returns last result."""
         last_result = CallResult(success=False, error="no attempts made")
         max_attempts = policy.max_retries + 1
 
         for attempt in range(max_attempts):
+            # Aggregate deadline: stop starting RETRIES once the budget is spent.
+            # Attempt 0 always runs (the chain gate already admitted this
+            # provider) — only same-provider retries are bounded, and never an
+            # in-flight call.
+            if attempt > 0 and deadline is not None and time.monotonic() >= deadline:
+                return last_result
             result = await self.delegate.call(provider, model_id, messages, **kwargs)
             if result.success:
                 return result

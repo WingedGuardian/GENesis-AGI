@@ -476,6 +476,91 @@ def test_trip_count_capped_on_restore(tmp_path):
         cb_mod._STATE_FILE = original_path
 
 
+# --- Probe-based recovery (record_probe_success) ---
+
+
+def _half_open_breaker(probe_threshold=3, **kw):
+    """A breaker driven to HALF_OPEN: tripped OPEN (failure_threshold=2), then
+    its open window expired so the next state read auto-transitions to HALF_OPEN.
+    """
+    t = [0.0]
+    cb = CircuitBreaker(
+        _provider("p1"), failure_threshold=2, open_duration_s=10,
+        clock=lambda: t[0], probe_success_threshold=probe_threshold, **kw,
+    )
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    cb.record_failure(ErrorCategory.TRANSIENT)  # trips OPEN
+    assert cb.state == ProviderState.OPEN
+    t[0] = 100.0  # past the open window
+    assert cb.state == ProviderState.HALF_OPEN
+    return cb, t
+
+
+def test_probe_success_heals_half_open_after_threshold():
+    cb, _ = _half_open_breaker(probe_threshold=3)
+    cb.record_probe_success()
+    assert cb.state == ProviderState.HALF_OPEN  # 1 < 3
+    cb.record_probe_success()
+    assert cb.state == ProviderState.HALF_OPEN  # 2 < 3
+    cb.record_probe_success()
+    assert cb.state == ProviderState.CLOSED     # 3 → healed
+    assert cb.trip_count == 0
+
+
+def test_probe_success_noop_when_closed():
+    cb = CircuitBreaker(_provider(), clock=lambda: 0)
+    assert cb.state == ProviderState.CLOSED
+    cb.record_probe_success()
+    assert cb.state == ProviderState.CLOSED
+    assert cb.trip_count == 0
+
+
+def test_probe_success_noop_when_open_not_expired():
+    """A probe success must NOT heal a breaker whose open window has not yet
+    expired (still genuinely OPEN)."""
+    t = [0.0]
+    cb = CircuitBreaker(_provider(), failure_threshold=2, open_duration_s=100, clock=lambda: t[0])
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    assert cb.state == ProviderState.OPEN
+    cb.record_probe_success()
+    assert cb.state == ProviderState.OPEN
+
+
+def test_probe_success_fires_on_recovery():
+    """On full recovery the breaker fires on_recovery — this is what drives
+    #698's escalation observation-resolve, so a probe-healed provider does not
+    leave a stale 'provider_failure' observation."""
+    recovered = []
+    t = [0.0]
+    cb = CircuitBreaker(
+        _provider("p1"), failure_threshold=2, open_duration_s=10,
+        clock=lambda: t[0], probe_success_threshold=2,
+        on_recovery=lambda name: recovered.append(name),
+    )
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    t[0] = 100.0
+    assert cb.state == ProviderState.HALF_OPEN
+    cb.record_probe_success()
+    assert recovered == []  # below threshold — no recovery yet
+    cb.record_probe_success()
+    assert cb.state == ProviderState.CLOSED
+    assert recovered == ["p1"]
+
+
+def test_real_failure_after_probe_heal_can_retrip():
+    """A provider healed via probe must still re-trip on real failures —
+    healing must not disable failure tracking."""
+    cb, _ = _half_open_breaker(probe_threshold=2)
+    cb.record_probe_success()
+    cb.record_probe_success()
+    assert cb.state == ProviderState.CLOSED
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    cb.record_failure(ErrorCategory.TRANSIENT)  # failure_threshold=2
+    assert cb.state == ProviderState.OPEN
+
+
 # --- Coverage-based degradation (essential_sites map injected) ---
 
 

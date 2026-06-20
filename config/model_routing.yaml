@@ -638,18 +638,29 @@ call_sites:
       \ for HA voice assistant. Groq first for speed (~1s), Gemini/Mistral\
       \ as fallbacks."
 retry:
+  # max_total_s: aggregate wall-clock ceiling (seconds) across a single
+  # route_call's retries x chain length. A safety net against pathological
+  # multi-minute hangs, checked only BETWEEN attempts (never interrupts an
+  # in-flight call). It bounds ONE completion's retry-multiplier, NOT Genesis's
+  # cognition (a reflection is many bounded completions). Omit for no cap.
   default:
     max_retries: 3
     base_delay_ms: 500
     max_delay_ms: 30000
+    max_total_s: 300
   user_facing:
     max_retries: 2
     base_delay_ms: 300
     max_delay_ms: 5000
+    max_total_s: 180
   background:
     max_retries: 4
     base_delay_ms: 1000
     max_delay_ms: 60000
+    # Generous safety net only — should never fire in normal operation. Dream /
+    # reflection / ego are exactly where a single completion may legitimately
+    # take a while across failovers; we only stop the pathology, not cognition.
+    max_total_s: 1800
 surplus:
   idle_threshold_minutes: 15
   dispatch_interval_minutes: 5

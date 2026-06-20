@@ -99,6 +99,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   everything else for up to 30 minutes. Now those responses fail straight over to the next
   provider without retrying or benching the one that's actually healthy — so you get faster
   failover and far fewer false "provider down" blips.
+- **Idle fallback providers heal on their own instead of staying stuck** — a provider that
+  recovered from an outage but then received little or no traffic could sit in a half-recovered
+  "on probation" state indefinitely, because only a real successful request could fully clear it.
+  Genesis's free health probes now confirm such a provider is reachable and restore it to normal
+  rotation (and clear its lingering "failing" alert), so rarely-used backups don't get permanently
+  benched.
+
+- **A single request can't hang for minutes across retries and failover** — each routing profile
+  now has an aggregate time budget, so the worst case where one request's retries multiply across
+  the whole provider chain into a multi-minute stall is bounded. It only caps the retry/failover
+  multiplier on one request (checked between attempts, never mid-call) — background thinking that
+  legitimately takes a while is unaffected.
 
 - **Recovered providers stop alarming once they come back** — when a model provider's
   circuit breaker reopens after an outage, Genesis now clears that provider's "failing"
