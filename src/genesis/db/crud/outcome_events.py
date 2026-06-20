@@ -129,18 +129,34 @@ async def count_by_signal_type(db: aiosqlite.Connection) -> dict[str, int]:
     return {r[0]: r[1] for r in rows}
 
 
+async def count_by_tier(db: aiosqlite.Connection) -> dict[int, int]:
+    """Coverage accounting: row counts grouped by signal_tier (1/2/3).
+
+    signal_type does NOT map 1:1 to tier (``user_decision`` is T2 when it
+    carries a rationale, else T3), so the tier breakdown cannot be derived
+    from ``count_by_signal_type`` — it needs its own GROUP BY.
+    """
+    cur = await db.execute(
+        "SELECT signal_tier, COUNT(*) FROM outcome_events GROUP BY signal_tier"
+    )
+    rows = await cur.fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
 async def aggregate_by_domain(
     db: aiosqlite.Connection,
     *,
-    days: int = 30,
+    days: int | None = 30,
     tier: int | None = None,
 ) -> list[dict]:
-    """Per-domain outcome rollup over a recent window.
+    """Per-domain outcome rollup.
 
-    ``tier`` optionally restricts to one signal tier (e.g. tier=1 for the
-    ground-truth view that downstream quality scoring should weight highest).
+    ``days`` bounds the window by ``occurred_at``; pass ``None`` for an
+    all-time rollup (so the per-domain breakdown reconciles with the lifetime
+    ``count_by_tier``/``count_by_signal_type`` totals). ``tier`` optionally
+    restricts to one signal tier (e.g. tier=1 for the ground-truth view that
+    downstream quality scoring should weight highest).
     """
-    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
     sql = """
         SELECT domain,
                COUNT(*)                                                   AS n,
@@ -150,12 +166,17 @@ async def aggregate_by_domain(
                AVG(stated_confidence)                                     AS avg_confidence,
                AVG(prediction_error)                                      AS avg_prediction_error
         FROM outcome_events
-        WHERE occurred_at >= ?
     """
-    params: list = [cutoff]
+    clauses: list[str] = []
+    params: list = []
+    if days is not None:
+        clauses.append("occurred_at >= ?")
+        params.append((datetime.now(UTC) - timedelta(days=days)).isoformat())
     if tier is not None:
-        sql += " AND signal_tier = ?"
+        clauses.append("signal_tier = ?")
         params.append(tier)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
     sql += " GROUP BY domain ORDER BY n DESC"
     cur = await db.execute(sql, params)
     rows = await cur.fetchall()

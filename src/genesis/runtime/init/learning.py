@@ -442,9 +442,14 @@ async def init(rt: GenesisRuntime) -> None:
                 rt.record_job_failure("procedure_promotion", str(exc))
                 logger.exception("Procedure promotion failed")
 
+        # CronTrigger instead of IntervalTrigger: IntervalTrigger resets its
+        # countdown on every server restart, so under frequent restarts the job
+        # can keep slipping its hour and never fire (same class of bug that bit
+        # user_model_evolution / process_reaper).  Runs at :30 past every hour
+        # (:15 is the process_reaper; hour-boundary minutes carry heavier jobs).
         rt._learning_scheduler.add_job(
             _run_procedure_promotion,
-            IntervalTrigger(hours=1),
+            CronTrigger(minute=30),
             id="procedure_promotion",
             max_instances=1,
             misfire_grace_time=600,
