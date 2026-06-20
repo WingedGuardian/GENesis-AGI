@@ -86,12 +86,16 @@ class EgoCadenceManager:
         idle_detector: IdleDetector | None = None,
         db: aiosqlite.Connection,
         event_bus: GenesisEventBus | None = None,
+        autonomy_manager: object | None = None,
     ) -> None:
         self._session = session
         self._config = config
         self._idle_detector = idle_detector
         self._db = db
         self._event_bus = event_bus
+        # AutonomyManager (duck-typed: detect_earnback_candidates / promote),
+        # used by the user-ego earn-back check. None disables earn-back.
+        self._autonomy_manager = autonomy_manager
 
         self._scheduler = AsyncIOScheduler()
         self._paused = False
@@ -320,6 +324,10 @@ class EgoCadenceManager:
         # Deadline scanner: push reactive events for approaching deadlines
         await self._check_approaching_deadlines()
 
+        # Autonomy earn-back: propose restoring earned levels whose evidence
+        # now supports it (user ego only; no-op otherwise).
+        await self._check_earnback_opportunities()
+
     async def _check_approaching_deadlines(self) -> None:
         """Push reactive events for events approaching within 48h."""
         try:
@@ -412,6 +420,110 @@ class EgoCadenceManager:
                 )
         except Exception:
             logger.debug("Goal staleness scanner failed", exc_info=True)
+
+    # -- Autonomy earn-back ------------------------------------------------
+
+    _EARNBACK_REJECT_COOLDOWN_DAYS = 7
+
+    async def _check_earnback_opportunities(self) -> None:
+        """Propose restoring earned autonomy for categories whose evidence now
+        supports it. User-ego only; evidence-gated; the user approves each
+        promotion. Never auto-promotes.
+        """
+        if self._session._source_tag != "user_ego_cycle":
+            return
+        if self._autonomy_manager is None:
+            return
+        try:
+            candidates = await self._autonomy_manager.detect_earnback_candidates()
+            if not candidates:
+                return
+
+            from genesis.db.crud import ego as ego_crud
+
+            # Anti-spam: skip categories that already have a pending earn-back
+            # proposal (also covered by create_batch content-hash dedup) or an
+            # active reject cooldown.
+            pending = await ego_crud.list_pending_proposals(self._session._db)
+            pending_cats = {
+                p.get("action_category")
+                for p in pending
+                if p.get("action_type") == "autonomy_earnback"
+            }
+
+            to_make: list[dict] = []
+            for cand in candidates:
+                category = cand["category"]
+                if category in pending_cats:
+                    continue
+                if await self._earnback_in_cooldown(category):
+                    continue
+                to_make.append(self._build_earnback_proposal(cand))
+
+            if not to_make:
+                return
+
+            batch_id, ids, _ = await self._session._proposals.create_batch(
+                to_make, ego_source="user_ego_cycle",
+            )
+            if ids:
+                await self._session._proposals.send_digest(
+                    batch_id, ego_source="user_ego_cycle",
+                )
+                logger.info(
+                    "Earn-back: proposed promotion for %d categor(ies)", len(ids),
+                )
+        except Exception:
+            logger.warning("Earn-back opportunity check failed", exc_info=True)
+
+    async def _earnback_in_cooldown(self, category: str) -> bool:
+        """True if *category*'s earn-back was rejected within the cooldown window."""
+        from genesis.db.crud import ego as ego_crud
+
+        ts = await ego_crud.get_state(
+            self._session._db, f"earnback_reject:{category}",
+        )
+        if not ts:
+            return False
+        try:
+            rejected_at = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            return False
+        if rejected_at.tzinfo is None:
+            rejected_at = rejected_at.replace(tzinfo=UTC)
+        age_days = (datetime.now(UTC) - rejected_at).days
+        return age_days < self._EARNBACK_REJECT_COOLDOWN_DAYS
+
+    @staticmethod
+    def _build_earnback_proposal(cand: dict) -> dict:
+        """Build a proposal dict for an earn-back candidate."""
+        category = cand["category"]
+        current = cand["current_level"]
+        target = cand["target_level"]
+        posterior = cand.get("posterior")
+        conf = round(float(posterior), 2) if posterior is not None else 0.7
+        regressed_on = (cand.get("last_regression_at") or "")[:10]
+        since = f" (demoted {regressed_on})" if regressed_on else ""
+        content = (
+            f"Restore {category} autonomy to L{target}. It was reduced to "
+            f"L{current}{since} after a Bayesian regression; the success record "
+            f"has since recovered enough to support L{target} again "
+            f"(posterior {conf})."
+        )
+        rationale = (
+            "Evidence-gated earn-back: the category's own success/correction "
+            "history now supports the earned level. Approve to restore it; "
+            "reject to keep it where it is."
+        )
+        return {
+            "action_type": "autonomy_earnback",
+            "action_category": category,
+            "content": content,
+            "rationale": rationale,
+            "confidence": conf,
+            "urgency": "low",
+            "expected_outputs": {"target_level": target},
+        }
 
     # -- Tick handlers -----------------------------------------------------
 

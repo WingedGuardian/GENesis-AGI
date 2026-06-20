@@ -1659,6 +1659,11 @@ class EgoSession:
 
         dispatched: list[str] = []
         for prop in approved:
+            # Autonomy earn-back proposals are resolved (promoted + marked
+            # executed) at approval time and must NEVER be dispatched as a
+            # session. Defense-in-depth in case one is still 'approved' here.
+            if prop.get("action_type") == "autonomy_earnback":
+                continue
             # Staleness guard — skip proposals approved more than 7 days ago.
             # Proposals go stale by clock only as a safety net; semantic
             # staleness (premise invalid) is the ego's job to evaluate.

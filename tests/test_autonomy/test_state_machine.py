@@ -421,3 +421,60 @@ class TestForceRegress:
     @pytest.mark.asyncio
     async def test_force_regress_missing_category(self, manager):
         assert await manager.force_regress("nonexistent") is False
+
+
+async def _seed_autonomy_state(
+    db, category, *, current, earned, successes, corrections, last_regression_at=None,
+):
+    """Insert an autonomy_state row with explicit counts for earn-back tests."""
+    await db.execute(
+        "INSERT INTO autonomy_state (id, category, current_level, earned_level, "
+        "total_successes, total_corrections, last_regression_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (category, category, current, earned, successes, corrections,
+         last_regression_at, "2026-06-20T00:00:00+00:00"),
+    )
+    await db.commit()
+
+
+class TestDetectEarnbackCandidates:
+    @pytest.mark.asyncio
+    async def test_candidate_when_demoted_and_evidence_recovered(self, manager, db):
+        # 50 successes / 2 corrections → posterior 0.94 → L4 supports earned L4.
+        await _seed_autonomy_state(
+            db, "direct_session", current=2, earned=4, successes=50, corrections=2,
+        )
+        cands = await manager.detect_earnback_candidates()
+        assert len(cands) == 1
+        assert cands[0]["category"] == "direct_session"
+        assert cands[0]["current_level"] == 2
+        assert cands[0]["target_level"] == 4
+
+    @pytest.mark.asyncio
+    async def test_no_candidate_when_not_demoted(self, manager, db):
+        await _seed_autonomy_state(
+            db, "direct_session", current=4, earned=4, successes=50, corrections=2,
+        )
+        assert await manager.detect_earnback_candidates() == []
+
+    @pytest.mark.asyncio
+    async def test_no_candidate_when_evidence_insufficient(self, manager, db):
+        # Live direct_session shape: 33S / 14C → posterior 0.694 → L3 < earned L4.
+        await _seed_autonomy_state(
+            db, "direct_session", current=3, earned=4, successes=33, corrections=14,
+        )
+        assert await manager.detect_earnback_candidates() == []
+
+    @pytest.mark.asyncio
+    async def test_returns_only_eligible_categories(self, manager, db):
+        await _seed_autonomy_state(
+            db, "direct_session", current=2, earned=4, successes=50, corrections=2,
+        )  # eligible
+        await _seed_autonomy_state(
+            db, "outreach", current=1, earned=1, successes=0, corrections=0,
+        )  # not demoted
+        await _seed_autonomy_state(
+            db, "sub_agent", current=2, earned=3, successes=3, corrections=14,
+        )  # evidence too low (L1 < earned L3)
+        cands = await manager.detect_earnback_candidates()
+        assert [c["category"] for c in cands] == ["direct_session"]
