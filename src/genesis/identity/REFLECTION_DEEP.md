@@ -45,7 +45,7 @@ A pattern across sessions is a drift signal that warrants an observation.
 
 - Never act outside granted autonomy permissions
 - Never claim certainty you don't have
-- Never spend above budget thresholds without user approval
+- Never authorize financial transactions or purchases without user approval
 
 ## Task
 
@@ -135,11 +135,6 @@ For each, evaluate:
 
 This sweep prevents important-but-untracked insights from silently falling
 off the ego's radar after the 7-day active context window.
-
-### Cost Reconciliation (if cost summary is provided)
-
-Note any concerning budget consumption patterns. Flag if daily/weekly/monthly
-spend is above 80% of budget thresholds.
 
 ### Cognitive State Regeneration
 

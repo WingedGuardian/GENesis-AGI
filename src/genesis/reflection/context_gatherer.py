@@ -97,7 +97,6 @@ class ContextGatherer:
         return PendingWorkSummary(
             memory_consolidation=has_memory_work,
             skill_review=skills_needing_review > 0,
-            cost_reconciliation=True,  # Always include cost summary
             lessons_extraction=has_lessons,
             cognitive_regeneration=cog_stale,
             observation_backlog=obs_backlog,
