@@ -30,10 +30,12 @@ logger = logging.getLogger(__name__)
 
 GOAL_STATUS_CHANGE_ACTION_TYPE = "goal_status_change"
 
-# The reversible transitions Genesis may *propose* (terminal achieve/abandon
-# stay a pure observation — the user decides those). Validated here so a
-# malformed expected_outputs can never write an arbitrary value.
-_VALID_STATUS = frozenset({"paused", "active"})
+# The ONLY reversible transitions Genesis actually *proposes* today (terminal
+# achieve/abandon stay a pure observation — the user decides those). Validated
+# here so a malformed expected_outputs can never write an arbitrary value.
+# "active" (resume) is deliberately NOT here: nothing generates it yet, and
+# leaving it out means a malformed proposal can never reactivate a paused goal.
+_VALID_STATUS = frozenset({"paused"})
 _VALID_PRIORITY = frozenset({"low", "medium", "high", "critical"})
 
 

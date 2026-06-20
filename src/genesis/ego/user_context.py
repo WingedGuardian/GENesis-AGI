@@ -1337,11 +1337,13 @@ class UserEgoContextBuilder:
         # is still active and hasn't advanced. Prompt the ego to diagnose WHY
         # rather than propose more of the same — framed as a hypothesis, NOT a
         # verdict, and explicitly NOT "just close it" (anti-timidity guardrail).
+        # Count via the unbounded per-status summary (NOT the capped display
+        # rows above) so this matches the cadence scanner's classification.
+        from genesis.db.crud import ego as _ego_crud
         from genesis.ego.types import GOAL_STUCK_EXECUTED_THRESHOLD
 
-        executed_count = sum(
-            1 for row in proposal_rows if (row[2] or "") == "executed"
-        )
+        _summary = await _ego_crud.get_goal_proposal_summary(self._db, focus_id)
+        executed_count = _summary.get("executed", 0)
         if (
             executed_count >= GOAL_STUCK_EXECUTED_THRESHOLD
             and goal.get("status") == "active"

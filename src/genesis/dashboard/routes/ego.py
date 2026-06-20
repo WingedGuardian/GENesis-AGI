@@ -329,33 +329,37 @@ async def ego_proposal_resolve(proposal_id: str):
         import logging
         logging.getLogger(__name__).warning("Journal resolve failed for %s", proposal_id)
 
-    # Autonomy earn-back: promote on approval / cooldown on reject.
-    try:
-        from genesis.ego.earnback import handle_earnback_resolution
+    # Resolution side-effects (earn-back + goal status change). Fetch the
+    # resolved proposal once and run both hooks against it; each is wrapped so
+    # one failing never aborts the other.
+    import logging as _logging
 
+    prop = None
+    try:
         prop = await ego_crud.get_proposal(rt._db, proposal_id)
-        if prop:
+    except Exception:
+        _logging.getLogger(__name__).warning(
+            "could not load proposal %s for resolution hooks", proposal_id,
+        )
+    if prop:
+        try:
+            from genesis.ego.earnback import handle_earnback_resolution
+
             await handle_earnback_resolution(
                 rt._db, prop, status, getattr(rt, "_autonomy_manager", None),
             )
-    except Exception:
-        import logging
-        logging.getLogger(__name__).warning(
-            "earnback resolution hook failed for %s", proposal_id,
-        )
+        except Exception:
+            _logging.getLogger(__name__).warning(
+                "earnback resolution hook failed for %s", proposal_id,
+            )
+        try:
+            from genesis.ego.goal_actions import handle_goal_status_change_resolution
 
-    # Goal status change: apply pause/deprioritize on approval.
-    try:
-        from genesis.ego.goal_actions import handle_goal_status_change_resolution
-
-        prop = await ego_crud.get_proposal(rt._db, proposal_id)
-        if prop:
             await handle_goal_status_change_resolution(rt._db, prop, status)
-    except Exception:
-        import logging
-        logging.getLogger(__name__).warning(
-            "goal status-change hook failed for %s", proposal_id,
-        )
+        except Exception:
+            _logging.getLogger(__name__).warning(
+                "goal status-change hook failed for %s", proposal_id,
+            )
 
     return jsonify({"ok": True, "id": proposal_id, "status": status})
 
