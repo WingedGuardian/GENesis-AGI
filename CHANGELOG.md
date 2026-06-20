@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **You can undo a change Genesis made to its own skills or calibration** — when Genesis
+  autonomously refines a skill, retunes its triage calibration, or re-synthesizes its user
+  knowledge, it now keeps a recoverable snapshot of the previous version. If one of those
+  self-edits turns out worse, you can list the recent self-modifications and roll any of them
+  back to its prior contents — with a safety check that refuses to overwrite a file that has
+  changed since (unless you force it).
+
 - **Genesis self-corrects a bad memory recall instead of running with it** — on high-stakes
   lookups (the explicit memory and knowledge recall tools), Genesis now grades whether the
   recalled results are actually on-topic, and when a recall comes back clearly irrelevant it
