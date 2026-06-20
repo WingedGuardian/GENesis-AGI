@@ -71,6 +71,7 @@ from genesis.mcp.health import j9_eval as _j9_eval  # noqa: E402, F401
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
 from genesis.mcp.health import module_ops as _module_ops  # noqa: E402
 from genesis.mcp.health import provider as _provider  # noqa: E402
+from genesis.mcp.health import self_improvement_status  # noqa: E402, F401
 from genesis.mcp.health import session_control as _session_control  # noqa: E402
 from genesis.mcp.health import settings as _settings  # noqa: E402
 from genesis.mcp.health import status as _status  # noqa: E402

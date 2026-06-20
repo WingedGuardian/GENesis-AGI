@@ -227,6 +227,43 @@ class TestAggregates:
         assert d["n"] == 1
 
     @pytest.mark.asyncio
+    async def test_count_by_tier(self, db):
+        # Two T1, one T3 — tier cannot be derived from signal_type alone, so
+        # this needs its own GROUP BY (the soak instrument relies on it).
+        await oe.record(
+            db, source="ego", ref_type="proposal", ref_id="ct1",
+            signal_type="execution_outcome", signal_tier=1, domain="d",
+        )
+        await oe.record(
+            db, source="ego", ref_type="proposal", ref_id="ct2",
+            signal_type="execution_outcome", signal_tier=1, domain="e",
+        )
+        await oe.record(
+            db, source="ego", ref_type="proposal", ref_id="ct3",
+            signal_type="dispatch", signal_tier=3, domain="d",
+        )
+        assert await oe.count_by_tier(db) == {1: 2, 3: 1}
+
+    @pytest.mark.asyncio
+    async def test_count_by_tier_empty(self, db):
+        assert await oe.count_by_tier(db) == {}
+
+    @pytest.mark.asyncio
+    async def test_aggregate_all_time_window(self, db):
+        # A row outside the 30-day window is excluded by default but included
+        # when days=None — the all-time view the soak instrument uses so the
+        # per-domain breakdown reconciles with the lifetime tier counts.
+        await oe.record(
+            db, source="ego", ref_type="proposal", ref_id="old",
+            signal_type="execution_outcome", signal_tier=1, domain="d",
+            value=1.0, occurred_at="2020-01-01T00:00:00+00:00",
+        )
+        assert await oe.aggregate_by_domain(db, tier=1, days=30) == []
+        all_time = await oe.aggregate_by_domain(db, tier=1, days=None)
+        d = next(a for a in all_time if a["domain"] == "d")
+        assert d["n"] == 1
+
+    @pytest.mark.asyncio
     async def test_calibration_by_domain_requires_confidence_and_value(self, db):
         await oe.record(
             db, source="ego", ref_type="proposal", ref_id="c1",
