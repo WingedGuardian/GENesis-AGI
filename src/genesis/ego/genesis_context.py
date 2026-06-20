@@ -285,7 +285,7 @@ class GenesisEgoContextBuilder:
             # not in _USER_WORLD_CATEGORIES that isn't :user tagged.
             exclude_placeholders = ",".join("?" for _ in _USER_WORLD_CATEGORIES)
             cursor = await self._db.execute(
-                f"SELECT source, type, category, content, priority, created_at "
+                f"SELECT id, source, type, category, content, priority, created_at "
                 f"FROM observations "
                 f"WHERE resolved = 0 "
                 f"AND created_at >= datetime('now', '-48 hours') "
@@ -300,6 +300,7 @@ class GenesisEgoContextBuilder:
                 f"    WHEN 'medium' THEN 2 "
                 f"    ELSE 3 "
                 f"  END, "
+                f"  (retrieved_count > 0), "
                 f"  created_at DESC "
                 f"LIMIT 20",
                 tuple(_USER_WORLD_CATEGORIES),
@@ -314,8 +315,18 @@ class GenesisEgoContextBuilder:
             lines.append("*No unresolved Genesis-internal observations.*\n")
             return "\n".join(lines)
 
+        # Read-receipt (non-fatal): record that these observations were pulled
+        # into the ego's reasoning context this cycle, so already-seen items
+        # demote below unread ones next cycle (blares iff unread AND unresolved).
+        try:
+            from genesis.db.crud import observations as _obs_crud
+
+            await _obs_crud.increment_retrieved_batch(self._db, [r[0] for r in rows])
+        except Exception:
+            logger.debug("Failed to record observation read-receipts", exc_info=True)
+
         lines.append(f"**{len(rows)} items** (sorted by priority):\n")
-        for source, obs_type, category, content, priority, _created_at in rows:
+        for _id, source, obs_type, category, content, priority, _created_at in rows:
             short = content[:200] + "..." if len(content) > 200 else content
             short = short.replace("\n", " ")
             cat_str = f"/{category}" if category else ""
@@ -323,10 +334,11 @@ class GenesisEgoContextBuilder:
                 f"- [{priority}] **{source}{cat_str}** ({obs_type}): {short}"
             )
 
-        # Count redirect observations requiring in-cycle investigation
+        # Count redirect observations requiring in-cycle investigation.
+        # row[2] is the observation type (id=row[0], source=row[1], type=row[2]).
         redirect_count = sum(
             1 for row in rows
-            if row[1] in ("cross_domain_redirect", "realist_redirect")
+            if row[2] in ("cross_domain_redirect", "realist_redirect")
         )
         if redirect_count:
             lines.append(

@@ -12,6 +12,27 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 logger = logging.getLogger(__name__)
 
 
+def _observation_status(row: dict) -> str:
+    """Derive an observation's lifecycle stage from its existing fields.
+
+    Stages, highest-precedence first:
+      - ``resolved``  — condition cleared (resolved=1)
+      - ``acted``     — drove a downstream artifact (influenced_action=1)
+      - ``read``      — a consumer/user has seen it (retrieved_count>0 or surfaced_at set)
+      - ``new``       — unread + active (still "blaring")
+
+    Pure derivation — no schema change. Backend-authoritative so the dashboard
+    badge and any future consumer agree on the stage.
+    """
+    if row.get("resolved"):
+        return "resolved"
+    if row.get("influenced_action"):
+        return "acted"
+    if (row.get("retrieved_count") or 0) > 0 or row.get("surfaced_at"):
+        return "read"
+    return "new"
+
+
 @blueprint.route("/api/genesis/observations")
 @_async_route
 async def observations_list():
@@ -51,6 +72,10 @@ async def observations_list():
 
     has_more = len(rows) > limit
     rows = rows[:limit]
+
+    # Derive the lifecycle stage (new/read/acted/resolved) for the panel badge.
+    for r in rows:
+        r["status"] = _observation_status(r)
 
     return jsonify({"observations": rows, "has_more": has_more})
 

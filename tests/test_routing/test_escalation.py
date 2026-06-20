@@ -93,6 +93,64 @@ class TestRecovery:
         """Recovering an untracked provider should not raise."""
         escalation.record_recovery("nonexistent")
 
+    async def _make_pf(self, escalation, empty_db, provider, oid):
+        # Raw INSERT (the repo's obs-test convention) so setup does not depend on
+        # obs_crud.create being unmocked under the full suite. The content_hash
+        # matches what _resolve_observation resolves on.
+        await empty_db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, content, priority, resolved, content_hash, created_at) "
+            "VALUES (?, 'routing', 'provider_failure', ?, 'high', 0, ?, datetime('now'))",
+            (oid, f"{provider} failing",
+             escalation._provider_content_hash(provider)),
+        )
+        await empty_db.commit()
+
+    async def _pf_state(self, empty_db, oid):
+        # Raw read of (resolved, resolution_notes) — independent of obs_crud so the
+        # assertion can't be defeated by a leaked CRUD mock elsewhere in the suite.
+        cur = await empty_db.execute(
+            "SELECT resolved, resolution_notes FROM observations WHERE id = ?", (oid,),
+        )
+        return await cur.fetchone()
+
+    async def test_recovery_resolves_provider_observation(self, escalation, empty_db):
+        """record_recovery resolves THIS provider's unresolved provider_failure obs."""
+        await self._make_pf(escalation, empty_db, "prov-x", "pf-x")
+        await escalation._resolve_observation("prov-x")
+        row = await self._pf_state(empty_db, "pf-x")
+        assert row["resolved"] == 1
+        assert "recovered" in (row["resolution_notes"] or "")
+
+    async def test_recovery_does_not_resolve_other_providers(self, escalation, empty_db):
+        """A recovered provider must NOT resolve a different (still-down) provider."""
+        await self._make_pf(escalation, empty_db, "prov-a", "pf-a")
+        await self._make_pf(escalation, empty_db, "prov-b", "pf-b")
+        await escalation._resolve_observation("prov-a")
+        assert (await self._pf_state(empty_db, "pf-a"))["resolved"] == 1
+        assert (await self._pf_state(empty_db, "pf-b"))["resolved"] == 0
+
+    async def test_record_recovery_schedules_resolve_task(self, escalation, empty_db):
+        """record_recovery (running loop) schedules + completes the resolve task."""
+        import asyncio
+
+        await self._make_pf(escalation, empty_db, "prov-y", "pf-y")
+        escalation.record_recovery("prov-y")
+        pending = [
+            t for t in asyncio.all_tasks()
+            if t.get_name() == "escalation-resolve-prov-y"
+        ]
+        assert pending, "record_recovery did not schedule the resolve task"
+        await asyncio.gather(*pending)
+        assert (await self._pf_state(empty_db, "pf-y"))["resolved"] == 1
+
+    async def test_record_recovery_no_running_loop_no_raise(self, escalation):
+        """record_recovery from a sync/no-loop context (worker thread) must not raise."""
+        import asyncio
+
+        # Runs the sync method in a thread with no running loop → guard returns.
+        await asyncio.to_thread(escalation.record_recovery, "test-provider")
+
 
 class TestEventFiltering:
     async def test_ignores_non_breaker_events(self, escalation):

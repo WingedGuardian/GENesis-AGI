@@ -63,6 +63,32 @@ async def test_resolve_nonexistent(db):
     assert await observations.resolve(db, "nope", resolved_at="x", resolution_notes="x") is False
 
 
+async def test_resolve_by_content_hash(db):
+    """resolve_by_content_hash resolves only rows matching source + content_hash."""
+    await observations.create(
+        db, id="pf-a", source="routing", type="provider_failure",
+        content="provider a down", priority="high",
+        created_at="2026-01-01T00:00:00", content_hash="hash-a",
+    )
+    await observations.create(
+        db, id="pf-b", source="routing", type="provider_failure",
+        content="provider b down", priority="high",
+        created_at="2026-01-01T00:00:00", content_hash="hash-b",
+    )
+    n = await observations.resolve_by_content_hash(
+        db, source="routing", content_hash="hash-a",
+        resolved_at="2026-01-02", resolution_notes="recovered",
+    )
+    assert n == 1
+    assert (await observations.get_by_id(db, "pf-a"))["resolved"] == 1
+    assert (await observations.get_by_id(db, "pf-b"))["resolved"] == 0
+    # Idempotent — re-running resolves nothing more.
+    assert await observations.resolve_by_content_hash(
+        db, source="routing", content_hash="hash-a",
+        resolved_at="2026-01-02", resolution_notes="recovered",
+    ) == 0
+
+
 async def test_increment_retrieved(db):
     await observations.create(db, id="o8", **_COMMON)
     assert await observations.increment_retrieved(db, "o8") is True
