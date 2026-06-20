@@ -57,6 +57,98 @@ def test_build_args_with_mcp_config(invoker):
     assert "/path/to/mcp.json" in args
 
 
+def test_build_args_includes_span_settings(invoker, monkeypatch):
+    """Dispatched sessions get --settings pointing at the span-hook file."""
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(
+        inv_mod, "cc_span_settings_path", lambda: "/tmp/cc-span-settings.json",
+    )
+    args = invoker._build_args(CCInvocation(prompt="hi"))
+    assert "--settings" in args
+    assert args[args.index("--settings") + 1] == "/tmp/cc-span-settings.json"
+
+
+def test_build_args_omits_span_settings_when_unavailable(invoker, monkeypatch):
+    """No --settings when the span-hook file can't be generated (None)."""
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: None)
+    args = invoker._build_args(CCInvocation(prompt="hi"))
+    assert "--settings" not in args
+
+
+def _fake_genesis_hook_repo(tmp_path):
+    """Create a fake repo root containing a genesis-hook launcher."""
+    hook = tmp_path / "repo" / ".claude" / "hooks" / "genesis-hook"
+    hook.parent.mkdir(parents=True)
+    hook.write_text("#!/bin/bash\n")
+    return tmp_path / "repo", hook
+
+
+def test_cc_span_settings_path_generates_file(monkeypatch, tmp_path):
+    """Generates a minimal settings file with the span hook at an ABSOLUTE path."""
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, hook = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    out = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", out)
+
+    result = inv_mod.cc_span_settings_path()
+    assert result == str(out)
+    data = json.loads(out.read_text())
+    entry = data["hooks"]["PostToolUse"][0]
+    assert entry["matcher"] == ".*"
+    cmd = entry["hooks"][0]["command"]
+    # Absolute launcher path, no ${CLAUDE_PROJECT_DIR} (unset in dispatched cwd).
+    assert cmd == f"{hook} hooks/cc_span_hook.py"
+    assert cmd.startswith("/")
+    assert "${CLAUDE_PROJECT_DIR}" not in cmd
+
+
+def test_cc_span_settings_path_none_when_hook_missing(monkeypatch, tmp_path):
+    """Returns None (→ no --settings) when the launcher is absent."""
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo = tmp_path / "repo"  # no .claude/hooks/genesis-hook
+    fake_repo.mkdir()
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", tmp_path / "x.json")
+    assert inv_mod.cc_span_settings_path() is None
+
+
+def test_cc_span_settings_path_idempotent(monkeypatch, tmp_path):
+    """Second call with unchanged content does not rewrite the file."""
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, _ = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    out = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", out)
+
+    inv_mod.cc_span_settings_path()
+    mtime1 = out.stat().st_mtime_ns
+    inv_mod.cc_span_settings_path()
+    assert out.stat().st_mtime_ns == mtime1
+
+
+def test_cc_span_settings_path_rewrites_when_stale(monkeypatch, tmp_path):
+    """A stale/corrupt file is rewritten to the correct content."""
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, _ = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    out = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", out)
+
+    inv_mod.cc_span_settings_path()
+    out.write_text("STALE")  # corrupt it
+    inv_mod.cc_span_settings_path()  # should rewrite
+    data = json.loads(out.read_text())
+    assert data["hooks"]["PostToolUse"][0]["matcher"] == ".*"
+
+
 def test_build_env_strips_claudecode(invoker):
     with patch.dict(
         "os.environ",
