@@ -92,6 +92,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   was reloaded (e.g. toggling a provider in the dashboard), Genesis was expiring *all* of the
   queued "retry the whole chain" requests before its scheduled retry job could replay them.
   Those items now persist across a config reload and get retried as intended.
+- **A rate-limited or over-budget request no longer knocks a working provider offline** —
+  when a provider replied "too many requests" (429) or rejected a single request as too large
+  or against policy (400/422), Genesis treated it like an outage: it retried the doomed request
+  several times and tripped that provider's circuit breaker, taking it out of rotation for
+  everything else for up to 30 minutes. Now those responses fail straight over to the next
+  provider without retrying or benching the one that's actually healthy — so you get faster
+  failover and far fewer false "provider down" blips.
 
 - **Recovered providers stop alarming once they come back** — when a model provider's
   circuit breaker reopens after an outage, Genesis now clears that provider's "failing"

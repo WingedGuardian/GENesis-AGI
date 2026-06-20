@@ -23,6 +23,16 @@ class ErrorCategory(StrEnum):
     # fails fast to the next provider in the chain, but the circuit breaker
     # still records the failure so a repeatedly-hanging provider trips OPEN.
     TIMEOUT = "timeout"
+    # A rate-limit (HTTP 429). Expected provider backpressure, NOT a health
+    # failure: the router fails fast to the next chain member and the breaker
+    # does NOT trip (the per-provider rate gate is the right brake — tripping
+    # would take a reachable provider offline for every other call site).
+    RATE_LIMITED = "rate_limited"
+    # A deterministic client-side error (HTTP 400/422: context-overflow,
+    # content-policy, malformed/unprocessable request). No same-provider retry
+    # and the breaker does NOT trip — it's our payload's fault, not the
+    # provider's health, so tripping would wrongly take a healthy provider down.
+    BAD_REQUEST = "bad_request"
 
 
 class DegradationLevel(StrEnum):
