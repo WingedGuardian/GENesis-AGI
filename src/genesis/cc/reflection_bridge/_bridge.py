@@ -8,6 +8,7 @@ _output submodules.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -33,6 +34,7 @@ from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType, ba
 from genesis.db.crud import cc_sessions as cc_sessions_crud
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.session_context import set_session_id as _set_obs_session
+from genesis.observability.spans import SpanKind, start_span
 from genesis.perception.types import ReflectionResult
 
 if TYPE_CHECKING:
@@ -195,6 +197,30 @@ class CCReflectionBridge:
         return None
 
     async def reflect(
+        self, depth: Depth, tick, *, db,
+        escalation_source: str | None = None,
+        skip_approval: bool = False,
+    ) -> ReflectionResult:
+        """Run a reflection cycle (traced).
+
+        Opens a ``reflection.cycle`` span so the LLM/CC spans this cycle triggers
+        nest under it (one trace per cycle). Best-effort — a no-op when capture
+        is disabled; never alters reflection behavior.
+        """
+        with start_span(
+            "reflection.cycle",
+            SpanKind.OPERATION,
+            attributes={"depth": getattr(depth, "value", str(depth))},
+        ) as span:
+            result = await self._reflect_inner(
+                depth, tick, db=db,
+                escalation_source=escalation_source, skip_approval=skip_approval,
+            )
+            with contextlib.suppress(Exception):
+                span.set_attr("success", result.success)
+            return result
+
+    async def _reflect_inner(
         self, depth: Depth, tick, *, db,
         escalation_source: str | None = None,
         skip_approval: bool = False,

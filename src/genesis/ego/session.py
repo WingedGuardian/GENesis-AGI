@@ -36,6 +36,7 @@ from genesis.ego.types import (
     EgoCycle,
 )
 from genesis.observability.session_context import set_session_id as _set_obs_session
+from genesis.observability.spans import SpanKind, start_span
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -162,6 +163,34 @@ class EgoSession:
     # -- Public API --------------------------------------------------------
 
     async def run_unified_cycle(
+        self,
+        signals: list[EgoSignal],
+        *,
+        model_override: str | None = None,
+        effort_override: str | None = None,
+    ) -> EgoCycle | None:
+        """Execute one ego cycle (traced).
+
+        Opens an ``ego.cycle`` span so the LLM/CC spans this cycle triggers nest
+        under it. Best-effort — a no-op when capture is disabled; never alters
+        ego behavior. A gate-blocked cycle (CycleBlockedError) closes the span
+        with error status and re-raises, unchanged.
+        """
+        with start_span(
+            "ego.cycle",
+            SpanKind.OPERATION,
+            attributes={"signals": len(signals)},
+        ) as span:
+            result = await self._run_unified_cycle_inner(
+                signals,
+                model_override=model_override,
+                effort_override=effort_override,
+            )
+            with contextlib.suppress(Exception):
+                span.set_attr("produced_cycle", result is not None)
+            return result
+
+    async def _run_unified_cycle_inner(
         self,
         signals: list[EgoSignal],
         *,

@@ -173,3 +173,26 @@ class TestCriticalPathSafety:
         assert result.success is True
         await _drain(writer)
         assert await _spans(db) == []
+
+
+@pytest.mark.asyncio
+async def test_operation_span_nests_route_call(wired_router) -> None:
+    """A3 composition: an enclosing operation span parents the LLM span — one trace.
+
+    This is the structure a real reflection/ego cycle produces (the cycle opens
+    an `operation` span; the LLM calls it makes nest under it).
+    """
+    from genesis.observability.spans import SpanKind, start_span
+
+    router, writer, db, _ = wired_router
+    with start_span("reflection.cycle", SpanKind.OPERATION):
+        result = await router.route_call("test_mixed", _MSG)
+    assert result.success is True
+    await _drain(writer)
+
+    rows = await _spans(db)
+    op = next(r for r in rows if r["kind"] == "operation")
+    llm = next(r for r in rows if r["kind"] == "llm")
+    assert op["parent_span_id"] is None  # root of the trace
+    assert llm["parent_span_id"] == op["span_id"]  # LLM nests under the cycle
+    assert llm["trace_id"] == op["trace_id"]  # one trace
