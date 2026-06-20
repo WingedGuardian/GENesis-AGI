@@ -41,3 +41,8 @@ dispatch_model_overrides:
 # Circuit breaker
 consecutive_failure_limit: 3
 failure_backoff_minutes: 60  # pause after N consecutive failures
+
+# Self-improvement: inject the ego's own confidence calibration into its context
+# so it can self-correct (informational only, never a mechanical rescale).
+# Live — takes effect next cycle. Set false to turn off instantly.
+calibration_injection_enabled: true

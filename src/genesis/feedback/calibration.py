@@ -76,6 +76,46 @@ def build_curve(pairs: list[dict]) -> list[dict]:
     return curve
 
 
+def format_calibration_section(snapshot: dict | None, *, depth: str = "deep") -> str:
+    """Render an ego calibration snapshot as ego-context text (informational).
+
+    For the ego's ``confidence`` field. Returns "" when there is no snapshot or the
+    snapshot is flagged ``low_confidence`` (not trustworthy to act on), so the ego is
+    never nudged by noise. Shared by the genesis-ego context section and the MCP
+    status surface (one source of formatting). NO mechanical rescaling — the text
+    invites the ego to weigh its history while keeping its own judgment.
+    """
+    if not snapshot or snapshot.get("low_confidence"):
+        return ""
+    ece = snapshot.get("ece", 0.0)
+    n = snapshot.get("sample_count", 0)
+
+    if depth == "light":
+        return (
+            "## Confidence Calibration\n"
+            f"Your stated confidence vs reality: ECE={ece:.2f} over n={n} outcomes "
+            "(weigh when setting the `confidence` field).\n"
+        )
+
+    lines = [
+        "## Confidence Calibration (for the `confidence` field below)",
+        "Your stated confidence vs actual outcomes. Weigh this — do NOT mechanically "
+        "rescale; keep your own judgment. Small-n buckets are directional only:",
+    ]
+    for c in snapshot.get("curve", []):
+        # half-up rounding (avoid banker's rounding misrepresenting .5 boundaries)
+        pred = int(c.get("predicted_confidence", 0.0) * 100 + 0.5)
+        actual = int(c.get("actual_success_rate", 0.0) * 100 + 0.5)
+        nb = c.get("sample_count", 0)
+        lines.append(
+            f"  - When you report ~{pred}% confidence, "
+            f"you're historically right ~{actual}% (n={nb})"
+        )
+    lines.append(f"Overall ECE={ece:.2f} over n={n} (0 = perfectly calibrated).")
+    lines.append("")
+    return "\n".join(lines)
+
+
 async def compute_ego_calibration(
     db: aiosqlite.Connection, *, days: int = 90
 ) -> dict | None:

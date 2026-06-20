@@ -137,5 +137,9 @@ class EgoConfig:
     # names ("opus", "sonnet", "haiku").  Falls back to profile-based
     # selection when the action_type is not listed.
     dispatch_model_overrides: dict = field(default_factory=dict)
+    # Inject the ego's own confidence calibration into its context so it can
+    # self-correct (informational, never a mechanical rescale). Live-read each
+    # cycle; default ON. Genesis ego only for now.
+    calibration_injection_enabled: bool = True
 
 
