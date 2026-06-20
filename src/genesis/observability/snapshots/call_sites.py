@@ -22,6 +22,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Dispatch modes that route (at least partly) through a Claude Code subprocess
+# rather than purely paid/free APIs: "cli" (CC-only), "dual" (API-first, CC
+# fallback), plus the retired "cc" alias (normalized to "cli" at YAML parse —
+# kept here defensively so a stray legacy value can't silently mislabel cost).
+# For these, the rendered cost_policy is the manual CC-subscription label (not an
+# auto-derived per-provider cost), AND the neural monitor inserts a CC/{model}
+# entry into the chain. See observability/_call_site_meta.py.
+_CC_DISPATCH = frozenset({"cc", "cli", "dual"})
+
 
 def _derive_cost_policy(
     site_cfg: CallSiteConfig,
@@ -175,9 +184,11 @@ async def call_sites(
         meta = _CALL_SITE_META.get(site_id)
         if meta:
             site_data.update(meta)
-        # Derive costPolicy from chain config (CC-dispatched sites keep manual policy)
+        # Derive costPolicy from chain config. CC-dispatched sites (cli/dual,
+        # + retired cc alias) keep their manual CC-subscription label; pure API
+        # and default sites auto-derive from the provider chain.
         dispatch = meta.get("dispatch") if meta else None
-        if dispatch not in ("cc", "dual"):
+        if dispatch not in _CC_DISPATCH:
             site_data["cost_policy"] = _derive_cost_policy(site_cfg, routing_config)
         result[site_id] = site_data
 
@@ -269,8 +280,8 @@ async def call_sites(
                 else:
                     entry["probe_status"] = "reachable"
 
-        # 2. Insert CC entry for dual/cc dispatch sites
-        if dispatch in ("dual", "cc"):
+        # 2. Insert CC entry for CC-dispatch sites (cli/dual, + retired cc alias)
+        if dispatch in _CC_DISPATCH:
             cc_model = yaml_ov.get("cc_model") or (meta.get("cc_model", "?") if meta else "?")
             cc_entry: dict = {
                 "provider": f"CC/{cc_model}",

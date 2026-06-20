@@ -66,6 +66,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The neural monitor labels every cognitive call site honestly.** Eight call sites
+  that previously showed blank (the eval judge, voice conversation, session observer,
+  task pre-mortem, intelligence intake, both resume-review passes, and the executor's
+  failure-exit gate) now display their purpose, category, and cost. Sites that actually
+  run on the Claude Code subscription (the ego cycle and the deep/strategic/weekly/quality
+  reflections) now read "CC background" with their CC model shown in the chain, instead of
+  being mislabeled as a paid API cost.
+
 - **Recovered providers stop alarming once they come back** — when a model provider's
   circuit breaker reopens after an outage, Genesis now clears that provider's "failing"
   alert instead of leaving it lingering for days until it expired. Per-session conversation

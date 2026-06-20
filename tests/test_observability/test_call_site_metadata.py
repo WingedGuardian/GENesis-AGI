@@ -1,0 +1,213 @@
+"""R2 — call-site metadata hygiene + dispatch-gate behavior.
+
+Locks three things the 2026-06-19 hygiene pass fixed:
+  * the 8 previously metadata-blind sites now carry accurate metadata and
+    auto-derive their cost (no frozen/wrong manual label);
+  * meta `dispatch`/`cc_model` no longer drift from authoritative YAML
+    (the broadened drift guard would have caught the 27 mislabel);
+  * both dispatch-consuming gates in call_sites.py — cost_policy retention
+    (line 180) and CC chain-entry insertion (line 273) — treat cli/dual as
+    CC-dispatch, via the shared `_CC_DISPATCH` set.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+import yaml
+
+import genesis.routing.config as routing_config_mod
+from genesis.observability._call_site_meta import _CALL_SITE_META
+from genesis.observability.snapshots.call_sites import _CC_DISPATCH, call_sites
+from genesis.routing.types import (
+    CallSiteConfig,
+    ProviderConfig,
+    ProviderState,
+    RetryPolicy,
+    RoutingConfig,
+)
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_YAML_PATH = _REPO_ROOT / "config" / "model_routing.yaml"
+
+
+def _live_config() -> RoutingConfig:
+    return routing_config_mod.load_config_from_string(_YAML_PATH.read_text())
+
+
+# The 8 sites that were absent from _CALL_SITE_META before this pass.
+_NEWLY_DOCUMENTED = [
+    "judge",
+    "voice_conversation",
+    "21_session_observer",
+    "44_task_premortem",
+    "45_intelligence_intake",
+    "41_resume_review_pass1",
+    "42_resume_review_pass2",
+    "failure_exit_gate",
+]
+
+
+# ── A: the 8 formerly-blind sites ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize("site_id", _NEWLY_DOCUMENTED)
+def test_newly_documented_sites_have_core_metadata(site_id: str):
+    meta = _CALL_SITE_META.get(site_id)
+    assert meta is not None, f"{site_id} is still blind in _CALL_SITE_META"
+    assert meta.get("description"), f"{site_id} missing description"
+    assert meta.get("category"), f"{site_id} missing category"
+    assert meta.get("model_tier"), f"{site_id} missing model_tier"
+
+
+@pytest.mark.parametrize("site_id", _NEWLY_DOCUMENTED)
+def test_newly_documented_sites_auto_derive_cost(site_id: str):
+    # These are api/dual sites, not CC-subscription. They must NOT carry a manual
+    # dispatch/cost_policy — that would freeze a (possibly stale) cost label and
+    # bypass auto-derivation. They also must not be wired=False (all are live).
+    meta = _CALL_SITE_META[site_id]
+    assert "dispatch" not in meta, f"{site_id} should omit dispatch (auto-derive)"
+    assert "cost_policy" not in meta, f"{site_id} should omit manual cost_policy"
+    assert meta.get("wired") is not False, f"{site_id} is live; must not be wired=False"
+
+
+# ── B: drift guard (would have caught the 27_pre_execution_assessment mislabel) ─
+
+
+def test_meta_dispatch_matches_authoritative_yaml():
+    """Every meta entry that sets `dispatch` must agree with the normalized YAML
+    dispatch (YAML is what routing actually uses). This catches a meta entry that
+    claims a CC mode for a site that really routes via API (the 27 bug)."""
+    cfg = _live_config()
+    mismatches = []
+    for sid, meta in _CALL_SITE_META.items():
+        md = meta.get("dispatch")
+        if md is None:
+            continue
+        cs = cfg.call_sites.get(sid)
+        assert cs is not None, f"{sid} sets meta dispatch={md!r} but is not a YAML call site"
+        if md != cs.dispatch:
+            mismatches.append((sid, md, cs.dispatch))
+    assert not mismatches, f"meta/YAML dispatch drift: {mismatches}"
+
+
+def test_meta_cc_model_matches_yaml():
+    raw = yaml.safe_load(_YAML_PATH.read_text())["call_sites"]
+    mismatches = []
+    for sid, meta in _CALL_SITE_META.items():
+        mcc = meta.get("cc_model")
+        rcc = raw.get(sid, {}).get("cc_model")
+        if mcc is not None and rcc is not None and mcc != rcc:
+            mismatches.append((sid, mcc, rcc))
+    assert not mismatches, f"meta/YAML cc_model drift: {mismatches}"
+
+
+def test_meta_dispatch_uses_canonical_vocab_only():
+    """No meta entry may use the retired `cc` alias or any non-canonical mode."""
+    bad = {
+        k: v["dispatch"]
+        for k, v in _CALL_SITE_META.items()
+        if v.get("dispatch") and v["dispatch"] not in routing_config_mod._VALID_DISPATCH_MODES
+    }
+    assert not bad, f"non-canonical/retired dispatch values in meta: {bad}"
+
+
+def test_27_pre_execution_assessment_not_mislabeled_as_cc():
+    """Regression lock: 27 is a dual API site (real chain), not a CC/Opus site."""
+    meta = _CALL_SITE_META["27_pre_execution_assessment"]
+    assert "dispatch" not in meta
+    assert "cc_model" not in meta
+
+
+def test_cc_dispatch_set_contents():
+    """Both gates key off this RUNTIME set; lock its contents (cli + dual + the
+    retired cc alias, kept defensively).
+
+    NOTE the deliberate asymmetry with ``test_meta_dispatch_uses_canonical_vocab_only``:
+    ``"cc"`` belongs in this runtime set (so a stray legacy value can't silently
+    mislabel cost) but is NOT a valid value to AUTHOR in ``_CALL_SITE_META`` — the
+    canonical-vocab test enforces that meta entries use only {api, cli, dual}.
+    These are not contradictory: one guards runtime tolerance, the other guards
+    hand-authored hygiene."""
+    assert sorted(_CC_DISPATCH) == ["cc", "cli", "dual"]
+
+
+# ── C/E: the two dispatch gates in call_sites() ─────────────────────────────
+
+
+def _provider(name: str, *, free: bool) -> ProviderConfig:
+    return ProviderConfig(
+        name=name, provider_type="test", model_id="m",
+        is_free=free, rpm_limit=None, open_duration_s=120,
+    )
+
+
+def _config(call_sites_map: dict, providers: dict) -> RoutingConfig:
+    return RoutingConfig(
+        providers=providers,
+        call_sites=call_sites_map,
+        retry_profiles={"default": RetryPolicy()},
+    )
+
+
+def _registry() -> MagicMock:
+    def _breaker(_name: str) -> MagicMock:
+        cb = MagicMock()
+        cb.state = ProviderState.CLOSED
+        cb.consecutive_failures = 0
+        cb.trip_count = 0
+        return cb
+
+    reg = MagicMock()
+    reg.get.side_effect = _breaker
+    return reg
+
+
+@pytest.mark.asyncio
+async def test_cli_site_retains_manual_cost_policy():
+    """cli sites keep their manual 'CC background' label instead of auto-deriving
+    a misleading 'Paid primary' (7_ego_cycle mis-rendered before this fix)."""
+    providers = {
+        "openrouter-sonnet": _provider("openrouter-sonnet", free=False),
+        "openrouter-opus": _provider("openrouter-opus", free=False),
+    }
+    cfg = _config(
+        {
+            "5_deep_reflection": CallSiteConfig(id="5_deep_reflection", chain=["openrouter-sonnet"]),
+            "7_ego_cycle": CallSiteConfig(id="7_ego_cycle", chain=["openrouter-opus"]),
+        },
+        providers,
+    )
+    result = await call_sites(db=None, routing_config=cfg, breakers=_registry())
+    assert result["5_deep_reflection"]["cost_policy"] == "CC background (Sonnet)"
+    assert result["7_ego_cycle"]["cost_policy"] == "CC background (Opus)"
+    assert "Paid primary" not in result["7_ego_cycle"]["cost_policy"]
+
+
+@pytest.mark.asyncio
+async def test_cli_site_shows_cc_chain_entry():
+    """A cli site renders a CC/{model} entry in chain_health (line-273 gate)."""
+    providers = {"openrouter-sonnet": _provider("openrouter-sonnet", free=False)}
+    cfg = _config(
+        {"5_deep_reflection": CallSiteConfig(id="5_deep_reflection", chain=["openrouter-sonnet"])},
+        providers,
+    )
+    result = await call_sites(db=None, routing_config=cfg, breakers=_registry())
+    chain = result["5_deep_reflection"]["chain_health"]
+    assert any(entry.get("is_cc") for entry in chain), f"no CC entry in chain: {chain}"
+
+
+@pytest.mark.asyncio
+async def test_api_site_auto_derives_and_has_no_cc_entry():
+    """An api site (judge) auto-derives 'Paid primary' and gets no CC entry."""
+    providers = {"openrouter-deepseek-v4": _provider("openrouter-deepseek-v4", free=False)}
+    cfg = _config(
+        {"judge": CallSiteConfig(id="judge", chain=["openrouter-deepseek-v4"])},
+        providers,
+    )
+    result = await call_sites(db=None, routing_config=cfg, breakers=_registry())
+    assert result["judge"]["cost_policy"].startswith("Paid primary")
+    chain = result["judge"]["chain_health"]
+    assert not any(entry.get("is_cc") for entry in chain)
