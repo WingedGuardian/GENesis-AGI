@@ -81,8 +81,13 @@ async def knowledge_recall(
     assert memory_mod._retriever is not None
     assert memory_mod._db is not None
 
+    # MEM-003: capture the recall_fired event the retriever emits so we enrich
+    # that single event with the final knowledge_recall result set below, rather
+    # than emitting a second recall_fired that double-counts downstream.
+    recall_event_sink: list[str] = []
     vector_results = await memory_mod._retriever.recall(
         query, source="knowledge", limit=limit, project_type=project,
+        event_id_sink=recall_event_sink,
     )
 
     fts_results: list[dict] = []
@@ -137,27 +142,44 @@ async def knowledge_recall(
         is_kb=lambda r: True,
     )[:limit]
 
-    # Selective corrective retrieval (CRAG). Default ON; gated + fail-fast.
-    # path="knowledge" → web fallback is permitted on an Incorrect verdict
-    # (external knowledge is legitimately on the web; episodic memory is not).
-    if corrective:
-        # Emit recall_fired first so the recall_corrected calibration event can
-        # link back to it (subject_id) — matches memory_recall's behavior.
-        recall_event_id: str | None = None
-        try:
+    # MEM-003: exactly ONE recall_fired per knowledge_recall. The retriever
+    # already emitted one (its id is in recall_event_sink) — enrich it with the
+    # final, post-merge/floor result set; emit a fresh one only if the retriever
+    # didn't (e.g. it returned early). Done before CRAG so the recall_corrected
+    # calibration event can link back to recall_event_id (subject_id).
+    recall_event_id: str | None = (
+        recall_event_sink[0] if recall_event_sink else None
+    )
+    try:
+        _top_scores = [r.get("score", 0.0) for r in final[:5]]
+        _memory_ids = [r.get("unit_id", "") for r in final[:10]]
+        if recall_event_id is not None:
+            from genesis.eval.j9_hooks import update_recall_metrics
+            await update_recall_metrics(
+                memory_mod._db,
+                recall_event_id,
+                result_count=len(final),
+                top_scores=_top_scores,
+                memory_ids=_memory_ids,
+            )
+        else:
             from genesis.eval.j9_hooks import emit_recall_fired
             recall_event_id = await emit_recall_fired(
                 memory_mod._db,
                 query=query,
                 result_count=len(final),
-                top_scores=[r.get("score", 0.0) for r in final[:5]],
-                memory_ids=[r.get("unit_id", "") for r in final[:10]],
+                top_scores=_top_scores,
+                memory_ids=_memory_ids,
                 latency_ms=0.0,
                 source="knowledge",
             )
-        except Exception:
-            pass  # instrumentation must never break recall
+    except Exception:
+        pass  # instrumentation must never break recall
 
+    # Selective corrective retrieval (CRAG). Default ON; gated + fail-fast.
+    # path="knowledge" → web fallback is permitted on an Incorrect verdict
+    # (external knowledge is legitimately on the web; episodic memory is not).
+    if corrective:
         from genesis.memory.corrective import maybe_correct_recall
         final = await maybe_correct_recall(
             query=query,

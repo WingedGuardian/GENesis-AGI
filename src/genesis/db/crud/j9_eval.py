@@ -45,6 +45,33 @@ async def insert_event(
     return eid
 
 
+async def update_event_metrics(
+    db: aiosqlite.Connection, event_id: str, **fields: object,
+) -> bool:
+    """Merge ``fields`` into an existing event's ``metrics_json``.
+
+    Enriches an already-emitted event in place rather than emitting a second
+    event (audit MEM-003: the MCP recall layer adds mode/pipeline_used/post-
+    filter counts to the single event the retriever already emitted). Existing
+    metric keys are overwritten by ``fields``; absent keys are added. Returns
+    ``True`` if a row was updated, ``False`` if no event has that id.
+    """
+    cursor = await db.execute(
+        "SELECT metrics_json FROM eval_events WHERE id = ?", (event_id,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return False
+    metrics = json.loads(row[0]) if row[0] else {}
+    metrics.update(fields)
+    await db.execute(
+        "UPDATE eval_events SET metrics_json = ? WHERE id = ?",
+        (json.dumps(metrics), event_id),
+    )
+    await db.commit()
+    return True
+
+
 async def get_events(
     db: aiosqlite.Connection,
     *,

@@ -112,6 +112,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Memory-quality self-evaluation got more honest** — every time Genesis searches its memory it
+  logs an internal "recall" event that feeds the self-graded memory-quality metrics (the
+  precision / MRR figures in its J-9 eval and morning report). It was logging that event *twice*
+  per search, inflating the counts and skewing the math. Each search now logs exactly one event,
+  so the memory-quality numbers Genesis reports on itself are accurate. It also now records a new
+  signal — whether its ranking merely favors the memories it retrieves most often — so
+  entrenchment of stale-but-popular memories can be watched over time (measured, not acted on).
+
 - **Knowledge-base searches stopped silently returning nothing** — the relevance floor that
   trims low-quality knowledge results was a fixed absolute cutoff that, on the score scale recall
   actually produces, sat above the entire range — so searching the knowledge base (or a broad
