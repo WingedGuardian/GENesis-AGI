@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis spots goals it's stuck on and asks before easing off them** — when a goal you
+  set has been worked on (several dispatched sessions) but still isn't moving, Genesis now
+  recognizes it as *stuck* rather than merely idle, bumps it up for review, and digs into
+  *why* it stalled instead of nudging it again. If it concludes the goal should be paused or
+  deprioritized, that becomes a proposal you approve or reject — nothing about your goals
+  changes without your say-so.
+
 - **Genesis records traces of what it does** — reflections, ego cycles, every LLM
   call, and the tools its dispatched Claude Code sessions run are now captured as
   nested trace spans (one trace per operation), so its activity can be inspected
