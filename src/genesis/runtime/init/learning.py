@@ -663,6 +663,32 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        async def _ingest_cc_spans() -> None:
+            """Drain CC-tool span flat-files into otel_spans (tracing backbone)."""
+            if rt._db is None:
+                return
+            try:
+                from genesis.observability.span_ingest import ingest_pending_spans
+
+                n = await ingest_pending_spans(rt._db)
+                rt.record_job_success("cc_span_ingest")
+                if n:
+                    logger.debug("CC span ingest: %d spans", n)
+            except Exception as exc:
+                rt.record_job_failure("cc_span_ingest", str(exc))
+                logger.exception("CC span ingest failed")
+
+        # Frequent (every 2 min) so dispatched-session tool spans land in the
+        # trace shortly after the session runs. minute-cron survives restart
+        # (no IntervalTrigger reset trap). No-op cost when idle (empty dir).
+        rt._learning_scheduler.add_job(
+            _ingest_cc_spans,
+            CronTrigger(minute="*/2"),
+            id="cc_span_ingest",
+            max_instances=1,
+            misfire_grace_time=60,
+        )
+
         async def _reap_stale_processes() -> None:
             """Kill leaked processes older than their configured threshold.
 
