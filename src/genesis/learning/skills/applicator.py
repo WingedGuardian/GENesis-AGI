@@ -70,7 +70,22 @@ class SkillApplicator:
             if path is None:
                 return {"action": "failed", "reason": "skill not found"}
 
-            path.write_text(proposal.proposed_content, encoding="utf-8")
+            # Route the overwrite through the cognitive self-mod ledger so the
+            # pre-image is captured and a degrading skill edit can be rolled back.
+            from genesis.learning.cognitive_ledger import record_file_modification
+
+            await record_file_modification(
+                db,
+                actor="skill_evolution",
+                path=path,
+                new_content=proposal.proposed_content,
+                summary=f"MINOR auto-apply: {proposal.rationale[:200]}",
+                metadata={
+                    "skill_name": proposal.skill_name,
+                    "change_size": proposal.change_size.value,
+                    "confidence": proposal.confidence,
+                },
+            )
 
             # Log observation (include validation warnings if any)
             from genesis.db.crud import observations
