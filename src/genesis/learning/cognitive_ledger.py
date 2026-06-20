@@ -50,11 +50,20 @@ def _read_current(path: Path) -> str | None:
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    """Write ``content`` to ``path`` atomically via a same-directory temp + rename."""
+    """Write ``content`` to ``path`` atomically via a same-directory temp + rename.
+
+    The temp name is UNIQUE so concurrent writers to the same target never share
+    (and corrupt) a temp file, and it is removed if the write fails before the
+    rename (no orphaned ``.cogtmp`` left behind).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".cogtmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)  # os.replace — atomic on the same filesystem, overwrites
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.cogtmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)  # os.replace — atomic on the same filesystem, overwrites
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 async def record_existing(

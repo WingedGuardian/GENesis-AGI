@@ -90,6 +90,23 @@ class TestCapture:
         rows = await cfm.recent(db, limit=10)
         assert len([r for r in rows if r["target_path"] == str(p)]) == 2
 
+    @pytest.mark.asyncio
+    async def test_atomic_write_cleans_temp_and_preserves_target_on_failure(
+        self, db, tmp_path, monkeypatch,
+    ):
+        p = tmp_path / "f.md"
+        p.write_text("orig")
+
+        def _boom(self, _target):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(cl.Path, "replace", _boom)
+        with pytest.raises(OSError):
+            await record_file_modification(db, actor="a", path=p, new_content="new")
+        # No orphaned temp; the original file is untouched (rename never completed).
+        assert not list(tmp_path.glob("*.cogtmp"))
+        assert p.read_text() == "orig"
+
 
 # --------------------------------------------------------------------------- #
 # Rollback
