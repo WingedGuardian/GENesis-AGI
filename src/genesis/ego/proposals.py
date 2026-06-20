@@ -152,10 +152,14 @@ class ProposalWorkflow:
         db: aiosqlite.Connection,
         topic_manager: TopicManager | None = None,
         memory_store: MemoryStore | None = None,
+        autonomy_manager: object | None = None,
     ) -> None:
         self._db = db
         self._topic_manager = topic_manager
         self._memory_store = memory_store
+        # AutonomyManager (duck-typed) for the earn-back promote hook in
+        # resolve_proposals. None disables earn-back on the Telegram path.
+        self._autonomy_manager = autonomy_manager
 
     # -- Late-binding setters (wired in standalone.py after Telegram init) --
 
@@ -512,6 +516,20 @@ class ProposalWorkflow:
                 # Auto-store correction memory on rejection with reason
                 if status == ProposalStatus.REJECTED and reason and self._memory_store:
                     await self._store_correction(prop, reason)
+                # Autonomy earn-back: promote on approval / cooldown on reject.
+                # No-op unless this is an autonomy_earnback proposal. Wrapped so a
+                # failure here never aborts resolution of sibling proposals.
+                try:
+                    from genesis.ego.earnback import handle_earnback_resolution
+
+                    await handle_earnback_resolution(
+                        self._db, prop, status, self._autonomy_manager,
+                    )
+                except Exception:
+                    logger.warning(
+                        "earnback resolution hook failed for %s",
+                        prop.get("id"), exc_info=True,
+                    )
             else:
                 logger.warning(
                     "Proposal %s not updated (already resolved?)",

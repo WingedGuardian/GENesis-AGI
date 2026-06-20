@@ -197,6 +197,18 @@ async def comms_resolve_proposal(proposal_id: str):
     except Exception:
         logger.warning("Journal resolve failed for proposal %s", proposal_id)
 
+    # Autonomy earn-back: promote on approval / cooldown on reject.
+    try:
+        from genesis.ego.earnback import handle_earnback_resolution
+
+        prop = await ego.get_proposal(rt.db, proposal_id)
+        if prop:
+            await handle_earnback_resolution(
+                rt.db, prop, status, getattr(rt, "_autonomy_manager", None),
+            )
+    except Exception:
+        logger.warning("earnback resolution hook failed for %s", proposal_id)
+
     # Trigger delayed sweep on approval — same 5-min grace as Telegram,
     # so the user can revoke before dispatch fires.
     if status == "approved" and rt.ego_session:
