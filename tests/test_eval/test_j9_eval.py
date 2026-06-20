@@ -538,3 +538,90 @@ async def test_memory_quality_ignores_duplicate_relevance(db):
     assert total_recalls == 1
     assert metrics["precision_at_5"] == 0.5
     assert metrics["total_memories_judged"] == 2  # deduped, not 3
+
+
+async def test_memory_quality_mrr_uses_stored_rank_not_insert_order(db):
+    """MRR must use the retrieval rank persisted in the event metrics, NOT the
+    DB/insert order. recall_relevance events are inserted CONCURRENTLY (arbitrary
+    order, read back ORDER BY timestamp DESC), so list order != retrieval rank.
+
+    Insert the only RELEVANT memory at rank 3 LAST (so it's returned FIRST by
+    timestamp DESC); MRR must be 1/3 (first relevant is at rank 3), not 1/1.
+    """
+    from genesis.eval.j9_aggregator import _compute_memory_quality
+
+    # Out of rank order: rank-1 (irrelevant) first … rank-3 (relevant) last.
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r1", "memory_id": "m1", "relevance": 0.0, "rank": 1},
+    )
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r1", "memory_id": "m2", "relevance": 0.0, "rank": 2},
+    )
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r1", "memory_id": "m3", "relevance": 1.0, "rank": 3},
+    )
+
+    metrics, _ = await _compute_memory_quality(db, since="2000-01-01", until="2100-01-01")
+    # First relevant is at rank 3 → MRR ≈ 1/3 (aggregator rounds to 4dp).
+    # The bug would give 1.0 (relevant returned first by timestamp DESC).
+    assert metrics["mrr"] == pytest.approx(1.0 / 3.0, abs=1e-3)
+
+
+async def test_insert_run_persists_metadata_json_per_result(db):
+    """eval_results.metadata_json must be written (migration 0014's documented
+    dual-write) — it mirrors scorer_detail so calibration/drift tooling can
+    query the judge payload structurally without re-parsing scorer_detail.
+    """
+    import importlib
+    import json as _json
+
+    from genesis.eval import db as eval_db
+    from genesis.eval.types import (
+        EvalRunSummary,
+        EvalTrigger,
+        ScoredOutput,
+        ScorerType,
+        TaskCategory,
+    )
+
+    # eval_runs/eval_results come from migrations, not create_all_tables. Apply
+    # the full eval_results column chain: 0002 (create) → 0003 (skipped) →
+    # 0014 (metadata_json).
+    for _mig in (
+        "0002_add_eval_tables",
+        "0003_eval_results_skipped",
+        "0014_eval_results_metadata",
+    ):
+        await importlib.import_module(f"genesis.db.migrations.{_mig}").up(db)
+    await db.commit()
+
+    detail = _json.dumps({"judge_model": "x", "judge_score": 0.7, "rationale": "ok"})
+    summary = EvalRunSummary(
+        run_id="run_meta_1", model_id="m", model_profile="p", dataset="d",
+        trigger=EvalTrigger.MANUAL, task_category=TaskCategory.CLASSIFICATION,
+        total_cases=2, passed_cases=2, failed_cases=0,
+        results=[
+            ScoredOutput(
+                case_id="c1", passed=True, score=0.7, actual_output="out",
+                scorer_type=ScorerType.LLM_JUDGE, scorer_detail=detail,
+            ),
+            # Non-judge scorer: scorer_detail is a plain (non-JSON) string, so
+            # metadata_json (the queryable JSON view) must be NULL, not that string.
+            ScoredOutput(
+                case_id="c2", passed=True, score=1.0, actual_output="3",
+                scorer_type=ScorerType.EXACT_MATCH, scorer_detail="expected=3, got=3",
+            ),
+        ],
+    )
+    await eval_db.insert_run(db, summary)
+    rows = {
+        r[0]: r[1]
+        for r in await (await db.execute(
+            "SELECT case_id, metadata_json FROM eval_results WHERE run_id = 'run_meta_1'"
+        )).fetchall()
+    }
+    assert rows["c1"] == detail  # judge result → JSON dual-write
+    assert rows["c2"] is None  # non-judge result → NULL (not the plain string)

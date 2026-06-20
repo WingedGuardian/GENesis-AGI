@@ -246,3 +246,25 @@ def test_render_report_blocked_verdict():
     md = render_report(result)
     assert "**Verdict:** BLOCKED" in md
     assert "do NOT promote" in md
+
+
+async def test_grade_observation_missing_score_raises(monkeypatch):
+    """_grade_observation must RAISE on a judge response that is valid JSON but
+    lacks the 'score' key — so the caller counts it as an error — rather than
+    silently grading it 0.0 and mislabeling a golden-set case.
+    """
+    from types import SimpleNamespace
+
+    import genesis.eval.reflection_golden_set as rgs
+
+    async def _fake_acompletion(*args, **kwargs):
+        return SimpleNamespace(choices=[
+            SimpleNamespace(message=SimpleNamespace(
+                content='{"rationale": "valid json, no score key"}')),
+        ])
+
+    monkeypatch.setattr("litellm.acompletion", _fake_acompletion)
+    monkeypatch.setattr(rgs, "_ensure_secrets", lambda: None)
+
+    with pytest.raises(ValueError, match="score"):
+        await rgs._grade_observation("some observation text", "session context")

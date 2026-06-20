@@ -125,24 +125,29 @@ class J9EvalBatchExecutor:
         )
 
         # Build the judgment worklist (skipping already-judged pairs).
-        worklist: list[tuple[dict, str, str]] = []
+        worklist: list[tuple[dict, str, str, int]] = []
         for event in recall_events:
             metrics = event.get("metrics", {})
             query = metrics.get("query", "")
             memory_ids = metrics.get("memory_ids", [])
             if not query or not memory_ids:
                 continue
-            for mid in memory_ids[:5]:  # Cap at top-5 per recall
+            # rank = the memory's position in this recall's memory_ids[:5] (1-5),
+            # persisted per relevance event so the aggregator computes MRR by
+            # retrieval rank — not by concurrent-insert / DB (timestamp DESC) order.
+            for rank, mid in enumerate(memory_ids[:5], 1):  # Cap at top-5 per recall
                 if (event["id"], mid) in already_judged:
                     continue
-                worklist.append((event, query, mid))
+                worklist.append((event, query, mid, rank))
 
         scored = 0
         errors = 0
         deferred = 0
         sem = asyncio.Semaphore(_MAX_CONCURRENT_JUDGES)
 
-        async def _judge_and_store(index: int, event: dict, query: str, mid: str) -> None:
+        async def _judge_and_store(
+            index: int, event: dict, query: str, mid: str, rank: int,
+        ) -> None:
             nonlocal scored, errors, deferred
             # Deadline check before acquiring a slot — past the budget, defer
             # the rest to the next (checkpointed) run rather than risk the
@@ -173,6 +178,7 @@ class J9EvalBatchExecutor:
                         metrics={
                             "recall_event_id": event["id"],
                             "memory_id": mid,
+                            "rank": rank,
                             "relevance": relevance,
                             "judge_rationale": rationale,
                             "judge_model": model_used,
@@ -184,8 +190,8 @@ class J9EvalBatchExecutor:
 
         results = await asyncio.gather(
             *(
-                _judge_and_store(i, event, query, mid)
-                for i, (event, query, mid) in enumerate(worklist)
+                _judge_and_store(i, event, query, mid, rank)
+                for i, (event, query, mid, rank) in enumerate(worklist)
             ),
             return_exceptions=True,
         )
@@ -396,7 +402,12 @@ class J9EvalBatchExecutor:
             text = result.content or ""
             # Parse JSON response
             parsed = json.loads(text.strip())
-            relevance = float(parsed.get("relevance", 0.0))
+            if "relevance" not in parsed:
+                # Valid JSON but no 'relevance' — route to the error path (None)
+                # so it is NOT stored as a fake relevance=0.0 event that would
+                # silently pollute precision@5 / MRR.
+                raise ValueError("judge response missing required 'relevance' key")
+            relevance = float(parsed["relevance"])
             rationale = parsed.get("rationale", "")
             return (max(0.0, min(1.0, relevance)), rationale, model_used)
         except (json.JSONDecodeError, KeyError, ValueError) as exc:

@@ -84,6 +84,29 @@ async def test_judges_all_memories_happy_path(db):
     assert await _relevance_pairs(db) == {(eid, "m1"), (eid, "m2"), (eid, "m3")}
 
 
+async def test_missing_relevance_key_not_stored_as_zero(db):
+    """A judge response that is valid JSON but LACKS the 'relevance' key must be
+    treated as an ERROR (not stored), NOT recorded as a fake relevance=0.0
+    event that silently pollutes precision@5 / MRR with a false 'irrelevant'.
+    """
+    class _NoRelevanceRouter:
+        async def route_call(self, call_site_id, messages, *, chain_offset=0, **kwargs):
+            return SimpleNamespace(
+                success=True, provider_used="fake", model_id="fake-judge",
+                content=json.dumps({"rationale": "forgot the relevance field"}),
+                error=None,
+            )
+
+    await _seed_recall(db, query="q", memory_ids=["m1"])
+    ex = J9EvalBatchExecutor(db=db, router=_NoRelevanceRouter())
+
+    result = await ex.execute(_task())
+
+    assert result.success
+    # Missing key → judge error → the pair is NOT stored (no fake 0.0 event).
+    assert await _relevance_pairs(db) == set()
+
+
 async def test_checkpoint_skips_already_judged(db):
     eid = await _seed_recall(db, query="q", memory_ids=["m1", "m2"])
     # Pre-existing judgment for (eid, m1) — simulates a prior partial/retry.
