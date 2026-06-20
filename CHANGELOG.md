@@ -66,6 +66,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A campaign that crashes mid-tick no longer fails silently** — when a scheduled campaign
+  tick raises an error, Genesis now records it in job-health tracking, so the failure surfaces
+  in the dashboard and to the ego instead of vanishing into the server log. Campaign
+  reliability problems become visible instead of going unnoticed.
+
 - **Surplus brainstorm messages read like prose, not raw JSON** — Genesis's background
   brainstorm ideas posted to the Telegram "Surplus" topic now render as clean bulleted text
   (idea, detail, and why it matters) instead of the raw ```json``` code block the model
