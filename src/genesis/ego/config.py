@@ -145,4 +145,8 @@ def validate_ego_config(changes: dict) -> list[str]:
             for action, model in v.items():
                 if model not in valid_models:
                     errors.append(f"dispatch_model_overrides[{action}]: model must be one of {valid_models}")
+    if "calibration_injection_enabled" in changes and not isinstance(
+        changes["calibration_injection_enabled"], bool
+    ):
+        errors.append("calibration_injection_enabled must be a boolean")
     return errors

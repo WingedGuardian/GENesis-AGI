@@ -129,8 +129,21 @@ fi
 # Abort before touching anything if tracked files are modified.
 # Untracked files (^??) are excluded — merge/reset never touches them.
 # git reset --hard in _do_rollback would silently discard uncommitted work.
+#
+# EXCEPTION — known-ephemeral tracked files (EPHEMERAL_DIRTY_RE): tracked files
+# that are routinely rewritten in place and are safe to ignore, because the
+# fast-forward merge never touches them and they regenerate themselves. Today
+# that's top-level `AGENTS.md` (GitNexus rewrites its auto-stat block). These no
+# longer block an update; REAL tracked changes still abort. The regex matches the
+# porcelain path (a single space precedes it), so only this exact top-level path
+# is excused — e.g. `src/AGENTS.md` would still abort.
+# (`.claude/settings.local.json` is handled the right way — untracked + already
+# in .gitignore — so it never appears here.)
+EPHEMERAL_DIRTY_RE=' AGENTS\.md$'
 if [[ "$POST_MERGE" == "false" ]]; then
-    DIRTY_FILES=$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null | grep -v "^??" || true)
+    DIRTY_FILES=$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null \
+        | grep -v "^??" \
+        | grep -vE "$EPHEMERAL_DIRTY_RE" || true)
     if [[ -n "$DIRTY_FILES" ]]; then
         echo "ERROR: Working tree has uncommitted changes. Clean them up first:"
         echo "$DIRTY_FILES"
