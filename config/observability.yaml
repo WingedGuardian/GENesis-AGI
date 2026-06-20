@@ -1,0 +1,11 @@
+# Observability — tracing/spans backbone.
+#
+# spans.enabled    Master capture switch. Read ONCE at startup (needs restart to
+#                  toggle). The env var GENESIS_SPANS_DISABLED=1 force-disables
+#                  across ALL processes (server, MCP, hooks) regardless of this.
+# spans.retention_days  How long span rows are kept before the daily prune
+#                  deletes them. Spans are for post-hoc trace inspection, not
+#                  long-term history (cost_events owns the financial record).
+spans:
+  enabled: true
+  retention_days: 14

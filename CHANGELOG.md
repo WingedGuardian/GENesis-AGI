@@ -11,6 +11,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis records traces of what it does** — reflections, ego cycles, every LLM
+  call, and the tools its dispatched Claude Code sessions run are now captured as
+  nested trace spans (one trace per operation), so its activity can be inspected
+  end to end instead of pieced together from logs. Capture is on by default and can
+  be turned off via the new `observability` settings domain (or
+  `GENESIS_SPANS_DISABLED=1`); spans are kept for a configurable window (default 14
+  days) and pruned automatically.
+
 - **Earned autonomy can be restored after a regression** — when Genesis loses a level of
   autonomy in a category (e.g. after a correction), that demotion is no longer a dead end. Once
   the category's track record recovers enough that the evidence again supports the earned level,

@@ -689,6 +689,30 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=60,
         )
 
+        async def _prune_otel_spans() -> None:
+            """Retention: delete spans older than config retention_days."""
+            if rt._span_writer is None:
+                return
+            try:
+                from genesis.observability.span_config import load_spans_config
+
+                _, retention_days = load_spans_config()
+                removed = await rt._span_writer.prune(older_than_days=retention_days)
+                rt.record_job_success("otel_span_prune")
+                if removed:
+                    logger.info("otel_spans prune: removed %d old spans", removed)
+            except Exception as exc:
+                rt.record_job_failure("otel_span_prune", str(exc))
+                logger.exception("otel_spans prune failed")
+
+        rt._learning_scheduler.add_job(
+            _prune_otel_spans,
+            CronTrigger(hour=4, minute=30, timezone=user_timezone()),
+            id="otel_span_prune",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         async def _reap_stale_processes() -> None:
             """Kill leaked processes older than their configured threshold.
 
