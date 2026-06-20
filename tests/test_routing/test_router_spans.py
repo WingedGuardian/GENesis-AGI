@@ -77,6 +77,7 @@ async def test_success_emits_llm_span(wired_router) -> None:
     assert s["model_id"] == result.model_id
     # Single source: span cost matches the RoutingResult that feeds cost_events.
     assert s["cost_usd"] == result.cost_usd
+    assert s["cost_known"] == 1  # measured cost (distinguishes a real $0 free call)
     assert s["parent_span_id"] is None  # root (no enclosing operation span)
     attrs = json.loads(s["attributes_json"])
     assert attrs["attempts"] == result.attempts

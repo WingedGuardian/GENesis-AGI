@@ -364,8 +364,16 @@ class CCInvoker:
                 "effort": invocation.effort,
                 "streaming": False,
             },
-        ):
-            return await self._run_inner(invocation)
+        ) as span:
+            output = await self._run_inner(invocation)
+            with contextlib.suppress(Exception):
+                span.set_attr("cost_usd", output.cost_usd)
+                span.set_attr("input_tokens", output.input_tokens)
+                span.set_attr("output_tokens", output.output_tokens)
+                span.set_attr("model_used", output.model_used)
+                if output.is_error:
+                    span.set_status_error(output.error_message or "CC session error")
+            return output
 
     async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
         args = self._build_args(invocation)
@@ -505,8 +513,16 @@ class CCInvoker:
                 "effort": invocation.effort,
                 "streaming": True,
             },
-        ):
-            return await self._run_streaming_inner(invocation, on_event)
+        ) as span:
+            output = await self._run_streaming_inner(invocation, on_event)
+            with contextlib.suppress(Exception):
+                span.set_attr("cost_usd", output.cost_usd)
+                span.set_attr("input_tokens", output.input_tokens)
+                span.set_attr("output_tokens", output.output_tokens)
+                span.set_attr("model_used", output.model_used)
+                if output.is_error:
+                    span.set_status_error(output.error_message or "CC session error")
+            return output
 
     async def _run_streaming_inner(
         self,

@@ -135,6 +135,9 @@ class RoutingResult:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
+    # Whether cost_usd is a measured value (litellm priced it) vs unknown.
+    # Lets a trace span distinguish a genuine $0 (free tier) from unmeasured.
+    cost_known: bool = True
 
 
 @dataclass(frozen=True)

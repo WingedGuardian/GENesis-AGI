@@ -182,6 +182,7 @@ class Router:
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
                     cost_usd=result.cost_usd,
+                    cost_known=result.cost_known,
                 )
                 span.set_attr("attempts", result.attempts)
                 span.set_attr("fallback_used", result.fallback_used)
@@ -378,6 +379,7 @@ class Router:
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
                     cost_usd=result.cost_usd,
+                    cost_known=result.cost_known,
                 )
             else:
                 failed_providers.append(provider_name)

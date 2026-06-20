@@ -88,10 +88,13 @@ async def ingest_pending_spans(db: aiosqlite.Connection) -> int:
         except OSError:
             continue  # already taken by another pass / removed
         rows: list[tuple] = []
+        capped = False
+        success = False
         try:
             with open(proc) as fh:
                 for i, line in enumerate(fh):
                     if i >= _MAX_LINES_PER_FILE:
+                        capped = True
                         break
                     line = line.strip()
                     if not line:
@@ -107,9 +110,21 @@ async def ingest_pending_spans(db: aiosqlite.Connection) -> int:
                 await db.executemany(_SPAN_INSERT, rows)
                 await db.commit()
                 total += len(rows)
+            success = True
         except Exception:
             logger.debug("span ingest failed for %s", proc.name, exc_info=True)
         finally:
-            with contextlib.suppress(OSError):
-                proc.unlink()
+            if success:
+                if capped:
+                    logger.warning(
+                        "span ingest: %s exceeded %d lines — remainder dropped",
+                        proc.name, _MAX_LINES_PER_FILE,
+                    )
+                with contextlib.suppress(OSError):
+                    proc.unlink()
+            else:
+                # DB write failed — restore the file so the next pass retries.
+                # INSERT OR IGNORE makes re-ingesting any committed rows safe.
+                with contextlib.suppress(OSError):
+                    os.rename(proc, f)
     return total

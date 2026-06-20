@@ -74,7 +74,13 @@ def _key_info(tool_name: str, tool_input: dict) -> dict:
 
 
 def _safe_key(candidate: str, fallback: str) -> str:
-    if not candidate or "/" in candidate or "\\" in candidate or ".." in candidate:
+    if (
+        not candidate
+        or len(candidate) > 200  # guard against pathological filenames
+        or "/" in candidate
+        or "\\" in candidate
+        or ".." in candidate
+    ):
         return fallback
     return candidate
 

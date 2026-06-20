@@ -160,6 +160,28 @@ class TestIngest:
         rows = await _spans(db)
         assert len([r for r in rows if r["span_id"] == "dup"]) == 1
 
+    @pytest.mark.asyncio
+    async def test_db_failure_restores_file_for_retry(
+        self, db, tmp_path, monkeypatch
+    ) -> None:
+        incoming = tmp_path / "incoming"
+        incoming.mkdir()
+        monkeypatch.setenv("GENESIS_SPANS_INCOMING_DIR", str(incoming))
+        rec = {"span_id": "x", "trace_id": "T", "name": "cc.tool.Bash",
+               "kind": "tool", "status": "ok", "start_unix_us": 1, "attributes": {}}
+        (incoming / "S.jsonl").write_text(json.dumps(rec) + "\n")
+
+        # Simulate a DB write failure during ingest.
+        async def _boom(*a, **k):
+            raise RuntimeError("db locked")
+
+        monkeypatch.setattr(db, "executemany", _boom)
+        n = await ingest_pending_spans(db)
+        assert n == 0
+        # File must be RESTORED (not deleted) so the next pass retries it.
+        assert (incoming / "S.jsonl").exists()
+        assert list(incoming.glob("*.processing")) == []
+
 
 class TestHookToIngestE2E:
 
