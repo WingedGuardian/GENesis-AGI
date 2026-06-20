@@ -73,22 +73,37 @@ class CampaignRunner:
             )
             return
 
+        job_id = f"campaign_{camp['name']}"
         self._scheduler.add_job(
             self._tick_wrapper,
             trigger,
-            args=[camp["id"]],
-            id=f"campaign_{camp['name']}",
+            args=[camp["id"], job_id],
+            id=job_id,
             max_instances=1,
             misfire_grace_time=300,
             replace_existing=True,
         )
 
-    async def _tick_wrapper(self, campaign_id: str) -> None:
-        """APScheduler entry point — wraps campaign_tick with error handling."""
+    async def _tick_wrapper(self, campaign_id: str, job_id: str) -> None:
+        """APScheduler entry point — wraps campaign_tick with error handling.
+
+        Records job health (success / failure) via the runtime so a tick crash
+        is observable through job_health → JobHealthCollector → ego/dashboard,
+        not just the server log. Mirrors the surplus scheduler's pattern. The
+        recording is best-effort (suppressed) and never propagates to
+        APScheduler — the tick-level swallow contract is preserved.
+        """
+        from genesis.runtime import GenesisRuntime
+
         try:
             await self.campaign_tick(campaign_id)
-        except Exception:
+        except Exception as exc:
             logger.exception("Campaign tick failed for %s", campaign_id)
+            with contextlib.suppress(Exception):
+                GenesisRuntime.instance().record_job_failure(job_id, str(exc)[:500])
+            return
+        with contextlib.suppress(Exception):
+            GenesisRuntime.instance().record_job_success(job_id)
 
     async def campaign_tick(
         self,
