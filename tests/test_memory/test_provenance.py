@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from genesis.memory.provenance import (
     is_external,
+    label_result_dicts,
     provenance_descriptor,
     short_source,
 )
@@ -90,3 +91,52 @@ def test_more_specific_pipeline_wins():
     # to the same label here, but the match must be deterministic, not error.
     assert short_source("knowledge_ingest_source") == "ingested"
     assert short_source("knowledge_ingest") == "ingested"
+
+
+# ── label_result_dicts (post-CRAG MCP-return pass) ──────────────────────────
+
+
+def test_label_result_dicts_episodic_default():
+    dicts = [{"memory_id": "m1", "content": "x"}]
+    label_result_dicts(dicts, default_collection="episodic_memory")
+    assert dicts[0]["collection"] == "episodic_memory"
+    assert dicts[0]["provenance"] == "first-party memory"
+
+
+def test_label_result_dicts_knowledge_default():
+    dicts = [{"unit_id": "u1", "content": "doc", "source_pipeline": "curated"}]
+    label_result_dicts(dicts, default_collection="knowledge_base")
+    assert dicts[0]["collection"] == "knowledge_base"
+    assert dicts[0]["provenance"].startswith("external-world knowledge")
+    assert "user-curated" in dicts[0]["provenance"]
+
+
+def test_label_result_dicts_crag_web_is_external_web():
+    dicts = [{"unit_id": "https://x", "content": "w", "origin": "web",
+              "source_pipeline": "crag_web"}]
+    label_result_dicts(dicts, default_collection="episodic_memory")
+    assert dicts[0]["collection"] == "knowledge_base"
+    assert "web" in dicts[0]["provenance"]
+
+
+def test_label_result_dicts_reads_collection_from_payload():
+    # CRAG augmented dicts may carry collection at top level OR in payload.
+    dicts = [{"memory_id": "m", "content": "c", "payload": {"collection": "knowledge_base"}}]
+    label_result_dicts(dicts, default_collection="episodic_memory")
+    assert dicts[0]["collection"] == "knowledge_base"
+    assert dicts[0]["provenance"].startswith("external-world knowledge")
+
+
+def test_label_result_dicts_skips_sentinels():
+    dicts = [{"not_found": ["a", "b"]}]
+    label_result_dicts(dicts)
+    assert dicts[0] == {"not_found": ["a", "b"]}  # untouched
+
+
+def test_label_result_dicts_idempotent():
+    dicts = [{"memory_id": "m", "content": "c", "collection": "knowledge_base",
+              "source_pipeline": "recon"}]
+    label_result_dicts(dicts)
+    first = dicts[0]["provenance"]
+    label_result_dicts(dicts)
+    assert dicts[0]["provenance"] == first

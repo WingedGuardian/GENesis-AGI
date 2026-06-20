@@ -29,6 +29,7 @@ _PIPELINE_FRIENDLY: dict[str, str] = {
     "knowledge_ingest": "ingested doc",
     "reference_store": "saved reference",
     "extraction_job": "auto-extracted",
+    "crag_web": "web",  # CRAG web-fallback augmentation — live internet content
     "recon": "recon/web",
     "surplus": "surplus insight",
 }
@@ -40,6 +41,7 @@ _PIPELINE_SHORT: dict[str, str] = {
     "knowledge_ingest": "ingested",
     "reference_store": "ref",
     "extraction_job": "extracted",
+    "crag_web": "web",
     "recon": "recon",
     "surplus": "surplus",
 }
@@ -87,3 +89,37 @@ def provenance_descriptor(
     if source_doc and source_doc not in _PLACEHOLDER_DOCS:
         return f"{_EXTERNAL} (source: {friendly}, doc: {source_doc})"
     return f"{_EXTERNAL} (source: {friendly})"
+
+
+def label_result_dicts(
+    dicts: list[dict],
+    *,
+    default_collection: str = "episodic_memory",
+) -> list[dict]:
+    """Stamp ``collection`` + ``provenance`` onto a list of recall result dicts.
+
+    Applied as a FINAL pass at MCP return points — AFTER any corrective-retrieval
+    (CRAG) augmentation — so original, relaxed/raw-KB-augmented, AND web-fallback
+    items are all labeled (audit D12). Idempotent and best-effort: a re-labeled
+    item gets the same value; sentinel dicts (e.g. ``{"not_found": [...]}``) pass
+    through untouched. CRAG web items (``origin='web'`` / ``source_pipeline=
+    'crag_web'``) are unambiguously external-world web content.
+    """
+    for d in dicts:
+        if not isinstance(d, dict):
+            continue
+        if "memory_id" not in d and "unit_id" not in d:
+            continue  # sentinel row — leave alone
+        payload = d.get("payload") or {}
+        sp = d.get("source_pipeline") or payload.get("source_pipeline")
+        if d.get("origin") == "web" or sp == "crag_web":
+            coll = KNOWLEDGE_COLLECTION
+        else:
+            coll = d.get("collection") or payload.get("collection") or default_collection
+        d["collection"] = coll
+        d["provenance"] = provenance_descriptor(
+            collection=coll,
+            source_pipeline=sp,
+            source_doc=d.get("source_doc") or d.get("source") or payload.get("source"),
+        )
+    return dicts

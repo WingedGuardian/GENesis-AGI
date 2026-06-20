@@ -345,7 +345,66 @@ async def test_knowledge_recall_labels_external(mock_deps, tools):
         _rr("kb1", collection="knowledge_base", score=0.9, pipeline="recon"),
     ])
 
-    results = await tools["knowledge_recall"].fn(query="q", limit=5, min_score=0.0)
+    results = await tools["knowledge_recall"].fn(
+        query="q", limit=5, min_score=0.0, corrective=False,
+    )
     assert results
     assert results[0]["provenance"].startswith("external-world knowledge")
     assert "recon" in results[0]["provenance"]
+
+
+@pytest.mark.asyncio
+async def test_knowledge_recall_labels_crag_web_item(mock_deps, tools, monkeypatch):
+    """A CRAG web-fallback item (origin='web' / source_pipeline='crag_web', no
+    collection) must be labeled external-world web by the post-CRAG pass — web
+    content is the most external thing there is (audit D12)."""
+    _init_with_mocks(mock_deps)
+    memory_mcp._retriever = MagicMock()
+    memory_mcp._retriever.recall = AsyncMock(return_value=[])
+
+    async def _fake_correct(**kwargs):
+        return [{
+            "unit_id": "https://example.com/doc", "content": "web snippet",
+            "score": 0.7, "origin": "web", "source_pipeline": "crag_web",
+        }]
+
+    import genesis.memory.corrective as corrective_mod
+    monkeypatch.setattr(corrective_mod, "maybe_correct_recall", _fake_correct)
+
+    results = await tools["knowledge_recall"].fn(query="q", limit=5, min_score=0.0)
+    assert results
+    web = results[0]
+    assert web["collection"] == "knowledge_base"
+    assert web["provenance"].startswith("external-world knowledge")
+    assert "web" in web["provenance"]
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_full_path_labels_post_crag(mock_deps, tools, monkeypatch):
+    """The full (non-compact) path runs CRAG; the final provenance pass must label
+    BOTH the original episodic result AND a CRAG-augmented KB item (audit D12)."""
+    _init_with_mocks(mock_deps)
+    memory_mcp._retriever = MagicMock()
+    memory_mcp._retriever.recall = AsyncMock(return_value=[
+        _rr("ep1", collection="episodic_memory"),
+    ])
+
+    async def _fake_correct(**kwargs):
+        out = list(kwargs["results"])
+        out.append({
+            "memory_id": "kb_aug", "content": "ext doc", "score": 0.8,
+            "payload": {}, "collection": "knowledge_base",
+            "source_pipeline": "curated",
+        })
+        return out
+
+    import genesis.memory.corrective as corrective_mod
+    monkeypatch.setattr(corrective_mod, "maybe_correct_recall", _fake_correct)
+
+    results = await tools["memory_recall"].fn(
+        query="q", source="both", limit=5, include_graph=False,
+    )
+    by_id = {r["memory_id"]: r for r in results}
+    assert by_id["ep1"]["provenance"] == "first-party memory"
+    assert by_id["kb_aug"]["collection"] == "knowledge_base"
+    assert by_id["kb_aug"]["provenance"].startswith("external-world knowledge")

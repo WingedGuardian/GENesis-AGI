@@ -8,7 +8,11 @@ from datetime import UTC, datetime
 
 from genesis.memory.activation import compute_activation
 from genesis.memory.graph import traverse as graph_traverse
-from genesis.memory.provenance import is_external, provenance_descriptor
+from genesis.memory.provenance import (
+    is_external,
+    label_result_dicts,
+    provenance_descriptor,
+)
 
 from ..memory import mcp
 
@@ -300,13 +304,6 @@ async def memory_recall(
     graph_elapsed_ms = 0.0
     for r in results:
         d = asdict(r)
-        # Provenance label (audit D12) — asdict already carries the raw
-        # ``collection``; add the human/LLM-readable first-party-vs-external tag.
-        d["provenance"] = provenance_descriptor(
-            collection=r.collection,
-            source_pipeline=r.source_pipeline,
-            source_doc=r.source,
-        )
         if include_graph and graph_elapsed_ms < graph_budget_ms:
             try:
                 traversal = await graph_traverse(
@@ -345,6 +342,10 @@ async def memory_recall(
             pipeline_used=pipeline_used,
             recall_event_id=recall_event_id,
         )
+    # Provenance pass (audit D12): label original + any CRAG-augmented items as
+    # first-party vs external-world. Runs regardless of `corrective` so the
+    # output contract is uniform.
+    label_result_dicts(enriched, default_collection="episodic_memory")
     return enriched
 
 

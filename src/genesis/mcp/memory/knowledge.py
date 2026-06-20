@@ -6,7 +6,7 @@ import json
 import logging
 from datetime import UTC, datetime
 
-from genesis.memory.provenance import provenance_descriptor
+from genesis.memory.provenance import label_result_dicts
 from genesis.memory.reference_ops import (
     REFERENCE_KINDS as _REFERENCE_KINDS,
 )
@@ -99,14 +99,6 @@ async def knowledge_recall(
             "score": r.score,
             "origin": "vector",
             "source_pipeline": r.source_pipeline,
-            # All knowledge_recall results are external-world by definition
-            # (the KB collection) — label them so the model never treats an
-            # ingested doc as first-party ground truth (audit D12).
-            "provenance": provenance_descriptor(
-                collection="knowledge_base",
-                source_pipeline=r.source_pipeline,
-                source_doc=r.source,
-            ),
         })
 
     for idx, fts_row in enumerate(fts_results):
@@ -126,11 +118,6 @@ async def knowledge_recall(
                 "score": fts_score,
                 "origin": "fts",
                 "source_pipeline": fts_row.get("source_pipeline"),
-                "provenance": provenance_descriptor(
-                    collection="knowledge_base",
-                    source_pipeline=fts_row.get("source_pipeline"),
-                    source_doc=fts_row.get("source_doc"),
-                ),
             })
 
     boosted = _apply_authority_boost(merged)
@@ -166,6 +153,10 @@ async def knowledge_recall(
             path="knowledge",
             recall_event_id=recall_event_id,
         )
+    # Provenance pass (audit D12): every knowledge_recall result is external-world
+    # — label original + any CRAG-augmented / web-fallback items. Runs regardless
+    # of `corrective` so the contract is uniform.
+    label_result_dicts(final, default_collection="knowledge_base")
     return final
 
 
