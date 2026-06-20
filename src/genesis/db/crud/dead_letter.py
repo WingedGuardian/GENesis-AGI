@@ -99,9 +99,16 @@ async def expire_orphans_by_provider(
     scan to proactively clean up items targeting providers that were
     removed from the routing config.
 
+    The reserved ``'all'`` sentinel is ALWAYS preserved: the router enqueues
+    chain-exhausted items with ``target_provider='all'`` to mean "retry the
+    WHOLE chain", not a single provider. ``'all'`` is never a real provider
+    name, so excluding it here stops every config reload from expiring 100% of
+    chain-exhausted items before the redispatch job can replay them.
+
     Args:
         active_providers: provider names that ARE still in the active
-            config. An empty list means every pending item is an orphan.
+            config. An empty list means every real-provider pending item is an
+            orphan (the ``'all'`` sentinel is still preserved).
 
     Returns:
         List of ``(id, target_provider)`` tuples that were expired.
@@ -110,14 +117,15 @@ async def expire_orphans_by_provider(
         placeholders = ",".join("?" * len(active_providers))
         sql = (
             "UPDATE dead_letter SET status = 'expired' "
-            f"WHERE status = 'pending' AND target_provider NOT IN ({placeholders}) "
+            "WHERE status = 'pending' AND target_provider != 'all' "
+            f"AND target_provider NOT IN ({placeholders}) "
             "RETURNING id, target_provider"
         )
         params: list = list(active_providers)
     else:
         sql = (
             "UPDATE dead_letter SET status = 'expired' "
-            "WHERE status = 'pending' "
+            "WHERE status = 'pending' AND target_provider != 'all' "
             "RETURNING id, target_provider"
         )
         params = []

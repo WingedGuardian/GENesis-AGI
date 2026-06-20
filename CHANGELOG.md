@@ -74,6 +74,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   didn't, leaving new code on disk and old code in memory. The updater now forces a
   true restart at the end and makes sure the server stays down during the upgrade, so
   an update always activates the version it just installed.
+- **Spend on GLM, MiniMax and other aggregator models is now reported accurately** — these
+  providers' usage was silently recorded as $0 because their model names aren't in the cost
+  library Genesis relies on, hiding real spend in cost reports. Genesis now falls back to each
+  model's configured price when the library can't price it, so spend reflects what you're
+  actually using. (Visibility only — it never throttles or blocks calls.)
+
+- **Queued retries survive a routing-config change** — every time the provider routing config
+  was reloaded (e.g. toggling a provider in the dashboard), Genesis was expiring *all* of the
+  queued "retry the whole chain" requests before its scheduled retry job could replay them.
+  Those items now persist across a config reload and get retried as intended.
 
 - **Recovered providers stop alarming once they come back** — when a model provider's
   circuit breaker reopens after an outage, Genesis now clears that provider's "failing"
