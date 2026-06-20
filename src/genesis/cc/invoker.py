@@ -23,6 +23,7 @@ from genesis.cc.exceptions import (
     CCTimeoutError,
 )
 from genesis.cc.types import CCInvocation, CCModel, CCOutput, StreamEvent, clamp_effort
+from genesis.observability.spans import SpanKind, start_span
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +193,16 @@ class CCInvoker:
             env["GENESIS_SESSION_ID"] = _sid
         else:
             env.pop("GENESIS_SESSION_ID", None)
+        # Propagate the active trace context so the CC PostToolUse span hook can
+        # stitch this session's tool spans under the dispatching operation's
+        # trace (cross-process). Absent when no span is active → hook no-ops.
+        from genesis.observability.spans import current_trace_context
+        _tc = current_trace_context()
+        if _tc:
+            env["GENESIS_TRACE_ID"], env["GENESIS_PARENT_SPAN_ID"] = _tc
+        else:
+            env.pop("GENESIS_TRACE_ID", None)
+            env.pop("GENESIS_PARENT_SPAN_ID", None)
         if inv and inv.stream_idle_timeout_ms is not None:
             env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(inv.stream_idle_timeout_ms)
         if inv and inv.anthropic_base_url:
@@ -337,6 +348,34 @@ class CCInvoker:
                 logger.warning("CC status callback failed for %s", status, exc_info=True)
 
     async def run(self, invocation: CCInvocation) -> CCOutput:
+        """Run a dispatched CC session (traced).
+
+        Opens a ``cc.session`` span spanning the whole subprocess lifetime so
+        (a) the active trace context is injected into the child env (see
+        ``_build_env``) and the CC PostToolUse hook nests tool spans under it,
+        and (b) any LLM/operation spans share one trace. Best-effort — a no-op
+        when capture is disabled.
+        """
+        with start_span(
+            "cc.session",
+            SpanKind.CC_SESSION,
+            attributes={
+                "model": invocation.model,
+                "effort": invocation.effort,
+                "streaming": False,
+            },
+        ) as span:
+            output = await self._run_inner(invocation)
+            with contextlib.suppress(Exception):
+                span.set_attr("cost_usd", output.cost_usd)
+                span.set_attr("input_tokens", output.input_tokens)
+                span.set_attr("output_tokens", output.output_tokens)
+                span.set_attr("model_used", output.model_used)
+                if output.is_error:
+                    span.set_status_error(output.error_message or "CC session error")
+            return output
+
+    async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
         args = self._build_args(invocation)
         env = self._build_env(invocation)
         start = time.monotonic()
@@ -461,6 +500,31 @@ class CCInvoker:
         return output
 
     async def run_streaming(
+        self,
+        invocation: CCInvocation,
+        on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+    ) -> CCOutput:
+        """Run CC with stream-json output (traced — see run() for span rationale)."""
+        with start_span(
+            "cc.session",
+            SpanKind.CC_SESSION,
+            attributes={
+                "model": invocation.model,
+                "effort": invocation.effort,
+                "streaming": True,
+            },
+        ) as span:
+            output = await self._run_streaming_inner(invocation, on_event)
+            with contextlib.suppress(Exception):
+                span.set_attr("cost_usd", output.cost_usd)
+                span.set_attr("input_tokens", output.input_tokens)
+                span.set_attr("output_tokens", output.output_tokens)
+                span.set_attr("model_used", output.model_used)
+                if output.is_error:
+                    span.set_status_error(output.error_message or "CC session error")
+            return output
+
+    async def _run_streaming_inner(
         self,
         invocation: CCInvocation,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,

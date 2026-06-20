@@ -1367,6 +1367,32 @@ TABLES = {
             UNIQUE(message_id)
         )
     """,
+    "otel_spans": """
+        CREATE TABLE IF NOT EXISTS otel_spans (
+            span_id         TEXT PRIMARY KEY,
+            trace_id        TEXT NOT NULL,
+            parent_span_id  TEXT,
+            name            TEXT NOT NULL,
+            kind            TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'ok'
+                                CHECK (status IN ('ok', 'error')),
+            status_message  TEXT,
+            start_unix_us   INTEGER NOT NULL,
+            end_unix_us     INTEGER,
+            duration_us     INTEGER,
+            session_id      TEXT,
+            process         TEXT,
+            call_site       TEXT,
+            provider        TEXT,
+            model_id        TEXT,
+            input_tokens    INTEGER,
+            output_tokens   INTEGER,
+            cost_usd        REAL,
+            cost_known      INTEGER,
+            attributes_json TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1628,6 +1654,13 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_email_threads_status ON email_threads(status)",
     "CREATE INDEX IF NOT EXISTS idx_email_threads_follow_up ON email_threads(follow_up_after)",
     "CREATE INDEX IF NOT EXISTS idx_email_thread_messages_thread ON email_thread_messages(thread_id)",
+    # otel spans (tracing backbone)
+    "CREATE INDEX IF NOT EXISTS idx_otel_spans_trace ON otel_spans(trace_id)",
+    "CREATE INDEX IF NOT EXISTS idx_otel_spans_parent ON otel_spans(parent_span_id)",
+    "CREATE INDEX IF NOT EXISTS idx_otel_spans_start ON otel_spans(start_unix_us)",
+    "CREATE INDEX IF NOT EXISTS idx_otel_spans_session ON otel_spans(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_otel_spans_roots "
+    "ON otel_spans(start_unix_us) WHERE parent_span_id IS NULL",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

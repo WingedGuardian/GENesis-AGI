@@ -696,6 +696,56 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        async def _ingest_cc_spans() -> None:
+            """Drain CC-tool span flat-files into otel_spans (tracing backbone)."""
+            if rt._db is None:
+                return
+            try:
+                from genesis.observability.span_ingest import ingest_pending_spans
+
+                n = await ingest_pending_spans(rt._db)
+                rt.record_job_success("cc_span_ingest")
+                if n:
+                    logger.debug("CC span ingest: %d spans", n)
+            except Exception as exc:
+                rt.record_job_failure("cc_span_ingest", str(exc))
+                logger.exception("CC span ingest failed")
+
+        # Frequent (every 2 min) so dispatched-session tool spans land in the
+        # trace shortly after the session runs. minute-cron survives restart
+        # (no IntervalTrigger reset trap). No-op cost when idle (empty dir).
+        rt._learning_scheduler.add_job(
+            _ingest_cc_spans,
+            CronTrigger(minute="*/2"),
+            id="cc_span_ingest",
+            max_instances=1,
+            misfire_grace_time=60,
+        )
+
+        async def _prune_otel_spans() -> None:
+            """Retention: delete spans older than config retention_days."""
+            if rt._span_writer is None:
+                return
+            try:
+                from genesis.observability.span_config import load_spans_config
+
+                _, retention_days = load_spans_config()
+                removed = await rt._span_writer.prune(older_than_days=retention_days)
+                rt.record_job_success("otel_span_prune")
+                if removed:
+                    logger.info("otel_spans prune: removed %d old spans", removed)
+            except Exception as exc:
+                rt.record_job_failure("otel_span_prune", str(exc))
+                logger.exception("otel_spans prune failed")
+
+        rt._learning_scheduler.add_job(
+            _prune_otel_spans,
+            CronTrigger(hour=4, minute=30, timezone=user_timezone()),
+            id="otel_span_prune",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         async def _reap_stale_processes() -> None:
             """Kill leaked processes older than their configured threshold.
 

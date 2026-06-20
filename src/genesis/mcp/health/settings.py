@@ -194,6 +194,13 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,
     ),
+    "observability": SettingsDomain(
+        name="observability",
+        description="Tracing/spans capture switch + retention (needs restart to toggle capture)",
+        config_filename="observability.yaml",
+        readonly=False,
+        needs_restart=True,
+    ),
 }
 
 
@@ -584,6 +591,28 @@ def _validate_contribution(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_observability(changes: dict) -> list[str]:
+    """Validate observability (spans) config changes."""
+    errors: list[str] = []
+    if set(changes) - {"spans"}:
+        errors.append("Only the 'spans' key is configurable")
+    spans = changes.get("spans", {})
+    if not isinstance(spans, dict):
+        errors.append("'spans' must be a mapping")
+        return errors
+    if set(spans) - {"enabled", "retention_days"}:
+        errors.append("spans keys: enabled (bool), retention_days (int >= 1)")
+    if "enabled" in spans and not isinstance(spans["enabled"], bool):
+        errors.append("spans.enabled must be a boolean")
+    if "retention_days" in spans and (
+        not isinstance(spans["retention_days"], int)
+        or isinstance(spans["retention_days"], bool)
+        or spans["retention_days"] < 1
+    ):
+        errors.append("spans.retention_days must be an integer >= 1")
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "tts": _validate_tts,
     "resilience": _validate_resilience,
@@ -594,6 +623,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ego": _validate_ego,
     "channels": _validate_channels,
     "contribution": _validate_contribution,
+    "observability": _validate_observability,
 }
 
 

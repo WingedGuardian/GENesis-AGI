@@ -9,6 +9,7 @@ import time
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.provider_activity import ProviderActivityTracker
+from genesis.observability.spans import SpanKind, start_span
 from genesis.observability.types import Severity, Subsystem
 from genesis.routing.circuit_breaker import CircuitBreakerRegistry
 from genesis.routing.cost_tracker import CostTracker
@@ -153,7 +154,60 @@ class Router:
         chain_offset: int = 0,
         **kwargs,
     ) -> RoutingResult:
-        """Route a call through the provider chain for the given call site."""
+        """Route a call through the provider chain for the given call site.
+
+        Thin tracing wrapper around ``_route_call_inner``: opens one ``llm`` span
+        per logical call and populates it from the returned ``RoutingResult``
+        (single source — no value drift vs ``cost_events``). Span capture is
+        best-effort and a no-op when disabled; it NEVER alters routing behavior
+        (``start_span`` swallows its own faults). ``cost_known`` is intentionally
+        not on the span — it lives in ``cost_events`` / the cost_unknown event.
+        """
+        with start_span(
+            "llm.call", SpanKind.LLM, attributes={"call_site": call_site_id}
+        ) as span:
+            result = await self._route_call_inner(
+                call_site_id,
+                messages,
+                budget_override=budget_override,
+                suppress_dead_letter=suppress_dead_letter,
+                chain_offset=chain_offset,
+                **kwargs,
+            )
+            if result.success:
+                span.set_llm_fields(
+                    call_site=call_site_id,
+                    provider=result.provider_used,
+                    model_id=result.model_id,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    cost_usd=result.cost_usd,
+                    cost_known=result.cost_known,
+                )
+                span.set_attr("attempts", result.attempts)
+                span.set_attr("fallback_used", result.fallback_used)
+            elif result.attempts == 0:
+                # Deliberately not run (degradation shed / unknown site / empty
+                # chain) — NOT a failure. Keep status 'ok'; record why.
+                span.set_attr("not_run", True)
+                span.set_attr("reason", result.error)
+            else:
+                # A real attempt that exhausted every provider in the chain.
+                span.set_status_error(result.error or "all providers exhausted")
+                span.set_attr("attempts", result.attempts)
+            return result
+
+    async def _route_call_inner(
+        self,
+        call_site_id: str,
+        messages: list[dict],
+        *,
+        budget_override: bool = False,
+        suppress_dead_letter: bool = False,
+        chain_offset: int = 0,
+        **kwargs,
+    ) -> RoutingResult:
+        """Route a call through the provider chain (the actual routing logic)."""
         # 1. Check call site exists
         if call_site_id not in self.config.call_sites:
             return RoutingResult(
@@ -325,6 +379,7 @@ class Router:
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
                     cost_usd=result.cost_usd,
+                    cost_known=result.cost_known,
                 )
             else:
                 failed_providers.append(provider_name)
