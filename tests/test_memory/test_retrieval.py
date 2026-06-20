@@ -739,3 +739,46 @@ async def test_recall_graph_boost_adjacency(mock_qdrant, mock_crud, mock_links, 
     a_result = next(r for r in results if r.memory_id == "a")
     # c's boosted score should exceed a's (despite lower vector score)
     assert c_result.score > a_result.score
+
+
+# --- MEM-005: entrenchment signal (hand-rolled Spearman) ---
+
+
+class TestSpearmanRankCorr:
+    """_spearman_rank_corr powers the activation-entrenchment metric (MEM-005):
+    does retrieval frequency predict final ranking? scipy is not a dependency,
+    so it is hand-rolled."""
+
+    def test_perfect_positive(self):
+        from genesis.memory.retrieval import _spearman_rank_corr
+
+        assert _spearman_rank_corr([1, 2, 3, 4], [10, 20, 30, 40]) == pytest.approx(1.0)
+
+    def test_perfect_negative(self):
+        from genesis.memory.retrieval import _spearman_rank_corr
+
+        assert _spearman_rank_corr([1, 2, 3, 4], [40, 30, 20, 10]) == pytest.approx(-1.0)
+
+    def test_none_when_too_short(self):
+        from genesis.memory.retrieval import _spearman_rank_corr
+
+        assert _spearman_rank_corr([1], [1]) is None
+        assert _spearman_rank_corr([], []) is None
+
+    def test_none_on_zero_variance(self):
+        from genesis.memory.retrieval import _spearman_rank_corr
+
+        # Constant xs → no ranking variance → undefined correlation.
+        assert _spearman_rank_corr([5, 5, 5], [1, 2, 3]) is None
+
+    def test_handles_ties_monotonic(self):
+        from genesis.memory.retrieval import _spearman_rank_corr
+
+        v = _spearman_rank_corr([1, 2, 2, 3], [10, 20, 20, 30])
+        assert v == pytest.approx(1.0)
+
+    def test_in_range(self):
+        from genesis.memory.retrieval import _spearman_rank_corr
+
+        v = _spearman_rank_corr([1, 5, 2, 8, 3], [2, 1, 4, 3, 9])
+        assert -1.0 <= v <= 1.0

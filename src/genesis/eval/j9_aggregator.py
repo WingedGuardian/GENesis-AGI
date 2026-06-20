@@ -139,10 +139,48 @@ def _dedupe_by_pair(events: list[dict]) -> list[dict]:
     return out
 
 
+async def _recall_entrenchment(
+    db: aiosqlite.Connection, since: str, until: str,
+) -> dict:
+    """MEM-005: weekly aggregation of the activation-entrenchment signal.
+
+    Reads ``recall_fired`` events (a separate read path from the relevance-based
+    quality metrics) and averages the per-recall ``entrenchment_corr`` (rank
+    correlation between a result's retrieval frequency and its final score),
+    plus mean retrieval count and mean recalled-memory age. Monitor-only (D7):
+    surfaced in the memory snapshot so a sustained rise can be spotted; it never
+    feeds the quality grade.
+    """
+    fired = await j9_eval.get_events(
+        db, dimension="memory", event_type="recall_fired",
+        since=since, until=until, limit=5000,
+    )
+    corrs = [m["entrenchment_corr"] for ev in fired
+             if (m := ev.get("metrics", {})).get("entrenchment_corr") is not None]
+    ret_counts = [ev.get("metrics", {})["mean_retrieved_count"] for ev in fired
+                  if ev.get("metrics", {}).get("mean_retrieved_count") is not None]
+    ages = [ev.get("metrics", {})["mean_age_days"] for ev in fired
+            if ev.get("metrics", {}).get("mean_age_days") is not None]
+    return {
+        "entrenchment_corr_mean": round(sum(corrs) / len(corrs), 4) if corrs else None,
+        "entrenchment_mean_retrieved_count": (
+            round(sum(ret_counts) / len(ret_counts), 2) if ret_counts else None),
+        "entrenchment_mean_age_days": (
+            round(sum(ages) / len(ages), 1) if ages else None),
+        "entrenchment_sample": len(corrs),
+    }
+
+
 async def _compute_memory_quality(
     db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
-    """Precision@5, hit rate, MRR from recall_relevance events."""
+    """Precision@5, hit rate, MRR from recall_relevance events.
+
+    Also folds in the MEM-005 entrenchment aggregation (separate read path over
+    recall_fired) as distinct ``entrenchment_*`` keys — monitor-only, not part
+    of the quality grade.
+    """
+    entrenchment = await _recall_entrenchment(db, since, until)
     relevance_events = await j9_eval.get_events(
         db, dimension="memory", event_type="recall_relevance",
         since=since, until=until, limit=5000,
@@ -153,7 +191,7 @@ async def _compute_memory_quality(
 
     if not relevance_events:
         return {"precision_at_5": None, "hit_rate": None, "mrr": None,
-                "usage_rate": None, "total_recalls": 0}, 0
+                "usage_rate": None, "total_recalls": 0, **entrenchment}, 0
 
     # Group by recall_event_id
     by_recall: dict[str, list[dict]] = defaultdict(list)
@@ -207,6 +245,8 @@ async def _compute_memory_quality(
         # Count only memories that actually fed the metrics (grouped under a
         # recall_event_id) — not orphan events that contribute nothing.
         "total_memories_judged": sum(len(v) for v in by_recall.values()),
+        # MEM-005 entrenchment signal (monitor-only, distinct from the grade).
+        **entrenchment,
     }
     return metrics, total_recalls
 

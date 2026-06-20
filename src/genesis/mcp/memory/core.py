@@ -152,6 +152,11 @@ async def memory_recall(
         except Exception:
             logger.warning("time_range event query failed", exc_info=True)
 
+    # MEM-003: collect the recall_fired event id the retriever emits (standard /
+    # auto_drift paths) so the single event is enriched below instead of a second
+    # one being emitted. Drift mode calls drift_recall (no emit) → stays empty.
+    recall_event_sink: list[str] = []
+
     if mode == "drift":
         # Direct DRIFT invocation — skip standard recall entirely
         from genesis.memory.drift import drift_recall
@@ -177,6 +182,7 @@ async def memory_recall(
             only_subsystem=only_subsystem,
             rerank=rerank,
             include_deprecated=include_deprecated,
+            event_id_sink=recall_event_sink,
         )
         pipeline_used = "standard"
 
@@ -262,21 +268,55 @@ async def memory_recall(
             is_kb=lambda r: is_external(r.collection),
         )
 
-    # MCP-layer instrumentation: emit with mode and pipeline attribution
-    recall_event_id: str | None = None
+    # MCP-layer instrumentation: exactly ONE recall_fired per logical recall
+    # (MEM-003). The standard / auto_drift paths already emitted one inside
+    # recall() (its id is in recall_event_sink) — enrich THAT event in place with
+    # the MCP-layer attribution (mode / pipeline_used) and the final post-filter
+    # results. Drift mode emitted nothing (empty sink) → emit a fresh event here.
+    recall_event_id: str | None = (
+        recall_event_sink[0] if recall_event_sink else None
+    )
     try:
-        from genesis.eval.j9_hooks import emit_recall_fired
-        recall_event_id = await emit_recall_fired(
-            memory_mod._db,
-            query=query,
-            result_count=len(results),
-            top_scores=[r.score for r in results[:5]],
-            memory_ids=[r.memory_id for r in results[:10]],
-            latency_ms=(_time.monotonic() - _t0) * 1000,
-            source=source,
-            mode=mode,
-            pipeline_used=pipeline_used,
+        _top_scores = [r.score for r in results[:5]]
+        _memory_ids = [r.memory_id for r in results[:10]]
+        _all_scores = [r.score for r in results]
+        _mean_score = (
+            round(sum(_all_scores) / len(_all_scores), 4) if _all_scores else None
         )
+        _latency_ms = round((_time.monotonic() - _t0) * 1000, 1)
+        if recall_event_id is not None:
+            from genesis.eval.j9_hooks import update_recall_metrics
+            # Realign the retriever's event with the FINAL returned set — the KB
+            # floor and any auto_drift fallback change result_count / ids / scores
+            # after the inner emit. The MEM-005 entrenchment fields stay as the
+            # retriever computed them (they need per-memory retrieved_count not
+            # available here); on the rare auto_drift path they describe the
+            # sparse standard pool — pipeline_used="auto_drift" flags those events.
+            await update_recall_metrics(
+                memory_mod._db,
+                recall_event_id,
+                mode=mode,
+                pipeline_used=pipeline_used,
+                result_count=len(results),
+                top_scores=_top_scores,
+                memory_ids=_memory_ids,
+                mean_score=_mean_score,
+                latency_ms=_latency_ms,
+            )
+        else:
+            from genesis.eval.j9_hooks import emit_recall_fired
+            recall_event_id = await emit_recall_fired(
+                memory_mod._db,
+                query=query,
+                result_count=len(results),
+                top_scores=_top_scores,
+                memory_ids=_memory_ids,
+                latency_ms=_latency_ms,
+                source=source,
+                mode=mode,
+                pipeline_used=pipeline_used,
+                mean_score=_mean_score,
+            )
     except Exception:
         pass  # instrumentation must never break recall
 

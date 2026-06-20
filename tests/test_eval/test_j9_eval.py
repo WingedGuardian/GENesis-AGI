@@ -42,6 +42,75 @@ async def test_insert_and_get_event(db):
     assert events[0]["session_id"] == "sess-1"
 
 
+async def test_update_event_metrics_merges_in_place(db):
+    """update_event_metrics enriches an existing event's metrics without
+    creating a second row (audit MEM-003: one recall_fired per logical recall)."""
+    eid = await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_fired",
+        metrics={"query": "q", "result_count": 1},
+    )
+    updated = await j9_eval.update_event_metrics(
+        db, eid, result_count=5, mode="auto", pipeline_used="standard",
+    )
+    assert updated is True
+
+    events = await j9_eval.get_events(db, event_type="recall_fired")
+    assert len(events) == 1  # merged in place, NOT a second event
+    m = events[0]["metrics"]
+    assert m["query"] == "q"          # pre-existing field preserved
+    assert m["result_count"] == 5      # overwritten
+    assert m["mode"] == "auto"         # new field added
+    assert m["pipeline_used"] == "standard"
+
+
+async def test_update_event_metrics_missing_id_is_noop(db):
+    """Updating a non-existent event returns False and inserts nothing."""
+    updated = await j9_eval.update_event_metrics(db, "does-not-exist", foo=1)
+    assert updated is False
+    events = await j9_eval.get_events(db, dimension="memory")
+    assert len(events) == 0
+
+
+async def test_recall_entrenchment_aggregates(db):
+    """MEM-005: the aggregator averages the per-recall entrenchment signal from
+    recall_fired events, ignoring events that carry no entrenchment fields."""
+    from genesis.eval.j9_aggregator import _recall_entrenchment
+
+    for corr, rc, age in [(0.8, 5.0, 10.0), (0.6, 3.0, 20.0)]:
+        await j9_eval.insert_event(
+            db, dimension="memory", event_type="recall_fired",
+            metrics={"entrenchment_corr": corr,
+                     "mean_retrieved_count": rc, "mean_age_days": age},
+        )
+    # An older-style event without entrenchment fields must not skew the means.
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_fired", metrics={"query": "q"},
+    )
+
+    result = await _recall_entrenchment(db, since="2000-01-01", until="2099-01-01")
+    assert result["entrenchment_corr_mean"] == pytest.approx(0.7)
+    assert result["entrenchment_mean_retrieved_count"] == pytest.approx(4.0)
+    assert result["entrenchment_mean_age_days"] == pytest.approx(15.0)
+    assert result["entrenchment_sample"] == 2
+
+
+async def test_memory_quality_includes_entrenchment_when_no_relevance(db):
+    """Entrenchment surfaces even when there are no recall_relevance events
+    (the early-return path still carries the MEM-005 keys)."""
+    from genesis.eval.j9_aggregator import _compute_memory_quality
+
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_fired",
+        metrics={"entrenchment_corr": 0.5, "mean_retrieved_count": 2.0},
+    )
+    metrics, sample = await _compute_memory_quality(
+        db, since="2000-01-01", until="2099-01-01",
+    )
+    assert metrics["precision_at_5"] is None      # no relevance events
+    assert metrics["entrenchment_corr_mean"] == pytest.approx(0.5)
+    assert metrics["entrenchment_sample"] == 1
+
+
 async def test_get_events_filter_by_type(db):
     await j9_eval.insert_event(db, dimension="memory", event_type="recall_fired", metrics={})
     await j9_eval.insert_event(db, dimension="memory", event_type="recall_relevance", metrics={})

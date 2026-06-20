@@ -102,6 +102,9 @@ async def test_memory_recall_delegates(mock_deps, tools):
         expand_query_terms=True,
         include_subsystem=False, only_subsystem=None,
         rerank=True, include_deprecated=False,
+        # MEM-003: the MCP layer passes an event-id sink so it can enrich the
+        # retriever's single recall_fired event instead of emitting a 2nd.
+        event_id_sink=[],
     )
 
 
