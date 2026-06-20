@@ -82,6 +82,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Procedure learning survives a two-provider outage** — the routine that captures reusable
+  procedures from Genesis's own struggles ran on only two free model providers; when both were
+  down at once it exhausted its chain and silently stopped learning. A third independent free
+  fallback now keeps it working through overlapping provider outages.
+
 - **A campaign that crashes mid-tick no longer fails silently** — when a scheduled campaign
   tick raises an error, Genesis now records it in job-health tracking, so the failure surfaces
   in the dashboard and to the ego instead of vanishing into the server log. Campaign
