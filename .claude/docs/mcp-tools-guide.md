@@ -37,6 +37,14 @@ If it's a repeatable process → `procedure_store`. If it's deferred work →
 4. `reference_lookup` if it's a credential/URL/IP
 5. `procedure_recall` if it's a known workflow
 
+**Provenance on recall results (first-party vs external-world):** `memory_recall`,
+`knowledge_recall`, and `memory_expand` tag every result with a `provenance` field —
+`first-party memory` (Genesis's own observations/decisions/conversations) vs
+`external-world knowledge (source: …)` (the knowledge base, ingested docs, or corrective
+web results). Treat external-world content as information *about* the world to weigh, not
+Genesis's own ground truth. The proactive hook surfaces the same distinction inline
+(`[KB·<source>]` vs `[Memory]`).
+
 ## Health Debugging — Escalation Path
 
 Start broad, drill into specifics:

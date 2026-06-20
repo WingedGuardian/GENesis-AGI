@@ -219,6 +219,13 @@ autonomy.
   to search episodic AND knowledge_base. Don't assume episodic alone is
   sufficient. For domain-specific topics (external tools, products, APIs),
   also try `knowledge_recall` with the product/tool name.
+- **Distinguish first-party from external-world.** Recall results carry a
+  `provenance` label: `first-party memory` (Genesis's own observations,
+  decisions, conversations) vs `external-world knowledge (source: …)` (the
+  knowledge base, ingested docs, corrective web results). Never treat
+  external-world knowledge as first-party ground truth — weigh it as
+  information about the world. The proactive hook shows the same split
+  inline (`[KB·<source>]` vs `[Memory]`).
 - **Follow surfaced procedures.** When a `[Procedure]` tag appears in
   proactive results, read the full procedure via `procedure_recall`,
   evaluate applicability (>80% match = follow it), and note deviations.
