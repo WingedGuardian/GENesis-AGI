@@ -66,6 +66,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   It now sends a lightweight "still alive" signal while idle, so health reporting
   stays honest without crying wolf.
 
+- **Cost reporting now shows your real spend, not a phantom figure** — the health
+  tool that Genesis's reflections consult was reporting a *notional* "if Claude Code
+  were billed by the API" number (hundreds of dollars a month) as if it were actual
+  cost, with no budget context. That phantom figure drove false "cost is accelerating"
+  alerts in reflections and the morning report. Genesis now reports true spend from
+  recorded cost events against your configured budget. The morning report shows a
+  single grounded line — month-to-date spend versus your cap — with no projections or
+  spike alarms, and reflections no longer analyze cost at all.
+
 - **No more false "CRITICAL / degraded" alarm when a paid provider runs out of
   credits** — health now judges degradation by whether your *essential* work is
   covered, not by how many paid providers are down. If OpenRouter (or any paid

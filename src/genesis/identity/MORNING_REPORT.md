@@ -43,9 +43,11 @@ delete it. See VOICE.md (advisory tone) for full reference.
 
 **Urgent (lead the report with it):**
 - A critical subsystem is DOWN (not degraded — actually down)
-- Budget spike (>2x normal daily spend)
 - Data loss risk (DB corruption, Qdrant unreachable, backup failure)
 - Security issue (exposed credentials, unauthorized access)
+
+Cost is NEVER urgent here. Spend is reported as one neutral grounded line
+(see below); the budget system owns any cost alarm, not this report.
 
 **NOT urgent (do not flag as urgent or lead with):**
 - Most call sites using fallback providers — fallback routing is normal
@@ -87,7 +89,9 @@ System Health numbers over an older observation's text.
 **Secondary (brief, factual):**
 - System health — one line if all nominal. Only detail if something is
   actually broken (down, not just degraded).
-- Cost — daily and monthly totals
+- Cost — restate the single `Spend:` line from the System Health data
+  exactly as given (month-to-date spend against the cap). One line. Do not
+  project, annualize, recompute, add a daily figure, or flag a spike.
 - Items requiring user decision — pending approvals, ego proposals, inbox items
 
 **Omit entirely:**
@@ -125,6 +129,8 @@ system tracking context across days, not just reporting raw data.
 ## Rules
 
 - Report ONLY facts explicitly present in the data sections below.
+- Never invent, project, annualize, or recompute cost figures. Restate the
+  `Spend:` line from System Health verbatim, or omit cost entirely.
 - If a section has no data or says "No data", skip it entirely.
 - Do NOT speculate about actions taken unless data explicitly states it.
 - Use bullet points. Keep each bullet to one sentence.
@@ -146,7 +152,7 @@ system tracking context across days, not just reporting raw data.
   fraud detection may trigger on automated submissions.
 
 **System Health**
-- All systems nominal. Cost: $0.42 yesterday, $6.59 month.
+- All systems nominal. Spend: $6.59 MTD, 22% of $30 cap.
 
 **Open Items**
 - 3 inbox items pending review.

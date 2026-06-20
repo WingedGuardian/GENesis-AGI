@@ -215,19 +215,6 @@ class TestEgoContextBuilder:
         assert "No unresolved observations" in result
 
     @pytest.mark.asyncio
-    async def test_cost_section(self, db, mock_health_data, capabilities):
-        await db.execute(
-            "INSERT INTO cost_events (cost_usd, created_at) VALUES (?, datetime('now'))",
-            (0.15,),
-        )
-        builder = EgoContextBuilder(
-            db=db, health_data=mock_health_data, capabilities=capabilities,
-        )
-        result = await builder.build()
-        assert "Cost Status" in result
-        assert "$0.15" in result
-
-    @pytest.mark.asyncio
     async def test_proposal_history_section(self, db, mock_health_data, capabilities):
         await db.execute(
             "INSERT INTO ego_proposals (id, action_type, action_category, content, status, created_at) "
