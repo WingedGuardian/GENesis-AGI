@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
@@ -71,7 +70,6 @@ class EgoContextBuilder:
         sections.append(await self._signals_section())
         sections.append(await self._observations_section())
         sections.append(await self._follow_ups_section())
-        sections.append(await self._cost_section())
         sections.append(await self._proposal_history_section())
         sections.append(await self._intervention_history_section())
         sections.append(await self._self_model_section())
@@ -321,42 +319,6 @@ class EgoContextBuilder:
             "and observations for noting things. Follow-ups are a user-facing "
             "tracking mechanism managed by foreground sessions only.\n"
         )
-        return "\n".join(lines)
-
-    async def _cost_section(self) -> str:
-        """Daily spend and budget status."""
-        lines = ["## Cost Status\n"]
-
-        try:
-            today = datetime.now(UTC).strftime("%Y-%m-%d")
-            cursor = await self._db.execute(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_events "
-                "WHERE created_at >= ?",
-                (today,),
-            )
-            row = await cursor.fetchone()
-            daily_spend = row[0] if row else 0.0
-        except Exception:
-            logger.error("Failed to query cost_events", exc_info=True)
-            lines.append("*Cost data unavailable.*\n")
-            return "\n".join(lines)
-
-        lines.append(f"- **Today's spend**: ${daily_spend:.4f}")
-
-        # Check ego-specific spend
-        try:
-            cursor = await self._db.execute(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM ego_cycles "
-                "WHERE created_at >= ?",
-                (today,),
-            )
-            row = await cursor.fetchone()
-            ego_spend = row[0] if row else 0.0
-            lines.append(f"- **Ego spend today**: ${ego_spend:.4f}")
-        except Exception:
-            pass  # ego_cycles table may not exist yet
-
-        lines.append("")
         return "\n".join(lines)
 
     def _format_proposal_row(

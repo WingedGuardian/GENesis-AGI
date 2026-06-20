@@ -136,13 +136,14 @@ class RecoveryOrchestrator:
 
         # Deferred work is intentionally LEFT PENDING (WS-6: AUTO-RECOV-01). The old
         # drain marked items completed without executing them — silently dropping
-        # reflection/outreach work. Reflections are re-dispatched by the awareness loop
-        # (next_pending(work_type="reflection")); outreach awaits a dedicated consumer
-        # (tracked follow-up). The overflow check below surfaces any accumulation.
+        # reflection/outreach work. Both types have real consumers: reflections via
+        # the awareness loop (next_pending(work_type="reflection")) and outreach_delivery
+        # via OutreachRecoveryWorker (resilience/outreach_recovery.py, polls + retries
+        # with backoff). The overflow check below surfaces any accumulation.
 
         # Check queue overflow. pending_count is the deferred backlog left for the
-        # normal consumers (reflection via the awareness loop; outreach via a future
-        # consumer) — surfaced honestly instead of drained-to-completed.
+        # normal consumers (reflection via the awareness loop; outreach_delivery via
+        # OutreachRecoveryWorker) — surfaced honestly instead of drained-to-completed.
         pending_count = await self._deferred_queue.count_pending()
         report.items_pending = pending_count
         if pending_count > self._queue_overflow_threshold and self._event_bus:
