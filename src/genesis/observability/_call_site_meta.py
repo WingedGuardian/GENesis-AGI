@@ -538,10 +538,12 @@ _CALL_SITE_META: dict[str, dict] = {
         "status_reason": "TEMP_DISABLED",
     },
     "outreach_fallback": {
-        "description": "Deferred outreach delivery retry. Enqueue path active (pipeline.py:335), but consumer NOT BUILT — deferred messages silently marked completed without retry. CRITICAL BUG: needs consumer implementation.",
+        "description": "Deferred outreach delivery retry. Enqueue active (outreach/pipeline.py:_defer → deferred-work work_type='outreach_delivery'). Consumer = OutreachRecoveryWorker (resilience/outreach_recovery.py): polls the deferred-work queue, retries via the pipeline with exponential backoff (max 5 attempts), and writes an observation on exhaustion. Wired at runtime/init/outreach.py (started whenever the deferred-work queue is present).",
         "category": "content",
         "frequency": "On outreach failure",
         "model_tier": "slm",
+        "wired": True,
+        "status_reason": "WIRED",
     },
     "40_knowledge_distillation": {
         "description": "Distills ingested knowledge sources into atomic units. Parallelized across provider chain via chain_offset.",
