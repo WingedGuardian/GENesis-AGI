@@ -262,8 +262,14 @@ class TestIdempotencyAndScheduling:
 
     @pytest.mark.asyncio
     async def test_incremental_run_is_idempotent_on_unique_key(self, db):
+        # Stamp the proposal "now-ish" so it always falls inside run()'s default
+        # 2-day incremental window. The _add_proposal default is a FIXED calendar
+        # date, which silently drifts out of that window as the suite ages — this
+        # test passed when written and started failing two days later.
+        recent = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
         await _add_proposal(
             db, pid="p1", status="executed", user_response="s|completed:x",
+            created_at=recent, resolved_at=recent,
         )
         await OutcomeHarvester(db).run()
         await OutcomeHarvester(db).run()  # re-scan same window
