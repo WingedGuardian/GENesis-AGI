@@ -120,6 +120,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   signal — whether its ranking merely favors the memories it retrieves most often — so
   entrenchment of stale-but-popular memories can be watched over time (measured, not acted on).
 
+- **Reflection is no longer falsely reported as "dark" during quiet periods** — the health and
+  morning reports track each subsystem by a periodic heartbeat, but the reflection loop only emitted
+  one when it actually ran a reflection. During legitimately calm stretches (most overnight ticks do
+  no reflection by design), that heartbeat could age past its overdue threshold and the report would
+  warn that reflection had gone silent or "dark" even though the loop was perfectly healthy. Reflection
+  now emits a lightweight idle heartbeat on those quiet ticks, so it only reads as overdue during a
+  genuine outage.
+
 - **Knowledge-base searches stopped silently returning nothing** — the relevance floor that
   trims low-quality knowledge results was a fixed absolute cutoff that, on the score scale recall
   actually produces, sat above the entire range — so searching the knowledge base (or a broad

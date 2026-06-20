@@ -878,6 +878,12 @@ class AwarenessLoop:
                 name=f"reflection-{result.classified_depth.value.lower()}-{result.tick_id[:8]}",
                 subsystem=Subsystem.AWARENESS,
             )
+        else:
+            # Idle alive-pulse: a quiet tick (depth=None) ran no reflection.
+            # Refresh the reflection heartbeat so subsystem_heartbeats does not
+            # falsely report reflection "dark" during calm periods. Degraded
+            # ticks are filtered inside the helper so a real outage still alarms.
+            await self._emit_reflection_idle_heartbeat(result)
 
         if not self._stopping:
             tracked_task(
@@ -921,6 +927,29 @@ class AwarenessLoop:
                     )
             except Exception:
                 logger.warning("Session observer processing failed", exc_info=True)
+
+    async def _emit_reflection_idle_heartbeat(self, result: TickResult) -> None:
+        """Emit a reflection heartbeat for a quiet tick that ran no reflection.
+
+        A tick that classified to ``depth=None`` (nothing triggered, or a
+        ceiling/floor throttle) correctly ran no reflection. Emitting a
+        heartbeat keeps ``subsystem_heartbeats`` fresh during the quiet ticks
+        that dominate calm periods (``depth=None`` is ~93% of ticks), so
+        reflection is not falsely reported "dark" overnight while the loop is
+        healthy. Called from ``_on_tick`` on the depth=None dispatch branch.
+
+        Skipped for a DEGRADED tick (``db_available`` is False — the DB was
+        unavailable so scoring/classification was skipped): a genuine
+        reflection outage must still age out past the heartbeat threshold and
+        alarm, rather than being masked by this pulse.
+        """
+        if not (result.db_available and self._event_bus):
+            return
+        with contextlib.suppress(Exception):
+            await self._event_bus.emit(
+                Subsystem.REFLECTION, Severity.DEBUG,
+                "heartbeat", "reflection idle (no depth triggered)",
+            )
 
     async def _dispatch_reflection(self, result: TickResult) -> None:
         depth = result.classified_depth
