@@ -102,6 +102,7 @@ async def test_no_unexpected_tables(db):
         "reflection_corpus",
         "email_threads", "email_thread_messages",
         "outcome_events",  # self-improvement outcome bus
+        "ego_calibration_snapshots",  # measure-only ego calibration
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"

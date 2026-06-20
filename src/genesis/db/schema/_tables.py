@@ -547,6 +547,19 @@ TABLES = {
             UNIQUE (source, ref_type, ref_id, signal_type)
         )
     """,
+    "ego_calibration_snapshots": """
+        CREATE TABLE IF NOT EXISTS ego_calibration_snapshots (
+            id              TEXT PRIMARY KEY,
+            domain          TEXT NOT NULL,
+            ece             REAL NOT NULL,
+            mce             REAL NOT NULL,
+            sample_count    INTEGER NOT NULL,
+            bucket_count    INTEGER NOT NULL,
+            low_confidence  INTEGER NOT NULL DEFAULT 0,
+            curve_json      TEXT NOT NULL,
+            computed_at     TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """,
     "events": """
         CREATE TABLE IF NOT EXISTS events (
             id               TEXT PRIMARY KEY,
@@ -1475,6 +1488,9 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_outcome_events_calibration "
     "ON outcome_events(domain, signal_tier) "
     "WHERE stated_confidence IS NOT NULL AND value IS NOT NULL",
+    # ego calibration snapshots (measure-only trend)
+    "CREATE INDEX IF NOT EXISTS idx_ego_calibration_domain_time "
+    "ON ego_calibration_snapshots(domain, computed_at)",
     # approval requests (Phase 9)
     "CREATE INDEX IF NOT EXISTS idx_approval_status ON approval_requests(status)",
     "CREATE INDEX IF NOT EXISTS idx_approval_class ON approval_requests(action_class)",

@@ -59,6 +59,23 @@ Cost is NEVER urgent here. Spend is reported as one neutral grounded line
 - Observation/finding counts without content — raw numbers are noise
 - Background task completion counts — unless something failed
 
+### Staleness check — cross-check stored alerts against live state
+
+Observations are point-in-time snapshots and may have resolved since they were
+written. Before surfacing ANY infrastructure / provider / security observation
+as urgent, check whether the live **System Health** data in this report
+corroborates it:
+- "Dead letter queue at 319" is STALE if System Health shows dead_letters at 0.
+- "Provider chain exhausted / circuit breaker open" is STALE if providers are
+  currently healthy.
+- "DASHBOARD_PASSWORD not set / endpoint unauthenticated" is STALE if the live
+  config shows it set.
+
+If a stored observation contradicts live System Health, treat it as resolved:
+note it at most as "earlier <condition>, now recovered", or omit it. Do NOT
+repeat the stale alarm as if it were current. When in doubt, trust the live
+System Health numbers over an older observation's text.
+
 ## What to Include
 
 **Primary focus (this is what the report is FOR):**
