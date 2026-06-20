@@ -100,6 +100,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   lane. They're now recorded at low priority — still tracked for trend deltas, just no longer
   treated as urgent.
 
+- **Genesis's at-a-glance state views stopped showing internal noise** — three cleanups to the
+  dashboard and to Genesis's own always-on context: empty sessions (ended before any messages were
+  exchanged) no longer appear as ghost "0 msgs" rows in the recent-sessions list; the "Active Work"
+  summary no longer ingests raw harness notifications (task-completion blobs, system reminders,
+  slash-command metadata) as if they were your prompts; and the memory "Wings" breakdown shows only
+  real, controlled-vocabulary domains instead of malformed or one-off tags. What you — and Genesis —
+  see reflects genuine activity, not plumbing.
+
 - **A campaign that crashes mid-tick no longer fails silently** — when a scheduled campaign
   tick raises an error, Genesis now records it in job-health tracking, so the failure surfaces
   in the dashboard and to the ego instead of vanishing into the server log. Campaign

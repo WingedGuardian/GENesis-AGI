@@ -171,6 +171,23 @@ def _detect_pivot(current_kw: list[str], trail: dict) -> bool:
     return similarity < _PIVOT_SIMILARITY_THRESHOLD
 
 
+# Harness-injected prompt envelopes — task-completion notifications, system
+# reminders, slash-command metadata, and local-command output. These are not
+# user messages; recording them as conversation pivots pollutes the L1 "Active
+# Work" view and the session-trail line with raw <task-notification> blobs.
+_HARNESS_ENVELOPE_PREFIXES = (
+    "<task-notification>",
+    "<system-reminder>",
+    "<local-command-",
+    "<command-",  # name, message, args, flag, and any future <command-*> variant
+)
+
+
+def _is_harness_envelope(prompt: str) -> bool:
+    """True if *prompt* is a harness-injected envelope, not genuine user input."""
+    return prompt.lstrip().startswith(_HARNESS_ENVELOPE_PREFIXES)
+
+
 def _record_pivot_observation(
     db_path: Path, session_id: str, label: str, trigger: str,
 ) -> None:
@@ -210,6 +227,12 @@ def _update_and_format_trail(
     Returns None if trail has fewer than 2 pivots (not useful yet).
     """
     if not session_id:
+        return None
+
+    # Skip harness-injected turns (task notifications, system reminders,
+    # slash-command metadata, local-command output) — they are not user
+    # messages and would pollute the pivot trail and L1 "Active Work".
+    if _is_harness_envelope(prompt):
         return None
 
     trail = _load_trail(session_id)

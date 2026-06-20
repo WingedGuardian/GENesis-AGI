@@ -223,3 +223,47 @@ class TestObservationStorage:
         assert row[2] == "conversation_pivot"  # type
         assert "memory search" in row[3]  # content
         assert row[6] is not None  # expires_at should be set
+
+
+class TestHarnessEnvelopeFiltering:
+    """#16: harness-injected prompts must not be recorded as pivots."""
+
+    def test_detects_task_notification(self) -> None:
+        assert _mod._is_harness_envelope(
+            "<task-notification><task-id>abc</task-id></task-notification>"
+        )
+
+    def test_detects_system_reminder(self) -> None:
+        assert _mod._is_harness_envelope("<system-reminder>do the thing</system-reminder>")
+
+    def test_detects_local_command(self) -> None:
+        assert _mod._is_harness_envelope("<local-command-stdout>output</local-command-stdout>")
+        assert _mod._is_harness_envelope("<local-command-caveat>note</local-command-caveat>")
+
+    def test_detects_slash_command(self) -> None:
+        assert _mod._is_harness_envelope("<command-name>/compact</command-name>")
+        assert _mod._is_harness_envelope("<command-flag>--all</command-flag>")
+
+    def test_detects_with_leading_whitespace(self) -> None:
+        assert _mod._is_harness_envelope("\n  <task-notification>x</task-notification>")
+
+    def test_false_for_genuine_user_prompt(self) -> None:
+        assert not _mod._is_harness_envelope("fix the executor pipeline bug")
+        # A user prompt that merely mentions a tag mid-text is NOT an envelope
+        assert not _mod._is_harness_envelope("can you look into the <foo> tag handling?")
+
+    def test_update_trail_skips_harness_prompt(self, tmp_path: Path) -> None:
+        """A harness turn records no pivot, no observation, and no trail state."""
+        with patch.object(_mod, "_TRAIL_DIR", tmp_path), \
+             patch.object(_mod, "_DB_PATH", tmp_path / "fake.db"):
+            result = _update_and_format_trail(
+                "s_harness", ["task", "notification"],
+                "<task-notification><task-id>abc</task-id></task-notification>",
+            )
+            assert result is None
+            # No pivot recorded and msg_count not incremented for a harness turn
+            trail = _load_trail("s_harness")
+            assert trail.get("pivots", []) == []
+            assert trail.get("msg_count", 0) == 0
+            # No observation DB written
+            assert not (tmp_path / "fake.db").exists()
