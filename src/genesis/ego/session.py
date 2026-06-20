@@ -532,13 +532,7 @@ class EgoSession:
 
             # Anti-spam: don't stack a second status-change proposal on a goal
             # that already has one open (pending or awaiting dispatch-approval).
-            cursor = await self._db.execute(
-                "SELECT 1 FROM ego_proposals WHERE goal_id = ? "
-                "AND action_type = 'goal_status_change' "
-                "AND status IN ('pending', 'approved') LIMIT 1",
-                (goal_id,),
-            )
-            if await cursor.fetchone():
+            if await ego_crud.has_open_goal_status_change(self._db, goal_id):
                 logger.info(
                     "goal_status_change already open for %s — skipping",
                     goal_id[:12],
