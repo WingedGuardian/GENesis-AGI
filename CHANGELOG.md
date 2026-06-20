@@ -105,6 +105,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Knowledge-base searches stopped silently returning nothing** — the relevance floor that
+  trims low-quality knowledge results was a fixed absolute cutoff that, on the score scale recall
+  actually produces, sat above the entire range — so searching the knowledge base (or a broad
+  memory search across everything) could return *zero* knowledge results even when directly
+  relevant ingested documents existed. The floor is now relative to the best-matching result, so
+  the strongest knowledge hit always survives and a proportional tail of weaker matches is kept,
+  regardless of the underlying score scale.
+
+- **Memory search got more precise on multi-word queries** — query expansion (which broadens a
+  search with related terms) could pull in documents that matched only a broad category tag —
+  the structural labels like class/wing/life-domain that Genesis attaches to *every* memory — so
+  an off-topic document could outrank genuinely relevant ones. Those ever-present structural tags
+  are now excluded from expansion, and for multi-word queries the related terms only *boost*
+  documents that already match part of your query rather than surfacing on their own.
+
 - **Genesis no longer loses contradicting or superseding links between memories** — its memory
   graph could only hold one relationship between any two memories, so recording a second kind
   (for example marking a pair as "contradicts" when they were already linked as "supports", or

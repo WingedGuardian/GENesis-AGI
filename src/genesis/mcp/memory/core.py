@@ -15,6 +15,7 @@ from genesis.memory.provenance import (
 )
 
 from ..memory import mcp
+from ._scoring import DEFAULT_KB_FLOOR_RATIO, relative_kb_floor
 
 
 def _memory_mod():
@@ -246,17 +247,20 @@ async def memory_recall(
 
     # KB noise control: when searching both collections, apply a score floor
     # to knowledge_base results to suppress low-relevance bulk intelligence.
-    # Episodic results are unfiltered. Score floor matches knowledge_recall's
-    # min_score=0.15 (post-authority-boost) as a conservative baseline.
-    # Keyed on the authoritative ``collection`` discriminator (audit D12), not
-    # payload["scope"] — the latter is absent on FTS5-only / pre-scope rows, so
-    # the old check silently let low-relevance KB through that path.
-    _KB_MIN_SCORE = 0.15
+    # Episodic results are unfiltered. The floor is RELATIVE to the strongest
+    # KB hit (audit MEM-004) — scale-invariant across reranker-on (positional)
+    # and reranker-off (RRF) score scales, where the old absolute 0.15 floor
+    # dropped most/all KB. Keyed on the authoritative ``collection``
+    # discriminator (audit D12), not payload["scope"] — the latter is absent on
+    # FTS5-only / pre-scope rows, so the old check silently let low-relevance KB
+    # through that path.
     if source == "both":
-        results = [
-            r for r in results
-            if not is_external(r.collection) or r.score >= _KB_MIN_SCORE
-        ]
+        results = relative_kb_floor(
+            results,
+            ratio=DEFAULT_KB_FLOOR_RATIO,
+            score_of=lambda r: r.score,
+            is_kb=lambda r: is_external(r.collection),
+        )
 
     # MCP-layer instrumentation: emit with mode and pipeline attribution
     recall_event_id: str | None = None

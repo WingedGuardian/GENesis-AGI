@@ -334,6 +334,28 @@ class TestTagCooccurrenceIndex:
         expansions = index.expand(["qdrant"], max_expansions=10)
         assert not any(e.startswith("obs:") for e in expansions)
 
+    def test_skips_structural_tags(self):
+        """Structural taxonomy tags (class:/wing:/life_domain:) are appended to
+        EVERY memory at store time (store.py), so they co-occur with all content
+        tags and would dominate expansion, collapsing FTS5 precision (MEM-001).
+        They must be excluded from the co-occurrence index."""
+        index = TagCooccurrenceIndex()
+        tag_lists = [
+            ["qdrant", "class:incident", "wing:infrastructure",
+             "life_domain:work", "recovery"],
+            ["qdrant", "class:incident", "wing:infrastructure",
+             "life_domain:work", "delete_guard"],
+        ]
+        index.build(tag_lists, memory_count=10)
+        expansions = index.expand(["qdrant"], max_expansions=10)
+        # No structural tag may be offered as an expansion.
+        assert not any(
+            e.startswith(("class:", "wing:", "life_domain:"))
+            for e in expansions
+        )
+        # Genuine content tags still expand.
+        assert "recovery" in expansions or "delete_guard" in expansions
+
     def test_max_expansions_limit(self):
         index = TagCooccurrenceIndex()
         # Create many co-occurring tags
@@ -356,3 +378,41 @@ class TestTagCooccurrenceIndex:
         expansions = index.expand(["qdrant", "incident"])
         assert "qdrant" not in expansions
         assert "incident" not in expansions
+
+
+class TestBuildExpandedQuery:
+    """_build_expanded_query composes the FTS5 boolean query so expansion terms
+    only BOOST documents that already match an original keyword — they must
+    never surface a doc matching an expansion alone (audit MEM-001)."""
+
+    def test_multi_keyword_gates_expansions(self):
+        from genesis.memory.intent import _build_expanded_query
+
+        q = _build_expanded_query(["configure", "routing"], ["setup", "deploy"])
+        # Expansions are AND-gated behind an original term, never bare-OR'd in.
+        assert q == (
+            "(configure AND routing) OR "
+            "((configure OR routing) AND (setup OR deploy))"
+        )
+
+    def test_single_keyword_keeps_flat_form(self):
+        from genesis.memory.intent import _build_expanded_query
+
+        # One keyword: no AND-gate is possible, so keep the flat boost form.
+        q = _build_expanded_query(["configure"], ["setup", "deploy"])
+        assert q == "(configure) OR setup OR deploy"
+
+    def test_no_expansions_returns_keywords_only(self):
+        from genesis.memory.intent import _build_expanded_query
+
+        assert (
+            _build_expanded_query(["configure", "routing"], [])
+            == "(configure AND routing)"
+        )
+        assert _build_expanded_query(["configure"], []) == "configure"
+
+    def test_parens_balanced(self):
+        from genesis.memory.intent import _build_expanded_query
+
+        q = _build_expanded_query(["a", "b", "c"], ["x", "y"])
+        assert q.count("(") == q.count(")")
