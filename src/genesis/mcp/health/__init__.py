@@ -60,6 +60,7 @@ def init_health_mcp(
 from genesis.mcp.health import browser as _browser  # noqa: E402
 from genesis.mcp.health import campaign_tools as _campaign_tools  # noqa: E402, F401
 from genesis.mcp.health import codebase as _codebase  # noqa: E402
+from genesis.mcp.health import cognitive_ledger_tools as _cognitive_ledger_tools  # noqa: E402, F401
 from genesis.mcp.health import db_schema as _db_schema  # noqa: E402
 from genesis.mcp.health import direct_session_tools as _direct_session_tools  # noqa: E402
 from genesis.mcp.health import ego_calibration as _ego_calibration  # noqa: E402, F401

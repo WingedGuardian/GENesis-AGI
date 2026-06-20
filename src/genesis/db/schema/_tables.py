@@ -1039,6 +1039,20 @@ TABLES = {
             timestamp        TEXT NOT NULL
         )
     """,
+    "cognitive_file_modifications": """
+        CREATE TABLE IF NOT EXISTS cognitive_file_modifications (
+            id              TEXT PRIMARY KEY,
+            actor           TEXT NOT NULL,
+            target_path     TEXT NOT NULL,
+            prior_content   TEXT,
+            applied_content TEXT NOT NULL,
+            change_summary  TEXT,
+            metadata        TEXT,
+            status          TEXT NOT NULL DEFAULT 'applied',
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            rolled_back_at  TEXT
+        )
+    """,
     "tool_call_outcomes": """
         CREATE TABLE IF NOT EXISTS tool_call_outcomes (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1573,6 +1587,11 @@ INDEXES = [
     # tool call outcomes (edit failure sensor)
     "CREATE INDEX IF NOT EXISTS idx_tco_tool_ts ON tool_call_outcomes(tool_name, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_tco_success ON tool_call_outcomes(success, timestamp)",
+    # cognitive self-modification ledger (rollback)
+    "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_target ON cognitive_file_modifications(target_path)",
+    "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_actor ON cognitive_file_modifications(actor)",
+    "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_created ON cognitive_file_modifications(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_status ON cognitive_file_modifications(status)",
     # direct session queue
     "CREATE INDEX IF NOT EXISTS idx_dsq_status_created ON direct_session_queue(status, created_at)",
     # J-9 eval infrastructure

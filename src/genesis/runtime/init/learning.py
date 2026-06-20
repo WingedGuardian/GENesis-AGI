@@ -497,11 +497,44 @@ async def init(rt: GenesisRuntime) -> None:
                                     "back to rules-based rendering",
                                 )
                         try:
+                            # Capture the pre-image before the loader overwrites it,
+                            # then record into the cognitive self-mod ledger so a bad
+                            # synthesis can be rolled back (Option B: no loader change).
+                            uk_path = identity_loader._dir / "USER_KNOWLEDGE.md"
+                            prior_uk = (
+                                uk_path.read_text(encoding="utf-8")
+                                if uk_path.exists() else None
+                            )
                             identity_loader.write_user_knowledge_md(
                                 result.model,
                                 evidence_count=result.evidence_count,
                                 narrative=narrative,
                             )
+                            try:
+                                from genesis.learning.cognitive_ledger import (
+                                    record_existing,
+                                )
+
+                                await record_existing(
+                                    rt._db,
+                                    actor="user_model_evolution",
+                                    path=uk_path,
+                                    prior_content=prior_uk,
+                                    applied_content=uk_path.read_text(encoding="utf-8"),
+                                    summary="USER_KNOWLEDGE synthesis ("
+                                    + ("narrative" if narrative else "rules")
+                                    + ")",
+                                    metadata={
+                                        "evidence_count": result.evidence_count,
+                                        "mode": "narrative" if narrative else "rules",
+                                    },
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "cognitive_ledger: USER_KNOWLEDGE record failed "
+                                    "(write unaffected)",
+                                    exc_info=True,
+                                )
                             if narrative:
                                 logger.info(
                                     "USER_KNOWLEDGE.md updated via LLM "

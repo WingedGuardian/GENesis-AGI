@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **You can undo a change Genesis made to its own skills or calibration** — when Genesis
+  autonomously refines a skill, retunes its triage calibration, or re-synthesizes its user
+  knowledge, it now keeps a recoverable snapshot of the previous version. If one of those
+  self-edits turns out worse, you can list the recent self-modifications and roll any of them
+  back to its prior contents — with a safety check that refuses to overwrite a file that has
+  changed since (unless you force it).
+
 - **Earned autonomy can be restored after a regression** — when Genesis loses a level of
   autonomy in a category (e.g. after a correction), that demotion is no longer a dead end. Once
   the category's track record recovers enough that the evidence again supports the earned level,
