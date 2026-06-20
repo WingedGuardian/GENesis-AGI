@@ -49,6 +49,60 @@ def _parse_search_queries(llm_output: str, max_queries: int = 5) -> list[str]:
     return queries
 
 
+# Matches ONLY a whole-message ```json fence (case-insensitive tag). `$` without
+# re.MULTILINE anchors to end-of-string, so combined with re.DOTALL the match
+# spans the entire message — inline fences (mid-text) and other-language blocks
+# (```python, bare ```) are deliberately NOT matched and pass through untouched.
+_FENCE_RE = re.compile(r"^\s*```(?i:json)\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL)
+
+
+def _humanize_surplus_content(content: str) -> str:
+    """Render a surplus brainstorm findings-JSON payload as readable prose.
+
+    ``BRAINSTORM_USER``/``BRAINSTORM_SELF`` tasks are prompted to return
+    ``{"findings": [{"title", "content", "relevance", ...}]}`` wrapped in a
+    ```json fence.  Posted raw, the user sees ```json{...}``` in the Surplus
+    Telegram topic.  This unwraps a whole-message ```json fence and, when the
+    payload is a findings list, renders plain-text bullets.
+
+    Non-findings JSON and plain text are returned unchanged.  A malformed
+    ```json fence is still unwrapped (so no stray ```json reaches the user),
+    but non-JSON code fences (``` ```python ```, bare ``` ``` ```) are left
+    untouched.  Never raises.
+    """
+    if not content:
+        return content
+    text = content.strip()
+    match = _FENCE_RE.match(text)
+    unwrapped = match.group(1).strip() if match else text
+    try:
+        data = json.loads(unwrapped)
+    except (ValueError, TypeError):
+        # Not JSON — return the fence-unwrapped inner text when we unwrapped a
+        # whole-message fence, otherwise the original content untouched.
+        return unwrapped if match else content
+    findings = data.get("findings") if isinstance(data, dict) else None
+    if not isinstance(findings, list) or not findings:
+        return unwrapped if match else content
+    blocks: list[str] = []
+    for item in findings:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        body = str(item.get("content") or "").strip()
+        relevance = str(item.get("relevance") or "").strip()
+        lines: list[str] = []
+        if title:
+            lines.append(f"• {title}")
+        if body:
+            lines.append(body)
+        if relevance:
+            lines.append(f"Why: {relevance}")
+        if lines:
+            blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) if blocks else (unwrapped if match else content)
+
+
 async def _fetch_search_results(queries: list[str]) -> str:
     """Fetch web search results for parsed queries.
 
@@ -750,6 +804,9 @@ class SurplusLLMExecutor:
         try:
             from html import escape
 
+            # Brainstorm tasks return fenced findings-JSON; render it as prose
+            # so the user never sees raw ```json{...}``` in the Surplus topic.
+            content = _humanize_surplus_content(content)
             label = task.task_type.replace("_", " ").title()
             # quote=False: keep &/</> escaped (needed so the <b> label parses under
             # parse_mode=HTML) but leave " and ' raw. With quote=True, html.escape turns

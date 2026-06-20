@@ -66,6 +66,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Surplus brainstorm messages read like prose, not raw JSON** — Genesis's background
+  brainstorm ideas posted to the Telegram "Surplus" topic now render as clean bulleted text
+  (idea, detail, and why it matters) instead of the raw ```json``` code block the model
+  produces. Plain-text and non-JSON messages are unaffected.
+
 - **The neural monitor labels every cognitive call site honestly.** Eight call sites
   that previously showed blank (the eval judge, voice conversation, session observer,
   task pre-mortem, intelligence intake, both resume-review passes, and the executor's

@@ -10,6 +10,7 @@ import pytest
 from genesis.surplus.executor import (
     StubExecutor,
     SurplusLLMExecutor,
+    _humanize_surplus_content,
     _read_essential_knowledge,
     _read_user_model_compact,
 )
@@ -81,6 +82,83 @@ async def test_post_to_telegram_keeps_quotes_raw():
 async def test_no_error():
     result = await StubExecutor().execute(_make_task())
     assert result.error is None
+
+
+# ── _humanize_surplus_content (strip ```json fences → readable prose) ──
+
+
+def test_humanize_renders_fenced_findings():
+    raw = (
+        "```json\n"
+        '{"findings": [{"title": "Idea A", "content": "Do the thing",'
+        ' "relevance": "Saves time", "sources": []}]}\n'
+        "```"
+    )
+    out = _humanize_surplus_content(raw)
+    assert "```" not in out
+    assert "findings" not in out and "json" not in out.lower()
+    assert "• Idea A" in out
+    assert "Do the thing" in out
+    assert "Why: Saves time" in out
+
+
+def test_humanize_bare_json_findings_no_fence():
+    raw = '{"findings": [{"title": "T", "content": "B", "relevance": "R"}]}'
+    out = _humanize_surplus_content(raw)
+    assert "```" not in out and "findings" not in out
+    assert "• T" in out and "B" in out and "Why: R" in out
+
+
+def test_humanize_multiple_findings():
+    raw = '{"findings": [{"title": "A", "content": "a"}, {"title": "B", "content": "b"}]}'
+    out = _humanize_surplus_content(raw)
+    assert "• A" in out and "• B" in out
+    assert out.count("•") == 2
+
+
+def test_humanize_non_findings_json_unchanged():
+    # A JSON object without a findings list is returned verbatim — protects the
+    # keeps-quotes-raw regression and avoids mangling other structured output.
+    raw = '{"title": "Jay\'s plan & <next> steps"}'
+    assert _humanize_surplus_content(raw) == raw
+
+
+def test_humanize_plain_prose_unchanged():
+    raw = "System looks healthy. No action needed right now."
+    assert _humanize_surplus_content(raw) == raw
+
+
+def test_humanize_non_json_code_fence_untouched():
+    # Only ```json fences are unwrapped; legitimate code blocks pass through.
+    raw = "```python\nx = 1\n```"
+    assert _humanize_surplus_content(raw) == raw
+
+
+def test_humanize_malformed_json_in_fence_no_raise():
+    raw = "```json\n{not valid json,,,\n```"
+    out = _humanize_surplus_content(raw)  # must not raise
+    assert "```" not in out  # whole-message fence unwrapped
+    assert "not valid json" in out
+
+
+@pytest.mark.asyncio
+async def test_post_to_telegram_strips_json_fences():
+    """Fenced brainstorm findings are humanized before reaching Telegram."""
+    ex = object.__new__(SurplusLLMExecutor)
+    ex._topic_manager = AsyncMock()
+    content = (
+        "```json\n"
+        '{"findings": [{"title": "Wire X", "content": "Connect A to B",'
+        ' "relevance": "Closes the gap"}]}\n'
+        "```"
+    )
+    await ex._post_to_telegram(_make_task(), content)
+
+    ex._topic_manager.send_to_category.assert_called_once()
+    _category, sent_text = ex._topic_manager.send_to_category.call_args[0][:2]
+    assert "```" not in sent_text
+    assert '"findings"' not in sent_text  # the raw JSON key didn't leak
+    assert "Wire X" in sent_text and "Connect A to B" in sent_text
 
 
 # ── SurplusLLMExecutor tests ──────────────────────────────────────────
