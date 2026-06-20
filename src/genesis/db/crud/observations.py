@@ -140,6 +140,8 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "test_isolation_gap": timedelta(days=30),
     "operational_gap": timedelta(days=30),
     "interaction_theme": timedelta(days=30),
+    # cognitive self-mod rollback audit (operator-visible correction event)
+    "self_mod_rollback": timedelta(days=30),
     # ── 60-day (action-required, real issues) ──────────────────────────
     "bug_identified": timedelta(days=60),
     "tech_debt": timedelta(days=60),

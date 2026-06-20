@@ -39,6 +39,26 @@ except ImportError:  # pragma: no cover — safety for minimal installs
 
 logger = logging.getLogger(__name__)
 
+
+def _strip_kv_prefix(value: str | None, key: str) -> str | None:
+    """Strip a leaked ``key=`` / ``key:`` prefix from a taxonomy value.
+
+    Synthesis (dream_cycle) prompts model tags as ``wing={wing}, room={room}``;
+    the LLM occasionally echoes the literal ``wing=channels`` form into its JSON
+    output. Without this guard that value is stored verbatim into the FTS5 tag,
+    the Qdrant payload, and ``memory_metadata.wing`` — polluting the wing
+    taxonomy and the L1 "Wings" view. Strips only a leading ``key=``/``key:``.
+    """
+    if not value:
+        return value
+    stripped = value.strip()
+    for sep in ("=", ":"):
+        prefix = f"{key}{sep}"
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):].strip()
+    return stripped
+
+
 _COLLECTION_MAP = {
     "episodic": "episodic_memory",
     "knowledge": "knowledge_base",  # External knowledge → knowledge_base
@@ -175,6 +195,11 @@ class MemoryStore:
         class_tag = f"class:{resolved_class}"
         if class_tag not in resolved_tags:
             resolved_tags = [*resolved_tags, class_tag]
+
+        # Defensive: strip a leaked ``wing=`` / ``room=`` prefix before the value
+        # fans out to the FTS5 tag, the Qdrant payload, and memory_metadata.
+        wing = _strip_kv_prefix(wing, "wing")
+        room = _strip_kv_prefix(room, "room")
 
         # Taxonomy classification — auto-classify if not explicitly provided
         if not wing or not room:

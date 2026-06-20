@@ -19,6 +19,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `GENESIS_SPANS_DISABLED=1`); spans are kept for a configurable window (default 14
   days) and pruned automatically.
 
+- **You can undo a change Genesis made to its own skills or calibration** — when Genesis
+  autonomously refines a skill, retunes its triage calibration, or re-synthesizes its user
+  knowledge, it now keeps a recoverable snapshot of the previous version. If one of those
+  self-edits turns out worse, you can list the recent self-modifications and roll any of them
+  back to its prior contents — with a safety check that refuses to overwrite a file that has
+  changed since (unless you force it).
+
 - **Earned autonomy can be restored after a regression** — when Genesis loses a level of
   autonomy in a category (e.g. after a correction), that demotion is no longer a dead end. Once
   the category's track record recovers enough that the evidence again supports the earned level,
@@ -89,6 +96,25 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   building before it ever trips an alert.
 
 ### Fixed
+
+- **Procedure learning survives a two-provider outage** — the routine that captures reusable
+  procedures from Genesis's own struggles ran on only two free model providers; when both were
+  down at once it exhausted its chain and silently stopped learning. A third independent free
+  fallback now keeps it working through overlapping provider outages.
+
+- **Star-count updates no longer crowd high-priority alerts** — GitHub star-count reconnaissance
+  pings inherited their watched project's priority (e.g. "high" for the main repo), so vanity
+  "+N stars" deltas competed with genuinely important findings in the morning report and alert
+  lane. They're now recorded at low priority — still tracked for trend deltas, just no longer
+  treated as urgent.
+
+- **Genesis's at-a-glance state views stopped showing internal noise** — three cleanups to the
+  dashboard and to Genesis's own always-on context: empty sessions (ended before any messages were
+  exchanged) no longer appear as ghost "0 msgs" rows in the recent-sessions list; the "Active Work"
+  summary no longer ingests raw harness notifications (task-completion blobs, system reminders,
+  slash-command metadata) as if they were your prompts; and the memory "Wings" breakdown shows only
+  real, controlled-vocabulary domains instead of malformed or one-off tags. What you — and Genesis —
+  see reflects genuine activity, not plumbing.
 
 - **A campaign that crashes mid-tick no longer fails silently** — when a scheduled campaign
   tick raises an error, Genesis now records it in job-health tracking, so the failure surfaces

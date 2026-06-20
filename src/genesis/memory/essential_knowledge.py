@@ -325,7 +325,17 @@ async def _active_session_count(db: aiosqlite.Connection) -> int:
 
 
 async def _wing_stats(db: aiosqlite.Connection) -> dict[str, int]:
-    """Count memories per wing from memory_metadata."""
+    """Count memories per wing from memory_metadata (canonical wings only).
+
+    Filters to the controlled ``taxonomy.WINGS`` vocabulary so malformed or
+    off-vocabulary wing values (e.g. a leaked ``wing=channels`` prefix or a
+    one-off LLM-invented wing) don't surface in the L1 "Wings" view.
+    """
+    # Deferred import by module convention: essential_knowledge keeps all
+    # genesis.* imports function-level (it is loaded early, low in the import
+    # graph), as elsewhere in this file (e.g. the taxonomy wing-set import in
+    # generate_deterministic).
+    from genesis.memory.taxonomy import WINGS
     try:
         cursor = await db.execute(
             "SELECT wing, COUNT(*) FROM memory_metadata "
@@ -333,7 +343,7 @@ async def _wing_stats(db: aiosqlite.Connection) -> dict[str, int]:
             "GROUP BY wing ORDER BY COUNT(*) DESC"
         )
         rows = await cursor.fetchall()
-        return {row[0]: row[1] for row in rows}
+        return {row[0]: row[1] for row in rows if row[0] in WINGS}
     except Exception:
         return {}
 

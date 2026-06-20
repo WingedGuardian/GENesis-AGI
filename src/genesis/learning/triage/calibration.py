@@ -9,6 +9,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
+from genesis.learning.cognitive_ledger import record_file_modification
 from genesis.learning.events import LEARNING_EVENTS
 from genesis.learning.types import CalibrationRules
 from genesis.observability.types import Severity, Subsystem
@@ -145,8 +146,8 @@ class TriageCalibrator:
                 )
             return None
 
-        # 5. Write atomically
-        self._write_calibration(rules)
+        # 5. Write atomically (via the cognitive self-mod ledger)
+        await self._write_calibration(rules)
 
         if self._event_bus:
             await self._event_bus.emit(
@@ -231,11 +232,13 @@ class TriageCalibrator:
             source_model=source_model,
         )
 
-    def _write_calibration(self, rules: CalibrationRules) -> None:
-        """Write calibration file atomically (write .tmp, rename)."""
-        tmp_path = self._calibration_path.with_suffix(".md.tmp")
-        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+    async def _write_calibration(self, rules: CalibrationRules) -> None:
+        """Render the calibration file and write it atomically.
 
+        The write is routed through the cognitive self-mod ledger
+        (:mod:`genesis.learning.cognitive_ledger`) so the prior version is
+        captured and a degrading regeneration can be rolled back.
+        """
         lines = [
             "---",
             # TODO(triage-calibration C): derive/bump the version instead of hardcoding
@@ -265,5 +268,15 @@ class TriageCalibrator:
             lines.append(f"- {rule}")
         lines.append("")
 
-        tmp_path.write_text("\n".join(lines))
-        tmp_path.rename(self._calibration_path)
+        await record_file_modification(
+            self._db,
+            actor="triage_calibration_daily",
+            path=self._calibration_path,
+            new_content="\n".join(lines),
+            summary=f"triage calibration regen by {rules.source_model}",
+            metadata={
+                "example_count": len(rules.examples),
+                "rule_count": len(rules.rules),
+                "source_model": rules.source_model,
+            },
+        )

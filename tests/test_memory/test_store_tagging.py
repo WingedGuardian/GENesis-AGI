@@ -65,6 +65,43 @@ async def test_store_without_source_pipeline_omits_from_payload(store):
     assert "source_pipeline" not in payload
 
 
+def test_strip_kv_prefix():
+    """#17: defensive strip of a leaked ``wing=``/``room=`` prefix."""
+    from genesis.memory.store import _strip_kv_prefix
+
+    assert _strip_kv_prefix("wing=channels", "wing") == "channels"
+    assert _strip_kv_prefix("wing:channels", "wing") == "channels"
+    assert _strip_kv_prefix("room=uncategorized", "room") == "uncategorized"
+    assert _strip_kv_prefix("channels", "wing") == "channels"  # already clean
+    assert _strip_kv_prefix(None, "wing") is None
+    assert _strip_kv_prefix("", "wing") == ""
+    # Only a leading ``key=`` is stripped — a non-matching key/mid-string '=' is kept
+    assert _strip_kv_prefix("a=b", "wing") == "a=b"
+
+
+@pytest.mark.asyncio()
+async def test_store_strips_leaked_wing_prefix(store):
+    """A leaked ``wing=channels`` value is sanitized before it reaches the Qdrant
+    payload, the FTS5 wing tag, and the memory_metadata write."""
+    with patch("genesis.memory.store.upsert_point") as mock_upsert, \
+         patch("genesis.memory.store.memory_crud") as mock_mem:
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        await store.store(
+            "test content", "src", wing="wing=channels", room="room=uncategorized",
+        )
+
+    payload = mock_upsert.call_args.kwargs["payload"]
+    assert payload["wing"] == "channels"
+    assert payload["room"] == "uncategorized"
+    assert "wing:channels" in payload["tags"]
+    assert "wing:wing=channels" not in payload["tags"]
+    # The memory_metadata companion write gets the sanitized value too
+    assert mock_mem.create_metadata.call_args.kwargs["wing"] == "channels"
+    assert mock_mem.create_metadata.call_args.kwargs["room"] == "uncategorized"
+
+
 @pytest.mark.asyncio()
 async def test_store_source_pipeline_various_values(store):
     """All expected source_pipeline values should work."""
