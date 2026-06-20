@@ -54,7 +54,7 @@ rollback needed.
 | Genesis Component | CC Feature Used | Files | Notes |
 |-------------------|----------------|-------|-------|
 | CCInvoker | `claude` CLI, `-p` flag, `--output-format` | `src/genesis/cc/invoker.py` | Core dispatch mechanism |
-| CCReflectionBridge | Background sessions, system prompts | `src/genesis/cc/reflection_bridge.py` | Deep/Strategic reflection dispatch |
+| CCReflectionBridge | Background sessions, system prompts | `src/genesis/cc/reflection_bridge/` | Light/Deep/Strategic reflection dispatch |
 | CCSessionManager | Session creation/tracking | `src/genesis/cc/session_manager.py` | Session lifecycle |
 | CCCheckpoint | Session pause/resume | `src/genesis/cc/checkpoint.py` | User question handling |
 | CCFormatter | Output formatting | `src/genesis/cc/formatter.py` | Response parsing |

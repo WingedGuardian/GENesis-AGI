@@ -2857,13 +2857,20 @@
           const apiKeys = this.health.api_keys;
           if (!apiKeys) return { state: "unknown", reason: "API key data unavailable" };
           const keys = apiKeys.providers || apiKeys;
-          const bad = Object.entries(keys).filter(([, info]) => info.status === "missing" || info.status === "failed");
-          if (!bad.length) return { state: "healthy", reason: "required provider keys are available" };
-          const blocking = bad.filter(([name]) => !this.providerFallbackActive(name));
-          if (blocking.length > 0) {
-            return { state: "error", reason: "one or more required provider keys are missing or failing" };
+          const vals = Object.values(keys);
+          // Convention: red = a provider's API is not working (breaker open /
+          // out of credits) → error chip; yellow = a key is missing/unconfigured
+          // → degraded chip; otherwise healthy. (System-wide alarm is governed
+          // separately by essential coverage, not by this card.)
+          const red = vals.filter(info => info.key_health === "red").length;
+          const yellow = vals.filter(info => info.key_health === "yellow").length;
+          if (red > 0) {
+            return { state: "error", reason: `${red} provider API(s) not working (e.g. out of credits)` };
           }
-          return { state: "degraded", reason: "provider key issues exist but fallback capacity remains" };
+          if (yellow > 0) {
+            return { state: "degraded", reason: `${yellow} provider key(s) missing or unconfigured` };
+          }
+          return { state: "healthy", reason: "provider keys are configured and working" };
         },
 
         overallHealthSemantic() {
@@ -2942,6 +2949,13 @@
             return "#4caf50";
           }
           return "#666";
+        },
+
+        keyHealthColor(c) {
+          // API-key health convention: green = configured + working,
+          // yellow = key missing/unconfigured, red = present but NOT working
+          // (circuit breaker open — incl. out of credits), gray = disabled.
+          return ({ green: "#4caf50", yellow: "#f0ad4e", red: "#d9534f", gray: "#888" })[c] || "#666";
         },
 
         get groupedConfigFiles() {
@@ -4738,21 +4752,28 @@
                   <span style="font-size: 0.82rem"
                         x-text="(() => {
                           const keys = ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {});
-                          const total = Object.keys(keys).length;
-                          const missing = Object.values(keys).filter(k => k.status === 'missing').length;
-                          const failed = Object.values(keys).filter(k => k.status === 'failed').length;
-                          const local = Object.values(keys).filter(k => k.status === 'local').length;
-                          const validated = Object.values(keys).filter(k => k.status === 'validated').length;
-                          if (missing > 0 || failed > 0) return validated + ' ok, ' + (missing + failed) + ' bad / ' + (total - local);
-                          return validated + '/' + (total - local) + ' validated';
+                          const vals = Object.values(keys);
+                          const local = vals.filter(k => ['local','cc_managed','disabled'].includes(k.status)).length;
+                          const red = vals.filter(k => k.key_health === 'red').length;
+                          const yellow = vals.filter(k => k.key_health === 'yellow').length;
+                          const green = vals.filter(k => k.key_health === 'green').length;
+                          const tracked = vals.length - local;
+                          if (red > 0 || yellow > 0) return green + ' ok, ' + (red + yellow) + ' issue(s) / ' + tracked;
+                          return green + '/' + tracked + ' working';
                         })()"></span>
                   <template x-for="(info, name) in ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {})" :key="name">
-                    <template x-if="info.status === 'missing' || info.status === 'failed'">
+                    <template x-if="info.key_health === 'red' || info.key_health === 'yellow'">
                       <div style="font-size: 0.72rem; margin-top: 0.1rem;"
-                           :style="`color: ${info.status === 'failed' ? '#d9534f' : '#f0ad4e'}`"
-                           :title="info.error || ''">
-                        <span class="status-dot" :style="`background: ${info.status === 'failed' ? '#d9534f' : '#f0ad4e'}`"></span>
-                        <span x-text="name + ' (' + (info.error ? info.error.substring(0, 40) : info.status) + ')'"></span>
+                           :style="`color: ${$store.genesisDashboard.keyHealthColor(info.key_health)}`"
+                           :title="info.error || info.cb_reason || ''">
+                        <span class="status-dot" :style="`background: ${$store.genesisDashboard.keyHealthColor(info.key_health)}`"></span>
+                        <span x-text="name + ' (' + (
+                          info.status === 'missing' ? 'key missing'
+                          : info.cb_reason === 'quota_exhausted' ? 'out of credits'
+                          : info.cb_state === 'open' ? 'API down'
+                          : info.error ? info.error.substring(0, 40)
+                          : info.status
+                        ) + ')'"></span>
                       </div>
                     </template>
                   </template>
@@ -7388,7 +7409,7 @@
             </div>
             <template x-for="(info, name) in ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {})" :key="name">
               <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0; border-bottom: 1px solid var(--color-border); font-size: 0.78rem; flex-wrap: wrap;">
-                <span class="status-dot" :style="`background: ${$store.genesisDashboard.probeStatusColor(info)}`"></span>
+                <span class="status-dot" :style="`background: ${$store.genesisDashboard.keyHealthColor(info.key_health)}`"></span>
                 <span style="font-weight: 600; min-width: 100px;" x-text="name"></span>
                 <template x-if="info.status === 'validated'">
                   <span style="min-width: 80px; color: #4caf50;" title="API key accepted by provider. Does not verify inference works.">key ok</span>

@@ -81,6 +81,9 @@ def api_key_health(
                     results[name] = {"status": "configured", "provider_type": name}
             else:
                 results[name] = {"status": "missing", "provider_type": name}
+            results[name]["key_health"] = _key_health_color(
+                results[name]["status"], "closed",
+            )
         return {"providers": results, "alerts": []}
 
     # Compute criticality per provider type
@@ -110,14 +113,25 @@ def api_key_health(
             if existing is None or _SEVERITY.get(state_str, 0) > _SEVERITY.get(existing[0], 0):
                 cb_by_type[ptype] = (state_str, reason)
 
+    # Essential coverage: a provider outage is only system-CRITICAL when it
+    # leaves an essential cloud site with no working provider. Derived once from
+    # the live breaker registry and shared with compute_degradation_level so the
+    # API-key alert and the degradation banner agree on what 'critical' means.
+    essential_uncovered = False
+    if breakers is not None and hasattr(breakers, "uncovered_essential_sites"):
+        try:
+            essential_uncovered = bool(breakers.uncovered_essential_sites())
+        except Exception:
+            logger.debug("uncovered_essential_sites() failed", exc_info=True)
+
     results = {}
     for name, provider_cfg in routing_config.providers.items():
         ptype = provider_cfg.provider_type
         if ptype in _LOCAL_TYPES:
-            results[name] = {"status": "local", "provider_type": ptype}
+            results[name] = {"status": "local", "provider_type": ptype, "key_health": "green"}
             continue
         if ptype in _CC_MANAGED_TYPES:
-            results[name] = {"status": "cc_managed", "provider_type": ptype}
+            results[name] = {"status": "cc_managed", "provider_type": ptype, "key_health": "green"}
             continue
         service = ptype.upper()
         key = None
@@ -159,7 +173,9 @@ def api_key_health(
             is_free=entry["is_free"],
             cb_state=cb_state,
             cb_reason=cb_reason,
+            essential_uncovered=essential_uncovered,
         )
+        entry["key_health"] = _key_health_color(entry["status"], cb_state)
         results[name] = entry
 
     # Include disabled providers for visibility — but mark as "disabled",
@@ -178,6 +194,7 @@ def api_key_health(
                 "cb_state": "closed",
                 "cb_reason": None,
                 "alert_severity": None,
+                "key_health": "gray",
             }
 
     # Build attention-strip alerts
@@ -193,34 +210,71 @@ def _compute_alert_severity(
     is_free: bool,
     cb_state: str,
     cb_reason: str | None,
+    essential_uncovered: bool = False,
 ) -> str | None:
-    """Compute alert severity from the intersection of criticality and state.
+    """Compute alert severity, gated on essential coverage.
 
-    Returns "critical", "warning", "info", or None.
+    Returns "critical", "warning", "info", or None. Only "critical"/"warning"
+    surface as attention-strip banners and escalate provider health; "info"/None
+    are silent (the API-keys card still reflects the per-provider color).
+
+    Governing principle (matches the degradation trigger): a provider problem is
+    only system-CRITICAL when it leaves an ESSENTIAL cloud site with NO working
+    provider. A provider being down while the essentials are still covered is
+    gracefully absorbed and stays SILENT (info) — surfaced only on the API-keys
+    card, never as a banner. This is what keeps "OpenRouter out of credits" from
+    raising a false CRITICAL (or even a warning banner) while essentials run on
+    free providers. ``cb_reason`` is accepted for call-site symmetry / future
+    use; severity does not branch on the specific failure reason (the
+    attention-strip message does).
     """
     if criticality == "dormant":
         return None
 
-    is_exhausted = cb_state == "open" and cb_reason == "quota_exhausted"
-    is_cb_open = cb_state == "open"
-    is_missing = status == "missing"
+    if cb_state == "open":
+        # Active outage (incl. out-of-credits / quota exhaustion): CRITICAL only
+        # when it uncovers an essential cloud site; otherwise the outage is
+        # gracefully absorbed (free providers cover the essentials) and stays
+        # SILENT (info) — surfaced only on the API-keys card, never as a banner.
+        # This is what keeps "OpenRouter out of credits" from raising a false
+        # CRITICAL while essentials are covered.
+        return "critical" if essential_uncovered else "info"
 
-    if is_exhausted and not is_free:
-        return "critical" if criticality in ("sole", "systemic") else "warning"
-
-    if is_cb_open and not is_free:
-        return "critical" if criticality == "sole" else "warning"
-
-    if is_cb_open and is_free:
-        return "warning" if criticality == "sole" else "info"
-
-    if is_missing and not is_free:
-        return "warning" if criticality in ("sole", "systemic") else "info"
-
-    if is_missing and is_free:
+    if status == "missing":
+        # A missing key is a config gap: a gentle warning for a critical non-free
+        # provider, info otherwise. If a missing key actually uncovers an
+        # essential, the degradation banner owns that alarm (not duplicated here).
+        if not is_free and criticality in ("sole", "systemic"):
+            return "warning"
         return "info"
 
     return None
+
+
+def _key_health_color(status: str, cb_state: str) -> str:
+    """Per-provider dashboard color — single source of truth for the API-keys UI.
+
+    Convention:
+      * yellow = API key missing / not configured (a setup gap, not a failure)
+      * red    = key present but the API is NOT working — circuit breaker OPEN
+                 (includes out-of-credits / quota exhaustion) or validation failed
+      * green  = configured and working (breaker closed); local / CC-managed
+      * gray   = deliberately disabled
+    """
+    if status == "disabled":
+        return "gray"
+    if status in ("local", "cc_managed"):
+        return "green"
+    if status == "missing":
+        return "yellow"
+    # Key is present from here on.
+    if status == "failed":
+        return "red"
+    if cb_state == "open":
+        return "red"
+    if cb_state == "half_open":
+        return "yellow"
+    return "green"
 
 
 def _build_alerts(providers: dict) -> list[dict]:
