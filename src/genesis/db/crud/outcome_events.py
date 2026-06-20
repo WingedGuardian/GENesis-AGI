@@ -168,11 +168,14 @@ async def calibration_by_domain(
     days: int = 90,
     tier: int = 1,
 ) -> list[dict]:
-    """Rows usable for calibration: a stated confidence paired with a graded
-    outcome value, within ``tier`` (ground truth by default).
+    """Rows usable for calibration grouped/labelled by their per-row ``domain``,
+    across ALL sources, within ``tier`` (ground truth by default).
 
-    Feeds Phase 2 (ego-decision calibration / ECE); returns raw paired rows so
-    the calibration engine owns the bucketing.
+    WARNING: does NOT filter by ``source``. Do NOT use this for ego calibration —
+    it would mix ego rows with outreach/triage and contaminate the ECE, and the
+    per-row ``domain`` is the action_type (e.g. 'dispatch'), not 'ego'. For an
+    aggregate ego calibration use ``calibration_pairs(source='ego', tier=1)``.
+    Retained for cross-source/diagnostic reads.
     """
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
     cur = await db.execute(
@@ -196,6 +199,37 @@ async def recent(db: aiosqlite.Connection, *, limit: int = 20) -> list[dict]:
     cur = await db.execute(
         "SELECT * FROM outcome_events ORDER BY occurred_at DESC LIMIT ?",
         (limit,),
+    )
+    rows = await cur.fetchall()
+    return _rows_to_dicts(cur, rows)
+
+
+async def calibration_pairs(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    tier: int = 1,
+    days: int = 90,
+) -> list[dict]:
+    """Confidence/outcome pairs for ONE source at one tier — the calibration
+    input set. Filtered by ``source`` so e.g. ego calibration never mixes in
+    outreach/triage rows (cross-source contamination would corrupt the ECE).
+    Unlike ``calibration_by_domain``, this ignores the per-row ``domain`` so an
+    aggregate (e.g. all ego T1 rows) can be computed regardless of action_type.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    cur = await db.execute(
+        """
+        SELECT stated_confidence, value, occurred_at
+        FROM outcome_events
+        WHERE source = ?
+          AND signal_tier = ?
+          AND stated_confidence IS NOT NULL
+          AND value IS NOT NULL
+          AND occurred_at >= ?
+        ORDER BY occurred_at
+        """,
+        (source, tier, cutoff),
     )
     rows = await cur.fetchall()
     return _rows_to_dicts(cur, rows)
