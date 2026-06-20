@@ -91,9 +91,19 @@ reasonable inference from sparse data.
 | 10 | 5 | 0.73 | L3 |
 | 50 | 5 | 0.90 | L4 |
 
-Promotion caps at +1 level per success — prevents overfitting to lucky streaks.
-Regression has no such cap. A single correction can drop multiple levels if the
-posterior crosses a threshold.
+Regression is automatic and uncapped: a single correction can drop multiple
+levels if the posterior crosses a threshold. Promotion is **not** automatic —
+recording a success only accrues evidence; restoring a level always requires
+explicit user approval (see **Earn-back** below).
+
+**Earn-back.** After a category regresses (`current_level < earned_level`), the
+user ego watches for recovery. Once the Bayesian posterior again supports the
+earned level, it raises an `autonomy_earnback` proposal ("restore <category> to
+L<n>"); only on the user's approval does `AutonomyManager.promote()` restore the
+level. A demotion therefore stays in place for as long as the evidence — and the
+user — agree it belongs there, and authority is never silently re-granted.
+Implementation: `AutonomyManager.detect_earnback_candidates`,
+`EgoCadenceManager._check_earnback_opportunities`, `ego/earnback.py`.
 
 ---
 

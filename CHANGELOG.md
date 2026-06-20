@@ -18,6 +18,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   back to its prior contents — with a safety check that refuses to overwrite a file that has
   changed since (unless you force it).
 
+- **Earned autonomy can be restored after a regression** — when Genesis loses a level of
+  autonomy in a category (e.g. after a correction), that demotion is no longer a dead end. Once
+  the category's track record recovers enough that the evidence again supports the earned level,
+  Genesis proposes restoring it and asks you to approve — it never silently re-grants authority,
+  and it won't nag while the lower level is genuinely warranted. Previously a demoted category
+  had no path back up.
+
 - **Genesis self-corrects a bad memory recall instead of running with it** — on high-stakes
   lookups (the explicit memory and knowledge recall tools), Genesis now grades whether the
   recalled results are actually on-topic, and when a recall comes back clearly irrelevant it

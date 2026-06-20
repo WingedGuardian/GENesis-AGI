@@ -329,6 +329,21 @@ async def ego_proposal_resolve(proposal_id: str):
         import logging
         logging.getLogger(__name__).warning("Journal resolve failed for %s", proposal_id)
 
+    # Autonomy earn-back: promote on approval / cooldown on reject.
+    try:
+        from genesis.ego.earnback import handle_earnback_resolution
+
+        prop = await ego_crud.get_proposal(rt._db, proposal_id)
+        if prop:
+            await handle_earnback_resolution(
+                rt._db, prop, status, getattr(rt, "_autonomy_manager", None),
+            )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "earnback resolution hook failed for %s", proposal_id,
+        )
+
     return jsonify({"ok": True, "id": proposal_id, "status": status})
 
 

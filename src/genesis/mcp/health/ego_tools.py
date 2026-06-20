@@ -519,6 +519,18 @@ async def ego_proposal_resolve(
                 user_response=reason or None,
             )
             results[prop["id"]] = status if updated else "not updated"
+            if updated:
+                # Autonomy earn-back: promote on approval / cooldown on reject.
+                try:
+                    from genesis.ego.earnback import handle_earnback_resolution
+                    from genesis.runtime import GenesisRuntime
+
+                    _rt = GenesisRuntime.instance()
+                    await handle_earnback_resolution(
+                        db, prop, status, getattr(_rt, "_autonomy_manager", None),
+                    )
+                except Exception:
+                    logger.debug("earnback resolution hook failed", exc_info=True)
 
     resolved = sum(1 for v in results.values() if v in ("approved", "rejected"))
     return {

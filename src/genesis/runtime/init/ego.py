@@ -74,6 +74,7 @@ async def init(rt: GenesisRuntime) -> None:
         proposal_workflow = ProposalWorkflow(
             db=rt._db,
             memory_store=rt._memory_store,
+            autonomy_manager=getattr(rt, "_autonomy_manager", None),
         )
         rt._ego_proposal_workflow = proposal_workflow
 
@@ -140,6 +141,7 @@ async def init(rt: GenesisRuntime) -> None:
             idle_detector=rt._idle_detector,
             db=rt._db,
             event_bus=rt._event_bus,
+            autonomy_manager=getattr(rt, "_autonomy_manager", None),
         )
         rt._ego_cadence_manager = user_ego_cadence
 
@@ -218,6 +220,7 @@ async def init(rt: GenesisRuntime) -> None:
             idle_detector=rt._idle_detector,
             db=rt._db,
             event_bus=rt._event_bus,
+            autonomy_manager=getattr(rt, "_autonomy_manager", None),
         )
         rt._genesis_ego_cadence_manager = genesis_ego_cadence
 
