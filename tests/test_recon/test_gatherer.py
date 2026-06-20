@@ -454,6 +454,26 @@ class TestGatherStars:
         assert "30 stars" in rows[0]["content"]
 
     @pytest.mark.asyncio
+    async def test_star_findings_pinned_to_low_priority(self, db):
+        """#13: github_stars findings are 'low' even when the watched project is
+        high-priority, so vanity star deltas don't crowd the high recon lane."""
+        gatherer = ReconGatherer(db)
+
+        with (
+            patch.object(ReconGatherer, "_load_watchlist", return_value=_STAR_WATCHLIST),
+            patch.object(ReconGatherer, "_run_gh", return_value="100"),
+        ):
+            await gatherer.gather_stars()
+
+        # _STAR_WATCHLIST's GENesis-AGI project is priority "high"...
+        rows = await observations.query(
+            db, source="recon", type="finding", category="github_stars"
+        )
+        assert len(rows) == 1
+        # ...but the star-count finding itself must be low.
+        assert rows[0]["priority"] == "low"
+
+    @pytest.mark.asyncio
     async def test_dedup_same_count(self, db):
         gatherer = ReconGatherer(db)
 

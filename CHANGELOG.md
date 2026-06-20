@@ -87,6 +87,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   down at once it exhausted its chain and silently stopped learning. A third independent free
   fallback now keeps it working through overlapping provider outages.
 
+- **Star-count updates no longer crowd high-priority alerts** — GitHub star-count reconnaissance
+  pings inherited their watched project's priority (e.g. "high" for the main repo), so vanity
+  "+N stars" deltas competed with genuinely important findings in the morning report and alert
+  lane. They're now recorded at low priority — still tracked for trend deltas, just no longer
+  treated as urgent.
+
 - **A campaign that crashes mid-tick no longer fails silently** — when a scheduled campaign
   tick raises an error, Genesis now records it in job-health tracking, so the failure surfaces
   in the dashboard and to the ego instead of vanishing into the server log. Campaign

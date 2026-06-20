@@ -184,7 +184,10 @@ class ReconGatherer:
             type="finding",
             category="github_stars",
             content=content,
-            priority=project.get("priority", "medium"),
+            # Star-count deltas are vanity/informational signal — pin them to
+            # "low" regardless of the watched project's priority so they don't
+            # crowd the high-priority recon lane or trigger proactive delivery.
+            priority="low",
             created_at=now,
             content_hash=content_hash,
         )
