@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import aiosqlite
 import pytest
 
@@ -31,11 +33,21 @@ async def db(tmp_path):
         yield conn
 
 
+def _recent(*, hours: float) -> str:
+    """An ISO timestamp `hours` in the past. Relative (not hardcoded) so the
+    windowed run() always sees default rows — fixed-date defaults silently
+    "expire" relative to the rolling window and break this suite as time passes.
+    """
+    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+
+
 async def _add_proposal(
     db, *, pid, status, user_response=None, confidence=0.8,
     action_type="investigate", cycle_id=None,
-    created_at="2026-06-18T00:00:00+00:00", resolved_at="2026-06-18T01:00:00+00:00",
+    created_at=None, resolved_at=None,
 ):
+    created_at = created_at or _recent(hours=2)
+    resolved_at = resolved_at or _recent(hours=1)
     await db.execute(
         "INSERT INTO ego_proposals "
         "(id, action_type, content, status, confidence, user_response, "
@@ -49,8 +61,9 @@ async def _add_proposal(
 
 async def _add_outreach(
     db, *, oid, engagement_outcome, user_response=None, category="notification",
-    prediction_error=None, delivered_at="2026-06-18T00:00:00+00:00",
+    prediction_error=None, delivered_at=None,
 ):
+    delivered_at = delivered_at or _recent(hours=1)
     await db.execute(
         "INSERT INTO outreach_history "
         "(id, signal_type, topic, category, salience_score, channel, "
@@ -58,7 +71,7 @@ async def _add_outreach(
         " delivered_at, created_at) "
         "VALUES (?, 'sig', 'topic', ?, 0.5, 'telegram', 'msg', ?, ?, ?, ?, ?)",
         (oid, category, engagement_outcome, user_response, prediction_error,
-         delivered_at, "2026-06-18T00:00:00+00:00"),
+         delivered_at, _recent(hours=2)),
     )
     await db.commit()
 
@@ -249,6 +262,8 @@ class TestIdempotencyAndScheduling:
 
     @pytest.mark.asyncio
     async def test_incremental_run_is_idempotent_on_unique_key(self, db):
+        # _add_proposal defaults to a recent timestamp (see _recent), so the row
+        # always falls inside run()'s default 2-day incremental window.
         await _add_proposal(
             db, pid="p1", status="executed", user_response="s|completed:x",
         )

@@ -74,6 +74,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reflections) now read "CC background" with their CC model shown in the chain, instead of
   being mislabeled as a paid API cost.
 
+- **Updates now reliably load the new code** — an update could finish "successfully"
+  while the running Genesis process kept executing the *old* code: when the updater
+  stopped the server, systemd's auto-restart could bring it back on the pre-update
+  code before the new code was even pulled, and the updater's final restart was a
+  no-op on the already-running process. The database migrated but the live process
+  didn't, leaving new code on disk and old code in memory. The updater now forces a
+  true restart at the end and makes sure the server stays down during the upgrade, so
+  an update always activates the version it just installed.
+
 - **Recovered providers stop alarming once they come back** — when a model provider's
   circuit breaker reopens after an outage, Genesis now clears that provider's "failing"
   alert instead of leaving it lingering for days until it expired. Per-session conversation
