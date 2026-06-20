@@ -477,8 +477,13 @@ class EgoContextBuilder:
                 lines.append("*Memory retriever not available.*\n")
                 return "\n".join(lines)
 
+            # Pin to episodic (audit D12): user corrections are first-party and
+            # stored episodic; without this the query classifies GENERAL → both,
+            # letting a knowledge_base item tagged 'user_correction' masquerade
+            # as a real user correction in the ego's context.
             results = await retriever.recall(
                 "user correction ego",
+                source="episodic",
                 limit=10,
             )
             # Filter for corrections tagged by the ego correction handler
