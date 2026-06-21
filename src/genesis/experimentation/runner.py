@@ -28,6 +28,8 @@ from genesis.eval.calibration import _load_golden_set
 from genesis.eval.scorers import LLMJudgeScorer
 from genesis.eval.stats import compute_score_winrate, compute_winrate
 from genesis.experimentation.standalone_router import (
+    DEFAULT_GEN_PROVIDER,
+    DEFAULT_JUDGE_PROVIDER,
     StandaloneLiteLLMRouter,
     _default_config_path,
 )
@@ -39,13 +41,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-# Default offline providers (routing-config names). Overridable per call.
-# Generation and judging use *different* providers to avoid self-judging bias;
-# the judge defaults to the deepseek family (closest available to the
-# golden-set's calibrated judge — re-run calibration if you change it).
-DEFAULT_GEN_PROVIDER = "groq-free"
-DEFAULT_JUDGE_PROVIDER = "nvidia-nim-deepseek"
 
 
 def _extract_reflection_text(raw: str) -> str:
@@ -182,6 +177,12 @@ async def run_reflection_experiment(
     # differences). Secondary: pass/fail at the rubric threshold, for context.
     winrate = compute_score_winrate(control_scores, treatment_scores)
     pass_winrate = compute_winrate(control_pass, treatment_pass)
+    try:
+        from genesis.experimentation.guards import pin_rubric_version
+
+        rubric_version = pin_rubric_version(rubric_name)
+    except Exception:  # noqa: BLE001 — version pin is best-effort audit metadata
+        rubric_version = None
 
     n = len(cases)
     result = ExperimentResult(
@@ -205,6 +206,7 @@ async def run_reflection_experiment(
         errors=errors,
         metadata={
             "rubric_name": rubric_name,
+            "rubric_version": rubric_version,
             "gen_provider": gen_provider,
             "judge_provider": judge_provider,
             "control_description": control.description,

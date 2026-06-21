@@ -35,6 +35,12 @@ _RETRYABLE = (
 _MAX_RETRIES = 2
 _RETRY_BASE_S = 5.0
 
+# Default offline providers (routing-config names). Generation + judging use
+# DIFFERENT providers to avoid self-judging bias; the judge defaults to the
+# deepseek family (closest available to the golden-set's calibrated judge).
+DEFAULT_GEN_PROVIDER = "groq-free"
+DEFAULT_JUDGE_PROVIDER = "nvidia-nim-deepseek"
+
 
 def _default_config_path() -> Path:
     return Path(__file__).resolve().parents[3] / "config" / "model_routing.yaml"
