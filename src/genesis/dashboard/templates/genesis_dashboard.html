@@ -26,7 +26,7 @@
       Alpine.store("genesisDashboard", {
         // Tab state
         activeTab: "overview",
-        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, observations: false, traces: false, memory: false, knowledge: false, backup: false },
+        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, observations: false, traces: false, autonomy: false, memory: false, knowledge: false, backup: false },
 
         // State
         health: {},
@@ -324,6 +324,13 @@
         tracesLoadingTrace: false,
         _traceReq: 0,
 
+        // Autonomy tab state
+        autonomyGrants: [],
+        autonomySends: [],
+        autonomyLoading: false,
+        autonomyFlagging: {},
+        _autonomyInterval: null,
+
         // Tab management
         _TAB_INTERVALS: {
           overview:  ["_cognitiveInterval", "_ekInterval", "_modulesInterval"],
@@ -334,6 +341,7 @@
           work:      ["_tasksInterval", "_workSessionsInterval", "_followUpsInterval"],
           observations: ["_observationsInterval"],
           traces:    ["_tracesInterval"],
+          autonomy:  ["_autonomyInterval"],
           memory:    [],
           knowledge: [],
           backup:    [],
@@ -341,7 +349,7 @@
 
         initTab() {
           const hash = location.hash.replace("#", "") || "overview";
-          const valid = ["overview", "chat", "internals", "config", "files", "work", "observations", "traces", "memory", "knowledge", "references", "backup"];
+          const valid = ["overview", "chat", "internals", "config", "files", "work", "observations", "traces", "autonomy", "memory", "knowledge", "references", "backup"];
           this.activeTab = valid.includes(hash) ? hash : "overview";
           window.addEventListener("hashchange", () => {
             const h = location.hash.replace("#", "");
@@ -407,6 +415,10 @@
             case "traces":
               if (first) { this.fetchSpansRecent(); }
               this._tracesInterval = setInterval(() => this.fetchSpansRecent(), 30000);
+              break;
+            case "autonomy":
+              if (first) { this.fetchAutonomyGrants(); this.fetchAutonomySends(); }
+              this._autonomyInterval = setInterval(() => { this.fetchAutonomyGrants(); this.fetchAutonomySends(); }, 30000);
               break;
             case "memory":
               if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); }
@@ -479,7 +491,7 @@
 
         cleanup() {
           if (this._healthInterval) clearInterval(this._healthInterval);
-          for (const tab of ["overview", "chat", "internals", "config", "work", "observations", "traces"]) {
+          for (const tab of ["overview", "chat", "internals", "config", "work", "observations", "traces", "autonomy"]) {
             this._stopTabIntervals(tab);
           }
           // Terminal runs in its own window — no cleanup needed here
@@ -1104,6 +1116,47 @@
           } finally {
             if (reqId === this._traceReq) this.tracesLoadingTrace = false;
           }
+        },
+
+        // ── Autonomy tab fetches ──────────────────────────────────
+        async fetchAutonomyGrants() {
+          try {
+            const resp = await fetchApi("/api/genesis/autonomy/grants");
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.autonomyGrants = data.grants || [];
+            }
+          } catch (e) { console.warn("Autonomy grants fetch failed:", e); }
+        },
+        async fetchAutonomySends() {
+          try {
+            const resp = await fetchApi("/api/genesis/autonomy/sends?limit=100");
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.autonomySends = data.sends || [];
+            }
+          } catch (e) { console.warn("Autonomy sends fetch failed:", e); }
+        },
+        async refreshAutonomy() {
+          this.autonomyLoading = true;
+          try {
+            await Promise.all([this.fetchAutonomyGrants(), this.fetchAutonomySends()]);
+          } finally { this.autonomyLoading = false; }
+        },
+        async flagAutonomousSend(sendId) {
+          this.autonomyFlagging = { ...this.autonomyFlagging, [sendId]: true };
+          try {
+            const resp = await fetchApi(`/api/genesis/autonomy/sends/${sendId}/flag`, {
+              method: "POST",
+            });
+            if (resp && resp.ok) {
+              // Flagging records a correction that demotes the cell, so refresh
+              // both the sends log and the standing-autonomy grants list.
+              await this.fetchAutonomySends();
+              await this.fetchAutonomyGrants();
+            }
+          } catch (e) { console.warn("Flag autonomous send failed:", e); }
+          finally { const { [sendId]: _, ...rest } = this.autonomyFlagging; this.autonomyFlagging = rest; }
         },
 
         // ── Comms fetches (on Chat tab) ──────────────────────────
@@ -4146,6 +4199,8 @@
       </button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'traces' }"
               @click="location.hash = 'traces'">Traces</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'autonomy' }"
+              @click="location.hash = 'autonomy'">Autonomy</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'memory' }"
               @click="location.hash = 'memory'">Memory</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'knowledge' }"
@@ -9095,6 +9150,119 @@
             </div>
           </template>
         </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Autonomy (standing grants + autonomous sends) [Tab: autonomy]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'autonomy'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">verified_user</span>
+        Autonomy
+        <button style="margin-left:auto; font-size:0.72rem; padding:0.22rem 0.55rem; border-radius:4px; border:1px solid var(--color-border); color:var(--color-text-secondary); background:transparent; cursor:pointer;"
+                :disabled="$store.genesisDashboard.autonomyLoading"
+                @click="$store.genesisDashboard.refreshAutonomy()"
+                x-text="$store.genesisDashboard.autonomyLoading ? 'Refreshing…' : 'Refresh'"></button>
+      </div>
+      <div class="panel-body">
+        <div style="font-size:0.68rem; color:var(--color-text-secondary); margin-bottom:0.8rem;">
+          What Genesis is authorized to do on its own, and a log of what it has done. Everything defaults to holding for your approval — autonomy is earned cell by cell. Flagging a send records a correction that demotes its cell back toward approval.
+        </div>
+
+        <!-- ── Standing autonomy ─────────────────────────────────── -->
+        <div style="font-size:0.78rem; font-weight:600; margin-bottom:0.4rem;">Standing autonomy</div>
+
+        <!-- Empty state (calm / good given the all-ASK default) -->
+        <template x-if="$store.genesisDashboard.autonomyGrants.length === 0">
+          <div style="padding:1.1rem; text-align:center; color:var(--color-text-secondary); font-size:0.74rem; margin-bottom:1.2rem;">
+            No standing autonomy — every action holds for your approval.
+          </div>
+        </template>
+
+        <!-- Granted cells table -->
+        <template x-if="$store.genesisDashboard.autonomyGrants.length > 0">
+          <div style="overflow-x: auto; margin-bottom:1.2rem;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 0.72rem;">
+              <thead>
+                <tr style="border-bottom: 1px solid var(--color-border); text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.65rem;">
+                  <th style="text-align: left; padding: 0.3rem 0.4rem;">Cell</th>
+                  <th style="text-align: right; padding: 0.3rem 0.4rem;">Successes</th>
+                  <th style="text-align: right; padding: 0.3rem 0.4rem;">Granted at</th>
+                  <th style="text-align: right; padding: 0.3rem 0.4rem;">Last used</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="g in $store.genesisDashboard.autonomyGrants" :key="g.id">
+                  <tr style="border-bottom: 1px solid rgba(255,255,255,0.04);">
+                    <td style="padding: 0.25rem 0.4rem; font-family: monospace;" x-text="g.id"></td>
+                    <td style="text-align: right; padding: 0.25rem 0.4rem;" x-text="g.successes != null ? g.successes : '—'"></td>
+                    <td style="text-align: right; padding: 0.25rem 0.4rem; font-family: monospace; font-size: 0.65rem;"
+                        x-text="$store.genesisDashboard.formatDateTime(g.granted_at)"></td>
+                    <td style="text-align: right; padding: 0.25rem 0.4rem; font-family: monospace; font-size: 0.65rem;"
+                        x-text="g.last_used_at ? $store.genesisDashboard.formatDateTime(g.last_used_at) : 'never'"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
+        <!-- ── Autonomous sends ──────────────────────────────────── -->
+        <div style="font-size:0.78rem; font-weight:600; margin-bottom:0.4rem;">Autonomous sends</div>
+
+        <!-- Empty state -->
+        <template x-if="$store.genesisDashboard.autonomySends.length === 0">
+          <div style="padding:1.1rem; text-align:center; color:var(--color-text-secondary); font-size:0.74rem;">
+            No autonomous sends yet.
+          </div>
+        </template>
+
+        <!-- Sends table -->
+        <template x-if="$store.genesisDashboard.autonomySends.length > 0">
+          <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 0.72rem;">
+              <thead>
+                <tr style="border-bottom: 1px solid var(--color-border); text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.65rem;">
+                  <th style="text-align: left; padding: 0.3rem 0.4rem;">Recipient</th>
+                  <th style="text-align: left; padding: 0.3rem 0.4rem;">Subject</th>
+                  <th style="text-align: left; padding: 0.3rem 0.4rem;">Cell</th>
+                  <th style="text-align: right; padding: 0.3rem 0.4rem;">Sent at</th>
+                  <th style="text-align: right; padding: 0.3rem 0.4rem;">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="s in $store.genesisDashboard.autonomySends" :key="s.id">
+                  <tr :style="s.flagged_at ? 'background: rgba(217,83,79,0.08)' : ''"
+                      style="border-bottom: 1px solid rgba(255,255,255,0.04);">
+                    <td style="padding: 0.25rem 0.4rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:160px;"
+                        :title="s.recipient" x-text="s.recipient || '—'"></td>
+                    <td style="padding: 0.25rem 0.4rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:220px;"
+                        :title="s.subject" x-text="s.subject || '(no subject)'"></td>
+                    <td style="padding: 0.25rem 0.4rem; font-family: monospace; font-size: 0.65rem;">
+                      <span x-text="(s.cell_domain || '?') + '/' + (s.cell_verb || '?')"></span>
+                      <span x-show="s.cell_risk_class" style="color:var(--color-text-secondary);"
+                            x-text="' (' + (s.cell_risk_class || '') + ')'"></span>
+                    </td>
+                    <td style="text-align: right; padding: 0.25rem 0.4rem; font-family: monospace; font-size: 0.65rem;"
+                        x-text="$store.genesisDashboard.formatDateTime(s.sent_at)"></td>
+                    <td style="text-align: right; padding: 0.25rem 0.4rem;">
+                      <template x-if="s.flagged_at">
+                        <span style="font-size:0.62rem; padding:0.12rem 0.4rem; border-radius:3px; background:rgba(217,83,79,0.15); color:#d9534f; font-weight:600;">Flagged</span>
+                      </template>
+                      <template x-if="!s.flagged_at">
+                        <button style="font-size:0.68rem; padding:0.2rem 0.5rem; border-radius:4px; border:1px solid rgba(217,83,79,0.4); color:#d9534f; background:transparent; cursor:pointer;"
+                                :disabled="$store.genesisDashboard.autonomyFlagging[s.id]"
+                                @click="$store.genesisDashboard.flagAutonomousSend(s.id)"
+                                x-text="$store.genesisDashboard.autonomyFlagging[s.id] ? 'Flagging…' : 'Flag as bad'"></button>
+                      </template>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </template>
       </div>
     </div>
 
