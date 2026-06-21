@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import aiosqlite
 
-from genesis.eval.types import EvalRunSummary, ScorerType
+from genesis.eval.types import EvalRunSummary, EvalTrigger, ScorerType
 
 
 async def insert_run(
@@ -84,6 +84,34 @@ async def insert_run(
 
     await db.commit()
     return run_id
+
+
+async def set_comparison_run(
+    db: aiosqlite.Connection,
+    run_id: str,
+    comparison_run_id: str,
+) -> None:
+    """Link one eval run to another (A/B pairing: treatment -> its control)."""
+    await db.execute(
+        "UPDATE eval_runs SET comparison_run_id = ? WHERE id = ?",
+        (comparison_run_id, run_id),
+    )
+    await db.commit()
+
+
+async def get_experiment_runs(
+    db: aiosqlite.Connection,
+    *,
+    limit: int = 20,
+) -> list[dict]:
+    """Fetch recent experiment-arm runs (trigger='experiment'), newest first."""
+    cursor = await db.execute(
+        "SELECT * FROM eval_runs WHERE trigger = ? ORDER BY created_at DESC LIMIT ?",
+        (EvalTrigger.EXPERIMENT.value, limit),
+    )
+    cols = [d[0] for d in cursor.description]
+    rows = await cursor.fetchall()
+    return [dict(zip(cols, row, strict=False)) for row in rows]
 
 
 async def get_runs(

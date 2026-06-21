@@ -88,6 +88,7 @@ async def run_reflection_experiment(
     limit: int | None = None,
     gen_router: object | None = None,
     judge: object | None = None,
+    db: object | None = None,
 ) -> ExperimentResult:
     """Run a control-vs-treatment reflection-prompt A/B over the golden set.
 
@@ -183,7 +184,7 @@ async def run_reflection_experiment(
     pass_winrate = compute_winrate(control_pass, treatment_pass)
 
     n = len(cases)
-    return ExperimentResult(
+    result = ExperimentResult(
         experiment_name=experiment_name,
         control=ArmResult(
             variant_name=control.name,
@@ -211,3 +212,9 @@ async def run_reflection_experiment(
             "pass_winrate": pass_winrate,
         },
     )
+
+    if db is not None:
+        from genesis.experimentation.persistence import persist_experiment
+
+        await persist_experiment(db, result, gen_provider=gen_provider, judge_provider=judge_provider)
+    return result

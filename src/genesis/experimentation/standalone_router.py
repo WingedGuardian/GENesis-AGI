@@ -15,6 +15,7 @@ raw litellm model string. Mirrors the pattern in
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,15 @@ from genesis.routing.litellm_delegate import LiteLLMDelegate
 from genesis.routing.types import RoutingConfig
 
 logger = logging.getLogger(__name__)
+
+# Transient errors worth retrying (free-tier judges 429 readily). Mirrors the
+# retry posture of `eval/runner.py`.
+_RETRYABLE = (
+    "rate limit", "ratelimit", "too many requests", "429", "503",
+    "overloaded", "timeout", "connection", "temporarily",
+)
+_MAX_RETRIES = 2
+_RETRY_BASE_S = 5.0
 
 
 def _default_config_path() -> Path:
@@ -85,12 +95,28 @@ class StandaloneLiteLLMRouter:
         messages: list[dict],
         **kwargs,
     ) -> StandaloneRoutingResult:
-        result = await self._delegate.call(
-            provider=self._provider_name,
-            model_id=self._model_id,
-            messages=messages,
-            **kwargs,
-        )
+        result = None
+        for attempt in range(_MAX_RETRIES + 1):
+            result = await self._delegate.call(
+                provider=self._provider_name,
+                model_id=self._model_id,
+                messages=messages,
+                **kwargs,
+            )
+            if result.success:
+                break
+            msg = (result.error or "").lower()
+            if attempt < _MAX_RETRIES and any(k in msg for k in _RETRYABLE):
+                delay = _RETRY_BASE_S * (2 ** attempt)
+                logger.info(
+                    "standalone %s via %s transient (%s); retry %d/%d in %.0fs",
+                    call_site_id, self._provider_name, result.error,
+                    attempt + 1, _MAX_RETRIES, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            break
+
         if not result.success:
             logger.warning(
                 "standalone route_call failed (%s via %s): %s",
