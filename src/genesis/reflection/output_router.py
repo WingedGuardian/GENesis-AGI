@@ -585,6 +585,20 @@ class OutputRouter:
 
         obs_type = "quality_drift" if output.drift_detected else "quality_calibration"
 
+        # Supersede any prior unresolved quality_drift BEFORE writing this
+        # cycle's result (never after — resolve_by_source_and_type resolves ALL
+        # unresolved matches, so resolving after would bury the row we just
+        # wrote). Resolving regardless of the new type means a clean (non-drift)
+        # calibration also clears a standing drift alarm (resolve-on-recovery),
+        # and a fresh drift replaces the previous one instead of stacking.
+        await observations.resolve_by_source_and_type(
+            db,
+            source="quality_calibration",
+            type="quality_drift",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="superseded by newer quality calibration",
+        )
+
         content = json.dumps({
             "drift_detected": output.drift_detected,
             "quarantine_candidates": output.quarantine_candidates,

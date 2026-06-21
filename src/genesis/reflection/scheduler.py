@@ -182,6 +182,10 @@ class ReflectionScheduler:
                 if regression:
                     await self._stability.emit_regression_signal(self._db)
                     logger.warning("Learning regression detected after calibration")
+                else:
+                    # Resolve-on-recovery: clear any standing regression alarm
+                    # once effectiveness recovers, so it doesn't persist stale.
+                    await self._stability.resolve_regression_if_standing(self._db)
 
             if result.success:
                 await self._record_job_result("weekly_calibration")

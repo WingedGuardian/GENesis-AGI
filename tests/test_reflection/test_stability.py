@@ -186,6 +186,38 @@ class TestCheckRegression:
         result = await monitor.check_regression(db)
         assert not result
 
+    @pytest.mark.asyncio
+    async def test_small_dip_not_regression(self, db, monitor):
+        """Consecutive decline but total drop < 0.10 → noise, not a regression."""
+        for i, score in enumerate([0.55, 0.60, 0.63]):  # newest first; drop 0.08
+            await db.execute(
+                "INSERT INTO observations (id, source, type, content, priority, created_at) "
+                "VALUES (?, 'weekly_assessment', 'self_assessment', ?, 'medium', ?)",
+                (
+                    f"a{i}",
+                    json.dumps({"dimensions": [{"dimension": "procedure_effectiveness", "score": score}]}),
+                    f"2026-03-{10-i:02d}T00:00:00",
+                ),
+            )
+        await db.commit()
+        assert not await monitor.check_regression(db)
+
+    @pytest.mark.asyncio
+    async def test_high_baseline_decline_not_regression(self, db, monitor):
+        """Meaningful drop but the latest score is still healthy (>= 0.60) → not flagged."""
+        for i, score in enumerate([0.70, 0.80, 0.85]):  # newest first; drop 0.15, newest 0.70
+            await db.execute(
+                "INSERT INTO observations (id, source, type, content, priority, created_at) "
+                "VALUES (?, 'weekly_assessment', 'self_assessment', ?, 'medium', ?)",
+                (
+                    f"a{i}",
+                    json.dumps({"dimensions": [{"dimension": "procedure_effectiveness", "score": score}]}),
+                    f"2026-03-{10-i:02d}T00:00:00",
+                ),
+            )
+        await db.commit()
+        assert not await monitor.check_regression(db)
+
 
 class TestEmitRegressionSignal:
     @pytest.mark.asyncio
@@ -206,6 +238,40 @@ class TestEmitRegressionSignal:
         monitor = LearningStabilityMonitor(event_bus=bus)
         await monitor.emit_regression_signal(db)
         bus.emit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_supersedes_prior_unresolved(self, db, monitor):
+        """Emitting again resolves the prior signal so only one stands unresolved."""
+        await monitor.emit_regression_signal(db)
+        await monitor.emit_regression_signal(db)
+
+        unresolved = (await (await db.execute(
+            "SELECT count(*) FROM observations "
+            "WHERE type='learning_regression' AND resolved=0"
+        )).fetchone())[0]
+        total = (await (await db.execute(
+            "SELECT count(*) FROM observations WHERE type='learning_regression'"
+        )).fetchone())[0]
+        assert unresolved == 1
+        assert total == 2  # prior superseded (resolved) + current
+
+
+class TestResolveRegressionIfStanding:
+    @pytest.mark.asyncio
+    async def test_resolves_standing(self, db, monitor):
+        """A standing regression is cleared on recovery."""
+        await monitor.emit_regression_signal(db)
+        await monitor.resolve_regression_if_standing(db)
+        unresolved = (await (await db.execute(
+            "SELECT count(*) FROM observations "
+            "WHERE type='learning_regression' AND resolved=0"
+        )).fetchone())[0]
+        assert unresolved == 0
+
+    @pytest.mark.asyncio
+    async def test_noop_when_none(self, db, monitor):
+        """No standing regression → no error, nothing to resolve."""
+        await monitor.resolve_regression_if_standing(db)  # must not raise
 
 
 class TestFindContradictions:
