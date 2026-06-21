@@ -299,3 +299,27 @@ class TestPRDCompetence:
                              event=CellEvent.CLASSIFY, updated_at=_TS)
         granted = await cg.list_granted(db)
         assert [g["id"] for g in granted] == ["email:send:standard"]
+
+    @pytest.mark.asyncio
+    async def test_decay_lapses_only_stale_grants(self, db):
+        from datetime import UTC, datetime, timedelta
+        now_dt = datetime(2026, 6, 21, tzinfo=UTC)
+        now = now_dt.isoformat()
+        # fresh grant (used today) — must NOT decay
+        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=now, **_EMAIL)
+        await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=now, **_EMAIL)
+        await cg.touch_used(db, used_at=now, **_EMAIL)
+        # stale grant (granted 100d ago, never used) — must decay
+        old = (now_dt - timedelta(days=100)).isoformat()
+        for ev in (CellEvent.CLASSIFY, CellEvent.APPROVE):
+            await cg.apply_event(db, domain="email", verb="send", risk_class="bulk",
+                                 event=ev, updated_at=old)
+
+        decayed = await cg.decay_stale_cells(db, now=now, half_life_days=90)
+
+        assert decayed == ["email:send:bulk"]
+        assert (await cg.get_cell(db, **_EMAIL))["state"] == CellState.GRANTED.value
+        bulk = await cg.get_cell(db, "email", "send", "bulk")
+        assert bulk["state"] == CellState.NOT_DETERMINED.value
+        assert bulk["granted_at"] is None
+        assert bulk["last_decayed_at"] == now

@@ -1,5 +1,10 @@
 # Genesis v3 Autonomy Configuration
 
+# WS-8 PR-D — owner notification on each autonomous (GRANTED-cell) email send.
+# Muted by default; the dashboard "Activity" tab is the primary visibility path.
+# Set true to also receive a per-send Telegram notice. Needs a server restart.
+email_send_notify: false
+
 # Default autonomy levels per category (user can override via natural language)
 defaults:
   direct_session: 1      # L1 — conservative start

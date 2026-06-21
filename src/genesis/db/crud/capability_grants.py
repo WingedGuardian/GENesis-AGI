@@ -17,6 +17,8 @@ These functions commit their own writes — do NOT call them inside a migration
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import aiosqlite
 
 from genesis.autonomy.capabilities import transition
@@ -289,3 +291,30 @@ async def detect_promotable_cells(
             row["posterior"] = posterior
             out.append(row)
     return out
+
+
+async def decay_stale_cells(
+    db: aiosqlite.Connection, *, now: str, half_life_days: int = 90,
+) -> list[str]:
+    """Decay GRANTED cells idle longer than the half-life back to NOT_DETERMINED
+    (the ``DECAY`` transition, applied in bulk).
+
+    Staleness is measured from the most recent activity (``last_used_at``, else
+    the grant time).  A decayed cell holds again on its next send (CLASSIFY→ASK),
+    so a long-unused standing autonomy lapses rather than entrenching.  Atomic
+    ``UPDATE…RETURNING``.  Returns the decayed cell ids.
+    """
+    cutoff = (
+        datetime.fromisoformat(now) - timedelta(days=half_life_days)
+    ).isoformat()
+    cursor = await db.execute(
+        """UPDATE capability_grants
+             SET state = ?, granted_at = NULL, last_decayed_at = ?, updated_at = ?
+           WHERE state = ?
+             AND COALESCE(last_used_at, granted_at) < ?
+           RETURNING id""",
+        (CellState.NOT_DETERMINED.value, now, now, CellState.GRANTED.value, cutoff),
+    )
+    rows = await cursor.fetchall()
+    await db.commit()
+    return [r[0] for r in rows]

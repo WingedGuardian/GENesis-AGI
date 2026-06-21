@@ -231,6 +231,42 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=300,
         )
 
+        # WS-8 PR-D capability staleness decay — a GRANTED email cell idle past
+        # the half-life lapses back to NOT_DETERMINED (holds again on next use),
+        # so standing autonomy can't entrench unused. Daily, INFO-level.
+        from genesis.db.crud import capability_grants as _cg
+
+        async def _capability_decay_sweep() -> None:
+            try:
+                if rt.paused:
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping capability decay", exc_info=True,
+                )
+                return
+            try:
+                decayed = await _cg.decay_stale_cells(
+                    rt._db, now=datetime.now(UTC).isoformat(),
+                )
+                rt.record_job_success("capability_decay_sweep")
+                if decayed:
+                    logger.info(
+                        "Capability decay: %d stale grant(s) lapsed: %s",
+                        len(decayed), ", ".join(decayed),
+                    )
+            except Exception as exc:
+                rt.record_job_failure("capability_decay_sweep", str(exc))
+                raise
+
+        rt._learning_scheduler.add_job(
+            _capability_decay_sweep,
+            CronTrigger(hour=3, minute=30, timezone=user_timezone()),
+            id="capability_decay_sweep",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         from genesis.db.crud import observations
         from genesis.learning.harvesting.auto_memory import harvest_auto_memory
 
