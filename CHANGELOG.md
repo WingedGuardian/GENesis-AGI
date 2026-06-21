@@ -119,6 +119,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The ego subsystem no longer shows a false "overdue" health status** — the health view marks
+  a background subsystem "overdue" if it hasn't checked in within a window, and the ego's check-in
+  was tied to its proactive thinking timer. That timer deliberately slows down during quiet
+  periods and gets pushed back every time the ego does other work, so it could legitimately go
+  hours between ticks — long enough to trip the 4-hour "overdue" alarm even while the ego was
+  healthy and actively running cycles. The ego now sends a steady "alive" check-in every few
+  minutes, independent of its work pace, so its health status reflects reality.
+
 - **Stale "quality drift" and "learning regression" alarms no longer linger or cry wolf** — when
   Genesis's weekly self-checks flagged a quality drift or a learning regression, that flag stayed
   active until it expired days later, so the morning report kept repeating a days-old warning as if
