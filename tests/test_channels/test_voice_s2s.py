@@ -173,7 +173,9 @@ class TestGenesisBridge:
 
     async def test_approve_pending_success(self):
         gate = AsyncMock()
-        gate.resolve_most_recent_pending_voice = AsyncMock(return_value="abc12345")
+        gate.resolve_pending_voice = AsyncMock(return_value={
+            "status": "resolved", "request_id": "abc12345", "label": "run tests",
+        })
 
         bridge = GenesisBridge(approval_gate=gate)
         result = await bridge.handle_tool_call(
@@ -182,13 +184,62 @@ class TestGenesisBridge:
         data = json.loads(result)
         assert "result" in data
         assert "approved" in data["result"]
-        gate.resolve_most_recent_pending_voice.assert_awaited_once_with(
-            decision="approved", resolved_by="voice:s2s",
+        assert data["action"] == "run tests"
+        gate.resolve_pending_voice.assert_awaited_once_with(
+            decision="approved", resolved_by="voice:s2s", request_id=None,
         )
+
+    async def test_approve_pending_by_id(self):
+        gate = AsyncMock()
+        gate.resolve_pending_voice = AsyncMock(return_value={
+            "status": "resolved", "request_id": "id-2", "label": "send email",
+        })
+
+        bridge = GenesisBridge(approval_gate=gate)
+        result = await bridge.handle_tool_call(
+            "approve_pending",
+            json.dumps({"decision": "approved", "request_id": "id-2"}),
+        )
+        data = json.loads(result)
+        assert "result" in data
+        gate.resolve_pending_voice.assert_awaited_once_with(
+            decision="approved", resolved_by="voice:s2s", request_id="id-2",
+        )
+
+    async def test_approve_pending_ambiguous_asks_which(self):
+        gate = AsyncMock()
+        gate.resolve_pending_voice = AsyncMock(return_value={
+            "status": "ambiguous",
+            "candidates": [
+                {"id": "id-1", "label": "run tests"},
+                {"id": "id-2", "label": "send email"},
+            ],
+        })
+
+        bridge = GenesisBridge(approval_gate=gate)
+        result = await bridge.handle_tool_call(
+            "approve_pending", json.dumps({"decision": "approved"}),
+        )
+        data = json.loads(result)
+        assert "needs_clarification" in data
+        assert {p["request_id"] for p in data["pending"]} == {"id-1", "id-2"}
+
+    async def test_approve_pending_not_found(self):
+        gate = AsyncMock()
+        gate.resolve_pending_voice = AsyncMock(return_value={"status": "not_found"})
+
+        bridge = GenesisBridge(approval_gate=gate)
+        result = await bridge.handle_tool_call(
+            "approve_pending",
+            json.dumps({"decision": "approved", "request_id": "gone"}),
+        )
+        data = json.loads(result)
+        assert "error" in data
+        assert "no longer pending" in data["error"]
 
     async def test_approve_pending_no_pending(self):
         gate = AsyncMock()
-        gate.resolve_most_recent_pending_voice = AsyncMock(return_value=None)
+        gate.resolve_pending_voice = AsyncMock(return_value={"status": "none"})
 
         bridge = GenesisBridge(approval_gate=gate)
         result = await bridge.handle_tool_call(
@@ -207,6 +258,79 @@ class TestGenesisBridge:
         data = json.loads(result)
         assert "error" in data
         assert "Invalid" in data["error"]
+
+    async def test_approve_pending_gate_invalid_decision(self):
+        # Defensive: if the gate reports invalid_decision, surface it clearly
+        # rather than the misleading "No pending approval request found".
+        gate = AsyncMock()
+        gate.resolve_pending_voice = AsyncMock(
+            return_value={"status": "invalid_decision"},
+        )
+        bridge = GenesisBridge(approval_gate=gate)
+        result = await bridge._approve_pending("approved")
+        data = json.loads(result)
+        assert "error" in data
+        assert "Invalid decision" in data["error"]
+
+    async def test_approve_pending_e2e_real_gate(self, tmp_path):
+        """E2E: bridge -> real gate -> real ApprovalManager -> real DB.
+
+        Two pending => "approve" must NOT guess; resolving by id hits exactly
+        one; then a lone pending resolves unambiguously.
+        """
+        from unittest.mock import MagicMock
+
+        import aiosqlite
+
+        from genesis.autonomy.approval import ApprovalManager
+        from genesis.autonomy.approval_gate import AutonomousCliApprovalGate
+        from genesis.db.schema import create_all_tables
+
+        conn = await aiosqlite.connect(str(tmp_path / "e2e.db"))
+        conn.row_factory = aiosqlite.Row
+        await create_all_tables(conn)
+        try:
+            mgr = ApprovalManager(db=conn)
+            rid1 = await mgr.request_approval(
+                action_type="sentinel_dispatch", action_class="reversible",
+                description="investigate the disk alert",
+            )
+            rid2 = await mgr.request_approval(
+                action_type="autonomous_cli_fallback", action_class="reversible",
+                description="run the deploy script",
+            )
+            gate = AutonomousCliApprovalGate(
+                runtime=MagicMock(), approval_manager=mgr,
+            )
+            bridge = GenesisBridge(approval_gate=gate)
+
+            # Two pending -> bare "approve" refuses to guess.
+            amb = json.loads(await bridge.handle_tool_call(
+                "approve_pending", json.dumps({"decision": "approved"}),
+            ))
+            assert "needs_clarification" in amb
+            assert {p["request_id"] for p in amb["pending"]} == {rid1, rid2}
+            assert (await mgr.get_by_id(rid1))["status"] == "pending"
+            assert (await mgr.get_by_id(rid2))["status"] == "pending"
+
+            # Resolve the specific one by id.
+            ok = json.loads(await bridge.handle_tool_call(
+                "approve_pending",
+                json.dumps({"decision": "approved", "request_id": rid2}),
+            ))
+            assert ok["result"] == "Request approved"
+            assert ok["action"] == "run the deploy script"
+            assert (await mgr.get_by_id(rid2))["status"] == "approved"
+            assert (await mgr.get_by_id(rid1))["status"] == "pending"
+
+            # Now only one pending -> unambiguous resolution.
+            ok2 = json.loads(await bridge.handle_tool_call(
+                "approve_pending", json.dumps({"decision": "rejected"}),
+            ))
+            assert ok2["result"] == "Request rejected"
+            assert (await mgr.get_by_id(rid1))["status"] == "rejected"
+        finally:
+            await conn.close()
 
 
 # ─── VoiceConversationHandler tests ─────────────────────────────────────

@@ -159,3 +159,118 @@ async def test_event_emitted_on_request(db):
     mgr = ApprovalManager(db=db, event_bus=event_bus)
     await _create_request(mgr)
     event_bus.emit.assert_called_once()
+
+
+# ------------------------------------------------------------------
+# Voice-gated approval resolution (AutonomousCliApprovalGate)
+# ------------------------------------------------------------------
+
+
+def _voice_gate(mgr):
+    from genesis.autonomy.approval_gate import AutonomousCliApprovalGate
+
+    return AutonomousCliApprovalGate(runtime=MagicMock(), approval_manager=mgr)
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_voice_single(db):
+    mgr = ApprovalManager(db=db)
+    rid = await _create_request(
+        mgr, action_type="sentinel_dispatch", description="investigate the thing",
+    )
+    gate = _voice_gate(mgr)
+    result = await gate.resolve_pending_voice(
+        decision="approved", resolved_by="voice:s2s",
+    )
+    assert result["status"] == "resolved"
+    assert result["request_id"] == rid
+    assert result["label"] == "investigate the thing"
+    assert (await mgr.get_by_id(rid))["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_voice_by_id(db):
+    mgr = ApprovalManager(db=db)
+    rid1 = await _create_request(
+        mgr, action_type="sentinel_dispatch", description="a",
+    )
+    rid2 = await _create_request(
+        mgr, action_type="autonomous_cli_fallback", description="b",
+    )
+    gate = _voice_gate(mgr)
+    result = await gate.resolve_pending_voice(
+        decision="approved", resolved_by="voice:s2s", request_id=rid2,
+    )
+    assert result["status"] == "resolved"
+    assert result["request_id"] == rid2
+    assert (await mgr.get_by_id(rid1))["status"] == "pending"
+    assert (await mgr.get_by_id(rid2))["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_voice_ambiguous_resolves_nothing(db):
+    mgr = ApprovalManager(db=db)
+    rid1 = await _create_request(
+        mgr, action_type="sentinel_dispatch", description="a",
+    )
+    rid2 = await _create_request(
+        mgr, action_type="sentinel_action", description="b",
+    )
+    gate = _voice_gate(mgr)
+    result = await gate.resolve_pending_voice(
+        decision="approved", resolved_by="voice:s2s",
+    )
+    assert result["status"] == "ambiguous"
+    assert {c["id"] for c in result["candidates"]} == {rid1, rid2}
+    # Neither was resolved — refuses to guess.
+    assert (await mgr.get_by_id(rid1))["status"] == "pending"
+    assert (await mgr.get_by_id(rid2))["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_voice_none(db):
+    mgr = ApprovalManager(db=db)
+    gate = _voice_gate(mgr)
+    result = await gate.resolve_pending_voice(
+        decision="approved", resolved_by="voice:s2s",
+    )
+    assert result["status"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_voice_not_found(db):
+    mgr = ApprovalManager(db=db)
+    await _create_request(
+        mgr, action_type="sentinel_dispatch", description="a",
+    )
+    gate = _voice_gate(mgr)
+    result = await gate.resolve_pending_voice(
+        decision="approved", resolved_by="voice:s2s", request_id="does-not-exist",
+    )
+    assert result["status"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_voice_invalid_decision(db):
+    mgr = ApprovalManager(db=db)
+    gate = _voice_gate(mgr)
+    result = await gate.resolve_pending_voice(
+        decision="maybe", resolved_by="voice:s2s",
+    )
+    assert result["status"] == "invalid_decision"
+
+
+@pytest.mark.asyncio
+async def test_pending_voice_actions_excludes_non_voice_types(db):
+    mgr = ApprovalManager(db=db)
+    await _create_request(
+        mgr, action_type="sentinel_dispatch", description="voice one",
+    )
+    await _create_request(
+        mgr, action_type="ego_proposal", description="not voice",
+    )
+    gate = _voice_gate(mgr)
+    actions = await gate.pending_voice_actions()
+    assert len(actions) == 1
+    assert actions[0]["action_type"] == "sentinel_dispatch"
+    assert actions[0]["label"] == "voice one"
