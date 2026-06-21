@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis won't send email on its own without your say-so** — outbound email now passes
+  a deterministic authorization check before it leaves. A reply on a thread you're already
+  in goes out normally, but anything else — a cold first email, a bulk or campaign send, or
+  anything involving money — is held for your approval and sent only once you approve it
+  (rejected or unanswered holds are never sent). Genesis earns the ability to send a given
+  kind of email on its own as you approve them over time, so you stay in the loop by default.
+
 - **See what Genesis did as a timeline** — the dashboard has a new **Traces** tab that
   renders each recorded operation (a reflection, an ego cycle, a dispatched session) as a
   nested waterfall: pick a recent trace and its LLM calls, sub-sessions, and tools lay out as

@@ -636,6 +636,28 @@ TABLES = {
             UNIQUE (domain, verb, risk_class)
         )
     """,
+    # WS-8 email autonomy gate hold store — a held outbound email awaiting
+    # owner approval (gate lives in outreach.pipeline._deliver).  request_id
+    # UNIQUE = the schema-level double-send guard.
+    "pending_email_sends": """
+        CREATE TABLE IF NOT EXISTS pending_email_sends (
+            id                  TEXT PRIMARY KEY,
+            request_id          TEXT NOT NULL UNIQUE,
+            thread_id           TEXT,
+            validated_recipient TEXT NOT NULL,
+            channel             TEXT NOT NULL DEFAULT 'email',
+            category            TEXT NOT NULL,
+            message             TEXT NOT NULL,
+            cell_domain         TEXT NOT NULL,
+            cell_verb           TEXT NOT NULL,
+            cell_risk_class     TEXT NOT NULL,
+            held_at             TEXT NOT NULL,
+            status              TEXT NOT NULL DEFAULT 'held'
+                                    CHECK (status IN ('held', 'sent', 'rejected', 'expired')),
+            sent_at             TEXT,
+            rejected_at         TEXT
+        )
+    """,
     "task_states": """
         CREATE TABLE IF NOT EXISTS task_states (
             task_id          TEXT PRIMARY KEY,
@@ -1565,6 +1587,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_approval_timeout ON approval_requests(timeout_at)",
     # capability grants (WS-8 — per-(domain,verb,risk_class) cells, dark in PR-B)
     "CREATE INDEX IF NOT EXISTS idx_capability_grants_domain ON capability_grants(domain, state)",
+    # WS-8 email gate hold store (drain queries WHERE status='held')
+    "CREATE INDEX IF NOT EXISTS idx_pending_email_sends_status ON pending_email_sends(status)",
     # task states (Phase 9)
     "CREATE INDEX IF NOT EXISTS idx_task_states_session ON task_states(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_task_states_phase ON task_states(current_phase)",

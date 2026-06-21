@@ -199,6 +199,38 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        # WS-8: email autonomy gate resolution watcher — the correctness
+        # guarantee for held email sends. Drains pending_email_sends: approved →
+        # send below the gate + record_success; rejected → record_correction;
+        # orphaned/expired → close out. max_instances=1 ⇒ no in-drain races.
+        from genesis.autonomy.email_gate_watcher import drain_pending_email_sends
+
+        async def _email_gate_drain() -> None:
+            try:
+                if rt.paused:
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping email gate drain", exc_info=True,
+                )
+                return
+            try:
+                n = await drain_pending_email_sends(rt)
+                rt.record_job_success("email_gate_drain")
+                if n:
+                    logger.info("Email gate drain resolved %d held send(s)", n)
+            except Exception as exc:
+                rt.record_job_failure("email_gate_drain", str(exc))
+                raise
+
+        rt._learning_scheduler.add_job(
+            _email_gate_drain,
+            CronTrigger(minute="*/5", timezone=user_timezone()),
+            id="email_gate_drain",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+
         from genesis.db.crud import observations
         from genesis.learning.harvesting.auto_memory import harvest_auto_memory
 
