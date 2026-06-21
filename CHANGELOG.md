@@ -119,6 +119,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Inbox items added soon after an evaluation are no longer silently skipped** — if you added a
+  link or note to an inbox file within the cool-down window just after Genesis had evaluated that
+  file, the new item could be marked as seen without ever being evaluated, and it stayed stranded
+  until you edited the file again. Genesis now defers those additions and picks them up on the
+  next pass once the cool-down clears, so nothing you add gets lost.
+
+- **Re-sharing an article you already added no longer creates a duplicate evaluation** — links
+  often carry per-share tracking parameters (for example, the same LinkedIn post shared from your
+  phone vs. your desktop produces different URLs), which used to make a re-paste look brand new.
+  Genesis now ignores those tracking parameters when deciding what's new, so the same article
+  isn't evaluated twice or spawn a duplicate follow-up.
+
 - **The ego subsystem no longer shows a false "overdue" health status** — the health view marks
   a background subsystem "overdue" if it hasn't checked in within a window, and the ego's check-in
   was tied to its proactive thinking timer. That timer deliberately slows down during quiet
