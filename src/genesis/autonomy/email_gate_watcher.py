@@ -65,6 +65,18 @@ async def drain_pending_email_sends(rt: object) -> int:
 
         status = approval.get("status")
         if status == "approved":
+            if approval.get("consumed_at") is not None:
+                # The approval was already consumed — a prior cycle delivered it
+                # but crashed before marking the hold 'sent'. Reconcile WITHOUT
+                # re-sending: this narrows the at-least-once window to the gap
+                # between adapter.send and mark_consumed.
+                await pes.mark_sent(db, row["id"], sent_at=now)
+                resolved += 1
+                logger.info(
+                    "Reconciled held email %s (approval already consumed) — not re-sent",
+                    row["id"],
+                )
+                continue
             # Deliver FIRST (verbatim, below the gate). Only on success do we
             # mark sent/consumed — a transient failure leaves the row held for
             # the next cycle (the drain owns resume retries).

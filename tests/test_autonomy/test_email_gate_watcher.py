@@ -118,6 +118,20 @@ async def test_pending_approval_left_held(db):
 
 
 @pytest.mark.asyncio
+async def test_already_consumed_approval_is_reconciled_not_resent(db):
+    # Approval delivered + consumed by a prior cycle that crashed before marking
+    # the hold sent → reconcile WITHOUT re-sending (double-send guard).
+    rid = await _approval(db, status="approved")
+    await ac.mark_consumed(db, rid, consumed_at=_TS)
+    await _hold(db, pid="p1", rid=rid)
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == []  # NOT re-sent
+    assert (await pes.get_by_id(db, "p1"))["status"] == "sent"
+
+
+@pytest.mark.asyncio
 async def test_approved_but_delivery_fails_stays_held(db):
     rid = await _approval(db, status="approved")
     await _hold(db, pid="p1", rid=rid)
