@@ -33,15 +33,12 @@ def config():
     )
 
 
-# Quiet window that cannot interfere with test execution regardless of
-# timezone.  The 1-minute window at 23:58-23:59 avoids the 02:00-02:30
-# collision that broke CI (GitHub Actions runs at ~02:18 UTC).
-_NO_QUIET_HOURS = QuietHours(start="23:58", end="23:59")
-
-
 def _cfg_no_quiet(**overrides):
+    # Quiet hours are pinned off for outreach tests by the autouse
+    # _disable_quiet_hours fixture (conftest.py), so the governance quiet-hours
+    # check can't flake on wall-clock time. The window value here is irrelevant.
     defaults = dict(
-        quiet_hours=_NO_QUIET_HOURS,
+        quiet_hours=QuietHours(start="22:00", end="07:00"),
         channel_preferences={"default": "telegram"},
         thresholds={"blocker": 0.0, "alert": 0.3, "surplus": 0.7, "digest": 0.0},
         max_daily=5,
@@ -122,6 +119,28 @@ async def test_surplus_above_threshold_allowed(db):
     )
     result = await gate.check(req)
     assert result.verdict == GovernanceVerdict.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_quiet_hours_denies_non_bypass(db, monkeypatch):
+    """Quiet hours deny a non-bypass category. Verified deterministically by
+    forcing the quiet-hours check on — it reads the wall clock in production,
+    so the test must not depend on the actual time it runs."""
+    monkeypatch.setattr(
+        "genesis.outreach.governance.GovernanceGate._in_quiet_hours",
+        lambda self: True,
+    )
+    gate = GovernanceGate(_cfg_no_quiet(), db)
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="Valuable insight",
+        context="Important finding",
+        salience_score=0.9,
+        signal_type="surplus_insight",
+    )
+    result = await gate.check(req)
+    assert result.verdict == GovernanceVerdict.DENY
+    assert any("quiet" in c for c in result.checks_failed)
 
 
 @pytest.mark.asyncio

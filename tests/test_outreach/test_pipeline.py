@@ -20,7 +20,9 @@ from genesis.outreach.types import (
 @pytest.fixture
 def config():
     return OutreachConfig(
-        quiet_hours=QuietHours(start="23:58", end="23:59"),
+        # Quiet hours are pinned off by the autouse _disable_quiet_hours
+        # fixture (conftest.py) so this can't flake on wall-clock time.
+        quiet_hours=QuietHours(start="22:00", end="07:00"),
         channel_preferences={"default": "telegram"},
         thresholds={"blocker": 0.0, "alert": 0.3, "surplus": 0.7, "digest": 0.0},
         max_daily=5,
