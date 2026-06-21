@@ -446,7 +446,12 @@ class OutreachPipeline:
                     logger.warning("DM copy failed for 'both' routing", exc_info=True)
         except Exception as exc:
             logger.error("Delivery failed on %s: %s", channel, exc, exc_info=True)
-            await self._defer(outreach_id, channel, formatted.text, request, str(exc))
+            if not gate_cleared:
+                # Gate-cleared (resume) sends are retried by the WS-8 email-gate
+                # drain, NOT the deferred-work queue: deferring here would route
+                # the retry back through _deliver and re-gate it. The drain owns
+                # resume retries (it leaves the hold 'held' on failure).
+                await self._defer(outreach_id, channel, formatted.text, request, str(exc))
             return OutreachResult(
                 outreach_id=outreach_id,
                 status=OutreachStatus.FAILED,

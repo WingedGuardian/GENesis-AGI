@@ -469,10 +469,19 @@ class AutonomousCliApprovalGate:
         }
 
     async def approve_all_pending(self, *, resolved_by: str) -> int:
-        """Approve every pending approval request.  Returns count approved."""
+        """Approve every pending approval request.  Returns count approved.
+
+        WS-8 email capability-gate holds are EXCLUDED: each held email is an
+        independent send decision and must be approved individually, never
+        swept by a batch "approve all".
+        """
+        from genesis.autonomy.email_gate import EMAIL_GATE_ACTION_TYPE
+
         pending = await self._approval_manager.get_pending()
         count = 0
         for req in pending:
+            if req.get("action_type") == EMAIL_GATE_ACTION_TYPE:
+                continue
             ok = await self._approval_manager.resolve(
                 req["id"], status="approved", resolved_by=resolved_by,
             )

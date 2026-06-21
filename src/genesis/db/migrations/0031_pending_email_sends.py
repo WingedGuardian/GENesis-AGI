@@ -10,6 +10,9 @@ gate on approval, or expires the hold on rejection/timeout.
 ``request_id`` is UNIQUE — the schema-level double-send guard: even if the
 watcher fires twice, only one row per approval can transition out of 'held'.
 
+The WS-8 deploy-state grant (Option B) is a SEPARATE migration (0032) so this
+one stays self-contained (no dependency on the capability_grants table).
+
 Idempotent (``IF NOT EXISTS``).  Fresh installs get the same DDL via
 ``db/schema/_tables.py``; this migration covers existing installs.
 """

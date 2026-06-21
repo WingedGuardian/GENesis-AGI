@@ -127,3 +127,29 @@ async def test_ungranted_reply_classifies_standard(db):
     assert decision.allow is False
     pend = await pes.get_by_request(db, decision.request_id)
     assert pend["cell_risk_class"] == "standard"
+
+
+@pytest.mark.asyncio
+async def test_approve_all_pending_excludes_email_gate(db):
+    """Batch 'approve all' must never sweep email-gate holds (each is its own
+    send decision)."""
+    from unittest.mock import MagicMock
+
+    from genesis.autonomy.approval_gate import AutonomousCliApprovalGate
+    from genesis.db.crud import approval_requests as ac
+
+    mgr = ApprovalManager(db=db)
+    email_rid = await mgr.request_approval(
+        action_type=EMAIL_GATE_ACTION_TYPE, action_class="costly_reversible",
+        description="email send",
+    )
+    other_rid = await mgr.request_approval(
+        action_type="autonomous_cli_fallback", action_class="reversible",
+        description="cli action",
+    )
+    gate = AutonomousCliApprovalGate(runtime=MagicMock(), approval_manager=mgr)
+
+    n = await gate.approve_all_pending(resolved_by="user")
+    assert n == 1  # only the non-email approval
+    assert (await ac.get_by_id(db, email_rid))["status"] == "pending"  # still held
+    assert (await ac.get_by_id(db, other_rid))["status"] == "approved"
