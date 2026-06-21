@@ -60,6 +60,9 @@ class GateDecision:
     pending_id: str | None = None
     request_id: str | None = None
     reason: str = ""
+    #: (domain, verb, risk_class) of the cell — set on a GRANTED (autonomous)
+    #: allow so the pipeline can log the send to the owner-visible ledger.
+    cell: tuple[str, str, str] | None = None
 
 
 class EmailAutonomyGate:
@@ -117,7 +120,9 @@ class EmailAutonomyGate:
             # which regresses GRANTED→ASK) AND hold THIS send for owner approval.
             trip = await self._scope_guard_trip(request, recipient, domain, verb, risk)
             if trip is None:
-                return GateDecision(allow=True, reason="granted")
+                return GateDecision(
+                    allow=True, reason="granted", cell=(domain, verb, risk),
+                )
             logger.warning(
                 "Email scope guard '%s' tripped on GRANTED cell %s:%s:%s "
                 "(recipient=%s) — demoting + holding",
