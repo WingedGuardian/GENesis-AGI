@@ -163,6 +163,21 @@ class EgoCadenceManager:
             max_instances=1,
             misfire_grace_time=300,
         )
+        # Liveness pulse: emit a heartbeat every 5 min on a fixed, never-
+        # rescheduled cadence so health monitoring tracks "ego subsystem alive"
+        # independent of the proactive _on_tick interval. _on_tick's interval
+        # stretches via adaptive backoff (up to 72h) and is deferred by
+        # reschedule_job on every completed cycle, so a heartbeat tied to it
+        # routinely exceeds the 4h overdue threshold during normal operation
+        # even while the ego is healthy and cycling. Mirrors the fixed-interval
+        # liveness ticks of awareness/surplus/dashboard.
+        self._scheduler.add_job(
+            self._on_heartbeat,
+            IntervalTrigger(minutes=5),
+            id="ego_heartbeat",
+            max_instances=1,
+            misfire_grace_time=60,
+        )
         # Goal staleness scanner: push goal_review signals for stale goals.
         # User ego only — genesis ego has no goal jurisdiction. Skipped at
         # runtime via source_tag check but also gate registration for clarity.
@@ -184,6 +199,10 @@ class EgoCadenceManager:
             logger=logger,
         )
         self._running = True
+        # Initial liveness pulse so a restart doesn't look stale to
+        # subsystem_heartbeats during the first 5-min ego_heartbeat window
+        # (mirrors awareness/surplus emitting a heartbeat at start).
+        self._emit_heartbeat("start")
         morning_str = (
             f", morning={self._config.morning_report_hour:02d}:"
             f"{self._config.morning_report_minute:02d} "
@@ -953,6 +972,18 @@ class EgoCadenceManager:
 
     # -- Observability -----------------------------------------------------
 
+    async def _on_heartbeat(self) -> None:
+        """Fixed-interval liveness pulse (every 5 min), decoupled from the
+        proactive ``_on_tick`` work cadence.
+
+        Registered as the ``ego_heartbeat`` APScheduler job in :meth:`start`.
+        Pure liveness — emits regardless of pause/idle/circuit state so a
+        paused or quiet ego is not mistaken for a dead one. The only thing it
+        proves (and the only thing the heartbeat is for) is that the ego
+        subsystem's scheduler is alive. Best-effort via :meth:`_emit_heartbeat`.
+        """
+        self._emit_heartbeat("alive")
+
     def _emit_heartbeat(self, trigger: str) -> None:
         """Emit a DEBUG heartbeat event for the neural monitor."""
         if self._event_bus is None:
@@ -969,7 +1000,9 @@ class EgoCadenceManager:
                     f"ego_{trigger} (interval={self._current_interval}m, "
                     f"failures={self._consecutive_failures})",
                 ),
-                name="ego_heartbeat",
+                name=f"ego_heartbeat_{trigger}",
             )
         except Exception:
-            pass  # Heartbeat emission is best-effort
+            # Best-effort, but never silent — a dark heartbeat with a live
+            # scheduler is exactly the thing this method exists to prevent.
+            logger.debug("Ego heartbeat emission failed", exc_info=True)

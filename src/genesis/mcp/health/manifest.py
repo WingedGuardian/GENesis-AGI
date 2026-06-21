@@ -64,7 +64,7 @@ async def _impl_subsystem_heartbeats() -> dict:
         "reflection": (600, 14400),
         "outreach": (86400, 172800),
         "dashboard": (120, 240),
-        "ego": (7200, 14400),         # adaptive cadence 30-120min, overdue at 4h
+        "ego": (300, 14400),          # 5-min liveness pulse (ego_heartbeat job), overdue at 4h
     }
 
     result = {}
