@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from genesis.dashboard.routes import (
     activity,
+    autonomy,
     backup,
     budget,
     comms,
@@ -46,6 +47,7 @@ from genesis.dashboard.routes import (
 
 __all__ = [
     "activity",
+    "autonomy",
     "backup",
     "budget",
     "comms",

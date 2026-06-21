@@ -289,3 +289,13 @@ class TestPRDCompetence:
         # Same evidence, heavier past harm ⇒ lower re-earn posterior ⇒ harder
         # to climb back to the 0.70 promotion bar.
         assert cg.cell_posterior(5, 1, 2.0) < cg.cell_posterior(5, 1, 1.0)
+
+    @pytest.mark.asyncio
+    async def test_list_granted_returns_only_granted(self, db):
+        # standard → GRANTED; bulk left at ASK.
+        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(db, domain="email", verb="send", risk_class="bulk",
+                             event=CellEvent.CLASSIFY, updated_at=_TS)
+        granted = await cg.list_granted(db)
+        assert [g["id"] for g in granted] == ["email:send:standard"]

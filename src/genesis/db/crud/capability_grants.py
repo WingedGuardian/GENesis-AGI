@@ -117,6 +117,17 @@ async def list_all(db: aiosqlite.Connection) -> list[dict]:
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def list_granted(db: aiosqlite.Connection) -> list[dict]:
+    """All GRANTED cells — what Genesis is authorized to do autonomously (the
+    'standing autonomy' pane of the owner-visibility Activity tab)."""
+    cursor = await db.execute(
+        "SELECT * FROM capability_grants WHERE state = ? "
+        "ORDER BY domain, verb, risk_class",
+        (CellState.GRANTED.value,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def apply_event(
     db: aiosqlite.Connection,
     *,
