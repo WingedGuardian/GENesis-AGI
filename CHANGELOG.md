@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **See what Genesis did as a timeline** — the dashboard has a new **Traces** tab that
+  renders each recorded operation (a reflection, an ego cycle, a dispatched session) as a
+  nested waterfall: pick a recent trace and its LLM calls, sub-sessions, and tools lay out as
+  bars on a shared timeline, with click-through detail for any span (provider, model, tokens,
+  cost, attributes). It reads the traces Genesis already captures, so you can inspect an
+  operation end to end instead of piecing it together from logs.
+
 - **Genesis spots goals it's stuck on and asks before easing off them** — when a goal you
   set has been worked on (several dispatched sessions) but still isn't moving, Genesis now
   recognizes it as *stuck* rather than merely idle, bumps it up for review, and digs into
