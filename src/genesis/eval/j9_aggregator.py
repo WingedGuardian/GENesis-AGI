@@ -1,4 +1,4 @@
-"""J-9 weekly eval aggregator — computes snapshots for all 5 dimensions.
+"""J-9 weekly eval aggregator — computes snapshots for all dimensions.
 
 Runs on a weekly CronTrigger. Reads eval_events and existing DB tables
 to compute metrics for each dimension, stores results in eval_snapshots.
@@ -9,6 +9,7 @@ Dimensions:
 3. Ego proposal quality (approval rate, confidence calibration)
 4. Cognitive loop value (recall vs no-recall session comparison)
 5. Procedural learning effectiveness (invocation rate, success rate)
+6. Cognitive drift (Phase 7, dark): dissent-rate + proposal-diversity
 """
 
 from __future__ import annotations
@@ -27,8 +28,66 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+async def _compute_cognitive_drift(
+    db: aiosqlite.Connection, period_start: str, period_end: str,
+) -> tuple[dict, int]:
+    """Dark drift metrics over ego_proposals (Phase 7 anti-overfitting baseline).
+
+    - dissent_rate: realist critic engagement = (amend + reject) / proposals with
+      a verdict. A FALLING rate is an overfitting alarm (the ego stops being
+      challenged / only proposes pre-vetted-safe work).
+    - alternative_rate: fraction of proposals that recorded a non-empty alternative.
+    - diversity_entropy: normalized Shannon entropy over action_type (mirrors the
+      j9 ``type_diversity`` convention). Falling = proposals collapsing/formulaic.
+
+    DARK: no cognitive path reads this; it establishes the baseline the future
+    personality-drift gates need. Self-silencing + exploration-floor are deferred
+    (statistically underpowered until more T1 negatives accrue).
+    """
+    import math
+    from collections import Counter
+
+    cursor = await db.execute(
+        """SELECT action_type, alternatives, realist_verdict
+           FROM ego_proposals
+           WHERE created_at >= ? AND created_at < ?""",
+        (period_start, period_end),
+    )
+    rows = [dict(r) for r in await cursor.fetchall()]
+    total = len(rows)
+    if total == 0:
+        return {
+            "dissent_rate": None, "alternative_rate": None,
+            "diversity_entropy": None, "n_proposals": 0,
+        }, 0
+
+    verdicts = [r["realist_verdict"] for r in rows if r["realist_verdict"]]
+    dissent = sum(1 for v in verdicts if v in ("amend", "reject"))
+    dissent_rate = (dissent / len(verdicts)) if verdicts else None
+
+    alt = sum(1 for r in rows if (r["alternatives"] or "").strip())
+
+    counts = Counter(r["action_type"] for r in rows)
+    k = len(counts)
+    if k <= 1:
+        entropy = 0.0
+    else:
+        h = -sum((c / total) * math.log(c / total) for c in counts.values())
+        entropy = h / math.log(k)  # normalize to [0, 1]
+
+    metrics = {
+        "dissent_rate": round(dissent_rate, 4) if dissent_rate is not None else None,
+        "alternative_rate": round(alt / total, 4),
+        "diversity_entropy": round(entropy, 4),
+        "distinct_action_types": k,
+        "n_proposals": total,
+        "n_with_verdict": len(verdicts),
+    }
+    return metrics, total
+
+
 async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
-    """Compute and store weekly snapshots for all 5 eval dimensions.
+    """Compute and store weekly snapshots for all 5 eval dimensions + drift.
 
     Returns dict of {dimension: metrics} for logging/inspection.
     """
@@ -44,6 +103,7 @@ async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
         ("ego", _compute_ego_quality),
         ("cognitive", _compute_cognitive_loop),
         ("procedure", _compute_procedural_effectiveness),
+        ("cognitive_drift", _compute_cognitive_drift),
     ]:
         try:
             metrics, sample_count = await fn(db, period_start, period_end)

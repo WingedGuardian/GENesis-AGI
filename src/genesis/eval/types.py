@@ -20,6 +20,7 @@ class EvalTrigger(StrEnum):
     MANUAL = "manual"
     SURPLUS = "surplus"
     SCHEDULE = "schedule"
+    EXPERIMENT = "experiment"  # cognitive A/B experiment arm (Phase 7)
 
 
 class TaskCategory(StrEnum):

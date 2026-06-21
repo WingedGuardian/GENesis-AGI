@@ -25,6 +25,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   cost, attributes). It reads the traces Genesis already captures, so you can inspect an
   operation end to end instead of piecing it together from logs.
 
+- **Genesis can A/B-test its own thinking before changing it** — a new experimentation
+  harness runs two versions of a cognitive config (for example a reflection prompt, or an
+  awareness signal weight) against a graded golden set, measures which does better with a
+  real significance test, and surfaces a recommendation you act on — it never promotes a
+  change on its own. It guards against gaming its own grader (the rubric must be calibrated,
+  and a "win" has to survive a second, independent judge). Results show up in the new
+  `experiment_status` health tool, and a weekly "cognitive drift" snapshot now tracks whether
+  Genesis is still challenging itself (dissent rate, proposal diversity).
+
 - **Genesis spots goals it's stuck on and asks before easing off them** — when a goal you
   set has been worked on (several dispatched sessions) but still isn't moving, Genesis now
   recognizes it as *stuck* rather than merely idle, bumps it up for review, and digs into
