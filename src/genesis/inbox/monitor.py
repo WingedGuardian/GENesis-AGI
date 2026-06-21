@@ -16,7 +16,13 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.cc.session_config import SessionConfigBuilder
-from genesis.inbox.scanner import compute_hash, detect_changes, read_content, scan_folder
+from genesis.inbox.scanner import (
+    compute_hash,
+    detect_changes,
+    normalize_url_line,
+    read_content,
+    scan_folder,
+)
 from genesis.inbox.types import CheckResult, InboxConfig, InboxItem
 from genesis.security import ContentSanitizer, ContentSource
 from genesis.util.tz import parse_utc_iso
@@ -1504,14 +1510,23 @@ def _compute_new_content(old_content: str, new_content: str) -> str:
     Uses a set of non-empty stripped lines from the old content to identify
     which lines in the new content are genuinely new. Preserves order and
     blank lines between new items.
+
+    Lines are compared after URL tracking-param normalization, so the same
+    article re-pasted with different share/tracking params is not treated as
+    new. The original (un-normalized) line is kept in the output for evaluation.
     """
-    old_lines = {line.strip() for line in old_content.splitlines() if line.strip()}
+    old_lines = {
+        normalize_url_line(line.strip())
+        for line in old_content.splitlines()
+        if line.strip()
+    }
     new_lines = new_content.splitlines()
     result: list[str] = []
     for line in new_lines:
-        if line.strip() and line.strip() not in old_lines:
+        stripped = line.strip()
+        if stripped and normalize_url_line(stripped) not in old_lines:
             result.append(line)
-        elif not line.strip() and result:
+        elif not stripped and result:
             # Keep blank lines between new items for readability
             result.append(line)
     # Strip trailing blank lines

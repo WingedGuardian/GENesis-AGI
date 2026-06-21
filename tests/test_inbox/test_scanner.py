@@ -6,7 +6,55 @@ from pathlib import Path
 
 import pytest
 
-from genesis.inbox.scanner import compute_hash, detect_changes, read_content, scan_folder
+from genesis.inbox.scanner import (
+    compute_hash,
+    detect_changes,
+    normalize_url_line,
+    read_content,
+    scan_folder,
+)
+
+
+class TestNormalizeUrlLine:
+    def test_strips_tracking_params_to_equal(self):
+        a = normalize_url_line(
+            "https://x.com/p?utm_source=android&utm_medium=member&rcm=AAA"
+        )
+        b = normalize_url_line(
+            "https://x.com/p?utm_source=desktop&utm_medium=web&rcm=BBB"
+        )
+        assert a == b == "https://x.com/p"
+
+    def test_keeps_meaningful_params(self):
+        assert (
+            normalize_url_line("https://x.com/p?id=5&utm_source=x")
+            == "https://x.com/p?id=5"
+        )
+
+    def test_leaves_non_url_text(self):
+        assert normalize_url_line("just some text") == "just some text"
+
+    def test_leaves_url_without_query(self):
+        assert normalize_url_line("https://x.com/a/b") == "https://x.com/a/b"
+
+    def test_preserves_trailing_punctuation(self):
+        assert (
+            normalize_url_line("see https://x.com/p?utm_source=x.")
+            == "see https://x.com/p."
+        )
+
+    def test_does_not_strip_path_share_codes(self):
+        # Path-level share codes are intentionally left intact (too risky).
+        assert (
+            normalize_url_line("https://lnkd.in/posts/foo-share-123-1G81/?rcm=A")
+            == "https://lnkd.in/posts/foo-share-123-1G81/"
+        )
+
+    def test_url_mid_line(self):
+        assert (
+            normalize_url_line("read https://x.com/p?fbclid=Z now")
+            == "read https://x.com/p now"
+        )
 
 
 @pytest.fixture
