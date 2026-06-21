@@ -612,6 +612,30 @@ TABLES = {
             chain_hash       TEXT                     -- SHA-256(previous_hash:content_hash)
         )
     """,
+    # Capability-grant matrix (WS-8) — per-(domain, verb, risk_class) cells.
+    # Replaces the linear L1–L7 ladder for ported channel-domains (email
+    # first).  DARK in PR-B: no runtime reader/writer yet; autonomy_state
+    # stays authoritative until PR-C ships enforcement + the L1–L7 read-out.
+    "capability_grants": """
+        CREATE TABLE IF NOT EXISTS capability_grants (
+            id            TEXT PRIMARY KEY,           -- "{domain}:{verb}:{risk_class}"
+            domain        TEXT NOT NULL,              -- channel-domain, e.g. 'email'
+            verb          TEXT NOT NULL,              -- e.g. 'send'
+            risk_class    TEXT NOT NULL DEFAULT 'standard' CHECK (risk_class IN (
+                'standard', 'identity', 'bulk', 'financial'
+            )),
+            state         TEXT NOT NULL DEFAULT 'not_determined' CHECK (state IN (
+                'not_determined', 'ask', 'granted', 'denied_permanent'
+            )),
+            successes     INTEGER NOT NULL DEFAULT 0,
+            corrections   INTEGER NOT NULL DEFAULT 0,
+            granted_at    TEXT,                       -- when cell most recently entered 'granted' (decay-clock origin)
+            last_used_at  TEXT,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (domain, verb, risk_class)
+        )
+    """,
     "task_states": """
         CREATE TABLE IF NOT EXISTS task_states (
             task_id          TEXT PRIMARY KEY,
@@ -1539,6 +1563,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_approval_status ON approval_requests(status)",
     "CREATE INDEX IF NOT EXISTS idx_approval_class ON approval_requests(action_class)",
     "CREATE INDEX IF NOT EXISTS idx_approval_timeout ON approval_requests(timeout_at)",
+    # capability grants (WS-8 — per-(domain,verb,risk_class) cells, dark in PR-B)
+    "CREATE INDEX IF NOT EXISTS idx_capability_grants_domain ON capability_grants(domain, state)",
     # task states (Phase 9)
     "CREATE INDEX IF NOT EXISTS idx_task_states_session ON task_states(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_task_states_phase ON task_states(current_phase)",
