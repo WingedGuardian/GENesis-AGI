@@ -55,6 +55,7 @@ EXPECTED_TABLES = [
     "centrality_cache",
     "campaigns",
     "campaign_runs",
+    "capability_grants",  # WS-8 PR-B: per-(domain,verb,risk_class) cells
 ]
 
 
@@ -214,6 +215,22 @@ async def test_autonomy_state_rejects_level_out_of_range(db):
         await db.execute(
             "INSERT INTO autonomy_state (id, category, current_level, earned_level, updated_at) "
             "VALUES ('test', 'test', 8, 1, '2026-01-01T00:00:00')"
+        )
+
+
+async def test_capability_grants_rejects_invalid_state(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO capability_grants (id, domain, verb, risk_class, state) "
+            "VALUES ('email:send:standard', 'email', 'send', 'standard', 'INVALID')"
+        )
+
+
+async def test_capability_grants_rejects_invalid_risk_class(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO capability_grants (id, domain, verb, risk_class) "
+            "VALUES ('email:send:nope', 'email', 'send', 'INVALID')"
         )
 
 

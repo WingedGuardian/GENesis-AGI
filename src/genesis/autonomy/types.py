@@ -177,6 +177,67 @@ CONTEXT_CEILING_MAP: dict[ContextCeiling, int] = {
 
 
 # ---------------------------------------------------------------------------
+# Capability-grant matrix (WS-8) — per-(domain, verb, risk_class) cells
+# ---------------------------------------------------------------------------
+# A capability cell is the standing authorization state for one
+# (channel-domain, verb, risk-class) tuple — e.g. ("email", "send",
+# "standard").  Autonomy is earned per channel-domain and replaces the linear
+# L1–L7 ladder for ported domains (email first).  PR-B lays this substrate
+# DARK: nothing enforces or mutates cells at runtime yet (enforcement = PR-C
+# at the outreach_send chokepoint), and ``autonomy_state`` remains
+# authoritative for every existing reader until then.
+
+class CellState(StrEnum):
+    """Lifecycle of a single capability cell.
+
+    Four PERSISTED states.  ``GRANTED_EPHEMERAL`` (approve-one-action-without-
+    promoting) is intentionally NOT a cell state — it is a one-time approved
+    row in ``approval_requests`` consumed by the per-action gate (PR-C).
+    """
+
+    NOT_DETERMINED = "not_determined"       # never exercised; no decision yet
+    ASK = "ask"                             # requires per-action user approval
+    GRANTED = "granted"                     # standing authorization (still per-action gated)
+    DENIED_PERMANENT = "denied_permanent"   # user-blocked; terminal, user-only escape
+
+
+class RiskClass(StrEnum):
+    """Risk axis of a capability cell, shared across domains.
+
+    For email: a known-thread reply is STANDARD; cold outreach to a new party
+    crosses the IDENTITY bar; a campaign/bulk send is BULK; anything monetary
+    is FINANCIAL (hardline — never trust-unlockable).
+    """
+
+    STANDARD = "standard"
+    IDENTITY = "identity"
+    BULK = "bulk"
+    FINANCIAL = "financial"
+
+
+# Severity ordering for risk classes (higher = more consequential).  Lets call
+# sites reason about the within-domain risk gradient (reply < cold < bulk)
+# without hard-coding comparisons.
+RISK_SEVERITY: dict[RiskClass, int] = {
+    RiskClass.STANDARD: 0,
+    RiskClass.IDENTITY: 1,
+    RiskClass.BULK: 2,
+    RiskClass.FINANCIAL: 3,
+}
+
+
+class CellEvent(StrEnum):
+    """Events that drive capability-cell state transitions."""
+
+    CLASSIFY = "classify"               # first action needing this cell appears
+    APPROVE = "approve"                 # user promotes the cell (ask → granted)
+    DENY_PERMANENT = "deny_permanent"   # user blocks the cell permanently
+    REGRESS = "regress"                 # competence dropped below the grant floor
+    DECAY = "decay"                     # staleness — unused grant lapses (sweep = PR-D)
+    REVOKE = "revoke"                   # user explicitly revokes a standing grant
+
+
+# ---------------------------------------------------------------------------
 # Watchdog types
 # ---------------------------------------------------------------------------
 

@@ -15,13 +15,19 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from genesis.autonomy.rules import RuleContext, RuleEngine
-from genesis.autonomy.types import ActionClass, ActionDomain, ApprovalDecision
+from genesis.autonomy.types import (
+    ActionClass,
+    ActionDomain,
+    ApprovalDecision,
+    RiskClass,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -320,3 +326,77 @@ def classify_domain(action_type: str, execution_plan: str = "") -> ActionDomain:
             return ActionDomain.SELF_MODIFY
 
     return ActionDomain.EXTERNAL_READ
+
+
+# ---------------------------------------------------------------------------
+# Email action classification (WS-8 capability matrix)
+# ---------------------------------------------------------------------------
+# Maps an outbound email action to its capability-cell key
+# (domain="email", verb="send", risk_class) plus the irreversibility class.
+# Like classify_domain, this is derived EXTERNALLY — the acting model never
+# sees or reasons about the cell taxonomy (Tenet 0 opacity).  DARK in PR-B:
+# the gate that calls this lives at the outreach_send chokepoint (PR-C), where
+# thread/recipient context is in scope.
+
+EMAIL_DOMAIN = "email"
+EMAIL_VERB = "send"
+
+_FINANCIAL_EMAIL_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\b(?:wire\s+transfer|invoice|payment|remit|deposit|ach|iban|"
+        r"routing\s+number|bank\s+details)\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+@dataclass(frozen=True)
+class EmailActionClassification:
+    """Classification of one outbound email action for the capability gate."""
+
+    domain: str                 # channel-domain for the cell key (always "email" here)
+    verb: str                   # cell verb (always "send" here)
+    risk_class: RiskClass       # cell risk axis
+    sub_class: str              # human label: reply | cold | bulk | financial
+    identity_bar: bool          # True = acts in the user's name (REPRESENT_USER)
+    action_class: ActionClass   # reversibility (reused keyword classifier)
+
+    @property
+    def cell_key(self) -> tuple[str, str, str]:
+        """The (domain, verb, risk_class) tuple used to look up the cell."""
+        return (self.domain, self.verb, str(self.risk_class))
+
+
+def classify_email_action(
+    *,
+    is_reply: bool = False,
+    recipient_known: bool = False,
+    is_bulk: bool = False,
+    subject: str = "",
+    body: str = "",
+) -> EmailActionClassification:
+    """Derive the capability-cell key for an outbound email.
+
+    Risk gradient (low → high): a known-thread reply (STANDARD) < cold
+    outreach to a new party, which crosses the identity bar (IDENTITY) <
+    a bulk/campaign send (BULK).  Any monetary email is FINANCIAL (hardline).
+    Inputs are supplied by the caller at the send chokepoint (PR-C).
+    """
+    text = f"{subject}\n{body}"
+    if any(p.search(text) for p in _FINANCIAL_EMAIL_PATTERNS):
+        risk, sub = RiskClass.FINANCIAL, "financial"
+    elif is_bulk:
+        risk, sub = RiskClass.BULK, "bulk"
+    elif is_reply and recipient_known:
+        risk, sub = RiskClass.STANDARD, "reply"
+    else:
+        risk, sub = RiskClass.IDENTITY, "cold"
+
+    return EmailActionClassification(
+        domain=EMAIL_DOMAIN,
+        verb=EMAIL_VERB,
+        risk_class=risk,
+        sub_class=sub,
+        identity_bar=True,  # email always represents the user (REPRESENT_USER)
+        action_class=classify_action(text),
+    )
