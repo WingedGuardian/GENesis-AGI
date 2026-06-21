@@ -273,6 +273,37 @@ class TestRouteCalibration:
         assert len(rows) == 1
         assert dict(rows[0])["priority"] == "medium"
 
+    @pytest.mark.asyncio
+    async def test_clean_cycle_clears_standing_drift(self, db, router):
+        """A clean (non-drift) calibration resolves a prior standing
+        quality_drift — resolve-on-recovery, so it stops surfacing."""
+        await router.route_calibration(
+            QualityCalibrationOutput(drift_detected=True, observations=["drift 1"]), db,
+        )
+        await router.route_calibration(
+            QualityCalibrationOutput(drift_detected=False), db,
+        )
+        unresolved = (await (await db.execute(
+            "SELECT count(*) FROM observations "
+            "WHERE type='quality_drift' AND resolved=0"
+        )).fetchone())[0]
+        assert unresolved == 0
+
+    @pytest.mark.asyncio
+    async def test_fresh_drift_supersedes_prior(self, db, router):
+        """Two consecutive drift cycles leave only the latest drift unresolved."""
+        await router.route_calibration(
+            QualityCalibrationOutput(drift_detected=True, observations=["drift 1"]), db,
+        )
+        await router.route_calibration(
+            QualityCalibrationOutput(drift_detected=True, observations=["drift 2"]), db,
+        )
+        unresolved = (await (await db.execute(
+            "SELECT count(*) FROM observations "
+            "WHERE type='quality_drift' AND resolved=0"
+        )).fetchone())[0]
+        assert unresolved == 1
+
 
 # ── Reflection summary embedding tests ────────────────────────────────
 

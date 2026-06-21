@@ -76,6 +76,17 @@ note it at most as "earlier <condition>, now recovered", or omit it. Do NOT
 repeat the stale alarm as if it were current. When in doubt, trust the live
 System Health numbers over an older observation's text.
 
+**Observation age tiers.** Every observation in "What I Noticed" is tagged with
+its age; treat age as a strong prior on relevance:
+- Under 24h: current — surface normally.
+- 1-3 days old: surface only if still actionable; lead with the age.
+- Over 3 days old (shown demoted and tagged "[aged]"): a historical signal, not
+  a current condition. Do NOT present it as a fresh alarm — mention it at most
+  as "earlier <condition>", or omit it if a newer signal supersedes it.
+This applies to ALL observation types, including cognitive-quality and learning
+signals: a days-old "quality drift" or "learning regression" note is not, by
+itself, evidence of a current problem.
+
 ## What to Include
 
 **Primary focus (this is what the report is FOR):**

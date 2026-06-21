@@ -122,6 +122,39 @@ async def test_format_health_cost_line_grounded(db, mock_health, mock_drafter):
 
 
 @pytest.mark.asyncio
+async def test_observation_insights_demotes_aged(db, mock_health, mock_drafter):
+    """A >3d-old observation is shown demoted and tagged [aged] so a stale write
+    doesn't surface as a fresh critical alarm; a recent one is left as-is."""
+    from datetime import UTC, datetime, timedelta
+
+    fresh = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    old = (datetime.now(UTC) - timedelta(days=6)).isoformat()
+    await db.execute(
+        "INSERT INTO observations (id, source, type, content, priority, created_at) "
+        "VALUES ('fresh', 'test', 'quality_drift', 'fresh critical thing', 'critical', ?)",
+        (fresh,),
+    )
+    await db.execute(
+        "INSERT INTO observations (id, source, type, content, priority, created_at) "
+        "VALUES ('old', 'test', 'quality_drift', 'old critical thing', 'critical', ?)",
+        (old,),
+    )
+    await db.commit()
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    out = await gen._get_observation_insights()
+    assert out is not None
+    aged_line = next(line for line in out.splitlines() if "old critical thing" in line)
+    fresh_line = next(line for line in out.splitlines() if "fresh critical thing" in line)
+    # 6-day-old critical: demoted to high and tagged.
+    assert "[aged]" in aged_line
+    assert "**high**" in aged_line
+    # 2-hour-old critical: unchanged.
+    assert "[aged]" not in fresh_line
+    assert "**critical**" in fresh_line
+
+
+@pytest.mark.asyncio
 async def test_format_health_cost_line_without_budget(db, mock_health, mock_drafter):
     """When no budget cap is configured, fall back to a bare MTD spend line."""
     gen = MorningReportGenerator(mock_health, db, mock_drafter)

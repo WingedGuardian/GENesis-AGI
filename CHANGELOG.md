@@ -119,6 +119,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Stale "quality drift" and "learning regression" alarms no longer linger or cry wolf** — when
+  Genesis's weekly self-checks flagged a quality drift or a learning regression, that flag stayed
+  active until it expired days later, so the morning report kept repeating a days-old warning as if
+  it were current. Now each weekly check supersedes the previous flag and clears it outright once the
+  underlying metric recovers, the regression alarm only fires on a meaningful sustained drop (not a
+  small wobble in a noisy self-score), and any observation older than three days is shown in the
+  report demoted and tagged as historical rather than as a fresh alarm.
+
 - **Genesis stops false-alarming about its own reflection quality declining** — its weekly
   self-assessment scored "reflection quality" from how often its recent reflections had been
   retrieved, but counted a running total over the 50 newest reflections. Because brand-new

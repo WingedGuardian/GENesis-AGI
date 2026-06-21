@@ -48,6 +48,14 @@ def _age_seconds(iso_ts: str) -> float:
         return 0
 
 
+# Observations older than this in "What I Noticed" are historical signals, not
+# current conditions: their DISPLAYED severity is demoted one level and tagged
+# so a days-old write (e.g. a stale quality_drift) doesn't read as a fresh
+# critical alarm. Stored priority is never changed.
+_STALE_OBS_SECONDS = 3 * 86400
+_STALE_PRIORITY_DEMOTION = {"critical": "high", "high": "medium", "medium": "medium"}
+
+
 class MorningReportGenerator:
     """Synthesizes system state into a daily morning report."""
 
@@ -564,10 +572,19 @@ class MorningReportGenerator:
         lines = []
         for obs in observations:
             prio = obs["priority"]
+            # Stale grounding: a >3d-old observation is a historical signal, not
+            # a current condition — demote its displayed severity one level and
+            # tag it so it doesn't surface as a fresh alarm (stored priority
+            # unchanged).
+            if _age_seconds(obs.get("created_at", "")) > _STALE_OBS_SECONDS:
+                prio = _STALE_PRIORITY_DEMOTION.get(prio, prio)
+                aged = " [aged]"
+            else:
+                aged = ""
             badge = {"critical": "🔴", "high": "🟠", "medium": "🟡"}.get(prio, "")
             content = obs["content"][:200].replace("\n", " ")
             age = _relative_age(obs.get("created_at", ""))
-            lines.append(f"- {badge} **{prio}** ({age}): {content}")
+            lines.append(f"- {badge} **{prio}**{aged} ({age}): {content}")
 
         # Defer surfacing until delivery is confirmed via confirm_delivery().
         # If delivery fails, these observations re-appear in the next report.
