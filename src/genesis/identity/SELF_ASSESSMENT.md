@@ -8,10 +8,17 @@ Do NOT confabulate metrics.
 ## Dimensions
 
 ### 1. Reflection Quality
-How useful are Genesis's reflections? Measured by:
-- How often observations are retrieved (retrieved_count > 0)
-- How often observations influence actions (influenced_action > 0)
-- Ratio of high-priority vs low-priority observations
+How useful are Genesis's recent reflections? Measured over a fixed *maturity
+cohort* — deep-reflection observations created 3-10 days ago (old enough to
+have had a fair chance to be retrieved, recent enough to reflect current
+quality):
+- Retrieval rate: how many of the cohort were retrieved (`retrieved_count` of
+  `cohort_size`)
+- Influence rate: how many were retrieved AND went on to influence an action
+- If `reflection_quality.data_available` is false (the cohort is too small —
+  this is common, because deep-reflection volume is low), set this dimension's
+  `data_available` to false and do NOT assign a score. Never infer a quality
+  decline from a small or empty cohort.
 
 ### 2. Procedure Effectiveness
 How well do learned procedures work? Measured by:
