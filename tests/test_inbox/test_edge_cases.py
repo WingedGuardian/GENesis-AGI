@@ -647,6 +647,34 @@ def test_compute_new_content_blank_lines_preserved():
     assert "new item 2" in delta
 
 
+def test_compute_new_content_dedups_tracking_param_variants():
+    """The same URL re-pasted with different tracking params is not 'new'."""
+    from genesis.inbox.monitor import _compute_new_content
+
+    old = "https://example.com/post?utm_source=android&utm_medium=member&rcm=AAA"
+    new = "https://example.com/post?utm_source=desktop&utm_medium=web&rcm=BBB"
+    assert _compute_new_content(old, new).strip() == ""
+
+
+def test_compute_new_content_keeps_genuinely_distinct_urls():
+    """Different articles must still register as new even with tracking params."""
+    from genesis.inbox.monitor import _compute_new_content
+
+    old = "https://example.com/post-a?utm_source=x"
+    new = "https://example.com/post-b?utm_source=y"
+    assert "post-b" in _compute_new_content(old, new)
+
+
+def test_compute_new_content_preserves_original_url_line():
+    """The delta keeps the original (un-normalized) line for evaluation."""
+    from genesis.inbox.monitor import _compute_new_content
+
+    old = "seed"
+    new = "seed\nhttps://example.com/post?id=5&utm_source=x"
+    delta = _compute_new_content(old, new)
+    assert "https://example.com/post?id=5&utm_source=x" in delta
+
+
 @pytest.mark.asyncio
 async def test_modified_file_only_sends_delta(
     monitor, inbox_dir, mock_invoker, db,

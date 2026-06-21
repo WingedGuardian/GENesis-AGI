@@ -371,6 +371,86 @@ async def test_cooldown_skips_recently_evaluated(
     assert result3.batches_dispatched == 1
 
 
+@pytest.mark.asyncio
+async def test_cooldown_defers_without_dropping_modification(
+    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+):
+    """A modification made within cooldown must still be evaluated once the
+    cooldown elapses, even if the file is never edited again.
+
+    Regression (cooldown-consume): the cooldown branch used to write a
+    'completed' row carrying the new content hash with no evaluation, which
+    advanced the known hash so the change was never re-detected — stranding
+    the new content until the next edit.
+    """
+    clock = _FakeClock()
+    config = InboxConfig(
+        watch_path=inbox_dir, batch_size=5, evaluation_cooldown_seconds=3600,
+    )
+    writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
+    mon = InboxMonitor(
+        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
+        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+    )
+    f = inbox_dir / "doc.md"
+
+    f.write_text("alpha")
+    assert (await mon.check_once()).batches_dispatched == 1
+
+    # Edit within cooldown -> deferred, not dispatched.
+    clock.now = clock.now + timedelta(minutes=10)
+    f.write_text("alpha\nbeta")
+    r2 = await mon.check_once()
+    assert r2.items_modified == 1
+    assert r2.batches_dispatched == 0
+
+    mock_invoker.run.reset_mock()
+
+    # Cooldown elapses; the file is NOT touched again. The deferred change
+    # must now be picked up and evaluated (not stranded with the hash advanced).
+    clock.now = clock.now + timedelta(hours=2)
+    r3 = await mon.check_once()
+    assert r3.batches_dispatched == 1, (
+        "modification deferred during cooldown was never evaluated"
+    )
+    mock_invoker.run.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_e2e_url_repaste_different_tracking_not_reevaluated(
+    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+):
+    """End-to-end via check_once: the same article re-pasted with different
+    share/tracking params is detected as a file change but produces no new
+    content, so it is not re-evaluated (no duplicate dispatch)."""
+    clock = _FakeClock()
+    # cooldown=0 isolates the URL-dedup path from the cooldown defer.
+    config = InboxConfig(
+        watch_path=inbox_dir, batch_size=5, evaluation_cooldown_seconds=0,
+    )
+    writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
+    mon = InboxMonitor(
+        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
+        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+    )
+    f = inbox_dir / "Genesis.md"
+    base = "https://www.linkedin.com/posts/foo-share-123-1G81/"
+
+    # First paste (android share) -> evaluated.
+    f.write_text(base + "?utm_source=share&utm_medium=member_android&rcm=AAA")
+    assert (await mon.check_once()).batches_dispatched == 1
+
+    mock_invoker.run.reset_mock()
+
+    # Re-paste of the SAME post from desktop (different tracking params).
+    clock.now = clock.now + timedelta(minutes=1)
+    f.write_text(base + "?utm_source=share&utm_medium=member_desktop&rcm=BBB")
+    r2 = await mon.check_once()
+    assert r2.items_modified == 1  # hash changed -> detected as modified
+    assert r2.batches_dispatched == 0  # ...but no NEW content -> no re-eval
+    mock_invoker.run.assert_not_called()
+
+
 # --- URL extraction tests ---
 
 

@@ -3,9 +3,65 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 RESPONSE_SUFFIX = ".genesis.md"
+
+# URL deduplication: strip volatile tracking/share params so the same article
+# re-pasted with different params (e.g. a LinkedIn share from android vs
+# desktop) compares equal. Query params only — URL *paths* are left intact
+# (path-level share codes are too risky to strip).
+# Exclude <> (and rely on the trailing-punct stripper for )]} etc.) so a
+# markdown-style <https://...> URL is matched cleanly, mirroring the URL
+# extraction regex in monitor.py.
+_URL_IN_LINE_RE = re.compile(r"https?://[^\s<>]+")
+_TRACKING_PARAM_PREFIXES = ("utm_", "mc_")
+_TRACKING_PARAM_EXACT = frozenset({
+    "rcm", "fbclid", "gclid", "igshid", "mkt_tok",
+    "_hsenc", "_hsmi", "vero_id", "yclid", "msclkid", "trk", "trkemail",
+})
+_URL_TRAILING_PUNCT = ".,;:!?)]}'\""
+
+
+def _strip_tracking_params(url: str) -> str:
+    """Remove tracking query params from a single URL; leave path/fragment intact."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if not parts.query:
+        return url
+    kept = [
+        (k, v)
+        for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if not (
+            k.lower().startswith(_TRACKING_PARAM_PREFIXES)
+            or k.lower() in _TRACKING_PARAM_EXACT
+        )
+    ]
+    return urlunsplit((
+        parts.scheme, parts.netloc, parts.path, urlencode(kept), parts.fragment,
+    ))
+
+
+def normalize_url_line(line: str) -> str:
+    """Return *line* with tracking query params stripped from any URL it contains.
+
+    Used only for dedup comparison — the original line is preserved for
+    evaluation. Non-URL text is returned unchanged; trailing sentence
+    punctuation after a URL is preserved.
+    """
+    def _repl(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        trail = ""
+        while raw and raw[-1] in _URL_TRAILING_PUNCT:
+            trail = raw[-1] + trail
+            raw = raw[:-1]
+        return _strip_tracking_params(raw) + trail
+
+    return _URL_IN_LINE_RE.sub(_repl, line)
 
 
 def scan_folder(
