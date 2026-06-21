@@ -1,11 +1,12 @@
 """Tests for genesis.util.tz — timezone display helpers."""
 
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
 
 import genesis.util.tz as tz_module
-from genesis.util.tz import fmt, fmt_short
+from genesis.util.tz import fmt, fmt_short, parse_utc_iso
 
 
 @pytest.fixture()
@@ -50,3 +51,30 @@ class TestFmtShort:
     def test_short_format(self, eastern_tz):
         result = fmt_short("2026-01-15T17:00:00+00:00")
         assert result == "12:00 EST"
+
+
+class TestParseUtcIso:
+    def test_aware_string_preserved(self):
+        dt = parse_utc_iso("2026-06-20T17:00:00+00:00")
+        assert dt == datetime(2026, 6, 20, 17, 0, tzinfo=UTC)
+        assert dt.tzinfo is not None
+
+    def test_naive_string_assumed_utc(self):
+        dt = parse_utc_iso("2026-06-20T17:00:00")
+        assert dt == datetime(2026, 6, 20, 17, 0, tzinfo=UTC)
+        assert dt.tzinfo is UTC
+
+    def test_naive_result_is_aware_and_subtractable(self):
+        # The core bug this guards against: naive value subtracted from aware now.
+        dt = parse_utc_iso("2026-06-20T17:00:00")
+        delta = datetime.now(UTC) - dt  # must not raise
+        assert delta.total_seconds() >= 0
+
+    def test_none_returns_none(self):
+        assert parse_utc_iso(None) is None
+
+    def test_empty_returns_none(self):
+        assert parse_utc_iso("") is None
+
+    def test_invalid_returns_none(self):
+        assert parse_utc_iso("not-a-timestamp") is None
