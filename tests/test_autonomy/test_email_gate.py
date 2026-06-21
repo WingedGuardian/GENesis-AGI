@@ -9,12 +9,19 @@ from email_thread_messages.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import aiosqlite
 import pytest
 
 from genesis.autonomy.approval import ApprovalManager
-from genesis.autonomy.email_gate import EMAIL_GATE_ACTION_TYPE, EmailAutonomyGate
+from genesis.autonomy.email_gate import (
+    _RATE_LIMIT_MAX,
+    EMAIL_GATE_ACTION_TYPE,
+    EmailAutonomyGate,
+)
 from genesis.autonomy.types import CellEvent
+from genesis.db.crud import autonomous_email_sends as aes
 from genesis.db.crud import capability_grants as cg
 from genesis.db.crud import pending_email_sends as pes
 from genesis.db.schema import create_all_tables
@@ -57,6 +64,23 @@ async def _add_inbound(db, thread_id):
     await db.commit()
 
 
+async def _add_inbound_from(db, thread_id, sender):
+    """Inbound message with a KNOWN sender (for the recipient-match guard)."""
+    await db.execute(
+        "INSERT INTO email_thread_messages "
+        "(thread_id, message_id, direction, sender, received_at) "
+        "VALUES (?, ?, 'received', ?, ?)",
+        (thread_id, f"m-{thread_id}-{sender}", sender, _TS),
+    )
+    await db.commit()
+
+
+async def _grant_standard(db):
+    for event in (CellEvent.CLASSIFY, CellEvent.APPROVE):
+        await cg.apply_event(db, domain="email", verb="send", risk_class="standard",
+                             event=event, updated_at=_TS)
+
+
 # --------------------------------------------------------------------------- #
 
 
@@ -83,12 +107,13 @@ async def test_cold_ungranted_email_is_held(db):
 
 @pytest.mark.asyncio
 async def test_granted_known_thread_reply_is_allowed(db):
-    # pre-grant the standard (known-thread reply) cell — the Option-B seed.
+    # pre-grant the standard (known-thread reply) cell, with the recipient as a
+    # recorded thread participant so the g1 recipient-match guard passes.
     await cg.apply_event(db, domain="email", verb="send", risk_class="standard",
                          event=CellEvent.CLASSIFY, updated_at=_TS)
     await cg.apply_event(db, domain="email", verb="send", risk_class="standard",
                          event=CellEvent.APPROVE, updated_at=_TS)
-    await _add_inbound(db, "t1")
+    await _add_inbound_from(db, "t1", "alice@example.com")
 
     gate = _gate(db)
     req = _req(validated_recipient="alice@example.com", thread_id="t1")
@@ -153,3 +178,63 @@ async def test_approve_all_pending_excludes_email_gate(db):
     assert n == 1  # only the non-email approval
     assert (await ac.get_by_id(db, email_rid))["status"] == "pending"  # still held
     assert (await ac.get_by_id(db, other_rid))["status"] == "approved"
+
+
+# --------------------------------------------------------------------------- #
+# WS-8 PR-D — deterministic pre-send scope guards on a GRANTED cell
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_granted_reply_recipient_mismatch_demotes_and_holds(db):
+    # g1: the granted standard cell's recipient is NOT a participant of the thread
+    # → scope drift → hold THIS send + demote the cell GRANTED→ASK.
+    await _grant_standard(db)
+    await _add_inbound_from(db, "t1", "alice@example.com")  # known correspondent
+    gate = _gate(db)
+    req = _req(validated_recipient="mallory@evil.com", thread_id="t1")
+    decision = await gate.check(
+        request=req, recipient="mallory@evil.com", message_text="re",
+    )
+    assert decision.allow is False  # held
+    cell = await cg.get_cell(db, "email", "send", "standard")
+    assert cell["state"] == "ask"  # demoted
+    assert cell["corrections"] == 1
+
+
+@pytest.mark.asyncio
+async def test_granted_reply_unknown_sender_trips_guard(db):
+    # A thread whose only inbound has no recorded sender is genuinely-ambiguous
+    # scope — g1 trips (hold + demote) rather than waving any recipient through.
+    # The real reply path always records a sender (reply_poller/record_reply), so
+    # this only affects anomalous/unparsed rows; the SAFE failure is to hold.
+    await _grant_standard(db)
+    await _add_inbound(db, "t1")  # NULL sender (anomalous)
+    gate = _gate(db)
+    req = _req(validated_recipient="anyone@example.com", thread_id="t1")
+    decision = await gate.check(
+        request=req, recipient="anyone@example.com", message_text="re",
+    )
+    assert decision.allow is False  # held — ambiguous scope is not waved through
+    assert (await cg.get_cell(db, "email", "send", "standard"))["state"] == "ask"
+
+
+@pytest.mark.asyncio
+async def test_granted_rate_limit_burst_demotes_and_holds(db):
+    # g3 (primary): a burst of autonomous sends for one cell within the window =
+    # a runaway loop → hold + demote.  g1 passes (recipient matches the thread).
+    await _grant_standard(db)
+    await _add_inbound_from(db, "t1", "alice@example.com")
+    now = datetime.now(UTC).isoformat()
+    for i in range(_RATE_LIMIT_MAX):
+        await aes.create(
+            db, id=f"a{i}", recipient="alice@example.com", sent_at=now,
+            cell_domain="email", cell_verb="send", cell_risk_class="standard",
+        )
+    gate = _gate(db)
+    req = _req(validated_recipient="alice@example.com", thread_id="t1")
+    decision = await gate.check(
+        request=req, recipient="alice@example.com", message_text="re",
+    )
+    assert decision.allow is False  # rate-limit tripped
+    assert (await cg.get_cell(db, "email", "send", "standard"))["state"] == "ask"

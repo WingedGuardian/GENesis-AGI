@@ -629,8 +629,10 @@ TABLES = {
             )),
             successes     INTEGER NOT NULL DEFAULT 0,
             corrections   INTEGER NOT NULL DEFAULT 0,
+            weighted_corrections REAL NOT NULL DEFAULT 0.0,  -- WS-8 PR-D: Σ consequence-weighted corrections (governs re-earn difficulty)
             granted_at    TEXT,                       -- when cell most recently entered 'granted' (decay-clock origin)
             last_used_at  TEXT,
+            last_decayed_at TEXT,                     -- WS-8 PR-D: most recent staleness-decay sweep that touched this cell
             created_at    TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE (domain, verb, risk_class)
@@ -656,6 +658,27 @@ TABLES = {
                                     CHECK (status IN ('held', 'sent', 'rejected', 'expired')),
             sent_at             TEXT,
             rejected_at         TEXT
+        )
+    """,
+    # WS-8 PR-D autonomous-send ledger — one row per email sent autonomously
+    # under a GRANTED capability cell (i.e. the gate allowed it without holding
+    # for owner approval).  This is the keystone the owner-visibility "Activity"
+    # tab, the flag-as-bad correction, and the per-cell rate-limit guard all read
+    # (outreach_history carries no recipient/thread/cell column).  Approved (held
+    # then owner-approved) sends are NOT logged here — only autonomous ones.
+    "autonomous_email_sends": """
+        CREATE TABLE IF NOT EXISTS autonomous_email_sends (
+            id                  TEXT PRIMARY KEY,
+            outreach_id         TEXT,                   -- link to outreach_history.id
+            thread_id           TEXT,
+            recipient           TEXT NOT NULL,
+            subject             TEXT,
+            cell_domain         TEXT NOT NULL,
+            cell_verb           TEXT NOT NULL,
+            cell_risk_class     TEXT NOT NULL,
+            sent_at             TEXT NOT NULL,
+            flagged_at          TEXT,                   -- owner flagged this send as bad → correction recorded on the cell
+            created_at          TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """,
     "task_states": """
@@ -1589,6 +1612,10 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_capability_grants_domain ON capability_grants(domain, state)",
     # WS-8 email gate hold store (drain queries WHERE status='held')
     "CREATE INDEX IF NOT EXISTS idx_pending_email_sends_status ON pending_email_sends(status)",
+    # WS-8 PR-D autonomous-send ledger — per-cell rate-limit window + ledger ordering
+    "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_cell "
+    "ON autonomous_email_sends(cell_domain, cell_verb, cell_risk_class, sent_at)",
+    "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_sent ON autonomous_email_sends(sent_at)",
     # task states (Phase 9)
     "CREATE INDEX IF NOT EXISTS idx_task_states_session ON task_states(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_task_states_phase ON task_states(current_phase)",

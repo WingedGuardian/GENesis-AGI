@@ -1777,7 +1777,7 @@ class EgoSession:
             # dispatched as a session. Defense-in-depth in case one is still
             # 'approved' here.
             if prop.get("action_type") in (
-                "autonomy_earnback", "goal_status_change",
+                "autonomy_earnback", "goal_status_change", "cell_promotion",
             ):
                 continue
             # Staleness guard — skip proposals approved more than 7 days ago.

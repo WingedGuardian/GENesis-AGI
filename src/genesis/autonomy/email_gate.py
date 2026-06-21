@@ -27,13 +27,14 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
 from genesis.autonomy.capabilities import InvalidTransition
 from genesis.autonomy.classification import classify_email_action
 from genesis.autonomy.types import CellEvent, CellState, RiskClass
+from genesis.db.crud import autonomous_email_sends as aes
 from genesis.db.crud import capability_grants as cg
 from genesis.db.crud import pending_email_sends as pes
 from genesis.observability.types import Severity, Subsystem
@@ -44,6 +45,12 @@ logger = logging.getLogger(__name__)
 #: (excluded from ``approve_all_pending`` / the voice pending count).
 EMAIL_GATE_ACTION_TYPE = "email_capability_gate"
 
+#: WS-8 PR-D deterministic pre-send scope guards for a GRANTED cell.  A trip is
+#: treated as scope drift inside the grant ⇒ the send is HELD and the cell is
+#: demoted (recorded as a correction).  Conservative defaults; calibration here.
+_RATE_LIMIT_WINDOW = timedelta(hours=1)   # g3: per-cell autonomous-send window
+_RATE_LIMIT_MAX = 10                      # g3: max autonomous sends per cell per window
+
 
 @dataclass(frozen=True)
 class GateDecision:
@@ -53,6 +60,9 @@ class GateDecision:
     pending_id: str | None = None
     request_id: str | None = None
     reason: str = ""
+    #: (domain, verb, risk_class) of the cell — set on a GRANTED (autonomous)
+    #: allow so the pipeline can log the send to the owner-visible ledger.
+    cell: tuple[str, str, str] | None = None
 
 
 class EmailAutonomyGate:
@@ -105,7 +115,23 @@ class EmailAutonomyGate:
         state = CellState(cell["state"]) if cell else CellState.ASK
 
         if state == CellState.GRANTED:
-            return GateDecision(allow=True, reason="granted")
+            # WS-8 PR-D auto-revert net: deterministic pre-send scope guards.
+            # A trip = scope drift inside the grant → demote (record a correction,
+            # which regresses GRANTED→ASK) AND hold THIS send for owner approval.
+            trip = await self._scope_guard_trip(request, recipient, domain, verb, risk)
+            if trip is None:
+                return GateDecision(
+                    allow=True, reason="granted", cell=(domain, verb, risk),
+                )
+            logger.warning(
+                "Email scope guard '%s' tripped on GRANTED cell %s:%s:%s "
+                "(recipient=%s) — demoting + holding",
+                trip, domain, verb, risk, recipient,
+            )
+            await cg.record_correction(
+                self._db, domain=domain, verb=verb, risk_class=risk, updated_at=now,
+            )
+            return await self._hold(request, message_text, classification, recipient, now)
 
         # 4. ASK / NOT_DETERMINED / DENIED → hold for owner approval.
         return await self._hold(request, message_text, classification, recipient, now)
@@ -119,6 +145,53 @@ class EmailAutonomyGate:
             "SELECT 1 FROM email_thread_messages "
             "WHERE thread_id = ? AND direction = 'received' LIMIT 1",
             (thread_id,),
+        )
+        return await cursor.fetchone() is not None
+
+    async def _scope_guard_trip(
+        self, request: object, recipient: str, domain: str, verb: str, risk: str,
+    ) -> str | None:
+        """Deterministic pre-send scope guards for a GRANTED cell.
+
+        Returns a trip-reason if the send drifts outside the grant's scope (so
+        the caller demotes + holds), else None (allow).  These are the ONLY
+        autonomous safety net once a cell is GRANTED — a GRANTED cell no longer
+        holds for owner approval, so nothing else would catch the drift.
+        """
+        # g1 (defense-in-depth): a standard reply must go to a participant of its
+        # thread.  validated_recipient is already thread-derived, so this rarely
+        # fires — but it catches a thread_id/recipient mismatch deterministically.
+        if risk == RiskClass.STANDARD.value:
+            thread_id = getattr(request, "thread_id", None)
+            if not await self._recipient_in_thread(thread_id, recipient):
+                return "recipient_mismatch"
+
+        # g3 (primary): a burst of autonomous sends for one cell = a runaway loop.
+        since = (datetime.now(UTC) - _RATE_LIMIT_WINDOW).isoformat()
+        count = await aes.count_for_cell_since(
+            self._db, cell_domain=domain, cell_verb=verb, cell_risk_class=risk,
+            since=since,
+        )
+        if count >= _RATE_LIMIT_MAX:
+            return "rate_limit"
+        return None
+
+    async def _recipient_in_thread(
+        self, thread_id: str | None, recipient: str,
+    ) -> bool:
+        """True iff ``recipient`` is a known participant (received-message sender)
+        of the thread.  The inbound path always records ``sender`` (the From
+        header — ``reply_poller``/``threads.record_reply`` require it), so a
+        normal reply matches its correspondent here.  We deliberately do NOT
+        treat a NULL/blank sender as a match: that would let a single
+        unparsed-sender row in a thread grant unbounded recipient scope (the safe
+        failure for a SECURITY guard is to trip and hold, not to wave through)."""
+        if not thread_id:
+            return False  # a 'standard' reply with no thread is itself suspect
+        cursor = await self._db.execute(
+            "SELECT 1 FROM email_thread_messages "
+            "WHERE thread_id = ? AND direction = 'received' AND sender = ? LIMIT 1",
+            (thread_id, recipient),
         )
         return await cursor.fetchone() is not None
 

@@ -57,6 +57,7 @@ EXPECTED_TABLES = [
     "campaign_runs",
     "capability_grants",  # WS-8 PR-B: per-(domain,verb,risk_class) cells
     "pending_email_sends",  # WS-8 PR-C: email autonomy gate hold store
+    "autonomous_email_sends",  # WS-8 PR-D: autonomous-send ledger (visibility + flag + rate-limit)
 ]
 
 

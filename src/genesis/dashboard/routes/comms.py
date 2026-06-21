@@ -220,6 +220,12 @@ async def comms_resolve_proposal(proposal_id: str):
             await handle_goal_status_change_resolution(rt.db, prop, status)
         except Exception:
             logger.warning("goal status-change hook failed for %s", proposal_id)
+        try:
+            from genesis.ego.cell_promotion import handle_cell_promotion_resolution
+
+            await handle_cell_promotion_resolution(rt.db, prop, status)
+        except Exception:
+            logger.warning("cell promotion hook failed for %s", proposal_id)
 
     # Trigger delayed sweep on approval — same 5-min grace as Telegram,
     # so the user can revoke before dispatch fires.

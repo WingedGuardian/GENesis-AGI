@@ -73,6 +73,24 @@ async def init(rt: GenesisRuntime) -> None:
                 ))
                 logger.info("Email autonomy gate wired into outreach pipeline")
 
+                # WS-8 PR-D: muted-by-default owner notification for autonomous
+                # sends — toggled via config/autonomy.yaml `email_send_notify`.
+                try:
+                    from pathlib import Path
+
+                    import yaml
+
+                    import genesis as _genesis
+                    _cfg = (
+                        Path(_genesis.__file__).resolve().parents[2]
+                        / "config" / "autonomy.yaml"
+                    )
+                    _data = yaml.safe_load(_cfg.read_text()) if _cfg.exists() else {}
+                    _notify = bool((_data or {}).get("email_send_notify", False))
+                except Exception:
+                    _notify = False
+                rt._outreach_pipeline.set_autonomous_send_notify(_notify)
+
             rt._autonomous_cli_policy_exporter = AutonomousCliPolicyExporter()
             if rt._router is not None:
                 rt._autonomous_cli_approval_gate = AutonomousCliApprovalGate(

@@ -18,6 +18,7 @@ from genesis.autonomy.types import CellEvent, CellState
 from genesis.db.crud import capability_grants as cg
 
 MIGRATION = importlib.import_module("genesis.db.migrations.0030_capability_grants")
+MIGRATION_PRD = importlib.import_module("genesis.db.migrations.0033_autonomy_earn_lose")
 
 _EMAIL = {"domain": "email", "verb": "send", "risk_class": "standard"}
 _TS = "2026-06-21T00:00:00"
@@ -25,11 +26,13 @@ _TS = "2026-06-21T00:00:00"
 
 @pytest.fixture
 async def db(tmp_path):
-    """Fresh DB with capability_grants created via the real migration up()."""
+    """Fresh DB via the real migration up()s (0030 + the PR-D 0033 columns the
+    CRUD now reads/writes)."""
     db_path = str(tmp_path / "test.db")
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         await MIGRATION.up(conn)  # up() must not commit — runner owns the txn
+        await MIGRATION_PRD.up(conn)
         await conn.commit()
         yield conn
 
@@ -162,14 +165,19 @@ class TestCrud:
         assert row["corrections"] == 1
 
     @pytest.mark.asyncio
-    async def test_correction_keeps_well_supported_grant(self, db):
+    async def test_correction_demotes_any_granted_cell(self, db):
+        # WS-8 PR-D "easy to lose": even a heavily-supported GRANTED cell
+        # regresses to ASK on a SINGLE correction (deterministic, NOT posterior-
+        # gated).  The well-supported counters only make it cheaper to re-earn.
         await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
         await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL)
         for _ in range(5):
             await cg.record_success(db, updated_at=_TS, **_EMAIL)
-        # 5 successes, 1 correction → posterior 6/8 = 0.75 ≥ floor → stays GRANTED.
         state = await cg.record_correction(db, updated_at=_TS, **_EMAIL)
-        assert state == CellState.GRANTED
+        assert state == CellState.ASK
+        row = await cg.get_cell(db, **_EMAIL)
+        assert row["state"] == CellState.ASK.value
+        assert row["granted_at"] is None  # decay-clock origin cleared on demotion
 
     @pytest.mark.asyncio
     async def test_correction_on_non_granted_is_inert(self, db):
@@ -209,3 +217,109 @@ class TestCrud:
         await cg.ensure_cell(db, updated_at=_TS, **_EMAIL)
         rows = await cg.list_all(db)
         assert [r["risk_class"] for r in rows] == ["bulk", "standard"]
+
+
+# --------------------------------------------------------------------------- #
+# WS-8 PR-D — consequence-weighted demotion + re-earn + promotion detection
+# --------------------------------------------------------------------------- #
+class TestPRDCompetence:
+    @pytest.mark.asyncio
+    async def test_correction_accumulates_severity_weight(self, db):
+        # A standard correction adds 1.0; a bulk correction adds 2.0.
+        await cg.record_correction(
+            db, updated_at=_TS, domain="email", verb="send", risk_class="standard"
+        )
+        assert (await cg.get_cell(db, "email", "send", "standard"))[
+            "weighted_corrections"
+        ] == pytest.approx(1.0)
+        await cg.record_correction(
+            db, updated_at=_TS, domain="email", verb="send", risk_class="bulk"
+        )
+        assert (await cg.get_cell(db, "email", "send", "bulk"))[
+            "weighted_corrections"
+        ] == pytest.approx(2.0)
+
+    @pytest.mark.asyncio
+    async def test_consequence_weight_override(self, db):
+        await cg.record_correction(db, updated_at=_TS, consequence_weight=3.5, **_EMAIL)
+        row = await cg.get_cell(db, **_EMAIL)
+        assert row["weighted_corrections"] == pytest.approx(3.5)
+        assert row["corrections"] == 1
+
+    @pytest.mark.asyncio
+    async def test_correction_on_ask_accrues_crater_without_regress(self, db):
+        # Demotion fires only on GRANTED; an ASK cell stays ASK but still
+        # accumulates the weighted crater (a rejected held send is negative).
+        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
+        state = await cg.record_correction(db, updated_at=_TS, **_EMAIL)
+        assert state == CellState.ASK
+        assert (await cg.get_cell(db, **_EMAIL))[
+            "weighted_corrections"
+        ] == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_touch_used_bumps_last_used_not_successes(self, db):
+        await cg.ensure_cell(db, updated_at=_TS, **_EMAIL)
+        assert await cg.touch_used(db, used_at="2026-06-22T00:00:00", **_EMAIL) is True
+        row = await cg.get_cell(db, **_EMAIL)
+        assert row["last_used_at"] == "2026-06-22T00:00:00"
+        assert row["successes"] == 0  # autonomous use is not a competence signal
+
+    @pytest.mark.asyncio
+    async def test_detect_promotable_requires_min_n_and_threshold(self, db):
+        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
+        for _ in range(4):  # below MIN_PROMOTE_N
+            await cg.record_success(db, updated_at=_TS, **_EMAIL)
+        assert await cg.detect_promotable_cells(db) == []
+        await cg.record_success(db, updated_at=_TS, **_EMAIL)  # 5th → promotable
+        cands = await cg.detect_promotable_cells(db)
+        assert [c["id"] for c in cands] == ["email:send:standard"]
+        assert cands[0]["posterior"] > 0.70
+
+    @pytest.mark.asyncio
+    async def test_detect_promotable_excludes_granted(self, db):
+        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL)
+        for _ in range(5):
+            await cg.record_success(db, updated_at=_TS, **_EMAIL)
+        assert await cg.detect_promotable_cells(db) == []  # already GRANTED
+
+    @pytest.mark.asyncio
+    async def test_heavier_harm_craters_reearn_deeper(self, db):
+        # Same evidence, heavier past harm ⇒ lower re-earn posterior ⇒ harder
+        # to climb back to the 0.70 promotion bar.
+        assert cg.cell_posterior(5, 1, 2.0) < cg.cell_posterior(5, 1, 1.0)
+
+    @pytest.mark.asyncio
+    async def test_list_granted_returns_only_granted(self, db):
+        # standard → GRANTED; bulk left at ASK.
+        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(db, domain="email", verb="send", risk_class="bulk",
+                             event=CellEvent.CLASSIFY, updated_at=_TS)
+        granted = await cg.list_granted(db)
+        assert [g["id"] for g in granted] == ["email:send:standard"]
+
+    @pytest.mark.asyncio
+    async def test_decay_lapses_only_stale_grants(self, db):
+        from datetime import UTC, datetime, timedelta
+        now_dt = datetime(2026, 6, 21, tzinfo=UTC)
+        now = now_dt.isoformat()
+        # fresh grant (used today) — must NOT decay
+        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=now, **_EMAIL)
+        await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=now, **_EMAIL)
+        await cg.touch_used(db, used_at=now, **_EMAIL)
+        # stale grant (granted 100d ago, never used) — must decay
+        old = (now_dt - timedelta(days=100)).isoformat()
+        for ev in (CellEvent.CLASSIFY, CellEvent.APPROVE):
+            await cg.apply_event(db, domain="email", verb="send", risk_class="bulk",
+                                 event=ev, updated_at=old)
+
+        decayed = await cg.decay_stale_cells(db, now=now, half_life_days=90)
+
+        assert decayed == ["email:send:bulk"]
+        assert (await cg.get_cell(db, **_EMAIL))["state"] == CellState.GRANTED.value
+        bulk = await cg.get_cell(db, "email", "send", "bulk")
+        assert bulk["state"] == CellState.NOT_DETERMINED.value
+        assert bulk["granted_at"] is None
+        assert bulk["last_decayed_at"] == now

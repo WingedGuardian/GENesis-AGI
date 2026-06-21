@@ -360,6 +360,14 @@ async def ego_proposal_resolve(proposal_id: str):
             _logging.getLogger(__name__).warning(
                 "goal status-change hook failed for %s", proposal_id,
             )
+        try:
+            from genesis.ego.cell_promotion import handle_cell_promotion_resolution
+
+            await handle_cell_promotion_resolution(rt._db, prop, status)
+        except Exception:
+            _logging.getLogger(__name__).warning(
+                "cell promotion hook failed for %s", proposal_id,
+            )
 
     return jsonify({"ok": True, "id": proposal_id, "status": status})
 
