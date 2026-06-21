@@ -87,6 +87,18 @@ async def test_generate_calls_drafter(db, mock_health, mock_drafter):
 
 
 @pytest.mark.asyncio
+async def test_system_prompt_includes_next_steps_section(db, mock_health, mock_drafter):
+    """The loaded MORNING_REPORT.md system prompt must instruct the LLM to produce
+    a 'Next Steps & Blockers' section — so the report highlights what to do, not
+    just status (the actionability gap the user flagged)."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    await gen.generate()
+    call_args = mock_drafter.draft.call_args[0][0]
+    assert call_args.system_prompt is not None
+    assert "Next Steps & Blockers" in call_args.system_prompt
+
+
+@pytest.mark.asyncio
 async def test_generate_includes_health_in_context(db, mock_health, mock_drafter):
     gen = MorningReportGenerator(mock_health, db, mock_drafter)
     await gen.generate()

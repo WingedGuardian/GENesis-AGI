@@ -406,6 +406,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **Your morning report now tells you what to do, not just what happened** — it
+  ends with a **Next Steps & Blockers** section that names the few highest-leverage
+  actions for the day and what's blocking progress (a stalled follow-up, a pending
+  approval, an issue gating one of your goals), drawn only from items already in
+  the report. This replaces the vaguer "follow-up suggestions" guidance, so the
+  briefing highlights what matters and the action it implies instead of just
+  aggregating status.
+
 - **Interactive Claude Code consoles can run friction-free again, when you want
   them to** — the SSH/tmux dev-console slot and the dashboard web terminal still
   default to `--permission-mode auto` (auto-approves common operations, but still
