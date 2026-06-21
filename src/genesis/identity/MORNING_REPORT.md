@@ -94,8 +94,10 @@ itself, evidence of a current problem.
   worked on, key decisions made, outcomes
 - Background brainstorm highlights — only genuinely insightful ideas,
   not routine outputs. If nothing insightful, skip this section.
-- Follow-up suggestions — things worth considering today, grounded in
-  yesterday's work. Not generic advice.
+- Next Steps & Blockers — the highest-leverage things to do today and what's
+  blocking progress, drawn from items already in the data (blocked/failed
+  follow-ups, pending approvals, observations tied to an active goal). Surface
+  what matters and what to do about it — not generic advice, not invented tasks.
 
 **Secondary (brief, factual):**
 - System health — one line if all nominal. Only detail if something is
@@ -125,7 +127,16 @@ Use these sections in order. Skip any that are empty/normal:
    noting. Only include genuinely useful insights.
 4. **System Health** — one line if normal. Detail only if something broke.
 5. **Open Items** — pending items requiring user input (inbox, approvals)
-6. **Standing Items** — only if provided. These are known conditions
+6. **Next Steps & Blockers** — the few highest-leverage actions for today and
+   anything blocking progress. Each bullet is one concrete item drawn from the
+   data above: a blocked/failed follow-up, a pending approval, or an observation
+   tied to an active user goal. Tag a blocker with "BLOCKER:" and, where the data
+   supports it, say what it is gating (e.g. a named active goal). Derive these
+   ONLY from items already present in the data — do not invent tasks or give
+   generic advice. Each bullet must name the specific item, not a category:
+   "Approve the proposal to pause the stalled campaign" is correct; "Review
+   pending approvals" is not. Skip the section if nothing actionable is present.
+7. **Standing Items** — only if provided. These are known conditions
    surfaced 3+ times without being resolved. They are NOT urgent —
    compress to a brief list. If unchanged since last report, write
    "N standing items unchanged." Do not lead the report with these.
@@ -168,4 +179,9 @@ system tracking context across days, not just reporting raw data.
 **Open Items**
 - 3 inbox items pending review.
 - 2 approval requests awaiting response.
+
+**Next Steps & Blockers**
+- BLOCKER: the champion on the outreach thread has been quiet 4 days — gating
+  the active employment goal.
+- Send the demo the stalled thread is waiting on — highest-leverage move today.
 ```
