@@ -26,7 +26,7 @@
       Alpine.store("genesisDashboard", {
         // Tab state
         activeTab: "overview",
-        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, observations: false, memory: false, knowledge: false, backup: false },
+        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, observations: false, traces: false, memory: false, knowledge: false, backup: false },
 
         // State
         health: {},
@@ -302,6 +302,7 @@
         _followUpsInterval: null,
         _observationsInterval: null,
         _commsInterval: null,
+        _tracesInterval: null,
 
         // Observations tab state
         observationsList: [],
@@ -315,6 +316,14 @@
         observationsMarkingRead: {},
         observationsBatchIds: {},
 
+        // Traces tab state
+        tracesList: [],
+        tracesExpanded: null,
+        tracesWaterfall: { rows: [], traceStart: 0, traceTotal: 0 },
+        tracesSpanExpanded: null,
+        tracesLoadingTrace: false,
+        _traceReq: 0,
+
         // Tab management
         _TAB_INTERVALS: {
           overview:  ["_cognitiveInterval", "_ekInterval", "_modulesInterval"],
@@ -324,6 +333,7 @@
           files:     [],
           work:      ["_tasksInterval", "_workSessionsInterval", "_followUpsInterval"],
           observations: ["_observationsInterval"],
+          traces:    ["_tracesInterval"],
           memory:    [],
           knowledge: [],
           backup:    [],
@@ -331,7 +341,7 @@
 
         initTab() {
           const hash = location.hash.replace("#", "") || "overview";
-          const valid = ["overview", "chat", "internals", "config", "files", "work", "observations", "memory", "knowledge", "references", "backup"];
+          const valid = ["overview", "chat", "internals", "config", "files", "work", "observations", "traces", "memory", "knowledge", "references", "backup"];
           this.activeTab = valid.includes(hash) ? hash : "overview";
           window.addEventListener("hashchange", () => {
             const h = location.hash.replace("#", "");
@@ -393,6 +403,10 @@
             case "observations":
               if (first) { this.fetchObservations(); this.fetchObservationsSummary(); this.fetchObservationsFilters(); }
               this._observationsInterval = setInterval(() => { this.fetchObservations(); this.fetchObservationsSummary(); }, 30000);
+              break;
+            case "traces":
+              if (first) { this.fetchSpansRecent(); }
+              this._tracesInterval = setInterval(() => this.fetchSpansRecent(), 30000);
               break;
             case "memory":
               if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); }
@@ -465,7 +479,7 @@
 
         cleanup() {
           if (this._healthInterval) clearInterval(this._healthInterval);
-          for (const tab of ["overview", "chat", "internals", "config", "work"]) {
+          for (const tab of ["overview", "chat", "internals", "config", "work", "observations", "traces"]) {
             this._stopTabIntervals(tab);
           }
           // Terminal runs in its own window — no cleanup needed here
@@ -992,6 +1006,104 @@
         },
         get observationsBatchCount() {
           return Object.keys(this.observationsBatchIds).filter(k => this.observationsBatchIds[k]).length;
+        },
+
+        // ── Traces tab (trace waterfall) ─────────────────────────
+        SPAN_KIND_COLORS: {
+          operation: '#60a5fa',   // blue
+          llm: '#a78bfa',         // purple
+          tool: '#34d399',        // green (populated after the cc-span deploy)
+          cc_session: '#fb923c',  // orange
+          internal: '#94a3b8',    // gray
+          recall: '#38bdf8',      // cyan (reserved)
+          executor: '#fbbf24',    // amber (reserved)
+        },
+        spanKindColor(kind) { return this.SPAN_KIND_COLORS[kind] || '#888'; },
+        formatUs(us) {
+          if (us == null) return '·';
+          if (us < 1000) return `${us}µs`;
+          if (us < 1000000) return `${(us / 1000).toFixed(us < 10000 ? 1 : 0)}ms`;
+          return `${(us / 1000000).toFixed(2)}s`;
+        },
+        computeWaterfall(spans) {
+          if (!spans || !spans.length) return { rows: [], traceStart: 0, traceTotal: 0 };
+          const spanEnd = (s) => (s.end_unix_us != null) ? s.end_unix_us
+            : (s.duration_us != null) ? s.start_unix_us + s.duration_us
+            : s.start_unix_us;
+          // Loop (not Math.min(...spread)) — a trace can carry many spans.
+          let traceStart = spans[0].start_unix_us, traceEnd = spanEnd(spans[0]);
+          for (const s of spans) {
+            if (s.start_unix_us < traceStart) traceStart = s.start_unix_us;
+            const e = spanEnd(s);
+            if (e > traceEnd) traceEnd = e;
+          }
+          const traceTotal = traceEnd - traceStart;
+          const MIN_W = 0.6;  // % floor so sub-ms spans stay visible
+          const rows = spans.map(s => {
+            const e = spanEnd(s);
+            const isPoint = e <= s.start_unix_us;  // zero effective width → tick (covers NULL end/duration AND duration=0)
+            let offset, width;
+            if (traceTotal <= 0) {
+              offset = 0;
+              width = isPoint ? 0 : 100;  // degenerate: all spans at one instant
+            } else {
+              offset = (s.start_unix_us - traceStart) / traceTotal * 100;
+              width = (e - s.start_unix_us) / traceTotal * 100;
+              offset = Math.min(100, Math.max(0, offset));  // clamp clock skew
+              if (isPoint) {
+                width = 0;  // rendered as a tick, not a bar
+              } else {
+                width = Math.max(MIN_W, width);  // floor so sub-ms bars stay visible
+                // Keep the floored bar inside the track by shifting it left,
+                // not shrinking it (shrinking would re-violate the MIN_W floor).
+                if (offset + width > 100) offset = Math.max(0, 100 - width);
+              }
+            }
+            return { ...s, offsetPct: offset, widthPct: width, isPoint };
+          });
+          return { rows, traceStart, traceTotal };
+        },
+        async fetchSpansRecent() {
+          try {
+            const resp = await fetchApi("/api/genesis/spans/recent?limit=50");
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.tracesList = data.traces || [];
+            }
+          } catch (e) { console.warn("Traces recent fetch failed:", e); }
+        },
+        async fetchTraceDetail(traceId) {
+          // Toggle collapse when clicking the already-open trace.
+          if (this.tracesExpanded === traceId) {
+            this.tracesExpanded = null;
+            this.tracesSpanExpanded = null;
+            this.tracesLoadingTrace = false;
+            this.tracesWaterfall = { rows: [], traceStart: 0, traceTotal: 0 };
+            return;
+          }
+          // Token so a slow/stale fetch can't clobber a newer selection.
+          const reqId = (this._traceReq || 0) + 1;
+          this._traceReq = reqId;
+          this.tracesExpanded = traceId;
+          this.tracesSpanExpanded = null;
+          this.tracesWaterfall = { rows: [], traceStart: 0, traceTotal: 0 };
+          this.tracesLoadingTrace = true;
+          try {
+            const resp = await fetchApi(`/api/genesis/spans/trace/${traceId}`);
+            if (reqId !== this._traceReq) return;  // superseded by a newer click
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              if (reqId !== this._traceReq) return;
+              this.tracesWaterfall = this.computeWaterfall(data.spans || []);
+            } else {
+              this.tracesWaterfall = { rows: [], traceStart: 0, traceTotal: 0 };
+            }
+          } catch (e) {
+            console.warn("Trace detail fetch failed:", e);
+            if (reqId === this._traceReq) this.tracesWaterfall = { rows: [], traceStart: 0, traceTotal: 0 };
+          } finally {
+            if (reqId === this._traceReq) this.tracesLoadingTrace = false;
+          }
         },
 
         // ── Comms fetches (on Chat tab) ──────────────────────────
@@ -3822,6 +3934,71 @@
 
     .activity-msg { flex: 1; word-break: break-word; }
 
+    /* Trace waterfall */
+    .waterfall { font-size: 0.74rem; }
+    .wf-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.18rem 0;
+      cursor: pointer;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    }
+    .wf-row:hover { background: rgba(255, 255, 255, 0.03); }
+    .wf-row-selected { background: rgba(33, 150, 243, 0.08); }
+    .wf-row-error .wf-name { color: #ef4444; }
+    .wf-label {
+      width: 280px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      overflow: hidden;
+    }
+    .wf-kind-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+    .wf-name {
+      font-family: monospace;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .wf-track {
+      position: relative;
+      flex: 1;
+      height: 14px;
+      background: rgba(255, 255, 255, 0.03);
+      border-radius: 3px;
+      min-width: 0;
+    }
+    .wf-bar {
+      position: absolute;
+      top: 2px;
+      height: 10px;
+      border-radius: 2px;
+      opacity: 0.85;
+      min-width: 2px;
+    }
+    .wf-tick {
+      position: absolute;
+      top: 0;
+      width: 2px;
+      height: 14px;
+      border-radius: 1px;
+      opacity: 0.95;
+    }
+    .wf-dur {
+      width: 64px;
+      flex-shrink: 0;
+      text-align: right;
+      font-family: monospace;
+      font-size: 0.66rem;
+      color: var(--color-text-secondary);
+    }
+    @media (max-width: 700px) {
+      .wf-label { width: 150px; }
+      .wf-dur { width: 48px; }
+    }
+
     /* Config files */
     .config-toggle {
       cursor: pointer;
@@ -3967,6 +4144,8 @@
               style="background:#ffa726; color:#000; border-radius:8px; padding:0 5px; font-size:0.6rem; margin-left:4px; font-weight:700;"
               x-text="$store.genesisDashboard.observationsCounts.total_unsurfaced"></span>
       </button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'traces' }"
+              @click="location.hash = 'traces'">Traces</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'memory' }"
               @click="location.hash = 'memory'">Memory</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'knowledge' }"
@@ -8798,6 +8977,123 @@
         <div x-show="$store.genesisDashboard.observationsHasMore"
              style="text-align:center; padding:0.5rem; font-size:0.65rem; color:var(--color-text-secondary);">
           Showing first 50 results. Use filters to narrow down.
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Traces (trace waterfall) [Tab: traces]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'traces'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">account_tree</span>
+        Traces
+      </div>
+      <div class="panel-body">
+        <div style="font-size:0.68rem; color:var(--color-text-secondary); margin-bottom:0.6rem;">
+          Each trace is one cognitive operation (reflection / ego cycle / dispatched session) with its nested LLM calls, sub-sessions, and tools. Click a trace to expand its waterfall; click a span for details.
+        </div>
+
+        <!-- Empty state -->
+        <template x-if="$store.genesisDashboard.tracesList.length === 0">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            No traces recorded yet.
+          </div>
+        </template>
+
+        <!-- Recent traces list -->
+        <div class="activity-feed" style="max-height:none;">
+          <template x-for="t in $store.genesisDashboard.tracesList" :key="t.trace_id">
+            <div>
+              <div class="activity-row" style="cursor:pointer; align-items:center;"
+                   @click="$store.genesisDashboard.fetchTraceDetail(t.trace_id)">
+                <span class="status-dot" :style="`background:${$store.genesisDashboard.spanKindColor(t.kind)}; margin-right:0;`"></span>
+                <span style="flex:1; font-family:monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                      x-text="t.name"></span>
+                <span x-show="t.status === 'error'" style="color:#ef4444; font-size:0.6rem; font-weight:600;">ERROR</span>
+                <span style="color:var(--color-text-secondary); font-size:0.62rem;" x-text="t.span_count + ' spans'"></span>
+                <span style="color:var(--color-text-secondary); font-size:0.62rem; font-family:monospace; min-width:48px; text-align:right;"
+                      x-text="$store.genesisDashboard.formatUs(t.duration_us)"></span>
+                <span style="color:var(--color-text-secondary); font-size:0.62rem; min-width:64px; text-align:right;"
+                      x-text="$store.genesisDashboard.relativeTime(t.start_unix_us / 1000)"></span>
+                <span class="material-symbols-outlined" style="font-size:1rem; color:var(--color-text-secondary);"
+                      :style="$store.genesisDashboard.tracesExpanded === t.trace_id ? 'transform:rotate(90deg);' : ''">chevron_right</span>
+              </div>
+
+              <!-- Inline full-width waterfall -->
+              <template x-if="$store.genesisDashboard.tracesExpanded === t.trace_id">
+                <div style="padding:0.5rem 0.25rem; background:rgba(0,0,0,0.12); border-radius:4px; margin:0.25rem 0 0.75rem;">
+                  <template x-if="$store.genesisDashboard.tracesLoadingTrace">
+                    <div style="padding:0.75rem; text-align:center; color:var(--color-text-secondary); font-size:0.7rem;">Loading…</div>
+                  </template>
+                  <template x-if="!$store.genesisDashboard.tracesLoadingTrace && $store.genesisDashboard.tracesWaterfall.rows.length === 0">
+                    <div style="padding:0.75rem; text-align:center; color:var(--color-text-secondary); font-size:0.7rem;">No spans for this trace.</div>
+                  </template>
+                  <div class="waterfall">
+                    <template x-for="row in $store.genesisDashboard.tracesWaterfall.rows" :key="row.span_id">
+                      <div>
+                        <div class="wf-row"
+                             :class="{ 'wf-row-selected': $store.genesisDashboard.tracesSpanExpanded === row.span_id, 'wf-row-error': row.status === 'error' }"
+                             @click="$store.genesisDashboard.tracesSpanExpanded = $store.genesisDashboard.tracesSpanExpanded === row.span_id ? null : row.span_id">
+                          <div class="wf-label" :style="`padding-left:${row.depth * 14}px;`">
+                            <span class="wf-kind-dot" :style="`background:${$store.genesisDashboard.spanKindColor(row.kind)};`"></span>
+                            <span class="wf-name" :title="row.name" x-text="row.name"></span>
+                          </div>
+                          <div class="wf-track">
+                            <template x-if="!row.isPoint">
+                              <div class="wf-bar"
+                                   :style="`left:${row.offsetPct}%; width:${row.widthPct}%; background:${$store.genesisDashboard.spanKindColor(row.kind)};` + (row.status === 'error' ? ' outline:1px solid #ef4444;' : '')"></div>
+                            </template>
+                            <template x-if="row.isPoint">
+                              <div class="wf-tick" :style="`left:${row.offsetPct}%; background:${$store.genesisDashboard.spanKindColor(row.kind)};`"></div>
+                            </template>
+                          </div>
+                          <div class="wf-dur" x-text="$store.genesisDashboard.formatUs(row.duration_us)"></div>
+                        </div>
+
+                        <!-- Span detail -->
+                        <template x-if="$store.genesisDashboard.tracesSpanExpanded === row.span_id">
+                          <div class="health-card" style="margin:0.25rem 0 0.5rem 1.5rem; font-size:0.72rem;">
+                            <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.4rem;">
+                              <span class="wf-kind-dot" :style="`background:${$store.genesisDashboard.spanKindColor(row.kind)};`"></span>
+                              <strong x-text="row.name"></strong>
+                              <span style="font-size:0.6rem; padding:0.1rem 0.4rem; border-radius:3px;"
+                                    :style="row.status === 'error' ? 'background:rgba(239,68,68,0.15); color:#ef4444;' : 'background:rgba(74,222,128,0.13); color:#4ade80;'"
+                                    x-text="row.status"></span>
+                            </div>
+                            <template x-if="row.status === 'error' && row.status_message">
+                              <div style="margin-bottom:0.4rem; padding:0.25rem 0.5rem; background:rgba(239,68,68,0.08); border-radius:3px; color:#ef4444; white-space:pre-wrap; word-break:break-word;"
+                                   x-text="row.status_message"></div>
+                            </template>
+                            <div style="display:flex; gap:0.75rem; flex-wrap:wrap; color:var(--color-text-secondary); font-size:0.65rem; margin-bottom:0.3rem;">
+                              <span x-text="'kind: ' + row.kind"></span>
+                              <span x-text="'duration: ' + $store.genesisDashboard.formatUs(row.duration_us)"></span>
+                              <span x-show="row.session_id" x-text="'session: ' + (row.session_id || '')"></span>
+                              <span x-show="row.process" x-text="'process: ' + (row.process || '')"></span>
+                            </div>
+                            <template x-if="row.kind === 'llm'">
+                              <div style="display:flex; gap:0.75rem; flex-wrap:wrap; font-size:0.65rem; margin-bottom:0.3rem;">
+                                <span x-show="row.provider" x-text="'provider: ' + (row.provider || '')"></span>
+                                <span x-show="row.model_id" x-text="'model: ' + (row.model_id || '')"></span>
+                                <span x-show="row.call_site" x-text="'call_site: ' + (row.call_site || '')"></span>
+                                <span x-show="row.input_tokens != null" x-text="'in: ' + row.input_tokens + ' tok'"></span>
+                                <span x-show="row.output_tokens != null" x-text="'out: ' + row.output_tokens + ' tok'"></span>
+                                <span x-show="row.cost_usd != null" x-text="'$' + Number(row.cost_usd).toFixed(4) + (row.cost_known ? '' : ' (est)')"></span>
+                              </div>
+                            </template>
+                            <template x-if="row.attributes && Object.keys(row.attributes).length">
+                              <pre style="margin:0.3rem 0 0; padding:0.4rem 0.5rem; background:rgba(0,0,0,0.2); border-radius:3px; font-size:0.63rem; max-height:200px; overflow:auto; white-space:pre-wrap; word-break:break-word;"
+                                   x-text="JSON.stringify(row.attributes, null, 2)"></pre>
+                            </template>
+                          </div>
+                        </template>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
         </div>
       </div>
     </div>
