@@ -552,6 +552,18 @@ class ProposalWorkflow:
                         "goal status-change hook failed for %s",
                         prop.get("id"), exc_info=True,
                     )
+                # Cell promotion (WS-8 PR-D): promote on approval / cooldown on reject.
+                try:
+                    from genesis.ego.cell_promotion import (
+                        handle_cell_promotion_resolution,
+                    )
+
+                    await handle_cell_promotion_resolution(self._db, prop, status)
+                except Exception:
+                    logger.warning(
+                        "cell promotion hook failed for %s",
+                        prop.get("id"), exc_info=True,
+                    )
             else:
                 logger.warning(
                     "Proposal %s not updated (already resolved?)",

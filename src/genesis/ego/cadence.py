@@ -347,6 +347,11 @@ class EgoCadenceManager:
         # now supports it (user ego only; no-op otherwise).
         await self._check_earnback_opportunities()
 
+        # Cell promotion (WS-8 PR-D): propose standing autonomy for email
+        # capability cells whose approved competence now supports it (user ego
+        # only; the user approves each promotion).
+        await self._check_cell_promotion_opportunities()
+
     async def _check_approaching_deadlines(self) -> None:
         """Push reactive events for events approaching within 48h."""
         try:
@@ -568,6 +573,112 @@ class EgoCadenceManager:
             "confidence": conf,
             "urgency": "low",
             "expected_outputs": {"target_level": target},
+        }
+
+    # -- Cell promotion (WS-8 PR-D) ----------------------------------------
+
+    _CELL_PROMOTION_REJECT_COOLDOWN_DAYS = 7
+
+    async def _check_cell_promotion_opportunities(self) -> None:
+        """Propose promoting email capability cells whose approved competence now
+        supports standing autonomy. User-ego only; evidence-gated; the user
+        approves each promotion. Never auto-promotes.
+        """
+        if self._session._source_tag != "user_ego_cycle":
+            return
+        db = self._session._db
+        if db is None:
+            return
+        try:
+            from genesis.db.crud import capability_grants as cg
+            from genesis.db.crud import ego as ego_crud
+
+            candidates = await cg.detect_promotable_cells(db)
+            if not candidates:
+                return
+
+            # Anti-spam: skip cells that already have a pending promotion proposal
+            # or an active reject cooldown (the digest rate-limiter is disabled, so
+            # these guards are the only backstop).
+            pending = await ego_crud.list_pending_proposals(db)
+            pending_cells = {
+                p.get("action_category")
+                for p in pending
+                if p.get("action_type") == "cell_promotion"
+            }
+
+            to_make: list[dict] = []
+            for cand in candidates:
+                cell_id = cand["id"]
+                if cell_id in pending_cells:
+                    continue
+                if await self._cell_promotion_in_cooldown(cell_id):
+                    continue
+                to_make.append(self._build_cell_promotion_proposal(cand))
+
+            if not to_make:
+                return
+
+            batch_id, ids, _ = await self._session._proposals.create_batch(
+                to_make, ego_source="user_ego_cycle",
+            )
+            if ids:
+                await self._session._proposals.send_digest(
+                    batch_id, ego_source="user_ego_cycle",
+                )
+                logger.info(
+                    "Cell promotion: proposed standing autonomy for %d cell(s)",
+                    len(ids),
+                )
+        except Exception:
+            logger.warning("Cell promotion opportunity check failed", exc_info=True)
+
+    async def _cell_promotion_in_cooldown(self, cell_id: str) -> bool:
+        """True if *cell_id*'s promotion was rejected within the cooldown window."""
+        from genesis.db.crud import ego as ego_crud
+
+        ts = await ego_crud.get_state(
+            self._session._db, f"cell_promotion_reject:{cell_id}",
+        )
+        if not ts:
+            return False
+        try:
+            rejected_at = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            return False
+        if rejected_at.tzinfo is None:
+            rejected_at = rejected_at.replace(tzinfo=UTC)
+        age_days = (datetime.now(UTC) - rejected_at).days
+        return age_days < self._CELL_PROMOTION_REJECT_COOLDOWN_DAYS
+
+    @staticmethod
+    def _build_cell_promotion_proposal(cand: dict) -> dict:
+        """Build a proposal dict for a promotable capability cell."""
+        cell_id = cand["id"]
+        domain, verb, risk = cand["domain"], cand["verb"], cand["risk_class"]
+        successes = cand.get("successes", 0)
+        posterior = cand.get("posterior")
+        conf = round(float(posterior), 2) if posterior is not None else 0.7
+        content = (
+            f"Promote the {cell_id} capability to standing autonomy. I've handled "
+            f"this {successes} times with your approval (confidence {conf}); "
+            f"promoting it means routine {risk} {domain} {verb}s won't need your "
+            f"sign-off each time. The auto-revert net still applies — any harm "
+            f"signal immediately drops it back to needing your approval."
+        )
+        rationale = (
+            "Evidence-gated promotion: the cell's own approved-success history "
+            "supports standing autonomy. Approve to grant; reject to keep holding "
+            "each send for approval."
+        )
+        return {
+            "action_type": "cell_promotion",
+            "action_category": cell_id,
+            "content": content,
+            "rationale": rationale,
+            "confidence": conf,
+            "urgency": "low",
+            "expected_outputs": {"cell": [domain, verb, risk]},
         }
 
     # -- Tick handlers -----------------------------------------------------

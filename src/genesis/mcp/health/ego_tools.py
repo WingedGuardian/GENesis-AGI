@@ -542,6 +542,15 @@ async def ego_proposal_resolve(
                     logger.debug(
                         "goal status-change hook failed", exc_info=True,
                     )
+                # Cell promotion (WS-8 PR-D).
+                try:
+                    from genesis.ego.cell_promotion import (
+                        handle_cell_promotion_resolution,
+                    )
+
+                    await handle_cell_promotion_resolution(db, prop, status)
+                except Exception:
+                    logger.debug("cell promotion hook failed", exc_info=True)
 
     resolved = sum(1 for v in results.values() if v in ("approved", "rejected"))
     return {
