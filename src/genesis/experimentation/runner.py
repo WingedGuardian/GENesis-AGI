@@ -116,15 +116,17 @@ async def run_reflection_experiment(
         raise ValueError("both control and treatment must set system_prompt for a reflection A/B")
 
     created_gen = gen_router is None
+    created_judge_router = None
     if gen_router is None or judge is None:
         config = load_config(_default_config_path())
         delegate = LiteLLMDelegate(config)
         if gen_router is None:
             gen_router = StandaloneLiteLLMRouter(gen_provider, config=config, delegate=delegate)
         if judge is None:
-            judge = LLMJudgeScorer(
-                router=StandaloneLiteLLMRouter(judge_provider, config=config, delegate=delegate),
+            created_judge_router = StandaloneLiteLLMRouter(
+                judge_provider, config=config, delegate=delegate,
             )
+            judge = LLMJudgeScorer(router=created_judge_router)
 
     control_scores: list[float] = []
     treatment_scores: list[float] = []
@@ -172,6 +174,8 @@ async def run_reflection_experiment(
     finally:
         if created_gen:
             await gen_router.close()
+        if created_judge_router is not None:
+            await created_judge_router.close()
 
     # Primary signal: continuous score comparison (sensitive to sub-threshold
     # differences). Secondary: pass/fail at the rubric threshold, for context.

@@ -37,7 +37,7 @@ async def _insert_ticks(db, n):
 async def test_divergence_counts_flips_and_gains(db, monkeypatch):
     await _insert_ticks(db, 3)
 
-    async def fake_compute(dbc, signals, *, now=None, weights_override=None):
+    async def fake_compute(dbc, signals, *, now=None, weights_override=None, decay_factors=None):
         # Under the variant weights, Light additionally triggers (Micro always on).
         if weights_override:
             return [_ds(Depth.MICRO, True), _ds(Depth.LIGHT, True)]
@@ -59,7 +59,7 @@ async def test_divergence_counts_flips_and_gains(db, monkeypatch):
 async def test_divergence_no_flip_when_identical(db, monkeypatch):
     await _insert_ticks(db, 2)
 
-    async def fake_compute(dbc, signals, *, now=None, weights_override=None):
+    async def fake_compute(dbc, signals, *, now=None, weights_override=None, decay_factors=None):
         return [_ds(Depth.MICRO, True), _ds(Depth.LIGHT, False)]
 
     monkeypatch.setattr(
@@ -74,3 +74,26 @@ async def test_divergence_no_flip_when_identical(db, monkeypatch):
 async def test_divergence_empty_override_raises(db):
     with pytest.raises(ValueError, match="non-empty"):
         await weight_divergence(db, signal_weight_overrides={}, limit=10)
+
+
+async def test_replay_does_not_mutate_live_staleness(db):
+    """The replay path (decay_factors=) must NOT touch the live awareness loop's
+    module-level staleness counters — the code-review P2 fix."""
+    import contextlib
+
+    from genesis.awareness import scorer
+    from genesis.awareness.types import SignalReading
+
+    signals = [SignalReading(name="x", value=0.5, source="replay", collected_at="")]
+
+    # Replay path: decay_factors provided -> _update_staleness is bypassed.
+    scorer._signal_unchanged_counts.clear()
+    with contextlib.suppress(Exception):  # missing seeded thresholds is fine
+        await scorer.compute_scores(db, signals, decay_factors={})
+    assert scorer._signal_unchanged_counts == {}, "replay must not mutate live staleness"
+
+    # Contrast — the live path (decay_factors=None) DOES update the counters.
+    scorer._signal_unchanged_counts.clear()
+    with contextlib.suppress(Exception):
+        await scorer.compute_scores(db, signals)
+    assert "x" in scorer._signal_unchanged_counts, "live path updates staleness as before"

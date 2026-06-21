@@ -80,8 +80,14 @@ async def weight_divergence(
             skipped += 1
             continue
 
-        base = await compute_scores(db, signals)
-        var = await compute_scores(db, signals, weights_override=signal_weight_overrides)
+        # decay_factors={}: no staleness decay AND — critically — does NOT call
+        # _update_staleness, so replaying historical ticks never mutates the live
+        # awareness loop's module-level staleness counters. Both arms share the
+        # same (no-decay) basis, so the only difference is the weight override.
+        base = await compute_scores(db, signals, decay_factors={})
+        var = await compute_scores(
+            db, signals, weights_override=signal_weight_overrides, decay_factors={},
+        )
         base_t = _triggered_depths(base)
         var_t = _triggered_depths(var)
 

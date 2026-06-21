@@ -1,4 +1,4 @@
-"""J-9 weekly eval aggregator — computes snapshots for all 5 dimensions.
+"""J-9 weekly eval aggregator — computes snapshots for all dimensions.
 
 Runs on a weekly CronTrigger. Reads eval_events and existing DB tables
 to compute metrics for each dimension, stores results in eval_snapshots.
@@ -9,6 +9,7 @@ Dimensions:
 3. Ego proposal quality (approval rate, confidence calibration)
 4. Cognitive loop value (recall vs no-recall session comparison)
 5. Procedural learning effectiveness (invocation rate, success rate)
+6. Cognitive drift (Phase 7, dark): dissent-rate + proposal-diversity
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ async def _compute_cognitive_drift(
     cursor = await db.execute(
         """SELECT action_type, alternatives, realist_verdict
            FROM ego_proposals
-           WHERE created_at >= ? AND created_at <= ?""",
+           WHERE created_at >= ? AND created_at < ?""",
         (period_start, period_end),
     )
     rows = [dict(r) for r in await cursor.fetchall()]
