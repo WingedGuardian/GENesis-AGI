@@ -33,6 +33,10 @@ class OutreachStatus(StrEnum):
     ENGAGED = "engaged"
     IGNORED = "ignored"
     FAILED = "failed"
+    # Outbound external action held by the WS-8 autonomy capability gate —
+    # not delivered, pending owner approval. Distinct from FAILED (this is not
+    # an error) and PENDING (not queued for automatic retry).
+    HELD = "held"
 
 
 class GovernanceVerdict(StrEnum):
@@ -56,6 +60,10 @@ class OutreachRequest:
     # delivery. Used by thread-aware email routing to send replies
     # to the correct per-thread recipient.
     validated_recipient: str | None = None
+    # Email thread this send belongs to, when known. Carried through to
+    # _deliver so the WS-8 autonomy gate can classify reply-vs-cold for the
+    # capability matrix. None for non-thread / cold sends.
+    thread_id: str | None = None
 
 
 @dataclass(frozen=True)
