@@ -1,11 +1,12 @@
 """Tests for health probes."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from genesis.observability.health import (
+    probe_ambient_health,
     probe_db,
     probe_disk,
     probe_ollama,
@@ -232,3 +233,150 @@ class TestInfrastructureWalPlumbing:
 
         assert "wal_mb" not in infra["genesis.db"]
         assert "wal_status" not in infra["genesis.db"]
+
+
+class TestProbeAmbientHealth:
+    """probe_ambient_health: maps the ambient evaluator's verdict to a
+    ProbeResult for the observability surface (config + SSH read are mocked;
+    the real, pure evaluate_ambient_health runs)."""
+
+    _MOD = "genesis.observability.ambient_health"
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        from genesis.observability import health
+
+        health._ambient_ssh_cache.clear()
+        yield
+        health._ambient_ssh_cache.clear()
+
+    def _cfg(self):
+        from genesis.observability.ambient_health import AmbientRemoteConfig
+
+        return AmbientRemoteConfig(host_ip="ambient-test-host", host_user="edge")
+
+    @pytest.mark.asyncio
+    async def test_not_configured_returns_none(self):
+        # No ambient edge configured -> observability no-op (caller omits it).
+        with patch(f"{self._MOD}.load_ambient_remote_config", return_value=None):
+            result = await probe_ambient_health(clock=FROZEN_CLOCK)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_healthy(self):
+        snap = {"ts": FROZEN_CLOCK().isoformat(), "diar_enabled": True, "diar_worker_alive": True}
+        with (
+            patch(f"{self._MOD}.load_ambient_remote_config", return_value=self._cfg()),
+            patch(f"{self._MOD}.read_edge_health", new_callable=AsyncMock, return_value=snap),
+        ):
+            result = await probe_ambient_health(clock=FROZEN_CLOCK)
+        assert result is not None
+        assert result.name == "ambient"
+        assert result.status == ProbeStatus.HEALTHY
+        assert result.details["verdict"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_stale_heartbeat_is_down(self):
+        stale = (FROZEN_CLOCK() - timedelta(minutes=10)).isoformat()
+        snap = {"ts": stale, "diar_enabled": True, "diar_worker_alive": True}
+        with (
+            patch(f"{self._MOD}.load_ambient_remote_config", return_value=self._cfg()),
+            patch(f"{self._MOD}.read_edge_health", new_callable=AsyncMock, return_value=snap),
+        ):
+            result = await probe_ambient_health(clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.DOWN
+        assert result.details["verdict"] == "down"
+
+    @pytest.mark.asyncio
+    async def test_dead_diar_worker_is_degraded(self):
+        snap = {"ts": FROZEN_CLOCK().isoformat(), "diar_enabled": True, "diar_worker_alive": False}
+        with (
+            patch(f"{self._MOD}.load_ambient_remote_config", return_value=self._cfg()),
+            patch(f"{self._MOD}.read_edge_health", new_callable=AsyncMock, return_value=snap),
+        ):
+            result = await probe_ambient_health(clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.DEGRADED
+        assert result.details["verdict"] == "degraded"
+
+    @pytest.mark.asyncio
+    async def test_unreachable_edge_is_degraded_not_down(self):
+        # Read failure -> verdict "unknown" -> DEGRADED: we can't confirm, which
+        # is neither healthy nor a confirmed-dead bridge.
+        with (
+            patch(f"{self._MOD}.load_ambient_remote_config", return_value=self._cfg()),
+            patch(f"{self._MOD}.read_edge_health", new_callable=AsyncMock, return_value=None),
+        ):
+            result = await probe_ambient_health(clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.DEGRADED
+        assert result.details["verdict"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_ttl_cache_avoids_second_ssh(self):
+        snap = {"ts": FROZEN_CLOCK().isoformat(), "diar_enabled": True, "diar_worker_alive": True}
+        read_mock = AsyncMock(return_value=snap)
+        with (
+            patch(f"{self._MOD}.load_ambient_remote_config", return_value=self._cfg()),
+            patch(f"{self._MOD}.read_edge_health", read_mock),
+        ):
+            first = await probe_ambient_health(clock=FROZEN_CLOCK)
+            second = await probe_ambient_health(clock=FROZEN_CLOCK)
+        assert first == second  # cached result returned
+        assert read_mock.await_count == 1  # the real "no second SSH" guarantee
+
+
+class TestInfrastructureAmbientPlumbing:
+    """Ambient health must surface in the infrastructure snapshot (so it flows
+    into health_status), and be ABSENT when no ambient edge is configured."""
+
+    @pytest.mark.asyncio
+    async def test_ambient_attached_when_configured(self):
+        ambient_probe = ProbeResult(
+            name="ambient",
+            status=ProbeStatus.HEALTHY,
+            latency_ms=1.2,
+            message="healthy",
+            details={"verdict": "ok"},
+        )
+        with patch(
+            "genesis.observability.snapshots.infrastructure.probe_ambient_health",
+            new_callable=AsyncMock,
+            return_value=ambient_probe,
+        ):
+            from genesis.observability.snapshots.infrastructure import infrastructure
+
+            infra = await infrastructure(
+                db=None, routing_config=None, learning_scheduler=None, state_machine=None,
+            )
+        assert infra["ambient"]["status"] == "healthy"
+        assert infra["ambient"]["verdict"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_ambient_absent_when_not_configured(self):
+        with patch(
+            "genesis.observability.snapshots.infrastructure.probe_ambient_health",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            from genesis.observability.snapshots.infrastructure import infrastructure
+
+            infra = await infrastructure(
+                db=None, routing_config=None, learning_scheduler=None, state_machine=None,
+            )
+        assert "ambient" not in infra
+
+    @pytest.mark.asyncio
+    async def test_ambient_error_surfaced_when_probe_raises(self):
+        # The probe normally swallows read failures (-> "unknown"), but the
+        # snapshot's defensive guard must still surface an unexpected raise.
+        with patch(
+            "genesis.observability.snapshots.infrastructure.probe_ambient_health",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("boom"),
+        ):
+            from genesis.observability.snapshots.infrastructure import infrastructure
+
+            infra = await infrastructure(
+                db=None, routing_config=None, learning_scheduler=None, state_machine=None,
+            )
+        assert infra["ambient"]["status"] == "error"
+        assert "boom" in infra["ambient"]["error"]

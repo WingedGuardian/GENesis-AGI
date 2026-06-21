@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from genesis.env import ollama_enabled
 from genesis.observability.health import (
+    probe_ambient_health,
     probe_db,
     probe_guardian,
     probe_ollama,
@@ -261,6 +262,22 @@ async def infrastructure(
             infra["guardian"].update(result.details)
     except Exception as exc:
         infra["guardian"] = {"status": "error", "error": str(exc)}
+
+    # Ambient-capture edge bridge (observability only). Omitted entirely when no
+    # ambient edge is configured — an absent ambient edge is not a fault.
+    try:
+        result = await probe_ambient_health()
+        if result is not None:
+            infra["ambient"] = {
+                "status": str(result.status),
+                "latency_ms": result.latency_ms,
+            }
+            if result.message:
+                infra["ambient"]["message"] = result.message
+            if result.details:
+                infra["ambient"].update(result.details)
+    except Exception as exc:
+        infra["ambient"] = {"status": "error", "error": str(exc)}
 
     if ollama_enabled():
         try:
