@@ -127,6 +127,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   healthy and actively running cycles. The ego now sends a steady "alive" check-in every few
   minutes, independent of its work pace, so its health status reflects reality.
 
+- **Voice approvals now resolve the action you actually mean** — when you say "approve" or
+  "reject" over voice, Genesis tells you which action it acted on, and if more than one action is
+  awaiting your decision it reads the options back and asks which one — instead of silently
+  resolving whichever was most recent (which could be the wrong one).
+
 - **Stale "quality drift" and "learning regression" alarms no longer linger or cry wolf** — when
   Genesis's weekly self-checks flagged a quality drift or a learning regression, that flag stayed
   active until it expired days later, so the morning report kept repeating a days-old warning as if
