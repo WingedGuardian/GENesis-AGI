@@ -13,7 +13,10 @@ RESPONSE_SUFFIX = ".genesis.md"
 # re-pasted with different params (e.g. a LinkedIn share from android vs
 # desktop) compares equal. Query params only — URL *paths* are left intact
 # (path-level share codes are too risky to strip).
-_URL_IN_LINE_RE = re.compile(r"https?://[^\s]+")
+# Exclude <> (and rely on the trailing-punct stripper for )]} etc.) so a
+# markdown-style <https://...> URL is matched cleanly, mirroring the URL
+# extraction regex in monitor.py.
+_URL_IN_LINE_RE = re.compile(r"https?://[^\s<>]+")
 _TRACKING_PARAM_PREFIXES = ("utm_", "mc_")
 _TRACKING_PARAM_EXACT = frozenset({
     "rcm", "fbclid", "gclid", "igshid", "mkt_tok",

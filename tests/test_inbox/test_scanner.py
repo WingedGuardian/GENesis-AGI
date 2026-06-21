@@ -56,6 +56,13 @@ class TestNormalizeUrlLine:
             == "read https://x.com/p now"
         )
 
+    def test_angle_bracketed_url(self):
+        # Markdown <url> form: the bracket must not leak into the URL path.
+        assert (
+            normalize_url_line("<https://x.com/p?utm_source=x>")
+            == "<https://x.com/p>"
+        )
+
 
 @pytest.fixture
 def inbox_dir(tmp_path: Path) -> Path:
