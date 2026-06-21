@@ -163,6 +163,10 @@ class TestCadenceHeartbeat:
         # _emit_heartbeat builds the emit() coroutine synchronously (recording
         # the call) then hands it to tracked_task. Stub tracked_task so no loose
         # task is left pending, and close the captured coroutine cleanly.
+        # Patch the SOURCE module (genesis.util.tasks): _emit_heartbeat imports
+        # tracked_task inline (function-local) and re-resolves it from that
+        # module on each call, so there is no genesis.ego.cadence.tracked_task
+        # module-scope binding to target.
         def _fake_tracked_task(coro, **kwargs):
             coro.close()
             return None
@@ -183,6 +187,16 @@ class TestCadenceHeartbeat:
         """No event bus (e.g. standalone/test) → silent no-op, never raises."""
         assert cadence._event_bus is None
         cadence._emit_heartbeat("alive")  # must not raise
+
+    async def test_start_emits_initial_heartbeat(self, cadence):
+        """start() fires an immediate liveness pulse so a fresh restart is not
+        reported stale until the first 5-min ego_heartbeat firing."""
+        cadence._emit_heartbeat = MagicMock()
+        await cadence.start()
+        try:
+            cadence._emit_heartbeat.assert_called_once_with("start")
+        finally:
+            await cadence.stop()
 
 
 # ---------------------------------------------------------------------------

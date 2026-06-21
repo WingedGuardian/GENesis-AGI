@@ -199,6 +199,10 @@ class EgoCadenceManager:
             logger=logger,
         )
         self._running = True
+        # Initial liveness pulse so a restart doesn't look stale to
+        # subsystem_heartbeats during the first 5-min ego_heartbeat window
+        # (mirrors awareness/surplus emitting a heartbeat at start).
+        self._emit_heartbeat("start")
         morning_str = (
             f", morning={self._config.morning_report_hour:02d}:"
             f"{self._config.morning_report_minute:02d} "
@@ -996,7 +1000,9 @@ class EgoCadenceManager:
                     f"ego_{trigger} (interval={self._current_interval}m, "
                     f"failures={self._consecutive_failures})",
                 ),
-                name="ego_heartbeat",
+                name=f"ego_heartbeat_{trigger}",
             )
         except Exception:
-            pass  # Heartbeat emission is best-effort
+            # Best-effort, but never silent — a dark heartbeat with a live
+            # scheduler is exactly the thing this method exists to prevent.
+            logger.debug("Ego heartbeat emission failed", exc_info=True)
