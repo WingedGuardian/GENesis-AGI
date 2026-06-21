@@ -180,14 +180,17 @@ class EmailAutonomyGate:
         self, thread_id: str | None, recipient: str,
     ) -> bool:
         """True iff ``recipient`` is a known participant (received-message sender)
-        of the thread.  A NULL sender (legacy / auto-reply rows) gets the benefit
-        of the doubt — we never demote a grant on missing data alone."""
+        of the thread.  The inbound path always records ``sender`` (the From
+        header — ``reply_poller``/``threads.record_reply`` require it), so a
+        normal reply matches its correspondent here.  We deliberately do NOT
+        treat a NULL/blank sender as a match: that would let a single
+        unparsed-sender row in a thread grant unbounded recipient scope (the safe
+        failure for a SECURITY guard is to trip and hold, not to wave through)."""
         if not thread_id:
             return False  # a 'standard' reply with no thread is itself suspect
         cursor = await self._db.execute(
             "SELECT 1 FROM email_thread_messages "
-            "WHERE thread_id = ? AND direction = 'received' "
-            "AND (sender = ? OR sender IS NULL) LIMIT 1",
+            "WHERE thread_id = ? AND direction = 'received' AND sender = ? LIMIT 1",
             (thread_id, recipient),
         )
         return await cursor.fetchone() is not None

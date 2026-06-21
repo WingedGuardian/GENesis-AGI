@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 
 import aiosqlite
 
-from genesis.autonomy.types import CellEvent
+from genesis.autonomy.types import CellEvent, CellState
 from genesis.db.crud import capability_grants as cg
 from genesis.db.crud import ego as ego_crud
 
@@ -98,11 +98,22 @@ async def handle_cell_promotion_resolution(
     domain, verb, risk = cell
     now = datetime.now(UTC).isoformat()
 
-    # Staleness guard: re-verify the cell still qualifies.  A correction landing
-    # between proposal and approval craters the posterior / demotes the cell —
-    # the evidence the user approved on no longer holds, so don't promote.
-    promotable = await cg.detect_promotable_cells(db)
-    if not any(c["id"] == f"{domain}:{verb}:{risk}" for c in promotable):
+    # Staleness guard: re-fetch THIS cell immediately before promoting (not a
+    # batch scan taken moments earlier — that leaves a TOCTOU window for a
+    # concurrent correction).  A correction landing between the proposal and the
+    # approval demotes the cell + craters its re-earn posterior, so the evidence
+    # the owner approved on no longer holds — don't promote.
+    current = await cg.get_cell(db, domain, verb, risk)
+    still_promotable = (
+        current is not None
+        and current["state"] == CellState.ASK.value
+        and current["successes"] >= cg.MIN_PROMOTE_N
+        and cg.cell_posterior(
+            current["successes"], current["corrections"],
+            current["weighted_corrections"] or 0.0,
+        ) >= cg.PROMOTE_THRESHOLD
+    )
+    if not still_promotable:
         logger.info(
             "cell_promotion for %s skipped — no longer promotable (evidence changed)",
             cell_key,

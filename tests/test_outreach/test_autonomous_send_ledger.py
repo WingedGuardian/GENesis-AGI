@@ -79,11 +79,12 @@ async def _grant_standard(db):
         )
 
 
-async def _add_inbound(db, thread_id):
+async def _add_inbound(db, thread_id, sender="alice@example.com"):
     await db.execute(
-        "INSERT INTO email_thread_messages (thread_id, message_id, direction, received_at) "
-        "VALUES (?, ?, 'received', ?)",
-        (thread_id, f"m-{thread_id}", _TS),
+        "INSERT INTO email_thread_messages "
+        "(thread_id, message_id, direction, sender, received_at) "
+        "VALUES (?, ?, 'received', ?, ?)",
+        (thread_id, f"m-{thread_id}", sender, _TS),
     )
     await db.commit()
 

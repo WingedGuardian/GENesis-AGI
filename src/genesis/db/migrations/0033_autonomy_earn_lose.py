@@ -60,7 +60,7 @@ _AUTONOMOUS_SENDS_INDEXES = (
 _REVERT_SEED = (
     "DELETE FROM capability_grants "
     "WHERE id = 'email:send:standard' AND state = 'granted' "
-    "AND successes = 0 AND corrections = 0"
+    "AND successes = 0 AND corrections = 0 AND weighted_corrections = 0.0"
 )
 
 
@@ -105,5 +105,5 @@ async def down(db: aiosqlite.Connection) -> None:
         "INSERT OR IGNORE INTO capability_grants "
         "(id, domain, verb, risk_class, state, granted_at, created_at, updated_at) "
         "VALUES ('email:send:standard', 'email', 'send', 'standard', 'granted', "
-        "datetime('now'), datetime('now'), datetime('now'))"
+        "strftime('%Y-%m-%dT%H:%M:%S+00:00','now'), datetime('now'), datetime('now'))"
     )

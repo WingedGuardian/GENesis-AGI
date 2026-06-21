@@ -311,6 +311,7 @@ async def decay_stale_cells(
         """UPDATE capability_grants
              SET state = ?, granted_at = NULL, last_decayed_at = ?, updated_at = ?
            WHERE state = ?
+             AND granted_at IS NOT NULL
              AND COALESCE(last_used_at, granted_at) < ?
            RETURNING id""",
         (CellState.NOT_DETERMINED.value, now, now, CellState.GRANTED.value, cutoff),
