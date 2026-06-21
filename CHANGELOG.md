@@ -12,11 +12,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 ### Added
 
 - **Genesis won't send email on its own without your say-so** — outbound email now passes
-  a deterministic authorization check before it leaves. A reply on a thread you're already
-  in goes out normally, but anything else — a cold first email, a bulk or campaign send, or
-  anything involving money — is held for your approval and sent only once you approve it
-  (rejected or unanswered holds are never sent). Genesis earns the ability to send a given
-  kind of email on its own as you approve them over time, so you stay in the loop by default.
+  a deterministic authorization check before it leaves. By default every send is held for your
+  approval: a reply on a thread you're already in is the lowest-risk kind, while a cold first
+  email, a bulk or campaign send, or anything involving money is held with a higher bar.
+  Rejected or unanswered holds are never sent. Over time Genesis can earn the ability to send a
+  given kind of email on its own (see below), so you stay in the loop by default.
+
+- **Genesis earns email autonomy you can revoke in one click** — once Genesis has sent a kind
+  of email with your approval enough times, it proposes a promotion: it asks "may I send these
+  on my own from now on?" — and only you can say yes. If a promoted send ever goes wrong, that
+  autonomy is revoked immediately and the next send holds for your approval again, whether the
+  system catches it (a send to the wrong person, or a sudden burst of sends) or you flag it
+  yourself. A new dashboard **Autonomy** tab shows what Genesis is allowed to do on its own and
+  a log of what it has done, with a "Flag as bad" button on every autonomous send. A per-send
+  Telegram notice is available but off by default (the tab is where to look) — turn it on with
+  `email_send_notify` in the autonomy config.
 
 - **See what Genesis did as a timeline** — the dashboard has a new **Traces** tab that
   renders each recorded operation (a reflection, an ego cycle, a dispatched session) as a
