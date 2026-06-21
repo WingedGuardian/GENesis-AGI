@@ -218,9 +218,18 @@ for collection in episodic_memory knowledge_base; do
 done
 
 # --- 3. CC session transcripts (encrypted — contain conversation PII) ---
+#
+# RETENTION POLICY — KEEP FOREVER BY DEFAULT. Backed-up transcripts are Genesis's
+# durable long-term conversational memory. The LOCAL store (~/.claude/projects)
+# expires on Claude Code's cleanupPeriodDays, but the BACKUP is the permanent
+# archive: transcripts/*.gpg accumulate here and are NEVER auto-pruned (the only
+# delete below is the pre-encryption plaintext staging, not the .gpg archive).
+# Any future retention work (GFS snapshot pruning, local-staging prune) MUST
+# EXEMPT transcripts/ — a user may opt into expiry, but the system must never
+# auto-expire transcripts the way the local store does.
 log "Backing up CC transcripts..."
 mkdir -p transcripts
-# Purge any pre-encryption plaintext transcripts.
+# Purge any pre-encryption plaintext transcripts (staging only — NOT the .gpg).
 find transcripts -maxdepth 1 -name '*.jsonl' -type f -delete 2>/dev/null || true
 if [ -d "$TRANSCRIPT_DIR" ]; then
     if ! $_ENCRYPT_READY; then
