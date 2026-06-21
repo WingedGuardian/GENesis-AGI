@@ -57,6 +57,22 @@ async def init(rt: GenesisRuntime) -> None:
                 event_bus=rt._event_bus,
                 classifier=rt._action_classifier,
             )
+
+            # WS-8: wire the deterministic email autonomy gate into the
+            # (already-built) outreach pipeline. Autonomy init runs AFTER
+            # outreach init, so both the pipeline and the approval manager
+            # exist here — wiring it during outreach init would pass a None
+            # approval manager.
+            if rt._outreach_pipeline is not None:
+                from genesis.autonomy.email_gate import EmailAutonomyGate
+
+                rt._outreach_pipeline.set_autonomy_gate(EmailAutonomyGate(
+                    db=rt._db,
+                    approval_manager=rt._approval_manager,
+                    event_bus=rt._event_bus,
+                ))
+                logger.info("Email autonomy gate wired into outreach pipeline")
+
             rt._autonomous_cli_policy_exporter = AutonomousCliPolicyExporter()
             if rt._router is not None:
                 rt._autonomous_cli_approval_gate = AutonomousCliApprovalGate(

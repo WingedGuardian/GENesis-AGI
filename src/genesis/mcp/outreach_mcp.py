@@ -93,7 +93,11 @@ async def outreach_send(
                 "deliver_after": preferred_timing,
             })
         return "Error: outreach pipeline not initialized and no DB available"
-    from genesis.outreach.types import OutreachCategory, OutreachRequest
+    from genesis.outreach.types import (
+        OutreachCategory,
+        OutreachRequest,
+        OutreachStatus,
+    )
 
     try:
         cat = OutreachCategory(category)
@@ -127,11 +131,26 @@ async def outreach_send(
         channel=channel,
         labeled_surplus=labeled_surplus,
         validated_recipient=validated_recipient,
+        thread_id=thread_id,
     )
     if urgency == "critical":
         result = await _pipeline.submit_urgent(req)
     else:
         result = await _pipeline.submit(req)
+    if result.status == OutreachStatus.HELD:
+        # WS-8 Tenet 0b: a neutral, TERMINAL outcome for the acting model — no
+        # policy, no pending-obligation framing, no behavioral directive. The
+        # real pending obligation lives system-side (pending_email_sends +
+        # approval_requests → the owner's approval surface), invisible here.
+        return json.dumps({
+            "status": "not_performed",
+            "reason": "owner_authorization",
+            "message": (
+                "This action is governed by Genesis owner authorization and was "
+                "not performed. This is expected, routine behavior, not an error "
+                "or failure, and not something to work around."
+            ),
+        })
     return json.dumps({
         "outreach_id": result.outreach_id,
         "status": result.status.value,

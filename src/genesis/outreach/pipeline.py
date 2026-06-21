@@ -73,6 +73,10 @@ class OutreachPipeline:
         self._thread_tracker: object | None = None  # Set via set_thread_tracker()
         self._topic_manager = None
         self._forum_chat_id: str | None = None
+        # WS-8 email autonomy gate — injected via set_autonomy_gate() during
+        # autonomy init (runs after outreach init, so ApprovalManager exists).
+        # None ⇒ no gating (e.g. pre-wiring / standalone tests).
+        self._autonomy_gate: object | None = None
 
     def set_reply_waiter(self, waiter: ReplyWaiter) -> None:
         """Attach a ReplyWaiter for bidirectional outreach."""
@@ -81,6 +85,11 @@ class OutreachPipeline:
     def set_thread_tracker(self, tracker: object) -> None:
         """Attach a ThreadTracker for email thread auto-registration."""
         self._thread_tracker = tracker
+
+    def set_autonomy_gate(self, gate: object) -> None:
+        """Attach the WS-8 email autonomy gate (deterministic owner-authorization
+        check applied to outbound email in ``_deliver``)."""
+        self._autonomy_gate = gate
 
     def reload_config(self, config: OutreachConfig) -> None:
         """Hot-reload outreach config on pipeline and governance gate."""
@@ -298,6 +307,7 @@ class OutreachPipeline:
         gov: object | None,
         *,
         reply_markup: object | None = None,
+        gate_cleared: bool = False,
     ) -> OutreachResult:
         adapter = self._channels.get(channel)
         recipient = request.validated_recipient or self._recipients.get(channel, "")
@@ -314,6 +324,28 @@ class OutreachPipeline:
                 message_content=formatted.text,
                 error=f"No adapter or recipient for {channel}",
             )
+
+        # WS-8 autonomy capability gate — deterministic owner-authorization for
+        # outbound email, BELOW the LLM tool call (Tenet 0). This is the sole
+        # unbypassable chokepoint: every send path converges on _deliver. A held
+        # send is recorded for owner approval and later resumed below the gate by
+        # the resolution watcher (gate_cleared=True). Non-email channels and the
+        # resume path skip it.
+        if channel == "email" and not gate_cleared and self._autonomy_gate is not None:
+            decision = await self._autonomy_gate.check(
+                request=request, recipient=recipient, message_text=formatted.text,
+            )
+            if not decision.allow:
+                logger.info(
+                    "Outreach %s HELD by email autonomy gate (pending=%s)",
+                    outreach_id, decision.pending_id,
+                )
+                return OutreachResult(
+                    outreach_id=outreach_id,
+                    status=OutreachStatus.HELD,
+                    channel=channel,
+                    message_content=formatted.text,
+                )
 
         # Determine delivery routing: supergroup, dm, or both
         routing = "supergroup"  # default
@@ -476,6 +508,32 @@ class OutreachPipeline:
             message_content=formatted.text,
             delivery_id=str(delivery_id),
             governance_result=gov,
+        )
+
+    async def deliver_approved(
+        self, pending: dict, *, subject: str | None = None,
+    ) -> OutreachResult:
+        """Send a previously-held email BELOW the autonomy gate.
+
+        Called ONLY by the resolution watcher after the owner approved the
+        hold.  The body was drafted + formatted when held, so it is delivered
+        verbatim (no re-draft, no governance).  ``gate_cleared=True`` skips
+        re-gating — the flag is set only here (trusted code), never by the LLM,
+        so it cannot be a re-entry / bypass vector.
+        """
+        req = OutreachRequest(
+            category=OutreachCategory(pending["category"]),
+            topic=subject or "",
+            context=pending["message"],
+            salience_score=0.5,
+            signal_type="email_gate_resume",
+            channel="email",
+            validated_recipient=pending["validated_recipient"],
+            thread_id=pending.get("thread_id"),
+        )
+        formatted = FormattedContent(text=pending["message"], target=FormatTarget.EMAIL)
+        return await self._deliver(
+            str(uuid.uuid4()), "email", formatted, req, None, gate_cleared=True,
         )
 
     def _should_voice(self, request: OutreachRequest) -> bool:
