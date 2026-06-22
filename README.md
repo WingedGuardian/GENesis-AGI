@@ -289,9 +289,9 @@ Total budget: under 1.5 seconds. If the embedding provider is down, vector searc
 
 **Not just documents in a vector space:**
 
-Memories aren't isolated documents—they're connected. The knowledge graph creates typed links between memories across 12 edge types: *supports, contradicts, extends, elaborates, succeeded_by, preceded_by*, and more. When a memory is stored, auto-linking finds its nearest neighbors and creates typed edges based on similarity. When you recall a fact, Genesis can walk the graph to find what supports it, what contradicts it, and what replaced it. After three months of operation: 30,000+ memories, 29,000+ vectors across two Qdrant collections, and a knowledge graph with tens of thousands of typed connections between them.
+Memories aren't isolated documents—they're connected. The knowledge graph creates typed links between memories across 12 edge types: *supports, contradicts, extends, elaborates, succeeded_by, preceded_by*, and more. When a memory is stored, auto-linking finds its nearest neighbors and creates typed edges based on similarity. When you recall a fact, Genesis can walk the graph to find what supports it, what contradicts it, and what replaced it. After nearly four months of operation: 40,000+ memories, 42,000+ vectors across two Qdrant collections, and a knowledge graph with 130,000+ typed connections between them.
 
-An event calendar tracks time-anchored information—deadlines, scheduled tasks, recurring cycles—so Genesis knows not just *what* happened but *when*, and can anticipate what's coming. Procedural memory (48 learned procedures at current count) captures reusable multi-step workflows extracted from experience, each with calibrated confidence scores that promote or demote based on outcomes.
+An event calendar tracks time-anchored information—deadlines, scheduled tasks, recurring cycles—so Genesis knows not just *what* happened but *when*, and can anticipate what's coming. Procedural memory captures reusable multi-step workflows extracted from experience, each with a calibrated confidence score that promotes or demotes it based on outcomes.
 
 Activation scoring ensures relevance isn't just cosine similarity—it's time-aware decay (configurable half-lives: 30-60 days by source type), access frequency (log scale, capping at 20 retrievals), graph connectivity, and class weighting. A steering rule from month one outranks a casual observation from yesterday.
 
@@ -306,21 +306,21 @@ Activation scoring ensures relevance isn't just cosine similarity—it's time-aw
 
 **Wing taxonomy:** Memory is classified into 15 structural domains (infrastructure, learning, channels, memory, dev_workflow, routing, autonomy, career, integrations, research, and more) with subtopics. Querying within a specific domain cuts noise from the full store. Classification uses tiered confidence signals: file path patterns (strongest) → keywords → tags → source pipeline → fallback.
 
-After three months of operation, Genesis doesn't just have more memories—it has a structured, interconnected, time-aware knowledge system that surfaces the right context before you ask for it. 30,000+ memories. 9,000+ observations. 2,000+ knowledge base entries. 48 learned procedures. Two vector collections. A knowledge graph connecting it all. That's what separates this from a chatbot with a vector database.
+After nearly four months of operation, Genesis doesn't just have more memories—it has a structured, interconnected, time-aware knowledge system that surfaces the right context before you ask for it. 40,000+ memories. 11,000+ observations. 2,300+ knowledge base entries. Two vector collections. A knowledge graph with 130,000+ typed connections wiring it all together. That's what separates this from a chatbot with a vector database.
 
 <p align="center">
-  <img src="docs/images/memory-growth-chart.png" alt="Genesis memory growth — 30,000+ memories across 3 months" width="760">
+  <img src="docs/images/memory-growth-chart.png" alt="Genesis memory growth — 40,000+ memories in under four months" width="760">
 </p>
 
 <details>
-<summary><i>Memory growth by the numbers (March–June 2026)</i></summary>
+<summary><i>Memory growth by the numbers (March–June 2026, through the 21st)</i></summary>
 
 | Month | Memories stored | Observations | Cumulative total |
 |---|---|---|---|
-| March | 1,188 | 2,786 | 1,188 |
-| April | 8,746 | 2,867 | 9,934 |
-| May | 18,972 | 3,119 | 28,906 |
-| June (2 days) | 1,414 | 294 | 30,320 |
+| March | 1,186 | 2,786 | 1,186 |
+| April | 8,659 | 2,866 | 9,845 |
+| May | 17,172 | 3,119 | 27,017 |
+| June (through 21st) | 13,726 | 2,453 | 40,743 |
 
 </details>
 
@@ -386,6 +386,8 @@ Genesis earns autonomy per category through demonstrated competence:
 | L4 | Proactive outreach | Initiating communication based on observations |
 
 V5 extends this to L5-L7: system configuration, learning modification, and identity evolution. These require months of L4 operational data before they're safe to activate.
+
+Under the hood, autonomy is tracked as a **capability-grant matrix**—a grant per *(domain, action, risk class)* cell, not one global setting. Genesis can earn the right to send a routine reply on an existing email thread on its own while a cold first email, a bulk send, or anything involving money still holds for your approval—each cell earned, demoted, and re-earned independently. Email is the first domain live on this model: every outbound message passes a deterministic authorization gate at the moment of send, autonomy for a given *kind* of email is granted only after enough approved sends, then revoked in one click the moment one goes wrong.
 
 Trust is granular, not binary. First failure in a category triggers demotion—Bayesian regression, not a fixed penalty. Earn it back through performance. The regression is always announced. Never silent.
 
@@ -560,6 +562,8 @@ The architecture draws from **Global Workspace Theory** (Baars, 1988) and the **
 **Autonomous codebase evolution.** Genesis proposes changes to its own source code. It searches for developments in AI research, evaluates them against its own architecture, and integrates what makes it better. Not a human reviewing papers—the system itself.
 
 **User-adaptive architecture.** The underlying codebase shifts to serve each user. Not personalized prompts—structural code changes that reshape how Genesis processes information based on months of learned behavior. The system you're running six months in is architecturally different from the one you started with.
+
+*Groundwork is already live.* Genesis can now A/B-test a change to its own cognition against a graded benchmark before adopting it (recommend-only), and it keeps a rollback ledger that snapshots every self-edit to a skill, calibration target, or its user model—so any self-modification can be reverted. The scaffolding for safe self-evolution is in place; V5 is about letting it reach the source code itself.
 
 **Full autonomy progression (L5-L7):**
 
