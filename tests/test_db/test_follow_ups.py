@@ -298,13 +298,15 @@ async def test_get_recently_completed_domain_exact_match(db):
     uw_id = await follow_ups.create(
         db, **{**_BASE, "content": "uw done"}, domain="user_world",
     )
+    null_id = await follow_ups.create(db, **{**_BASE, "content": "null done"})
     await follow_ups.update_status(db, int_id, "completed")
     await follow_ups.update_status(db, uw_id, "completed")
+    await follow_ups.update_status(db, null_id, "completed")
 
     scoped = [r["content"] for r in await follow_ups.get_recently_completed(db, domain="user_world")]
-    assert scoped == ["uw done"]  # internal excluded (NB: result has no domain col)
+    assert scoped == ["uw done"]  # internal + NULL excluded (NB: result has no domain col)
     unscoped = {r["content"] for r in await follow_ups.get_recently_completed(db)}
-    assert unscoped == {"int done", "uw done"}  # backward-compat no-op
+    assert unscoped == {"int done", "uw done", "null done"}  # NULL survives unscoped no-op
 
 
 async def test_get_actionable_domain_excludes_pinned_internal(db):
