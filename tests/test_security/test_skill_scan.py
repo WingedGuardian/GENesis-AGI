@@ -92,6 +92,28 @@ def test_report_to_finding_builds_recon_finding():
     assert "DO NOT INSTALL" in finding["summary"]
 
 
+def test_report_to_finding_handles_dict_location():
+    # SkillSpector emits `location` as either a string ("file:line") or a dict
+    # ({"file","start_line","end_line"}); the summary must render a clean
+    # "file:line", never a raw dict repr.
+    result = parse_report(
+        {
+            "skill": {"name": "x"},
+            "risk_assessment": {"score": 25, "severity": "MEDIUM", "recommendation": "CAUTION"},
+            "issues": [
+                {
+                    "category": "Memory Poisoning",
+                    "severity": "HIGH",
+                    "location": {"file": "SKILL.md", "start_line": 288, "end_line": None},
+                }
+            ],
+        }
+    )
+    finding = report_to_finding(result)
+    assert "SKILL.md:288" in finding["summary"]
+    assert "{" not in finding["summary"]  # no raw dict repr leaked into the text
+
+
 def test_report_to_finding_safe_skill_is_low_priority():
     safe = parse_report(
         {

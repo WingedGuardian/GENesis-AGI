@@ -69,6 +69,20 @@ def parse_report(report: dict) -> ScanResult:
     )
 
 
+def _format_location(loc: object) -> str:
+    """Render a SkillSpector issue location as 'file:line'.
+
+    SkillSpector emits ``location`` as either a string ("file:line") or a dict
+    ({"file", "start_line", "end_line"}); normalize both to a clean string so a
+    raw dict repr never leaks into a human-facing finding.
+    """
+    if isinstance(loc, dict):
+        file = loc.get("file") or ""
+        line = loc.get("start_line")
+        return f"{file}:{line}" if file and line is not None else (file or "")
+    return str(loc or "")
+
+
 def report_to_finding(result: ScanResult) -> dict:
     """Build a recon finding payload (title/summary/priority/source_url/job_type).
 
@@ -86,7 +100,7 @@ def report_to_finding(result: ScanResult) -> dict:
         for issue in result.issues[:10]:
             cat = issue.get("category", "?")
             sev = issue.get("severity", "?")
-            loc = issue.get("location", "")
+            loc = _format_location(issue.get("location"))
             lines.append(f"  - [{sev}] {cat}{f' @ {loc}' if loc else ''}")
     else:
         lines.append("No issues detected.")
@@ -163,10 +177,12 @@ def run_skillspector(
 ) -> dict | None:
     """Run ``skillspector scan <dir> -f json`` and return the parsed report.
 
-    Returns None on timeout, non-zero exit, or unreadable output — one bad/huge
+    Returns None on timeout, exec error, or unreadable output — one bad/huge
     skill (e.g. a skill bundling thousands of files) is logged and skipped, never
-    fatal to the sweep. SkillSpector must be installed separately; pass
-    ``skillspector_bin`` or have it on PATH.
+    fatal to the sweep. A NON-ZERO exit is NOT treated as failure: SkillSpector
+    signals risk level via the exit code (CRITICAL -> rc=1), so the parsed JSON
+    is trusted whenever it parses. SkillSpector must be installed separately;
+    pass ``skillspector_bin`` or have it on PATH.
     """
     import json
     import os
@@ -193,6 +209,10 @@ def run_skillspector(
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         logger.warning("skillspector scan timed out for %s (%ss)", skill_dir, timeout_s)
+        _safe_unlink(out_path)
+        return None
+    except OSError as exc:
+        logger.warning("skillspector could not be executed for %s: %s", skill_dir, exc)
         _safe_unlink(out_path)
         return None
 
