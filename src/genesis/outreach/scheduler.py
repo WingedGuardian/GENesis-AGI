@@ -500,12 +500,24 @@ class OutreachScheduler:
         """
         try:
             from genesis.observability.ambient_health import (
+                AmbientRemoteConfigError,
                 evaluate_ambient_health,
                 load_ambient_remote_config,
                 read_edge_health,
             )
 
-            cfg = load_ambient_remote_config()
+            try:
+                cfg = load_ambient_remote_config()
+            except AmbientRemoteConfigError as cfg_err:
+                # Present-but-malformed config: log loudly + record a clean run (the
+                # job itself didn't fail). The dashboard's degraded ambient card
+                # carries the detail; this avoids flapping a phantom job failure.
+                logger.error(
+                    "ambient_remote.yaml misconfigured — ambient health monitor disabled: %s",
+                    cfg_err,
+                )
+                await self._record_job_result("ambient_health")
+                return
             if cfg is None:
                 return  # no ambient edge on this install — silent no-op
 
