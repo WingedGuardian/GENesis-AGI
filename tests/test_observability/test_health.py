@@ -263,6 +263,23 @@ class TestProbeAmbientHealth:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_misconfigured_config_is_degraded_not_silent(self):
+        # Present-but-malformed config (loader raises) -> VISIBLE degraded card,
+        # NOT a silent None that looks identical to "not configured".
+        from genesis.observability.ambient_health import AmbientRemoteConfigError
+
+        with patch(
+            f"{self._MOD}.load_ambient_remote_config",
+            side_effect=AmbientRemoteConfigError("missing host_ip/host_user"),
+        ):
+            result = await probe_ambient_health(clock=FROZEN_CLOCK)
+        assert result is not None
+        assert result.name == "ambient"
+        assert result.status == ProbeStatus.DEGRADED
+        assert result.details["verdict"] == "misconfigured"
+        assert "misconfigured" in result.message
+
+    @pytest.mark.asyncio
     async def test_healthy(self):
         snap = {"ts": FROZEN_CLOCK().isoformat(), "diar_enabled": True, "diar_worker_alive": True}
         with (

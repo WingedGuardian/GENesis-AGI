@@ -39,31 +39,47 @@ class AmbientRemoteConfig:
     health_path: str = _DEFAULT_HEALTH_PATH
 
 
+class AmbientRemoteConfigError(Exception):
+    """Raised when ``~/.genesis/ambient_remote.yaml`` is present AND enabled but
+    malformed (unparseable, or missing ``host_ip``/``host_user``).
+
+    Distinct from absent/disabled (which return ``None``) so callers can surface a
+    VISIBLE "misconfigured" state — instead of a config typo silently looking
+    identical to "no ambient edge configured" and disabling monitoring unnoticed."""
+
+
 def load_ambient_remote_config() -> AmbientRemoteConfig | None:
-    """Load ``~/.genesis/ambient_remote.yaml``; return None if absent, disabled,
-    or invalid (monitor then no-ops). Never raises."""
+    """Load ``~/.genesis/ambient_remote.yaml``.
+
+    Returns ``None`` when the config is **absent** or **explicitly disabled**
+    (``enabled: false``) — both legitimate no-ops on installs without an ambient
+    edge. Raises :class:`AmbientRemoteConfigError` when the file is **present and
+    enabled but malformed** (unparseable, or missing ``host_ip``/``host_user``), so
+    a config typo surfaces visibly instead of silently looking like "not configured"."""
     if not _CONFIG_PATH.exists():
         return None
     try:
         import yaml
 
         data = yaml.safe_load(_CONFIG_PATH.read_text()) or {}
-        if not data.get("enabled", True):
-            return None
-        host_ip = data.get("host_ip")
-        host_user = data.get("host_user")
-        if not host_ip or not host_user:
-            logger.warning("ambient_remote.yaml missing host_ip/host_user — monitor disabled")
-            return None
-        return AmbientRemoteConfig(
-            host_ip=str(host_ip),
-            host_user=str(host_user),
-            ssh_key=str(data.get("ssh_key", _DEFAULT_KEY)),
-            health_path=str(data.get("health_path", _DEFAULT_HEALTH_PATH)),
-        )
-    except Exception:
-        logger.warning("Failed to load ambient_remote.yaml — monitor disabled", exc_info=True)
+    except Exception as exc:
+        raise AmbientRemoteConfigError(
+            f"ambient_remote.yaml could not be parsed: {exc}"
+        ) from exc
+    if not data.get("enabled", True):
         return None
+    host_ip = data.get("host_ip")
+    host_user = data.get("host_user")
+    if not host_ip or not host_user:
+        raise AmbientRemoteConfigError(
+            "ambient_remote.yaml is enabled but missing host_ip/host_user"
+        )
+    return AmbientRemoteConfig(
+        host_ip=str(host_ip),
+        host_user=str(host_user),
+        ssh_key=str(data.get("ssh_key", _DEFAULT_KEY)),
+        health_path=str(data.get("health_path", _DEFAULT_HEALTH_PATH)),
+    )
 
 
 async def read_edge_health(cfg: AmbientRemoteConfig) -> dict | None:

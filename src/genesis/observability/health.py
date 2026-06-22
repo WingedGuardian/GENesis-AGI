@@ -645,13 +645,26 @@ async def probe_ambient_health(clock=None) -> ProbeResult | None:
     hammer the edge.
     """
     from genesis.observability.ambient_health import (
+        AmbientRemoteConfigError,
         evaluate_ambient_health,
         load_ambient_remote_config,
         read_edge_health,
     )
 
     _clock = clock or (lambda: datetime.now(UTC))
-    cfg = load_ambient_remote_config()
+    try:
+        cfg = load_ambient_remote_config()
+    except AmbientRemoteConfigError as exc:
+        # Present-but-malformed config: surface a VISIBLE degraded card with the
+        # reason, instead of silently looking like "no ambient edge configured".
+        return ProbeResult(
+            name="ambient",
+            status=ProbeStatus.DEGRADED,
+            latency_ms=0.0,
+            message=f"ambient_remote.yaml misconfigured: {exc}",
+            checked_at=_clock().isoformat(),
+            details={"verdict": "misconfigured"},
+        )
     if cfg is None:
         return None  # no ambient edge configured — observability no-op
 
