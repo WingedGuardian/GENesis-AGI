@@ -339,6 +339,8 @@ def default_trusted_file() -> Path:
 
 
 def load_trusted_names(path: Path) -> set[str]:
+    """Return the set of trusted skill names from *path* (one per line, ``#``
+    comments and blanks ignored), or an empty set if the file does not exist."""
     if not path.is_file():
         return set()
     return {
