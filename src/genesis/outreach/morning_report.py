@@ -428,9 +428,11 @@ class MorningReportGenerator:
 
         lines = []
 
-        # User-input-needed items
+        # User-input-needed items. Strict user_world throughout: the morning
+        # report is the USER's brief — internal-dev items (incl. internal
+        # failed/blocked) belong to the genesis ego / health, not here.
         user_items = await follow_ups.get_pending(
-            self._db, strategy="user_input_needed",
+            self._db, strategy="user_input_needed", domain="user_world",
         )
         if user_items:
             lines.append("**Needs your input:**")
@@ -438,8 +440,8 @@ class MorningReportGenerator:
                 lines.append(f"- {fu['content'][:200]}")
 
         # Blocked/failed items
-        blocked = await follow_ups.get_by_status(self._db, "failed")
-        blocked += await follow_ups.get_by_status(self._db, "blocked")
+        blocked = await follow_ups.get_by_status(self._db, "failed", domain="user_world")
+        blocked += await follow_ups.get_by_status(self._db, "blocked", domain="user_world")
         if blocked:
             lines.append("**Blocked/failed:**")
             for fu in blocked[:5]:
@@ -448,7 +450,7 @@ class MorningReportGenerator:
 
         # Recently completed (last 24h)
         completed = await follow_ups.get_recently_completed(
-            self._db, hours=24, limit=5,
+            self._db, hours=24, limit=5, domain="user_world",
         )
         if completed:
             lines.append("**Completed (24h):**")

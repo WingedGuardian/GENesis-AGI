@@ -305,3 +305,18 @@ async def test_get_recently_completed_domain_exact_match(db):
     assert scoped == ["uw done"]  # internal excluded (NB: result has no domain col)
     unscoped = {r["content"] for r in await follow_ups.get_recently_completed(db)}
     assert unscoped == {"int done", "uw done"}  # backward-compat no-op
+
+
+async def test_get_actionable_domain_excludes_pinned_internal(db):
+    """A PINNED internal row is still excluded by domain='user_world'. Locks the
+    PR3 decision that pinned/high-priority cross-domain items re-home to the
+    cockpit, NOT the user (CEO) ego."""
+    uw = await follow_ups.create(
+        db, **{**_BASE, "content": "user item"}, domain="user_world",
+    )
+    pinned_internal = await follow_ups.create(
+        db, **{**_BASE, "content": "pinned internal"}, domain="internal", pinned=True,
+    )
+    ids = {r["id"] for r in await follow_ups.get_actionable(db, domain="user_world")}
+    assert ids == {uw}
+    assert pinned_internal not in ids

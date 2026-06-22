@@ -685,7 +685,11 @@ class UserEgoContextBuilder:
             cursor = await self._db.execute(
                 "SELECT COUNT(*), MIN(created_at) FROM follow_ups "
                 "WHERE status = 'pending' "
-                "AND strategy = 'user_input_needed'"
+                "AND strategy = 'user_input_needed' "
+                # Strict user_world: only items genuinely awaiting the USER's
+                # input (excludes internal-dev backlog parked under this strategy
+                # and any tabled rows).
+                "AND domain = 'user_world' AND kind = 'follow_up'"
             )
             row = await cursor.fetchone()
             if row and row[0] > 0:
@@ -849,7 +853,14 @@ class UserEgoContextBuilder:
         try:
             from genesis.db.crud import follow_ups as follow_up_crud
 
-            actionable = await follow_up_crud.get_actionable(self._db)
+            # Strict user_world: the user (CEO) ego tracks the user's world only.
+            # Scoping in SQL (before get_actionable's LIMIT) is what actually
+            # surfaces the genuine user items — they're recent, so unscoped they
+            # rank past the cap and never appear. Pinned/high-priority internal
+            # items intentionally re-home to the cockpit, not the user ego.
+            actionable = await follow_up_crud.get_actionable(
+                self._db, domain="user_world",
+            )
         except Exception:
             logger.error("Failed to query follow-ups", exc_info=True)
             lines.append("*Could not query follow-ups.*\n")
