@@ -26,6 +26,14 @@ DEFAULT_DB_PATH = genesis_db_path()
 
 BUSY_TIMEOUT_MS = 5000
 
+# Schema migrations run rarely (deploy / server startup) but must win the write
+# lock even when other processes (concurrent CC-session MCP servers) are writing.
+# A generous timeout lets the migration's BEGIN IMMEDIATE and its COMMIT-time
+# autocheckpoint wait out that contention instead of failing with
+# "database is locked". The runner reconciles against schema_migrations either
+# way, but this keeps the common case quiet.
+MIGRATION_BUSY_TIMEOUT_MS = 60000
+
 
 class SerializedConnection:
     """Proxy that serializes all DB operations through an asyncio.Lock.
