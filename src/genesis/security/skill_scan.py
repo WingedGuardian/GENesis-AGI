@@ -313,7 +313,7 @@ async def store_finding(db: object, finding: dict) -> str | None:
     return finding_id
 
 
-def _repo_skill_roots() -> list[Path]:
+def repo_skill_roots() -> list[Path]:
     """First-party (in-repo) skill roots — trusted by default."""
     try:
         import genesis
@@ -324,21 +324,21 @@ def _repo_skill_roots() -> list[Path]:
         return []
 
 
-def _default_roots() -> list[Path]:
+def default_roots() -> list[Path]:
     """Default skill roots to sweep (some live outside the repo)."""
     return [
         Path.home() / ".claude" / "skills",
         Path.home() / ".genesis" / "skill-library",
-        *_repo_skill_roots(),
+        *repo_skill_roots(),
     ]
 
 
-def _default_trusted_file() -> Path:
+def default_trusted_file() -> Path:
     """Allowlist of trusted skill names (one per line); blessed via --seed-trusted."""
     return Path.home() / ".genesis" / "config" / "skill_scan_trusted.txt"
 
 
-def _load_trusted_names(path: Path) -> set[str]:
+def load_trusted_names(path: Path) -> set[str]:
     if not path.is_file():
         return set()
     return {
@@ -370,7 +370,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-store", action="store_true", help="Scan + print only; do not write recon findings.")
     parser.add_argument(
         "--trusted-file", default=None,
-        help=f"Allowlist of trusted skill names (default: {_default_trusted_file()}).",
+        help=f"Allowlist of trusted skill names (default: {default_trusted_file()}).",
     )
     parser.add_argument(
         "--seed-trusted", action="store_true",
@@ -382,11 +382,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    roots = [Path(r) for r in args.roots] if args.roots else _default_roots()
+    roots = [Path(r) for r in args.roots] if args.roots else default_roots()
     skill_dirs = discover_skill_dirs(roots)
     print(f"Discovered {len(skill_dirs)} skills across {len(roots)} roots.")
 
-    trusted_file = Path(args.trusted_file) if args.trusted_file else _default_trusted_file()
+    trusted_file = Path(args.trusted_file) if args.trusted_file else default_trusted_file()
 
     if args.seed_trusted:
         names = sorted({d.name for d in skill_dirs})
@@ -401,8 +401,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Seeded {len(names)} trusted skill names -> {trusted_file}")
         return 0
 
-    trusted_names = set() if args.no_trust else _load_trusted_names(trusted_file)
-    trusted_roots = [] if args.no_trust else _repo_skill_roots()
+    trusted_names = set() if args.no_trust else load_trusted_names(trusted_file)
+    trusted_roots = [] if args.no_trust else repo_skill_roots()
 
     def trusted(skill_dir: Path) -> bool:
         return is_trusted(skill_dir, trusted_names=trusted_names, trusted_roots=trusted_roots)
