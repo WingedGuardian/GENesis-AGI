@@ -399,6 +399,9 @@ async def get_recently_completed(
 _VALID_KIND = {"follow_up", "tabled"}
 _VALID_DOMAIN = {"internal", "user_world"}
 _VALID_PRIORITY = {"low", "medium", "high", "critical"}
+_VALID_STATUS = {
+    "pending", "scheduled", "in_progress", "completed", "failed", "blocked",
+}
 
 # Allowlisted sort keys → ORDER BY fragment (never interpolate caller input).
 _SORT_MAP: dict[str, str] = {
@@ -497,6 +500,10 @@ async def update_status_batch(
 
     Mirrors update_status: stamps completed_at on terminal states.
     """
+    if status not in _VALID_STATUS:
+        raise ValueError(
+            f"invalid status {status!r}; must be one of {sorted(_VALID_STATUS)}"
+        )
     if not ids:
         return 0
     parts = ["status = ?"]

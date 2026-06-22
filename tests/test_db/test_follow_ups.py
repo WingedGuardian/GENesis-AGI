@@ -230,3 +230,9 @@ async def test_update_status_batch_stamps_completed_at(db):
         assert row["status"] == "completed"
         assert row["completed_at"] is not None
         assert row["resolution_notes"] == "bulk done"
+
+
+async def test_update_status_batch_rejects_invalid_status(db):
+    fid = await follow_ups.create(db, **_BASE)
+    with pytest.raises(ValueError):
+        await follow_ups.update_status_batch(db, [fid], "cancelled")

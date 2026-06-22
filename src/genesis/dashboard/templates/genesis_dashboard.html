@@ -9171,6 +9171,7 @@
         <!-- Filter bar -->
         <div style="display:flex; gap:0.25rem; margin-bottom:0.75rem; flex-wrap:wrap; align-items:center;">
           <select style="font-size:0.68rem; padding:0.2rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);"
+                  :value="$store.genesisDashboard.cockpitFilters.domain"
                   @change="$store.genesisDashboard.cockpitFilters.domain = $event.target.value; $store.genesisDashboard.cockpitApplyFilter()">
             <option value="">All domains</option>
             <option value="internal">Internal</option>
@@ -9179,6 +9180,7 @@
           </select>
 
           <select style="font-size:0.68rem; padding:0.2rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);"
+                  :value="$store.genesisDashboard.cockpitFilters.status"
                   @change="$store.genesisDashboard.cockpitFilters.status = $event.target.value; $store.genesisDashboard.cockpitApplyFilter()">
             <option value="">All statuses</option>
             <template x-for="s in $store.genesisDashboard.cockpitAvailableFilters.statuses" :key="s">
@@ -9187,6 +9189,7 @@
           </select>
 
           <select style="font-size:0.68rem; padding:0.2rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);"
+                  :value="$store.genesisDashboard.cockpitFilters.source"
                   @change="$store.genesisDashboard.cockpitFilters.source = $event.target.value; $store.genesisDashboard.cockpitApplyFilter()">
             <option value="">All sources</option>
             <template x-for="s in $store.genesisDashboard.cockpitAvailableFilters.sources" :key="s">
@@ -9195,6 +9198,7 @@
           </select>
 
           <select style="font-size:0.68rem; padding:0.2rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);"
+                  :value="$store.genesisDashboard.cockpitSort"
                   @change="$store.genesisDashboard.cockpitSort = $event.target.value; $store.genesisDashboard.cockpitApplyFilter()">
             <option value="priority">Sort: Priority</option>
             <option value="created_desc">Sort: Newest</option>
@@ -9204,6 +9208,7 @@
           </select>
 
           <input type="text" placeholder="Search content/reason… (Enter)"
+                 :value="$store.genesisDashboard.cockpitFilters.search"
                  @keydown.enter="$store.genesisDashboard.cockpitFilters.search = $event.target.value; $store.genesisDashboard.cockpitApplyFilter()"
                  style="font-size:0.68rem; padding:0.2rem 0.4rem; border-radius:3px; min-width:160px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
 

@@ -298,13 +298,17 @@ async def follow_up_batch():
     if len(ids) > 200:
         return jsonify({"ok": False, "error": "Too many ids (max 200)"}), 400
 
-    if action == "done":
-        count = await follow_ups.update_status_batch(
-            rt.db, ids, "completed", resolution_notes=notes,
-        )
-    elif action == "delete":
-        count = await follow_ups.delete_batch(rt.db, ids)
-    else:  # "tabled" | "follow_up"
-        count = await follow_ups.set_kind_batch(rt.db, ids, action)
+    try:
+        if action == "done":
+            count = await follow_ups.update_status_batch(
+                rt.db, ids, "completed", resolution_notes=notes,
+            )
+        elif action == "delete":
+            count = await follow_ups.delete_batch(rt.db, ids)
+        else:  # "tabled" | "follow_up"
+            count = await follow_ups.set_kind_batch(rt.db, ids, action)
+    except Exception:
+        logger.error("Batch follow-up action %r failed", action, exc_info=True)
+        return jsonify({"ok": False, "error": "Batch action failed"}), 503
 
     return jsonify({"ok": True, "count": count})
