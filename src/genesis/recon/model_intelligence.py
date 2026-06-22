@@ -467,6 +467,7 @@ class ModelIntelligenceJob:
                 strategy="surplus_task",
                 reason=json.dumps(payload),
                 priority="medium",
+                domain="internal",
             )
             logger.info("Created benchmark follow-up %s for %s", fid[:8], model_id)
             return fid

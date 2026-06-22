@@ -1498,6 +1498,8 @@ class InboxMonitor:
                 strategy=strategy,
                 priority=priority,
                 pinned=pinned,
+                # The evaluator already judges each item genesis-vs-user; reuse it.
+                domain="internal" if rec.classification == "genesis" else "user_world",
             )
             created += 1
 

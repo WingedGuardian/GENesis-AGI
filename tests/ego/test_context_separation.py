@@ -286,7 +286,8 @@ _EXTRA_TABLES_DDL = [
         linked_task_id TEXT, priority TEXT NOT NULL DEFAULT 'medium',
         created_at TEXT NOT NULL, completed_at TEXT,
         resolution_notes TEXT, blocked_reason TEXT,
-        escalated_to TEXT
+        escalated_to TEXT,
+        kind TEXT NOT NULL DEFAULT 'follow_up', domain TEXT, goal_id TEXT
     )""",
     """CREATE TABLE user_model_cache (
         id TEXT PRIMARY KEY DEFAULT 'current', person_id TEXT,

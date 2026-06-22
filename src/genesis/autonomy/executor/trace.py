@@ -643,6 +643,7 @@ class ExecutionTracer:
                 strategy="ego_judgment",
                 reason="Retrospective learning extraction failed — needs investigation",
                 priority="medium",
+                domain="internal",
             )
         except Exception:
             # Last resort — at least the log warning above was emitted

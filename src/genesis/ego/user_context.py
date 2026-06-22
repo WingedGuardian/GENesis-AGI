@@ -19,6 +19,7 @@ from typing import Any
 
 import aiosqlite
 
+from genesis.ego.domain_classifier import is_genesis_internal as _is_genesis_internal
 from genesis.ego.types import NEUTRAL_STATUS
 
 logger = logging.getLogger(__name__)
@@ -35,24 +36,9 @@ _USER_WORLD_CATEGORIES = frozenset({
     "marketing", "outreach", "networking",
 })
 
-# Keywords indicating a session is about Genesis internals (not user-world).
-# Used to annotate conversation transcripts so the user ego knows which
-# sessions fall under the Genesis ego's jurisdiction.
-_GENESIS_INTERNAL_KEYWORDS = frozenset({
-    "surplus", "dream cycle", "dream_cycle", "genesis runtime",
-    "routing config", "circuit breaker", "guardian", "sentinel", "qdrant",
-    "awareness loop", "health check", "dead letter", "model_routing",
-    "worktree", "genesis-development", "dashboard fix", "ego cycle",
-    "model eval", "surplus_task", "provider fallback", "watchdog",
-    "systemd", "genesis server", "eval batch", "j9 eval",
-    "runtime init", "embedding chain", "embedding fallback",
-})
-
-
-def _is_genesis_internal(topic: str) -> bool:
-    """Check if a session topic is about Genesis internals."""
-    topic_lower = topic.lower()
-    return any(kw in topic_lower for kw in _GENESIS_INTERNAL_KEYWORDS)
+# Genesis-internal keyword detection now lives in genesis.ego.domain_classifier
+# (shared with follow-up domain classification); imported above as
+# _is_genesis_internal.
 
 
 class UserEgoContextBuilder:

@@ -36,6 +36,7 @@ async def _impl_follow_up_create(
     scheduled_at: str | None = None,
     priority: str = "medium",
     pinned: bool = False,
+    domain: str | None = None,
     source_session: str | None = None,
 ) -> dict:
     """Create a follow-up item in the accountability ledger."""
@@ -51,6 +52,10 @@ async def _impl_follow_up_create(
     if priority not in valid_priorities:
         return {"error": f"Invalid priority '{priority}'. Must be one of: {', '.join(sorted(valid_priorities))}"}
 
+    valid_domains = {"internal", "user_world"}
+    if domain is not None and domain not in valid_domains:
+        return {"error": f"Invalid domain '{domain}'. Must be one of: {', '.join(sorted(valid_domains))}"}
+
     if strategy == "scheduled_task" and not scheduled_at:
         return {"error": "scheduled_at is required when strategy is 'scheduled_task'"}
 
@@ -58,12 +63,19 @@ async def _impl_follow_up_create(
         import os
 
         from genesis.db.crud import follow_ups
+        from genesis.ego.domain_classifier import classify_domain
 
         # Detect dispatched session context for proper source attribution
         if os.environ.get("GENESIS_CC_SESSION") == "1":
             source = "ego_dispatch"
         else:
             source = "foreground_session"
+
+        # The session declares domain when it knows; otherwise fall back to the
+        # internal-only classifier (returns 'internal' on a keyword hit, else
+        # None → stored NULL, never a user_world guess).
+        if domain is None:
+            domain = classify_domain(f"{content} {reason}")
 
         fid = await follow_ups.create(
             db,
@@ -75,13 +87,16 @@ async def _impl_follow_up_create(
             scheduled_at=scheduled_at,
             priority=priority,
             pinned=pinned,
+            domain=domain,
         )
         return {
             "id": fid,
             "status": "pending",
             "strategy": strategy,
+            "domain": domain,
             "pinned": pinned,
             "message": f"Follow-up created. Strategy: {strategy}."
+            + (f" Domain: {domain}." if domain else "")
             + (" (pinned — ego cannot auto-resolve)" if pinned else ""),
         }
     except Exception as exc:
@@ -202,6 +217,7 @@ async def follow_up_create(
     scheduled_at: str = "",
     priority: str = "medium",
     pinned: bool = False,
+    domain: str = "",
 ) -> dict:
     """Create a follow-up item for Genesis to track and execute.
 
@@ -228,6 +244,10 @@ async def follow_up_create(
         pinned: If true, ego can see this follow-up but cannot auto-resolve it.
             Only the user can close a pinned follow-up. Use for items you want
             to track personally.
+        domain: Whose world this belongs to — "internal" (Genesis's own system
+            work: runtime, routing, memory, health, dev) or "user_world" (the
+            user's life, career, content, interests). Leave empty to let Genesis
+            classify (it only auto-detects internal; otherwise leaves it unset).
     """
     return await _impl_follow_up_create(
         content,
@@ -236,6 +256,7 @@ async def follow_up_create(
         scheduled_at=scheduled_at or None,
         priority=priority,
         pinned=pinned,
+        domain=domain or None,
     )
 
 
