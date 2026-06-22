@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import hashlib
 import json
 import logging
@@ -15,6 +13,7 @@ from pathlib import Path
 import aiosqlite
 
 from genesis.db.crud import observations
+from genesis.recon.gh_cli import run_gh
 
 logger = logging.getLogger(__name__)
 
@@ -350,35 +349,13 @@ class ReconGatherer:
         return None
 
     async def _run_gh(self, *args: str) -> str:
-        """Run gh CLI command with timeout. Returns stdout or empty on failure."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=_GH_TIMEOUT
-            )
-            if proc.returncode != 0:
-                logger.warning(
-                    "gh command failed (rc=%d): %s — %s",
-                    proc.returncode,
-                    " ".join(args),
-                    stderr.decode("utf-8", errors="replace")[:200],
-                )
-                return ""
-            return stdout.decode("utf-8", errors="replace").strip()
-        except TimeoutError:
-            logger.warning("gh command timed out: %s", " ".join(args))
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            with contextlib.suppress(ChildProcessError):
-                await proc.wait()
-            return ""
-        except OSError:
-            logger.warning("gh command failed to start: %s", " ".join(args), exc_info=True)
-            return ""
+        """Run gh CLI command with timeout. Returns stdout or empty on failure.
+
+        Delegates to the shared ``gh_cli.run_gh`` (single source of truth for the
+        subprocess/timeout/kill handling); kept as a method so existing call
+        sites and tests that patch ``ReconGatherer._run_gh`` are unaffected.
+        """
+        return await run_gh(*args, timeout=_GH_TIMEOUT)
 
     @staticmethod
     def _load_watchlist() -> list[dict]:
