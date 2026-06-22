@@ -34,11 +34,18 @@ _GH_FIELDS = "fullName,url,stargazersCount,createdAt,pushedAt,description,langua
 # GitHub search API allows 30 req/min → ≥2s between topic queries.
 _QUERY_SPACING_S = 2.0
 
-# ── Scoring tunables (eyeballed at the foundation checkpoint, easy to adjust) ──
+# ── Scoring tunables — "balanced" calibration (recalibrated at the checkpoint
+# against real shortlists so no axis saturates and a young riser and an
+# established leader can both surface). All easy to adjust. ──
 _MOMENTUM_AGE_FLOOR_DAYS = 30.0   # don't reward 1-day-old stars-per-day spikes
-_MOMENTUM_SATURATION = 50.0       # stars/day at which momentum ≈ 1.0
-_ACTIVITY_TAU_DAYS = 45.0         # push-recency decay constant
-_MATURITY_TAU_DAYS = 180.0        # age-maturity rise constant
+# stars/day at which momentum ≈ 1.0. Set high so hot repos (mem0 ~54/day,
+# deer-flow ~178/day) stay distinguishable instead of all pegging at 1.0.
+_MOMENTUM_SATURATION = 250.0
+_ACTIVITY_TAU_DAYS = 45.0         # push-recency decay constant (liveness)
+# Maturity is a SOFT ramp, not an age reward: rises linearly to 1.0 by this many
+# days, then plateaus — so it penalizes only brand-new/unproven repos and does
+# NOT keep rewarding a 3-year-old repo over a healthy 6-month-old one.
+_MATURITY_PLATEAU_DAYS = 120.0
 
 
 @dataclass(frozen=True)
@@ -108,11 +115,12 @@ def score_activity(pushed_at: str | None, now: datetime) -> float:
 
 
 def score_maturity(created_at: str | None, now: datetime) -> float:
-    """Saturating rise with age: brand-new repos score low (unproven)."""
+    """Soft linear ramp with age, plateauing at 1.0: brand-new repos score low
+    (unproven), but age past the plateau is not further rewarded."""
     age = _days_between(created_at, now)
     if age is None:
         return 0.0
-    return _clamp01(1.0 - math.exp(-max(age, 0.0) / _MATURITY_TAU_DAYS))
+    return _clamp01(max(age, 0.0) / _MATURITY_PLATEAU_DAYS)
 
 
 def score_candidate(

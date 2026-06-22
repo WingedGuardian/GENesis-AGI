@@ -50,6 +50,15 @@ def test_momentum_handles_missing_date():
     assert score_momentum(1000, "", _NOW) == 0.0
 
 
+def test_momentum_discriminates_among_hot_repos_no_saturation():
+    # Balanced calibration: popular repos must NOT all peg at 1.0 — momentum has
+    # to separate a fast grower from a faster one across the realistic range.
+    hot = score_momentum(10000, _iso(100), _NOW)     # ~100 stars/day
+    hotter = score_momentum(20000, _iso(100), _NOW)  # ~200 stars/day
+    assert hot < hotter
+    assert hot < 1.0 and hotter < 1.0
+
+
 # ── score_activity ───────────────────────────────────────────────────────────
 
 
