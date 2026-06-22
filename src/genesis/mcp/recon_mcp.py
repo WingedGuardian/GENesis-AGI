@@ -369,3 +369,41 @@ async def recon_run_skill_scan() -> dict:
 
     job = SkillSecurityScanJob(db=_db)
     return await job.run()
+
+
+@mcp.tool()
+async def recon_run_github_discovery(query: str, limit: int = 10) -> dict:
+    """Discover GitHub repos for a topic, ranked by momentum/activity/maturity.
+
+    On-demand foreground tool — searches GitHub (newest+most-starred pool),
+    scores each repo on three axes, and returns the top `limit` ranked
+    candidates. Files NOTHING (read-only). The composite `score` plus its
+    momentum/activity/maturity breakdown are returned so a fast-growing
+    lower-star repo can visibly outrank a stale high-star one.
+
+    momentum = stars-per-day-since-creation (log-damped); activity = push
+    recency; maturity = repo age. Forks and archived repos are excluded.
+    """
+    from genesis.recon.github_discovery import search_repos
+
+    candidates = await search_repos(query, limit=limit)
+    repos = [
+        {
+            "full_name": c.full_name,
+            "url": c.url,
+            "stars": c.stars,
+            "language": c.language,
+            "description": (c.description or "")[:200],
+            "created_at": c.created_at,
+            "pushed_at": c.pushed_at,
+            "score": round(c.score, 4),
+            "momentum": round(c.momentum, 4),
+            "activity": round(c.activity, 4),
+            "maturity": round(c.maturity, 4),
+        }
+        for c in candidates
+    ]
+    result = {"query": query, "count": len(repos), "repos": repos}
+    if not repos:
+        result["note"] = "no results — if unexpected, check gh auth / rate-limit (30/min) in logs"
+    return result
