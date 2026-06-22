@@ -13,7 +13,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
-- **Genesis earns email autonomy you can revoke in one click** — once Genesis has sent a kind
+- **Genesis earns email autonomy you can revoke in one click** (#734, #737, #738) — once Genesis has sent a kind
   of email with your approval enough times, it proposes a promotion: it asks "may I send these
   on my own from now on?" — and only you can say yes. If a promoted send ever goes wrong, that
   autonomy is revoked immediately and the next send holds for your approval again, whether the
@@ -23,14 +23,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Telegram notice is available but off by default (the tab is where to look) — turn it on with
   `email_send_notify` in the autonomy config.
 
-- **See what Genesis did as a timeline** — the dashboard has a new **Traces** tab that
+- **See what Genesis did as a timeline** (#718, #726) — the dashboard has a new **Traces** tab that
   renders each recorded operation (a reflection, an ego cycle, a dispatched session) as a
   nested waterfall: pick a recent trace and its LLM calls, sub-sessions, and tools lay out as
   bars on a shared timeline, with click-through detail for any span (provider, model, tokens,
   cost, attributes). It reads the traces Genesis already captures, so you can inspect an
   operation end to end instead of piecing it together from logs.
 
-- **Genesis can A/B-test its own thinking before changing it** — a new experimentation
+- **Genesis can A/B-test its own thinking before changing it** (#729) — a new experimentation
   harness runs two versions of a cognitive config (for example a reflection prompt, or an
   awareness signal weight) against a graded golden set, measures which does better with a
   real significance test, and surfaces a recommendation you act on — it never promotes a
@@ -39,14 +39,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `experiment_status` health tool, and a weekly "cognitive drift" snapshot now tracks whether
   Genesis is still challenging itself (dissent rate, proposal diversity).
 
-- **Genesis spots goals it's stuck on and asks before easing off them** — when a goal you
+- **Genesis spots goals it's stuck on and asks before easing off them** (#720) — when a goal you
   set has been worked on (several dispatched sessions) but still isn't moving, Genesis now
   recognizes it as *stuck* rather than merely idle, bumps it up for review, and digs into
   *why* it stalled instead of nudging it again. If it concludes the goal should be paused or
   deprioritized, that becomes a proposal you approve or reject — nothing about your goals
   changes without your say-so.
 
-- **Genesis records traces of what it does** — reflections, ego cycles, every LLM
+- **Genesis records traces of what it does** (#718, #722) — reflections, ego cycles, every LLM
   call, and the tools its dispatched Claude Code sessions run are now captured as
   nested trace spans (one trace per operation), so its activity can be inspected
   end to end instead of pieced together from logs. Capture is on by default and can
@@ -54,20 +54,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `GENESIS_SPANS_DISABLED=1`); spans are kept for a configurable window (default 14
   days) and pruned automatically.
 
-- **You can undo a change Genesis made to its own skills or calibration** — when Genesis
+- **You can undo a change Genesis made to its own skills or calibration** (#717) — when Genesis
   autonomously refines a skill, retunes its triage calibration, or re-synthesizes its user
   knowledge, it now keeps a recoverable snapshot of the previous version. If one of those
   self-edits turns out worse, you can list the recent self-modifications and roll any of them
   back to its prior contents — with a safety check that refuses to overwrite a file that has
   changed since (unless you force it).
 
-- **Earned autonomy can be restored after a regression** — when Genesis loses a level of
+- **Earned autonomy can be restored after a regression** (#715) — when Genesis loses a level of
   autonomy in a category (e.g. after a correction), that demotion is no longer a dead end. Once
   the category's track record recovers enough that the evidence again supports the earned level,
   Genesis proposes restoring it and asks you to approve — it never silently re-grants authority,
   and it won't nag while the lower level is genuinely warranted. Previously a demoted category
   had no path back up.
-- **Genesis tells its own memories apart from what it read on the world** — every recalled
+- **Genesis tells its own memories apart from what it read on the world** (#716) — every recalled
   knowledge-base item (ingested docs, and the new corrective web results) is now labeled
   "external-world knowledge (source: …)" wherever it reaches Genesis's context: explicit
   recall, the proactive memory hook, voice, and the dashboard memory search. First-party
@@ -76,7 +76,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   The knowledge-base relevance floor that keeps low-quality bulk content out of answers now
   applies reliably (it previously slipped past keyword-only matches).
 
-- **Genesis self-corrects a bad memory recall instead of running with it** — on high-stakes
+- **Genesis self-corrects a bad memory recall instead of running with it** (#711) — on high-stakes
   lookups (the explicit memory and knowledge recall tools), Genesis now grades whether the
   recalled results are actually on-topic, and when a recall comes back clearly irrelevant it
   automatically tries again — broadening the search, drawing on the knowledge base, and (for
@@ -85,27 +85,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   strong, and it fails fast so it never slows a recall if the grader is unavailable. Latency-
   sensitive paths (the proactive hook, voice, in-session context injection) are unaffected.
 
-- **The dashboard's Observations panel shows where each item stands** — every observation
+- **The dashboard's Observations panel shows where each item stands** (#697) — every observation
   now carries a colour-coded stage badge: **new** (unread, still needs attention), **read**
   (Genesis has seen it), **acted** (it drove a proposal or follow-up), or **resolved**.
   Already-seen items stop blaring, so the panel — and Genesis's own thinking — surface what's
   genuinely new instead of a wall of stale alerts.
 
-- **Browse and manage your reference store from the dashboard** — a new **References** tab
+- **Browse and manage your reference store from the dashboard** (#674, #676) — a new **References** tab
   lists every credential, URL, IP, and account handle Genesis has stored, grouped by kind, with
   search and a per-entry badge showing whether you saved it (verified) or Genesis auto-captured
   it. Secret values stay hidden until you click reveal, then you can copy or delete any entry.
   This replaces the old `~/.genesis/known-to-genesis.md` text file (now retired) with a single,
   always-current, access-controlled view — no more stale or secret-leaking flat file.
 
-- **Genesis now detects and auto-heals a stalled Guardian updater** — it watches whether the
+- **Genesis now detects and auto-heals a stalled Guardian updater** (#669, #670) — it watches whether the
   Guardian's *deployed* updater script on the host matches the code it has actually pulled. If
   the updater silently froze (the failure that left it ~2 months stale), Genesis notices within
   a few checks, automatically redeploys the current updater once, and re-verifies — escalating
   to you only if the self-heal doesn't resolve it. Closes the blind spot where the host kept
   pulling new code while its updater quietly stopped refreshing.
 
-- **A new "deliverable-builder" skill produces send-ready work, not raw markdown** — when you
+- **A new "deliverable-builder" skill produces send-ready work, not raw markdown** (#657) — when you
   ask Genesis to build a job take-home, client report, one-pager, or deck, it runs a gated
   pipeline: it frames the deliverable with you (audience, format, what leads), drafts and
   structures it to lead with the strongest point, writes it in your voice, strips AI tells,
@@ -113,7 +113,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reviewer checks the finished artifact against the original requirements before it reaches you.
   The session won't quietly end with an unverified deliverable.
 
-- **Background tasks can now produce those deliverables on their own** — when a `/task` you
+- **Background tasks can now produce those deliverables on their own** (#668) — when a `/task` you
   submit will produce a send-ready artifact (report, deck, take-home, one-pager), the intake now
   captures how it should look and read (format, visual style, whether it must pass as fully
   human-written, audience), and the autonomous executor runs the deliverable-builder pipeline as
@@ -121,26 +121,26 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   documents now default to a clean modern font (so they read like a real document, not a LaTeX
   paper); set the visual style to `formal` or `academic` to change it.
 
-- **Content Genesis sends to other people is auto-cleaned before it goes out** —
+- **Content Genesis sends to other people is auto-cleaned before it goes out** (#654) —
   email, Discord, and the article/post drafts you review now pass through a
   deterministic check that fixes the most common AI giveaway (a spaced em dash,
   `like — this`) and scans for accidentally-included secrets (API keys,
   credentials) before the message leaves Genesis. Messages to *you* (Telegram,
   voice) are left exactly as written.
 
-- **Genesis now watches its own database journal size** — if SQLite's
+- **Genesis now watches its own database journal size** (#647, #687) — if SQLite's
   write-ahead log grows abnormally large (the sign of a stuck database reader
   holding the file open), Genesis raises a high/critical alert on Telegram and in
   the morning report, instead of letting it balloon silently for days.
 
-- **The dashboard shows your database journal (WAL) size at a glance** — the
+- **The dashboard shows your database journal (WAL) size at a glance** (#687) — the
   Infrastructure health panel now displays the SQLite WAL size next to the
   database probe, colored green / amber / red, so you can spot DB-lock pressure
   building before it ever trips an alert.
 
 ### Changed
 
-- **Your morning report now tells you what to do, not just what happened** — it
+- **Your morning report now tells you what to do, not just what happened** (#733) — it
   ends with a **Next Steps & Blockers** section that names the few highest-leverage
   actions for the day and what's blocking progress (a stalled follow-up, a pending
   approval, an issue gating one of your goals), drawn only from items already in
@@ -164,7 +164,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   and updates the host to match when it has drifted, so container and host never
   fall out of step. It's skipped when already in sync and never fails your update
   if the host is unreachable.
-- **Voice: you now choose exactly which alerts are spoken aloud** — the
+- **Voice: you now choose exactly which alerts are spoken aloud** (#618) — the
   Voice PE only speaks alerts on an allowlist you control (`voice.alert_ids`
   in `outreach.yaml`) instead of chiming for every blocker, alert, and
   approval. The default set covers what's worth interrupting you for: disk
@@ -173,7 +173,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   approval, and blocked autonomous tasks. CLI approval prompts and generic
   provider credit-exhaustion no longer chime by default. Everything still
   arrives on Telegram regardless — this only controls what's spoken out loud.
-- **Earlier memory and memory-search alerts** — the container-memory alert
+- **Earlier memory and memory-search alerts** (#618) — the container-memory alert
   now fires at 85% (was 90%) and the vector-search-failure alert at 50%
   failure (was 100% only), so you hear about pressure and degradation
   sooner, on both Telegram and voice.
@@ -186,24 +186,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
-- **Inbox items added soon after an evaluation are no longer silently skipped** — if you added a
+- **Inbox items added soon after an evaluation are no longer silently skipped** (#736) — if you added a
   link or note to an inbox file within the cool-down window just after Genesis had evaluated that
   file, the new item could be marked as seen without ever being evaluated, and it stayed stranded
   until you edited the file again. Genesis now defers those additions and picks them up on the
   next pass once the cool-down clears, so nothing you add gets lost.
 
-- **Re-sharing an article you already added no longer creates a duplicate evaluation** — links
+- **Re-sharing an article you already added no longer creates a duplicate evaluation** (#736) — links
   often carry per-share tracking parameters (for example, the same LinkedIn post shared from your
   phone vs. your desktop produces different URLs), which used to make a re-paste look brand new.
   Genesis now ignores those tracking parameters when deciding what's new, so the same article
   isn't evaluated twice or spawn a duplicate follow-up.
 
-- **Voice approvals now resolve the action you actually mean** — when you say "approve" or
+- **Voice approvals now resolve the action you actually mean** (#731) — when you say "approve" or
   "reject" over voice, Genesis tells you which action it acted on, and if more than one action is
   awaiting your decision it reads the options back and asks which one — instead of silently
   resolving whichever was most recent (which could be the wrong one).
 
-- **Fewer false health alarms about Genesis's own subsystems** — several background loops report
+- **Fewer false health alarms about Genesis's own subsystems** (#723, #725, #728, #732) — several background loops report
   health through a periodic heartbeat, and a couple could trip "overdue" or "dark" alarms while
   perfectly healthy. The ego's check-in rode its proactive-thinking timer, which slows during quiet
   periods and gets pushed back by other work, so it could go hours between ticks and trip the 4-hour
@@ -214,7 +214,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   alarm only fires on a sustained drop rather than a noisy wobble, and anything older than three days
   is demoted and tagged historical instead of repeated as a fresh alarm.
 
-- **Genesis's self-quality metrics are now accurate** — several bugs were skewing the numbers Genesis
+- **Genesis's self-quality metrics are now accurate** (#708, #724) — several bugs were skewing the numbers Genesis
   uses to grade its own competence (the J9 readiness grades, the morning-report quality figures, and
   the gate that decides which self-improvements ship). Memory retrieval quality (MRR) was computed
   against database arrival order instead of the actual retrieval rank; each memory search logged its
@@ -227,7 +227,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   trustworthy. Genesis also now tracks whether its ranking merely favors the memories it retrieves
   most often, so entrenchment can be watched over time.
 
-- **Knowledge-base searches stopped silently returning nothing** — the relevance floor that
+- **Knowledge-base searches stopped silently returning nothing** (#721) — the relevance floor that
   trims low-quality knowledge results was a fixed absolute cutoff that, on the score scale recall
   actually produces, sat above the entire range — so searching the knowledge base (or a broad
   memory search across everything) could return *zero* knowledge results even when directly
@@ -235,32 +235,32 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   the strongest knowledge hit always survives and a proportional tail of weaker matches is kept,
   regardless of the underlying score scale.
 
-- **Memory search got more precise on multi-word queries** — query expansion (which broadens a
+- **Memory search got more precise on multi-word queries** (#721) — query expansion (which broadens a
   search with related terms) could pull in documents that matched only a broad category tag —
   the structural labels like class/wing/life-domain that Genesis attaches to *every* memory — so
   an off-topic document could outrank genuinely relevant ones. Those ever-present structural tags
   are now excluded from expansion, and for multi-word queries the related terms only *boost*
   documents that already match part of your query rather than surfacing on their own.
 
-- **Genesis no longer loses contradicting or superseding links between memories** — its memory
+- **Genesis no longer loses contradicting or superseding links between memories** (#719) — its memory
   graph could only hold one relationship between any two memories, so recording a second kind
   (for example marking a pair as "contradicts" when they were already linked as "supports", or
   "succeeded_by" when one memory replaces another) was silently dropped. Different relationship
   types between the same two memories are now all kept, so Genesis reasons over a fuller, more
   honest picture of how its memories relate.
 
-- **Procedure learning survives a two-provider outage** — the routine that captures reusable
+- **Procedure learning survives a two-provider outage** (#710) — the routine that captures reusable
   procedures from Genesis's own struggles ran on only two free model providers; when both were
   down at once it exhausted its chain and silently stopped learning. A third independent free
   fallback now keeps it working through overlapping provider outages.
 
-- **Star-count updates no longer crowd high-priority alerts** — GitHub star-count reconnaissance
+- **Star-count updates no longer crowd high-priority alerts** (#714) — GitHub star-count reconnaissance
   pings inherited their watched project's priority (e.g. "high" for the main repo), so vanity
   "+N stars" deltas competed with genuinely important findings in the morning report and alert
   lane. They're now recorded at low priority — still tracked for trend deltas, just no longer
   treated as urgent.
 
-- **Genesis's at-a-glance state views stopped showing internal noise** — three cleanups to the
+- **Genesis's at-a-glance state views stopped showing internal noise** (#712) — three cleanups to the
   dashboard and to Genesis's own always-on context: empty sessions (ended before any messages were
   exchanged) no longer appear as ghost "0 msgs" rows in the recent-sessions list; the "Active Work"
   summary no longer ingests raw harness notifications (task-completion blobs, system reminders,
@@ -268,16 +268,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   real, controlled-vocabulary domains instead of malformed or one-off tags. What you — and Genesis —
   see reflects genuine activity, not plumbing.
 
-- **A campaign that crashes mid-tick no longer fails silently** — when a scheduled campaign
+- **A campaign that crashes mid-tick no longer fails silently** (#706) — when a scheduled campaign
   tick raises an error, Genesis now records it in job-health tracking, so the failure surfaces
   in the dashboard and to the ego instead of vanishing into the server log. Campaign
   reliability problems become visible instead of going unnoticed.
 
-- **Surplus brainstorm messages read like prose, not raw JSON** — Genesis's background
+- **Surplus brainstorm messages read like prose, not raw JSON** (#707) — Genesis's background
   brainstorm ideas posted to the Telegram "Surplus" topic now render as clean bulleted text
   (idea, detail, and why it matters) instead of the raw ```json``` code block the model
   produces. Plain-text and non-JSON messages are unaffected.
-- **The neural monitor labels every cognitive call site correctly.** Eight call sites
+- **The neural monitor labels every cognitive call site correctly.** (#702) Eight call sites
   that previously showed blank (the eval judge, voice conversation, session observer,
   task pre-mortem, intelligence intake, both resume-review passes, and the executor's
   failure-exit gate) now display their purpose, category, and cost. Sites that actually
@@ -285,7 +285,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reflections) now read "CC background" with their CC model shown in the chain, instead of
   being mislabeled as a paid API cost.
 
-- **Updates now reliably load the new code** — an update could finish "successfully"
+- **Updates now reliably load the new code** (#700) — an update could finish "successfully"
   while the running Genesis process kept executing the *old* code: when the updater
   stopped the server, systemd's auto-restart could bring it back on the pre-update
   code before the new code was even pulled, and the updater's final restart was a
@@ -293,43 +293,43 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   didn't, leaving new code on disk and old code in memory. The updater now forces a
   true restart at the end and makes sure the server stays down during the upgrade, so
   an update always activates the version it just installed.
-- **Spend on GLM, MiniMax and other aggregator models is now reported accurately** — these
+- **Spend on GLM, MiniMax and other aggregator models is now reported accurately** (#701) — these
   providers' usage was silently recorded as $0 because their model names aren't in the cost
   library Genesis relies on, hiding real spend in cost reports. Genesis now falls back to each
   model's configured price when the library can't price it, so spend reflects what you're
   actually using. (Visibility only — it never throttles or blocks calls.)
 
-- **Queued retries survive a routing-config change** — every time the provider routing config
+- **Queued retries survive a routing-config change** (#701) — every time the provider routing config
   was reloaded (e.g. toggling a provider in the dashboard), Genesis was expiring *all* of the
   queued "retry the whole chain" requests before its scheduled retry job could replay them.
   Those items now persist across a config reload and get retried as intended.
-- **A rate-limited or over-budget request no longer knocks a working provider offline** —
+- **A rate-limited or over-budget request no longer knocks a working provider offline** (#703) —
   when a provider replied "too many requests" (429) or rejected a single request as too large
   or against policy (400/422), Genesis treated it like an outage: it retried the doomed request
   several times and tripped that provider's circuit breaker, taking it out of rotation for
   everything else for up to 30 minutes. Now those responses fail straight over to the next
   provider without retrying or benching the one that's actually healthy — so you get faster
   failover and far fewer false "provider down" blips.
-- **Idle fallback providers heal on their own instead of staying stuck** — a provider that
+- **Idle fallback providers heal on their own instead of staying stuck** (#705) — a provider that
   recovered from an outage but then received little or no traffic could sit in a half-recovered
   "on probation" state indefinitely, because only a real successful request could fully clear it.
   Genesis's free health probes now confirm such a provider is reachable and restore it to normal
   rotation (and clear its lingering "failing" alert), so rarely-used backups don't get permanently
   benched.
 
-- **A single request can't hang for minutes across retries and failover** — each routing profile
+- **A single request can't hang for minutes across retries and failover** (#705) — each routing profile
   now has an aggregate time budget, so the worst case where one request's retries multiply across
   the whole provider chain into a multi-minute stall is bounded. It only caps the retry/failover
   multiplier on one request (checked between attempts, never mid-call) — background thinking that
   legitimately takes a while is unaffected.
 
-- **Recovered providers stop alarming once they come back** — when a model provider's
+- **Recovered providers stop alarming once they come back** (#698) — when a model provider's
   circuit breaker reopens after an outage, Genesis now clears that provider's "failing"
   alert instead of leaving it lingering for days until it expired. Per-session conversation
   telemetry no longer floods the Observations panel either, so the panel reflects current
   state rather than a backlog of stale entries.
 
-- **Cost reporting now shows your real spend, not a phantom figure** — the health
+- **Cost reporting now shows your real spend, not a phantom figure** (#694) — the health
   tool that Genesis's reflections consult was reporting a *notional* "if Claude Code
   were billed by the API" number (hundreds of dollars a month) as if it were actual
   cost, with no budget context. That phantom figure drove false "cost is accelerating"
@@ -345,50 +345,50 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Genesis stays NORMAL instead of flashing a system-wide CRITICAL. The alarm
   now fires only when an essential capability genuinely has no working provider.
 
-- **Clearer API-key colors on the dashboard** — the API Keys panel now shows
+- **Clearer API-key colors on the dashboard** (#698) — the API Keys panel now shows
   🟡 yellow for a key that's missing/unconfigured, 🔴 red for a key that's set
   but not working (circuit breaker open, including out-of-credits), and 🟢 green
   for working. A paid provider that's down now shows up red on the API-keys card
   (e.g. "openrouter — out of credits") without raising a system-wide alarm.
-- **Approving a light reflection's Claude Code fallback now actually runs it** —
+- **Approving a light reflection's Claude Code fallback now actually runs it** (#693) —
   when all of light reflection's free model providers were down at once, Genesis
   would ask you to approve a Claude Code fallback, but approving it did nothing:
   the reflection was never resumed (only deep and strategic reflections were).
   Light reflections are now resumed on approval like the others, and a deferred
   reflection is logged instead of silently dropped.
 
-- **Genesis can now detect replies to the emails it sends** — outbound email
+- **Genesis can now detect replies to the emails it sends** (#689) — outbound email
   was going out without a real Message-ID header, so mail clients couldn't thread
   it and Genesis couldn't match incoming replies back to the original message.
   Outbound mail now carries a proper Message-ID, so replies are recognized and
   routed to the right conversation.
 
-- **Background work deferred during an outage is no longer silently dropped** —
+- **Background work deferred during an outage is no longer silently dropped** (#689) —
   when the system was degraded, the recovery pass marked queued reflection and
   outreach work "done" without ever running it, and a stuck outreach item could
   block reflection retries entirely. Deferred work is now kept until it actually
   runs, reflections are no longer blocked behind it, and recovery holds off
   re-trying until the system is genuinely stable.
 
-- **The skill auto-tuner can no longer truncate a large skill** — Genesis's
+- **The skill auto-tuner can no longer truncate a large skill** (#687) — Genesis's
   weekly skill-refinement pass reviewed long skill files from a clipped
   3,000-character view and could auto-apply a much shorter rewrite, silently
   dropping most of the content. It now reviews the full skill, and any
   auto-applied edit that would shrink a skill below half its size is held for
   review instead of overwriting the file.
 
-- **The dashboard's degraded-mode banner no longer overflows** — a long
+- **The dashboard's degraded-mode banner no longer overflows** (#687) — a long
   "providers down" summary now wraps instead of spilling past the edge on
   narrow windows.
 
-- **Telegram approval buttons work again** — tapping the inline **Approve** / **Approve all**
+- **Telegram approval buttons work again** (#686) — tapping the inline **Approve** / **Approve all**
   buttons (and any inline-keyboard button) had silently stopped doing anything for several days.
   Telegram was dropping every button press before Genesis received it, because the Guardian's
   recovery-approval check had narrowed the bot's update filter to text messages only. Genesis now
   always requests Telegram's default update set (which includes button presses) — and the Guardian
   check no longer narrows it — so button presses are delivered and resolve immediately again.
 
-- **Off-site backups can now actually be restored** — the large data (the
+- **Off-site backups can now actually be restored** (#673) — the large data (the
   database, vector memory, and transcripts) is stored only on your off-site
   (NAS) target, but the restore tool had no way to fetch it — so a from-scratch
   recovery silently couldn't bring back your database or memory. Restore now
@@ -396,7 +396,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   as dated point-in-time snapshots (so you can recover a *specific* run, not just
   the last one) with transcripts included off-site too.
 
-- **A backup that can't reach off-site storage no longer fails silently** — if
+- **A backup that can't reach off-site storage no longer fails silently** (#672) — if
   you've configured an off-site (NAS) backup target and a run captures your data
   locally but can't replicate it off-site, Genesis now sends a distinct alert
   ("off-site replication failed — local backup OK") and records `offsite_confirmed`
@@ -404,7 +404,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   intact); only the off-site replica is flagged as missing. Local-only setups (no
   off-site target) are unaffected.
 
-- **Restoring a backup is now safe against corruption** — `restore.sh` now stops
+- **Restoring a backup is now safe against corruption** (#671) — `restore.sh` now stops
   the running Genesis server before swapping the SQLite database (so a live
   connection can't corrupt the restore), clears stale write-ahead-log sidecars
   that would otherwise replay onto and corrupt the restored DB, and runs an
@@ -420,13 +420,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reports its result reliably, so a successful update that pulled changes is no
   longer misread as a failure.
 
-- **Guardian host updates no longer silently stall** — on hosts where the
+- **Guardian host updates no longer silently stall** (#670) — on hosts where the
   Guardian's `CLAUDE.md` had been pinned with git's skip-worktree flag, the
   Guardian's self-update (`git pull`) would abort the moment that file changed
   upstream, quietly leaving the host Guardian stuck on old code. The update now
   clears the flag first, so existing installs self-heal and stay current.
 
-- **Guardian host self-updates are now reliable on hosts with passwordless sudo**
+- **Guardian host self-updates are now reliable on hosts with passwordless sudo** (#669)
   — an unguarded step while refreshing kernel tuning could make the Guardian's
   self-update abort partway, so it reported a failure (and could leave its own
   updater script frozen on old code) even though the code pull had already
@@ -434,13 +434,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   update; the update reliably refreshes the updater first and records what it
   deployed; and there's a new one-step recovery path to refresh a stalled updater.
 
-- **Telegram `/stop` now stops your session, not a background task** — when a
+- **Telegram `/stop` now stops your session, not a background task** (#656) — when a
   background task (reflection, inbox, an ego session, etc.) was running at the
   same time as your chat, `/stop` could interrupt the wrong one. Each session's
   Claude Code subprocess is now tracked separately, so `/stop` always targets
   the generation in your conversation.
 
-- **The Guardian alerts once when Genesis goes down — and once when it's back** —
+- **The Guardian alerts once when Genesis goes down — and once when it's back** (#655) —
   previously, if Genesis went down and its diagnosis couldn't reach Claude Code,
   the host Guardian re-ran a full investigation and re-sent a critical Telegram
   alert every 30 seconds until recovery — an alert storm. It now sends a single
@@ -448,7 +448,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   comes back on its own it sends a single "restored" notification — which it
   never did before.
 
-- **"database is locked" errors under load are largely gone** — several independent paths could pin
+- **"database is locked" errors under load are largely gone** (#634, #647) — several independent paths could pin
   the database or fail on a transient lock. A cancelled read could leave a stale lock while the
   write-ahead log ballooned (it reached ~2 GB); a long-lived MCP connection left read transactions
   open after read-only calls, pinning the WAL and making `memory_store` / `reference_store` fail until
@@ -464,15 +464,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   disabled every hook** (session activity capture, file/edit audit logging) when
   you ran Claude Code from a worktree. It now resolves the main repo with
   `git rev-parse --git-common-dir` (no pipe), so hooks fire reliably everywhere.
-- **Outreach emails actually send now** — email (and Discord/voice) outreach was
+- **Outreach emails actually send now** (#637) — email (and Discord/voice) outreach was
   being misaddressed to the Telegram forum chat for any category that routes to
   the supergroup, so every such send failed and silently piled up as retries.
   Forum/topic routing is now correctly Telegram-only; other channels deliver to
   their own recipient.
-- **A slow or failed email can no longer stall Genesis** — SMTP sending now runs
+- **A slow or failed email can no longer stall Genesis** (#637) — SMTP sending now runs
   off the event loop, so a hung or rejected send no longer freezes heartbeats,
   health checks, or the awareness loop.
-- **Provider hangs no longer stall reflections and the dream cycle** — when a
+- **Provider hangs no longer stall reflections and the dream cycle** (#627) — when a
   model provider hangs (accepts the connection but never responds), Genesis
   now fails over to the next provider within its timeout instead of blocking
   for minutes. Reflections and the nightly dream cycle stop piling up
@@ -485,23 +485,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   while merging almost nothing. It now aborts early once the providers are
   clearly saturated and defers the rest to the next run, and no longer
   dead-letters its own consolidation attempts.
-- **Job health no longer shows a permanent failure after a job recovers.**
+- **Job health no longer shows a permanent failure after a job recovers.** (#624)
   A scheduled job that failed once kept that failure timestamp in the health
   view forever, even after it started succeeding again; recovery now clears
   the stale failure and error so job health reflects reality.
-- **Circuit-breaker trips now survive a restart.** A provider that tripped
+- **Circuit-breaker trips now survive a restart.** (#626) A provider that tripped
   open was silently coming back available on every restart (a saved-state
   casing mismatch), so a failing provider got retried immediately instead of
   serving out its backoff. Breaker state is now also written atomically, and
   MCP helper processes no longer overwrite the shared state file.
-- **The error log no longer silently under-counts during incident storms.**
+- **The error log no longer silently under-counts during incident storms.** (#631)
   When the event-persistence queue filled up, events were dropped without a
   trace — so the dashboard and health views under-reported errors exactly when
   things were worst. Dropped events are now counted and made visible (an
   "event queue overflow" warning in the same error views, plus a live counter
   on the health snapshot), the buffer is 10× larger (500 → 5000) to absorb
   bursts, and a single un-serializable event can no longer drop a whole batch.
-- **Dashboard settings changes now actually take effect.** Overrides you saved
+- **Dashboard settings changes now actually take effect.** (#632) Overrides you saved
   from the dashboard (or the settings tool) are written to `~/.genesis/config/`,
   but several subsystems (inbox, surplus, resilience, voice/TTS, perception
   confidence, and more) still read their `.local.yaml` overlay from the repo's
@@ -511,17 +511,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Security
 
-- **Hardened remote Claude Code dispatch against shell injection.** The SSH
+- **Hardened remote Claude Code dispatch against shell injection.** (#625) The SSH
   module adapter now shell-quotes the model, effort, and path values it sends
   to a remote host, so a crafted value can no longer run arbitrary commands
   there. Normal dispatch is unchanged.
-- **Documented the dashboard's network-exposure model.** `SECURITY.md` now
+- **Documented the dashboard's network-exposure model.** (#646) `SECURITY.md` now
   spells out that the dashboard binds all interfaces for proxy/overlay reach
   and that its `/api`, `/v1`, web terminal, and noVNC console are
   unauthenticated administrative access — so operators know to keep those ports
   on a private overlay (e.g., Tailscale) or behind a reverse proxy and never
   expose them publicly.
-- **Interactive Claude Code consoles no longer skip all permission checks.**
+- **Interactive Claude Code consoles no longer skip all permission checks.** (#630, #646)
   The dashboard web terminal and the SSH dev-console slot now launch Claude
   Code in auto-permission mode instead of `--dangerously-skip-permissions`:
   common operations still run without prompting, but risky ones ask for your
