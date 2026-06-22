@@ -350,6 +350,26 @@ fi
 if command -v serena &>/dev/null; then
     echo "  Serena: $(serena --version 2>/dev/null || echo 'installed')"
 fi
+
+# SkillSpector (NVIDIA — skill-security scanner; external dep, not vendored).
+# The scheduled skill-security scan resolves the binary from this stable path.
+SKILLSPECTOR_DIR="$HOME/.genesis/deps/skillspector"
+if [[ ! -x "$SKILLSPECTOR_DIR/.venv/bin/skillspector" ]]; then
+    echo "  SkillSpector not found — installing..."
+    mkdir -p "$HOME/.genesis/deps"
+    if [[ ! -d "$SKILLSPECTOR_DIR/.git" ]]; then
+        git clone --depth 1 https://github.com/NVIDIA/SkillSpector.git "$SKILLSPECTOR_DIR" 2>/dev/null \
+            || echo "  WARNING: SkillSpector clone failed (skill-security scan will no-op until installed)"
+    fi
+    if [[ -d "$SKILLSPECTOR_DIR" ]]; then
+        "$PYTHON_BIN" -m venv "$SKILLSPECTOR_DIR/.venv" 2>/dev/null \
+            && "$SKILLSPECTOR_DIR/.venv/bin/pip" install -q "$SKILLSPECTOR_DIR" 2>/dev/null \
+            || echo "  WARNING: SkillSpector install failed (non-critical)"
+    fi
+fi
+if [[ -x "$SKILLSPECTOR_DIR/.venv/bin/skillspector" ]]; then
+    echo "  SkillSpector: installed at $SKILLSPECTOR_DIR/.venv/bin/skillspector"
+fi
 echo
 
 # --- Python venv ---
@@ -367,6 +387,13 @@ if ! "$VENV_DIR/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/d
     echo "  Re-run: $VENV_DIR/bin/pip install -e $GENESIS_ROOT --verbose"
     exit 1
 fi
+echo
+
+# --- Skill-security trusted baseline ---
+# Bless the currently-installed skills so the scheduled scan files findings only
+# for NEW/untrusted skills (a raw scan flags ~every capable skill as CRITICAL).
+echo "--- Seeding skill-security trusted allowlist ---"
+"$VENV_DIR/bin/python" -m genesis.security.skill_scan --seed-trusted 2>&1 | tail -1 || true
 echo
 
 # --- Secrets ---

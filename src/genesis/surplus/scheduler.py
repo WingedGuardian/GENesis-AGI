@@ -128,6 +128,7 @@ class SurplusScheduler:
         self._recon_gatherer: ReconGatherer | None = None
         self._model_intelligence_job = None  # Set via set_model_intelligence_job()
         self._models_md_synthesis_job = None  # Set via set_models_md_synthesis_job()
+        self._skill_security_scan_job = None  # Set via set_skill_security_scan_job()
         self._extraction_store: MemoryStore | None = None
         self._extraction_router: Router | None = None
         self._follow_up_dispatcher = None  # Set via set_follow_up_dispatcher()
@@ -216,6 +217,10 @@ class SurplusScheduler:
     def set_models_md_synthesis_job(self, job) -> None:
         """Set the ModelsMdSynthesisJob for weekly models.md updates."""
         self._models_md_synthesis_job = job
+
+    def set_skill_security_scan_job(self, job) -> None:
+        """Set the SkillSecurityScanJob for the weekly skill-security scan."""
+        self._skill_security_scan_job = job
 
     def set_extraction_deps(
         self,
@@ -309,6 +314,15 @@ class SurplusScheduler:
                 self.run_models_md_synthesis,
                 CronTrigger(day_of_week="sun", hour=10, timezone=user_timezone()),
                 id="models_md_synthesis",
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
+        # Skill-security scan: weekly Monday 2am — audits installed skills via SkillSpector.
+        if self._skill_security_scan_job is not None:
+            self._scheduler.add_job(
+                self.run_skill_security_scan,
+                CronTrigger(day_of_week="mon", hour=2, timezone=user_timezone()),
+                id="skill_security_scan",
                 max_instances=1,
                 misfire_grace_time=3600,
             )
@@ -1043,6 +1057,45 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("model_intelligence", str(exc))
+            except Exception:
+                pass
+
+    async def run_skill_security_scan(self) -> None:
+        """Run the weekly skill-security scan (SkillSpector → recon findings)."""
+        if self._skill_security_scan_job is None:
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure(
+                    "skill_security_scan", "job not wired",
+                )
+            except Exception:
+                pass
+            return
+        try:
+            result = await self._skill_security_scan_job.run()
+            total = result.get("total_findings", 0)
+            logger.info("Skill-security scan: %d untrusted findings", total)
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.DEBUG,
+                    "heartbeat", "skill_security_scan completed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("skill_security_scan")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Skill-security scan failed")
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.ERROR,
+                    "skill_security_scan.failed",
+                    "Skill-security scan failed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("skill_security_scan", str(exc))
             except Exception:
                 pass
 

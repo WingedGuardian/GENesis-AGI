@@ -9,9 +9,10 @@ its JSON report, and stores ranked findings as recon observations
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -181,14 +182,22 @@ async def scan_and_store(
     skills are scanned (for visibility) but kept out of recon to avoid swamping it
     with expected CRITICALs. A failed/timed-out scan (scanner returns None) is
     skipped, not fatal.
+
+    Each result's ``source`` is stamped with the actual scanned ``skill_dir`` (not
+    SkillSpector's self-reported ``skill.source``, which may be a URL/blank), so a
+    caller re-deriving filed/trusted counts via ``trusted(Path(r.source))`` agrees
+    with the filing decision made here. The scanner is a *blocking* subprocess, so
+    it is offloaded to a worker thread — callers run on the scheduler event loop.
     """
     results: list[ScanResult] = []
     for raw_dir in skill_dirs:
         skill_dir = Path(raw_dir)
-        report = scanner(skill_dir)
+        report = await asyncio.to_thread(scanner, skill_dir)
         if report is None:
             continue
-        result = parse_report(report)
+        # Stamp the authoritative provenance (the dir we scanned) over whatever
+        # SkillSpector reported, so trust/location consumers can't disagree.
+        result = replace(parse_report(report), source=str(skill_dir))
         results.append(result)
         if result.score >= min_score and not (trusted and trusted(skill_dir)):
             await storer(db, report_to_finding(result))
@@ -383,7 +392,11 @@ def main(argv: list[str] | None = None) -> int:
         names = sorted({d.name for d in skill_dirs})
         trusted_file.parent.mkdir(parents=True, exist_ok=True)
         trusted_file.write_text(
-            "# Trusted skill names — scanned but NOT filed to recon.\n" + "\n".join(names) + "\n"
+            "# Trusted skill names — scanned but NOT filed to recon.\n"
+            "# Seeded from the skills installed at this moment. Skills installed\n"
+            "# LATER are untrusted and will surface as recon findings until you\n"
+            "# re-bless them: python -m genesis.security.skill_scan --seed-trusted\n"
+            + "\n".join(names) + "\n"
         )
         print(f"Seeded {len(names)} trusted skill names -> {trusted_file}")
         return 0
