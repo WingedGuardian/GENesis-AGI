@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 # Stable install path the bootstrap uses (see scripts/bootstrap.sh).
 _INSTALL_BIN = Path.home() / ".genesis" / "deps" / "skillspector" / ".venv" / "bin" / "skillspector"
 
+# Single source of truth for the file-it threshold: passed to scan_and_store
+# (which decides what reaches the DB) AND used to count the summary, so the
+# reported total can never disagree with what was actually stored.
+_MIN_SCORE = 1
+
 
 def _known_install_bin() -> str | None:
     return str(_INSTALL_BIN) if _INSTALL_BIN.is_file() else None
@@ -69,9 +74,10 @@ class SkillSecurityScanJob:
             return run_skillspector(skill_dir, skillspector_bin=binary, no_llm=True)
 
         results = await scan_and_store(
-            self._db, skill_dirs, scanner=scanner, storer=store_finding, trusted=trusted
+            self._db, skill_dirs, scanner=scanner, storer=store_finding,
+            trusted=trusted, min_score=_MIN_SCORE,
         )
-        filed = sum(1 for r in results if r.score >= 1 and not trusted(Path(r.source)))
+        filed = sum(1 for r in results if r.score >= _MIN_SCORE and not trusted(Path(r.source)))
         logger.info(
             "Skill-security scan: %d skills scanned, %d untrusted findings filed",
             len(results),

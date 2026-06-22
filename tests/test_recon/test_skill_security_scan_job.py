@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from genesis.recon.skill_security_scan_job import SkillSecurityScanJob
 
 
@@ -22,6 +24,7 @@ def test_resolve_bin_returns_none_when_nothing_found(monkeypatch):
     assert SkillSecurityScanJob(db=None)._resolve_bin() is None
 
 
+@pytest.mark.asyncio
 async def test_run_skips_gracefully_when_binary_missing(monkeypatch):
     job = SkillSecurityScanJob(db=None)
     monkeypatch.setattr(job, "_resolve_bin", lambda: None)
@@ -31,6 +34,7 @@ async def test_run_skips_gracefully_when_binary_missing(monkeypatch):
     assert result.get("skipped")
 
 
+@pytest.mark.asyncio
 async def test_run_delegates_and_summarizes(monkeypatch):
     """run() resolves the binary, scans, and reports the untrusted-filed count."""
     import genesis.recon.skill_security_scan_job as mod
