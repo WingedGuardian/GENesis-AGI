@@ -1,6 +1,6 @@
 [project]
 name = "genesis-v3"
-version = "3.0.0b15"
+version = "3.0.0b16"
 requires-python = ">=3.12"
 dependencies = [
     "aiosqlite",
@@ -28,6 +28,10 @@ dependencies = [
     "curl_cffi>=0.15.0",  # curl_cffi backend for Scrapling's AsyncFetcher
     "networkx>=3.0",  # In-memory graph for memory_links traversal + algorithms
     "wyoming>=1.5",  # Wyoming protocol for HA voice satellite STT/TTS integration
+    # Transitive deps pinned to secure floors (audit #638) so a clean/cached install can't resolve a vulnerable version
+    "urllib3>=2.7.0",  # via qdrant-client/requests — CVE-2026-44431/44432 (auth-header leak, decompression DoS)
+    "idna>=3.15",  # via httpx/requests — CVE-2026-45409 (quadratic-processing DoS)
+    "certifi>=2026.5.20",  # via httpx/curl_cffi — current CA bundle
 ]
 
 [project.optional-dependencies]

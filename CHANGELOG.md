@@ -9,6 +9,8 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+## [v3.0b16] - 2026-06-21
+
 ### Added
 
 - **Genesis won't send email on its own without your say-so** — outbound email now passes
@@ -142,6 +144,52 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Infrastructure health panel now displays the SQLite WAL size next to the
   database probe, colored green / amber / red, so you can spot DB-lock pressure
   building before it ever trips an alert.
+
+### Changed
+
+- **Your morning report now tells you what to do, not just what happened** — it
+  ends with a **Next Steps & Blockers** section that names the few highest-leverage
+  actions for the day and what's blocking progress (a stalled follow-up, a pending
+  approval, an issue gating one of your goals), drawn only from items already in
+  the report. This replaces the vaguer "follow-up suggestions" guidance, so the
+  briefing highlights what matters and the action it implies instead of just
+  aggregating status.
+
+- **Interactive Claude Code consoles can run friction-free again, when you want
+  them to** — the SSH/tmux dev-console slot and the dashboard web terminal still
+  default to `--permission-mode auto` (auto-approves common operations, but still
+  prompts you on deny/ask rules), but you can now opt a session back into
+  `--dangerously-skip-permissions` by setting `GENESIS_CC_PERMISSION_MODE=bypass`.
+  For the SSH slot, put that line in `~/.genesis/cc-slot.env` (SSH sessions don't
+  read your shell profile); for the dashboard terminal, set it in the dashboard's
+  environment. Headless autonomous sessions are unaffected.
+
+- **`update.sh` now keeps Claude Code in sync on your host VM too** — if you run
+  Genesis with a Guardian on a separate host VM, updates previously only touched
+  the container's Claude Code, letting the host drift behind. `update.sh` now
+  checks the host's version against a single pin (`scripts/lib/cc_version.sh`)
+  and updates the host to match when it has drifted, so container and host never
+  fall out of step. It's skipped when already in sync and never fails your update
+  if the host is unreachable.
+- **Voice: you now choose exactly which alerts are spoken aloud** — the
+  Voice PE only speaks alerts on an allowlist you control (`voice.alert_ids`
+  in `outreach.yaml`) instead of chiming for every blocker, alert, and
+  approval. The default set covers what's worth interrupting you for: disk
+  and memory emergencies, memory-system failures (embeddings, vector
+  search), a stalled awareness loop, Sentinel decisions that need your
+  approval, and blocked autonomous tasks. CLI approval prompts and generic
+  provider credit-exhaustion no longer chime by default. Everything still
+  arrives on Telegram regardless — this only controls what's spoken out loud.
+- **Earlier memory and memory-search alerts** — the container-memory alert
+  now fires at 85% (was 90%) and the vector-search-failure alert at 50%
+  failure (was 100% only), so you hear about pressure and degradation
+  sooner, on both Telegram and voice.
+- **Voice runs from its own repo now** — the Voice PE device firmware and the
+  voice bridges (the conversational OpenAI Realtime bridge, plus a new
+  ambient-listening capture service) have moved to the separate
+  [GENesis-Voice](https://github.com/WingedGuardian/GENesis-Voice) repo, which
+  documents the full setup. Genesis keeps its internal voice integration; if you
+  flash the device or run a voice bridge, get them from GENesis-Voice.
 
 ### Fixed
 
@@ -447,54 +495,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reads are now cancellation-safe and the journal is size-bounded, so the lock
   can't get stuck and the file can't run away.
 
-### Changed
-
-- **Your morning report now tells you what to do, not just what happened** — it
-  ends with a **Next Steps & Blockers** section that names the few highest-leverage
-  actions for the day and what's blocking progress (a stalled follow-up, a pending
-  approval, an issue gating one of your goals), drawn only from items already in
-  the report. This replaces the vaguer "follow-up suggestions" guidance, so the
-  briefing highlights what matters and the action it implies instead of just
-  aggregating status.
-
-- **Interactive Claude Code consoles can run friction-free again, when you want
-  them to** — the SSH/tmux dev-console slot and the dashboard web terminal still
-  default to `--permission-mode auto` (auto-approves common operations, but still
-  prompts you on deny/ask rules), but you can now opt a session back into
-  `--dangerously-skip-permissions` by setting `GENESIS_CC_PERMISSION_MODE=bypass`.
-  For the SSH slot, put that line in `~/.genesis/cc-slot.env` (SSH sessions don't
-  read your shell profile); for the dashboard terminal, set it in the dashboard's
-  environment. Headless autonomous sessions are unaffected.
-
-- **`update.sh` now keeps Claude Code in sync on your host VM too** — if you run
-  Genesis with a Guardian on a separate host VM, updates previously only touched
-  the container's Claude Code, letting the host drift behind. `update.sh` now
-  checks the host's version against a single pin (`scripts/lib/cc_version.sh`)
-  and updates the host to match when it has drifted, so container and host never
-  fall out of step. It's skipped when already in sync and never fails your update
-  if the host is unreachable.
-- **Voice: you now choose exactly which alerts are spoken aloud** — the
-  Voice PE only speaks alerts on an allowlist you control (`voice.alert_ids`
-  in `outreach.yaml`) instead of chiming for every blocker, alert, and
-  approval. The default set covers what's worth interrupting you for: disk
-  and memory emergencies, memory-system failures (embeddings, vector
-  search), a stalled awareness loop, Sentinel decisions that need your
-  approval, and blocked autonomous tasks. CLI approval prompts and generic
-  provider credit-exhaustion no longer chime by default. Everything still
-  arrives on Telegram regardless — this only controls what's spoken out loud.
-- **Earlier memory and memory-search alerts** — the container-memory alert
-  now fires at 85% (was 90%) and the vector-search-failure alert at 50%
-  failure (was 100% only), so you hear about pressure and degradation
-  sooner, on both Telegram and voice.
-- **Voice runs from its own repo now** — the Voice PE device firmware and the
-  voice bridges (the conversational OpenAI Realtime bridge, plus a new
-  ambient-listening capture service) have moved to the separate
-  [GENesis-Voice](https://github.com/WingedGuardian/GENesis-Voice) repo, which
-  documents the full setup. Genesis keeps its internal voice integration; if you
-  flash the device or run a voice bridge, get them from GENesis-Voice.
-
-### Fixed
-
 - **Claude Code hooks work from a git worktree again** — the hook launcher
   located the Python venv via a `git worktree list | head` pipeline that, with
   many worktrees, died on SIGPIPE under `set -o pipefail` and **silently
@@ -577,6 +577,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   common operations still run without prompting, but risky ones ask for your
   approval right there in the session (you're present to answer). Headless,
   autonomous sessions are unchanged — they have no one to answer a prompt.
+
+- **Pinned secure floors for bundled dependencies.** `urllib3`, `idna`, and
+  `certifi` now carry minimum-version floors so a fresh or cached install can't
+  resolve to a version with a known CVE (dependency audit #638). No behavior
+  change — existing installs already satisfy the floors.
 
 ---
 
