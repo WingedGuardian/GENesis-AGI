@@ -28,6 +28,22 @@ class SkillApplicator:
         self._autonomy_level = autonomy_level
         self._validator = SkillValidator()
 
+    @staticmethod
+    def _build_modification_metadata(proposal: SkillProposal) -> dict:
+        """Metadata recorded with a skill mutation in the cognitive-mod ledger.
+
+        Captures *why* the skill changed — the triggering signals
+        (failure_patterns_addressed + the SkillReport-derived provenance trace) —
+        not just the diff, so a degrading edit can be understood and rolled back.
+        """
+        return {
+            "skill_name": proposal.skill_name,
+            "change_size": proposal.change_size.value,
+            "confidence": proposal.confidence,
+            "failure_patterns_addressed": proposal.failure_patterns_addressed,
+            "provenance_trace": proposal.provenance_trace,
+        }
+
     async def apply(
         self,
         proposal: SkillProposal,
@@ -79,11 +95,7 @@ class SkillApplicator:
                 path=path,
                 new_content=proposal.proposed_content,
                 summary=f"MINOR auto-apply: {proposal.rationale[:200]}",
-                metadata={
-                    "skill_name": proposal.skill_name,
-                    "change_size": proposal.change_size.value,
-                    "confidence": proposal.confidence,
-                },
+                metadata=self._build_modification_metadata(proposal),
             )
 
             # Log observation (include validation warnings if any)

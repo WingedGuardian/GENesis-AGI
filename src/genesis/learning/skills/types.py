@@ -47,6 +47,9 @@ class SkillProposal:
     change_size: ChangeSize
     confidence: float = 0.7
     failure_patterns_addressed: list[str] = field(default_factory=list)
+    # Why this refinement was triggered (SkillReport signals: trend, usage,
+    # success rate, failure patterns). Recorded in the cognitive-mod ledger.
+    provenance_trace: str | None = None
 
 
 @dataclass(frozen=True)
