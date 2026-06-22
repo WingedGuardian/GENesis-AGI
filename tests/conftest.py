@@ -86,6 +86,47 @@ async def db():
     await wrapped.close()
 
 
+@pytest.fixture(autouse=True)
+def _guard_db_crud_not_mocked():
+    """Pin the test that leaks a Mock onto a real ``genesis.db.crud`` function.
+
+    A bare ``obs_crud.create = AsyncMock()`` — assigning a mock to a real module
+    attribute *without* ``monkeypatch``/``patch`` — is never restored. It then
+    silently poisons the shared ``db`` fixture for the rest of the session:
+    inserts return a truthy Mock but write nothing, so a distant victim test
+    reads 0 rows and fails mysteriously (cost us a multi-session hunt). This
+    guard makes the leak fail at the *offending* test instead.
+
+    Scoped to ``observations`` (the proven hotspot + highest-traffic crud
+    module). Autouse fixtures tear down *after* explicitly-requested fixtures,
+    so a legitimate ``monkeypatch.setattr(obs_crud, …)`` is already restored
+    when this check runs — no false positives. Cost: one ``isinstance`` sweep
+    of one small module's namespace per test.
+
+    Caveat: a *session*/*module*-scoped fixture that patches ``obs_crud`` and is
+    still active during a later function-scoped test's teardown would trip this
+    guard (no such fixture exists today). Use function scope, or set the mock on
+    a local object, if you ever need one.
+    """
+    from unittest.mock import Mock
+
+    import genesis.db.crud.observations as obs_crud
+
+    yield
+    leaked = sorted(
+        name
+        for name, obj in vars(obs_crud).items()
+        if not name.startswith("__") and isinstance(obj, Mock)
+    )
+    if leaked:
+        raise AssertionError(
+            "Test leaked unittest.mock object(s) onto real module "
+            f"genesis.db.crud.observations: {leaked}. Use monkeypatch.setattr "
+            "or `with patch(...)` so the patch is restored, or set the mock on a "
+            "local mock object — never assign to the real module attribute."
+        )
+
+
 @pytest.fixture
 async def empty_db():
     """In-memory SQLite database with tables but no seed data."""

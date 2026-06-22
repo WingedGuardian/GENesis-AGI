@@ -122,6 +122,18 @@ async def init(rt: GenesisRuntime) -> None:
             logger.error("Unexpected error wiring ModelsMdSynthesisJob", exc_info=True)
             await _degraded(rt, "ModelsMdSynthesisJob")
 
+        try:
+            from genesis.recon.skill_security_scan_job import SkillSecurityScanJob
+            skill_scan_job = SkillSecurityScanJob(db=rt._db)
+            rt._surplus_scheduler.set_skill_security_scan_job(skill_scan_job)
+            logger.info("SkillSecurityScanJob wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire SkillSecurityScanJob", exc_info=True)
+            await _degraded(rt, "SkillSecurityScanJob")
+        except Exception:
+            logger.error("Unexpected error wiring SkillSecurityScanJob", exc_info=True)
+            await _degraded(rt, "SkillSecurityScanJob")
+
         await rt._surplus_scheduler.start()
         logger.info("Genesis surplus scheduler started")
 

@@ -350,3 +350,22 @@ async def recon_run_model_intelligence() -> dict:
         db=_db, profile_registry=profile_registry, surplus_queue=_surplus_queue,
     )
     return await job.run()
+
+
+@mcp.tool()
+async def recon_run_skill_scan() -> dict:
+    """Run the skill-security scan on-demand (NVIDIA SkillSpector → recon findings).
+
+    Normally runs weekly (Monday 2am). Scans installed skills and files findings
+    for UNTRUSTED skills only — trusted-source skills (first-party + the
+    --seed-trusted allowlist) are scanned but kept out of recon to avoid noise.
+    Requires SkillSpector installed (see scripts/bootstrap.sh); returns a
+    {"skipped": ...} summary if the binary is missing.
+    """
+    if _db is None:
+        return {"error": "Database not initialized"}
+
+    from genesis.recon.skill_security_scan_job import SkillSecurityScanJob
+
+    job = SkillSecurityScanJob(db=_db)
+    return await job.run()
