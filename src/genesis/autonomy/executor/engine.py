@@ -896,6 +896,7 @@ class CCSessionExecutor:
                 source="task_executor",
                 strategy="ego_judgment",
                 reason=content,
+                domain="internal",
             )
         except Exception:
             logger.exception("Failed to create challenge follow-up")

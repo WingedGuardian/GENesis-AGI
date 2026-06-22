@@ -124,7 +124,10 @@ async def db():
                 completed_at     TEXT,
                 resolution_notes TEXT,
                 blocked_reason   TEXT,
-                escalated_to     TEXT
+                escalated_to     TEXT,
+                kind             TEXT NOT NULL DEFAULT 'follow_up',
+                domain           TEXT,
+                goal_id          TEXT
             )
         """)
         yield conn

@@ -270,6 +270,22 @@ async def test_budgets_rejects_invalid_budget_type(db):
         )
 
 
+async def test_follow_ups_rejects_invalid_kind(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO follow_ups (id, source, content, strategy, created_at, kind) "
+            "VALUES ('t', 's', 'c', 'ego_judgment', '2026-01-01T00:00:00', 'INVALID')"
+        )
+
+
+async def test_follow_ups_rejects_invalid_domain(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO follow_ups (id, source, content, strategy, created_at, domain) "
+            "VALUES ('t', 's', 'c', 'ego_judgment', '2026-01-01T00:00:00', 'INVALID')"
+        )
+
+
 # ─── NOT NULL constraints ────────────────────────────────────────────────────
 
 
