@@ -124,6 +124,30 @@ jobs:
           fi
           echo "Email scan: CLEAN"
 
+      - name: Binary/data artifact scan
+        run: |
+          set -euo pipefail
+          # Voiceprints, audio, databases, and models match NONE of the text
+          # scans above, so a `git add -f` past .gitignore would commit one
+          # unnoticed. Block any TRACKED artifact of these types (uses the git
+          # index, so untracked local data is ignored).
+          data_globs=(
+            '*.wav' '*.flac' '*.pcm' '*.mp3' '*.m4a' '*.ogg' '*.opus'
+            '*.db' '*.db-wal' '*.db-shm' '*.sqlite' '*.sqlite3'
+            '*.onnx'
+            '*speaker_registry*.json' 'ambient_enroll_*.json'
+          )
+          # Allowlist: ':(exclude)path' entries for confirmed-legit files.
+          data_allow=()
+          hits=$(git ls-files -z -- "${data_globs[@]}" "${data_allow[@]}" 2>/dev/null \
+                 | tr '\0' '\n' || true)
+          if [[ -n "$hits" ]]; then
+            echo "::error::Binary/data artifacts must never be committed (voiceprints, audio, databases, models):"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+          echo "Binary/data artifact scan: CLEAN"
+
       - name: PR description scan
         if: github.event_name == 'pull_request'
         env:
