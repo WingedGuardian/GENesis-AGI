@@ -234,17 +234,22 @@ async def test_scan_and_store_skips_failed_scans():
     assert results == []
 
 
-async def test_store_finding_persists_queryable_recon_finding(db):
-    """A stored finding is retrievable via the same query recon_findings uses."""
-    from genesis.db.crud import observations as obs_crud
+async def test_store_finding_persists_recon_observation_row(db):
+    """A stored finding lands as a recon observation row (source/type/category).
 
+    Verified by direct SQL rather than ``observations.query`` so the assertion is
+    immune to a leaked mock of that helper elsewhere in the full suite — it checks
+    the actual persisted row.
+    """
     finding = report_to_finding(parse_report(SAMPLE_REPORT))
     finding_id = await store_finding(db, finding)
     assert finding_id
 
-    rows = await obs_crud.query(
-        db, source="recon", type="finding", category="skill-security", limit=10
+    cursor = await db.execute(
+        "SELECT content, priority FROM observations "
+        "WHERE source = 'recon' AND type = 'finding' AND category = 'skill-security'"
     )
+    rows = await cursor.fetchall()
     assert len(rows) == 1
     assert "demo-skill" in rows[0]["content"]
     assert rows[0]["priority"] == "high"
