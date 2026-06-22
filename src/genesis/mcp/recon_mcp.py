@@ -407,3 +407,23 @@ async def recon_run_github_discovery(query: str, limit: int = 10) -> dict:
     if not repos:
         result["note"] = "no results — if unexpected, check gh auth / rate-limit (30/min) in logs"
     return result
+
+
+@mcp.tool()
+async def recon_run_github_discovery_job() -> dict:
+    """Run the curated GitHub Discovery JOB on-demand (files new repos → triage).
+
+    Normally runs weekly (Wednesday 6am). Searches the configured topics
+    (config/github_discovery_topics.yaml), scores candidates, and files the top
+    few NEW high-signal repos as recon findings to the TRIAGE queue (surfaced via
+    recon_findings job_type="github_discovery") — never the knowledge base.
+    Curated by design: narrow topics, a hard per-run cap, a score threshold, and
+    dedup vs the watchlist + already-filed findings. Returns a count summary.
+    """
+    if _db is None:
+        return {"error": "Database not initialized"}
+
+    from genesis.recon.github_discovery import GitHubDiscoveryJob
+
+    job = GitHubDiscoveryJob(db=_db, router=_router)
+    return await job.run()

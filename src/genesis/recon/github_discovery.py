@@ -17,12 +17,16 @@ deterministic under test.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 
+from genesis.db.crud import observations
 from genesis.recon.gh_cli import run_gh
 
 logger = logging.getLogger(__name__)
@@ -242,3 +246,152 @@ async def discover(
 
     ranked = sorted(best.values(), key=lambda c: c.score, reverse=True)
     return ranked[:total_cap] if total_cap else ranked
+
+
+# ── Curated proactive job (files survivors to the recon triage queue) ─────────
+
+_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
+_TOPICS_FILE = "github_discovery_topics.yaml"
+# Curation knobs: file at most N high-signal repos per run, above a score floor.
+_FILE_SCORE_THRESHOLD = 0.55
+_MAX_FILE_PER_RUN = 5
+_DISCOVER_LIMIT_PER_QUERY = 10
+_DISCOVER_TOTAL_CAP = 30
+
+
+def _discovery_hash(full_name: str, score: float) -> str:
+    """Dedup key: repo + score TIER (0–10). A repo re-surfaces only if it climbs
+    a tier — not on every minor star drift, and (with unresolved_only) it can
+    re-surface after a prior finding is triaged or expires."""
+    bucket = int(score * 10)
+    return hashlib.sha256(f"gh_discovery:{full_name}:{bucket}".encode()).hexdigest()[:16]
+
+
+def _load_topics(path: Path) -> list[str]:
+    """Discovery topics: base YAML + optional gitignored ``.local.yaml`` overlay."""
+    if not path.exists():
+        return []
+    try:
+        import yaml
+
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        topics = list(data.get("topics", []))
+        local = path.with_suffix(".local.yaml")
+        if local.exists():
+            with open(local) as f:
+                ldata = yaml.safe_load(f) or {}
+            for t in ldata.get("topics", []):
+                if t not in topics:
+                    topics.append(t)
+        return [str(t) for t in topics if t]
+    except Exception:
+        logger.error("Failed to load github_discovery topics from %s", path, exc_info=True)
+        return []
+
+
+def _format_finding(c: RepoCandidate) -> str:
+    """Human-readable triage finding — leads with full_name and shows WHY it
+    surfaced (the score breakdown)."""
+    return (
+        f"{c.full_name} — {c.stars}★ ({c.language or 'n/a'})\n"
+        f"score {c.score:.2f} (momentum {c.momentum:.2f} / activity {c.activity:.2f} / "
+        f"maturity {c.maturity:.2f})\n"
+        f"{c.description}\n"
+        f"created {c.created_at[:10]}, pushed {c.pushed_at[:10]}\n"
+        f"Source: {c.url}"
+    )
+
+
+class GitHubDiscoveryJob:
+    """Weekly curated discovery: search the user's topics, score, and file the
+    top few high-signal repos as recon findings for human triage.
+
+    Anti-firehose by construction: narrow topics, a hard per-run cap, a score
+    threshold, dedup vs the watchlist and already-filed findings, and filing
+    straight to the recon triage lane — never the knowledge base.
+    """
+
+    def __init__(
+        self, *, db, router: object | None = None, topics_path: Path | None = None
+    ) -> None:
+        self._db = db
+        self._router = router  # reserved for an optional LLM relevance pass
+        self._topics_path = topics_path
+
+    async def _probe_gh_auth(self) -> bool:
+        """True if gh is authenticated, so a silent 401 can't masquerade as
+        'no results'. ``gh api user`` requires auth and prints the login."""
+        return bool(await run_gh("gh", "api", "user", "--jq", ".login"))
+
+    def _resolve_topics(self) -> list[str]:
+        return _load_topics(self._topics_path or (_CONFIG_DIR / _TOPICS_FILE))
+
+    def _watchlist_names(self) -> set[str]:
+        """Repos already hand-tracked in the recon watchlist (skip — not 'new')."""
+        from genesis.recon.gatherer import ReconGatherer
+
+        return {
+            str(p.get("repo", "")).lower()
+            for p in ReconGatherer._load_watchlist()
+            if p.get("repo")
+        }
+
+    async def run(self) -> dict:
+        if not await self._probe_gh_auth():
+            logger.warning("github_discovery: gh not authenticated — skipping")
+            return {"filed": 0, "candidates": 0, "skipped": "gh not authenticated"}
+
+        topics = self._resolve_topics()
+        if not topics:
+            return {"filed": 0, "candidates": 0, "skipped": "no topics configured"}
+
+        candidates = await discover(
+            topics,
+            limit_per_query=_DISCOVER_LIMIT_PER_QUERY,
+            total_cap=_DISCOVER_TOTAL_CAP,
+        )
+        watchlist = self._watchlist_names()
+        now = datetime.now(UTC).isoformat()
+
+        # Curated cream only: drop watchlist repos and anything below the quality
+        # floor, then take the top N BY SCORE (candidates are already sorted desc).
+        # We file the not-yet-filed repos among THESE — we do NOT walk further down
+        # the pool to refill the cap, so once you've seen the top entrants the job
+        # goes quiet until better ones appear (anti-firehose).
+        eligible = [
+            c
+            for c in candidates
+            if c.score >= _FILE_SCORE_THRESHOLD and c.full_name.lower() not in watchlist
+        ][:_MAX_FILE_PER_RUN]
+
+        filed = 0
+        for cand in eligible:
+            content_hash = _discovery_hash(cand.full_name, cand.score)
+            # NEVER route discovery candidates through run_intake() — that path
+            # leads to the KB flood. File directly as a triageable recon finding.
+            # Permanent dedup (no unresolved_only): a repo seen at this score tier
+            # won't nag again even after you triage it; it re-surfaces only if it
+            # climbs a tier (new hash) or its finding TTL-expires.
+            if await observations.exists_by_hash(
+                self._db, source="recon", content_hash=content_hash
+            ):
+                continue
+            await observations.create(
+                self._db,
+                id=str(uuid.uuid4()),
+                source="recon",
+                type="finding",
+                category="github_discovery",
+                content=_format_finding(cand),
+                priority="low",  # surface in the triage queue, don't push-alert
+                created_at=now,
+                content_hash=content_hash,
+            )
+            filed += 1
+
+        logger.info(
+            "github_discovery: topics=%d candidates=%d filed=%d",
+            len(topics), len(candidates), filed,
+        )
+        return {"filed": filed, "candidates": len(candidates), "topics": len(topics)}

@@ -129,6 +129,7 @@ class SurplusScheduler:
         self._model_intelligence_job = None  # Set via set_model_intelligence_job()
         self._models_md_synthesis_job = None  # Set via set_models_md_synthesis_job()
         self._skill_security_scan_job = None  # Set via set_skill_security_scan_job()
+        self._github_discovery_job = None  # Set via set_github_discovery_job()
         self._extraction_store: MemoryStore | None = None
         self._extraction_router: Router | None = None
         self._follow_up_dispatcher = None  # Set via set_follow_up_dispatcher()
@@ -221,6 +222,10 @@ class SurplusScheduler:
     def set_skill_security_scan_job(self, job) -> None:
         """Set the SkillSecurityScanJob for the weekly skill-security scan."""
         self._skill_security_scan_job = job
+
+    def set_github_discovery_job(self, job) -> None:
+        """Set the GitHubDiscoveryJob for weekly curated repo discovery."""
+        self._github_discovery_job = job
 
     def set_extraction_deps(
         self,
@@ -323,6 +328,16 @@ class SurplusScheduler:
                 self.run_skill_security_scan,
                 CronTrigger(day_of_week="mon", hour=2, timezone=user_timezone()),
                 id="skill_security_scan",
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
+        # GitHub Discovery: weekly Wednesday 6am — finds new repos in the user's
+        # domains and files the top few to the recon triage queue for review.
+        if self._github_discovery_job is not None:
+            self._scheduler.add_job(
+                self.run_github_discovery,
+                CronTrigger(day_of_week="wed", hour=6, timezone=user_timezone()),
+                id="github_discovery",
                 max_instances=1,
                 misfire_grace_time=3600,
             )
@@ -1109,6 +1124,45 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("skill_security_scan", str(exc))
+            except Exception:
+                pass
+
+    async def run_github_discovery(self) -> None:
+        """Run weekly curated GitHub Discovery (new repos → recon triage queue)."""
+        if self._github_discovery_job is None:
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure(
+                    "github_discovery", "job not wired",
+                )
+            except Exception:
+                pass
+            return
+        try:
+            result = await self._github_discovery_job.run()
+            filed = result.get("filed", 0)
+            logger.info("GitHub Discovery: %d new repo(s) filed for triage", filed)
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.DEBUG,
+                    "heartbeat", "github_discovery completed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("github_discovery")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("GitHub Discovery failed")
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.ERROR,
+                    "github_discovery.failed",
+                    "GitHub Discovery failed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("github_discovery", str(exc))
             except Exception:
                 pass
 
