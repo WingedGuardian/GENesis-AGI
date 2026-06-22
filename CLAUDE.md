@@ -304,8 +304,13 @@ When a user shares a file path or URL in conversation:
   without explicit user confirmation.
 - **Session wrap-up**: structured handoff — what changed, what's pending,
   what was learned. If it's not committed, it doesn't exist.
-- **Follow-up ownership**: create follow-ups via `follow_up_create` MCP
-  before session ends. Never leave a follow-up as just text.
+- **Follow-up discipline**: bias = FIX NOW, not defer. A follow-up is valid
+  ONLY if the work is (1) blocked on a precondition unmet this session (incl.
+  an unmade design decision), (2) gated on time/data, or (3) big enough to
+  derail this session — or the user directs it as separate. Otherwise do it
+  now, even if unrelated/unasked; "already noted in a PR/comment" is not a
+  reason to also create a row. Valid ones: create via `follow_up_create` MCP,
+  never leave as just text. (Genuine someday/maybe → `tabled`, not a follow-up.)
 - **No laziness.** Find root causes. No temporary fixes. No shortcuts.
   Don't EVER mute the symptom — fix the problem.
 - **Read before writing.** Never modify code you haven't fully read.
@@ -322,6 +327,9 @@ When a user shares a file path or URL in conversation:
   the stated request — find related issues, challenge assumptions, suggest
   what the user hasn't thought of. The value of Genesis is anticipation,
   not compliance. If you catch yourself just doing exactly what was asked
-  and nothing more, you're underperforming.
+  and nothing more, you're underperforming. And treat the user's examples as
+  a sample, not the spec: when they name a few instances, enumerate and probe
+  the broader class yourself instead of spiking only the named cases —
+  "just a couple of examples" is always implied.
 - Dev-specific rules (commit prefixes, targeted tests, push/PR workflow,
   capability registration) are in the genesis-development skill.
