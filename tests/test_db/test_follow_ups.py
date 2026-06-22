@@ -180,3 +180,53 @@ async def test_query_page_rejects_nothing_on_bad_sort(db):
     await follow_ups.create(db, **_BASE)
     rows = await follow_ups.query_page(db, sort="; DROP TABLE follow_ups; --")
     assert len(rows) == 1
+
+
+async def test_set_priority_updates(db):
+    fid = await follow_ups.create(db, **_BASE)
+    assert await follow_ups.set_priority(db, fid, "critical")
+    assert (await follow_ups.get_by_id(db, fid))["priority"] == "critical"
+
+
+async def test_set_priority_rejects_invalid(db):
+    fid = await follow_ups.create(db, **_BASE)
+    with pytest.raises(ValueError):
+        await follow_ups.set_priority(db, fid, "urgent")
+
+
+async def test_set_priority_unknown_id_returns_false(db):
+    assert await follow_ups.set_priority(db, "nope", "high") is False
+
+
+async def test_delete_batch_removes_all(db):
+    ids = [await follow_ups.create(db, **_BASE) for _ in range(3)]
+    assert await follow_ups.delete_batch(db, ids) == 3
+    for fid in ids:
+        assert await follow_ups.get_by_id(db, fid) is None
+    # Empty selection is a no-op, not an error.
+    assert await follow_ups.delete_batch(db, []) == 0
+
+
+async def test_set_kind_batch_moves_lane(db):
+    ids = [await follow_ups.create(db, **_BASE) for _ in range(2)]
+    assert await follow_ups.set_kind_batch(db, ids, "tabled") == 2
+    for fid in ids:
+        assert (await follow_ups.get_by_id(db, fid))["kind"] == "tabled"
+
+
+async def test_set_kind_batch_rejects_invalid(db):
+    fid = await follow_ups.create(db, **_BASE)
+    with pytest.raises(ValueError):
+        await follow_ups.set_kind_batch(db, [fid], "bogus")
+
+
+async def test_update_status_batch_stamps_completed_at(db):
+    ids = [await follow_ups.create(db, **_BASE) for _ in range(2)]
+    assert await follow_ups.update_status_batch(
+        db, ids, "completed", resolution_notes="bulk done"
+    ) == 2
+    for fid in ids:
+        row = await follow_ups.get_by_id(db, fid)
+        assert row["status"] == "completed"
+        assert row["completed_at"] is not None
+        assert row["resolution_notes"] == "bulk done"
