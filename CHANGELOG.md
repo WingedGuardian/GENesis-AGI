@@ -13,13 +13,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
-- **Genesis won't send email on its own without your say-so** — outbound email now passes
-  a deterministic authorization check before it leaves. By default every send is held for your
-  approval: a reply on a thread you're already in is the lowest-risk kind, while a cold first
-  email, a bulk or campaign send, or anything involving money is held with a higher bar.
-  Rejected or unanswered holds are never sent. Over time Genesis can earn the ability to send a
-  given kind of email on its own (see below), so you stay in the loop by default.
-
 - **Genesis earns email autonomy you can revoke in one click** — once Genesis has sent a kind
   of email with your approval enough times, it proposes a promotion: it asks "may I send these
   on my own from now on?" — and only you can say yes. If a promoted send ever goes wrong, that
@@ -205,52 +198,34 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Genesis now ignores those tracking parameters when deciding what's new, so the same article
   isn't evaluated twice or spawn a duplicate follow-up.
 
-- **The ego subsystem no longer shows a false "overdue" health status** — the health view marks
-  a background subsystem "overdue" if it hasn't checked in within a window, and the ego's check-in
-  was tied to its proactive thinking timer. That timer deliberately slows down during quiet
-  periods and gets pushed back every time the ego does other work, so it could legitimately go
-  hours between ticks — long enough to trip the 4-hour "overdue" alarm even while the ego was
-  healthy and actively running cycles. The ego now sends a steady "alive" check-in every few
-  minutes, independent of its work pace, so its health status reflects reality.
-
 - **Voice approvals now resolve the action you actually mean** — when you say "approve" or
   "reject" over voice, Genesis tells you which action it acted on, and if more than one action is
   awaiting your decision it reads the options back and asks which one — instead of silently
   resolving whichever was most recent (which could be the wrong one).
 
-- **Stale "quality drift" and "learning regression" alarms no longer linger or cry wolf** — when
-  Genesis's weekly self-checks flagged a quality drift or a learning regression, that flag stayed
-  active until it expired days later, so the morning report kept repeating a days-old warning as if
-  it were current. Now each weekly check supersedes the previous flag and clears it outright once the
-  underlying metric recovers, the regression alarm only fires on a meaningful sustained drop (not a
-  small wobble in a noisy self-score), and any observation older than three days is shown in the
-  report demoted and tagged as historical rather than as a fresh alarm.
+- **Fewer false health alarms about Genesis's own subsystems** — several background loops report
+  health through a periodic heartbeat, and a couple could trip "overdue" or "dark" alarms while
+  perfectly healthy. The ego's check-in rode its proactive-thinking timer, which slows during quiet
+  periods and gets pushed back by other work, so it could go hours between ticks and trip the 4-hour
+  alarm; and the reflection loop only emitted a heartbeat when it actually ran one, so calm overnight
+  stretches read as silent. Both now send a steady lightweight "alive" heartbeat independent of their
+  work pace. Separately, weekly "quality drift" and "learning regression" warnings no longer linger:
+  each weekly check supersedes and clears the previous flag once the metric recovers, the regression
+  alarm only fires on a sustained drop rather than a noisy wobble, and anything older than three days
+  is demoted and tagged historical instead of repeated as a fresh alarm.
 
-- **Genesis stops false-alarming about its own reflection quality declining** — its weekly
-  self-assessment scored "reflection quality" from how often its recent reflections had been
-  retrieved, but counted a running total over the 50 newest reflections. Because brand-new
-  reflections haven't had time to be referenced yet, that score drifted downward purely as new
-  reflections were created — a measurement artifact that looked like an alarming "quality crater"
-  and fed scary (but baseless) warnings into the morning report. The score is now measured over a
-  fair, fixed age window (reflections that are 3-10 days old), counts a reflection as influential
-  only if it was actually retrieved first, and honestly reports "insufficient data" when there are
-  too few mature reflections to judge — rather than inventing a decline.
-
-- **Memory-quality self-evaluation got more honest** — every time Genesis searches its memory it
-  logs an internal "recall" event that feeds the self-graded memory-quality metrics (the
-  precision / MRR figures in its J-9 eval and morning report). It was logging that event *twice*
-  per search, inflating the counts and skewing the math. Each search now logs exactly one event,
-  so the memory-quality numbers Genesis reports on itself are accurate. It also now records a new
-  signal — whether its ranking merely favors the memories it retrieves most often — so
-  entrenchment of stale-but-popular memories can be watched over time (measured, not acted on).
-
-- **Reflection is no longer falsely reported as "dark" during quiet periods** — the health and
-  morning reports track each subsystem by a periodic heartbeat, but the reflection loop only emitted
-  one when it actually ran a reflection. During legitimately calm stretches (most overnight ticks do
-  no reflection by design), that heartbeat could age past its overdue threshold and the report would
-  warn that reflection had gone silent or "dark" even though the loop was perfectly healthy. Reflection
-  now emits a lightweight idle heartbeat on those quiet ticks, so it only reads as overdue during a
-  genuine outage.
+- **Genesis's self-quality metrics are now accurate** — several bugs were skewing the numbers Genesis
+  uses to grade its own competence (the J9 readiness grades, the morning-report quality figures, and
+  the gate that decides which self-improvements ship). Memory retrieval quality (MRR) was computed
+  against database arrival order instead of the actual retrieval rank; each memory search logged its
+  internal "recall" event twice, inflating the counts; reflection quality was scored as a running
+  total over the newest reflections, so it drifted downward purely because new reflections hadn't been
+  referenced yet (a "quality crater" that was a measurement artifact); and a malformed LLM-judge
+  verdict was silently recorded as a confident "0 / fail" instead of an error. All now reflect
+  reality — reflection quality is measured over a fair, fixed age window and reports "insufficient
+  data" when there aren't enough mature reflections, and the readiness grades and ship-gate are
+  trustworthy. Genesis also now tracks whether its ranking merely favors the memories it retrieves
+  most often, so entrenchment can be watched over time.
 
 - **Knowledge-base searches stopped silently returning nothing** — the relevance floor that
   trims low-quality knowledge results was a fixed absolute cutoff that, on the score scale recall
@@ -302,16 +277,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   brainstorm ideas posted to the Telegram "Surplus" topic now render as clean bulleted text
   (idea, detail, and why it matters) instead of the raw ```json``` code block the model
   produces. Plain-text and non-JSON messages are unaffected.
-- **Genesis's self-quality metrics are trustworthy again.** Three bugs were corrupting the
-  numbers Genesis uses to judge its own competence (the J9 readiness grades and the quality
-  gate that decides which self-improvements ship): the memory retrieval-quality metric (MRR)
-  was computed against database arrival order instead of the actual retrieval rank, making it
-  meaningless; and when the LLM judge returned a malformed verdict (valid JSON but missing the
-  score), it was silently recorded as a confident "0 / fail" instead of an error — quietly
-  polluting the quality gate and calibration. Both now reflect reality, so the readiness grades
-  and ship-gate are honest.
-
-- **The neural monitor labels every cognitive call site honestly.** Eight call sites
+- **The neural monitor labels every cognitive call site correctly.** Eight call sites
   that previously showed blank (the eval judge, voice conversation, session observer,
   task pre-mortem, intelligence intake, both resume-review passes, and the executor's
   failure-exit gate) now display their purpose, category, and cost. Sites that actually
@@ -482,12 +448,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   comes back on its own it sends a single "restored" notification — which it
   never did before.
 
-- **Memory writes no longer get stuck behind a database lock** — under heavy load
-  or a provider outage, a cancelled database read could leave a stale lock that
-  made saving to memory (`reference_store` / `memory_store`) fail with "database
-  is locked" while the write-ahead log ballooned (it reached ~2 GB). Database
-  reads are now cancellation-safe and the journal is size-bounded, so the lock
-  can't get stuck and the file can't run away.
+- **"database is locked" errors under load are largely gone** — several independent paths could pin
+  the database or fail on a transient lock. A cancelled read could leave a stale lock while the
+  write-ahead log ballooned (it reached ~2 GB); a long-lived MCP connection left read transactions
+  open after read-only calls, pinning the WAL and making `memory_store` / `reference_store` fail until
+  a restart; and several standalone connections (the ego tools, web-agent cost tracking, the
+  contribution gate, and two hooks) opened with no wait-for-lock timeout, so brief contention failed
+  immediately. Reads are now cancellation-safe with a size-bounded journal, MCP calls release their
+  snapshot at each boundary and are serialized, and the standalone connections share one WAL-aware
+  helper with a bounded wait — so writes ride out transient contention and the WAL stays bounded.
 
 - **Claude Code hooks work from a git worktree again** — the hook launcher
   located the Python venv via a `git worktree list | head` pipeline that, with
@@ -495,13 +464,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   disabled every hook** (session activity capture, file/edit audit logging) when
   you ran Claude Code from a worktree. It now resolves the main repo with
   `git rev-parse --git-common-dir` (no pipe), so hooks fire reliably everywhere.
-- **Memory storage no longer gets wedged on "database is locked"** — a
-  long-lived MCP database connection left read transactions open after read-only
-  tool calls, which pinned the SQLite write-ahead log (it could grow to
-  gigabytes on disk) and made `memory_store` / `reference_store` fail until a
-  restart. MCP tool calls now release their database snapshot at each call
-  boundary, and the MCP connections are serialized to prevent transaction-state
-  corruption — so writes keep working and the WAL stays bounded.
 - **Outreach emails actually send now** — email (and Discord/voice) outreach was
   being misaddressed to the Telegram forum chat for any category that routes to
   the supergroup, so every such send failed and silently piled up as retries.
@@ -546,12 +508,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `config/` dir — so your changes were silently ignored, even after a restart.
   Loaders now read the user-config overlay first (falling back to the repo path
   for older installs), and the settings tool reports the correct saved path.
-- **Fewer "database is locked" errors under heavy concurrent load.** Several
-  standalone database connections (the ego tools, web-agent cost tracking, the
-  contribution gate, and two hooks) opened without a busy-timeout, so a brief
-  write lock made them fail immediately instead of waiting their turn. They now
-  share one connection helper (WAL + a bounded wait), so transient contention
-  is ridden out rather than surfaced as an error.
 
 ### Security
 
