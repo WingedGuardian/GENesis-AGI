@@ -9,6 +9,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Updates no longer abort when a schema migration actually succeeded** — if the
+  database was busy during an update (for example a background task writing at the same
+  time), a migration could commit successfully yet still surface a transient "database
+  is locked" error, which made the update roll the code back while the database had
+  already moved forward. Updates now confirm whether the migration was truly applied
+  before treating it as a failure, and give migrations more room to wait out a busy
+  database.
+
 ## [v3.0b16] - 2026-06-21
 
 ### Added
