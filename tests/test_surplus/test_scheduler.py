@@ -31,6 +31,27 @@ def _make_scheduler(db, *, idle=True, lmstudio_up=False, enable_code_audits=Fals
     ), compute
 
 
+async def test_run_gitnexus_strip_cleans_claude_md(db, tmp_path, monkeypatch):
+    """run_gitnexus_strip removes the GitNexus block from CLAUDE.md, not AGENTS.md."""
+    from pathlib import Path as _P
+
+    sched, _ = _make_scheduler(db)  # build before patching Path.home
+
+    genesis_dir = tmp_path / "genesis"
+    genesis_dir.mkdir()
+    block = "<!-- gitnexus:start -->\n# GitNexus\nidx\n<!-- gitnexus:end -->\n"
+    (genesis_dir / "CLAUDE.md").write_text("# Real instructions\n\n" + block)
+    (genesis_dir / "AGENTS.md").write_text("# Agents\n\n" + block)
+
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+    await sched.run_gitnexus_strip()
+
+    claude = (genesis_dir / "CLAUDE.md").read_text()
+    assert "gitnexus:start" not in claude, "block stripped from CLAUDE.md"
+    assert "# Real instructions" in claude, "real content preserved"
+    assert "gitnexus:start" in (genesis_dir / "AGENTS.md").read_text(), "AGENTS.md kept"
+
+
 async def test_dispatch_skips_when_not_idle(db):
     sched, compute = _make_scheduler(db, idle=False)
     with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):
@@ -112,7 +133,8 @@ async def test_brainstorm_check_schedules_sessions(db):
 
 async def test_start_and_stop(db):
     sched, compute = _make_scheduler(db, idle=True, enable_code_audits=True)
-    with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):
+    with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False), \
+         patch.object(sched, "run_gitnexus_strip", new_callable=AsyncMock):
         await sched.start()
     assert sched._scheduler.running is True
     # Verify jobs were registered
@@ -129,7 +151,8 @@ async def test_start_and_stop(db):
 
 async def test_start_without_code_audits(db):
     sched, compute = _make_scheduler(db, idle=True, enable_code_audits=False)
-    with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):
+    with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False), \
+         patch.object(sched, "run_gitnexus_strip", new_callable=AsyncMock):
         await sched.start()
     assert sched._scheduler.running is True
     # Code audit job should NOT be registered
