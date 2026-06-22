@@ -42,8 +42,8 @@ async def test_run_delegates_and_summarizes(monkeypatch):
 
     job = SkillSecurityScanJob(db=object(), skillspector_bin="/x/ss")
     monkeypatch.setattr(mod, "discover_skill_dirs", lambda _roots: ["/x/bad", "/x/ok"])
-    monkeypatch.setattr(mod, "_load_trusted_names", lambda _p: {"ok"})
-    monkeypatch.setattr(mod, "_repo_skill_roots", lambda: [])
+    monkeypatch.setattr(mod, "load_trusted_names", lambda _p: {"ok"})
+    monkeypatch.setattr(mod, "repo_skill_roots", lambda: [])
 
     async def fake_scan_and_store(db, dirs, *, scanner, storer, trusted, **kw):
         # Mimic the real shape: one untrusted finding, one trusted (skipped).

@@ -14,12 +14,12 @@ import shutil
 from pathlib import Path
 
 from genesis.security.skill_scan import (
-    _default_roots,
-    _default_trusted_file,
-    _load_trusted_names,
-    _repo_skill_roots,
+    default_roots,
+    default_trusted_file,
     discover_skill_dirs,
     is_trusted,
+    load_trusted_names,
+    repo_skill_roots,
     run_skillspector,
     scan_and_store,
     store_finding,
@@ -62,10 +62,10 @@ class SkillSecurityScanJob:
             logger.warning("SkillSpector binary not found — skipping skill-security scan")
             return {"total_findings": 0, "skills_scanned": 0, "skipped": "skillspector not installed"}
 
-        roots = _default_roots()
+        roots = default_roots()
         skill_dirs = discover_skill_dirs(roots)
-        trusted_names = _load_trusted_names(_default_trusted_file())
-        trusted_roots = _repo_skill_roots()
+        trusted_names = load_trusted_names(default_trusted_file())
+        trusted_roots = repo_skill_roots()
 
         def trusted(skill_dir: Path) -> bool:
             return is_trusted(skill_dir, trusted_names=trusted_names, trusted_roots=trusted_roots)
