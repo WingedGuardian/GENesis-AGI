@@ -293,7 +293,7 @@ async def follow_up_batch():
     ids = data.get("ids", [])
     notes = data.get("notes") or None
 
-    if not ids or action not in _BATCH_ACTIONS:
+    if not isinstance(ids, list) or not ids or action not in _BATCH_ACTIONS:
         return jsonify({"ok": False, "error": "Invalid action or empty ids"}), 400
     if len(ids) > 200:
         return jsonify({"ok": False, "error": "Too many ids (max 200)"}), 400
