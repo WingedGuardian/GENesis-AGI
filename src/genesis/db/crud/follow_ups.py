@@ -25,6 +25,20 @@ def _normalize_scheduled_at(iso_str: str | None) -> str | None:
     return dt.isoformat()
 
 
+def _domain_eq(domain: str | None) -> tuple[str, list[str]]:
+    """Build an exact-match domain WHERE fragment for the reader queries.
+
+    Returns ``("", [])`` when ``domain`` is None (no-op — the caller behaves
+    byte-identically to before), else ``(" AND domain = ?", [domain])``. Exact
+    match only: when a domain is given, NULL-domain rows are excluded. This
+    mirrors the cockpit's ``_build_filter_where`` exact-match semantics — it is
+    deliberately NOT a second NULL-handling idiom (no "domain OR NULL" union).
+    """
+    if domain is None:
+        return "", []
+    return " AND domain = ?", [domain]
+
+
 async def create(
     db: aiosqlite.Connection,
     *,
@@ -74,11 +88,13 @@ async def get_pending(
     source: str | None = None,
     strategy: str | None = None,
     include_tabled: bool = False,
+    domain: str | None = None,
 ) -> list[dict]:
-    """Get pending follow-ups, optionally filtered by source/strategy.
+    """Get pending follow-ups, optionally filtered by source/strategy/domain.
 
     Tabled follow-ups (kind='tabled') are excluded unless include_tabled=True —
     tabled items are tracked but never dispatched or surfaced as action.
+    domain (exact match) scopes to that domain only; None = all domains (no-op).
     """
     query = "SELECT * FROM follow_ups WHERE status = 'pending'"
     params: list[str] = []
@@ -90,6 +106,9 @@ async def get_pending(
     if strategy is not None:
         query += " AND strategy = ?"
         params.append(strategy)
+    dom_clause, dom_params = _domain_eq(domain)
+    query += dom_clause
+    params.extend(dom_params)
     query += " ORDER BY created_at ASC"
     cursor = await db.execute(query, params)
     return [dict(row) for row in await cursor.fetchall()]
@@ -98,31 +117,41 @@ async def get_pending(
 async def get_by_status(
     db: aiosqlite.Connection,
     status: str,
+    *,
+    domain: str | None = None,
 ) -> list[dict]:
+    """Get follow-ups by status. domain (exact match) scopes to that domain
+    only; None = all domains (no-op, identical to the prior behaviour)."""
+    dom_clause, dom_params = _domain_eq(domain)
     cursor = await db.execute(
-        "SELECT * FROM follow_ups WHERE status = ? ORDER BY created_at ASC",
-        (status,),
+        f"SELECT * FROM follow_ups WHERE status = ?{dom_clause} "
+        "ORDER BY created_at ASC",
+        (status, *dom_params),
     )
     return [dict(row) for row in await cursor.fetchall()]
 
 
 async def get_actionable(
     db: aiosqlite.Connection, *, limit: int = 50, include_tabled: bool = False,
+    domain: str | None = None,
 ) -> list[dict]:
     """Get follow-ups needing attention: pending, failed, blocked.
 
     Tabled follow-ups are excluded unless include_tabled=True. Capped at `limit`
-    to prevent unbounded growth from flooding contexts.
+    to prevent unbounded growth from flooding contexts. domain (exact match)
+    scopes to that domain only — applied in SQL BEFORE the LIMIT, so the cap
+    samples within the scoped domain (None = all domains, identical to before).
     """
     kind_clause = "" if include_tabled else "AND kind = 'follow_up' "
+    dom_clause, dom_params = _domain_eq(domain)
     cursor = await db.execute(
         "SELECT * FROM follow_ups WHERE status IN ('pending', 'failed', 'blocked') "
-        f"{kind_clause}"
+        f"{kind_clause}{dom_clause} "
         "ORDER BY CASE priority "
         "  WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
         "  WHEN 'medium' THEN 2 ELSE 3 END, created_at ASC "
         "LIMIT ?",
-        (limit,),
+        (*dom_params, limit),
     )
     return [dict(row) for row in await cursor.fetchall()]
 
@@ -379,14 +408,21 @@ async def get_recently_completed(
     *,
     hours: int = 24,
     limit: int = 5,
+    domain: str | None = None,
 ) -> list[dict]:
-    """Get follow-ups completed within the given time window."""
+    """Get follow-ups completed within the given time window.
+
+    domain (exact match) scopes to that domain only and is applied in SQL
+    BEFORE the LIMIT (so the cap samples within the scoped domain — a Python
+    post-filter would be wrong here). None = all domains (no-op).
+    """
+    dom_clause, dom_params = _domain_eq(domain)
     cursor = await db.execute(
         "SELECT content, resolution_notes FROM follow_ups "
         "WHERE status = 'completed' "
-        "AND completed_at >= datetime('now', ? || ' hours') "
+        f"AND completed_at >= datetime('now', ? || ' hours'){dom_clause} "
         "ORDER BY completed_at DESC LIMIT ?",
-        (f"-{hours}", limit),
+        (f"-{hours}", *dom_params, limit),
     )
     return [dict(row) for row in await cursor.fetchall()]
 
