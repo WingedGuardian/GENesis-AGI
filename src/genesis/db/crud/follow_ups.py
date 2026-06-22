@@ -398,6 +398,10 @@ async def get_recently_completed(
 
 _VALID_KIND = {"follow_up", "tabled"}
 _VALID_DOMAIN = {"internal", "user_world"}
+_VALID_PRIORITY = {"low", "medium", "high", "critical"}
+_VALID_STATUS = {
+    "pending", "scheduled", "in_progress", "completed", "failed", "blocked",
+}
 
 # Allowlisted sort keys → ORDER BY fragment (never interpolate caller input).
 _SORT_MAP: dict[str, str] = {
@@ -441,6 +445,82 @@ async def set_domain(db: aiosqlite.Connection, id: str, domain: str | None) -> b
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def set_priority(db: aiosqlite.Connection, id: str, priority: str) -> bool:
+    """Set a follow-up's priority (validated against the schema CHECK set)."""
+    if priority not in _VALID_PRIORITY:
+        raise ValueError(
+            f"invalid priority {priority!r}; must be one of {sorted(_VALID_PRIORITY)}"
+        )
+    cursor = await db.execute(
+        "UPDATE follow_ups SET priority = ? WHERE id = ?", (priority, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+# Batch mutations — single-statement WHERE id IN (...) so a multi-row cockpit
+# action is one transaction (no silent partial failure on a 200-id selection).
+async def delete_batch(db: aiosqlite.Connection, ids: list[str]) -> int:
+    """Permanently delete multiple follow-ups in one statement. Returns count."""
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    cursor = await db.execute(
+        f"DELETE FROM follow_ups WHERE id IN ({placeholders})", ids,
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def set_kind_batch(db: aiosqlite.Connection, ids: list[str], kind: str) -> int:
+    """Move multiple follow-ups between lanes in one statement. Returns count."""
+    if kind not in _VALID_KIND:
+        raise ValueError(f"invalid kind {kind!r}; must be one of {sorted(_VALID_KIND)}")
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    cursor = await db.execute(
+        f"UPDATE follow_ups SET kind = ? WHERE id IN ({placeholders})",
+        [kind, *ids],
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def update_status_batch(
+    db: aiosqlite.Connection,
+    ids: list[str],
+    status: str,
+    *,
+    resolution_notes: str | None = None,
+) -> int:
+    """Update status for multiple follow-ups in one statement. Returns count.
+
+    Mirrors update_status: stamps completed_at on terminal states.
+    """
+    if status not in _VALID_STATUS:
+        raise ValueError(
+            f"invalid status {status!r}; must be one of {sorted(_VALID_STATUS)}"
+        )
+    if not ids:
+        return 0
+    parts = ["status = ?"]
+    params: list[str | None] = [status]
+    if status in ("completed", "failed"):
+        parts.append("completed_at = ?")
+        params.append(_now_iso())
+    if resolution_notes is not None:
+        parts.append("resolution_notes = ?")
+        params.append(resolution_notes)
+    placeholders = ",".join("?" for _ in ids)
+    cursor = await db.execute(
+        f"UPDATE follow_ups SET {', '.join(parts)} WHERE id IN ({placeholders})",
+        [*params, *ids],
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 async def get_distinct_sources(db: aiosqlite.Connection) -> list[str]:

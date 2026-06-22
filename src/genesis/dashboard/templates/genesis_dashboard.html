@@ -26,7 +26,7 @@
       Alpine.store("genesisDashboard", {
         // Tab state
         activeTab: "overview",
-        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, observations: false, traces: false, autonomy: false, memory: false, knowledge: false, backup: false },
+        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, "follow-ups": false, observations: false, traces: false, autonomy: false, memory: false, knowledge: false, backup: false },
 
         // State
         health: {},
@@ -301,6 +301,7 @@
         _workSessionsInterval: null,
         _followUpsInterval: null,
         _observationsInterval: null,
+        _cockpitInterval: null,
         _commsInterval: null,
         _tracesInterval: null,
 
@@ -315,6 +316,18 @@
         observationsResolving: {},
         observationsMarkingRead: {},
         observationsBatchIds: {},
+
+        // Follow-ups cockpit tab state
+        cockpitList: [],
+        cockpitTotal: 0,
+        cockpitPage: 1,
+        cockpitPageSize: 50,
+        cockpitFilters: { kind: 'follow_up', domain: '', status: '', source: '', search: '' },
+        cockpitSort: 'priority',
+        cockpitAvailableFilters: { sources: [], statuses: [] },
+        cockpitExpanded: null,
+        cockpitBatchIds: {},
+        cockpitMutating: {},
 
         // Traces tab state
         tracesList: [],
@@ -340,6 +353,7 @@
           files:     [],
           work:      ["_tasksInterval", "_workSessionsInterval", "_followUpsInterval"],
           observations: ["_observationsInterval"],
+          "follow-ups": ["_cockpitInterval"],
           traces:    ["_tracesInterval"],
           autonomy:  ["_autonomyInterval"],
           memory:    [],
@@ -349,7 +363,7 @@
 
         initTab() {
           const hash = location.hash.replace("#", "") || "overview";
-          const valid = ["overview", "chat", "internals", "config", "files", "work", "observations", "traces", "autonomy", "memory", "knowledge", "references", "backup"];
+          const valid = ["overview", "chat", "internals", "config", "files", "work", "follow-ups", "observations", "traces", "autonomy", "memory", "knowledge", "references", "backup"];
           this.activeTab = valid.includes(hash) ? hash : "overview";
           window.addEventListener("hashchange", () => {
             const h = location.hash.replace("#", "");
@@ -411,6 +425,10 @@
             case "observations":
               if (first) { this.fetchObservations(); this.fetchObservationsSummary(); this.fetchObservationsFilters(); }
               this._observationsInterval = setInterval(() => { this.fetchObservations(); this.fetchObservationsSummary(); }, 30000);
+              break;
+            case "follow-ups":
+              if (first) { this.fetchCockpit(); this.fetchCockpitFilters(); }
+              this._cockpitInterval = setInterval(() => this.fetchCockpit(), 30000);
               break;
             case "traces":
               if (first) { this.fetchSpansRecent(); }
@@ -1018,6 +1036,96 @@
         },
         get observationsBatchCount() {
           return Object.keys(this.observationsBatchIds).filter(k => this.observationsBatchIds[k]).length;
+        },
+
+        // ── Follow-ups cockpit tab ───────────────────────────────
+        async fetchCockpit() {
+          try {
+            const f = this.cockpitFilters;
+            const params = new URLSearchParams();
+            if (f.kind) params.set("kind", f.kind);
+            if (f.domain) params.set("domain", f.domain);
+            if (f.status) params.set("status", f.status);
+            if (f.source) params.set("source", f.source);
+            if (f.search) params.set("search", f.search);
+            params.set("sort", this.cockpitSort);
+            params.set("page", String(this.cockpitPage));
+            params.set("page_size", String(this.cockpitPageSize));
+            const resp = await fetchApi(`/api/genesis/follow-ups/cockpit?${params}`);
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.cockpitList = data.items || [];
+              this.cockpitTotal = data.total || 0;
+            }
+          } catch (e) { console.warn("Cockpit fetch failed:", e); }
+        },
+        async fetchCockpitFilters() {
+          try {
+            const resp = await fetchApi("/api/genesis/follow-ups/filters");
+            if (resp && resp.ok) { this.cockpitAvailableFilters = await resp.json(); }
+          } catch (e) { console.warn("Cockpit filters fetch failed:", e); }
+        },
+        cockpitApplyFilter() {
+          this.cockpitPage = 1;   // reset paging whenever a filter changes
+          this.fetchCockpit();
+        },
+        get cockpitTotalPages() {
+          return Math.max(1, Math.ceil(this.cockpitTotal / this.cockpitPageSize));
+        },
+        cockpitPrevPage() {
+          if (this.cockpitPage > 1) { this.cockpitPage--; this.fetchCockpit(); }
+        },
+        cockpitNextPage() {
+          if (this.cockpitPage < this.cockpitTotalPages) { this.cockpitPage++; this.fetchCockpit(); }
+        },
+        async _cockpitMutate(id, path, body) {
+          this.cockpitMutating = { ...this.cockpitMutating, [id]: true };
+          try {
+            const resp = await fetchApi(`/api/genesis/follow-ups/${id}${path}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body || {}),
+            });
+            if (resp && resp.ok) { await this.fetchCockpit(); return true; }
+          } catch (e) { console.warn("Cockpit mutate failed:", e); }
+          finally { const { [id]: _, ...rest } = this.cockpitMutating; this.cockpitMutating = rest; }
+          return false;
+        },
+        cockpitDone(id) { return this._cockpitMutate(id, '/done', {}); },
+        cockpitPin(id, pinned) { return this._cockpitMutate(id, '/pin', { pinned }); },
+        cockpitSetPriority(id, priority) { return this._cockpitMutate(id, '/priority', { priority }); },
+        cockpitMoveKind(id, kind) { return this._cockpitMutate(id, '/kind', { kind }); },
+        cockpitSetDomain(id, d) {
+          const domain = (d === '__clear__') ? '' : d;
+          return this._cockpitMutate(id, '/domain', { domain });
+        },
+        cockpitDelete(id) {
+          if (!confirm('Delete this follow-up forever? This cannot be undone.')) return;
+          return this._cockpitMutate(id, '/delete', {});
+        },
+        async cockpitBatch(action) {
+          const ids = Object.keys(this.cockpitBatchIds).filter(k => this.cockpitBatchIds[k]);
+          if (!ids.length) return;
+          if (action === 'delete' && !confirm(`Delete ${ids.length} follow-up(s) forever? This cannot be undone.`)) return;
+          try {
+            const resp = await fetchApi("/api/genesis/follow-ups/batch", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ action, ids }),
+            });
+            if (resp && resp.ok) { this.cockpitBatchIds = {}; await this.fetchCockpit(); }
+          } catch (e) { console.warn("Cockpit batch failed:", e); }
+        },
+        toggleCockpitBatch(id) {
+          if (this.cockpitBatchIds[id]) {
+            const { [id]: _, ...rest } = this.cockpitBatchIds;
+            this.cockpitBatchIds = rest;
+          } else {
+            this.cockpitBatchIds = { ...this.cockpitBatchIds, [id]: true };
+          }
+        },
+        get cockpitBatchCount() {
+          return Object.keys(this.cockpitBatchIds).filter(k => this.cockpitBatchIds[k]).length;
         },
 
         // ── Traces tab (trace waterfall) ─────────────────────────
@@ -4191,6 +4299,8 @@
               @click="location.hash = 'chat'">Chat</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'work' }"
               @click="location.hash = 'work'">Work</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'follow-ups' }"
+              @click="location.hash = 'follow-ups'">Follow-ups</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'observations' }"
               @click="location.hash = 'observations'">Observations
         <span x-show="$store.genesisDashboard.observationsCounts.total_unsurfaced > 0"
@@ -9032,6 +9142,226 @@
         <div x-show="$store.genesisDashboard.observationsHasMore"
              style="text-align:center; padding:0.5rem; font-size:0.65rem; color:var(--color-text-secondary);">
           Showing first 50 results. Use filters to narrow down.
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Follow-ups cockpit [Tab: follow-ups]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'follow-ups'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">checklist</span>
+        Follow-ups
+        <span class="panel-status" x-show="$store.genesisDashboard.cockpitTotal > 0">
+          <span x-text="$store.genesisDashboard.cockpitTotal + ' shown'"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <!-- Tier toggle: follow_up | tabled | all -->
+        <div style="display:flex; gap:0.25rem; margin-bottom:0.6rem; align-items:center; flex-wrap:wrap;">
+          <template x-for="tier in [{k:'follow_up',l:'Follow-ups'},{k:'tabled',l:'Tabled'},{k:'',l:'All'}]" :key="tier.l">
+            <button style="font-size:0.7rem; padding:0.2rem 0.7rem; border-radius:3px; cursor:pointer; border:1px solid #555;"
+                    :style="$store.genesisDashboard.cockpitFilters.kind === tier.k ? 'background:rgba(33,150,243,0.18); color:#2196F3; border-color:rgba(33,150,243,0.4); font-weight:600;' : 'background:transparent; color:var(--color-text-secondary);'"
+                    @click="$store.genesisDashboard.cockpitFilters.kind = tier.k; $store.genesisDashboard.cockpitApplyFilter()"
+                    x-text="tier.l"></button>
+          </template>
+        </div>
+
+        <!-- Filter bar -->
+        <div style="display:flex; gap:0.25rem; margin-bottom:0.75rem; flex-wrap:wrap; align-items:center;">
+          <select style="font-size:0.68rem; padding:0.2rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);"
+                  :value="$store.genesisDashboard.cockpitFilters.domain"
+                  @change="$store.genesisDashboard.cockpitFilters.domain = $event.target.value; $store.genesisDashboard.cockpitApplyFilter()">
+            <option value="">All domains</option>
+            <option value="internal">Internal</option>
+            <option value="user_world">User world</option>
+            <option value="__null__">Unclassified</option>
+          </select>
+
+          <select style="font-size:0.68rem; padding:0.2rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);"
+                  :value="$store.genesisDashboard.cockpitFilters.status"
+                  @change="$store.genesisDashboard.cockpitFilters.status = $event.target.value; $store.genesisDashboard.cockpitApplyFilter()">
+            <option value="">All statuses</option>
+            <template x-for="s in $store.genesisDashboard.cockpitAvailableFilters.statuses" :key="s">
+              <option :value="s" x-text="s"></option>
+            </template>
+          </select>
+
+          <select style="font-size:0.68rem; padding:0.2rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);"
+                  :value="$store.genesisDashboard.cockpitFilters.source"
+                  @change="$store.genesisDashboard.cockpitFilters.source = $event.target.value; $store.genesisDashboard.cockpitApplyFilter()">
+            <option value="">All sources</option>
+            <template x-for="s in $store.genesisDashboard.cockpitAvailableFilters.sources" :key="s">
+              <option :value="s" x-text="s"></option>
+            </template>
+          </select>
+
+          <select style="font-size:0.68rem; padding:0.2rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);"
+                  :value="$store.genesisDashboard.cockpitSort"
+                  @change="$store.genesisDashboard.cockpitSort = $event.target.value; $store.genesisDashboard.cockpitApplyFilter()">
+            <option value="priority">Sort: Priority</option>
+            <option value="created_desc">Sort: Newest</option>
+            <option value="created_asc">Sort: Oldest</option>
+            <option value="status">Sort: Status</option>
+            <option value="source">Sort: Source</option>
+          </select>
+
+          <input type="text" placeholder="Search content/reason… (Enter)"
+                 :value="$store.genesisDashboard.cockpitFilters.search"
+                 @keydown.enter="$store.genesisDashboard.cockpitFilters.search = $event.target.value; $store.genesisDashboard.cockpitApplyFilter()"
+                 style="font-size:0.68rem; padding:0.2rem 0.4rem; border-radius:3px; min-width:160px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+
+          <!-- Batch actions -->
+          <template x-if="$store.genesisDashboard.cockpitBatchCount > 0">
+            <div style="margin-left:auto; display:flex; gap:0.25rem; align-items:center;">
+              <span style="font-size:0.62rem; color:var(--color-text-secondary);" x-text="$store.genesisDashboard.cockpitBatchCount + ' selected'"></span>
+              <button style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(102,187,106,0.1); color:#66bb6a; border:1px solid rgba(102,187,106,0.2);"
+                      @click="$store.genesisDashboard.cockpitBatch('done')">Done</button>
+              <button style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(149,117,205,0.12); color:#9575cd; border:1px solid rgba(149,117,205,0.25);"
+                      @click="$store.genesisDashboard.cockpitBatch('tabled')">Table</button>
+              <button style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(33,150,243,0.1); color:#2196F3; border:1px solid rgba(33,150,243,0.2);"
+                      @click="$store.genesisDashboard.cockpitBatch('follow_up')">Un-table</button>
+              <button style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(244,67,54,0.1); color:#ef5350; border:1px solid rgba(244,67,54,0.25);"
+                      @click="$store.genesisDashboard.cockpitBatch('delete')">Delete</button>
+            </div>
+          </template>
+        </div>
+
+        <!-- Empty state -->
+        <template x-if="$store.genesisDashboard.cockpitList.length === 0">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            No follow-ups match these filters.
+          </div>
+        </template>
+
+        <!-- Follow-up list -->
+        <div class="activity-feed">
+          <template x-for="item in $store.genesisDashboard.cockpitList" :key="item.id">
+            <div>
+              <div class="activity-row" style="cursor:pointer; display:flex; align-items:center; gap:0.5rem;"
+                   @click="$store.genesisDashboard.cockpitExpanded = $store.genesisDashboard.cockpitExpanded === item.id ? null : item.id">
+                <!-- Batch checkbox -->
+                <input type="checkbox" @click.stop
+                       :checked="!!$store.genesisDashboard.cockpitBatchIds[item.id]"
+                       @change="$store.genesisDashboard.toggleCockpitBatch(item.id)"
+                       style="width:12px; height:12px; cursor:pointer; flex-shrink:0;">
+                <!-- Pinned -->
+                <span x-show="item.pinned" title="Pinned" style="color:#ffd54f; font-size:0.8rem; flex-shrink:0;">★</span>
+                <!-- Priority badge -->
+                <span style="font-size:0.6rem; padding:0.1rem 0.35rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0; min-width:3rem; text-align:center;"
+                      :style="{
+                        critical: 'background:rgba(244,67,54,0.15); color:#f44336',
+                        high: 'background:rgba(255,152,0,0.15); color:#ff9800',
+                        medium: 'background:rgba(255,193,7,0.15); color:#ffc107',
+                        low: 'background:rgba(158,158,158,0.15); color:#9e9e9e'
+                      }[item.priority] || ''"
+                      x-text="item.priority"></span>
+                <!-- Status badge -->
+                <span style="font-size:0.55rem; padding:0.1rem 0.3rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0;"
+                      :style="{
+                        pending:     'background:rgba(158,158,158,0.15); color:#9e9e9e',
+                        scheduled:   'background:rgba(149,117,205,0.15); color:#9575cd',
+                        in_progress: 'background:rgba(33,150,243,0.15); color:#2196F3',
+                        blocked:     'background:rgba(255,167,38,0.15); color:#ffa726',
+                        completed:   'background:rgba(102,187,106,0.15); color:#66bb6a',
+                        failed:      'background:rgba(244,67,54,0.15); color:#ef5350'
+                      }[item.status] || 'background:rgba(158,158,158,0.15); color:#9e9e9e'"
+                      x-text="item.status"></span>
+                <!-- Tabled chip -->
+                <span x-show="item.kind === 'tabled'" title="Tabled (someday/maybe)"
+                      style="font-size:0.52rem; padding:0.1rem 0.3rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0; background:rgba(149,117,205,0.12); color:#9575cd;">tabled</span>
+                <!-- Domain chip -->
+                <span style="font-size:0.52rem; padding:0.1rem 0.3rem; border-radius:3px; flex-shrink:0; letter-spacing:0.02em;"
+                      :style="{
+                        internal:   'background:rgba(100,181,246,0.13); color:#64b5f6',
+                        user_world: 'background:rgba(129,199,132,0.13); color:#81c784'
+                      }[item.domain] || 'background:rgba(158,158,158,0.1); color:#9e9e9e'"
+                      x-text="item.domain || 'unclassified'"></span>
+                <!-- Content preview -->
+                <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.72rem;"
+                      x-text="item.content || item.id"></span>
+                <!-- Timestamp (date+time — rows can be weeks old) -->
+                <span style="color:var(--color-text-secondary); font-size:0.63rem; flex-shrink:0;"
+                      x-text="$store.genesisDashboard.formatDateTime(item.created_at)"></span>
+                <!-- Expand arrow -->
+                <span class="material-symbols-outlined" style="font-size:0.9rem; color:var(--color-text-secondary); transition:transform 0.15s;"
+                      :style="$store.genesisDashboard.cockpitExpanded === item.id ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+              </div>
+
+              <!-- Expanded detail -->
+              <template x-if="$store.genesisDashboard.cockpitExpanded === item.id">
+                <div style="padding:0.5rem 0.75rem; background:rgba(0,0,0,0.15); border-radius:4px; margin:0.25rem 0 0.5rem 1.5rem; font-size:0.72rem;">
+                  <div style="margin-bottom:0.4rem; line-height:1.5; white-space:pre-wrap; word-break:break-word;" x-text="item.content"></div>
+                  <template x-if="item.reason">
+                    <div style="margin-bottom:0.3rem; color:var(--color-text-secondary); font-size:0.68rem;">
+                      <strong>Reason:</strong> <span x-text="item.reason"></span>
+                    </div>
+                  </template>
+                  <div style="display:flex; gap:0.5rem; font-size:0.62rem; color:var(--color-text-secondary); flex-wrap:wrap; margin-bottom:0.4rem;">
+                    <span x-text="'Strategy: ' + (item.strategy || 'unknown')"></span>
+                    <span x-text="'Source: ' + (item.source || 'unknown')"></span>
+                    <span x-text="'Created: ' + $store.genesisDashboard.formatDateTime(item.created_at)"></span>
+                  </div>
+                  <template x-if="item.resolution_notes">
+                    <div style="margin-top:0.3rem; padding:0.25rem 0.5rem; background:rgba(102,187,106,0.08); border-radius:3px; font-size:0.65rem;">
+                      <strong style="color:#66bb6a;">Resolution:</strong> <span x-text="item.resolution_notes"></span>
+                    </div>
+                  </template>
+                  <template x-if="item.blocked_reason">
+                    <div style="margin-top:0.3rem; padding:0.25rem 0.5rem; background:rgba(255,167,38,0.08); border-radius:3px; border:1px solid rgba(255,167,38,0.15); font-size:0.65rem;">
+                      <strong style="color:#ffa726;">Blocked:</strong> <span x-text="item.blocked_reason"></span>
+                    </div>
+                  </template>
+                  <!-- Actions -->
+                  <div style="display:flex; gap:0.3rem; margin-top:0.5rem; align-items:center; flex-wrap:wrap;"
+                       :style="$store.genesisDashboard.cockpitMutating[item.id] ? 'opacity:0.5; pointer-events:none;' : ''">
+                    <button @click.stop="$store.genesisDashboard.cockpitDone(item.id)"
+                            x-show="item.status !== 'completed'"
+                            style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(102,187,106,0.1); color:#66bb6a; border:1px solid rgba(102,187,106,0.2);">Done</button>
+                    <button @click.stop="$store.genesisDashboard.cockpitPin(item.id, !item.pinned)"
+                            style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(255,213,79,0.1); color:#ffd54f; border:1px solid rgba(255,213,79,0.2);"
+                            x-text="item.pinned ? 'Unpin' : 'Pin'"></button>
+                    <select @click.stop
+                            @change.stop="if($event.target.value){ $store.genesisDashboard.cockpitSetPriority(item.id, $event.target.value); $event.target.selectedIndex=0; }"
+                            style="font-size:0.63rem; padding:0.15rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                      <option value="">Priority…</option>
+                      <option value="critical">Critical</option>
+                      <option value="high">High</option>
+                      <option value="medium">Medium</option>
+                      <option value="low">Low</option>
+                    </select>
+                    <button x-show="item.kind !== 'tabled'" @click.stop="$store.genesisDashboard.cockpitMoveKind(item.id, 'tabled')"
+                            style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(149,117,205,0.1); color:#9575cd; border:1px solid rgba(149,117,205,0.25);">→ Tabled</button>
+                    <button x-show="item.kind === 'tabled'" @click.stop="$store.genesisDashboard.cockpitMoveKind(item.id, 'follow_up')"
+                            style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(33,150,243,0.1); color:#2196F3; border:1px solid rgba(33,150,243,0.2);">→ Follow-up</button>
+                    <select @click.stop
+                            @change.stop="$store.genesisDashboard.cockpitSetDomain(item.id, $event.target.value); $event.target.selectedIndex=0;"
+                            style="font-size:0.63rem; padding:0.15rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                      <option value="">Domain…</option>
+                      <option value="internal">Internal</option>
+                      <option value="user_world">User world</option>
+                      <option value="__clear__">Clear</option>
+                    </select>
+                    <button @click.stop="$store.genesisDashboard.cockpitDelete(item.id)"
+                            style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(244,67,54,0.1); color:#ef5350; border:1px solid rgba(244,67,54,0.25); margin-left:auto;">Delete</button>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+
+        <!-- Pagination -->
+        <div x-show="$store.genesisDashboard.cockpitTotal > 0"
+             style="display:flex; gap:0.5rem; align-items:center; justify-content:center; padding:0.6rem; font-size:0.68rem; color:var(--color-text-secondary);">
+          <button @click="$store.genesisDashboard.cockpitPrevPage()" :disabled="$store.genesisDashboard.cockpitPage <= 1"
+                  style="font-size:0.65rem; padding:0.15rem 0.6rem; border-radius:3px; cursor:pointer; background:rgba(33,150,243,0.1); color:#2196F3; border:1px solid rgba(33,150,243,0.2);"
+                  :style="$store.genesisDashboard.cockpitPage <= 1 ? 'opacity:0.4; cursor:default;' : ''">Prev</button>
+          <span x-text="'Page ' + $store.genesisDashboard.cockpitPage + ' of ' + $store.genesisDashboard.cockpitTotalPages + ' · ' + $store.genesisDashboard.cockpitTotal + ' items'"></span>
+          <button @click="$store.genesisDashboard.cockpitNextPage()" :disabled="$store.genesisDashboard.cockpitPage >= $store.genesisDashboard.cockpitTotalPages"
+                  style="font-size:0.65rem; padding:0.15rem 0.6rem; border-radius:3px; cursor:pointer; background:rgba(33,150,243,0.1); color:#2196F3; border:1px solid rgba(33,150,243,0.2);"
+                  :style="$store.genesisDashboard.cockpitPage >= $store.genesisDashboard.cockpitTotalPages ? 'opacity:0.4; cursor:default;' : ''">Next</button>
         </div>
       </div>
     </div>
