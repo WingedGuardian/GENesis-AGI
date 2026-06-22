@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
 _WATCHLIST_PATH = _CONFIG_DIR / "recon_watchlist.yaml"
-_GH_TIMEOUT = 15  # seconds — network calls are slower than local git
 _RELEASES_PER_PROJECT = 2
 _MAX_BODY_CHARS = 1000
 
@@ -355,7 +354,7 @@ class ReconGatherer:
         subprocess/timeout/kill handling); kept as a method so existing call
         sites and tests that patch ``ReconGatherer._run_gh`` are unaffected.
         """
-        return await run_gh(*args, timeout=_GH_TIMEOUT)
+        return await run_gh(*args)
 
     @staticmethod
     def _load_watchlist() -> list[dict]:

@@ -25,6 +25,7 @@ async def run_gh(*args: str, timeout: int | float = _DEFAULT_TIMEOUT) -> str:
     an empty string so callers can treat "no data" uniformly. On timeout the
     child process is killed and reaped to avoid leaks.
     """
+    proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -43,10 +44,11 @@ async def run_gh(*args: str, timeout: int | float = _DEFAULT_TIMEOUT) -> str:
         return stdout.decode("utf-8", errors="replace").strip()
     except TimeoutError:
         logger.warning("gh command timed out: %s", " ".join(args))
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(ChildProcessError):
-            await proc.wait()
+        if proc is not None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(ProcessLookupError):
+                await proc.wait()
         return ""
     except OSError:
         logger.warning("gh command failed to start: %s", " ".join(args), exc_info=True)
