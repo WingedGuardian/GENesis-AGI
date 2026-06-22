@@ -3224,6 +3224,14 @@
           return "#666";
         },
 
+        // Display label for infrastructure probe keys: the internal dict key stays
+        // canonical (e.g. "ambient"); only the surfaced name is user-facing. The
+        // ambient-capture edge bridge is shown as "Voice Bridge" on the card.
+        infraLabel(name) {
+          const labels = { ambient: "Voice Bridge" };
+          return labels[name] || name;
+        },
+
         keyHealthColor(c) {
           // API-key health convention: green = configured + working,
           // yellow = key missing/unconfigured, red = present but NOT working
@@ -4389,19 +4397,19 @@
                   <div x-show="!['container_memory', 'disk', 'cpu'].includes(name)"
                        style="margin-bottom: 0.2rem; cursor: default;"
                        :title="probe.error
-                         ? name + ': ERROR — ' + probe.error
+                         ? $store.genesisDashboard.infraLabel(name) + ': ERROR — ' + probe.error
                          : probe.latency_ms != null
-                           ? name + ': ' + (probe.status || 'healthy') + ' (' + Math.round(probe.latency_ms) + 'ms)'
+                           ? $store.genesisDashboard.infraLabel(name) + ': ' + (probe.status || 'healthy') + ' (' + Math.round(probe.latency_ms) + 'ms)'
                            : probe.free_pct != null
-                             ? name + ': ' + probe.free_gb?.toFixed(1) + ' GB free (' + probe.free_pct?.toFixed(0) + '% of ' + probe.total_gb?.toFixed(0) + ' GB)'
+                             ? $store.genesisDashboard.infraLabel(name) + ': ' + probe.free_gb?.toFixed(1) + ' GB free (' + probe.free_pct?.toFixed(0) + '% of ' + probe.total_gb?.toFixed(0) + ' GB)'
                              : probe.total_points != null
-                               ? name + ': ' + probe.total_points + ' total points across ' + (probe.collections?.length || 0) + ' collections'
+                               ? $store.genesisDashboard.infraLabel(name) + ': ' + probe.total_points + ' total points across ' + (probe.collections?.length || 0) + ' collections'
                              : probe.cc_tier != null
-                               ? name + ': CC ' + probe.cc_tier + ' (' + probe.cc_used_mb + '/' + probe.cc_budget_mb + 'MB)' + (probe.sys_tier ? ', /tmp ' + probe.sys_tier + ' (' + probe.sys_used_pct + '%)' : '')
-                             : name + ': ' + (probe.status || 'unknown')">
+                               ? $store.genesisDashboard.infraLabel(name) + ': CC ' + probe.cc_tier + ' (' + probe.cc_used_mb + '/' + probe.cc_budget_mb + 'MB)' + (probe.sys_tier ? ', /tmp ' + probe.sys_tier + ' (' + probe.sys_used_pct + '%)' : '')
+                             : $store.genesisDashboard.infraLabel(name) + ': ' + (probe.status || 'unknown')">
                     <span class="status-dot"
                           :style="`background: ${$store.genesisDashboard.probeStatusColor(probe)}`"></span>
-                    <span x-text="name" style="font-size: 0.82rem"></span>
+                    <span x-text="$store.genesisDashboard.infraLabel(name)" style="font-size: 0.82rem"></span>
                     <template x-if="probe.wal_mb != null">
                       <span style="margin-left: 0.4rem; font-size: 0.72rem; opacity: 0.75;"
                             :title="'SQLite WAL sidecar size — green < 100MB, yellow ≥ 100MB, red ≥ 500MB'">
