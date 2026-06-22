@@ -9,6 +9,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **The dashboard Infrastructure card now labels the ambient-capture bridge as "Voice Bridge"** —
+  a clearer, user-facing name. It still only appears when a voice/ambient edge is configured.
+
 ### Fixed
 
 - **Updates no longer abort when a schema migration actually succeeded** — if the
