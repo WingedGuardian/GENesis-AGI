@@ -234,22 +234,32 @@ async def test_scan_and_store_skips_failed_scans():
     assert results == []
 
 
-async def test_store_finding_persists_recon_observation_row(db):
-    """A stored finding lands as a recon observation row (source/type/category).
+async def test_store_finding_uses_recon_finding_contract():
+    """store_finding persists via observations.create with the recon-finding shape
+    (source/type/category/priority) so findings surface through recon_findings.
 
-    Verified by direct SQL rather than ``observations.query`` so the assertion is
-    immune to a leaked mock of that helper elsewhere in the full suite — it checks
-    the actual persisted row.
+    Asserts store_finding's translation contract deterministically by mocking the
+    CRUD layer — no shared DB fixture, so it can't be poisoned by suite-wide
+    connection state. The real DB round-trip is covered separately by
+    observations.create's own tests and the live-DB scan E2E.
     """
-    finding = report_to_finding(parse_report(SAMPLE_REPORT))
-    finding_id = await store_finding(db, finding)
-    assert finding_id
+    from unittest.mock import AsyncMock, patch
 
-    cursor = await db.execute(
-        "SELECT content, priority FROM observations "
-        "WHERE source = 'recon' AND type = 'finding' AND category = 'skill-security'"
-    )
-    rows = await cursor.fetchall()
-    assert len(rows) == 1
-    assert "demo-skill" in rows[0]["content"]
-    assert rows[0]["priority"] == "high"
+    finding = report_to_finding(parse_report(SAMPLE_REPORT))
+    fake_db = AsyncMock()
+    with patch(
+        "genesis.db.crud.observations.create", new_callable=AsyncMock, return_value="fid-1"
+    ) as mock_create:
+        finding_id = await store_finding(fake_db, finding)
+
+    assert finding_id == "fid-1"
+    mock_create.assert_awaited_once()
+    kwargs = mock_create.call_args.kwargs
+    assert kwargs["source"] == "recon"
+    assert kwargs["type"] == "finding"
+    assert kwargs["category"] == "skill-security"
+    assert kwargs["priority"] == "high"
+    assert kwargs["skip_if_duplicate"] is True
+    assert "demo-skill" in kwargs["content"]
+    assert "DO NOT INSTALL" in kwargs["content"]  # summary folded into content
+    fake_db.commit.assert_awaited_once()
