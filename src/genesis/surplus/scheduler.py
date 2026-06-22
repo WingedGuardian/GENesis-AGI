@@ -1129,6 +1129,13 @@ class SurplusScheduler:
 
     async def run_github_discovery(self) -> None:
         """Run weekly curated GitHub Discovery (new repos → recon triage queue)."""
+        try:
+            from genesis.runtime import GenesisRuntime
+            if GenesisRuntime.instance().paused:
+                logger.debug("GitHub Discovery skipped (Genesis paused)")
+                return
+        except Exception:
+            pass
         if self._github_discovery_job is None:
             try:
                 from genesis.runtime import GenesisRuntime
