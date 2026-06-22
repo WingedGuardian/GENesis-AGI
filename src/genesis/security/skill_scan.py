@@ -132,11 +132,37 @@ def discover_skill_dirs(roots: Iterable[Path]) -> list[Path]:
     return found
 
 
+def is_trusted(
+    skill_dir: Path,
+    *,
+    trusted_names: set[str],
+    trusted_roots: Iterable[Path],
+) -> bool:
+    """Whether a skill is trusted (name allowlisted OR under a trusted root).
+
+    Trusted skills are still scanned, but their findings are NOT filed to recon:
+    a curated, capable skill (gstack, first-party Genesis) legitimately trips
+    SkillSpector's excessive-agency / dangerous-code patterns, so filing them all
+    would swamp the recon lane. The signal is in untrusted / unknown skills.
+    """
+    skill_dir = Path(skill_dir).resolve()
+    if skill_dir.name in trusted_names:
+        return True
+    for root in trusted_roots:
+        try:
+            skill_dir.relative_to(Path(root).resolve())
+            return True
+        except (ValueError, OSError):
+            continue
+    return False
+
+
 # A scanner takes a skill dir and returns a SkillSpector JSON report, or None on
 # failure/timeout. A storer persists one finding payload. Both are injected so
 # the orchestration is testable without a live subprocess or DB.
 ScannerFn = Callable[[Path], "dict | None"]
 StorerFn = Callable[[object, dict], Awaitable[None]]
+TrustedFn = Callable[[Path], bool]
 
 
 async def scan_and_store(
@@ -146,21 +172,25 @@ async def scan_and_store(
     scanner: ScannerFn,
     storer: StorerFn,
     min_score: int = 1,
+    trusted: TrustedFn | None = None,
 ) -> list[ScanResult]:
     """Scan each skill dir, parse the report, and file a recon finding.
 
-    Every successfully-scanned skill is returned; only those at/above
-    ``min_score`` are filed to recon (keeps clean skills from swamping the lane).
-    A failed/timed-out scan (scanner returns None) is skipped, not fatal.
+    Every successfully-scanned skill is returned; a finding is filed only when the
+    skill scores at/above ``min_score`` AND is not ``trusted`` — trusted-source
+    skills are scanned (for visibility) but kept out of recon to avoid swamping it
+    with expected CRITICALs. A failed/timed-out scan (scanner returns None) is
+    skipped, not fatal.
     """
     results: list[ScanResult] = []
-    for skill_dir in skill_dirs:
-        report = scanner(Path(skill_dir))
+    for raw_dir in skill_dirs:
+        skill_dir = Path(raw_dir)
+        report = scanner(skill_dir)
         if report is None:
             continue
         result = parse_report(report)
         results.append(result)
-        if result.score >= min_score:
+        if result.score >= min_score and not (trusted and trusted(skill_dir)):
             await storer(db, report_to_finding(result))
     return results
 
@@ -274,29 +304,54 @@ async def store_finding(db: object, finding: dict) -> str | None:
     return finding_id
 
 
-def _default_roots() -> list[Path]:
-    """Default skill roots to sweep (some live outside the repo)."""
-    roots = [
-        Path.home() / ".claude" / "skills",
-        Path.home() / ".genesis" / "skill-library",
-    ]
+def _repo_skill_roots() -> list[Path]:
+    """First-party (in-repo) skill roots — trusted by default."""
     try:
         import genesis
 
         repo = Path(genesis.__file__).resolve().parents[2]
-        roots += [repo / ".claude" / "skills", repo / "src" / "genesis" / "skills"]
+        return [repo / ".claude" / "skills", repo / "src" / "genesis" / "skills"]
     except Exception:  # pragma: no cover - best-effort repo-root resolution
-        pass
-    return roots
+        return []
+
+
+def _default_roots() -> list[Path]:
+    """Default skill roots to sweep (some live outside the repo)."""
+    return [
+        Path.home() / ".claude" / "skills",
+        Path.home() / ".genesis" / "skill-library",
+        *_repo_skill_roots(),
+    ]
+
+
+def _default_trusted_file() -> Path:
+    """Allowlist of trusted skill names (one per line); blessed via --seed-trusted."""
+    return Path.home() / ".genesis" / "config" / "skill_scan_trusted.txt"
+
+
+def _load_trusted_names(path: Path) -> set[str]:
+    if not path.is_file():
+        return set()
+    return {
+        line.strip()
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI: scan installed skills with SkillSpector and file recon findings."""
+    """CLI: scan installed skills with SkillSpector.
+
+    Files recon findings for UNTRUSTED skills only — trusted-source skills
+    (first-party repo + the ``--trusted-file`` allowlist) are scanned for
+    visibility but kept out of recon, since curated capable skills legitimately
+    score CRITICAL and would otherwise swamp the lane.
+    """
     import argparse
     import asyncio
 
     parser = argparse.ArgumentParser(
-        description="Scan installed skills with NVIDIA SkillSpector → recon findings.",
+        description="Scan installed skills with NVIDIA SkillSpector → recon findings (untrusted only).",
     )
     parser.add_argument("--roots", nargs="*", help="Skill root dirs (default: standard skill locations).")
     parser.add_argument("--skillspector-bin", default=None, help="Path to the skillspector binary.")
@@ -304,11 +359,40 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-score", type=int, default=1, help="Only file findings at/above this score.")
     parser.add_argument("--llm", action="store_true", help="Enable SkillSpector's LLM stage (default: static-only).")
     parser.add_argument("--no-store", action="store_true", help="Scan + print only; do not write recon findings.")
+    parser.add_argument(
+        "--trusted-file", default=None,
+        help=f"Allowlist of trusted skill names (default: {_default_trusted_file()}).",
+    )
+    parser.add_argument(
+        "--seed-trusted", action="store_true",
+        help="Write the currently-discovered skill names to the trusted allowlist and exit.",
+    )
+    parser.add_argument(
+        "--no-trust", action="store_true",
+        help="Disable trust filtering — file EVERY skill (the noisy mode).",
+    )
     args = parser.parse_args(argv)
 
     roots = [Path(r) for r in args.roots] if args.roots else _default_roots()
     skill_dirs = discover_skill_dirs(roots)
     print(f"Discovered {len(skill_dirs)} skills across {len(roots)} roots.")
+
+    trusted_file = Path(args.trusted_file) if args.trusted_file else _default_trusted_file()
+
+    if args.seed_trusted:
+        names = sorted({d.name for d in skill_dirs})
+        trusted_file.parent.mkdir(parents=True, exist_ok=True)
+        trusted_file.write_text(
+            "# Trusted skill names — scanned but NOT filed to recon.\n" + "\n".join(names) + "\n"
+        )
+        print(f"Seeded {len(names)} trusted skill names -> {trusted_file}")
+        return 0
+
+    trusted_names = set() if args.no_trust else _load_trusted_names(trusted_file)
+    trusted_roots = [] if args.no_trust else _repo_skill_roots()
+
+    def trusted(skill_dir: Path) -> bool:
+        return is_trusted(skill_dir, trusted_names=trusted_names, trusted_roots=trusted_roots)
 
     def scanner(skill_dir: Path) -> dict | None:
         return run_skillspector(
@@ -318,14 +402,18 @@ def main(argv: list[str] | None = None) -> int:
             no_llm=not args.llm,
         )
 
+    async def _run(storer: StorerFn, db: object) -> list[ScanResult]:
+        return await scan_and_store(
+            db, skill_dirs, scanner=scanner, storer=storer,
+            min_score=args.min_score, trusted=trusted,
+        )
+
     async def _go() -> int:
         if args.no_store:
             async def _noop(_db: object, _finding: dict) -> None:
                 return None
 
-            results = await scan_and_store(
-                None, skill_dirs, scanner=scanner, storer=_noop, min_score=args.min_score
-            )
+            results = await _run(_noop, None)
         else:
             import aiosqlite
 
@@ -333,14 +421,17 @@ def main(argv: list[str] | None = None) -> int:
 
             async with aiosqlite.connect(str(genesis_db_path())) as db:
                 await db.execute("PRAGMA busy_timeout=5000")
-                results = await scan_and_store(
-                    db, skill_dirs, scanner=scanner, storer=store_finding, min_score=args.min_score
-                )
+                results = await _run(store_finding, db)
 
-        filed = sum(1 for r in results if r.score >= args.min_score)
-        print(f"Scanned {len(results)} skills; filed {filed} findings (min_score={args.min_score}).\n")
+        filed = sum(1 for r in results if r.score >= args.min_score and not trusted(Path(r.source)))
+        skipped = sum(1 for r in results if trusted(Path(r.source)))
+        print(
+            f"Scanned {len(results)} skills; filed {filed} untrusted finding(s); "
+            f"{skipped} trusted-source skipped (min_score={args.min_score}).\n"
+        )
         for r in sorted(results, key=lambda r: r.score, reverse=True):
-            print(f"  {r.score:3d}/100  {r.severity:8s}  {r.name}  ({len(r.issues)} issues)")
+            mark = "trust" if trusted(Path(r.source)) else "FILE "
+            print(f"  [{mark}] {r.score:3d}/100  {r.severity:8s}  {r.name}  ({len(r.issues)} issues)")
         return 0
 
     return asyncio.run(_go())

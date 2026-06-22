@@ -7,6 +7,7 @@ from pathlib import Path
 from genesis.security.skill_scan import (
     ScanResult,
     discover_skill_dirs,
+    is_trusted,
     parse_report,
     report_to_finding,
     scan_and_store,
@@ -172,6 +173,50 @@ async def test_scan_and_store_files_findings_above_threshold():
     assert len(stored) == 1
     assert stored[0]["title"].startswith("Skill 'bad'")
     assert stored[0]["priority"] == "high"
+
+
+def test_is_trusted_by_root_or_name(tmp_path):
+    repo_skills = tmp_path / "repo" / ".claude" / "skills"
+    (repo_skills / "first-party").mkdir(parents=True)
+    ext = tmp_path / "ext"
+    (ext / "blessed").mkdir(parents=True)
+    (ext / "unknown").mkdir(parents=True)
+
+    # Under a trusted root -> trusted (first-party).
+    assert is_trusted(repo_skills / "first-party", trusted_names=set(), trusted_roots=[repo_skills]) is True
+    # Name on the allowlist -> trusted, regardless of root.
+    assert is_trusted(ext / "blessed", trusted_names={"blessed"}, trusted_roots=[repo_skills]) is True
+    # Neither -> untrusted.
+    assert is_trusted(ext / "unknown", trusted_names={"blessed"}, trusted_roots=[repo_skills]) is False
+
+
+async def test_scan_and_store_skips_filing_trusted_sources():
+    stored: list[dict] = []
+
+    def fake_scanner(skill_dir: Path) -> dict:
+        # Everything scores CRITICAL (the real-world false-positive case).
+        return {
+            "skill": {"name": skill_dir.name, "source": str(skill_dir)},
+            "risk_assessment": {"score": 100, "severity": "CRITICAL", "recommendation": "DO NOT INSTALL"},
+            "issues": [{"category": "Excessive Agency", "severity": "CRITICAL"}],
+        }
+
+    async def fake_storer(db: object, finding: dict) -> None:
+        stored.append(finding)
+
+    results = await scan_and_store(
+        None,
+        [Path("/x/trusted-skill"), Path("/x/unknown-skill")],
+        scanner=fake_scanner,
+        storer=fake_storer,
+        min_score=1,
+        trusted=lambda d: d.name == "trusted-skill",
+    )
+
+    # Both are scanned + returned, but only the untrusted one is filed to recon.
+    assert sorted(r.name for r in results) == ["trusted-skill", "unknown-skill"]
+    assert len(stored) == 1
+    assert stored[0]["title"].startswith("Skill 'unknown-skill'")
 
 
 async def test_scan_and_store_skips_failed_scans():
