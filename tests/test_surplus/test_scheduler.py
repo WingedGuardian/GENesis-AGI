@@ -141,6 +141,22 @@ async def test_start_without_code_audits(db):
     await sched.stop()
 
 
+async def test_start_registers_skill_security_scan(db):
+    """A wired SkillSecurityScanJob registers its weekly cron job on start().
+
+    Locks the scheduler wiring end-to-end: proves start() resolves CronTrigger /
+    user_timezone in scope and registers the job under id 'skill_security_scan'.
+    A CronTrigger job does not enqueue surplus tasks, so the pending_count
+    assertions in the sibling start tests are unaffected.
+    """
+    sched, compute = _make_scheduler(db, idle=True)
+    sched.set_skill_security_scan_job(AsyncMock())
+    with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):
+        await sched.start()
+    assert sched._scheduler.get_job("skill_security_scan") is not None
+    await sched.stop()
+
+
 async def test_schedule_code_audit_noop_when_disabled(db):
     sched, compute = _make_scheduler(db, idle=True, enable_code_audits=False)
     # Direct call should be a no-op
