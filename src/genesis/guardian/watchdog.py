@@ -52,21 +52,55 @@ class GuardianWatchdog:
         self,
         remote,  # GuardianRemote — import avoided for loose coupling
         event_bus=None,
-        outreach_queue=None,
+        outreach_pipeline=None,  # OutreachPipeline — for user-facing alerts
     ) -> None:
         self._remote = remote
         self._event_bus = event_bus
-        self._outreach_queue = outreach_queue
+        self._outreach_pipeline = outreach_pipeline
         self._sentinel = None
         self._last_recovery_at: datetime | None = None
         self._last_reset_at: datetime | None = None
         self._consecutive_stuck: int = 0
+        self._recovery_failed_escalated: bool = False  # one alert per DOWN episode
         self._drift_count: int = 0
+        self._drift_escalated: bool = False  # one user alert per drift episode
         # Deployed-gateway staleness: the install-dir code can be current while
         # ~/.local/bin/guardian-gateway.sh lags (the bug that froze it ~2 months).
         self._gateway_drift_count: int = 0
         self._gateway_resync_attempted: bool = False
         self._gateway_escalated: bool = False
+
+    async def _alert_user(self, *, topic: str, context: str, source_id: str) -> None:
+        """Deliver a user-facing (Telegram) alert about a Guardian degradation.
+
+        Uses the outreach pipeline's ``submit_raw`` — the idiomatic urgent-infra
+        path (BLOCKER category → Telegram, governance skipped, built-in dedup),
+        the same one health alerts use. No-op when the pipeline isn't wired
+        (graceful degradation). Wrapped so an outreach failure NEVER breaks a
+        watchdog tick. Each call site passes a DISTINCT ``topic`` so the
+        pipeline's (signal_type, topic, category) dedup never cross-suppresses
+        one Guardian alert with another.
+        """
+        if not self._outreach_pipeline:
+            return
+        try:
+            from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+            await self._outreach_pipeline.submit_raw(
+                context,
+                OutreachRequest(
+                    category=OutreachCategory.BLOCKER,
+                    topic=topic,
+                    context=context,
+                    salience_score=1.0,
+                    signal_type="guardian_alert",
+                    source_id=source_id,
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to send Guardian alert (%s)", source_id, exc_info=True,
+            )
 
     def _in_cooldown(self) -> bool:
         if self._last_recovery_at is None:
@@ -104,6 +138,7 @@ class GuardianWatchdog:
 
         if result.status != ProbeStatus.DOWN:
             self._consecutive_stuck = 0
+            self._recovery_failed_escalated = False  # re-arm for the next episode
             return
 
         staleness = result.details.get("staleness_s", 0) if result.details else 0
@@ -135,16 +170,17 @@ class GuardianWatchdog:
                         "guardian.recovery.failed",
                         f"Guardian restart via SSH failed (stale {staleness:.0f}s)",
                     )
-                if self._outreach_queue:
-                    try:
-                        await self._outreach_queue.enqueue(
-                            f"Guardian is DOWN (heartbeat stale {staleness:.0f}s) "
-                            "and SSH restart failed. Manual intervention needed.",
-                            priority="high",
-                            source="guardian_watchdog",
-                        )
-                    except Exception:
-                        logger.warning("Failed to queue Guardian alert", exc_info=True)
+                if not self._recovery_failed_escalated:
+                    self._recovery_failed_escalated = True
+                    await self._alert_user(
+                        topic="Guardian is DOWN",
+                        context=(
+                            f"🚨 Guardian is DOWN (heartbeat stale "
+                            f"{staleness:.0f}s) and SSH restart failed. "
+                            "Manual intervention needed."
+                        ),
+                        source_id="guardian:recovery_failed",
+                    )
 
         # Step 2: Check if Guardian is stuck in confirmed_dead
         await self._check_stuck_state()
@@ -293,6 +329,7 @@ class GuardianWatchdog:
                 logger.info("Guardian code drift resolved (container=%s host=%s)",
                             container_hash, host_hash)
             self._drift_count = 0
+            self._drift_escalated = False  # re-arm the user alert for next episode
             return
 
         # Drift detected — host's deployed HEAD does NOT contain the container's
@@ -312,14 +349,22 @@ class GuardianWatchdog:
                     f"Guardian code version mismatch — container={container_hash} "
                     f"host={host_hash} (drifted {self._drift_count} ticks)",
                 )
-            if self._outreach_queue:
-                await self._outreach_queue.enqueue(
+
+        # User-facing alert: ONCE per drift episode (re-armed on resolution) —
+        # NOT every 3 ticks like the event-bus observability emit above.
+        if self._drift_count >= self.DRIFT_ALERT_THRESHOLD and \
+                not self._drift_escalated:
+            self._drift_escalated = True
+            await self._alert_user(
+                topic="Guardian code drift",
+                context=(
                     f"⚠️ Guardian code drift: container={container_hash} "
-                    f"host={host_hash}. Auto-redeploy may have failed. "
-                    "Check update logs or run install_guardian.sh --non-interactive on host.",
-                    priority="high",
-                    source="guardian_watchdog",
-                )
+                    f"host={host_hash}. Auto-redeploy may have failed. Check "
+                    "update logs or run install_guardian.sh --non-interactive "
+                    "on host."
+                ),
+                source_id="guardian:code_drift",
+            )
 
     async def _host_contains_commit(
         self, container_hash: str, host_hash: str,
@@ -440,11 +485,8 @@ class GuardianWatchdog:
                 )
             return
 
-        # Self-heal already attempted and it's STILL stale → escalate once via
-        # the event bus (ERROR surfaces in health/observability). NOTE: a
-        # user-facing outreach (Telegram) path for Guardian watchdog escalations
-        # is not yet wired — init builds the watchdog without an outreach_queue,
-        # the same gap as the code-drift escalation above. Tracked as a follow-up.
+        # Self-heal already attempted and it's STILL stale → escalate once per
+        # episode: the event bus (observability) AND a user-facing Telegram alert.
         if not self._gateway_escalated:
             self._gateway_escalated = True
             logger.error(
@@ -461,3 +503,12 @@ class GuardianWatchdog:
                     f"{host_gw_sha[:12]} vs expected {expected[:12]} @ "
                     f"{host_code_ver}). Manual check needed.",
                 )
+            await self._alert_user(
+                topic="Guardian gateway stale",
+                context=(
+                    f"Guardian deployed gateway is STILL stale after auto-resync "
+                    f"(sha {host_gw_sha[:12]} vs expected {expected[:12]} @ "
+                    f"{host_code_ver}). Manual intervention needed."
+                ),
+                source_id="guardian:gateway_stale",
+            )

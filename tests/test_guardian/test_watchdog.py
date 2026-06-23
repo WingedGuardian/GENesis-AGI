@@ -127,6 +127,35 @@ class TestEventEmission:
         args = event_bus.emit.call_args
         assert "recovery.failed" in args[0][2]
 
+    @pytest.mark.asyncio
+    async def test_recovery_failed_alerts_once_per_episode_and_rearms(self):
+        """Guardian DOWN + SSH restart fails → ONE user alert per DOWN episode
+        (even across repeated restart attempts), re-armed when Guardian recovers.
+        The most critical escalation: the last line of defense is down."""
+        outreach = AsyncMock()
+        r = AsyncMock()
+        r.restart.return_value = False
+        r.status.return_value = {"current_state": "healthy"}
+        wd = GuardianWatchdog(r, event_bus=AsyncMock(), outreach_pipeline=outreach)
+        wd._check_code_drift = AsyncMock()   # isolate from real git subprocess
+        wd._in_cooldown = lambda: False        # allow a restart attempt every tick
+        down = _make_probe_result(ProbeStatus.DOWN, staleness_s=600)
+        healthy = _make_probe_result(ProbeStatus.HEALTHY)
+
+        with patch("genesis.observability.health.probe_guardian", return_value=down):
+            for _ in range(3):                 # 3 down+fail ticks
+                await wd.check_and_recover()
+        outreach.submit_raw.assert_called_once()   # ONE alert for the episode
+        assert outreach.submit_raw.call_args.args[1].source_id == "guardian:recovery_failed"
+
+        with patch("genesis.observability.health.probe_guardian", return_value=healthy):
+            await wd.check_and_recover()           # recovers → re-arm
+        assert wd._recovery_failed_escalated is False
+
+        with patch("genesis.observability.health.probe_guardian", return_value=down):
+            await wd.check_and_recover()           # second episode → second alert
+        assert outreach.submit_raw.call_count == 2
+
 
 class TestStuckDetection:
     """Test container-side detection of Guardian stuck in confirmed_dead."""
@@ -223,7 +252,7 @@ def _gw_watchdog(sync_ok: bool = True):
     r.sync_gateway = AsyncMock(return_value={"ok": sync_ok})
     event_bus = AsyncMock()
     outreach = AsyncMock()
-    wd = GuardianWatchdog(r, event_bus=event_bus, outreach_queue=outreach)
+    wd = GuardianWatchdog(r, event_bus=event_bus, outreach_pipeline=outreach)
     wd._expected_gateway_sha = AsyncMock(return_value=_EXPECTED_GW_SHA)
     return wd, r, event_bus, outreach
 
@@ -280,19 +309,22 @@ class TestGatewayStaleness:
             await wd._check_gateway_staleness(vi)
         r.sync_gateway.assert_called_once()
         assert any("gateway_resync" in e for e in _emitted_events(eb))
-        outreach.enqueue.assert_not_called()  # not escalated yet
+        outreach.submit_raw.assert_not_called()  # not escalated yet
 
     @pytest.mark.asyncio
     async def test_still_stale_after_resync_escalates_once(self):
-        wd, r, eb, _ = _gw_watchdog()
+        wd, r, eb, outreach = _gw_watchdog()
         vi = {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"}
         for _ in range(_THRESHOLD):
             await wd._check_gateway_staleness(vi)   # → one resync
-        await wd._check_gateway_staleness(vi)        # still stale → escalate (event bus)
+        await wd._check_gateway_staleness(vi)        # still stale → escalate
         await wd._check_gateway_staleness(vi)        # quiet — no second escalation
         stale_events = [e for e in _emitted_events(eb) if "gateway_stale" in e]
         assert len(stale_events) == 1               # escalated exactly once
         r.sync_gateway.assert_called_once()          # resync attempted exactly once
+        outreach.submit_raw.assert_called_once()     # ONE user alert per episode
+        req = outreach.submit_raw.call_args.args[1]
+        assert req.source_id == "guardian:gateway_stale"
 
     @pytest.mark.asyncio
     async def test_resolved_after_resync_resets_state(self):
@@ -404,7 +436,7 @@ def _drift_watchdog(deployed_commit: str):
     r.version = AsyncMock(return_value={"deployed_commit": deployed_commit})
     event_bus = AsyncMock()
     outreach = AsyncMock()
-    wd = GuardianWatchdog(r, event_bus=event_bus, outreach_queue=outreach)
+    wd = GuardianWatchdog(r, event_bus=event_bus, outreach_pipeline=outreach)
     return wd, r, event_bus, outreach
 
 
@@ -442,25 +474,30 @@ class TestCodeDrift:
             for _ in range(_THRESHOLD + 1):
                 await wd._check_code_drift_inner()
         assert wd._drift_count == 0
-        outreach.enqueue.assert_not_called()
+        outreach.submit_raw.assert_not_called()
         assert not any("code_drift" in e for e in _emitted_events(eb))
         wd._host_contains_commit.assert_awaited()  # the ancestry path ran
 
     @pytest.mark.asyncio
-    async def test_genuine_drift_alerts_at_threshold(self):
+    async def test_genuine_drift_alerts_once_per_episode(self):
         """Host genuinely missing the Guardian commit → quiet below threshold,
-        alerts exactly at the threshold tick (event bus + user-facing outreach)."""
+        then ONE user alert per episode — NOT every 3 ticks like the event-bus
+        emit. (The spam fix: ticking far past the threshold yields one Telegram.)"""
         wd, r, eb, outreach = _drift_watchdog(deployed_commit="0ld0ld0")
         wd._host_contains_commit = AsyncMock(return_value=False)
         with patch("genesis.guardian.watchdog.subprocess.run",
                    side_effect=_git_side_effect("a915a28")):
             for _ in range(_THRESHOLD - 1):
                 await wd._check_code_drift_inner()
-            outreach.enqueue.assert_not_called()   # below threshold: silent
-            await wd._check_code_drift_inner()       # tick == THRESHOLD
-        assert wd._drift_count == _THRESHOLD
-        assert any("code_drift" in e for e in _emitted_events(eb))
-        outreach.enqueue.assert_called_once()
+            outreach.submit_raw.assert_not_called()   # below threshold: silent
+            for _ in range(2 * _THRESHOLD):           # tick well past threshold
+                await wd._check_code_drift_inner()
+        assert wd._drift_count >= _THRESHOLD
+        assert any("code_drift" in e for e in _emitted_events(eb))  # bus re-emits
+        outreach.submit_raw.assert_called_once()       # user alerted exactly once
+        req = outreach.submit_raw.call_args.args[1]
+        assert req.source_id == "guardian:code_drift"
+        assert req.topic == "Guardian code drift"
 
     @pytest.mark.asyncio
     async def test_unresolvable_skips_no_alarm(self):
@@ -473,13 +510,13 @@ class TestCodeDrift:
             for _ in range(_THRESHOLD + 1):
                 await wd._check_code_drift_inner()
         assert wd._drift_count == 0
-        outreach.enqueue.assert_not_called()
+        outreach.submit_raw.assert_not_called()
         eb.emit.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_drift_then_resolved_resets(self):
-        """A genuine drift episode that later resolves (host catches up) resets
-        the counter — no 'stuck drifting' after recovery."""
+    async def test_drift_then_resolved_resets_and_rearms(self):
+        """A drift episode resolves (host catches up) → counter AND the user-alert
+        flag reset; a SECOND episode alerts again (no 'quiet forever')."""
         wd, r, eb, outreach = _drift_watchdog(deployed_commit="0ld0ld0")
         wd._host_contains_commit = AsyncMock(return_value=False)
         with patch("genesis.guardian.watchdog.subprocess.run",
@@ -487,9 +524,15 @@ class TestCodeDrift:
             for _ in range(_THRESHOLD):
                 await wd._check_code_drift_inner()
             assert wd._drift_count == _THRESHOLD
+            outreach.submit_raw.assert_called_once()   # episode 1: one alert
             wd._host_contains_commit = AsyncMock(return_value=True)  # host caught up
             await wd._check_code_drift_inner()
-        assert wd._drift_count == 0
+            assert wd._drift_count == 0
+            assert wd._drift_escalated is False         # re-armed
+            wd._host_contains_commit = AsyncMock(return_value=False)  # episode 2
+            for _ in range(_THRESHOLD):
+                await wd._check_code_drift_inner()
+        assert outreach.submit_raw.call_count == 2      # second episode re-alerts
 
     @pytest.mark.asyncio
     async def test_exit_128_full_chain_skips_no_alarm(self):
@@ -514,5 +557,40 @@ class TestCodeDrift:
             for _ in range(_THRESHOLD + 1):
                 await wd._check_code_drift_inner()
         assert wd._drift_count == 0
-        outreach.enqueue.assert_not_called()
+        outreach.submit_raw.assert_not_called()
         assert not any("code_drift" in e for e in _emitted_events(eb))
+
+
+class TestAlertUser:
+    """Direct coverage of the _alert_user delivery helper (shared by all three
+    escalation paths). Must reach the outreach pipeline, degrade gracefully when
+    unwired, and never propagate an outreach failure into a watchdog tick."""
+
+    @pytest.mark.asyncio
+    async def test_submits_raw_with_blocker_envelope(self):
+        from genesis.outreach.types import OutreachCategory
+        outreach = AsyncMock()
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None, outreach_pipeline=outreach)
+        await wd._alert_user(
+            topic="Guardian code drift", context="msg body",
+            source_id="guardian:code_drift",
+        )
+        outreach.submit_raw.assert_awaited_once()
+        text, req = outreach.submit_raw.call_args.args
+        assert text == "msg body"
+        assert req.category == OutreachCategory.BLOCKER  # → Telegram, skips quiet hours
+        assert req.signal_type == "guardian_alert"
+        assert req.topic == "Guardian code drift"
+        assert req.source_id == "guardian:code_drift"
+
+    @pytest.mark.asyncio
+    async def test_no_pipeline_is_noop(self):
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None, outreach_pipeline=None)
+        await wd._alert_user(topic="t", context="c", source_id="guardian:x")  # no raise
+
+    @pytest.mark.asyncio
+    async def test_outreach_failure_never_propagates(self):
+        outreach = AsyncMock()
+        outreach.submit_raw.side_effect = Exception("telegram down")
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None, outreach_pipeline=outreach)
+        await wd._alert_user(topic="t", context="c", source_id="guardian:x")  # swallowed
