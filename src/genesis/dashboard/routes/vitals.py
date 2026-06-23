@@ -468,21 +468,31 @@ async def _build_llm_section(rt, routing_ctx: dict) -> dict:
             providers_list.sort(key=lambda p: (-p["calls_24h"], p["name"]))
             section["providers"] = providers_list
 
-            # Totals
+            # Totals — call counts come from activity_log (EVERY LLM call is
+            # logged there, including free-tier providers that emit no
+            # cost_events row); dollar cost comes from cost_events. Counting
+            # calls from cost_events undercounted by ~75% because free calls
+            # are gated out of cost_events (router writes only when cost > 0).
             cursor = await rt.db.execute(
                 "SELECT "
                 "  COUNT(*) FILTER (WHERE created_at >= datetime('now', '-1 hour')), "
-                "  COUNT(*) FILTER (WHERE created_at >= datetime('now', '-24 hours')), "
+                "  COUNT(*) FILTER (WHERE created_at >= datetime('now', '-24 hours')) "
+                "FROM activity_log WHERE provider LIKE 'llm.%'"
+            )
+            calls_row = await cursor.fetchone()
+            cursor = await rt.db.execute(
+                "SELECT "
                 "  COALESCE(SUM(cost_usd) FILTER (WHERE created_at >= datetime('now', '-1 hour')), 0), "
                 "  COALESCE(SUM(cost_usd) FILTER (WHERE created_at >= datetime('now', '-24 hours')), 0) "
                 "FROM cost_events"
             )
-            row = await cursor.fetchone()
-            if row:
-                section["totals"] = {
-                    "calls_1h": row[0], "calls_24h": row[1],
-                    "cost_1h": round(row[2], 4), "cost_24h": round(row[3], 4),
-                }
+            cost_row = await cursor.fetchone()
+            section["totals"] = {
+                "calls_1h": calls_row[0] if calls_row else 0,
+                "calls_24h": calls_row[1] if calls_row else 0,
+                "cost_1h": round(cost_row[0], 4) if cost_row else 0.0,
+                "cost_24h": round(cost_row[1], 4) if cost_row else 0.0,
+            }
 
             # Sessions
             cursor = await rt.db.execute(
