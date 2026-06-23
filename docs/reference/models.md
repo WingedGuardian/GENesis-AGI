@@ -455,9 +455,13 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 ### Groq Free Tier
 - **Endpoint:** `api.groq.com`
 - **Setup:** Create account at console.groq.com — no payment required
-- **Best model:** Llama 3.3 70B Versatile
-- **Rate limits:** 30 RPM, 1,000 RPD, ~6,000 tokens/min
+- **Best model:** GPT-OSS 120B (reasoning) / GPT-OSS 20B (fast workhorse)
+- **Rate limits:** 30 RPM, 1,000 RPD, ~8,000 tokens/min
 - Best for burst scenarios or when Mistral's 2 RPM limit is too slow
+- Note: Llama 3.3 70B Versatile and Llama 3.1 8B Instant are decommissioned by
+  Groq on 2026-08-16; `groq-free` migrated to `openai/gpt-oss-20b`. gpt-oss is a
+  reasoning model — Genesis sets `include_reasoning:false` to keep reasoning out
+  of `content`.
 
 ### OpenRouter Free Tier
 - ~26 models available as free variants (`:free` suffix) on OpenRouter
