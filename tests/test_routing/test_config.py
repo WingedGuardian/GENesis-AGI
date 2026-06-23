@@ -155,8 +155,11 @@ def test_load_full_yaml(monkeypatch):
     assert cfg.call_sites["5_deep_reflection"].default_paid is True
     assert cfg.call_sites["36_code_auditor"].never_pays is False
     assert cfg.call_sites["37_infrastructure_monitor"].default_paid is True
-    # judge: LLM-as-judge eval primitive — same-family fallback, paid-by-default
-    assert cfg.call_sites["judge"].chain == ["openrouter-deepseek-v4", "openrouter-deepseek-v4-flash"]
+    # judge: LLM-as-judge eval primitive — free NIM v4-pro first, then paid v4-pro,
+    # then v4-flash; paid-by-default
+    assert cfg.call_sites["judge"].chain == [
+        "nvidia-nim-deepseek", "openrouter-deepseek-v4", "openrouter-deepseek-v4-flash"
+    ]
     assert cfg.call_sites["judge"].default_paid is True
     assert cfg.call_sites["judge"].dispatch == "api"
 
