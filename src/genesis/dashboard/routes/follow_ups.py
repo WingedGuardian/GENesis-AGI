@@ -14,57 +14,6 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 logger = logging.getLogger(__name__)
 
 
-@blueprint.route("/api/genesis/follow-ups")
-@_async_route
-async def follow_up_list():
-    """Return follow-ups with optional status filter.
-
-    Query params:
-        status – filter by status (default: all)
-        limit – max results (default 30)
-    """
-    from genesis.db.crud import follow_ups
-    from genesis.runtime import GenesisRuntime
-
-    rt = GenesisRuntime.instance()
-    if not rt.is_bootstrapped or rt.db is None:
-        return jsonify({"follow_ups": [], "counts": {}})
-
-    status_filter = request.args.get("status", "").strip() or None
-    source_filter = request.args.get("source", "").strip() or None
-    source_mode = request.args.get("source_mode", "all").strip()
-    limit = min(request.args.get("limit", 30, type=int), 200)
-
-    # Backward compat: source=user maps to source_mode=mine
-    if source_filter == "user" and source_mode == "all":
-        source_mode = "mine"
-
-    try:
-        if status_filter:
-            items = await follow_ups.get_by_status(rt.db, status_filter)
-            # Apply source_mode filter post-query for status-filtered results
-            if source_mode == "mine":
-                items = [i for i in items if i.get("source") == "foreground_session"]
-            elif source_mode == "system":
-                items = [i for i in items if i.get("source") != "foreground_session"]
-            items = items[:limit]
-        else:
-            items = await follow_ups.get_recent(
-                rt.db, limit=limit, source_mode=source_mode,
-            )
-
-        counts = await follow_ups.get_summary_counts(rt.db)
-    except Exception:
-        logger.error("Failed to list follow-ups", exc_info=True)
-        return jsonify({"follow_ups": [], "counts": {}})
-
-    return jsonify({
-        "follow_ups": items,
-        "counts": counts,
-        "total": sum(counts.values()),
-    })
-
-
 @blueprint.route("/api/genesis/follow-ups/summary")
 @_async_route
 async def follow_up_summary():
@@ -91,6 +40,8 @@ async def follow_up_summary():
 _COCKPIT_STATUSES = (
     "pending", "scheduled", "in_progress", "completed", "failed", "blocked",
 )
+# Terminal states hidden by the cockpit's default "hide done" view.
+_DONE_STATUSES = ["completed", "failed"]
 _BATCH_ACTIONS = ("done", "delete", "tabled", "follow_up")
 
 
@@ -100,7 +51,11 @@ async def follow_up_cockpit():
     """Paginated/sorted/filtered follow-up list for the cockpit tab.
 
     Query params: kind (follow_up|tabled|all), domain (internal|user_world|
-    __null__), status, source, search, sort, page, page_size.
+    __null__), status, source, search, sort, page, page_size, hide_done.
+
+    ``hide_done`` (default "1") excludes terminal states (completed/failed) so
+    the default view is actionable work; it is ignored when an explicit
+    ``status`` filter is supplied. Pass hide_done=0 to show everything.
     """
     from genesis.db.crud import follow_ups
     from genesis.runtime import GenesisRuntime
@@ -118,18 +73,20 @@ async def follow_up_cockpit():
     source = request.args.get("source", "").strip() or None
     search = request.args.get("search", "").strip() or None
     sort = request.args.get("sort", "priority").strip() or "priority"
+    hide_done = request.args.get("hide_done", "1").strip() not in ("0", "false", "")
+    status_exclude = _DONE_STATUSES if hide_done else None
     page = max(1, request.args.get("page", 1, type=int))
     page_size = min(max(request.args.get("page_size", 50, type=int), 1), 200)
 
     try:
         items = await follow_ups.query_page(
             rt.db, kind=kind, domain=domain, status=status, source=source,
-            search=search, sort=sort, offset=(page - 1) * page_size,
-            limit=page_size,
+            search=search, status_exclude=status_exclude, sort=sort,
+            offset=(page - 1) * page_size, limit=page_size,
         )
         total = await follow_ups.count_filtered(
             rt.db, kind=kind, domain=domain, status=status, source=source,
-            search=search,
+            search=search, status_exclude=status_exclude,
         )
     except Exception:
         logger.error("Failed to query follow-up cockpit", exc_info=True)
