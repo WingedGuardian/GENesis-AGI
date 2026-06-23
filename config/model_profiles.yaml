@@ -606,6 +606,8 @@ profiles:
     review_source: manual
 
   llama-3.3-70b:
+    # EOL 2026-08-16 (Groq decommission). groq-free migrated to gpt-oss-20b;
+    # no active provider references this profile. Kept for history/cost ref.
     display_name: "Llama 3.3 70B"
     provider: meta
     api_id: "meta-llama/llama-3.3-70b-versatile"
@@ -633,6 +635,64 @@ profiles:
       provider: groq
       limits: "30 RPM, 6000 RPD"
     last_reviewed: "2026-03-26"
+    review_source: manual
+
+  gpt-oss-20b:
+    display_name: "GPT-OSS 20B"
+    provider: openai
+    api_id: "openai/gpt-oss-20b"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: B
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: low
+    strengths:
+      - high throughput on Groq
+      - cheap reasoning model
+      - structured output
+    weaknesses:
+      - weaker than 120B on complex reasoning
+      - reasoning tokens inflate free-tier TPM
+    best_for: [triage, fact_extraction, memory_consolidation, surplus_brainstorm]
+    avoid_for: [deep_reflection, strategic_reflection, quality_calibration]
+    free_tier:
+      available: true
+      provider: groq
+      limits: "30 RPM, 1000 RPD, 8000 TPM"
+    last_reviewed: "2026-06-22"
+    review_source: manual
+
+  gpt-oss-120b:
+    display_name: "GPT-OSS 120B"
+    provider: openai
+    api_id: "openai/gpt-oss-120b"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: low
+    strengths:
+      - strong reasoning (Groq's recommended Llama-3.3-70B replacement)
+      - JSON schema mode
+      - tool use
+    weaknesses:
+      - reasoning tokens inflate TPM
+      - community-reported reasoning-bleed mitigated via include_reasoning:false
+    best_for: [hard_reasoning, structured_extraction, strategic_reflection, fallback_reasoning]
+    avoid_for: [high_throughput]
+    free_tier:
+      available: true
+      provider: groq
+      limits: "30 RPM, 1000 RPD, 8000 TPM"
+    last_reviewed: "2026-06-22"
     review_source: manual
 
   qwen-2.5-72b:

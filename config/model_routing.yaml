@@ -32,11 +32,31 @@ providers:
     open_duration_s: 120
   groq-free:
     type: groq
-    model: llama-3.3-70b-versatile
-    profile: llama-3.3-70b
+    # llama-3.3-70b-versatile decommissioned by Groq 2026-08-16; migrated to
+    # gpt-oss-20b (fast/cheap workhorse). include_reasoning:false keeps the
+    # reasoning field out of `content` (gpt-oss is a reasoning model).
+    model: openai/gpt-oss-20b
+    profile: gpt-oss-20b
     free: true
     rpm_limit: 30
     open_duration_s: 120
+    params:
+      extra_body:
+        include_reasoning: false
+        reasoning_effort: low
+  # GROUNDWORK (WS2 rebalance): gpt-oss-120b for reasoning/JSON-heavy chains.
+  # Added + tested now but NOT yet wired into any chain — that is the WS2 PR.
+  groq-oss-120b:
+    type: groq
+    model: openai/gpt-oss-120b
+    profile: gpt-oss-120b
+    free: true
+    rpm_limit: 30
+    open_duration_s: 120
+    params:
+      extra_body:
+        include_reasoning: false
+        reasoning_effort: low
   gemini-free:
     type: google
     model: gemini-3-flash-preview

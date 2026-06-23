@@ -631,3 +631,95 @@ async def test_failure_logging_rate_limited():
         # Second call — should be suppressed
         await delegate.call("test-provider", "m", [{"role": "user", "content": "b"}])
         assert mock_logger.warning.call_count == 1  # Still 1, not 2
+
+
+# ── Per-provider params (extra litellm kwargs) — Groq EOL migration ─────────
+
+
+def _config_with_params(params) -> RoutingConfig:
+    """Single-provider config carrying a per-provider ``params`` block."""
+    return RoutingConfig(
+        providers={
+            "test-provider": ProviderConfig(
+                name="test-provider",
+                provider_type="groq",
+                model_id="openai/gpt-oss-20b",
+                is_free=True,
+                rpm_limit=30,
+                open_duration_s=120,
+                params=params,
+            ),
+        },
+        call_sites={},
+        retry_profiles={},
+    )
+
+
+async def test_call_applies_provider_params_extra_body():
+    """A provider config with params={"extra_body": {...}} must pass that
+    extra_body through to litellm.acompletion (Groq gpt-oss reasoning
+    controls — keeps the reasoning field out of `content`)."""
+    config = _config_with_params({"extra_body": {"include_reasoning": False}})
+    delegate = LiteLLMDelegate(config)
+    mock_resp = _mock_response()
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+        mock_litellm.completion_cost.return_value = 0.0
+
+        await delegate.call(
+            "test-provider", "openai/gpt-oss-20b",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+        call_kwargs = mock_litellm.acompletion.call_args.kwargs
+        assert call_kwargs["extra_body"] == {"include_reasoning": False}
+
+
+async def test_call_provider_params_extra_body_deep_merges_caller_wins():
+    """When BOTH the provider config and the caller supply extra_body, the two
+    bodies deep-merge (union of keys) rather than one clobbering the other, and
+    on a key collision the explicit caller value wins (provider params are
+    defaults)."""
+    config = _config_with_params(
+        {"extra_body": {"include_reasoning": False, "reasoning_effort": "low"}},
+    )
+    delegate = LiteLLMDelegate(config)
+    mock_resp = _mock_response()
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+        mock_litellm.completion_cost.return_value = 0.0
+
+        await delegate.call(
+            "test-provider", "openai/gpt-oss-20b",
+            [{"role": "user", "content": "Hi"}],
+            # Caller overrides reasoning_effort and adds a new key.
+            extra_body={"reasoning_effort": "high", "caller_key": 1},
+        )
+
+        body = mock_litellm.acompletion.call_args.kwargs["extra_body"]
+        # Provider-only key preserved (deep merge, no clobber)
+        assert body["include_reasoning"] is False
+        # Caller wins on the collided key
+        assert body["reasoning_effort"] == "high"
+        # Caller-only key carried through
+        assert body["caller_key"] == 1
+
+
+async def test_call_no_params_passes_no_extra_body():
+    """A provider WITHOUT a params block must not inject an extra_body kwarg."""
+    config = _config()  # no params
+    delegate = LiteLLMDelegate(config)
+    mock_resp = _mock_response()
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+        mock_litellm.completion_cost.return_value = 0.0
+
+        await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+        assert "extra_body" not in mock_litellm.acompletion.call_args.kwargs

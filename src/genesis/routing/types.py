@@ -62,6 +62,15 @@ class ProviderConfig:
     keep_alive: str | int | None = None
     enabled: bool = True
     profile: str | None = None
+    # Extra litellm.acompletion() kwargs applied per-provider, as defaults
+    # under explicit call kwargs (the delegate merges via setdefault; an
+    # extra_body sub-dict is deep-merged, caller-wins). Used for Groq gpt-oss
+    # reasoning controls: {"extra_body": {"include_reasoning": False,
+    # "reasoning_effort": "low"}}. RESERVED keys — do NOT place api_key /
+    # api_base / timeout / num_retries here; the delegate sets those itself
+    # and a stray value would override its guards. hash=False: dict is
+    # unhashable and ProviderConfig is frozen (hashable on its other fields).
+    params: dict | None = field(default=None, hash=False)
     # False when no API key env var is configured for this provider.
     # Set by the config loader at parse time. Router treats False as
     # down-by-config (skip in chain walk, no LiteLLM call, no CB trip),
