@@ -32,6 +32,14 @@ def _ok_proc(stdout="installed: ...", returncode=0, stderr=""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+@pytest.fixture(autouse=True)
+def _authed():
+    """Default the privileged-write gate to authenticated; individual tests
+    that need the unauthenticated path re-patch within their own block."""
+    with patch(f"{_BK}.is_authenticated", return_value=True):
+        yield
+
+
 # ── _strip_url_creds ──────────────────────────────────────────────────
 def test_strip_url_creds_removes_token():
     from genesis.dashboard.routes.backup import _strip_url_creds
@@ -43,6 +51,22 @@ def test_strip_url_creds_removes_token():
     assert _strip_url_creds("git@github.com:u/r.git") == "git@github.com:u/r.git"
     assert _strip_url_creds("") == ""
     assert _strip_url_creds(None) is None
+
+
+# ── POST auth gate ────────────────────────────────────────────────────
+def test_set_requires_auth(client):
+    """The privileged write endpoint returns 401 when a dashboard password is
+    set but the caller is unauthenticated — and never writes anything."""
+    with (
+        patch(f"{_BK}.is_authenticated", return_value=False),
+        patch(f"{_SEC}._update_secrets_file") as wr,
+        patch(f"{_BK}.subprocess.run") as run,
+    ):
+        resp = client.post("/api/genesis/backup/config",
+                           json={"tier2_backend": "none"})
+    assert resp.status_code == 401
+    wr.assert_not_called()
+    run.assert_not_called()
 
 
 # ── POST validation ───────────────────────────────────────────────────

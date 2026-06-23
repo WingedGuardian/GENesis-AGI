@@ -161,6 +161,12 @@ def backup_config_set():
     Env changes take effect on the next backup run (backup.sh sources
     secrets.env directly) — no server restart required.
     """
+    # Privileged write (credentials + cron) — gate it. No-op when the dashboard
+    # has no password configured (is_authenticated() returns True), so a
+    # passwordless install is unaffected; a password-protected one is enforced.
+    if not is_authenticated():
+        return jsonify({"error": "authentication required"}), 401
+
     from genesis.dashboard.routes.secrets import _key_value, _update_secrets_file
 
     data = request.get_json(silent=True) or {}
