@@ -37,6 +37,20 @@ providers:
     free: true
     rpm_limit: 30
     open_duration_s: 120
+  # GROUNDWORK: gpt-oss-120b — a free reasoning option for reasoning/JSON-heavy
+  # chains. Defined + tested (per-provider param plumbing), not yet wired into
+  # any chain; wiring is a separate routing-rebalance change.
+  groq-oss-120b:
+    type: groq
+    model: openai/gpt-oss-120b
+    profile: gpt-oss-120b
+    free: true
+    rpm_limit: 30
+    open_duration_s: 120
+    params:
+      extra_body:
+        include_reasoning: false
+        reasoning_effort: low
   gemini-free:
     type: google
     model: gemini-3-flash-preview

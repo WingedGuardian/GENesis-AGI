@@ -202,6 +202,16 @@ class LiteLLMDelegate:
         api_key = _resolve_api_key(cfg.provider_type)
 
         call_kwargs = {**kwargs}
+        # Per-provider extra litellm kwargs (e.g. Groq gpt-oss reasoning
+        # controls) applied as DEFAULTS — explicit caller kwargs win.
+        # extra_body is deep-merged so provider- and caller-level bodies
+        # don't clobber each other.
+        if cfg.params:
+            for _k, _v in cfg.params.items():
+                if _k == "extra_body" and isinstance(_v, dict):
+                    call_kwargs["extra_body"] = {**_v, **(call_kwargs.get("extra_body") or {})}
+                else:
+                    call_kwargs.setdefault(_k, _v)
         if "timeout" not in call_kwargs:
             call_kwargs["timeout"] = _DEFAULT_TIMEOUT_S
         # Genesis's router owns retry + provider fallback. litellm must make

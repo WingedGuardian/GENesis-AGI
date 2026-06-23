@@ -125,7 +125,9 @@ def test_load_full_yaml(monkeypatch):
     # (cerebras disabled 2026-06 — reasoning-only models incompatible;
     # openrouter-deepseek-r1 removed entirely 2026-05-24;
     # nvidia-nim-deepseek + nvidia-nim-kimi added 2026-05-25)
-    assert len(cfg.providers) == 28
+    # 2026-06-23: 28 → 29 after groq-oss-120b added (free reasoning option,
+    # not yet wired into any chain).
+    assert len(cfg.providers) == 29
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
@@ -473,3 +475,36 @@ def test_dispatch_unknown_falls_back_to_dual():
 def test_dispatch_case_insensitive():
     cfg = load_config_from_string(_DISPATCH_YAML)
     assert cfg.call_sites["upper_site"].dispatch == "cli"
+
+
+# ---------------------------------------------------------------------------
+# Per-provider ``params`` (extra litellm kwargs) parsing.
+# ---------------------------------------------------------------------------
+
+
+def test_provider_params_parsed():
+    """A provider with a ``params:`` block (e.g. Groq gpt-oss reasoning
+    controls) must parse into ProviderConfig.params verbatim. A provider
+    without one must get params=None."""
+    cfg = load_config_from_string("""\
+providers:
+  gpt_oss:
+    type: groq
+    model: openai/gpt-oss-20b
+    free: true
+    params:
+      extra_body:
+        include_reasoning: false
+        reasoning_effort: low
+  plain:
+    type: ollama
+    model: m
+    free: true
+call_sites:
+  s:
+    chain: [gpt_oss, plain]
+""")
+    assert cfg.providers["gpt_oss"].params == {
+        "extra_body": {"include_reasoning": False, "reasoning_effort": "low"},
+    }
+    assert cfg.providers["plain"].params is None

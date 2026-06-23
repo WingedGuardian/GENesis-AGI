@@ -218,6 +218,7 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
             keep_alive=p.get("keep_alive"),
             enabled=True,
             profile=p.get("profile"),
+            params=p.get("params"),
         )
 
         # Keyless providers stay registered with has_api_key=False. The
