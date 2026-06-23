@@ -43,8 +43,23 @@ async def _impl_experiment_status(limit: int = 10) -> dict:
     by_id = {r["id"]: r for r in rows}
 
     experiments = []
+    evo_runs = []
     for r in rows:
         meta = _meta(r)
+        if meta.get("kind") == "evo_summary":
+            # Evo loop run summary (one row per run) — surfaced separately.
+            if len(evo_runs) < limit:
+                evo_runs.append({
+                    "evo_run": r.get("dataset"),  # "evo:reflection:<id>"
+                    "created_at": r.get("created_at"),
+                    "winner": meta.get("winner"),
+                    "winner_approach": meta.get("winner_approach"),
+                    "survivors": meta.get("survivors"),
+                    "candidates_evaluated": meta.get("candidates_evaluated"),
+                    "holdout_disjoint": meta.get("holdout_disjoint"),
+                    "note": meta.get("note"),
+                })
+            continue
         if meta.get("arm") != "treatment":
             continue  # the treatment row carries the comparison + win-rate
         control = by_id.get(r.get("comparison_run_id")) or {}
@@ -75,6 +90,7 @@ async def _impl_experiment_status(limit: int = 10) -> dict:
         "status": "ok",
         "autonomous_action": False,
         "experiments": experiments,
+        "evo_runs": evo_runs,
         "note": (
             "Recommend-only: the harness NEVER promotes a variant. Act on a "
             "recommendation manually — settings_update for flag knobs, "
