@@ -159,6 +159,7 @@ _documents_tools = importlib.import_module(".documents", __name__)  # noqa: F401
 _knowledge_tools = importlib.import_module(".knowledge", __name__)  # noqa: F401
 _observations_tools = importlib.import_module(".observations", __name__)  # noqa: F401
 _procedural_tools = importlib.import_module(".procedural", __name__)  # noqa: F401
+_locate_tools = importlib.import_module(".locate", __name__)  # noqa: F401
 
 
 # Backward-compatible patch points expected by tests and callers.
