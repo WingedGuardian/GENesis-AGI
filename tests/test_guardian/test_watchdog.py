@@ -611,6 +611,22 @@ class TestCodeDrift:
         outreach.submit_raw.assert_not_called()
         eb.emit.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_no_guardian_commit_reachable_skips(self):
+        """deploy_ref resolves but `git log` finds no Guardian-path commit at/
+        before it (exit 0, empty stdout) → skip before the SSH round-trip, no
+        alarm. Guards the empty-container_hash branch."""
+        wd, r, eb, outreach = _drift_watchdog(deployed_commit="0ld0ld0",
+                                              deploy_ref="dep10y0")
+        wd._host_contains_commit = AsyncMock(return_value=False)
+        with patch("genesis.guardian.watchdog.subprocess.run",
+                   side_effect=_git_side_effect("")):   # git log → empty
+            await wd._check_code_drift_inner()
+        assert wd._drift_count == 0
+        r.version.assert_not_called()
+        wd._host_contains_commit.assert_not_awaited()
+        outreach.submit_raw.assert_not_called()
+
 
 class TestLastDeployedCommit:
     """The deploy baseline read from update_history: the commit update.sh last
@@ -664,6 +680,21 @@ class TestLastDeployedCommit:
                             lambda: tmp_path / "nonexistent.db")
         wd = GuardianWatchdog(AsyncMock(), event_bus=None)
         assert await wd._last_deployed_commit() is None
+
+    @pytest.mark.asyncio
+    async def test_orders_by_true_instant_not_lexicographic(self, tmp_path, monkeypatch):
+        """Mixed timezone offsets must order by actual instant, not raw string.
+        Values chosen so lexicographic and true-instant order DIFFER: the row
+        whose string sorts higher ('...T20:00:00+05:00' = 15:00 UTC) is the
+        EARLIER instant, so it must NOT win over '...T16:00:00+00:00' (16:00 UTC)."""
+        db = tmp_path / "genesis.db"
+        self._seed_db(db, [
+            ("1", "WRONG_lexwin", "success", "2026-06-23T20:00:00+05:00"),   # 15:00 UTC
+            ("2", "RIGHT_instant", "success", "2026-06-23T16:00:00+00:00"),  # 16:00 UTC
+        ])
+        monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None)
+        assert await wd._last_deployed_commit() == "RIGHT_instant"
 
 
 class TestAlertUser:

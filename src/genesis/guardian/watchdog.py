@@ -309,6 +309,13 @@ class GuardianWatchdog:
         if branch_result.returncode == 0 and branch_result.stdout.strip() not in ("main",):
             return
         if not container_hash:
+            # deploy_ref resolved but no Guardian-path commit is reachable from
+            # it — nothing to compare. Log so this silent-skip is observable
+            # (mirrors the no-baseline debug above) rather than going dark.
+            logger.debug(
+                "Guardian drift check: no Guardian-path commit reachable from "
+                "deploy_ref=%s — skipping", deploy_ref,
+            )
             return
 
         # Get host's deployed hash via SSH version command
@@ -452,7 +459,10 @@ class GuardianWatchdog:
                 cur = await db.execute(
                     "SELECT new_commit FROM update_history "
                     "WHERE status = 'success' AND new_commit IS NOT NULL "
-                    "ORDER BY started_at DESC LIMIT 1",
+                    # datetime() normalizes the ISO timestamp (incl. tz offset)
+                    # to UTC so mixed-offset rows order by true instant, not
+                    # lexicographically.
+                    "ORDER BY datetime(started_at) DESC LIMIT 1",
                 )
                 row = await cur.fetchone()
         except Exception:
