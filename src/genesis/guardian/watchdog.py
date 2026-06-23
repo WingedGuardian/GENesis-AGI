@@ -268,14 +268,34 @@ class GuardianWatchdog:
         """Inner implementation of drift detection (may raise)."""
         import asyncio
 
-        # Get container's hash for Guardian-relevant paths (non-blocking)
+        # Reference point = the commit update.sh LAST SUCCESSFULLY DEPLOYED, not
+        # the container's live HEAD. The host Guardian is only redeployed by an
+        # update.sh run, while container `main` advances on every PR merge — so
+        # HEAD races ahead of the host between deploys and comparing against it
+        # false-alarms on benign lag. Measuring against the last deploy makes
+        # drift fire only when a redeploy was attempted but didn't take (a
+        # genuinely stale/frozen host), which is what this check exists to catch.
+        deploy_ref = await self._last_deployed_commit()
+        if deploy_ref is None:
+            # No successful update recorded → no deploy baseline. Skip rather
+            # than fall back to HEAD (which re-introduces the false alarm).
+            logger.debug(
+                "Guardian drift check: no successful update_history baseline "
+                "— skipping",
+            )
+            return
+
+        # Get container's hash for Guardian-relevant paths AS OF the last deploy
+        # (non-blocking).
         result = await asyncio.to_thread(
             subprocess.run,
             ["git", "-C", str(Path.home() / "genesis"),
-             "log", "-1", "--format=%h", "--"] + self._GUARDIAN_PATHS,
+             "log", "-1", "--format=%h", deploy_ref, "--"] + self._GUARDIAN_PATHS,
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
+            # deploy_ref unresolvable in the container's git (e.g. rewritten
+            # history) — skip, never false-alarm.
             return
         container_hash = result.stdout.strip()
 
@@ -289,6 +309,13 @@ class GuardianWatchdog:
         if branch_result.returncode == 0 and branch_result.stdout.strip() not in ("main",):
             return
         if not container_hash:
+            # deploy_ref resolved but no Guardian-path commit is reachable from
+            # it — nothing to compare. Log so this silent-skip is observable
+            # (mirrors the no-baseline debug above) rather than going dark.
+            logger.debug(
+                "Guardian drift check: no Guardian-path commit reachable from "
+                "deploy_ref=%s — skipping", deploy_ref,
+            )
             return
 
         # Get host's deployed hash via SSH version command
@@ -403,6 +430,38 @@ class GuardianWatchdog:
         if result.returncode == 1:
             return False  # genuinely not contained → real drift
         return None       # 128 (unknown object — host ahead) / other → skip
+
+    async def _last_deployed_commit(self) -> str | None:
+        """Commit hash that update.sh LAST SUCCESSFULLY deployed.
+
+        This is the host Guardian's expected baseline: the host is only
+        redeployed by an update.sh run (which records the run in
+        ``update_history``), whereas the container's live HEAD advances on
+        every merge. Drift must be measured against this, not HEAD, or normal
+        between-deploy lag false-alarms.
+
+        Returns None when no successful update is recorded (no baseline → the
+        caller skips, never false-alarms). Best-effort: any DB failure → None.
+        The SQL lives in ``genesis.db.crud.update_history`` (CRUD-layer reader);
+        all imports are function-level so ``genesis.db`` stays off the host's
+        import path (this watchdog is container-side only — see
+        guardian/DEPLOYMENT.md), with connection management kept here.
+        """
+        import aiosqlite
+
+        from genesis.db.connection import BUSY_TIMEOUT_MS
+        from genesis.db.crud import update_history
+        from genesis.env import genesis_db_path
+
+        db_path = genesis_db_path()
+        if not db_path.exists():
+            return None
+        try:
+            async with aiosqlite.connect(str(db_path)) as db:
+                await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+                return await update_history.last_successful_deploy_commit(db)
+        except Exception:
+            return None
 
     async def _expected_gateway_sha(self, code_version: str) -> str | None:
         """sha256 of the gateway script at the host's install-dir commit.

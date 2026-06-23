@@ -429,14 +429,18 @@ class TestHostContainsCommit:
             assert await wd._host_contains_commit("a915a28", "0a07272") is None
 
 
-def _drift_watchdog(deployed_commit: str):
+def _drift_watchdog(deployed_commit: str, deploy_ref: str | None = "dep10y0"):
     """Watchdog wired for code-drift tests: mock remote.version() → deployed_commit,
-    mock event_bus/outreach. `_host_contains_commit` is stubbed per-test."""
+    mock event_bus/outreach. `_last_deployed_commit` (the deploy baseline drift is
+    measured against) is stubbed to `deploy_ref` so the check runs without a DB;
+    pass deploy_ref=None to exercise the no-baseline skip. `_host_contains_commit`
+    is stubbed per-test."""
     r = AsyncMock()
     r.version = AsyncMock(return_value={"deployed_commit": deployed_commit})
     event_bus = AsyncMock()
     outreach = AsyncMock()
     wd = GuardianWatchdog(r, event_bus=event_bus, outreach_pipeline=outreach)
+    wd._last_deployed_commit = AsyncMock(return_value=deploy_ref)
     return wd, r, event_bus, outreach
 
 
@@ -559,6 +563,138 @@ class TestCodeDrift:
         assert wd._drift_count == 0
         outreach.submit_raw.assert_not_called()
         assert not any("code_drift" in e for e in _emitted_events(eb))
+
+    @pytest.mark.asyncio
+    async def test_reference_is_deploy_baseline_not_head(self):
+        """The container reference is the last DEPLOYED commit, not live HEAD:
+        the `git log` that derives the Guardian commit is scoped to the deploy
+        baseline. This is the fix for the per-commit false alarm — container
+        `main` races ahead of the host between update.sh runs, so HEAD is the
+        wrong reference."""
+        from unittest.mock import MagicMock
+        wd, r, eb, outreach = _drift_watchdog(deployed_commit="dep10y0",
+                                              deploy_ref="dep10y0")
+        wd._host_contains_commit = AsyncMock(return_value=True)
+        seen: dict = {}
+
+        def _se(cmd, **kw):
+            if "symbolic-ref" in cmd:
+                return MagicMock(returncode=0, stdout="main\n")
+            if "log" in cmd:
+                seen["log_cmd"] = cmd
+                return MagicMock(returncode=0, stdout="dep10y0\n")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("genesis.guardian.watchdog.subprocess.run", side_effect=_se):
+            await wd._check_code_drift_inner()
+        # git log was scoped to the deploy baseline (not implicit HEAD)
+        assert "dep10y0" in seen["log_cmd"]
+        assert wd._drift_count == 0
+        outreach.submit_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_deploy_baseline_skips_no_alarm(self):
+        """No successful update recorded → no baseline → skip the whole check
+        (never fall back to live HEAD). version() is not even queried, so a host
+        that is legitimately behind because no deploy has run yet cannot
+        false-alarm — even ticking far past the threshold."""
+        wd, r, eb, outreach = _drift_watchdog(deployed_commit="0ld0ld0",
+                                              deploy_ref=None)
+        wd._host_contains_commit = AsyncMock(return_value=False)  # would alarm if reached
+        with patch("genesis.guardian.watchdog.subprocess.run",
+                   side_effect=_git_side_effect("a915a28")):
+            for _ in range(_THRESHOLD + 1):
+                await wd._check_code_drift_inner()
+        assert wd._drift_count == 0
+        r.version.assert_not_called()
+        wd._host_contains_commit.assert_not_awaited()
+        outreach.submit_raw.assert_not_called()
+        eb.emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_guardian_commit_reachable_skips(self):
+        """deploy_ref resolves but `git log` finds no Guardian-path commit at/
+        before it (exit 0, empty stdout) → skip before the SSH round-trip, no
+        alarm. Guards the empty-container_hash branch."""
+        wd, r, eb, outreach = _drift_watchdog(deployed_commit="0ld0ld0",
+                                              deploy_ref="dep10y0")
+        wd._host_contains_commit = AsyncMock(return_value=False)
+        with patch("genesis.guardian.watchdog.subprocess.run",
+                   side_effect=_git_side_effect("")):   # git log → empty
+            await wd._check_code_drift_inner()
+        assert wd._drift_count == 0
+        r.version.assert_not_called()
+        wd._host_contains_commit.assert_not_awaited()
+        outreach.submit_raw.assert_not_called()
+
+
+class TestLastDeployedCommit:
+    """The deploy baseline read from update_history: the commit update.sh last
+    SUCCESSFULLY deployed. Drift is measured against this, not container HEAD."""
+
+    @staticmethod
+    def _seed_db(path, rows):
+        import sqlite3
+        con = sqlite3.connect(str(path))
+        con.execute(
+            "CREATE TABLE update_history (id TEXT PRIMARY KEY, old_tag TEXT, "
+            "new_tag TEXT, old_commit TEXT, new_commit TEXT, status TEXT, "
+            "rollback_tag TEXT, failure_reason TEXT, degraded_subsystems TEXT, "
+            "started_at TEXT, completed_at TEXT)",
+        )
+        con.executemany(
+            "INSERT INTO update_history (id, new_commit, status, started_at) "
+            "VALUES (?, ?, ?, ?)", rows,
+        )
+        con.commit()
+        con.close()
+
+    @pytest.mark.asyncio
+    async def test_returns_latest_success_new_commit(self, tmp_path, monkeypatch):
+        """Most recent status='success' row wins; a newer non-success row (e.g.
+        a failed deploy after) is correctly ignored."""
+        db = tmp_path / "genesis.db"
+        self._seed_db(db, [
+            ("1", "OLDcom", "success", "2026-06-23T01:00:00+00:00"),
+            ("2", "NEWcom", "success", "2026-06-23T14:00:00+00:00"),
+            ("3", "FAILcom", "failed", "2026-06-23T15:00:00+00:00"),
+        ])
+        monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None)
+        assert await wd._last_deployed_commit() == "NEWcom"
+
+    @pytest.mark.asyncio
+    async def test_no_success_rows_returns_none(self, tmp_path, monkeypatch):
+        db = tmp_path / "genesis.db"
+        self._seed_db(db, [
+            ("1", "Xcom", "failed", "2026-06-23T01:00:00+00:00"),
+            ("2", "Ycom", "rolled_back", "2026-06-23T02:00:00+00:00"),
+        ])
+        monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None)
+        assert await wd._last_deployed_commit() is None
+
+    @pytest.mark.asyncio
+    async def test_missing_db_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("genesis.env.genesis_db_path",
+                            lambda: tmp_path / "nonexistent.db")
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None)
+        assert await wd._last_deployed_commit() is None
+
+    @pytest.mark.asyncio
+    async def test_orders_by_true_instant_not_lexicographic(self, tmp_path, monkeypatch):
+        """Mixed timezone offsets must order by actual instant, not raw string.
+        Values chosen so lexicographic and true-instant order DIFFER: the row
+        whose string sorts higher ('...T20:00:00+05:00' = 15:00 UTC) is the
+        EARLIER instant, so it must NOT win over '...T16:00:00+00:00' (16:00 UTC)."""
+        db = tmp_path / "genesis.db"
+        self._seed_db(db, [
+            ("1", "WRONG_lexwin", "success", "2026-06-23T20:00:00+05:00"),   # 15:00 UTC
+            ("2", "RIGHT_instant", "success", "2026-06-23T16:00:00+00:00"),  # 16:00 UTC
+        ])
+        monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None)
+        assert await wd._last_deployed_commit() == "RIGHT_instant"
 
 
 class TestAlertUser:
