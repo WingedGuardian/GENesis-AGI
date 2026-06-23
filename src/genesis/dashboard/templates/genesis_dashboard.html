@@ -237,6 +237,18 @@
 
         // ── Backup tab state ──────────────────────────────────────
         backupStatus: null,
+        backupConfig: null,
+        backupConfigForm: {
+          repo: '', tier2_backend: 'none', local_path: '',
+          nas: '', nas_user: '', nas_pass: '', passphrase: '',
+          schedule: '0 */6 * * *', schedule_enabled: true,
+        },
+        backupConfigSaving: false,
+        backupConfigMsg: null,
+        // Only POST the schedule (a stateful cron side-effect) when the user
+        // actually touches the schedule controls — a plain Save must not
+        // silently install/replace the cron job.
+        scheduleDirty: false,
 
         // ── Update state ─────────────────────────────────────────
         updateStatus: null,
@@ -450,7 +462,7 @@
               if (first) { this.fetchReferenceList(); this.fetchReferenceStats(); }
               break;
             case "backup":
-              if (first) { this.fetchBackupStatus(); this.fetchUpdateStatus(); this.fetchUpdateProgress(); }
+              if (first) { this.fetchBackupStatus(); this.fetchBackupConfig(); this.fetchUpdateStatus(); this.fetchUpdateProgress(); }
               break;
           }
         },
@@ -1601,6 +1613,72 @@
             if (resp && resp.ok) { alert("Backup triggered"); setTimeout(() => this.fetchBackupStatus(), 5000); }
             else { alert("Trigger failed"); }
           } catch (e) { alert("Trigger failed: " + e.message); }
+        },
+        async fetchBackupConfig() {
+          try {
+            const resp = await fetchApi("/api/genesis/backup/config");
+            if (resp && resp.ok) {
+              const c = await resp.json();
+              this.backupConfig = c;
+              const f = this.backupConfigForm;
+              f.repo = c.repo || '';
+              f.tier2_backend = c.tier2_backend || 'none';
+              f.local_path = c.local_path || '';
+              f.nas = c.nas || '';
+              f.nas_user = c.nas_user || '';
+              f.schedule = c.schedule || '0 */6 * * *';
+              f.schedule_enabled = c.schedule_enabled !== false;
+              this.scheduleDirty = false;   // loaded state is not a user change
+              // passphrase / nas_pass are write-only — never populated.
+            }
+          } catch (e) { console.warn("Backup config fetch failed:", e); }
+        },
+        async saveBackupConfig() {
+          this.backupConfigSaving = true;
+          this.backupConfigMsg = null;
+          try {
+            const f = this.backupConfigForm;
+            const body = { tier2_backend: f.tier2_backend };
+            // The cron job is a stateful side-effect — only touch it when the
+            // user actually changed the schedule controls.
+            if (this.scheduleDirty) {
+              body.schedule = f.schedule;
+              body.schedule_enabled = f.schedule_enabled;
+            }
+            // Only send repo if the user actually changed it — re-sending the
+            // credential-stripped value would clobber any token in the stored URL.
+            if (f.repo && f.repo !== (this.backupConfig?.repo || '')) body.repo = f.repo;
+            if (f.local_path) body.local_path = f.local_path;
+            if (f.nas) body.nas = f.nas;
+            if (f.nas_user) body.nas_user = f.nas_user;
+            if (f.nas_pass) body.nas_pass = f.nas_pass;
+            if (f.passphrase) body.passphrase = f.passphrase;
+            const resp = await fetchApi("/api/genesis/backup/config", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+            const data = resp ? await resp.json() : null;
+            if (resp && resp.ok) {
+              this.backupConfigMsg = {
+                ok: true,
+                text: "Saved — applies on the next backup run.",
+                warnings: (data && data.warnings) || [],
+              };
+              f.nas_pass = ''; f.passphrase = '';   // clear write-only fields
+              this.scheduleDirty = false;
+              this.fetchBackupConfig();
+              this.fetchBackupStatus();
+            } else {
+              const detail = data && (data.error +
+                (data.details ? ': ' + data.details.join('; ') : ''));
+              this.backupConfigMsg = { ok: false, text: detail || "Save failed", warnings: [] };
+            }
+          } catch (e) {
+            this.backupConfigMsg = { ok: false, text: String(e), warnings: [] };
+          } finally {
+            this.backupConfigSaving = false;
+          }
         },
 
         // ── Update methods ──────────────────────────────────────
@@ -10427,6 +10505,106 @@
                   <span x-text="$store.genesisDashboard.backupStatus.configured ? 'Installed' : 'Not found'"
                         :style="$store.genesisDashboard.backupStatus.configured ? 'color:#81c784' : 'color:#ef9a9a'"></span>
                 </div>
+              </div>
+            </div>
+            <!-- Editable backup configuration -->
+            <div class="card" style="padding:1rem; margin-top:0.75rem;">
+              <h3 style="margin:0 0 0.6rem 0; font-size:1rem;">Backup configuration</h3>
+              <div style="display:flex; flex-direction:column; gap:0.55rem; font-size:0.82rem; max-width:520px;">
+                <!-- Destination repo -->
+                <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                  <span style="color:var(--color-text-secondary);">Backups repo (git URL)</span>
+                  <input type="text" x-model="$store.genesisDashboard.backupConfigForm.repo"
+                         placeholder="https://github.com/you/genesis-backups.git"
+                         style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                </label>
+                <template x-if="$store.genesisDashboard.backupConfigForm.repo && $store.genesisDashboard.backupConfig && $store.genesisDashboard.backupConfig.repo && $store.genesisDashboard.backupConfigForm.repo !== $store.genesisDashboard.backupConfig.repo">
+                  <div style="font-size:0.72rem; color:#ffb74d;">⚠ Changing the repo URL does not migrate existing backup history — keep the old repo reachable for restores.</div>
+                </template>
+
+                <!-- Encryption passphrase (write-only) -->
+                <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                  <span style="color:var(--color-text-secondary);">Encryption passphrase
+                    <span x-show="$store.genesisDashboard.backupConfig?.passphrase_set" style="color:#81c784;">(set — blank keeps current)</span></span>
+                  <input type="password" autocomplete="new-password" x-model="$store.genesisDashboard.backupConfigForm.passphrase"
+                         placeholder="leave blank to keep current"
+                         style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                </label>
+                <template x-if="$store.genesisDashboard.backupConfigForm.passphrase">
+                  <div style="font-size:0.72rem; color:#ffb74d;">⚠ Rotating the passphrase does NOT re-encrypt existing backups. Keep the old one until a fresh backup is verified.</div>
+                </template>
+
+                <!-- Off-site backend -->
+                <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                  <span style="color:var(--color-text-secondary);">Off-site backend</span>
+                  <select x-model="$store.genesisDashboard.backupConfigForm.tier2_backend"
+                          style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    <option value="none">None</option>
+                    <option value="local">Local / mounted path</option>
+                    <option value="smb">SMB / NAS</option>
+                  </select>
+                </label>
+                <template x-if="$store.genesisDashboard.backupConfigForm.tier2_backend === 'local'">
+                  <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                    <span style="color:var(--color-text-secondary);">Local path</span>
+                    <input type="text" x-model="$store.genesisDashboard.backupConfigForm.local_path" placeholder="/mnt/backups"
+                           style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                  </label>
+                </template>
+                <template x-if="$store.genesisDashboard.backupConfigForm.tier2_backend === 'smb'">
+                  <div style="display:flex; flex-direction:column; gap:0.55rem;">
+                    <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                      <span style="color:var(--color-text-secondary);">NAS share</span>
+                      <input type="text" x-model="$store.genesisDashboard.backupConfigForm.nas" placeholder="//host/share"
+                             style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    </label>
+                    <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                      <span style="color:var(--color-text-secondary);">NAS user</span>
+                      <input type="text" x-model="$store.genesisDashboard.backupConfigForm.nas_user"
+                             style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    </label>
+                    <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                      <span style="color:var(--color-text-secondary);">NAS password
+                        <span x-show="$store.genesisDashboard.backupConfig?.nas_pass_set" style="color:#81c784;">(set — blank keeps current)</span></span>
+                      <input type="password" autocomplete="new-password" x-model="$store.genesisDashboard.backupConfigForm.nas_pass" placeholder="leave blank to keep current"
+                             style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    </label>
+                  </div>
+                </template>
+
+                <!-- Schedule -->
+                <label style="display:flex; align-items:center; gap:0.4rem; margin-top:0.2rem;">
+                  <input type="checkbox" x-model="$store.genesisDashboard.backupConfigForm.schedule_enabled"
+                         @change="$store.genesisDashboard.scheduleDirty = true">
+                  <span>Scheduled (cron) backups</span>
+                </label>
+                <template x-if="$store.genesisDashboard.backupConfigForm.schedule_enabled">
+                  <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                    <span style="color:var(--color-text-secondary);">Cron schedule</span>
+                    <input type="text" x-model="$store.genesisDashboard.backupConfigForm.schedule" placeholder="0 */6 * * *"
+                           @input="$store.genesisDashboard.scheduleDirty = true"
+                           style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary); font-family:monospace;">
+                    <span style="font-size:0.7rem; color:var(--color-text-secondary);">5-field cron — e.g. <code>0 */6 * * *</code> = every 6 hours</span>
+                  </label>
+                </template>
+
+                <!-- Save -->
+                <div style="display:flex; gap:0.6rem; align-items:center; margin-top:0.3rem;">
+                  <button @click="$store.genesisDashboard.saveBackupConfig()"
+                          :disabled="$store.genesisDashboard.backupConfigSaving"
+                          style="font-size:0.8rem; padding:0.35rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(33,150,243,0.15); color:#64b5f6; border:1px solid rgba(33,150,243,0.4);"
+                          x-text="$store.genesisDashboard.backupConfigSaving ? 'Saving…' : 'Save configuration'"></button>
+                  <span x-show="$store.genesisDashboard.backupConfigMsg"
+                        :style="$store.genesisDashboard.backupConfigMsg?.ok ? 'color:#81c784; font-size:0.78rem;' : 'color:#ef9a9a; font-size:0.78rem;'"
+                        x-text="$store.genesisDashboard.backupConfigMsg?.text"></span>
+                </div>
+                <template x-if="$store.genesisDashboard.backupConfigMsg?.warnings?.length">
+                  <div style="font-size:0.72rem; color:#ffb74d; display:flex; flex-direction:column; gap:0.2rem;">
+                    <template x-for="w in $store.genesisDashboard.backupConfigMsg.warnings" :key="w">
+                      <div x-text="'⚠ ' + w"></div>
+                    </template>
+                  </div>
+                </template>
               </div>
             </div>
           </div>

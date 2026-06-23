@@ -40,7 +40,9 @@ _LABEL_RE = re.compile(r"^#\s*---\s*(.+?)\s*---")
 _USED_BY_RE = re.compile(r"^#\s*Used by:\s*(.+)", re.IGNORECASE)
 _SIGNUP_RE = re.compile(r"^#\s*Signup:\s*(.+)", re.IGNORECASE)
 _KEY_RE = re.compile(r"^([A-Z][A-Z0-9_]+)=")
-_SENSITIVE_RE = re.compile(r"API_KEY_|_API_KEY|_TOKEN|_PASSPHRASE|FIRECRAWL_API")
+# Note: ``_PASS`` covers NAS/SMB passwords (GENESIS_BACKUP_NAS_PASS) and any
+# *_PASSWORD key; it also subsumes _PASSPHRASE but that is kept for clarity.
+_SENSITIVE_RE = re.compile(r"API_KEY_|_API_KEY|_TOKEN|_PASSPHRASE|_PASS|FIRECRAWL_API")
 
 
 def _parse_example_file() -> list[SecretKeyDef]:
