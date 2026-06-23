@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid as _uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -573,20 +574,56 @@ _FALLBACK_PROMPTS = {
 }
 
 
-def system_prompt_for_depth(depth: Depth, prompt_dir: Path) -> str:
-    """Load the system prompt for a given depth, with model-specific variant support."""
+def _resolve_prompt_in_dir(depth: Depth, prompt_dir: Path) -> str | None:
+    """Resolve a depth's prompt within one dir — model-specific variant
+    (e.g. ``REFLECTION_DEEP_SONNET.md``) then the base file. None if neither
+    exists or the dir can't be read."""
     filename = _PROMPT_FILES.get(depth)
-    if filename:
+    if not filename:
+        return None
+    try:
         model = _DEPTH_MODEL.get(depth)
         if model:
             stem = filename.rsplit(".", 1)[0]
-            model_file = f"{stem}_{model.value.upper()}.md"
-            model_path = prompt_dir / model_file
+            model_path = prompt_dir / f"{stem}_{model.value.upper()}.md"
             if model_path.exists():
                 return model_path.read_text()
         path = prompt_dir / filename
         if path.exists():
             return path.read_text()
+    except OSError:
+        logger.debug("reflection prompt read failed in %s", prompt_dir, exc_info=True)
+    return None
+
+
+def _reflection_override_dir() -> Path:
+    """User overlay dir for reflection prompts (``~/.genesis/config/reflection``).
+
+    A writable, out-of-git-tree target for hand-overriding the reflection prompt
+    (and the future Evo promotion path). Env-overridable via
+    ``GENESIS_REFLECTION_PROMPT_DIR`` for tests / explicit control.
+    """
+    value = os.environ.get("GENESIS_REFLECTION_PROMPT_DIR")
+    if value:
+        return Path(value).expanduser()
+    from genesis.env import genesis_home
+
+    return genesis_home() / "config" / "reflection"
+
+
+def system_prompt_for_depth(depth: Depth, prompt_dir: Path) -> str:
+    """Load the depth's reflection system prompt.
+
+    Resolution order, first hit wins: (1) the user overlay
+    (``~/.genesis/config/reflection``; env ``GENESIS_REFLECTION_PROMPT_DIR``),
+    (2) the repo ``prompt_dir``, (3) the hardcoded fallback. Within each dir the
+    model-specific variant beats the base file. No overlay file → behavior is
+    identical to using ``prompt_dir`` alone.
+    """
+    for prompt_source in (_reflection_override_dir(), prompt_dir):
+        resolved = _resolve_prompt_in_dir(depth, prompt_source)
+        if resolved is not None:
+            return resolved
     return _FALLBACK_PROMPTS.get(depth, _FALLBACK_PROMPTS[Depth.DEEP])
 
 
