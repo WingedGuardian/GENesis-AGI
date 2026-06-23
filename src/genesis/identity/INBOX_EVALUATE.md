@@ -343,6 +343,27 @@ assign a scope tag, and produce the Recommendation YAML block (see output format
 in Step 5). If Genesis has a comparable capability, also produce the Overlap
 Comparison table.
 
+### Tool/Product Scoring Rubric (for concrete external tools, products, libraries, repos)
+
+When a Genesis-relevant item IS a specific external tool/product/library/repo
+(not an abstract idea or pattern), also score its **traction** on three axes.
+These complement — they don't replace — the fit-focused scoring axes above
+(capability gap, replacement risk, integration cost, lock-in risk):
+
+- **Momentum (40%)** — is it growing? Star/adoption trend, release frequency,
+  contributor growth. A fast-rising newcomer can outweigh a larger but stagnant
+  incumbent — don't anchor on raw size alone.
+- **Activity (30%)** — is it alive? Recency of commits/releases, issue response,
+  maintenance signals. Penalize abandoned/stale projects regardless of past size.
+- **Maturity (30%)** — is it proven? Age, release stability, production usage,
+  documentation depth. Penalize brand-new/unproven, but don't over-reward age alone.
+
+Judge each axis **high / medium / low** from whatever signals the source provides
+— you won't always have exact metrics; reason from what's available. For such
+items, add the optional `tool_momentum` / `tool_activity` / `tool_maturity` fields
+to the Recommendation YAML (see Step 5). Omit them for abstract ideas, patterns,
+or non-tool items.
+
 ### User Evaluation Framework
 
 For user-relevant items, read and apply the full evaluation framework from:
@@ -496,6 +517,10 @@ effort: Small              # Trivial | Small | Medium | Large
 scope: V4                  # V4 (current) | V5 (next) | Future | Never
 confidence: high           # low | medium | high
 architecture_impact: extends  # validates | extends | challenges | irrelevant
+# Optional — ONLY for concrete external tools/products/repos (see Step 3 rubric):
+tool_momentum: high        # high | medium | low — growth/adoption trend
+tool_activity: high        # high | medium | low — maintenance/recency
+tool_maturity: medium      # high | medium | low — proven/stable/age
 ```
 
 For **User-relevant** items, use this YAML block:
