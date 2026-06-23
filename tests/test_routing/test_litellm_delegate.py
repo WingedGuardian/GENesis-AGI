@@ -633,7 +633,7 @@ async def test_failure_logging_rate_limited():
         assert mock_logger.warning.call_count == 1  # Still 1, not 2
 
 
-# ── Per-provider params (extra litellm kwargs) — Groq EOL migration ─────────
+# ── Per-provider params (extra litellm kwargs) ─────────────────────────────
 
 
 def _config_with_params(params) -> RoutingConfig:

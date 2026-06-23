@@ -606,8 +606,6 @@ profiles:
     review_source: manual
 
   llama-3.3-70b:
-    # EOL 2026-08-16 (Groq decommission). groq-free migrated to gpt-oss-20b;
-    # no active provider references this profile. Kept for history/cost ref.
     display_name: "Llama 3.3 70B"
     provider: meta
     api_id: "meta-llama/llama-3.3-70b-versatile"
@@ -680,7 +678,7 @@ profiles:
     cost_per_mtok_out: 0.0
     latency: low
     strengths:
-      - strong reasoning (Groq's recommended Llama-3.3-70B replacement)
+      - strong reasoning (Groq production reasoning model)
       - JSON schema mode
       - tool use
     weaknesses:

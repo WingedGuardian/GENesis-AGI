@@ -13,11 +13,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 - **The dashboard Infrastructure card now labels the ambient-capture bridge as "Voice Bridge"** —
   a clearer, user-facing name. It still only appears when a voice/ambient edge is configured.
-- **Free-tier Groq routing migrated ahead of a Groq model shutdown.** Groq
-  decommissions Llama 3.3 70B on 2026-08-16, so the `groq-free` provider now runs
-  `openai/gpt-oss-20b` — faster and cheaper, still free. Reasoning output is kept
-  out of responses so nothing downstream changes. A stronger `groq-oss-120b`
-  option is also available for reasoning-heavy work.
 
 ### Fixed
 

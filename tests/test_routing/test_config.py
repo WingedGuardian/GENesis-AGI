@@ -125,7 +125,8 @@ def test_load_full_yaml(monkeypatch):
     # (cerebras disabled 2026-06 — reasoning-only models incompatible;
     # openrouter-deepseek-r1 removed entirely 2026-05-24;
     # nvidia-nim-deepseek + nvidia-nim-kimi added 2026-05-25)
-    # 2026-06-22: 28 → 29 after groq-oss-120b added (Groq EOL migration WS1).
+    # 2026-06-23: 28 → 29 after groq-oss-120b added (free reasoning option,
+    # not yet wired into any chain).
     assert len(cfg.providers) == 29
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
@@ -477,7 +478,7 @@ def test_dispatch_case_insensitive():
 
 
 # ---------------------------------------------------------------------------
-# Per-provider ``params`` (extra litellm kwargs) parsing — Groq EOL migration.
+# Per-provider ``params`` (extra litellm kwargs) parsing.
 # ---------------------------------------------------------------------------
 
 
