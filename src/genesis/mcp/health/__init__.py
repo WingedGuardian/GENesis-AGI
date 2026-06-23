@@ -66,6 +66,7 @@ from genesis.mcp.health import direct_session_tools as _direct_session_tools  # 
 from genesis.mcp.health import ego_calibration as _ego_calibration  # noqa: E402, F401
 from genesis.mcp.health import ego_tools as _ego_tools  # noqa: E402
 from genesis.mcp.health import errors as _errors  # noqa: E402
+from genesis.mcp.health import experiment_run as _experiment_run  # noqa: E402, F401
 from genesis.mcp.health import experiment_status as _experiment_status  # noqa: E402, F401
 from genesis.mcp.health import follow_up_tools as _follow_up_tools  # noqa: E402
 from genesis.mcp.health import inbox_digest as _inbox_digest  # noqa: E402
