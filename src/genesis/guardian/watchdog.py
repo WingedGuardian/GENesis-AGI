@@ -272,15 +272,31 @@ class GuardianWatchdog:
         if not isinstance(host_hash, str) or host_hash == "unknown":
             return  # Host hasn't been redeployed yet (pre-feature) — skip
 
-        # Compare (short hashes — prefix match)
-        if container_hash.startswith(host_hash) or host_hash.startswith(container_hash):
+        # The host records `deployed_commit` as the full deploy HEAD, while
+        # `container_hash` is the LAST commit touching Guardian paths. A deploy
+        # batch with non-Guardian commits landing after the last Guardian-touching
+        # one leaves the two unequal even though HEAD *contains* the Guardian
+        # commit — so test containment (ancestry), not equality.
+        contains = await self._host_contains_commit(container_hash, host_hash)
+        if contains is None:
+            # Unresolvable (e.g. host ahead on a commit the container's git hasn't
+            # fetched) — never false-alarm. The self-referential deploy of THIS
+            # file is also covered: it drifts only until the host redeploys, which
+            # DRIFT_ALERT_THRESHOLD absorbs.
+            logger.debug(
+                "Guardian code drift check unresolvable (container=%s host=%s) "
+                "— skipping", container_hash, host_hash,
+            )
+            return
+        if contains:
             if self._drift_count > 0:
                 logger.info("Guardian code drift resolved (container=%s host=%s)",
                             container_hash, host_hash)
             self._drift_count = 0
             return
 
-        # Drift detected
+        # Drift detected — host's deployed HEAD does NOT contain the container's
+        # latest Guardian-path commit (genuine staleness).
         self._drift_count += 1
         if self._drift_count >= self.DRIFT_ALERT_THRESHOLD and \
                 self._drift_count % self.DRIFT_ALERT_THRESHOLD == 0:
@@ -304,6 +320,44 @@ class GuardianWatchdog:
                     priority="high",
                     source="guardian_watchdog",
                 )
+
+    async def _host_contains_commit(
+        self, container_hash: str, host_hash: str,
+    ) -> bool | None:
+        """Whether the host's deployed HEAD CONTAINS the container's latest
+        Guardian-path commit (i.e. the host Guardian is current).
+
+        Returns True when ``container_hash`` is an ancestor of (or equal to)
+        ``host_hash`` — the host's deployed code includes the container's latest
+        Guardian-relevant commit. Returns False on a genuine miss (real drift —
+        the host lacks that commit). Returns None when the relationship can't be
+        resolved (e.g. the host is ahead on a commit the container's git doesn't
+        have yet) — the caller then skips, never false-alarms. Mirrors
+        ``_expected_gateway_sha``'s None-on-unresolvable contract. Split out so
+        tests can stub it / exercise the exit-code mapping directly.
+
+        ``git merge-base --is-ancestor`` exits 0 (is ancestor), 1 (is not), or
+        128 (unknown object). The mapping is EXPLICIT on purpose: a naive
+        ``returncode == 0`` would fold 128 into False and re-introduce a false
+        alarm whenever the host is legitimately ahead. Argument order is
+        load-bearing: ``container_hash`` (the purported ancestor) FIRST.
+        """
+        import asyncio
+
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["git", "-C", str(Path.home() / "genesis"),
+                 "merge-base", "--is-ancestor", container_hash, host_hash],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            return None  # subprocess/timeout failure → unresolvable → skip
+        if result.returncode == 0:
+            return True   # container's Guardian commit is in the host's HEAD
+        if result.returncode == 1:
+            return False  # genuinely not contained → real drift
+        return None       # 128 (unknown object — host ahead) / other → skip
 
     async def _expected_gateway_sha(self, code_version: str) -> str | None:
         """sha256 of the gateway script at the host's install-dir commit.

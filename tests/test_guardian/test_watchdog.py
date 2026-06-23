@@ -355,3 +355,164 @@ class TestExpectedGatewaySha:
         fake = MagicMock(returncode=0, stdout=b"")
         with patch("genesis.guardian.watchdog.subprocess.run", return_value=fake):
             assert await wd._expected_gateway_sha("abc1234") is None
+
+
+class TestHostContainsCommit:
+    """Direct coverage of the merge-base ancestry helper. The exit-code mapping
+    is load-bearing: a naive `returncode == 0` would fold 128 (host ahead) into
+    False and re-introduce a false alarm — the exact bug this fix removes."""
+
+    @pytest.mark.asyncio
+    async def test_ancestor_returns_true(self):
+        from unittest.mock import MagicMock
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None)
+        with patch("genesis.guardian.watchdog.subprocess.run",
+                   return_value=MagicMock(returncode=0)):
+            assert await wd._host_contains_commit("a915a28", "0a07272") is True
+
+    @pytest.mark.asyncio
+    async def test_not_ancestor_returns_false(self):
+        from unittest.mock import MagicMock
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None)
+        with patch("genesis.guardian.watchdog.subprocess.run",
+                   return_value=MagicMock(returncode=1)):
+            assert await wd._host_contains_commit("a915a28", "0ld0ld0") is False
+
+    @pytest.mark.asyncio
+    async def test_unknown_object_returns_none_not_false(self):
+        """exit 128 (host ahead — commit not in the container's git) MUST map to
+        None (skip), NOT False (which would false-alarm)."""
+        from unittest.mock import MagicMock
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None)
+        with patch("genesis.guardian.watchdog.subprocess.run",
+                   return_value=MagicMock(returncode=128)):
+            assert await wd._host_contains_commit("a915a28", "ffffff0") is None
+
+    @pytest.mark.asyncio
+    async def test_subprocess_exception_returns_none(self):
+        """A slow/raising git (e.g. TimeoutExpired) skips, never false-alarms."""
+        wd = GuardianWatchdog(AsyncMock(), event_bus=None)
+        with patch("genesis.guardian.watchdog.subprocess.run",
+                   side_effect=TimeoutError("slow git")):
+            assert await wd._host_contains_commit("a915a28", "0a07272") is None
+
+
+def _drift_watchdog(deployed_commit: str):
+    """Watchdog wired for code-drift tests: mock remote.version() → deployed_commit,
+    mock event_bus/outreach. `_host_contains_commit` is stubbed per-test."""
+    r = AsyncMock()
+    r.version = AsyncMock(return_value={"deployed_commit": deployed_commit})
+    event_bus = AsyncMock()
+    outreach = AsyncMock()
+    wd = GuardianWatchdog(r, event_bus=event_bus, outreach_queue=outreach)
+    return wd, r, event_bus, outreach
+
+
+def _git_side_effect(container_hash: str):
+    """subprocess.run side_effect for the two git calls _check_code_drift_inner
+    makes before the (stubbed) ancestry check: git log → container_hash, and
+    symbolic-ref → 'main'."""
+    from unittest.mock import MagicMock
+
+    def _run(cmd, **kw):
+        if "symbolic-ref" in cmd:
+            return MagicMock(returncode=0, stdout="main\n")
+        if "log" in cmd:
+            return MagicMock(returncode=0, stdout=container_hash + "\n")
+        return MagicMock(returncode=0, stdout="")
+
+    return _run
+
+
+class TestCodeDrift:
+    """Drift = host's deployed HEAD does NOT CONTAIN the container's latest
+    Guardian-path commit. Equality was wrong: a deploy batch with non-Guardian
+    commits landing after the last Guardian-touching one leaves HEAD != that
+    commit even though HEAD contains it (the false positive this fix removes)."""
+
+    @pytest.mark.asyncio
+    async def test_host_contains_commit_no_drift(self):
+        """Regression: container's Guardian commit IS an ancestor of host HEAD
+        (later non-Guardian commits advanced HEAD) → host current → NO drift,
+        NO false Telegram alarm — even after many ticks."""
+        wd, r, eb, outreach = _drift_watchdog(deployed_commit="0a07272")
+        wd._host_contains_commit = AsyncMock(return_value=True)
+        with patch("genesis.guardian.watchdog.subprocess.run",
+                   side_effect=_git_side_effect("a915a28")):
+            for _ in range(_THRESHOLD + 1):
+                await wd._check_code_drift_inner()
+        assert wd._drift_count == 0
+        outreach.enqueue.assert_not_called()
+        assert not any("code_drift" in e for e in _emitted_events(eb))
+        wd._host_contains_commit.assert_awaited()  # the ancestry path ran
+
+    @pytest.mark.asyncio
+    async def test_genuine_drift_alerts_at_threshold(self):
+        """Host genuinely missing the Guardian commit → quiet below threshold,
+        alerts exactly at the threshold tick (event bus + user-facing outreach)."""
+        wd, r, eb, outreach = _drift_watchdog(deployed_commit="0ld0ld0")
+        wd._host_contains_commit = AsyncMock(return_value=False)
+        with patch("genesis.guardian.watchdog.subprocess.run",
+                   side_effect=_git_side_effect("a915a28")):
+            for _ in range(_THRESHOLD - 1):
+                await wd._check_code_drift_inner()
+            outreach.enqueue.assert_not_called()   # below threshold: silent
+            await wd._check_code_drift_inner()       # tick == THRESHOLD
+        assert wd._drift_count == _THRESHOLD
+        assert any("code_drift" in e for e in _emitted_events(eb))
+        outreach.enqueue.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_skips_no_alarm(self):
+        """Ancestry unresolvable (host ahead / git error) → skip every tick,
+        never alarm, drift_count untouched."""
+        wd, r, eb, outreach = _drift_watchdog(deployed_commit="ffffff0")
+        wd._host_contains_commit = AsyncMock(return_value=None)
+        with patch("genesis.guardian.watchdog.subprocess.run",
+                   side_effect=_git_side_effect("a915a28")):
+            for _ in range(_THRESHOLD + 1):
+                await wd._check_code_drift_inner()
+        assert wd._drift_count == 0
+        outreach.enqueue.assert_not_called()
+        eb.emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_drift_then_resolved_resets(self):
+        """A genuine drift episode that later resolves (host catches up) resets
+        the counter — no 'stuck drifting' after recovery."""
+        wd, r, eb, outreach = _drift_watchdog(deployed_commit="0ld0ld0")
+        wd._host_contains_commit = AsyncMock(return_value=False)
+        with patch("genesis.guardian.watchdog.subprocess.run",
+                   side_effect=_git_side_effect("a915a28")):
+            for _ in range(_THRESHOLD):
+                await wd._check_code_drift_inner()
+            assert wd._drift_count == _THRESHOLD
+            wd._host_contains_commit = AsyncMock(return_value=True)  # host caught up
+            await wd._check_code_drift_inner()
+        assert wd._drift_count == 0
+
+    @pytest.mark.asyncio
+    async def test_exit_128_full_chain_skips_no_alarm(self):
+        """End-to-end on the most dangerous path: the REAL _host_contains_commit
+        (not stubbed) with merge-base exit 128 (host ahead) must map through to a
+        skip, never a false alarm. Guards the 128->False misimplementation across
+        the whole chain (git 128 -> helper None -> drift check skips)."""
+        from unittest.mock import MagicMock
+        wd, r, eb, outreach = _drift_watchdog(deployed_commit="ffffff0")
+
+        def _side_effect(cmd, **kw):
+            if "symbolic-ref" in cmd:
+                return MagicMock(returncode=0, stdout="main\n")
+            if "log" in cmd:
+                return MagicMock(returncode=0, stdout="a915a28\n")
+            if "merge-base" in cmd:
+                return MagicMock(returncode=128)  # unknown object — host ahead
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("genesis.guardian.watchdog.subprocess.run",
+                   side_effect=_side_effect):
+            for _ in range(_THRESHOLD + 1):
+                await wd._check_code_drift_inner()
+        assert wd._drift_count == 0
+        outreach.enqueue.assert_not_called()
+        assert not any("code_drift" in e for e in _emitted_events(eb))
