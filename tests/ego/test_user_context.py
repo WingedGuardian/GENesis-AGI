@@ -803,11 +803,22 @@ class TestUserEgoContextBuilder:
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             ("f1", "recon", "finding", "finding", "Interesting article", "medium", 0, old_date),
         )
+        # A genuine user_world item — counts toward "Awaiting user input".
         await db.execute(
             "INSERT INTO follow_ups "
-            "(id, source, content, strategy, status, priority, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("fu1", "ego", "Review draft", "user_input_needed", "pending", "high", old_date),
+            "(id, source, content, strategy, status, priority, domain, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("fu1", "ego", "Review draft", "user_input_needed", "pending",
+             "high", "user_world", old_date),
+        )
+        # An internal item under the SAME strategy must NOT inflate the user
+        # backlog — PR3 scopes the "Awaiting user input" counter to user_world.
+        await db.execute(
+            "INSERT INTO follow_ups "
+            "(id, source, content, strategy, status, priority, domain, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("fu2", "foreground_session", "Fix internal bug", "user_input_needed",
+             "pending", "high", "internal", old_date),
         )
         builder = UserEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
@@ -817,6 +828,7 @@ class TestUserEgoContextBuilder:
         assert "**Inbox**: 2 pending" in result
         assert "6d ago" in result
         assert "**Recon findings**: 1 pending" in result
+        # Only the user_world item is counted (internal fu2 excluded).
         assert "**Awaiting user input**: 1 pending" in result
 
     @pytest.mark.asyncio

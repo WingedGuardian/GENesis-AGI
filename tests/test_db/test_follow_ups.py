@@ -236,3 +236,89 @@ async def test_update_status_batch_rejects_invalid_status(db):
     fid = await follow_ups.create(db, **_BASE)
     with pytest.raises(ValueError):
         await follow_ups.update_status_batch(db, [fid], "cancelled")
+
+
+# ─── PR3: exact-match domain scoping on the reader queries ───────────────────
+# Each reader gains an optional exact-match `domain`. Two guarantees per reader:
+#   (1) domain="user_world" returns ONLY user_world rows (NULL excluded);
+#   (2) domain=None (or omitted) returns IDENTICAL rows to before — the
+#       load-bearing backward-compat claim for every untouched caller.
+
+
+async def _seed_pending_domains(db):
+    """One pending follow-up per domain. Returns {domain_key: id}."""
+    return {
+        "internal": await follow_ups.create(
+            db, **{**_BASE, "content": "internal item"}, domain="internal",
+        ),
+        "user_world": await follow_ups.create(
+            db, **{**_BASE, "content": "user item"}, domain="user_world",
+        ),
+        "null": await follow_ups.create(
+            db, **{**_BASE, "content": "unclassified item"},
+        ),
+    }
+
+
+async def test_get_pending_domain_exact_match(db):
+    ids = await _seed_pending_domains(db)
+    scoped = {r["id"] for r in await follow_ups.get_pending(db, domain="user_world")}
+    assert scoped == {ids["user_world"]}  # NULL + internal excluded
+
+
+async def test_get_pending_domain_none_is_noop(db):
+    ids = await _seed_pending_domains(db)
+    explicit_none = {r["id"] for r in await follow_ups.get_pending(db, domain=None)}
+    unscoped = {r["id"] for r in await follow_ups.get_pending(db)}
+    assert explicit_none == unscoped == set(ids.values())
+
+
+async def test_get_by_status_domain_exact_match(db):
+    ids = await _seed_pending_domains(db)
+    scoped = {
+        r["id"] for r in await follow_ups.get_by_status(db, "pending", domain="user_world")
+    }
+    assert scoped == {ids["user_world"]}
+    unscoped = {r["id"] for r in await follow_ups.get_by_status(db, "pending")}
+    assert unscoped == set(ids.values())  # backward-compat no-op
+
+
+async def test_get_actionable_domain_exact_match(db):
+    ids = await _seed_pending_domains(db)
+    scoped = {r["id"] for r in await follow_ups.get_actionable(db, domain="user_world")}
+    assert scoped == {ids["user_world"]}
+    unscoped = {r["id"] for r in await follow_ups.get_actionable(db)}
+    assert unscoped == set(ids.values())  # backward-compat no-op
+
+
+async def test_get_recently_completed_domain_exact_match(db):
+    int_id = await follow_ups.create(
+        db, **{**_BASE, "content": "int done"}, domain="internal",
+    )
+    uw_id = await follow_ups.create(
+        db, **{**_BASE, "content": "uw done"}, domain="user_world",
+    )
+    null_id = await follow_ups.create(db, **{**_BASE, "content": "null done"})
+    await follow_ups.update_status(db, int_id, "completed")
+    await follow_ups.update_status(db, uw_id, "completed")
+    await follow_ups.update_status(db, null_id, "completed")
+
+    scoped = [r["content"] for r in await follow_ups.get_recently_completed(db, domain="user_world")]
+    assert scoped == ["uw done"]  # internal + NULL excluded (NB: result has no domain col)
+    unscoped = {r["content"] for r in await follow_ups.get_recently_completed(db)}
+    assert unscoped == {"int done", "uw done", "null done"}  # NULL survives unscoped no-op
+
+
+async def test_get_actionable_domain_excludes_pinned_internal(db):
+    """A PINNED internal row is still excluded by domain='user_world'. Locks the
+    PR3 decision that pinned/high-priority cross-domain items re-home to the
+    cockpit, NOT the user (CEO) ego."""
+    uw = await follow_ups.create(
+        db, **{**_BASE, "content": "user item"}, domain="user_world",
+    )
+    pinned_internal = await follow_ups.create(
+        db, **{**_BASE, "content": "pinned internal"}, domain="internal", pinned=True,
+    )
+    ids = {r["id"] for r in await follow_ups.get_actionable(db, domain="user_world")}
+    assert ids == {uw}
+    assert pinned_internal not in ids

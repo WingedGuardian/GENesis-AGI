@@ -71,6 +71,12 @@ class UserGoalStalenessCollector:
                 "SELECT created_at FROM follow_ups "
                 "WHERE strategy = 'user_input_needed' "
                 "AND status IN ('pending', 'blocked') "
+                # Strict user_world so this measures genuine USER-goal staleness,
+                # not internal-dev backlog parked under user_input_needed. NOTE:
+                # this signal feeds the Light-reflection scorer, so scoping it
+                # (correctly) lowers its value and softens Light-reflection
+                # cadence — an intended de-biasing, not a side effect.
+                "AND domain = 'user_world' AND kind = 'follow_up' "
                 "ORDER BY created_at ASC LIMIT 1"
             )
             row = await cursor.fetchone()
