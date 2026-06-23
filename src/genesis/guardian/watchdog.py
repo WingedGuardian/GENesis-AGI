@@ -442,12 +442,15 @@ class GuardianWatchdog:
 
         Returns None when no successful update is recorded (no baseline → the
         caller skips, never false-alarms). Best-effort: any DB failure → None.
-        Function-level imports keep ``genesis.db`` off the host's import path
-        (this watchdog is container-side only — see guardian/DEPLOYMENT.md).
+        The SQL lives in ``genesis.db.crud.update_history`` (CRUD-layer reader);
+        all imports are function-level so ``genesis.db`` stays off the host's
+        import path (this watchdog is container-side only — see
+        guardian/DEPLOYMENT.md), with connection management kept here.
         """
         import aiosqlite
 
         from genesis.db.connection import BUSY_TIMEOUT_MS
+        from genesis.db.crud import update_history
         from genesis.env import genesis_db_path
 
         db_path = genesis_db_path()
@@ -456,18 +459,9 @@ class GuardianWatchdog:
         try:
             async with aiosqlite.connect(str(db_path)) as db:
                 await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-                cur = await db.execute(
-                    "SELECT new_commit FROM update_history "
-                    "WHERE status = 'success' AND new_commit IS NOT NULL "
-                    # datetime() normalizes the ISO timestamp (incl. tz offset)
-                    # to UTC so mixed-offset rows order by true instant, not
-                    # lexicographically.
-                    "ORDER BY datetime(started_at) DESC LIMIT 1",
-                )
-                row = await cur.fetchone()
+                return await update_history.last_successful_deploy_commit(db)
         except Exception:
             return None
-        return str(row[0]).strip() if row and row[0] else None
 
     async def _expected_gateway_sha(self, code_version: str) -> str | None:
         """sha256 of the gateway script at the host's install-dir commit.
