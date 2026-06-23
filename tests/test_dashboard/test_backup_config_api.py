@@ -127,10 +127,12 @@ def test_set_writes_env_and_installs_cron(client):
     assert written["GENESIS_BACKUP_REPO"] == "https://github.com/u/backups.git"
     assert written["GENESIS_BACKUP_TIER2_BACKEND"] == "local"
     assert written["GENESIS_BACKUP_LOCAL_PATH"] == "/mnt/bk"
-    # cron wrapper invoked with install + the schedule
+    # cron wrapper invoked with install; the schedule is passed via the
+    # environment (never the argv), and the wrapper path is correct.
     cmd = run.call_args.args[0]
-    assert "install" in cmd and "0 */6 * * *" in cmd
+    assert "install" in cmd and "0 */6 * * *" not in cmd
     assert cmd[1].endswith("manage_backup_cron.sh")
+    assert run.call_args.kwargs["env"]["GENESIS_BACKUP_CRON_SCHEDULE"] == "0 */6 * * *"
 
 
 def test_set_schedule_disabled_removes_cron(client):

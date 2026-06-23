@@ -288,13 +288,18 @@ def backup_config_set():
     schedule_result: str | None = None
     if cron_action is not None:
         action, expr = cron_action
+        # The schedule (already validated by _valid_cron) is passed via the
+        # environment, NOT the argv — user-derived data never reaches the
+        # command line. The wrapper re-validates it before use.
         cmd = ["bash", str(_CRON_SCRIPT), action]
+        env = os.environ.copy()
         if expr:
-            cmd.append(expr)
+            env["GENESIS_BACKUP_CRON_SCHEDULE"] = expr
         try:
             # Local crontab op with no external watchdog — a hung crontab would
             # block this request thread, so a short bound is justified here.
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=15, env=env)
         except (subprocess.TimeoutExpired, OSError) as exc:
             logger.error("Backup cron update failed: %s", exc, exc_info=True)
             return jsonify({"error": "Failed to update backup schedule"}), 500

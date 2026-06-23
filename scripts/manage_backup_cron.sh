@@ -24,7 +24,13 @@ _crontab_without_backup() {
 
 case "$ACTION" in
     install)
-        SCHED="${2:?cron schedule required}"
+        # Schedule comes from the env (dashboard path — keeps user data off the
+        # argv) or from arg 2 (manual CLI use).
+        SCHED="${GENESIS_BACKUP_CRON_SCHEDULE:-${2:-}}"
+        if [ -z "$SCHED" ]; then
+            echo "cron schedule required (GENESIS_BACKUP_CRON_SCHEDULE or arg 2)" >&2
+            exit 2
+        fi
         # Defence in depth (the caller validates too): exactly 5 fields, and
         # only the safe cron charset — no shell metacharacters, no newlines.
         if [ "$(printf '%s' "$SCHED" | awk '{print NF}')" -ne 5 ]; then
