@@ -134,6 +134,20 @@ async def init(rt: GenesisRuntime) -> None:
             logger.error("Unexpected error wiring SkillSecurityScanJob", exc_info=True)
             await _degraded(rt, "SkillSecurityScanJob")
 
+        try:
+            from genesis.recon.github_discovery import GitHubDiscoveryJob
+            gh_discovery_job = GitHubDiscoveryJob(
+                db=rt._db, router=getattr(rt, "_router", None),
+            )
+            rt._surplus_scheduler.set_github_discovery_job(gh_discovery_job)
+            logger.info("GitHubDiscoveryJob wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire GitHubDiscoveryJob", exc_info=True)
+            await _degraded(rt, "GitHubDiscoveryJob")
+        except Exception:
+            logger.error("Unexpected error wiring GitHubDiscoveryJob", exc_info=True)
+            await _degraded(rt, "GitHubDiscoveryJob")
+
         await rt._surplus_scheduler.start()
         logger.info("Genesis surplus scheduler started")
 

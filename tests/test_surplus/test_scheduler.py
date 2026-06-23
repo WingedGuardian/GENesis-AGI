@@ -180,6 +180,21 @@ async def test_start_registers_skill_security_scan(db):
     await sched.stop()
 
 
+async def test_start_registers_github_discovery(db):
+    """A wired GitHubDiscoveryJob registers its weekly cron job on start().
+
+    Locks the scheduler wiring: start() resolves CronTrigger / user_timezone and
+    registers the job under id 'github_discovery'. A CronTrigger job does not
+    enqueue surplus tasks, so sibling pending_count assertions are unaffected.
+    """
+    sched, compute = _make_scheduler(db, idle=True)
+    sched.set_github_discovery_job(AsyncMock())
+    with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):
+        await sched.start()
+    assert sched._scheduler.get_job("github_discovery") is not None
+    await sched.stop()
+
+
 async def test_schedule_code_audit_noop_when_disabled(db):
     sched, compute = _make_scheduler(db, idle=True, enable_code_audits=False)
     # Direct call should be a no-op
