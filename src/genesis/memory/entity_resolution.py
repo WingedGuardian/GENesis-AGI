@@ -34,6 +34,14 @@ LLM_CHECK_FLOOR: float = 0.85
 MAX_ENTITY_CHECKS_PER_RUN: int = 50
 CALL_SITE_ID: str = "dream_cycle_entity_check"
 
+# Evidence gate for auto-merge (spec ③). A ≥0.95-cosine pair auto-merges only
+# when its multi-signal evidence strength clears this floor; below it, the pair
+# is flagged for review instead of being silently deprecated. Calibrated
+# against 1727 historical auto-merges: at 0.30 the gate blocks ~5% of merges,
+# entirely within the 0.95–0.96 suspect band, and never blocks a ≥0.98
+# near-identical pair (see PR for the calibration replay).
+EVIDENCE_THRESHOLD: float = 0.30
+
 _ALIAS_PATH = Path(
     os.environ.get(
         "GENESIS_ENTITY_ALIASES",
@@ -199,6 +207,110 @@ def _find_dedup_candidates_sync(
             candidates.append((point, point_b, hit["score"]))
 
     return candidates
+
+
+# ── Evidence Gate (spec ③) ───────────────────────────────────────────────
+
+
+def _parse_created_at(payload: dict) -> datetime | None:
+    """Parse a payload's ``created_at`` ISO timestamp; None on absence/garbage."""
+    ts = payload.get("created_at")
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+
+
+def compute_evidence_strength(
+    payload_a: dict,
+    payload_b: dict,
+    cosine: float,
+) -> tuple[float, dict[str, Any]]:
+    """Multi-signal evidence score in ``[0, 1]`` for an auto-merge candidate.
+
+    Higher = safer to auto-merge. The auto-merge gate flags (not merges) a
+    pair whose strength is below :data:`EVIDENCE_THRESHOLD`.
+
+    Coincident-weakness design (calibrated against 1727 historical merges):
+    cosine is the dominant term so near-identical text keeps a strong floor and
+    always clears the gate regardless of the other signals. Temporal closeness
+    and confidence are *capped* modifiers — neither can block on its own; only
+    coincident weakness (e.g. floor cosine AND far apart) drops below the gate.
+    The load-bearing factor is an intentional bar-raiser (a heavily-retrieved
+    memory needs more corroboration before deprecation), not a "weakness".
+    Absent payload fields resolve to neutral and never block on their own (so
+    sparse payloads keep merging as before).
+
+    Returns ``(strength, signals)`` where ``signals`` is an audit-friendly
+    breakdown (cosine, temporal distance in days, mean confidence, max
+    retrieved_count).
+    """
+    def clamp01(x: float) -> float:
+        return max(0.0, min(1.0, x))
+
+    conf_a = payload_a.get("confidence")
+    conf_b = payload_b.get("confidence")
+    conf_a = 0.5 if conf_a is None else conf_a
+    conf_b = 0.5 if conf_b is None else conf_b
+    conf_mean = (conf_a + conf_b) / 2.0
+
+    rc_max = max(payload_a.get("retrieved_count") or 0,
+                 payload_b.get("retrieved_count") or 0)
+
+    dt_a = _parse_created_at(payload_a)
+    dt_b = _parse_created_at(payload_b)
+    if dt_a is not None and dt_b is not None:
+        dt_days: float | None = abs((dt_a - dt_b).total_seconds()) / 86400.0
+        s_temporal = clamp01(1.0 - dt_days / 30.0)  # 0d→1, 30d→0
+    else:
+        dt_days = None
+        s_temporal = 0.7  # unknown timestamps → mildly supportive (neutral)
+
+    s_cos = clamp01((cosine - 0.95) / 0.045)   # 0.95→0, 0.995→1 (dominant)
+    s_conf = clamp01((conf_mean - 0.5) / 0.4)  # 0.5(default)→0, 0.9→1
+    s_load = 1.0 if rc_max < 5 else 0.5        # heavily-retrieved → raise the bar
+
+    strength = clamp01(
+        0.45 * s_cos + 0.25 * s_temporal + 0.15 * s_conf + 0.15 * s_load
+    )
+    signals = {
+        "cosine": round(cosine, 4),
+        "dt_days": round(dt_days, 2) if dt_days is not None else None,
+        "conf_mean": round(conf_mean, 3),
+        "retrieved_count_max": rc_max,
+    }
+    return strength, signals
+
+
+def pick_duplicate_survivor(
+    id_a: str,
+    payload_a: dict,
+    dt_a: datetime,
+    id_b: str,
+    payload_b: dict,
+    dt_b: datetime,
+) -> tuple[str, str]:
+    """Pick ``(survivor_id, deprecated_id)`` for a CONFIRMED-DUPLICATE pair.
+
+    Prefers the more-retrieved (load-bearing) memory as survivor even when it is
+    the older one — duplicates carry ~identical content, so we keep the
+    established memory rather than deprecating one that is actively used. Ties
+    break to the newer memory (prior behavior).
+
+    For duplicate paths only (auto_merge / llm_merge). The contradiction /
+    succeeded_by path keeps temporal survivorship (newer supersedes older) and
+    must NOT be routed through here.
+    """
+    rc_a = payload_a.get("retrieved_count") or 0
+    rc_b = payload_b.get("retrieved_count") or 0
+    if rc_a > rc_b:
+        return id_a, id_b
+    if rc_b > rc_a:
+        return id_b, id_a
+    return (id_a, id_b) if dt_a >= dt_b else (id_b, id_a)
 
 
 # ── Semantic Overlap Checker ─────────────────────────────────────────────
