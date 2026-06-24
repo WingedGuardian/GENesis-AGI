@@ -127,7 +127,8 @@ def test_load_full_yaml(monkeypatch):
     # nvidia-nim-deepseek + nvidia-nim-kimi added 2026-05-25)
     # 2026-06-23: 28 → 29 after groq-oss-120b added (free reasoning option,
     # not yet wired into any chain).
-    assert len(cfg.providers) == 29
+    # 2026-06-23 (WS2b): 29 → 28 after removing expired openrouter-trinity-free.
+    assert len(cfg.providers) == 28
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
