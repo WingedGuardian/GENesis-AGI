@@ -134,16 +134,18 @@ def _get_embedder():
 async def _store_judged_procedure(
     db: aiosqlite.Connection,
     data: dict,
+    router: object,
     *,
     source_type: str,
     source_session_id: str | None = None,
 ) -> str | None:
-    """Run novelty check, then store via store_procedure_checked.
+    """Run the scoping + novelty checks, then store via store_procedure_checked.
 
-    Returns procedure ID on success, None on skip/duplicate.
+    Returns procedure ID on success, None on skip/duplicate/directive.
     """
     from genesis.learning.procedural.extractor import _principle_is_novel
     from genesis.learning.procedural.operations import store_procedure_checked
+    from genesis.learning.procedural.scoping import is_behavioral_directive
 
     task_type = data["task_type"]
     principle = data["principle"]
@@ -160,6 +162,15 @@ async def _store_judged_procedure(
         tools_used = [tools_used]
     if isinstance(context_tags, str):
         context_tags = [context_tags]
+
+    # Scoping gate: behavioral DIRECTIVES (general working-style rules — confidence,
+    # due diligence, planning cadence) belong in CLAUDE.md, not the procedure store,
+    # and are the dominant near-duplicate source. Fails open to "keep" on any
+    # classifier error — never suppress a real procedure.
+    if await is_behavioral_directive(
+        router, task_type=task_type, principle=principle, steps=steps,
+    ):
+        return None
 
     # Cosine novelty check
     embedder = _get_embedder()
@@ -271,7 +282,7 @@ async def judge_struggle_procedure(
         return None
 
     return await _store_judged_procedure(
-        db, data,
+        db, data, router,
         source_type="struggle_extraction",
         source_session_id=source_session_id,
     )
@@ -315,7 +326,7 @@ async def judge_extraction_candidate(
         return None
 
     return await _store_judged_procedure(
-        db, data,
+        db, data, router,
         source_type="extraction_pipeline",
         source_session_id=source_session_id,
     )

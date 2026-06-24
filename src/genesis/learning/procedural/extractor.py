@@ -250,6 +250,20 @@ async def extract_procedure(
         logger.warning("Procedure extraction: missing required fields in %s", list(data.keys()))
         return None
 
+    # Scoping gate: behavioral DIRECTIVES (general working-style rules) belong in
+    # CLAUDE.md, not the procedure store, and are the dominant near-duplicate source.
+    # Fails open to "keep" on any classifier error — never suppress a real procedure.
+    from genesis.learning.procedural.scoping import is_behavioral_directive
+
+    if await is_behavioral_directive(
+        router, task_type=data["task_type"], principle=data["principle"], steps=data["steps"],
+    ):
+        logger.info(
+            "Extraction: skipping behavioral directive %s (belongs in CLAUDE.md)",
+            data["task_type"],
+        )
+        return None
+
     # Skip if an explicit-teach procedure already covers this task_type
     try:
         from genesis.db.crud.procedural import find_by_task_type
