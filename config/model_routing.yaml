@@ -348,6 +348,8 @@ call_sites:
     cc_model: Sonnet
   17_executor_review:
     chain:
+    - nvidia-nim-deepseek
+    - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - openrouter-qwen36plus
     default_paid: true
@@ -361,6 +363,7 @@ call_sites:
   20_adversarial_counterargument:
     chain:
     - openrouter-gpt55
+    - nvidia-nim-deepseek
     - openrouter-deepseek-v4
     - openrouter-qwen36plus
     default_paid: true
@@ -476,6 +479,8 @@ call_sites:
     description: Synthesize research results into concise summaries
   38_procedure_extraction:
     chain:
+    - nvidia-nim-deepseek
+    - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - groq-free
     - mistral-large-free
@@ -490,6 +495,8 @@ call_sites:
     description: "Unified cognitive loop focus selector — picks ego attention direction from pending signals"
   43_task_retrospective:
     chain:
+    - nvidia-nim-deepseek
+    - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - mistral-large-free
     - gemini-free
@@ -497,6 +504,8 @@ call_sites:
     description: Post-execution retrospective learning extraction
   44_task_premortem:
     chain:
+    - nvidia-nim-deepseek
+    - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - mistral-large-free
     - gemini-free
@@ -645,6 +654,7 @@ call_sites:
       \ grader is slow/down) and sheds under REDUCED degradation."
   judge:
     chain:
+    - nvidia-nim-deepseek
     - openrouter-deepseek-v4
     - openrouter-deepseek-v4-flash
     default_paid: true
@@ -652,7 +662,7 @@ call_sites:
     dispatch: api
     description: "LLM-as-judge primitive \u2014 grades outputs against versioned\
       \ rubrics for the eval harness (and, in later phases, CRAG retrieval).\
-      \ Same-family fallback (v4 then v4-flash) for resilience; model_used\
+      \ Free NIM v4-pro first, then paid v4-pro, then v4-flash for resilience; model_used\
       \ is logged per judgment for calibration traceability."
   voice_conversation:
     chain:
