@@ -362,9 +362,12 @@ async def _compute_system_composite(
     obs_influenced = row["influenced"] if row else 0
     obs_influence_pct = round(obs_influenced / obs_total, 4) if obs_total else None
 
-    # Procedure mean confidence
+    # Procedure mean confidence — VALIDATED procedures only. Speculative
+    # candidates (extracted at confidence ≈ 0, never invoked) measure extraction
+    # volume, not knowledge quality; including them tanked this composite signal.
     cursor = await db.execute(
-        "SELECT AVG(confidence) as avg_conf FROM procedural_memory WHERE deprecated = 0",
+        "SELECT AVG(confidence) as avg_conf FROM procedural_memory "
+        "WHERE deprecated = 0 AND speculative = 0",
     )
     row = await cursor.fetchone()
     proc_mean_conf = round(row["avg_conf"], 4) if row and row["avg_conf"] else None
@@ -530,9 +533,12 @@ async def _compute_procedural_effectiveness(
     outcome_total = len(outcomes)
     success_rate = round(successes / outcome_total, 4) if outcome_total else None
 
-    # Overall procedure stats
+    # Overall procedure stats. total counts the whole store (consistent with
+    # tier_distribution below); mean_confidence averages VALIDATED procedures
+    # only (speculative candidates start at ≈0 and would mask real quality).
     cursor = await db.execute(
-        """SELECT COUNT(*) as total, AVG(confidence) as avg_conf
+        """SELECT COUNT(*) as total,
+                  AVG(CASE WHEN speculative = 0 THEN confidence END) as avg_conf
         FROM procedural_memory WHERE deprecated = 0""",
     )
     row = await cursor.fetchone()
