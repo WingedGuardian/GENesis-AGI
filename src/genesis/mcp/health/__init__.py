@@ -62,6 +62,7 @@ from genesis.mcp.health import campaign_tools as _campaign_tools  # noqa: E402, 
 from genesis.mcp.health import codebase as _codebase  # noqa: E402
 from genesis.mcp.health import cognitive_ledger_tools as _cognitive_ledger_tools  # noqa: E402, F401
 from genesis.mcp.health import db_schema as _db_schema  # noqa: E402
+from genesis.mcp.health import deliberation_tools as _deliberation_tools  # noqa: E402
 from genesis.mcp.health import direct_session_tools as _direct_session_tools  # noqa: E402
 from genesis.mcp.health import ego_calibration as _ego_calibration  # noqa: E402, F401
 from genesis.mcp.health import ego_tools as _ego_tools  # noqa: E402
@@ -95,6 +96,7 @@ update_history = _update_history
 
 _impl_codebase_navigate = _codebase._impl_codebase_navigate
 _impl_db_schema = _db_schema._impl_db_schema
+_impl_deliberate = _deliberation_tools._impl_deliberate
 _impl_health_errors = _errors._impl_health_errors
 _impl_health_alerts = _errors._impl_health_alerts
 _impl_bootstrap_manifest = _manifest._impl_bootstrap_manifest
