@@ -83,7 +83,7 @@ def _resolve_canonical_base_prompt() -> str:
     resolved = _resolve_prompt_in_dir(Depth.DEEP, _DEFAULT_PROMPT_DIR)
     if resolved is not None:
         return resolved
-    return _FALLBACK_PROMPTS.get(Depth.DEEP, _FALLBACK_PROMPTS[Depth.DEEP])
+    return _FALLBACK_PROMPTS[Depth.DEEP]
 
 
 async def promote_evo_winner(

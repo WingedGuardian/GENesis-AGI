@@ -503,6 +503,18 @@ class TestProcessExecutionBriefs:
         prop = await ego_crud.get_proposal(db, "prop_cvp")
         assert prop["status"] == "approved"  # untouched by the dispatch path
 
+    async def test_cognitive_variant_not_dispatched_by_sweep(
+        self, ego_with_runner, mock_direct_runner, db,
+    ):
+        """The OTHER dispatch path — the approved-proposal sweep — must also skip
+        cognitive_variant_promotion (the blocklist fires before any spawn)."""
+        await self._insert_proposal(
+            db, "prop_cvp_sweep", action_type="cognitive_variant_promotion",
+        )
+        await ego_with_runner.sweep_approved_proposals()
+        mock_direct_runner.spawn.assert_not_called()
+        assert (await ego_crud.get_proposal(db, "prop_cvp_sweep"))["status"] == "approved"
+
 
 def test_never_dispatch_action_types_single_source_of_truth():
     """Both dispatch paths (sweep + execution-briefs) read this one tuple.

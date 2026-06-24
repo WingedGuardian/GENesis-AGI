@@ -126,6 +126,56 @@ async def test_missing_full_prompt_refused(db, overlay_dir):
     assert (await ego_crud.get_proposal(db, prop["id"]))["status"] == "executed"
 
 
+async def test_full_promote_approve_apply_rollback_e2e(db, overlay_dir, tmp_path):
+    """Decisive E2E (real functions, no mocks for the apply path): an Evo winner
+    is filed as a recommend-only proposal, the user approves it, the overlay is
+    written + goes live to the reflection bridge, and rollback reverts it."""
+    from genesis.experimentation.evo import EvoResult
+    from genesis.experimentation.types import CognitiveVariant
+    from genesis.learning import cognitive_ledger
+    from genesis.mcp.health.evo_run import promote_evo_winner
+
+    winner_prompt = "CANONICAL DEEP PROMPT\n\nbe more concise"
+    result = EvoResult(
+        winner=CognitiveVariant(
+            name="evo_v0", description="be more concise", system_prompt=winner_prompt,
+        ),
+        winner_winrate={"recommendation": "treatment_wins", "p_value": 0.002},
+        holdout_winrate={"recommendation": "treatment_wins", "p_value": 0.01,
+                         "treatment_mean_score": 0.82, "control_mean_score": 0.70},
+        candidates_evaluated=6, survivors=2, note="confirmed", holdout_disjoint=True,
+    )
+    overlay = overlay_dir / _OVERLAY_FILENAME
+
+    # 1. Evo files the winner — recommend-only: NOTHING is applied yet.
+    pid = await promote_evo_winner(
+        db, result, gen_provider="cc-haiku", judge_provider="groq-free",
+    )
+    assert pid is not None
+    assert not overlay.exists()
+
+    # 2. The user approves → the resolution site resolves to 'approved' then
+    #    runs the apply hook (mirrors all 4 wired resolution sites).
+    await ego_crud.resolve_proposal(db, pid, status="approved")
+    prop = await ego_crud.get_proposal(db, pid)
+    assert await handle_cognitive_variant_resolution(db, prop, "approved") is True
+    assert (await ego_crud.get_proposal(db, pid))["status"] == "executed"
+
+    # 3. The overlay is written AND live (the bridge reads it ahead of the repo).
+    assert overlay.read_text() == winner_prompt
+    empty_repo = tmp_path / "repo_identity"
+    empty_repo.mkdir()
+    assert system_prompt_for_depth(Depth.DEEP, empty_repo) == winner_prompt
+
+    # 4. Rollback reverts — overlay removed, no longer live.
+    rows = await cognitive_ledger.recent(db, limit=1, actor="evo_promotion")
+    assert rows, "ledger should have recorded the promotion"
+    res = await cognitive_ledger.rollback(db, rows[0]["id"])
+    assert res["ok"] is True
+    assert not overlay.exists()
+    assert system_prompt_for_depth(Depth.DEEP, empty_repo) != winner_prompt
+
+
 def test_handler_wired_into_all_resolution_paths():
     """Every proposal-resolution entry point MUST call the cognitive-variant
     apply hook, or an approval there silently no-ops (the prompt is never
