@@ -1,21 +1,23 @@
 """Fusion backend — OpenRouter Fusion (a server-side panel-of-models + judge).
 
-Two modes, both probe-confirmed live (2026-06-24):
+Two modes × two presets, all probe-confirmed live (2026-06-24):
 
-- **synthesis** (default, fast ~47s, ~$0.16): the `openrouter/fusion` model-slug. A meta-model
-  synthesizes the panel into a prose verdict in ``message.content``. It IGNORES output-format
-  instructions, so we take its markdown as the ``answer`` (consensus/dissent stay empty — the
-  disagreement is woven into the prose).
-- **analysis** (deep ~170s, ~$0.12): a free, tool-capable orchestrator + the Fusion *server-tool*
-  (`tools:[{"type":"openrouter:fusion"}]`, `tool_choice:"required"`, passed via extra_body so litellm
-  doesn't drop the non-standard tool). The orchestrator runs the panel, then — because it IS a normal
-  instruct model that honors a system prompt — returns machine-structured JSON
-  {answer, consensus, dissent[], blind_spots[], confidence}.
+- **synthesis** (default, fast): the `openrouter/fusion` model-slug → a synthesized prose verdict in
+  ``message.content`` (the meta-model IGNORES output-format prompts, so we take its markdown as the
+  ``answer``; consensus/dissent stay empty). Default preset: **budget**.
+- **analysis** (deep): a free, tool-capable orchestrator + the Fusion *server-tool*
+  (`tools:[{"type":"openrouter:fusion"}]`, `tool_choice:"required"`, via extra_body) → the orchestrator
+  (a normal instruct model that honors a JSON system prompt) returns machine-structured
+  {answer, consensus, dissent[], blind_spots[], confidence}. Default preset: **strong**.
 
-We call litellm directly (not the Router) to own the request shape, cost, and error handling — a
-documented exception to route-everything, justified by deliberate()'s structured-synthesis value.
-An explicit ``max_tokens`` is REQUIRED (litellm's 65536 default trips an OpenRouter 402); cost is read
-from ``response.usage.cost`` (``litellm.completion_cost`` can't price these aggregator strings).
+Presets control the panel (who deliberates): **strong** → OpenRouter's `general-high` (strongest panel);
+**budget** → `general-budget` (mid-tier panel, cheaper). Passed via the fusion `plugins` entry
+(synthesis) or the server-tool `parameters` (analysis). Verified: budget → sonnet-3.5/gpt-4o/gemini-1.5.
+
+We call `litellm.acompletion` directly (a documented exception to routing via the Router) to own the
+request shape and read side data: an explicit ``max_tokens`` is REQUIRED (litellm's 65536 default trips
+an OpenRouter 402); cost is read from ``response.usage.cost`` (``litellm.completion_cost`` can't price
+these aggregator strings).
 """
 
 from __future__ import annotations
@@ -37,11 +39,19 @@ logger = logging.getLogger(__name__)
 _MODEL = "openrouter/openrouter/fusion"
 # analysis: a free, tool-capable orchestrator that calls the fusion server-tool and returns structured JSON.
 _ANALYSIS_ORCHESTRATOR = "openrouter/openai/gpt-oss-120b:free"
-_ANALYSIS_EXTRA = {"tools": [{"type": "openrouter:fusion"}], "tool_choice": "required"}
+
+# Our two presets → OpenRouter's curated panel+judge slugs.
+_PRESET_SLUG = {"strong": "general-high", "budget": "general-budget"}
+# Mode-aware default when the caller doesn't specify a preset.
+_DEFAULT_PRESET = {"synthesis": "budget", "analysis": "strong"}
 
 _MAX_TOKENS = 2000  # explicit — the 65536 default trips OpenRouter's "fewer max_tokens" 402.
-_DEFAULT_TIMEOUT_S = 240.0  # analysis (panel + judge + orchestrator) runs ~170s; synthesis ~47s.
+_DEFAULT_TIMEOUT_S = 240.0  # analysis (panel + judge + orchestrator) runs ~120-170s; synthesis ~47-110s.
 _ANSWER_CAP = 6000
+# deliberate() bypasses the Router, so it owns its own retry on TRANSIENT provider errors (frontier
+# panels 429 under load — observed on the strong/general-high preset). 4xx and timeouts are NOT retried.
+_MAX_ATTEMPTS = 3
+_BACKOFF_S = 3.0
 
 _SYNTHESIS_SYSTEM = (
     "You are a panel of independent expert models with a judge. Deliberate on the user's question "
@@ -70,6 +80,12 @@ def _openrouter_key() -> str | None:
     return None
 
 
+def _resolve_preset(preset: str | None, mode: str) -> tuple[str, str]:
+    """(preset_name, openrouter_slug). Falls back to the mode-aware default for unknown/None."""
+    name = preset if preset in _PRESET_SLUG else _DEFAULT_PRESET.get(mode, "budget")
+    return name, _PRESET_SLUG[name]
+
+
 class FusionBackend:
     """OpenRouter Fusion backend — `synthesis` (model-slug) and `analysis` (server-tool) modes."""
 
@@ -82,10 +98,11 @@ class FusionBackend:
         context: str | None = None,
         stakes: str = "normal",
         mode: str = "synthesis",
+        preset: str | None = None,
         timeout_s: float = _DEFAULT_TIMEOUT_S,
-        models: list[str] | None = None,  # noqa: ARG002 — Fusion's panel is server-side
+        models: list[str] | None = None,  # noqa: ARG002 — panel is set via preset, not a client list
     ) -> DeliberationResult:
-        """Deliberate via Fusion in the given mode. Returns a DeliberationResult; never raises."""
+        """Deliberate via Fusion in the given mode/preset. Returns a DeliberationResult; never raises."""
         key = _openrouter_key()
         if not key:
             return DeliberationResult(
@@ -93,14 +110,21 @@ class FusionBackend:
             )
         user = question if not context else f"{question}\n\nContext:\n{context}"
         high = _HIGH_SUFFIX if stakes == "high" else ""
+        preset_name, slug = _resolve_preset(preset, mode)
         if mode == "analysis":
+            extra = {
+                "tools": [{"type": "openrouter:fusion", "parameters": {"preset": slug}}],
+                "tool_choice": "required",
+            }
             return await _call(
-                _ANALYSIS_ORCHESTRATOR, _ANALYSIS_SYSTEM + high, user, key, timeout_s, _ANALYSIS_EXTRA, "analysis"
+                _ANALYSIS_ORCHESTRATOR, _ANALYSIS_SYSTEM + high, user, key, timeout_s, extra,
+                "analysis", preset_name,
             )
-        return await _call(_MODEL, _SYNTHESIS_SYSTEM + high, user, key, timeout_s, None, "synthesis")
+        extra = {"plugins": [{"id": "fusion", "preset": slug}]}
+        return await _call(_MODEL, _SYNTHESIS_SYSTEM + high, user, key, timeout_s, extra, "synthesis", preset_name)
 
 
-async def _call(model, system, user, key, timeout_s, extra_body, mode) -> DeliberationResult:
+async def _call(model, system, user, key, timeout_s, extra_body, mode, preset) -> DeliberationResult:
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     kwargs = {
         "model": model,
@@ -114,31 +138,44 @@ async def _call(model, system, user, key, timeout_s, extra_body, mode) -> Delibe
     if extra_body:
         kwargs["extra_body"] = extra_body
     t0 = time.perf_counter()
-    try:
-        resp = await asyncio.wait_for(litellm.acompletion(**kwargs), timeout=timeout_s + 10)
-    except (TimeoutError, litellm.Timeout):
-        return DeliberationResult(
-            answer=None,
-            backend_used=f"fusion/{mode}",
-            latency_s=time.perf_counter() - t0,
-            error=f"fusion ({mode}) timed out after ~{timeout_s:.0f}s",
-        )
-    except Exception as exc:  # noqa: BLE001 — map ALL litellm errors to a graceful result
-        return _error_result(exc, time.perf_counter() - t0, mode)
-    return _normalize(resp, time.perf_counter() - t0, mode)
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            resp = await asyncio.wait_for(litellm.acompletion(**kwargs), timeout=timeout_s + 10)
+        except (TimeoutError, litellm.Timeout):
+            return DeliberationResult(
+                answer=None,
+                backend_used=f"fusion/{mode}",
+                preset_used=preset,
+                latency_s=time.perf_counter() - t0,
+                error=f"fusion ({mode}) timed out after ~{timeout_s:.0f}s",
+            )
+        except (litellm.RateLimitError, litellm.ServiceUnavailableError) as exc:
+            # transient — back off and retry (frontier panels 429 under load)
+            last_exc = exc
+            if attempt + 1 < _MAX_ATTEMPTS:
+                await asyncio.sleep(_BACKOFF_S * (attempt + 1))
+                continue
+            return _error_result(exc, time.perf_counter() - t0, mode, preset)
+        except Exception as exc:  # noqa: BLE001 — map ALL other litellm errors to a graceful result
+            return _error_result(exc, time.perf_counter() - t0, mode, preset)
+        else:
+            return _normalize(resp, time.perf_counter() - t0, mode, preset)
+    return _error_result(last_exc or RuntimeError("retries exhausted"), time.perf_counter() - t0, mode, preset)
 
 
-def _error_result(exc: Exception, latency: float, mode: str) -> DeliberationResult:
+def _error_result(exc: Exception, latency: float, mode: str, preset: str) -> DeliberationResult:
     status = getattr(exc, "status_code", None)
     return DeliberationResult(
         answer=None,
         backend_used=f"fusion/{mode}",
+        preset_used=preset,
         latency_s=latency,
         error=f"fusion ({mode}) call failed ({type(exc).__name__}, status={status}): {str(exc)[:300]}",
     )
 
 
-def _normalize(resp: object, latency: float, mode: str) -> DeliberationResult:
+def _normalize(resp: object, latency: float, mode: str, preset: str) -> DeliberationResult:
     content = _content(resp)
     parsed = _parse_content(content)
     cost, cost_known = _extract_cost(resp)
@@ -151,6 +188,7 @@ def _normalize(resp: object, latency: float, mode: str) -> DeliberationResult:
         confidence=parsed.get("confidence"),
         per_model=(),
         backend_used=f"fusion/{mode}",
+        preset_used=preset,
         latency_s=latency,
         cost_usd=cost,
         cost_known=cost_known,

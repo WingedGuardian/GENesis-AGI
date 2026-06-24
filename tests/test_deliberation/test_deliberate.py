@@ -11,6 +11,7 @@ from genesis.deliberation.backends.fusion import (
     _extract_cost,
     _normalize,
     _parse_content,
+    _resolve_preset,
 )
 
 # ── fixtures: real-shaped litellm responses ──────────────────────────────────
@@ -86,34 +87,43 @@ def test_parse_blind_spots():
 
 
 def test_normalize_prose_uses_content_as_answer():
-    r = _normalize(_resp(PROSE, cost=0.3211), 80.0, "synthesis")
+    r = _normalize(_resp(PROSE, cost=0.3211), 80.0, "synthesis", "budget")
     assert r.ok
     assert r.answer.startswith("# Recommendation")
     assert r.dissent == ()
     assert r.cost_usd == 0.3211 and r.cost_known
     assert r.latency_s == 80.0
-    assert r.backend_used == "fusion/synthesis"
+    assert r.backend_used == "fusion/synthesis" and r.preset_used == "budget"
 
 
 def test_normalize_json_structured():
-    r = _normalize(_resp(JSON_OK, cost=0.05), 70.0, "synthesis")
+    r = _normalize(_resp(JSON_OK, cost=0.05), 70.0, "synthesis", "budget")
     assert r.answer.startswith("Cut now")
     assert r.consensus and len(r.dissent) == 1 and r.confidence == 0.82
 
 
 def test_normalize_analysis_structured():
-    r = _normalize(_resp(ANALYSIS_JSON, cost=0.12), 173.0, "analysis")
+    r = _normalize(_resp(ANALYSIS_JSON, cost=0.12), 173.0, "analysis", "strong")
     assert r.answer.startswith("Choose A")
     assert len(r.dissent) == 3
     assert len(r.blind_spots) == 2
     assert r.confidence == 0.81
-    assert r.backend_used == "fusion/analysis"
+    assert r.backend_used == "fusion/analysis" and r.preset_used == "strong"
     assert r.cost_usd == 0.12 and r.cost_known
 
 
 def test_normalize_empty_content_errors():
-    r = _normalize(_resp("", cost=0.01), 1.0, "synthesis")
+    r = _normalize(_resp("", cost=0.01), 1.0, "synthesis", "budget")
     assert not r.ok and "empty" in r.error
+
+
+def test_resolve_preset_mapping_and_defaults():
+    assert _resolve_preset("strong", "synthesis") == ("strong", "general-high")
+    assert _resolve_preset("budget", "analysis") == ("budget", "general-budget")
+    # mode-aware defaults when preset is None/unknown
+    assert _resolve_preset(None, "synthesis") == ("budget", "general-budget")
+    assert _resolve_preset(None, "analysis") == ("strong", "general-high")
+    assert _resolve_preset("bogus", "analysis") == ("strong", "general-high")
 
 
 def test_extract_cost_from_usage():
@@ -138,10 +148,12 @@ async def test_fusion_happy(monkeypatch):
         r = await FusionBackend().run("q", stakes="high")
     assert r.ok and r.answer.startswith("Cut now")
     assert r.cost_usd == 0.05 and r.cost_known and isinstance(r.latency_s, float)
+    assert r.preset_used == "budget"  # synthesis default preset
     kwargs = m.call_args.kwargs
     assert "HIGH-STAKES" in kwargs["messages"][0]["content"]  # stakes strengthens system prompt
     assert kwargs["max_tokens"] == 2000  # explicit max_tokens (the 402 guard)
     assert kwargs["model"] == "openrouter/openrouter/fusion"
+    assert kwargs["extra_body"]["plugins"][0]["preset"] == "general-budget"
 
 
 async def test_fusion_analysis_mode_request(monkeypatch):
@@ -152,10 +164,23 @@ async def test_fusion_analysis_mode_request(monkeypatch):
     ) as m:
         r = await FusionBackend().run("q", mode="analysis")
     assert r.ok and len(r.dissent) == 3 and r.backend_used == "fusion/analysis"
+    assert r.preset_used == "strong"  # analysis default preset
     kwargs = m.call_args.kwargs
     assert kwargs["model"] == "openrouter/openai/gpt-oss-120b:free"
     assert kwargs["extra_body"]["tools"][0]["type"] == "openrouter:fusion"
+    assert kwargs["extra_body"]["tools"][0]["parameters"]["preset"] == "general-high"
     assert kwargs["extra_body"]["tool_choice"] == "required"
+
+
+async def test_fusion_preset_override(monkeypatch):
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+    with patch(
+        "genesis.deliberation.backends.fusion.litellm.acompletion",
+        new=AsyncMock(return_value=_resp(ANALYSIS_JSON, cost=0.12)),
+    ) as m:
+        r = await FusionBackend().run("q", mode="analysis", preset="budget")
+    assert r.preset_used == "budget"
+    assert m.call_args.kwargs["extra_body"]["tools"][0]["parameters"]["preset"] == "general-budget"
 
 
 async def test_fusion_no_key(monkeypatch):
@@ -196,6 +221,30 @@ async def test_fusion_litellm_timeout_graceful(monkeypatch):
     ):
         r = await FusionBackend().run("q", timeout_s=1.0)
     assert not r.ok and "timed out" in r.error
+
+
+async def test_fusion_retries_on_ratelimit(monkeypatch):
+    import litellm
+
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+    monkeypatch.setattr("genesis.deliberation.backends.fusion._BACKOFF_S", 0.0)
+    rle = litellm.RateLimitError(message="429", model="m", llm_provider="openrouter")
+    mock = AsyncMock(side_effect=[rle, rle, _resp(JSON_OK, cost=0.05)])  # fail twice, then succeed
+    with patch("genesis.deliberation.backends.fusion.litellm.acompletion", new=mock):
+        r = await FusionBackend().run("q")
+    assert r.ok and r.answer.startswith("Cut now")
+    assert mock.call_count == 3  # 1 + 2 retries
+
+
+async def test_fusion_ratelimit_exhausted(monkeypatch):
+    import litellm
+
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+    monkeypatch.setattr("genesis.deliberation.backends.fusion._BACKOFF_S", 0.0)
+    rle = litellm.RateLimitError(message="429", model="m", llm_provider="openrouter")
+    with patch("genesis.deliberation.backends.fusion.litellm.acompletion", new=AsyncMock(side_effect=rle)):
+        r = await FusionBackend().run("q")
+    assert not r.ok and "call failed" in r.error
 
 
 # ── deliberate() core ────────────────────────────────────────────────────────
@@ -246,13 +295,15 @@ async def test_backend_receives_stakes_and_context(monkeypatch):
     class Stub:
         name = "stub"
 
-        async def run(self, q, *, context, stakes, mode, timeout_s, models):
-            seen.update(q=q, context=context, stakes=stakes, mode=mode)
+        async def run(self, q, *, context, stakes, mode, preset, timeout_s, models):
+            seen.update(q=q, context=context, stakes=stakes, mode=mode, preset=preset)
             return DeliberationResult(answer="ok")
 
     monkeypatch.setattr("genesis.deliberation.core.get_backend", lambda n: Stub())
-    await deliberate("decide", context="bg", stakes="high", mode="analysis", backend="stub")
-    assert seen == {"q": "decide", "context": "bg", "stakes": "high", "mode": "analysis"}
+    await deliberate("decide", context="bg", stakes="high", mode="analysis", preset="budget", backend="stub")
+    assert seen == {
+        "q": "decide", "context": "bg", "stakes": "high", "mode": "analysis", "preset": "budget"
+    }
 
 
 # ── MCP tool ─────────────────────────────────────────────────────────────────

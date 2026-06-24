@@ -33,6 +33,7 @@ class DeliberationResult:
     confidence: float | None = None
     per_model: tuple[PerModel, ...] = ()
     backend_used: str = "fusion"
+    preset_used: str | None = None
     latency_s: float | None = None
     cost_usd: float = 0.0
     cost_known: bool = False

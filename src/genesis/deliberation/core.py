@@ -27,6 +27,7 @@ async def deliberate(
     stakes: Stakes = "normal",
     backend: str = "fusion",
     mode: str = "synthesis",
+    preset: str | None = None,
     timeout_s: float = 240.0,
     models: list[str] | None = None,
 ) -> DeliberationResult:
@@ -52,7 +53,8 @@ async def deliberate(
     token = _in_deliberate.set(True)
     try:
         return await be.run(
-            question, context=context, stakes=stakes, mode=mode, timeout_s=timeout_s, models=models
+            question, context=context, stakes=stakes, mode=mode, preset=preset,
+            timeout_s=timeout_s, models=models,
         )
     except Exception as exc:  # noqa: BLE001 — last-resort envelope; backends are not supposed to raise
         logger.exception("deliberate() backend %s raised", backend)
