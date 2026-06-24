@@ -11,6 +11,7 @@ import pytest
 from genesis.recon.model_intelligence import (
     ModelIntelligenceJob,
     _eol_findings_from_rows,
+    _parse_gemini_deprecation_table,
     _parse_groq_deprecation_table,
 )
 from genesis.routing.config import load_config_from_string
@@ -376,6 +377,67 @@ call_sites:
     chain: [groq-doomed, groq-free]
 """
 
+# Google's Gemini deprecations table: 4 columns, month-name dates, multi-section,
+# "No shutdown date announced" for undated models, a "Preview models" separator,
+# and a prose line. Only the two rows with a real dated shutdown must parse.
+_SAMPLE_GEMINI_TABLE = """\
+## Gemini 3 models
+| **Model** | **Release date** | **Shutdown date** | **Recommended replacement** |
+|---|---|---|---|
+| `gemini-3.5-flash` | May 19, 2026 | No shutdown date announced | |
+| `gemini-3.1-flash-lite` | May 7, 2026 | May 7, 2027 | |
+| Preview models ||||
+| `gemini-3-flash-preview` | December 17, 2025 | No shutdown date announced | `gemini-3.5-flash` |
+## Gemini 2.5 Flash models
+| `gemini-2.5-flash` | June 17, 2025 | October 16, 2026 | `gemini-3.5-flash` |
+Some prose | with a pipe but no date | here too | and here |
+"""
+
+
+class TestGeminiDeprecationParser:
+    """Pure parsing of Google's Gemini deprecations markdown table."""
+
+    def test_parses_dated_rows_only(self) -> None:
+        rows = _parse_gemini_deprecation_table(_SAMPLE_GEMINI_TABLE)
+        assert ("gemini-3.1-flash-lite", "2027-05-07", "") in rows
+        assert ("gemini-2.5-flash", "2026-10-16", "gemini-3.5-flash") in rows
+        assert len(rows) == 2
+
+    def test_skips_undated_models(self) -> None:
+        # "No shutdown date announced" models must NOT fire (the no-false-alarm
+        # case — exactly our current gemini-3-flash-preview situation).
+        models = [r[0] for r in _parse_gemini_deprecation_table(_SAMPLE_GEMINI_TABLE)]
+        assert "gemini-3.5-flash" not in models
+        assert "gemini-3-flash-preview" not in models
+
+    def test_skips_headers_separators_prose_and_preview_label(self) -> None:
+        models = [r[0] for r in _parse_gemini_deprecation_table(_SAMPLE_GEMINI_TABLE)]
+        assert "Model" not in models and "**Model**" not in models
+        assert all("---" not in m for m in models)
+        assert "Preview models" not in models
+        assert "Some prose" not in models
+
+    def test_no_surrounding_pipe_variant(self) -> None:
+        # genesis.web.fetch may render rows without surrounding pipes.
+        live = "`gemini-2.5-flash`| June 17, 2025| October 16, 2026| `gemini-3.5-flash`\n"
+        rows = _parse_gemini_deprecation_table(live)
+        assert ("gemini-2.5-flash", "2026-10-16", "gemini-3.5-flash") in rows
+
+    def test_accepts_abbreviated_months(self) -> None:
+        # A narrowed column could abbreviate months — must NOT silently drop a
+        # real dated shutdown (the dangerous false-negative direction).
+        live = "`gemini-x`| Jan 5, 2026| Sep 30, 2027| `repl`\n"
+        rows = _parse_gemini_deprecation_table(live)
+        assert ("gemini-x", "2027-09-30", "repl") in rows
+
+    def test_empty_or_garbage_returns_empty(self) -> None:
+        assert _parse_gemini_deprecation_table("") == []
+        assert _parse_gemini_deprecation_table("no tables here\njust text") == []
+        assert _parse_gemini_deprecation_table(
+            "| **Model** | **Release date** | **Shutdown date** | **Replacement** |\n"
+            "|---|---|---|---|"
+        ) == []
+
 
 class TestGroqDeprecationParser:
     """Pure parsing of the Groq deprecations markdown table."""
@@ -466,10 +528,40 @@ class TestEOLMatcher:
         assert _eol_findings_from_rows(rows, cfg.providers, cfg.call_sites) == []
 
     def test_non_groq_model_ignored(self) -> None:
-        # vendor gate is groq — a google model string must not match
+        # default vendor gate is groq — a google model string must not match
         cfg = self._cfg()
         rows = [("gemini-3-flash-preview", "2026-06-01", "gemini-3.5-flash")]
         assert _eol_findings_from_rows(rows, cfg.providers, cfg.call_sites) == []
+
+    def test_fires_for_our_deprecated_gemini_model(self) -> None:
+        # The google vendor gate matches our active google provider and tags
+        # the finding with vendor/source + the right blast radius.
+        cfg = self._cfg()
+        rows = [("gemini-3-flash-preview", "2026-09-01", "gemini-3.5-flash")]
+        findings = _eol_findings_from_rows(
+            rows, cfg.providers, cfg.call_sites,
+            provider_type="google", vendor="google",
+            source="gemini_deprecations_page",
+        )
+        assert len(findings) == 1
+        f = findings[0]
+        assert f["model"] == "gemini-3-flash-preview"
+        assert f["provider"] == "gemini-free"
+        assert f["vendor"] == "google"
+        assert f["shutdown_date"] == "2026-09-01"
+        assert f["blast_radius"] == ["s_micro"]
+        assert f["source"] == "gemini_deprecations_page"
+
+    def test_google_gate_ignores_groq_model(self) -> None:
+        # symmetric to the groq gate: a groq model string must not match under
+        # the google gate (no cross-vendor false positives).
+        cfg = self._cfg()
+        rows = [("llama-3.3-70b-versatile", "2026-08-16", "x")]
+        assert _eol_findings_from_rows(
+            rows, cfg.providers, cfg.call_sites,
+            provider_type="google", vendor="google",
+            source="gemini_deprecations_page",
+        ) == []
 
 
 class TestActiveProvidersJob:
@@ -489,20 +581,65 @@ class TestActiveProvidersJob:
         assert findings[0]["model"] == "moonshotai/kimi-k2-instruct-0905"
 
     @pytest.mark.asyncio
-    async def test_check_active_providers_no_groq_short_circuits(self, db) -> None:
+    async def test_check_active_providers_fires_gemini(self, db) -> None:
+        # The google vendor path runs independently of Groq and fires for an
+        # active gemini provider with a dated shutdown.
+        job = ModelIntelligenceJob(db=db)
+        cfg = load_config_from_string(_EOL_CONFIG_YAML)
+        gemini_rows = [("gemini-3-flash-preview", "2026-09-01", "gemini-3.5-flash")]
+        with (
+            patch.object(job, "_fetch_groq_deprecations", AsyncMock(return_value=[])),
+            patch.object(
+                job, "_fetch_gemini_deprecations",
+                AsyncMock(return_value=gemini_rows),
+            ),
+            patch("genesis.routing.config.load_config", return_value=cfg),
+        ):
+            findings = await job._check_active_providers()
+        google = [f for f in findings if f["vendor"] == "google"]
+        assert len(google) == 1
+        assert google[0]["model"] == "gemini-3-flash-preview"
+        assert google[0]["provider"] == "gemini-free"
+
+    @pytest.mark.asyncio
+    async def test_per_vendor_gating_google_only(self, db) -> None:
+        # google-only install: Gemini IS checked, Groq is never fetched.
         job = ModelIntelligenceJob(db=db)
         cfg = load_config_from_string(
             "providers:\n  g:\n    type: google\n    model: m\n    free: true\n"
             "call_sites:\n  s:\n    chain: [g]\n"
         )
-        mock_fetch = AsyncMock(return_value=[])
+        groq_fetch = AsyncMock(return_value=[])
+        gem_fetch = AsyncMock(return_value=[])
         with (
-            patch.object(job, "_fetch_groq_deprecations", mock_fetch),
+            patch.object(job, "_fetch_groq_deprecations", groq_fetch),
+            patch.object(job, "_fetch_gemini_deprecations", gem_fetch),
             patch("genesis.routing.config.load_config", return_value=cfg),
         ):
             findings = await job._check_active_providers()
         assert findings == []
-        mock_fetch.assert_not_called()  # no Groq providers → never fetches
+        groq_fetch.assert_not_called()  # no Groq providers → never fetches Groq
+        gem_fetch.assert_called_once()  # has Google provider → checks Gemini
+
+    @pytest.mark.asyncio
+    async def test_per_vendor_gating_groq_only(self, db) -> None:
+        # groq-only install: Groq IS checked, Gemini is never fetched.
+        job = ModelIntelligenceJob(db=db)
+        cfg = load_config_from_string(
+            "providers:\n  gq:\n    type: groq\n    model: m\n    free: true\n"
+            "call_sites:\n  s:\n    chain: [gq]\n"
+        )
+        groq_fetch = AsyncMock(return_value=[])
+        gem_fetch = AsyncMock(return_value=[])
+        with (
+            patch.object(job, "_fetch_groq_deprecations", groq_fetch),
+            patch.object(job, "_fetch_gemini_deprecations", gem_fetch),
+            patch("genesis.routing.config.load_config", return_value=cfg),
+        ):
+            findings = await job._check_active_providers()
+        assert findings == []
+        gem_fetch.assert_not_called()  # no Google providers → never fetches Gemini
+        groq_fetch.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_check_active_providers_config_failure_is_safe(self, db) -> None:
