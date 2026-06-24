@@ -322,3 +322,61 @@ async def test_get_actionable_domain_excludes_pinned_internal(db):
     ids = {r["id"] for r in await follow_ups.get_actionable(db, domain="user_world")}
     assert ids == {uw}
     assert pinned_internal not in ids
+
+
+# ─── Cockpit: status exclusion + pin-first / actionability sort ──────────────
+
+
+async def test_query_page_status_exclude_hides_terminal(db):
+    """status_exclude drops the listed statuses (the cockpit 'hide done')."""
+    keep = await follow_ups.create(db, **{**_BASE, "content": "still open"})
+    done = await follow_ups.create(db, **{**_BASE, "content": "finished"})
+    await follow_ups.update_status(db, done, status="completed")
+
+    rows = await follow_ups.query_page(db, status_exclude=["completed", "failed"])
+    ids = {r["id"] for r in rows}
+    assert keep in ids and done not in ids
+    assert await follow_ups.count_filtered(
+        db, status_exclude=["completed", "failed"]
+    ) == 1
+
+
+async def test_query_page_explicit_status_overrides_exclude(db):
+    """An explicit status filter wins over status_exclude (mutually exclusive)."""
+    done = await follow_ups.create(db, **{**_BASE, "content": "finished"})
+    await follow_ups.update_status(db, done, status="completed")
+
+    rows = await follow_ups.query_page(
+        db, status="completed", status_exclude=["completed"],
+    )
+    assert {r["id"] for r in rows} == {done}
+
+
+async def test_query_page_pinned_floats_to_top(db):
+    """Pinned rows sort first regardless of the chosen sort key."""
+    pinned_old = await follow_ups.create(db, **{**_BASE, "content": "pinned old"})
+    await follow_ups.create(db, **{**_BASE, "content": "newer unpinned"})
+    # Make the pinned row OLDER so a plain recency/priority sort would bury it.
+    await db.execute(
+        "UPDATE follow_ups SET pinned = 1, "
+        "created_at = '2025-01-01T00:00:00+00:00' WHERE id = ?",
+        (pinned_old,),
+    )
+    await db.commit()
+
+    for sort in ("priority", "created_desc", "status", "source"):
+        rows = await follow_ups.query_page(db, sort=sort)
+        assert rows[0]["id"] == pinned_old, f"pinned not first under sort={sort}"
+
+
+async def test_query_page_status_sort_ranks_by_actionability(db):
+    """Status sort surfaces active work before terminal states (not A→Z)."""
+    done = await follow_ups.create(db, **{**_BASE, "content": "done"})
+    active = await follow_ups.create(db, **{**_BASE, "content": "active"})
+    await follow_ups.update_status(db, done, status="completed")
+    await follow_ups.update_status(db, active, status="in_progress")
+
+    order = [r["id"] for r in await follow_ups.query_page(db, sort="status")]
+    # Alphabetical 'completed' < 'in_progress' would invert this — the rank CASE
+    # must put in_progress first.
+    assert order.index(active) < order.index(done)

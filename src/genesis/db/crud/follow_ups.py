@@ -440,15 +440,26 @@ _VALID_STATUS = {
 }
 
 # Allowlisted sort keys → ORDER BY fragment (never interpolate caller input).
+# Every fragment floats pinned rows to the top (pinned is a "keep visible"
+# flag, honored regardless of the chosen sort). The status sort ranks by
+# actionability — active work first, terminal states last — not alphabetically
+# (plain ``status ASC`` buried pending/blocked items under completed ones).
 _SORT_MAP: dict[str, str] = {
     "priority": (
+        "pinned DESC, "
         "CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
         "WHEN 'medium' THEN 2 ELSE 3 END, created_at DESC"
     ),
-    "created_desc": "created_at DESC",
-    "created_asc": "created_at ASC",
-    "status": "status ASC, created_at DESC",
-    "source": "source ASC, created_at DESC",
+    "created_desc": "pinned DESC, created_at DESC",
+    "created_asc": "pinned DESC, created_at ASC",
+    "status": (
+        "pinned DESC, "
+        "CASE status WHEN 'in_progress' THEN 0 WHEN 'blocked' THEN 1 "
+        "WHEN 'pending' THEN 2 WHEN 'scheduled' THEN 3 "
+        "WHEN 'failed' THEN 4 WHEN 'completed' THEN 5 ELSE 6 END, "
+        "created_at DESC"
+    ),
+    "source": "pinned DESC, source ASC, created_at DESC",
 }
 
 
@@ -574,12 +585,15 @@ def _build_filter_where(
     status: str | None,
     source: str | None,
     search: str | None,
+    status_exclude: list[str] | None = None,
 ) -> tuple[str, list]:
     """Build a parameterized WHERE clause shared by query_page/count_filtered.
 
     Only static column/clause text is assembled here; every caller value is
     bound via a ``?`` placeholder. ``domain='__null__'`` matches unclassified
-    rows (domain IS NULL).
+    rows (domain IS NULL). ``status_exclude`` hides terminal states (e.g.
+    completed/failed) and is ignored when an explicit ``status`` is requested
+    — filtering *to* a status and excluding it are mutually exclusive intents.
     """
     clauses: list[str] = []
     params: list = []
@@ -595,6 +609,10 @@ def _build_filter_where(
     if status is not None:
         clauses.append("status = ?")
         params.append(status)
+    elif status_exclude:
+        placeholders = ",".join("?" for _ in status_exclude)
+        clauses.append(f"status NOT IN ({placeholders})")
+        params.extend(status_exclude)
     if source is not None:
         clauses.append("source = ?")
         params.append(source)
@@ -614,10 +632,12 @@ async def count_filtered(
     status: str | None = None,
     source: str | None = None,
     search: str | None = None,
+    status_exclude: list[str] | None = None,
 ) -> int:
     """Count follow-ups matching the cockpit filters."""
     where, params = _build_filter_where(
         kind=kind, domain=domain, status=status, source=source, search=search,
+        status_exclude=status_exclude,
     )
     cursor = await db.execute(f"SELECT COUNT(*) FROM follow_ups{where}", params)
     row = await cursor.fetchone()
@@ -632,6 +652,7 @@ async def query_page(
     status: str | None = None,
     source: str | None = None,
     search: str | None = None,
+    status_exclude: list[str] | None = None,
     sort: str = "priority",
     offset: int = 0,
     limit: int = 50,
@@ -640,9 +661,11 @@ async def query_page(
 
     ``sort`` is allowlisted (see ``_SORT_MAP``); unknown values fall back to
     priority. ``domain='__null__'`` matches rows with no domain set.
+    ``status_exclude`` hides terminal states (ignored when ``status`` is set).
     """
     where, params = _build_filter_where(
         kind=kind, domain=domain, status=status, source=source, search=search,
+        status_exclude=status_exclude,
     )
     order = _SORT_MAP.get(sort, _SORT_MAP["priority"])
     limit = max(1, min(limit, 200))
