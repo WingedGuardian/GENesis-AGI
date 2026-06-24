@@ -53,11 +53,20 @@ providers:
         reasoning_effort: low
   gemini-free:
     type: google
-    model: gemini-3-flash-preview
-    profile: gemini-3-flash
+    # GA stable (was gemini-3-flash-preview; gemini-3.5-flash is Google's own
+    # recommended replacement for that preview — escape preview deprecation churn).
+    model: gemini-3.5-flash
+    profile: gemini-3.5-flash
     free: true
     rpm_limit: 15
     open_duration_s: 120
+    # gemini-3.5-flash reasons by default (~70-90 thinking tokens even on trivial
+    # prompts → empty content at tight max_tokens + free-tier TPM bloat). This is
+    # the fast-flash lane (fact extraction, tagging, surplus brainstorm), so
+    # suppress thinking. reasoning_effort=disable → Gemini thinkingBudget=0
+    # (verified live 2026-06-23: content correct, 0 reasoning tokens at mt=20).
+    params:
+      reasoning_effort: disable
   openrouter-free:
     type: openrouter
     model: qwen/qwen-2.5-72b-instruct
@@ -231,14 +240,6 @@ providers:
     free: false
     rpm_limit: 20
     open_duration_s: 120
-  openrouter-trinity-free:
-    type: openrouter
-    model: arcee-ai/trinity-large-preview:free
-    profile: trinity-large-preview
-    free: true
-    # 400B MoE (13B active). Free until 2026-04-22. Benchmark before expiry.
-    rpm_limit: 20
-    open_duration_s: 120
   lmstudio-30b:
     type: lmstudio
     model: mistral-small-3.2-24b-instruct-2506
@@ -260,7 +261,6 @@ call_sites:
     # paid fallback. Healthy OpenRouter-free models first; NIM last (shared
     # 40 RPM pool, currently flaky).
     - openrouter-gemma4
-    - openrouter-trinity-free
     - nvidia-nim-kimi
     - nvidia-nim-deepseek
     retry_profile: background
@@ -409,7 +409,6 @@ call_sites:
     - gemini-free
     - mistral-large-free
     - openrouter-gemma4
-    - openrouter-trinity-free
     retry_profile: background
   # Adversarial challenge of entity "duplicate" verdicts. Flipped pairing:
   # DeepSeek challenges Kimi's entity judgments.
