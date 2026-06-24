@@ -75,6 +75,47 @@ def test_cockpit_empty_200_when_not_bootstrapped(client):
     assert resp.get_json()["items"] == []
 
 
+def test_cockpit_hide_done_default_excludes_terminal(client):
+    """Default view (no hide_done param) excludes completed/failed."""
+    qp = AsyncMock(return_value=[])
+    cf = AsyncMock(return_value=0)
+    with (
+        patch(_RT) as MockRT,
+        patch(f"{_CRUD}.query_page", new=qp),
+        patch(f"{_CRUD}.count_filtered", new=cf),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        client.get("/api/genesis/follow-ups/cockpit?kind=follow_up")
+    assert qp.call_args.kwargs["status_exclude"] == ["completed", "failed"]
+    assert cf.call_args.kwargs["status_exclude"] == ["completed", "failed"]
+
+
+def test_cockpit_hide_done_off_includes_all(client):
+    """hide_done=0 passes status_exclude=None (show everything)."""
+    qp = AsyncMock(return_value=[])
+    with (
+        patch(_RT) as MockRT,
+        patch(f"{_CRUD}.query_page", new=qp),
+        patch(f"{_CRUD}.count_filtered", new=AsyncMock(return_value=0)),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        client.get("/api/genesis/follow-ups/cockpit?hide_done=0")
+    assert qp.call_args.kwargs["status_exclude"] is None
+
+
+def test_cockpit_explicit_status_still_passes_through(client):
+    """An explicit status filter is forwarded; exclusion is handled CRUD-side."""
+    qp = AsyncMock(return_value=[])
+    with (
+        patch(_RT) as MockRT,
+        patch(f"{_CRUD}.query_page", new=qp),
+        patch(f"{_CRUD}.count_filtered", new=AsyncMock(return_value=0)),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        client.get("/api/genesis/follow-ups/cockpit?status=completed")
+    assert qp.call_args.kwargs["status"] == "completed"
+
+
 def test_cockpit_passes_null_domain_sentinel(client):
     qp = AsyncMock(return_value=[])
     with (

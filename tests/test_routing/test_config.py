@@ -127,7 +127,8 @@ def test_load_full_yaml(monkeypatch):
     # nvidia-nim-deepseek + nvidia-nim-kimi added 2026-05-25)
     # 2026-06-23: 28 → 29 after groq-oss-120b added (free reasoning option,
     # not yet wired into any chain).
-    assert len(cfg.providers) == 29
+    # 2026-06-23 (WS2b): 29 → 28 after removing expired openrouter-trinity-free.
+    assert len(cfg.providers) == 28
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
@@ -155,8 +156,11 @@ def test_load_full_yaml(monkeypatch):
     assert cfg.call_sites["5_deep_reflection"].default_paid is True
     assert cfg.call_sites["36_code_auditor"].never_pays is False
     assert cfg.call_sites["37_infrastructure_monitor"].default_paid is True
-    # judge: LLM-as-judge eval primitive — same-family fallback, paid-by-default
-    assert cfg.call_sites["judge"].chain == ["openrouter-deepseek-v4", "openrouter-deepseek-v4-flash"]
+    # judge: LLM-as-judge eval primitive — free NIM v4-pro first, then paid v4-pro,
+    # then v4-flash; paid-by-default
+    assert cfg.call_sites["judge"].chain == [
+        "nvidia-nim-deepseek", "openrouter-deepseek-v4", "openrouter-deepseek-v4-flash"
+    ]
     assert cfg.call_sites["judge"].default_paid is True
     assert cfg.call_sites["judge"].dispatch == "api"
 

@@ -8,7 +8,6 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
 
 import aiosqlite
 
@@ -17,8 +16,6 @@ from genesis.recon.gh_cli import run_gh
 
 logger = logging.getLogger(__name__)
 
-_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
-_WATCHLIST_PATH = _CONFIG_DIR / "recon_watchlist.yaml"
 _RELEASES_PER_PROJECT = 2
 _MAX_BODY_CHARS = 1000
 
@@ -358,36 +355,12 @@ class ReconGatherer:
 
     @staticmethod
     def _load_watchlist() -> list[dict]:
-        """Load project watchlist with local overlay support.
+        """Active watchlist: base minus user-disabled, plus the install overlay.
 
-        Base: ``config/recon_watchlist.yaml`` (committed, project-level)
-        Overlay: ``config/recon_watchlist.local.yaml`` (gitignored, install-level)
-
-        Projects from the local overlay are appended to the base list.
+        Delegates to the shared ``recon.watchlist`` store so the gatherer, the
+        recon MCP view, and the dashboard editor all agree on one
+        merged-and-tombstoned list (the loaders used to diverge — the MCP read
+        base-only, so overlay edits were invisible there).
         """
-        if not _WATCHLIST_PATH.exists():
-            return []
-        try:
-            import yaml
-
-            with open(_WATCHLIST_PATH) as f:
-                data = yaml.safe_load(f) or {}
-            projects = list(data.get("projects", []))
-
-            # Merge install-specific overlay (gitignored)
-            local_path = _WATCHLIST_PATH.with_suffix(".local.yaml")
-            if local_path.exists():
-                with open(local_path) as f:
-                    local_data = yaml.safe_load(f) or {}
-                local_projects = local_data.get("projects", [])
-                # Deduplicate by repo name
-                existing_repos = {p.get("repo") for p in projects}
-                for lp in local_projects:
-                    if lp.get("repo") not in existing_repos:
-                        projects.append(lp)
-                        existing_repos.add(lp.get("repo"))
-
-            return projects
-        except Exception:
-            logger.error("Failed to load watchlist", exc_info=True)
-            return []
+        from genesis.recon import watchlist
+        return watchlist.active_entries()

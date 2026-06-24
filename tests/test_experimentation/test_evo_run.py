@@ -158,3 +158,185 @@ def test_make_router_cc_provider_returns_cc_cli_router():
     r = _make_router("cc-haiku", None, None)
     assert isinstance(r, CCCliRouter)
     assert r._model == "haiku"
+
+
+# ---------------------------------------------------------------------------
+# Auto-file path (PR-B): promote_evo_winner + canonical base + propose gate
+# ---------------------------------------------------------------------------
+
+import aiosqlite  # noqa: E402
+import pytest  # noqa: E402
+
+from genesis.db.crud import ego as ego_crud  # noqa: E402
+from genesis.db.schema import create_all_tables  # noqa: E402
+
+
+@pytest.fixture
+async def cvdb():
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    await create_all_tables(conn)
+    yield conn
+    await conn.close()
+
+
+def _winner_result(*, holdout_p=0.01, t_mean=0.82, c_mean=0.70):
+    return EvoResult(
+        winner=CognitiveVariant(
+            name="evo_v0", description="be more concise",
+            system_prompt="CANONICAL\n\nbe more concise",
+        ),
+        winner_winrate={"recommendation": "treatment_wins", "p_value": 0.002,
+                        "treatment_mean_score": t_mean},
+        holdout_winrate={"recommendation": "treatment_wins", "p_value": holdout_p,
+                         "treatment_mean_score": t_mean, "control_mean_score": c_mean},
+        candidates_evaluated=6, survivors=2, note="confirmed", holdout_disjoint=True,
+    )
+
+
+async def test_promote_files_winner_proposal(cvdb):
+    from genesis.mcp.health.evo_run import promote_evo_winner
+
+    pid = await promote_evo_winner(
+        cvdb, _winner_result(), gen_provider="groq-free", judge_provider="groq-free",
+    )
+    assert pid is not None
+    prop = await ego_crud.get_proposal(cvdb, pid)
+    assert prop["action_type"] == "cognitive_variant_promotion"
+    assert prop["status"] == "pending"          # dashboard-visible, awaiting approval
+    assert float(prop["confidence"]) >= 0.75    # 1 - holdout_p = 0.99
+    outputs = json.loads(prop["expected_outputs"])
+    assert outputs["full_prompt"] == "CANONICAL\n\nbe more concise"
+    assert outputs["approach"] == "be more concise"
+
+
+async def test_promote_self_scoring_caveat(cvdb):
+    """Same gen+judge provider → the proposal rationale carries a self-scoring
+    caveat; cross-provider → it does not."""
+    from genesis.mcp.health.evo_run import promote_evo_winner
+
+    same = await promote_evo_winner(
+        cvdb, _winner_result(), gen_provider="groq-free", judge_provider="groq-free",
+    )
+    rat_same = (await ego_crud.get_proposal(cvdb, same))["rationale"]
+    assert "CAVEAT" in rat_same and "share a provider" in rat_same
+
+    # distinct winner so content-hash dedup doesn't skip the second proposal
+    cross_result = _winner_result()
+    cross_result = EvoResult(
+        winner=CognitiveVariant(
+            name="evo_v1", description="be deeper",
+            system_prompt="CANONICAL\n\nbe deeper",
+        ),
+        winner_winrate=cross_result.winner_winrate,
+        holdout_winrate=cross_result.holdout_winrate,
+        candidates_evaluated=6, survivors=2, note="x", holdout_disjoint=True,
+    )
+    cross = await promote_evo_winner(
+        cvdb, cross_result, gen_provider="groq-free", judge_provider="cc-haiku",
+    )
+    rat_cross = (await ego_crud.get_proposal(cvdb, cross))["rationale"]
+    assert "CAVEAT" not in rat_cross
+
+
+async def test_promote_no_winner_files_nothing(cvdb):
+    from genesis.mcp.health.evo_run import promote_evo_winner
+
+    no_winner = EvoResult(
+        winner=None, winner_winrate=None, holdout_winrate=None,
+        candidates_evaluated=6, survivors=0, note="none",
+    )
+    pid = await promote_evo_winner(
+        cvdb, no_winner, gen_provider="g", judge_provider="j",
+    )
+    assert pid is None
+
+
+async def test_promote_below_floor_files_nothing(cvdb):
+    """A winner whose held-out p maps to confidence < 0.75 is NOT filed
+    (belt-and-suspenders to the held-out gate)."""
+    from genesis.mcp.health.evo_run import promote_evo_winner
+
+    pid = await promote_evo_winner(
+        cvdb, _winner_result(holdout_p=0.30),  # confidence 0.70
+        gen_provider="g", judge_provider="j",
+    )
+    assert pid is None
+
+
+async def test_promote_missing_holdout_p_files_nothing(cvdb):
+    from genesis.mcp.health.evo_run import promote_evo_winner
+
+    res = _winner_result()
+    res = EvoResult(
+        winner=res.winner, winner_winrate=res.winner_winrate,
+        holdout_winrate={"recommendation": "treatment_wins"},  # no p_value
+        candidates_evaluated=6, survivors=2, note="x", holdout_disjoint=True,
+    )
+    pid = await promote_evo_winner(cvdb, res, gen_provider="g", judge_provider="j")
+    assert pid is None
+
+
+def test_resolve_canonical_ignores_overlay(tmp_path, monkeypatch):
+    """The canonical base must read the REPO prompt, NOT the overlay — else
+    repeated promotions stack directives unboundedly."""
+    from genesis.mcp.health.evo_run import _resolve_canonical_base_prompt
+
+    overlay = tmp_path / "REFLECTION_DEEP.md"
+    overlay.write_text("OVERLAY_SENTINEL should never be the measurement base")
+    monkeypatch.setenv("GENESIS_REFLECTION_PROMPT_DIR", str(tmp_path))
+
+    base = _resolve_canonical_base_prompt()
+    assert "OVERLAY_SENTINEL" not in base
+    assert base.strip()  # the real repo prompt, non-empty
+
+
+async def test_evo_run_propose_false_skips_filing(cvdb, tmp_path, monkeypatch):
+    _stub_routers(monkeypatch)
+    _stub_variants(monkeypatch)
+    import genesis.mcp.health_mcp as health_mcp_mod
+
+    class _Svc:
+        _db = cvdb
+
+    monkeypatch.setattr(health_mcp_mod, "_service", _Svc(), raising=False)
+
+    async def fake_run_evo(**kw):
+        return _winner_result()
+
+    monkeypatch.setattr("genesis.experimentation.evo.run_evo", fake_run_evo)
+
+    from genesis.mcp.health.evo_run import _impl_evo_run
+
+    out = await _impl_evo_run(
+        base_prompt="BASE", golden_set_path=str(_golden(tmp_path)), propose=False,
+    )
+    assert out["status"] == "ok"
+    assert out["proposal_id"] is None
+    assert await ego_crud.list_proposals(cvdb, status="pending") == []
+
+
+async def test_evo_run_propose_true_files_winner(cvdb, tmp_path, monkeypatch):
+    _stub_routers(monkeypatch)
+    _stub_variants(monkeypatch)
+    import genesis.mcp.health_mcp as health_mcp_mod
+
+    class _Svc:
+        _db = cvdb
+
+    monkeypatch.setattr(health_mcp_mod, "_service", _Svc(), raising=False)
+
+    async def fake_run_evo(**kw):
+        return _winner_result()
+
+    monkeypatch.setattr("genesis.experimentation.evo.run_evo", fake_run_evo)
+
+    from genesis.mcp.health.evo_run import _impl_evo_run
+
+    out = await _impl_evo_run(
+        base_prompt="BASE", golden_set_path=str(_golden(tmp_path)), propose=True,
+    )
+    assert out["status"] == "ok"
+    assert out["proposal_id"] is not None
+    prop = await ego_crud.get_proposal(cvdb, out["proposal_id"])
+    assert prop["action_type"] == "cognitive_variant_promotion"

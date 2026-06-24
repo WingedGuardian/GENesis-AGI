@@ -551,6 +551,24 @@ async def ego_proposal_resolve(
                     await handle_cell_promotion_resolution(db, prop, status)
                 except Exception:
                     logger.debug("cell promotion hook failed", exc_info=True)
+                # Cognitive variant promotion (Evo PR-B).
+                try:
+                    from genesis.ego.cognitive_variant import (
+                        handle_cognitive_variant_resolution,
+                    )
+
+                    await handle_cognitive_variant_resolution(db, prop, status)
+                except Exception:
+                    logger.debug("cognitive-variant hook failed", exc_info=True)
+                # J-9 regression (informational): mark executed on approval.
+                try:
+                    from genesis.ego.j9_regression_actions import (
+                        handle_j9_regression_resolution,
+                    )
+
+                    await handle_j9_regression_resolution(db, prop, status)
+                except Exception:
+                    logger.debug("j9 regression hook failed", exc_info=True)
 
     resolved = sum(1 for v in results.values() if v in ("approved", "rejected"))
     return {

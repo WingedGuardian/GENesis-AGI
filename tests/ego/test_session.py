@@ -357,14 +357,15 @@ class TestProcessExecutionBriefs:
             direct_session_runner=mock_direct_runner,
         )
 
-    async def _insert_proposal(self, db, proposal_id, status="approved"):
+    async def _insert_proposal(self, db, proposal_id, status="approved",
+                               action_type="investigate"):
         """Insert a proposal into the DB for testing."""
         await db.execute(
             "INSERT INTO ego_proposals "
             "(id, action_type, action_category, content, rationale, "
             "confidence, urgency, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-            (proposal_id, "investigate", "test", "test content",
+            (proposal_id, action_type, "test", "test content",
              "test rationale", 0.8, "normal", status),
         )
         await db.commit()
@@ -482,6 +483,49 @@ class TestProcessExecutionBriefs:
         await ego_with_runner._process_execution_briefs(briefs)
 
         mock_direct_runner.spawn.assert_not_called()
+
+    async def test_cognitive_variant_promotion_never_dispatched(
+        self, ego_with_runner, mock_direct_runner, db,
+    ):
+        """An approved cognitive_variant_promotion must NEVER be auto-dispatched
+        as a session via the execution-briefs path. This fixture has no autonomy
+        gate, so the assertion proves the explicit action_type blocklist (not the
+        gate) is the backstop — the fail-open path the architect flagged. The
+        proposal is applied only by its resolution handler at approval time."""
+        await self._insert_proposal(
+            db, "prop_cvp", action_type="cognitive_variant_promotion",
+        )
+
+        briefs = [{"proposal_id": "prop_cvp", "prompt": "apply winning prompt"}]
+        await ego_with_runner._process_execution_briefs(briefs)
+
+        mock_direct_runner.spawn.assert_not_called()
+        prop = await ego_crud.get_proposal(db, "prop_cvp")
+        assert prop["status"] == "approved"  # untouched by the dispatch path
+
+    async def test_cognitive_variant_not_dispatched_by_sweep(
+        self, ego_with_runner, mock_direct_runner, db,
+    ):
+        """The OTHER dispatch path — the approved-proposal sweep — must also skip
+        cognitive_variant_promotion (the blocklist fires before any spawn)."""
+        await self._insert_proposal(
+            db, "prop_cvp_sweep", action_type="cognitive_variant_promotion",
+        )
+        await ego_with_runner.sweep_approved_proposals()
+        mock_direct_runner.spawn.assert_not_called()
+        assert (await ego_crud.get_proposal(db, "prop_cvp_sweep"))["status"] == "approved"
+
+
+def test_never_dispatch_action_types_single_source_of_truth():
+    """Both dispatch paths (sweep + execution-briefs) read this one tuple.
+    cognitive_variant_promotion must be present (else an approved Evo promotion
+    could be auto-run as a session); the pre-existing apply-at-approval types
+    must remain (regression guard for the refactor to a shared constant)."""
+    from genesis.ego.session import _NEVER_DISPATCH_ACTION_TYPES
+
+    assert "cognitive_variant_promotion" in _NEVER_DISPATCH_ACTION_TYPES
+    for legacy in ("autonomy_earnback", "goal_status_change", "cell_promotion"):
+        assert legacy in _NEVER_DISPATCH_ACTION_TYPES
 
 
 # ---------------------------------------------------------------------------

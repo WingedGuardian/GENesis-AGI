@@ -266,3 +266,73 @@ async def test_no_event_bus_still_works(db, mock_health, mock_drafter):
     gen = MorningReportGenerator(mock_health, db, mock_drafter, event_bus=None)
     req = await gen.generate()
     assert req.category == OutreachCategory.DIGEST
+
+
+async def _insert_grade(db, subsystem, grade, score, period_end="2026-06-22T00:00:00Z"):
+    from genesis.db.crud import j9_eval
+
+    await j9_eval.insert_subsystem_grade(
+        db,
+        period_start="2026-06-15T00:00:00Z",
+        period_end=period_end,
+        period_type="weekly",
+        subsystem=subsystem,
+        grade=grade,
+        score=score,
+        factors={"f": 1.0},
+        sample_count=10,
+    )
+
+
+@pytest.mark.asyncio
+async def test_eval_quality_section_surfaces_grades(db, mock_health, mock_drafter):
+    """Graded subsystems are surfaced with grade + score, sorted by name."""
+    await _insert_grade(db, "memory", "B", 82.0)
+    await _insert_grade(db, "ego", "D", 64.0)
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    out = await gen._get_eval_quality_section()
+
+    assert out is not None
+    assert "- ego: D (64)" in out
+    assert "- memory: B (82)" in out
+    # ego sorts before memory
+    assert out.index("ego:") < out.index("memory:")
+
+
+@pytest.mark.asyncio
+async def test_eval_quality_section_none_when_no_grades(db, mock_health, mock_drafter):
+    """No grades at all → section skipped entirely (returns None)."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    assert await gen._get_eval_quality_section() is None
+
+
+@pytest.mark.asyncio
+async def test_eval_quality_section_omits_ungraded(db, mock_health, mock_drafter):
+    """A None grade (cold-start / insufficient data) is omitted, never shown as
+    a problem; if it's the only row, the section is skipped. (cognitive_drift is
+    excluded at the schema level — the grades table CHECK-constrains subsystem to
+    the 5 graded subsystems, so the dark drift dimension never reaches here.)"""
+    await _insert_grade(db, "awareness", None, None)  # insufficient data → None
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    assert await gen._get_eval_quality_section() is None
+
+    # With one graded + one ungraded, only the graded one shows.
+    await _insert_grade(db, "memory", "A", 91.0)
+    out = await gen._get_eval_quality_section()
+    assert out is not None
+    assert "memory: A (91)" in out
+    assert "awareness" not in out
+
+
+@pytest.mark.asyncio
+async def test_eval_quality_section_appears_in_assembled_context(db, mock_health, mock_drafter):
+    """Wiring proof (Level-3 data-flow): when grades exist, the section reaches
+    the full assembled context that the LLM narrates."""
+    await _insert_grade(db, "memory", "B", 82.0)
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+
+    context = await gen._assemble_context()
+
+    assert "## Cognitive Subsystem Grades" in context
+    assert "memory: B (82)" in context

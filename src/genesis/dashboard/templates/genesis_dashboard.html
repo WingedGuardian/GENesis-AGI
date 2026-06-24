@@ -175,11 +175,6 @@
         sessionsList: [],
         sessionsView: 'active',    // 'active' or 'history'
         sessionsExpanded: null,
-        followUpsList: [],
-        followUpsView: 'active',   // 'active' or 'all'
-        followUpsSourceMode: 'all', // 'all' | 'mine' | 'system'
-        followUpsCounts: {},
-        followUpsExpanded: null,
 
         // ── Comms state (on Chat tab) ────────────────────────────
         commsOutreach: [],
@@ -220,6 +215,11 @@
         knowledgeUploads: [],
         knowledgeTaxonomy: { project_types: [], domains: [] },
         _uploadPollInterval: null,
+        // Tracked GitHub repositories (recon watchlist)
+        watchlistEntries: [],
+        watchlistForm: { name: '', repo: '', track: 'releases,commits', priority: 'medium', notes: '' },
+        watchlistMsg: null,
+        watchlistSaving: false,
 
         // ── References tab state ──────────────────────────────────
         referenceByKind: {},
@@ -237,6 +237,18 @@
 
         // ── Backup tab state ──────────────────────────────────────
         backupStatus: null,
+        backupConfig: null,
+        backupConfigForm: {
+          repo: '', tier2_backend: 'none', local_path: '',
+          nas: '', nas_user: '', nas_pass: '', passphrase: '',
+          schedule: '0 */6 * * *', schedule_enabled: true,
+        },
+        backupConfigSaving: false,
+        backupConfigMsg: null,
+        // Only POST the schedule (a stateful cron side-effect) when the user
+        // actually touches the schedule controls — a plain Save must not
+        // silently install/replace the cron job.
+        scheduleDirty: false,
 
         // ── Update state ─────────────────────────────────────────
         updateStatus: null,
@@ -299,7 +311,6 @@
         _jobHealthInterval: null,
         _tasksInterval: null,
         _workSessionsInterval: null,
-        _followUpsInterval: null,
         _observationsInterval: null,
         _cockpitInterval: null,
         _commsInterval: null,
@@ -324,6 +335,7 @@
         cockpitPageSize: 50,
         cockpitFilters: { kind: 'follow_up', domain: '', status: '', source: '', search: '' },
         cockpitSort: 'priority',
+        cockpitHideDone: true,   // default: hide completed/failed (actionable view)
         cockpitAvailableFilters: { sources: [], statuses: [] },
         cockpitExpanded: null,
         cockpitBatchIds: {},
@@ -351,7 +363,7 @@
           internals: ["_awarenessInterval", "_routingInterval", "_jobHealthInterval", "_activityInterval", "_sessionsInterval"],
           config:    [],
           files:     [],
-          work:      ["_tasksInterval", "_workSessionsInterval", "_followUpsInterval"],
+          work:      ["_tasksInterval", "_workSessionsInterval"],
           observations: ["_observationsInterval"],
           "follow-ups": ["_cockpitInterval"],
           traces:    ["_tracesInterval"],
@@ -417,10 +429,9 @@
               if (first) { this.fetchFiles(); }
               break;
             case "work":
-              if (first) { this.fetchTasks(); this.fetchWorkSessions(); this.fetchFollowUps(); }
+              if (first) { this.fetchTasks(); this.fetchWorkSessions(); }
               this._tasksInterval = setInterval(() => this.fetchTasks(), 5000);
               this._workSessionsInterval = setInterval(() => this.fetchWorkSessions(), 10000);
-              this._followUpsInterval = setInterval(() => this.fetchFollowUps(), 15000);
               break;
             case "observations":
               if (first) { this.fetchObservations(); this.fetchObservationsSummary(); this.fetchObservationsFilters(); }
@@ -442,7 +453,7 @@
               if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); }
               break;
             case "knowledge":
-              if (first) { this.fetchKnowledgeRecent(); this.fetchKnowledgeStats(); this.fetchKnowledgeUploads(); this.fetchKnowledgeTaxonomy(); }
+              if (first) { this.fetchKnowledgeRecent(); this.fetchKnowledgeStats(); this.fetchKnowledgeUploads(); this.fetchKnowledgeTaxonomy(); this.fetchWatchlist(); }
               // Resume polling if any uploads are processing
               if (this.knowledgeUploads.some(u => u.status === "processing")) { this._startUploadPolling(); }
               break;
@@ -450,7 +461,7 @@
               if (first) { this.fetchReferenceList(); this.fetchReferenceStats(); }
               break;
             case "backup":
-              if (first) { this.fetchBackupStatus(); this.fetchUpdateStatus(); this.fetchUpdateProgress(); }
+              if (first) { this.fetchBackupStatus(); this.fetchBackupConfig(); this.fetchUpdateStatus(); this.fetchUpdateProgress(); }
               break;
           }
         },
@@ -931,18 +942,6 @@
             }
           } catch (e) { console.warn("Work sessions fetch failed:", e); }
         },
-        async fetchFollowUps() {
-          try {
-            const sm = this.followUpsSourceMode;
-            const url = `/api/genesis/follow-ups?limit=50${sm !== 'all' ? '&source_mode=' + sm : ''}`;
-            const resp = await fetchApi(url);
-            if (resp && resp.ok) {
-              const data = await resp.json();
-              this.followUpsList = data.follow_ups || [];
-              this.followUpsCounts = data.counts || {};
-            }
-          } catch (e) { console.warn("Follow-ups fetch failed:", e); }
-        },
 
         // ── Observations tab fetches ─────────────────────────────
         async fetchObservations() {
@@ -1049,6 +1048,7 @@
             if (f.source) params.set("source", f.source);
             if (f.search) params.set("search", f.search);
             params.set("sort", this.cockpitSort);
+            params.set("hide_done", this.cockpitHideDone ? "1" : "0");
             params.set("page", String(this.cockpitPage));
             params.set("page_size", String(this.cockpitPageSize));
             const resp = await fetchApi(`/api/genesis/follow-ups/cockpit?${params}`);
@@ -1358,6 +1358,59 @@
             if (resp && resp.ok) { this.knowledgeStats = await resp.json(); }
           } catch (e) { console.warn("Knowledge stats failed:", e); }
         },
+        // ── Tracked repositories (recon watchlist) ──────────────────
+        async fetchWatchlist() {
+          try {
+            const resp = await fetchApi("/api/genesis/recon/watchlist");
+            if (resp && resp.ok) { this.watchlistEntries = (await resp.json()).entries || []; }
+          } catch (e) { console.warn("Watchlist fetch failed:", e); }
+        },
+        async addWatchlistRepo() {
+          this.watchlistSaving = true; this.watchlistMsg = null;
+          try {
+            const f = this.watchlistForm;
+            const body = {
+              name: f.name, repo: f.repo, priority: f.priority,
+              track: f.track.split(',').map(t => t.trim()).filter(Boolean),
+            };
+            if (f.notes) body.notes = f.notes;
+            const resp = await fetchApi("/api/genesis/recon/watchlist", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+            const data = resp ? await resp.json() : null;
+            if (resp && resp.ok) {
+              this.watchlistMsg = { ok: true, text: "Added " + data.repo };
+              f.name = ''; f.repo = ''; f.notes = '';
+              this.fetchWatchlist();
+            } else {
+              this.watchlistMsg = { ok: false, text: (data && (data.error || (data.details || []).join('; '))) || "Add failed" };
+            }
+          } catch (e) {
+            this.watchlistMsg = { ok: false, text: String(e) };
+          } finally { this.watchlistSaving = false; }
+        },
+        async toggleWatchlistRepo(repo, disabled) {
+          try {
+            const resp = await fetchApi("/api/genesis/recon/watchlist/disable", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ repo, disabled }),
+            });
+            if (resp && resp.ok) { this.fetchWatchlist(); }
+            else { const d = resp ? await resp.json() : null; this.watchlistMsg = { ok: false, text: (d && d.error) || "Update failed" }; }
+          } catch (e) { this.watchlistMsg = { ok: false, text: String(e) }; }
+        },
+        async removeWatchlistRepo(repo) {
+          if (!await this.showConfirm("Remove repository", "Remove " + repo + " from tracked repositories?")) return;
+          try {
+            const resp = await fetchApi("/api/genesis/recon/watchlist", {
+              method: "DELETE", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ repo }),
+            });
+            if (resp && resp.ok) { this.fetchWatchlist(); }
+            else { const d = resp ? await resp.json() : null; this.watchlistMsg = { ok: false, text: (d && d.error) || "Remove failed" }; }
+          } catch (e) { this.watchlistMsg = { ok: false, text: String(e) }; }
+        },
         async searchKnowledge() {
           if (!this.knowledgeQuery.trim()) return;
           try {
@@ -1601,6 +1654,72 @@
             if (resp && resp.ok) { alert("Backup triggered"); setTimeout(() => this.fetchBackupStatus(), 5000); }
             else { alert("Trigger failed"); }
           } catch (e) { alert("Trigger failed: " + e.message); }
+        },
+        async fetchBackupConfig() {
+          try {
+            const resp = await fetchApi("/api/genesis/backup/config");
+            if (resp && resp.ok) {
+              const c = await resp.json();
+              this.backupConfig = c;
+              const f = this.backupConfigForm;
+              f.repo = c.repo || '';
+              f.tier2_backend = c.tier2_backend || 'none';
+              f.local_path = c.local_path || '';
+              f.nas = c.nas || '';
+              f.nas_user = c.nas_user || '';
+              f.schedule = c.schedule || '0 */6 * * *';
+              f.schedule_enabled = c.schedule_enabled !== false;
+              this.scheduleDirty = false;   // loaded state is not a user change
+              // passphrase / nas_pass are write-only — never populated.
+            }
+          } catch (e) { console.warn("Backup config fetch failed:", e); }
+        },
+        async saveBackupConfig() {
+          this.backupConfigSaving = true;
+          this.backupConfigMsg = null;
+          try {
+            const f = this.backupConfigForm;
+            const body = { tier2_backend: f.tier2_backend };
+            // The cron job is a stateful side-effect — only touch it when the
+            // user actually changed the schedule controls.
+            if (this.scheduleDirty) {
+              body.schedule = f.schedule;
+              body.schedule_enabled = f.schedule_enabled;
+            }
+            // Only send repo if the user actually changed it — re-sending the
+            // credential-stripped value would clobber any token in the stored URL.
+            if (f.repo && f.repo !== (this.backupConfig?.repo || '')) body.repo = f.repo;
+            if (f.local_path) body.local_path = f.local_path;
+            if (f.nas) body.nas = f.nas;
+            if (f.nas_user) body.nas_user = f.nas_user;
+            if (f.nas_pass) body.nas_pass = f.nas_pass;
+            if (f.passphrase) body.passphrase = f.passphrase;
+            const resp = await fetchApi("/api/genesis/backup/config", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+            const data = resp ? await resp.json() : null;
+            if (resp && resp.ok) {
+              this.backupConfigMsg = {
+                ok: true,
+                text: "Saved — applies on the next backup run.",
+                warnings: (data && data.warnings) || [],
+              };
+              f.nas_pass = ''; f.passphrase = '';   // clear write-only fields
+              this.scheduleDirty = false;
+              this.fetchBackupConfig();
+              this.fetchBackupStatus();
+            } else {
+              const detail = data && (data.error +
+                (data.details ? ': ' + data.details.join('; ') : ''));
+              this.backupConfigMsg = { ok: false, text: detail || "Save failed", warnings: [] };
+            }
+          } catch (e) {
+            this.backupConfigMsg = { ok: false, text: String(e), warnings: [] };
+          } finally {
+            this.backupConfigSaving = false;
+          }
         },
 
         // ── Update methods ──────────────────────────────────────
@@ -8864,110 +8983,6 @@
       </div>
     </div>
 
-    <!-- Work: Follow-ups -->
-    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'work'">
-      <div class="panel-header">
-        <span class="material-symbols-outlined">follow_the_signs</span>
-        Follow-ups
-        <span class="panel-status" x-show="$store.genesisDashboard.followUpsCounts.pending > 0">
-          <span style="background:#ce93d8; width:6px; height:6px; border-radius:50%; display:inline-block;"></span>
-          <span x-text="$store.genesisDashboard.followUpsCounts.pending + ' pending'"></span>
-        </span>
-      </div>
-      <div class="panel-body">
-        <!-- Active / All toggle -->
-        <div style="display:flex; gap:0.25rem; margin-bottom:0.75rem;">
-          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
-                  :style="$store.genesisDashboard.followUpsView === 'active' ? 'background:#4caf5033; border:1px solid #4caf50; color:#4caf50; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
-                  @click="$store.genesisDashboard.followUpsView = 'active'">Active</button>
-          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
-                  :style="$store.genesisDashboard.followUpsView === 'all' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
-                  @click="$store.genesisDashboard.followUpsView = 'all'">All</button>
-          <!-- Source filter -->
-          <span style="border-left:1px solid #555; margin:0 0.25rem;"></span>
-          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
-                  :style="$store.genesisDashboard.followUpsSourceMode === 'all' ? 'background:#9c27b033; border:1px solid #9c27b0; color:#9c27b0; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
-                  @click="$store.genesisDashboard.followUpsSourceMode = 'all'; $store.genesisDashboard.fetchFollowUps()">All Sources</button>
-          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
-                  :style="$store.genesisDashboard.followUpsSourceMode === 'mine' ? 'background:#ff980033; border:1px solid #ff9800; color:#ff9800; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
-                  @click="$store.genesisDashboard.followUpsSourceMode = 'mine'; $store.genesisDashboard.fetchFollowUps()">Mine</button>
-          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
-                  :style="$store.genesisDashboard.followUpsSourceMode === 'system' ? 'background:#00bcd433; border:1px solid #00bcd4; color:#00bcd4; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
-                  @click="$store.genesisDashboard.followUpsSourceMode = 'system'; $store.genesisDashboard.fetchFollowUps()">System</button>
-        </div>
-        <template x-if="$store.genesisDashboard.followUpsList.filter(f => {
-          if ($store.genesisDashboard.followUpsView === 'active') return ['pending','in_progress','blocked'].includes(f.status);
-          return true;
-        }).length === 0">
-          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
-            No follow-ups found.
-          </div>
-        </template>
-        <div class="activity-feed">
-          <template x-for="item in $store.genesisDashboard.followUpsList.filter(f => {
-            if ($store.genesisDashboard.followUpsView === 'active') return ['pending','in_progress','blocked'].includes(f.status);
-            return true;
-          })" :key="item.id">
-            <div>
-              <div class="activity-row" style="cursor:pointer; display:flex; align-items:center; gap:0.5rem;"
-                   @click="$store.genesisDashboard.followUpsExpanded = $store.genesisDashboard.followUpsExpanded === item.id ? null : item.id">
-                <!-- Status badge -->
-                <span style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0;"
-                      :style="{
-                        'pending':     'background:rgba(158,158,158,0.15); color:#9e9e9e;',
-                        'in_progress': 'background:rgba(33,150,243,0.15); color:#2196F3;',
-                        'blocked':     'background:rgba(255,167,38,0.15); color:#ffa726;',
-                        'completed':   'background:rgba(102,187,106,0.15); color:#66bb6a;',
-                        'cancelled':   'background:rgba(158,158,158,0.15); color:#9e9e9e;',
-                      }[item.status] || 'background:rgba(158,158,158,0.15); color:#9e9e9e;'"
-                      x-text="item.status"></span>
-                <!-- Priority badge -->
-                <template x-if="item.priority && item.priority !== 'medium'">
-                  <span style="font-size:0.6rem; padding:0.08rem 0.3rem; border-radius:3px; flex-shrink:0;"
-                        :style="item.priority === 'high' || item.priority === 'critical' ? 'background:rgba(239,154,154,0.15); color:#ef9a9a;' : 'background:rgba(158,158,158,0.1); color:#9e9e9e;'"
-                        x-text="item.priority"></span>
-                </template>
-                <!-- Description -->
-                <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.73rem;"
-                      x-text="item.content || item.id"></span>
-                <!-- Timestamp -->
-                <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
-                      x-text="$store.genesisDashboard.formatTime(item.created_at)"></span>
-                <!-- Expand arrow -->
-                <span class="material-symbols-outlined" style="font-size:0.9rem; color:var(--color-text-secondary); transition:transform 0.15s;"
-                      :style="$store.genesisDashboard.followUpsExpanded === item.id ? 'transform:rotate(90deg)' : ''">chevron_right</span>
-              </div>
-              <!-- Expanded detail -->
-              <template x-if="$store.genesisDashboard.followUpsExpanded === item.id">
-                <div style="padding:0.5rem 0.75rem; background:rgba(0,0,0,0.15); border-radius:4px; margin:0.25rem 0 0.5rem 0; font-size:0.72rem;">
-                  <div style="margin-bottom:0.4rem; line-height:1.5;" x-text="item.content"></div>
-                  <template x-if="item.reason">
-                    <div style="margin-bottom:0.3rem; color:var(--color-text-secondary); font-size:0.7rem;">
-                      <strong>Reason:</strong> <span x-text="item.reason"></span>
-                    </div>
-                  </template>
-                  <div style="display:flex; gap:0.5rem; font-size:0.65rem; color:var(--color-text-secondary);">
-                    <span x-text="'Strategy: ' + (item.strategy || 'unknown')"></span>
-                    <span x-text="'Source: ' + (item.source || 'unknown')"></span>
-                  </div>
-                  <template x-if="item.resolution_notes">
-                    <div style="margin-top:0.3rem; padding:0.2rem 0.4rem; background:rgba(0,0,0,0.2); border-radius:3px; font-size:0.65rem; color:var(--color-text-secondary);">
-                      <strong>Resolution:</strong> <span x-text="item.resolution_notes"></span>
-                    </div>
-                  </template>
-                  <template x-if="item.blocked_reason">
-                    <div style="margin-top:0.3rem; padding:0.2rem 0.4rem; background:rgba(255,167,38,0.08); border-radius:3px; border:1px solid rgba(255,167,38,0.15); font-size:0.65rem;">
-                      <strong style="color:#ffa726;">Blocked:</strong> <span x-text="item.blocked_reason"></span>
-                    </div>
-                  </template>
-                </div>
-              </template>
-            </div>
-          </template>
-        </div>
-      </div>
-    </div>
-
     <!-- ═══════════════════════════════════════════════════════════
          Panel: Observations [Tab: observations]
          ═══════════════════════════════════════════════════════════ -->
@@ -9214,6 +9229,17 @@
             <option value="status">Sort: Status</option>
             <option value="source">Sort: Source</option>
           </select>
+
+          <!-- Hide done toggle: excludes completed/failed (ignored when a
+               specific status is selected). On by default → actionable view. -->
+          <label style="display:inline-flex; align-items:center; gap:0.3rem; font-size:0.68rem; color:var(--color-text-secondary); cursor:pointer; user-select:none;"
+                 :title="$store.genesisDashboard.cockpitFilters.status ? 'Showing the selected status — hide-done does not apply' : 'Hide completed and failed follow-ups'">
+            <input type="checkbox"
+                   :checked="$store.genesisDashboard.cockpitHideDone"
+                   :disabled="!!$store.genesisDashboard.cockpitFilters.status"
+                   @change="$store.genesisDashboard.cockpitHideDone = $event.target.checked; $store.genesisDashboard.cockpitApplyFilter()">
+            Hide done
+          </label>
 
           <input type="text" placeholder="Search content/reason… (Enter)"
                  :value="$store.genesisDashboard.cockpitFilters.search"
@@ -9768,6 +9794,75 @@
         Knowledge Base
       </div>
       <div style="padding: 1rem;">
+
+      <!-- ── Tracked GitHub Repositories (recon watchlist) ───── -->
+      <div style="margin-bottom: 1.5rem;">
+        <div style="display:flex; align-items:center; gap:0.4rem; margin-bottom:0.4rem;">
+          <span class="material-symbols-outlined" style="font-size:1.1rem;">visibility</span>
+          <strong>Tracked GitHub Repositories</strong>
+          <span style="font-size:0.72rem; color:var(--color-text-secondary);"
+                x-text="'(' + $store.genesisDashboard.watchlistEntries.length + ')'"></span>
+        </div>
+        <div style="font-size:0.74rem; color:var(--color-text-secondary); margin-bottom:0.6rem;">
+          Repos Genesis monitors for releases, commits, and issues. Base entries ship with
+          Genesis (lock icon — can be disabled); add install-specific repos below.
+        </div>
+        <div style="display:flex; flex-direction:column; gap:0.3rem; margin-bottom:0.6rem;">
+          <template x-for="e in $store.genesisDashboard.watchlistEntries" :key="e.repo">
+            <div style="display:flex; align-items:center; gap:0.5rem; padding:0.35rem 0.5rem; border-radius:4px; background:rgba(0,0,0,0.15);"
+                 :style="e.disabled ? 'opacity:0.5;' : ''">
+              <span class="material-symbols-outlined" style="font-size:0.85rem; color:var(--color-text-secondary);"
+                    x-text="e.source === 'base' ? 'lock' : 'person'"
+                    :title="e.source === 'base' ? 'Base entry (ships with Genesis)' : 'Install-added'"></span>
+              <a :href="'https://github.com/' + e.repo" target="_blank" rel="noopener"
+                 style="font-family:monospace; font-size:0.78rem; color:#64b5f6; text-decoration:none;" x-text="e.repo"></a>
+              <span style="font-size:0.62rem; padding:0.05rem 0.3rem; border-radius:3px; background:rgba(255,255,255,0.08); color:var(--color-text-secondary);" x-text="e.priority"></span>
+              <span style="font-size:0.66rem; color:var(--color-text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;" x-text="(e.track || []).join(', ')"></span>
+              <template x-if="e.source === 'base'">
+                <button style="font-size:0.62rem; padding:0.1rem 0.45rem; border-radius:3px; cursor:pointer; border:1px solid #555; background:transparent;"
+                        :style="e.disabled ? 'color:#81c784; border-color:#81c784;' : 'color:#aaa;'"
+                        @click="$store.genesisDashboard.toggleWatchlistRepo(e.repo, !e.disabled)"
+                        x-text="e.disabled ? 'Enable' : 'Disable'"></button>
+              </template>
+              <template x-if="e.source === 'overlay'">
+                <button style="font-size:0.62rem; padding:0.1rem 0.45rem; border-radius:3px; cursor:pointer; border:1px solid rgba(239,83,80,0.4); background:transparent; color:#ef9a9a;"
+                        @click="$store.genesisDashboard.removeWatchlistRepo(e.repo)">Remove</button>
+              </template>
+            </div>
+          </template>
+          <template x-if="$store.genesisDashboard.watchlistEntries.length === 0">
+            <div style="font-size:0.74rem; color:var(--color-text-secondary); padding:0.5rem;">No tracked repositories loaded.</div>
+          </template>
+        </div>
+        <details style="font-size:0.78rem;">
+          <summary style="cursor:pointer; color:var(--color-text-secondary);">+ Add a repository</summary>
+          <div style="display:flex; flex-direction:column; gap:0.4rem; margin-top:0.5rem; max-width:480px;">
+            <input type="text" x-model="$store.genesisDashboard.watchlistForm.name" placeholder="Name (e.g. Cool Project)"
+                   style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+            <input type="text" x-model="$store.genesisDashboard.watchlistForm.repo" placeholder="owner/repo (not a URL)"
+                   style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary); font-family:monospace;">
+            <input type="text" x-model="$store.genesisDashboard.watchlistForm.track" placeholder="track: releases,commits,issues,discussions,stars"
+                   style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+            <select x-model="$store.genesisDashboard.watchlistForm.priority"
+                    style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+              <option value="high">Priority: high</option>
+              <option value="medium">Priority: medium</option>
+              <option value="low">Priority: low</option>
+            </select>
+            <input type="text" x-model="$store.genesisDashboard.watchlistForm.notes" placeholder="Notes (optional) — why track this?"
+                   style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+            <div style="display:flex; gap:0.6rem; align-items:center;">
+              <button @click="$store.genesisDashboard.addWatchlistRepo()"
+                      :disabled="$store.genesisDashboard.watchlistSaving"
+                      style="font-size:0.78rem; padding:0.3rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(33,150,243,0.15); color:#64b5f6; border:1px solid rgba(33,150,243,0.4);"
+                      x-text="$store.genesisDashboard.watchlistSaving ? 'Adding…' : 'Add repository'"></button>
+              <span x-show="$store.genesisDashboard.watchlistMsg"
+                    :style="$store.genesisDashboard.watchlistMsg?.ok ? 'color:#81c784; font-size:0.76rem;' : 'color:#ef9a9a; font-size:0.76rem;'"
+                    x-text="$store.genesisDashboard.watchlistMsg?.text"></span>
+            </div>
+          </div>
+        </details>
+      </div>
 
       <!-- ── Upload Zone ─────────────────────────────────────── -->
       <div style="margin-bottom: 1.5rem;">
@@ -10427,6 +10522,106 @@
                   <span x-text="$store.genesisDashboard.backupStatus.configured ? 'Installed' : 'Not found'"
                         :style="$store.genesisDashboard.backupStatus.configured ? 'color:#81c784' : 'color:#ef9a9a'"></span>
                 </div>
+              </div>
+            </div>
+            <!-- Editable backup configuration -->
+            <div class="card" style="padding:1rem; margin-top:0.75rem;">
+              <h3 style="margin:0 0 0.6rem 0; font-size:1rem;">Backup configuration</h3>
+              <div style="display:flex; flex-direction:column; gap:0.55rem; font-size:0.82rem; max-width:520px;">
+                <!-- Destination repo -->
+                <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                  <span style="color:var(--color-text-secondary);">Backups repo (git URL)</span>
+                  <input type="text" x-model="$store.genesisDashboard.backupConfigForm.repo"
+                         placeholder="https://github.com/you/genesis-backups.git"
+                         style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                </label>
+                <template x-if="$store.genesisDashboard.backupConfigForm.repo && $store.genesisDashboard.backupConfig && $store.genesisDashboard.backupConfig.repo && $store.genesisDashboard.backupConfigForm.repo !== $store.genesisDashboard.backupConfig.repo">
+                  <div style="font-size:0.72rem; color:#ffb74d;">⚠ Changing the repo URL does not migrate existing backup history — keep the old repo reachable for restores.</div>
+                </template>
+
+                <!-- Encryption passphrase (write-only) -->
+                <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                  <span style="color:var(--color-text-secondary);">Encryption passphrase
+                    <span x-show="$store.genesisDashboard.backupConfig?.passphrase_set" style="color:#81c784;">(set — blank keeps current)</span></span>
+                  <input type="password" autocomplete="new-password" x-model="$store.genesisDashboard.backupConfigForm.passphrase"
+                         placeholder="leave blank to keep current"
+                         style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                </label>
+                <template x-if="$store.genesisDashboard.backupConfigForm.passphrase">
+                  <div style="font-size:0.72rem; color:#ffb74d;">⚠ Rotating the passphrase does NOT re-encrypt existing backups. Keep the old one until a fresh backup is verified.</div>
+                </template>
+
+                <!-- Off-site backend -->
+                <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                  <span style="color:var(--color-text-secondary);">Off-site backend</span>
+                  <select x-model="$store.genesisDashboard.backupConfigForm.tier2_backend"
+                          style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    <option value="none">None</option>
+                    <option value="local">Local / mounted path</option>
+                    <option value="smb">SMB / NAS</option>
+                  </select>
+                </label>
+                <template x-if="$store.genesisDashboard.backupConfigForm.tier2_backend === 'local'">
+                  <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                    <span style="color:var(--color-text-secondary);">Local path</span>
+                    <input type="text" x-model="$store.genesisDashboard.backupConfigForm.local_path" placeholder="/mnt/backups"
+                           style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                  </label>
+                </template>
+                <template x-if="$store.genesisDashboard.backupConfigForm.tier2_backend === 'smb'">
+                  <div style="display:flex; flex-direction:column; gap:0.55rem;">
+                    <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                      <span style="color:var(--color-text-secondary);">NAS share</span>
+                      <input type="text" x-model="$store.genesisDashboard.backupConfigForm.nas" placeholder="//host/share"
+                             style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    </label>
+                    <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                      <span style="color:var(--color-text-secondary);">NAS user</span>
+                      <input type="text" x-model="$store.genesisDashboard.backupConfigForm.nas_user"
+                             style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    </label>
+                    <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                      <span style="color:var(--color-text-secondary);">NAS password
+                        <span x-show="$store.genesisDashboard.backupConfig?.nas_pass_set" style="color:#81c784;">(set — blank keeps current)</span></span>
+                      <input type="password" autocomplete="new-password" x-model="$store.genesisDashboard.backupConfigForm.nas_pass" placeholder="leave blank to keep current"
+                             style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    </label>
+                  </div>
+                </template>
+
+                <!-- Schedule -->
+                <label style="display:flex; align-items:center; gap:0.4rem; margin-top:0.2rem;">
+                  <input type="checkbox" x-model="$store.genesisDashboard.backupConfigForm.schedule_enabled"
+                         @change="$store.genesisDashboard.scheduleDirty = true">
+                  <span>Scheduled (cron) backups</span>
+                </label>
+                <template x-if="$store.genesisDashboard.backupConfigForm.schedule_enabled">
+                  <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                    <span style="color:var(--color-text-secondary);">Cron schedule</span>
+                    <input type="text" x-model="$store.genesisDashboard.backupConfigForm.schedule" placeholder="0 */6 * * *"
+                           @input="$store.genesisDashboard.scheduleDirty = true"
+                           style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary); font-family:monospace;">
+                    <span style="font-size:0.7rem; color:var(--color-text-secondary);">5-field cron — e.g. <code>0 */6 * * *</code> = every 6 hours</span>
+                  </label>
+                </template>
+
+                <!-- Save -->
+                <div style="display:flex; gap:0.6rem; align-items:center; margin-top:0.3rem;">
+                  <button @click="$store.genesisDashboard.saveBackupConfig()"
+                          :disabled="$store.genesisDashboard.backupConfigSaving"
+                          style="font-size:0.8rem; padding:0.35rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(33,150,243,0.15); color:#64b5f6; border:1px solid rgba(33,150,243,0.4);"
+                          x-text="$store.genesisDashboard.backupConfigSaving ? 'Saving…' : 'Save configuration'"></button>
+                  <span x-show="$store.genesisDashboard.backupConfigMsg"
+                        :style="$store.genesisDashboard.backupConfigMsg?.ok ? 'color:#81c784; font-size:0.78rem;' : 'color:#ef9a9a; font-size:0.78rem;'"
+                        x-text="$store.genesisDashboard.backupConfigMsg?.text"></span>
+                </div>
+                <template x-if="$store.genesisDashboard.backupConfigMsg?.warnings?.length">
+                  <div style="font-size:0.72rem; color:#ffb74d; display:flex; flex-direction:column; gap:0.2rem;">
+                    <template x-for="w in $store.genesisDashboard.backupConfigMsg.warnings" :key="w">
+                      <div x-text="'⚠ ' + w"></div>
+                    </template>
+                  </div>
+                </template>
               </div>
             </div>
           </div>

@@ -564,6 +564,32 @@ class ProposalWorkflow:
                         "cell promotion hook failed for %s",
                         prop.get("id"), exc_info=True,
                     )
+                # Cognitive variant promotion (Evo PR-B): apply the reflection
+                # prompt winner to the overlay on approval.
+                try:
+                    from genesis.ego.cognitive_variant import (
+                        handle_cognitive_variant_resolution,
+                    )
+
+                    await handle_cognitive_variant_resolution(self._db, prop, status)
+                except Exception:
+                    logger.warning(
+                        "cognitive-variant hook failed for %s",
+                        prop.get("id"), exc_info=True,
+                    )
+                # J-9 regression (informational): mark executed on approval, no
+                # side-effect. Never dispatched (blocklist + NOTIFY_USER gate).
+                try:
+                    from genesis.ego.j9_regression_actions import (
+                        handle_j9_regression_resolution,
+                    )
+
+                    await handle_j9_regression_resolution(self._db, prop, status)
+                except Exception:
+                    logger.warning(
+                        "j9 regression hook failed for %s",
+                        prop.get("id"), exc_info=True,
+                    )
             else:
                 logger.warning(
                     "Proposal %s not updated (already resolved?)",

@@ -288,6 +288,16 @@ ACTION_TYPE_DOMAIN_MAP: dict[str, ActionDomain] = {
     "payment": ActionDomain.FINANCIAL,
     "code_change": ActionDomain.SELF_MODIFY,
     "refactor": ActionDomain.SELF_MODIFY,
+    # Evo promotion rewrites Genesis's own deep-reflection prompt — a change to
+    # its cognition. SELF_MODIFY is hard-blocked from background dispatch
+    # (ACTION_DOMAIN_MIN_LEVEL = None), so an approved promotion can never be
+    # auto-run as a session; it is applied ONLY by its resolution handler.
+    "cognitive_variant_promotion": ActionDomain.SELF_MODIFY,
+    # J-9 regression surfacing is INFORMATIONAL — it notifies the operator about
+    # a cognitive-quality regression and applies nothing. NOTIFY_USER + the
+    # _NEVER_DISPATCH_ACTION_TYPES blocklist mean an approved one is marked
+    # executed by its handler, never auto-run as a background session.
+    "j9_regression": ActionDomain.NOTIFY_USER,
 }
 
 
