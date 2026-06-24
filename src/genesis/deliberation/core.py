@@ -11,7 +11,7 @@ import logging
 from contextvars import ContextVar
 
 from genesis.deliberation.backends import get_backend
-from genesis.deliberation.types import DeliberationResult, Stakes
+from genesis.deliberation.types import DeliberationResult
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ async def deliberate(
     question: str,
     *,
     context: str | None = None,
-    stakes: Stakes = "normal",
+    stakes: str | None = None,
     backend: str = "fusion",
     mode: str = "synthesis",
     preset: str | None = None,
@@ -32,6 +32,12 @@ async def deliberate(
     models: list[str] | None = None,
 ) -> DeliberationResult:
     """Run a question through a chorus of models and return verdict + dissent.
+
+    ``mode`` ``"synthesis"`` (fast prose) | ``"analysis"`` (structured consensus/dissent).
+    ``preset`` ``"strong"`` (frontier panel) | ``"budget"`` (mid-tier); mode-aware default
+    (synthesis→budget, analysis→strong, which is always forced strong). ``stakes`` left as
+    ``None`` auto-couples to high for analysis or the strong preset, else normal — pass an
+    explicit ``"normal"``/``"high"`` to override.
 
     Never raises — every failure comes back as ``DeliberationResult(error=...)``.
     PAID (Fusion) and recursion-blocked.
@@ -47,8 +53,8 @@ async def deliberate(
     be = get_backend(backend)
     if be is None:
         return DeliberationResult(answer=None, backend_used=backend, error=f"unknown backend: {backend}")
-    if stakes not in ("normal", "high"):
-        stakes = "normal"
+    # stakes left as-is (incl. None / unknown): the backend auto-couples it from mode+preset
+    # when not an explicit "normal"/"high". See FusionBackend._resolve_stakes.
 
     token = _in_deliberate.set(True)
     try:
