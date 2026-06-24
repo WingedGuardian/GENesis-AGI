@@ -48,10 +48,12 @@ def _load_yaml(path: Path) -> dict:
 
 
 def load_base() -> list[dict]:
+    """Return the committed base project list (``recon_watchlist.yaml``)."""
     return list(_load_yaml(WATCHLIST_PATH).get("projects") or [])
 
 
 def load_overlay() -> dict:
+    """Return the gitignored overlay (install-added ``projects`` + ``disabled`` tombstones)."""
     data = _load_yaml(LOCAL_PATH)
     return {
         "projects": list(data.get("projects") or []),
