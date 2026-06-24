@@ -22,6 +22,7 @@ class Backend(Protocol):
         *,
         context: str | None,
         stakes: str,
+        mode: str,
         timeout_s: float,
         models: list[str] | None,
     ) -> DeliberationResult: ...

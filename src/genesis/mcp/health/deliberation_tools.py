@@ -13,18 +13,23 @@ from genesis.mcp.health import mcp
 logger = logging.getLogger(__name__)
 
 
-async def _impl_deliberate(question: str, context: str = "", stakes: str = "normal") -> dict:
+async def _impl_deliberate(
+    question: str, context: str = "", stakes: str = "normal", mode: str = "synthesis"
+) -> dict:
     from genesis.deliberation import deliberate
 
     if not question or not question.strip():
         return {"error": "question is required"}
     if stakes not in ("normal", "high"):
         stakes = "normal"
-    result = await deliberate(question, context=(context or None), stakes=stakes, backend="fusion")
+    if mode not in ("synthesis", "analysis"):
+        mode = "synthesis"
+    result = await deliberate(question, context=(context or None), stakes=stakes, mode=mode, backend="fusion")
     return {
         "answer": result.answer,
         "consensus": result.consensus,
         "dissent": list(result.dissent),
+        "blind_spots": list(result.blind_spots),
         "confidence": result.confidence,
         "per_model": [
             {"model": pm.model, "answer": pm.answer, "stance": pm.stance} for pm in result.per_model
@@ -38,20 +43,23 @@ async def _impl_deliberate(question: str, context: str = "", stakes: str = "norm
 
 
 @mcp.tool()
-async def deliberate(question: str, context: str = "", stakes: str = "normal") -> dict:
-    """Consult a chorus of models (a server-side panel + judge) for a synthesized verdict PLUS
-    the dissent — for genuinely high-stakes or contested decisions.
+async def deliberate(
+    question: str, context: str = "", stakes: str = "normal", mode: str = "synthesis"
+) -> dict:
+    """Consult a chorus of models (a server-side panel + judge) for a verdict PLUS the dissent —
+    for genuinely high-stakes or contested decisions.
 
-    PAID + opt-in: routes to OpenRouter Fusion (non-free; a panel deliberates with web search,
-    ~60-90s). Use ONLY for high-stakes/explicit calls — never as a default judgment path.
-    Recursion-blocked.
+    PAID + opt-in: routes to OpenRouter Fusion (non-free). Use ONLY for high-stakes/explicit calls —
+    never as a default judgment path. Recursion-blocked.
 
     Args:
       question: the decision or question to deliberate.
       context:  optional background to ground the panel.
       stakes:   "normal" (default) or "high" (weights dissent more heavily).
+      mode:     "synthesis" (default) = fast (~45-60s) prose verdict; "analysis" = deeper (~2-3min)
+                machine-structured consensus + dissent[] + blind_spots[].
 
-    Returns {answer, consensus, dissent[], confidence, per_model[], cost_usd, cost_known,
-    latency_s, error}. On failure, answer is null and error is set (never raises).
+    Returns {answer, consensus, dissent[], blind_spots[], confidence, per_model[], cost_usd,
+    cost_known, latency_s, error}. On failure, answer is null and error is set (never raises).
     """
-    return await _impl_deliberate(question, context, stakes)
+    return await _impl_deliberate(question, context, stakes, mode)

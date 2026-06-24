@@ -28,6 +28,16 @@ JSON_OK = (
 )
 JSON_FENCED = "```json\n" + JSON_OK + "\n```"
 JSON_IN_PROSE = "Here is the panel's verdict.\n\n" + JSON_OK + "\n\nHope that helps."
+# ANALYSIS mode: the orchestrator returns clean structured JSON (real probe output, 2026-06-24).
+ANALYSIS_JSON = (
+    '{"answer": "Choose A — harden reliability; reserve ~20-30% for one high-impact feature.", '
+    '"consensus": "All three models agreed churn is the biggest risk, usually from reliability.", '
+    '"dissent": ["If churn is a missing-feature problem, one feature beats reliability.", '
+    '"A pure tech-debt quarter can unsettle investors and demotivate the team.", '
+    '"Not all debt causes churn; target paydown surgically."], '
+    '"blind_spots": ["Concrete churn-reason data.", "Runway/burn and fundraise timing."], '
+    '"confidence": 0.81}'
+)
 
 
 def _resp(content, cost=None):
@@ -71,23 +81,38 @@ def test_dissent_string_coerced_to_list():
     assert _parse_content('{"answer":"x","dissent":"single point"}')["dissent"] == ["single point"]
 
 
+def test_parse_blind_spots():
+    assert _parse_content('{"answer":"x","blind_spots":["b1","b2"]}')["blind_spots"] == ["b1", "b2"]
+
+
 def test_normalize_prose_uses_content_as_answer():
-    r = _normalize(_resp(PROSE, cost=0.3211), latency=80.0)
+    r = _normalize(_resp(PROSE, cost=0.3211), 80.0, "synthesis")
     assert r.ok
     assert r.answer.startswith("# Recommendation")
     assert r.dissent == ()
     assert r.cost_usd == 0.3211 and r.cost_known
     assert r.latency_s == 80.0
+    assert r.backend_used == "fusion/synthesis"
 
 
 def test_normalize_json_structured():
-    r = _normalize(_resp(JSON_OK, cost=0.05), latency=70.0)
+    r = _normalize(_resp(JSON_OK, cost=0.05), 70.0, "synthesis")
     assert r.answer.startswith("Cut now")
     assert r.consensus and len(r.dissent) == 1 and r.confidence == 0.82
 
 
+def test_normalize_analysis_structured():
+    r = _normalize(_resp(ANALYSIS_JSON, cost=0.12), 173.0, "analysis")
+    assert r.answer.startswith("Choose A")
+    assert len(r.dissent) == 3
+    assert len(r.blind_spots) == 2
+    assert r.confidence == 0.81
+    assert r.backend_used == "fusion/analysis"
+    assert r.cost_usd == 0.12 and r.cost_known
+
+
 def test_normalize_empty_content_errors():
-    r = _normalize(_resp("", cost=0.01), latency=1.0)
+    r = _normalize(_resp("", cost=0.01), 1.0, "synthesis")
     assert not r.ok and "empty" in r.error
 
 
@@ -119,6 +144,20 @@ async def test_fusion_happy(monkeypatch):
     assert kwargs["model"] == "openrouter/openrouter/fusion"
 
 
+async def test_fusion_analysis_mode_request(monkeypatch):
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+    with patch(
+        "genesis.deliberation.backends.fusion.litellm.acompletion",
+        new=AsyncMock(return_value=_resp(ANALYSIS_JSON, cost=0.12)),
+    ) as m:
+        r = await FusionBackend().run("q", mode="analysis")
+    assert r.ok and len(r.dissent) == 3 and r.backend_used == "fusion/analysis"
+    kwargs = m.call_args.kwargs
+    assert kwargs["model"] == "openrouter/openai/gpt-oss-120b:free"
+    assert kwargs["extra_body"]["tools"][0]["type"] == "openrouter:fusion"
+    assert kwargs["extra_body"]["tool_choice"] == "required"
+
+
 async def test_fusion_no_key(monkeypatch):
     for var in ("API_KEY_OPENROUTER", "OPENROUTER_API_KEY", "OPENROUTER_API_TOKEN"):
         monkeypatch.delenv(var, raising=False)
@@ -133,7 +172,7 @@ async def test_fusion_error_graceful(monkeypatch):
         new=AsyncMock(side_effect=RuntimeError("boom")),
     ):
         r = await FusionBackend().run("q")
-    assert not r.ok and "fusion call failed" in r.error
+    assert not r.ok and "call failed" in r.error
 
 
 async def test_fusion_timeout_graceful(monkeypatch):
@@ -194,13 +233,13 @@ async def test_backend_receives_stakes_and_context(monkeypatch):
     class Stub:
         name = "stub"
 
-        async def run(self, q, *, context, stakes, timeout_s, models):
-            seen.update(q=q, context=context, stakes=stakes)
+        async def run(self, q, *, context, stakes, mode, timeout_s, models):
+            seen.update(q=q, context=context, stakes=stakes, mode=mode)
             return DeliberationResult(answer="ok")
 
     monkeypatch.setattr("genesis.deliberation.core.get_backend", lambda n: Stub())
-    await deliberate("decide", context="bg", stakes="high", backend="stub")
-    assert seen == {"q": "decide", "context": "bg", "stakes": "high"}
+    await deliberate("decide", context="bg", stakes="high", mode="analysis", backend="stub")
+    assert seen == {"q": "decide", "context": "bg", "stakes": "high", "mode": "analysis"}
 
 
 # ── MCP tool ─────────────────────────────────────────────────────────────────

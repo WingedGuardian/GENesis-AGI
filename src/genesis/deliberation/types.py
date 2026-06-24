@@ -29,6 +29,7 @@ class DeliberationResult:
     answer: str | None
     consensus: str | None = None
     dissent: tuple[str, ...] = ()
+    blind_spots: tuple[str, ...] = ()
     confidence: float | None = None
     per_model: tuple[PerModel, ...] = ()
     backend_used: str = "fusion"
