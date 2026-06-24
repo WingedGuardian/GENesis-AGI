@@ -124,10 +124,10 @@ profiles:
     last_reviewed: "2026-03-14"
     review_source: manual
 
-  gemini-3-flash:
-    display_name: "Gemini 3 Flash"
+  gemini-3.5-flash:
+    display_name: "Gemini 3.5 Flash"
     provider: google
-    api_id: "google/gemini-3-flash"
+    api_id: "google/gemini-3.5-flash"
     intelligence_tier: B
     reasoning: B
     instruction_following: A
