@@ -240,3 +240,19 @@ def test_get_config_returns_nas_when_authenticated(client):
     data = resp.get_json()
     assert data["nas"] == "//host/share" and data["nas_user"] == "bk"
     assert data["local_path"] == "/mnt/bk"
+
+
+# ── Secrets-UI masking (the `_SENSITIVE_RE` change) ──────────────────────────
+
+def test_sensitive_re_masks_backup_nas_pass():
+    """The NAS password (and passphrase) render masked in the Secrets UI, while
+    the non-secret backup config fields stay visible. Guards the `_SENSITIVE_RE`
+    `_PASS` addition that this PR introduced."""
+    from genesis.dashboard.routes.secrets import _SENSITIVE_RE
+
+    assert _SENSITIVE_RE.search("GENESIS_BACKUP_NAS_PASS")
+    assert _SENSITIVE_RE.search("GENESIS_BACKUP_PASSPHRASE")
+    # Non-secret destination fields must NOT be masked (users need to see them).
+    assert not _SENSITIVE_RE.search("GENESIS_BACKUP_NAS_SHARE")
+    assert not _SENSITIVE_RE.search("GENESIS_BACKUP_NAS_USER")
+    assert not _SENSITIVE_RE.search("GENESIS_BACKUP_LOCAL_PATH")
