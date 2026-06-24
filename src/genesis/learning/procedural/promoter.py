@@ -139,25 +139,29 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
             despeculated += 1
             logger.info("De-speculated procedure %s (success=%d)", row["task_type"], row["success_count"])
 
-        # Compute target tier: the higher of real-metric promotion and
-        # read-driven (effective-metric) promotion. Reads can only *raise* the
-        # target; quarantine/demotion below stay on real metrics.
+        # Compute target tier. Failure evidence (`_check_demotion`) takes
+        # precedence over BOTH real-metric and read-driven promotion: a
+        # failing procedure must never be promoted — least of all by soft read
+        # signal. Otherwise the target is the higher of real-metric and
+        # read-driven (effective-metric) promotion (reads can only *raise* it).
         real_target = _compute_tier(row)
-        reads = row.get("invocation_count") or 0
-        eff_success = row["success_count"] + reads // READ_CONFIDENCE_DISCOUNT
-        eff_conf = effective_confidence(row["success_count"], row["failure_count"], reads)
-        read_target = _read_eligible_tier(eff_success, eff_conf, row["success_count"])
-        target_tier = (
-            real_target
-            if _TIER_RANK[real_target] >= _TIER_RANK[read_target]
-            else read_target
-        )
-
-        # Check for demotion
         if _check_demotion(row):
+            target_tier = real_target  # promote-only on real metrics; held for failing rows
             current_rank = _TIER_RANK.get(current_tier, 1)
             if current_rank > 1:
                 target_tier = _RANK_TIER[current_rank - 1]
+        else:
+            reads = row.get("invocation_count") or 0
+            eff_success = row["success_count"] + reads // READ_CONFIDENCE_DISCOUNT
+            eff_conf = effective_confidence(
+                row["success_count"], row["failure_count"], reads
+            )
+            read_target = _read_eligible_tier(eff_success, eff_conf, row["success_count"])
+            target_tier = (
+                real_target
+                if _TIER_RANK[real_target] >= _TIER_RANK[read_target]
+                else read_target
+            )
 
         if target_tier != current_tier:
             target_rank = _TIER_RANK.get(target_tier, 1)

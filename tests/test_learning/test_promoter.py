@@ -381,6 +381,31 @@ async def test_despeculate_on_real_success(db):
 
 
 @pytest.mark.asyncio
+async def test_reads_do_not_promote_a_failing_procedure(db):
+    """A procedure in a failure state (trips _check_demotion) must NOT be
+    read-promoted, even with enough reads to otherwise qualify. Reads are a
+    soft signal; recorded failures are the hard counterweight.
+
+    Sits in the 0.3–0.5 confidence band so it escapes the quarantine guard and
+    actually reaches the promote/demote block.
+    """
+    await _insert(
+        db, id="failing-read", task_type="t",
+        success_count=1, failure_count=4, confidence=0.333,
+        speculative=0, activation_tier="L4", invocation_count=40,  # eff_success=9
+        failure_modes=json.dumps([
+            {"description": "x", "conditions": "x", "times_hit": 3},
+        ]),
+    )
+    result = await promote_and_demote(db)
+    assert result["promotions"] == 0
+    cursor = await db.execute(
+        "SELECT activation_tier FROM procedural_memory WHERE id = ?", ("failing-read",),
+    )
+    assert (await cursor.fetchone())[0] == "L4"  # reads can't promote a failing proc
+
+
+@pytest.mark.asyncio
 async def test_despeculate_blocked_by_failure(db):
     """A failure blocks de-speculation even with real successes."""
     await _insert(

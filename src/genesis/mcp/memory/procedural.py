@@ -159,8 +159,11 @@ async def procedure_recall(
         from genesis.eval.j9_hooks import emit_procedure_invoked
         for r in results:
             pid = r.get("procedure_id", "")
-            if pid:
-                await procedural.record_invocation(memory_mod._db, pid)
+            if not pid:
+                continue
+            # Keep the read counter and the J-9 event in lockstep — both gated
+            # on a real procedure_id so neither records an orphan.
+            await procedural.record_invocation(memory_mod._db, pid)
             await emit_procedure_invoked(
                 memory_mod._db,
                 procedure_id=pid,
