@@ -231,14 +231,6 @@ providers:
     free: false
     rpm_limit: 20
     open_duration_s: 120
-  openrouter-trinity-free:
-    type: openrouter
-    model: arcee-ai/trinity-large-preview:free
-    profile: trinity-large-preview
-    free: true
-    # 400B MoE (13B active). Free until 2026-04-22. Benchmark before expiry.
-    rpm_limit: 20
-    open_duration_s: 120
   lmstudio-30b:
     type: lmstudio
     model: mistral-small-3.2-24b-instruct-2506
@@ -260,7 +252,6 @@ call_sites:
     # paid fallback. Healthy OpenRouter-free models first; NIM last (shared
     # 40 RPM pool, currently flaky).
     - openrouter-gemma4
-    - openrouter-trinity-free
     - nvidia-nim-kimi
     - nvidia-nim-deepseek
     retry_profile: background
@@ -409,7 +400,6 @@ call_sites:
     - gemini-free
     - mistral-large-free
     - openrouter-gemma4
-    - openrouter-trinity-free
     retry_profile: background
   # Adversarial challenge of entity "duplicate" verdicts. Flipped pairing:
   # DeepSeek challenges Kimi's entity judgments.
