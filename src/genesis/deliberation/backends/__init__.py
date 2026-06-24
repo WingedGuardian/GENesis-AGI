@@ -13,4 +13,5 @@ BACKENDS: dict[str, Backend] = {"fusion": FusionBackend()}
 
 
 def get_backend(name: str) -> Backend | None:
+    """Return the registered backend by name, or None if unknown."""
     return BACKENDS.get(name)

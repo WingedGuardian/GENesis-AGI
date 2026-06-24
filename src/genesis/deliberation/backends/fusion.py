@@ -71,6 +71,8 @@ def _openrouter_key() -> str | None:
 
 
 class FusionBackend:
+    """OpenRouter Fusion backend — `synthesis` (model-slug) and `analysis` (server-tool) modes."""
+
     name = "fusion"
 
     async def run(
@@ -83,6 +85,7 @@ class FusionBackend:
         timeout_s: float = _DEFAULT_TIMEOUT_S,
         models: list[str] | None = None,  # noqa: ARG002 — Fusion's panel is server-side
     ) -> DeliberationResult:
+        """Deliberate via Fusion in the given mode. Returns a DeliberationResult; never raises."""
         key = _openrouter_key()
         if not key:
             return DeliberationResult(
