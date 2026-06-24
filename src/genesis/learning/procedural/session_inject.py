@@ -1,7 +1,12 @@
-"""SessionStart procedure injection — load relevant procedures for session context.
+"""SessionStart procedure injection — inject CORE-tier procedures.
 
-Queries the procedure store for L3+ tier procedures relevant to the current
-session context. Renders as compact markdown within a 200-word budget.
+Queries the procedure store for CORE-tier (L1) procedures — the most-proven,
+always-on set. Surfacing v2 narrowed this from L1/L2/L3 to CORE-only: blind
+session-start injection runs before the session topic is known, so it should
+carry only procedures proven enough to apply regardless of topic. Lower tiers
+surface contextually instead (the proactive hook on the first message, the
+tool advisor on tool use, and explicit recall). Renders as compact markdown
+within a 200-word budget.
 
 Called by genesis_session_context.py during the SessionStart hook.
 """
@@ -27,10 +32,10 @@ _MAX_WORDS = 200
 
 
 async def load_active_procedures(db_path: str | Path) -> str | None:
-    """Load relevant procedures for session context injection.
+    """Load CORE-tier procedures for session context injection.
 
-    Returns formatted markdown string, or None if no procedures found.
-    Budget: 200 words max, top 5 procedures.
+    Returns formatted markdown string, or None if no CORE procedures found.
+    Budget: 200 words max.
     """
     from genesis.db.connection import BUSY_TIMEOUT_MS
 
@@ -43,11 +48,14 @@ async def load_active_procedures(db_path: str | Path) -> str | None:
         return None
 
     try:
-        # Get L3+ procedures, ordered by confidence
+        # CORE-tier (L1) only — the always-on, most-proven set. v2 narrowed
+        # blind session-start injection from L1/L2/L3 to CORE so we don't
+        # inject mid-tier procedures of uncertain relevance before the session
+        # topic is known. Lower tiers surface contextually elsewhere.
         rows = await db.execute(
             """SELECT task_type, principle, steps, activation_tier, confidence
                FROM procedural_memory
-               WHERE activation_tier IN ('L1', 'L2', 'L3')
+               WHERE activation_tier = 'L1'
                  AND deprecated = 0 AND quarantined = 0
                ORDER BY confidence DESC
                LIMIT ?""",
