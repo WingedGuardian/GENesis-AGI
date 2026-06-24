@@ -1002,6 +1002,24 @@ async def init(rt: GenesisRuntime) -> None:
                 results = await run_weekly_aggregation(rt._db)
                 dims_computed = len(results)
                 logger.info("J9 weekly aggregation: %d dimensions computed", dims_computed)
+                # Close the J-9 loop: a subsystem-grade regression becomes a
+                # control path — a BLOCKER alert + a human-gated proposal. Wrapped
+                # so a surfacing failure never fails the aggregation job.
+                try:
+                    from genesis.eval.regression_alert import (
+                        check_and_alert_regressions,
+                    )
+
+                    regressions = await check_and_alert_regressions(
+                        rt._db, getattr(rt, "_outreach_pipeline", None),
+                    )
+                    if regressions:
+                        logger.info(
+                            "J9 regression check surfaced %d regression(s)",
+                            len(regressions),
+                        )
+                except Exception:
+                    logger.warning("J9 regression check failed", exc_info=True)
                 rt.record_job_success("j9_eval_aggregation")
             except Exception as exc:
                 rt.record_job_failure("j9_eval_aggregation", str(exc))

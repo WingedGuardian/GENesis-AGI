@@ -17,6 +17,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   of buried in a dashboard. Healthy grades compress to a single "nominal" line — it only
   elaborates on a subsystem that's low.
 
+- **Genesis now tells you when its own cognitive quality regresses — and proposes a fix.**
+  When a subsystem's weekly grade drops to F or falls sharply from the week before, Genesis
+  sends you an alert and files a dashboard proposal to investigate (for example, running an
+  experiment on the affected subsystem). Nothing changes automatically — it's a heads-up plus
+  a recommendation you approve or dismiss.
+
 - **Genesis can now propose improvements to how it reflects — and apply them only with your approval.**
   The Evo loop measures variations of the deep-reflection prompt against a golden set
   (with held-out re-validation), and when one is a confirmed improvement it files a

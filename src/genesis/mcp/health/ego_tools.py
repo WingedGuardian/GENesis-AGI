@@ -560,6 +560,15 @@ async def ego_proposal_resolve(
                     await handle_cognitive_variant_resolution(db, prop, status)
                 except Exception:
                     logger.debug("cognitive-variant hook failed", exc_info=True)
+                # J-9 regression (informational): mark executed on approval.
+                try:
+                    from genesis.ego.j9_regression_actions import (
+                        handle_j9_regression_resolution,
+                    )
+
+                    await handle_j9_regression_resolution(db, prop, status)
+                except Exception:
+                    logger.debug("j9 regression hook failed", exc_info=True)
 
     resolved = sum(1 for v in results.values() if v in ("approved", "rejected"))
     return {

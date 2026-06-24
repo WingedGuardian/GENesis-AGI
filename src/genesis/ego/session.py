@@ -69,6 +69,9 @@ _NEVER_DISPATCH_ACTION_TYPES = (
     "goal_status_change",
     "cell_promotion",
     "cognitive_variant_promotion",
+    # j9_regression is informational (NOTIFY_USER); its handler marks it executed
+    # on approval. Blocklisted so it can never be dispatched as a session.
+    "j9_regression",
 )
 
 
