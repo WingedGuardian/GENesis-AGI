@@ -3,7 +3,7 @@
 
 These procedures are extracted from existing hooks, memory files, and
 incident-driven lessons. They start at their natural activation tier
-(L1 for hook-backed procedures, L3 for session-level knowledge).
+(CORE for hook-backed procedures, LIBRARY for session-level knowledge).
 
 Run once, or re-run safely (uses upsert with deterministic IDs).
 
@@ -207,10 +207,10 @@ async def main(db_path: Path) -> None:
 
     await db.commit()
 
-    # Regenerate L1 trigger cache for the PreToolUse advisor hook
+    # Regenerate CORE/ADVISORY trigger cache for the PreToolUse advisor hook
     from genesis.learning.procedural.trigger_cache import regenerate
     n_triggers = await regenerate(db)
-    print(f"\nRegenerated trigger cache: {n_triggers} L1 triggers")
+    print(f"\nRegenerated trigger cache: {n_triggers} CORE/ADVISORY triggers")
 
     await db.close()
     print(f"Seeded {seeded} procedures into {db_path}")

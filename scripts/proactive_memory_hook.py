@@ -468,8 +468,9 @@ def _search_procedures(
     """Return (procedure_id, task_type, principle_snippet) if a procedure's
     principle embedding clears the cosine threshold, else None.
 
-    Only LIBRARY+ tiers (L1/L2/L3) are eligible for proactive surfacing; the
-    DORMANT tier (L4 — unproven drafts) is recall-only and never auto-injected.
+    Only LIBRARY+ tiers (CORE/ADVISORY/LIBRARY) are eligible for proactive
+    surfacing; the DORMANT tier (unproven drafts) is recall-only and never
+    auto-injected.
 
     Best-effort: catches every failure mode and returns None so the parent
     hook (memory recall) is never blocked by this addition.

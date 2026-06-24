@@ -4,16 +4,16 @@ Evaluates all active procedures for tier changes based on confidence and
 success/failure history. Runs as a scheduled background job (hourly).
 
 Promotion thresholds:
-  L4 → L3: success_count >= 3 AND confidence >= 0.65
-  L3 → L2: success_count >= 5 AND confidence >= 0.75
-  L2 → L1: success_count >= 8 AND confidence >= 0.85 AND tool_trigger set
+  DORMANT → LIBRARY:  success_count >= 3 AND confidence >= 0.65
+  LIBRARY → ADVISORY: success_count >= 5 AND confidence >= 0.75
+  ADVISORY → CORE:    success_count >= 8 AND confidence >= 0.85 AND tool_trigger set
 
 Demotion is **evidence-driven only** — never metrics-based:
   3+ failure-mode hits AND failure_count >= success_count + 3 → tier - 1
   confidence < 0.3 AND total samples >= 3                       → quarantine
 
 `_compute_tier` only PROMOTES. If a procedure's metrics no longer support
-its current tier (e.g., a seeded L3 with success_count=1, or a procedure
+its current tier (e.g., a seeded LIBRARY with success_count=1, or a procedure
 that was created at a higher tier than its raw counts justify), it stays
 where it is until either (a) it earns enough successes to be promoted
 further, or (b) it accumulates real failures and trips `_check_demotion`
@@ -188,7 +188,7 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
                 demotions += 1
                 logger.info("Demoted %s: %s → %s", row["task_type"], current_tier, target_tier)
 
-    # Regenerate L1 trigger cache if any tier changes occurred
+    # Regenerate CORE/ADVISORY trigger cache if any tier changes occurred
     if promotions or demotions or quarantined:
         try:
             await regenerate(db)
