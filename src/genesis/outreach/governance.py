@@ -47,6 +47,7 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "mail_reply": 1,  # Email replies — short window to allow ack + full response
     "mail_follow_up": 24,  # Follow-up emails — one per day max per topic
     "discord_poll": 168,  # Discord polls — 7 days (matches default poll duration)
+    "j9_regression_alert": 168,  # Weekly eval regressions — one alert/week max
 }
 _DEFAULT_DEDUP_HOURS = 24
 

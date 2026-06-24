@@ -293,6 +293,11 @@ ACTION_TYPE_DOMAIN_MAP: dict[str, ActionDomain] = {
     # (ACTION_DOMAIN_MIN_LEVEL = None), so an approved promotion can never be
     # auto-run as a session; it is applied ONLY by its resolution handler.
     "cognitive_variant_promotion": ActionDomain.SELF_MODIFY,
+    # J-9 regression surfacing is INFORMATIONAL — it notifies the operator about
+    # a cognitive-quality regression and applies nothing. NOTIFY_USER + the
+    # _NEVER_DISPATCH_ACTION_TYPES blocklist mean an approved one is marked
+    # executed by its handler, never auto-run as a background session.
+    "j9_regression": ActionDomain.NOTIFY_USER,
 }
 
 
