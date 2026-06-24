@@ -18,7 +18,7 @@ Reliability decreases as scope increases. Layers reinforce each other.
 - `scripts/procedure_advisor.py` — fires on every CC tool call
 - Reads YAML trigger cache (`config/procedure_triggers.yaml`)
 - Outputs JSON with `additionalContext` for matching procedures
-- Only L1-tier procedures with tool triggers
+- Only L1/L2-tier procedures with tool triggers (trigger cache built from both)
 - ~10ms overhead per non-matching call
 
 ### Layer 2: Skill-Embedded Procedures (active when skill invoked)
@@ -27,13 +27,34 @@ Reliability decreases as scope increases. Layers reinforce each other.
 - Auto-applied as MINOR changes at L2+ autonomy
 
 ### Layer 3: SessionStart Injection (active per session)
-- `scripts/genesis_session_context.py` section 2.5
-- Injects top-5 L3+ procedures, 200-word budget
+- `scripts/genesis_session_context.py` → `session_inject.load_active_procedures`
+- Injects CORE-tier (L1) procedures only, 200-word budget. **v2** narrowed this
+  from L3+: blind session-start injection runs before the session topic is
+  known, so it carries only the most-proven, topic-independent procedures.
 - Positioned after cognitive state, before MCP tools hint
 
 ### Layer 4: CLAUDE.md / STEERING.md Rule (advisory)
 - "Check procedures before multi-step tasks"
 - Weakest layer but broadest scope
+
+### Surfacing by tier (v2 re-gating)
+
+Beyond the activation layers, the **proactive memory hook**
+(`scripts/proactive_memory_hook.py` → `_search_procedures`) surfaces the single
+best embedding match on each user message. v2 gates surfacing so each tier is an
+*additive* channel — a higher tier gets everything the lower tiers do, plus one
+more surface:
+
+| Tier | recall (MCP) | proactive hook | tool advisor | session inject |
+|------|:---:|:---:|:---:|:---:|
+| L4 (DORMANT)  | ✓ |   |   |   |
+| L3 (LIBRARY)  | ✓ | ✓ |   |   |
+| L2 (ADVISORY) | ✓ | ✓ | ✓ |   |
+| L1 (CORE)     | ✓ | ✓ | ✓ | ✓ |
+
+So unproven L4 drafts are **recall-only** (never auto-injected), and only the
+proven L1 set is injected blindly at session start. (The L1–L4 labels are
+slated to become CORE/ADVISORY/LIBRARY/DORMANT in a follow-up rename.)
 
 ## Procedure Lifecycle
 

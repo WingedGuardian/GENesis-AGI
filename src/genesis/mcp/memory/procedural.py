@@ -74,10 +74,12 @@ async def procedure_store(
     An MCP `procedure_store` call represents an *explicit teach* — the caller
     is asserting the procedure works. We seed it as already-confirmed
     (speculative=0) with one Laplace-equivalent success (success_count=1,
-    confidence=2/3), and place it at L3 so it is immediately recallable AND
-    eligible for SessionStart injection. Subsequent organic
-    successes/failures via `record_success`/`record_failure` continue to
-    update the row via Laplace smoothing.
+    confidence=2/3), and place it at L3 (LIBRARY) so it is immediately
+    recallable and eligible for proactive-hook surfacing. (Blind SessionStart
+    injection is CORE/L1-only as of Surfacing v2, so an explicit teach reaches
+    a session via the proactive hook on the first prompt, not at session start.)
+    Subsequent organic successes/failures via `record_success`/`record_failure`
+    continue to update the row via Laplace smoothing.
 
     Computes a principle embedding for the proactive procedure hook. If the
     embedding stack is unavailable, the procedure stores without it and the
