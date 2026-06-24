@@ -30,12 +30,33 @@ from datetime import UTC, datetime
 import aiosqlite
 
 from genesis.db.crud import procedural
+from genesis.learning.procedural.operations import (
+    READ_CONFIDENCE_DISCOUNT,
+    effective_confidence,
+)
 from genesis.learning.procedural.trigger_cache import regenerate
 
 logger = logging.getLogger(__name__)
 
 _TIER_RANK = {"L1": 4, "L2": 3, "L3": 2, "L4": 1}
 _RANK_TIER = {4: "L1", 3: "L2", 2: "L3", 1: "L4"}
+
+
+def _read_eligible_tier(eff_success: int, eff_conf: float, real_success: int) -> str:
+    """Tier a procedure qualifies for from *effective* (read-inclusive) metrics.
+
+    Hybrid guard (reads are a dampened signal, not proof of success):
+      - L3 (passive surfacing): reads alone may qualify.
+      - L2 (advisory-eligible): requires >= 1 *real* success.
+      - L1 (always-on): never reachable from reads.
+
+    Mirrors `_compute_tier`'s real-metric thresholds, minus the L1 branch.
+    """
+    if eff_success >= 5 and eff_conf >= 0.75 and real_success >= 1:
+        return "L2"
+    if eff_success >= 3 and eff_conf >= 0.65:
+        return "L3"
+    return "L4"
 
 
 def _compute_tier(row: dict) -> str:
@@ -88,12 +109,14 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
     promotions = 0
     demotions = 0
     quarantined = 0
+    despeculated = 0
 
     for row in rows:
         current_tier = row.get("activation_tier", "L4")
         proc_id = row["id"]
 
-        # Quarantine check
+        # Quarantine check — uses REAL stored confidence + real counts (reads
+        # never mask a genuinely-failing procedure).
         if row["confidence"] < 0.3 and row["success_count"] + row["failure_count"] >= 3:
             history = json.loads(row.get("promotion_history") or "[]")
             history.append({
@@ -108,14 +131,37 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
             logger.info("Quarantined procedure %s (conf=%.2f)", row["task_type"], row["confidence"])
             continue
 
-        # Compute target tier
-        target_tier = _compute_tier(row)
+        # De-speculation: a draft graduates to validated once it has >=1 real
+        # success and no failures (reads alone do NOT de-speculate). Closes the
+        # gap where nothing ever cleared speculative=1.
+        if row["speculative"] and row["success_count"] >= 1 and row["failure_count"] == 0:
+            await procedural.update(db, proc_id, speculative=0)
+            despeculated += 1
+            logger.info("De-speculated procedure %s (success=%d)", row["task_type"], row["success_count"])
 
-        # Check for demotion
+        # Compute target tier. Failure evidence (`_check_demotion`) takes
+        # precedence over BOTH real-metric and read-driven promotion: a
+        # failing procedure must never be promoted — least of all by soft read
+        # signal. Otherwise the target is the higher of real-metric and
+        # read-driven (effective-metric) promotion (reads can only *raise* it).
+        real_target = _compute_tier(row)
         if _check_demotion(row):
+            target_tier = real_target  # promote-only on real metrics; held for failing rows
             current_rank = _TIER_RANK.get(current_tier, 1)
             if current_rank > 1:
                 target_tier = _RANK_TIER[current_rank - 1]
+        else:
+            reads = row.get("invocation_count") or 0
+            eff_success = row["success_count"] + reads // READ_CONFIDENCE_DISCOUNT
+            eff_conf = effective_confidence(
+                row["success_count"], row["failure_count"], reads
+            )
+            read_target = _read_eligible_tier(eff_success, eff_conf, row["success_count"])
+            target_tier = (
+                real_target
+                if _TIER_RANK[real_target] >= _TIER_RANK[read_target]
+                else read_target
+            )
 
         if target_tier != current_tier:
             target_rank = _TIER_RANK.get(target_tier, 1)
@@ -149,7 +195,12 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
         except Exception:
             logger.error("Failed to regenerate trigger cache after promotion", exc_info=True)
 
-    result = {"promotions": promotions, "demotions": demotions, "quarantined": quarantined}
+    result = {
+        "promotions": promotions,
+        "demotions": demotions,
+        "quarantined": quarantined,
+        "despeculated": despeculated,
+    }
     if any(v > 0 for v in result.values()):
         logger.info("Promotion results: %s", result)
     return result

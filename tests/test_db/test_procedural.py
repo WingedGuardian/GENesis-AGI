@@ -112,3 +112,25 @@ async def test_list_by_task_type_filters_by_person_id(db):
     rows = await procedural.list_by_task_type(db, "deploy", person_id="alice")
     assert len(rows) == 1
     assert rows[0]["id"] == "ppid3"
+
+
+# ── record_invocation: count reads (procedure recalled = surfaced to model) ──
+
+
+async def test_record_invocation_increments_and_stamps(db):
+    await procedural.create(db, id="p_read", **_COMMON)
+    row = await procedural.get_by_id(db, "p_read")
+    assert row["invocation_count"] == 0
+    assert row["last_used"] is None
+
+    assert await procedural.record_invocation(db, "p_read") is True
+    row = await procedural.get_by_id(db, "p_read")
+    assert row["invocation_count"] == 1
+    assert row["last_used"] is not None
+
+    await procedural.record_invocation(db, "p_read")
+    assert (await procedural.get_by_id(db, "p_read"))["invocation_count"] == 2
+
+
+async def test_record_invocation_unknown_id_is_noop(db):
+    assert await procedural.record_invocation(db, "nope") is False

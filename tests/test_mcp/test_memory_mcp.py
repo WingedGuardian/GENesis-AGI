@@ -121,6 +121,46 @@ async def test_procedure_store_recall_roundtrip():
             mod._retriever = old_retriever
 
 
+async def test_procedure_recall_counts_reads():
+    """Recalling a procedure (surfacing it to the model) bumps invocation_count
+    — the top-of-funnel usage signal that was previously never recorded."""
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        real_db.row_factory = aiosqlite.Row
+        from genesis.db.schema import create_all_tables
+        await create_all_tables(real_db)
+        await real_db.commit()
+
+        old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+        try:
+            mod._store, mod._db, mod._retriever = MagicMock(), real_db, MagicMock()
+            tools = await _get_tools()
+            pid = await tools["procedure_store"].fn(
+                task_type="discourse-forum-registration",
+                principle="Browser is required; the raw API returns fake success.",
+                steps=["navigate", "fill", "submit", "verify"],
+                tools_used=["browser_navigate"],
+                context_tags=["discourse", "forum", "registration", "browser"],
+            )
+
+            async def invocations() -> int:
+                cur = await real_db.execute(
+                    "SELECT invocation_count FROM procedural_memory WHERE id = ?", (pid,))
+                return (await cur.fetchone())[0]
+
+            assert await invocations() == 0
+            await tools["procedure_recall"].fn(
+                task_description="register on discourse forum",
+                context_tags=["discourse", "forum", "registration"],
+            )
+            assert await invocations() >= 1   # read counted
+        finally:
+            mod._store, mod._db, mod._retriever = old_store, old_db, old_retriever
+
+
 # ─── End-to-end knowledge_ingest test ────────────────────────────────────────
 
 
