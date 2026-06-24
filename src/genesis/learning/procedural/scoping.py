@@ -97,47 +97,56 @@ async def is_behavioral_directive(
     """Return True iff this extracted procedure is really a behavioral directive
     (and should be kept OUT of the procedure store).
 
-    Fails OPEN (returns False = keep) on any error, unsuccessful call, or
+    Fails OPEN (returns False = keep) on ANY error, unsuccessful call, or
     unparseable / unknown classification — never suppress a real procedure on a
-    flaky classifier.
+    flaky classifier. The whole body is wrapped so that no exception can reach
+    the caller (where it would be treated as a failed extraction and drop the
+    procedure — i.e. fail CLOSED, the opposite of what we want).
     """
-    prompt = _CLASSIFIER_PROMPT.format(
-        task_type=task_type,
-        principle=(principle or "")[:600],
-        steps=json.dumps(steps or [])[:800],
-    )
     try:
-        result = await router.route_call(
-            call_site_id=_CALL_SITE,
-            messages=[{"role": "user", "content": prompt}],
+        prompt = _CLASSIFIER_PROMPT.format(
+            task_type=task_type,
+            principle=(principle or "")[:600],
+            steps=json.dumps(steps or [])[:800],
         )
+        try:
+            result = await router.route_call(
+                call_site_id=_CALL_SITE,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception:
+            logger.warning(
+                "procedure scoping: classifier call failed for %s; keeping",
+                task_type, exc_info=True,
+            )
+            return False
+
+        if not getattr(result, "success", False):
+            logger.warning(
+                "procedure scoping: classifier unsuccessful for %s (%s); keeping",
+                task_type, getattr(result, "error", None),
+            )
+            return False
+
+        ptype = _parse_procedure_type(getattr(result, "content", None))
+        if ptype is None:
+            logger.warning(
+                "procedure scoping: unparseable classification for %s; keeping",
+                task_type,
+            )
+            return False
+
+        is_directive = ptype == PROCEDURE_TYPE_DIRECTIVE
+        if is_directive:
+            logger.info(
+                "procedure scoping: %s classified as behavioral_directive "
+                "(belongs in CLAUDE.md) — not stored",
+                task_type,
+            )
+        return is_directive
     except Exception:
         logger.warning(
-            "procedure scoping: classifier call failed for %s; keeping",
-            task_type, exc_info=True,
+            "procedure scoping: unexpected error for %s; keeping", task_type,
+            exc_info=True,
         )
         return False
-
-    if not getattr(result, "success", False):
-        logger.warning(
-            "procedure scoping: classifier unsuccessful for %s (%s); keeping",
-            task_type, getattr(result, "error", None),
-        )
-        return False
-
-    ptype = _parse_procedure_type(getattr(result, "content", None))
-    if ptype is None:
-        logger.warning(
-            "procedure scoping: unparseable classification for %s; keeping",
-            task_type,
-        )
-        return False
-
-    is_directive = ptype == PROCEDURE_TYPE_DIRECTIVE
-    if is_directive:
-        logger.info(
-            "procedure scoping: %s classified as behavioral_directive "
-            "(belongs in CLAUDE.md) — not stored",
-            task_type,
-        )
-    return is_directive

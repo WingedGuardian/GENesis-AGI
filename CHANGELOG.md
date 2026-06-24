@@ -30,6 +30,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   is fully reversible (one click rolls it back). Nothing is ever applied automatically —
   Genesis recommends, you decide.
 
+- **Genesis stops cluttering its procedure store with general working-style rules.** When it
+  learns a "procedure" from a work session, it now tells a reusable *task procedure* (how a
+  specific tool or system works) apart from a *behavioral directive* (a general habit like
+  "double-check before acting" — which belongs in its standing instructions, not the procedure
+  store). Directives are no longer stored, removing the most common source of near-duplicate
+  procedures. The check errs toward keeping, so genuine procedures are never dropped.
+
 ### Changed
 
 - **Genesis no longer auto-surfaces unproven draft procedures.** Procedures it

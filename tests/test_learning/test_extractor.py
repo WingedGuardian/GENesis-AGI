@@ -34,10 +34,21 @@ class _FakeRouterResult:
 
 
 def _router_returning(payload: dict) -> MagicMock:
+    """Router mock: the first route_call returns the extraction payload; any
+    subsequent call (the scoping classifier) returns a task_procedure verdict so
+    real procedures pass the scoping gate by an explicit verdict, not via the
+    fail-open path."""
     router = MagicMock()
-    router.route_call = AsyncMock(
-        return_value=_FakeRouterResult(success=True, content=json.dumps(payload))
-    )
+    pending = [_FakeRouterResult(success=True, content=json.dumps(payload))]
+
+    def _call(*_args, **_kwargs):
+        if pending:
+            return pending.pop(0)
+        return _FakeRouterResult(
+            success=True, content='{"procedure_type": "task_procedure"}',
+        )
+
+    router.route_call = AsyncMock(side_effect=_call)
     return router
 
 

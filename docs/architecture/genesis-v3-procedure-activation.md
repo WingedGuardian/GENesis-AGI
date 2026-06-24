@@ -134,6 +134,12 @@ promoter runs.
    organic successes before promotion. **Capped at 3 new speculative
    procedures per session** (`max_procedures_per_session`, shared across the
    extraction and struggle streams) so a single session cannot flood the store.
+   **Scoping gate:** before storage, an LLM classifies each extracted procedure as a
+   reusable *task procedure* (how a specific external system works) vs a general
+   *behavioral directive* (working-style rules — confidence, due diligence, planning
+   cadence — that belong in CLAUDE.md). Directives are not stored, removing the dominant
+   near-duplicate source. The gate **fails open** (keeps) on any classifier error, so a
+   real procedure is never suppressed (`scoping.py`).
 2. **MCP tool** — `procedure_store` for explicit user teaching. Treated
    as one Laplace-equivalent confirmed success — seeds at L3 with
    speculative=0, success_count=1, confidence=2/3. The caller asserting
@@ -150,6 +156,7 @@ promoter runs.
 | File | Purpose |
 |------|---------|
 | `src/genesis/learning/procedural/extractor.py` | LLM procedure extraction |
+| `src/genesis/learning/procedural/scoping.py` | Scoping gate: keep behavioral directives out of the store |
 | `src/genesis/learning/procedural/trigger_cache.py` | YAML cache generation |
 | `src/genesis/learning/procedural/session_inject.py` | SessionStart injection |
 | `src/genesis/learning/procedural/promoter.py` | Tier promotion/demotion |
