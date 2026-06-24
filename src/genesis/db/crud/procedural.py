@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import aiosqlite
 
@@ -239,6 +240,22 @@ async def update(db: aiosqlite.Connection, id: str, **fields) -> bool:
     values = list(fields.values()) + [id]
     cursor = await db.execute(
         f"UPDATE procedural_memory SET {set_clause} WHERE id = ?", values
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def record_invocation(db: aiosqlite.Connection, id: str) -> bool:
+    """Count a procedure read: a model recalled it (surfaced into context).
+
+    Atomically bumps ``invocation_count`` and stamps ``last_used``. This is the
+    top-of-funnel usage signal — distinct from ``record_success``/``record_failure``
+    (outcomes). Returns True if the procedure exists.
+    """
+    cursor = await db.execute(
+        "UPDATE procedural_memory "
+        "SET invocation_count = invocation_count + 1, last_used = ? WHERE id = ?",
+        (datetime.now(UTC).isoformat(), id),
     )
     await db.commit()
     return cursor.rowcount > 0

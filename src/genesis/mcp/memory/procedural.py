@@ -125,13 +125,18 @@ async def procedure_recall(
         if len(results) >= 3:
             break
 
-    # J-9 eval: log procedure invocations for learning effectiveness tracking
+    # Count the read (usage signal) + log the J-9 invocation event. Returning a
+    # procedure means the model recalled it and it is surfaced into context.
     if results:
+        from genesis.db.crud import procedural
         from genesis.eval.j9_hooks import emit_procedure_invoked
         for r in results:
+            pid = r.get("procedure_id", "")
+            if pid:
+                await procedural.record_invocation(memory_mod._db, pid)
             await emit_procedure_invoked(
                 memory_mod._db,
-                procedure_id=r.get("procedure_id", ""),
+                procedure_id=pid,
                 confidence=r.get("confidence", 0.0),
                 matched_tags=tags[:10] if tags else [],
             )
