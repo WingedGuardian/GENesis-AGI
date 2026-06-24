@@ -14,6 +14,26 @@ from genesis.db.crud import procedural
 
 logger = logging.getLogger(__name__)
 
+# Reads-as-signal: a deliberate procedure_recall ("read") is a soft positive
+# signal. Every READ_CONFIDENCE_DISCOUNT reads count as one *effective* success.
+# Recorded failures are the counterweight. This derived value is used ONLY for
+# ranking + tier decisions — the stored `confidence` column stays real Laplace
+# (success/failure only), so the j9 metric, quarantine, and demotion stay honest.
+READ_CONFIDENCE_DISCOUNT = 5
+
+
+def effective_confidence(
+    success_count: int, failure_count: int, invocation_count: int
+) -> float:
+    """Laplace-smoothed confidence that folds reads in as fractional successes.
+
+    ``eff_success = success_count + invocation_count // READ_CONFIDENCE_DISCOUNT``;
+    returns ``(eff_success + 1) / (eff_success + failure_count + 2)``. With zero
+    reads this is identical to the real Laplace confidence.
+    """
+    eff_success = success_count + invocation_count // READ_CONFIDENCE_DISCOUNT
+    return (eff_success + 1) / (eff_success + failure_count + 2)
+
 
 @dataclass
 class StoreResult:

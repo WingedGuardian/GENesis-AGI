@@ -28,6 +28,7 @@ def _row_to_match(row: dict) -> ProcedureMatch:
         tool_trigger=tool_trigger,
         steps=steps,
         principle=row.get("principle"),
+        invocation_count=row.get("invocation_count", 0) or 0,
     )
 
 

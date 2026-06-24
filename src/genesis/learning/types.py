@@ -124,6 +124,7 @@ class ProcedureMatch:
     tool_trigger: list[str] | None = None
     steps: list[str] | None = None
     principle: str | None = None
+    invocation_count: int = 0
 
 
 @dataclass(frozen=True)

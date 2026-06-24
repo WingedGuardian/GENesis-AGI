@@ -18,6 +18,27 @@ def _memory_mod():
     return memory_mod
 
 
+def _rank_by_effective_confidence(results: list[dict]) -> list[dict]:
+    """Re-rank recall results so deliberately-read procedures surface first.
+
+    Reads count as fractional successes via ``effective_confidence``; a stable
+    sort preserves ``find_relevant``'s relevance order on ties. Isolated to the
+    recall path — ``find_relevant`` itself is unchanged (6 callers, incl.
+    autonomy outcome-attribution).
+    """
+    from genesis.learning.procedural.operations import effective_confidence
+
+    return sorted(
+        results,
+        key=lambda r: effective_confidence(
+            r.get("success_count", 0) or 0,
+            r.get("failure_count", 0) or 0,
+            r.get("invocation_count", 0) or 0,
+        ),
+        reverse=True,
+    )
+
+
 async def _embed_principle_for_hook(principle: str) -> bytes | None:
     """Best-effort: compute principle embedding for the proactive procedure
     hook. Returns None on any failure — the hook simply skips rows without
@@ -110,20 +131,26 @@ async def procedure_recall(
     memory_mod._require_init()
     assert memory_mod._db is not None
 
-    results = []
+    results: list[dict] = []
+    seen: set[str] = set()
 
     if context_tags:
         match = await find_best_match(memory_mod._db, task_description, context_tags)
         if match:
             results.append(_asdict(match))
+            seen.add(match.procedure_id)
 
     tags = context_tags or task_description.lower().replace("-", " ").split()
-    relevant = await find_relevant(memory_mod._db, tags, limit=3)
+    # Widen the candidate pool, then re-rank by reads (effective confidence) and
+    # cap — so a proven-useful procedure can surface, not just get reordered
+    # within an already-relevance-capped top 3.
+    relevant = await find_relevant(memory_mod._db, tags, limit=10)
     for m in relevant:
-        if not any(r.get("procedure_id") == m.procedure_id for r in results):
+        if m.procedure_id not in seen:
             results.append(_asdict(m))
-        if len(results) >= 3:
-            break
+            seen.add(m.procedure_id)
+
+    results = _rank_by_effective_confidence(results)[:3]
 
     # Count the read (usage signal) + log the J-9 invocation event. Returning a
     # procedure means the model recalled it and it is surfaced into context.

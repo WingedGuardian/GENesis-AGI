@@ -50,6 +50,42 @@ Explicit user teach (procedure_store MCP tool):
        Earns further promotion to L2/L1 organically via record_success.
 ```
 
+### Reads as a usage signal (effective confidence)
+
+Recorded outcomes are sparse — `record_success`/`record_failure` only fire from
+the autonomy executor's task retrospective, never from the dominant
+`procedure_recall` path. So a procedure can be recalled (read) dozens of times
+yet never earn confidence. To stop that, a **read** (a deliberate
+`procedure_recall` that surfaces a procedure, tracked on `invocation_count`) is
+treated as a *dampened* positive signal:
+
+- `effective_confidence(success, failure, invocation_count)` folds reads in as
+  fractional successes: every `READ_CONFIDENCE_DISCOUNT` (=5) reads count as one
+  effective success, with recorded failures as the counterweight.
+- **Stored `confidence` stays real Laplace** (success/failure only). Effective
+  confidence is *derived* and used ONLY for (a) recall ranking and (b) tier
+  promotion — so the j9 metric, quarantine, and demotion stay honest.
+- **Hybrid promotion guard:** reads alone may promote to **L3** (passive
+  surfacing); **L2** (advisory-eligible) requires ≥1 *real* success; **L1**
+  (always-on) is never reachable from reads. Promotion is additive — the target
+  tier is the higher of the real-metric and read-eligible tiers (`_compute_tier`
+  vs `_read_eligible_tier`), still promote-only.
+- **Recall ranking:** `procedure_recall` widens the candidate pool then re-ranks
+  by `effective_confidence` (read-heavy procedures surface first; ties keep
+  relevance order). Isolated to the recall path — `find_relevant`'s global
+  behavior is unchanged (it has 6 callers, incl. autonomy outcome-attribution).
+- **De-speculation:** a draft (`speculative=1`) graduates to validated
+  (`speculative=0`) on its first *real* success with no failures — closing the
+  prior gap where nothing ever cleared the flag. Reads alone do not de-speculate.
+
+The one-time migration `0035_backfill_procedure_invocation_count` seeds
+`invocation_count` from historical `procedure_invoked` events in `eval_events`
+so the signal doesn't start at zero.
+
+> **Limitation:** reads are a *proxy* for usefulness, not proof a procedure
+> worked. The discount, the ≥1-real-success gate for L2, and the FailureDetector
+> are the counterweights. A real recall-path outcome signal remains future work.
+
 Demotion is **evidence-driven only** — never metric drift:
 - 3+ failure-mode hits AND failure_count >= success_count + 3 → tier - 1
 - confidence < 0.3 AND total samples >= 3 → quarantine (excluded everywhere)

@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **Procedures you actually use now earn their keep.** How often a learned
+  procedure is recalled ("reads") now counts as a dampened usefulness signal:
+  frequently-recalled procedures rank higher when surfaced, and can be promoted
+  to higher activation tiers (reads alone can reach passive surfacing; the
+  proactive advisory tier still requires a real success). A procedure also now
+  graduates from speculative to validated on its first real success — previously
+  nothing ever cleared that flag.
 - **The dashboard Infrastructure card now labels the ambient-capture bridge as "Voice Bridge"** —
   a clearer, user-facing name. It still only appears when a voice/ambient edge is configured.
 

@@ -10,6 +10,7 @@ from genesis.learning.procedural import trigger_cache
 from genesis.learning.procedural.promoter import (
     _check_demotion,
     _compute_tier,
+    _read_eligible_tier,
     promote_and_demote,
 )
 
@@ -262,3 +263,134 @@ async def test_promote_and_demote_does_not_metric_demote_l1(db):
     )
     row = await cursor.fetchone()
     assert row[0] == "L1"
+
+
+# ─── reads-as-signal: _read_eligible_tier (hybrid, dampened) ──────────────────
+
+
+def test_read_eligible_tier_l3_on_reads_alone():
+    """Effective metrics from reads alone qualify for L3 (passive surfacing)."""
+    # eff_success=3, eff_conf=(3+1)/(3+0+2)=0.8 ≥ 0.65
+    assert _read_eligible_tier(3, 0.8, 0) == "L3"
+
+
+def test_read_eligible_tier_l2_requires_real_success():
+    """L2 (the advisory-eligible tier) needs ≥1 *real* success — reads alone
+    can't reach it."""
+    # eff metrics qualify for L2 but real_success=0 → capped at L3.
+    assert _read_eligible_tier(5, 0.78, 0) == "L3"
+    # same effective metrics, but with one real success → L2.
+    assert _read_eligible_tier(5, 0.78, 1) == "L2"
+
+
+def test_read_eligible_tier_never_l1():
+    """Reads can never buy L1 (always-on), no matter how high the effective
+    metrics, even with a real success."""
+    assert _read_eligible_tier(50, 0.99, 5) == "L2"
+
+
+def test_read_eligible_tier_below_threshold_is_l4():
+    assert _read_eligible_tier(2, 0.6, 0) == "L4"
+
+
+# ─── reads-as-signal: promote_and_demote integration ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reads_promote_speculative_to_l3_but_stay_speculative(db):
+    """A heavily-read draft (no real success) promotes to L3 on effective
+    metrics, but stays speculative (de-spec needs a real success)."""
+    await _insert(
+        db, id="read-draft", task_type="t",
+        success_count=0, failure_count=0, confidence=0.5,
+        speculative=1, activation_tier="L4", invocation_count=15,  # eff_success=3
+    )
+    result = await promote_and_demote(db)
+    assert result["promotions"] == 1
+    cursor = await db.execute(
+        "SELECT activation_tier, speculative FROM procedural_memory WHERE id = ?",
+        ("read-draft",),
+    )
+    row = await cursor.fetchone()
+    assert row[0] == "L3"
+    assert row[1] == 1  # still speculative — reads don't de-speculate
+
+
+@pytest.mark.asyncio
+async def test_reads_without_real_success_do_not_reach_l2(db):
+    """Effective metrics alone (no real success) cannot push past L3."""
+    await _insert(
+        db, id="read-only", task_type="t",
+        success_count=0, failure_count=0, confidence=0.5,
+        speculative=1, activation_tier="L3", invocation_count=25,  # eff_success=5
+    )
+    await promote_and_demote(db)
+    cursor = await db.execute(
+        "SELECT activation_tier FROM procedural_memory WHERE id = ?", ("read-only",),
+    )
+    assert (await cursor.fetchone())[0] == "L3"
+
+
+@pytest.mark.asyncio
+async def test_reads_plus_real_success_promote_to_l2(db):
+    """Reads + ≥1 real success promote to L2."""
+    await _insert(
+        db, id="read-proven", task_type="t",
+        success_count=1, failure_count=0, confidence=2 / 3,
+        speculative=0, activation_tier="L3", invocation_count=20,  # eff_success=5
+    )
+    result = await promote_and_demote(db)
+    assert result["promotions"] == 1
+    cursor = await db.execute(
+        "SELECT activation_tier FROM procedural_memory WHERE id = ?", ("read-proven",),
+    )
+    assert (await cursor.fetchone())[0] == "L2"
+
+
+@pytest.mark.asyncio
+async def test_reads_never_promote_to_l1(db):
+    """No volume of reads lifts a procedure to L1 (always-on)."""
+    await _insert(
+        db, id="read-heavy", task_type="t",
+        success_count=0, failure_count=0, confidence=0.5,
+        speculative=0, activation_tier="L2", invocation_count=200,
+        tool_trigger=json.dumps(["Bash"]),
+    )
+    await promote_and_demote(db)
+    cursor = await db.execute(
+        "SELECT activation_tier FROM procedural_memory WHERE id = ?", ("read-heavy",),
+    )
+    assert (await cursor.fetchone())[0] == "L2"
+
+
+@pytest.mark.asyncio
+async def test_despeculate_on_real_success(db):
+    """A speculative procedure with ≥1 real success and no failures graduates
+    to validated (speculative=0) — closing the de-speculation gap."""
+    await _insert(
+        db, id="grad-1", task_type="t",
+        success_count=1, failure_count=0, confidence=2 / 3,
+        speculative=1, activation_tier="L3",
+    )
+    result = await promote_and_demote(db)
+    assert result["despeculated"] == 1
+    cursor = await db.execute(
+        "SELECT speculative FROM procedural_memory WHERE id = ?", ("grad-1",),
+    )
+    assert (await cursor.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_despeculate_blocked_by_failure(db):
+    """A failure blocks de-speculation even with real successes."""
+    await _insert(
+        db, id="grad-fail", task_type="t",
+        success_count=2, failure_count=1, confidence=0.6,
+        speculative=1, activation_tier="L3",
+    )
+    result = await promote_and_demote(db)
+    assert result["despeculated"] == 0
+    cursor = await db.execute(
+        "SELECT speculative FROM procedural_memory WHERE id = ?", ("grad-fail",),
+    )
+    assert (await cursor.fetchone())[0] == 1
