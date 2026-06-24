@@ -113,7 +113,7 @@ async def _call(model, system, user, key, timeout_s, extra_body, mode) -> Delibe
     t0 = time.perf_counter()
     try:
         resp = await asyncio.wait_for(litellm.acompletion(**kwargs), timeout=timeout_s + 10)
-    except TimeoutError:
+    except (TimeoutError, litellm.Timeout):
         return DeliberationResult(
             answer=None,
             backend_used=f"fusion/{mode}",
@@ -168,7 +168,7 @@ def _parse_content(content: str) -> dict:
     if not content:
         return {}
     candidates = [content]
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", content, re.DOTALL)
     if fenced:
         candidates.append(fenced.group(1))
     braced = re.search(r"\{.*\}", content, re.DOTALL)

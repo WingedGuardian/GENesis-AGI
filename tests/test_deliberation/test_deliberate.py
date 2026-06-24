@@ -185,6 +185,19 @@ async def test_fusion_timeout_graceful(monkeypatch):
     assert not r.ok and "timed out" in r.error
 
 
+async def test_fusion_litellm_timeout_graceful(monkeypatch):
+    import litellm
+
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+    exc = litellm.Timeout(message="slow", model="m", llm_provider="openrouter")
+    with patch(
+        "genesis.deliberation.backends.fusion.litellm.acompletion",
+        new=AsyncMock(side_effect=exc),
+    ):
+        r = await FusionBackend().run("q", timeout_s=1.0)
+    assert not r.ok and "timed out" in r.error
+
+
 # ── deliberate() core ────────────────────────────────────────────────────────
 
 
