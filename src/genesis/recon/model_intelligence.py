@@ -50,11 +50,15 @@ _DEP_DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{2,4})")
 # `text/markdown` and rejected by the fetch content-type allowlist.
 _GEMINI_DEPRECATIONS_URL = "https://ai.google.dev/gemini-api/docs/deprecations"
 _GEMINI_DATE_RE = re.compile(r"\b([A-Z][a-z]{2,8})\s+(\d{1,2}),\s+(\d{4})\b")
-_MONTH_TO_NUM = {
-    m: i for i, m in enumerate(
-        ["January", "February", "March", "April", "May", "June", "July",
-         "August", "September", "October", "November", "December"], start=1)
-}
+_MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June", "July",
+    "August", "September", "October", "November", "December",
+]
+# Full names + 3-letter abbreviations ("Jan", "Sep"), in case a rendered table
+# narrows the column. An unrecognised month after a date-shaped match is WARNED,
+# never silently dropped (a missed EOL is the dangerous failure mode).
+_MONTH_TO_NUM = {m: i for i, m in enumerate(_MONTH_NAMES, start=1)}
+_MONTH_TO_NUM.update({m[:3]: i for i, m in enumerate(_MONTH_NAMES, start=1)})
 
 
 def _parse_groq_deprecation_table(text: str) -> list[tuple[str, str, str]]:
@@ -120,6 +124,11 @@ def _parse_gemini_deprecation_table(text: str) -> list[tuple[str, str, str]]:
         month_name, dd, yyyy = date_m.groups()
         month = _MONTH_TO_NUM.get(month_name)
         if month is None:
+            logger.warning(
+                "EOL check: unrecognised month %r in Gemini shutdown cell %r — "
+                "row skipped (possible page-format change)",
+                month_name, shutdown_cell,
+            )
             continue
         dd_int = int(dd)
         if not (1 <= dd_int <= 31):
@@ -778,9 +787,15 @@ class ModelIntelligenceJob:
         )
         content = json.dumps({"title": title, **finding, "detected_at": now})
         # Stable dedup key — independent of detected_at / blast-radius churn.
+        # Includes vendor so two vendors deprecating the same model-id string on
+        # the same date don't suppress each other.
         dedup_key = hashlib.sha256(
             json.dumps(
-                {"model_id": model_id, "shutdown_date": shutdown_date},
+                {
+                    "model_id": model_id,
+                    "shutdown_date": shutdown_date,
+                    "vendor": finding.get("vendor", ""),
+                },
                 sort_keys=True,
             ).encode()
         ).hexdigest()

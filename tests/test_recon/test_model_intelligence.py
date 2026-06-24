@@ -423,6 +423,13 @@ class TestGeminiDeprecationParser:
         rows = _parse_gemini_deprecation_table(live)
         assert ("gemini-2.5-flash", "2026-10-16", "gemini-3.5-flash") in rows
 
+    def test_accepts_abbreviated_months(self) -> None:
+        # A narrowed column could abbreviate months — must NOT silently drop a
+        # real dated shutdown (the dangerous false-negative direction).
+        live = "`gemini-x`| Jan 5, 2026| Sep 30, 2027| `repl`\n"
+        rows = _parse_gemini_deprecation_table(live)
+        assert ("gemini-x", "2027-09-30", "repl") in rows
+
     def test_empty_or_garbage_returns_empty(self) -> None:
         assert _parse_gemini_deprecation_table("") == []
         assert _parse_gemini_deprecation_table("no tables here\njust text") == []
@@ -595,20 +602,44 @@ class TestActiveProvidersJob:
         assert google[0]["provider"] == "gemini-free"
 
     @pytest.mark.asyncio
-    async def test_check_active_providers_no_groq_short_circuits(self, db) -> None:
+    async def test_per_vendor_gating_google_only(self, db) -> None:
+        # google-only install: Gemini IS checked, Groq is never fetched.
         job = ModelIntelligenceJob(db=db)
         cfg = load_config_from_string(
             "providers:\n  g:\n    type: google\n    model: m\n    free: true\n"
             "call_sites:\n  s:\n    chain: [g]\n"
         )
-        mock_fetch = AsyncMock(return_value=[])
+        groq_fetch = AsyncMock(return_value=[])
+        gem_fetch = AsyncMock(return_value=[])
         with (
-            patch.object(job, "_fetch_groq_deprecations", mock_fetch),
+            patch.object(job, "_fetch_groq_deprecations", groq_fetch),
+            patch.object(job, "_fetch_gemini_deprecations", gem_fetch),
             patch("genesis.routing.config.load_config", return_value=cfg),
         ):
             findings = await job._check_active_providers()
         assert findings == []
-        mock_fetch.assert_not_called()  # no Groq providers → never fetches
+        groq_fetch.assert_not_called()  # no Groq providers → never fetches Groq
+        gem_fetch.assert_called_once()  # has Google provider → checks Gemini
+
+    @pytest.mark.asyncio
+    async def test_per_vendor_gating_groq_only(self, db) -> None:
+        # groq-only install: Groq IS checked, Gemini is never fetched.
+        job = ModelIntelligenceJob(db=db)
+        cfg = load_config_from_string(
+            "providers:\n  gq:\n    type: groq\n    model: m\n    free: true\n"
+            "call_sites:\n  s:\n    chain: [gq]\n"
+        )
+        groq_fetch = AsyncMock(return_value=[])
+        gem_fetch = AsyncMock(return_value=[])
+        with (
+            patch.object(job, "_fetch_groq_deprecations", groq_fetch),
+            patch.object(job, "_fetch_gemini_deprecations", gem_fetch),
+            patch("genesis.routing.config.load_config", return_value=cfg),
+        ):
+            findings = await job._check_active_providers()
+        assert findings == []
+        gem_fetch.assert_not_called()  # no Google providers → never fetches Gemini
+        groq_fetch.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_check_active_providers_config_failure_is_safe(self, db) -> None:
