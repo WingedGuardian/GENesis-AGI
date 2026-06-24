@@ -210,6 +210,35 @@ async def test_promote_files_winner_proposal(cvdb):
     assert outputs["approach"] == "be more concise"
 
 
+async def test_promote_self_scoring_caveat(cvdb):
+    """Same gen+judge provider → the proposal rationale carries a self-scoring
+    caveat; cross-provider → it does not."""
+    from genesis.mcp.health.evo_run import promote_evo_winner
+
+    same = await promote_evo_winner(
+        cvdb, _winner_result(), gen_provider="groq-free", judge_provider="groq-free",
+    )
+    rat_same = (await ego_crud.get_proposal(cvdb, same))["rationale"]
+    assert "CAVEAT" in rat_same and "share a provider" in rat_same
+
+    # distinct winner so content-hash dedup doesn't skip the second proposal
+    cross_result = _winner_result()
+    cross_result = EvoResult(
+        winner=CognitiveVariant(
+            name="evo_v1", description="be deeper",
+            system_prompt="CANONICAL\n\nbe deeper",
+        ),
+        winner_winrate=cross_result.winner_winrate,
+        holdout_winrate=cross_result.holdout_winrate,
+        candidates_evaluated=6, survivors=2, note="x", holdout_disjoint=True,
+    )
+    cross = await promote_evo_winner(
+        cvdb, cross_result, gen_provider="groq-free", judge_provider="cc-haiku",
+    )
+    rat_cross = (await ego_crud.get_proposal(cvdb, cross))["rationale"]
+    assert "CAVEAT" not in rat_cross
+
+
 async def test_promote_no_winner_files_nothing(cvdb):
     from genesis.mcp.health.evo_run import promote_evo_winner
 

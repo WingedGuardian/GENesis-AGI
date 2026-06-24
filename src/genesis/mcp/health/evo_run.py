@@ -141,6 +141,13 @@ async def promote_evo_winner(
         f"{result.candidates_evaluated} survivors at the Bonferroni alpha/N gate. "
         f"Judged via {judge_provider}; generated via {gen_provider}."
     )
+    if gen_provider == judge_provider:
+        # Self-scoring caveat (architect): same provider generates AND judges, so
+        # scores may be optimistic. Surface it so the user can discount.
+        rationale += (
+            f" CAVEAT: generator and judge share a provider ({gen_provider}) — "
+            "scores may be optimistic; a cross-provider re-run would strengthen this."
+        )
     execution_plan = (
         "On approval: writes this prompt to the deep-reflection overlay "
         "(~/.genesis/config/reflection/REFLECTION_DEEP.md) via the cognitive "
