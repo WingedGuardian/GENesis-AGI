@@ -226,6 +226,14 @@ async def comms_resolve_proposal(proposal_id: str):
             await handle_cell_promotion_resolution(rt.db, prop, status)
         except Exception:
             logger.warning("cell promotion hook failed for %s", proposal_id)
+        try:
+            from genesis.ego.cognitive_variant import (
+                handle_cognitive_variant_resolution,
+            )
+
+            await handle_cognitive_variant_resolution(rt.db, prop, status)
+        except Exception:
+            logger.warning("cognitive-variant hook failed for %s", proposal_id)
 
     # Trigger delayed sweep on approval — same 5-min grace as Telegram,
     # so the user can revoke before dispatch fires.

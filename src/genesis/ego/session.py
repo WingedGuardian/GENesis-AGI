@@ -58,6 +58,19 @@ _DEFAULT_PROMPT_PATH = Path(__file__).resolve().parent.parent / "identity" / "EG
 _DEFAULT_CALL_SITE = "7_ego_cycle"
 _DEFAULT_FOCUS_SUMMARY_KEY = "ego_focus_summary"
 
+# Action_types that are applied + marked 'executed' by their resolution handler
+# at approval time and must NEVER be auto-dispatched as a background session.
+# Single source of truth for BOTH dispatch paths (the approved-sweep and the
+# execution-briefs path). cognitive_variant_promotion (Evo prompt promotion) is
+# also hard-blocked by the autonomy domain gate (SELF_MODIFY) — this is
+# defense-in-depth that holds even if that gate is absent or fails open.
+_NEVER_DISPATCH_ACTION_TYPES = (
+    "autonomy_earnback",
+    "goal_status_change",
+    "cell_promotion",
+    "cognitive_variant_promotion",
+)
+
 
 class CycleBlockedError(Exception):
     """Raised when the ego cycle is blocked by an approval gate.
@@ -1348,6 +1361,29 @@ class EgoSession:
             if not proposal_id or not prompt:
                 continue
 
+            # Never-dispatch guard (defense-in-depth, gate-independent): the
+            # approved-sweep path has an action_type blocklist; this path did
+            # not. Apply-at-approval action_types (resolved + marked 'executed'
+            # by their handler) must NEVER be auto-run as a session — this holds
+            # even if the autonomy gate below is absent or fails open. On a load
+            # failure we skip (conservative): we can't confirm it's safe.
+            try:
+                _brief_prop = await ego_crud.get_proposal(self._db, proposal_id)
+            except Exception:
+                logger.warning(
+                    "Execution brief %s: proposal load failed (blocklist check) — skipping",
+                    proposal_id, exc_info=True,
+                )
+                continue
+            if (_brief_prop is not None
+                    and _brief_prop.get("action_type") in _NEVER_DISPATCH_ACTION_TYPES):
+                logger.info(
+                    "Execution brief %s skipped — action_type %r is apply-at-approval "
+                    "(never dispatched as a session)",
+                    proposal_id, _brief_prop.get("action_type"),
+                )
+                continue
+
             # Append content firewall rules to ego-authored dispatch prompt.
             # The ego writes the brief prompt directly — this safety net
             # catches information that slips through the ego's own judgment.
@@ -1776,9 +1812,7 @@ class EgoSession:
             # (applied + marked executed) at approval time and must NEVER be
             # dispatched as a session. Defense-in-depth in case one is still
             # 'approved' here.
-            if prop.get("action_type") in (
-                "autonomy_earnback", "goal_status_change", "cell_promotion",
-            ):
+            if prop.get("action_type") in _NEVER_DISPATCH_ACTION_TYPES:
                 continue
             # Staleness guard — skip proposals approved more than 7 days ago.
             # Proposals go stale by clock only as a safety net; semantic

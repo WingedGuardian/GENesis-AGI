@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from genesis.autonomy.classification import ActionClassifier, classify_action
-from genesis.autonomy.types import ActionClass, ApprovalDecision
+from genesis.autonomy.classification import (
+    ActionClassifier,
+    classify_action,
+    classify_domain,
+)
+from genesis.autonomy.types import ActionClass, ActionDomain, ApprovalDecision
 
 # ---------------------------------------------------------------------------
 # TestActionClassifier
@@ -157,3 +161,28 @@ class TestClassifyAction:
 
     def test_unknown_action_reversible(self) -> None:
         assert classify_action("do some analysis") is ActionClass.REVERSIBLE
+
+
+# ---------------------------------------------------------------------------
+# TestClassifyDomain (action_type -> ActionDomain)
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyDomain:
+    """Tests for classify_domain() — the action_type -> ActionDomain mapping
+    that the dispatch gate uses to enforce autonomy levels."""
+
+    def test_cognitive_variant_promotion_is_self_modify(self) -> None:
+        """A reflection-prompt promotion changes Genesis's own cognition, so it
+        must classify as SELF_MODIFY (hard-blocked from background dispatch) —
+        NOT fall through to the EXTERNAL_READ default (always allowed)."""
+        assert (
+            classify_domain("cognitive_variant_promotion")
+            is ActionDomain.SELF_MODIFY
+        )
+
+    def test_existing_code_change_self_modify(self) -> None:
+        assert classify_domain("code_change") is ActionDomain.SELF_MODIFY
+
+    def test_unknown_action_type_falls_to_external_read(self) -> None:
+        assert classify_domain("totally_unknown_xyz") is ActionDomain.EXTERNAL_READ

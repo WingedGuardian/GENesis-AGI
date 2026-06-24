@@ -9,6 +9,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **Genesis can now propose improvements to how it reflects — and apply them only with your approval.**
+  The Evo loop measures variations of the deep-reflection prompt against a golden set
+  (with held-out re-validation), and when one is a confirmed improvement it files a
+  proposal on the dashboard. Approving it updates the live reflection prompt; the change
+  is fully reversible (one click rolls it back). Nothing is ever applied automatically —
+  Genesis recommends, you decide.
+
 ### Changed
 
 - **The dashboard Infrastructure card now labels the ambient-capture bridge as "Voice Bridge"** —
