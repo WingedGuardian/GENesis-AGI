@@ -2,9 +2,9 @@
 
 When the triage pipeline classifies an interaction as APPROACH_FAILURE,
 WORKAROUND_SUCCESS, or (on autonomous channels) SUCCESS, this module extracts
-a reusable procedure and stores it. New procedures start at L3 with
-speculative=1 and confidence=0.5 — immediately visible to session injection
-and proactive surfacing.
+a reusable procedure and stores it. New procedures start at LIBRARY with
+speculative=1 and confidence=0.5 — immediately recallable and eligible for
+proactive surfacing (but not blind session-start injection, which is CORE-only).
 
 Quality gate: the extraction prompt includes criteria for the LLM to
 self-assess whether the procedure codifies correct behavior and is
@@ -391,7 +391,7 @@ async def extract_procedure(
             tools_used=data["tools_used"],
             context_tags=data["context_tags"],
             tool_trigger=data.get("tool_trigger"),
-            activation_tier="L3",
+            activation_tier="LIBRARY",
             speculative=1,
             confidence=gate_result.adjusted_confidence,
             source={"type": "auto_extracted", "triage_outcome": outcome},

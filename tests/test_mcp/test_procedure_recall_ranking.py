@@ -45,7 +45,7 @@ async def test_find_relevant_carries_invocation_count(db):
         db, id="m1", task_type="t", principle="p", steps=["s"],
         tools_used=[], context_tags=["alpha"],
         created_at="2026-01-01T00:00:00",
-        confidence=0.6, speculative=0, activation_tier="L3",
+        confidence=0.6, speculative=0, activation_tier="LIBRARY",
     )
     await procedural.record_invocation(db, "m1")
     matches = await find_relevant(db, ["alpha"], min_confidence=0.3, limit=5)

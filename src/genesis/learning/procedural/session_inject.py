@@ -1,7 +1,7 @@
 """SessionStart procedure injection — inject CORE-tier procedures.
 
-Queries the procedure store for CORE-tier (L1) procedures — the most-proven,
-always-on set. Surfacing v2 narrowed this from L1/L2/L3 to CORE-only: blind
+Queries the procedure store for CORE-tier procedures — the most-proven,
+always-on set. Surfacing v2 narrowed this from CORE/ADVISORY/LIBRARY to CORE-only: blind
 session-start injection runs before the session topic is known, so it should
 carry only procedures proven enough to apply regardless of topic. Lower tiers
 surface contextually instead (the proactive hook on the first message, the
@@ -48,14 +48,14 @@ async def load_active_procedures(db_path: str | Path) -> str | None:
         return None
 
     try:
-        # CORE-tier (L1) only — the always-on, most-proven set. v2 narrowed
-        # blind session-start injection from L1/L2/L3 to CORE so we don't
-        # inject mid-tier procedures of uncertain relevance before the session
-        # topic is known. Lower tiers surface contextually elsewhere.
+        # CORE-tier only — the always-on, most-proven set. v2 narrowed
+        # blind session-start injection from CORE/ADVISORY/LIBRARY to CORE so we
+        # don't inject mid-tier procedures of uncertain relevance before the
+        # session topic is known. Lower tiers surface contextually elsewhere.
         rows = await db.execute(
             """SELECT task_type, principle, steps, activation_tier, confidence
                FROM procedural_memory
-               WHERE activation_tier = 'L1'
+               WHERE activation_tier = 'CORE'
                  AND deprecated = 0 AND quarantined = 0
                ORDER BY confidence DESC
                LIMIT ?""",

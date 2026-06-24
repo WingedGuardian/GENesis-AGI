@@ -2,8 +2,8 @@
 
 The UserPromptSubmit hook's `_search_procedures` previously surfaced the
 best cosine match across ALL tiers — including the large pool of unproven
-DORMANT (L4) drafts. v2 gates proactive surfacing to LIBRARY+ (L1/L2/L3),
-making DORMANT drafts recall-only (never auto-injected).
+DORMANT drafts. v2 gates proactive surfacing to LIBRARY+ (CORE/ADVISORY/
+LIBRARY), making DORMANT drafts recall-only (never auto-injected).
 
 `_search_procedures(db_path, prompt_vector)` takes the vector directly, so
 these are fast unit tests with seeded embeddings — no embedding backend.
@@ -64,14 +64,14 @@ async def _seed(db_path, rows: list[dict]) -> None:
 
 @pytest.mark.asyncio
 async def test_dormant_excluded_even_at_best_cosine(tmp_path):
-    """A DORMANT (L4) row that is the BEST cosine match is still excluded;
-    the lower-scoring LIBRARY (L3) row is surfaced instead."""
+    """A DORMANT row that is the BEST cosine match is still excluded;
+    the lower-scoring LIBRARY row is surfaced instead."""
     db = tmp_path / "t.db"
     await _seed(db, [
         {"id": "d", "task_type": "dorm", "principle": "dormant", "confidence": 0.9,
-         "activation_tier": "L4", "embedding": _vec(1.0)},
+         "activation_tier": "DORMANT", "embedding": _vec(1.0)},
         {"id": "l", "task_type": "lib", "principle": "library", "confidence": 0.5,
-         "activation_tier": "L3", "embedding": _vec(0.8, 0.6)},
+         "activation_tier": "LIBRARY", "embedding": _vec(0.8, 0.6)},
     ])
     result = _search_procedures(db, _vec(1.0))
     assert result is not None
@@ -85,7 +85,7 @@ async def test_only_dormant_returns_none(tmp_path):
     db = tmp_path / "t.db"
     await _seed(db, [
         {"id": "d", "task_type": "dorm", "principle": "p", "confidence": 0.9,
-         "activation_tier": "L4", "embedding": _vec(1.0)},
+         "activation_tier": "DORMANT", "embedding": _vec(1.0)},
     ])
     assert _search_procedures(db, _vec(1.0)) is None
 
@@ -96,7 +96,7 @@ async def test_library_tier_still_surfaced(tmp_path):
     db = tmp_path / "t.db"
     await _seed(db, [
         {"id": "l", "task_type": "lib", "principle": "p", "confidence": 0.5,
-         "activation_tier": "L3", "embedding": _vec(1.0)},
+         "activation_tier": "LIBRARY", "embedding": _vec(1.0)},
     ])
     result = _search_procedures(db, _vec(1.0))
     assert result is not None and result[1] == "lib"

@@ -212,7 +212,7 @@ async def _store_judged_procedure(
         tools_used=tools_used,
         context_tags=context_tags,
         tool_trigger=tool_trigger,
-        activation_tier="L4",
+        activation_tier="DORMANT",
         speculative=1,
         success_count=0,
         confidence=0.0,

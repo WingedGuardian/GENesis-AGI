@@ -1,6 +1,6 @@
 # Procedure Activation Architecture
 
-**Status:** Active | **Last updated:** 2026-04-09
+**Status:** Active | **Last updated:** 2026-06-24
 
 
 ## Problem
@@ -18,18 +18,18 @@ Reliability decreases as scope increases. Layers reinforce each other.
 - `scripts/procedure_advisor.py` — fires on every CC tool call
 - Reads YAML trigger cache (`config/procedure_triggers.yaml`)
 - Outputs JSON with `additionalContext` for matching procedures
-- Only L1/L2-tier procedures with tool triggers (trigger cache built from both)
+- Only CORE/ADVISORY-tier procedures with tool triggers (trigger cache built from both)
 - ~10ms overhead per non-matching call
 
 ### Layer 2: Skill-Embedded Procedures (active when skill invoked)
 - Skills contain `## Known Procedures` section
-- Procedures synced from L2-tier via `skills/procedure_sync.py`
+- Procedures synced from ADVISORY-tier via `skills/procedure_sync.py`
 - Auto-applied as MINOR changes at L2+ autonomy
 
 ### Layer 3: SessionStart Injection (active per session)
 - `scripts/genesis_session_context.py` → `session_inject.load_active_procedures`
-- Injects CORE-tier (L1) procedures only, 200-word budget. **v2** narrowed this
-  from L3+: blind session-start injection runs before the session topic is
+- Injects CORE-tier procedures only, 200-word budget. **v2** narrowed this
+  from LIBRARY+: blind session-start injection runs before the session topic is
   known, so it carries only the most-proven, topic-independent procedures.
 - Positioned after cognitive state, before MCP tools hint
 
@@ -47,28 +47,29 @@ more surface:
 
 | Tier | recall (MCP) | proactive hook | tool advisor | session inject |
 |------|:---:|:---:|:---:|:---:|
-| L4 (DORMANT)  | ✓ |   |   |   |
-| L3 (LIBRARY)  | ✓ | ✓ |   |   |
-| L2 (ADVISORY) | ✓ | ✓ | ✓ |   |
-| L1 (CORE)     | ✓ | ✓ | ✓ | ✓ |
+| DORMANT  | ✓ |   |   |   |
+| LIBRARY  | ✓ | ✓ |   |   |
+| ADVISORY | ✓ | ✓ | ✓ |   |
+| CORE     | ✓ | ✓ | ✓ | ✓ |
 
-So unproven L4 drafts are **recall-only** (never auto-injected), and only the
-proven L1 set is injected blindly at session start. (The L1–L4 labels are
-slated to become CORE/ADVISORY/LIBRARY/DORMANT in a follow-up rename.)
+So unproven DORMANT drafts are **recall-only** (never auto-injected), and only the
+proven CORE set is injected blindly at session start. The tiers are ranked
+CORE > ADVISORY > LIBRARY > DORMANT (CORE = most-proven; see `_TIER_RANK` in
+`promoter.py`).
 
 ## Procedure Lifecycle
 
 ```
 Auto-extracted (triage / extractor pipeline):
-  → L4 (speculative=1, success_count=0, conf=0.0, advisory only)
-  → L3 (3+ successes, conf >= 0.65, speculative=0)
-  → L2 (5+ successes, conf >= 0.75, embedded in skills)
-  → L1 (8+ successes, conf >= 0.85, tool trigger set)
+  → DORMANT (speculative=1, success_count=0, conf=0.0, advisory only)
+  → LIBRARY (3+ successes, conf >= 0.65, speculative=0)
+  → ADVISORY (5+ successes, conf >= 0.75, embedded in skills)
+  → CORE (8+ successes, conf >= 0.85, tool trigger set)
 
 Explicit user teach (procedure_store MCP tool):
-  → L3 (speculative=0, success_count=1, conf=2/3) — eligible for
-       SessionStart injection from the moment it is stored.
-       Earns further promotion to L2/L1 organically via record_success.
+  → LIBRARY (speculative=0, success_count=1, conf=2/3) — recallable and
+       eligible for proactive-hook surfacing from the moment it is stored.
+       Earns further promotion to ADVISORY/CORE organically via record_success.
 ```
 
 ### Reads as a usage signal (effective confidence)
@@ -86,8 +87,8 @@ treated as a *dampened* positive signal:
 - **Stored `confidence` stays real Laplace** (success/failure only). Effective
   confidence is *derived* and used ONLY for (a) recall ranking and (b) tier
   promotion — so the j9 metric, quarantine, and demotion stay honest.
-- **Hybrid promotion guard:** reads alone may promote to **L3** (passive
-  surfacing); **L2** (advisory-eligible) requires ≥1 *real* success; **L1**
+- **Hybrid promotion guard:** reads alone may promote to **LIBRARY** (passive
+  surfacing); **ADVISORY** (advisory-eligible) requires ≥1 *real* success; **CORE**
   (always-on) is never reachable from reads. Promotion is additive — the target
   tier is the higher of the real-metric and read-eligible tiers (`_compute_tier`
   vs `_read_eligible_tier`), still promote-only.
@@ -104,7 +105,7 @@ The one-time migration `0035_backfill_procedure_invocation_count` seeds
 so the signal doesn't start at zero.
 
 > **Limitation:** reads are a *proxy* for usefulness, not proof a procedure
-> worked. The discount, the ≥1-real-success gate for L2, and the FailureDetector
+> worked. The discount, the ≥1-real-success gate for ADVISORY, and the FailureDetector
 > are the counterweights. A real recall-path outcome signal remains future work.
 
 Demotion is **evidence-driven only** — never metric drift:
@@ -120,7 +121,7 @@ Demotion is **evidence-driven only** — never metric drift:
 The `_compute_tier` function in `promoter.py` is strict promote-only: it
 returns the highest tier the row's metrics qualify for, but never returns
 a lower rank than the row's current tier. A procedure whose confidence
-drifts (e.g., L1 dropping from 0.86 → 0.83) is held at its existing tier
+drifts (e.g., CORE dropping from 0.86 → 0.83) is held at its existing tier
 unless `_check_demotion` or quarantine fires. This prevents seed and
 explicit-teach procedures from being silently downgraded between hourly
 promoter runs.
@@ -129,20 +130,20 @@ promoter runs.
 
 1. **Triage / extraction pipeline** — extracts procedures from
    APPROACH_FAILURE and WORKAROUND_SUCCESS outcomes via LLM (call site 34),
-   plus the per-session extraction + struggle streams. Defaults to L4 /
+   plus the per-session extraction + struggle streams. Defaults to DORMANT /
    speculative=1 — the LLM hypothesis must earn trust through real
    organic successes before promotion. **Capped at 3 new speculative
    procedures per session** (`max_procedures_per_session`, shared across the
    extraction and struggle streams) so a single session cannot flood the store.
 2. **MCP tool** — `procedure_store` for explicit user teaching. Treated
-   as one Laplace-equivalent confirmed success — seeds at L3 with
+   as one Laplace-equivalent confirmed success — seeds at LIBRARY with
    speculative=0, success_count=1, confidence=2/3. The caller asserting
    "this procedure works" is the evidence; the system trusts that
    assertion enough to make the procedure immediately recallable and
-   eligible for SessionStart injection.
+   eligible for proactive-hook surfacing.
 3. **Seed script** — `scripts/seed_procedures.py` for battle-tested
    procedures. Uses raw SQL upsert with hand-tuned counts and
-   confidence (e.g., success_count=10, confidence=0.92, L2). Bypasses
+   confidence (e.g., success_count=10, confidence=0.92, ADVISORY). Bypasses
    the operations / CRUD layer entirely.
 
 ## Key Files
@@ -155,7 +156,7 @@ promoter runs.
 | `src/genesis/learning/procedural/promoter.py` | Tier promotion/demotion |
 | `scripts/procedure_advisor.py` | PreToolUse hook |
 | `scripts/seed_procedures.py` | Known procedure seeding |
-| `config/procedure_triggers.yaml` | L1 trigger cache |
+| `config/procedure_triggers.yaml` | CORE/ADVISORY trigger cache |
 
 ## Hook Registration
 

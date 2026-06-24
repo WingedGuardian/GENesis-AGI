@@ -61,7 +61,7 @@ async def db(tmp_path):
                 quarantined INTEGER DEFAULT 0, speculative INTEGER DEFAULT 1,
                 success_count INTEGER DEFAULT 0, failure_count INTEGER DEFAULT 0,
                 invocation_count INTEGER DEFAULT 0,
-                activation_tier TEXT DEFAULT 'L4',
+                activation_tier TEXT DEFAULT 'DORMANT',
                 tool_trigger TEXT,
                 created_at TEXT, updated_at TEXT
             )

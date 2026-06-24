@@ -3,7 +3,7 @@
 
 These procedures are extracted from existing hooks, memory files, and
 incident-driven lessons. They start at their natural activation tier
-(L1 for hook-backed procedures, L3 for session-level knowledge).
+(CORE for hook-backed procedures, LIBRARY for session-level knowledge).
 
 Run once, or re-run safely (uses upsert with deterministic IDs).
 
@@ -45,7 +45,7 @@ SEED_PROCEDURES = [
         ],
         "tools_used": ["Bash", "Read"],
         "context_tags": ["youtube", "video", "transcript", "ssl", "content-fetch"],
-        "activation_tier": "L1",
+        "activation_tier": "CORE",
         "tool_trigger": ["WebFetch"],
         "speculative": 0,
         "success_count": 5,
@@ -62,7 +62,7 @@ SEED_PROCEDURES = [
         ],
         "tools_used": ["WebFetch", "WebSearch"],
         "context_tags": ["youtube", "transcript", "workaround", "fallback"],
-        "activation_tier": "L3",
+        "activation_tier": "LIBRARY",
         "tool_trigger": None,
         "speculative": 0,
         "success_count": 2,
@@ -79,7 +79,7 @@ SEED_PROCEDURES = [
         ],
         "tools_used": ["Bash"],
         "context_tags": ["pip.*-e", "pip.*--editable"],
-        "activation_tier": "L1",
+        "activation_tier": "CORE",
         "tool_trigger": ["Bash"],
         "speculative": 0,
         "success_count": 8,
@@ -96,7 +96,7 @@ SEED_PROCEDURES = [
         ],
         "tools_used": ["Write", "Edit"],
         "context_tags": ["os.killpg", "os.kill(", "killpg(", "mock_proc.pid", "pgid"],
-        "activation_tier": "L1",
+        "activation_tier": "CORE",
         "tool_trigger": ["Write", "Edit"],
         "speculative": 0,
         "success_count": 5,
@@ -114,7 +114,7 @@ SEED_PROCEDURES = [
         ],
         "tools_used": ["Bash"],
         "context_tags": ["git", "worktree", "concurrent", "safety", "commit"],
-        "activation_tier": "L3",
+        "activation_tier": "LIBRARY",
         "tool_trigger": None,
         "speculative": 0,
         "success_count": 10,
@@ -133,7 +133,7 @@ SEED_PROCEDURES = [
         ],
         "tools_used": ["Bash"],
         "context_tags": ["tmp", "filesystem", "disk", "safety", "tmpdir", "watchgod"],
-        "activation_tier": "L3",
+        "activation_tier": "LIBRARY",
         "tool_trigger": None,
         "speculative": 0,
         "success_count": 3,
@@ -152,7 +152,7 @@ SEED_PROCEDURES = [
         ],
         "tools_used": ["Write", "Edit"],
         "context_tags": ["planning", "decision", "confidence", "framework", "analysis"],
-        "activation_tier": "L3",
+        "activation_tier": "LIBRARY",
         "tool_trigger": None,
         "speculative": 0,
         "success_count": 4,
@@ -207,10 +207,10 @@ async def main(db_path: Path) -> None:
 
     await db.commit()
 
-    # Regenerate L1 trigger cache for the PreToolUse advisor hook
+    # Regenerate CORE/ADVISORY trigger cache for the PreToolUse advisor hook
     from genesis.learning.procedural.trigger_cache import regenerate
     n_triggers = await regenerate(db)
-    print(f"\nRegenerated trigger cache: {n_triggers} L1 triggers")
+    print(f"\nRegenerated trigger cache: {n_triggers} CORE/ADVISORY triggers")
 
     await db.close()
     print(f"Seeded {seeded} procedures into {db_path}")

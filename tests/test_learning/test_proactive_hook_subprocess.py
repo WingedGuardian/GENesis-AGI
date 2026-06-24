@@ -83,7 +83,7 @@ def seeded_db(tmp_path: Path):
             confidence REAL DEFAULT 0.9,
             deprecated INTEGER DEFAULT 0,
             quarantined INTEGER DEFAULT 0,
-            activation_tier TEXT DEFAULT 'L4',
+            activation_tier TEXT DEFAULT 'DORMANT',
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
@@ -94,13 +94,13 @@ def seeded_db(tmp_path: Path):
     assert vector is not None, "Embedding failed during test setup"
 
     proc_id = str(uuid.uuid4())
-    # activation_tier must be LIBRARY+ (L1/L2/L3): Surfacing v2 gates the
-    # proactive hook to those tiers, so a default-'L4' (DORMANT) procedure
-    # would be recall-only and never surfaced here. L3 is the eligibility floor.
+    # activation_tier must be LIBRARY+ (CORE/ADVISORY/LIBRARY): Surfacing v2
+    # gates the proactive hook to those tiers, so a default-'DORMANT' procedure
+    # would be recall-only and never surfaced here. LIBRARY is the eligibility floor.
     conn.execute(
         "INSERT INTO procedural_memory "
         "(id, task_type, principle, principle_embedding, confidence, activation_tier) "
-        "VALUES (?, ?, ?, ?, ?, 'L3')",
+        "VALUES (?, ?, ?, ?, ?, 'LIBRARY')",
         (proc_id, _TASK_TYPE, _PROCEDURE_PRINCIPLE, pack_embedding(vector), 0.92),
     )
     conn.commit()

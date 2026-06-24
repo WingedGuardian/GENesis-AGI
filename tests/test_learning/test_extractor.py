@@ -346,7 +346,7 @@ async def test_auto_extracted_starts_at_l3_with_baseline_confidence(db):
     )
     rows = await cursor.fetchall()
     assert len(rows) == 1
-    assert rows[0][0] == "L3"
+    assert rows[0][0] == "LIBRARY"
     assert rows[0][1] == pytest.approx(0.5)
     assert rows[0][2] == 1  # still marked speculative (provenance only)
 

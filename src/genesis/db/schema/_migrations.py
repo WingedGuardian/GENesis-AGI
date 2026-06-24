@@ -102,7 +102,7 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
 
     # Procedure activation: tier + tool trigger for layered procedure surfacing
     await _try_alter(db,
-        "ALTER TABLE procedural_memory ADD COLUMN activation_tier TEXT NOT NULL DEFAULT 'L4'",
+        "ALTER TABLE procedural_memory ADD COLUMN activation_tier TEXT NOT NULL DEFAULT 'DORMANT'",
         "procedural_memory.activation_tier")
     await _try_alter(db,
         "ALTER TABLE procedural_memory ADD COLUMN tool_trigger TEXT",

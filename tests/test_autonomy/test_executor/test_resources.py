@@ -118,7 +118,7 @@ class TestGatherResourceInventory:
             workarounds: list = field(default_factory=list)
             steps: list = field(default_factory=lambda: ["step 1", "step 2"])
             principle: str = "Build REST endpoints"
-            activation_tier: str = "L3"
+            activation_tier: str = "LIBRARY"
             tool_trigger: list | None = None
 
         with patch(
