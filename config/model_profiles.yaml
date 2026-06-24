@@ -492,7 +492,7 @@ profiles:
   minimax-m2.7:
     display_name: "MiniMax M2.7"
     provider: minimax
-    api_id: "minimax/minimax-m2.7"
+    api_id: "MiniMax-M2.7"
     intelligence_tier: A
     reasoning: B
     instruction_following: A
