@@ -1,22 +1,25 @@
-"""Tests for deliberate() — the chorus. litellm is mocked; no live calls."""
+"""Tests for deliberate() — the chorus. The HTTP layer (_consume_stream) is mocked; no live calls."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+import httpx
 
 from genesis.deliberation import DeliberationResult, deliberate
 from genesis.deliberation.backends.fusion import (
+    _PRESET_PANELS,
     FusionBackend,
-    _extract_cost,
     _normalize,
     _parse_content,
+    _parse_sse,
     _resolve_preset,
+    _resolve_stakes,
 )
 
-# ── fixtures: real-shaped litellm responses ──────────────────────────────────
-# PROSE = the actual probe output (2026-06-24): bare model-slug returns synthesized
-# MARKDOWN in message.content, no structured fields.
+# ── fixtures: real-shaped content ────────────────────────────────────────────
+# PROSE = the actual probe output (2026-06-24): the fusion model-slug returns synthesized
+# MARKDOWN, no structured fields.
 PROSE = (
     "# Recommendation: Cut now — but cut surgically\n\n"
     "**B is a trap dressed up as ambition** and the math gives it away.\n"
@@ -41,11 +44,59 @@ ANALYSIS_JSON = (
 )
 
 
-def _resp(content, cost=None):
-    """Mimic the litellm ModelResponse shape the backend reads."""
-    msg = SimpleNamespace(content=content)
-    usage = SimpleNamespace(cost=cost) if cost is not None else SimpleNamespace()
-    return SimpleNamespace(choices=[SimpleNamespace(message=msg)], usage=usage, _hidden_params={})
+def _http_error(status: int) -> httpx.HTTPStatusError:
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    resp = httpx.Response(status, request=req)
+    return httpx.HTTPStatusError(f"status {status}", request=req, response=resp)
+
+
+# ── SSE parser ───────────────────────────────────────────────────────────────
+
+
+def test_parse_sse_assembles_content_and_cost():
+    lines = [
+        ": OPENROUTER PROCESSING",  # keep-alive comment
+        "",
+        'data: {"choices":[{"delta":{"content":"Hello "}}]}',
+        'data: {"choices":[{"delta":{"content":"world"}}]}',
+        'data: {"choices":[],"usage":{"prompt_tokens":10,"cost":0.1839}}',
+        "data: [DONE]",
+    ]
+    content, cost, err = _parse_sse(lines)
+    assert content == "Hello world"
+    assert cost == 0.1839
+    assert err is None
+
+
+def test_parse_sse_skips_comments_and_malformed():
+    lines = [": keep-alive", "", "data: not-json", 'data: {"choices":[{"delta":{"content":"ok"}}]}']
+    content, cost, _ = _parse_sse(lines)
+    assert content == "ok" and cost is None
+
+
+def test_parse_sse_stops_at_done():
+    lines = [
+        'data: {"choices":[{"delta":{"content":"keep"}}]}',
+        "data: [DONE]",
+        'data: {"choices":[{"delta":{"content":"DROP"}}]}',
+    ]
+    content, _, _ = _parse_sse(lines)
+    assert content == "keep"
+
+
+def test_parse_sse_cost_bool_rejected():
+    content, cost, _ = _parse_sse(['data: {"choices":[],"usage":{"cost":true}}'])
+    assert content == "" and cost is None
+
+
+def test_parse_sse_captures_in_stream_error():
+    lines = [
+        ": OPENROUTER PROCESSING",
+        'data: {"choices":[],"error":{"code":502,"message":"panel upstream failed"}}',
+    ]
+    content, cost, err = _parse_sse(lines)
+    assert content == "" and cost is None
+    assert err == "panel upstream failed"
 
 
 # ── parser / normalizer ──────────────────────────────────────────────────────
@@ -87,7 +138,7 @@ def test_parse_blind_spots():
 
 
 def test_normalize_prose_uses_content_as_answer():
-    r = _normalize(_resp(PROSE, cost=0.3211), 80.0, "synthesis", "budget")
+    r = _normalize(PROSE, 0.3211, None, 80.0, "synthesis", "budget")
     assert r.ok
     assert r.answer.startswith("# Recommendation")
     assert r.dissent == ()
@@ -97,13 +148,13 @@ def test_normalize_prose_uses_content_as_answer():
 
 
 def test_normalize_json_structured():
-    r = _normalize(_resp(JSON_OK, cost=0.05), 70.0, "synthesis", "budget")
+    r = _normalize(JSON_OK, 0.05, None, 70.0, "synthesis", "budget")
     assert r.answer.startswith("Cut now")
     assert r.consensus and len(r.dissent) == 1 and r.confidence == 0.82
 
 
 def test_normalize_analysis_structured():
-    r = _normalize(_resp(ANALYSIS_JSON, cost=0.12), 173.0, "analysis", "strong")
+    r = _normalize(ANALYSIS_JSON, 0.12, None, 173.0, "analysis", "strong")
     assert r.answer.startswith("Choose A")
     assert len(r.dissent) == 3
     assert len(r.blind_spots) == 2
@@ -112,75 +163,125 @@ def test_normalize_analysis_structured():
     assert r.cost_usd == 0.12 and r.cost_known
 
 
+def test_normalize_cost_unknown():
+    r = _normalize(PROSE, None, None, 80.0, "synthesis", "budget")
+    assert r.ok and r.cost_usd == 0.0 and not r.cost_known
+
+
 def test_normalize_empty_content_errors():
-    r = _normalize(_resp("", cost=0.01), 1.0, "synthesis", "budget")
-    assert not r.ok and "empty" in r.error
+    r = _normalize("", 0.01, None, 1.0, "synthesis", "budget")
+    assert not r.ok and "no content" in r.error
 
 
-def test_resolve_preset_mapping_and_defaults():
-    assert _resolve_preset("strong", "synthesis") == ("strong", "general-high")
-    assert _resolve_preset("budget", "analysis") == ("budget", "general-budget")
-    # mode-aware defaults when preset is None/unknown
-    assert _resolve_preset(None, "synthesis") == ("budget", "general-budget")
-    assert _resolve_preset(None, "analysis") == ("strong", "general-high")
-    assert _resolve_preset("bogus", "analysis") == ("strong", "general-high")
+def test_normalize_empty_surfaces_stream_error():
+    r = _normalize("", None, "panel exploded", 1.0, "analysis", "strong")
+    assert not r.ok and "no content" in r.error and "panel exploded" in r.error
 
 
-def test_extract_cost_from_usage():
-    cost, known = _extract_cost(_resp("x", cost=0.42))
-    assert cost == 0.42 and known
+def test_normalize_content_with_trailing_error_stays_ok():
+    # a complete/usable verdict alongside a late in-stream error is NOT false-failed (error is logged)
+    r = _normalize("a real verdict", 0.1, "late panel error", 50.0, "synthesis", "strong")
+    assert r.ok and r.answer == "a real verdict"
 
 
-def test_extract_cost_unknown():
-    cost, known = _extract_cost(_resp("x"))
-    assert cost == 0.0 and not known
+def test_resolve_preset_returns_panels_and_defaults():
+    # explicit synthesis presets pick the matching custom panel
+    assert _resolve_preset("strong", "synthesis") == ("strong", _PRESET_PANELS["strong"])
+    assert _resolve_preset("budget", "synthesis") == ("budget", _PRESET_PANELS["budget"])
+    # synthesis defaults to budget when preset is None/unknown
+    assert _resolve_preset(None, "synthesis") == ("budget", _PRESET_PANELS["budget"])
+    assert _resolve_preset("bogus", "synthesis") == ("budget", _PRESET_PANELS["budget"])
+    # analysis is ALWAYS strong, ignoring any requested preset
+    assert _resolve_preset(None, "analysis") == ("strong", _PRESET_PANELS["strong"])
+    assert _resolve_preset("budget", "analysis") == ("strong", _PRESET_PANELS["strong"])
 
 
-# ── FusionBackend.run (litellm mocked) ───────────────────────────────────────
+def test_resolve_stakes_auto_couples():
+    # an explicit normal/high always wins
+    assert _resolve_stakes("normal", "analysis", "strong") == "normal"
+    assert _resolve_stakes("high", "synthesis", "budget") == "high"
+    # auto-couple when stakes is None/unknown: analysis→high, synthesis strong→high, budget→normal
+    assert _resolve_stakes(None, "analysis", "strong") == "high"
+    assert _resolve_stakes(None, "synthesis", "strong") == "high"
+    assert _resolve_stakes(None, "synthesis", "budget") == "normal"
+    assert _resolve_stakes("", "synthesis", "budget") == "normal"
+    assert _resolve_stakes("garbage", "synthesis", "strong") == "high"
+
+
+# ── FusionBackend.run (HTTP layer mocked) ────────────────────────────────────
+# Patch _consume_stream → (content, cost); assert the request body shape + error mapping.
+_STREAM = "genesis.deliberation.backends.fusion._consume_stream"
 
 
 async def test_fusion_happy(monkeypatch):
     monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
-    with patch(
-        "genesis.deliberation.backends.fusion.litellm.acompletion",
-        new=AsyncMock(return_value=_resp(JSON_OK, cost=0.05)),
-    ) as m:
+    with patch(_STREAM, new=AsyncMock(return_value=(JSON_OK, 0.05, None))) as m:
         r = await FusionBackend().run("q", stakes="high")
     assert r.ok and r.answer.startswith("Cut now")
     assert r.cost_usd == 0.05 and r.cost_known and isinstance(r.latency_s, float)
     assert r.preset_used == "budget"  # synthesis default preset
-    kwargs = m.call_args.kwargs
-    assert "HIGH-STAKES" in kwargs["messages"][0]["content"]  # stakes strengthens system prompt
-    assert kwargs["max_tokens"] == 2000  # explicit max_tokens (the 402 guard)
-    assert kwargs["model"] == "openrouter/openrouter/fusion"
-    assert kwargs["extra_body"]["plugins"][0]["preset"] == "general-budget"
+    body = m.call_args.args[0]
+    assert "HIGH-STAKES" in body["messages"][0]["content"]  # stakes strengthens system prompt
+    assert body["max_tokens"] == 2000  # explicit max_tokens (the 402 guard)
+    assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
+    assert body["model"] == "openrouter/fusion"
+    plugin = body["plugins"][0]
+    assert plugin["id"] == "fusion"  # synthesis default preset → budget panel
+    assert plugin["analysis_models"] == _PRESET_PANELS["budget"]["analysis_models"]
+    assert plugin["model"] == _PRESET_PANELS["budget"]["model"]
 
 
 async def test_fusion_analysis_mode_request(monkeypatch):
     monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
-    with patch(
-        "genesis.deliberation.backends.fusion.litellm.acompletion",
-        new=AsyncMock(return_value=_resp(ANALYSIS_JSON, cost=0.12)),
-    ) as m:
+    with patch(_STREAM, new=AsyncMock(return_value=(ANALYSIS_JSON, 0.12, None))) as m:
         r = await FusionBackend().run("q", mode="analysis")
     assert r.ok and len(r.dissent) == 3 and r.backend_used == "fusion/analysis"
     assert r.preset_used == "strong"  # analysis default preset
-    kwargs = m.call_args.kwargs
-    assert kwargs["model"] == "openrouter/openai/gpt-oss-120b:free"
-    assert kwargs["extra_body"]["tools"][0]["type"] == "openrouter:fusion"
-    assert kwargs["extra_body"]["tools"][0]["parameters"]["preset"] == "general-high"
-    assert kwargs["extra_body"]["tool_choice"] == "required"
+    body = m.call_args.args[0]
+    assert body["model"] == "openai/gpt-oss-120b:free"
+    assert body["tools"][0]["type"] == "openrouter:fusion"
+    params = body["tools"][0]["parameters"]  # analysis default preset → strong panel
+    assert params["analysis_models"] == _PRESET_PANELS["strong"]["analysis_models"]
+    assert params["model"] == _PRESET_PANELS["strong"]["model"]
+    assert body["tool_choice"] == "required"
 
 
-async def test_fusion_preset_override(monkeypatch):
+async def test_fusion_analysis_always_strong(monkeypatch):
+    """analysis pins the strong panel even when budget is requested."""
     monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
-    with patch(
-        "genesis.deliberation.backends.fusion.litellm.acompletion",
-        new=AsyncMock(return_value=_resp(ANALYSIS_JSON, cost=0.12)),
-    ) as m:
+    with patch(_STREAM, new=AsyncMock(return_value=(ANALYSIS_JSON, 0.12, None))) as m:
         r = await FusionBackend().run("q", mode="analysis", preset="budget")
-    assert r.preset_used == "budget"
-    assert m.call_args.kwargs["extra_body"]["tools"][0]["parameters"]["preset"] == "general-budget"
+    assert r.preset_used == "strong"
+    params = m.call_args.args[0]["tools"][0]["parameters"]
+    assert params["analysis_models"] == _PRESET_PANELS["strong"]["analysis_models"]
+    assert params["model"] == _PRESET_PANELS["strong"]["model"]
+
+
+async def test_fusion_synthesis_preset_override(monkeypatch):
+    """synthesis honors an explicit strong preset → the frontier panel."""
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+    with patch(_STREAM, new=AsyncMock(return_value=(JSON_OK, 0.05, None))) as m:
+        r = await FusionBackend().run("q", preset="strong")
+    assert r.preset_used == "strong"
+    plugin = m.call_args.args[0]["plugins"][0]
+    assert plugin["analysis_models"] == _PRESET_PANELS["strong"]["analysis_models"]
+    assert plugin["model"] == _PRESET_PANELS["strong"]["model"]
+
+
+async def test_fusion_stakes_auto_couples(monkeypatch):
+    """Default stakes (None) auto-couples to the system prompt: budget synthesis stays normal,
+    strong synthesis and analysis go high; an explicit value overrides."""
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+
+    async def _system_prompt(**kw):
+        with patch(_STREAM, new=AsyncMock(return_value=(JSON_OK, 0.05, None))) as m:
+            await FusionBackend().run("q", **kw)
+        return m.call_args.args[0]["messages"][0]["content"]
+
+    assert "HIGH-STAKES" not in await _system_prompt()  # synthesis + budget default → normal
+    assert "HIGH-STAKES" in await _system_prompt(preset="strong")  # synthesis + strong → high
+    assert "HIGH-STAKES" in await _system_prompt(mode="analysis")  # analysis → high
+    assert "HIGH-STAKES" not in await _system_prompt(mode="analysis", stakes="normal")  # override
 
 
 async def test_fusion_no_key(monkeypatch):
@@ -192,59 +293,76 @@ async def test_fusion_no_key(monkeypatch):
 
 async def test_fusion_error_graceful(monkeypatch):
     monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
-    with patch(
-        "genesis.deliberation.backends.fusion.litellm.acompletion",
-        new=AsyncMock(side_effect=RuntimeError("boom")),
-    ):
+    with patch(_STREAM, new=AsyncMock(side_effect=RuntimeError("boom"))):
         r = await FusionBackend().run("q")
     assert not r.ok and "call failed" in r.error
 
 
 async def test_fusion_timeout_graceful(monkeypatch):
     monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
-    with patch(
-        "genesis.deliberation.backends.fusion.litellm.acompletion",
-        new=AsyncMock(side_effect=TimeoutError()),
-    ):
+    with patch(_STREAM, new=AsyncMock(side_effect=httpx.ReadTimeout("slow"))):
         r = await FusionBackend().run("q", timeout_s=1.0)
     assert not r.ok and "timed out" in r.error
 
 
-async def test_fusion_litellm_timeout_graceful(monkeypatch):
-    import litellm
-
+async def test_fusion_http_400_no_retry(monkeypatch):
     monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
-    exc = litellm.Timeout(message="slow", model="m", llm_provider="openrouter")
-    with patch(
-        "genesis.deliberation.backends.fusion.litellm.acompletion",
-        new=AsyncMock(side_effect=exc),
-    ):
-        r = await FusionBackend().run("q", timeout_s=1.0)
-    assert not r.ok and "timed out" in r.error
+    mock = AsyncMock(side_effect=_http_error(400))
+    with patch(_STREAM, new=mock):
+        r = await FusionBackend().run("q")
+    assert not r.ok and "call failed" in r.error and "status=400" in r.error
+    assert mock.call_count == 1  # 4xx is not retried
 
 
-async def test_fusion_retries_on_ratelimit(monkeypatch):
-    import litellm
-
+async def test_fusion_http_429_retries(monkeypatch):
     monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
     monkeypatch.setattr("genesis.deliberation.backends.fusion._BACKOFF_S", 0.0)
-    rle = litellm.RateLimitError(message="429", model="m", llm_provider="openrouter")
-    mock = AsyncMock(side_effect=[rle, rle, _resp(JSON_OK, cost=0.05)])  # fail twice, then succeed
-    with patch("genesis.deliberation.backends.fusion.litellm.acompletion", new=mock):
+    mock = AsyncMock(side_effect=[_http_error(429), _http_error(429), (JSON_OK, 0.05, None)])
+    with patch(_STREAM, new=mock):
         r = await FusionBackend().run("q")
     assert r.ok and r.answer.startswith("Cut now")
     assert mock.call_count == 3  # 1 + 2 retries
 
 
-async def test_fusion_ratelimit_exhausted(monkeypatch):
-    import litellm
-
+async def test_fusion_transport_error_retries(monkeypatch):
     monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
     monkeypatch.setattr("genesis.deliberation.backends.fusion._BACKOFF_S", 0.0)
-    rle = litellm.RateLimitError(message="429", model="m", llm_provider="openrouter")
-    with patch("genesis.deliberation.backends.fusion.litellm.acompletion", new=AsyncMock(side_effect=rle)):
+    mock = AsyncMock(side_effect=[httpx.ConnectError("reset"), (JSON_OK, 0.05, None)])
+    with patch(_STREAM, new=mock):
         r = await FusionBackend().run("q")
-    assert not r.ok and "call failed" in r.error
+    assert r.ok and mock.call_count == 2
+
+
+async def test_fusion_retries_on_empty_stream(monkeypatch):
+    """A transient empty / in-stream-error result gets one more shot, then succeeds."""
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+    monkeypatch.setattr("genesis.deliberation.backends.fusion._BACKOFF_S", 0.0)
+    mock = AsyncMock(side_effect=[("", None, "panel hiccup"), (JSON_OK, 0.05, None)])
+    with patch(_STREAM, new=mock):
+        r = await FusionBackend().run("q")
+    assert r.ok and r.answer.startswith("Cut now")
+    assert mock.call_count == 2
+
+
+async def test_fusion_empty_stream_surfaces_error(monkeypatch):
+    """An empty stream that never recovers surfaces the real in-stream error, not a generic message."""
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+    monkeypatch.setattr("genesis.deliberation.backends.fusion._BACKOFF_S", 0.0)
+    mock = AsyncMock(return_value=("", None, "panel exploded"))
+    with patch(_STREAM, new=mock):
+        r = await FusionBackend().run("q")
+    assert not r.ok and "no content" in r.error and "panel exploded" in r.error
+    assert mock.call_count == 3  # empty retried to exhaustion
+
+
+async def test_fusion_http_429_exhausted(monkeypatch):
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+    monkeypatch.setattr("genesis.deliberation.backends.fusion._BACKOFF_S", 0.0)
+    mock = AsyncMock(side_effect=_http_error(429))
+    with patch(_STREAM, new=mock):
+        r = await FusionBackend().run("q")
+    assert not r.ok and "call failed" in r.error and "status=429" in r.error
+    assert mock.call_count == 3  # exhausts all attempts
 
 
 # ── deliberate() core ────────────────────────────────────────────────────────
@@ -306,6 +424,22 @@ async def test_backend_receives_stakes_and_context(monkeypatch):
     }
 
 
+async def test_deliberate_default_stakes_is_none(monkeypatch):
+    """Unspecified stakes reaches the backend as None so it can auto-couple."""
+    seen = {}
+
+    class Stub:
+        name = "stub"
+
+        async def run(self, q, *, context, stakes, mode, preset, timeout_s, models):
+            seen["stakes"] = stakes
+            return DeliberationResult(answer="ok")
+
+    monkeypatch.setattr("genesis.deliberation.core.get_backend", lambda n: Stub())
+    await deliberate("q", backend="stub")
+    assert seen["stakes"] is None
+
+
 # ── MCP tool ─────────────────────────────────────────────────────────────────
 
 
@@ -333,3 +467,23 @@ async def test_mcp_impl_graceful(monkeypatch):
     assert out["dissent"] == ["d1"]
     assert out["cost_known"] is True
     assert out["latency_s"] == 70.0
+
+
+async def test_mcp_impl_stakes_passthrough(monkeypatch):
+    """The tool's "" default and unknown values pass None (auto-couple); normal/high pass through."""
+    seen = {}
+    import genesis.deliberation as dl
+
+    async def fake(q, **kw):
+        seen["stakes"] = kw.get("stakes")
+        return DeliberationResult(answer="A")
+
+    monkeypatch.setattr(dl, "deliberate", fake)
+    from genesis.mcp.health import deliberation_tools as dt
+
+    await dt._impl_deliberate("q")  # "" default → None
+    assert seen["stakes"] is None
+    await dt._impl_deliberate("q", stakes="high")
+    assert seen["stakes"] == "high"
+    await dt._impl_deliberate("q", stakes="garbage")  # unknown → None
+    assert seen["stakes"] is None
