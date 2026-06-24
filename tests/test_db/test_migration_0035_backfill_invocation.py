@@ -89,3 +89,19 @@ async def test_backfill_ignores_orphan_events(db):
     # An event whose subject_id matches no procedure must not crash.
     await _add_invoked_events(db, "ghost", 2)
     await M35.up(db)  # no row to update; must complete cleanly
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_when_base_tables_absent(tmp_path):
+    """The migration runner applies migrations against a bare DB (no base
+    tables). 0035 must skip cleanly rather than fail on a missing table —
+    otherwise it breaks the runner's apply-all sequence for every migration."""
+    async with aiosqlite.connect(str(tmp_path / "bare.db")) as conn:
+        conn.row_factory = aiosqlite.Row
+        # Simulate the runner state where 0002 created eval_events but the base
+        # procedural_memory table does not exist yet.
+        await conn.execute(
+            "CREATE TABLE eval_events (id TEXT, event_type TEXT, subject_id TEXT)"
+        )
+        await conn.commit()
+        await M35.up(conn)  # must not raise (no such table: procedural_memory)

@@ -18,11 +18,17 @@ import aiosqlite
 
 
 async def up(db: aiosqlite.Connection) -> None:
-    # Fresh installs may not have eval_events yet — nothing to backfill.
+    # Both tables must be present. In production `create_all_tables` (which
+    # creates the base `procedural_memory` table) runs before the migration
+    # runner, so this guard passes and the backfill runs. The runner's own unit
+    # tests apply migrations against a bare DB where base tables are absent —
+    # there is simply nothing to backfill, so skip cleanly. (Mirrors 0013.)
     cursor = await db.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='eval_events'"
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name IN ('eval_events', 'procedural_memory')"
     )
-    if not await cursor.fetchone():
+    tables = {row[0] for row in await cursor.fetchall()}
+    if not {"eval_events", "procedural_memory"} <= tables:
         return
 
     await db.execute(
