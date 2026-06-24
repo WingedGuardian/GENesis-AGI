@@ -44,6 +44,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The Internals "composite" self-improvement score is no longer dragged down by draft
+  procedures** — Genesis extracts candidate procedures from its own sessions; these start
+  unvalidated (near-zero confidence) until they prove useful. The weekly composite score was
+  averaging *every* procedure's confidence, so a burst of new drafts made the score crater
+  even though nothing had actually regressed. The score now reflects only validated
+  procedures. Genesis also caps how many drafts a single session can create, so the
+  procedure store stops accumulating dead weight.
 - **Updates no longer abort when a schema migration actually succeeded** — if the
   database was busy during an update (for example a background task writing at the same
   time), a migration could commit successfully yet still surface a transient "database

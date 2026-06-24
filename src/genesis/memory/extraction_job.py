@@ -104,6 +104,7 @@ async def run_extraction_cycle(
     start_line_override: int | None = None,
     session_filter: set[str] | None = None,
     max_extractions_per_session: int = 30,
+    max_procedures_per_session: int = 3,
 ) -> dict:
     """Run one extraction cycle across all eligible sessions.
 
@@ -170,6 +171,10 @@ async def run_extraction_cycle(
         all_keywords: set[str] = set()
         latest_topic = ""
         session_extraction_count = 0
+        # Per-session cap on NEW speculative procedures (extraction + struggle
+        # streams). Without this, a single session can flood the store with
+        # hundreds of conf≈0 candidates that never get validated.
+        session_procs = 0
 
         for chunk in chunks:
             chunk_start = chunk[0].line_number
@@ -241,7 +246,7 @@ async def run_extraction_cycle(
             # references). Only in normal mode — procedure candidates are
             # a new extraction type flagged by the SLM, routed to the Judge
             # LLM for validation. Each Judge call is timeout-guarded.
-            if not reference_only_mode:
+            if not reference_only_mode and session_procs < max_procedures_per_session:
                 try:
                     from genesis.memory.procedure_extraction import (
                         extract_procedures_from_chunk,
@@ -253,7 +258,9 @@ async def run_extraction_cycle(
                         router=router,
                         source_session_id=cc_session_id,
                         chunk_context=format_chunk_for_extraction(chunk),
+                        max_new=max_procedures_per_session - session_procs,
                     )
+                    session_procs += proc_count
                     summary["procedures_extracted"] = (
                         summary.get("procedures_extracted", 0) + proc_count
                     )
@@ -444,7 +451,10 @@ async def run_extraction_cycle(
 
                 spine = build_action_spine(transcript_path)
                 struggle_score = score_struggle(spine)
-                if struggle_score >= STRUGGLE_THRESHOLD:
+                if (
+                    struggle_score >= STRUGGLE_THRESHOLD
+                    and session_procs < max_procedures_per_session
+                ):
                     from genesis.learning.procedural.judge import (
                         JUDGE_TIMEOUT_SECS,
                         judge_struggle_procedure,

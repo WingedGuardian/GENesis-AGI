@@ -538,3 +538,51 @@ class TestScoreStruggleSignals:
         score = score_struggle(spine)
         # Has errors + pivots, should be non-trivial
         assert score > 0.2
+
+
+# ── Stream 2: per-session extraction throttle (max_new) ──────────────────────
+
+
+def _proc_candidate_extraction() -> Extraction:
+    return Extraction(
+        content="When deploying to HA, you must fully uninstall the addon "
+                "first because Docker caches layers",
+        extraction_type="procedure_candidate",
+        confidence=0.85,
+        entities=["HA Supervisor", "Docker"],
+        scenario="deploying updated code to a Home Assistant addon",
+    )
+
+
+async def test_extract_procedures_respects_max_new(db, monkeypatch):
+    """max_new caps how many candidates are stored (and judged) per call."""
+    from genesis.memory import procedure_extraction as pe
+
+    calls = []
+
+    async def _fake_judge(db, candidate, ctx, router, *, source_session_id=None):
+        calls.append(candidate)
+        return f"stored-{len(calls)}"
+
+    monkeypatch.setattr(
+        "genesis.learning.procedural.judge.judge_extraction_candidate", _fake_judge,
+    )
+    exts = [_proc_candidate_extraction() for _ in range(5)]
+    count = await pe.extract_procedures_from_chunk(exts, db=db, router=None, max_new=3)
+    assert count == 3
+    assert len(calls) == 3  # Judge not called once the cap is hit
+
+
+async def test_extract_procedures_no_cap_when_max_new_none(db, monkeypatch):
+    """Without a cap, behavior is unchanged (all valid candidates judged)."""
+    from genesis.memory import procedure_extraction as pe
+
+    async def _fake_judge(db, candidate, ctx, router, *, source_session_id=None):
+        return "stored"
+
+    monkeypatch.setattr(
+        "genesis.learning.procedural.judge.judge_extraction_candidate", _fake_judge,
+    )
+    exts = [_proc_candidate_extraction() for _ in range(5)]
+    count = await pe.extract_procedures_from_chunk(exts, db=db, router=None)
+    assert count == 5

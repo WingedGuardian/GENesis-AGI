@@ -90,6 +90,12 @@ Demotion is **evidence-driven only** — never metric drift:
 - 3+ failure-mode hits AND failure_count >= success_count + 3 → tier - 1
 - confidence < 0.3 AND total samples >= 3 → quarantine (excluded everywhere)
 
+> **Eval note:** the J-9 system composite's procedure-confidence signal and the
+> procedure dimension's `mean_confidence` average **validated** procedures
+> (speculative=0) only. Speculative candidates start at conf≈0 and would measure
+> extraction *volume*, not knowledge *quality* (`total_procedures` still counts
+> the whole store, consistent with `tier_distribution`).
+
 The `_compute_tier` function in `promoter.py` is strict promote-only: it
 returns the highest tier the row's metrics qualify for, but never returns
 a lower rank than the row's current tier. A procedure whose confidence
@@ -100,10 +106,13 @@ promoter runs.
 
 ## Ingestion Paths
 
-1. **Triage pipeline** — extracts procedures from APPROACH_FAILURE and
-   WORKAROUND_SUCCESS outcomes via LLM (call site 34). Defaults to L4 /
+1. **Triage / extraction pipeline** — extracts procedures from
+   APPROACH_FAILURE and WORKAROUND_SUCCESS outcomes via LLM (call site 34),
+   plus the per-session extraction + struggle streams. Defaults to L4 /
    speculative=1 — the LLM hypothesis must earn trust through real
-   organic successes before promotion.
+   organic successes before promotion. **Capped at 3 new speculative
+   procedures per session** (`max_procedures_per_session`, shared across the
+   extraction and struggle streams) so a single session cannot flood the store.
 2. **MCP tool** — `procedure_store` for explicit user teaching. Treated
    as one Laplace-equivalent confirmed success — seeds at L3 with
    speculative=0, success_count=1, confidence=2/3. The caller asserting
