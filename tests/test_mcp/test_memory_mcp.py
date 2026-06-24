@@ -103,7 +103,7 @@ async def test_procedure_store_recall_roundtrip():
             assert row[0] == 0  # speculative
             assert row[1] == 1  # success_count
             assert abs(row[2] - 2 / 3) < 1e-9  # Laplace
-            assert row[3] == "L3"  # activation_tier
+            assert row[3] == "LIBRARY"  # activation_tier
 
             # Now recall the procedure — must be visible.
             results = await tools["procedure_recall"].fn(

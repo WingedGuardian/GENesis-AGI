@@ -488,9 +488,10 @@ def _search_procedures(
                 "FROM procedural_memory "
                 "WHERE deprecated = 0 AND quarantined = 0 "
                 "AND principle_embedding IS NOT NULL "
-                # v2: gate proactive surfacing to LIBRARY+ (L1/L2/L3) — DORMANT
-                # (L4) drafts are recall-only, never proactively auto-injected.
-                "AND activation_tier IN ('L1', 'L2', 'L3') "
+                # v2: gate proactive surfacing to LIBRARY+ (CORE/ADVISORY/
+                # LIBRARY) — DORMANT drafts are recall-only, never proactively
+                # auto-injected.
+                "AND activation_tier IN ('CORE', 'ADVISORY', 'LIBRARY') "
                 "ORDER BY confidence DESC LIMIT 100"
             ).fetchall()
         finally:

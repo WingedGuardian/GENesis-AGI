@@ -38,25 +38,25 @@ from genesis.learning.procedural.trigger_cache import regenerate
 
 logger = logging.getLogger(__name__)
 
-_TIER_RANK = {"L1": 4, "L2": 3, "L3": 2, "L4": 1}
-_RANK_TIER = {4: "L1", 3: "L2", 2: "L3", 1: "L4"}
+_TIER_RANK = {"CORE": 4, "ADVISORY": 3, "LIBRARY": 2, "DORMANT": 1}
+_RANK_TIER = {4: "CORE", 3: "ADVISORY", 2: "LIBRARY", 1: "DORMANT"}
 
 
 def _read_eligible_tier(eff_success: int, eff_conf: float, real_success: int) -> str:
     """Tier a procedure qualifies for from *effective* (read-inclusive) metrics.
 
     Hybrid guard (reads are a dampened signal, not proof of success):
-      - L3 (passive surfacing): reads alone may qualify.
-      - L2 (advisory-eligible): requires >= 1 *real* success.
-      - L1 (always-on): never reachable from reads.
+      - LIBRARY (passive surfacing): reads alone may qualify.
+      - ADVISORY (advisory-eligible): requires >= 1 *real* success.
+      - CORE (always-on): never reachable from reads.
 
-    Mirrors `_compute_tier`'s real-metric thresholds, minus the L1 branch.
+    Mirrors `_compute_tier`'s real-metric thresholds, minus the CORE branch.
     """
     if eff_success >= 5 and eff_conf >= 0.75 and real_success >= 1:
-        return "L2"
+        return "ADVISORY"
     if eff_success >= 3 and eff_conf >= 0.65:
-        return "L3"
-    return "L4"
+        return "LIBRARY"
+    return "DORMANT"
 
 
 def _compute_tier(row: dict) -> str:
@@ -65,7 +65,7 @@ def _compute_tier(row: dict) -> str:
     Strict promote-only. Returns the highest tier the row's metrics
     qualify for, then compares against the row's CURRENT tier and never
     returns a lower rank — even if a lower-tier rule still matches. This
-    prevents one-failure metric drift (e.g., an L1 procedure whose conf
+    prevents one-failure metric drift (e.g., a CORE procedure whose conf
     drifts from 0.86 → 0.83) from silently downgrading the tier.
 
     Evidence-driven demotions are handled separately by `_check_demotion`
@@ -75,15 +75,15 @@ def _compute_tier(row: dict) -> str:
     s = row["success_count"]
     conf = row["confidence"]
     has_trigger = bool(row.get("tool_trigger"))
-    current = row.get("activation_tier") or "L4"
+    current = row.get("activation_tier") or "DORMANT"
 
-    qualified = "L4"
+    qualified = "DORMANT"
     if s >= 8 and conf >= 0.85 and has_trigger:
-        qualified = "L1"
+        qualified = "CORE"
     elif s >= 5 and conf >= 0.75:
-        qualified = "L2"
+        qualified = "ADVISORY"
     elif s >= 3 and conf >= 0.65:
-        qualified = "L3"
+        qualified = "LIBRARY"
 
     # Promote-only: never demote via metrics drift.
     if _TIER_RANK.get(qualified, 1) > _TIER_RANK.get(current, 1):
@@ -112,7 +112,7 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
     despeculated = 0
 
     for row in rows:
-        current_tier = row.get("activation_tier", "L4")
+        current_tier = row.get("activation_tier", "DORMANT")
         proc_id = row["id"]
 
         # Quarantine check — uses REAL stored confidence + real counts (reads

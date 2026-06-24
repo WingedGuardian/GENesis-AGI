@@ -298,7 +298,7 @@ async def test_store_procedure_explicit_teach_defaults(db):
         steps=["navigate", "fill", "click", "verify"],
         tools_used=["browser_navigate", "browser_fill", "browser_click"],
         context_tags=["discourse", "forum", "registration"],
-        activation_tier="L3",
+        activation_tier="LIBRARY",
         speculative=0,
         success_count=1,
         confidence=2 / 3,
@@ -312,7 +312,7 @@ async def test_store_procedure_explicit_teach_defaults(db):
     assert row[0] == 0  # speculative
     assert row[1] == 1  # success_count
     assert abs(row[2] - 2 / 3) < 1e-9  # Laplace for 1 success
-    assert row[3] == "L3"  # activation_tier
+    assert row[3] == "LIBRARY"  # activation_tier
 
 
 @pytest.mark.asyncio
@@ -330,7 +330,7 @@ async def test_find_relevant_surfaces_explicit_teach(db):
         steps=["navigate", "fill", "click"],
         tools_used=["browser_navigate"],
         context_tags=["discourse", "forum", "registration"],
-        activation_tier="L3",
+        activation_tier="LIBRARY",
         speculative=0,
         success_count=1,
         confidence=2 / 3,
@@ -508,7 +508,7 @@ async def test_promoter_records_promotion_history(db):
         db, task_type="promotable", principle="test",
         steps=["s1"], tools_used=["Bash"], context_tags=["test"],
         speculative=0, success_count=5, confidence=0.78,
-        activation_tier="L4",
+        activation_tier="DORMANT",
     )
     # Mock regenerate to avoid clobbering the filesystem trigger cache
     with patch("genesis.learning.procedural.promoter.regenerate", new_callable=AsyncMock):
@@ -519,5 +519,5 @@ async def test_promoter_records_promotion_history(db):
     row = await get_by_id(db, proc_id)
     history = json.loads(row["promotion_history"])
     assert len(history) >= 1
-    assert history[0]["from_tier"] == "L4"
+    assert history[0]["from_tier"] == "DORMANT"
     assert history[0]["reason"] == "metrics_promotion"

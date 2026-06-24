@@ -41,11 +41,11 @@ async def regenerate(db: object) -> int:
     """
     from genesis.db.crud import procedural
 
-    # Include both L1 and L2 procedures — L2 with tool triggers are mature
-    # enough (5+ successes, 75%+ confidence) to warrant hook advisories.
-    rows_l1 = await procedural.list_by_tier(db, "L1")  # type: ignore[arg-type]
-    rows_l2 = await procedural.list_by_tier(db, "L2")  # type: ignore[arg-type]
-    rows = rows_l1 + rows_l2
+    # Include both CORE and ADVISORY procedures — ADVISORY with tool triggers
+    # are mature enough (5+ successes, 75%+ confidence) to warrant hook advisories.
+    rows_core = await procedural.list_by_tier(db, "CORE")  # type: ignore[arg-type]
+    rows_advisory = await procedural.list_by_tier(db, "ADVISORY")  # type: ignore[arg-type]
+    rows = rows_core + rows_advisory
     triggers = []
     for row in rows:
         tool_trigger = json.loads(row["tool_trigger"]) if row.get("tool_trigger") else None

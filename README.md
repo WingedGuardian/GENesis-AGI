@@ -357,13 +357,13 @@ If you treat "I did it wrong" and "I can't do it yet" the same way, you learn th
 
 **Procedure extraction builds reusable knowledge:**
 
-Extracted procedures start at L4 (advisory-only, never auto-injected) and promote through tiers as they prove themselves:
+Extracted procedures start at DORMANT (recall-only, never auto-surfaced) and promote through tiers as they prove themselves. Each tier is an *additive* channel — it gets everything the lower tiers do, plus one more surface:
 
 ```
-L4 (new)     → Advisory only. Auto-extracted, unproven.
-L3 (proven)  → Injected at session start. Requires 3+ successes, ≥65% confidence.
-L2 (reliable)→ Higher injection priority. Requires 5+ successes, ≥75% confidence.
-L1 (core)    → Trigger-cached, instant recall. Requires 8+ successes, ≥85% confidence.
+DORMANT (new)      → Recall-only. Auto-extracted, unproven.
+LIBRARY (proven)   → + Proactively surfaced on matching prompts. Requires 3+ successes, ≥65% confidence.
+ADVISORY (reliable)→ + Tool-trigger advisories. Requires 5+ successes, ≥75% confidence.
+CORE (core)        → + Injected at session start, trigger-cached. Requires 8+ successes, ≥85% confidence.
 ```
 
 Confidence uses Laplace smoothing: `(successes + 1) / (total + 2)`. A newly-extracted procedure starts at ~67% confidence—not zero, not certain. Evidence moves it. Three consecutive failures and `failure_count >= success_count + 3` triggers demotion. Confidence below 30% with enough samples quarantines the procedure entirely.

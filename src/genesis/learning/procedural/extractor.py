@@ -391,7 +391,7 @@ async def extract_procedure(
             tools_used=data["tools_used"],
             context_tags=data["context_tags"],
             tool_trigger=data.get("tool_trigger"),
-            activation_tier="L3",
+            activation_tier="LIBRARY",
             speculative=1,
             confidence=gate_result.adjusted_confidence,
             source={"type": "auto_extracted", "triage_outcome": outcome},

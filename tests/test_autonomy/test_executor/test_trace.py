@@ -169,7 +169,7 @@ class TestRetrospective:
         call_kwargs = mock_store.call_args
         # First positional arg is db
         assert call_kwargs.kwargs["task_type"] == "api-endpoint-creation"
-        assert call_kwargs.kwargs["activation_tier"] == "L3"
+        assert call_kwargs.kwargs["activation_tier"] == "LIBRARY"
         assert call_kwargs.kwargs["confidence"] == 0.5
         assert call_kwargs.kwargs["speculative"] == 1
         assert "proc-new-123" in trace.procedural_extractions
