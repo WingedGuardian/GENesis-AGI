@@ -155,6 +155,16 @@ class MorningReportGenerator:
             logger.warning("Morning report: cognitive state unavailable", exc_info=True)
             await self._emit_warning("cognitive_state", "Cognitive state section unavailable")
 
+        # 3b. Cognitive subsystem quality grades (weekly J9 grades; neutral
+        # observability — the regression alarm is a separate deterministic path)
+        try:
+            eval_quality = await self._get_eval_quality_section()
+            if eval_quality:
+                sections.append(f"## Cognitive Subsystem Grades\n{eval_quality}")
+        except Exception:
+            logger.warning("Morning report: eval quality section unavailable", exc_info=True)
+            await self._emit_warning("eval_quality", "Cognitive subsystem grades section unavailable")
+
         # 4. Pending Items (user-actionable only)
         try:
             pending = await self._get_pending_items()
@@ -364,6 +374,37 @@ class MorningReportGenerator:
             aging_tag = " [AGING]" if _age_seconds(r["created_at"]) > 43200 else ""  # >12h
             entry_lines.append(f"- [{r['section']}]{aging_tag} {r['content'][:300]} ({age})")
         return header + "\n" + "\n".join(entry_lines)
+
+    async def _get_eval_quality_section(self) -> str | None:
+        """Weekly cognitive-subsystem quality grades (A–F) — neutral readout.
+
+        This is OBSERVABILITY, not an alarm channel: a grade *regression* is
+        surfaced separately and deterministically at aggregation time, not via
+        this LLM-narrated report. Returns None when no graded subsystem exists
+        (cold start / insufficient data) so the section is skipped entirely.
+        Subsystems with no letter grade (``cognitive_drift`` is dark by design;
+        sparse weeks grade to None) are omitted — never shown as a problem.
+        """
+        from genesis.db.crud import j9_eval
+
+        grades = await j9_eval.get_latest_subsystem_grades(self._db)
+        graded = [g for g in grades if g.get("grade")]
+        if not graded:
+            return None
+
+        lines = [
+            "Weekly cognitive-subsystem grades. Mention a subsystem ONLY if it "
+            "is at D/F or notably low; otherwise compress to 'cognitive "
+            "subsystems nominal'. Weekly cadence — do not repeat unchanged "
+            "grades in the daily report.",
+        ]
+        for g in sorted(graded, key=lambda x: x.get("subsystem", "")):
+            sub = g.get("subsystem", "?")
+            grade = g.get("grade", "?")
+            score = g.get("score")
+            score_txt = f" ({score:.0f})" if isinstance(score, (int, float)) else ""
+            lines.append(f"- {sub}: {grade}{score_txt}")
+        return "\n".join(lines)
 
     async def _get_pending_items(self) -> str:
         from genesis.db.crud import approval_requests as approval_crud
