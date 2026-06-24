@@ -105,6 +105,12 @@ itself, evidence of a current problem.
 - Cost — restate the single `Spend:` line from the System Health data
   exactly as given (month-to-date spend against the cap). One line. Do not
   project, annualize, recompute, add a daily figure, or flag a spike.
+- Cognitive subsystem grades — the weekly cognitive-quality readout (memory,
+  ego, procedural, awareness, reflection), when provided. Mention a subsystem
+  ONLY if it is at D/F or dropped since last week; otherwise compress to
+  "cognitive subsystems nominal" or omit. Weekly cadence — do not repeat
+  unchanged grades in the daily report. This is a neutral readout, not an
+  alarm; do not lead the report with it.
 - Items requiring user decision — pending approvals, ego proposals, inbox items
 
 **Omit entirely:**
