@@ -16,13 +16,17 @@ def source_files(tmp_path, monkeypatch):
     monkeypatch.setattr(recon_mcp, "_REPO_SOURCES", sources_path)
     monkeypatch.setattr(recon_mcp, "_USER_CONFIG_DIR", tmp_path)
 
+    # The watchlist now loads via the shared recon.watchlist store, so point
+    # its paths (not the removed recon_mcp._WATCHLIST_PATH) at the temp file.
+    from genesis.recon import watchlist as _watchlist
     watchlist_path = tmp_path / "recon_watchlist.yaml"
     watchlist_path.write_text(yaml.safe_dump({
         "projects": [
             {"name": "TestProject", "repo": "test/repo", "track": ["releases"], "priority": "high"},
         ]
     }))
-    monkeypatch.setattr(recon_mcp, "_WATCHLIST_PATH", watchlist_path)
+    monkeypatch.setattr(_watchlist, "WATCHLIST_PATH", watchlist_path)
+    monkeypatch.setattr(_watchlist, "LOCAL_PATH", tmp_path / "recon_watchlist.local.yaml")
     return sources_path
 
 

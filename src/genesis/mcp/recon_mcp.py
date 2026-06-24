@@ -24,9 +24,6 @@ mcp = FastMCP("genesis-recon")
 _REPO_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
 _USER_CONFIG_DIR = Path.home() / ".genesis" / "config"
 
-# Watchlist is read-only (curated by developer), always from repo
-_WATCHLIST_PATH = _REPO_CONFIG_DIR / "recon_watchlist.yaml"
-
 # Schedules and sources are user-modifiable — prefer user override
 _REPO_SCHEDULES = _REPO_CONFIG_DIR / "recon_schedules.yaml"
 _REPO_SOURCES = _REPO_CONFIG_DIR / "recon_sources.yaml"
@@ -64,12 +61,15 @@ def init_recon_mcp(
 
 
 def _load_watchlist() -> list[dict]:
-    """Load the hardcoded project watchlist from config/recon_watchlist.yaml."""
-    if not _WATCHLIST_PATH.exists():
-        return []
-    with open(_WATCHLIST_PATH) as f:
-        data = yaml.safe_load(f)
-    return data.get("projects", []) if data else []
+    """Active watchlist (base minus user-disabled + install overlay).
+
+    Delegates to the shared ``recon.watchlist`` store so the recon_config MCP
+    view reflects overlay edits made via the dashboard (previously this read
+    base-only, so those edits were invisible here). Read-only by design —
+    recon targets must not be self-modifiable from an autonomous loop.
+    """
+    from genesis.recon import watchlist
+    return watchlist.active_entries()
 
 
 def _load_schedules() -> dict[str, dict]:

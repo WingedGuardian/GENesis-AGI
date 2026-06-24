@@ -215,6 +215,11 @@
         knowledgeUploads: [],
         knowledgeTaxonomy: { project_types: [], domains: [] },
         _uploadPollInterval: null,
+        // Tracked GitHub repositories (recon watchlist)
+        watchlistEntries: [],
+        watchlistForm: { name: '', repo: '', track: 'releases,commits', priority: 'medium', notes: '' },
+        watchlistMsg: null,
+        watchlistSaving: false,
 
         // ── References tab state ──────────────────────────────────
         referenceByKind: {},
@@ -436,7 +441,7 @@
               if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); }
               break;
             case "knowledge":
-              if (first) { this.fetchKnowledgeRecent(); this.fetchKnowledgeStats(); this.fetchKnowledgeUploads(); this.fetchKnowledgeTaxonomy(); }
+              if (first) { this.fetchKnowledgeRecent(); this.fetchKnowledgeStats(); this.fetchKnowledgeUploads(); this.fetchKnowledgeTaxonomy(); this.fetchWatchlist(); }
               // Resume polling if any uploads are processing
               if (this.knowledgeUploads.some(u => u.status === "processing")) { this._startUploadPolling(); }
               break;
@@ -1340,6 +1345,59 @@
             const resp = await fetchApi("/api/genesis/knowledge/stats");
             if (resp && resp.ok) { this.knowledgeStats = await resp.json(); }
           } catch (e) { console.warn("Knowledge stats failed:", e); }
+        },
+        // ── Tracked repositories (recon watchlist) ──────────────────
+        async fetchWatchlist() {
+          try {
+            const resp = await fetchApi("/api/genesis/recon/watchlist");
+            if (resp && resp.ok) { this.watchlistEntries = (await resp.json()).entries || []; }
+          } catch (e) { console.warn("Watchlist fetch failed:", e); }
+        },
+        async addWatchlistRepo() {
+          this.watchlistSaving = true; this.watchlistMsg = null;
+          try {
+            const f = this.watchlistForm;
+            const body = {
+              name: f.name, repo: f.repo, priority: f.priority,
+              track: f.track.split(',').map(t => t.trim()).filter(Boolean),
+            };
+            if (f.notes) body.notes = f.notes;
+            const resp = await fetchApi("/api/genesis/recon/watchlist", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+            const data = resp ? await resp.json() : null;
+            if (resp && resp.ok) {
+              this.watchlistMsg = { ok: true, text: "Added " + data.repo };
+              f.name = ''; f.repo = ''; f.notes = '';
+              this.fetchWatchlist();
+            } else {
+              this.watchlistMsg = { ok: false, text: (data && (data.error || (data.details || []).join('; '))) || "Add failed" };
+            }
+          } catch (e) {
+            this.watchlistMsg = { ok: false, text: String(e) };
+          } finally { this.watchlistSaving = false; }
+        },
+        async toggleWatchlistRepo(repo, disabled) {
+          try {
+            const resp = await fetchApi("/api/genesis/recon/watchlist/disable", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ repo, disabled }),
+            });
+            if (resp && resp.ok) { this.fetchWatchlist(); }
+            else { const d = resp ? await resp.json() : null; this.watchlistMsg = { ok: false, text: (d && d.error) || "Update failed" }; }
+          } catch (e) { this.watchlistMsg = { ok: false, text: String(e) }; }
+        },
+        async removeWatchlistRepo(repo) {
+          if (!await this.showConfirm("Remove repository", "Remove " + repo + " from tracked repositories?")) return;
+          try {
+            const resp = await fetchApi("/api/genesis/recon/watchlist", {
+              method: "DELETE", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ repo }),
+            });
+            if (resp && resp.ok) { this.fetchWatchlist(); }
+            else { const d = resp ? await resp.json() : null; this.watchlistMsg = { ok: false, text: (d && d.error) || "Remove failed" }; }
+          } catch (e) { this.watchlistMsg = { ok: false, text: String(e) }; }
         },
         async searchKnowledge() {
           if (!this.knowledgeQuery.trim()) return;
@@ -9658,6 +9716,75 @@
         Knowledge Base
       </div>
       <div style="padding: 1rem;">
+
+      <!-- ── Tracked GitHub Repositories (recon watchlist) ───── -->
+      <div style="margin-bottom: 1.5rem;">
+        <div style="display:flex; align-items:center; gap:0.4rem; margin-bottom:0.4rem;">
+          <span class="material-symbols-outlined" style="font-size:1.1rem;">visibility</span>
+          <strong>Tracked GitHub Repositories</strong>
+          <span style="font-size:0.72rem; color:var(--color-text-secondary);"
+                x-text="'(' + $store.genesisDashboard.watchlistEntries.length + ')'"></span>
+        </div>
+        <div style="font-size:0.74rem; color:var(--color-text-secondary); margin-bottom:0.6rem;">
+          Repos Genesis monitors for releases, commits, and issues. Base entries ship with
+          Genesis (lock icon — can be disabled); add install-specific repos below.
+        </div>
+        <div style="display:flex; flex-direction:column; gap:0.3rem; margin-bottom:0.6rem;">
+          <template x-for="e in $store.genesisDashboard.watchlistEntries" :key="e.repo">
+            <div style="display:flex; align-items:center; gap:0.5rem; padding:0.35rem 0.5rem; border-radius:4px; background:rgba(0,0,0,0.15);"
+                 :style="e.disabled ? 'opacity:0.5;' : ''">
+              <span class="material-symbols-outlined" style="font-size:0.85rem; color:var(--color-text-secondary);"
+                    x-text="e.source === 'base' ? 'lock' : 'person'"
+                    :title="e.source === 'base' ? 'Base entry (ships with Genesis)' : 'Install-added'"></span>
+              <a :href="'https://github.com/' + e.repo" target="_blank" rel="noopener"
+                 style="font-family:monospace; font-size:0.78rem; color:#64b5f6; text-decoration:none;" x-text="e.repo"></a>
+              <span style="font-size:0.62rem; padding:0.05rem 0.3rem; border-radius:3px; background:rgba(255,255,255,0.08); color:var(--color-text-secondary);" x-text="e.priority"></span>
+              <span style="font-size:0.66rem; color:var(--color-text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;" x-text="(e.track || []).join(', ')"></span>
+              <template x-if="e.source === 'base'">
+                <button style="font-size:0.62rem; padding:0.1rem 0.45rem; border-radius:3px; cursor:pointer; border:1px solid #555; background:transparent;"
+                        :style="e.disabled ? 'color:#81c784; border-color:#81c784;' : 'color:#aaa;'"
+                        @click="$store.genesisDashboard.toggleWatchlistRepo(e.repo, !e.disabled)"
+                        x-text="e.disabled ? 'Enable' : 'Disable'"></button>
+              </template>
+              <template x-if="e.source === 'overlay'">
+                <button style="font-size:0.62rem; padding:0.1rem 0.45rem; border-radius:3px; cursor:pointer; border:1px solid rgba(239,83,80,0.4); background:transparent; color:#ef9a9a;"
+                        @click="$store.genesisDashboard.removeWatchlistRepo(e.repo)">Remove</button>
+              </template>
+            </div>
+          </template>
+          <template x-if="$store.genesisDashboard.watchlistEntries.length === 0">
+            <div style="font-size:0.74rem; color:var(--color-text-secondary); padding:0.5rem;">No tracked repositories loaded.</div>
+          </template>
+        </div>
+        <details style="font-size:0.78rem;">
+          <summary style="cursor:pointer; color:var(--color-text-secondary);">+ Add a repository</summary>
+          <div style="display:flex; flex-direction:column; gap:0.4rem; margin-top:0.5rem; max-width:480px;">
+            <input type="text" x-model="$store.genesisDashboard.watchlistForm.name" placeholder="Name (e.g. Cool Project)"
+                   style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+            <input type="text" x-model="$store.genesisDashboard.watchlistForm.repo" placeholder="owner/repo (not a URL)"
+                   style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary); font-family:monospace;">
+            <input type="text" x-model="$store.genesisDashboard.watchlistForm.track" placeholder="track: releases,commits,issues,discussions,stars"
+                   style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+            <select x-model="$store.genesisDashboard.watchlistForm.priority"
+                    style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+              <option value="high">Priority: high</option>
+              <option value="medium">Priority: medium</option>
+              <option value="low">Priority: low</option>
+            </select>
+            <input type="text" x-model="$store.genesisDashboard.watchlistForm.notes" placeholder="Notes (optional) — why track this?"
+                   style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+            <div style="display:flex; gap:0.6rem; align-items:center;">
+              <button @click="$store.genesisDashboard.addWatchlistRepo()"
+                      :disabled="$store.genesisDashboard.watchlistSaving"
+                      style="font-size:0.78rem; padding:0.3rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(33,150,243,0.15); color:#64b5f6; border:1px solid rgba(33,150,243,0.4);"
+                      x-text="$store.genesisDashboard.watchlistSaving ? 'Adding…' : 'Add repository'"></button>
+              <span x-show="$store.genesisDashboard.watchlistMsg"
+                    :style="$store.genesisDashboard.watchlistMsg?.ok ? 'color:#81c784; font-size:0.76rem;' : 'color:#ef9a9a; font-size:0.76rem;'"
+                    x-text="$store.genesisDashboard.watchlistMsg?.text"></span>
+            </div>
+          </div>
+        </details>
+      </div>
 
       <!-- ── Upload Zone ─────────────────────────────────────── -->
       <div style="margin-bottom: 1.5rem;">
