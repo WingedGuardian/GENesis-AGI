@@ -114,7 +114,7 @@ def test_set_writes_env_and_installs_cron(client):
     with (
         patch(f"{_SEC}._key_value", return_value=""),
         patch(f"{_SEC}._update_secrets_file") as wr,
-        patch(f"{_BK}.subprocess.run", return_value=_ok_proc()) as run,
+        patch(f"{_BK}.subprocess.run", return_value=_ok_proc("")) as run,
         patch.dict("os.environ", {}, clear=False),
     ):
         resp = client.post("/api/genesis/backup/config", json={
@@ -127,25 +127,32 @@ def test_set_writes_env_and_installs_cron(client):
     assert written["GENESIS_BACKUP_REPO"] == "https://github.com/u/backups.git"
     assert written["GENESIS_BACKUP_TIER2_BACKEND"] == "local"
     assert written["GENESIS_BACKUP_LOCAL_PATH"] == "/mnt/bk"
-    # cron wrapper invoked with install; the schedule is passed via the
-    # environment (never the argv), and the wrapper path is correct.
-    cmd = run.call_args.args[0]
-    assert "install" in cmd and "0 */6 * * *" not in cmd
-    assert cmd[1].endswith("manage_backup_cron.sh")
-    assert run.call_args.kwargs["env"]["GENESIS_BACKUP_CRON_SCHEDULE"] == "0 */6 * * *"
+    # Cron written via `crontab -` (constant argv); the schedule appears only in
+    # the stdin content, never on a command line.
+    write_call = run.call_args                  # last call = the write
+    assert write_call.args[0] == ["crontab", "-"]
+    assert "0 */6 * * *" in write_call.kwargs["input"]
+    assert "backup.sh" in write_call.kwargs["input"]
 
 
 def test_set_schedule_disabled_removes_cron(client):
+    # Existing crontab has an unrelated entry + the backup line; remove must
+    # drop only the backup line and preserve the other.
+    read = _ok_proc("0 5 * * * /h/inbox_sync.sh\n"
+                    "0 */6 * * * /h/genesis/scripts/backup.sh >> /l 2>&1")
     with (
         patch(f"{_SEC}._key_value", return_value=""),
         patch(f"{_SEC}._update_secrets_file"),
-        patch(f"{_BK}.subprocess.run", return_value=_ok_proc("removed")) as run,
+        patch(f"{_BK}.subprocess.run", side_effect=[read, _ok_proc("")]) as run,
         patch.dict("os.environ", {}, clear=False),
     ):
         resp = client.post("/api/genesis/backup/config",
                            json={"schedule_enabled": False})
     assert resp.status_code == 200
-    assert "remove" in run.call_args.args[0]
+    write_call = run.call_args_list[1]
+    assert write_call.args[0] == ["crontab", "-"]
+    inp = write_call.kwargs["input"]
+    assert "inbox_sync" in inp and "backup.sh" not in inp
 
 
 def test_set_secrets_only_written_when_provided(client):

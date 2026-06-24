@@ -2,8 +2,10 @@
 
 Configuration is split by responsibility: the destination/credential env vars
 (GENESIS_BACKUP_*) are written through the hardened secrets writer reused from
-``secrets.py``; the cron SCHEDULE is managed by ``scripts/manage_backup_cron.sh``
-(never by editing the crontab inline from this web process).
+``secrets.py``; the cron SCHEDULE is managed with the read-filter-reinstall
+idiom (``crontab -l`` → drop the backup line → ``crontab -``), which preserves
+every other crontab entry and keeps the validated schedule in stdin content
+only — never on a command line.
 """
 
 from __future__ import annotations
@@ -26,7 +28,6 @@ logger = logging.getLogger(__name__)
 _HOME = Path.home()
 _STATUS_FILE = _HOME / ".genesis" / "backup_status.json"
 _BACKUP_SCRIPT = _HOME / "genesis" / "scripts" / "backup.sh"
-_CRON_SCRIPT = _HOME / "genesis" / "scripts" / "manage_backup_cron.sh"
 _BACKUP_LOG = _HOME / "genesis" / "logs" / "backup.log"
 _BACKUP_DIR = _HOME / "backups" / "genesis-backups"
 
@@ -87,6 +88,38 @@ def _current_schedule() -> tuple[str | None, bool]:
 def _valid_cron(expr: str) -> bool:
     fields = expr.split()
     return len(fields) == 5 and all(_CRON_FIELD_RE.match(f) for f in fields)
+
+
+def _set_backup_cron(schedule: str | None) -> bool:
+    """Install (``schedule`` given) or remove (``None``) the backup.sh crontab
+    line, preserving every other entry — the read-filter-reinstall idiom done
+    in-process. ``crontab -`` is invoked with a constant argv; the (already
+    ``_valid_cron``-validated) schedule only ever appears in the stdin content,
+    never on a command line. Returns True on success.
+    """
+    try:
+        # crontab -l: constant argv, no user data. Quick local op; the short
+        # bound guards a hung crontab from blocking this request thread.
+        read = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    existing = read.stdout.splitlines() if read.returncode == 0 else []
+    lines = [ln for ln in existing if "backup.sh" not in ln]
+    if schedule:
+        lines.append(f"{schedule} {_BACKUP_SCRIPT} >> {_BACKUP_LOG} 2>&1")
+    content = "\n".join(lines)
+    if content:
+        content += "\n"
+    try:
+        write = subprocess.run(
+            ["crontab", "-"], input=content, text=True,
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return write.returncode == 0
 
 
 # ── Routes ────────────────────────────────────────────────────────────
@@ -288,29 +321,9 @@ def backup_config_set():
     schedule_result: str | None = None
     if cron_action is not None:
         action, expr = cron_action
-        # The schedule (already validated by _valid_cron) is passed via the
-        # environment, NOT the argv — user-derived data never reaches the
-        # command line. The wrapper re-validates it before use.
-        cmd = ["bash", str(_CRON_SCRIPT), action]
-        env = os.environ.copy()
-        if expr:
-            env["GENESIS_BACKUP_CRON_SCHEDULE"] = expr
-        try:
-            # Local crontab op with no external watchdog — a hung crontab would
-            # block this request thread, so a short bound is justified here.
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=15, env=env)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            logger.error("Backup cron update failed: %s", exc, exc_info=True)
+        if not _set_backup_cron(expr if action == "install" else None):
             return jsonify({"error": "Failed to update backup schedule"}), 500
-        if proc.returncode != 0:
-            logger.error("Backup cron update rc=%d: %s", proc.returncode,
-                         proc.stderr.strip())
-            return jsonify({
-                "error": "Failed to update backup schedule",
-                "details": proc.stderr.strip(),
-            }), 500
-        schedule_result = proc.stdout.strip()
+        schedule_result = "installed" if action == "install" else "removed"
 
     logger.info("Backup config updated: keys=%s schedule=%s",
                 sorted(env_updates.keys()), cron_action[0] if cron_action else None)
