@@ -202,3 +202,109 @@ async def test_health_check_single_alert_still_batches(config, db):
     batched_text = pipeline.submit_raw.call_args[0][0]
     assert "/tmp at 3% free" in batched_text
     assert "1 critical alert(s)" in batched_text
+
+
+# ── _drain_pending_job: terminal handling + thread routing + age cap ────────
+
+
+def _drain_pipeline(status):
+    pipeline = AsyncMock()
+    result = OutreachResult(
+        outreach_id="o", status=status, channel="email", message_content="",
+    )
+    pipeline.submit = AsyncMock(return_value=result)
+    pipeline.submit_urgent = AsyncMock(return_value=result)
+    return pipeline
+
+
+async def _remaining(db):
+    """Rows still eligible for the next drain (delivered=0)."""
+    from genesis.db.crud import pending_outreach
+    return await pending_outreach.drain(db, now="2999-01-01T00:00:00+00:00")
+
+
+@pytest.mark.asyncio
+async def test_drain_reconstructs_request_with_thread_and_recipient(config, db):
+    """A queued email row must rebuild an OutreachRequest carrying its thread_id
+    + validated_recipient — so _deliver routes to the real recipient, not self."""
+    from genesis.db.crud import pending_outreach
+    await pending_outreach.enqueue(
+        db, message="follow up", category="notification", channel="email",
+        thread_id="t1", validated_recipient="real@prospect.com",
+    )
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    pipeline.submit.assert_called_once()
+    req = pipeline.submit.call_args[0][0]
+    assert req.thread_id == "t1"
+    assert req.validated_recipient == "real@prospect.com"
+
+
+@pytest.mark.asyncio
+async def test_drain_held_is_terminal_not_retried(config, db):
+    """HELD = handed off to the gate's approval queue; the queue row is done.
+    Re-submitting every cycle is exactly the spam multiplier we are killing."""
+    from genesis.db.crud import pending_outreach
+    await pending_outreach.enqueue(
+        db, message="x", category="notification", channel="email",
+    )
+    pipeline = _drain_pipeline(OutreachStatus.HELD)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    assert await _remaining(db) == []  # marked delivered, not retried
+
+
+@pytest.mark.asyncio
+async def test_drain_ignored_is_terminal(config, db):
+    from genesis.db.crud import pending_outreach
+    await pending_outreach.enqueue(
+        db, message="x", category="notification", channel="email",
+    )
+    pipeline = _drain_pipeline(OutreachStatus.IGNORED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    assert await _remaining(db) == []
+
+
+@pytest.mark.asyncio
+async def test_drain_rejected_is_retried(config, db):
+    """A transient governance rejection (e.g. quiet_hours) stays queued."""
+    from genesis.db.crud import pending_outreach
+    await pending_outreach.enqueue(
+        db, message="x", category="notification", channel="telegram",
+    )
+    pipeline = _drain_pipeline(OutreachStatus.REJECTED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    assert len(await _remaining(db)) == 1  # still pending for next cycle
+
+
+@pytest.mark.asyncio
+async def test_drain_ages_out_perpetually_stuck_row(config, db):
+    """A row that never reaches a terminal status must be dropped after 24h
+    instead of looping forever (the churn that locked the DB)."""
+    from datetime import UTC, datetime, timedelta
+    old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    await db.execute(
+        "INSERT INTO pending_outreach (id, message, category, channel, urgency, "
+        "created_at, delivered) VALUES ('old1', 'x', 'notification', 'telegram', "
+        "'low', ?, 0)",
+        (old,),
+    )
+    await db.commit()
+    pipeline = _drain_pipeline(OutreachStatus.REJECTED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    pipeline.submit.assert_not_called()  # aged out BEFORE re-submitting
+    assert await _remaining(db) == []    # dropped
