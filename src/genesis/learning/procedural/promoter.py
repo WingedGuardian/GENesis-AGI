@@ -109,7 +109,7 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
     promotions = 0
     demotions = 0
     quarantined = 0
-    despeculated = 0
+    drafts_cleared = 0
 
     for row in rows:
         current_tier = row.get("activation_tier", "DORMANT")
@@ -131,13 +131,13 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
             logger.info("Quarantined procedure %s (conf=%.2f)", row["task_type"], row["confidence"])
             continue
 
-        # De-speculation: a draft graduates to validated once it has >=1 real
-        # success and no failures (reads alone do NOT de-speculate). Closes the
-        # gap where nothing ever cleared speculative=1.
-        if row["speculative"] and row["success_count"] >= 1 and row["failure_count"] == 0:
-            await procedural.update(db, proc_id, speculative=0)
-            despeculated += 1
-            logger.info("De-speculated procedure %s (success=%d)", row["task_type"], row["success_count"])
+        # Draft clearing: a draft graduates to validated once it has >=1 real
+        # success and no failures (reads alone do NOT clear the draft flag).
+        # Closes the gap where nothing ever cleared draft=1.
+        if row["draft"] and row["success_count"] >= 1 and row["failure_count"] == 0:
+            await procedural.update(db, proc_id, draft=0)
+            drafts_cleared += 1
+            logger.info("Cleared draft on procedure %s (success=%d)", row["task_type"], row["success_count"])
 
         # Compute target tier. Failure evidence (`_check_demotion`) takes
         # precedence over BOTH real-metric and read-driven promotion: a
@@ -199,7 +199,7 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
         "promotions": promotions,
         "demotions": demotions,
         "quarantined": quarantined,
-        "despeculated": despeculated,
+        "drafts_cleared": drafts_cleared,
     }
     if any(v > 0 for v in result.values()):
         logger.info("Promotion results: %s", result)

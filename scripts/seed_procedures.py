@@ -47,7 +47,7 @@ SEED_PROCEDURES = [
         "context_tags": ["youtube", "video", "transcript", "ssl", "content-fetch"],
         "activation_tier": "CORE",
         "tool_trigger": ["WebFetch"],
-        "speculative": 0,
+        "draft": 0,
         "success_count": 5,
         "confidence": 0.86,  # (5+1)/(5+0+2) = 0.857
     },
@@ -64,7 +64,7 @@ SEED_PROCEDURES = [
         "context_tags": ["youtube", "transcript", "workaround", "fallback"],
         "activation_tier": "LIBRARY",
         "tool_trigger": None,
-        "speculative": 0,
+        "draft": 0,
         "success_count": 2,
         "confidence": 0.75,  # (2+1)/(2+0+2) = 0.75
     },
@@ -81,7 +81,7 @@ SEED_PROCEDURES = [
         "context_tags": ["pip.*-e", "pip.*--editable"],
         "activation_tier": "CORE",
         "tool_trigger": ["Bash"],
-        "speculative": 0,
+        "draft": 0,
         "success_count": 8,
         "confidence": 0.90,  # (8+1)/(8+0+2) = 0.90
     },
@@ -98,7 +98,7 @@ SEED_PROCEDURES = [
         "context_tags": ["os.killpg", "os.kill(", "killpg(", "mock_proc.pid", "pgid"],
         "activation_tier": "CORE",
         "tool_trigger": ["Write", "Edit"],
-        "speculative": 0,
+        "draft": 0,
         "success_count": 5,
         "confidence": 0.86,
     },
@@ -116,7 +116,7 @@ SEED_PROCEDURES = [
         "context_tags": ["git", "worktree", "concurrent", "safety", "commit"],
         "activation_tier": "LIBRARY",
         "tool_trigger": None,
-        "speculative": 0,
+        "draft": 0,
         "success_count": 10,
         "confidence": 0.92,
     },
@@ -135,7 +135,7 @@ SEED_PROCEDURES = [
         "context_tags": ["tmp", "filesystem", "disk", "safety", "tmpdir", "watchgod"],
         "activation_tier": "LIBRARY",
         "tool_trigger": None,
-        "speculative": 0,
+        "draft": 0,
         "success_count": 3,
         "confidence": 0.90,
     },
@@ -148,13 +148,13 @@ SEED_PROCEDURES = [
             "Call out what you don't know — lead with unknowns",
             "State falsifiability criteria: 'This would be DISPROVEN if [observation]'",
             "Include regression markers: what to watch for if the fix is wrong",
-            "No speculative changes without diagnosis confirmation",
+            "No draft changes without diagnosis confirmation",
         ],
         "tools_used": ["Write", "Edit"],
         "context_tags": ["planning", "decision", "confidence", "framework", "analysis"],
         "activation_tier": "LIBRARY",
         "tool_trigger": None,
-        "speculative": 0,
+        "draft": 0,
         "success_count": 4,
         "confidence": 0.83,
     },
@@ -177,7 +177,7 @@ async def main(db_path: Path) -> None:
         await db.execute(
             """INSERT INTO procedural_memory
                (id, task_type, principle, steps, tools_used, context_tags,
-                activation_tier, tool_trigger, speculative, success_count,
+                activation_tier, tool_trigger, draft, success_count,
                 confidence, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                ON CONFLICT(id) DO UPDATE SET
@@ -187,7 +187,7 @@ async def main(db_path: Path) -> None:
                  context_tags = excluded.context_tags,
                  activation_tier = excluded.activation_tier,
                  tool_trigger = excluded.tool_trigger,
-                 speculative = excluded.speculative""",
+                 draft = excluded.draft""",
             (
                 proc_id,
                 proc["task_type"],
@@ -197,7 +197,7 @@ async def main(db_path: Path) -> None:
                 json.dumps(proc["context_tags"]),
                 proc["activation_tier"],
                 json.dumps(proc["tool_trigger"]) if proc["tool_trigger"] else None,
-                proc["speculative"],
+                proc["draft"],
                 proc["success_count"],
                 proc["confidence"],
             ),

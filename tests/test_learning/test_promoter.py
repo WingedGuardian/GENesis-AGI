@@ -35,7 +35,7 @@ def _isolate_trigger_cache_path(tmp_path, monkeypatch):
 async def _insert(db, *, id: str, task_type: str, **fields) -> None:
     """Insert a procedural_memory row with explicit field overrides.
 
-    Defaults to a fresh DORMANT speculative procedure unless overridden.
+    Defaults to a fresh DORMANT draft procedure unless overridden.
     """
     defaults = dict(
         person_id=None,
@@ -46,7 +46,7 @@ async def _insert(db, *, id: str, task_type: str, **fields) -> None:
         success_count=0,
         failure_count=0,
         confidence=0.0,
-        speculative=1,
+        draft=1,
         activation_tier="DORMANT",
         tool_trigger=None,
         failure_modes=None,
@@ -72,7 +72,7 @@ async def _insert(db, *, id: str, task_type: str, **fields) -> None:
 
 def test_compute_tier_promotes_to_library():
     row = {
-        "success_count": 3, "confidence": 0.65, "speculative": 0,
+        "success_count": 3, "confidence": 0.65, "draft": 0,
         "tool_trigger": None, "activation_tier": "DORMANT",
     }
     assert _compute_tier(row) == "LIBRARY"
@@ -80,7 +80,7 @@ def test_compute_tier_promotes_to_library():
 
 def test_compute_tier_promotes_to_advisory():
     row = {
-        "success_count": 5, "confidence": 0.78, "speculative": 0,
+        "success_count": 5, "confidence": 0.78, "draft": 0,
         "tool_trigger": None, "activation_tier": "DORMANT",
     }
     assert _compute_tier(row) == "ADVISORY"
@@ -88,7 +88,7 @@ def test_compute_tier_promotes_to_advisory():
 
 def test_compute_tier_promotes_to_core_with_trigger():
     row = {
-        "success_count": 8, "confidence": 0.86, "speculative": 0,
+        "success_count": 8, "confidence": 0.86, "draft": 0,
         "tool_trigger": ["Bash"], "activation_tier": "DORMANT",
     }
     assert _compute_tier(row) == "CORE"
@@ -97,7 +97,7 @@ def test_compute_tier_promotes_to_core_with_trigger():
 def test_compute_tier_no_core_without_trigger():
     """CORE requires tool_trigger; without it, fall back to ADVISORY."""
     row = {
-        "success_count": 8, "confidence": 0.86, "speculative": 0,
+        "success_count": 8, "confidence": 0.86, "draft": 0,
         "tool_trigger": None, "activation_tier": "DORMANT",
     }
     assert _compute_tier(row) == "ADVISORY"
@@ -110,7 +110,7 @@ def test_compute_tier_explicit_teach_stays_at_library():
     through to DORMANT — it preserves the explicitly-stored tier.
     """
     row = {
-        "success_count": 1, "confidence": 2 / 3, "speculative": 0,
+        "success_count": 1, "confidence": 2 / 3, "draft": 0,
         "tool_trigger": None, "activation_tier": "LIBRARY",
     }
     assert _compute_tier(row) == "LIBRARY"
@@ -124,20 +124,20 @@ def test_compute_tier_core_with_drift_stays_at_core():
     or quarantine can demote — never tier drift.
     """
     row = {
-        "success_count": 9, "confidence": 0.83, "speculative": 0,
+        "success_count": 9, "confidence": 0.83, "draft": 0,
         "tool_trigger": ["Bash"], "activation_tier": "CORE",
     }
     # CORE fails (conf<0.85), ADVISORY matches (s>=5, conf>=0.75) — but we hold CORE.
     assert _compute_tier(row) == "CORE"
 
 
-def test_compute_tier_speculative_procedure_can_promote_to_library():
+def test_compute_tier_draft_procedure_can_promote_to_library():
     """Speculative procedures can promote to LIBRARY if they meet thresholds."""
     row = {
-        "success_count": 5, "confidence": 0.7, "speculative": 1,
+        "success_count": 5, "confidence": 0.7, "draft": 1,
         "tool_trigger": None, "activation_tier": "DORMANT",
     }
-    # speculative flag is provenance metadata, not a promotion gate.
+    # draft flag is provenance metadata, not a promotion gate.
     assert _compute_tier(row) == "LIBRARY"
 
 
@@ -172,7 +172,7 @@ async def test_promote_and_demote_does_not_demote_explicit_teach(db):
     await _insert(
         db, id="explicit-1", task_type="user-teach",
         success_count=1, failure_count=0, confidence=2 / 3,
-        speculative=0, activation_tier="LIBRARY",
+        draft=0, activation_tier="LIBRARY",
     )
     result = await promote_and_demote(db)
     assert result["demotions"] == 0
@@ -191,7 +191,7 @@ async def test_promote_and_demote_promotes_on_thresholds(db):
     await _insert(
         db, id="earned-1", task_type="t",
         success_count=5, failure_count=0, confidence=0.78,
-        speculative=0, activation_tier="DORMANT",
+        draft=0, activation_tier="DORMANT",
     )
     result = await promote_and_demote(db)
     assert result["promotions"] == 1
@@ -210,7 +210,7 @@ async def test_promote_and_demote_demotes_on_failure_evidence(db):
     await _insert(
         db, id="failing-1", task_type="t",
         success_count=1, failure_count=4, confidence=0.4,
-        speculative=0, activation_tier="LIBRARY",
+        draft=0, activation_tier="LIBRARY",
         failure_modes=json.dumps([
             {"description": "timeout", "conditions": "timeout",
              "times_hit": 3, "transient": False},
@@ -233,7 +233,7 @@ async def test_promote_and_demote_quarantines_low_confidence(db):
     await _insert(
         db, id="bad-1", task_type="t",
         success_count=1, failure_count=10, confidence=0.15,
-        speculative=0, activation_tier="LIBRARY",
+        draft=0, activation_tier="LIBRARY",
     )
     result = await promote_and_demote(db)
     assert result["quarantined"] == 1
@@ -252,7 +252,7 @@ async def test_promote_and_demote_does_not_metric_demote_core(db):
     await _insert(
         db, id="drifty-1", task_type="t",
         success_count=9, failure_count=2, confidence=0.83,
-        speculative=0, activation_tier="CORE",
+        draft=0, activation_tier="CORE",
         tool_trigger=json.dumps(["Bash"]),
     )
     result = await promote_and_demote(db)
@@ -297,23 +297,23 @@ def test_read_eligible_tier_below_threshold_is_dormant():
 
 
 @pytest.mark.asyncio
-async def test_reads_promote_speculative_to_library_but_stay_speculative(db):
+async def test_reads_promote_draft_to_library_but_stay_draft(db):
     """A heavily-read draft (no real success) promotes to LIBRARY on effective
-    metrics, but stays speculative (de-spec needs a real success)."""
+    metrics, but stays draft (de-spec needs a real success)."""
     await _insert(
         db, id="read-draft", task_type="t",
         success_count=0, failure_count=0, confidence=0.5,
-        speculative=1, activation_tier="DORMANT", invocation_count=15,  # eff_success=3
+        draft=1, activation_tier="DORMANT", invocation_count=15,  # eff_success=3
     )
     result = await promote_and_demote(db)
     assert result["promotions"] == 1
     cursor = await db.execute(
-        "SELECT activation_tier, speculative FROM procedural_memory WHERE id = ?",
+        "SELECT activation_tier, draft FROM procedural_memory WHERE id = ?",
         ("read-draft",),
     )
     row = await cursor.fetchone()
     assert row[0] == "LIBRARY"
-    assert row[1] == 1  # still speculative — reads don't de-speculate
+    assert row[1] == 1  # still draft — reads don't de-speculate
 
 
 @pytest.mark.asyncio
@@ -322,7 +322,7 @@ async def test_reads_without_real_success_do_not_reach_advisory(db):
     await _insert(
         db, id="read-only", task_type="t",
         success_count=0, failure_count=0, confidence=0.5,
-        speculative=1, activation_tier="LIBRARY", invocation_count=25,  # eff_success=5
+        draft=1, activation_tier="LIBRARY", invocation_count=25,  # eff_success=5
     )
     await promote_and_demote(db)
     cursor = await db.execute(
@@ -337,7 +337,7 @@ async def test_reads_plus_real_success_promote_to_advisory(db):
     await _insert(
         db, id="read-proven", task_type="t",
         success_count=1, failure_count=0, confidence=2 / 3,
-        speculative=0, activation_tier="LIBRARY", invocation_count=20,  # eff_success=5
+        draft=0, activation_tier="LIBRARY", invocation_count=20,  # eff_success=5
     )
     result = await promote_and_demote(db)
     assert result["promotions"] == 1
@@ -353,7 +353,7 @@ async def test_reads_never_promote_to_core(db):
     await _insert(
         db, id="read-heavy", task_type="t",
         success_count=0, failure_count=0, confidence=0.5,
-        speculative=0, activation_tier="ADVISORY", invocation_count=200,
+        draft=0, activation_tier="ADVISORY", invocation_count=200,
         tool_trigger=json.dumps(["Bash"]),
     )
     await promote_and_demote(db)
@@ -365,17 +365,17 @@ async def test_reads_never_promote_to_core(db):
 
 @pytest.mark.asyncio
 async def test_despeculate_on_real_success(db):
-    """A speculative procedure with ≥1 real success and no failures graduates
-    to validated (speculative=0) — closing the de-speculation gap."""
+    """A draft procedure with ≥1 real success and no failures graduates
+    to validated (draft=0) — closing the de-speculation gap."""
     await _insert(
         db, id="grad-1", task_type="t",
         success_count=1, failure_count=0, confidence=2 / 3,
-        speculative=1, activation_tier="LIBRARY",
+        draft=1, activation_tier="LIBRARY",
     )
     result = await promote_and_demote(db)
-    assert result["despeculated"] == 1
+    assert result["drafts_cleared"] == 1
     cursor = await db.execute(
-        "SELECT speculative FROM procedural_memory WHERE id = ?", ("grad-1",),
+        "SELECT draft FROM procedural_memory WHERE id = ?", ("grad-1",),
     )
     assert (await cursor.fetchone())[0] == 0
 
@@ -392,7 +392,7 @@ async def test_reads_do_not_promote_a_failing_procedure(db):
     await _insert(
         db, id="failing-read", task_type="t",
         success_count=1, failure_count=4, confidence=0.333,
-        speculative=0, activation_tier="DORMANT", invocation_count=40,  # eff_success=9
+        draft=0, activation_tier="DORMANT", invocation_count=40,  # eff_success=9
         failure_modes=json.dumps([
             {"description": "x", "conditions": "x", "times_hit": 3},
         ]),
@@ -411,11 +411,11 @@ async def test_despeculate_blocked_by_failure(db):
     await _insert(
         db, id="grad-fail", task_type="t",
         success_count=2, failure_count=1, confidence=0.6,
-        speculative=1, activation_tier="LIBRARY",
+        draft=1, activation_tier="LIBRARY",
     )
     result = await promote_and_demote(db)
-    assert result["despeculated"] == 0
+    assert result["drafts_cleared"] == 0
     cursor = await db.execute(
-        "SELECT speculative FROM procedural_memory WHERE id = ?", ("grad-fail",),
+        "SELECT draft FROM procedural_memory WHERE id = ?", ("grad-fail",),
     )
     assert (await cursor.fetchone())[0] == 1
