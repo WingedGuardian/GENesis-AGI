@@ -26,9 +26,11 @@ state. On failure: rollback, stop, remaining migrations not attempted.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -45,6 +47,27 @@ _MIGRATION_PATTERN = re.compile(r"^(\d{4})_\w+\.py$")
 # COMMIT / ROLLBACK envelope. Matched case-insensitively against the
 # first token of the SQL passed to execute()/executemany().
 _FORBIDDEN_SQL_TOKENS = frozenset({"BEGIN", "COMMIT", "ROLLBACK", "END", "SAVEPOINT", "RELEASE"})
+
+# A migration's DDL can lose the lock to a concurrent reader holding the table
+# schema. SQLite reports this as "database is locked" (SQLITE_LOCKED), which
+# `busy_timeout` does NOT wait on — so a single-shot apply fails the moment a
+# brief periodic writer (e.g. a ~5-min scheduler job) is mid-transaction. The
+# runner instead retries the whole atomic apply (it was rolled back, so re-running
+# is safe) with backoff until it catches a free window. Regression for the
+# 2026-06-25 deploy incident (0037 lost the lock to the outreach scheduler).
+_MAX_LOCK_RETRIES = 10
+_LOCK_RETRY_BASE_DELAY_S = 2.0
+_LOCK_RETRY_MAX_DELAY_S = 10.0
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    """True if ``exc`` is a transient SQLite lock-contention error.
+
+    Covers both 'database is locked' (SQLITE_BUSY/SQLITE_LOCKED) and
+    'database table is locked' — the retryable class. Anything else is a real
+    migration bug and must fail fast (no retry).
+    """
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
 
 
 def _first_sql_token(sql: object) -> str | None:
@@ -256,91 +279,129 @@ class MigrationRunner:
                 logger.info("[dry-run] Would apply: %s", name)
                 continue
 
-            t0 = time.monotonic()
-            try:
-                # Import the migration module
-                spec_name = f"genesis.db.migrations.{path.stem}"
-                mod = importlib.import_module(spec_name)
-
-                if not hasattr(mod, "up"):
-                    raise AttributeError(f"Migration {name} missing 'up' function")
-
-                # Atomic transaction: migration body + tracking row committed
-                # together via EXPLICIT SQL BEGIN IMMEDIATE / COMMIT / ROLLBACK.
-                # This is critical because Python's sqlite3 module auto-commits
-                # before DDL (CREATE/DROP) when using db.commit()/db.rollback()
-                # methods — explicit SQL transaction control bypasses that and
-                # ensures DDL is included in the rollback. Migration bodies
-                # MUST NOT call commit() or BEGIN themselves — enforced
-                # mechanically by _MigrationConnectionProxy, which raises
-                # RuntimeError on commit()/rollback()/async-with.
-                await self._db.execute("BEGIN IMMEDIATE")
-                await mod.up(_MigrationConnectionProxy(self._db))
-                duration_ms = int((time.monotonic() - t0) * 1000)
-                await self._db.execute(
-                    "INSERT INTO schema_migrations (id, name, applied_at, duration_ms) "
-                    "VALUES (?, ?, ?, ?)",
-                    (mid, name, datetime.now(UTC).isoformat(), duration_ms),
-                )
-                await self._db.execute("COMMIT")
-
-                results.append(MigrationResult(
-                    id=mid, name=name, success=True, duration_ms=duration_ms,
-                ))
-                logger.info("Applied migration: %s (%dms)", name, duration_ms)
-
-            except Exception as exc:
-                duration_ms = int((time.monotonic() - t0) * 1000)
-                # Roll back FIRST. A WAL COMMIT can return SQLITE_BUSY from a
-                # post-commit autocheckpoint AFTER the commit frame is durably
-                # written, so this error does NOT prove the migration failed.
-                # ROLLBACK is a harmless no-op ("no transaction is active") when
-                # the commit already landed, and undoes a genuinely open
-                # transaction otherwise — either way schema_migrations then holds
-                # the TRUE durable state.
+            # Apply with retry-on-lock. A migration's DDL can lose the lock to a
+            # concurrent reader (SQLITE_LOCKED, which busy_timeout won't wait on).
+            # Each attempt is a full atomic BEGIN..COMMIT, rolled back on failure,
+            # so re-running is safe. The reconcile path (commit landed, then
+            # SQLITE_BUSY) is checked BEFORE retrying, so a committed migration is
+            # never re-run.
+            result: MigrationResult | None = None
+            for attempt in range(1, _MAX_LOCK_RETRIES + 1):
+                t0 = time.monotonic()
                 try:
-                    await self._db.execute("ROLLBACK")
-                except Exception as rb_exc:
-                    logger.debug(
-                        "ROLLBACK after migration %s error (expected when the "
-                        "commit already landed): %s", name, rb_exc,
-                    )
+                    # Import the migration module (cached; cheap to re-resolve).
+                    spec_name = f"genesis.db.migrations.{path.stem}"
+                    mod = importlib.import_module(spec_name)
 
-                # Reconcile against the source of truth: is the migration durably
-                # recorded? If so, the COMMIT-time error was post-commit noise —
-                # treat it as applied instead of reporting a false failure (which
-                # previously rolled back the code and left new-schema + old-code).
-                applied = False
-                try:
-                    cur = await self._db.execute(
-                        "SELECT 1 FROM schema_migrations WHERE id = ?", (mid,)
-                    )
-                    applied = await cur.fetchone() is not None
-                except Exception:
-                    logger.error(
-                        "Reconciliation read failed after migration %s error — "
-                        "treating as failed", name, exc_info=True,
-                    )
-                    applied = False
+                    if not hasattr(mod, "up"):
+                        raise AttributeError(f"Migration {name} missing 'up' function")
 
-                if applied:
-                    logger.warning(
-                        "Migration %s raised %r but is durably recorded in "
-                        "schema_migrations — treating as applied (likely a "
-                        "post-commit WAL autocheckpoint SQLITE_BUSY).",
-                        name, exc,
+                    # Atomic transaction: migration body + tracking row committed
+                    # together via EXPLICIT SQL BEGIN IMMEDIATE / COMMIT / ROLLBACK.
+                    # This is critical because Python's sqlite3 module auto-commits
+                    # before DDL (CREATE/DROP) when using db.commit()/db.rollback()
+                    # methods — explicit SQL transaction control bypasses that and
+                    # ensures DDL is included in the rollback. Migration bodies
+                    # MUST NOT call commit() or BEGIN themselves — enforced
+                    # mechanically by _MigrationConnectionProxy, which raises
+                    # RuntimeError on commit()/rollback()/async-with.
+                    await self._db.execute("BEGIN IMMEDIATE")
+                    await mod.up(_MigrationConnectionProxy(self._db))
+                    duration_ms = int((time.monotonic() - t0) * 1000)
+                    await self._db.execute(
+                        "INSERT INTO schema_migrations (id, name, applied_at, duration_ms) "
+                        "VALUES (?, ?, ?, ?)",
+                        (mid, name, datetime.now(UTC).isoformat(), duration_ms),
                     )
-                    results.append(MigrationResult(
+                    await self._db.execute("COMMIT")
+
+                    result = MigrationResult(
                         id=mid, name=name, success=True, duration_ms=duration_ms,
-                    ))
-                    continue  # proceed to the next migration
+                    )
+                    logger.info("Applied migration: %s (%dms)", name, duration_ms)
+                    break
 
-                results.append(MigrationResult(
-                    id=mid, name=name, success=False,
-                    duration_ms=duration_ms, error=str(exc),
-                ))
-                logger.error("Migration %s failed: %s", name, exc, exc_info=True)
-                break  # Stop on first failure
+                except Exception as exc:
+                    duration_ms = int((time.monotonic() - t0) * 1000)
+                    # Roll back FIRST. A WAL COMMIT can return SQLITE_BUSY from a
+                    # post-commit autocheckpoint AFTER the commit frame is durably
+                    # written, so this error does NOT prove the migration failed.
+                    # ROLLBACK is a harmless no-op ("no transaction is active") when
+                    # the commit already landed, and undoes a genuinely open
+                    # transaction otherwise — either way schema_migrations then holds
+                    # the TRUE durable state.
+                    try:
+                        await self._db.execute("ROLLBACK")
+                    except Exception as rb_exc:
+                        logger.debug(
+                            "ROLLBACK after migration %s error (expected when the "
+                            "commit already landed): %s", name, rb_exc,
+                        )
+
+                    # Reconcile against the source of truth: is the migration durably
+                    # recorded? If so, the COMMIT-time error was post-commit noise —
+                    # treat it as applied instead of reporting a false failure (which
+                    # previously rolled back the code and left new-schema + old-code).
+                    # Checked BEFORE the retry decision so a committed migration is
+                    # never re-run.
+                    applied = False
+                    try:
+                        cur = await self._db.execute(
+                            "SELECT 1 FROM schema_migrations WHERE id = ?", (mid,)
+                        )
+                        applied = await cur.fetchone() is not None
+                    except Exception:
+                        logger.error(
+                            "Reconciliation read failed after migration %s error — "
+                            "treating as failed", name, exc_info=True,
+                        )
+                        applied = False
+
+                    if applied:
+                        logger.warning(
+                            "Migration %s raised %r but is durably recorded in "
+                            "schema_migrations — treating as applied (likely a "
+                            "post-commit WAL autocheckpoint SQLITE_BUSY).",
+                            name, exc,
+                        )
+                        result = MigrationResult(
+                            id=mid, name=name, success=True, duration_ms=duration_ms,
+                        )
+                        break
+
+                    # Not applied. Retry transient lock contention (the migration
+                    # was rolled back, so re-running is safe); fail fast otherwise.
+                    if _is_lock_error(exc) and attempt < _MAX_LOCK_RETRIES:
+                        delay = min(
+                            _LOCK_RETRY_BASE_DELAY_S * attempt, _LOCK_RETRY_MAX_DELAY_S,
+                        )
+                        logger.warning(
+                            "Migration %s hit lock contention (%s) — retry %d/%d "
+                            "in %.1fs", name, exc, attempt, _MAX_LOCK_RETRIES, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
+                    result = MigrationResult(
+                        id=mid, name=name, success=False,
+                        duration_ms=duration_ms, error=str(exc),
+                    )
+                    if _is_lock_error(exc):
+                        logger.error(
+                            "Migration %s failed after %d lock-retry attempts: %s",
+                            name, _MAX_LOCK_RETRIES, exc, exc_info=True,
+                        )
+                    else:
+                        logger.error("Migration %s failed: %s", name, exc, exc_info=True)
+                    break
+
+            # `result` is always set: every path in the retry loop either breaks
+            # (success / reconciled / terminal failure) or continues to retry, and
+            # the final attempt cannot continue.
+            assert result is not None
+            results.append(result)
+            if not result.success:
+                break  # Stop on first (terminal) failure
 
         return results
 

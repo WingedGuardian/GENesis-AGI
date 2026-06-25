@@ -530,3 +530,133 @@ class TestFalseFailureReconciliation:
         assert "0001" in applied, "migration durably recorded"
         # Idempotent: re-run is a no-op.
         assert await runner.run_pending() == []
+
+
+class TestLockRetry:
+    """A migration's `up()` can hit `database is locked` (SQLITE_LOCKED) when a
+    concurrent reader holds the table schema — `busy_timeout` does NOT cover
+    that error class. The runner must retry the whole atomic apply (safe: it was
+    rolled back) until it catches a free window. Regression for the 2026-06-25
+    deploy incident (0037 lost the lock to the outreach scheduler)."""
+
+    @pytest.mark.asyncio
+    async def test_retries_on_database_locked_then_succeeds(self, db, monkeypatch) -> None:
+        from sqlite3 import OperationalError
+
+        monkeypatch.setattr(
+            "genesis.db.migrations.runner._LOCK_RETRY_BASE_DELAY_S", 0.001,
+        )
+        runner = MigrationRunner(db)
+        mod = importlib.import_module("genesis.db.migrations.0001_add_update_history")
+        original_up = mod.up
+        calls = {"n": 0}
+
+        async def flaky_up(conn):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise OperationalError("database is locked")
+            await original_up(conn)
+
+        mod.up = flaky_up
+        try:
+            results = await runner.run_pending()
+        finally:
+            mod.up = original_up
+
+        # Failed twice, succeeded on the 3rd attempt.
+        assert calls["n"] == 3
+        assert results[0].success, f"expected retry to succeed: {results[0].error}"
+        assert "0001" in await runner.get_applied()
+        # And the DDL actually landed (atomic apply on the successful attempt).
+        cur = await db.execute(
+            "SELECT name FROM sqlite_master WHERE name='update_history'"
+        )
+        assert await cur.fetchone() is not None
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_max_lock_retries(self, db, monkeypatch) -> None:
+        from sqlite3 import OperationalError
+
+        monkeypatch.setattr(
+            "genesis.db.migrations.runner._LOCK_RETRY_BASE_DELAY_S", 0.001,
+        )
+        monkeypatch.setattr(
+            "genesis.db.migrations.runner._MAX_LOCK_RETRIES", 4,
+        )
+        runner = MigrationRunner(db)
+        mod = importlib.import_module("genesis.db.migrations.0001_add_update_history")
+        original_up = mod.up
+        calls = {"n": 0}
+
+        async def always_locked(conn):
+            calls["n"] += 1
+            raise OperationalError("database is locked")
+
+        mod.up = always_locked
+        try:
+            results = await runner.run_pending()
+        finally:
+            mod.up = original_up
+
+        assert calls["n"] == 4, "should attempt exactly _MAX_LOCK_RETRIES times"
+        assert not results[0].success
+        assert "locked" in results[0].error.lower()
+        assert "0001" not in await runner.get_applied()
+
+    @pytest.mark.asyncio
+    async def test_non_lock_error_does_not_retry(self, db) -> None:
+        runner = MigrationRunner(db)
+        mod = importlib.import_module("genesis.db.migrations.0001_add_update_history")
+        original_up = mod.up
+        calls = {"n": 0}
+
+        async def boom(conn):
+            calls["n"] += 1
+            raise RuntimeError("not a lock error")
+
+        mod.up = boom
+        try:
+            results = await runner.run_pending()
+        finally:
+            mod.up = original_up
+
+        # A non-lock error fails immediately — no retries.
+        assert calls["n"] == 1
+        assert not results[0].success
+        assert "not a lock error" in results[0].error
+
+    @pytest.mark.asyncio
+    async def test_post_commit_busy_reconciles_before_retrying(self, db, monkeypatch) -> None:
+        """The reconcile path (commit landed, then SQLITE_BUSY) must win over the
+        retry path — a committed migration is treated as applied, NOT re-run."""
+        from sqlite3 import OperationalError
+
+        monkeypatch.setattr(
+            "genesis.db.migrations.runner._LOCK_RETRY_BASE_DELAY_S", 0.001,
+        )
+
+        class _CommitThenRaise:
+            def __init__(self, real):
+                self._real = real
+                self._tripped = False
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def execute(self, sql, *args, **kwargs):
+                if not self._tripped and sql.strip().upper().startswith("COMMIT"):
+                    self._tripped = True
+
+                    async def _commit_then_raise():
+                        await self._real.execute("COMMIT")
+                        raise OperationalError("database is locked")
+
+                    return _commit_then_raise()
+                return self._real.execute(sql, *args, **kwargs)
+
+        runner = MigrationRunner(_CommitThenRaise(db))
+        results = await runner.run_pending()
+
+        # Committed-but-busy reconciles to applied; it must not be retried.
+        assert all(r.success for r in results)
+        assert "0001" in await runner.get_applied()
