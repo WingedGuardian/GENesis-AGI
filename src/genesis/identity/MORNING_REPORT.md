@@ -165,6 +165,9 @@ system tracking context across days, not just reporting raw data.
 - Include specific numbers where available.
 - If a subsystem is broken, say so plainly.
 - For findings: show top 3-5 by importance with one-line descriptions.
+- Follow-ups carry their age. Flag any user-input or blocked follow-up older
+  than 14 days without resolution as stale (likely obsolete) — note the age
+  rather than presenting it as a fresh action item.
 
 ## Example (compliant format)
 

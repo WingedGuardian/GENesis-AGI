@@ -217,6 +217,33 @@ async def test_context_includes_user_goals(db, mock_health, mock_drafter):
 
 
 @pytest.mark.asyncio
+async def test_follow_up_summary_includes_age(db):
+    """User-world follow-ups render with their relative age (C2a).
+
+    Uses a tz-aware ISO created_at to mirror real follow-ups (the crud writes
+    ``datetime.now(UTC).isoformat()``); naive timestamps would degrade to
+    "unknown age" via _relative_age's TypeError guard.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    created = (datetime.now(UTC) - timedelta(days=20)).isoformat()
+    await db.execute(
+        "INSERT INTO follow_ups (id, source, content, strategy, status, "
+        "priority, domain, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("fu1", "foreground_session", "Decide on the migration approach",
+         "user_input_needed", "pending", "medium", "user_world", created),
+    )
+    await db.commit()
+
+    gen = MorningReportGenerator.__new__(MorningReportGenerator)
+    gen._db = db
+    summary = await gen._get_follow_ups_summary()
+    assert summary is not None
+    assert "Decide on the migration approach" in summary
+    assert "20d ago)" in summary
+
+
+@pytest.mark.asyncio
 async def test_background_sessions_excluded_from_topics(db, mock_health, mock_drafter):
     """Background sessions should NOT appear in session topics."""
     await db.execute(

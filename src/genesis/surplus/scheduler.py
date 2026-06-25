@@ -303,6 +303,18 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=3600,
         )
+        # Weekly DB integrity check: Sunday 3am local. A DETERMINISTIC full
+        # PRAGMA integrity_check that ALARMS on corruption. The
+        # DbMaintenanceExecutor already reports a fast quick_check, but on the
+        # probabilistic surplus cadence and advisory-only — corruption
+        # detection must not depend on idle scheduling.
+        self._scheduler.add_job(
+            self.run_db_integrity_check,
+            CronTrigger(day_of_week="sun", hour=3, timezone=user_timezone()),
+            id="db_integrity_check",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
         # Model intelligence: weekly Sunday 8am local (after dream cycle clears)
         if self._model_intelligence_job is not None:
             self._scheduler.add_job(
@@ -906,6 +918,73 @@ class SurplusScheduler:
                 GenesisRuntime.instance().record_job_failure("schedule_wing_audit", str(exc))
             except Exception:
                 pass
+
+    async def run_db_integrity_check(self) -> None:
+        """Weekly full PRAGMA integrity_check with an alarm on corruption.
+
+        Deterministic counterpart to the DbMaintenanceExecutor's fast
+        quick_check — guaranteed cadence plus a real alarm (observation +
+        ERROR event) so DB corruption can't go silent.
+        """
+        try:
+            from genesis.runtime import GenesisRuntime
+            if GenesisRuntime.instance().paused:
+                logger.debug("DB integrity check skipped (Genesis paused)")
+                return
+        except Exception:
+            pass
+        try:
+            from genesis.surplus.maintenance import check_db_integrity
+            status = await check_db_integrity(self._db)
+            if status == "ok":
+                logger.info("Weekly DB integrity check passed")
+            else:
+                logger.error("DB integrity check FAILED: %s", status[:500])
+                await self._alarm_db_integrity(status)
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("db_integrity_check")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("DB integrity check job failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("db_integrity_check", str(exc))
+            except Exception:
+                pass
+
+    async def _alarm_db_integrity(self, detail: str) -> None:
+        """Persist + broadcast a DB-corruption alarm (observation + ERROR event)."""
+        import uuid
+
+        # Observation — surfaces in the morning report / health views.
+        # skip_if_duplicate so a persistent corruption doesn't re-alarm weekly.
+        try:
+            from genesis.db.crud import observations
+            await observations.create(
+                self._db,
+                id=uuid.uuid4().hex,
+                source="surplus_scheduler",
+                type="db_integrity_failure",
+                content=f"PRAGMA integrity_check failed: {detail[:1000]}",
+                priority="critical",
+                created_at=datetime.now(UTC).isoformat(),
+                skip_if_duplicate=True,
+            )
+        except Exception:
+            logger.warning("Failed to write db_integrity_failure observation", exc_info=True)
+
+        # Event bus — dashboard / Sentinel alerting path.
+        if self._event_bus:
+            try:
+                await self._event_bus.emit(
+                    Subsystem.SURPLUS, Severity.ERROR,
+                    "db.integrity_failed",
+                    f"SQLite integrity_check failed: {detail[:300]}",
+                )
+            except Exception:
+                logger.warning("Failed to emit db integrity event", exc_info=True)
 
     async def schedule_cc_memory_staleness(self) -> None:
         """Enqueue a CC memory staleness scan if none pending/running."""

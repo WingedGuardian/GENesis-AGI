@@ -478,7 +478,9 @@ class MorningReportGenerator:
         if user_items:
             lines.append("**Needs your input:**")
             for fu in user_items[:5]:
-                lines.append(f"- {fu['content'][:200]}")
+                lines.append(
+                    f"- {fu['content'][:200]} ({_relative_age(fu.get('created_at', ''))})"
+                )
 
         # Blocked/failed items
         blocked = await follow_ups.get_by_status(self._db, "failed", domain="user_world")
@@ -487,7 +489,10 @@ class MorningReportGenerator:
             lines.append("**Blocked/failed:**")
             for fu in blocked[:5]:
                 reason = fu.get("blocked_reason", "") or "no reason recorded"
-                lines.append(f"- {fu['content'][:150]} — {reason[:100]}")
+                lines.append(
+                    f"- {fu['content'][:150]} "
+                    f"({_relative_age(fu.get('created_at', ''))}) — {reason[:100]}"
+                )
 
         # Recently completed (last 24h)
         completed = await follow_ups.get_recently_completed(

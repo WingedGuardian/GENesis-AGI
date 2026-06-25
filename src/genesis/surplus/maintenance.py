@@ -324,6 +324,24 @@ class DbMaintenanceExecutor:
         )
 
 
+async def check_db_integrity(db: aiosqlite.Connection) -> str:
+    """Run a full ``PRAGMA integrity_check`` and return its status.
+
+    Returns ``"ok"`` on a healthy database, else a joined summary of the
+    problems SQLite reports (one row per problem). This is the THOROUGH check
+    used by the deterministic weekly integrity job — distinct from the fast
+    ``quick_check(1)`` in :class:`DbMaintenanceExecutor`, which trades
+    completeness for speed on its probabilistic cadence.
+    """
+    cursor = await db.execute("PRAGMA integrity_check")
+    rows = await cursor.fetchall()
+    if not rows:
+        return "unknown"
+    if len(rows) == 1 and rows[0][0] == "ok":
+        return "ok"
+    return "; ".join(str(r[0]) for r in rows)[:2000]
+
+
 # ─── Transcript Archival ────────────────────────────────────────────────
 
 
