@@ -506,7 +506,7 @@ async def test_email_to_own_address_is_ignored_not_held(
 ):
     """A send to the agent's own address is terminally IGNORED — never HELD
     (approval flood) or DEFERred (retry loop)."""
-    self_addr = "genesisagiagent@gmail.com"
+    self_addr = "genesis@example.com"
     adapter = _email_adapter(self_addr)
     gate = AsyncMock()
     pipeline = OutreachPipeline(
@@ -534,7 +534,7 @@ async def test_email_without_recipient_is_ignored_not_deferred(
 ):
     """A recipient-less email is terminally IGNORED, NOT FAILED/deferred — a
     deferred no-recipient email would just loop in the deferred-work queue."""
-    adapter = _email_adapter("genesisagiagent@gmail.com")
+    adapter = _email_adapter("genesis@example.com")
     pipeline = OutreachPipeline(
         governance=GovernanceGate(config, db),
         drafter=mock_drafter, formatter=mock_formatter,
@@ -558,7 +558,7 @@ async def test_self_send_skipped_on_gate_cleared_resume(
 ):
     """The self-guard fires even on the gate_cleared resume path
     (deliver_approved) — an approved self-send must still never be sent."""
-    self_addr = "genesisagiagent@gmail.com"
+    self_addr = "genesis@example.com"
     adapter = _email_adapter(self_addr)
     pipeline = OutreachPipeline(
         governance=GovernanceGate(config, db),
