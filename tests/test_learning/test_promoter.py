@@ -132,7 +132,7 @@ def test_compute_tier_core_with_drift_stays_at_core():
 
 
 def test_compute_tier_draft_procedure_can_promote_to_library():
-    """Speculative procedures can promote to LIBRARY if they meet thresholds."""
+    """Draft procedures can promote to LIBRARY if they meet thresholds."""
     row = {
         "success_count": 5, "confidence": 0.7, "draft": 1,
         "tool_trigger": None, "activation_tier": "DORMANT",
@@ -313,7 +313,7 @@ async def test_reads_promote_draft_to_library_but_stay_draft(db):
     )
     row = await cursor.fetchone()
     assert row[0] == "LIBRARY"
-    assert row[1] == 1  # still draft — reads don't de-speculate
+    assert row[1] == 1  # still draft — reads don't clear the draft flag
 
 
 @pytest.mark.asyncio
@@ -364,9 +364,9 @@ async def test_reads_never_promote_to_core(db):
 
 
 @pytest.mark.asyncio
-async def test_despeculate_on_real_success(db):
+async def test_draft_cleared_on_real_success(db):
     """A draft procedure with ≥1 real success and no failures graduates
-    to validated (draft=0) — closing the de-speculation gap."""
+    to validated (draft=0) — closing the draft-clearing gap."""
     await _insert(
         db, id="grad-1", task_type="t",
         success_count=1, failure_count=0, confidence=2 / 3,
@@ -406,8 +406,8 @@ async def test_reads_do_not_promote_a_failing_procedure(db):
 
 
 @pytest.mark.asyncio
-async def test_despeculate_blocked_by_failure(db):
-    """A failure blocks de-speculation even with real successes."""
+async def test_draft_clearing_blocked_by_failure(db):
+    """A failure blocks draft clearing even with real successes."""
     await _insert(
         db, id="grad-fail", task_type="t",
         success_count=2, failure_count=1, confidence=0.6,
