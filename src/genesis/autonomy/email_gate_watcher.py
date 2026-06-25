@@ -99,8 +99,12 @@ async def drain_pending_email_sends(rt: object) -> int:
                 # The pipeline terminally SKIPPED this approved send (self-
                 # addressed / no recipient). It is not deliverable and not an
                 # error — mark the hold rejected so it can't busy-loop every
-                # cycle. No correction (the skip is a guard, not owner intent).
+                # cycle, and consume the approval so it doesn't linger as a ghost
+                # approved/unconsumed row. No correction (a guard, not owner intent).
                 if await pes.mark_rejected(db, row["id"], rejected_at=now):
+                    await approval_crud.mark_consumed(
+                        db, row["request_id"], consumed_at=now,
+                    )
                     resolved += 1
                 logger.warning(
                     "Held email %s skipped by pipeline (IGNORED) — marked terminal",

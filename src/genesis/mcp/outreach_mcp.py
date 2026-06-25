@@ -79,7 +79,9 @@ async def outreach_send(
             logger.warning("Thread %s not found for recipient lookup", thread_id)
     elif channel == "email" and not thread_id:
         logger.warning(
-            "outreach_send email without thread_id — no recipient resolved"
+            "outreach_send email without thread_id — recipient will come from "
+            "OUTREACH_RECIPIENT_EMAIL if configured, else the send is dropped "
+            "(IGNORED) by the pipeline self-send guard"
         )
 
     if not _pipeline:

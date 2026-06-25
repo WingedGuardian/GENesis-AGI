@@ -308,3 +308,28 @@ async def test_drain_ages_out_perpetually_stuck_row(config, db):
 
     pipeline.submit.assert_not_called()  # aged out BEFORE re-submitting
     assert await _remaining(db) == []    # dropped
+
+
+@pytest.mark.asyncio
+async def test_drain_ages_out_naive_timestamp_row(config, db):
+    """A created_at WITHOUT a tz offset must still age out — a naive timestamp
+    must not silently bypass the cap (and loop forever)."""
+    from datetime import UTC, datetime, timedelta
+    old_naive = (
+        (datetime.now(UTC) - timedelta(hours=25)).replace(tzinfo=None).isoformat()
+    )
+    assert "+00:00" not in old_naive  # genuinely naive
+    await db.execute(
+        "INSERT INTO pending_outreach (id, message, category, channel, urgency, "
+        "created_at, delivered) VALUES ('oldnaive', 'x', 'notification', "
+        "'telegram', 'low', ?, 0)",
+        (old_naive,),
+    )
+    await db.commit()
+    pipeline = _drain_pipeline(OutreachStatus.REJECTED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    pipeline.submit.assert_not_called()
+    assert await _remaining(db) == []

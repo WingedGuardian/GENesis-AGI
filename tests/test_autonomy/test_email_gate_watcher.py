@@ -155,4 +155,6 @@ async def test_approved_but_pipeline_ignores_is_terminal(db):
     assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
     assert pipe.calls == [("p1", "hi")]  # attempted (deliver_approved called)
     assert (await pes.get_by_id(db, "p1"))["status"] == "rejected"  # terminal
-    assert (await ac.get_by_id(db, rid))["consumed_at"] is None  # not a real send
+    # The approval lifecycle is closed (consumed) so it doesn't linger as a
+    # ghost approved/unconsumed row in operator views.
+    assert (await ac.get_by_id(db, rid))["consumed_at"] is not None

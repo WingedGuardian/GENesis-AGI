@@ -605,7 +605,13 @@ class OutreachScheduler:
                     created_at = row.get("created_at")
                     if created_at:
                         try:
-                            age = datetime.now(UTC) - datetime.fromisoformat(created_at)
+                            parsed = datetime.fromisoformat(created_at)
+                            if parsed.tzinfo is None:
+                                # A naive timestamp must not silently bypass the
+                                # cap (subtracting naive from aware raises) — treat
+                                # it as UTC, which is how created_at is written.
+                                parsed = parsed.replace(tzinfo=UTC)
+                            age = datetime.now(UTC) - parsed
                         except (ValueError, TypeError):
                             age = None
                         if age is not None and age > timedelta(hours=24):
