@@ -235,3 +235,55 @@ async def test_send_standalone_valid_category():
     finally:
         mcp_mod._pipeline = old_pipeline
         mcp_mod._db = old_db
+
+
+@pytest.mark.asyncio
+async def test_send_standalone_email_resolves_and_enqueues_thread_recipient():
+    """Fallback (pipeline=None) MUST resolve the thread's recipient and carry
+    both thread_id + validated_recipient into enqueue — otherwise the queued
+    email is recipient-less and the drain self-sends to the agent's own address.
+    """
+    old_pipeline, old_db = mcp_mod._pipeline, mcp_mod._db
+    enq = AsyncMock(return_value="pending-xyz")
+    try:
+        mcp_mod._pipeline = None
+        mcp_mod._db = AsyncMock()
+        with patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock), \
+             patch("genesis.db.crud.pending_outreach.enqueue", enq), \
+             patch("genesis.db.crud.email_threads.get_thread", new_callable=AsyncMock,
+                   return_value={"recipient": "real@prospect.com"}):
+            tools = await mcp.get_tools()
+            result = await tools["outreach_send"].fn(
+                message="following up", category="notification", channel="email",
+                thread_id="t1",
+            )
+        assert json.loads(result)["status"] == "queued"
+        kwargs = enq.call_args.kwargs
+        assert kwargs["thread_id"] == "t1"
+        assert kwargs["validated_recipient"] == "real@prospect.com"
+    finally:
+        mcp_mod._pipeline = old_pipeline
+        mcp_mod._db = old_db
+
+
+@pytest.mark.asyncio
+async def test_send_standalone_email_without_thread_enqueues_no_recipient():
+    """A queued email with no thread_id carries validated_recipient=None so the
+    drain's self-send guard drops it (never silently self-sends)."""
+    old_pipeline, old_db = mcp_mod._pipeline, mcp_mod._db
+    enq = AsyncMock(return_value="pending-none")
+    try:
+        mcp_mod._pipeline = None
+        mcp_mod._db = AsyncMock()
+        with patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock), \
+             patch("genesis.db.crud.pending_outreach.enqueue", enq):
+            tools = await mcp.get_tools()
+            await tools["outreach_send"].fn(
+                message="orphan", category="notification", channel="email",
+            )
+        kwargs = enq.call_args.kwargs
+        assert kwargs["thread_id"] is None
+        assert kwargs["validated_recipient"] is None
+    finally:
+        mcp_mod._pipeline = old_pipeline
+        mcp_mod._db = old_db
