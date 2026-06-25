@@ -477,3 +477,103 @@ async def test_submit_to_email_quarantines_secret_end_to_end(config, db, mock_dr
     assert result.status == OutreachStatus.FAILED
     assert "quarantine" in (result.error or "").lower()
     email_adapter.send_message.assert_not_called()
+
+
+# ── self-send / recipient-less terminal guards at the _deliver chokepoint ──
+
+
+def _email_adapter(from_address):
+    from genesis.channels.email_adapter import EmailAdapter
+    a = EmailAdapter(
+        smtp_host="smtp.invalid", smtp_port=465, username="u",
+        password="p", from_address=from_address,
+    )
+    a.send_message = AsyncMock(return_value="<id@x>")
+    return a
+
+
+def test_email_adapter_exposes_from_address():
+    assert _email_adapter("me@self.com").from_address == "me@self.com"
+
+
+@pytest.mark.asyncio
+async def test_email_to_own_address_is_ignored_not_held(
+    config, db, mock_drafter, mock_formatter
+):
+    """A send to the agent's own address is terminally IGNORED — never HELD
+    (approval flood) or DEFERred (retry loop)."""
+    self_addr = "genesisagiagent@gmail.com"
+    adapter = _email_adapter(self_addr)
+    gate = AsyncMock()
+    pipeline = OutreachPipeline(
+        governance=GovernanceGate(config, db),
+        drafter=mock_drafter, formatter=mock_formatter,
+        channels={"email": adapter}, db=db, config=config,
+        recipients={"email": self_addr},  # the misconfigured self default
+    )
+    pipeline._autonomy_gate = gate
+    request = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION, topic="hi", context="body",
+        salience_score=0.5, signal_type="x", channel="email",
+    )
+
+    result = await pipeline.submit_raw("body", request)
+
+    assert result.status == OutreachStatus.IGNORED
+    gate.check.assert_not_called()             # never reached the gate (no hold)
+    adapter.send_message.assert_not_called()   # never sent
+
+
+@pytest.mark.asyncio
+async def test_email_without_recipient_is_ignored_not_deferred(
+    config, db, mock_drafter, mock_formatter
+):
+    """A recipient-less email is terminally IGNORED, NOT FAILED/deferred — a
+    deferred no-recipient email would just loop in the deferred-work queue."""
+    adapter = _email_adapter("genesisagiagent@gmail.com")
+    pipeline = OutreachPipeline(
+        governance=GovernanceGate(config, db),
+        drafter=mock_drafter, formatter=mock_formatter,
+        channels={"email": adapter}, db=db, config=config,
+        recipients={},  # no email default -> recipient resolves to ""
+    )
+    request = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION, topic="hi", context="body",
+        salience_score=0.5, signal_type="x", channel="email",
+    )
+
+    result = await pipeline.submit_raw("body", request)
+
+    assert result.status == OutreachStatus.IGNORED
+    adapter.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_self_send_skipped_on_gate_cleared_resume(
+    config, db, mock_drafter, mock_formatter
+):
+    """The self-guard fires even on the gate_cleared resume path
+    (deliver_approved) — an approved self-send must still never be sent."""
+    self_addr = "genesisagiagent@gmail.com"
+    adapter = _email_adapter(self_addr)
+    pipeline = OutreachPipeline(
+        governance=GovernanceGate(config, db),
+        drafter=mock_drafter, formatter=mock_formatter,
+        channels={"email": adapter}, db=db, config=config,
+        recipients={"email": self_addr},
+    )
+    request = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION, topic="t", context="c",
+        salience_score=0.5, signal_type="x", channel="email",
+        validated_recipient=self_addr,
+    )
+    formatted = FormattedContent(
+        text="hi", target=FormatTarget.EMAIL, truncated=False, original_length=2,
+    )
+
+    result = await pipeline._deliver(
+        "oid", "email", formatted, request, None, gate_cleared=True,
+    )
+
+    assert result.status == OutreachStatus.IGNORED
+    adapter.send_message.assert_not_called()

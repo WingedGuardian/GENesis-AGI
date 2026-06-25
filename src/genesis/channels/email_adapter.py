@@ -39,6 +39,13 @@ class EmailAdapter(ChannelAdapter):
         self._from_address = from_address
         self._from_name = from_name
 
+    @property
+    def from_address(self) -> str:
+        """The configured sender address — the pipeline's self-send guard
+        compares delivery recipients against this to suppress emails the agent
+        would otherwise address to itself."""
+        return self._from_address
+
     async def start(self) -> None:
         """No-op — SMTP is stateless per-send."""
 
