@@ -587,7 +587,7 @@ class OutreachScheduler:
         if self._is_paused():
             return
         try:
-            from datetime import UTC, datetime
+            from datetime import UTC, datetime, timedelta
 
             from genesis.db.crud import pending_outreach
 
@@ -599,6 +599,33 @@ class OutreachScheduler:
 
             for row in rows:
                 try:
+                    # Retry-age cap: a row that never reaches a terminal status
+                    # (e.g. a recipient-less email perpetually rejected) must not
+                    # churn forever — that loop locked the DB. Drop it after 24h.
+                    created_at = row.get("created_at")
+                    if created_at:
+                        try:
+                            parsed = datetime.fromisoformat(created_at)
+                            if parsed.tzinfo is None:
+                                # A naive timestamp must not silently bypass the
+                                # cap (subtracting naive from aware raises) — treat
+                                # it as UTC, which is how created_at is written.
+                                parsed = parsed.replace(tzinfo=UTC)
+                            age = datetime.now(UTC) - parsed
+                        except (ValueError, TypeError):
+                            age = None
+                        if age is not None and age > timedelta(hours=24):
+                            await pending_outreach.mark_delivered(
+                                self._db, row["id"],
+                                delivered_at=datetime.now(UTC).isoformat(),
+                            )
+                            logger.warning(
+                                "Pending outreach %s aged out (%.1fh, never "
+                                "delivered) — dropping",
+                                row["id"], age.total_seconds() / 3600,
+                            )
+                            continue
+
                     # Validate category — map known non-enum values, fall
                     # back to DIGEST (not ALERT) for truly unknown ones.
                     _CATEGORY_ALIASES = {
@@ -629,23 +656,32 @@ class OutreachScheduler:
                         salience_score=0.7,
                         signal_type="pending_queue",
                         channel=channel,
+                        thread_id=row.get("thread_id"),
+                        validated_recipient=row.get("validated_recipient"),
                     )
                     if row.get("urgency") == "high":
                         result = await self._pipeline.submit_urgent(req)
                     else:
                         result = await self._pipeline.submit(req)
 
-                    # Only mark delivered on actual success
+                    # Terminal dispositions stop the retry. DELIVERED/ENGAGED =
+                    # sent; HELD = handed off to the gate's approval queue (the
+                    # watcher owns its lifecycle — re-submitting just re-holds);
+                    # IGNORED = the pipeline deliberately dropped it (self-send /
+                    # no recipient). Anything else (REJECTED via quiet_hours,
+                    # FAILED) is transient and retried next cycle.
                     if result.status in (
                         OutreachStatus.DELIVERED,
                         OutreachStatus.ENGAGED,
+                        OutreachStatus.HELD,
+                        OutreachStatus.IGNORED,
                     ):
                         delivered_at = datetime.now(UTC).isoformat()
                         await pending_outreach.mark_delivered(
                             self._db, row["id"], delivered_at=delivered_at,
                         )
                         logger.info(
-                            "Drained pending outreach %s: %s",
+                            "Drained pending outreach %s: %s (terminal)",
                             row["id"], result.status.value,
                         )
                     else:

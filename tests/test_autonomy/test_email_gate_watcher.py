@@ -141,3 +141,20 @@ async def test_approved_but_delivery_fails_stays_held(db):
     assert pipe.calls == [("p1", "hi")]  # attempted
     assert (await pes.get_by_id(db, "p1"))["status"] == "held"  # retry next cycle
     assert (await ac.get_by_id(db, rid))["consumed_at"] is None  # not consumed
+
+
+@pytest.mark.asyncio
+async def test_approved_but_pipeline_ignores_is_terminal(db):
+    """If the pipeline terminally skips an approved send (IGNORED — e.g. a
+    self-addressed hold the new guard drops), the watcher must mark it rejected,
+    NOT leave it held to busy-loop every cycle."""
+    rid = await _approval(db, status="approved")
+    await _hold(db, pid="p1", rid=rid)
+    pipe = _FakePipeline(OutreachStatus.IGNORED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == [("p1", "hi")]  # attempted (deliver_approved called)
+    assert (await pes.get_by_id(db, "p1"))["status"] == "rejected"  # terminal
+    # The approval lifecycle is closed (consumed) so it doesn't linger as a
+    # ghost approved/unconsumed row in operator views.
+    assert (await ac.get_by_id(db, rid))["consumed_at"] is not None

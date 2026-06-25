@@ -198,15 +198,17 @@ TABLES = {
     """,
     "pending_outreach": """
         CREATE TABLE IF NOT EXISTS pending_outreach (
-            id              TEXT PRIMARY KEY,
-            message         TEXT NOT NULL,
-            category        TEXT NOT NULL,
-            channel         TEXT NOT NULL DEFAULT 'telegram',
-            urgency         TEXT NOT NULL DEFAULT 'low',
-            deliver_after   TEXT,
-            created_at      TEXT NOT NULL,
-            delivered       INTEGER NOT NULL DEFAULT 0,
-            delivered_at    TEXT
+            id                  TEXT PRIMARY KEY,
+            message             TEXT NOT NULL,
+            category            TEXT NOT NULL,
+            channel             TEXT NOT NULL DEFAULT 'telegram',
+            urgency             TEXT NOT NULL DEFAULT 'low',
+            deliver_after       TEXT,
+            created_at          TEXT NOT NULL,
+            delivered           INTEGER NOT NULL DEFAULT 0,
+            delivered_at        TEXT,
+            thread_id           TEXT,
+            validated_recipient TEXT
         )
     """,
     "brainstorm_log": """

@@ -18,17 +18,27 @@ async def enqueue(
     channel: str = "telegram",
     urgency: str = "low",
     deliver_after: str | None = None,
+    thread_id: str | None = None,
+    validated_recipient: str | None = None,
 ) -> str:
-    """Queue a message for bridge delivery. Returns the pending ID."""
+    """Queue a message for bridge delivery. Returns the pending ID.
+
+    ``thread_id`` / ``validated_recipient`` carry the resolved email thread and
+    recipient through the queue so the genesis-server drain can rebuild a
+    properly-routed request — without them a queued email defaulted to the
+    agent's own address (a self-send loop).
+    """
     from datetime import UTC, datetime
 
     pending_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
     await db.execute(
         """INSERT INTO pending_outreach
-           (id, message, category, channel, urgency, deliver_after, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (pending_id, message, category, channel, urgency, deliver_after, now),
+           (id, message, category, channel, urgency, deliver_after, created_at,
+            thread_id, validated_recipient)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (pending_id, message, category, channel, urgency, deliver_after, now,
+         thread_id, validated_recipient),
     )
     await db.commit()
     return pending_id
@@ -74,15 +84,17 @@ async def ensure_table(db: aiosqlite.Connection) -> None:
     """
     await db.execute("""
         CREATE TABLE IF NOT EXISTS pending_outreach (
-            id              TEXT PRIMARY KEY,
-            message         TEXT NOT NULL,
-            category        TEXT NOT NULL,
-            channel         TEXT NOT NULL DEFAULT 'telegram',
-            urgency         TEXT NOT NULL DEFAULT 'low',
-            deliver_after   TEXT,
-            created_at      TEXT NOT NULL,
-            delivered       INTEGER NOT NULL DEFAULT 0,
-            delivered_at    TEXT
+            id                  TEXT PRIMARY KEY,
+            message             TEXT NOT NULL,
+            category            TEXT NOT NULL,
+            channel             TEXT NOT NULL DEFAULT 'telegram',
+            urgency             TEXT NOT NULL DEFAULT 'low',
+            deliver_after       TEXT,
+            created_at          TEXT NOT NULL,
+            delivered           INTEGER NOT NULL DEFAULT 0,
+            delivered_at        TEXT,
+            thread_id           TEXT,
+            validated_recipient TEXT
         )
     """)
     await db.commit()

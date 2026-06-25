@@ -66,6 +66,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   even though nothing had actually regressed. The score now reflects only validated
   procedures. Genesis also caps how many drafts a single session can create, so the
   procedure store stops accumulating dead weight.
+- **Genesis no longer floods its own approvals with follow-up emails addressed to itself.**
+  A follow-up drafted in a background session could lose its thread (and therefore its
+  recipient) on the way to the outreach queue, then fall back to Genesis's own email address.
+  The capability gate correctly held each one for approval, but because the queue kept
+  retrying, a new held "email to myself" piled up every few minutes. Genesis now keeps the
+  thread recipient with the queued message, never sends an email to its own address, and
+  treats a held or undeliverable message as resolved instead of retrying it forever. A
+  message that can never be delivered is now dropped after a day rather than looping.
 - **Updates no longer abort when a schema migration actually succeeded** — if the
   database was busy during an update (for example a background task writing at the same
   time), a migration could commit successfully yet still surface a transient "database

@@ -64,8 +64,12 @@ async def init(rt: GenesisRuntime) -> None:
                 password=gmail_pass,
                 from_address=gmail_addr,
             )
-            if "email" not in recipients:
-                recipients["email"] = gmail_addr
+            # NOTE: do NOT default recipients["email"] to the agent's own
+            # address. A recipient-less email used to fall back to gmail_addr →
+            # the pipeline self-addressed it → the WS-8 gate HELD it → a self-send
+            # spam loop. Email recipients now come only from the thread (replies)
+            # or an explicit OUTREACH_RECIPIENT_EMAIL; a send with no recipient is
+            # terminally skipped in _deliver (IGNORED).
             logger.info("Email channel adapter registered (from: %s)", gmail_addr)
 
         # Wire Discord webhook adapter if webhook URL exists

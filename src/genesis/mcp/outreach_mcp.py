@@ -62,6 +62,28 @@ async def outreach_send(
     The thread_id maps to a registered email thread whose recipient is
     used for delivery.
     """
+    # Resolve the per-thread recipient for email sends BEFORE the
+    # pipeline/fallback split — so a QUEUED follow-up (pipeline=None subprocess)
+    # carries its thread recipient through pending_outreach instead of arriving
+    # recipient-less and self-sending to the agent's own address on drain.
+    validated_recipient: str | None = None
+    if thread_id and channel == "email" and _db is not None:
+        from genesis.db.crud import email_threads
+        thread = await email_threads.get_thread(_db, thread_id)
+        if thread:
+            validated_recipient = thread.get("recipient")
+            logger.info(
+                "Thread %s resolved recipient: %s", thread_id, validated_recipient,
+            )
+        else:
+            logger.warning("Thread %s not found for recipient lookup", thread_id)
+    elif channel == "email" and not thread_id:
+        logger.warning(
+            "outreach_send email without thread_id — recipient will come from "
+            "OUTREACH_RECIPIENT_EMAIL if configured, else the send is dropped "
+            "(IGNORED) by the pipeline self-send guard"
+        )
+
     if not _pipeline:
         # Validate category before enqueuing (same check the pipeline path does)
         from genesis.outreach.types import OutreachCategory
@@ -86,6 +108,8 @@ async def outreach_send(
                 channel=channel,
                 urgency=urgency,
                 deliver_after=preferred_timing,
+                thread_id=thread_id,
+                validated_recipient=validated_recipient,
             )
             return json.dumps({
                 "status": "queued",
@@ -104,24 +128,7 @@ async def outreach_send(
     except ValueError:
         return f"Error: invalid category '{category}'"
 
-    # Resolve per-thread recipient for email sends
-    validated_recipient: str | None = None
-    if channel == "email" and not thread_id:
-        logger.warning(
-            "outreach_send email without thread_id — using pipeline default recipient"
-        )
-    if thread_id and channel == "email" and _db is not None:
-        from genesis.db.crud import email_threads
-        thread = await email_threads.get_thread(_db, thread_id)
-        if thread:
-            validated_recipient = thread.get("recipient")
-            logger.info(
-                "Thread %s resolved recipient: %s",
-                thread_id, validated_recipient,
-            )
-        else:
-            logger.warning("Thread %s not found for recipient lookup", thread_id)
-
+    # validated_recipient was resolved above (shared with the fallback path).
     req = OutreachRequest(
         category=cat,
         topic=message[:100],

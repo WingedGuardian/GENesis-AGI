@@ -193,6 +193,7 @@ class OutreachPipeline:
                 channel="",
                 message_content="",
                 governance_result=gov,
+                error=gov.reason,  # surface the reason so retry logs aren't blank
             )
 
         if request.category == OutreachCategory.SURPLUS and self._fresh_eyes:
@@ -377,6 +378,37 @@ class OutreachPipeline:
     ) -> OutreachResult:
         adapter = self._channels.get(channel)
         recipient = request.validated_recipient or self._recipients.get(channel, "")
+
+        # Email self-send / no-recipient terminal skip (WS-8 spam-loop fix). A
+        # send to the agent's OWN address, or an email with no resolved
+        # recipient, is never valid outreach — drop it terminally (IGNORED)
+        # here, BEFORE the no-recipient defer below (which would retry-loop in
+        # the deferred-work queue) and BEFORE the gate below (which would HELD
+        # it and flood approvals). Fires regardless of gate_cleared: an approved
+        # self-send must still never be sent.
+        if channel == "email":
+            self_addr = getattr(self._channels.get("email"), "from_address", None)
+            if not recipient:
+                logger.warning(
+                    "Outreach %s: email has no resolved recipient — "
+                    "skipping (IGNORED)", outreach_id,
+                )
+                return OutreachResult(
+                    outreach_id=outreach_id, status=OutreachStatus.IGNORED,
+                    channel=channel, message_content=formatted.text,
+                    error="no recipient resolved",
+                )
+            if self_addr and recipient == self_addr:
+                logger.warning(
+                    "Outreach %s: email recipient is the agent's own address "
+                    "(%s) — skipping self-send (IGNORED)", outreach_id, recipient,
+                )
+                return OutreachResult(
+                    outreach_id=outreach_id, status=OutreachStatus.IGNORED,
+                    channel=channel, message_content=formatted.text,
+                    error="self-addressed email suppressed",
+                )
+
         if not adapter or not recipient:
             logger.warning("No adapter/recipient for channel %s — deferring", channel)
             await self._defer(
