@@ -64,6 +64,7 @@ async def count_for_cell_since(
 
 
 async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
+    """Fetch a single autonomous send by id.  Returns None if not found."""
     cursor = await db.execute(
         "SELECT * FROM autonomous_email_sends WHERE id = ?", (id,)
     )

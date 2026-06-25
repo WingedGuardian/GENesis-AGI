@@ -187,3 +187,32 @@ async def list_active_threads(
     )
     rows = await cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+async def has_inbound(db: aiosqlite.Connection, thread_id: str) -> bool:
+    """True iff the thread has at least one received (inbound) message —
+    i.e. a reply has come back, so a send on it is not cold outreach."""
+    cursor = await db.execute(
+        "SELECT 1 FROM email_thread_messages "
+        "WHERE thread_id = ? AND direction = 'received' LIMIT 1",
+        (thread_id,),
+    )
+    return await cursor.fetchone() is not None
+
+
+async def recipient_in_thread(
+    db: aiosqlite.Connection, thread_id: str, recipient: str,
+) -> bool:
+    """True iff ``recipient`` is a received-message sender in the thread.
+
+    Deliberately does NOT treat a NULL/blank sender as a match: a single
+    unparsed-sender row must not grant unbounded recipient scope (the safe
+    failure for the SECURITY scope guard is to trip and hold, not wave
+    through).
+    """
+    cursor = await db.execute(
+        "SELECT 1 FROM email_thread_messages "
+        "WHERE thread_id = ? AND direction = 'received' AND sender = ? LIMIT 1",
+        (thread_id, recipient),
+    )
+    return await cursor.fetchone() is not None

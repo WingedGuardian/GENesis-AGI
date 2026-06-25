@@ -36,6 +36,7 @@ from genesis.autonomy.classification import classify_email_action
 from genesis.autonomy.types import CellEvent, CellState, RiskClass
 from genesis.db.crud import autonomous_email_sends as aes
 from genesis.db.crud import capability_grants as cg
+from genesis.db.crud import email_threads as et
 from genesis.db.crud import pending_email_sends as pes
 from genesis.observability.types import Severity, Subsystem
 
@@ -141,12 +142,7 @@ class EmailAutonomyGate:
         — i.e. this send is a reply, not cold outreach."""
         if not thread_id:
             return False
-        cursor = await self._db.execute(
-            "SELECT 1 FROM email_thread_messages "
-            "WHERE thread_id = ? AND direction = 'received' LIMIT 1",
-            (thread_id,),
-        )
-        return await cursor.fetchone() is not None
+        return await et.has_inbound(self._db, thread_id)
 
     async def _scope_guard_trip(
         self, request: object, recipient: str, domain: str, verb: str, risk: str,
@@ -188,12 +184,7 @@ class EmailAutonomyGate:
         failure for a SECURITY guard is to trip and hold, not to wave through)."""
         if not thread_id:
             return False  # a 'standard' reply with no thread is itself suspect
-        cursor = await self._db.execute(
-            "SELECT 1 FROM email_thread_messages "
-            "WHERE thread_id = ? AND direction = 'received' AND sender = ? LIMIT 1",
-            (thread_id, recipient),
-        )
-        return await cursor.fetchone() is not None
+        return await et.recipient_in_thread(self._db, thread_id, recipient)
 
     async def _hold(
         self, request: object, message_text: str, classification: object,

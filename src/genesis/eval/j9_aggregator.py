@@ -20,6 +20,7 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from genesis.db.crud import ego as ego_crud
 from genesis.db.crud import j9_eval
 
 if TYPE_CHECKING:
@@ -47,13 +48,9 @@ async def _compute_cognitive_drift(
     import math
     from collections import Counter
 
-    cursor = await db.execute(
-        """SELECT action_type, alternatives, realist_verdict
-           FROM ego_proposals
-           WHERE created_at >= ? AND created_at < ?""",
-        (period_start, period_end),
+    rows = await ego_crud.get_proposals_for_drift(
+        db, start=period_start, end=period_end,
     )
-    rows = [dict(r) for r in await cursor.fetchall()]
     total = len(rows)
     if total == 0:
         return {
@@ -334,18 +331,9 @@ async def _compute_system_composite(
     session_success_pct = round(session_completed / session_total, 4) if session_total else None
 
     # Ego acceptance rate
-    cursor = await db.execute(
-        """SELECT
-            COUNT(*) as total,
-            SUM(CASE WHEN status = 'approved' OR status = 'executed' THEN 1 ELSE 0 END) as accepted
-        FROM ego_proposals
-        WHERE created_at >= ? AND created_at < ?
-        AND status NOT IN ('pending', 'expired')""",
-        (since, until),
-    )
-    row = await cursor.fetchone()
-    ego_total = row["total"] if row else 0
-    ego_accepted = row["accepted"] if row else 0
+    counts = await ego_crud.get_acceptance_counts(db, start=since, end=until)
+    ego_total = counts["total"] if counts else 0
+    ego_accepted = counts["accepted"] if counts else 0
     ego_acceptance_pct = round(ego_accepted / ego_total, 4) if ego_total else None
 
     # Observation influence rate
@@ -405,13 +393,9 @@ async def _compute_ego_quality(
     db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
     """Approval rate, execution success, confidence calibration."""
-    cursor = await db.execute(
-        """SELECT id, status, confidence, action_type
-        FROM ego_proposals
-        WHERE created_at >= ? AND created_at < ?""",
-        (since, until),
+    proposals = await ego_crud.get_proposals_for_quality(
+        db, start=since, end=until,
     )
-    proposals = [dict(r) for r in await cursor.fetchall()]
     total = len(proposals)
 
     if not total:
