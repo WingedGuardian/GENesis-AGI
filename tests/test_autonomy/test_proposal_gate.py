@@ -67,6 +67,16 @@ class TestProposalDispatchGate:
         assert result.action_domain == ActionDomain.SELF_MODIFY
 
     @pytest.mark.asyncio
+    async def test_cognitive_variant_promotion_always_blocked(self) -> None:
+        """An approved Evo prompt-promotion must NEVER be auto-dispatched as a
+        session — even at max autonomy. It is SELF_MODIFY (always blocked); the
+        only path that applies it is its resolution handler at approval time."""
+        gate = _make_gate(current_level=4)
+        result = await gate.evaluate({"action_type": "cognitive_variant_promotion"})
+        assert not result.allowed
+        assert result.action_domain == ActionDomain.SELF_MODIFY
+
+    @pytest.mark.asyncio
     async def test_financial_blocked_below_l4(self) -> None:
         gate = _make_gate(current_level=3)
         result = await gate.evaluate({"action_type": "purchase"})

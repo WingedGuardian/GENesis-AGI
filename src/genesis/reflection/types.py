@@ -11,7 +11,6 @@ class DeepReflectionJob(StrEnum):
 
     MEMORY_CONSOLIDATION = "memory_consolidation"
     SKILL_REVIEW = "skill_review"
-    COST_RECONCILIATION = "cost_reconciliation"
     LESSONS_EXTRACTION = "lessons_extraction"
     COGNITIVE_REGENERATION = "cognitive_regeneration"
 
@@ -33,7 +32,6 @@ class PendingWorkSummary:
 
     memory_consolidation: bool = False
     skill_review: bool = False
-    cost_reconciliation: bool = False
     lessons_extraction: bool = False
     cognitive_regeneration: bool = False
 
@@ -47,9 +45,8 @@ class PendingWorkSummary:
     def has_any_work(self) -> bool:
         """True if there's substantive work justifying a deep reflection.
 
-        Cost reconciliation is always-included but doesn't justify triggering
-        a reflection on its own.  Cognitive regeneration DOES justify a
-        reflection — stale or missing cognitive state is self-healing work.
+        Cognitive regeneration DOES justify a reflection — stale or missing
+        cognitive state is self-healing work.
         """
         return any([
             self.memory_consolidation,
@@ -65,8 +62,6 @@ class PendingWorkSummary:
             jobs.append(DeepReflectionJob.MEMORY_CONSOLIDATION)
         if self.skill_review:
             jobs.append(DeepReflectionJob.SKILL_REVIEW)
-        if self.cost_reconciliation:
-            jobs.append(DeepReflectionJob.COST_RECONCILIATION)
         if self.lessons_extraction:
             jobs.append(DeepReflectionJob.LESSONS_EXTRACTION)
         if self.cognitive_regeneration:

@@ -19,6 +19,7 @@ from typing import Any
 
 import aiosqlite
 
+from genesis.ego.domain_classifier import is_genesis_internal as _is_genesis_internal
 from genesis.ego.types import NEUTRAL_STATUS
 
 logger = logging.getLogger(__name__)
@@ -35,24 +36,9 @@ _USER_WORLD_CATEGORIES = frozenset({
     "marketing", "outreach", "networking",
 })
 
-# Keywords indicating a session is about Genesis internals (not user-world).
-# Used to annotate conversation transcripts so the user ego knows which
-# sessions fall under the Genesis ego's jurisdiction.
-_GENESIS_INTERNAL_KEYWORDS = frozenset({
-    "surplus", "dream cycle", "dream_cycle", "genesis runtime",
-    "routing config", "circuit breaker", "guardian", "sentinel", "qdrant",
-    "awareness loop", "health check", "dead letter", "model_routing",
-    "worktree", "genesis-development", "dashboard fix", "ego cycle",
-    "model eval", "surplus_task", "provider fallback", "watchdog",
-    "systemd", "genesis server", "eval batch", "j9 eval",
-    "runtime init", "embedding chain", "embedding fallback",
-})
-
-
-def _is_genesis_internal(topic: str) -> bool:
-    """Check if a session topic is about Genesis internals."""
-    topic_lower = topic.lower()
-    return any(kw in topic_lower for kw in _GENESIS_INTERNAL_KEYWORDS)
+# Genesis-internal keyword detection now lives in genesis.ego.domain_classifier
+# (shared with follow-up domain classification); imported above as
+# _is_genesis_internal.
 
 
 class UserEgoContextBuilder:
@@ -699,7 +685,11 @@ class UserEgoContextBuilder:
             cursor = await self._db.execute(
                 "SELECT COUNT(*), MIN(created_at) FROM follow_ups "
                 "WHERE status = 'pending' "
-                "AND strategy = 'user_input_needed'"
+                "AND strategy = 'user_input_needed' "
+                # Strict user_world: only items genuinely awaiting the USER's
+                # input (excludes internal-dev backlog parked under this strategy
+                # and any tabled rows).
+                "AND domain = 'user_world' AND kind = 'follow_up'"
             )
             row = await cursor.fetchone()
             if row and row[0] > 0:
@@ -764,7 +754,7 @@ class UserEgoContextBuilder:
 
         try:
             cursor = await self._db.execute(
-                "SELECT source, content, priority, created_at "
+                "SELECT id, source, content, priority, created_at "
                 "FROM observations "
                 "WHERE resolved = 0 "
                 "AND type = 'escalation_to_user_ego' "
@@ -776,6 +766,7 @@ class UserEgoContextBuilder:
                 "    WHEN 'medium' THEN 2 "
                 "    ELSE 3 "
                 "  END, "
+                "  (retrieved_count > 0), "
                 "  created_at DESC "
                 "LIMIT 10"
             )
@@ -787,20 +778,31 @@ class UserEgoContextBuilder:
 
         # Filter out pure infrastructure escalations — the genesis ego
         # handles those.  Keep escalations with user-facing impact.
+        # (id is r[0] now, so content is r[2].)
         rows = [
             r for r in rows
             if not any(
-                kw in r[1].lower() for kw in self._INFRA_ESCALATION_KEYWORDS
+                kw in r[2].lower() for kw in self._INFRA_ESCALATION_KEYWORDS
             )
         ]
+
+        # Read-receipt (non-fatal): these escalations were pulled into the user
+        # ego's context this cycle; already-seen ones demote below unread next
+        # cycle. r[0] is the observation id.
+        try:
+            from genesis.db.crud import observations as _obs_crud
+
+            await _obs_crud.increment_retrieved_batch(self._db, [r[0] for r in rows])
+        except Exception:
+            logger.debug("Failed to record escalation read-receipts", exc_info=True)
 
         if not rows:
             lines.append("*No escalations from Genesis ego.*\n")
             return "\n".join(lines)
 
         if depth == "light":
-            crit = sum(1 for r in rows if r[2] == "critical")
-            high = sum(1 for r in rows if r[2] == "high")
+            crit = sum(1 for r in rows if r[3] == "critical")
+            high = sum(1 for r in rows if r[3] == "high")
             parts = [f"{len(rows)} escalations"]
             if crit:
                 parts.append(f"{crit} critical")
@@ -809,7 +811,7 @@ class UserEgoContextBuilder:
             return f"## Genesis Ego Escalations\n{', '.join(parts)}.\n"
 
         lines.append(f"**{len(rows)} escalations** needing your attention:\n")
-        for _source, content, priority, created_at in rows:
+        for _id, _source, content, priority, created_at in rows:
             age = self._days_ago(created_at) or "?"
             short = content[:300] + "..." if len(content) > 300 else content
             short = short.replace("\n", " ")
@@ -851,7 +853,14 @@ class UserEgoContextBuilder:
         try:
             from genesis.db.crud import follow_ups as follow_up_crud
 
-            actionable = await follow_up_crud.get_actionable(self._db)
+            # Strict user_world: the user (CEO) ego tracks the user's world only.
+            # Scoping in SQL (before get_actionable's LIMIT) is what actually
+            # surfaces the genuine user items — they're recent, so unscoped they
+            # rank past the cap and never appear. Pinned/high-priority internal
+            # items intentionally re-home to the cockpit, not the user ego.
+            actionable = await follow_up_crud.get_actionable(
+                self._db, domain="user_world",
+            )
         except Exception:
             logger.error("Failed to query follow-ups", exc_info=True)
             lines.append("*Could not query follow-ups.*\n")
@@ -1319,6 +1328,33 @@ class UserEgoContextBuilder:
         else:
             lines.append(
                 "### Goal-Linked Proposals\n*No proposals for this goal.*\n"
+            )
+
+        # Stuck diagnosis: effort spent (>= N executed proposals) but the goal
+        # is still active and hasn't advanced. Prompt the ego to diagnose WHY
+        # rather than propose more of the same — framed as a hypothesis, NOT a
+        # verdict, and explicitly NOT "just close it" (anti-timidity guardrail).
+        # Count via the unbounded per-status summary (NOT the capped display
+        # rows above) so this matches the cadence scanner's classification.
+        from genesis.db.crud import ego as _ego_crud
+        from genesis.ego.types import GOAL_STUCK_EXECUTED_THRESHOLD
+
+        _summary = await _ego_crud.get_goal_proposal_summary(self._db, focus_id)
+        executed_count = _summary.get("executed", 0)
+        if (
+            executed_count >= GOAL_STUCK_EXECUTED_THRESHOLD
+            and goal.get("status") == "active"
+        ):
+            lines.append(
+                "### ⚠ Stuck Signal\n"
+                f"This goal has **{executed_count} executed proposals** but is "
+                "still `active` and hasn't advanced (last updated "
+                f"{(goal.get('updated_at') or '?')[:10]}). Effort is being spent "
+                "without progress. **Diagnose WHY** before proposing more of the "
+                "same: wrong strategy? an unaddressed blocker? does it need "
+                "decomposing into subgoals, or a fundamentally different "
+                "approach? Do NOT simply recommend closing it to clear this "
+                "signal — that avoids the problem rather than solving it.\n"
             )
 
         # Subgoals: show children if this is a parent goal

@@ -37,13 +37,36 @@ providers:
     free: true
     rpm_limit: 30
     open_duration_s: 120
+  # GROUNDWORK: gpt-oss-120b — a free reasoning option for reasoning/JSON-heavy
+  # chains. Defined + tested (per-provider param plumbing), not yet wired into
+  # any chain; wiring is a separate routing-rebalance change.
+  groq-oss-120b:
+    type: groq
+    model: openai/gpt-oss-120b
+    profile: gpt-oss-120b
+    free: true
+    rpm_limit: 30
+    open_duration_s: 120
+    params:
+      extra_body:
+        include_reasoning: false
+        reasoning_effort: low
   gemini-free:
     type: google
-    model: gemini-3-flash-preview
-    profile: gemini-3-flash
+    # GA stable (was gemini-3-flash-preview; gemini-3.5-flash is Google's own
+    # recommended replacement for that preview — escape preview deprecation churn).
+    model: gemini-3.5-flash
+    profile: gemini-3.5-flash
     free: true
     rpm_limit: 15
     open_duration_s: 120
+    # gemini-3.5-flash reasons by default (~70-90 thinking tokens even on trivial
+    # prompts → empty content at tight max_tokens + free-tier TPM bloat). This is
+    # the fast-flash lane (fact extraction, tagging, surplus brainstorm), so
+    # suppress thinking. reasoning_effort=disable → Gemini thinkingBudget=0
+    # (verified live 2026-06-23: content correct, 0 reasoning tokens at mt=20).
+    params:
+      reasoning_effort: disable
   openrouter-free:
     type: openrouter
     model: qwen/qwen-2.5-72b-instruct
@@ -217,14 +240,6 @@ providers:
     free: false
     rpm_limit: 20
     open_duration_s: 120
-  openrouter-trinity-free:
-    type: openrouter
-    model: arcee-ai/trinity-large-preview:free
-    profile: trinity-large-preview
-    free: true
-    # 400B MoE (13B active). Free until 2026-04-22. Benchmark before expiry.
-    rpm_limit: 20
-    open_duration_s: 120
   lmstudio-30b:
     type: lmstudio
     model: mistral-small-3.2-24b-instruct-2506
@@ -246,7 +261,6 @@ call_sites:
     # paid fallback. Healthy OpenRouter-free models first; NIM last (shared
     # 40 RPM pool, currently flaky).
     - openrouter-gemma4
-    - openrouter-trinity-free
     - nvidia-nim-kimi
     - nvidia-nim-deepseek
     retry_profile: background
@@ -334,6 +348,8 @@ call_sites:
     cc_model: Sonnet
   17_executor_review:
     chain:
+    - nvidia-nim-deepseek
+    - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - openrouter-qwen36plus
     default_paid: true
@@ -347,6 +363,7 @@ call_sites:
   20_adversarial_counterargument:
     chain:
     - openrouter-gpt55
+    - nvidia-nim-deepseek
     - openrouter-deepseek-v4
     - openrouter-qwen36plus
     default_paid: true
@@ -395,7 +412,6 @@ call_sites:
     - gemini-free
     - mistral-large-free
     - openrouter-gemma4
-    - openrouter-trinity-free
     retry_profile: background
   # Adversarial challenge of entity "duplicate" verdicts. Flipped pairing:
   # DeepSeek challenges Kimi's entity judgments.
@@ -463,8 +479,11 @@ call_sites:
     description: Synthesize research results into concise summaries
   38_procedure_extraction:
     chain:
+    - nvidia-nim-deepseek
+    - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - groq-free
+    - mistral-large-free
     default_paid: true
     description: Judge + store procedures from struggle detection and extraction
       pipeline candidates
@@ -476,6 +495,8 @@ call_sites:
     description: "Unified cognitive loop focus selector — picks ego attention direction from pending signals"
   43_task_retrospective:
     chain:
+    - nvidia-nim-deepseek
+    - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - mistral-large-free
     - gemini-free
@@ -483,6 +504,8 @@ call_sites:
     description: Post-execution retrospective learning extraction
   44_task_premortem:
     chain:
+    - nvidia-nim-deepseek
+    - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - mistral-large-free
     - gemini-free
@@ -615,8 +638,23 @@ call_sites:
     default_paid: true
     description: "Contribution pipeline \u2014 evaluates whether a code change is\
       \ already fixed upstream"
+  crag_grade:
+    chain:
+    - openrouter-haiku
+    - mistral-small-free
+    - groq-free
+    - gemini-free
+    default_paid: true
+    retry_profile: user_facing
+    dispatch: api
+    description: "CRAG retrieval grader — scores topical relevance of a recalled\
+      \ memory to the query for selective corrective retrieval\
+      \ (memory_recall/knowledge_recall). Fast cross-vendor chain; the corrective\
+      \ pass fail-fasts (bounded grade step — returns original results if the\
+      \ grader is slow/down) and sheds under REDUCED degradation."
   judge:
     chain:
+    - nvidia-nim-deepseek
     - openrouter-deepseek-v4
     - openrouter-deepseek-v4-flash
     default_paid: true
@@ -624,7 +662,7 @@ call_sites:
     dispatch: api
     description: "LLM-as-judge primitive \u2014 grades outputs against versioned\
       \ rubrics for the eval harness (and, in later phases, CRAG retrieval).\
-      \ Same-family fallback (v4 then v4-flash) for resilience; model_used\
+      \ Free NIM v4-pro first, then paid v4-pro, then v4-flash for resilience; model_used\
       \ is logged per judgment for calibration traceability."
   voice_conversation:
     chain:
@@ -638,18 +676,29 @@ call_sites:
       \ for HA voice assistant. Groq first for speed (~1s), Gemini/Mistral\
       \ as fallbacks."
 retry:
+  # max_total_s: aggregate wall-clock ceiling (seconds) across a single
+  # route_call's retries x chain length. A safety net against pathological
+  # multi-minute hangs, checked only BETWEEN attempts (never interrupts an
+  # in-flight call). It bounds ONE completion's retry-multiplier, NOT Genesis's
+  # cognition (a reflection is many bounded completions). Omit for no cap.
   default:
     max_retries: 3
     base_delay_ms: 500
     max_delay_ms: 30000
+    max_total_s: 300
   user_facing:
     max_retries: 2
     base_delay_ms: 300
     max_delay_ms: 5000
+    max_total_s: 180
   background:
     max_retries: 4
     base_delay_ms: 1000
     max_delay_ms: 60000
+    # Generous safety net only — should never fire in normal operation. Dream /
+    # reflection / ego are exactly where a single completion may legitimately
+    # take a while across failovers; we only stop the pathology, not cognition.
+    max_total_s: 1800
 surplus:
   idle_threshold_minutes: 15
   dispatch_interval_minutes: 5

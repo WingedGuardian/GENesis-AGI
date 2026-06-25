@@ -519,6 +519,56 @@ async def ego_proposal_resolve(
                 user_response=reason or None,
             )
             results[prop["id"]] = status if updated else "not updated"
+            if updated:
+                # Autonomy earn-back: promote on approval / cooldown on reject.
+                try:
+                    from genesis.ego.earnback import handle_earnback_resolution
+                    from genesis.runtime import GenesisRuntime
+
+                    _rt = GenesisRuntime.instance()
+                    await handle_earnback_resolution(
+                        db, prop, status, getattr(_rt, "_autonomy_manager", None),
+                    )
+                except Exception:
+                    logger.debug("earnback resolution hook failed", exc_info=True)
+                # Goal status change: apply pause/deprioritize on approval.
+                try:
+                    from genesis.ego.goal_actions import (
+                        handle_goal_status_change_resolution,
+                    )
+
+                    await handle_goal_status_change_resolution(db, prop, status)
+                except Exception:
+                    logger.debug(
+                        "goal status-change hook failed", exc_info=True,
+                    )
+                # Cell promotion (WS-8 PR-D).
+                try:
+                    from genesis.ego.cell_promotion import (
+                        handle_cell_promotion_resolution,
+                    )
+
+                    await handle_cell_promotion_resolution(db, prop, status)
+                except Exception:
+                    logger.debug("cell promotion hook failed", exc_info=True)
+                # Cognitive variant promotion (Evo PR-B).
+                try:
+                    from genesis.ego.cognitive_variant import (
+                        handle_cognitive_variant_resolution,
+                    )
+
+                    await handle_cognitive_variant_resolution(db, prop, status)
+                except Exception:
+                    logger.debug("cognitive-variant hook failed", exc_info=True)
+                # J-9 regression (informational): mark executed on approval.
+                try:
+                    from genesis.ego.j9_regression_actions import (
+                        handle_j9_regression_resolution,
+                    )
+
+                    await handle_j9_regression_resolution(db, prop, status)
+                except Exception:
+                    logger.debug("j9 regression hook failed", exc_info=True)
 
     resolved = sum(1 for v in results.values() if v in ("approved", "rejected"))
     return {

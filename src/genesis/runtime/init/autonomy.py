@@ -57,6 +57,40 @@ async def init(rt: GenesisRuntime) -> None:
                 event_bus=rt._event_bus,
                 classifier=rt._action_classifier,
             )
+
+            # WS-8: wire the deterministic email autonomy gate into the
+            # (already-built) outreach pipeline. Autonomy init runs AFTER
+            # outreach init, so both the pipeline and the approval manager
+            # exist here — wiring it during outreach init would pass a None
+            # approval manager.
+            if rt._outreach_pipeline is not None:
+                from genesis.autonomy.email_gate import EmailAutonomyGate
+
+                rt._outreach_pipeline.set_autonomy_gate(EmailAutonomyGate(
+                    db=rt._db,
+                    approval_manager=rt._approval_manager,
+                    event_bus=rt._event_bus,
+                ))
+                logger.info("Email autonomy gate wired into outreach pipeline")
+
+                # WS-8 PR-D: muted-by-default owner notification for autonomous
+                # sends — toggled via config/autonomy.yaml `email_send_notify`.
+                try:
+                    from pathlib import Path
+
+                    import yaml
+
+                    import genesis as _genesis
+                    _cfg = (
+                        Path(_genesis.__file__).resolve().parents[2]
+                        / "config" / "autonomy.yaml"
+                    )
+                    _data = yaml.safe_load(_cfg.read_text()) if _cfg.exists() else {}
+                    _notify = bool((_data or {}).get("email_send_notify", False))
+                except Exception:
+                    _notify = False
+                rt._outreach_pipeline.set_autonomous_send_notify(_notify)
+
             rt._autonomous_cli_policy_exporter = AutonomousCliPolicyExporter()
             if rt._router is not None:
                 rt._autonomous_cli_approval_gate = AutonomousCliApprovalGate(

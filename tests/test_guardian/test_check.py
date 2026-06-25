@@ -9,6 +9,7 @@ import pytest
 
 from genesis.guardian.check import (
     _build_dispatcher,
+    _execute_recovery_with_approval,
     _handle_cc_resolved,
     _handle_confirmed_dead,
     _handle_healthy,
@@ -273,6 +274,22 @@ def _resolved_diagnosis() -> DiagnosisResult:
     )
 
 
+def _proposed_diagnosis(
+    action: RecoveryAction = RecoveryAction.RESTART_SERVICES,
+) -> DiagnosisResult:
+    """Propose-only diagnosis: CC investigated and PROPOSES an action (never acts)."""
+    return DiagnosisResult(
+        likely_cause="server process crashed",
+        confidence_pct=80,
+        evidence=[],
+        recommended_action=action,
+        reasoning="proposed for approval",
+        source="cc",
+        outcome="proposed",
+        actions_taken=[],
+    )
+
+
 def _seed_state(config: GuardianConfig, **fields) -> Path:
     """Write a minimal state.json so run_check loads it (from_dict fills defaults)."""
     import json
@@ -490,8 +507,18 @@ class TestGuardianAlertOnce:
         assert sm.state.down_alert_sent is False  # un-marked → next tick retries
 
     @pytest.mark.asyncio
-    async def test_cc_resolved_recovery_clears_flag(self, config: GuardianConfig) -> None:
-        """CC-auto-resolved recovery clears the flag at its recovery point (no leak)."""
+    async def test_cc_resolved_is_firewalled_not_auto_confirmed(
+        self, config: GuardianConfig
+    ) -> None:
+        """Propose-only firewall: a CC 'resolved' claim is NOT trusted.
+
+        Under propose-only mode CC must never self-resolve. If it does anyway
+        (a regression / stale response), `_handle_cc_resolved` must route to the
+        approval gate and never auto-confirm recovery. With no Telegram channel
+        (MagicMock dispatcher → empty `_channels`), the gate falls back to a
+        manual-intervention alert and does NOT auto-recover: state stays
+        CONFIRMED_DEAD and the storm-suppression flag is retained (it clears only
+        on genuine recovery — covered by the autonomous-recovery test above)."""
         sm = ConfirmationStateMachine(config)
         sm._state.current_state = GuardianState.CONFIRMED_DEAD
         sm._state.down_alert_sent = True
@@ -499,20 +526,28 @@ class TestGuardianAlertOnce:
         dispatcher = MagicMock()
         dispatcher.send = AsyncMock()
         recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
 
-        with (
-            patch(
-                "genesis.guardian.check.collect_all_signals",
-                AsyncMock(return_value=_healthy_snapshot()),
-            ),
-            patch("asyncio.sleep", new_callable=AsyncMock),
+        with patch(
+            "genesis.guardian.check.collect_all_signals",
+            AsyncMock(return_value=_dead_snapshot()),
         ):
             await _handle_cc_resolved(
                 config, sm, dispatcher, _resolved_diagnosis(), recovery_engine
             )
 
-        assert sm.current_state == GuardianState.HEALTHY
-        assert sm.state.down_alert_sent is False
+        # The untrusted "resolved" claim must NOT trigger auto-recovery...
+        recovery_engine.execute.assert_not_called()
+        # ...nor flip the system healthy on CC's say-so...
+        assert sm.current_state == GuardianState.CONFIRMED_DEAD
+        # ...and the episode stays open (storm stays suppressed; clears on real recovery).
+        assert sm.state.down_alert_sent is True
+        # A manual-intervention alert must have fired (no Telegram approval channel).
+        titles = _alert_titles(dispatcher)
+        assert any(
+            "approval gate unavailable" in t.lower() or "no telegram" in t.lower()
+            for t in titles
+        ), f"expected manual-intervention alert; got {titles}"
 
     @pytest.mark.asyncio
     async def test_full_episode_is_two_pings_regardless_of_duration(
@@ -570,3 +605,244 @@ class TestGuardianAlertOnce:
         titles = _alert_titles(mock_dispatcher)
         restored = [t for t in titles if "restored" in t.lower() or "recovered" in t.lower()]
         assert len(restored) == 1, f"expected exactly one restored ping; titles={titles}"
+
+
+def _mock_gate_channel(poll_returns: object) -> MagicMock:
+    """Mock TelegramAlertChannel for the approval gate.
+
+    `send_text` returns a truthy message_id (the poll target is mocked, so the
+    exact id is irrelevant). `poll_for_keyword` yields `poll_returns` — a single
+    str (every gate gets it) or a list (one value consumed per gate).
+    """
+    channel = MagicMock()
+    channel.send_text = AsyncMock(return_value=1)
+    if isinstance(poll_returns, (list, tuple)):
+        channel.poll_for_keyword = AsyncMock(side_effect=list(poll_returns))
+    else:
+        channel.poll_for_keyword = AsyncMock(return_value=poll_returns)
+    return channel
+
+
+class TestTwoGateApproval:
+    """`_execute_recovery_with_approval` — gate everything: no recovery without an
+    APPROVE reply to BOTH gates; self-cancel on genuine recovery; no fixed timeout."""
+
+    def _sm(self, config: GuardianConfig) -> ConfirmationStateMachine:
+        sm = ConfirmationStateMachine(config)
+        sm._state.current_state = GuardianState.CONFIRMED_DEAD
+        sm._state.down_alert_sent = True
+        sm._state.first_failure_at = _now_iso()
+        return sm
+
+    @pytest.mark.asyncio
+    async def test_approve_then_approve_executes(self, config: GuardianConfig) -> None:
+        """APPROVE at both gates → the proposed action runs exactly once."""
+        sm = self._sm(config)
+        channel = _mock_gate_channel(["APPROVE", "APPROVE"])
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock()
+        recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
+
+        with (
+            patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+            patch("genesis.guardian.check.collect_all_signals",
+                  AsyncMock(return_value=_dead_snapshot())),
+            patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
+            patch("genesis.guardian.check.write_diagnosis_result"),
+            patch.object(DiagnosisEngine, "diagnose",
+                         AsyncMock(return_value=_proposed_diagnosis())),
+        ):
+            await _execute_recovery_with_approval(
+                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+            )
+
+        recovery_engine.execute.assert_awaited_once()
+        assert channel.poll_for_keyword.await_count == 2  # one reply per gate
+        # _execute_recovery_with_approval delegates flag-clearing to the recovery
+        # engine (which clears only on VERIFIED recovery). On APPROVE it must NOT
+        # clear the flag itself — recovery_engine is mocked here, so it stays set.
+        assert sm.state.down_alert_sent is True
+
+    @pytest.mark.asyncio
+    async def test_deny_at_gate1_does_not_execute(self, config: GuardianConfig) -> None:
+        """DENY at Gate 1 → never diagnose, never execute, episode flag cleared."""
+        sm = self._sm(config)
+        channel = _mock_gate_channel("DENY")
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock()
+        recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
+
+        with (
+            patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+            patch("genesis.guardian.check.collect_all_signals",
+                  AsyncMock(return_value=_dead_snapshot())),
+            patch.object(DiagnosisEngine, "diagnose", AsyncMock()) as diag,
+        ):
+            await _execute_recovery_with_approval(
+                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+            )
+
+        recovery_engine.execute.assert_not_called()
+        diag.assert_not_called()  # DENY at gate 1 → no diagnosis run
+        assert sm.state.down_alert_sent is False  # episode closed → next tick re-diagnoses
+
+    @pytest.mark.asyncio
+    async def test_deny_at_gate2_does_not_execute(self, config: GuardianConfig) -> None:
+        """APPROVE Gate 1 (diagnose) then DENY Gate 2 → action NOT executed."""
+        sm = self._sm(config)
+        channel = _mock_gate_channel(["APPROVE", "DENY"])
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock()
+        recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
+
+        with (
+            patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+            patch("genesis.guardian.check.collect_all_signals",
+                  AsyncMock(return_value=_dead_snapshot())),
+            patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
+            patch("genesis.guardian.check.write_diagnosis_result"),
+            patch.object(DiagnosisEngine, "diagnose",
+                         AsyncMock(return_value=_proposed_diagnosis())),
+        ):
+            await _execute_recovery_with_approval(
+                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+            )
+
+        recovery_engine.execute.assert_not_called()
+        assert sm.state.down_alert_sent is False
+
+    @pytest.mark.asyncio
+    async def test_self_recovery_stands_down_without_executing(
+        self, config: GuardianConfig,
+    ) -> None:
+        """Health returns while waiting at Gate 1 → stand down: no poll, no
+        execution, flag cleared (the no-timeout self-cancel)."""
+        sm = self._sm(config)
+        channel = _mock_gate_channel("APPROVE")  # would approve, but never polled
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock()
+        recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
+
+        with (
+            patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+            patch("genesis.guardian.check.collect_all_signals",
+                  AsyncMock(return_value=_healthy_snapshot())),
+        ):
+            await _execute_recovery_with_approval(
+                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+            )
+
+        recovery_engine.execute.assert_not_called()
+        channel.poll_for_keyword.assert_not_awaited()  # recovered before reading a reply
+        assert sm.state.down_alert_sent is False
+
+    @pytest.mark.asyncio
+    async def test_escalate_executes_without_a_gate(self, config: GuardianConfig) -> None:
+        """ESCALATE = no safe automated action → execute (manual alert) with NO
+        approval gate (nothing to approve)."""
+        sm = self._sm(config)
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock()
+        recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
+
+        with patch("genesis.guardian.check._find_telegram_channel") as find:
+            await _execute_recovery_with_approval(
+                config, sm, dispatcher, recovery_engine,
+                _proposed_diagnosis(RecoveryAction.ESCALATE),
+            )
+
+        recovery_engine.execute.assert_awaited_once()
+        find.assert_not_called()  # ESCALATE short-circuits before the gate
+
+    @pytest.mark.asyncio
+    async def test_no_telegram_channel_never_auto_recovers(
+        self, config: GuardianConfig,
+    ) -> None:
+        """No Telegram channel → alert for manual action, NEVER auto-recover."""
+        sm = self._sm(config)
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock()
+        recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
+
+        with (
+            patch("genesis.guardian.check._find_telegram_channel", return_value=None),
+            patch("genesis.guardian.check.collect_all_signals",
+                  AsyncMock(return_value=_dead_snapshot())),
+        ):
+            await _execute_recovery_with_approval(
+                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+            )
+
+        recovery_engine.execute.assert_not_called()
+        titles = _alert_titles(dispatcher)
+        assert any(
+            "approval gate unavailable" in t.lower() or "no telegram" in t.lower()
+            for t in titles
+        ), f"expected manual-intervention alert; got {titles}"
+
+    @pytest.mark.asyncio
+    async def test_gate1_send_failure_clears_flag_for_retry(
+        self, config: GuardianConfig,
+    ) -> None:
+        """A failed Gate-1 prompt send must NOT permanently mute the Guardian: a
+        failed delivery isn't a successful 'alert once', so the flag is cleared and
+        the next cycle retries (recovers from a transient Telegram failure)."""
+        sm = self._sm(config)
+        channel = MagicMock()
+        channel.send_text = AsyncMock(return_value=None)  # send fails
+        channel.poll_for_keyword = AsyncMock()
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock()
+        recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
+
+        with (
+            patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+            patch("genesis.guardian.check.collect_all_signals",
+                  AsyncMock(return_value=_dead_snapshot())),
+        ):
+            await _execute_recovery_with_approval(
+                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+            )
+
+        recovery_engine.execute.assert_not_called()
+        channel.poll_for_keyword.assert_not_awaited()  # never reached the poll
+        assert sm.state.down_alert_sent is False  # cleared → next cycle retries
+
+    @pytest.mark.asyncio
+    async def test_gate2_send_failure_clears_flag_for_retry(
+        self, config: GuardianConfig,
+    ) -> None:
+        """APPROVE Gate 1, then the Gate-2 prompt send fails → no execution, and
+        the flag is cleared so the next cycle retries instead of going silent."""
+        sm = self._sm(config)
+        channel = MagicMock()
+        # gate1 prompt ok, "Diagnosing…" ok, gate2 prompt FAILS (None)
+        channel.send_text = AsyncMock(side_effect=[1, 111, None])
+        channel.poll_for_keyword = AsyncMock(return_value="APPROVE")
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock()
+        recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
+
+        with (
+            patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+            patch("genesis.guardian.check.collect_all_signals",
+                  AsyncMock(return_value=_dead_snapshot())),
+            patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
+            patch("genesis.guardian.check.write_diagnosis_result"),
+            patch.object(DiagnosisEngine, "diagnose",
+                         AsyncMock(return_value=_proposed_diagnosis())),
+        ):
+            await _execute_recovery_with_approval(
+                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+            )
+
+        recovery_engine.execute.assert_not_called()
+        assert sm.state.down_alert_sent is False

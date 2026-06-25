@@ -120,10 +120,11 @@ class ProcedureMatch:
     failure_count: int
     failure_modes: list[dict]
     workarounds: list[dict]
-    activation_tier: str = "L4"
+    activation_tier: str = "DORMANT"
     tool_trigger: list[str] | None = None
     steps: list[str] | None = None
     principle: str | None = None
+    invocation_count: int = 0
 
 
 @dataclass(frozen=True)

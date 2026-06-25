@@ -125,6 +125,9 @@ def test_load_full_yaml(monkeypatch):
     # (cerebras disabled 2026-06 — reasoning-only models incompatible;
     # openrouter-deepseek-r1 removed entirely 2026-05-24;
     # nvidia-nim-deepseek + nvidia-nim-kimi added 2026-05-25)
+    # 2026-06-23: 28 → 29 after groq-oss-120b added (free reasoning option,
+    # not yet wired into any chain).
+    # 2026-06-23 (WS2b): 29 → 28 after removing expired openrouter-trinity-free.
     assert len(cfg.providers) == 28
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
@@ -142,7 +145,9 @@ def test_load_full_yaml(monkeypatch):
     # 2026-05-24: 49 → 48 after models_md_synthesis removed (converted to CC session dispatch).
     # 2026-05-29: 48 → 49 after dream_cycle_entity_check added (Sprint 2).
     # 2026-06-06: 49 → 51 after dream_cycle_synthesis_challenge + dream_cycle_entity_challenge (immune system PR).
-    assert len(cfg.call_sites) == 51
+    # 2026-06-20: 51 → 52 after crag_grade added (W-CRAG selective corrective retrieval, PR #711).
+    assert len(cfg.call_sites) == 52
+    assert "crag_grade" in cfg.call_sites  # W-CRAG runtime grader (2026-06-20)
     assert "models_md_synthesis" not in cfg.call_sites  # removed 2026-05-24
     assert "2_triage" not in cfg.call_sites  # removed 2026-05-10
     assert "7_task_retrospective" not in cfg.call_sites  # removed 2026-05-10 (duplicate; live one is 43_task_retrospective)
@@ -151,8 +156,11 @@ def test_load_full_yaml(monkeypatch):
     assert cfg.call_sites["5_deep_reflection"].default_paid is True
     assert cfg.call_sites["36_code_auditor"].never_pays is False
     assert cfg.call_sites["37_infrastructure_monitor"].default_paid is True
-    # judge: LLM-as-judge eval primitive — same-family fallback, paid-by-default
-    assert cfg.call_sites["judge"].chain == ["openrouter-deepseek-v4", "openrouter-deepseek-v4-flash"]
+    # judge: LLM-as-judge eval primitive — free NIM v4-pro first, then paid v4-pro,
+    # then v4-flash; paid-by-default
+    assert cfg.call_sites["judge"].chain == [
+        "nvidia-nim-deepseek", "openrouter-deepseek-v4", "openrouter-deepseek-v4-flash"
+    ]
     assert cfg.call_sites["judge"].default_paid is True
     assert cfg.call_sites["judge"].dispatch == "api"
 
@@ -471,3 +479,36 @@ def test_dispatch_unknown_falls_back_to_dual():
 def test_dispatch_case_insensitive():
     cfg = load_config_from_string(_DISPATCH_YAML)
     assert cfg.call_sites["upper_site"].dispatch == "cli"
+
+
+# ---------------------------------------------------------------------------
+# Per-provider ``params`` (extra litellm kwargs) parsing.
+# ---------------------------------------------------------------------------
+
+
+def test_provider_params_parsed():
+    """A provider with a ``params:`` block (e.g. Groq gpt-oss reasoning
+    controls) must parse into ProviderConfig.params verbatim. A provider
+    without one must get params=None."""
+    cfg = load_config_from_string("""\
+providers:
+  gpt_oss:
+    type: groq
+    model: openai/gpt-oss-20b
+    free: true
+    params:
+      extra_body:
+        include_reasoning: false
+        reasoning_effort: low
+  plain:
+    type: ollama
+    model: m
+    free: true
+call_sites:
+  s:
+    chain: [gpt_oss, plain]
+""")
+    assert cfg.providers["gpt_oss"].params == {
+        "extra_body": {"include_reasoning": False, "reasoning_effort": "low"},
+    }
+    assert cfg.providers["plain"].params is None

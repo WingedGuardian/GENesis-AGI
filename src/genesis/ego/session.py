@@ -36,6 +36,7 @@ from genesis.ego.types import (
     EgoCycle,
 )
 from genesis.observability.session_context import set_session_id as _set_obs_session
+from genesis.observability.spans import SpanKind, start_span
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -56,6 +57,22 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PROMPT_PATH = Path(__file__).resolve().parent.parent / "identity" / "EGO_SESSION.md"
 _DEFAULT_CALL_SITE = "7_ego_cycle"
 _DEFAULT_FOCUS_SUMMARY_KEY = "ego_focus_summary"
+
+# Action_types that are applied + marked 'executed' by their resolution handler
+# at approval time and must NEVER be auto-dispatched as a background session.
+# Single source of truth for BOTH dispatch paths (the approved-sweep and the
+# execution-briefs path). cognitive_variant_promotion (Evo prompt promotion) is
+# also hard-blocked by the autonomy domain gate (SELF_MODIFY) — this is
+# defense-in-depth that holds even if that gate is absent or fails open.
+_NEVER_DISPATCH_ACTION_TYPES = (
+    "autonomy_earnback",
+    "goal_status_change",
+    "cell_promotion",
+    "cognitive_variant_promotion",
+    # j9_regression is informational (NOTIFY_USER); its handler marks it executed
+    # on approval. Blocklisted so it can never be dispatched as a session.
+    "j9_regression",
+)
 
 
 class CycleBlockedError(Exception):
@@ -162,6 +179,34 @@ class EgoSession:
     # -- Public API --------------------------------------------------------
 
     async def run_unified_cycle(
+        self,
+        signals: list[EgoSignal],
+        *,
+        model_override: str | None = None,
+        effort_override: str | None = None,
+    ) -> EgoCycle | None:
+        """Execute one ego cycle (traced).
+
+        Opens an ``ego.cycle`` span so the LLM/CC spans this cycle triggers nest
+        under it. Best-effort — a no-op when capture is disabled; never alters
+        ego behavior. A gate-blocked cycle (CycleBlockedError) closes the span
+        with error status and re-raises, unchanged.
+        """
+        with start_span(
+            "ego.cycle",
+            SpanKind.OPERATION,
+            attributes={"signals": len(signals)},
+        ) as span:
+            result = await self._run_unified_cycle_inner(
+                signals,
+                model_override=model_override,
+                effort_override=effort_override,
+            )
+            with contextlib.suppress(Exception):
+                span.set_attr("produced_cycle", result is not None)
+            return result
+
+    async def _run_unified_cycle_inner(
         self,
         signals: list[EgoSignal],
         *,
@@ -433,12 +478,23 @@ class EgoSession:
         recommendation: str,
         assessment: str,
     ) -> None:
-        """Surface a goal status recommendation as an observation.
+        """Route the ego's goal status recommendation to the user.
 
-        The ego assesses; the user decides. Recommendations appear in the
-        user's morning report and may trigger Telegram notifications via
-        the outreach pipeline.
+        Recommend-only — nothing is applied autonomously. The reversible
+        recommendations (``pause`` / ``deprioritize``) become an *approvable*
+        ``goal_status_change`` proposal applied ONLY on user approval (see
+        ``ego/goal_actions.py``). Terminal/other recommendations (``close`` →
+        achieve vs abandon) stay a passive observation — that call is genuinely
+        the user's. The ego assesses; the user decides.
         """
+        if recommendation in ("pause", "deprioritize"):
+            await self._propose_goal_status_change(
+                goal_id=goal_id,
+                recommendation=recommendation,
+                assessment=assessment,
+            )
+            return
+
         import uuid
 
         from genesis.db.crud import observations as obs_crud
@@ -471,6 +527,79 @@ class EgoSession:
         except Exception:
             logger.warning(
                 "Failed to surface goal recommendation", exc_info=True,
+            )
+
+    async def _propose_goal_status_change(
+        self,
+        *,
+        goal_id: str,
+        recommendation: str,
+        assessment: str,
+    ) -> None:
+        """Create an approvable ``goal_status_change`` proposal (recommend-only).
+
+        Delivered out-of-band via the proposal workflow (``create_batch`` +
+        ``send_digest``), bypassing the realist gate — mirrors how autonomy
+        earn-back proposals are surfaced. The change is applied ONLY when the
+        user approves the proposal (``ego/goal_actions.py``), never here.
+        """
+        try:
+            from genesis.db.crud import user_goals
+
+            # Anti-spam: don't stack a second status-change proposal on a goal
+            # that already has one open (pending or awaiting dispatch-approval).
+            if await ego_crud.has_open_goal_status_change(self._db, goal_id):
+                logger.info(
+                    "goal_status_change already open for %s — skipping",
+                    goal_id[:12],
+                )
+                return
+
+            goal = await user_goals.get_by_id(self._db, goal_id)
+            title = (goal.get("title") or "?") if goal else "?"
+
+            if recommendation == "pause":
+                change, value, verb = "status", "paused", "Pause"
+            else:  # deprioritize — drop priority one notch (reversible)
+                current = (goal.get("priority") or "medium") if goal else "medium"
+                lower = {
+                    "critical": "high", "high": "medium",
+                    "medium": "low", "low": "low",
+                }
+                value, change, verb = lower.get(current, "low"), "priority", "Deprioritize"
+
+            prop = {
+                "action_type": "goal_status_change",
+                "action_category": "goal_management",
+                "content": (
+                    f"{verb} goal '{title}'.\n\n"
+                    f"Assessment: {assessment[:400]}\n\n"
+                    f"Approve to apply ({change} → {value}); reject to keep as-is."
+                ),
+                "rationale": (
+                    "Goal-review recommendation on a stale/stuck goal. "
+                    "Recommend-only — applied only if you approve."
+                ),
+                "confidence": 0.7,
+                "urgency": "low",
+                "goal_id": goal_id,
+                "expected_outputs": {"change": change, "value": value},
+            }
+
+            batch_id, ids, _ = await self._proposals.create_batch(
+                [prop], ego_source=self._source_tag,
+            )
+            if ids:
+                await self._proposals.send_digest(
+                    batch_id, ego_source=self._source_tag,
+                )
+                logger.info(
+                    "Goal status-change proposal surfaced: %s %s→%s",
+                    goal_id[:12], change, value,
+                )
+        except Exception:
+            logger.warning(
+                "Failed to surface goal status-change proposal", exc_info=True,
             )
 
     # -- Output processing --------------------------------------------------
@@ -989,58 +1118,14 @@ class EgoSession:
             logger.warning("Realist filter failed, passing through", exc_info=True)
             filtered = proposals  # fail-open: use unfiltered list
 
-        # Quality gate (Verified Autonomy L3) — runs AFTER realist gate.
-        # Placed outside the realist try-except so a quality gate failure
-        # cannot accidentally undo realist rejections. _quality_gate has
-        # its own fail-open error handling.
-        filtered = await self._quality_gate(filtered)
+        # The realist (Opus) is the sole proposal quality gate. A separate
+        # LLM-judge "quality gate" used to run here, but it was an eval-harness
+        # primitive mis-applied as a realist-for-the-realist: redundant with the
+        # Opus realist, it only filtered digest visibility (never execution), and
+        # on a fragile judge chain it silently quarantined every proposal during a
+        # provider outage. Removed. The eval harness still uses that judge; the
+        # proposal pipeline does not. Do NOT re-add a judge gate here.
         return filtered
-
-    async def _quality_gate(self, proposals: list[dict]) -> list[dict]:
-        """Score proposals for coherence/relevance/completeness.
-
-        Proposals below threshold get ``_realist_verdict = "quality_hold"``
-        and stay in the list (stored in DB) but ``send_digest()`` skips them.
-        Fails open: any error passes all proposals through.
-        """
-        if not proposals or not self._router:
-            return proposals
-
-        try:
-            from genesis.eval.scorers import get_scorer
-            from genesis.eval.types import ScorerType
-
-            scorer = get_scorer(ScorerType.OUTPUT_QUALITY)
-            scorer.set_router(self._router)
-
-            held_count = 0
-            for p in proposals:
-                try:
-                    passed, score, detail = await scorer.score_async(
-                        actual=(
-                            f"{p.get('content', '')}\n\n"
-                            f"Rationale: {p.get('rationale', '')}"
-                        ),
-                        expected="autonomous proposal",
-                        config={"rubric_name": "output_quality"},
-                    )
-                    if not passed:
-                        p["_realist_verdict"] = "quality_hold"
-                        p["_realist_reasoning"] = (
-                            f"Quality score {score:.2f} below threshold. {detail[:300]}"
-                        )
-                        held_count += 1
-                except Exception:
-                    logger.debug("Quality scoring failed for proposal, passing", exc_info=True)
-
-            if held_count:
-                logger.info(
-                    "Quality gate: held %d/%d proposals", held_count, len(proposals),
-                )
-        except Exception:
-            logger.warning("Quality gate failed, passing all proposals", exc_info=True)
-
-        return proposals
 
     # Genesis ego allowed action categories (infrastructure/operations only)
     _GENESIS_EGO_ALLOWED_CATEGORIES = frozenset({
@@ -1237,6 +1322,14 @@ class EgoSession:
                 )
                 if delivery:
                     logger.info("Ego digest sent (delivery_id=%s)", delivery)
+                else:
+                    logger.warning(
+                        "Ego digest NOT delivered for batch %s (send_digest "
+                        "returned None): proposals stored but undelivered — "
+                        "check for all-quality_held, digest rate-limit, or a "
+                        "topic-send failure.",
+                        batch_id,
+                    )
             else:
                 logger.info(
                     "Ego decided stay_quiet — batch %s stored only",
@@ -1269,6 +1362,29 @@ class EgoSession:
             proposal_id = brief.get("proposal_id", "")
             prompt = brief.get("prompt", "")
             if not proposal_id or not prompt:
+                continue
+
+            # Never-dispatch guard (defense-in-depth, gate-independent): the
+            # approved-sweep path has an action_type blocklist; this path did
+            # not. Apply-at-approval action_types (resolved + marked 'executed'
+            # by their handler) must NEVER be auto-run as a session — this holds
+            # even if the autonomy gate below is absent or fails open. On a load
+            # failure we skip (conservative): we can't confirm it's safe.
+            try:
+                _brief_prop = await ego_crud.get_proposal(self._db, proposal_id)
+            except Exception:
+                logger.warning(
+                    "Execution brief %s: proposal load failed (blocklist check) — skipping",
+                    proposal_id, exc_info=True,
+                )
+                continue
+            if (_brief_prop is not None
+                    and _brief_prop.get("action_type") in _NEVER_DISPATCH_ACTION_TYPES):
+                logger.info(
+                    "Execution brief %s skipped — action_type %r is apply-at-approval "
+                    "(never dispatched as a session)",
+                    proposal_id, _brief_prop.get("action_type"),
+                )
                 continue
 
             # Append content firewall rules to ego-authored dispatch prompt.
@@ -1518,6 +1634,13 @@ class EgoSession:
             if not isinstance(notif, dict):
                 continue
             content = notif.get("content", "").strip()
+            # Strip one layer of matched wrapping quotes (straight or smart) —
+            # the ego LLM sometimes wraps its whole message in literal quote
+            # characters, which then render verbatim in the user's DM.
+            if len(content) >= 2 and (content[0], content[-1]) in (
+                ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"),
+            ):
+                content = content[1:-1].strip()
             if not content:
                 continue
             # Cap content length to prevent runaway LLM output from
@@ -1688,6 +1811,12 @@ class EgoSession:
 
         dispatched: list[str] = []
         for prop in approved:
+            # Autonomy earn-back and goal-status-change proposals are resolved
+            # (applied + marked executed) at approval time and must NEVER be
+            # dispatched as a session. Defense-in-depth in case one is still
+            # 'approved' here.
+            if prop.get("action_type") in _NEVER_DISPATCH_ACTION_TYPES:
+                continue
             # Staleness guard — skip proposals approved more than 7 days ago.
             # Proposals go stale by clock only as a safety net; semantic
             # staleness (premise invalid) is the ego's job to evaluate.

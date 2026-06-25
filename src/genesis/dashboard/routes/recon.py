@@ -1,12 +1,16 @@
-"""Recon findings and code audit routes."""
+"""Recon findings, code audit, and watchlist routes."""
 
 from __future__ import annotations
 
 import json
+import logging
 
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
+from genesis.dashboard.auth import is_authenticated
+
+logger = logging.getLogger(__name__)
 
 
 @blueprint.route("/api/genesis/recon/findings")
@@ -46,3 +50,54 @@ async def recon_findings():
         results.append(finding)
 
     return jsonify(results)
+
+
+# ── Tracked-repo watchlist (recon) ────────────────────────────────────
+# The list (base + install overlay) is non-sensitive and readable; mutations
+# write the gitignored overlay and are gated behind dashboard auth (a no-op
+# when no password is configured). The recon MCP tool stays read-only by
+# design, so the editor is the only write surface.
+
+@blueprint.route("/api/genesis/recon/watchlist")
+def recon_watchlist_list():
+    """Annotated watchlist entries (base + overlay, with source/disabled)."""
+    from genesis.recon import watchlist
+    try:
+        return jsonify({"entries": watchlist.list_entries()})
+    except Exception:
+        logger.error("Failed to list watchlist", exc_info=True)
+        return jsonify({"entries": []})
+
+
+@blueprint.route("/api/genesis/recon/watchlist", methods=["POST"])
+def recon_watchlist_add():
+    """Add an install-specific tracked repo to the overlay."""
+    if not is_authenticated():
+        return jsonify({"error": "authentication required"}), 401
+    from genesis.recon import watchlist
+    result = watchlist.add_repo(request.get_json(silent=True) or {})
+    return (jsonify(result), 422) if "error" in result else jsonify(result)
+
+
+@blueprint.route("/api/genesis/recon/watchlist/disable", methods=["POST"])
+def recon_watchlist_disable():
+    """Disable/re-enable a BASE watchlist entry (tombstone in the overlay)."""
+    if not is_authenticated():
+        return jsonify({"error": "authentication required"}), 401
+    from genesis.recon import watchlist
+    data = request.get_json(silent=True) or {}
+    repo = str(data.get("repo") or "").strip()
+    result = watchlist.set_base_disabled(repo, bool(data.get("disabled", True)))
+    return (jsonify(result), 422) if "error" in result else jsonify(result)
+
+
+@blueprint.route("/api/genesis/recon/watchlist", methods=["DELETE"])
+def recon_watchlist_remove():
+    """Remove an install-added repo from the overlay (base entries: disable)."""
+    if not is_authenticated():
+        return jsonify({"error": "authentication required"}), 401
+    from genesis.recon import watchlist
+    data = request.get_json(silent=True) or {}
+    repo = str(data.get("repo") or "").strip()
+    result = watchlist.remove_overlay_repo(repo)
+    return (jsonify(result), 422) if "error" in result else jsonify(result)

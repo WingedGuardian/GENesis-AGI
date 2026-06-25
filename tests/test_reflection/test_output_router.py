@@ -246,6 +246,25 @@ class TestRouteAssessment:
         md_files = glob.glob(str(tmp_path / "reflections" / "**" / "*.md"), recursive=True)
         assert len(md_files) == 1
 
+    @pytest.mark.asyncio
+    async def test_returns_empty_string_on_dedup(self, db, router):
+        """self_assessment has no supersession (it's a historical ledger the
+        maturity-cohort metric reads), so an identical assessment two cycles
+        running genuinely content-hash dedups. route_assessment must honor its
+        `-> str` contract and return '' — never leak None to callers."""
+        output = WeeklyAssessmentOutput(overall_score=0.8, observations=["steady"])
+        first = await router.route_assessment(output, db)
+        second = await router.route_assessment(output, db)
+
+        assert first          # real id on first write
+        assert second == ""   # deduped → empty string, NOT None
+
+        # Ledger semantics preserved: still exactly one self_assessment row.
+        rows = (await (await db.execute(
+            "SELECT count(*) FROM observations WHERE type='self_assessment'"
+        )).fetchone())[0]
+        assert rows == 1
+
 
 class TestRouteCalibration:
     @pytest.mark.asyncio
@@ -272,6 +291,78 @@ class TestRouteCalibration:
         rows = await cursor.fetchall()
         assert len(rows) == 1
         assert dict(rows[0])["priority"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_clean_cycle_clears_standing_drift(self, db, router):
+        """A clean (non-drift) calibration resolves a prior standing
+        quality_drift — resolve-on-recovery, so it stops surfacing."""
+        await router.route_calibration(
+            QualityCalibrationOutput(drift_detected=True, observations=["drift 1"]), db,
+        )
+        await router.route_calibration(
+            QualityCalibrationOutput(drift_detected=False), db,
+        )
+        unresolved = (await (await db.execute(
+            "SELECT count(*) FROM observations "
+            "WHERE type='quality_drift' AND resolved=0"
+        )).fetchone())[0]
+        assert unresolved == 0
+
+    @pytest.mark.asyncio
+    async def test_fresh_drift_supersedes_prior(self, db, router):
+        """Two consecutive drift cycles leave only the latest drift unresolved."""
+        await router.route_calibration(
+            QualityCalibrationOutput(drift_detected=True, observations=["drift 1"]), db,
+        )
+        await router.route_calibration(
+            QualityCalibrationOutput(drift_detected=True, observations=["drift 2"]), db,
+        )
+        unresolved = (await (await db.execute(
+            "SELECT count(*) FROM observations "
+            "WHERE type='quality_drift' AND resolved=0"
+        )).fetchone())[0]
+        assert unresolved == 1
+
+    @pytest.mark.asyncio
+    async def test_unchanged_clean_calibration_writes_fresh_row(self, db, router):
+        """An unchanged (byte-identical) clean calibration two cycles running must
+        still write a *fresh* this-week row. The prior identical row is superseded
+        first, so content-hash dedup can't suppress the write and leave the weekly
+        scheduler guard (_already_ran_this_week, which looks for a this-week row)
+        unable to see the run. Returns a real id both times, never None."""
+        output = QualityCalibrationOutput(drift_detected=False, observations=["all good"])
+        first = await router.route_calibration(output, db)
+        second = await router.route_calibration(output, db)
+
+        # Contract: a real id both times; the second is a genuinely new row.
+        assert first
+        assert second
+        assert second != first
+
+        # Exactly one UNRESOLVED quality_calibration row (the latest); the prior
+        # identical one was resolved (superseded), not deduped into oblivion.
+        unresolved = (await (await db.execute(
+            "SELECT count(*) FROM observations "
+            "WHERE type='quality_calibration' AND resolved=0"
+        )).fetchone())[0]
+        assert unresolved == 1
+        total = (await (await db.execute(
+            "SELECT count(*) FROM observations WHERE type='quality_calibration'"
+        )).fetchone())[0]
+        assert total == 2
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_string_when_write_dedups(self, db, router):
+        """If `_write_observation` ever dedups to None (a path supersession makes
+        structurally unreachable on the normal single-writer path), route_calibration
+        still honors its `-> str` contract. Mocked to test the guard in isolation."""
+        from unittest.mock import AsyncMock
+
+        router._write_observation = AsyncMock(return_value=None)
+        result = await router.route_calibration(
+            QualityCalibrationOutput(drift_detected=False), db,
+        )
+        assert result == ""
 
 
 # ── Reflection summary embedding tests ────────────────────────────────

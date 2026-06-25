@@ -29,8 +29,9 @@ class TestDetectPendingWork:
     async def test_no_pending_work_empty_db(self, db, gatherer):
         pending = await gatherer.detect_pending_work(db)
         assert not pending.memory_consolidation
-        assert pending.cost_reconciliation  # always true
-        assert not pending.has_any_work or pending.cost_reconciliation
+        # Cost reconciliation removed (2026-06): cost is observability, not a
+        # reflection job — the field no longer exists on PendingWorkSummary.
+        assert not hasattr(pending, "cost_reconciliation")
 
     @pytest.mark.asyncio
     async def test_memory_consolidation_below_threshold(self, db, gatherer):
@@ -157,6 +158,61 @@ class TestGatherForAssessment:
         assert "learning_velocity" in data
         assert "resource_efficiency" in data
         assert "blind_spots" in data
+
+
+class TestReflectionQualityCohort:
+    """Dimension 1 uses an age-fair 3-10 day maturity cohort (not a LIMIT-50
+    recency window), counts influence only among retrieved observations, and
+    abstains when the cohort is too small to score."""
+
+    async def _insert_deep_obs(self, db, *, days_ago, retrieved=0, influenced=0):
+        created = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+        await db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, content, priority, created_at, "
+            "retrieved_count, influenced_action) "
+            "VALUES (?, 'cc_reflection_deep', 'reflection', 'c', 'medium', ?, ?, ?)",
+            (str(uuid.uuid4()), created, retrieved, influenced),
+        )
+
+    @pytest.mark.asyncio
+    async def test_cohort_excludes_too_new_and_too_old(self, db, gatherer):
+        for _ in range(6):
+            await self._insert_deep_obs(db, days_ago=5, retrieved=1)
+        await self._insert_deep_obs(db, days_ago=1, retrieved=1)   # too new (<3d)
+        await self._insert_deep_obs(db, days_ago=20, retrieved=1)  # too old (>10d)
+        await db.commit()
+
+        rq = (await gatherer.gather_for_assessment(db))["reflection_quality"]
+        assert rq["cohort_size"] == 6
+        assert rq["retrieved_count"] == 6
+        assert rq["data_available"] is True
+        assert rq["maturity_window_days"] == "3-10"
+
+    @pytest.mark.asyncio
+    async def test_abstains_below_min_cohort(self, db, gatherer):
+        for _ in range(4):  # below the 5-row floor
+            await self._insert_deep_obs(db, days_ago=5, retrieved=1)
+        await db.commit()
+
+        rq = (await gatherer.gather_for_assessment(db))["reflection_quality"]
+        assert rq["cohort_size"] == 4
+        assert rq["data_available"] is False
+
+    @pytest.mark.asyncio
+    async def test_influence_counted_only_among_retrieved(self, db, gatherer):
+        await self._insert_deep_obs(db, days_ago=5, retrieved=1, influenced=1)  # counts
+        await self._insert_deep_obs(db, days_ago=5, retrieved=1, influenced=1)  # counts
+        await self._insert_deep_obs(db, days_ago=5, retrieved=0, influenced=1)  # influenced but NOT retrieved → excluded
+        await self._insert_deep_obs(db, days_ago=5, retrieved=1, influenced=0)  # retrieved only
+        await self._insert_deep_obs(db, days_ago=5, retrieved=0, influenced=0)  # neither
+        await db.commit()
+
+        rq = (await gatherer.gather_for_assessment(db))["reflection_quality"]
+        assert rq["cohort_size"] == 5
+        assert rq["retrieved_count"] == 3
+        assert rq["influenced_count"] == 2  # only the 2 retrieved-AND-influenced
+        assert rq["data_available"] is True
 
 
 class TestGatherForCalibration:

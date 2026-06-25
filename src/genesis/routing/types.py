@@ -23,6 +23,16 @@ class ErrorCategory(StrEnum):
     # fails fast to the next provider in the chain, but the circuit breaker
     # still records the failure so a repeatedly-hanging provider trips OPEN.
     TIMEOUT = "timeout"
+    # A rate-limit (HTTP 429). Expected provider backpressure, NOT a health
+    # failure: the router fails fast to the next chain member and the breaker
+    # does NOT trip (the per-provider rate gate is the right brake — tripping
+    # would take a reachable provider offline for every other call site).
+    RATE_LIMITED = "rate_limited"
+    # A deterministic client-side error (HTTP 400/422: context-overflow,
+    # content-policy, malformed/unprocessable request). No same-provider retry
+    # and the breaker does NOT trip — it's our payload's fault, not the
+    # provider's health, so tripping would wrongly take a healthy provider down.
+    BAD_REQUEST = "bad_request"
 
 
 class DegradationLevel(StrEnum):
@@ -52,6 +62,15 @@ class ProviderConfig:
     keep_alive: str | int | None = None
     enabled: bool = True
     profile: str | None = None
+    # Extra litellm.acompletion() kwargs applied per-provider, as defaults
+    # under explicit call kwargs (the delegate merges via setdefault; an
+    # extra_body sub-dict is deep-merged, caller-wins). Used for Groq gpt-oss
+    # reasoning controls: {"extra_body": {"include_reasoning": False,
+    # "reasoning_effort": "low"}}. RESERVED keys — do NOT place api_key /
+    # api_base / timeout / num_retries here; the delegate sets those itself
+    # and a stray value would override its guards. hash=False: dict is
+    # unhashable and ProviderConfig is frozen (hashable on its other fields).
+    params: dict | None = field(default=None, hash=False)
     # False when no API key env var is configured for this provider.
     # Set by the config loader at parse time. Router treats False as
     # down-by-config (skip in chain walk, no LiteLLM call, no CB trip),
@@ -87,6 +106,13 @@ class RetryPolicy:
     max_delay_ms: int = 30000
     backoff_multiplier: float = 2.0
     jitter_pct: float = 0.25
+    # Aggregate wall-clock ceiling (seconds) across the whole route_call chain
+    # walk — retries x chain length. None = no aggregate cap (today's behavior).
+    # A GATE checked only BETWEEN attempts/providers: it never interrupts an
+    # in-flight call (the delegate's per-attempt timeout owns that). It bounds
+    # the retry-multiplier on a SINGLE completion, NOT Genesis's cognition (a
+    # reflection is many bounded completions).
+    max_total_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +144,9 @@ class RoutingResult:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
+    # Whether cost_usd is a measured value (litellm priced it) vs unknown.
+    # Lets a trace span distinguish a genuine $0 (free tier) from unmeasured.
+    cost_known: bool = True
 
 
 @dataclass(frozen=True)

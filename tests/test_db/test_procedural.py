@@ -28,14 +28,14 @@ async def test_create_with_initial_counts(db):
     """Verify success_count and confidence kwargs are persisted on create."""
     await procedural.create(
         db, id="p_seed", success_count=1, confidence=2 / 3,
-        speculative=0, activation_tier="L3", **_COMMON,
+        draft=0, activation_tier="LIBRARY", **_COMMON,
     )
     row = await procedural.get_by_id(db, "p_seed")
     assert row is not None
     assert row["success_count"] == 1
     assert abs(row["confidence"] - 2 / 3) < 1e-9
-    assert row["speculative"] == 0
-    assert row["activation_tier"] == "L3"
+    assert row["draft"] == 0
+    assert row["activation_tier"] == "LIBRARY"
 
 
 async def test_get_nonexistent(db):
@@ -112,3 +112,25 @@ async def test_list_by_task_type_filters_by_person_id(db):
     rows = await procedural.list_by_task_type(db, "deploy", person_id="alice")
     assert len(rows) == 1
     assert rows[0]["id"] == "ppid3"
+
+
+# ── record_invocation: count reads (procedure recalled = surfaced to model) ──
+
+
+async def test_record_invocation_increments_and_stamps(db):
+    await procedural.create(db, id="p_read", **_COMMON)
+    row = await procedural.get_by_id(db, "p_read")
+    assert row["invocation_count"] == 0
+    assert row["last_used"] is None
+
+    assert await procedural.record_invocation(db, "p_read") is True
+    row = await procedural.get_by_id(db, "p_read")
+    assert row["invocation_count"] == 1
+    assert row["last_used"] is not None
+
+    await procedural.record_invocation(db, "p_read")
+    assert (await procedural.get_by_id(db, "p_read"))["invocation_count"] == 2
+
+
+async def test_record_invocation_unknown_id_is_noop(db):
+    assert await procedural.record_invocation(db, "nope") is False

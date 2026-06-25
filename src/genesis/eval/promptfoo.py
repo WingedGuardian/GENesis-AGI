@@ -18,6 +18,8 @@ from pathlib import Path
 
 import yaml
 
+from genesis.util.tmp import big_tmp_dir
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,7 +64,7 @@ async def compare_models(
     # Build promptfoo config
     config = _build_promptfoo_config(model_a, model_b, dataset_path, delay_ms)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory(dir=big_tmp_dir()) as tmpdir:
         config_path = Path(tmpdir) / "promptfoo.yaml"
         output_path = Path(tmpdir) / "output.json"
         config_path.write_text(yaml.dump(config, default_flow_style=False))

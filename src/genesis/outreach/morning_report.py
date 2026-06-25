@@ -48,6 +48,14 @@ def _age_seconds(iso_ts: str) -> float:
         return 0
 
 
+# Observations older than this in "What I Noticed" are historical signals, not
+# current conditions: their DISPLAYED severity is demoted one level and tagged
+# so a days-old write (e.g. a stale quality_drift) doesn't read as a fresh
+# critical alarm. Stored priority is never changed.
+_STALE_OBS_SECONDS = 3 * 86400
+_STALE_PRIORITY_DEMOTION = {"critical": "high", "high": "medium", "medium": "medium"}
+
+
 class MorningReportGenerator:
     """Synthesizes system state into a daily morning report."""
 
@@ -147,6 +155,16 @@ class MorningReportGenerator:
             logger.warning("Morning report: cognitive state unavailable", exc_info=True)
             await self._emit_warning("cognitive_state", "Cognitive state section unavailable")
 
+        # 3b. Cognitive subsystem quality grades (weekly J9 grades; neutral
+        # observability — the regression alarm is a separate deterministic path)
+        try:
+            eval_quality = await self._get_eval_quality_section()
+            if eval_quality:
+                sections.append(f"## Cognitive Subsystem Grades\n{eval_quality}")
+        except Exception:
+            logger.warning("Morning report: eval quality section unavailable", exc_info=True)
+            await self._emit_warning("eval_quality", "Cognitive subsystem grades section unavailable")
+
         # 4. Pending Items (user-actionable only)
         try:
             pending = await self._get_pending_items()
@@ -237,7 +255,7 @@ class MorningReportGenerator:
         bg_active = bg.get("active", 0) if isinstance(bg, dict) else bg
         lines = [
             "## System Health",
-            f"- Cost: ${cost.get('daily_usd', 0):.2f} today, ${cost.get('monthly_usd', 0):.2f} month",
+            self._format_cost_line(cost),
             f"- Infrastructure: DB={infra.get('genesis.db', {}).get('status', '?')}, Qdrant={infra.get('qdrant', {}).get('status', '?')}",
             f"- Queues: deferred={queues.get('deferred_work', 0)}, dead_letters={queues.get('dead_letters', 0)}, pending_embeddings={queues.get('pending_embeddings', 0)}",
             f"- Surplus: {surplus.get('status', '?')}, queue_depth={surplus.get('queue_depth', 0)}",
@@ -247,17 +265,27 @@ class MorningReportGenerator:
         pending_embed = queues.get('pending_embeddings', 0)
         if pending_embed and pending_embed > 100:
             lines.append(f"- **Embedding queue elevated**: {pending_embed} pending")
-        # Top cost drivers (data already in the snapshot, just not displayed)
-        by_provider = cost.get("cost_by_provider", [])
-        if by_provider:
-            top = [
-                f"{p['provider']}: ${p['month_usd']:.2f}"
-                for p in by_provider[:3]
-                if p.get("month_usd", 0) > 0.01
-            ]
-            if top:
-                lines.append(f"- Top cost drivers (month): {', '.join(top)}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_cost_line(cost: dict) -> str:
+        """One neutral, grounded cost line: month-to-date spend against the
+        monthly cap. Real numbers only — no projection, no daily figure, no
+        spike alarm. Cost is observability, not control; the user decides
+        tradeoffs. The budget system (cost_tracker events) owns alarms, not
+        this report.
+        """
+        spend = cost.get("monthly_usd")
+        if spend is None:
+            return "- Spend: unavailable"
+        cap = cost.get("budget_monthly_limit")
+        pct = cost.get("budget_pct_used")
+        # A falsy cap (None when the budget query failed, or a nonsensical $0)
+        # drops the cap clause rather than printing a misleading "$0 cap".
+        if cap:
+            pct_txt = f"{pct:.0f}% of " if pct is not None else ""
+            return f"- Spend: ${spend:.2f} MTD, {pct_txt}${cap:.0f} cap"
+        return f"- Spend: ${spend:.2f} MTD"
 
     async def _get_activity_summary(self) -> str:
         from genesis.db.crud import cc_sessions as sessions_crud
@@ -347,6 +375,37 @@ class MorningReportGenerator:
             entry_lines.append(f"- [{r['section']}]{aging_tag} {r['content'][:300]} ({age})")
         return header + "\n" + "\n".join(entry_lines)
 
+    async def _get_eval_quality_section(self) -> str | None:
+        """Weekly cognitive-subsystem quality grades (A–F) — neutral readout.
+
+        This is OBSERVABILITY, not an alarm channel: a grade *regression* is
+        surfaced separately and deterministically at aggregation time, not via
+        this LLM-narrated report. Returns None when no graded subsystem exists
+        (cold start / insufficient data) so the section is skipped entirely.
+        Subsystems with no letter grade (``cognitive_drift`` is dark by design;
+        sparse weeks grade to None) are omitted — never shown as a problem.
+        """
+        from genesis.db.crud import j9_eval
+
+        grades = await j9_eval.get_latest_subsystem_grades(self._db)
+        graded = [g for g in grades if g.get("grade")]
+        if not graded:
+            return None
+
+        lines = [
+            "Weekly cognitive-subsystem grades. Mention a subsystem ONLY if it "
+            "is at D/F or notably low; otherwise compress to 'cognitive "
+            "subsystems nominal'. Weekly cadence — do not repeat unchanged "
+            "grades in the daily report.",
+        ]
+        for g in sorted(graded, key=lambda x: x.get("subsystem", "")):
+            sub = g.get("subsystem", "?")
+            grade = g.get("grade", "?")
+            score = g.get("score")
+            score_txt = f" ({score:.0f})" if isinstance(score, (int, float)) else ""
+            lines.append(f"- {sub}: {grade}{score_txt}")
+        return "\n".join(lines)
+
     async def _get_pending_items(self) -> str:
         from genesis.db.crud import approval_requests as approval_crud
         from genesis.db.crud import ego as ego_crud
@@ -410,9 +469,11 @@ class MorningReportGenerator:
 
         lines = []
 
-        # User-input-needed items
+        # User-input-needed items. Strict user_world throughout: the morning
+        # report is the USER's brief — internal-dev items (incl. internal
+        # failed/blocked) belong to the genesis ego / health, not here.
         user_items = await follow_ups.get_pending(
-            self._db, strategy="user_input_needed",
+            self._db, strategy="user_input_needed", domain="user_world",
         )
         if user_items:
             lines.append("**Needs your input:**")
@@ -420,8 +481,8 @@ class MorningReportGenerator:
                 lines.append(f"- {fu['content'][:200]}")
 
         # Blocked/failed items
-        blocked = await follow_ups.get_by_status(self._db, "failed")
-        blocked += await follow_ups.get_by_status(self._db, "blocked")
+        blocked = await follow_ups.get_by_status(self._db, "failed", domain="user_world")
+        blocked += await follow_ups.get_by_status(self._db, "blocked", domain="user_world")
         if blocked:
             lines.append("**Blocked/failed:**")
             for fu in blocked[:5]:
@@ -430,7 +491,7 @@ class MorningReportGenerator:
 
         # Recently completed (last 24h)
         completed = await follow_ups.get_recently_completed(
-            self._db, hours=24, limit=5,
+            self._db, hours=24, limit=5, domain="user_world",
         )
         if completed:
             lines.append("**Completed (24h):**")
@@ -554,10 +615,19 @@ class MorningReportGenerator:
         lines = []
         for obs in observations:
             prio = obs["priority"]
+            # Stale grounding: a >3d-old observation is a historical signal, not
+            # a current condition — demote its displayed severity one level and
+            # tag it so it doesn't surface as a fresh alarm (stored priority
+            # unchanged).
+            if _age_seconds(obs.get("created_at", "")) > _STALE_OBS_SECONDS:
+                prio = _STALE_PRIORITY_DEMOTION.get(prio, prio)
+                aged = " [aged]"
+            else:
+                aged = ""
             badge = {"critical": "🔴", "high": "🟠", "medium": "🟡"}.get(prio, "")
             content = obs["content"][:200].replace("\n", " ")
             age = _relative_age(obs.get("created_at", ""))
-            lines.append(f"- {badge} **{prio}** ({age}): {content}")
+            lines.append(f"- {badge} **{prio}**{aged} ({age}): {content}")
 
         # Defer surfacing until delivery is confirmed via confirm_delivery().
         # If delivery fails, these observations re-appear in the next report.

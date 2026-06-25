@@ -199,6 +199,74 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        # WS-8: email autonomy gate resolution watcher — the correctness
+        # guarantee for held email sends. Drains pending_email_sends: approved →
+        # send below the gate + record_success; rejected → record_correction;
+        # orphaned/expired → close out. max_instances=1 ⇒ no in-drain races.
+        from genesis.autonomy.email_gate_watcher import drain_pending_email_sends
+
+        async def _email_gate_drain() -> None:
+            try:
+                if rt.paused:
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping email gate drain", exc_info=True,
+                )
+                return
+            try:
+                n = await drain_pending_email_sends(rt)
+                rt.record_job_success("email_gate_drain")
+                if n:
+                    logger.info("Email gate drain resolved %d held send(s)", n)
+            except Exception as exc:
+                rt.record_job_failure("email_gate_drain", str(exc))
+                raise
+
+        rt._learning_scheduler.add_job(
+            _email_gate_drain,
+            CronTrigger(minute="*/5", timezone=user_timezone()),
+            id="email_gate_drain",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+
+        # WS-8 PR-D capability staleness decay — a GRANTED email cell idle past
+        # the half-life lapses back to NOT_DETERMINED (holds again on next use),
+        # so standing autonomy can't entrench unused. Daily, INFO-level.
+        from genesis.db.crud import capability_grants as _cg
+
+        async def _capability_decay_sweep() -> None:
+            try:
+                if rt.paused:
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping capability decay", exc_info=True,
+                )
+                return
+            try:
+                decayed = await _cg.decay_stale_cells(
+                    rt._db, now=datetime.now(UTC).isoformat(),
+                )
+                rt.record_job_success("capability_decay_sweep")
+                if decayed:
+                    logger.info(
+                        "Capability decay: %d stale grant(s) lapsed: %s",
+                        len(decayed), ", ".join(decayed),
+                    )
+            except Exception as exc:
+                rt.record_job_failure("capability_decay_sweep", str(exc))
+                raise
+
+        rt._learning_scheduler.add_job(
+            _capability_decay_sweep,
+            CronTrigger(hour=3, minute=30, timezone=user_timezone()),
+            id="capability_decay_sweep",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         from genesis.db.crud import observations
         from genesis.learning.harvesting.auto_memory import harvest_auto_memory
 
@@ -319,13 +387,12 @@ async def init(rt: GenesisRuntime) -> None:
                 try:
                     report = await rt._recovery_orchestrator.run_recovery()
                     rt.record_job_success("recovery_orchestrator")
-                    if (report.dead_letters_replayed or report.embeddings_recovered
-                            or report.items_drained):
+                    if report.dead_letters_replayed or report.embeddings_recovered:
                         logger.info(
-                            "Recovery: replayed=%d embeddings=%d drained=%d",
+                            "Recovery: replayed=%d embeddings=%d pending=%d",
                             report.dead_letters_replayed,
                             report.embeddings_recovered,
-                            report.items_drained,
+                            report.items_pending,
                         )
                 except Exception:
                     rt.record_job_failure("recovery_orchestrator", "recovery failed")
@@ -443,9 +510,14 @@ async def init(rt: GenesisRuntime) -> None:
                 rt.record_job_failure("procedure_promotion", str(exc))
                 logger.exception("Procedure promotion failed")
 
+        # CronTrigger instead of IntervalTrigger: IntervalTrigger resets its
+        # countdown on every server restart, so under frequent restarts the job
+        # can keep slipping its hour and never fire (same class of bug that bit
+        # user_model_evolution / process_reaper).  Runs at :30 past every hour
+        # (:15 is the process_reaper; hour-boundary minutes carry heavier jobs).
         rt._learning_scheduler.add_job(
             _run_procedure_promotion,
-            IntervalTrigger(hours=1),
+            CronTrigger(minute=30),
             id="procedure_promotion",
             max_instances=1,
             misfire_grace_time=600,
@@ -493,11 +565,44 @@ async def init(rt: GenesisRuntime) -> None:
                                     "back to rules-based rendering",
                                 )
                         try:
+                            # Capture the pre-image before the loader overwrites it,
+                            # then record into the cognitive self-mod ledger so a bad
+                            # synthesis can be rolled back (Option B: no loader change).
+                            uk_path = identity_loader._dir / "USER_KNOWLEDGE.md"
+                            prior_uk = (
+                                uk_path.read_text(encoding="utf-8")
+                                if uk_path.exists() else None
+                            )
                             identity_loader.write_user_knowledge_md(
                                 result.model,
                                 evidence_count=result.evidence_count,
                                 narrative=narrative,
                             )
+                            try:
+                                from genesis.learning.cognitive_ledger import (
+                                    record_existing,
+                                )
+
+                                await record_existing(
+                                    rt._db,
+                                    actor="user_model_evolution",
+                                    path=uk_path,
+                                    prior_content=prior_uk,
+                                    applied_content=uk_path.read_text(encoding="utf-8"),
+                                    summary="USER_KNOWLEDGE synthesis ("
+                                    + ("narrative" if narrative else "rules")
+                                    + ")",
+                                    metadata={
+                                        "evidence_count": result.evidence_count,
+                                        "mode": "narrative" if narrative else "rules",
+                                    },
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "cognitive_ledger: USER_KNOWLEDGE record failed "
+                                    "(write unaffected)",
+                                    exc_info=True,
+                                )
                             if narrative:
                                 logger.info(
                                     "USER_KNOWLEDGE.md updated via LLM "
@@ -572,6 +677,73 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        async def _run_outcome_harvest() -> None:
+            # Fold existing siloed outcome signals into the outcome_events
+            # ledger. DARK: nothing consumes the ledger yet, so this is
+            # behaviour-neutral — it only populates a new table. The one-shot
+            # backfill (guarded by an ego_state marker) runs once; run() keeps
+            # the recent window fresh thereafter.
+            if rt._db is None:
+                return
+            try:
+                from genesis.feedback.harvest import OutcomeHarvester
+
+                harvester = OutcomeHarvester(rt._db)
+                backfill = await harvester.run_backfill()
+                incremental = await harvester.run()
+                rt.record_job_success("outcome_harvest")
+                if not backfill.get("skipped"):
+                    logger.info("Outcome backfill: %s", backfill)
+                if any(incremental.values()):
+                    logger.info("Outcome harvest: %s", incremental)
+            except Exception as exc:
+                rt.record_job_failure("outcome_harvest", str(exc))
+                logger.exception("Outcome harvest failed")
+
+        rt._learning_scheduler.add_job(
+            _run_outcome_harvest,
+            # 30 min before capability_map_refresh (9:15/21:15) in CLOCK time —
+            # APScheduler fires by trigger time, not registration order — so the
+            # map step (a future PR) reads a fresh harvest. Avoids the loaded
+            # 0-6h windows (calibration, reapers, dream cycle, user-model).
+            CronTrigger(hour="8,20", minute=45, timezone=user_timezone()),
+            id="outcome_harvest",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
+        async def _run_ego_calibration() -> None:
+            # Compute the ego's confidence calibration from the Outcome Bus T1
+            # rows and snapshot it (ECE-over-time trend). MEASURE-ONLY / DARK:
+            # writes only ego_calibration_snapshots (no cognitive-path reader),
+            # never injects back into the ego. Runs 15 min after outcome_harvest
+            # (8:45/20:45) so it reads a fresh harvest, 15 min before
+            # capability_map_refresh (9:15/21:15) — a clean WAL gap.
+            if rt._db is None:
+                return
+            try:
+                from genesis.feedback.calibration import compute_ego_calibration
+
+                snap = await compute_ego_calibration(rt._db)
+                rt.record_job_success("ego_calibration")
+                if snap is not None:
+                    logger.info(
+                        "Ego calibration: ECE=%.4f n=%d%s",
+                        snap["ece"], snap["sample_count"],
+                        " (low-confidence)" if snap["low_confidence"] else "",
+                    )
+            except Exception as exc:
+                rt.record_job_failure("ego_calibration", str(exc))
+                logger.exception("Ego calibration failed")
+
+        rt._learning_scheduler.add_job(
+            _run_ego_calibration,
+            CronTrigger(hour="9,21", minute=0, timezone=user_timezone()),
+            id="ego_calibration",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         async def _reap_activity_log() -> None:
             if rt._activity_tracker is None:
                 return
@@ -588,6 +760,56 @@ async def init(rt: GenesisRuntime) -> None:
             _reap_activity_log,
             CronTrigger(hour="2,8,14,20", minute=0, timezone=user_timezone()),
             id="activity_log_reaper",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
+        async def _ingest_cc_spans() -> None:
+            """Drain CC-tool span flat-files into otel_spans (tracing backbone)."""
+            if rt._db is None:
+                return
+            try:
+                from genesis.observability.span_ingest import ingest_pending_spans
+
+                n = await ingest_pending_spans(rt._db)
+                rt.record_job_success("cc_span_ingest")
+                if n:
+                    logger.debug("CC span ingest: %d spans", n)
+            except Exception as exc:
+                rt.record_job_failure("cc_span_ingest", str(exc))
+                logger.exception("CC span ingest failed")
+
+        # Frequent (every 2 min) so dispatched-session tool spans land in the
+        # trace shortly after the session runs. minute-cron survives restart
+        # (no IntervalTrigger reset trap). No-op cost when idle (empty dir).
+        rt._learning_scheduler.add_job(
+            _ingest_cc_spans,
+            CronTrigger(minute="*/2"),
+            id="cc_span_ingest",
+            max_instances=1,
+            misfire_grace_time=60,
+        )
+
+        async def _prune_otel_spans() -> None:
+            """Retention: delete spans older than config retention_days."""
+            if rt._span_writer is None:
+                return
+            try:
+                from genesis.observability.span_config import load_spans_config
+
+                _, retention_days = load_spans_config()
+                removed = await rt._span_writer.prune(older_than_days=retention_days)
+                rt.record_job_success("otel_span_prune")
+                if removed:
+                    logger.info("otel_spans prune: removed %d old spans", removed)
+            except Exception as exc:
+                rt.record_job_failure("otel_span_prune", str(exc))
+                logger.exception("otel_spans prune failed")
+
+        rt._learning_scheduler.add_job(
+            _prune_otel_spans,
+            CronTrigger(hour=4, minute=30, timezone=user_timezone()),
+            id="otel_span_prune",
             max_instances=1,
             misfire_grace_time=3600,
         )
@@ -780,6 +1002,24 @@ async def init(rt: GenesisRuntime) -> None:
                 results = await run_weekly_aggregation(rt._db)
                 dims_computed = len(results)
                 logger.info("J9 weekly aggregation: %d dimensions computed", dims_computed)
+                # Close the J-9 loop: a subsystem-grade regression becomes a
+                # control path — a BLOCKER alert + a human-gated proposal. Wrapped
+                # so a surfacing failure never fails the aggregation job.
+                try:
+                    from genesis.eval.regression_alert import (
+                        check_and_alert_regressions,
+                    )
+
+                    regressions = await check_and_alert_regressions(
+                        rt._db, getattr(rt, "_outreach_pipeline", None),
+                    )
+                    if regressions:
+                        logger.info(
+                            "J9 regression check surfaced %d regression(s)",
+                            len(regressions),
+                        )
+                except Exception:
+                    logger.warning("J9 regression check failed", exc_info=True)
                 rt.record_job_success("j9_eval_aggregation")
             except Exception as exc:
                 rt.record_job_failure("j9_eval_aggregation", str(exc))

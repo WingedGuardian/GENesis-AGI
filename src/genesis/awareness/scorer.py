@@ -106,24 +106,39 @@ async def compute_scores(
     signals: list[SignalReading],
     *,
     now: str | None = None,
+    weights_override: dict[str, float] | None = None,
+    decay_factors: dict[str, float] | None = None,
 ) -> list[DepthScore]:
-    """Compute urgency scores for all four depths."""
+    """Compute urgency scores for all four depths.
+
+    ``weights_override`` ({signal_name: weight}) substitutes specific signal
+    weights for this computation only — used by the experimentation harness to
+    measure how a weight change shifts depth decisions WITHOUT mutating the live
+    ``signal_weights`` table. Default None = live weights (identical behaviour).
+
+    ``decay_factors`` ({signal_name: factor}) supplies pre-computed staleness
+    decay and BYPASSES ``_update_staleness`` — which mutates module-level
+    consecutive-unchanged counters. The experimentation replay passes this (an
+    empty dict = no decay) so replaying historical ticks never corrupts the live
+    awareness loop's staleness state. Default None = live staleness (mutating).
+    """
     if now is None:
         now = datetime.now(UTC).isoformat()
 
     signal_map = {s.name: s.value for s in signals}
 
-    # Fetch previous tick's signals for staleness comparison
-    prev_tick = await awareness_ticks.last_tick(db)
-    prev_signals: dict[str, float] = {}
-    if prev_tick and prev_tick.get("signals_json"):
-        try:
-            for entry in json.loads(prev_tick["signals_json"]):
-                prev_signals[entry["name"]] = entry["value"]
-        except (json.JSONDecodeError, KeyError, TypeError):
-            logger.debug("Could not parse previous tick signals for staleness")
-
-    decay_factors = _update_staleness(signal_map, prev_signals)
+    if decay_factors is None:
+        # Fetch previous tick's signals for staleness comparison (live path —
+        # mutates module-level unchanged counts via _update_staleness).
+        prev_tick = await awareness_ticks.last_tick(db)
+        prev_signals: dict[str, float] = {}
+        if prev_tick and prev_tick.get("signals_json"):
+            try:
+                for entry in json.loads(prev_tick["signals_json"]):
+                    prev_signals[entry["name"]] = entry["value"]
+            except (json.JSONDecodeError, KeyError, TypeError):
+                logger.debug("Could not parse previous tick signals for staleness")
+        decay_factors = _update_staleness(signal_map, prev_signals)
 
     thresholds = {r["depth_name"]: r for r in await depth_thresholds.list_all(db)}
     results = []
@@ -135,7 +150,12 @@ async def compute_scores(
         for w in weights_rows:
             val = signal_map.get(w["signal_name"], 0.0)
             factor = decay_factors.get(w["signal_name"], 1.0)
-            raw_score += val * w["current_weight"] * factor
+            weight = (
+                weights_override.get(w["signal_name"], w["current_weight"])
+                if weights_override
+                else w["current_weight"]
+            )
+            raw_score += val * weight * factor
 
         # Elapsed time since last tick at this depth
         last_tick = await awareness_ticks.last_at_depth(db, depth.value)

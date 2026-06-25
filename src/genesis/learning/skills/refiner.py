@@ -51,7 +51,31 @@ class SkillRefiner:
             logger.exception("Skill refiner LLM call failed")
             return None
 
-        return self._parse_response(report.skill_name, result.content)
+        return self._parse_response(
+            report.skill_name,
+            result.content,
+            provenance_trace=self._build_provenance(report),
+        )
+
+    @staticmethod
+    def _build_provenance(report: SkillReport) -> str:
+        """Summarize the SkillReport signals that triggered this refinement.
+
+        Recorded with the mutation so the cognitive-mod ledger captures *why*
+        the skill changed, not just the diff.
+        """
+        parts = [
+            f"usage={report.usage_count}",
+            f"success_rate={report.success_rate:.0%}",
+            f"trend={report.trend.value}",
+        ]
+        if report.baseline_success_rate is not None:
+            parts.append(f"baseline={report.baseline_success_rate:.0%}")
+        if report.failure_patterns:
+            parts.append(f"failure_patterns={', '.join(report.failure_patterns)}")
+        if report.sessions_since_last_refined:
+            parts.append(f"sessions_since_refined={report.sessions_since_last_refined}")
+        return "; ".join(parts)
 
     def _build_prompt(self, report: SkillReport, current_content: str) -> str:
         lines = len(current_content.splitlines())
@@ -93,7 +117,7 @@ class SkillRefiner:
             f"- Tools used: {', '.join(report.tools_used) or 'none'}\n"
             f"- Tools declared: {', '.join(report.tools_declared) or 'none'}\n"
             f"{notes_block}\n\n"
-            f"## Current Content ({lines} lines)\n```\n{current_content[:3000]}\n```\n\n"
+            f"## Current Content ({lines} lines)\n```\n{current_content}\n```\n\n"
             f"Respond with JSON:\n"
             f'{{"proposed_content": "...", "rationale": "...", '
             f'"change_size": "minor|moderate|major", '
@@ -101,7 +125,9 @@ class SkillRefiner:
             f'"failure_patterns_addressed": ["..."]}}'
         )
 
-    def _parse_response(self, skill_name: str, text: str) -> SkillProposal | None:
+    def _parse_response(
+        self, skill_name: str, text: str, *, provenance_trace: str | None = None
+    ) -> SkillProposal | None:
         try:
             match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
             raw = match.group(1) if match else text
@@ -127,4 +153,5 @@ class SkillRefiner:
             change_size=change_size,
             confidence=float(data.get("confidence", 0.7)),
             failure_patterns_addressed=data.get("failure_patterns_addressed", []),
+            provenance_trace=provenance_trace,
         )

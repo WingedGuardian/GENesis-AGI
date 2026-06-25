@@ -39,6 +39,11 @@ Real humans have mixed feelings. "This is impressive but also kind of unsettling
 - "I've seen this go wrong when..."
 - "What I don't understand is..."
 
+## Exclamation marks are fine
+
+Use them where they feel natural — they convey energy and genuine enthusiasm.
+Don't overdo it, but don't sterilize them out of otherwise-human writing either.
+
 ## Let some mess in
 
 Perfect structure feels algorithmic. Tangents, asides, and half-formed thoughts are human. Not every piece needs them, but they signal a real person behind the words.

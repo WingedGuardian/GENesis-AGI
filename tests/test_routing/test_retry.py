@@ -23,8 +23,24 @@ def test_quota_codes():
 
 
 def test_transient_codes():
-    for code in (429, 500, 502, 503, 504):
+    # 429 is no longer TRANSIENT — it is RATE_LIMITED (see test_rate_limited_code).
+    for code in (500, 502, 503, 504):
         assert classify_error(code, "") == ErrorCategory.TRANSIENT
+
+
+def test_rate_limited_code():
+    # 429 → RATE_LIMITED: expected provider backpressure, not a health failure.
+    # The router fails fast to the next chain member and does NOT trip the
+    # breaker (the rate gate is the right brake, not the circuit breaker).
+    assert classify_error(429, "") == ErrorCategory.RATE_LIMITED
+
+
+def test_bad_request_codes():
+    # 400 / 422 → BAD_REQUEST: deterministic client-side errors (context
+    # overflow, content policy, malformed request). Retrying is futile and
+    # tripping the breaker would wrongly take a healthy provider offline.
+    assert classify_error(400, "") == ErrorCategory.BAD_REQUEST
+    assert classify_error(422, "") == ErrorCategory.BAD_REQUEST
 
 
 def test_timeout_code():

@@ -158,7 +158,10 @@ async def db():
                 completed_at     TEXT,
                 resolution_notes TEXT,
                 blocked_reason   TEXT,
-                escalated_to     TEXT
+                escalated_to     TEXT,
+                kind             TEXT NOT NULL DEFAULT 'follow_up',
+                domain           TEXT,
+                goal_id          TEXT
             )
         """)
         yield conn
@@ -395,6 +398,30 @@ class TestUserEgoContextBuilder:
         assert "Genesis Ego Escalations" in result
         assert "Outreach pipeline down" in result
         assert "[high]" in result
+
+    @pytest.mark.asyncio
+    async def test_escalations_record_read_receipt(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Building user-ego context increments retrieved_count on escalations (B2)."""
+        await db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, category, content, priority, resolved, "
+            " retrieved_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            (
+                "esc_rr", "genesis_ego", "escalation_to_user_ego", "outreach",
+                "Outreach pipeline needs your decision", "high", 0, 0,
+            ),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        await builder.build()
+        cur = await db.execute(
+            "SELECT retrieved_count FROM observations WHERE id = 'esc_rr'"
+        )
+        assert (await cur.fetchone())[0] == 1
 
     @pytest.mark.asyncio
     async def test_escalations_infra_filtered(self, db, mock_health_data, capabilities):
@@ -776,11 +803,22 @@ class TestUserEgoContextBuilder:
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             ("f1", "recon", "finding", "finding", "Interesting article", "medium", 0, old_date),
         )
+        # A genuine user_world item — counts toward "Awaiting user input".
         await db.execute(
             "INSERT INTO follow_ups "
-            "(id, source, content, strategy, status, priority, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("fu1", "ego", "Review draft", "user_input_needed", "pending", "high", old_date),
+            "(id, source, content, strategy, status, priority, domain, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("fu1", "ego", "Review draft", "user_input_needed", "pending",
+             "high", "user_world", old_date),
+        )
+        # An internal item under the SAME strategy must NOT inflate the user
+        # backlog — PR3 scopes the "Awaiting user input" counter to user_world.
+        await db.execute(
+            "INSERT INTO follow_ups "
+            "(id, source, content, strategy, status, priority, domain, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("fu2", "foreground_session", "Fix internal bug", "user_input_needed",
+             "pending", "high", "internal", old_date),
         )
         builder = UserEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
@@ -790,6 +828,7 @@ class TestUserEgoContextBuilder:
         assert "**Inbox**: 2 pending" in result
         assert "6d ago" in result
         assert "**Recon findings**: 1 pending" in result
+        # Only the user_world item is counted (internal fu2 excluded).
         assert "**Awaiting user input**: 1 pending" in result
 
     @pytest.mark.asyncio
@@ -956,6 +995,79 @@ class TestUserEgoContextBuilder:
         assert "Goal-Linked Proposals" in result
         assert "Audit auth middleware" in result
         assert "completed" in result  # NEUTRAL_STATUS maps executed → completed
+
+    @pytest.mark.asyncio
+    async def test_goal_deep_dive_stuck_diagnosis(
+        self, db, mock_health_data, capabilities,
+    ):
+        """>= threshold executed proposals on an active goal → stuck diagnosis."""
+        import contextlib
+
+        await db.execute(TABLES["user_goals"])
+        with contextlib.suppress(Exception):
+            await db.execute("ALTER TABLE ego_proposals ADD COLUMN goal_id TEXT")
+        await db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("goal-stuck", "Ship Feature", "project", "high", "active",
+             "2026-05-01", "2026-05-10"),
+        )
+        for i in range(2):  # GOAL_STUCK_EXECUTED_THRESHOLD
+            await db.execute(
+                "INSERT INTO ego_proposals "
+                "(id, action_type, content, status, goal_id, confidence, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (f"sp-{i}", "investigate", "tried something",
+                 "executed", "goal-stuck", 0.8, "2026-05-12"),
+            )
+        await db.commit()
+
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        builder._current_focus_id = "goal-stuck"
+        result = await builder._goal_deep_dive_section()
+
+        assert "Stuck Signal" in result
+        assert "2 executed proposals" in result
+        assert "Diagnose WHY" in result
+        # anti-timidity guardrail: must NOT steer the ego to just close it
+        assert "avoids the problem" in result
+
+    @pytest.mark.asyncio
+    async def test_goal_deep_dive_no_stuck_below_threshold(
+        self, db, mock_health_data, capabilities,
+    ):
+        """< threshold executed proposals → no stuck diagnosis rendered."""
+        import contextlib
+
+        await db.execute(TABLES["user_goals"])
+        with contextlib.suppress(Exception):
+            await db.execute("ALTER TABLE ego_proposals ADD COLUMN goal_id TEXT")
+        await db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("goal-ok", "On Track", "project", "high", "active",
+             "2026-05-01", "2026-05-10"),
+        )
+        await db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, content, status, goal_id, confidence, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("op-0", "investigate", "first attempt",
+             "executed", "goal-ok", 0.8, "2026-05-12"),
+        )
+        await db.commit()
+
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        builder._current_focus_id = "goal-ok"
+        result = await builder._goal_deep_dive_section()
+
+        assert "Stuck Signal" not in result
 
     @pytest.mark.asyncio
     async def test_goal_deep_dive_skip_depth(

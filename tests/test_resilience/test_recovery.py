@@ -106,13 +106,20 @@ class TestRunRecovery:
         assert report.embeddings_recovered == 5
         mocks["embedding_worker"].drain_pending.assert_awaited_once_with(limit=500)
 
-    async def test_processes_deferred_work(self, orchestrator, mocks):
+    async def test_deferred_work_left_pending_not_completed(self, orchestrator, mocks):
+        """WS-6: recovery must NOT mark un-executed deferred items completed (data loss).
+
+        The old behaviour drained items and marked them completed without executing
+        them — silently dropping reflection/outreach work. Items must be left pending.
+        """
         items = [{"id": "a"}, {"id": "b"}]
         mocks["deferred_queue"].drain_by_priority = AsyncMock(return_value=items)
         mocks["deferred_queue"].mark_processing = AsyncMock(return_value=True)
         mocks["deferred_queue"].mark_completed = AsyncMock(return_value=True)
+        mocks["deferred_queue"].count_pending = AsyncMock(return_value=2)
         report = await orchestrator.run_recovery()
-        assert report.items_drained == 2
+        mocks["deferred_queue"].mark_completed.assert_not_awaited()
+        assert report.items_pending == 2  # left pending, not completed
 
     async def test_replays_dead_letters(self, orchestrator, mocks):
         mocks["dead_letter"].replay_pending = AsyncMock(return_value=4)
@@ -147,3 +154,27 @@ class TestRunRecovery:
         report = await orchestrator.run_recovery()
         assert report.dead_letters_replayed == 2
         mocks["dead_letter"].replay_pending.assert_awaited_once()
+
+    async def test_redispatch_skipped_when_degraded(self, orchestrator, mocks):
+        """WS-6: while any axis is degraded, re-dispatch (embedding drain + dead-letter
+        replay) is skipped, but housekeeping (expire) still runs."""
+        from genesis.resilience.state import CloudStatus as _Cloud
+        mocks["state_machine"].update_cloud(_Cloud.FALLBACK)  # degrade
+        report = await orchestrator.run_recovery()
+        mocks["embedding_worker"].drain_pending.assert_not_awaited()
+        mocks["dead_letter"].replay_pending.assert_not_awaited()
+        # housekeeping still runs
+        mocks["deferred_queue"].expire_stale.assert_awaited()
+        mocks["deferred_queue"].expire_stuck_processing.assert_awaited()
+        assert report.embeddings_recovered == 0
+        assert report.dead_letters_replayed == 0
+
+    async def test_tmp_pressure_does_not_gate_redispatch(self, orchestrator, mocks):
+        """WS-6: cc-tmp pressure (a monitoring signal) must NOT suppress re-dispatch —
+        it doesn't impair Qdrant or LLM providers."""
+        from genesis.resilience.state import TmpPressureStatus
+        mocks["state_machine"].update_tmp_pressure(TmpPressureStatus.MODERATE)
+        mocks["embedding_worker"].drain_pending = AsyncMock(return_value=5)
+        report = await orchestrator.run_recovery()
+        mocks["embedding_worker"].drain_pending.assert_awaited_once_with(limit=500)
+        assert report.embeddings_recovered == 5

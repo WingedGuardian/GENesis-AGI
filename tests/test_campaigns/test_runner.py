@@ -268,3 +268,69 @@ class TestDayBoundaryReset:
         state = {"posts_today": 3, "total_posts": 10}
         reset = _day_boundary_reset(state, "2026-06-07T08:00:00Z", "2026-06-07T16:00:00Z")
         assert reset["posts_today"] == 3  # Same day, no reset
+
+
+class TestTickWrapperJobHealth:
+    """_tick_wrapper records job health so tick crashes are observable (#15)."""
+
+    @pytest.mark.anyio
+    async def test_records_failure_on_exception(self, db, mock_session_runner):
+        from genesis.campaigns.runner import CampaignRunner
+
+        runner = CampaignRunner(db=db, session_runner=mock_session_runner)
+        runner.campaign_tick = AsyncMock(side_effect=RuntimeError("boom"))
+
+        with patch("genesis.runtime.GenesisRuntime") as rt_cls:
+            inst = MagicMock()
+            rt_cls.instance.return_value = inst
+            # Must NOT propagate — the tick-level swallow contract is preserved.
+            await runner._tick_wrapper("camp-1", "campaign_test")
+
+        inst.record_job_failure.assert_called_once()
+        job_id, err = inst.record_job_failure.call_args[0][:2]
+        assert job_id == "campaign_test"
+        assert "boom" in err
+        inst.record_job_success.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_records_success_on_clean_tick(self, db, mock_session_runner):
+        from genesis.campaigns.runner import CampaignRunner
+
+        runner = CampaignRunner(db=db, session_runner=mock_session_runner)
+        runner.campaign_tick = AsyncMock(return_value={"outcome": "skip"})
+
+        with patch("genesis.runtime.GenesisRuntime") as rt_cls:
+            inst = MagicMock()
+            rt_cls.instance.return_value = inst
+            await runner._tick_wrapper("camp-1", "campaign_test")
+
+        inst.record_job_success.assert_called_once_with("campaign_test")
+        inst.record_job_failure.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_success_record_errors_are_suppressed(self, db, mock_session_runner):
+        """A failure recording the SUCCESS heartbeat must never propagate."""
+        from genesis.campaigns.runner import CampaignRunner
+
+        runner = CampaignRunner(db=db, session_runner=mock_session_runner)
+        runner.campaign_tick = AsyncMock(return_value={"outcome": "skip"})
+
+        with patch("genesis.runtime.GenesisRuntime") as rt_cls:
+            rt_cls.instance.side_effect = RuntimeError("runtime not ready")
+            # Must not raise even though instance() blows up.
+            await runner._tick_wrapper("camp-1", "campaign_test")
+
+    @pytest.mark.anyio
+    async def test_failure_record_errors_are_suppressed(self, db, mock_session_runner):
+        """A failed tick whose record_job_failure ALSO raises must not propagate."""
+        from genesis.campaigns.runner import CampaignRunner
+
+        runner = CampaignRunner(db=db, session_runner=mock_session_runner)
+        runner.campaign_tick = AsyncMock(side_effect=RuntimeError("boom"))
+
+        with patch("genesis.runtime.GenesisRuntime") as rt_cls:
+            inst = MagicMock()
+            inst.record_job_failure.side_effect = RuntimeError("record blew up")
+            rt_cls.instance.return_value = inst
+            # tick raised AND record_job_failure raised — still must not propagate.
+            await runner._tick_wrapper("camp-1", "campaign_test")

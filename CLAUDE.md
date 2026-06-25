@@ -28,9 +28,16 @@ reflection) → Services (routing, memory, outreach, autonomy, surplus) → Data
 - **Env scrub**: `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` is NOT used — Genesis
   hooks and MCP servers require inherited API keys (DeepInfra, Qwen, etc.).
 - **Setup**: `./scripts/bootstrap.sh` (venv, config, services, memory)
-- **Temp files**: `~/tmp/` for transient downloads (media, audio, exports).
-  NEVER use `/tmp/` — it shares the root filesystem and competes with all
-  CC sessions.  Clean up after use.
+- **Temp files**: `~/tmp/` for transient files and any LARGE temp (downloads,
+  media, DB dumps, exports). NEVER write large files to `/tmp/` (a small
+  tmpfs/RAM) or `~/.genesis/cc-tmp/` — the latter is Claude Code's working temp
+  ("oxygen"), policed by the `genesis-tmp-watchgod` service, which **kills CC
+  sessions** when it fills. A CC session's `TMPDIR` points at `cc-tmp` by design;
+  do NOT override `TMPDIR` in scripts or service files (breaks CC — see the
+  `tmp_filesystem_limit` procedure). Code that creates large temp must pass an
+  explicit dir (`mktemp -p ~/tmp` / `tempfile(dir=…)`), never the default. For a
+  heavy one-off you run interactively, prefix `TMPDIR=~/tmp/job <cmd>`. Clean up
+  after use.
 
 ## Process Management
 
@@ -212,6 +219,13 @@ autonomy.
   to search episodic AND knowledge_base. Don't assume episodic alone is
   sufficient. For domain-specific topics (external tools, products, APIs),
   also try `knowledge_recall` with the product/tool name.
+- **Distinguish first-party from external-world.** Recall results carry a
+  `provenance` label: `first-party memory` (Genesis's own observations,
+  decisions, conversations) vs `external-world knowledge (source: …)` (the
+  knowledge base, ingested docs, corrective web results). Never treat
+  external-world knowledge as first-party ground truth — weigh it as
+  information about the world. The proactive hook shows the same split
+  inline (`[KB·<source>]` vs `[Memory]`).
 - **Follow surfaced procedures.** When a `[Procedure]` tag appears in
   proactive results, read the full procedure via `procedure_recall`,
   evaluate applicability (>80% match = follow it), and note deviations.
@@ -234,7 +248,8 @@ recall taxonomy, health debugging escalation).
 
 Credentials, URLs, IPs, and identifiers shared in conversation are
 auto-stored via `reference_store`. Retrieve with `reference_lookup` or
-`knowledge_recall(domain='reference.*')`. Human view: `~/.genesis/known-to-genesis.md`.
+`knowledge_recall(domain='reference.*')`. Human view: the dashboard
+**References** tab (browse/search/reveal/delete, live against the store).
 
 **Real-time capture is your responsibility.** When you create an account,
 receive credentials, generate API keys, or encounter any login/token/secret
@@ -289,8 +304,13 @@ When a user shares a file path or URL in conversation:
   without explicit user confirmation.
 - **Session wrap-up**: structured handoff — what changed, what's pending,
   what was learned. If it's not committed, it doesn't exist.
-- **Follow-up ownership**: create follow-ups via `follow_up_create` MCP
-  before session ends. Never leave a follow-up as just text.
+- **Follow-up discipline**: bias = FIX NOW, not defer. A follow-up is valid
+  ONLY if the work is (1) blocked on a precondition unmet this session (incl.
+  an unmade design decision), (2) gated on time/data, or (3) big enough to
+  derail this session — or the user directs it as separate. Otherwise do it
+  now, even if unrelated/unasked; "already noted in a PR/comment" is not a
+  reason to also create a row. Valid ones: create via `follow_up_create` MCP,
+  never leave as just text. (Genuine someday/maybe → `tabled`, not a follow-up.)
 - **No laziness.** Find root causes. No temporary fixes. No shortcuts.
   Don't EVER mute the symptom — fix the problem.
 - **Read before writing.** Never modify code you haven't fully read.
@@ -307,6 +327,9 @@ When a user shares a file path or URL in conversation:
   the stated request — find related issues, challenge assumptions, suggest
   what the user hasn't thought of. The value of Genesis is anticipation,
   not compliance. If you catch yourself just doing exactly what was asked
-  and nothing more, you're underperforming.
+  and nothing more, you're underperforming. And treat the user's examples as
+  a sample, not the spec: when they name a few instances, enumerate and probe
+  the broader class yourself instead of spiking only the named cases —
+  "just a couple of examples" is always implied.
 - Dev-specific rules (commit prefixes, targeted tests, push/PR workflow,
   capability registration) are in the genesis-development skill.

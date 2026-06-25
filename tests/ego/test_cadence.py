@@ -107,6 +107,8 @@ class TestCadenceLifecycle:
         job_ids = {j.id for j in jobs}
         assert "ego_cycle" in job_ids
         assert "ego_morning_report" in job_ids
+        # Dedicated liveness pulse, decoupled from the proactive _on_tick.
+        assert "ego_heartbeat" in job_ids
         # Consumer task should be running
         assert cadence._signal_consumer_task is not None
         assert not cadence._signal_consumer_task.done()
@@ -125,6 +127,76 @@ class TestCadenceLifecycle:
         assert cadence.is_paused
         cadence.resume()
         assert not cadence.is_paused
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat — dedicated fixed-interval liveness pulse (decoupled from _on_tick)
+# ---------------------------------------------------------------------------
+
+
+class TestCadenceHeartbeat:
+    async def test_on_heartbeat_emits_alive(self, cadence):
+        """The dedicated heartbeat job emits an 'alive' liveness pulse."""
+        cadence._emit_heartbeat = MagicMock()
+        await cadence._on_heartbeat()
+        cadence._emit_heartbeat.assert_called_once_with("alive")
+
+    async def test_on_heartbeat_emits_even_when_paused(self, cadence):
+        """Liveness pulse fires regardless of pause — a paused ego is alive,
+        not dead, and must not trigger a false 'overdue' health alarm."""
+        cadence.pause()
+        cadence._emit_heartbeat = MagicMock()
+        await cadence._on_heartbeat()
+        cadence._emit_heartbeat.assert_called_once_with("alive")
+
+    async def test_emit_heartbeat_reaches_event_bus_with_ego_contract(self, cadence):
+        """_emit_heartbeat fires a Subsystem.EGO 'heartbeat' event — the exact
+        (subsystem, event_type) contract the health read-path queries on."""
+        from unittest.mock import patch
+
+        from genesis.observability.types import Severity, Subsystem
+
+        bus = MagicMock()
+        bus.emit = AsyncMock()
+        cadence._event_bus = bus
+
+        # _emit_heartbeat builds the emit() coroutine synchronously (recording
+        # the call) then hands it to tracked_task. Stub tracked_task so no loose
+        # task is left pending, and close the captured coroutine cleanly.
+        # Patch the SOURCE module (genesis.util.tasks): _emit_heartbeat imports
+        # tracked_task inline (function-local) and re-resolves it from that
+        # module on each call, so there is no genesis.ego.cadence.tracked_task
+        # module-scope binding to target.
+        def _fake_tracked_task(coro, **kwargs):
+            coro.close()
+            return None
+
+        with patch("genesis.util.tasks.tracked_task", side_effect=_fake_tracked_task):
+            cadence._emit_heartbeat("alive")
+
+        bus.emit.assert_called_once()
+        args = bus.emit.call_args.args
+        assert (args[0], args[1], args[2]) == (
+            Subsystem.EGO,
+            Severity.DEBUG,
+            "heartbeat",
+        )
+        assert args[3].startswith("ego_alive")
+
+    async def test_emit_heartbeat_noop_without_event_bus(self, cadence):
+        """No event bus (e.g. standalone/test) → silent no-op, never raises."""
+        assert cadence._event_bus is None
+        cadence._emit_heartbeat("alive")  # must not raise
+
+    async def test_start_emits_initial_heartbeat(self, cadence):
+        """start() fires an immediate liveness pulse so a fresh restart is not
+        reported stale until the first 5-min ego_heartbeat firing."""
+        cadence._emit_heartbeat = MagicMock()
+        await cadence.start()
+        try:
+            cadence._emit_heartbeat.assert_called_once_with("start")
+        finally:
+            await cadence.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -888,10 +960,13 @@ class TestGoalStaleness:
 
     @pytest.fixture
     async def goal_db(self):
-        """DB with user_goals table."""
+        """DB with user_goals + ego_proposals tables (proposals for stuck-detection)."""
         async with aiosqlite.connect(":memory:") as conn:
             conn.row_factory = aiosqlite.Row
-            for table in ("ego_cycles", "ego_state", "cc_sessions", "user_goals"):
+            for table in (
+                "ego_cycles", "ego_state", "cc_sessions",
+                "user_goals", "ego_proposals",
+            ):
                 await conn.execute(TABLES[table])
             await conn.commit()
             yield conn
@@ -1015,3 +1090,67 @@ class TestGoalStaleness:
         await goal_cadence._check_stale_goals()
         # Should NOT trigger: 8 days < global 30
         assert goal_cadence._signal_queue.empty()
+
+    async def test_stuck_goal_high_priority_signal(self, goal_cadence, goal_db):
+        """Stale goal with >= threshold executed proposals → stuck/high-priority."""
+        old = (datetime.now(UTC) - timedelta(days=20)).isoformat()
+        await goal_db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("goal-stuck", "Stuck Goal", "project", "high", "active", old, old),
+        )
+        for i in range(2):  # GOAL_STUCK_EXECUTED_THRESHOLD
+            await goal_db.execute(
+                "INSERT INTO ego_proposals "
+                "(id, action_type, content, status, goal_id, created_at) "
+                "VALUES (?, 'investigate', 'x', 'executed', ?, ?)",
+                (f"p-stuck-{i}", "goal-stuck", datetime.now(UTC).isoformat()),
+            )
+        await goal_db.commit()
+
+        await goal_cadence._check_stale_goals()
+
+        signals = goal_cadence._signal_queue.drain()
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.priority == "high"
+        assert sig.metadata["mode"] == "stuck"
+        assert sig.metadata["executed_proposals"] == 2
+        assert "stuck" in sig.summary.lower()
+
+    async def test_worked_but_below_threshold_is_stale(self, goal_cadence, goal_db):
+        """Stale goal with < threshold executed proposals stays stale/medium.
+
+        Also asserts non-executed (pending) proposals do NOT count as effort.
+        """
+        old = (datetime.now(UTC) - timedelta(days=20)).isoformat()
+        await goal_db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("goal-onep", "One Proposal", "project", "medium", "active", old, old),
+        )
+        await goal_db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, content, status, goal_id, created_at) "
+            "VALUES (?, 'investigate', 'x', 'executed', ?, ?)",
+            ("p-onep-0", "goal-onep", datetime.now(UTC).isoformat()),
+        )
+        # A pending proposal must NOT count toward "executed" effort.
+        await goal_db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, content, status, goal_id, created_at) "
+            "VALUES (?, 'investigate', 'x', 'pending', ?, ?)",
+            ("p-onep-1", "goal-onep", datetime.now(UTC).isoformat()),
+        )
+        await goal_db.commit()
+
+        await goal_cadence._check_stale_goals()
+
+        signals = goal_cadence._signal_queue.drain()
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.priority == "medium"
+        assert sig.metadata["mode"] == "stale"
+        assert sig.metadata["executed_proposals"] == 1

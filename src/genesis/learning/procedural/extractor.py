@@ -2,9 +2,9 @@
 
 When the triage pipeline classifies an interaction as APPROACH_FAILURE,
 WORKAROUND_SUCCESS, or (on autonomous channels) SUCCESS, this module extracts
-a reusable procedure and stores it. New procedures start at L3 with
-speculative=1 and confidence=0.5 — immediately visible to session injection
-and proactive surfacing.
+a reusable procedure and stores it. New procedures start at LIBRARY with
+draft=1 and confidence=0.5 — immediately recallable and eligible for
+proactive surfacing (but not blind session-start injection, which is CORE-only).
 
 Quality gate: the extraction prompt includes criteria for the LLM to
 self-assess whether the procedure codifies correct behavior and is
@@ -250,12 +250,26 @@ async def extract_procedure(
         logger.warning("Procedure extraction: missing required fields in %s", list(data.keys()))
         return None
 
+    # Scoping gate: behavioral DIRECTIVES (general working-style rules) belong in
+    # CLAUDE.md, not the procedure store, and are the dominant near-duplicate source.
+    # Fails open to "keep" on any classifier error — never suppress a real procedure.
+    from genesis.learning.procedural.scoping import is_behavioral_directive
+
+    if await is_behavioral_directive(
+        router, task_type=data["task_type"], principle=data["principle"], steps=data["steps"],
+    ):
+        logger.info(
+            "Extraction: skipping behavioral directive %s (belongs in CLAUDE.md)",
+            data["task_type"],
+        )
+        return None
+
     # Skip if an explicit-teach procedure already covers this task_type
     try:
         from genesis.db.crud.procedural import find_by_task_type
 
         existing = await find_by_task_type(db, data["task_type"])
-        if existing and existing.get("speculative") == 0:
+        if existing and existing.get("draft") == 0:
             logger.info(
                 "Skipped extraction for %s: explicit-teach %s exists",
                 data["task_type"], existing["id"],
@@ -309,7 +323,7 @@ async def extract_procedure(
         for ov in overlapping:
             if (
                 ov.get("confidence", 0) >= 0.5
-                and ov.get("speculative") == 0
+                and ov.get("draft") == 0
                 and principle_vec is not None
                 and embedder is not None
             ):
@@ -391,8 +405,8 @@ async def extract_procedure(
             tools_used=data["tools_used"],
             context_tags=data["context_tags"],
             tool_trigger=data.get("tool_trigger"),
-            activation_tier="L3",
-            speculative=1,
+            activation_tier="LIBRARY",
+            draft=1,
             confidence=gate_result.adjusted_confidence,
             source={"type": "auto_extracted", "triage_outcome": outcome},
             principle_embedding=principle_blob,

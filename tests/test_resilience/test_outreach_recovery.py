@@ -87,13 +87,16 @@ async def test_failed_retry_resets_to_pending(worker):
 @pytest.mark.asyncio
 async def test_exhausted_creates_observation(worker):
     """After max retries, item is discarded and observation created."""
+    from unittest.mock import patch
+
     item = _make_item(attempts=_MAX_RETRIES)
 
-    # Mock the observation create
-    import genesis.db.crud.observations as obs_crud
-    obs_crud.create = AsyncMock()
-
-    await worker._exhaust(item)
+    # Mock the observation create. Context-managed so the patch is RESTORED —
+    # a bare ``obs_crud.create = AsyncMock()`` leaks process-wide and turns
+    # every later real insert into a silent no-op, poisoning the shared ``db``
+    # fixture for the rest of the suite (returns an id but writes nothing).
+    with patch("genesis.db.crud.observations.create", new_callable=AsyncMock):
+        await worker._exhaust(item)
 
     worker._queue.mark_discarded.assert_awaited_once()
     assert "exhausted" in worker._queue.mark_discarded.call_args[0][1].lower()

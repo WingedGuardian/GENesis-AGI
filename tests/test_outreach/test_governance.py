@@ -1,6 +1,6 @@
 """Tests for the deterministic governance gate."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 import pytest
@@ -33,15 +33,12 @@ def config():
     )
 
 
-# Quiet window that cannot interfere with test execution regardless of
-# timezone.  The 1-minute window at 23:58-23:59 avoids the 02:00-02:30
-# collision that broke CI (GitHub Actions runs at ~02:18 UTC).
-_NO_QUIET_HOURS = QuietHours(start="23:58", end="23:59")
-
-
 def _cfg_no_quiet(**overrides):
+    # Quiet hours are pinned off for outreach tests by the autouse
+    # _disable_quiet_hours fixture (conftest.py), so the governance quiet-hours
+    # check can't flake on wall-clock time. The window value here is irrelevant.
     defaults = dict(
-        quiet_hours=_NO_QUIET_HOURS,
+        quiet_hours=QuietHours(start="22:00", end="07:00"),
         channel_preferences={"default": "telegram"},
         thresholds={"blocker": 0.0, "alert": 0.3, "surplus": 0.7, "digest": 0.0},
         max_daily=5,
@@ -122,6 +119,28 @@ async def test_surplus_above_threshold_allowed(db):
     )
     result = await gate.check(req)
     assert result.verdict == GovernanceVerdict.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_quiet_hours_denies_non_bypass(db, monkeypatch):
+    """Quiet hours deny a non-bypass category. Verified deterministically by
+    forcing the quiet-hours check on — it reads the wall clock in production,
+    so the test must not depend on the actual time it runs."""
+    monkeypatch.setattr(
+        "genesis.outreach.governance.GovernanceGate._in_quiet_hours",
+        lambda self: True,
+    )
+    gate = GovernanceGate(_cfg_no_quiet(), db)
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="Valuable insight",
+        context="Important finding",
+        salience_score=0.9,
+        signal_type="surplus_insight",
+    )
+    result = await gate.check(req)
+    assert result.verdict == GovernanceVerdict.DENY
+    assert any("quiet" in c for c in result.checks_failed)
 
 
 @pytest.mark.asyncio
@@ -275,6 +294,61 @@ async def test_expired_window_allows_resend(db):
         signal_type="surplus_insight",
     )
     result = await gate.check(req)
+    assert result.verdict == GovernanceVerdict.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_iso_t_delivered_at_outside_window_not_deduped(db):
+    """Regression: ISO-8601 'T'-separator delivered_at must compare correctly
+    against SQLite's space-separated datetime('now', ?).
+
+    Production stores delivered_at via ``datetime.now(UTC).isoformat()`` →
+    ``'2026-06-19T03:18:54+00:00'`` (literal 'T'). A *raw* string comparison
+    treats 'T' (0x54) > ' ' (0x20), so a row delivered earlier on the cutoff's
+    own UTC date sorts as "newer" than the space-separated cutoff — the dedup
+    window then never expires within a calendar day. Wrapping the column in
+    ``datetime(delivered_at)`` makes SQLite parse both sides before comparing.
+
+    The existing expired-window test uses ``datetime('now', '-25 hours')`` for
+    delivered_at — that value is space-separated, so it never exercises this bug.
+    """
+    cfg = _cfg_no_quiet()
+    gate = GovernanceGate(cfg, db)
+
+    # surplus_insight uses the 24h default window. Anchor delivered_at to the
+    # START of the cutoff's UTC date, in ISO-'T' format: strictly earlier than
+    # the cutoff in real time (=> OUTSIDE the window) yet sharing the cutoff's
+    # date prefix (=> the exact T-vs-space trigger). The guard covers the rare
+    # (~1s/day) case where the cutoff itself lands at midnight.
+    cutoff = datetime.now(UTC) - timedelta(hours=24)
+    delivered_dt = cutoff.replace(hour=0, minute=0, second=1, microsecond=0)
+    if delivered_dt >= cutoff:
+        delivered_dt -= timedelta(days=1)
+    delivered = delivered_dt.isoformat()
+
+    await outreach_crud.create(
+        db,
+        id="iso-old",
+        signal_type="surplus_insight",
+        topic="Old ISO topic",
+        category="surplus",
+        salience_score=0.9,
+        channel="telegram",
+        message_content="Old",
+        created_at=delivered,
+    )
+    await outreach_crud.record_delivery(db, "iso-old", delivered_at=delivered)
+
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="Old ISO topic",
+        context="Same topic, window long expired",
+        salience_score=0.9,
+        signal_type="surplus_insight",
+    )
+    result = await gate.check(req)
+    # delivered_at is > 24h old → must ALLOW. The pre-fix raw-string compare
+    # wrongly DENYs because 'T' (0x54) > ' ' (0x20).
     assert result.verdict == GovernanceVerdict.ALLOW
 
 

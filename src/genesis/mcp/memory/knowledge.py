@@ -6,9 +6,19 @@ import json
 import logging
 from datetime import UTC, datetime
 
-from genesis.memory.reference_mirror import regenerate_mirror
+from genesis.memory.provenance import label_result_dicts
+from genesis.memory.reference_ops import (
+    REFERENCE_KINDS as _REFERENCE_KINDS,
+)
+from genesis.memory.reference_ops import (
+    REFERENCE_PROJECT as _REFERENCE_PROJECT,
+)
+from genesis.memory.reference_ops import (
+    delete_reference_entry,
+)
 
 from ..memory import mcp
+from ._scoring import DEFAULT_KB_FLOOR_RATIO, relative_kb_floor
 
 
 def _memory_mod():
@@ -42,43 +52,42 @@ def _apply_authority_boost(merged: list[dict]) -> list[dict]:
     return merged
 
 
-async def _refresh_mirror_safe() -> None:
-    """Regenerate the markdown mirror, absorbing any failure."""
-    try:
-        memory_mod = _memory_mod()
-        if memory_mod._db is not None:
-            await regenerate_mirror(memory_mod._db)
-    except Exception:
-        logger.warning(
-            "reference_mirror: write failed — mirror may be stale",
-            exc_info=True,
-        )
-
-
 @mcp.tool()
 async def knowledge_recall(
     query: str,
     project: str | None = None,
     domain: str | None = None,
     limit: int = 5,
-    min_score: float = 0.15,
+    min_score: float = DEFAULT_KB_FLOOR_RATIO,
+    corrective: bool = True,
 ) -> list[dict]:
     """Search the knowledge base (ingested authoritative sources like docs, APIs, papers).
 
     For personal/experiential memories, use memory_recall instead.
     For stored references (credentials, URLs), use reference_lookup.
 
-    Returns fewer results than ``memory_recall`` by default (5 vs 10)
-    and applies a post-authority-boost relevance floor (``min_score``)
-    to suppress low-relevance noise from bulk-ingested content.
+    Returns fewer results than ``memory_recall`` by default (5 vs 10) and
+    applies a post-authority-boost relevance floor to suppress low-relevance
+    noise from bulk-ingested content. ``min_score`` is a RELATIVE floor (audit
+    MEM-004): a result survives only if its boosted score is at least
+    ``min_score`` × the top result's boosted score (default 0.2 = within 20% of
+    the strongest hit). Being relative makes it scale-invariant, so the single
+    best hit always survives regardless of retrieval mode (the old absolute
+    floor could drop most/all results when their scores landed on a different
+    scale). Pass ``min_score=0`` to disable the floor.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._retriever is not None
     assert memory_mod._db is not None
 
+    # MEM-003: capture the recall_fired event the retriever emits so we enrich
+    # that single event with the final knowledge_recall result set below, rather
+    # than emitting a second recall_fired that double-counts downstream.
+    recall_event_sink: list[str] = []
     vector_results = await memory_mod._retriever.recall(
         query, source="knowledge", limit=limit, project_type=project,
+        event_id_sink=recall_event_sink,
     )
 
     fts_results: list[dict] = []
@@ -98,6 +107,7 @@ async def knowledge_recall(
             "unit_id": r.memory_id,
             "content": r.content,
             "source": r.source,
+            "source_doc": r.source,
             "score": r.score,
             "origin": "vector",
             "source_pipeline": r.source_pipeline,
@@ -123,7 +133,67 @@ async def knowledge_recall(
             })
 
     boosted = _apply_authority_boost(merged)
-    return [r for r in boosted if r.get("score", 0.0) >= min_score][:limit]
+    # Relative floor over the (all-KB) result set (audit MEM-004): keep results
+    # within ``min_score`` × the top boosted score, then trim to the limit.
+    final = relative_kb_floor(
+        boosted,
+        ratio=min_score,
+        score_of=lambda r: r.get("score", 0.0),
+        is_kb=lambda r: True,
+    )[:limit]
+
+    # MEM-003: exactly ONE recall_fired per knowledge_recall. The retriever
+    # already emitted one (its id is in recall_event_sink) — enrich it with the
+    # final, post-merge/floor result set; emit a fresh one only if the retriever
+    # didn't (e.g. it returned early). Done before CRAG so the recall_corrected
+    # calibration event can link back to recall_event_id (subject_id).
+    recall_event_id: str | None = (
+        recall_event_sink[0] if recall_event_sink else None
+    )
+    try:
+        _top_scores = [r.get("score", 0.0) for r in final[:5]]
+        _memory_ids = [r.get("unit_id", "") for r in final[:10]]
+        if recall_event_id is not None:
+            from genesis.eval.j9_hooks import update_recall_metrics
+            await update_recall_metrics(
+                memory_mod._db,
+                recall_event_id,
+                result_count=len(final),
+                top_scores=_top_scores,
+                memory_ids=_memory_ids,
+            )
+        else:
+            from genesis.eval.j9_hooks import emit_recall_fired
+            recall_event_id = await emit_recall_fired(
+                memory_mod._db,
+                query=query,
+                result_count=len(final),
+                top_scores=_top_scores,
+                memory_ids=_memory_ids,
+                latency_ms=0.0,
+                source="knowledge",
+            )
+    except Exception:
+        pass  # instrumentation must never break recall
+
+    # Selective corrective retrieval (CRAG). Default ON; gated + fail-fast.
+    # path="knowledge" → web fallback is permitted on an Incorrect verdict
+    # (external knowledge is legitimately on the web; episodic memory is not).
+    if corrective:
+        from genesis.memory.corrective import maybe_correct_recall
+        final = await maybe_correct_recall(
+            query=query,
+            results=final,
+            retriever=memory_mod._retriever,
+            db=memory_mod._db,
+            path="knowledge",
+            recall_event_id=recall_event_id,
+        )
+    # Provenance pass (audit D12): every knowledge_recall result is external-world
+    # — label original + any CRAG-augmented / web-fallback items. Runs regardless
+    # of `corrective` so the contract is uniform.
+    label_result_dicts(final, default_collection="knowledge_base")
+    return final
 
 
 async def _ingest_knowledge_unit(
@@ -266,18 +336,6 @@ async def knowledge_status(
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
-_REFERENCE_KINDS = frozenset({
-    "credentials",
-    "url",
-    "network",
-    "persona_pointer",
-    "account",
-    "fact",
-})
-
-_REFERENCE_PROJECT = "reference"
-
-
 def _format_reference_body(
     *,
     kind: str,
@@ -414,7 +472,6 @@ async def reference_store(
         collection="episodic_memory",
         memory_type="episodic",
     )
-    await _refresh_mirror_safe()
     return unit_id
 
 
@@ -604,43 +661,22 @@ async def reference_delete(unit_id: str) -> bool:
     assert memory_mod._store is not None
     assert memory_mod._db is not None
 
-    # Fetch the row first so we have the qdrant_id for cleanup.
-    row = await memory_mod.knowledge.get(memory_mod._db, unit_id)
-    if row is None:
-        return False
-
-    # Only delete reference entries via this tool — refuse to use it as a
-    # generic knowledge_unit delete path, which could break external callers.
-    if row.get("project_type") != _REFERENCE_PROJECT:
-        raise ValueError(
-            f"reference_delete: unit {unit_id} is not a reference entry "
-            f"(project_type={row.get('project_type')!r})"
-        )
-
-    qdrant_id = row.get("qdrant_id")
-    if qdrant_id:
-        try:
-            await memory_mod._store.delete(qdrant_id)
-        except Exception:
-            logger.error(
-                "reference_delete: Qdrant cleanup failed for unit %s "
-                "(qdrant_id=%s)", unit_id, qdrant_id, exc_info=True,
-            )
-
-    deleted = await memory_mod.knowledge.delete(memory_mod._db, unit_id)
-    logger.info("Reference entry %s deleted: %s", unit_id, deleted)
-    await _refresh_mirror_safe()
-    return deleted
+    # Shared delete path (SQLite row + FTS + Qdrant across both collections),
+    # also used by the dashboard reference browser. Raises ValueError if the
+    # unit is not a reference entry.
+    return await delete_reference_entry(
+        memory_mod._db, memory_mod._store, unit_id,
+    )
 
 
 @mcp.tool()
 async def reference_export() -> dict:
-    """Export a summary of the reference store and regenerate the markdown mirror.
+    """Export a summary of the reference store.
 
     Returns counts per domain plus the total entry count. Use for manual
     inspection from a CC session — answers "what do I have stored?" without
-    exposing values. Use ``reference_lookup`` to retrieve actual entries.
-    Also regenerates ``~/.genesis/known-to-genesis.md``.
+    exposing values. Use ``reference_lookup`` to retrieve actual entries, or
+    browse the reference store live on the dashboard References tab.
     Does NOT return values/bodies — use ``reference_lookup`` or
     ``knowledge_recall`` for that.
     """
@@ -651,7 +687,6 @@ async def reference_export() -> dict:
     stats_result = await memory_mod.knowledge.stats(
         memory_mod._db, project=_REFERENCE_PROJECT,
     )
-    await _refresh_mirror_safe()
     return {
         "project_type": _REFERENCE_PROJECT,
         "total": stats_result["total"],

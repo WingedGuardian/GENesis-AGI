@@ -48,6 +48,13 @@ class RetrievalResult:
     # Intent routing — V4 groundwork
     query_intent: str | None = None
     intent_confidence: float = 0.0
+    # Provenance discriminator (audit D12): the Qdrant collection this result was
+    # retrieved from. ``knowledge_base`` == external-world knowledge; anything
+    # else == first-party memory. Authoritative (always known at retrieval),
+    # unlike the per-item ``source`` string. Defaults first-party so an unset
+    # value is never mislabeled external. Kept LAST for positional-construction
+    # safety. Use ``genesis.memory.provenance`` to turn it into a label.
+    collection: str = "episodic_memory"
 
 
 @dataclass(frozen=True)

@@ -49,6 +49,18 @@ def _mock_response(content="Hello", prompt_tokens=10, completion_tokens=5):
     return SimpleNamespace(choices=[choice], usage=usage)
 
 
+def _install_litellm_exceptions(mock_litellm):
+    """Install real exception classes on a MagicMock'd litellm so the delegate's
+    ``except litellm.X`` chain evaluates. An un-set Mock attribute used in an
+    ``except`` clause raises ``TypeError: catching classes that do not inherit
+    from BaseException``."""
+    for _name in (
+        "RateLimitError", "AuthenticationError", "NotFoundError", "Timeout",
+        "ServiceUnavailableError", "BadRequestError", "UnprocessableEntityError",
+    ):
+        setattr(mock_litellm, _name, type(_name, (Exception,), {}))
+
+
 # ── Model string construction ──────────────────────────────────────────────
 
 
@@ -267,11 +279,7 @@ async def test_call_hard_timeout_cancels_hung_provider():
         return _mock_response()
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = _hang
 
         start = _t.monotonic()
@@ -296,11 +304,7 @@ async def test_call_rate_limit_error():
     delegate = LiteLLMDelegate(config)
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=mock_litellm.RateLimitError("rate limited"),
         )
@@ -319,11 +323,7 @@ async def test_call_auth_error():
     delegate = LiteLLMDelegate(config)
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=mock_litellm.AuthenticationError("bad key"),
         )
@@ -342,11 +342,7 @@ async def test_call_timeout_error():
     delegate = LiteLLMDelegate(config)
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=mock_litellm.Timeout("timed out"),
         )
@@ -365,11 +361,7 @@ async def test_call_generic_error():
     delegate = LiteLLMDelegate(config)
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=RuntimeError("something broke"),
         )
@@ -384,13 +376,136 @@ async def test_call_generic_error():
     assert "something broke" in result.error
 
 
+async def test_call_bad_request_error():
+    """litellm.BadRequestError (and its ContextWindowExceeded / ContentPolicy
+    subclasses) must map to status 400 so the router classifies it BAD_REQUEST
+    and fails fast without same-provider retries or a breaker trip."""
+    config = _config()
+    delegate = LiteLLMDelegate(config)
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        _install_litellm_exceptions(mock_litellm)
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=mock_litellm.BadRequestError("context window exceeded"),
+        )
+
+        result = await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+    assert result.success is False
+    assert result.status_code == 400
+
+
+async def test_call_unprocessable_entity_error():
+    """litellm.UnprocessableEntityError must map to status 422 (→ BAD_REQUEST)."""
+    config = _config()
+    delegate = LiteLLMDelegate(config)
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        _install_litellm_exceptions(mock_litellm)
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=mock_litellm.UnprocessableEntityError("unprocessable"),
+        )
+
+        result = await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+    assert result.success is False
+    assert result.status_code == 422
+
+
+def test_litellm_badrequest_subclasses_are_stable():
+    """Regression guard against a litellm upgrade: the delegate catches
+    litellm.BadRequestError to map context-overflow + content-policy errors to
+    400. That relies on these being BadRequestError subclasses — assert it
+    against the INSTALLED litellm so a hierarchy change fails loudly here."""
+    import litellm
+    assert issubclass(litellm.ContextWindowExceededError, litellm.BadRequestError)
+    assert issubclass(litellm.ContentPolicyViolationError, litellm.BadRequestError)
+
+
 # ── Cost extraction fallback ───────────────────────────────────────────────
 
 
 async def test_call_cost_extraction_fallback():
-    """If completion_cost raises on a paid provider, cost_usd should be 0.0 and cost_known False."""
+    """Graceful-degrade path: when completion_cost raises on a paid provider that
+    has NO model_profiles entry (cfg.profile is unset here), cost_usd stays 0.0
+    and cost_known False. The profile-PRESENT path is covered by
+    test_call_cost_profile_fallback_when_litellm_unknown."""
     config = _config(is_free=False)
     delegate = LiteLLMDelegate(config)
+    mock_resp = _mock_response()
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+        mock_litellm.completion_cost.side_effect = Exception("unknown model")
+
+        result = await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+    assert result.success is True
+    assert result.cost_usd == 0.0
+    assert result.cost_known is False
+
+
+async def test_call_cost_profile_fallback_when_litellm_unknown():
+    """When litellm.completion_cost raises (aggregator model not in litellm's DB)
+    but the provider has a model_profiles entry, cost is computed from the
+    profile's cost_per_mtok and cost_known is True — closing the blind-spend gap
+    (ROUTE-03 / ROUT-03). Visibility only; never gates routing or budget.
+    """
+    from types import SimpleNamespace
+
+    class _FakeRegistry:
+        def get(self, name):
+            if name == "glm-5.1":
+                return SimpleNamespace(cost_per_mtok_in=0.80, cost_per_mtok_out=2.56)
+            return None
+
+    config = RoutingConfig(
+        providers={
+            "glm51": ProviderConfig(
+                name="glm51", provider_type="zenmux", model_id="z-ai/glm-5.1",
+                is_free=False, rpm_limit=None, open_duration_s=120, profile="glm-5.1",
+            ),
+        },
+        call_sites={},
+        retry_profiles={},
+    )
+    delegate = LiteLLMDelegate(config, profile_registry=_FakeRegistry())
+    # 1M in + 1M out → cost = 1*0.80 + 1*2.56 = 3.36 (clean arithmetic).
+    mock_resp = _mock_response(prompt_tokens=1_000_000, completion_tokens=1_000_000)
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+        mock_litellm.completion_cost.side_effect = Exception("This model isn't mapped yet")
+
+        result = await delegate.call(
+            "glm51", "z-ai/glm-5.1", [{"role": "user", "content": "Hi"}],
+        )
+
+    assert result.success is True
+    assert result.cost_known is True
+    assert result.cost_usd == pytest.approx(3.36)
+
+
+async def test_call_cost_profile_fallback_missing_profile_stays_unknown():
+    """Paid provider whose profile is absent from the registry → graceful
+    degrade: cost 0.0, cost_known False (logged, not silent)."""
+    from types import SimpleNamespace  # noqa: F401
+
+    class _EmptyRegistry:
+        def get(self, name):
+            return None
+
+    config = _config(is_free=False)
+    delegate = LiteLLMDelegate(config, profile_registry=_EmptyRegistry())
     mock_resp = _mock_response()
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
@@ -422,11 +537,7 @@ async def test_auth_error_logs_warning():
         patch("genesis.routing.litellm_delegate.litellm") as mock_litellm,
         patch("genesis.routing.litellm_delegate.logger") as mock_logger,
     ):
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=mock_litellm.AuthenticationError("bad key"),
         )
@@ -452,11 +563,7 @@ async def test_rate_limit_logs_warning():
         patch("genesis.routing.litellm_delegate.litellm") as mock_litellm,
         patch("genesis.routing.litellm_delegate.logger") as mock_logger,
     ):
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=mock_litellm.RateLimitError("rate limited"),
         )
@@ -512,11 +619,7 @@ async def test_failure_logging_rate_limited():
         patch("genesis.routing.litellm_delegate.litellm") as mock_litellm,
         patch("genesis.routing.litellm_delegate.logger") as mock_logger,
     ):
-        mock_litellm.RateLimitError = type("RateLimitError", (Exception,), {})
-        mock_litellm.AuthenticationError = type("AuthenticationError", (Exception,), {})
-        mock_litellm.NotFoundError = type("NotFoundError", (Exception,), {})
-        mock_litellm.Timeout = type("Timeout", (Exception,), {})
-        mock_litellm.ServiceUnavailableError = type("ServiceUnavailableError", (Exception,), {})
+        _install_litellm_exceptions(mock_litellm)
         mock_litellm.acompletion = AsyncMock(
             side_effect=mock_litellm.AuthenticationError("bad key"),
         )
@@ -528,3 +631,95 @@ async def test_failure_logging_rate_limited():
         # Second call — should be suppressed
         await delegate.call("test-provider", "m", [{"role": "user", "content": "b"}])
         assert mock_logger.warning.call_count == 1  # Still 1, not 2
+
+
+# ── Per-provider params (extra litellm kwargs) ─────────────────────────────
+
+
+def _config_with_params(params) -> RoutingConfig:
+    """Single-provider config carrying a per-provider ``params`` block."""
+    return RoutingConfig(
+        providers={
+            "test-provider": ProviderConfig(
+                name="test-provider",
+                provider_type="groq",
+                model_id="openai/gpt-oss-20b",
+                is_free=True,
+                rpm_limit=30,
+                open_duration_s=120,
+                params=params,
+            ),
+        },
+        call_sites={},
+        retry_profiles={},
+    )
+
+
+async def test_call_applies_provider_params_extra_body():
+    """A provider config with params={"extra_body": {...}} must pass that
+    extra_body through to litellm.acompletion (Groq gpt-oss reasoning
+    controls — keeps the reasoning field out of `content`)."""
+    config = _config_with_params({"extra_body": {"include_reasoning": False}})
+    delegate = LiteLLMDelegate(config)
+    mock_resp = _mock_response()
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+        mock_litellm.completion_cost.return_value = 0.0
+
+        await delegate.call(
+            "test-provider", "openai/gpt-oss-20b",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+        call_kwargs = mock_litellm.acompletion.call_args.kwargs
+        assert call_kwargs["extra_body"] == {"include_reasoning": False}
+
+
+async def test_call_provider_params_extra_body_deep_merges_caller_wins():
+    """When BOTH the provider config and the caller supply extra_body, the two
+    bodies deep-merge (union of keys) rather than one clobbering the other, and
+    on a key collision the explicit caller value wins (provider params are
+    defaults)."""
+    config = _config_with_params(
+        {"extra_body": {"include_reasoning": False, "reasoning_effort": "low"}},
+    )
+    delegate = LiteLLMDelegate(config)
+    mock_resp = _mock_response()
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+        mock_litellm.completion_cost.return_value = 0.0
+
+        await delegate.call(
+            "test-provider", "openai/gpt-oss-20b",
+            [{"role": "user", "content": "Hi"}],
+            # Caller overrides reasoning_effort and adds a new key.
+            extra_body={"reasoning_effort": "high", "caller_key": 1},
+        )
+
+        body = mock_litellm.acompletion.call_args.kwargs["extra_body"]
+        # Provider-only key preserved (deep merge, no clobber)
+        assert body["include_reasoning"] is False
+        # Caller wins on the collided key
+        assert body["reasoning_effort"] == "high"
+        # Caller-only key carried through
+        assert body["caller_key"] == 1
+
+
+async def test_call_no_params_passes_no_extra_body():
+    """A provider WITHOUT a params block must not inject an extra_body kwarg."""
+    config = _config()  # no params
+    delegate = LiteLLMDelegate(config)
+    mock_resp = _mock_response()
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+        mock_litellm.completion_cost.return_value = 0.0
+
+        await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+        assert "extra_body" not in mock_litellm.acompletion.call_args.kwargs

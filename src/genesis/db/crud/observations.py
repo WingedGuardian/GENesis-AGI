@@ -35,6 +35,9 @@ INTERNAL_OBS_TYPES: frozenset[str] = frozenset({
     "light_escalation_pending",
     "light_escalation_resolved",
     "light_reflection_candidate",
+    # Session/conversation telemetry — per-session pivots; consumed internally
+    # by L1 essential-knowledge (queried by type directly), never user-facing.
+    "conversation_pivot",
     # Memory internals
     "memory_operation_executed",
     "memory_operation",
@@ -137,6 +140,8 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "test_isolation_gap": timedelta(days=30),
     "operational_gap": timedelta(days=30),
     "interaction_theme": timedelta(days=30),
+    # cognitive self-mod rollback audit (operator-visible correction event)
+    "self_mod_rollback": timedelta(days=30),
     # ── 60-day (action-required, real issues) ──────────────────────────
     "bug_identified": timedelta(days=60),
     "tech_debt": timedelta(days=60),
@@ -150,6 +155,10 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "quarantined_reflection": timedelta(days=14),
     "code_audit": timedelta(days=14),
     "cc_memory_staleness": timedelta(days=14),
+    # provider_failure resolves on breaker recovery (ProviderEscalation); the
+    # explicit TTL is only a backstop for a provider that never comes back
+    # (= the previous implicit default, made explicit to silence the warning).
+    "provider_failure": timedelta(days=14),
 }
 _TTL_PREFIX: list[tuple[str, timedelta]] = [
     ("triage_depth_", timedelta(days=30)),
@@ -529,6 +538,33 @@ async def resolve_by_source_and_type(
         "resolution_notes = ? "
         "WHERE source = ? AND type = ? AND resolved = 0",
         (resolved_at, resolution_notes, source, type),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def resolve_by_content_hash(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    content_hash: str,
+    resolved_at: str,
+    resolution_notes: str,
+) -> int:
+    """Resolve all unresolved observations matching a source + content_hash pair.
+
+    Used for condition-recheck resolution where the writer derives a stable,
+    subject-specific content_hash (e.g. one per provider): the recovery signal
+    resolves exactly that subject's row and nothing else. Idempotent — a cheap
+    no-op when no unresolved row matches.
+
+    Returns the number of rows resolved.
+    """
+    cursor = await db.execute(
+        "UPDATE observations SET resolved = 1, resolved_at = ?, "
+        "resolution_notes = ? "
+        "WHERE source = ? AND content_hash = ? AND resolved = 0",
+        (resolved_at, resolution_notes, source, content_hash),
     )
     await db.commit()
     return cursor.rowcount

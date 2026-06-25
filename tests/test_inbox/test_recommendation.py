@@ -45,6 +45,26 @@ architecture_impact: extends
 Some analysis here.
 """
 
+GENESIS_WITH_TOOL_SCORES = """\
+## 1. Some Agent Framework
+
+**Classification:** Genesis-relevant
+
+### Recommendation
+
+```yaml
+action: WATCH
+next_step: "Track release cadence and revisit in Q3"
+effort: Small
+scope: V5
+confidence: medium
+architecture_impact: extends
+tool_momentum: high
+tool_activity: high
+tool_maturity: low
+```
+"""
+
 USER_SINGLE = """\
 ---
 date: 2026-06-06
@@ -265,6 +285,21 @@ class TestParseRecommendations:
         assert r.classification == "genesis"
         assert r.item_title == "Evo — Autoresearch Loop for Codebase Optimization"
         assert r.is_actionable is True
+
+    def test_parses_tool_scoring_fields(self):
+        recs = parse_recommendations(GENESIS_WITH_TOOL_SCORES)
+        assert len(recs) == 1
+        r = recs[0]
+        assert r.tool_momentum == "high"
+        assert r.tool_activity == "high"
+        assert r.tool_maturity == "low"
+
+    def test_tool_scoring_fields_default_none_when_absent(self):
+        # Backward compatible: existing recommendations without the rubric.
+        r = parse_recommendations(GENESIS_SINGLE)[0]
+        assert r.tool_momentum is None
+        assert r.tool_activity is None
+        assert r.tool_maturity is None
 
     def test_user_single(self):
         recs = parse_recommendations(USER_SINGLE)

@@ -4,16 +4,16 @@ Evaluates all active procedures for tier changes based on confidence and
 success/failure history. Runs as a scheduled background job (hourly).
 
 Promotion thresholds:
-  L4 → L3: success_count >= 3 AND confidence >= 0.65
-  L3 → L2: success_count >= 5 AND confidence >= 0.75
-  L2 → L1: success_count >= 8 AND confidence >= 0.85 AND tool_trigger set
+  DORMANT → LIBRARY:  success_count >= 3 AND confidence >= 0.65
+  LIBRARY → ADVISORY: success_count >= 5 AND confidence >= 0.75
+  ADVISORY → CORE:    success_count >= 8 AND confidence >= 0.85 AND tool_trigger set
 
 Demotion is **evidence-driven only** — never metrics-based:
   3+ failure-mode hits AND failure_count >= success_count + 3 → tier - 1
   confidence < 0.3 AND total samples >= 3                       → quarantine
 
 `_compute_tier` only PROMOTES. If a procedure's metrics no longer support
-its current tier (e.g., a seeded L3 with success_count=1, or a procedure
+its current tier (e.g., a seeded LIBRARY with success_count=1, or a procedure
 that was created at a higher tier than its raw counts justify), it stays
 where it is until either (a) it earns enough successes to be promoted
 further, or (b) it accumulates real failures and trips `_check_demotion`
@@ -30,12 +30,33 @@ from datetime import UTC, datetime
 import aiosqlite
 
 from genesis.db.crud import procedural
+from genesis.learning.procedural.operations import (
+    READ_CONFIDENCE_DISCOUNT,
+    effective_confidence,
+)
 from genesis.learning.procedural.trigger_cache import regenerate
 
 logger = logging.getLogger(__name__)
 
-_TIER_RANK = {"L1": 4, "L2": 3, "L3": 2, "L4": 1}
-_RANK_TIER = {4: "L1", 3: "L2", 2: "L3", 1: "L4"}
+_TIER_RANK = {"CORE": 4, "ADVISORY": 3, "LIBRARY": 2, "DORMANT": 1}
+_RANK_TIER = {4: "CORE", 3: "ADVISORY", 2: "LIBRARY", 1: "DORMANT"}
+
+
+def _read_eligible_tier(eff_success: int, eff_conf: float, real_success: int) -> str:
+    """Tier a procedure qualifies for from *effective* (read-inclusive) metrics.
+
+    Hybrid guard (reads are a dampened signal, not proof of success):
+      - LIBRARY (passive surfacing): reads alone may qualify.
+      - ADVISORY (advisory-eligible): requires >= 1 *real* success.
+      - CORE (always-on): never reachable from reads.
+
+    Mirrors `_compute_tier`'s real-metric thresholds, minus the CORE branch.
+    """
+    if eff_success >= 5 and eff_conf >= 0.75 and real_success >= 1:
+        return "ADVISORY"
+    if eff_success >= 3 and eff_conf >= 0.65:
+        return "LIBRARY"
+    return "DORMANT"
 
 
 def _compute_tier(row: dict) -> str:
@@ -44,7 +65,7 @@ def _compute_tier(row: dict) -> str:
     Strict promote-only. Returns the highest tier the row's metrics
     qualify for, then compares against the row's CURRENT tier and never
     returns a lower rank — even if a lower-tier rule still matches. This
-    prevents one-failure metric drift (e.g., an L1 procedure whose conf
+    prevents one-failure metric drift (e.g., a CORE procedure whose conf
     drifts from 0.86 → 0.83) from silently downgrading the tier.
 
     Evidence-driven demotions are handled separately by `_check_demotion`
@@ -54,15 +75,15 @@ def _compute_tier(row: dict) -> str:
     s = row["success_count"]
     conf = row["confidence"]
     has_trigger = bool(row.get("tool_trigger"))
-    current = row.get("activation_tier") or "L4"
+    current = row.get("activation_tier") or "DORMANT"
 
-    qualified = "L4"
+    qualified = "DORMANT"
     if s >= 8 and conf >= 0.85 and has_trigger:
-        qualified = "L1"
+        qualified = "CORE"
     elif s >= 5 and conf >= 0.75:
-        qualified = "L2"
+        qualified = "ADVISORY"
     elif s >= 3 and conf >= 0.65:
-        qualified = "L3"
+        qualified = "LIBRARY"
 
     # Promote-only: never demote via metrics drift.
     if _TIER_RANK.get(qualified, 1) > _TIER_RANK.get(current, 1):
@@ -88,12 +109,14 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
     promotions = 0
     demotions = 0
     quarantined = 0
+    drafts_cleared = 0
 
     for row in rows:
-        current_tier = row.get("activation_tier", "L4")
+        current_tier = row.get("activation_tier", "DORMANT")
         proc_id = row["id"]
 
-        # Quarantine check
+        # Quarantine check — uses REAL stored confidence + real counts (reads
+        # never mask a genuinely-failing procedure).
         if row["confidence"] < 0.3 and row["success_count"] + row["failure_count"] >= 3:
             history = json.loads(row.get("promotion_history") or "[]")
             history.append({
@@ -108,14 +131,37 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
             logger.info("Quarantined procedure %s (conf=%.2f)", row["task_type"], row["confidence"])
             continue
 
-        # Compute target tier
-        target_tier = _compute_tier(row)
+        # Draft clearing: a draft graduates to validated once it has >=1 real
+        # success and no failures (reads alone do NOT clear the draft flag).
+        # Closes the gap where nothing ever cleared draft=1.
+        if row["draft"] and row["success_count"] >= 1 and row["failure_count"] == 0:
+            await procedural.update(db, proc_id, draft=0)
+            drafts_cleared += 1
+            logger.info("Cleared draft on procedure %s (success=%d)", row["task_type"], row["success_count"])
 
-        # Check for demotion
+        # Compute target tier. Failure evidence (`_check_demotion`) takes
+        # precedence over BOTH real-metric and read-driven promotion: a
+        # failing procedure must never be promoted — least of all by soft read
+        # signal. Otherwise the target is the higher of real-metric and
+        # read-driven (effective-metric) promotion (reads can only *raise* it).
+        real_target = _compute_tier(row)
         if _check_demotion(row):
+            target_tier = real_target  # promote-only on real metrics; held for failing rows
             current_rank = _TIER_RANK.get(current_tier, 1)
             if current_rank > 1:
                 target_tier = _RANK_TIER[current_rank - 1]
+        else:
+            reads = row.get("invocation_count") or 0
+            eff_success = row["success_count"] + reads // READ_CONFIDENCE_DISCOUNT
+            eff_conf = effective_confidence(
+                row["success_count"], row["failure_count"], reads
+            )
+            read_target = _read_eligible_tier(eff_success, eff_conf, row["success_count"])
+            target_tier = (
+                real_target
+                if _TIER_RANK[real_target] >= _TIER_RANK[read_target]
+                else read_target
+            )
 
         if target_tier != current_tier:
             target_rank = _TIER_RANK.get(target_tier, 1)
@@ -142,14 +188,19 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
                 demotions += 1
                 logger.info("Demoted %s: %s → %s", row["task_type"], current_tier, target_tier)
 
-    # Regenerate L1 trigger cache if any tier changes occurred
+    # Regenerate CORE/ADVISORY trigger cache if any tier changes occurred
     if promotions or demotions or quarantined:
         try:
             await regenerate(db)
         except Exception:
             logger.error("Failed to regenerate trigger cache after promotion", exc_info=True)
 
-    result = {"promotions": promotions, "demotions": demotions, "quarantined": quarantined}
+    result = {
+        "promotions": promotions,
+        "demotions": demotions,
+        "quarantined": quarantined,
+        "drafts_cleared": drafts_cleared,
+    }
     if any(v > 0 for v in result.values()):
         logger.info("Promotion results: %s", result)
     return result

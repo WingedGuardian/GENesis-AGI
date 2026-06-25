@@ -13,6 +13,18 @@
 #   GENESIS_DIR                — target Genesis root (default: ~/genesis)
 #   QDRANT_URL                 — target Qdrant server (default: http://localhost:6333)
 #   SECRETS_PATH               — target secrets file (default: $GENESIS_DIR/secrets.env)
+#   GENESIS_BACKUP_TIER2_BACKEND — off-site backend: none|local|smb (default: smb if
+#                                GENESIS_BACKUP_NAS is set, else none). The DB/Qdrant/
+#                                transcripts live ONLY off-site (not git).
+#   GENESIS_BACKUP_LOCAL_PATH  — local/mounted off-site dir (when backend=local)
+#   GENESIS_BACKUP_NAS         — SMB share for the off-site pull (e.g. //nas/share),
+#                                when backend=smb
+#   GENESIS_BACKUP_NAS_USER    — SMB username for the off-site pull
+#   GENESIS_BACKUP_NAS_PASS    — SMB password for the off-site pull
+#   GENESIS_BACKUP_NAS_HOST    — SOURCE host name the snapshot was backed up under
+#                                (default: this host; set it on a fresh DR box
+#                                whose hostname differs — or rely on auto-detect
+#                                when only one host exists on the NAS)
 #
 # Behavior:
 #   - Skips destinations that already exist AND are newer than the backup
@@ -21,6 +33,12 @@
 #     compatibility with backups predating the encryption hardening.
 #   - Writes ~/.genesis/restore_status.json on every run (success or failure).
 set -euo pipefail
+
+# Pluggable Tier-2 (off-site) backend interface — selects none/local/smb at runtime
+# (backward-compat: a configured GENESIS_BACKUP_NAS with no selector → smb).
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/backup_backends.sh
+source "$_SCRIPT_DIR/lib/backup_backends.sh"
 
 # ── Args ─────────────────────────────────────────────────────────────
 BACKUP_REPO_OVERRIDE=""
@@ -63,7 +81,7 @@ _write_status() {
 {"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
 STATUSEOF
 }
-trap '_write_status' EXIT
+trap '_write_status; backend_cleanup' EXIT
 
 # ── Setup ────────────────────────────────────────────────────────────
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
@@ -78,6 +96,34 @@ LOG_PREFIX="[genesis-restore]"
 log()  { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 warn() { log "WARNING: $*"; _FAILURES+=("$*"); }
 die()  { log "FATAL: $*"; _FAILURES+=("$*"); exit 1; }
+
+# Large intermediate files (the ~269MB decrypted SQLite .dump, decrypted Qdrant snapshots)
+# must NOT land in the inherited TMPDIR (cc-tmp = the watchgod "oxygen" folder for a CC run;
+# /tmp tmpfs/RAM otherwise). Route them to a dedicated on-disk dir per the tmp_filesystem_limit
+# procedure. NOT an `export TMPDIR` — only the big files move.
+GENESIS_BIG_TMP="${GENESIS_BACKUP_TMPDIR:-$HOME/tmp}"
+mkdir -p "$GENESIS_BIG_TMP"
+log "big-temp dir: $GENESIS_BIG_TMP"
+
+# Quiesce the live writer before swapping the SQLite DB — a live WAL connection
+# would corrupt the restore. Guarded for fresh-box DR (no systemctl / no unit /
+# no user session → no-op). Intentionally does NOT restart: the operator
+# verifies the restored DB first, then starts the server.
+_SERVER_WAS_STOPPED=false
+_quiesce_genesis_server() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if systemctl --user is-active --quiet genesis-server 2>/dev/null; then
+        log "Stopping genesis-server before SQLite restore (will NOT auto-restart)..."
+        # Only record "stopped" if the stop actually succeeded — otherwise the
+        # end-of-run note would tell the operator to restart a server that never
+        # stopped (and is still holding the DB).
+        if systemctl --user stop genesis-server 2>/dev/null; then
+            _SERVER_WAS_STOPPED=true
+        else
+            warn "could not stop genesis-server — proceeding (a live writer may still hold the DB; verify before trusting the restore)"
+        fi
+    fi
+}
 
 _BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
 
@@ -139,6 +185,125 @@ if [ -d "$BACKUP_DIR/.git" ]; then
     (cd "$BACKUP_DIR" && git pull --rebase --quiet 2>/dev/null) || log "git pull failed, continuing with local backup state"
 fi
 
+# ── Off-site (backend) pull ──────────────────────────────────────────
+# The large binaries (SQLite dump, Qdrant snapshots, transcripts) live ONLY on the
+# off-site backend — gitignored from Tier-1 — so on a fresh DR box they must be
+# pulled from the latest dated COMPLETE snapshot before the restore sections below
+# can find them. Destination is the pluggable backend (none/local/smb).
+_pull_from_offsite() {
+    backend_init
+    # Clean the backend's transient creds when this function returns (tighter than
+    # the script-wide EXIT trap, which also calls it — backend_cleanup is idempotent).
+    trap 'backend_cleanup' RETURN
+    local be
+    be="$(backend_name)"
+    [ "$be" = "none" ] && return 0
+    if $DRY_RUN; then log "off-site: (dry-run) would pull the latest snapshot via the $be backend"; return 0; fi
+    backend_available || { log "off-site: backend '$be' is not available — skipping off-site pull"; return 0; }
+    # Don't clobber a payload already staged locally (same-box re-run) unless
+    # forced — the off-site pull is for fresh-box DR.
+    if [ -f "$BACKUP_DIR/data/genesis.sql.gpg" ] && ! $FORCE; then
+        log "off-site: local payload already present — skipping off-site pull (use --force to override)"
+        return 0
+    fi
+
+    local host_dir off_host latest snap fname dst hosts n
+
+    # Latest snapshot under host dir $1 that is COMPLETE — a marker backup.sh writes
+    # only after every file uploaded — so a half-uploaded snapshot from a crashed
+    # backup is never selected. Echoes the stamp; returns 1 if none. Newest first.
+    _latest_complete() {
+        local hd="$1" st
+        while read -r st; do
+            [ -n "$st" ] || continue
+            backend_exists "$hd/$st/COMPLETE" && { echo "$st"; return 0; }
+        done < <(backend_list_dirs "$hd" | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -ru)
+        return 1
+    }
+
+    # The snapshot was written under the SOURCE host's name. On a fresh DR box the
+    # hostname differs, so honour an explicit override (GENESIS_BACKUP_NAS_HOST),
+    # and otherwise fall back to the sole host dir when there's exactly one.
+    off_host="${GENESIS_BACKUP_NAS_HOST:-$(hostname)}"
+    host_dir="Genesis/$off_host"
+    latest="$(_latest_complete "$host_dir" || true)"
+    if [ -z "$latest" ]; then
+        hosts=$(backend_list_dirs "Genesis" || true)
+        n=$(printf '%s' "$hosts" | grep -c . || true)
+        if [ "$n" = 1 ]; then
+            host_dir="Genesis/$hosts"
+            log "off-site: no snapshots under host '$off_host' — using the only host: $hosts"
+            latest="$(_latest_complete "$host_dir" || true)"
+        fi
+    fi
+    if [ -z "$latest" ]; then
+        log "off-site: no COMPLETE dated snapshot found (set GENESIS_BACKUP_NAS_HOST to the source host name) — skipping off-site pull"
+        return 0
+    fi
+    log "off-site: pulling latest snapshot $latest (backend: $be)"
+    snap="$host_dir/$latest"
+
+    # SQLite dump.
+    mkdir -p "$BACKUP_DIR/data"
+    if backend_get "$snap/data/genesis.sql.gpg" "$BACKUP_DIR/data/genesis.sql.gpg"; then
+        log "  off-site: pulled data/genesis.sql.gpg"
+    else
+        warn "off-site: failed to pull genesis.sql.gpg from snapshot $latest — the database will not be restored from off-site"
+    fi
+    # Qdrant snapshots + transcripts: list the subdir, then get each *.gpg. The
+    # staging dir is created only when there's actually something to pull, so an
+    # empty set doesn't make the restore sections below run (and e.g. warn that
+    # Qdrant isn't reachable yet → spurious failure).
+    for sub in qdrant transcripts; do
+        dst="$BACKUP_DIR/data/qdrant"
+        [ "$sub" = transcripts ] && dst="$BACKUP_DIR/transcripts"
+        # `|| true`: an empty subdir makes `grep` exit non-zero → pipefail would
+        # otherwise abort the whole restore.
+        backend_list "$snap/$sub" | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u | while read -r fname; do
+            mkdir -p "$dst"
+            if backend_get "$snap/$sub/$fname" "$dst/$fname"; then
+                log "  off-site: pulled $sub/$fname"
+            fi
+        done || true
+    done
+
+    # memory / config overlays / secrets — previously only in the Tier-1 git clone. Pull
+    # them from the snapshot too so a no-git fresh box can rehydrate them (the §4/§6/§7
+    # restore sections read from these BACKUP_DIR subdirs). memory is flat; config overlays
+    # are plaintext .local.yaml; secrets is the encrypted blob. Staging dirs are created
+    # only when there's something to pull.
+    #
+    # Process substitution (not a `… | while`) is deliberate: a failed pull of these
+    # payloads is the silent DR footgun this PR exists to prevent, so a failed get must
+    # `warn` (→ _FAILURES → non-zero restore). A pipe-into-while runs the body in a
+    # SUBSHELL where _FAILURES appends are lost; `done < <(…)` runs it in THIS shell.
+    while read -r fname; do
+        mkdir -p "$BACKUP_DIR/memory"
+        if backend_get "$snap/memory/$fname" "$BACKUP_DIR/memory/$fname"; then
+            log "  off-site: pulled memory/$fname"
+        else
+            warn "off-site: failed to pull memory/$fname from snapshot $latest"
+        fi
+    done < <(backend_list "$snap/memory" | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
+    while read -r fname; do
+        mkdir -p "$BACKUP_DIR/config_overrides"
+        if backend_get "$snap/config_overrides/$fname" "$BACKUP_DIR/config_overrides/$fname"; then
+            log "  off-site: pulled config_overrides/$fname"
+        else
+            warn "off-site: failed to pull config_overrides/$fname from snapshot $latest"
+        fi
+    done < <(backend_list "$snap/config_overrides" | grep -oE '[A-Za-z0-9._-]+\.local\.yaml' | sort -u)
+    if backend_exists "$snap/secrets/secrets.env.gpg"; then
+        mkdir -p "$BACKUP_DIR/secrets"
+        if backend_get "$snap/secrets/secrets.env.gpg" "$BACKUP_DIR/secrets/secrets.env.gpg"; then
+            log "  off-site: pulled secrets/secrets.env.gpg"
+        else
+            warn "off-site: failed to pull secrets.env.gpg from snapshot $latest — secrets will not be restored"
+        fi
+    fi
+}
+_pull_from_offsite
+
 # Check encrypted payloads exist without passphrase → fail fast.
 _has_encrypted=false
 for candidate in "$BACKUP_DIR"/data/genesis.sql.gpg "$BACKUP_DIR"/secrets/secrets.env.gpg; do
@@ -165,7 +330,7 @@ if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
             log "SQLite: would restore from $src → $DB_FILE"
         elif confirm "Restore SQLite from $(basename "$src") into $DB_FILE?"; then
             mkdir -p "$(dirname "$DB_FILE")"
-            _SQL_TMP=$(mktemp)
+            _SQL_TMP=$(mktemp -p "$GENESIS_BIG_TMP")  # ~269MB dump — keep off cc-tmp/RAM
             if $__PAYLOAD_NEEDS_DECRYPT; then
                 decrypt_file "$src" "$_SQL_TMP" || { warn "SQLite decrypt failed"; rm -f "$_SQL_TMP"; }
             else
@@ -176,12 +341,23 @@ if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
                 if [ -f "$DB_FILE" ]; then
                     cp "$DB_FILE" "${DB_FILE}.pre-restore.$(date +%s)"
                 fi
-                # Fresh DB from the SQL dump.
-                rm -f "$DB_FILE"
+                # Fresh DB from the SQL dump. Stop the live writer first, and
+                # clear stale WAL/SHM sidecars — a leftover -wal would replay
+                # onto the new DB and corrupt it.
+                _quiesce_genesis_server
+                rm -f "$DB_FILE" "$DB_FILE-wal" "$DB_FILE-shm"
                 if command -v sqlite3 >/dev/null; then
                     if sqlite3 "$DB_FILE" ".read $_SQL_TMP"; then
                         _SQLITE_RESTORED=true
                         log "SQLite: restored → $DB_FILE"
+                        # Verify the restored DB is structurally sound — loud on failure.
+                        # 2>&1 so a sqlite3 error (can't open, etc.) surfaces in the warn.
+                        _ic=$(sqlite3 "$DB_FILE" "PRAGMA integrity_check;" 2>&1 | head -1)
+                        if [ "$_ic" = "ok" ]; then
+                            log "SQLite: integrity_check ok"
+                        else
+                            warn "SQLite: integrity_check FAILED (${_ic:-no output}) — restored DB may be corrupt; inspect ${DB_FILE}.pre-restore.*"
+                        fi
                     else
                         warn "SQLite .read failed — inspect ${DB_FILE}.pre-restore.*"
                     fi
@@ -253,7 +429,7 @@ if [ -d "$BACKUP_DIR/data/qdrant" ]; then
                     warn "Qdrant: '$coll' is encrypted but GENESIS_BACKUP_PASSPHRASE unset — skipping"
                     continue
                 fi
-                _QDRANT_TMP=$(mktemp --suffix=.snapshot)
+                _QDRANT_TMP=$(mktemp -p "$GENESIS_BIG_TMP" --suffix=.snapshot)  # large — keep off cc-tmp/RAM
                 if ! decrypt_file "$snap" "$_QDRANT_TMP"; then
                     warn "Qdrant: decrypt failed for '$coll'"
                     rm -f "$_QDRANT_TMP"
@@ -412,6 +588,10 @@ else
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────
+if $_SERVER_WAS_STOPPED; then
+    log "NOTE: genesis-server was stopped for the restore and left stopped."
+    log "      Verify the restored DB, then: systemctl --user start genesis-server"
+fi
 if [ ${#_FAILURES[@]} -eq 0 ]; then
     _SUCCESS=true
     log "Restore complete"

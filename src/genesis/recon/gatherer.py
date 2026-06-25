@@ -2,25 +2,20 @@
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import hashlib
 import json
 import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
 
 import aiosqlite
 
 from genesis.db.crud import observations
+from genesis.recon.gh_cli import run_gh
 
 logger = logging.getLogger(__name__)
 
-_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
-_WATCHLIST_PATH = _CONFIG_DIR / "recon_watchlist.yaml"
-_GH_TIMEOUT = 15  # seconds — network calls are slower than local git
 _RELEASES_PER_PROJECT = 2
 _MAX_BODY_CHARS = 1000
 
@@ -184,7 +179,10 @@ class ReconGatherer:
             type="finding",
             category="github_stars",
             content=content,
-            priority=project.get("priority", "medium"),
+            # Star-count deltas are vanity/informational signal — pin them to
+            # "low" regardless of the watched project's priority so they don't
+            # crowd the high-priority recon lane or trigger proactive delivery.
+            priority="low",
             created_at=now,
             content_hash=content_hash,
         )
@@ -347,68 +345,22 @@ class ReconGatherer:
         return None
 
     async def _run_gh(self, *args: str) -> str:
-        """Run gh CLI command with timeout. Returns stdout or empty on failure."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=_GH_TIMEOUT
-            )
-            if proc.returncode != 0:
-                logger.warning(
-                    "gh command failed (rc=%d): %s — %s",
-                    proc.returncode,
-                    " ".join(args),
-                    stderr.decode("utf-8", errors="replace")[:200],
-                )
-                return ""
-            return stdout.decode("utf-8", errors="replace").strip()
-        except TimeoutError:
-            logger.warning("gh command timed out: %s", " ".join(args))
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            with contextlib.suppress(ChildProcessError):
-                await proc.wait()
-            return ""
-        except OSError:
-            logger.warning("gh command failed to start: %s", " ".join(args), exc_info=True)
-            return ""
+        """Run gh CLI command with timeout. Returns stdout or empty on failure.
+
+        Delegates to the shared ``gh_cli.run_gh`` (single source of truth for the
+        subprocess/timeout/kill handling); kept as a method so existing call
+        sites and tests that patch ``ReconGatherer._run_gh`` are unaffected.
+        """
+        return await run_gh(*args)
 
     @staticmethod
     def _load_watchlist() -> list[dict]:
-        """Load project watchlist with local overlay support.
+        """Active watchlist: base minus user-disabled, plus the install overlay.
 
-        Base: ``config/recon_watchlist.yaml`` (committed, project-level)
-        Overlay: ``config/recon_watchlist.local.yaml`` (gitignored, install-level)
-
-        Projects from the local overlay are appended to the base list.
+        Delegates to the shared ``recon.watchlist`` store so the gatherer, the
+        recon MCP view, and the dashboard editor all agree on one
+        merged-and-tombstoned list (the loaders used to diverge — the MCP read
+        base-only, so overlay edits were invisible there).
         """
-        if not _WATCHLIST_PATH.exists():
-            return []
-        try:
-            import yaml
-
-            with open(_WATCHLIST_PATH) as f:
-                data = yaml.safe_load(f) or {}
-            projects = list(data.get("projects", []))
-
-            # Merge install-specific overlay (gitignored)
-            local_path = _WATCHLIST_PATH.with_suffix(".local.yaml")
-            if local_path.exists():
-                with open(local_path) as f:
-                    local_data = yaml.safe_load(f) or {}
-                local_projects = local_data.get("projects", [])
-                # Deduplicate by repo name
-                existing_repos = {p.get("repo") for p in projects}
-                for lp in local_projects:
-                    if lp.get("repo") not in existing_repos:
-                        projects.append(lp)
-                        existing_repos.add(lp.get("repo"))
-
-            return projects
-        except Exception:
-            logger.error("Failed to load watchlist", exc_info=True)
-            return []
+        from genesis.recon import watchlist
+        return watchlist.active_entries()

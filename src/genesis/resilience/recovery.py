@@ -14,10 +14,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RecoveryReport:
-    items_drained: int = 0
+    items_pending: int = 0  # deferred work left pending (not executed by recovery)
     items_expired: int = 0
     items_unstuck: int = 0
-    items_failed: int = 0
     embeddings_recovered: int = 0
     dead_letters_replayed: int = 0
     dead_letters_failed: int = 0
@@ -109,34 +108,44 @@ class RecoveryOrchestrator:
             except Exception:
                 logger.warning("Failed to reset failed embeddings", exc_info=True)
 
-        # 2. Drain pending embeddings — limit=500 to handle full extraction
-        # cycle output (extraction queues FTS5-only, recovery embeds at pace)
-        report.embeddings_recovered = await self._embedding_worker.drain_pending(limit=500)
-
-        # 3. Drain deferred work by priority
-        items = await self._deferred_queue.drain_by_priority(limit=50)
-        for item in items:
-            try:
-                await self._deferred_queue.mark_processing(item["id"])
-                # Actual re-dispatch is Phase 8/9 work — just mark completed
-                await self._deferred_queue.mark_completed(item["id"])
-                report.items_drained += 1
-            except Exception:
-                report.items_failed += 1
-                logger.exception("Failed to process deferred item %s", item["id"])
-
-        # 4. Re-dispatch dead letters (or mark-only if no dispatch_fn)
-        if self._dispatch_fn is not None and hasattr(self._dead_letter, "redispatch"):
-            succeeded, failed = await self._dead_letter.redispatch(self._dispatch_fn)
-            report.dead_letters_replayed = succeeded
-            report.dead_letters_failed = failed
-        else:
-            report.dead_letters_replayed = await self._dead_letter.replay_pending(
-                target_provider="all",
+        # Re-dispatch (embedding drain + dead-letter replay) re-attempts work against
+        # downstreams (Qdrant, providers). Gate it on a stable system — re-dispatching
+        # into a still-degraded system just churns and re-fails (WS-6: AUTO-RECOV-02).
+        # Housekeeping above (expire stuck/stale, reset-failed) runs unconditionally.
+        if self._state_machine is not None and self._state_machine.is_any_degraded(
+            include_tmp_pressure=False
+        ):
+            logger.info(
+                "Recovery: system still degraded — skipping re-dispatch "
+                "(embedding drain + dead-letter replay) this cycle"
             )
+        else:
+            # 2. Drain pending embeddings — limit=500 to handle a full extraction
+            # cycle output (extraction queues FTS5-only, recovery embeds at pace).
+            report.embeddings_recovered = await self._embedding_worker.drain_pending(limit=500)
 
-        # Check queue overflow
+            # 3. Re-dispatch dead letters (or mark-only if no dispatch_fn).
+            if self._dispatch_fn is not None and hasattr(self._dead_letter, "redispatch"):
+                succeeded, failed = await self._dead_letter.redispatch(self._dispatch_fn)
+                report.dead_letters_replayed = succeeded
+                report.dead_letters_failed = failed
+            else:
+                report.dead_letters_replayed = await self._dead_letter.replay_pending(
+                    target_provider="all",
+                )
+
+        # Deferred work is intentionally LEFT PENDING (WS-6: AUTO-RECOV-01). The old
+        # drain marked items completed without executing them — silently dropping
+        # reflection/outreach work. Both types have real consumers: reflections via
+        # the awareness loop (next_pending(work_type="reflection")) and outreach_delivery
+        # via OutreachRecoveryWorker (resilience/outreach_recovery.py, polls + retries
+        # with backoff). The overflow check below surfaces any accumulation.
+
+        # Check queue overflow. pending_count is the deferred backlog left for the
+        # normal consumers (reflection via the awareness loop; outreach_delivery via
+        # OutreachRecoveryWorker) — surfaced honestly instead of drained-to-completed.
         pending_count = await self._deferred_queue.count_pending()
+        report.items_pending = pending_count
         if pending_count > self._queue_overflow_threshold and self._event_bus:
             await self._event_bus.emit(
                 Subsystem.HEALTH,
@@ -149,8 +158,8 @@ class RecoveryOrchestrator:
 
         report.duration_s = time.monotonic() - start
         logger.info(
-            "Recovery completed: drained=%d expired=%d embeddings=%d dead_letters=%d (%.1fs)",
-            report.items_drained, report.items_expired,
+            "Recovery completed: pending=%d expired=%d embeddings=%d dead_letters=%d (%.1fs)",
+            report.items_pending, report.items_expired,
             report.embeddings_recovered, report.dead_letters_replayed,
             report.duration_s,
         )

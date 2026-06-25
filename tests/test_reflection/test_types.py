@@ -21,12 +21,16 @@ class TestDeepReflectionJob:
     def test_enum_values(self):
         assert DeepReflectionJob.MEMORY_CONSOLIDATION == "memory_consolidation"
         assert DeepReflectionJob.SKILL_REVIEW == "skill_review"
-        assert DeepReflectionJob.COST_RECONCILIATION == "cost_reconciliation"
         assert DeepReflectionJob.LESSONS_EXTRACTION == "lessons_extraction"
         assert DeepReflectionJob.COGNITIVE_REGENERATION == "cognitive_regeneration"
 
+    def test_cost_reconciliation_removed(self):
+        # Cost is observability, not a reflection job. Reflections are no longer
+        # instructed to analyze spend (the fabricated-cost-crisis fix, 2026-06).
+        assert "cost_reconciliation" not in [j.value for j in DeepReflectionJob]
+
     def test_all_values(self):
-        assert len(DeepReflectionJob) == 5
+        assert len(DeepReflectionJob) == 4
 
     def test_surplus_review_removed(self):
         assert "surplus_review" not in [j.value for j in DeepReflectionJob]

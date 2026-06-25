@@ -42,10 +42,12 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "surplus_opportunity": 24,
     "content_review": 1,  # Short window — distinct content pieces may share topics
     "cli_approval": 0,  # Never dedup — every approval request must be delivered
+    "ambient_health": 0,  # Never dedup — the monitor's state machine gates re-alerts/recovery
     "ego_notification": 12,  # Ego notifications — don't repeat same topic within 12h
     "mail_reply": 1,  # Email replies — short window to allow ack + full response
     "mail_follow_up": 24,  # Follow-up emails — one per day max per topic
     "discord_poll": 168,  # Discord polls — 7 days (matches default poll duration)
+    "j9_regression_alert": 168,  # Weekly eval regressions — one alert/week max
 }
 _DEFAULT_DEDUP_HOURS = 24
 
@@ -191,12 +193,17 @@ class GovernanceGate:
             return False
         window_spec = f"-{window_hours} hours"
 
-        # Primary key: (signal_type, topic, category) within the window
+        # Primary key: (signal_type, topic, category) within the window.
+        # NB: wrap delivered_at in datetime(). Stored values are ISO-8601 with a
+        # 'T' separator (datetime.now(UTC).isoformat()); a raw string compare
+        # against SQLite's space-separated datetime('now', ?) is wrong because
+        # 'T' (0x54) > ' ' (0x20), which made the window never expire within a
+        # UTC day. datetime() parses both sides before comparing.
         cursor = await self._db.execute(
             "SELECT COUNT(*) FROM outreach_history "
             "WHERE signal_type = ? AND topic = ? AND category = ? "
             "AND delivered_at IS NOT NULL "
-            "AND delivered_at >= datetime('now', ?)",
+            "AND datetime(delivered_at) >= datetime('now', ?)",
             (request.signal_type, request.topic, request.category.value, window_spec),
         )
         row = await cursor.fetchone()
@@ -209,13 +216,14 @@ class GovernanceGate:
             )
             return True
 
-        # Secondary: content-hash match (catches near-duplicate topics with same body)
+        # Secondary: content-hash match (catches near-duplicate topics with same
+        # body). Same datetime(delivered_at) normalization as the primary query.
         chash = content_hash(request.context)
         cursor = await self._db.execute(
             "SELECT COUNT(*) FROM outreach_history "
             "WHERE signal_type = ? AND category = ? AND content_hash = ? "
             "AND delivered_at IS NOT NULL "
-            "AND delivered_at >= datetime('now', ?)",
+            "AND datetime(delivered_at) >= datetime('now', ?)",
             (request.signal_type, request.category.value, chash, window_spec),
         )
         row = await cursor.fetchone()

@@ -11,6 +11,7 @@ from genesis.awareness.loop import AwarenessLoop, perform_tick
 from genesis.awareness.signals import ConversationCollector
 from genesis.awareness.types import Depth, DepthScore, SignalReading, TickResult
 from genesis.db.crud import awareness_ticks, observations
+from genesis.observability.types import Subsystem
 
 
 async def _persist_tick(db, tick: TickResult) -> None:
@@ -227,3 +228,75 @@ async def test_micro_dispatch_fires_llm_on_critical_failure(db):
     await loop._dispatch_reflection(tick)
 
     engine.reflect.assert_called_once()
+
+
+# ── depth=None idle alive-pulse (keep reflection heartbeat fresh when quiet) ──
+
+
+def _idle_tick(*, db_available: bool = True, tick_id: str = "idle-tick") -> TickResult:
+    """Helper: a quiet tick that classified to depth=None (no reflection ran)."""
+    return TickResult(
+        tick_id=tick_id,
+        timestamp="2026-06-20T04:00:00+00:00",
+        source="scheduled",
+        signals=[],
+        scores=[],
+        classified_depth=None,
+        trigger_reason="no trigger",
+        db_available=db_available,
+    )
+
+
+async def test_idle_heartbeat_helper_emits_when_healthy(db):
+    """The idle-pulse helper emits a REFLECTION heartbeat for a healthy
+    depth=None tick so subsystem_heartbeats does not falsely report 'dark'."""
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    loop = AwarenessLoop(db=db, collectors=[], event_bus=event_bus)
+
+    await loop._emit_reflection_idle_heartbeat(_idle_tick())
+
+    event_bus.emit.assert_called_once()
+    call_args = event_bus.emit.call_args.args
+    assert call_args[0] == Subsystem.REFLECTION
+    assert call_args[2] == "heartbeat"
+
+
+async def test_idle_heartbeat_helper_skips_degraded_tick(db):
+    """A DEGRADED tick (db_available=False) must NOT pulse — a genuine
+    reflection outage should still age out and alarm rather than be masked."""
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    loop = AwarenessLoop(db=db, collectors=[], event_bus=event_bus)
+
+    await loop._emit_reflection_idle_heartbeat(
+        _idle_tick(db_available=False, tick_id="degraded-tick"),
+    )
+
+    event_bus.emit.assert_not_called()
+
+
+async def test_on_tick_pulses_reflection_heartbeat_when_idle(db, monkeypatch):
+    """Wiring: a real quiet tick (no signals → depth=None) routes through
+    _on_tick to the idle pulse and emits exactly one REFLECTION heartbeat.
+
+    This guards against the pulse being placed on a path _on_tick never calls
+    (e.g. inside _dispatch_reflection, which only runs when depth is non-None)."""
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    loop = AwarenessLoop(db=db, collectors=[], event_bus=event_bus)
+
+    # Record out-of-band dispatches without running them (deferred-retry etc.).
+    def _fake_tracked_task(coro, *, name="", **kw):
+        coro.close()
+        return None
+
+    monkeypatch.setattr("genesis.util.tasks.tracked_task", _fake_tracked_task)
+
+    await loop._on_tick()
+
+    reflection_beats = [
+        c for c in event_bus.emit.call_args_list
+        if c.args and c.args[0] == Subsystem.REFLECTION and c.args[2] == "heartbeat"
+    ]
+    assert len(reflection_beats) == 1

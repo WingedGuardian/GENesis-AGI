@@ -34,10 +34,21 @@ class _FakeRouterResult:
 
 
 def _router_returning(payload: dict) -> MagicMock:
+    """Router mock: the first route_call returns the extraction payload; any
+    subsequent call (the scoping classifier) returns a task_procedure verdict so
+    real procedures pass the scoping gate by an explicit verdict, not via the
+    fail-open path."""
     router = MagicMock()
-    router.route_call = AsyncMock(
-        return_value=_FakeRouterResult(success=True, content=json.dumps(payload))
-    )
+    pending = [_FakeRouterResult(success=True, content=json.dumps(payload))]
+
+    def _call(*_args, **_kwargs):
+        if pending:
+            return pending.pop(0)
+        return _FakeRouterResult(
+            success=True, content='{"procedure_type": "task_procedure"}',
+        )
+
+    router.route_call = AsyncMock(side_effect=_call)
     return router
 
 
@@ -260,7 +271,7 @@ async def test_cross_type_duplicate_blocked(db):
         steps=["run yt-dlp"],
         tools_used=["Bash"],
         context_tags=["youtube", "video", "transcript"],
-        speculative=0,
+        draft=0,
         confidence=0.7,
     )
 
@@ -297,7 +308,7 @@ async def test_cross_type_check_allows_different_principles(db):
         steps=["run yt-dlp"],
         tools_used=["Bash"],
         context_tags=["youtube", "video", "transcript"],
-        speculative=0,
+        draft=0,
         confidence=0.7,
     )
 
@@ -341,14 +352,14 @@ async def test_auto_extracted_starts_at_l3_with_baseline_confidence(db):
     assert proc_id is not None
 
     cursor = await db.execute(
-        "SELECT activation_tier, confidence, speculative FROM procedural_memory WHERE id = ?",
+        "SELECT activation_tier, confidence, draft FROM procedural_memory WHERE id = ?",
         (proc_id,),
     )
     rows = await cursor.fetchall()
     assert len(rows) == 1
-    assert rows[0][0] == "L3"
+    assert rows[0][0] == "LIBRARY"
     assert rows[0][1] == pytest.approx(0.5)
-    assert rows[0][2] == 1  # still marked speculative (provenance only)
+    assert rows[0][2] == 1  # still marked draft (provenance only)
 
 
 # ─── FM5: Fail-open rate limiter ────────────────────────────────────────────

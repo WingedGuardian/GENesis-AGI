@@ -58,6 +58,10 @@ async def init_guardian_monitoring(rt) -> None:
     watchdog = GuardianWatchdog(
         remote,
         event_bus=rt._event_bus,
+        # Wire user-facing alerts (Telegram) for Guardian degradation. The
+        # outreach init step runs before guardian-monitoring init, so the
+        # pipeline is ready here; None-safe via getattr if it's ever absent.
+        outreach_pipeline=getattr(rt, "_outreach_pipeline", None),
     )
 
     if rt._awareness_loop:

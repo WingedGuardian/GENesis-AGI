@@ -26,29 +26,12 @@ logger = logging.getLogger(__name__)
 
 _ESSENTIAL_KNOWLEDGE_PATH = Path.home() / ".genesis" / "essential_knowledge.md"
 
-# Tool declarations for the S2S model session config
+# Tool declarations for the S2S model session config.
+# NOTE: ask_genesis is intentionally DISABLED here pending the voice-memory
+# refactor — the raw-snippet dump it returned was poor input for the S2S model.
+# Its dispatch in handle_tool_call() and the _ask_genesis() implementation are
+# kept below, so re-enabling is just restoring its schema to this list.
 TOOL_DECLARATIONS = [
-    {
-        "type": "function",
-        "name": "ask_genesis",
-        "description": (
-            "REQUIRED for any question about: conversations, past events, "
-            "what we discussed, what we worked on, memories, personal context, "
-            "projects, tasks, or anything the user has told you before. "
-            "You do NOT have this information yourself — you MUST call this "
-            "tool to access the user's history. Genesis has full memory."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The user's question, rephrased as a query",
-                },
-            },
-            "required": ["query"],
-        },
-    },
     {
         "type": "function",
         "name": "web_search",
@@ -75,8 +58,8 @@ TOOL_DECLARATIONS = [
         "description": (
             "Approve or reject a pending action that requires user confirmation. "
             "Call this when the user says 'approve', 'yes go ahead', 'do it', "
-            "'reject it', or similar. Resolves the most recent pending request. "
-            "You do NOT need a request ID — just the decision."
+            "'reject it', or similar. If more than one action is pending you'll "
+            "be told the options; call again with the matching request_id."
         ),
         "parameters": {
             "type": "object",
@@ -85,6 +68,14 @@ TOOL_DECLARATIONS = [
                     "type": "string",
                     "enum": ["approved", "rejected"],
                     "description": "The user's decision",
+                },
+                "request_id": {
+                    "type": "string",
+                    "description": (
+                        "Which pending action to resolve. Omit when only one is "
+                        "pending; when several are, pass the id of the one the "
+                        "user chose."
+                    ),
                 },
             },
             "required": ["decision"],
@@ -95,16 +86,18 @@ TOOL_DECLARATIONS = [
 # System instructions for the S2S model
 SYSTEM_INSTRUCTIONS = """\
 You are Genesis, a cognitive AI partner, speaking through a voice interface.
-You have two tools. Use them.
+You have two tools — web search and approvals. Use them.
 
 TOOL RULES (important — follow these strictly):
-- "what did we do / work on / discuss" → ALWAYS call ask_genesis. Never guess.
 - "what time is it / what's the date / what day is it" → answer from the \
 Current time in your context. No tool call needed.
 - "search / look up / what's the weather / news" → ALWAYS call web_search.
 - "can you search the web" or similar capability questions → call web_search \
 with a relevant query to demonstrate the capability.
-- Questions about the user's personal context, projects, history → call ask_genesis.
+- You do NOT currently have access to past conversations, stored memories, or \
+the user's history. If asked what you discussed or worked on before, or for \
+personal context you weren't given here, say plainly that you don't have that \
+available right now — never invent it.
 - General knowledge you're confident about → answer directly, no tool call.
 - When in doubt between answering directly and calling a tool → call the tool. \
 Better to be thorough than to guess wrong.
@@ -120,7 +113,7 @@ they can always ask for more.
 caveats, or "here's why" — over voice that's just noise. Don't restate the \
 question; no filler openers or closers ("let me know if you need anything"). \
 Lead with the answer.
-- For a dense tool result (memory, search), give only the 1-3 points that matter \
+- For a dense tool result (a web search), give only the 1-3 points that matter \
 for what they asked, then offer "Want me to go deeper?" — and only if there's \
 genuinely more worth hearing.
 - Never use markdown, bullet points, or formatting. Speak naturally, like someone \
@@ -133,7 +126,11 @@ decision "approved".
 - "reject it" / "reject that" / "don't do that" → call approve_pending with \
 decision "rejected". Note: a bare "no" in conversation is NOT a rejection — \
 only explicit rejection language like "reject" triggers this.
-- You don't need a request ID. The system resolves the most recent pending request.
+- After it resolves, tell the user in one short sentence what you approved or \
+rejected (the tool returns the action).
+- If the tool reports more than one action is pending, read the options back \
+and ask which one, then call approve_pending again with that request_id. \
+Never guess.
 
 {voice_context}
 """
@@ -172,7 +169,9 @@ class GenesisBridge:
         if name == "web_search":
             return await self._web_search(args.get("query", ""))
         if name == "approve_pending":
-            return await self._approve_pending(args.get("decision", ""))
+            return await self._approve_pending(
+                args.get("decision", ""), request_id=args.get("request_id"),
+            )
 
         return json.dumps({"error": f"Unknown tool: {name}"})
 
@@ -230,11 +229,14 @@ class GenesisBridge:
 
         return json.dumps({"error": "Web search unavailable"})
 
-    async def _approve_pending(self, decision: str) -> str:
-        """Approve or reject the most recent pending approval request.
+    async def _approve_pending(
+        self, decision: str, *, request_id: str | None = None,
+    ) -> str:
+        """Approve or reject a voice-gated pending approval.
 
-        Resolves sentinel_dispatch, sentinel_action, and
-        autonomous_cli_fallback types — all gated action types.
+        Binds to a specific request when *request_id* is given (or when only
+        one is pending); refuses to guess when several are pending and returns
+        the options so the model can ask the user which one.
         """
         if not self._approval_gate:
             return json.dumps({"error": "Approval system not available"})
@@ -242,18 +244,36 @@ class GenesisBridge:
             return json.dumps({"error": f"Invalid decision: {decision}"})
 
         try:
-            request_id = await self._approval_gate.resolve_most_recent_pending_voice(
-                decision=decision, resolved_by="voice:s2s",
+            result = await self._approval_gate.resolve_pending_voice(
+                decision=decision, resolved_by="voice:s2s", request_id=request_id,
             )
         except Exception:
             logger.exception("Voice approval failed")
             return json.dumps({"error": "Approval processing failed"})
 
-        if request_id:
+        status = result.get("status")
+        if status == "resolved":
             return json.dumps({
                 "result": f"Request {decision}",
-                "request_id": request_id[:8],
+                "action": result.get("label", ""),
+                "request_id": str(result.get("request_id", ""))[:8],
             })
+        if status == "ambiguous":
+            options = [
+                {"request_id": c["id"], "action": c["label"]}
+                for c in result.get("candidates", [])
+            ]
+            return json.dumps({
+                "needs_clarification": (
+                    "More than one action is pending. Ask the user which one, "
+                    "then call approve_pending again with its request_id."
+                ),
+                "pending": options,
+            })
+        if status == "not_found":
+            return json.dumps({"error": "That request is no longer pending"})
+        if status == "invalid_decision":
+            return json.dumps({"error": f"Invalid decision: {decision}"})
         return json.dumps({"error": "No pending approval request found"})
 
     def get_system_prompt(self) -> str:

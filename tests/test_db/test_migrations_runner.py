@@ -476,3 +476,57 @@ class TestSerializedConnectionCompat:
             # Re-run is a no-op (idempotence holds through the wrapper)
             second = await runner.run_pending()
             assert second == []
+
+
+class TestFalseFailureReconciliation:
+    """A WAL COMMIT can return SQLITE_BUSY from a post-commit autocheckpoint
+    AFTER the commit frame is durably written (concurrent readers blocking the
+    checkpoint). The runner must reconcile against schema_migrations and treat
+    such a migration as APPLIED — not report a false failure that rolls back the
+    deploy code. Regression for the 2026-06-22 deploy incident (migration 0034)."""
+
+    @pytest.mark.asyncio
+    async def test_commit_busy_after_commit_is_treated_as_applied(self, db, caplog) -> None:
+        import logging
+        from sqlite3 import OperationalError
+
+        class _CommitThenRaise:
+            """First execute('COMMIT') commits for real, then raises SQLITE_BUSY."""
+
+            def __init__(self, real):
+                self._real = real
+                self._tripped = False
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def execute(self, sql, *args, **kwargs):
+                if not self._tripped and sql.strip().upper().startswith("COMMIT"):
+                    self._tripped = True
+
+                    async def _commit_then_raise():
+                        await self._real.execute("COMMIT")
+                        raise OperationalError("database is locked")
+
+                    return _commit_then_raise()
+                return self._real.execute(sql, *args, **kwargs)
+
+        runner = MigrationRunner(_CommitThenRaise(db))
+        with caplog.at_level(logging.WARNING, logger="genesis.db.migrations.runner"):
+            results = await runner.run_pending()
+
+        # The reconciliation path MUST have fired — otherwise this test would pass
+        # even if the wrapper never tripped or reconciliation were removed.
+        assert any(
+            "treating as applied" in rec.getMessage() for rec in caplog.records
+        ), "reconciliation warning not emitted — busy-after-commit path not exercised"
+
+        # The first migration's COMMIT raised SQLITE_BUSY *after* committing;
+        # reconciliation must report it applied rather than a false failure.
+        failed = [(r.name, r.error) for r in results if not r.success]
+        assert not failed, f"committed-but-busy must reconcile to applied: {failed}"
+
+        applied = await runner.get_applied()
+        assert "0001" in applied, "migration durably recorded"
+        # Idempotent: re-run is a no-op.
+        assert await runner.run_pending() == []

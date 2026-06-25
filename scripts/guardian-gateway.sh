@@ -9,14 +9,16 @@
 #   reset-state    — reset stuck state machine to healthy
 #   version        — report CC, code, and Node versions
 #   update         — pull latest code + self-update gateway script
+#   sync-gateway    — redeploy gateway script from install dir (no pull; recovery)
 #   redeploy <hash> — receive tar archive on stdin, deploy to install dir
 #   update-cc <ver> — install a pinned Claude Code version (validated semver)
+#   test-approval   — E2E test the keyword-reply approval gate (no recovery)
 #   ping            — liveness check
 #
 # SSH authorized_keys entry (replace CONTAINER_IP with your container's IP):
 #   command="~/.local/bin/guardian-gateway.sh",from="CONTAINER_IP" ssh-ed25519 ...
 #
-# This gives Genesis a fixed allowlist of 10 operations on the host. Nothing else.
+# This gives Genesis a fixed allowlist of operations on the host. Nothing else.
 
 set -euo pipefail
 
@@ -88,8 +90,13 @@ PYEOF
         CODE_VER=$(cd "$INSTALL_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
         CODE_DATE=$(cd "$INSTALL_DIR" && git log -1 --format=%ci 2>/dev/null || echo "unknown")
         DEPLOYED=$(python3 -c "import json; print(json.load(open('$STATE_DIR/deploy_state.json')).get('deployed_commit','unknown'))" 2>/dev/null || echo "unknown")
-        printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s", "deployed_commit": "%s"}\n' \
-            "$CC_VER" "$NODE_VER" "$CODE_VER" "$CODE_DATE" "$DEPLOYED"
+        # sha256 of the DEPLOYED gateway script — lets the container detect a
+        # stale/frozen gateway whose self-update silently failed (the install-dir
+        # code can be current while ~/.local/bin/guardian-gateway.sh lags).
+        GW_SHA=$(sha256sum "$HOME/.local/bin/guardian-gateway.sh" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
+        [ -n "$GW_SHA" ] || GW_SHA="unknown"
+        printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s", "deployed_commit": "%s", "gateway_sha": "%s"}\n' \
+            "$CC_VER" "$NODE_VER" "$CODE_VER" "$CODE_DATE" "$DEPLOYED" "$GW_SHA"
         ;;
     update)
         INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
@@ -100,98 +107,128 @@ PYEOF
             # repo's version would overwrite with the wrong content (container
             # dev instructions vs Guardian diagnostic instructions). We
             # regenerate it from config/guardian-claude.md after every pull.
-            git checkout -- CLAUDE.md 2>/dev/null || true
+            # Clear skip-worktree first: legacy installs marked CLAUDE.md
+            # --skip-worktree, which wedges `git pull` ("local changes would be
+            # overwritten") the moment upstream touches the tracked CLAUDE.md.
+            git update-index --no-skip-worktree CLAUDE.md 2>/dev/null || true
+            git checkout -- CLAUDE.md >/dev/null 2>&1 || true
             # Stash remaining local config changes (container_ip, etc.)
             STASHED=0
             if ! git diff --quiet 2>/dev/null; then
-                git stash --quiet 2>/dev/null && STASHED=1
+                git stash --quiet >/dev/null 2>&1 && STASHED=1
             fi
-            if git pull --ff-only 2>/dev/null; then
+            # NOTE: every git command in this verb redirects stdout to /dev/null.
+            # The verb's contract is "JSON on stdout ONLY" (the container parses the
+            # whole stdout with json.loads); git's diffstat / "Updating.."/ conflict
+            # chatter on stdout would otherwise corrupt the response into a parse
+            # failure (a successful update misread as {"ok": false}).
+            if git pull --ff-only >/dev/null 2>&1; then
                 # Restore local config changes
                 CONFIG_RESET=0
                 if [ "$STASHED" -eq 1 ]; then
-                    if ! git stash pop --quiet 2>/dev/null; then
-                        # Conflict — drop the stash and warn (config can be re-set)
-                        git checkout -- . 2>/dev/null || true
-                        git stash drop --quiet 2>/dev/null || true
+                    if ! git stash pop --quiet >/dev/null 2>&1; then
+                        # Conflict applying local config onto the freshly pulled
+                        # tree. Reset the worktree to a clean post-pull state so the
+                        # gateway stays functional, but DO NOT `git stash drop` — the
+                        # local config (container_ip, etc.) stays recoverable via
+                        # `git stash list`. Dropping it here silently destroyed the
+                        # operator's config (the bug this fixes). Stashes may
+                        # accumulate across repeated conflicts — that is benign and
+                        # recoverable, unlike silent loss.
+                        git reset --hard --quiet HEAD >/dev/null 2>&1 || git checkout -- . >/dev/null 2>&1 || true
                         CONFIG_RESET=1
                     fi
                 fi
-                # Regenerate Guardian CLAUDE.md from template (never use repo version)
-                if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
-                    cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
-                    # Append per-machine network identity from guardian.yaml
-                    _cfg="$INSTALL_DIR/config/guardian.yaml"
-                    if [ -f "$_cfg" ]; then
-                        _cname=$(grep 'container_name:' "$_cfg" | awk '{print $2}' | tr -d '"' || true)
-                        _cip=$(grep 'container_ip:' "$_cfg" | awk '{print $2}' | tr -d '"' || true)
-                        _hip=$(grep 'host_ip:' "$_cfg" | awk '{print $2}' | tr -d '"' || true)
-                        _hv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' | head -1 || echo '')
-                        {
-                            echo ""
-                            echo "## Network"
-                            echo ""
-                            echo "- **Container**: ${_cname} at ${_cip}"
-                            echo "- **Host VM**: ${_hip} (this machine)"
-                            [ -n "$_hv6" ] && echo "- **Host IPv6**: $_hv6"
-                            echo "- **Dashboard**: http://${_cip}:5000 (direct, container network)"
-                            [ -n "$_hip" ] && echo "               http://${_hip}:5000 (via proxy device)"
-                        } >> "$INSTALL_DIR/CLAUDE.md"
-                    fi
-                fi
-                # Self-update: copy gateway script from pulled repo to ~/.local/bin/
-                # Safe mid-execution: Linux preserves old inode while this process holds fd.
-                # Atomic rename ensures next SSH invocation picks up the new script.
+                # Self-update FIRST (before any best-effort step): copy the freshly
+                # pulled gateway to ~/.local/bin so nothing below can leave the
+                # deployed gateway stale. Atomic rename is safe mid-execution —
+                # Linux preserves the old inode for this running process's fd.
+                # Guarded so `set -e` can't abort the whole update if it fails.
                 if [ -f "$INSTALL_DIR/scripts/guardian-gateway.sh" ]; then
-                    cp "$INSTALL_DIR/scripts/guardian-gateway.sh" "$HOME/.local/bin/guardian-gateway.sh.new"
-                    chmod +x "$HOME/.local/bin/guardian-gateway.sh.new"
-                    mv "$HOME/.local/bin/guardian-gateway.sh.new" "$HOME/.local/bin/guardian-gateway.sh"
+                    cp "$INSTALL_DIR/scripts/guardian-gateway.sh" "$HOME/.local/bin/guardian-gateway.sh.new" \
+                        && chmod +x "$HOME/.local/bin/guardian-gateway.sh.new" \
+                        && mv "$HOME/.local/bin/guardian-gateway.sh.new" "$HOME/.local/bin/guardian-gateway.sh" \
+                        || true
                 fi
+                # Regenerate Guardian CLAUDE.md from template (never use repo
+                # version). Shared host/container facts live in the user-level
+                # ~/.claude/CLAUDE.md (D16), so nothing is appended here.
+                if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
+                    cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md" || true
+                fi
+                # --- BEST-EFFORT host tuning below: every command is guarded so a
+                # sudo/tee/cp failure can NEVER abort the update or suppress the
+                # success JSON (Bug A — froze the deployed gateway for ~2 months
+                # on a passwordless-sudo host where an unguarded sudo tee failed). ---
                 # Update systemd units from repo (picks up MemoryMax, OOMScoreAdjust, etc.)
                 SYSTEMD_DIR="$HOME/.config/systemd/user"
                 mkdir -p "$SYSTEMD_DIR"
                 for unit in genesis-guardian.service genesis-guardian.timer \
                             genesis-guardian-watchman.service genesis-guardian-watchman.timer; do
                     if [ -f "$INSTALL_DIR/config/$unit" ]; then
-                        cp "$INSTALL_DIR/config/$unit" "$SYSTEMD_DIR/$unit"
+                        cp "$INSTALL_DIR/config/$unit" "$SYSTEMD_DIR/$unit" || true
                     fi
                 done
                 systemctl --user daemon-reload 2>/dev/null || true
                 # Refresh host sysctl/udev configs (I/O tuning, BFQ scheduler)
                 if sudo -n true 2>/dev/null; then
                     if [ -f "$INSTALL_DIR/config/60-ioscheduler.rules" ]; then
-                        sudo cp "$INSTALL_DIR/config/60-ioscheduler.rules" /etc/udev/rules.d/ 2>/dev/null
+                        sudo cp "$INSTALL_DIR/config/60-ioscheduler.rules" /etc/udev/rules.d/ 2>/dev/null || true
                         sudo udevadm control --reload-rules 2>/dev/null || true
                     fi
                     # Regenerate I/O sysctl from canonical values
-                    sudo tee /etc/sysctl.d/99-genesis-io-tuning.conf > /dev/null 2>&1 << 'IOSYSCTL'
+                    sudo tee /etc/sysctl.d/99-genesis-io-tuning.conf > /dev/null 2>&1 << 'IOSYSCTL' || true
 vm.swappiness = 10
 vm.dirty_ratio = 10
 vm.dirty_background_ratio = 3
 vm.vfs_cache_pressure = 50
 IOSYSCTL
-                    # Regenerate OOM sysctl (same formula as install_guardian.sh Step 9)
-                    _HOST_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-                    _MIN_FREE=$(( _HOST_RAM_KB / 100 ))
-                    [ "$_MIN_FREE" -lt 131072 ] && _MIN_FREE=131072
-                    [ "$_MIN_FREE" -gt 1048576 ] && _MIN_FREE=1048576
-                    sudo tee /etc/sysctl.d/99-genesis-oom-tuning.conf > /dev/null 2>&1 << OOMSYSCTL
+                    # Regenerate OOM sysctl (same formula as install_guardian.sh Step 9).
+                    # Guard the arithmetic: empty/odd /proc/meminfo would make
+                    # $(( _HOST_RAM_KB / 100 )) a syntax error that aborts under set -e.
+                    _HOST_RAM_KB=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "")
+                    if [ -n "$_HOST_RAM_KB" ]; then
+                        _MIN_FREE=$(( _HOST_RAM_KB / 100 ))
+                        # if-form (not `[ ] && x`): clearer + avoids any set -e
+                        # ambiguity when the clamp condition is false.
+                        if [ "$_MIN_FREE" -lt 131072 ]; then _MIN_FREE=131072; fi
+                        if [ "$_MIN_FREE" -gt 1048576 ]; then _MIN_FREE=1048576; fi
+                        sudo tee /etc/sysctl.d/99-genesis-oom-tuning.conf > /dev/null 2>&1 << OOMSYSCTL || true
 vm.min_free_kbytes = $_MIN_FREE
 vm.watermark_scale_factor = 50
 vm.oom_kill_allocating_task = 1
 OOMSYSCTL
+                    fi
                     sudo sysctl --system > /dev/null 2>&1 || true
                 fi
                 # Restart timer so new check.py code takes effect immediately
                 systemctl --user restart genesis-guardian.timer 2>/dev/null || true
-                NEW=$(git rev-parse --short HEAD 2>/dev/null)
+                NEW=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+                # Record the deployed commit so the watchdog's drift detection works
+                # for pull-based installs (previously only `redeploy` wrote this →
+                # drift detection silently skipped on a "unknown" deployed_commit).
+                mkdir -p "$STATE_DIR"
+                python3 << PYEOF 2>/dev/null || true
+import json
+from datetime import datetime, timezone
+sf = "$STATE_DIR/deploy_state.json"
+try:
+    with open(sf) as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+d["deployed_commit"] = "$NEW"
+d["deployed_at"] = datetime.now(timezone.utc).isoformat()
+with open(sf, "w") as f:
+    json.dump(d, f, indent=2)
+PYEOF
                 if [ "$CONFIG_RESET" -eq 1 ]; then
-                    printf '{"ok": true, "action": "update", "old": "%s", "new": "%s", "warning": "local config changes were discarded due to merge conflict — re-run install_guardian.sh to regenerate"}\n' "$OLD" "$NEW"
+                    printf '{"ok": true, "action": "update", "old": "%s", "new": "%s", "warning": "local config changes conflicted with the update and were preserved in git stash (recover with: git stash list); or re-run install_guardian.sh to regenerate"}\n' "$OLD" "$NEW"
                 else
                     printf '{"ok": true, "action": "update", "old": "%s", "new": "%s"}\n' "$OLD" "$NEW"
                 fi
             else
-                [ "$STASHED" -eq 1 ] && git stash pop --quiet 2>/dev/null || true
+                [ "$STASHED" -eq 1 ] && git stash pop --quiet >/dev/null 2>&1 || true
                 printf '{"ok": false, "action": "update", "error": "git pull failed"}\n' >&2
                 exit 1
             fi
@@ -244,24 +281,11 @@ OOMSYSCTL
             mv "$HOME/.local/bin/guardian-gateway.sh.new" "$HOME/.local/bin/guardian-gateway.sh"
         fi
 
-        # Regenerate CLAUDE.md from template (never use repo version on host)
+        # Regenerate CLAUDE.md from template (never use repo version on host).
+        # Shared host/container facts live in the user-level ~/.claude/CLAUDE.md
+        # (D16), so nothing is appended here.
         if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
             cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
-            _cfg="$INSTALL_DIR/config/guardian.yaml"
-            if [ -f "$_cfg" ]; then
-                # || true: guardian.yaml is host-specific; some fields may be absent
-                _cname=$(grep 'container_name:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
-                _cip=$(grep 'container_ip:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
-                _hip=$(grep 'host_ip:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
-                {
-                    echo ""
-                    echo "## Network"
-                    echo ""
-                    [ -n "$_cname" ] && echo "- **Container**: ${_cname} at ${_cip}"
-                    [ -n "$_hip" ] && echo "- **Host VM**: ${_hip} (this machine)"
-                    [ -n "$_cip" ] && echo "- **Dashboard**: http://${_cip}:5000"
-                } >> "$INSTALL_DIR/CLAUDE.md"
-            fi
         fi
 
         # Record deployed commit (separate file — state.json is overwritten by Guardian ticks)
@@ -324,6 +348,50 @@ PYEOF
             printf '{"ok": true, "action": "update-cc", "version": "%s", "installed": "%s"}\n' "$VERSION" "$INSTALLED"
         else
             printf '{"ok": false, "action": "update-cc", "error": "version mismatch after install", "requested": "%s", "installed": "%s"}\n' "$VERSION" "$INSTALLED" >&2
+            exit 1
+        fi
+        ;;
+    test-approval)
+        # E2E self-test of the keyword-reply approval gate. Sends a test
+        # prompt and polls getUpdates for an APPROVE/DENY reply (~120s).
+        # No recovery is performed. Timeout-guarded just above the self-test's
+        # internal 120s budget so a hung poll can't wedge this SSH session.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "test-approval", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+        GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
+            timeout 130 "$VENV_PY" -m genesis.guardian --test-approval
+        ;;
+    sync-gateway)
+        # Recovery: redeploy the gateway script from the (already-pulled) install
+        # dir to ~/.local/bin, WITHOUT a git pull. Recovers a stale/frozen deployed
+        # gateway when the `update` self-update path is unavailable (e.g. a gateway
+        # too old to have this verb is bootstrapped by a one-time host-local copy).
+        # No git, no sudo — just an idempotent copy of a repo-tracked file.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        SRC="$INSTALL_DIR/scripts/guardian-gateway.sh"
+        DEST="$HOME/.local/bin/guardian-gateway.sh"
+        if [ ! -f "$SRC" ]; then
+            echo '{"ok": false, "action": "sync-gateway", "error": "install-dir gateway not found"}' >&2
+            exit 1
+        fi
+        OLD_SHA=$(sha256sum "$DEST" 2>/dev/null | cut -d' ' -f1 || echo "none")
+        [ -n "$OLD_SHA" ] || OLD_SHA="none"
+        mkdir -p "$(dirname "$DEST")"
+        # Guard the copy so a write failure reports a clean JSON error rather
+        # than a bare set -e abort with no output.
+        if cp "$SRC" "$DEST.new" && chmod +x "$DEST.new" && mv "$DEST.new" "$DEST"; then
+            NEW_SHA=$(sha256sum "$DEST" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
+            printf '{"ok": true, "action": "sync-gateway", "old_sha": "%s", "new_sha": "%s"}\n' \
+                "$OLD_SHA" "$NEW_SHA"
+        else
+            rm -f "$DEST.new" 2>/dev/null || true
+            echo '{"ok": false, "action": "sync-gateway", "error": "failed to deploy gateway"}' >&2
             exit 1
         fi
         ;;

@@ -13,6 +13,7 @@ Contradictions create ``contradicts`` or ``succeeded_by`` links in the graph.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -59,17 +60,21 @@ async def run_entity_resolution(
     """
     from genesis.memory.entity_resolution import (
         AUTO_MERGE_THRESHOLD,
+        EVIDENCE_THRESHOLD,
         LLM_CHECK_FLOOR,
         MAX_ENTITY_CHECKS_PER_RUN,
         check_semantic_overlap,
+        compute_evidence_strength,
         find_dedup_candidates,
         log_resolution,
+        pick_duplicate_survivor,
     )
     from genesis.qdrant import collections as qdrant_ops
 
     report: dict[str, Any] = {
         "candidates_found": 0,
         "auto_merged": 0,
+        "low_evidence_skipped": 0,
         "llm_checked": 0,
         "llm_merged": 0,
         "contradictions": 0,
@@ -184,7 +189,41 @@ async def run_entity_resolution(
                     survivor_id, deprecated_id = point_b["id"], point_a["id"]
 
                 if score >= AUTO_MERGE_THRESHOLD:
-                    # Auto-merge: deprecate older, keep newer
+                    # Evidence gate (spec ③): high cosine alone is not enough.
+                    # A near-floor merge whose corroborating signals (temporal
+                    # distance, confidence, load-bearing) are jointly weak is
+                    # flagged for review instead of being silently deprecated.
+                    strength, evidence = compute_evidence_strength(
+                        payload_a, payload_b, score,
+                    )
+                    if strength < EVIDENCE_THRESHOLD:
+                        await log_resolution(
+                            db,
+                            run_id=run_id,
+                            action="flagged",
+                            memory_id_a=point_a["id"],
+                            memory_id_b=point_b["id"],
+                            content_a=content_a,
+                            content_b=content_b,
+                            cosine_score=score,
+                            llm_verdict="low_evidence",
+                            llm_reasoning=json.dumps({
+                                "reason": "low_evidence_auto_merge",
+                                "strength": round(strength, 4),
+                                "threshold": EVIDENCE_THRESHOLD,
+                                "signals": evidence,
+                            }),
+                        )
+                        report["low_evidence_skipped"] += 1
+                        continue
+
+                    # Confirmed duplicate: keep the load-bearing memory as
+                    # survivor (not merely the newer one — survivor fix).
+                    survivor_id, deprecated_id = pick_duplicate_survivor(
+                        point_a["id"], payload_a, dt_a,
+                        point_b["id"], payload_b, dt_b,
+                    )
+                    # Auto-merge: deprecate the non-survivor, keep the survivor
                     try:
                         await _deprecate_memory(
                             qdrant, db, deprecated_id,
@@ -269,6 +308,12 @@ async def run_entity_resolution(
                             )
                             continue
 
+                        # Confirmed duplicate: keep the load-bearing memory as
+                        # survivor (consistent with the auto-merge path).
+                        survivor_id, deprecated_id = pick_duplicate_survivor(
+                            point_a["id"], payload_a, dt_a,
+                            point_b["id"], payload_b, dt_b,
+                        )
                         try:
                             await _deprecate_memory(
                                 qdrant, db, deprecated_id,
@@ -303,14 +348,17 @@ async def run_entity_resolution(
                         if ts_a != ts_b:
                             link_type = "succeeded_by"
 
+                        # Resolve link direction BEFORE the try so the error
+                        # handler below can never hit an unbound name if the
+                        # import or create() raises.
+                        # Older → newer for succeeded_by; either direction for contradicts
+                        if link_type == "succeeded_by":
+                            src, tgt = deprecated_id, survivor_id
+                        else:
+                            src, tgt = point_a["id"], point_b["id"]
+
                         try:
                             from genesis.db.crud import memory_links
-
-                            # Older → newer for succeeded_by; either direction for contradicts
-                            if link_type == "succeeded_by":
-                                src, tgt = deprecated_id, survivor_id
-                            else:
-                                src, tgt = point_a["id"], point_b["id"]
 
                             await memory_links.create(
                                 db,
@@ -368,10 +416,12 @@ async def run_entity_resolution(
             pass
 
     logger.info(
-        "Entity resolution: %d candidates, %d auto-merged, %d LLM-checked "
+        "Entity resolution: %d candidates, %d auto-merged, "
+        "%d low-evidence-flagged, %d LLM-checked "
         "(%d merged, %d contradictions, %d distinct), %d errors",
         report["candidates_found"],
         report["auto_merged"],
+        report["low_evidence_skipped"],
         report["llm_checked"],
         report["llm_merged"],
         report["contradictions"],

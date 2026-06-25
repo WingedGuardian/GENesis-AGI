@@ -161,6 +161,69 @@ async def test_recall_knowledge_only(mock_qdrant, mock_crud, mock_links, _):
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_threads_collection_episodic(mock_qdrant, mock_crud, mock_links, _):
+    """A Qdrant hit from episodic_memory → result.collection == 'episodic_memory'
+    (the authoritative first-party/external discriminator, audit D12)."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.9)]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    _setup_link_mocks(mock_links)
+
+    results = await retriever.recall(
+        "test", source="episodic", limit=5, min_activation=0.0, rerank=False,
+    )
+    assert results
+    assert results[0].collection == "episodic_memory"
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_threads_collection_knowledge(mock_qdrant, mock_crud, mock_links, _):
+    """A Qdrant hit from knowledge_base → result.collection == 'knowledge_base'."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.9)]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    _setup_link_mocks(mock_links)
+
+    results = await retriever.recall(
+        "test", source="knowledge", limit=5, min_activation=0.0, rerank=False,
+    )
+    assert results
+    assert results[0].collection == "knowledge_base"
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_threads_collection_fts_only(mock_qdrant, mock_crud, mock_links, _):
+    """An FTS5-only hit (no Qdrant vector) must still carry its collection from
+    the FTS row — this is exactly the path where the old payload['scope'] signal
+    was absent, so the collection discriminator must cover it (audit D12)."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = []  # no vector hits → FTS-only
+    mock_crud.search_ranked = AsyncMock(return_value=[
+        {**_make_fts_row("mem-kb", -5.0), "collection": "knowledge_base"},
+    ])
+    _setup_link_mocks(mock_links)
+
+    results = await retriever.recall(
+        "test", source="both", limit=5, min_activation=0.0, rerank=False,
+    )
+    assert results
+    assert results[0].memory_id == "mem-kb"
+    assert results[0].collection == "knowledge_base"
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
 async def test_recall_both_sources(mock_qdrant, mock_crud, mock_links, _):
     retriever, _, _, _ = _build_retriever()
 
@@ -676,3 +739,46 @@ async def test_recall_graph_boost_adjacency(mock_qdrant, mock_crud, mock_links, 
     a_result = next(r for r in results if r.memory_id == "a")
     # c's boosted score should exceed a's (despite lower vector score)
     assert c_result.score > a_result.score
+
+
+# --- MEM-005: entrenchment signal (hand-rolled Spearman) ---
+
+
+class TestSpearmanRankCorr:
+    """_spearman_rank_corr powers the activation-entrenchment metric (MEM-005):
+    does retrieval frequency predict final ranking? scipy is not a dependency,
+    so it is hand-rolled."""
+
+    def test_perfect_positive(self):
+        from genesis.memory.retrieval import _spearman_rank_corr
+
+        assert _spearman_rank_corr([1, 2, 3, 4], [10, 20, 30, 40]) == pytest.approx(1.0)
+
+    def test_perfect_negative(self):
+        from genesis.memory.retrieval import _spearman_rank_corr
+
+        assert _spearman_rank_corr([1, 2, 3, 4], [40, 30, 20, 10]) == pytest.approx(-1.0)
+
+    def test_none_when_too_short(self):
+        from genesis.memory.retrieval import _spearman_rank_corr
+
+        assert _spearman_rank_corr([1], [1]) is None
+        assert _spearman_rank_corr([], []) is None
+
+    def test_none_on_zero_variance(self):
+        from genesis.memory.retrieval import _spearman_rank_corr
+
+        # Constant xs → no ranking variance → undefined correlation.
+        assert _spearman_rank_corr([5, 5, 5], [1, 2, 3]) is None
+
+    def test_handles_ties_monotonic(self):
+        from genesis.memory.retrieval import _spearman_rank_corr
+
+        v = _spearman_rank_corr([1, 2, 2, 3], [10, 20, 20, 30])
+        assert v == pytest.approx(1.0)
+
+    def test_in_range(self):
+        from genesis.memory.retrieval import _spearman_rank_corr
+
+        v = _spearman_rank_corr([1, 5, 2, 8, 3], [2, 1, 4, 3, 9])
+        assert -1.0 <= v <= 1.0

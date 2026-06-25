@@ -144,6 +144,46 @@ class AutonomyManager:
             return None
         return _row_to_state(row)
 
+    async def detect_earnback_candidates(self) -> list[dict]:
+        """Categories whose autonomy can be earned back, gated on EVIDENCE.
+
+        A category is a candidate iff it is demoted (``current_level <
+        earned_level``) AND the system's own Bayesian evidence now supports the
+        earned level again (``bayesian_level(successes, corrections) >=
+        earned_level``). This keeps proposals silent while the lower level is
+        genuinely correct and fires only once the category re-earns the level.
+        Promotion itself still requires explicit user approval — this only
+        identifies who is eligible.
+
+        Note: ``consecutive_corrections`` is deliberately NOT part of the gate.
+        ``record_correction`` resets it to 0 on a regression, so it would be 0
+        right after a category got worse; the Bayesian posterior is the honest,
+        sufficient signal.
+
+        Returns dicts: ``{category, current_level, target_level,
+        total_successes, total_corrections, posterior, last_regression_at}``.
+        """
+        candidates: list[dict] = []
+        for row in await crud.list_all(self._db):
+            current = row["current_level"]
+            earned = row["earned_level"]
+            if current >= earned:
+                continue  # not demoted — nothing to earn back
+            successes = row.get("total_successes", 0)
+            corrections = row.get("total_corrections", 0)
+            if crud.bayesian_level(successes, corrections) < earned:
+                continue  # evidence does not yet support the earned level
+            candidates.append({
+                "category": row["category"],
+                "current_level": current,
+                "target_level": earned,
+                "total_successes": successes,
+                "total_corrections": corrections,
+                "posterior": crud.bayesian_posterior(successes, corrections),
+                "last_regression_at": row.get("last_regression_at"),
+            })
+        return candidates
+
     # ------------------------------------------------------------------
     # Level queries
     # ------------------------------------------------------------------

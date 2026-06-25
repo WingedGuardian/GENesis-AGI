@@ -23,6 +23,7 @@ from genesis.cc.exceptions import (
     CCTimeoutError,
 )
 from genesis.cc.types import CCInvocation, CCModel, CCOutput, StreamEvent, clamp_effort
+from genesis.observability.spans import SpanKind, start_span
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,78 @@ def _get_scope_args() -> list[str]:
     if _SCOPE_ARGS is None:
         _SCOPE_ARGS = _build_scope_args()
     return _SCOPE_ARGS
+
+
+# A minimal, runtime-generated CC settings file that registers ONLY the span
+# PostToolUse hook. Lives outside the repo so it is install-local and never
+# committed; regenerated idempotently (see cc_span_settings_path).
+_CC_SPAN_SETTINGS_PATH = Path.home() / ".genesis" / "cc-span-settings.json"
+
+
+def cc_span_settings_path() -> str | None:
+    """Generate (idempotently) a minimal CC settings file that registers ONLY
+    the span PostToolUse hook, and return its absolute path — or ``None`` if the
+    launcher is unavailable.
+
+    Why this exists: dispatched CC sessions run with a working directory outside
+    any git repo (``~/.genesis/background-sessions``), and Claude Code discovers
+    project ``.claude/settings.json`` via git-root detection — so the repo-level
+    hook registration never loads there and ``cc_span_hook`` never fires. Passing
+    this file via ``--settings`` injects JUST that hook; CC merges it with the
+    user's settings, leaving every other hook untouched. The hook itself no-ops
+    unless ``GENESIS_TRACE_ID`` is set, so attaching it to every dispatch is safe
+    (and is why this is the *single* registration — the repo-level one was
+    removed to avoid a double-fire when a dispatch runs in a worktree cwd, which
+    *does* load repo settings).
+
+    The hook command uses an ABSOLUTE path to the ``genesis-hook`` launcher,
+    which self-locates the install root from its own filesystem position — NOT
+    ``${CLAUDE_PROJECT_DIR}``, which CC leaves unset in dispatched sessions.
+    Written atomically and only when stale, so it tracks the install root across
+    updates with no bootstrap-ordering dependency and no per-dispatch churn.
+    """
+    from genesis import env
+
+    genesis_hook = env.repo_root() / ".claude" / "hooks" / "genesis-hook"
+    if not genesis_hook.exists():
+        return None
+
+    desired = json.dumps(
+        {
+            "hooks": {
+                "PostToolUse": [
+                    {
+                        "matcher": ".*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"{genesis_hook} hooks/cc_span_hook.py",
+                                "timeout": 500,
+                            },
+                        ],
+                    },
+                ],
+            },
+        },
+        indent=2,
+    )
+
+    path = _CC_SPAN_SETTINGS_PATH
+    try:
+        if path.exists() and path.read_text(encoding="utf-8") == desired:
+            return str(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Unique temp name (pid-suffixed) so concurrent processes can't clobber
+        # each other mid-write; os.replace is atomic.
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(desired, encoding="utf-8")
+        os.replace(tmp, path)
+        return str(path)
+    except OSError:
+        logger.warning(
+            "Could not write CC span settings file at %s", path, exc_info=True,
+        )
+        return None
 
 
 class CCInvoker:
@@ -159,6 +232,14 @@ class CCInvoker:
             args += ["--resume", inv.resume_session_id]
         if inv.mcp_config:
             args += ["--mcp-config", inv.mcp_config]
+        # Register the span-capture PostToolUse hook for this dispatched session.
+        # Dispatched sessions run with a cwd outside any git repo, so CC never
+        # loads the repo's .claude/settings.json; --settings injects just this
+        # hook (CC merges it with the user's settings). No-op unless a trace is
+        # active (GENESIS_TRACE_ID). See cc_span_settings_path.
+        span_settings = cc_span_settings_path()
+        if span_settings:
+            args += ["--settings", span_settings]
         if inv.skip_permissions:
             args.append("--dangerously-skip-permissions")
         if inv.allowed_tools:
@@ -192,6 +273,16 @@ class CCInvoker:
             env["GENESIS_SESSION_ID"] = _sid
         else:
             env.pop("GENESIS_SESSION_ID", None)
+        # Propagate the active trace context so the CC PostToolUse span hook can
+        # stitch this session's tool spans under the dispatching operation's
+        # trace (cross-process). Absent when no span is active → hook no-ops.
+        from genesis.observability.spans import current_trace_context
+        _tc = current_trace_context()
+        if _tc:
+            env["GENESIS_TRACE_ID"], env["GENESIS_PARENT_SPAN_ID"] = _tc
+        else:
+            env.pop("GENESIS_TRACE_ID", None)
+            env.pop("GENESIS_PARENT_SPAN_ID", None)
         if inv and inv.stream_idle_timeout_ms is not None:
             env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(inv.stream_idle_timeout_ms)
         if inv and inv.anthropic_base_url:
@@ -337,6 +428,34 @@ class CCInvoker:
                 logger.warning("CC status callback failed for %s", status, exc_info=True)
 
     async def run(self, invocation: CCInvocation) -> CCOutput:
+        """Run a dispatched CC session (traced).
+
+        Opens a ``cc.session`` span spanning the whole subprocess lifetime so
+        (a) the active trace context is injected into the child env (see
+        ``_build_env``) and the CC PostToolUse hook nests tool spans under it,
+        and (b) any LLM/operation spans share one trace. Best-effort — a no-op
+        when capture is disabled.
+        """
+        with start_span(
+            "cc.session",
+            SpanKind.CC_SESSION,
+            attributes={
+                "model": invocation.model,
+                "effort": invocation.effort,
+                "streaming": False,
+            },
+        ) as span:
+            output = await self._run_inner(invocation)
+            with contextlib.suppress(Exception):
+                span.set_attr("cost_usd", output.cost_usd)
+                span.set_attr("input_tokens", output.input_tokens)
+                span.set_attr("output_tokens", output.output_tokens)
+                span.set_attr("model_used", output.model_used)
+                if output.is_error:
+                    span.set_status_error(output.error_message or "CC session error")
+            return output
+
+    async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
         args = self._build_args(invocation)
         env = self._build_env(invocation)
         start = time.monotonic()
@@ -465,10 +584,38 @@ class CCInvoker:
         invocation: CCInvocation,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
+        """Run CC with stream-json output (traced — see run() for span rationale)."""
+        with start_span(
+            "cc.session",
+            SpanKind.CC_SESSION,
+            attributes={
+                "model": invocation.model,
+                "effort": invocation.effort,
+                "streaming": True,
+            },
+        ) as span:
+            output = await self._run_streaming_inner(invocation, on_event)
+            with contextlib.suppress(Exception):
+                span.set_attr("cost_usd", output.cost_usd)
+                span.set_attr("input_tokens", output.input_tokens)
+                span.set_attr("output_tokens", output.output_tokens)
+                span.set_attr("model_used", output.model_used)
+                if output.is_error:
+                    span.set_status_error(output.error_message or "CC session error")
+            return output
+
+    async def _run_streaming_inner(
+        self,
+        invocation: CCInvocation,
+        on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+    ) -> CCOutput:
         """Run CC with stream-json output, calling on_event for each line."""
         args = self._build_args(invocation)
-        # Override output format to stream-json (requires --verbose with -p)
-        fmt_idx = args.index("json")
+        # Override output format to stream-json (requires --verbose with -p).
+        # Target the --output-format value by its flag, not a bare args.index("json")
+        # scan — other args (e.g. --settings .../cc-span-settings.json) can contain
+        # the substring "json", and keying off the flag is unambiguous.
+        fmt_idx = args.index("--output-format") + 1
         args[fmt_idx] = "stream-json"
         args.insert(1, "--verbose")
 

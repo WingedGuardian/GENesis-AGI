@@ -8,6 +8,7 @@ import aiosqlite
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
+from genesis.memory.provenance import provenance_descriptor
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,14 @@ async def memory_search():
                 "activation_score": round(r.activation_score, 4) if r.activation_score else None,
                 "source_session_id": r.source_session_id,
                 "source_pipeline": r.source_pipeline,
+                # Provenance (audit D12): let the UI distinguish/badge
+                # external-world KB from first-party memory.
+                "collection": r.collection,
+                "provenance": provenance_descriptor(
+                    collection=r.collection,
+                    source_pipeline=r.source_pipeline,
+                    source_doc=r.source,
+                ),
             })
 
         return jsonify({"results": items, "query": query, "count": len(items)})

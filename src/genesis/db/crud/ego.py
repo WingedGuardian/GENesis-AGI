@@ -1092,6 +1092,24 @@ async def get_goal_proposal_summary(
         return {}
 
 
+async def has_open_goal_status_change(
+    db: aiosqlite.Connection,
+    goal_id: str,
+) -> bool:
+    """True if an unresolved ``goal_status_change`` proposal exists for *goal_id*.
+
+    Used by goal-review post-processing to avoid stacking a second status-change
+    proposal on a goal while one is still pending or awaiting dispatch-approval.
+    """
+    cursor = await db.execute(
+        "SELECT 1 FROM ego_proposals "
+        "WHERE goal_id = ? AND action_type = 'goal_status_change' "
+        "AND status IN ('pending', 'approved') LIMIT 1",
+        (goal_id,),
+    )
+    return await cursor.fetchone() is not None
+
+
 async def compute_vcr(
     db: aiosqlite.Connection,
     *,

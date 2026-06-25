@@ -55,3 +55,27 @@ def fmt(iso_str: str, fmt_str: str = "%a %Y-%m-%d %H:%M %Z") -> str:
 def fmt_short(iso_str: str) -> str:
     """Short time-only format: '14:30 EST'."""
     return fmt(iso_str, "%H:%M %Z")
+
+
+def parse_utc_iso(iso_str: str | None) -> datetime | None:
+    """Parse a stored ISO-8601 timestamp into a UTC-aware ``datetime``.
+
+    Genesis stores timestamps as UTC ISO strings. A value written without an
+    offset (naive) is treated as UTC. Returns ``None`` on empty or unparseable
+    input so callers can branch explicitly instead of silently swallowing the
+    error and disabling a guard.
+
+    Unlike :func:`fmt`, this is for *comparison/arithmetic* on the read path,
+    not display. Use it wherever a stored timestamp is subtracted from
+    ``datetime.now(UTC)`` so a naive value can never raise
+    ``can't subtract offset-naive and offset-aware datetimes``.
+    """
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt

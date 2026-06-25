@@ -163,14 +163,19 @@ def main() -> None:
         except OSError as exc:
             print(f"SessionEnd hook: failed to write pending bookmark: {exc}", file=sys.stderr)
 
-    # 3. Append session patch for cognitive state freshness
-    patch_topic = _extract_topic(messages, fallback=topic_hint)
-    _append_session_patch(
-        session_id=session_id,
-        topic_hint=patch_topic,
-        message_count=len(messages),
-        ended_at=now,
-    )
+    # 3. Append session patch for cognitive state freshness — only for sessions
+    #    that actually had messages. A zero-message session (e.g. one ended
+    #    during a server restart before any messages.jsonl was written) would
+    #    otherwise write a ghost "no topic · 0 msgs" row into the dashboard's
+    #    recent-sessions list.
+    if messages:
+        patch_topic = _extract_topic(messages, fallback=topic_hint)
+        _append_session_patch(
+            session_id=session_id,
+            topic_hint=patch_topic,
+            message_count=len(messages),
+            ended_at=now,
+        )
 
     # 4. If session ran in a worktree, backup transcript to main project dir.
     _backup_worktree_transcript(transcript_path)

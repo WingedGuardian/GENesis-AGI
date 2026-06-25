@@ -63,7 +63,7 @@ async def test_procedure_recall_registered():
 async def test_procedure_store_recall_roundtrip():
     """End-to-end regression test for the procedure_store→procedure_recall bug.
 
-    Pre-fix: procedure_store wrote speculative=1, success_count=0,
+    Pre-fix: procedure_store wrote draft=1, success_count=0,
     confidence=0.0 → find_relevant filtered it out → procedure_recall
     returned []. This test stores a procedure and verifies it comes back.
     """
@@ -95,15 +95,15 @@ async def test_procedure_store_recall_roundtrip():
 
             # Verify the row landed with explicit-teach defaults.
             cursor = await real_db.execute(
-                "SELECT speculative, success_count, confidence, activation_tier "
+                "SELECT draft, success_count, confidence, activation_tier "
                 "FROM procedural_memory WHERE id = ?",
                 (pid,),
             )
             row = await cursor.fetchone()
-            assert row[0] == 0  # speculative
+            assert row[0] == 0  # draft
             assert row[1] == 1  # success_count
             assert abs(row[2] - 2 / 3) < 1e-9  # Laplace
-            assert row[3] == "L3"  # activation_tier
+            assert row[3] == "LIBRARY"  # activation_tier
 
             # Now recall the procedure — must be visible.
             results = await tools["procedure_recall"].fn(
@@ -119,6 +119,46 @@ async def test_procedure_store_recall_roundtrip():
             mod._store = old_store
             mod._db = old_db
             mod._retriever = old_retriever
+
+
+async def test_procedure_recall_counts_reads():
+    """Recalling a procedure (surfacing it to the model) bumps invocation_count
+    — the top-of-funnel usage signal that was previously never recorded."""
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        real_db.row_factory = aiosqlite.Row
+        from genesis.db.schema import create_all_tables
+        await create_all_tables(real_db)
+        await real_db.commit()
+
+        old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+        try:
+            mod._store, mod._db, mod._retriever = MagicMock(), real_db, MagicMock()
+            tools = await _get_tools()
+            pid = await tools["procedure_store"].fn(
+                task_type="discourse-forum-registration",
+                principle="Browser is required; the raw API returns fake success.",
+                steps=["navigate", "fill", "submit", "verify"],
+                tools_used=["browser_navigate"],
+                context_tags=["discourse", "forum", "registration", "browser"],
+            )
+
+            async def invocations() -> int:
+                cur = await real_db.execute(
+                    "SELECT invocation_count FROM procedural_memory WHERE id = ?", (pid,))
+                return (await cur.fetchone())[0]
+
+            assert await invocations() == 0
+            await tools["procedure_recall"].fn(
+                task_description="register on discourse forum",
+                context_tags=["discourse", "forum", "registration"],
+            )
+            assert await invocations() >= 1   # read counted
+        finally:
+            mod._store, mod._db, mod._retriever = old_store, old_db, old_retriever
 
 
 # ─── End-to-end knowledge_ingest test ────────────────────────────────────────
@@ -1301,5 +1341,96 @@ async def test_memory_recall_explicit_both_still_works():
         mod._retriever.recall.assert_called_once()
         call_kwargs = mod._retriever.recall.call_args.kwargs
         assert call_kwargs.get("source") == "both"
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+# ── MEM-003: exactly one recall_fired per logical recall ────────────────────
+
+
+def _ri_result(mid: str):
+    from genesis.memory.types import RetrievalResult
+
+    return RetrievalResult(
+        memory_id=mid, content=f"c-{mid}", source="test", memory_type="episodic",
+        score=0.5, vector_rank=1, fts_rank=1, activation_score=0.3, payload={},
+        source_pipeline="hybrid", collection="episodic_memory",
+    )
+
+
+async def test_memory_recall_standard_emits_exactly_one_recall_fired(db):
+    """MEM-003: the standard path emits ONE recall_fired (the retriever's),
+    enriched in place by the MCP layer with mode/pipeline_used — not a 2nd."""
+    import genesis.mcp.memory_mcp as mod
+    from genesis.db.crud import j9_eval
+    from genesis.eval.j9_hooks import emit_recall_fired
+
+    results = [_ri_result("a"), _ri_result("b"), _ri_result("c")]
+
+    async def fake_recall(*_a, event_id_sink=None, **_k):
+        # Mirror the real retriever: emit the inner event + populate the sink.
+        eid = await emit_recall_fired(
+            db, query="q", result_count=len(results),
+            top_scores=[r.score for r in results],
+            memory_ids=[r.memory_id for r in results],
+            latency_ms=1.0, source="both",
+        )
+        if event_id_sink is not None and eid is not None:
+            event_id_sink.append(eid)
+        return list(results)
+
+    mock_retriever = AsyncMock()
+    mock_retriever.recall = fake_recall
+    mock_retriever._embeddings = MagicMock()
+
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._retriever = mock_retriever
+        mod._qdrant = MagicMock()
+        tools = await _get_tools()
+        await tools["memory_recall"].fn(
+            query="q", source="both", limit=10, compact=True,
+        )
+        events = await j9_eval.get_events(db, event_type="recall_fired")
+        assert len(events) == 1  # ONE event, enriched in place
+        m = events[0]["metrics"]
+        assert m["pipeline_used"] == "standard"  # MCP-layer attribution merged
+        assert m["mode"] == "auto"
+        assert m["result_count"] == 3
+        # Realigned to the final returned set (the inner emit sent no mean_score).
+        assert m["mean_score"] == pytest.approx(0.5)
+        assert "latency_ms" in m
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_memory_recall_drift_mode_emits_exactly_one_recall_fired(db):
+    """MEM-003: drift mode calls drift_recall (no inner emit) → the MCP layer
+    emits exactly one fresh recall_fired (empty sink → INSERT)."""
+    import genesis.mcp.memory_mcp as mod
+    from genesis.db.crud import j9_eval
+
+    drift_results = [_ri_result("x"), _ri_result("y")]
+
+    mock_retriever = AsyncMock()
+    mock_retriever._embeddings = MagicMock()
+
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._retriever = mock_retriever
+        mod._qdrant = MagicMock()
+        with patch.object(_drift_patch(), "drift_recall",
+                          new_callable=AsyncMock, return_value=drift_results):
+            tools = await _get_tools()
+            await tools["memory_recall"].fn(
+                query="q", source="both", mode="drift", limit=10, compact=True,
+            )
+        events = await j9_eval.get_events(db, event_type="recall_fired")
+        assert len(events) == 1  # exactly one, freshly inserted
+        assert events[0]["metrics"]["pipeline_used"] == "drift"
     finally:
         mod._store, mod._db, mod._retriever, mod._qdrant = old

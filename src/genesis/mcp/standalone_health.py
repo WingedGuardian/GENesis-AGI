@@ -112,15 +112,24 @@ class StandaloneHealthDataService:
 
             cc_data = await cc_sessions_snap(self._db, None, None)
             result["cc_sessions"] = cc_data
-            # Wire shadow costs into the cost field
-            if isinstance(cc_data, dict):
-                result["cost"] = {
-                    "daily_usd": cc_data.get("shadow_cost_today"),
-                    "monthly_usd": cc_data.get("shadow_cost_month"),
-                    "budget_status": "unknown",
-                }
+            # NOTE: cc_data carries shadow_cost_* (notional "if CC were API-billed").
+            # That is NOT real spend — keep it under cc_sessions, never as `cost`.
         except Exception:
             logger.warning("CC sessions snapshot failed in standalone mode", exc_info=True)
+
+        # Real spend from cost_events — the SAME snapshot genesis-server uses, so
+        # the standalone MCP surface reports identical, real numbers (not the shadow
+        # "if-CC-were-API-billed" figure). Construct a read-only CostTracker on the
+        # shared DB; event_bus=None means no budget events fire. On failure the
+        # snapshot keeps its honest {None, None, "unknown"} default rather than a
+        # fabricated figure.
+        try:
+            from genesis.observability.snapshots.cost import cost as cost_snap
+            from genesis.routing.cost_tracker import CostTracker
+
+            result["cost"] = await cost_snap(self._db, CostTracker(self._db), None)
+        except Exception:
+            logger.warning("Cost snapshot failed in standalone mode", exc_info=True)
 
         # Call sites — last activity per call site from call_site_last_run table
         try:

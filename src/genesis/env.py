@@ -93,6 +93,30 @@ def genesis_db_path() -> Path:
     return repo_root() / "data" / "genesis.db"
 
 
+def genesis_home() -> Path:
+    """Resolve the Genesis runtime home (~/.genesis): output, sessions, config."""
+    value = os.environ.get("GENESIS_HOME")
+    return Path(value).expanduser() if value else Path.home() / ".genesis"
+
+
+def claude_home() -> Path:
+    """Resolve the Claude Code home (~/.claude): plans, skills, projects."""
+    value = os.environ.get("CLAUDE_HOME")
+    return Path(value).expanduser() if value else Path.home() / ".claude"
+
+
+def plans_dir() -> Path:
+    """Working plan/roadmap docs (~/.claude/plans)."""
+    value = os.environ.get("GENESIS_PLANS_DIR")
+    return Path(value).expanduser() if value else claude_home() / "plans"
+
+
+def output_dir() -> Path:
+    """Genesis report/spec/content output (~/.genesis/output)."""
+    value = os.environ.get("GENESIS_OUTPUT_DIR")
+    return Path(value).expanduser() if value else genesis_home() / "output"
+
+
 def cc_project_dir() -> str:
     """Claude Code project directory name, derived from repo root path.
 

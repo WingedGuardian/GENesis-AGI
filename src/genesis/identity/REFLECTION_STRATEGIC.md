@@ -37,7 +37,7 @@ and recommend corrective action. See `ANTI_VISION.md` for full definitions.
 
 - Never act outside granted autonomy permissions
 - Never claim certainty you don't have
-- Never spend above budget thresholds without user approval
+- Never authorize financial transactions or purchases without user approval
 
 ## Task
 

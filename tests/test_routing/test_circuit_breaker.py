@@ -474,3 +474,176 @@ def test_trip_count_capped_on_restore(tmp_path):
         assert cb._trip_count == 3  # capped from 90
     finally:
         cb_mod._STATE_FILE = original_path
+
+
+# --- Probe-based recovery (record_probe_success) ---
+
+
+def _half_open_breaker(probe_threshold=3, **kw):
+    """A breaker driven to HALF_OPEN: tripped OPEN (failure_threshold=2), then
+    its open window expired so the next state read auto-transitions to HALF_OPEN.
+    """
+    t = [0.0]
+    cb = CircuitBreaker(
+        _provider("p1"), failure_threshold=2, open_duration_s=10,
+        clock=lambda: t[0], probe_success_threshold=probe_threshold, **kw,
+    )
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    cb.record_failure(ErrorCategory.TRANSIENT)  # trips OPEN
+    assert cb.state == ProviderState.OPEN
+    t[0] = 100.0  # past the open window
+    assert cb.state == ProviderState.HALF_OPEN
+    return cb, t
+
+
+def test_probe_success_heals_half_open_after_threshold():
+    cb, _ = _half_open_breaker(probe_threshold=3)
+    cb.record_probe_success()
+    assert cb.state == ProviderState.HALF_OPEN  # 1 < 3
+    cb.record_probe_success()
+    assert cb.state == ProviderState.HALF_OPEN  # 2 < 3
+    cb.record_probe_success()
+    assert cb.state == ProviderState.CLOSED     # 3 → healed
+    assert cb.trip_count == 0
+
+
+def test_probe_success_noop_when_closed():
+    cb = CircuitBreaker(_provider(), clock=lambda: 0)
+    assert cb.state == ProviderState.CLOSED
+    cb.record_probe_success()
+    assert cb.state == ProviderState.CLOSED
+    assert cb.trip_count == 0
+
+
+def test_probe_success_noop_when_open_not_expired():
+    """A probe success must NOT heal a breaker whose open window has not yet
+    expired (still genuinely OPEN)."""
+    t = [0.0]
+    cb = CircuitBreaker(_provider(), failure_threshold=2, open_duration_s=100, clock=lambda: t[0])
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    assert cb.state == ProviderState.OPEN
+    cb.record_probe_success()
+    assert cb.state == ProviderState.OPEN
+
+
+def test_probe_success_fires_on_recovery():
+    """On full recovery the breaker fires on_recovery — this is what drives
+    #698's escalation observation-resolve, so a probe-healed provider does not
+    leave a stale 'provider_failure' observation."""
+    recovered = []
+    t = [0.0]
+    cb = CircuitBreaker(
+        _provider("p1"), failure_threshold=2, open_duration_s=10,
+        clock=lambda: t[0], probe_success_threshold=2,
+        on_recovery=lambda name: recovered.append(name),
+    )
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    t[0] = 100.0
+    assert cb.state == ProviderState.HALF_OPEN
+    cb.record_probe_success()
+    assert recovered == []  # below threshold — no recovery yet
+    cb.record_probe_success()
+    assert cb.state == ProviderState.CLOSED
+    assert recovered == ["p1"]
+
+
+def test_real_failure_after_probe_heal_can_retrip():
+    """A provider healed via probe must still re-trip on real failures —
+    healing must not disable failure tracking."""
+    cb, _ = _half_open_breaker(probe_threshold=2)
+    cb.record_probe_success()
+    cb.record_probe_success()
+    assert cb.state == ProviderState.CLOSED
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    cb.record_failure(ErrorCategory.TRANSIENT)  # failure_threshold=2
+    assert cb.state == ProviderState.OPEN
+
+
+# --- Coverage-based degradation (essential_sites map injected) ---
+
+
+def test_degradation_coverage_paid_down_but_essentials_covered_is_normal():
+    """The demo scenario: the PAID provider is down (e.g. OpenRouter out of
+    credits), but every essential cloud site still has a free provider up →
+    coverage-based degradation = NORMAL. No false 'all cloud down ⇒ ESSENTIAL'.
+    """
+    providers = {
+        "paid_or": _provider("paid_or", "openrouter"),
+        "free_g": _provider("free_g", "google", is_free=True),
+        "free_q": _provider("free_q", "groq", is_free=True),
+    }
+    essential = {
+        "4_light_reflection": ["paid_or", "free_g", "free_q"],
+        "3_micro_reflection": ["paid_or", "free_q"],
+    }
+    reg = CircuitBreakerRegistry(providers, clock=lambda: 0, essential_sites=essential)
+    for _ in range(3):
+        reg.get("paid_or").record_failure(ErrorCategory.QUOTA_EXHAUSTED)
+    assert reg.get("paid_or").state == ProviderState.OPEN
+    assert reg.compute_degradation_level() == DegradationLevel.NORMAL
+
+
+def test_degradation_coverage_essential_uncovered_is_essential():
+    """When an essential site has NO available provider, degrade to ESSENTIAL."""
+    providers = {
+        "p1": _provider("p1", "openrouter"),
+        "p2": _provider("p2", "google", is_free=True),
+    }
+    essential = {"9_fact_extraction": ["p1", "p2"]}
+    reg = CircuitBreakerRegistry(providers, clock=lambda: 0, essential_sites=essential)
+    for name in ("p1", "p2"):
+        for _ in range(3):
+            reg.get(name).record_failure(ErrorCategory.TRANSIENT)
+    assert reg.compute_degradation_level() == DegradationLevel.ESSENTIAL
+
+
+def test_degradation_coverage_missing_api_key_uncovers_site():
+    """A provider with no API key cannot cover an essential site even when its
+    breaker is CLOSED."""
+    providers = {
+        "nokey": ProviderConfig(
+            name="nokey", provider_type="openrouter", model_id="m",
+            is_free=False, rpm_limit=None, open_duration_s=120,
+            has_api_key=False,
+        ),
+    }
+    essential = {"40_ego_focus_selection": ["nokey"]}
+    reg = CircuitBreakerRegistry(providers, clock=lambda: 0, essential_sites=essential)
+    assert reg.get("nokey").is_available()  # breaker closed...
+    assert reg.compute_degradation_level() == DegradationLevel.ESSENTIAL  # ...but no key
+
+
+def test_degradation_coverage_all_healthy_is_normal():
+    """All essentials covered, nothing down → NORMAL."""
+    providers = {
+        "p1": _provider("p1", "openrouter"),
+        "p2": _provider("p2", "google", is_free=True),
+    }
+    essential = {"8_ego_compaction": ["p1", "p2"]}
+    reg = CircuitBreakerRegistry(providers, clock=lambda: 0, essential_sites=essential)
+    assert reg.compute_degradation_level() == DegradationLevel.NORMAL
+
+
+def test_degradation_coverage_unknown_provider_in_chain_is_unavailable():
+    """A provider name in an essential chain that isn't registered counts as
+    unavailable — if it's the only one, the site is uncovered."""
+    providers = {"real": _provider("real", "google", is_free=True)}
+    essential = {"3_micro_reflection": ["ghost"]}  # 'ghost' not in providers
+    reg = CircuitBreakerRegistry(providers, clock=lambda: 0, essential_sites=essential)
+    assert reg.compute_degradation_level() == DegradationLevel.ESSENTIAL
+
+
+def test_degradation_coverage_ollama_axis_independent_of_essential_map():
+    """Ollama (local-compute) axis is checked before cloud coverage, even when
+    the essential map is present."""
+    providers = {
+        "ol": _provider("ol", "ollama"),
+        "free_g": _provider("free_g", "google", is_free=True),
+    }
+    essential = {"4_light_reflection": ["free_g"]}
+    reg = CircuitBreakerRegistry(providers, clock=lambda: 0, essential_sites=essential)
+    for _ in range(3):
+        reg.get("ol").record_failure(ErrorCategory.TRANSIENT)
+    assert reg.compute_degradation_level() == DegradationLevel.LOCAL_COMPUTE_DOWN

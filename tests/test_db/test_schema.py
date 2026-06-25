@@ -55,6 +55,9 @@ EXPECTED_TABLES = [
     "centrality_cache",
     "campaigns",
     "campaign_runs",
+    "capability_grants",  # WS-8 PR-B: per-(domain,verb,risk_class) cells
+    "pending_email_sends",  # WS-8 PR-C: email autonomy gate hold store
+    "autonomous_email_sends",  # WS-8 PR-D: autonomous-send ledger (visibility + flag + rate-limit)
 ]
 
 
@@ -101,6 +104,10 @@ async def test_no_unexpected_tables(db):
         "eval_subsystem_grades",
         "reflection_corpus",
         "email_threads", "email_thread_messages",
+        "outcome_events",  # self-improvement outcome bus
+        "ego_calibration_snapshots",  # measure-only ego calibration
+        "otel_spans",  # tracing/spans backbone
+        "cognitive_file_modifications",  # cognitive self-mod rollback ledger
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"
@@ -213,6 +220,22 @@ async def test_autonomy_state_rejects_level_out_of_range(db):
         )
 
 
+async def test_capability_grants_rejects_invalid_state(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO capability_grants (id, domain, verb, risk_class, state) "
+            "VALUES ('email:send:standard', 'email', 'send', 'standard', 'INVALID')"
+        )
+
+
+async def test_capability_grants_rejects_invalid_risk_class(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO capability_grants (id, domain, verb, risk_class) "
+            "VALUES ('email:send:nope', 'email', 'send', 'INVALID')"
+        )
+
+
 async def test_surplus_rejects_invalid_drive(db):
     with pytest.raises(sqlite3.IntegrityError):
         await db.execute(
@@ -244,6 +267,22 @@ async def test_budgets_rejects_invalid_budget_type(db):
         await db.execute(
             "INSERT INTO budgets (id, budget_type, limit_usd, created_at, updated_at) "
             "VALUES ('test', 'INVALID', 10.0, '2026-01-01', '2026-01-01')"
+        )
+
+
+async def test_follow_ups_rejects_invalid_kind(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO follow_ups (id, source, content, strategy, created_at, kind) "
+            "VALUES ('t', 's', 'c', 'ego_judgment', '2026-01-01T00:00:00', 'INVALID')"
+        )
+
+
+async def test_follow_ups_rejects_invalid_domain(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO follow_ups (id, source, content, strategy, created_at, domain) "
+            "VALUES ('t', 's', 'c', 'ego_judgment', '2026-01-01T00:00:00', 'INVALID')"
         )
 
 

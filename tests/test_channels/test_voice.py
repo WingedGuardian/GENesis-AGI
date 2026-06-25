@@ -637,7 +637,8 @@ class TestVoiceAPI:
             assert "Genesis" in data["prompt"]
 
     def test_tool_declarations_endpoint(self, app):
-        """Tool declarations endpoint returns the 3 Genesis voice tools."""
+        """Tool declarations endpoint returns the advertised voice tools
+        (ask_genesis disabled until the memory refactor)."""
         with (
             patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
             app.test_client() as client,
@@ -647,7 +648,7 @@ class TestVoiceAPI:
             data = resp.get_json()
             assert "tools" in data
             tool_names = [t["name"] for t in data["tools"]]
-            assert "ask_genesis" in tool_names
+            assert "ask_genesis" not in tool_names  # disabled until the memory refactor
             assert "web_search" in tool_names
             assert "approve_pending" in tool_names
 

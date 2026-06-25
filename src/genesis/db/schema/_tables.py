@@ -26,13 +26,13 @@ TABLES = {
             deprecated        INTEGER NOT NULL DEFAULT 0,
             deprecated_reason TEXT,
             superseded_by     TEXT,                -- FK to procedural_memory.id
-            speculative       INTEGER NOT NULL DEFAULT 1,
+            draft             INTEGER NOT NULL DEFAULT 1,  -- untested draft (was: speculative)
             invocation_count  INTEGER NOT NULL DEFAULT 0,
             attempted_workarounds TEXT,            -- JSON: array of {description, outcome, conditions}
             version           INTEGER NOT NULL DEFAULT 1,
             created_at        TEXT NOT NULL,
-            activation_tier   TEXT NOT NULL DEFAULT 'L4',  -- L1/L2/L3/L4 promotion tier
-            tool_trigger      TEXT,                        -- JSON array of tool names for L1 matching
+            activation_tier   TEXT NOT NULL DEFAULT 'DORMANT',  -- CORE/ADVISORY/LIBRARY/DORMANT promotion tier
+            tool_trigger      TEXT,                        -- JSON array of tool names for CORE matching
             source            TEXT,                        -- JSON: {type, session_id?, observation_id?, triage_outcome?}
             promotion_history TEXT,                        -- JSON array: [{from_tier, to_tier, at, reason}]
             principle_embedding BLOB                       -- qwen3-embedding(1024 float32) of `principle`, little-endian; read by proactive procedure hook
@@ -464,7 +464,11 @@ TABLES = {
             ),
             strength    REAL NOT NULL DEFAULT 0.5,
             created_at  TEXT NOT NULL,
-            PRIMARY KEY (source_id, target_id)
+            -- link_type is part of the PK (audit DLI-04 / D15): distinct
+            -- relationship types between the same pair (e.g. supports AND
+            -- contradicts) must coexist, not silently overwrite. Migration
+            -- 0029 brings existing DBs to this shape.
+            PRIMARY KEY (source_id, target_id, link_type)
         )
     """,
     "deferred_work_queue": """
@@ -523,6 +527,43 @@ TABLES = {
             matched_at        TEXT
         )
     """,
+    "outcome_events": """
+        CREATE TABLE IF NOT EXISTS outcome_events (
+            id                TEXT PRIMARY KEY,
+            source            TEXT NOT NULL,
+            ref_type          TEXT NOT NULL,
+            ref_id            TEXT NOT NULL,
+            domain            TEXT,
+            signal_type       TEXT NOT NULL,
+            signal_class      TEXT NOT NULL DEFAULT 'implicit'
+                                  CHECK (signal_class IN ('implicit', 'explicit')),
+            signal_tier       INTEGER NOT NULL CHECK (signal_tier IN (1, 2, 3)),
+            polarity          TEXT CHECK (polarity IN ('positive', 'negative', 'neutral')),
+            value             REAL,
+            stated_confidence REAL,
+            prediction_error  REAL,
+            reason            TEXT,
+            reason_text       TEXT,
+            metadata          TEXT,
+            harvested_from    TEXT,
+            occurred_at       TEXT NOT NULL,
+            created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (source, ref_type, ref_id, signal_type)
+        )
+    """,
+    "ego_calibration_snapshots": """
+        CREATE TABLE IF NOT EXISTS ego_calibration_snapshots (
+            id              TEXT PRIMARY KEY,
+            domain          TEXT NOT NULL,
+            ece             REAL NOT NULL,
+            mce             REAL NOT NULL,
+            sample_count    INTEGER NOT NULL,
+            bucket_count    INTEGER NOT NULL,
+            low_confidence  INTEGER NOT NULL DEFAULT 0,
+            curve_json      TEXT NOT NULL,
+            computed_at     TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """,
     "events": """
         CREATE TABLE IF NOT EXISTS events (
             id               TEXT PRIMARY KEY,
@@ -569,6 +610,75 @@ TABLES = {
             content_hash     TEXT,                    -- SHA-256 of canonical(action_type,class,desc,ctx)
             previous_hash    TEXT,                    -- chain link: previous record's chain_hash
             chain_hash       TEXT                     -- SHA-256(previous_hash:content_hash)
+        )
+    """,
+    # Capability-grant matrix (WS-8) — per-(domain, verb, risk_class) cells.
+    # Replaces the linear L1–L7 ladder for ported channel-domains (email
+    # first).  DARK in PR-B: no runtime reader/writer yet; autonomy_state
+    # stays authoritative until PR-C ships enforcement + the L1–L7 read-out.
+    "capability_grants": """
+        CREATE TABLE IF NOT EXISTS capability_grants (
+            id            TEXT PRIMARY KEY,           -- "{domain}:{verb}:{risk_class}"
+            domain        TEXT NOT NULL,              -- channel-domain, e.g. 'email'
+            verb          TEXT NOT NULL,              -- e.g. 'send'
+            risk_class    TEXT NOT NULL DEFAULT 'standard' CHECK (risk_class IN (
+                'standard', 'identity', 'bulk', 'financial'
+            )),
+            state         TEXT NOT NULL DEFAULT 'not_determined' CHECK (state IN (
+                'not_determined', 'ask', 'granted', 'denied_permanent'
+            )),
+            successes     INTEGER NOT NULL DEFAULT 0,
+            corrections   INTEGER NOT NULL DEFAULT 0,
+            weighted_corrections REAL NOT NULL DEFAULT 0.0,  -- WS-8 PR-D: Σ consequence-weighted corrections (governs re-earn difficulty)
+            granted_at    TEXT,                       -- when cell most recently entered 'granted' (decay-clock origin)
+            last_used_at  TEXT,
+            last_decayed_at TEXT,                     -- WS-8 PR-D: most recent staleness-decay sweep that touched this cell
+            created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (domain, verb, risk_class)
+        )
+    """,
+    # WS-8 email autonomy gate hold store — a held outbound email awaiting
+    # owner approval (gate lives in outreach.pipeline._deliver).  request_id
+    # UNIQUE = the schema-level double-send guard.
+    "pending_email_sends": """
+        CREATE TABLE IF NOT EXISTS pending_email_sends (
+            id                  TEXT PRIMARY KEY,
+            request_id          TEXT NOT NULL UNIQUE,
+            thread_id           TEXT,
+            validated_recipient TEXT NOT NULL,
+            channel             TEXT NOT NULL DEFAULT 'email',
+            category            TEXT NOT NULL,
+            message             TEXT NOT NULL,
+            cell_domain         TEXT NOT NULL,
+            cell_verb           TEXT NOT NULL,
+            cell_risk_class     TEXT NOT NULL,
+            held_at             TEXT NOT NULL,
+            status              TEXT NOT NULL DEFAULT 'held'
+                                    CHECK (status IN ('held', 'sent', 'rejected', 'expired')),
+            sent_at             TEXT,
+            rejected_at         TEXT
+        )
+    """,
+    # WS-8 PR-D autonomous-send ledger — one row per email sent autonomously
+    # under a GRANTED capability cell (i.e. the gate allowed it without holding
+    # for owner approval).  This is the keystone the owner-visibility "Activity"
+    # tab, the flag-as-bad correction, and the per-cell rate-limit guard all read
+    # (outreach_history carries no recipient/thread/cell column).  Approved (held
+    # then owner-approved) sends are NOT logged here — only autonomous ones.
+    "autonomous_email_sends": """
+        CREATE TABLE IF NOT EXISTS autonomous_email_sends (
+            id                  TEXT PRIMARY KEY,
+            outreach_id         TEXT,                   -- link to outreach_history.id
+            thread_id           TEXT,
+            recipient           TEXT NOT NULL,
+            subject             TEXT,
+            cell_domain         TEXT NOT NULL,
+            cell_verb           TEXT NOT NULL,
+            cell_risk_class     TEXT NOT NULL,
+            sent_at             TEXT NOT NULL,
+            flagged_at          TEXT,                   -- owner flagged this send as bad → correction recorded on the cell
+            created_at          TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """,
     "task_states": """
@@ -988,7 +1098,14 @@ TABLES = {
             escalated_to     TEXT,
             verified_at      TEXT,
             verification_notes TEXT,
-            pinned           INTEGER NOT NULL DEFAULT 0
+            pinned           INTEGER NOT NULL DEFAULT 0,
+            kind             TEXT NOT NULL DEFAULT 'follow_up' CHECK (
+                kind IN ('follow_up', 'tabled')
+            ),
+            domain           TEXT CHECK (
+                domain IN ('internal', 'user_world')
+            ),
+            goal_id          TEXT
         )
     """,
     "file_modifications": """
@@ -1000,6 +1117,20 @@ TABLES = {
             tool_name        TEXT,
             file_hash        TEXT,
             timestamp        TEXT NOT NULL
+        )
+    """,
+    "cognitive_file_modifications": """
+        CREATE TABLE IF NOT EXISTS cognitive_file_modifications (
+            id              TEXT PRIMARY KEY,
+            actor           TEXT NOT NULL,
+            target_path     TEXT NOT NULL,
+            prior_content   TEXT,
+            applied_content TEXT NOT NULL,
+            change_summary  TEXT,
+            metadata        TEXT,
+            status          TEXT NOT NULL DEFAULT 'applied',
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            rolled_back_at  TEXT
         )
     """,
     "tool_call_outcomes": """
@@ -1316,6 +1447,32 @@ TABLES = {
             UNIQUE(message_id)
         )
     """,
+    "otel_spans": """
+        CREATE TABLE IF NOT EXISTS otel_spans (
+            span_id         TEXT PRIMARY KEY,
+            trace_id        TEXT NOT NULL,
+            parent_span_id  TEXT,
+            name            TEXT NOT NULL,
+            kind            TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'ok'
+                                CHECK (status IN ('ok', 'error')),
+            status_message  TEXT,
+            start_unix_us   INTEGER NOT NULL,
+            end_unix_us     INTEGER,
+            duration_us     INTEGER,
+            session_id      TEXT,
+            process         TEXT,
+            call_site       TEXT,
+            provider        TEXT,
+            model_id        TEXT,
+            input_tokens    INTEGER,
+            output_tokens   INTEGER,
+            cost_usd        REAL,
+            cost_known      INTEGER,
+            attributes_json TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1346,7 +1503,7 @@ KNOWLEDGE_FTS5_DDL = """
 
 INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_procedural_task_type ON procedural_memory(task_type)",
-    "CREATE INDEX IF NOT EXISTS idx_procedural_speculative ON procedural_memory(speculative)",
+    "CREATE INDEX IF NOT EXISTS idx_procedural_draft ON procedural_memory(draft)",
     "CREATE INDEX IF NOT EXISTS idx_procedural_activation_tier ON procedural_memory(activation_tier)",
     "CREATE INDEX IF NOT EXISTS idx_observations_source ON observations(source)",
     "CREATE INDEX IF NOT EXISTS idx_observations_type ON observations(type)",
@@ -1441,10 +1598,31 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_predictions_domain ON predictions(domain)",
     "CREATE INDEX IF NOT EXISTS idx_predictions_bucket ON predictions(confidence_bucket)",
     "CREATE INDEX IF NOT EXISTS idx_predictions_unmatched ON predictions(outcome) WHERE outcome IS NULL",
+    # outcome bus (self-improvement ledger)
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_domain ON outcome_events(domain)",
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_source ON outcome_events(source)",
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_tier ON outcome_events(signal_tier)",
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_signal_type ON outcome_events(signal_type)",
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_ref ON outcome_events(ref_type, ref_id)",
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_occurred ON outcome_events(occurred_at)",
+    "CREATE INDEX IF NOT EXISTS idx_outcome_events_calibration "
+    "ON outcome_events(domain, signal_tier) "
+    "WHERE stated_confidence IS NOT NULL AND value IS NOT NULL",
+    # ego calibration snapshots (measure-only trend)
+    "CREATE INDEX IF NOT EXISTS idx_ego_calibration_domain_time "
+    "ON ego_calibration_snapshots(domain, computed_at)",
     # approval requests (Phase 9)
     "CREATE INDEX IF NOT EXISTS idx_approval_status ON approval_requests(status)",
     "CREATE INDEX IF NOT EXISTS idx_approval_class ON approval_requests(action_class)",
     "CREATE INDEX IF NOT EXISTS idx_approval_timeout ON approval_requests(timeout_at)",
+    # capability grants (WS-8 — per-(domain,verb,risk_class) cells, dark in PR-B)
+    "CREATE INDEX IF NOT EXISTS idx_capability_grants_domain ON capability_grants(domain, state)",
+    # WS-8 email gate hold store (drain queries WHERE status='held')
+    "CREATE INDEX IF NOT EXISTS idx_pending_email_sends_status ON pending_email_sends(status)",
+    # WS-8 PR-D autonomous-send ledger — per-cell rate-limit window + ledger ordering
+    "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_cell "
+    "ON autonomous_email_sends(cell_domain, cell_verb, cell_risk_class, sent_at)",
+    "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_sent ON autonomous_email_sends(sent_at)",
     # task states (Phase 9)
     "CREATE INDEX IF NOT EXISTS idx_task_states_session ON task_states(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_task_states_phase ON task_states(current_phase)",
@@ -1523,6 +1701,11 @@ INDEXES = [
     # tool call outcomes (edit failure sensor)
     "CREATE INDEX IF NOT EXISTS idx_tco_tool_ts ON tool_call_outcomes(tool_name, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_tco_success ON tool_call_outcomes(success, timestamp)",
+    # cognitive self-modification ledger (rollback)
+    "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_target ON cognitive_file_modifications(target_path)",
+    "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_actor ON cognitive_file_modifications(actor)",
+    "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_created ON cognitive_file_modifications(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_status ON cognitive_file_modifications(status)",
     # direct session queue
     "CREATE INDEX IF NOT EXISTS idx_dsq_status_created ON direct_session_queue(status, created_at)",
     # J-9 eval infrastructure
@@ -1559,6 +1742,13 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_email_threads_status ON email_threads(status)",
     "CREATE INDEX IF NOT EXISTS idx_email_threads_follow_up ON email_threads(follow_up_after)",
     "CREATE INDEX IF NOT EXISTS idx_email_thread_messages_thread ON email_thread_messages(thread_id)",
+    # otel spans (tracing backbone)
+    "CREATE INDEX IF NOT EXISTS idx_otel_spans_trace ON otel_spans(trace_id)",
+    "CREATE INDEX IF NOT EXISTS idx_otel_spans_parent ON otel_spans(parent_span_id)",
+    "CREATE INDEX IF NOT EXISTS idx_otel_spans_start ON otel_spans(start_unix_us)",
+    "CREATE INDEX IF NOT EXISTS idx_otel_spans_session ON otel_spans(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_otel_spans_roots "
+    "ON otel_spans(start_unix_us) WHERE parent_span_id IS NULL",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

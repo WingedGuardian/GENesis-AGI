@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,6 +32,31 @@ if TYPE_CHECKING:
     from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
+
+
+# `gitnexus analyze` injects a `<!-- gitnexus:start --> … <!-- gitnexus:end -->`
+# block into BOTH CLAUDE.md and AGENTS.md, with no per-file flag. We keep it in
+# AGENTS.md (read by cross-tool agents — Codex/Cursor/etc.) but strip it from
+# CLAUDE.md so Claude Code's instructions file stays clean.
+_GITNEXUS_BLOCK_RE = re.compile(
+    r"\n*<!-- gitnexus:start -->.*?<!-- gitnexus:end -->[^\n]*\n?",
+    re.DOTALL,
+)
+
+
+def _strip_gitnexus_block(path: Path) -> bool:
+    """Remove GitNexus's auto-injected block from a file. Returns True if removed."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    stripped = _GITNEXUS_BLOCK_RE.sub("", text)
+    if stripped == text:
+        return False
+    if stripped and not stripped.endswith("\n"):
+        stripped += "\n"
+    path.write_text(stripped)
+    return True
 
 
 class SurplusScheduler:
@@ -102,6 +128,8 @@ class SurplusScheduler:
         self._recon_gatherer: ReconGatherer | None = None
         self._model_intelligence_job = None  # Set via set_model_intelligence_job()
         self._models_md_synthesis_job = None  # Set via set_models_md_synthesis_job()
+        self._skill_security_scan_job = None  # Set via set_skill_security_scan_job()
+        self._github_discovery_job = None  # Set via set_github_discovery_job()
         self._extraction_store: MemoryStore | None = None
         self._extraction_router: Router | None = None
         self._follow_up_dispatcher = None  # Set via set_follow_up_dispatcher()
@@ -190,6 +218,14 @@ class SurplusScheduler:
     def set_models_md_synthesis_job(self, job) -> None:
         """Set the ModelsMdSynthesisJob for weekly models.md updates."""
         self._models_md_synthesis_job = job
+
+    def set_skill_security_scan_job(self, job) -> None:
+        """Set the SkillSecurityScanJob for the weekly skill-security scan."""
+        self._skill_security_scan_job = job
+
+    def set_github_discovery_job(self, job) -> None:
+        """Set the GitHubDiscoveryJob for weekly curated repo discovery."""
+        self._github_discovery_job = job
 
     def set_extraction_deps(
         self,
@@ -286,6 +322,25 @@ class SurplusScheduler:
                 max_instances=1,
                 misfire_grace_time=3600,
             )
+        # Skill-security scan: weekly Monday 2am — audits installed skills via SkillSpector.
+        if self._skill_security_scan_job is not None:
+            self._scheduler.add_job(
+                self.run_skill_security_scan,
+                CronTrigger(day_of_week="mon", hour=2, timezone=user_timezone()),
+                id="skill_security_scan",
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
+        # GitHub Discovery: weekly Wednesday 6am — finds new repos in the user's
+        # domains and files the top few to the recon triage queue for review.
+        if self._github_discovery_job is not None:
+            self._scheduler.add_job(
+                self.run_github_discovery,
+                CronTrigger(day_of_week="wed", hour=6, timezone=user_timezone()),
+                id="github_discovery",
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
         # Dream cycle: weekly Sunday 4am — episodic memory consolidation
         from apscheduler.triggers.cron import CronTrigger
         self._scheduler.add_job(
@@ -304,6 +359,17 @@ class SurplusScheduler:
             id="gitnexus_reindex",
             max_instances=1,
             misfire_grace_time=3600,
+        )
+        # GitNexus CLAUDE.md strip: hourly. Decoupled from the reindex job above —
+        # out-of-band reindexes (GitNexus's own staleness `analyze`) also re-inject
+        # the block but never run that job's post-strip, so without this the block
+        # would persist in CLAUDE.md until the next Mon/Thu reindex.
+        self._scheduler.add_job(
+            self.run_gitnexus_strip,
+            CronTrigger(minute=0, timezone=user_timezone()),
+            id="gitnexus_strip",
+            max_instances=1,
+            misfire_grace_time=300,
         )
         # Wing audit: twice-weekly memory taxonomy review (Tue & Fri 2am local).
         # Moved off Sunday to avoid dream cycle congestion.
@@ -437,6 +503,8 @@ class SurplusScheduler:
             await self.schedule_model_eval()
         if self._analytical_hours > 0:
             await self.schedule_analytical()
+        # Clean any GitNexus block an out-of-band reindex left in CLAUDE.md.
+        await self.run_gitnexus_strip()
         logger.info(
             "Surplus scheduler started (dispatch=%dm, brainstorm=%dh)",
             self._dispatch_interval, self._brainstorm_interval,
@@ -1020,6 +1088,91 @@ class SurplusScheduler:
             except Exception:
                 pass
 
+    async def run_skill_security_scan(self) -> None:
+        """Run the weekly skill-security scan (SkillSpector → recon findings)."""
+        if self._skill_security_scan_job is None:
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure(
+                    "skill_security_scan", "job not wired",
+                )
+            except Exception:
+                pass
+            return
+        try:
+            result = await self._skill_security_scan_job.run()
+            total = result.get("total_findings", 0)
+            logger.info("Skill-security scan: %d untrusted findings", total)
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.DEBUG,
+                    "heartbeat", "skill_security_scan completed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("skill_security_scan")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Skill-security scan failed")
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.ERROR,
+                    "skill_security_scan.failed",
+                    "Skill-security scan failed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("skill_security_scan", str(exc))
+            except Exception:
+                pass
+
+    async def run_github_discovery(self) -> None:
+        """Run weekly curated GitHub Discovery (new repos → recon triage queue)."""
+        try:
+            from genesis.runtime import GenesisRuntime
+            if GenesisRuntime.instance().paused:
+                logger.debug("GitHub Discovery skipped (Genesis paused)")
+                return
+        except Exception:
+            pass
+        if self._github_discovery_job is None:
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure(
+                    "github_discovery", "job not wired",
+                )
+            except Exception:
+                pass
+            return
+        try:
+            result = await self._github_discovery_job.run()
+            filed = result.get("filed", 0)
+            logger.info("GitHub Discovery: %d new repo(s) filed for triage", filed)
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.DEBUG,
+                    "heartbeat", "github_discovery completed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("github_discovery")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("GitHub Discovery failed")
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.ERROR,
+                    "github_discovery.failed",
+                    "GitHub Discovery failed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("github_discovery", str(exc))
+            except Exception:
+                pass
+
     async def run_models_md_synthesis(self) -> None:
         """Run weekly models.md synthesis (Sunday 8am UTC).
 
@@ -1236,6 +1389,11 @@ class SurplusScheduler:
                 return
             if proc.returncode == 0:
                 logger.info("GitNexus reindex complete")
+                # Keep the gitnexus block in AGENTS.md (cross-tool agents) but
+                # strip it from CLAUDE.md — analyze injects both with no per-file flag.
+                with contextlib.suppress(Exception):
+                    if _strip_gitnexus_block(Path(repo_root) / "CLAUDE.md"):
+                        logger.info("Stripped GitNexus block from CLAUDE.md (kept in AGENTS.md)")
                 with contextlib.suppress(Exception):
                     GenesisRuntime.instance().record_job_success("gitnexus_reindex")
             else:
@@ -1251,6 +1409,28 @@ class SurplusScheduler:
                 GenesisRuntime.instance().record_job_failure(
                     "gitnexus_reindex", str(exc),
                 )
+
+    async def run_gitnexus_strip(self) -> None:
+        """Strip GitNexus's auto-injected block from CLAUDE.md (hourly + on startup).
+
+        ``gitnexus analyze`` re-injects the block into CLAUDE.md on EVERY reindex,
+        including the out-of-band staleness reindex run by GitNexus's own MCP
+        server — which never triggers ``run_gitnexus_reindex``'s post-strip. This
+        decoupled job keeps CLAUDE.md clean regardless of what reindexed; AGENTS.md
+        intentionally keeps the block (read by cross-tool agents). Idempotent no-op
+        when the block is absent.
+        """
+        from genesis.runtime import GenesisRuntime
+
+        try:
+            if _strip_gitnexus_block(Path.home() / "genesis" / "CLAUDE.md"):
+                logger.info("Stripped GitNexus block from CLAUDE.md (kept in AGENTS.md)")
+            with contextlib.suppress(Exception):
+                GenesisRuntime.instance().record_job_success("gitnexus_strip")
+        except Exception as exc:
+            logger.warning("GitNexus strip failed", exc_info=True)
+            with contextlib.suppress(Exception):
+                GenesisRuntime.instance().record_job_failure("gitnexus_strip", str(exc))
 
     async def run_memory_extraction(self) -> None:
         """Run periodic memory extraction from session transcripts."""

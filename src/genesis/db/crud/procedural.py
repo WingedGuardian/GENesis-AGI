@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import aiosqlite
 
@@ -19,10 +20,10 @@ async def create(
     created_at: str,
     scenario: str | None = None,
     person_id: str | None = None,
-    speculative: int = 1,
+    draft: int = 1,
     attempted_workarounds: list | None = None,
     version: int = 1,
-    activation_tier: str = "L4",
+    activation_tier: str = "DORMANT",
     tool_trigger: list[str] | None = None,
     success_count: int = 0,
     confidence: float = 0.0,
@@ -35,14 +36,14 @@ async def create(
     await db.execute(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, scenario, steps, tools_used,
-            context_tags, speculative, attempted_workarounds, version, created_at,
+            context_tags, draft, attempted_workarounds, version, created_at,
             activation_tier, tool_trigger, success_count, confidence,
             source, promotion_history, principle_embedding,
             extraction_context, first_mover)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, person_id, task_type, principle, scenario,
          json.dumps(steps), json.dumps(tools_used),
-         json.dumps(context_tags), speculative,
+         json.dumps(context_tags), draft,
          json.dumps(attempted_workarounds) if attempted_workarounds else None,
          version, created_at, activation_tier,
          json.dumps(tool_trigger) if tool_trigger else None,
@@ -64,10 +65,10 @@ async def upsert(
     context_tags: list[str],
     created_at: str,
     person_id: str | None = None,
-    speculative: int = 1,
+    draft: int = 1,
     attempted_workarounds: list | None = None,
     version: int = 1,
-    activation_tier: str = "L4",
+    activation_tier: str = "DORMANT",
     tool_trigger: list[str] | None = None,
     success_count: int = 0,
     confidence: float = 0.0,
@@ -79,13 +80,13 @@ async def upsert(
     Mirrors `create()`'s `success_count` / `confidence` plumbing so that
     callers building idempotent seed/teach paths (e.g., batch seed scripts,
     future explicit-teach upserters) can't accidentally land rows with the
-    invisible-to-recall (speculative=0, success_count=0, confidence=0.0)
+    invisible-to-recall (draft=0, success_count=0, confidence=0.0)
     profile that bit `procedure_store` before this fix.
     """
     await db.execute(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, steps, tools_used, context_tags,
-            speculative, attempted_workarounds, version, created_at,
+            draft, attempted_workarounds, version, created_at,
             activation_tier, tool_trigger, success_count, confidence,
             source, promotion_history)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -93,7 +94,7 @@ async def upsert(
              person_id = excluded.person_id,
              task_type = excluded.task_type, principle = excluded.principle,
              steps = excluded.steps, tools_used = excluded.tools_used,
-             context_tags = excluded.context_tags, speculative = excluded.speculative,
+             context_tags = excluded.context_tags, draft = excluded.draft,
              attempted_workarounds = excluded.attempted_workarounds,
              version = excluded.version,
              activation_tier = excluded.activation_tier,
@@ -103,7 +104,7 @@ async def upsert(
              source = COALESCE(procedural_memory.source, excluded.source),
              promotion_history = COALESCE(procedural_memory.promotion_history, excluded.promotion_history)""",
         (id, person_id, task_type, principle, json.dumps(steps), json.dumps(tools_used),
-         json.dumps(context_tags), speculative,
+         json.dumps(context_tags), draft,
          json.dumps(attempted_workarounds) if attempted_workarounds else None,
          version, created_at, activation_tier,
          json.dumps(tool_trigger) if tool_trigger else None,
@@ -239,6 +240,22 @@ async def update(db: aiosqlite.Connection, id: str, **fields) -> bool:
     values = list(fields.values()) + [id]
     cursor = await db.execute(
         f"UPDATE procedural_memory SET {set_clause} WHERE id = ?", values
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def record_invocation(db: aiosqlite.Connection, id: str) -> bool:
+    """Count a procedure read: a model recalled it (surfaced into context).
+
+    Atomically bumps ``invocation_count`` and stamps ``last_used``. This is the
+    top-of-funnel usage signal — distinct from ``record_success``/``record_failure``
+    (outcomes). Returns True if the procedure exists.
+    """
+    cursor = await db.execute(
+        "UPDATE procedural_memory "
+        "SET invocation_count = invocation_count + 1, last_used = ? WHERE id = ?",
+        (datetime.now(UTC).isoformat(), id),
     )
     await db.commit()
     return cursor.rowcount > 0

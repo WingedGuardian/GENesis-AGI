@@ -181,6 +181,7 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
             max_delay_ms=rp.get("max_delay_ms", 30000),
             backoff_multiplier=rp.get("backoff_multiplier", 2.0),
             jitter_pct=rp.get("jitter_pct", 0.25),
+            max_total_s=rp.get("max_total_s"),  # None = no aggregate cap
         )
     # Ensure "default" always exists
     if "default" not in retry_profiles:
@@ -217,6 +218,7 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
             keep_alive=p.get("keep_alive"),
             enabled=True,
             profile=p.get("profile"),
+            params=p.get("params"),
         )
 
         # Keyless providers stay registered with has_api_key=False. The

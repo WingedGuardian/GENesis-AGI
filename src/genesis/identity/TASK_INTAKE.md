@@ -44,6 +44,22 @@ more.
 - Deliverable format --- code (branch + PR), document, summary, external action?
 - Quality bar --- what level of review/verification is appropriate?
 
+### Send-ready deliverables --- capture a Deliverable Frame
+
+If the outcome is an artifact a human will **read or submit as finished** ---
+a report, slide deck, job take-home, one-pager, proposal, or document going out
+under the user's name (NOT code, a data dump, or an internal note) --- then this
+is a **deliverable task**. The executor will render it through the
+deliverable-builder skill, and that skill can only get the look and authenticity
+right if you capture the frame NOW, while the user is here to answer. You cannot
+recover these later.
+
+Ask the Gate-1 questions from
+`.claude/skills/deliverable-builder/references/intake.md` (one at a time) and
+record the answers in a `## Deliverable Frame` section of the plan. The frame is
+un-recoverable after intake --- this is the whole reason the interview happens at
+intake time and not during execution.
+
 ## Writing the Plan
 
 When you have enough information, enter plan mode and write a plan document with
@@ -66,6 +82,18 @@ How to verify the task is complete. Be specific and testable.
 
 ## Deliverable Format
 What the user receives (branch + PR, document, summary, etc).
+
+## Deliverable Frame
+INCLUDE THIS SECTION ONLY for send-ready deliverables (report, deck, take-home,
+one-pager, proposal, document). Omit it for code/data/internal tasks — its
+presence is what tells the executor to run the deliverable-builder pipeline.
+Capture (from the Gate-1 questions in the deliverable-builder skill):
+- **format** — PDF / DOCX / PPTX / etc.
+- **visual_style** — modern (default) / formal / academic (drives the render font)
+- **authenticity_target** — fully-human-made vs AI-assisted-OK (drives the AI-tell bar)
+- **audience** — who reads it
+- **what_leads** — the single strongest point it should open with
+- **acceptance** — the substance bar that makes it "done"
 
 ## Quality Checks
 What verification is appropriate (tests, lint, review, manual check).

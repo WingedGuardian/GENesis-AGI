@@ -104,7 +104,10 @@ _STOP_WORDS = frozenset({
 _TRAIL_DIR = Path.home() / ".genesis" / "sessions"
 _PIVOT_SIMILARITY_THRESHOLD = 0.3
 _PIVOT_DEBOUNCE_MSGS = 3
-_MAX_TRAIL_DISPLAY = 8  # Show at most this many pivots in injected line
+_MAX_TRAIL_DISPLAY = 50  # Show up to this many pivots — the full session arc for
+# typical sessions. Was 8; the small window dropped early-session topics across long
+# multi-phase sessions (e.g. an audit phase scrolling off before a later backup phase),
+# leaving only the recent tail visible after compaction.
 _GENESIS_PREFIX = str(Path.home() / "genesis") + "/"
 
 
@@ -168,6 +171,23 @@ def _detect_pivot(current_kw: list[str], trail: dict) -> bool:
     return similarity < _PIVOT_SIMILARITY_THRESHOLD
 
 
+# Harness-injected prompt envelopes — task-completion notifications, system
+# reminders, slash-command metadata, and local-command output. These are not
+# user messages; recording them as conversation pivots pollutes the L1 "Active
+# Work" view and the session-trail line with raw <task-notification> blobs.
+_HARNESS_ENVELOPE_PREFIXES = (
+    "<task-notification>",
+    "<system-reminder>",
+    "<local-command-",
+    "<command-",  # name, message, args, flag, and any future <command-*> variant
+)
+
+
+def _is_harness_envelope(prompt: str) -> bool:
+    """True if *prompt* is a harness-injected envelope, not genuine user input."""
+    return prompt.lstrip().startswith(_HARNESS_ENVELOPE_PREFIXES)
+
+
 def _record_pivot_observation(
     db_path: Path, session_id: str, label: str, trigger: str,
 ) -> None:
@@ -207,6 +227,12 @@ def _update_and_format_trail(
     Returns None if trail has fewer than 2 pivots (not useful yet).
     """
     if not session_id:
+        return None
+
+    # Skip harness-injected turns (task notifications, system reminders,
+    # slash-command metadata, local-command output) — they are not user
+    # messages and would pollute the pivot trail and L1 "Active Work".
+    if _is_harness_envelope(prompt):
         return None
 
     trail = _load_trail(session_id)
@@ -442,6 +468,10 @@ def _search_procedures(
     """Return (procedure_id, task_type, principle_snippet) if a procedure's
     principle embedding clears the cosine threshold, else None.
 
+    Only LIBRARY+ tiers (CORE/ADVISORY/LIBRARY) are eligible for proactive
+    surfacing; the DORMANT tier (unproven drafts) is recall-only and never
+    auto-injected.
+
     Best-effort: catches every failure mode and returns None so the parent
     hook (memory recall) is never blocked by this addition.
     """
@@ -459,6 +489,10 @@ def _search_procedures(
                 "FROM procedural_memory "
                 "WHERE deprecated = 0 AND quarantined = 0 "
                 "AND principle_embedding IS NOT NULL "
+                # v2: gate proactive surfacing to LIBRARY+ (CORE/ADVISORY/
+                # LIBRARY) — DORMANT drafts are recall-only, never proactively
+                # auto-injected.
+                "AND activation_tier IN ('CORE', 'ADVISORY', 'LIBRARY') "
                 "ORDER BY confidence DESC LIMIT 100"
             ).fetchall()
         finally:
@@ -608,6 +642,9 @@ async def _search_qdrant(
                         "_retrieved_count": payload.get("retrieved_count", 0),
                         "_wing": payload.get("wing"),
                         "collection": collection,
+                        # Provenance source tier for KB results (audit D12) — the
+                        # label needs it; memory_metadata doesn't carry it.
+                        "source_pipeline": payload.get("source_pipeline"),
                     })
                 return results
     except Exception as exc:
@@ -806,7 +843,13 @@ def _format_results(results: list[dict]) -> str:
         wing = r.get("_wing") or ""
 
         is_kb = r.get("collection") == "knowledge_base"
-        parts = ["KB" if is_kb else "Memory"]
+        if is_kb:
+            # Name the external source tier so the model treats KB content as
+            # external-world info, not its own first-party memory (audit D12).
+            from genesis.memory.provenance import short_source
+            parts = [f"KB·{short_source(r.get('source_pipeline'))}"]
+        else:
+            parts = ["Memory"]
         if age != "?" and not is_kb:
             parts.append(age)
         if wing and wing != "memory":

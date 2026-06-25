@@ -1,15 +1,27 @@
-"""Backup monitoring routes — status, trigger, config."""
+"""Backup monitoring + configuration routes — status, trigger, log, config.
+
+Configuration is split by responsibility: the destination/credential env vars
+(GENESIS_BACKUP_*) are written through the hardened secrets writer reused from
+``secrets.py``; the cron SCHEDULE is managed with the read-filter-reinstall
+idiom (``crontab -l`` → drop the backup line → ``crontab -``), which preserves
+every other crontab entry and keeps the validated schedule in stdin content
+only — never on a command line.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import subprocess
+import urllib.parse
 from pathlib import Path
 
-from flask import jsonify
+from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
+from genesis.dashboard.auth import is_authenticated
 
 logger = logging.getLogger(__name__)
 
@@ -19,57 +31,309 @@ _BACKUP_SCRIPT = _HOME / "genesis" / "scripts" / "backup.sh"
 _BACKUP_LOG = _HOME / "genesis" / "logs" / "backup.log"
 _BACKUP_DIR = _HOME / "backups" / "genesis-backups"
 
+_BACKENDS = {"none", "local", "smb"}
+_CRON_FIELD_RE = re.compile(r"^[0-9*,/-]+$")
+_NAS_RE = re.compile(r"^//[^/\s]+/[^\s]+$")
+_REPO_RE = re.compile(r"^(https?://|git@|ssh://).+")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+def _strip_url_creds(url: str | None) -> str | None:
+    """Remove any embedded ``user:token@`` from an http(s) URL.
+
+    The status/config reads are reachable unauthenticated; a backup repo URL
+    that embeds a token must never be echoed back in the clear.
+    """
+    if not url:
+        return url
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.netloc and "@" in parts.netloc:
+            host = parts.netloc.split("@", 1)[1]
+            return urllib.parse.urlunsplit(parts._replace(netloc=host))
+    except ValueError:
+        pass
+    return url
+
+
+def _current_cron_line() -> str | None:
+    """The active (uncommented) backup.sh crontab line, if any."""
+    try:
+        out = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    for line in out.stdout.splitlines():
+        s = line.strip()
+        if "backup.sh" in s and not s.startswith("#"):
+            return s
+    return None
+
+
+def _current_schedule() -> tuple[str | None, bool]:
+    """(cron expression, enabled) for the backup job."""
+    line = _current_cron_line()
+    if not line:
+        return None, False
+    fields = line.split()
+    if len(fields) >= 5:
+        return " ".join(fields[:5]), True
+    return None, True
+
+
+def _valid_cron(expr: str) -> bool:
+    fields = expr.split()
+    return len(fields) == 5 and all(_CRON_FIELD_RE.match(f) for f in fields)
+
+
+def _set_backup_cron(schedule: str | None) -> bool:
+    """Install (``schedule`` given) or remove (``None``) the backup.sh crontab
+    line, preserving every other entry — the read-filter-reinstall idiom done
+    in-process. ``crontab -`` is invoked with a constant argv; the (already
+    ``_valid_cron``-validated) schedule only ever appears in the stdin content,
+    never on a command line. Returns True on success.
+    """
+    try:
+        # crontab -l: constant argv, no user data. Quick local op; the short
+        # bound guards a hung crontab from blocking this request thread.
+        read = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    existing = read.stdout.splitlines() if read.returncode == 0 else []
+    lines = [ln for ln in existing if "backup.sh" not in ln]
+    if schedule:
+        lines.append(f"{schedule} {_BACKUP_SCRIPT} >> {_BACKUP_LOG} 2>&1")
+    content = "\n".join(lines)
+    if content:
+        content += "\n"
+    try:
+        write = subprocess.run(
+            ["crontab", "-"], input=content, text=True,
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return write.returncode == 0
+
+
+# ── Routes ────────────────────────────────────────────────────────────
 
 @blueprint.route("/api/genesis/backup/status")
 def backup_status():
-    """Return last backup status from status file + cron info."""
+    """Return last backup status from status file + cron + repo info."""
     result = {
         "configured": _BACKUP_SCRIPT.is_file(),
         "repo_configured": _BACKUP_DIR.is_dir(),
     }
 
-    # Read structured status file
     if _STATUS_FILE.is_file():
         try:
-            data = json.loads(_STATUS_FILE.read_text())
-            result["last_backup"] = data
+            result["last_backup"] = json.loads(_STATUS_FILE.read_text())
         except (json.JSONDecodeError, OSError):
             result["last_backup"] = None
     else:
         result["last_backup"] = None
 
-    # Check cron schedule
-    try:
-        cron_output = subprocess.run(
-            ["crontab", "-l"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if cron_output.returncode == 0:
-            for line in cron_output.stdout.splitlines():
-                if "backup.sh" in line and not line.strip().startswith("#"):
-                    result["cron_schedule"] = line.strip()
-                    break
-            else:
-                result["cron_schedule"] = None
-        else:
-            result["cron_schedule"] = None
-    except (subprocess.TimeoutExpired, OSError):
-        result["cron_schedule"] = None
+    line = _current_cron_line()
+    result["cron_schedule"] = line
 
-    # Backup repo info
     if _BACKUP_DIR.is_dir():
         try:
             remote = subprocess.run(
                 ["git", "-C", str(_BACKUP_DIR), "remote", "get-url", "origin"],
                 capture_output=True, text=True, timeout=5,
             )
-            result["repo"] = remote.stdout.strip() if remote.returncode == 0 else None
+            repo = remote.stdout.strip() if remote.returncode == 0 else None
+            result["repo"] = _strip_url_creds(repo)
         except (subprocess.TimeoutExpired, OSError):
             result["repo"] = None
     else:
         result["repo"] = None
 
     return jsonify(result)
+
+
+@blueprint.route("/api/genesis/backup/config")
+def backup_config_get():
+    """Current backup configuration for the dashboard form.
+
+    Non-sensitive fields are always returned (with the repo URL credential-
+    stripped). The NAS share/user are infra detail returned only to
+    authenticated callers; passphrase/NAS password are NEVER returned — only
+    a boolean indicating whether they are set.
+    """
+    from genesis.dashboard.routes.secrets import _key_value
+
+    schedule, enabled = _current_schedule()
+    result = {
+        "repo": _strip_url_creds(_key_value("GENESIS_BACKUP_REPO")),
+        "tier2_backend": _key_value("GENESIS_BACKUP_TIER2_BACKEND") or "none",
+        "schedule": schedule,
+        "schedule_enabled": enabled,
+        "passphrase_set": bool(_key_value("GENESIS_BACKUP_PASSPHRASE")),
+        "nas_pass_set": bool(_key_value("GENESIS_BACKUP_NAS_PASS")),
+    }
+    # Filesystem paths/shares are infra detail — only for authenticated callers.
+    if is_authenticated():
+        result["local_path"] = _key_value("GENESIS_BACKUP_LOCAL_PATH")
+        result["nas"] = _key_value("GENESIS_BACKUP_NAS")
+        result["nas_user"] = _key_value("GENESIS_BACKUP_NAS_USER")
+    return jsonify(result)
+
+
+@blueprint.route("/api/genesis/backup/config", methods=["POST"])
+def backup_config_set():
+    """Update backup destination/credentials (secrets.env) and schedule (cron).
+
+    Env changes take effect on the next backup run (backup.sh sources
+    secrets.env directly) — no server restart required.
+    """
+    # Privileged write (credentials + cron) — gate it. No-op when the dashboard
+    # has no password configured (is_authenticated() returns True), so a
+    # passwordless install is unaffected; a password-protected one is enforced.
+    if not is_authenticated():
+        return jsonify({"error": "authentication required"}), 401
+
+    from genesis.dashboard.routes.secrets import _key_value, _update_secrets_file
+
+    data = request.get_json(silent=True) or {}
+    errors: list[str] = []
+    warnings: list[str] = []
+    env_updates: dict[str, str] = {}
+
+    def _clean(val: str) -> str | None:
+        """Reject control chars / overlong values; return the trimmed value."""
+        v = val.strip()
+        if "\n" in v or "\x00" in v:
+            return None
+        if len(v) > 500:
+            return None
+        return v
+
+    repo = (data.get("repo") or "").strip()
+    if repo:
+        if not _REPO_RE.match(repo) or _clean(repo) is None:
+            errors.append("repo must be an https://, ssh://, or git@ URL")
+        else:
+            env_updates["GENESIS_BACKUP_REPO"] = repo
+            current = _key_value("GENESIS_BACKUP_REPO")
+            if current and current != repo:
+                warnings.append(
+                    "Changing the repo URL does not migrate existing backup "
+                    "history. Delete ~/backups/genesis-backups and re-clone, "
+                    "or keep the old repo reachable for restores."
+                )
+
+    backend = (data.get("tier2_backend") or "").strip()
+    if backend:
+        if backend not in _BACKENDS:
+            errors.append(f"tier2_backend must be one of {sorted(_BACKENDS)}")
+        else:
+            env_updates["GENESIS_BACKUP_TIER2_BACKEND"] = backend
+
+    local_path = (data.get("local_path") or "").strip()
+    if local_path:
+        if not local_path.startswith("/") or _clean(local_path) is None:
+            errors.append("local_path must be an absolute path")
+        else:
+            env_updates["GENESIS_BACKUP_LOCAL_PATH"] = local_path
+
+    nas = (data.get("nas") or "").strip()
+    if nas:
+        if not _NAS_RE.match(nas):
+            errors.append("nas must look like //host/share")
+        else:
+            env_updates["GENESIS_BACKUP_NAS"] = nas
+
+    nas_user = (data.get("nas_user") or "").strip()
+    if nas_user:
+        if _clean(nas_user) is None:
+            errors.append("nas_user is invalid")
+        else:
+            env_updates["GENESIS_BACKUP_NAS_USER"] = nas_user
+
+    # Cross-field: a selected backend needs its destination (new or already set).
+    if backend == "smb" and not (nas or _key_value("GENESIS_BACKUP_NAS")):
+        errors.append("smb backend requires a NAS share (//host/share)")
+    if backend == "local" and not (
+        local_path or _key_value("GENESIS_BACKUP_LOCAL_PATH")
+    ):
+        errors.append("local backend requires a local_path")
+
+    # Secrets — only written when a non-empty value is supplied, so leaving the
+    # field blank never blanks an existing secret.
+    nas_pass = data.get("nas_pass")
+    if nas_pass:
+        cleaned = _clean(nas_pass)
+        if cleaned is None:
+            errors.append("nas_pass is invalid")
+        else:
+            env_updates["GENESIS_BACKUP_NAS_PASS"] = cleaned
+
+    passphrase = data.get("passphrase")
+    if passphrase:
+        cleaned = _clean(passphrase)
+        if cleaned is None:
+            errors.append("passphrase is invalid")
+        else:
+            env_updates["GENESIS_BACKUP_PASSPHRASE"] = cleaned
+            current = _key_value("GENESIS_BACKUP_PASSPHRASE")
+            if current and current != cleaned:
+                warnings.append(
+                    "Rotating the passphrase does NOT re-encrypt existing "
+                    "backups. Keep the old passphrase until you have verified "
+                    "a fresh backup with the new one."
+                )
+
+    # Schedule — install/remove the cron line via the wrapper script.
+    cron_action: tuple[str, str | None] | None = None
+    if "schedule_enabled" in data or data.get("schedule"):
+        schedule = (data.get("schedule") or "").strip()
+        if data.get("schedule_enabled", True):
+            if not _valid_cron(schedule):
+                errors.append(
+                    "schedule must be a 5-field cron expression "
+                    "(e.g. '0 */6 * * *')"
+                )
+            else:
+                cron_action = ("install", schedule)
+        else:
+            cron_action = ("remove", None)
+
+    if errors:
+        return jsonify({"error": "Validation failed", "details": errors}), 422
+
+    if env_updates:
+        try:
+            _update_secrets_file(env_updates)
+            for k, v in env_updates.items():
+                os.environ[k] = v
+        except Exception:
+            logger.error("Failed to write backup secrets", exc_info=True)
+            return jsonify({"error": "Failed to write secrets.env"}), 500
+
+    schedule_result: str | None = None
+    if cron_action is not None:
+        action, expr = cron_action
+        if not _set_backup_cron(expr if action == "install" else None):
+            return jsonify({"error": "Failed to update backup schedule"}), 500
+        schedule_result = "installed" if action == "install" else "removed"
+
+    logger.info("Backup config updated: keys=%s schedule=%s",
+                sorted(env_updates.keys()), cron_action[0] if cron_action else None)
+    return jsonify({
+        "status": "ok",
+        "updated": sorted(env_updates.keys()),
+        "schedule": schedule_result,
+        "warnings": warnings,
+        "needs_restart": False,
+    })
 
 
 @blueprint.route("/api/genesis/backup/trigger", methods=["POST"])
@@ -100,7 +364,6 @@ def backup_log():
 
     try:
         lines = _BACKUP_LOG.read_text().splitlines()
-        # Return last 50 lines
         return jsonify({"lines": lines[-50:]})
     except OSError as exc:
         return jsonify({"lines": [], "error": str(exc)})

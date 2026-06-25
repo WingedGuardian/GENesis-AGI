@@ -43,6 +43,26 @@ def test_retrieval_result_fields():
     assert r.payload == {"k": "v"}
 
 
+def test_retrieval_result_collection_defaults_episodic():
+    """collection defaults to episodic_memory (first-party) and is overridable.
+
+    The default must be first-party so an unset collection is never mislabeled
+    as external-world knowledge (audit D12)."""
+    r = RetrievalResult(
+        memory_id="m1", content="x", source="s", memory_type="t",
+        score=0.5, vector_rank=1, fts_rank=None, activation_score=0.3,
+        payload={},
+    )
+    assert r.collection == "episodic_memory"
+
+    kb = RetrievalResult(
+        memory_id="m2", content="x", source="s", memory_type="knowledge",
+        score=0.5, vector_rank=1, fts_rank=None, activation_score=0.3,
+        payload={}, collection="knowledge_base",
+    )
+    assert kb.collection == "knowledge_base"
+
+
 def test_link_record_frozen():
     link = LinkRecord(
         source_id="a", target_id="b", link_type="related",

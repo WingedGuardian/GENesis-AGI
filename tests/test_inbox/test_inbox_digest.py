@@ -35,7 +35,10 @@ async def db():
         escalated_to TEXT,
         verified_at TEXT,
         verification_notes TEXT,
-        pinned INTEGER DEFAULT 0
+        pinned INTEGER DEFAULT 0,
+        kind TEXT NOT NULL DEFAULT 'follow_up',
+        domain TEXT,
+        goal_id TEXT
     )""")
     await conn.execute("""CREATE TABLE inbox_items (
         id TEXT PRIMARY KEY,

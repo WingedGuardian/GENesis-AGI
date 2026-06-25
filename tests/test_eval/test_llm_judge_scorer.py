@@ -332,3 +332,25 @@ async def test_set_router_after_construction(simple_rubric):
     )
     assert passed is True
     assert score == 0.6
+
+
+async def test_score_async_valid_json_missing_score_is_parse_fail(simple_rubric):
+    """Valid JSON LACKING the top-level 'score' key must route to parse_fail —
+    NOT be recorded as a confident 0.0. Otherwise calibration miscounts it as a
+    disagreement (user graded higher) instead of an error, polluting the ego
+    quality gate. The output_quality rubric invites this: it asks for
+    coherence/relevance/completeness PLUS a composite 'score', and a model can
+    return the parts but forget the composite.
+    """
+    router = StubRouter(
+        response_content='{"coherence": 0.8, "relevance": 0.7, "rationale": "no composite"}',
+    )
+    s = LLMJudgeScorer(router=router)
+    passed, score, detail_json = await s.score_async(
+        "a", "b", {"rubric_name": "test_simple"},
+    )
+    assert passed is False
+    assert score == 0.0
+    detail = json.loads(detail_json)
+    assert detail["error"] == "judge_parse_fail"
+    assert "score" in detail["error_message"].lower()

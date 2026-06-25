@@ -46,6 +46,11 @@ class Recommendation:
     # User-relevant fields
     timeline: str | None = None
     relevance: str | None = None
+    # Tool/product traction rubric (for Genesis-relevant external tools/repos;
+    # qualitative high|medium|low — the inbox eval has no live metrics)
+    tool_momentum: str | None = None
+    tool_activity: str | None = None
+    tool_maturity: str | None = None
     # Context
     item_title: str = ""
     classification: str = ""  # "genesis" or "user"
@@ -159,6 +164,18 @@ def parse_recommendations(evaluation_text: str) -> list[Recommendation]:
             relevance=(
                 str(data["relevance"]).strip()
                 if "relevance" in data else None
+            ),
+            tool_momentum=(
+                str(data["tool_momentum"]).strip()
+                if "tool_momentum" in data else None
+            ),
+            tool_activity=(
+                str(data["tool_activity"]).strip()
+                if "tool_activity" in data else None
+            ),
+            tool_maturity=(
+                str(data["tool_maturity"]).strip()
+                if "tool_maturity" in data else None
             ),
             item_title=title,
             classification=classification,

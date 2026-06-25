@@ -22,6 +22,14 @@ logger = logging.getLogger(__name__)
 _MIN_USES_FOR_QUARANTINE = 3
 _MAX_SUCCESS_RATE_FOR_QUARANTINE = 0.40
 
+# Learning-regression alarm gating. A regression fires only when the
+# procedure-effectiveness score declines for N consecutive assessments AND the
+# total drop is meaningful AND the latest score is below a healthy floor. This
+# keeps noisy LLM-assigned scores from latching a persistent CRITICAL alarm on
+# small dips or a high-but-slightly-declining trajectory.
+_MIN_REGRESSION_DROP = 0.10
+_MAX_HEALTHY_SCORE = 0.60
+
 # Negation patterns for simple contradiction detection
 _NEGATION_PAIRS = [
     ("always", "never"),
@@ -132,14 +140,32 @@ class LearningStabilityMonitor:
         if len(scores) < weeks + 1:
             return False
 
-        # Check consecutive decline (scores are ordered newest first)
-        return all(scores[i] < scores[i + 1] for i in range(weeks))
+        # Consecutive decline (scores ordered newest-first: scores[0] = newest).
+        if not all(scores[i] < scores[i + 1] for i in range(weeks)):
+            return False
+        # Gate on magnitude AND absolute level: a couple of small dips in noisy
+        # LLM-assigned scores, or a high-but-dipping trajectory (e.g.
+        # 0.85 -> 0.80 -> 0.75), must not latch a persistent regression alarm.
+        total_drop = scores[weeks] - scores[0]  # oldest minus newest; >0 = declined
+        return total_drop >= _MIN_REGRESSION_DROP and scores[0] < _MAX_HEALTHY_SCORE
 
     async def emit_regression_signal(
         self, db: aiosqlite.Connection,
     ) -> None:
         """Emit a learning regression event and update cognitive state."""
         now = datetime.now(UTC).isoformat()
+
+        # Supersede any prior unresolved learning_regression so only the latest
+        # standing signal remains and its timestamp reflects this detection —
+        # stale regression notes otherwise persist in ego / morning-report
+        # context until their TTL.
+        await observations.resolve_by_source_and_type(
+            db,
+            source="stability_monitor",
+            type="learning_regression",
+            resolved_at=now,
+            resolution_notes="superseded by newer regression detection",
+        )
 
         # Write observation instead of overwriting state_flags.
         # State flags are now computed from real data; regressions surface
@@ -166,6 +192,29 @@ class LearningStabilityMonitor:
             )
 
         logger.warning("Learning regression signal emitted")
+
+    async def resolve_regression_if_standing(
+        self, db: aiosqlite.Connection,
+    ) -> None:
+        """Resolve a standing learning_regression once effectiveness recovers.
+
+        Called from the calibration path when ``check_regression`` returns
+        False, so a regression alarm clears on recovery instead of lingering in
+        ego / morning-report context until its TTL.
+        """
+        now = datetime.now(UTC).isoformat()
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source="stability_monitor",
+            type="learning_regression",
+            resolved_at=now,
+            resolution_notes="procedure effectiveness recovered (no regression this cycle)",
+        )
+        if resolved:
+            logger.info(
+                "Resolved %d standing learning_regression observation(s) on recovery",
+                resolved,
+            )
 
     def find_contradictions(
         self, obs_list: list[dict],

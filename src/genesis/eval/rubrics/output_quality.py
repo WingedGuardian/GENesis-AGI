@@ -1,9 +1,13 @@
-"""Output quality rubric for autonomous outputs (Verified Autonomy L3).
+"""Output quality rubric for the eval harness (Verified Autonomy L3).
 
-Grades ego proposals and task deliverables on three dimensions:
-coherence (internal consistency), relevance (addresses the intent),
-and completeness (covers necessary points). Outputs flagged below
-threshold are held for human review instead of auto-executing.
+An eval-harness scorer: grades an output on three dimensions — coherence
+(internal consistency), relevance (addresses the intent), and completeness
+(covers necessary points). Used by the eval/calibration harness to grade
+autonomous outputs against a versioned rubric.
+
+NOT a gate on the live ego proposal pipeline — the Opus realist is the sole
+proposal gate. (A quality-gate use in the ego pipeline was removed; it was
+redundant with the realist and fragile under judge-provider outages.)
 
 Reference: doi.org/10.5281/zenodo.19096229, Section 6
 """

@@ -42,6 +42,75 @@ async def test_insert_and_get_event(db):
     assert events[0]["session_id"] == "sess-1"
 
 
+async def test_update_event_metrics_merges_in_place(db):
+    """update_event_metrics enriches an existing event's metrics without
+    creating a second row (audit MEM-003: one recall_fired per logical recall)."""
+    eid = await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_fired",
+        metrics={"query": "q", "result_count": 1},
+    )
+    updated = await j9_eval.update_event_metrics(
+        db, eid, result_count=5, mode="auto", pipeline_used="standard",
+    )
+    assert updated is True
+
+    events = await j9_eval.get_events(db, event_type="recall_fired")
+    assert len(events) == 1  # merged in place, NOT a second event
+    m = events[0]["metrics"]
+    assert m["query"] == "q"          # pre-existing field preserved
+    assert m["result_count"] == 5      # overwritten
+    assert m["mode"] == "auto"         # new field added
+    assert m["pipeline_used"] == "standard"
+
+
+async def test_update_event_metrics_missing_id_is_noop(db):
+    """Updating a non-existent event returns False and inserts nothing."""
+    updated = await j9_eval.update_event_metrics(db, "does-not-exist", foo=1)
+    assert updated is False
+    events = await j9_eval.get_events(db, dimension="memory")
+    assert len(events) == 0
+
+
+async def test_recall_entrenchment_aggregates(db):
+    """MEM-005: the aggregator averages the per-recall entrenchment signal from
+    recall_fired events, ignoring events that carry no entrenchment fields."""
+    from genesis.eval.j9_aggregator import _recall_entrenchment
+
+    for corr, rc, age in [(0.8, 5.0, 10.0), (0.6, 3.0, 20.0)]:
+        await j9_eval.insert_event(
+            db, dimension="memory", event_type="recall_fired",
+            metrics={"entrenchment_corr": corr,
+                     "mean_retrieved_count": rc, "mean_age_days": age},
+        )
+    # An older-style event without entrenchment fields must not skew the means.
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_fired", metrics={"query": "q"},
+    )
+
+    result = await _recall_entrenchment(db, since="2000-01-01", until="2099-01-01")
+    assert result["entrenchment_corr_mean"] == pytest.approx(0.7)
+    assert result["entrenchment_mean_retrieved_count"] == pytest.approx(4.0)
+    assert result["entrenchment_mean_age_days"] == pytest.approx(15.0)
+    assert result["entrenchment_sample"] == 2
+
+
+async def test_memory_quality_includes_entrenchment_when_no_relevance(db):
+    """Entrenchment surfaces even when there are no recall_relevance events
+    (the early-return path still carries the MEM-005 keys)."""
+    from genesis.eval.j9_aggregator import _compute_memory_quality
+
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_fired",
+        metrics={"entrenchment_corr": 0.5, "mean_retrieved_count": 2.0},
+    )
+    metrics, sample = await _compute_memory_quality(
+        db, since="2000-01-01", until="2099-01-01",
+    )
+    assert metrics["precision_at_5"] is None      # no relevance events
+    assert metrics["entrenchment_corr_mean"] == pytest.approx(0.5)
+    assert metrics["entrenchment_sample"] == 1
+
+
 async def test_get_events_filter_by_type(db):
     await j9_eval.insert_event(db, dimension="memory", event_type="recall_fired", metrics={})
     await j9_eval.insert_event(db, dimension="memory", event_type="recall_relevance", metrics={})
@@ -538,3 +607,90 @@ async def test_memory_quality_ignores_duplicate_relevance(db):
     assert total_recalls == 1
     assert metrics["precision_at_5"] == 0.5
     assert metrics["total_memories_judged"] == 2  # deduped, not 3
+
+
+async def test_memory_quality_mrr_uses_stored_rank_not_insert_order(db):
+    """MRR must use the retrieval rank persisted in the event metrics, NOT the
+    DB/insert order. recall_relevance events are inserted CONCURRENTLY (arbitrary
+    order, read back ORDER BY timestamp DESC), so list order != retrieval rank.
+
+    Insert the only RELEVANT memory at rank 3 LAST (so it's returned FIRST by
+    timestamp DESC); MRR must be 1/3 (first relevant is at rank 3), not 1/1.
+    """
+    from genesis.eval.j9_aggregator import _compute_memory_quality
+
+    # Out of rank order: rank-1 (irrelevant) first … rank-3 (relevant) last.
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r1", "memory_id": "m1", "relevance": 0.0, "rank": 1},
+    )
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r1", "memory_id": "m2", "relevance": 0.0, "rank": 2},
+    )
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r1", "memory_id": "m3", "relevance": 1.0, "rank": 3},
+    )
+
+    metrics, _ = await _compute_memory_quality(db, since="2000-01-01", until="2100-01-01")
+    # First relevant is at rank 3 → MRR ≈ 1/3 (aggregator rounds to 4dp).
+    # The bug would give 1.0 (relevant returned first by timestamp DESC).
+    assert metrics["mrr"] == pytest.approx(1.0 / 3.0, abs=1e-3)
+
+
+async def test_insert_run_persists_metadata_json_per_result(db):
+    """eval_results.metadata_json must be written (migration 0014's documented
+    dual-write) — it mirrors scorer_detail so calibration/drift tooling can
+    query the judge payload structurally without re-parsing scorer_detail.
+    """
+    import importlib
+    import json as _json
+
+    from genesis.eval import db as eval_db
+    from genesis.eval.types import (
+        EvalRunSummary,
+        EvalTrigger,
+        ScoredOutput,
+        ScorerType,
+        TaskCategory,
+    )
+
+    # eval_runs/eval_results come from migrations, not create_all_tables. Apply
+    # the full eval_results column chain: 0002 (create) → 0003 (skipped) →
+    # 0014 (metadata_json).
+    for _mig in (
+        "0002_add_eval_tables",
+        "0003_eval_results_skipped",
+        "0014_eval_results_metadata",
+    ):
+        await importlib.import_module(f"genesis.db.migrations.{_mig}").up(db)
+    await db.commit()
+
+    detail = _json.dumps({"judge_model": "x", "judge_score": 0.7, "rationale": "ok"})
+    summary = EvalRunSummary(
+        run_id="run_meta_1", model_id="m", model_profile="p", dataset="d",
+        trigger=EvalTrigger.MANUAL, task_category=TaskCategory.CLASSIFICATION,
+        total_cases=2, passed_cases=2, failed_cases=0,
+        results=[
+            ScoredOutput(
+                case_id="c1", passed=True, score=0.7, actual_output="out",
+                scorer_type=ScorerType.LLM_JUDGE, scorer_detail=detail,
+            ),
+            # Non-judge scorer: scorer_detail is a plain (non-JSON) string, so
+            # metadata_json (the queryable JSON view) must be NULL, not that string.
+            ScoredOutput(
+                case_id="c2", passed=True, score=1.0, actual_output="3",
+                scorer_type=ScorerType.EXACT_MATCH, scorer_detail="expected=3, got=3",
+            ),
+        ],
+    )
+    await eval_db.insert_run(db, summary)
+    rows = {
+        r[0]: r[1]
+        for r in await (await db.execute(
+            "SELECT case_id, metadata_json FROM eval_results WHERE run_id = 'run_meta_1'"
+        )).fetchall()
+    }
+    assert rows["c1"] == detail  # judge result → JSON dual-write
+    assert rows["c2"] is None  # non-judge result → NULL (not the plain string)

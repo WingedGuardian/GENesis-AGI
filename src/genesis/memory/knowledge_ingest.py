@@ -44,6 +44,7 @@ async def ingest_knowledge_unit(
     ingestion_source: str | None = None,
     collection: str = "knowledge_base",
     memory_type: str = "knowledge",
+    confidence: float = 0.85,
 ) -> str:
     """Ingest or upsert a knowledge unit, returning the stable unit_id.
 
@@ -87,7 +88,7 @@ async def ingest_knowledge_unit(
         memory_type=memory_type,
         collection=collection,
         tags=[domain, project, authority],
-        confidence=0.85,
+        confidence=confidence,
         auto_link=False,
         source_pipeline=source_pipeline_val,
         memory_class=memory_class,
@@ -122,12 +123,15 @@ async def ingest_knowledge_unit(
         tags=resolved_tags,
         ingested_at=now_iso,
         qdrant_id=qdrant_memory_id,
-        confidence=0.85,
+        confidence=confidence,
         source_platform=provenance.get("platform") if provenance else None,
         section_title=provenance.get("section_title") if provenance else None,
         source_date=provenance.get("source_date") if provenance else None,
         embedding_model=embedding_model,
-        source_pipeline=provenance.get("source_pipeline") if provenance else None,
+        # Mirror the Qdrant write's default (audit D12): never leave the SQLite
+        # knowledge_units pipeline NULL while the vector payload has a value —
+        # provenance must be consistent across both stores.
+        source_pipeline=source_pipeline_val,
         purpose=json.dumps(purpose) if purpose else None,
         ingestion_source=ingestion_source,
     )

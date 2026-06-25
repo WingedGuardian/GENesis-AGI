@@ -9,6 +9,7 @@ import re
 import shutil
 
 from genesis.knowledge.processors.base import ProcessedContent
+from genesis.util.tmp import big_tmp_dir
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,7 @@ class YouTubeProcessor:
         """Download subtitles to a temp dir and read them."""
         import tempfile
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(dir=big_tmp_dir()) as tmpdir:
             proc = await asyncio.create_subprocess_exec(
                 "yt-dlp",
                 "--write-auto-subs",
@@ -131,7 +132,7 @@ class YouTubeProcessor:
         from pathlib import Path
 
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with tempfile.TemporaryDirectory(dir=big_tmp_dir()) as tmpdir:
                 out_path = f"{tmpdir}/audio.mp3"
                 proc = await asyncio.create_subprocess_exec(
                     "yt-dlp",

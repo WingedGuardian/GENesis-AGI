@@ -67,7 +67,16 @@ class ProviderEscalation:
             task.add_done_callback(self._on_task_done)
 
     def record_recovery(self, provider: str) -> None:
-        """Called when a provider recovers (breaker → CLOSED). Reset state."""
+        """Called when a provider recovers (breaker → CLOSED).
+
+        Clears in-memory tracking AND resolves the provider's lingering
+        ``provider_failure`` observation. Without the resolve the pipeline is
+        write-only on recovery: the row created on trip survives until its TTL
+        and keeps reporting the provider as failing after it has recovered.
+        The resolve is unconditional (not gated on in-memory state) so a row
+        created before a restart still clears — mirrors the dead-letter
+        resolve-on-drain pattern.
+        """
         if provider in self._state:
             logger.info(
                 "Provider '%s' recovered after %d trips — clearing escalation state",
@@ -75,6 +84,24 @@ class ProviderEscalation:
                 self._state[provider].get("trip_count", 0),
             )
             del self._state[provider]
+
+        # record_recovery() is called from the SYNC CircuitBreaker.record_success()
+        # path. In production that runs inside the async routing call (a loop is
+        # present); a sync caller (e.g. a unit test) may have none — guard so we
+        # never raise there, and defer the DB resolve like _create_observation does.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug(
+                "record_recovery('%s'): no running loop; skipping observation resolve",
+                provider,
+            )
+            return
+        task = loop.create_task(
+            self._resolve_observation(provider),
+            name=f"escalation-resolve-{provider}",
+        )
+        task.add_done_callback(self._on_task_done)
 
     async def _create_observation(self, provider: str, state: dict) -> None:
         """Create a high-priority observation for a persistently failing provider."""
@@ -90,10 +117,9 @@ class ProviderEscalation:
                 f"without recovery. All calls are falling back to other providers."
             ),
         })
-        # Hash on provider name — one unresolved observation per provider
-        content_hash = hashlib.sha256(
-            f"provider_failure:{provider}".encode(),
-        ).hexdigest()
+        # Hash on provider name — one unresolved observation per provider.
+        # Shared helper so the resolve-on-recovery path computes the SAME hash.
+        content_hash = self._provider_content_hash(provider)
 
         try:
             obs_id = await observations.create(
@@ -128,6 +154,46 @@ class ProviderEscalation:
                 provider,
                 exc_info=True,
             )
+
+    async def _resolve_observation(self, provider: str) -> None:
+        """Resolve the lingering provider_failure observation on recovery.
+
+        Keyed on the deterministic per-provider content_hash, so only THIS
+        provider's row resolves — a different, still-down provider's row is
+        untouched. Idempotent (no-op when nothing matches) and non-fatal.
+        """
+        from genesis.db.crud import observations
+
+        content_hash = self._provider_content_hash(provider)
+        try:
+            resolved = await observations.resolve_by_content_hash(
+                self._db,
+                source="routing",
+                content_hash=content_hash,
+                resolved_at=self._clock().isoformat(),
+                resolution_notes=(
+                    f"auto-resolved: provider '{provider}' recovered "
+                    f"(circuit breaker closed)"
+                ),
+            )
+            if resolved:
+                logger.info(
+                    "Auto-resolved %d provider_failure observation(s) for "
+                    "recovered provider '%s'",
+                    resolved,
+                    provider,
+                )
+        except Exception:
+            logger.error(
+                "Failed to resolve provider_failure observation for '%s'",
+                provider,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _provider_content_hash(provider: str) -> str:
+        """Deterministic per-provider hash — MUST match between create + resolve."""
+        return hashlib.sha256(f"provider_failure:{provider}".encode()).hexdigest()
 
     @staticmethod
     def _on_task_done(task: asyncio.Task) -> None:

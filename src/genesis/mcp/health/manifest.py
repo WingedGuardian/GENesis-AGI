@@ -56,10 +56,15 @@ async def _impl_subsystem_heartbeats() -> dict:
         "awareness": (300, 360),      # 5 min tick, error at 6 min
         "surplus": (300, 600),
         "inbox": (1800, 3600),
-        "reflection": (600, 1200),
+        # Reflections only fire when signals warrant; calm periods can be quiet
+        # for hours. An idle alive-pulse (awareness loop) keeps this fresh during
+        # legitimate idle, so overdue=4h (matches ego) avoids false "dark" alarms.
+        # A real reflection outage surfaces faster via the awareness heartbeat
+        # (6 min), the cc resilience axis, and the deferred-work backlog.
+        "reflection": (600, 14400),
         "outreach": (86400, 172800),
         "dashboard": (120, 240),
-        "ego": (7200, 14400),         # adaptive cadence 30-120min, overdue at 4h
+        "ego": (300, 14400),          # 5-min liveness pulse (ego_heartbeat job), overdue at 4h
     }
 
     result = {}

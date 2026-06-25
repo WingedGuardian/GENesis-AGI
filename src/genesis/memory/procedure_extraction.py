@@ -53,18 +53,23 @@ async def extract_procedures_from_chunk(
     router,
     source_session_id: str | None = None,
     chunk_context: str = "",
+    max_new: int | None = None,
 ) -> int:
     """Run classifier over chunk extractions, route candidates to Judge.
 
     Returns count of procedures stored. Each Judge call is individually
     timeout-guarded to prevent a single hung LLM from blocking the
-    entire extraction loop.
+    entire extraction loop. ``max_new`` caps how many procedures this call may
+    store (the caller's remaining per-session budget); once reached, no further
+    candidates are judged.
     """
     # Deferred import — memory → learning direction
     from genesis.learning.procedural.judge import judge_extraction_candidate
 
     count = 0
     for ext in extractions:
+        if max_new is not None and count >= max_new:
+            break
         candidate = classify_as_procedure(ext)
         if candidate is None:
             continue

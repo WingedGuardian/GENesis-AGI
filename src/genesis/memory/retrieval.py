@@ -130,6 +130,43 @@ def _rrf_fuse(
     return scores
 
 
+def _rank(values: list[float]) -> list[float]:
+    """Average (tie-corrected) ranks of ``values``, 1-based. Ties share the
+    mean of the positions they span."""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        avg = (i + j) / 2 + 1  # 1-based mean position across the tie group
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    return ranks
+
+
+def _spearman_rank_corr(xs: list[float], ys: list[float]) -> float | None:
+    """Spearman rank correlation in [-1, 1] (Pearson on tie-corrected ranks).
+
+    Hand-rolled — scipy is not a dependency (MEM-005). Returns ``None`` when
+    undefined: fewer than 2 points, mismatched lengths, or zero ranking
+    variance in either input (e.g. all values equal).
+    """
+    n = len(xs)
+    if n < 2 or len(ys) != n:
+        return None
+    rx, ry = _rank(xs), _rank(ys)
+    mx, my = sum(rx) / n, sum(ry) / n
+    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry, strict=True))
+    vx = sum((a - mx) ** 2 for a in rx)
+    vy = sum((b - my) ** 2 for b in ry)
+    if vx <= 0 or vy <= 0:
+        return None
+    return cov / (vx**0.5 * vy**0.5)
+
+
 def _get_candidate_content(
     mid: str,
     qdrant_by_id: dict[str, dict],
@@ -283,6 +320,7 @@ class HybridRetriever:
         only_subsystem: str | list[str] | None = None,
         rerank: bool = True,
         include_deprecated: bool = False,
+        event_id_sink: list[str] | None = None,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
 
@@ -463,6 +501,10 @@ class HybridRetriever:
         # 5b. Compute activation scores using batched link data
         activation_by_id: dict[str, float] = {}
         inbound_by_id: dict[str, int] = {}  # saved for graph boost in step 7b
+        # MEM-005: capture retrieval frequency + age per id to measure (not act
+        # on) whether the activation loop entrenches frequently-retrieved memories.
+        retrieved_count_by_id: dict[str, int] = {}
+        created_at_by_id: dict[str, str] = {}
         for mid in all_ids:
             total_links, inbound_links = link_counts.get(mid, (0, 0))
             inbound_by_id[mid] = inbound_links
@@ -491,6 +533,8 @@ class HybridRetriever:
                 last_retrieved_at=payload.get("last_retrieved_at") if qdrant_hit else None,
             )
             activation_by_id[mid] = act.final_score
+            retrieved_count_by_id[mid] = retrieved_count
+            created_at_by_id[mid] = created_at
 
         # 6. Build ranked lists for RRF (or FTS5-only if no embedding)
         vector_ranked_dedup: list[str] = []
@@ -729,17 +773,22 @@ class HybridRetriever:
             qdrant_hit = qdrant_by_id.get(mid)
             fts_hit = fts_by_id.get(mid)
 
-            # Determine content and metadata
+            # Determine content and metadata. ``_collection`` is the
+            # authoritative first-party/external discriminator (audit D12):
+            # the Qdrant collection on a vector hit (set at recall time, ~L367),
+            # or the FTS row's collection tag for an FTS5-only hit.
             if qdrant_hit:
                 payload = qdrant_hit.get("payload", {})
                 content = payload.get("content", "")
                 src = payload.get("source", "")
                 mem_type = payload.get("memory_type", "")
+                _collection = qdrant_hit.get("_collection", "episodic_memory")
             elif fts_hit:
                 content = fts_hit.get("content", "")
                 src = fts_hit.get("source_type", "")
                 mem_type = fts_hit.get("collection", "")
                 payload = fts_hit
+                _collection = fts_hit.get("collection", "episodic_memory")
             else:
                 continue
 
@@ -779,6 +828,7 @@ class HybridRetriever:
                     memory_class=_p.get("memory_class", "fact"),
                     query_intent=intent.category,
                     intent_confidence=intent.confidence,
+                    collection=_collection,
                 ),
             )
 
@@ -789,6 +839,38 @@ class HybridRetriever:
         )
 
         _scores = [r.score for r in results]
+        # MEM-005: entrenchment signal — does retrieval frequency predict final
+        # ranking? A positive corr(retrieved_count, score) means the activation
+        # loop is rewarding mere frequency in the ranking. Monitor-only (D7:
+        # instrument, do NOT re-rank); a sustained strong-positive trend over
+        # time flags entrenchment of stale-but-popular memories. Defensive — it
+        # reads external payload data and must never break recall.
+        _entrenchment = _mean_retrieved = _mean_age_days = None
+        try:
+            _ret_counts = [
+                float(retrieved_count_by_id.get(r.memory_id, 0)) for r in results
+            ]
+            if _ret_counts:
+                _entrenchment = _spearman_rank_corr(_ret_counts, _scores)
+                _mean_retrieved = round(sum(_ret_counts) / len(_ret_counts), 2)
+                _now_dt = datetime.fromisoformat(now_str.replace("Z", "+00:00"))
+                _ages: list[float] = []
+                for r in results:
+                    _ca = created_at_by_id.get(r.memory_id)
+                    if not _ca:
+                        continue
+                    try:
+                        _ages.append(
+                            (_now_dt - datetime.fromisoformat(
+                                _ca.replace("Z", "+00:00"))).total_seconds() / 86400.0
+                        )
+                    except (ValueError, AttributeError):
+                        continue
+                if _ages:
+                    _mean_age_days = round(sum(_ages) / len(_ages), 1)
+        except Exception:
+            logger.debug("MEM-005 entrenchment metric failed", exc_info=True)
+
         recall_event_id = await emit_recall_fired(
             self._db,
             query=query,
@@ -801,7 +883,17 @@ class HybridRetriever:
             graph_boost_applied=graph_boost_applied,
             mean_score=sum(_scores) / len(_scores) if _scores else None,
             wing=wing,
+            entrenchment_corr=_entrenchment,
+            mean_retrieved_count=_mean_retrieved,
+            mean_age_days=_mean_age_days,
         )
+
+        # MEM-003: hand the emitted event id back to an MCP caller so it can
+        # enrich THIS event (mode / pipeline_used / post-filter counts) instead
+        # of emitting a second recall_fired that double-counts in the J-9
+        # aggregator and batch judge.
+        if event_id_sink is not None and recall_event_id is not None:
+            event_id_sink.append(recall_event_id)
 
         # Recall diagnostics: capture intermediate pipeline metrics
         _overlap = len(set(qdrant_by_id) & set(fts_by_id))

@@ -309,11 +309,6 @@ snapshots:
   retention: 5
   prefix: "guardian-"
 
-approval:
-  port: 8888
-  token_expiry_s: 86400
-  bind_host: "${TS_IP:-}"
-
 briefing:
   enabled: true
   shared_subdir: "shared"
@@ -382,29 +377,11 @@ echo "[7/14] Generating CLAUDE.md for diagnostic CC..."
 if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
     cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
 
-    # Append per-machine network identity (no hardcoded IPs in the template)
-    _host_v4="${TS_IP:-$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo '')}"
-    _host_v6="$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' | head -1 || echo '')"
-    {
-        echo ""
-        echo "## Network"
-        echo ""
-        echo "- **Container**: $CONTAINER_NAME at $CONTAINER_IP"
-        echo "- **Host VM**: $_host_v4 (this machine)"
-        [ -n "$_host_v6" ] && echo "- **Host IPv6**: $_host_v6"
-        echo "- **Dashboard**: http://$CONTAINER_IP:5000 (direct, container network)"
-        [ -n "$_host_v4" ] && echo "               http://$_host_v4:5000 (via proxy device)"
-    } >> "$INSTALL_DIR/CLAUDE.md"
-
-    # Tell git to ignore local CLAUDE.md changes. The file is tracked but the
-    # host uses guardian-claude.md instead. Without skip-worktree, git pull
-    # tries to merge the repo's container CLAUDE.md over the Guardian version.
-    if [ -d "$INSTALL_DIR/.git" ]; then
-        cd "$INSTALL_DIR" && git update-index --skip-worktree CLAUDE.md 2>/dev/null || true
-    else
-        echo "  NOTE: $INSTALL_DIR/.git not found — CLAUDE.md skip-worktree not set"
-        echo "        (ok for a non-git deploy; a future 'git pull' here could overwrite CLAUDE.md)"
-    fi
+    # No network block is appended: shared host/container facts live in the
+    # user-level ~/.claude/CLAUDE.md (D16). CLAUDE.md is also deliberately NOT
+    # marked --skip-worktree — that wedges the gateway's `git pull` once upstream
+    # touches the tracked CLAUDE.md ("local changes would be overwritten"). The
+    # gateway regenerates CLAUDE.md via checkout+cp on every update instead.
 
     # D16: the diagnostic CC runs with cwd = cc.work_dir (see diagnosis.py), so the
     # Guardian CLAUDE.md must live there to be auto-loaded as project context — the
@@ -462,8 +439,8 @@ _host_mem_gb=$(( ${_host_mem_kb:-0} / 1048576 ))
 if [ "$_host_mem_gb" -gt 0 ] 2>/dev/null; then
     # Scale min_free_kbytes to ~1% of host RAM (floor 128MB, cap 1024MB)
     _min_free_mb=$(( _host_mem_gb * 10 ))  # ~1% in MB
-    [ "$_min_free_mb" -lt 128 ] && _min_free_mb=128
-    [ "$_min_free_mb" -gt 1024 ] && _min_free_mb=1024
+    if [ "$_min_free_mb" -lt 128 ]; then _min_free_mb=128; fi
+    if [ "$_min_free_mb" -gt 1024 ]; then _min_free_mb=1024; fi
     _min_free_kb=$(( _min_free_mb * 1024 ))
 
     # Idempotency: don't downgrade if someone already set a higher value.
@@ -471,14 +448,17 @@ if [ "$_host_mem_gb" -gt 0 ] 2>/dev/null; then
     if [ "${_current_min_free:-0}" -ge "$_min_free_kb" ]; then
         echo "  OOM tuning already adequate (min_free_kbytes=${_current_min_free})"
     elif sudo -n true 2>/dev/null; then
-        sudo tee /etc/sysctl.d/99-genesis-oom-tuning.conf > /dev/null << SYSCTL
+        # Best-effort tuning: guard each sudo command so a failure can't abort
+        # the install under `set -euo pipefail` (the WARN branch below is the
+        # intended fallback when tuning can't be applied).
+        sudo tee /etc/sysctl.d/99-genesis-oom-tuning.conf > /dev/null << SYSCTL || true
 # Genesis — kernel OOM protection (installed by install_guardian.sh)
 # Prevents VM freeze under memory pressure. Safe to customize.
 vm.min_free_kbytes = $_min_free_kb
 vm.watermark_scale_factor = 50
 vm.oom_kill_allocating_task = 1
 SYSCTL
-        sudo sysctl --system > /dev/null 2>&1
+        sudo sysctl --system > /dev/null 2>&1 || true
         echo "  + OOM tuning applied (min_free=${_min_free_mb}MB for ${_host_mem_gb}GB host)"
     else
         echo "  WARN  Cannot apply OOM tuning (no passwordless sudo)"
@@ -498,8 +478,10 @@ fi
 # Reference configs: config/99-container-host.conf, config/60-ioscheduler.rules
 
 if sudo -n true 2>/dev/null; then
+    # Best-effort tuning: guard each sudo command so a failure can't abort the
+    # install under `set -euo pipefail` (the SKIP branch below is the fallback).
     # I/O sysctl — always overwrite to pick up value changes on update
-    sudo tee /etc/sysctl.d/99-genesis-io-tuning.conf > /dev/null << 'SYSCTL'
+    sudo tee /etc/sysctl.d/99-genesis-io-tuning.conf > /dev/null << 'SYSCTL' || true
 # Genesis — I/O pressure reduction (installed by install_guardian.sh)
 # Reduces dirty page cache to prevent I/O death spirals under sustained write load.
 vm.swappiness = 10
@@ -507,12 +489,12 @@ vm.dirty_ratio = 10
 vm.dirty_background_ratio = 3
 vm.vfs_cache_pressure = 50
 SYSCTL
-    sudo sysctl --system > /dev/null 2>&1
+    sudo sysctl --system > /dev/null 2>&1 || true
     echo "  + I/O tuning applied (swappiness=10, dirty_ratio=10)"
 
     # BFQ I/O scheduler — always refresh from repo
     if [ -d "$INSTALL_DIR/config" ] && [ -f "$INSTALL_DIR/config/60-ioscheduler.rules" ]; then
-        sudo cp "$INSTALL_DIR/config/60-ioscheduler.rules" /etc/udev/rules.d/
+        sudo cp "$INSTALL_DIR/config/60-ioscheduler.rules" /etc/udev/rules.d/ || true
         sudo udevadm control --reload-rules 2>/dev/null || true
         echo "  + BFQ I/O scheduler rule installed"
     fi

@@ -16,6 +16,8 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
+from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,6 +34,154 @@ logger = logging.getLogger(__name__)
 _OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 _AA_MODELS_URL = "https://artificialanalysis.ai/api/data/llms/models"
 _FREE_MODEL_CACHE_PATH = Path.home() / ".genesis" / "free_model_cache.json"
+
+# ── Active-model EOL detection (vendor deprecation pages: Groq + Gemini) ────
+_GROQ_DEPRECATIONS_URL = "https://console.groq.com/docs/deprecations"
+# A Groq deprecations table row is 3 pipe-separated cells. Rendered text may
+# carry surrounding pipes (`| model | date | repl |`, MCP-style markdown) or
+# not (`model| date| repl`, what genesis.web.fetch returns) — handle both.
+_DEP_DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{2,4})")
+
+# Google's Gemini deprecations page. Same intent as Groq's, but a 4-column
+# table (`Model | Release | Shutdown | Repl`) with month-name dates
+# ("May 19, 2026"). Models without a dated shutdown carry "No shutdown date
+# announced" and must NOT fire. We fetch the HTML doc (rendered to markdown by
+# genesis.web.fetch) — NOT the `.md.txt` mirror, which is served as
+# `text/markdown` and rejected by the fetch content-type allowlist.
+_GEMINI_DEPRECATIONS_URL = "https://ai.google.dev/gemini-api/docs/deprecations"
+_GEMINI_DATE_RE = re.compile(r"\b([A-Z][a-z]{2,8})\s+(\d{1,2}),\s+(\d{4})\b")
+_MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June", "July",
+    "August", "September", "October", "November", "December",
+]
+# Full names + 3-letter abbreviations ("Jan", "Sep"), in case a rendered table
+# narrows the column. An unrecognised month after a date-shaped match is WARNED,
+# never silently dropped (a missed EOL is the dangerous failure mode).
+_MONTH_TO_NUM = {m: i for i, m in enumerate(_MONTH_NAMES, start=1)}
+_MONTH_TO_NUM.update({m[:3]: i for i, m in enumerate(_MONTH_NAMES, start=1)})
+
+
+def _parse_groq_deprecation_table(text: str) -> list[tuple[str, str, str]]:
+    """Parse Groq's deprecations markdown table into rows of
+    ``(model_id, shutdown_date_iso, replacement)``.
+
+    Only rows whose middle column carries a ``MM/DD/YY`` date count as
+    deprecation entries; header / separator / other rows are skipped. Robust
+    to missing backticks. Returns ``[]`` when nothing parses (the caller logs
+    a structure-changed warning).
+    """
+    rows: list[tuple[str, str, str]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if "|" not in line:
+            continue
+        # Strip surrounding pipes (markdown style) then split into cells.
+        parts = [c.strip() for c in line.strip("|").split("|")]
+        if len(parts) != 3:
+            continue
+        model_cell, date_cell, repl_cell = parts
+        date_m = _DEP_DATE_RE.search(date_cell)
+        if not date_m:
+            continue  # header / separator / non-date row
+        model_id = model_cell.strip("` ").strip()
+        if not model_id or model_id.lower() == "deprecated model":
+            continue
+        mm, dd, yy = date_m.groups()
+        mm_int, dd_int = int(mm), int(dd)
+        if not (1 <= mm_int <= 12 and 1 <= dd_int <= 31):
+            continue  # not a real calendar date (e.g. a version number)
+        year = int(yy) + 2000 if int(yy) < 100 else int(yy)
+        shutdown_iso = f"{year:04d}-{mm_int:02d}-{dd_int:02d}"
+        replacement = repl_cell.replace("`", "").strip()
+        rows.append((model_id, shutdown_iso, replacement))
+    return rows
+
+
+def _parse_gemini_deprecation_table(text: str) -> list[tuple[str, str, str]]:
+    """Parse Google's Gemini deprecations markdown into rows of
+    ``(model_id, shutdown_date_iso, replacement)``.
+
+    The page is multi-section with 4-column tables
+    (``Model | Release date | Shutdown date | Recommended replacement``) and
+    month-name dates. Only rows whose *shutdown* column carries a real date
+    count — "No shutdown date announced", header, separator, and "Preview
+    models" rows are skipped. Robust to backticks / bold markers and to the
+    leading/trailing-pipe variation. Returns ``[]`` when nothing parses (the
+    caller logs a structure-changed warning).
+    """
+    rows: list[tuple[str, str, str]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if "|" not in line:
+            continue
+        parts = [c.strip() for c in line.strip("|").split("|")]
+        if len(parts) != 4:
+            continue
+        model_cell, _release_cell, shutdown_cell, repl_cell = parts
+        date_m = _GEMINI_DATE_RE.search(shutdown_cell)
+        if not date_m:
+            continue  # "No shutdown date announced" / header / separator row
+        month_name, dd, yyyy = date_m.groups()
+        month = _MONTH_TO_NUM.get(month_name)
+        if month is None:
+            logger.warning(
+                "EOL check: unrecognised month %r in Gemini shutdown cell %r — "
+                "row skipped (possible page-format change)",
+                month_name, shutdown_cell,
+            )
+            continue
+        dd_int = int(dd)
+        if not (1 <= dd_int <= 31):
+            continue
+        model_id = model_cell.strip("`* ").strip()
+        if not model_id or model_id.lower().startswith("model"):
+            continue  # header row ("**Model**")
+        shutdown_iso = f"{int(yyyy):04d}-{month:02d}-{dd_int:02d}"
+        replacement = repl_cell.strip("`* ").strip()
+        rows.append((model_id, shutdown_iso, replacement))
+    return rows
+
+
+def _eol_findings_from_rows(
+    rows: list[tuple[str, str, str]], providers: dict, call_sites: dict,
+    *,
+    provider_type: str = "groq",
+    vendor: str = "groq",
+    source: str = "groq_deprecations_page",
+) -> list[dict]:
+    """Match parsed deprecation rows against our ACTIVE providers of one vendor.
+
+    Emits an ``active_model_eol`` finding only for a model we actually use
+    (firehose guard: an unrelated deprecation yields nothing), annotated with
+    blast radius — the call-site chains that depend on that provider.
+    ``provider_type`` gates which of our providers a row can match (e.g.
+    ``"groq"`` rows never match a ``"google"`` provider and vice versa).
+    """
+    provider_chains: dict[str, list[str]] = defaultdict(list)
+    for site_id, site in call_sites.items():
+        for prov in site.chain:
+            provider_chains[prov].append(site_id)
+    active_models = {
+        p.model_id: name
+        for name, p in providers.items()
+        if p.enabled and p.provider_type == provider_type
+    }
+    findings: list[dict] = []
+    for model_id, shutdown_iso, replacement in rows:
+        name = active_models.get(model_id)
+        if name is None:
+            continue
+        findings.append({
+            "type": "active_model_eol",
+            "model": model_id,
+            "provider": name,
+            "vendor": vendor,
+            "shutdown_date": shutdown_iso,
+            "replacement": replacement,
+            "blast_radius": sorted(set(provider_chains.get(name, []))),
+            "source": source,
+        })
+    return findings
 
 
 class ModelIntelligenceJob:
@@ -73,7 +223,11 @@ class ModelIntelligenceJob:
         stale_findings = await self._check_staleness()
         findings.extend(stale_findings)
 
-        # 5. Store all findings
+        # 5. Active-provider EOL check (models WE USE being deprecated)
+        eol_findings = await self._check_active_providers()
+        findings.extend(eol_findings)
+
+        # 6. Store all findings
         for f in findings:
             await self._store_finding(f)
 
@@ -86,6 +240,7 @@ class ModelIntelligenceJob:
             "free_model_findings": len(free_findings),
             "aa_findings": len(aa_findings),
             "stale_findings": len(stale_findings),
+            "eol_findings": len(eol_findings),
             "findings": findings,
         }
 
@@ -384,6 +539,12 @@ class ModelIntelligenceJob:
         now = datetime.now(UTC).isoformat()
         finding_type = finding.get("type", "unknown")
 
+        # active_model_eol is a HIGH-priority, actionable alert — surface it as
+        # a recon observation, NOT via run_intake (curated model-intelligence
+        # findings route to the knowledge base, which would bury it).
+        if finding_type == "active_model_eol":
+            return await self._surface_eol_observation(finding, finding_id, now)
+
         title = f"Model intelligence: {finding_type}"
         if "model" in finding:
             title += f" — {finding['model']}"
@@ -467,9 +628,193 @@ class ModelIntelligenceJob:
                 strategy="surplus_task",
                 reason=json.dumps(payload),
                 priority="medium",
+                domain="internal",
             )
             logger.info("Created benchmark follow-up %s for %s", fid[:8], model_id)
             return fid
         except Exception:
             logger.warning("Failed to create benchmark follow-up for %s", model_id, exc_info=True)
             return None
+
+    async def _check_active_providers(self) -> list[dict]:
+        """Detect EOL of models WE ACTUALLY USE across vendors that publish a
+        structured deprecation page (Groq + Gemini/Google).
+
+        Loads the effective routing config to learn our active models per
+        vendor and the chains that depend on each provider (blast radius),
+        parses each vendor's deprecation table, and emits an
+        ``active_model_eol`` finding ONLY for our active models that appear
+        with a real shutdown date.
+
+        Firehose-proof by construction: a deprecation for a model we don't use
+        yields nothing; a fetch/parse failure yields nothing (degrade
+        gracefully, never crash the scan). Per vendor we only fetch when we
+        actually have an active provider of that type. Catalog ``/v1/models``
+        diff for the remaining OpenAI-compatible vendors is a documented
+        follow-up, not a silent gap.
+        """
+        try:
+            from genesis.env import repo_root
+            from genesis.routing.config import load_config
+
+            cfg = load_config(
+                repo_root() / "config" / "model_routing.yaml",
+                check_api_keys=False,
+            )
+        except Exception:
+            logger.warning(
+                "EOL check: could not load routing config — skipping", exc_info=True,
+            )
+            return []
+
+        def _active(provider_type: str) -> int:
+            return sum(
+                1 for p in cfg.providers.values()
+                if p.enabled and p.provider_type == provider_type
+            )
+
+        findings: list[dict] = []
+
+        groq_count = _active("groq")
+        if groq_count:
+            rows = await self._fetch_groq_deprecations()
+            findings.extend(_eol_findings_from_rows(
+                rows, cfg.providers, cfg.call_sites,
+                provider_type="groq", vendor="groq",
+                source="groq_deprecations_page",
+            ))
+
+        google_count = _active("google")
+        if google_count:
+            grows = await self._fetch_gemini_deprecations()
+            findings.extend(_eol_findings_from_rows(
+                grows, cfg.providers, cfg.call_sites,
+                provider_type="google", vendor="google",
+                source="gemini_deprecations_page",
+            ))
+
+        if findings:
+            logger.warning(
+                "EOL check: %d active model(s) deprecated: %s",
+                len(findings), [f["model"] for f in findings],
+            )
+        logger.info(
+            "EOL check: scanned deprecations for %d Groq + %d Google active "
+            "model(s); catalog-diff + other vendors deferred to follow-up",
+            groq_count, google_count,
+        )
+        return findings
+
+    async def _fetch_groq_deprecations(self) -> list[tuple[str, str, str]]:
+        """Fetch + parse Groq's deprecations page. Fails safe → [] on any error.
+
+        Uses ``genesis.web.fetch`` (rendered fetch with anti-bot/JS handling),
+        because the Groq docs page is JS-rendered and raw httpx would not see
+        the table.
+        """
+        try:
+            from genesis.web import fetch
+
+            result = await fetch(_GROQ_DEPRECATIONS_URL, max_chars=40000)
+        except Exception:
+            logger.warning("EOL check: Groq deprecations fetch raised", exc_info=True)
+            return []
+        if result.error or not result.text:
+            logger.warning(
+                "EOL check: Groq deprecations page unavailable (%s)", result.error,
+            )
+            return []
+        rows = _parse_groq_deprecation_table(result.text)
+        if not rows:
+            logger.warning(
+                "EOL check: Groq deprecations parse yielded 0 rows — page "
+                "structure may have changed (this is NOT 'no deprecations')",
+            )
+        return rows
+
+    async def _fetch_gemini_deprecations(self) -> list[tuple[str, str, str]]:
+        """Fetch + parse Google's Gemini deprecations page. Fails safe → [].
+
+        Uses ``genesis.web.fetch`` against the HTML doc (rendered to markdown).
+        The ``.md.txt`` mirror is served as ``text/markdown`` and rejected by
+        the fetch content-type allowlist, so we deliberately use the HTML URL.
+        """
+        try:
+            from genesis.web import fetch
+
+            result = await fetch(_GEMINI_DEPRECATIONS_URL, max_chars=40000)
+        except Exception:
+            logger.warning(
+                "EOL check: Gemini deprecations fetch raised", exc_info=True,
+            )
+            return []
+        if result.error or not result.text:
+            logger.warning(
+                "EOL check: Gemini deprecations page unavailable (%s)", result.error,
+            )
+            return []
+        rows = _parse_gemini_deprecation_table(result.text)
+        if not rows:
+            logger.warning(
+                "EOL check: Gemini deprecations parse yielded 0 rows — page "
+                "structure may have changed (this is NOT 'no deprecations')",
+            )
+        return rows
+
+    async def _surface_eol_observation(
+        self, finding: dict, finding_id: str, now: str,
+    ) -> str:
+        """Surface an ``active_model_eol`` finding as a HIGH-priority recon
+        observation (``type='finding'``, ``category='active_model_eol'``).
+
+        Bypasses ``run_intake`` on purpose: curated MODEL_INTELLIGENCE findings
+        route to the knowledge base (``intake.route``), where an actionable EOL
+        alert would be buried. The dashboard recon tab and the ``recon_findings``
+        MCP tool read ``source='recon'`` / ``type='finding'`` observations.
+        Deduped on ``(model_id, shutdown_date)`` so the same EOL never re-fires
+        while unresolved (self-healing: re-alerts only after resolution).
+        """
+        import hashlib
+
+        from genesis.db.crud import observations
+
+        model_id = finding.get("model", "")
+        shutdown_date = finding.get("shutdown_date", "")
+        blast = finding.get("blast_radius", [])
+        title = (
+            f"Active model EOL: {model_id} (shutdown {shutdown_date}) — "
+            f"{len(blast)} chain(s) affected"
+        )
+        content = json.dumps({"title": title, **finding, "detected_at": now})
+        # Stable dedup key — independent of detected_at / blast-radius churn.
+        # Includes vendor so two vendors deprecating the same model-id string on
+        # the same date don't suppress each other.
+        dedup_key = hashlib.sha256(
+            json.dumps(
+                {
+                    "model_id": model_id,
+                    "shutdown_date": shutdown_date,
+                    "vendor": finding.get("vendor", ""),
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        try:
+            await observations.create(
+                self._db,
+                id=finding_id,
+                source="recon",
+                type="finding",
+                category="active_model_eol",
+                content=content,
+                priority="high",
+                created_at=now,
+                content_hash=dedup_key,
+                skip_if_duplicate=True,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to surface active_model_eol observation for %s",
+                model_id, exc_info=True,
+            )
+        return finding_id

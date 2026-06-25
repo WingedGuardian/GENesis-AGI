@@ -566,7 +566,12 @@ class OutputRouter:
             "self-assessment", content, output.overall_score,
         )
 
-        return obs_id
+        # `_write_observation` returns None when this week's content hashes
+        # identically to an existing unresolved row (content-hash dedup). Honor
+        # the `-> str` contract / "empty string on failure" docstring rather than
+        # leaking None to callers. (No supersession here: self_assessment is a
+        # historical ledger the maturity-cohort metric reads — see #725.)
+        return obs_id or ""
 
     async def route_calibration(
         self, output: QualityCalibrationOutput, db: aiosqlite.Connection,
@@ -585,6 +590,28 @@ class OutputRouter:
 
         obs_type = "quality_drift" if output.drift_detected else "quality_calibration"
 
+        # Supersede BOTH prior unresolved calibration outputs (quality_drift AND
+        # quality_calibration) BEFORE writing this cycle's result — never after,
+        # since resolve_by_source_and_type resolves ALL unresolved matches and
+        # would bury the row we just wrote. Resolving both types means:
+        #   • a clean (non-drift) calibration clears a standing drift alarm
+        #     (resolve-on-recovery), and a fresh drift replaces the previous one
+        #     instead of stacking (the original #728 behaviour); and
+        #   • each cycle always writes a *fresh* row — the prior identical
+        #     calibration is resolved first, so content-hash dedup can't suppress
+        #     this week's write. Without this, an unchanged week would dedup to
+        #     no new row, and scheduler._already_ran_this_week (which looks for a
+        #     this-week row) would miss the run and could re-trigger it.
+        now_iso = datetime.now(UTC).isoformat()
+        for prior_type in ("quality_drift", "quality_calibration"):
+            await observations.resolve_by_source_and_type(
+                db,
+                source="quality_calibration",
+                type=prior_type,
+                resolved_at=now_iso,
+                resolution_notes="superseded by newer quality calibration",
+            )
+
         content = json.dumps({
             "drift_detected": output.drift_detected,
             "quarantine_candidates": output.quarantine_candidates,
@@ -602,7 +629,11 @@ class OutputRouter:
             drift=output.drift_detected,
         )
 
-        return obs_id
+        # Honor the `-> str` contract on the dedup path where `_write_observation`
+        # returns None. Supersession above makes that path structurally
+        # unreachable on the normal single-writer path (the prior identical row is
+        # always resolved first), so this is a defensive guard, not a hot path.
+        return obs_id or ""
 
     # ── Private helpers ───────────────────────────────────────────────
 

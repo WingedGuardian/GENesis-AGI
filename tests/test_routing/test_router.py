@@ -108,6 +108,90 @@ async def test_timeout_fails_fast_no_same_provider_retry(
 
 
 @pytest.mark.asyncio
+async def test_rate_limited_fails_fast_no_retry_no_breaker_trip(
+    sample_config, breakers, cost_tracker, degradation,
+):
+    """A 429 (RATE_LIMITED) must fail fast to the next provider WITHOUT a
+    same-provider retry AND WITHOUT tripping the breaker. A rate limit is
+    expected backpressure (the rate gate is the right brake) — tripping the
+    breaker would wrongly take a reachable provider offline for every other
+    call site that uses it.
+    """
+    delegate = MockDelegate(responses={
+        "free-1": CallResult(success=False, error="rate limited", status_code=429),
+    })
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+    result = await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+
+    assert result.success is True
+    assert result.provider_used == "free-2"
+    assert "free-1" in result.failed_providers
+    # Called exactly ONCE — not retried despite default max_retries=1
+    free1_calls = [c for c in delegate.calls if c["provider"] == "free-1"]
+    assert len(free1_calls) == 1
+    # The breaker must NOT record the rate-limit as a failure
+    assert breakers.get("free-1").consecutive_failures == 0
+    assert breakers.get("free-1").trip_count == 0
+
+
+@pytest.mark.asyncio
+async def test_bad_request_fails_fast_no_retry_no_breaker_trip(
+    sample_config, breakers, cost_tracker, degradation,
+):
+    """A 400 (BAD_REQUEST: context overflow / content policy / malformed) must
+    fail fast WITHOUT a same-provider retry AND WITHOUT tripping the breaker —
+    the error is our payload's fault, not the provider being unhealthy.
+    """
+    delegate = MockDelegate(responses={
+        "free-1": CallResult(
+            success=False, error="context window exceeded", status_code=400,
+        ),
+    })
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+    result = await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+
+    assert result.success is True
+    assert result.provider_used == "free-2"
+    free1_calls = [c for c in delegate.calls if c["provider"] == "free-1"]
+    assert len(free1_calls) == 1
+    assert breakers.get("free-1").consecutive_failures == 0
+    assert breakers.get("free-1").trip_count == 0
+
+
+@pytest.mark.asyncio
+async def test_transient_still_retries_and_records_breaker_failure(
+    sample_config, breakers, cost_tracker, degradation,
+):
+    """Contrast guard: a 503 (TRANSIENT) is STILL retried on the same provider
+    (default max_retries=1 → 2 calls) and STILL recorded against the breaker —
+    proving the RATE_LIMITED/BAD_REQUEST no-trip gating did not disable real
+    health failures.
+    """
+    delegate = MockDelegate(responses={
+        "free-1": CallResult(success=False, error="service unavailable", status_code=503),
+    })
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+    result = await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+
+    assert result.success is True
+    assert result.provider_used == "free-2"
+    # Retried once on free-1 (2 calls total) since 503 is transient
+    free1_calls = [c for c in delegate.calls if c["provider"] == "free-1"]
+    assert len(free1_calls) == 2
+    # And the breaker recorded the failure (one record per provider per route_call)
+    assert breakers.get("free-1").consecutive_failures == 1
+
+
+@pytest.mark.asyncio
 async def test_timeout_failover_end_to_end(sample_config, breakers, cost_tracker, degradation):
     """E2E: a hung provider routed through the REAL LiteLLMDelegate is
     hard-capped by asyncio.wait_for and the router fails fast to the next
@@ -421,3 +505,130 @@ async def test_failed_providers_tracked_on_open_breaker(sample_config, breakers,
     assert result.success is True
     assert result.provider_used == "free-2"
     assert "free-1" in result.failed_providers
+
+
+# ── Aggregate wall-clock deadline (RetryPolicy.max_total_s) ───────────────────
+
+
+def _three_free_config(max_total_s, max_retries=0):
+    from genesis.routing.types import CallSiteConfig, ProviderConfig, RetryPolicy, RoutingConfig
+    providers = {
+        f"free-{i}": ProviderConfig(
+            name=f"free-{i}", provider_type="test", model_id="m",
+            is_free=True, rpm_limit=None, open_duration_s=120,
+        ) for i in range(1, 4)
+    }
+    return RoutingConfig(
+        providers=providers,
+        call_sites={"site": CallSiteConfig(id="site", chain=["free-1", "free-2", "free-3"])},
+        retry_profiles={"default": RetryPolicy(
+            max_retries=max_retries, base_delay_ms=0, jitter_pct=0.0, max_total_s=max_total_s,
+        )},
+    )
+
+
+def _clock_advancing_delegate(clock, per_call=0.1):
+    """A MockDelegate that fails every provider and advances `clock` per call."""
+    delegate = MockDelegate(responses={
+        f"free-{i}": CallResult(success=False, status_code=503, error="down")
+        for i in range(1, 4)
+    })
+    orig = delegate.call
+
+    async def _timed(provider, model_id, messages, **kwargs):
+        r = await orig(provider, model_id, messages, **kwargs)
+        clock[0] += per_call
+        return r
+
+    delegate.call = _timed
+    return delegate
+
+
+@pytest.mark.asyncio
+async def test_aggregate_deadline_stops_chain_walk(cost_tracker, degradation):
+    """With max_total_s set, route_call stops walking the chain once the
+    aggregate wall-clock budget is exceeded — it does NOT try every remaining
+    provider. The gate is checked BETWEEN providers (never interrupts a call).
+    """
+    from unittest.mock import patch
+
+    config = _three_free_config(max_total_s=0.15)
+    breakers = CircuitBreakerRegistry(config.providers)
+    clock = [0.0]
+    delegate = _clock_advancing_delegate(clock)
+    router = Router(
+        config=config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+
+    with patch("genesis.routing.router.time.monotonic", lambda: clock[0]):
+        result = await router.route_call("site", [{"role": "user", "content": "hi"}])
+
+    assert result.success is False
+    # free-1 (0.0→0.1) + free-2 (0.1→0.2); at the top of free-3 the elapsed
+    # (0.2) already exceeds max_total_s (0.15) → free-3 is never attempted.
+    called = [c["provider"] for c in delegate.calls]
+    assert called == ["free-1", "free-2"]
+    assert "free-3" not in called
+
+
+@pytest.mark.asyncio
+async def test_no_aggregate_deadline_tries_full_chain(cost_tracker, degradation):
+    """max_total_s=None (default) keeps today's behavior — the whole chain is
+    attempted no matter how long the cumulative wall-clock is.
+    """
+    from unittest.mock import patch
+
+    config = _three_free_config(max_total_s=None)
+    breakers = CircuitBreakerRegistry(config.providers)
+    clock = [0.0]
+    delegate = _clock_advancing_delegate(clock, per_call=10.0)  # huge per-call
+    router = Router(
+        config=config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+
+    with patch("genesis.routing.router.time.monotonic", lambda: clock[0]):
+        result = await router.route_call("site", [{"role": "user", "content": "hi"}])
+
+    assert result.success is False
+    called = [c["provider"] for c in delegate.calls]
+    assert called == ["free-1", "free-2", "free-3"]
+
+
+@pytest.mark.asyncio
+async def test_aggregate_deadline_stops_inner_retries(cost_tracker, degradation):
+    """The deadline also bounds same-provider RETRIES: a single provider with a
+    long retry budget stops retrying once the aggregate deadline passes (never
+    interrupting an in-flight attempt — checked between attempts).
+    """
+    from unittest.mock import patch
+
+    from genesis.routing.types import CallSiteConfig, ProviderConfig, RetryPolicy, RoutingConfig
+
+    providers = {"free-1": ProviderConfig(
+        name="free-1", provider_type="test", model_id="m",
+        is_free=True, rpm_limit=None, open_duration_s=120,
+    )}
+    config = RoutingConfig(
+        providers=providers,
+        call_sites={"site": CallSiteConfig(id="site", chain=["free-1"])},
+        retry_profiles={"default": RetryPolicy(
+            max_retries=5, base_delay_ms=0, jitter_pct=0.0, max_total_s=0.25,
+        )},
+    )
+    breakers = CircuitBreakerRegistry(providers)
+    clock = [0.0]
+    delegate = _clock_advancing_delegate(clock)  # advances 0.1 per call
+
+    router = Router(
+        config=config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+    with patch("genesis.routing.router.time.monotonic", lambda: clock[0]):
+        result = await router.route_call("site", [{"role": "user", "content": "hi"}])
+
+    assert result.success is False
+    # attempt0(0.0→0.1) attempt1(0.1→0.2) attempt2(0.2→0.3); attempt3 sees
+    # 0.3 >= 0.25 and stops — 3 calls, NOT the full 6 (max_retries+1).
+    assert len(delegate.calls) == 3

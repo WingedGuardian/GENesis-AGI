@@ -24,10 +24,11 @@ def _row_to_match(row: dict) -> ProcedureMatch:
         failure_count=row["failure_count"],
         failure_modes=failure_modes,
         workarounds=workarounds,
-        activation_tier=row.get("activation_tier", "L4"),
+        activation_tier=row.get("activation_tier", "DORMANT"),
         tool_trigger=tool_trigger,
         steps=steps,
         principle=row.get("principle"),
+        invocation_count=row.get("invocation_count", 0) or 0,
     )
 
 

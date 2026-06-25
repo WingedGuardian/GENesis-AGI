@@ -479,3 +479,62 @@ class TestDailyEgoCost:
         )
         cost = await ego_crud.daily_ego_cost(db, date="2026-03-28")
         assert abs(cost - 0.5) < 0.001
+
+
+class TestHasOpenGoalStatusChange:
+    async def test_false_when_none(self, db_with_proposals):
+        assert await ego_crud.has_open_goal_status_change(
+            db_with_proposals, "g1",
+        ) is False
+
+    async def test_true_for_pending(self, db_with_proposals):
+        await ego_crud.create_proposal(
+            db_with_proposals,
+            **_make_proposal_kwargs(
+                "p1", action_type="goal_status_change", status="pending",
+                goal_id="g1",
+            ),
+        )
+        assert await ego_crud.has_open_goal_status_change(
+            db_with_proposals, "g1",
+        ) is True
+
+    async def test_true_for_approved(self, db_with_proposals):
+        await ego_crud.create_proposal(
+            db_with_proposals,
+            **_make_proposal_kwargs(
+                "p1", action_type="goal_status_change", status="approved",
+                goal_id="g1",
+            ),
+        )
+        assert await ego_crud.has_open_goal_status_change(
+            db_with_proposals, "g1",
+        ) is True
+
+    async def test_ignores_resolved_and_other_types(self, db_with_proposals):
+        # executed goal_status_change for g1 → resolved, doesn't count
+        await ego_crud.create_proposal(
+            db_with_proposals,
+            **_make_proposal_kwargs(
+                "p1", action_type="goal_status_change", status="executed",
+                goal_id="g1",
+            ),
+        )
+        # a pending NON-goal_status_change proposal for g1 → doesn't count
+        await ego_crud.create_proposal(
+            db_with_proposals,
+            **_make_proposal_kwargs(
+                "p2", action_type="investigate", status="pending", goal_id="g1",
+            ),
+        )
+        # a pending goal_status_change for a DIFFERENT goal → doesn't count
+        await ego_crud.create_proposal(
+            db_with_proposals,
+            **_make_proposal_kwargs(
+                "p3", action_type="goal_status_change", status="pending",
+                goal_id="g2",
+            ),
+        )
+        assert await ego_crud.has_open_goal_status_change(
+            db_with_proposals, "g1",
+        ) is False

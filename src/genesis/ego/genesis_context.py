@@ -93,6 +93,7 @@ class GenesisEgoContextBuilder:
             ("proposal_board", self._proposal_board_section),
             ("execution_outcomes", self._execution_outcomes_section),
             ("capability_performance", self._capability_performance_section),
+            ("confidence_calibration", self._confidence_calibration_section),
             ("output_contract", self._output_contract_section),
         ]
 
@@ -284,7 +285,7 @@ class GenesisEgoContextBuilder:
             # not in _USER_WORLD_CATEGORIES that isn't :user tagged.
             exclude_placeholders = ",".join("?" for _ in _USER_WORLD_CATEGORIES)
             cursor = await self._db.execute(
-                f"SELECT source, type, category, content, priority, created_at "
+                f"SELECT id, source, type, category, content, priority, created_at "
                 f"FROM observations "
                 f"WHERE resolved = 0 "
                 f"AND created_at >= datetime('now', '-48 hours') "
@@ -299,6 +300,7 @@ class GenesisEgoContextBuilder:
                 f"    WHEN 'medium' THEN 2 "
                 f"    ELSE 3 "
                 f"  END, "
+                f"  (retrieved_count > 0), "
                 f"  created_at DESC "
                 f"LIMIT 20",
                 tuple(_USER_WORLD_CATEGORIES),
@@ -313,8 +315,18 @@ class GenesisEgoContextBuilder:
             lines.append("*No unresolved Genesis-internal observations.*\n")
             return "\n".join(lines)
 
+        # Read-receipt (non-fatal): record that these observations were pulled
+        # into the ego's reasoning context this cycle, so already-seen items
+        # demote below unread ones next cycle (blares iff unread AND unresolved).
+        try:
+            from genesis.db.crud import observations as _obs_crud
+
+            await _obs_crud.increment_retrieved_batch(self._db, [r[0] for r in rows])
+        except Exception:
+            logger.debug("Failed to record observation read-receipts", exc_info=True)
+
         lines.append(f"**{len(rows)} items** (sorted by priority):\n")
-        for source, obs_type, category, content, priority, _created_at in rows:
+        for _id, source, obs_type, category, content, priority, _created_at in rows:
             short = content[:200] + "..." if len(content) > 200 else content
             short = short.replace("\n", " ")
             cat_str = f"/{category}" if category else ""
@@ -322,10 +334,11 @@ class GenesisEgoContextBuilder:
                 f"- [{priority}] **{source}{cat_str}** ({obs_type}): {short}"
             )
 
-        # Count redirect observations requiring in-cycle investigation
+        # Count redirect observations requiring in-cycle investigation.
+        # row[2] is the observation type (id=row[0], source=row[1], type=row[2]).
         redirect_count = sum(
             1 for row in rows
-            if row[1] in ("cross_domain_redirect", "realist_redirect")
+            if row[2] in ("cross_domain_redirect", "realist_redirect")
         )
         if redirect_count:
             lines.append(
@@ -579,6 +592,42 @@ class GenesisEgoContextBuilder:
 
         lines.append("")
         return "\n".join(lines)
+
+    async def _confidence_calibration_section(self, *, depth: str = "deep") -> str:
+        """The ego's own confidence calibration — so it can self-correct.
+
+        Informational context for the ``confidence`` field (rendered right before
+        the output contract), NOT a limiter and NOT a mechanical rescale. Reads
+        ``ego_calibration_snapshots`` ONLY (never ``calibration_curves`` — that table
+        is auto-injected into the perception context). Genesis ego only for v1 — the
+        aggregate calibration is genesis-ego dominated; per-ego split is future work.
+
+        Live flag ``EgoConfig.calibration_injection_enabled`` (default ON) is read
+        fresh each cycle, so toggling it takes effect next cycle without a restart.
+        Must be ``async`` (calls async ``get_latest``). Not in ``_ALL_SECTIONS``
+        (that table is user-ego only); the genesis section_map drives it directly.
+        """
+        try:
+            from genesis.ego.config import load_ego_config
+
+            cfg = load_ego_config()
+            # Default ON: disable ONLY on an explicit False (a YAML null / missing
+            # key / truthy value all keep it on, so it can't be silently disabled).
+            if getattr(cfg, "calibration_injection_enabled", True) is False:
+                return ""
+
+            from genesis.db.crud import ego_calibration as cal_crud
+            from genesis.feedback.calibration import format_calibration_section
+
+            snapshot = await cal_crud.get_latest(self._db, domain="ego")
+            return format_calibration_section(snapshot, depth=depth)
+        except aiosqlite.OperationalError:
+            # Expected before PR-B is deployed (table absent) — not an error.
+            logger.debug("ego_calibration_snapshots not yet available")
+            return ""
+        except Exception:
+            logger.warning("Failed to build confidence calibration section", exc_info=True)
+            return ""
 
     async def _capability_performance_section(self, *, depth: str = "deep") -> str:
         """System capability performance — domain confidence from multiple sources."""

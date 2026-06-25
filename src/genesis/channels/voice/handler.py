@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from genesis.channels.tts_config import sanitize_for_speech
 from genesis.channels.voice.sessions import VoiceSessionManager
+from genesis.memory.provenance import is_external
 
 if TYPE_CHECKING:
     from genesis.memory.retrieval import HybridRetriever
@@ -96,7 +97,14 @@ class VoiceConversationHandler:
                 for r in results[:5]:
                     content = getattr(r, "content", str(r))
                     if isinstance(content, str) and content.strip():
-                        snippets.append(f"- {content[:300]}")
+                        # Mark external-world KB so it isn't spoken as first-party
+                        # memory (audit D12).
+                        prefix = (
+                            "[external-world knowledge] "
+                            if is_external(getattr(r, "collection", ""))
+                            else ""
+                        )
+                        snippets.append(f"- {prefix}{content[:300]}")
                 if snippets:
                     memories_text = "Recalled memories:\n" + "\n".join(snippets)
         except Exception:

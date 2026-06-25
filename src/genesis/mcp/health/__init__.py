@@ -60,16 +60,23 @@ def init_health_mcp(
 from genesis.mcp.health import browser as _browser  # noqa: E402
 from genesis.mcp.health import campaign_tools as _campaign_tools  # noqa: E402, F401
 from genesis.mcp.health import codebase as _codebase  # noqa: E402
+from genesis.mcp.health import cognitive_ledger_tools as _cognitive_ledger_tools  # noqa: E402, F401
 from genesis.mcp.health import db_schema as _db_schema  # noqa: E402
+from genesis.mcp.health import deliberation_tools as _deliberation_tools  # noqa: E402
 from genesis.mcp.health import direct_session_tools as _direct_session_tools  # noqa: E402
+from genesis.mcp.health import ego_calibration as _ego_calibration  # noqa: E402, F401
 from genesis.mcp.health import ego_tools as _ego_tools  # noqa: E402
 from genesis.mcp.health import errors as _errors  # noqa: E402
+from genesis.mcp.health import evo_run as _evo_run  # noqa: E402, F401
+from genesis.mcp.health import experiment_run as _experiment_run  # noqa: E402, F401
+from genesis.mcp.health import experiment_status as _experiment_status  # noqa: E402, F401
 from genesis.mcp.health import follow_up_tools as _follow_up_tools  # noqa: E402
 from genesis.mcp.health import inbox_digest as _inbox_digest  # noqa: E402
 from genesis.mcp.health import j9_eval as _j9_eval  # noqa: E402, F401
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
 from genesis.mcp.health import module_ops as _module_ops  # noqa: E402
 from genesis.mcp.health import provider as _provider  # noqa: E402
+from genesis.mcp.health import self_improvement_status  # noqa: E402, F401
 from genesis.mcp.health import session_control as _session_control  # noqa: E402
 from genesis.mcp.health import settings as _settings  # noqa: E402
 from genesis.mcp.health import status as _status  # noqa: E402
@@ -91,6 +98,7 @@ update_history = _update_history
 
 _impl_codebase_navigate = _codebase._impl_codebase_navigate
 _impl_db_schema = _db_schema._impl_db_schema
+_impl_deliberate = _deliberation_tools._impl_deliberate
 _impl_health_errors = _errors._impl_health_errors
 _impl_health_alerts = _errors._impl_health_alerts
 _impl_bootstrap_manifest = _manifest._impl_bootstrap_manifest

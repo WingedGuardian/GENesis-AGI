@@ -172,6 +172,9 @@ async def test_retry_deferred_reflection_success_marks_completed(db):
 
     dq.mark_completed.assert_awaited_once_with("item-1")
     dq.reset_to_pending.assert_not_awaited()
+    # WS-6 head-of-line: the consumer must filter by work_type so a higher-priority
+    # non-reflection item at the head can't block reflection retries.
+    dq.next_pending.assert_awaited_once_with(work_type="reflection", max_priority=40)
 
 
 async def test_retry_deferred_reflection_failure_resets_to_pending(db):
@@ -205,3 +208,126 @@ async def test_retry_deferred_reflection_failure_resets_to_pending(db):
 
     dq.reset_to_pending.assert_awaited_once_with("item-2")
     dq.mark_completed.assert_not_awaited()
+
+
+# ── _resume_approved_reflections tests ───────────────────────────────────
+
+def _approval_loop(db, cc_bridge, approved_for):
+    """Build an AwarenessLoop wired to a mock bridge whose approval gate
+    reports the given ``policy_id`` → approval-request-id pairs as
+    approved-but-unconsumed.
+    """
+    gate = MagicMock()
+
+    async def _find(*, subsystem, policy_id):
+        rid = approved_for.get(policy_id)
+        return {"id": rid} if rid else None
+
+    gate.find_recently_approved = AsyncMock(side_effect=_find)
+    gate.mark_consumed = AsyncMock(return_value=True)
+
+    dispatcher = MagicMock()
+    dispatcher.approval_gate = gate
+    cc_bridge._autonomous_dispatcher = dispatcher
+
+    loop = AwarenessLoop(db, [])
+    loop.set_cc_reflection_bridge(cc_bridge)
+    loop._last_tick_result = TickResult(
+        tick_id="t-resume", timestamp="2026-03-24T05:00:00+00:00",
+        source="scheduled", signals=[], scores=[],
+        classified_depth=Depth.LIGHT, trigger_reason=None,
+    )
+    return loop, gate
+
+
+async def test_resume_approved_light_reflection_dispatches_as_light(db):
+    """An approved LIGHT reflection resumes as Depth.LIGHT (not STRATEGIC).
+
+    Regression guard: the resume loop's previous binary depth resolution
+    (``Depth.DEEP if name == "deep" else Depth.STRATEGIC``) would have
+    mis-dispatched light as an expensive STRATEGIC reflection.
+    """
+    cc_bridge = AsyncMock()
+    cc_bridge.reflect = AsyncMock(return_value=_MockReflectionResult(success=True))
+
+    loop, gate = _approval_loop(db, cc_bridge, {"reflection_light": "appr-light"})
+
+    await loop._resume_approved_reflections()
+
+    gate.mark_consumed.assert_awaited_once_with("appr-light")
+    cc_bridge.reflect.assert_awaited_once()
+    call = cc_bridge.reflect.call_args
+    assert call.args[0] == Depth.LIGHT
+    assert call.kwargs["skip_approval"] is True
+
+
+async def test_resume_approved_reflection_depth_mapping(db):
+    """Each approved policy_id resumes at its OWN depth — no binary collapse."""
+    cc_bridge = AsyncMock()
+    cc_bridge.reflect = AsyncMock(return_value=_MockReflectionResult(success=True))
+
+    loop, gate = _approval_loop(db, cc_bridge, {
+        "reflection_deep": "appr-deep",
+        "reflection_strategic": "appr-strat",
+        "reflection_light": "appr-light",
+    })
+
+    await loop._resume_approved_reflections()
+
+    # Order-independent on purpose: the invariant is that each policy_id resumes
+    # at its OWN depth (no binary collapse), NOT a specific dispatch order. If
+    # light had collapsed to STRATEGIC, the set would be missing Depth.LIGHT.
+    dispatched = [c.args[0] for c in cc_bridge.reflect.call_args_list]
+    assert len(dispatched) == 3
+    assert set(dispatched) == {Depth.DEEP, Depth.STRATEGIC, Depth.LIGHT}
+    assert gate.mark_consumed.await_count == 3
+
+
+async def test_reflection_light_approval_resume_data_path(db):
+    """Integration: a real approved ``reflection_light`` request flows through
+    the same crud the resume loop uses — pending → approved → found →
+    atomically consumed. The loop's dispatch is covered by the unit tests
+    above; this covers the real data layer (no mocks) end-to-end.
+    """
+    import json
+
+    from genesis.autonomy.approval import ApprovalManager
+    from genesis.db.crud import approval_requests as ar_crud
+
+    mgr = ApprovalManager(db=db)
+    req_id = await mgr.request_approval(
+        action_type="autonomous_cli_fallback",
+        action_class="costly_reversible",
+        description="Approve Claude Code session for light reflection?",
+        context=json.dumps({
+            "kind": "autonomous_cli_fallback",
+            "subsystem": "reflection",
+            "policy_id": "reflection_light",
+        }),
+    )
+
+    # A still-pending request is NOT resumable.
+    assert await ar_crud.find_approved_unconsumed(
+        db, subsystem="reflection", policy_id="reflection_light",
+    ) is None
+
+    # User approves it.
+    assert await mgr.resolve(req_id, status="approved") is True
+
+    found = await ar_crud.find_approved_unconsumed(
+        db, subsystem="reflection", policy_id="reflection_light",
+    )
+    assert found is not None and found["id"] == req_id
+
+    # Atomic consume — the second call must fail (double-dispatch guard).
+    assert await ar_crud.mark_consumed(
+        db, req_id, consumed_at="2026-06-19T00:00:00+00:00",
+    ) is True
+    assert await ar_crud.mark_consumed(
+        db, req_id, consumed_at="2026-06-19T00:00:01+00:00",
+    ) is False
+
+    # Once consumed, it is no longer resumable.
+    assert await ar_crud.find_approved_unconsumed(
+        db, subsystem="reflection", policy_id="reflection_light",
+    ) is None

@@ -52,16 +52,55 @@ class GuardianWatchdog:
         self,
         remote,  # GuardianRemote — import avoided for loose coupling
         event_bus=None,
-        outreach_queue=None,
+        outreach_pipeline=None,  # OutreachPipeline — for user-facing alerts
     ) -> None:
         self._remote = remote
         self._event_bus = event_bus
-        self._outreach_queue = outreach_queue
+        self._outreach_pipeline = outreach_pipeline
         self._sentinel = None
         self._last_recovery_at: datetime | None = None
         self._last_reset_at: datetime | None = None
         self._consecutive_stuck: int = 0
+        self._recovery_failed_escalated: bool = False  # one alert per DOWN episode
         self._drift_count: int = 0
+        self._drift_escalated: bool = False  # one user alert per drift episode
+        # Deployed-gateway staleness: the install-dir code can be current while
+        # ~/.local/bin/guardian-gateway.sh lags (the bug that froze it ~2 months).
+        self._gateway_drift_count: int = 0
+        self._gateway_resync_attempted: bool = False
+        self._gateway_escalated: bool = False
+
+    async def _alert_user(self, *, topic: str, context: str, source_id: str) -> None:
+        """Deliver a user-facing (Telegram) alert about a Guardian degradation.
+
+        Uses the outreach pipeline's ``submit_raw`` — the idiomatic urgent-infra
+        path (BLOCKER category → Telegram, governance skipped, built-in dedup),
+        the same one health alerts use. No-op when the pipeline isn't wired
+        (graceful degradation). Wrapped so an outreach failure NEVER breaks a
+        watchdog tick. Each call site passes a DISTINCT ``topic`` so the
+        pipeline's (signal_type, topic, category) dedup never cross-suppresses
+        one Guardian alert with another.
+        """
+        if not self._outreach_pipeline:
+            return
+        try:
+            from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+            await self._outreach_pipeline.submit_raw(
+                context,
+                OutreachRequest(
+                    category=OutreachCategory.BLOCKER,
+                    topic=topic,
+                    context=context,
+                    salience_score=1.0,
+                    signal_type="guardian_alert",
+                    source_id=source_id,
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to send Guardian alert (%s)", source_id, exc_info=True,
+            )
 
     def _in_cooldown(self) -> bool:
         if self._last_recovery_at is None:
@@ -99,6 +138,7 @@ class GuardianWatchdog:
 
         if result.status != ProbeStatus.DOWN:
             self._consecutive_stuck = 0
+            self._recovery_failed_escalated = False  # re-arm for the next episode
             return
 
         staleness = result.details.get("staleness_s", 0) if result.details else 0
@@ -130,16 +170,17 @@ class GuardianWatchdog:
                         "guardian.recovery.failed",
                         f"Guardian restart via SSH failed (stale {staleness:.0f}s)",
                     )
-                if self._outreach_queue:
-                    try:
-                        await self._outreach_queue.enqueue(
-                            f"Guardian is DOWN (heartbeat stale {staleness:.0f}s) "
-                            "and SSH restart failed. Manual intervention needed.",
-                            priority="high",
-                            source="guardian_watchdog",
-                        )
-                    except Exception:
-                        logger.warning("Failed to queue Guardian alert", exc_info=True)
+                if not self._recovery_failed_escalated:
+                    self._recovery_failed_escalated = True
+                    await self._alert_user(
+                        topic="Guardian is DOWN",
+                        context=(
+                            f"🚨 Guardian is DOWN (heartbeat stale "
+                            f"{staleness:.0f}s) and SSH restart failed. "
+                            "Manual intervention needed."
+                        ),
+                        source_id="guardian:recovery_failed",
+                    )
 
         # Step 2: Check if Guardian is stuck in confirmed_dead
         await self._check_stuck_state()
@@ -227,14 +268,34 @@ class GuardianWatchdog:
         """Inner implementation of drift detection (may raise)."""
         import asyncio
 
-        # Get container's hash for Guardian-relevant paths (non-blocking)
+        # Reference point = the commit update.sh LAST SUCCESSFULLY DEPLOYED, not
+        # the container's live HEAD. The host Guardian is only redeployed by an
+        # update.sh run, while container `main` advances on every PR merge — so
+        # HEAD races ahead of the host between deploys and comparing against it
+        # false-alarms on benign lag. Measuring against the last deploy makes
+        # drift fire only when a redeploy was attempted but didn't take (a
+        # genuinely stale/frozen host), which is what this check exists to catch.
+        deploy_ref = await self._last_deployed_commit()
+        if deploy_ref is None:
+            # No successful update recorded → no deploy baseline. Skip rather
+            # than fall back to HEAD (which re-introduces the false alarm).
+            logger.debug(
+                "Guardian drift check: no successful update_history baseline "
+                "— skipping",
+            )
+            return
+
+        # Get container's hash for Guardian-relevant paths AS OF the last deploy
+        # (non-blocking).
         result = await asyncio.to_thread(
             subprocess.run,
             ["git", "-C", str(Path.home() / "genesis"),
-             "log", "-1", "--format=%h", "--"] + self._GUARDIAN_PATHS,
+             "log", "-1", "--format=%h", deploy_ref, "--"] + self._GUARDIAN_PATHS,
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
+            # deploy_ref unresolvable in the container's git (e.g. rewritten
+            # history) — skip, never false-alarm.
             return
         container_hash = result.stdout.strip()
 
@@ -248,26 +309,58 @@ class GuardianWatchdog:
         if branch_result.returncode == 0 and branch_result.stdout.strip() not in ("main",):
             return
         if not container_hash:
+            # deploy_ref resolved but no Guardian-path commit is reachable from
+            # it — nothing to compare. Log so this silent-skip is observable
+            # (mirrors the no-baseline debug above) rather than going dark.
+            logger.debug(
+                "Guardian drift check: no Guardian-path commit reachable from "
+                "deploy_ref=%s — skipping", deploy_ref,
+            )
             return
 
         # Get host's deployed hash via SSH version command
         version_info = await self._remote.version()
         if not isinstance(version_info, dict):
             return
+
+        # Deployed-gateway staleness check reuses this same version() payload.
+        # Isolated in its own suppress so a failure here can't skip the
+        # code-drift logic below.
+        import contextlib
+        with contextlib.suppress(Exception):
+            await self._check_gateway_staleness(version_info)
+
         host_hash = version_info.get("deployed_commit", "unknown")
 
         if not isinstance(host_hash, str) or host_hash == "unknown":
             return  # Host hasn't been redeployed yet (pre-feature) — skip
 
-        # Compare (short hashes — prefix match)
-        if container_hash.startswith(host_hash) or host_hash.startswith(container_hash):
+        # The host records `deployed_commit` as the full deploy HEAD, while
+        # `container_hash` is the LAST commit touching Guardian paths. A deploy
+        # batch with non-Guardian commits landing after the last Guardian-touching
+        # one leaves the two unequal even though HEAD *contains* the Guardian
+        # commit — so test containment (ancestry), not equality.
+        contains = await self._host_contains_commit(container_hash, host_hash)
+        if contains is None:
+            # Unresolvable (e.g. host ahead on a commit the container's git hasn't
+            # fetched) — never false-alarm. The self-referential deploy of THIS
+            # file is also covered: it drifts only until the host redeploys, which
+            # DRIFT_ALERT_THRESHOLD absorbs.
+            logger.debug(
+                "Guardian code drift check unresolvable (container=%s host=%s) "
+                "— skipping", container_hash, host_hash,
+            )
+            return
+        if contains:
             if self._drift_count > 0:
                 logger.info("Guardian code drift resolved (container=%s host=%s)",
                             container_hash, host_hash)
             self._drift_count = 0
+            self._drift_escalated = False  # re-arm the user alert for next episode
             return
 
-        # Drift detected
+        # Drift detected — host's deployed HEAD does NOT contain the container's
+        # latest Guardian-path commit (genuine staleness).
         self._drift_count += 1
         if self._drift_count >= self.DRIFT_ALERT_THRESHOLD and \
                 self._drift_count % self.DRIFT_ALERT_THRESHOLD == 0:
@@ -283,11 +376,198 @@ class GuardianWatchdog:
                     f"Guardian code version mismatch — container={container_hash} "
                     f"host={host_hash} (drifted {self._drift_count} ticks)",
                 )
-            if self._outreach_queue:
-                await self._outreach_queue.enqueue(
+
+        # User-facing alert: ONCE per drift episode (re-armed on resolution) —
+        # NOT every 3 ticks like the event-bus observability emit above.
+        if self._drift_count >= self.DRIFT_ALERT_THRESHOLD and \
+                not self._drift_escalated:
+            self._drift_escalated = True
+            await self._alert_user(
+                topic="Guardian code drift",
+                context=(
                     f"⚠️ Guardian code drift: container={container_hash} "
-                    f"host={host_hash}. Auto-redeploy may have failed. "
-                    "Check update logs or run install_guardian.sh --non-interactive on host.",
-                    priority="high",
-                    source="guardian_watchdog",
+                    f"host={host_hash}. Auto-redeploy may have failed. Check "
+                    "update logs or run install_guardian.sh --non-interactive "
+                    "on host."
+                ),
+                source_id="guardian:code_drift",
+            )
+
+    async def _host_contains_commit(
+        self, container_hash: str, host_hash: str,
+    ) -> bool | None:
+        """Whether the host's deployed HEAD CONTAINS the container's latest
+        Guardian-path commit (i.e. the host Guardian is current).
+
+        Returns True when ``container_hash`` is an ancestor of (or equal to)
+        ``host_hash`` — the host's deployed code includes the container's latest
+        Guardian-relevant commit. Returns False on a genuine miss (real drift —
+        the host lacks that commit). Returns None when the relationship can't be
+        resolved (e.g. the host is ahead on a commit the container's git doesn't
+        have yet) — the caller then skips, never false-alarms. Mirrors
+        ``_expected_gateway_sha``'s None-on-unresolvable contract. Split out so
+        tests can stub it / exercise the exit-code mapping directly.
+
+        ``git merge-base --is-ancestor`` exits 0 (is ancestor), 1 (is not), or
+        128 (unknown object). The mapping is EXPLICIT on purpose: a naive
+        ``returncode == 0`` would fold 128 into False and re-introduce a false
+        alarm whenever the host is legitimately ahead. Argument order is
+        load-bearing: ``container_hash`` (the purported ancestor) FIRST.
+        """
+        import asyncio
+
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["git", "-C", str(Path.home() / "genesis"),
+                 "merge-base", "--is-ancestor", container_hash, host_hash],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            return None  # subprocess/timeout failure → unresolvable → skip
+        if result.returncode == 0:
+            return True   # container's Guardian commit is in the host's HEAD
+        if result.returncode == 1:
+            return False  # genuinely not contained → real drift
+        return None       # 128 (unknown object — host ahead) / other → skip
+
+    async def _last_deployed_commit(self) -> str | None:
+        """Commit hash that update.sh LAST SUCCESSFULLY deployed.
+
+        This is the host Guardian's expected baseline: the host is only
+        redeployed by an update.sh run (which records the run in
+        ``update_history``), whereas the container's live HEAD advances on
+        every merge. Drift must be measured against this, not HEAD, or normal
+        between-deploy lag false-alarms.
+
+        Returns None when no successful update is recorded (no baseline → the
+        caller skips, never false-alarms). Best-effort: any DB failure → None.
+        The SQL lives in ``genesis.db.crud.update_history`` (CRUD-layer reader);
+        all imports are function-level so ``genesis.db`` stays off the host's
+        import path (this watchdog is container-side only — see
+        guardian/DEPLOYMENT.md), with connection management kept here.
+        """
+        import aiosqlite
+
+        from genesis.db.connection import BUSY_TIMEOUT_MS
+        from genesis.db.crud import update_history
+        from genesis.env import genesis_db_path
+
+        db_path = genesis_db_path()
+        if not db_path.exists():
+            return None
+        try:
+            async with aiosqlite.connect(str(db_path)) as db:
+                await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+                return await update_history.last_successful_deploy_commit(db)
+        except Exception:
+            return None
+
+    async def _expected_gateway_sha(self, code_version: str) -> str | None:
+        """sha256 of the gateway script at the host's install-dir commit.
+
+        Returns None if the container's git can't resolve that commit (e.g. the
+        host is ahead of the container) — the caller then skips, never
+        false-alarms. Split out so tests can stub the expected value.
+        """
+        import asyncio
+        import hashlib
+
+        show = await asyncio.to_thread(
+            subprocess.run,
+            ["git", "-C", str(Path.home() / "genesis"),
+             "show", f"{code_version}:scripts/guardian-gateway.sh"],
+            capture_output=True, timeout=5,
+        )
+        if show.returncode != 0 or not show.stdout:
+            return None
+        return hashlib.sha256(show.stdout).hexdigest()
+
+    async def _check_gateway_staleness(self, version_info: dict) -> None:
+        """Detect (and self-heal) a stale DEPLOYED gateway script.
+
+        The `update` self-update can fail while the git pull succeeds, leaving
+        ``~/.local/bin/guardian-gateway.sh`` frozen while the install dir
+        advances — the bug that froze the host gateway ~2 months. We compare the
+        host's reported ``gateway_sha`` against the sha of the gateway script at
+        the host's install-dir commit. On a confirmed mismatch we attempt ONE
+        guarded ``sync-gateway`` self-heal per episode, then escalate if still
+        unresolved. Best-effort (invoked under _check_code_drift's suppress).
+        """
+        host_gw_sha = version_info.get("gateway_sha", "unknown")
+        host_code_ver = version_info.get("code_version", "unknown")
+        if not isinstance(host_gw_sha, str) or host_gw_sha in ("", "unknown"):
+            return  # host gateway predates gateway_sha, or unreadable
+        if not isinstance(host_code_ver, str) or host_code_ver in ("", "unknown"):
+            return
+
+        expected = await self._expected_gateway_sha(host_code_ver)
+        if expected is None:
+            return  # can't determine expected sha — don't false-alarm
+
+        if host_gw_sha == expected:
+            if self._gateway_drift_count > 0:
+                logger.info("Guardian deployed-gateway staleness resolved (sha=%s)",
+                            host_gw_sha[:12])
+            self._gateway_drift_count = 0
+            self._gateway_resync_attempted = False
+            self._gateway_escalated = False
+            return
+
+        # Deployed gateway does not match the install-dir's gateway → stale.
+        self._gateway_drift_count += 1
+        if self._gateway_drift_count < self.DRIFT_ALERT_THRESHOLD:
+            return
+
+        if not self._gateway_resync_attempted:
+            # One guarded self-heal attempt per episode: redeploy from install dir.
+            self._gateway_resync_attempted = True
+            logger.warning(
+                "Guardian deployed gateway stale (deployed=%s expected=%s @ %s) "
+                "— auto-running sync-gateway",
+                host_gw_sha[:12], expected[:12], host_code_ver,
+            )
+            try:
+                res = await self._remote.sync_gateway()
+            except Exception:
+                logger.exception("sync-gateway self-heal raised")
+                res = {"ok": False}
+            if self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+                ok = res.get("ok")
+                await self._event_bus.emit(
+                    Subsystem.GUARDIAN, Severity.WARNING,
+                    "guardian.gateway_resync",
+                    f"Deployed gateway was stale (sha {host_gw_sha[:12]} vs "
+                    f"{expected[:12]} @ {host_code_ver}); auto sync-gateway "
+                    f"ok={ok}. Re-verifying next tick.",
                 )
+            return
+
+        # Self-heal already attempted and it's STILL stale → escalate once per
+        # episode: the event bus (observability) AND a user-facing Telegram alert.
+        if not self._gateway_escalated:
+            self._gateway_escalated = True
+            logger.error(
+                "Guardian deployed gateway STILL stale after auto sync-gateway "
+                "(deployed=%s expected=%s @ %s)",
+                host_gw_sha[:12], expected[:12], host_code_ver,
+            )
+            if self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+                await self._event_bus.emit(
+                    Subsystem.GUARDIAN, Severity.ERROR,
+                    "guardian.gateway_stale",
+                    f"Deployed gateway still stale after auto-resync (sha "
+                    f"{host_gw_sha[:12]} vs expected {expected[:12]} @ "
+                    f"{host_code_ver}). Manual check needed.",
+                )
+            await self._alert_user(
+                topic="Guardian gateway stale",
+                context=(
+                    f"Guardian deployed gateway is STILL stale after auto-resync "
+                    f"(sha {host_gw_sha[:12]} vs expected {expected[:12]} @ "
+                    f"{host_code_ver}). Manual intervention needed."
+                ),
+                source_id="guardian:gateway_stale",
+            )

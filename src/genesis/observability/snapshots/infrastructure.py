@@ -11,11 +11,13 @@ from typing import TYPE_CHECKING
 
 from genesis.env import ollama_enabled
 from genesis.observability.health import (
+    probe_ambient_health,
     probe_db,
     probe_guardian,
     probe_ollama,
     probe_qdrant,
     probe_scheduler,
+    probe_wal,
 )
 from genesis.observability.types import ProbeStatus
 from genesis.routing.types import DegradationLevel, RoutingConfig
@@ -134,6 +136,20 @@ async def infrastructure(
     else:
         infra["genesis.db"] = {"status": "error", "error": "no database connection"}
 
+    # WAL size — only meaningful when the DB is connected. Early signal of
+    # DB-lock pressure (a long-lived reader pinning an old snapshot bloats the
+    # -wal sidecar). Attached to the genesis.db probe so the dashboard surfaces
+    # it without a new top-level entry. Skipped when db is None — a "WAL: 0 MB"
+    # readout next to a "no database connection" error would mislead operators.
+    if db:
+        try:
+            wal_result = await probe_wal()
+            if wal_result.details:
+                infra["genesis.db"]["wal_mb"] = wal_result.details.get("wal_mb")
+            infra["genesis.db"]["wal_status"] = str(wal_result.status)
+        except Exception as exc:
+            logger.warning("WAL probe failed: %s", exc)
+
     try:
         result = await probe_qdrant()
         infra["qdrant"] = {
@@ -246,6 +262,22 @@ async def infrastructure(
             infra["guardian"].update(result.details)
     except Exception as exc:
         infra["guardian"] = {"status": "error", "error": str(exc)}
+
+    # Ambient-capture edge bridge (observability only). Omitted entirely when no
+    # ambient edge is configured — an absent ambient edge is not a fault.
+    try:
+        result = await probe_ambient_health()
+        if result is not None:
+            infra["ambient"] = {
+                "status": str(result.status),
+                "latency_ms": result.latency_ms,
+            }
+            if result.message:
+                infra["ambient"]["message"] = result.message
+            if result.details:
+                infra["ambient"].update(result.details)
+    except Exception as exc:
+        infra["ambient"] = {"status": "error", "error": str(exc)}
 
     if ollama_enabled():
         try:

@@ -102,6 +102,9 @@ async def test_memory_recall_delegates(mock_deps, tools):
         expand_query_terms=True,
         include_subsystem=False, only_subsystem=None,
         rerank=True, include_deprecated=False,
+        # MEM-003: the MCP layer passes an event-id sink so it can enrich the
+        # retriever's single recall_fired event instead of emitting a 2nd.
+        event_id_sink=[],
     )
 
 
@@ -248,3 +251,163 @@ async def test_uninitialized_raises(tools):
 
     with pytest.raises(RuntimeError, match="not initialized"):
         await tools["observation_write"].fn(content="x", source="y", type="z")
+
+
+# ─── WS-7 / D12: provenance surfacing ───────────────────────────────────────
+
+
+def _rr(mid: str, *, collection: str, score: float = 0.9, pipeline: str | None = None):
+    """Build a RetrievalResult with a given collection (provenance discriminator)."""
+    return RetrievalResult(
+        memory_id=mid, content=f"content {mid}", source="src",
+        memory_type="knowledge" if collection == "knowledge_base" else "episodic",
+        score=score, vector_rank=1, fts_rank=None, activation_score=0.5,
+        payload={}, source_pipeline=pipeline, collection=collection,
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_labels_first_party_vs_external(mock_deps, tools):
+    """memory_recall must tag each result's provenance so KB content reads as
+    external-world and episodic reads as first-party (audit D12)."""
+    _init_with_mocks(mock_deps)
+    memory_mcp._retriever = MagicMock()
+    memory_mcp._retriever.recall = AsyncMock(return_value=[
+        _rr("ep1", collection="episodic_memory"),
+        _rr("kb1", collection="knowledge_base", pipeline="curated"),
+    ])
+
+    results = await tools["memory_recall"].fn(
+        query="q", source="both", limit=5, compact=True,
+    )
+    by_id = {r["memory_id"]: r for r in results}
+    assert by_id["ep1"]["provenance"] == "first-party memory"
+    assert by_id["kb1"]["provenance"].startswith("external-world knowledge")
+    assert "user-curated" in by_id["kb1"]["provenance"]
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_both_filter_drops_lowscore_kb_keeps_episodic(mock_deps, tools):
+    """The source='both' KB score floor must key on the collection discriminator,
+    not payload['scope'] — so a low-score KB hit (even FTS-only, no scope) is
+    dropped while a low-score episodic hit is kept (audit D12 bug fix)."""
+    _init_with_mocks(mock_deps)
+    memory_mcp._retriever = MagicMock()
+    memory_mcp._retriever.recall = AsyncMock(return_value=[
+        _rr("kb_low", collection="knowledge_base", score=0.05),   # below 0.15 → drop
+        _rr("kb_high", collection="knowledge_base", score=0.50),  # keep
+        _rr("ep_low", collection="episodic_memory", score=0.05),  # keep (not external)
+    ])
+
+    results = await tools["memory_recall"].fn(
+        query="q", source="both", limit=10, compact=True,
+    )
+    ids = {r["memory_id"] for r in results}
+    assert "kb_low" not in ids
+    assert "kb_high" in ids
+    assert "ep_low" in ids
+
+
+@pytest.mark.asyncio
+async def test_memory_expand_labels_collection_and_provenance(mock_deps, tools):
+    """memory_expand bypasses RetrievalResult — it must still tag each expanded
+    item with its collection + provenance (audit D12)."""
+    from types import SimpleNamespace
+
+    _init_with_mocks(mock_deps)
+
+    def _retrieve(collection_name, ids, with_payload):
+        if collection_name == "knowledge_base":
+            return [SimpleNamespace(
+                id="kb1",
+                payload={"content": "ext doc", "source": "api.pdf",
+                         "source_pipeline": "curated", "memory_type": "knowledge"},
+            )]
+        return [SimpleNamespace(
+            id="ep1",
+            payload={"content": "my note", "source": "chat", "memory_type": "episodic"},
+        )]
+
+    memory_mcp._qdrant.retrieve = MagicMock(side_effect=_retrieve)
+
+    results = await tools["memory_expand"].fn(memory_ids=["ep1", "kb1"])
+    by_id = {r["memory_id"]: r for r in results if "memory_id" in r}
+    assert by_id["ep1"]["collection"] == "episodic_memory"
+    assert by_id["ep1"]["provenance"] == "first-party memory"
+    assert by_id["kb1"]["collection"] == "knowledge_base"
+    assert by_id["kb1"]["provenance"].startswith("external-world knowledge")
+
+
+@pytest.mark.asyncio
+async def test_knowledge_recall_labels_external(mock_deps, tools):
+    """knowledge_recall is all-external by definition — every result must carry
+    the external-world provenance label (audit D12)."""
+    _init_with_mocks(mock_deps)
+    memory_mcp._retriever = MagicMock()
+    memory_mcp._retriever.recall = AsyncMock(return_value=[
+        _rr("kb1", collection="knowledge_base", score=0.9, pipeline="recon"),
+    ])
+
+    results = await tools["knowledge_recall"].fn(
+        query="q", limit=5, min_score=0.0, corrective=False,
+    )
+    assert results
+    assert results[0]["provenance"].startswith("external-world knowledge")
+    assert "recon" in results[0]["provenance"]
+
+
+@pytest.mark.asyncio
+async def test_knowledge_recall_labels_crag_web_item(mock_deps, tools, monkeypatch):
+    """A CRAG web-fallback item (origin='web' / source_pipeline='crag_web', no
+    collection) must be labeled external-world web by the post-CRAG pass — web
+    content is the most external thing there is (audit D12)."""
+    _init_with_mocks(mock_deps)
+    memory_mcp._retriever = MagicMock()
+    memory_mcp._retriever.recall = AsyncMock(return_value=[])
+
+    async def _fake_correct(**kwargs):
+        return [{
+            "unit_id": "https://example.com/doc", "content": "web snippet",
+            "score": 0.7, "origin": "web", "source_pipeline": "crag_web",
+        }]
+
+    import genesis.memory.corrective as corrective_mod
+    monkeypatch.setattr(corrective_mod, "maybe_correct_recall", _fake_correct)
+
+    results = await tools["knowledge_recall"].fn(query="q", limit=5, min_score=0.0)
+    assert results
+    web = results[0]
+    assert web["collection"] == "knowledge_base"
+    assert web["provenance"].startswith("external-world knowledge")
+    assert "web" in web["provenance"]
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_full_path_labels_post_crag(mock_deps, tools, monkeypatch):
+    """The full (non-compact) path runs CRAG; the final provenance pass must label
+    BOTH the original episodic result AND a CRAG-augmented KB item (audit D12)."""
+    _init_with_mocks(mock_deps)
+    memory_mcp._retriever = MagicMock()
+    memory_mcp._retriever.recall = AsyncMock(return_value=[
+        _rr("ep1", collection="episodic_memory"),
+    ])
+
+    async def _fake_correct(**kwargs):
+        out = list(kwargs["results"])
+        out.append({
+            "memory_id": "kb_aug", "content": "ext doc", "score": 0.8,
+            "payload": {}, "collection": "knowledge_base",
+            "source_pipeline": "curated",
+        })
+        return out
+
+    import genesis.memory.corrective as corrective_mod
+    monkeypatch.setattr(corrective_mod, "maybe_correct_recall", _fake_correct)
+
+    results = await tools["memory_recall"].fn(
+        query="q", source="both", limit=5, include_graph=False,
+    )
+    by_id = {r["memory_id"]: r for r in results}
+    assert by_id["ep1"]["provenance"] == "first-party memory"
+    assert by_id["kb_aug"]["collection"] == "knowledge_base"
+    assert by_id["kb_aug"]["provenance"].startswith("external-world knowledge")

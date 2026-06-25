@@ -9,6 +9,7 @@ import time
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.provider_activity import ProviderActivityTracker
+from genesis.observability.spans import SpanKind, start_span
 from genesis.observability.types import Severity, Subsystem
 from genesis.routing.circuit_breaker import CircuitBreakerRegistry
 from genesis.routing.cost_tracker import CostTracker
@@ -153,7 +154,60 @@ class Router:
         chain_offset: int = 0,
         **kwargs,
     ) -> RoutingResult:
-        """Route a call through the provider chain for the given call site."""
+        """Route a call through the provider chain for the given call site.
+
+        Thin tracing wrapper around ``_route_call_inner``: opens one ``llm`` span
+        per logical call and populates it from the returned ``RoutingResult``
+        (single source — no value drift vs ``cost_events``). Span capture is
+        best-effort and a no-op when disabled; it NEVER alters routing behavior
+        (``start_span`` swallows its own faults). ``cost_known`` is intentionally
+        not on the span — it lives in ``cost_events`` / the cost_unknown event.
+        """
+        with start_span(
+            "llm.call", SpanKind.LLM, attributes={"call_site": call_site_id}
+        ) as span:
+            result = await self._route_call_inner(
+                call_site_id,
+                messages,
+                budget_override=budget_override,
+                suppress_dead_letter=suppress_dead_letter,
+                chain_offset=chain_offset,
+                **kwargs,
+            )
+            if result.success:
+                span.set_llm_fields(
+                    call_site=call_site_id,
+                    provider=result.provider_used,
+                    model_id=result.model_id,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    cost_usd=result.cost_usd,
+                    cost_known=result.cost_known,
+                )
+                span.set_attr("attempts", result.attempts)
+                span.set_attr("fallback_used", result.fallback_used)
+            elif result.attempts == 0:
+                # Deliberately not run (degradation shed / unknown site / empty
+                # chain) — NOT a failure. Keep status 'ok'; record why.
+                span.set_attr("not_run", True)
+                span.set_attr("reason", result.error)
+            else:
+                # A real attempt that exhausted every provider in the chain.
+                span.set_status_error(result.error or "all providers exhausted")
+                span.set_attr("attempts", result.attempts)
+            return result
+
+    async def _route_call_inner(
+        self,
+        call_site_id: str,
+        messages: list[dict],
+        *,
+        budget_override: bool = False,
+        suppress_dead_letter: bool = False,
+        chain_offset: int = 0,
+        **kwargs,
+    ) -> RoutingResult:
+        """Route a call through the provider chain (the actual routing logic)."""
         # 1. Check call site exists
         if call_site_id not in self.config.call_sites:
             return RoutingResult(
@@ -196,7 +250,22 @@ class Router:
         first_provider = chain[0]
         failed_providers: list[str] = []
 
+        # Aggregate wall-clock deadline across the whole chain walk (retries x
+        # chain length). A GATE only — checked between providers/attempts, never
+        # interrupts an in-flight call (the delegate's per-attempt timeout owns
+        # that). None = no cap (today's behavior).
+        route_start = time.monotonic()
+        deadline = (
+            (route_start + policy.max_total_s)
+            if policy.max_total_s is not None
+            else None
+        )
+
         for provider_name in chain:
+            # Out of aggregate budget — stop walking the chain. The primary
+            # provider always gets a shot; later providers are gated.
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             provider_cfg = self.config.providers[provider_name]
 
             # Skip providers with no API key — treat as down-by-config.
@@ -228,7 +297,8 @@ class Router:
             # Try with retry (timed for activity tracking)
             t0 = time.monotonic()
             result = await self._try_with_retry(
-                provider_name, provider_cfg.model_id, messages, policy, **kwargs,
+                provider_name, provider_cfg.model_id, messages, policy,
+                deadline=deadline, **kwargs,
             )
             latency_ms = (time.monotonic() - t0) * 1000
             attempts += 1
@@ -309,20 +379,29 @@ class Router:
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
                     cost_usd=result.cost_usd,
+                    cost_known=result.cost_known,
                 )
             else:
-                # Record CB failure
                 failed_providers.append(provider_name)
                 category = classify_error(result.status_code, result.error or "")
-                tripped = cb.record_failure(category)
-                if tripped and self._event_bus:
-                    await self._event_bus.emit(
-                        Subsystem.ROUTING, Severity.WARNING,
-                        "breaker.tripped",
-                        f"Circuit breaker tripped for {provider_name}",
-                        provider=provider_name,
-                        call_site=call_site_id,
-                    )
+                # RATE_LIMITED (429) and BAD_REQUEST (400/422) are NOT provider-
+                # health signals: a 429 is expected backpressure (the rate gate
+                # is the brake) and a 400/422 is our payload's fault. Tripping
+                # the breaker on these would wrongly take a reachable provider
+                # offline for every other call site — fail through to the next
+                # chain member WITHOUT recording a breaker failure.
+                if category not in (
+                    ErrorCategory.RATE_LIMITED, ErrorCategory.BAD_REQUEST,
+                ):
+                    tripped = cb.record_failure(category)
+                    if tripped and self._event_bus:
+                        await self._event_bus.emit(
+                            Subsystem.ROUTING, Severity.WARNING,
+                            "breaker.tripped",
+                            f"Circuit breaker tripped for {provider_name}",
+                            provider=provider_name,
+                            call_site=call_site_id,
+                        )
 
         # All exhausted
         if self._event_bus:
@@ -376,13 +455,20 @@ class Router:
         return list(site.chain)
 
     async def _try_with_retry(
-        self, provider: str, model_id: str, messages: list[dict], policy, **kwargs,
+        self, provider: str, model_id: str, messages: list[dict], policy,
+        *, deadline: float | None = None, **kwargs,
     ) -> CallResult:
         """Try calling a provider with retries. Returns last result."""
         last_result = CallResult(success=False, error="no attempts made")
         max_attempts = policy.max_retries + 1
 
         for attempt in range(max_attempts):
+            # Aggregate deadline: stop starting RETRIES once the budget is spent.
+            # Attempt 0 always runs (the chain gate already admitted this
+            # provider) — only same-provider retries are bounded, and never an
+            # in-flight call.
+            if attempt > 0 and deadline is not None and time.monotonic() >= deadline:
+                return last_result
             result = await self.delegate.call(provider, model_id, messages, **kwargs)
             if result.success:
                 return result
@@ -397,7 +483,15 @@ class Router:
             #    wall-clock (this is what produced the ~30-min dream-cycle
             #    hangs). Fail fast — route_call advances to the next provider,
             #    and the circuit breaker still records this failure.
-            if category in (ErrorCategory.PERMANENT, ErrorCategory.TIMEOUT):
+            #  - RATE_LIMITED: a 429 won't clear on an immediate same-provider
+            #    retry — fall through to the next chain member instead of
+            #    burning more of this provider's rate quota.
+            #  - BAD_REQUEST: a 400/422 is deterministic (our payload) — the
+            #    same provider with the same payload fails identically.
+            if category in (
+                ErrorCategory.PERMANENT, ErrorCategory.TIMEOUT,
+                ErrorCategory.RATE_LIMITED, ErrorCategory.BAD_REQUEST,
+            ):
                 return result
 
             # Transient/degraded: retry with delay (skip delay on last attempt)

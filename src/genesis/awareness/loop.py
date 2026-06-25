@@ -388,12 +388,22 @@ async def perform_tick(
                     logger.warning("Failed to enqueue deferred reflection")
     elif cc_reflection_bridge is not None and classified_depth in (Depth.LIGHT, Depth.DEEP, Depth.STRATEGIC):
         try:
-            await cc_reflection_bridge.reflect(
+            ref_result = await cc_reflection_bridge.reflect(
                 classified_depth,
                 result,
                 db=db,
                 escalation_source=escalation_source if classified_depth == Depth.DEEP else None,
             )
+            # A non-success result here is normally a gated CC fallback awaiting
+            # approval (not a crash, so no exception fires). Log it so the
+            # deferral is observable rather than a silent no-op; the approved
+            # request is picked up later by _resume_approved_reflections.
+            if ref_result is not None and not ref_result.success:
+                logger.info(
+                    "%s reflection deferred for tick %s: %s",
+                    classified_depth.value, tick_id,
+                    ref_result.reason or "unknown",
+                )
             # Resolve escalation after successful dispatch
             if escalation_pending_id and classified_depth == Depth.DEEP:
                 try:
@@ -868,6 +878,12 @@ class AwarenessLoop:
                 name=f"reflection-{result.classified_depth.value.lower()}-{result.tick_id[:8]}",
                 subsystem=Subsystem.AWARENESS,
             )
+        else:
+            # Idle alive-pulse: a quiet tick (depth=None) ran no reflection.
+            # Refresh the reflection heartbeat so subsystem_heartbeats does not
+            # falsely report reflection "dark" during calm periods. Degraded
+            # ticks are filtered inside the helper so a real outage still alarms.
+            await self._emit_reflection_idle_heartbeat(result)
 
         if not self._stopping:
             tracked_task(
@@ -911,6 +927,29 @@ class AwarenessLoop:
                     )
             except Exception:
                 logger.warning("Session observer processing failed", exc_info=True)
+
+    async def _emit_reflection_idle_heartbeat(self, result: TickResult) -> None:
+        """Emit a reflection heartbeat for a quiet tick that ran no reflection.
+
+        A tick that classified to ``depth=None`` (nothing triggered, or a
+        ceiling/floor throttle) correctly ran no reflection. Emitting a
+        heartbeat keeps ``subsystem_heartbeats`` fresh during the quiet ticks
+        that dominate calm periods (``depth=None`` is ~93% of ticks), so
+        reflection is not falsely reported "dark" overnight while the loop is
+        healthy. Called from ``_on_tick`` on the depth=None dispatch branch.
+
+        Skipped for a DEGRADED tick (``db_available`` is False — the DB was
+        unavailable so scoring/classification was skipped): a genuine
+        reflection outage must still age out past the heartbeat threshold and
+        alarm, rather than being masked by this pulse.
+        """
+        if not (result.db_available and self._event_bus):
+            return
+        with contextlib.suppress(Exception):
+            await self._event_bus.emit(
+                Subsystem.REFLECTION, Severity.DEBUG,
+                "heartbeat", "reflection idle (no depth triggered)",
+            )
 
     async def _dispatch_reflection(self, result: TickResult) -> None:
         depth = result.classified_depth
@@ -991,6 +1030,18 @@ class AwarenessLoop:
                     "Micro tick %s silent (no critical signals active)",
                     tick_id[:8],
                 )
+                # Idle alive-pulse: a calm tick correctly ran no reflection.
+                # Emit a heartbeat so subsystem_heartbeats does not falsely
+                # report reflection "dark" during legitimately quiet periods.
+                # This fires ONLY on the silent path — a tick that ATTEMPTS and
+                # fails a reflection does not pulse, so a real outage still ages
+                # out and alarms.
+                if self._event_bus:
+                    with contextlib.suppress(Exception):
+                        await self._event_bus.emit(
+                            Subsystem.REFLECTION, Severity.DEBUG,
+                            "heartbeat", "reflection idle (no critical signals)",
+                        )
 
             # Always mark dispatched — cascade counting works on ticks
             try:
@@ -1086,12 +1137,16 @@ class AwarenessLoop:
             logger.warning("Deferred reflection retry failed", exc_info=True)
 
     async def _resume_approved_reflections(self) -> None:
-        """Resume deep/strategic reflections whose approvals were granted.
+        """Resume light/deep/strategic reflections whose approvals were granted.
 
-        When a user approves a deep reflection via Telegram or dashboard,
-        the awareness loop's scoring may never independently reach the "Deep"
-        threshold again. This method checks for approved-but-unconsumed
-        reflection approvals and dispatches them immediately.
+        When a user approves a reflection's CC fallback via Telegram or
+        dashboard, the awareness loop's scoring may never independently reach
+        that depth's threshold again. This method checks for approved-but-
+        unconsumed reflection approvals and dispatches them immediately.
+
+        Light is included because its free API chain (dispatch=dual) can
+        exhaust during a provider outage and escalate to the gated CC
+        fallback; without a resume path the approved request would never run.
         """
         if not self._cc_reflection_bridge:
             return
@@ -1108,7 +1163,15 @@ class AwarenessLoop:
         if tick is None:
             return  # No tick yet — can't build reflection prompt
 
-        for depth_name in ("deep", "strategic"):
+        # Explicit name→depth map (NOT a binary): each policy_id must resolve
+        # to its own depth, otherwise an added name would mis-dispatch (e.g.
+        # light running as an expensive STRATEGIC reflection).
+        resumable_depths = {
+            "deep": Depth.DEEP,
+            "strategic": Depth.STRATEGIC,
+            "light": Depth.LIGHT,
+        }
+        for depth_name, depth in resumable_depths.items():
             try:
                 approved = await gate.find_recently_approved(
                     subsystem="reflection",
@@ -1122,7 +1185,6 @@ class AwarenessLoop:
                 consumed = await gate.mark_consumed(approved["id"])
                 if not consumed:
                     continue  # Another tick already consumed it
-                depth = Depth.DEEP if depth_name == "deep" else Depth.STRATEGIC
                 logger.info(
                     "Resuming %s reflection from approved request %s",
                     depth_name, approved["id"][:8],
@@ -1196,8 +1258,8 @@ class AwarenessLoop:
             logger.debug("Skipping deferred reflection retry — loop is stopping")
             return
 
-        item = await self._deferred_queue.next_pending(max_priority=40)
-        if not item or item.get("work_type") != "reflection":
+        item = await self._deferred_queue.next_pending(work_type="reflection", max_priority=40)
+        if not item:
             return
 
         item_id = item["id"]

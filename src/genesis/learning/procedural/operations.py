@@ -14,6 +14,26 @@ from genesis.db.crud import procedural
 
 logger = logging.getLogger(__name__)
 
+# Reads-as-signal: a deliberate procedure_recall ("read") is a soft positive
+# signal. Every READ_CONFIDENCE_DISCOUNT reads count as one *effective* success.
+# Recorded failures are the counterweight. This derived value is used ONLY for
+# ranking + tier decisions — the stored `confidence` column stays real Laplace
+# (success/failure only), so the j9 metric, quarantine, and demotion stay honest.
+READ_CONFIDENCE_DISCOUNT = 5
+
+
+def effective_confidence(
+    success_count: int, failure_count: int, invocation_count: int
+) -> float:
+    """Laplace-smoothed confidence that folds reads in as fractional successes.
+
+    ``eff_success = success_count + invocation_count // READ_CONFIDENCE_DISCOUNT``;
+    returns ``(eff_success + 1) / (eff_success + failure_count + 2)``. With zero
+    reads this is identical to the real Laplace confidence.
+    """
+    eff_success = success_count + invocation_count // READ_CONFIDENCE_DISCOUNT
+    return (eff_success + 1) / (eff_success + failure_count + 2)
+
 
 @dataclass
 class StoreResult:
@@ -34,9 +54,9 @@ async def store_procedure(
     tools_used: list[str],
     context_tags: list[str],
     scenario: str | None = None,
-    activation_tier: str = "L4",
+    activation_tier: str = "DORMANT",
     tool_trigger: list[str] | None = None,
-    speculative: int = 1,
+    draft: int = 1,
     success_count: int = 0,
     confidence: float = 0.0,
     source: dict | None = None,
@@ -46,10 +66,10 @@ async def store_procedure(
 ) -> str:
     """Create a new procedure and return its ID.
 
-    Defaults match the extractor path (speculative=1, success_count=0,
+    Defaults match the extractor path (draft=1, success_count=0,
     confidence=0.0). Callers that represent explicit confirmations — e.g.,
     user-driven `procedure_store` MCP writes — should pass non-default
-    values to seed the procedure as already-trusted (speculative=0,
+    values to seed the procedure as already-trusted (draft=0,
     success_count>=1, confidence via Laplace).
 
     `principle_embedding` is the packed BLOB returned by
@@ -75,7 +95,7 @@ async def store_procedure(
         created_at=now,
         activation_tier=activation_tier,
         tool_trigger=tool_trigger,
-        speculative=speculative,
+        draft=draft,
         success_count=success_count,
         confidence=confidence,
         source=json.dumps(source) if source else None,
@@ -95,9 +115,9 @@ async def store_procedure_checked(
     tools_used: list[str],
     context_tags: list[str],
     scenario: str | None = None,
-    activation_tier: str = "L3",
+    activation_tier: str = "LIBRARY",
     tool_trigger: list[str] | None = None,
-    speculative: int = 0,
+    draft: int = 0,
     success_count: int = 1,
     confidence: float = 2 / 3,
     source: dict | None = None,
@@ -105,7 +125,7 @@ async def store_procedure_checked(
 ) -> StoreResult:
     """Store a procedure with conflict detection.
 
-    Defaults match the explicit-teach path (speculative=0, success_count=1).
+    Defaults match the explicit-teach path (draft=0, success_count=1).
 
     Conflict resolution:
     - Exact task_type match, incoming is auto-extracted but existing is
@@ -118,7 +138,7 @@ async def store_procedure_checked(
 
     if existing:
         # Auto-extracted should never overwrite explicit-teach
-        if speculative == 1 and existing.get("speculative") == 0:
+        if draft == 1 and existing.get("draft") == 0:
             logger.info(
                 "Skipped auto-extracted procedure for %s: explicit-teach %s exists",
                 task_type, existing["id"],
@@ -171,7 +191,7 @@ async def store_procedure_checked(
         context_tags=context_tags,
         activation_tier=activation_tier,
         tool_trigger=tool_trigger,
-        speculative=speculative,
+        draft=draft,
         success_count=success_count,
         confidence=confidence,
         source=source,

@@ -8,8 +8,12 @@ Fields:
   category:       Subsystem grouping for neural monitor ring/color
   frequency:      How often this fires
   cost_policy:    Auto-derived for most; manual for CC-dispatched sites
-  dispatch:       "cc" (CC background only), "dual" (API-first, CC fallback)
-  cc_model:       Which CC model (Haiku/Sonnet/Opus) for dispatch=cc/dual
+  dispatch:       "api" (API providers only), "cli" (CC subprocess only),
+                  "dual" (API-first, CC fallback). OMIT for plain API/default
+                  sites — cost auto-derives from the chain. Legacy "cc" is a
+                  RETIRED alias, normalized to "cli" at YAML parse
+                  (routing.config._normalize_dispatch); author "cli" here.
+  cc_model:       Which CC model (Haiku/Sonnet/Opus) for dispatch=cli/dual
   wired:          False if config exists but no code invokes this call site
   model_tier:     What class of model this needs (embedding/slm/mid/frontier/cc)
   status_reason:  Machine-readable status (WIRED, WIRED_DIFFERENT_MECHANISM,
@@ -154,7 +158,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "category": "reflection",
         "frequency": "Weekly + high urgency",
         "cost_policy": "CC background (Sonnet)",
-        "dispatch": "cc",
+        "dispatch": "cli",
         "cc_model": "Sonnet",
         "model_tier": "cc",
     },
@@ -163,7 +167,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "category": "reflection",
         "frequency": "4-8/month",
         "cost_policy": "CC background (Opus)",
-        "dispatch": "cc",
+        "dispatch": "cli",
         "cc_model": "Opus",
         "model_tier": "cc",
     },
@@ -200,12 +204,12 @@ _CALL_SITE_META: dict[str, dict] = {
         "model_tier": "slm",
     },
     "14_weekly_self_assessment": {
-        "description": "Honest self-evaluation of Genesis's recent performance. Dispatched via CC background session (Sonnet).",
+        "description": "Honest self-evaluation of Genesis's recent performance. Dispatched via CC background session (Opus).",
         "category": "reasoning",
         "frequency": "Weekly",
-        "cost_policy": "CC background (Sonnet)",
-        "dispatch": "cc",
-        "cc_model": "Sonnet",
+        "cost_policy": "CC background (Opus)",
+        "dispatch": "cli",
+        "cc_model": "Opus",
         "model_tier": "cc",
     },
     "16_quality_calibration": {
@@ -213,7 +217,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "category": "calibration",
         "frequency": "Weekly",
         "cost_policy": "CC background (Sonnet)",
-        "dispatch": "cc",
+        "dispatch": "cli",
         "cc_model": "Sonnet",
         "model_tier": "cc",
     },
@@ -320,14 +324,69 @@ _CALL_SITE_META: dict[str, dict] = {
         "model_tier": "slm",
         "status_reason": "WIRED",
     },
+    "judge": {
+        "description": "LLM-as-judge scorer for the J9 evaluation harness — scores rubric dimensions against model outputs. Eval-only (eval/j9_batch.py:386, eval/scorers.py:334); listed in routing/degradation._L2_SKIP so it sheds under REDUCED degradation. API dispatch, paid chain (DeepSeek V4 Pro primary).",
+        "category": "assessment",
+        "frequency": "Per J9 eval scoring",
+        "model_tier": "frontier",
+    },
+    "crag_grade": {
+        "description": "CRAG retrieval grader — scores topical relevance of recalled memories to the query for selective corrective retrieval (memory_recall/knowledge_recall), reusing the memory_recall_grounding_runtime rubric. Gated (only borderline/low recalls) + fail-fast (returns original results if slow/down). In routing/degradation._L2_SKIP so it sheds under REDUCED degradation. Caller: memory/corrective.py.",
+        "category": "assessment",
+        "frequency": "Per corrective recall (gated)",
+        "model_tier": "slm",
+    },
+    "voice_conversation": {
+        "description": "Realtime voice S2S conversational-turn generation. Free API chain (Groq/Gemini/Mistral) with user-facing retry profile (latency-sensitive). Caller: channels/voice/handler.py.",
+        "category": "reasoning",
+        "frequency": "Per voice turn",
+        "model_tier": "slm",
+    },
+    "21_session_observer": {
+        "description": "Extracts memory notes from CC-session transcript observations (opportunistic context capture, batched). Free dual chain. Caller: memory/session_observer.py:313. NOTE: the '21' prefix is unrelated to 21_embeddings / 21b_query_embedding (embedding paths) — different subsystem.",
+        "category": "processing",
+        "frequency": "Per CC-session batch",
+        "model_tier": "slm",
+        "see_also": ["21_embeddings", "21b_query_embedding"],
+    },
+    "44_task_premortem": {
+        "description": "Pre-mortem failure analysis before the executor commits to a task: blocks execution below confidence 50, injects mitigations into plan context below 70. Paid-primary dual chain (DeepSeek V4 Pro + free fallback). Caller: autonomy/executor/review.py:101 (TaskReviewer).",
+        "category": "assessment",
+        "frequency": "Per task (pre-execution)",
+        "model_tier": "frontier",
+    },
+    "45_intelligence_intake": {
+        "description": "Intelligence intake pipeline — atomize / score / route surplus insights, recon findings, and web-search results into knowledge / observation / discard. Free-only (never pays). Caller: surplus/intake.py:324.",
+        "category": "processing",
+        "frequency": "Per intake finding",
+        "model_tier": "slm",
+    },
+    "41_resume_review_pass1": {
+        "description": "Resume review pass 1 — structural analysis (formatting, clarity, impact quantification, action verbs, ATS compatibility, JD keyword alignment). Free dual chain. Caller: knowledge/applications/resume_review.py:21.",
+        "category": "assessment",
+        "frequency": "Per resume review",
+        "model_tier": "slm",
+        "see_also": ["42_resume_review_pass2"],
+    },
+    "42_resume_review_pass2": {
+        "description": "Resume review pass 2 — knowledge-augmented critique: queries the knowledge base for professional/domain context, cross-references the resume, surfaces gaps and missed opportunities. Free dual chain. Caller: knowledge/applications/resume_review.py:22.",
+        "category": "assessment",
+        "frequency": "Per resume review",
+        "model_tier": "slm",
+        "see_also": ["41_resume_review_pass1"],
+    },
+    "failure_exit_gate": {
+        "description": "Executor failure-handling gate: when a step exhausts retries, judges whether the blockers are genuine (exit) or retryable (continue); defaults to accept on call failure to avoid infinite loops. Paid-primary dual chain (Sonnet primary, Qwen 3.6+ fallback via OpenRouter). Caller: autonomy/executor/engine.py:785.",
+        "category": "assessment",
+        "frequency": "Per executor step failure",
+        "model_tier": "frontier",
+    },
     # ── PARTIALLY WIRED: code exists, conditions haven't triggered yet ─
     "27_pre_execution_assessment": {
-        "description": "Sanity-checks proposed task execution plans before committing resources. Opus via CC invoker, route_call fallback.",
+        "description": "Pre-execution plan sanity-check (executor TaskReviewer.review_plan + autonomy/decomposer.py). The PRIMARY path is the CC invoker (Opus) directly; THIS call site is the API-dual fallback (GLM 5.1 / MiniMax M2.5 / DeepSeek V4 Flash) routed via route_call when the CC invoker is unavailable. Cost auto-derives from that chain — it is NOT a CC-subscription site (the prior dispatch=cli/cc_model=Opus meta was stale and mislabeled it).",
         "category": "reasoning",
-        "frequency": "Per task",
-        "model_tier": "cc",
-        "dispatch": "cli",
-        "cc_model": "Opus",
+        "frequency": "Per task (pre-execution)",
+        "model_tier": "frontier",
         "wired": True,
     },
     "33_skill_refiner": {
@@ -479,10 +538,12 @@ _CALL_SITE_META: dict[str, dict] = {
         "status_reason": "TEMP_DISABLED",
     },
     "outreach_fallback": {
-        "description": "Deferred outreach delivery retry. Enqueue path active (pipeline.py:335), but consumer NOT BUILT — deferred messages silently marked completed without retry. CRITICAL BUG: needs consumer implementation.",
+        "description": "Deferred outreach delivery retry. Enqueue active (outreach/pipeline.py:_defer → deferred-work work_type='outreach_delivery'). Consumer = OutreachRecoveryWorker (resilience/outreach_recovery.py): polls the deferred-work queue, retries via the pipeline with exponential backoff (max 5 attempts), and writes an observation on exhaustion. Wired at runtime/init/outreach.py (started whenever the deferred-work queue is present).",
         "category": "content",
         "frequency": "On outreach failure",
         "model_tier": "slm",
+        "wired": True,
+        "status_reason": "WIRED",
     },
     "40_knowledge_distillation": {
         "description": "Distills ingested knowledge sources into atomic units. Parallelized across provider chain via chain_offset.",

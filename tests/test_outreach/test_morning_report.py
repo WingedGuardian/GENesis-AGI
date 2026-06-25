@@ -25,7 +25,13 @@ def mock_health():
     health = AsyncMock()
     health.snapshot.return_value = {
         "timestamp": "2026-03-12T07:00:00Z",
-        "cost": {"daily_usd": 1.23, "monthly_usd": 15.0, "budget_status": "ok"},
+        "cost": {
+            "daily_usd": 1.23,
+            "monthly_usd": 15.0,
+            "budget_status": "UNDER_LIMIT",
+            "budget_monthly_limit": 30.0,
+            "budget_pct_used": 50.0,
+        },
         "cc_sessions": {"foreground": 0, "background": {"active": 0}},
         "queues": {"deferred_work": 0, "dead_letters": 0},
         "infrastructure": {
@@ -81,11 +87,96 @@ async def test_generate_calls_drafter(db, mock_health, mock_drafter):
 
 
 @pytest.mark.asyncio
+async def test_system_prompt_includes_next_steps_section(db, mock_health, mock_drafter):
+    """The loaded MORNING_REPORT.md system prompt must instruct the LLM to produce
+    a 'Next Steps & Blockers' section — so the report highlights what to do, not
+    just status (the actionability gap the user flagged)."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    await gen.generate()
+    call_args = mock_drafter.draft.call_args[0][0]
+    assert call_args.system_prompt is not None
+    assert "Next Steps & Blockers" in call_args.system_prompt
+
+
+@pytest.mark.asyncio
 async def test_generate_includes_health_in_context(db, mock_health, mock_drafter):
     gen = MorningReportGenerator(mock_health, db, mock_drafter)
     await gen.generate()
     call_args = mock_drafter.draft.call_args[0][0]
-    assert "1.23" in call_args.context
+    # Month-to-date spend (grounded against the cap) appears in the context.
+    assert "15.00" in call_args.context
+
+
+@pytest.mark.asyncio
+async def test_format_health_cost_line_grounded(db, mock_health, mock_drafter):
+    """Cost is ONE neutral grounded line: month-to-date spend against the cap,
+    real numbers only — no projection, no daily figure, no spike alarm, no
+    provider breakdown. Cost is observability, not control."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health({
+        "cost": {
+            "daily_usd": 0.14,
+            "monthly_usd": 3.79,
+            "budget_status": "UNDER_LIMIT",
+            "budget_monthly_limit": 30.0,
+            "budget_pct_used": 12.6,  # renders as "13%" via :.0f rounding (pins the format)
+            "forecast_monthly_usd": 622.0,  # projection — must NOT appear
+            "cost_by_provider": [{"provider": "x", "month_usd": 2.0}],
+        },
+        "queues": {}, "infrastructure": {}, "surplus": {},
+        "awareness": {}, "cc_sessions": {},
+    })
+    assert "Spend: $3.79 MTD" in section
+    assert "13% of $30 cap" in section  # 12.6% → "13%" (.0f); pins the rendered format
+    assert "622" not in section            # no projection leaked
+    assert "today" not in section.lower()  # MTD only — no daily figure
+    assert "Top cost drivers" not in section
+
+
+@pytest.mark.asyncio
+async def test_observation_insights_demotes_aged(db, mock_health, mock_drafter):
+    """A >3d-old observation is shown demoted and tagged [aged] so a stale write
+    doesn't surface as a fresh critical alarm; a recent one is left as-is."""
+    from datetime import UTC, datetime, timedelta
+
+    fresh = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    old = (datetime.now(UTC) - timedelta(days=6)).isoformat()
+    await db.execute(
+        "INSERT INTO observations (id, source, type, content, priority, created_at) "
+        "VALUES ('fresh', 'test', 'quality_drift', 'fresh critical thing', 'critical', ?)",
+        (fresh,),
+    )
+    await db.execute(
+        "INSERT INTO observations (id, source, type, content, priority, created_at) "
+        "VALUES ('old', 'test', 'quality_drift', 'old critical thing', 'critical', ?)",
+        (old,),
+    )
+    await db.commit()
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    out = await gen._get_observation_insights()
+    assert out is not None
+    aged_line = next(line for line in out.splitlines() if "old critical thing" in line)
+    fresh_line = next(line for line in out.splitlines() if "fresh critical thing" in line)
+    # 6-day-old critical: demoted to high and tagged.
+    assert "[aged]" in aged_line
+    assert "**high**" in aged_line
+    # 2-hour-old critical: unchanged.
+    assert "[aged]" not in fresh_line
+    assert "**critical**" in fresh_line
+
+
+@pytest.mark.asyncio
+async def test_format_health_cost_line_without_budget(db, mock_health, mock_drafter):
+    """When no budget cap is configured, fall back to a bare MTD spend line."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health({
+        "cost": {"monthly_usd": 3.79, "budget_status": "unknown"},
+        "queues": {}, "infrastructure": {}, "surplus": {},
+        "awareness": {}, "cc_sessions": {},
+    })
+    assert "Spend: $3.79 MTD" in section
+    assert "cap" not in section.lower()
 
 
 @pytest.mark.asyncio
@@ -175,3 +266,73 @@ async def test_no_event_bus_still_works(db, mock_health, mock_drafter):
     gen = MorningReportGenerator(mock_health, db, mock_drafter, event_bus=None)
     req = await gen.generate()
     assert req.category == OutreachCategory.DIGEST
+
+
+async def _insert_grade(db, subsystem, grade, score, period_end="2026-06-22T00:00:00Z"):
+    from genesis.db.crud import j9_eval
+
+    await j9_eval.insert_subsystem_grade(
+        db,
+        period_start="2026-06-15T00:00:00Z",
+        period_end=period_end,
+        period_type="weekly",
+        subsystem=subsystem,
+        grade=grade,
+        score=score,
+        factors={"f": 1.0},
+        sample_count=10,
+    )
+
+
+@pytest.mark.asyncio
+async def test_eval_quality_section_surfaces_grades(db, mock_health, mock_drafter):
+    """Graded subsystems are surfaced with grade + score, sorted by name."""
+    await _insert_grade(db, "memory", "B", 82.0)
+    await _insert_grade(db, "ego", "D", 64.0)
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    out = await gen._get_eval_quality_section()
+
+    assert out is not None
+    assert "- ego: D (64)" in out
+    assert "- memory: B (82)" in out
+    # ego sorts before memory
+    assert out.index("ego:") < out.index("memory:")
+
+
+@pytest.mark.asyncio
+async def test_eval_quality_section_none_when_no_grades(db, mock_health, mock_drafter):
+    """No grades at all → section skipped entirely (returns None)."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    assert await gen._get_eval_quality_section() is None
+
+
+@pytest.mark.asyncio
+async def test_eval_quality_section_omits_ungraded(db, mock_health, mock_drafter):
+    """A None grade (cold-start / insufficient data) is omitted, never shown as
+    a problem; if it's the only row, the section is skipped. (cognitive_drift is
+    excluded at the schema level — the grades table CHECK-constrains subsystem to
+    the 5 graded subsystems, so the dark drift dimension never reaches here.)"""
+    await _insert_grade(db, "awareness", None, None)  # insufficient data → None
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    assert await gen._get_eval_quality_section() is None
+
+    # With one graded + one ungraded, only the graded one shows.
+    await _insert_grade(db, "memory", "A", 91.0)
+    out = await gen._get_eval_quality_section()
+    assert out is not None
+    assert "memory: A (91)" in out
+    assert "awareness" not in out
+
+
+@pytest.mark.asyncio
+async def test_eval_quality_section_appears_in_assembled_context(db, mock_health, mock_drafter):
+    """Wiring proof (Level-3 data-flow): when grades exist, the section reaches
+    the full assembled context that the LLM narrates."""
+    await _insert_grade(db, "memory", "B", 82.0)
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+
+    context = await gen._assemble_context()
+
+    assert "## Cognitive Subsystem Grades" in context
+    assert "memory: B (82)" in context

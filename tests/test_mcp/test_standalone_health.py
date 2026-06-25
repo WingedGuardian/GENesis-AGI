@@ -591,13 +591,43 @@ class TestEnrichFromDB:
         assert isinstance(snap["call_sites"], dict)
         assert isinstance(snap["cost"], dict)
 
-    async def test_enrich_cost_wired_from_cc_sessions(
+    async def test_enrich_cost_uses_real_cost_events_not_shadow(
         self, db, status_json: Path,
     ) -> None:
-        """cost field should reflect shadow costs from cc_sessions when available."""
+        """The cost field must report REAL spend from cost_events with a real
+        budget_status — NOT the shadow 'if-CC-were-API-billed' figure from
+        cc_sessions.
+
+        Regression guard for the 2026-06 fake-cost surface: the standalone MCP
+        used to wire cc_sessions.shadow_cost_* into ``cost`` with
+        ``budget_status="unknown"``, so reflections calling health_status saw a
+        notional ~$371/mo with no budget and wrote false cost-crisis narratives.
+        Real spend comes from cost_events; shadow stays under cc_sessions.
+        """
+        from datetime import UTC, datetime
         from unittest.mock import patch
 
         from genesis.mcp.standalone_health import StandaloneHealthDataService
+
+        now = datetime.now(UTC).isoformat()
+        # Real spend this month: two cost events totalling $1.23.
+        await db.execute(
+            "INSERT INTO cost_events (id, event_type, provider, cost_usd, "
+            "cost_known, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("ce-test-1", "llm_call", "deepinfra", 1.00, 1, now),
+        )
+        await db.execute(
+            "INSERT INTO cost_events (id, event_type, provider, cost_usd, "
+            "cost_known, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("ce-test-2", "api_call", "qwen", 0.23, 1, now),
+        )
+        # An active monthly budget so budget_status is computed, not "unknown".
+        await db.execute(
+            "INSERT INTO budgets (id, budget_type, limit_usd, warning_pct, "
+            "active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("bud-test-monthly", "monthly", 30.0, 0.8, 1, now, now),
+        )
+        await db.commit()
 
         with patch(
             "genesis.observability.service_status.collect_service_status",
@@ -606,10 +636,19 @@ class TestEnrichFromDB:
             svc = StandaloneHealthDataService(status_path=status_json, db=db)
             snap = await svc.snapshot()
 
-        # cost should have structured fields, not a placeholder note
-        assert isinstance(snap["cost"], dict)
-        assert "daily_usd" in snap["cost"]
-        assert "budget_status" in snap["cost"]
+        cost = snap["cost"]
+        assert isinstance(cost, dict)
+        # REAL monthly + daily spend from cost_events (not shadow, not the None default).
+        assert cost["monthly_usd"] == pytest.approx(1.23)
+        assert cost["daily_usd"] == pytest.approx(1.23)
+        # budget_status computed from the real $30 cap ($1.23 << $30) — never "unknown".
+        assert cost["budget_status"] not in ("unknown", "error")
+        assert cost.get("budget_monthly_limit") == pytest.approx(30.0)
+        # budget_monthly_limit is only produced by the real cost() path — the old
+        # shadow wiring never set it, so its presence proves we're on the real path.
+        # Shadow remains AVAILABLE but isolated under cc_sessions, never as cost.
+        assert "shadow_cost_month" in snap["cc_sessions"]
+        assert "shadow_cost" not in str(snap["cost"])  # shadow must never bleed into cost
 
 
 class TestReflectionHeartbeatEmission:
@@ -691,3 +730,82 @@ class TestReflectionHeartbeatEmission:
         await loop._dispatch_reflection(tick)
 
         mock_bus.emit.assert_not_awaited()
+
+    async def test_idle_pulse_emitted_on_silent_tick(self) -> None:
+        """A calm Micro tick (no critical signals) emits an idle alive-pulse.
+
+        Without it, legitimately quiet periods (no reflection-worthy signals for
+        hours) made subsystem_heartbeats falsely report reflection "dark". The
+        pulse fires only on the silent path, so a tick that ATTEMPTS and fails a
+        reflection still does not pulse — a real outage ages out and alarms.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from genesis.awareness.loop import AwarenessLoop
+        from genesis.awareness.types import Depth, SignalReading, TickResult
+        from genesis.observability.types import Severity, Subsystem
+
+        mock_engine = AsyncMock()
+        mock_bus = AsyncMock()
+
+        loop = AwarenessLoop.__new__(AwarenessLoop)
+        loop._reflection_engine = mock_engine
+        loop._event_bus = mock_bus
+        loop._cc_reflection_bridge = None
+        loop._deferred_queue = None
+        loop._db = AsyncMock()
+        loop._topic_manager = None
+
+        # A routine (non-critical) signal → silent micro tick → idle alive-pulse,
+        # and NO LLM reflection runs. value=0.0 keeps it structurally non-critical
+        # even if its name is ever added to _MICRO_CRITICAL_SIGNALS.
+        routine_signal = SignalReading(
+            name="container_memory_pct", value=0.0,
+            source="test", collected_at="2026-01-01T00:00:00Z",
+        )
+        tick = MagicMock(spec=TickResult)
+        tick.classified_depth = Depth.MICRO
+        tick.tick_id = "test-tick-idle"
+        tick.signals = [routine_signal]
+
+        await loop._dispatch_reflection(tick)
+
+        mock_engine.reflect.assert_not_awaited()
+        mock_bus.emit.assert_awaited_once_with(
+            Subsystem.REFLECTION, Severity.DEBUG,
+            "heartbeat", "reflection idle (no critical signals)",
+        )
+
+
+class TestReflectionHeartbeatThreshold:
+    """The reflection overdue threshold tolerates quiet periods.
+
+    Reflections only fire when signals warrant; with the idle alive-pulse a
+    healthy system stays fresh, and a 30-minute gap must read 'alive', not the
+    false 'dark' the old 20-minute threshold produced.
+    """
+
+    async def test_reflection_alive_at_30_minutes(self, db, monkeypatch) -> None:
+        import types as _types
+        from datetime import UTC, datetime, timedelta
+
+        import genesis.mcp.health as health_mod
+        from genesis.mcp.health.manifest import _impl_subsystem_heartbeats
+
+        ts = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+        await db.execute(
+            "INSERT INTO events (id, timestamp, subsystem, severity, event_type, "
+            "message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ev-refl-hb", ts, "reflection", "DEBUG", "heartbeat",
+             "reflection idle (no critical signals)", ts),
+        )
+        await db.commit()
+
+        monkeypatch.setattr(health_mod, "_service", _types.SimpleNamespace(_db=db))
+        monkeypatch.setattr(health_mod, "_event_bus", None)
+
+        result = await _impl_subsystem_heartbeats()
+        # 30 min < the 4h overdue threshold → alive (was "overdue" at the old 20m).
+        assert result["reflection"]["status"] == "alive"
+        # ~30 min old: older than the OLD 1200s threshold, well under the new 4h.
+        assert 1700 < result["reflection"]["age_seconds"] < 1900

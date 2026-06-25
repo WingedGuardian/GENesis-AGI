@@ -23,12 +23,12 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime
+from html import escape as html_escape
 from pathlib import Path
 
 from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.alert.dispatcher import AlertDispatcher
-from genesis.guardian.alert.telegram import TelegramAlertChannel
-from genesis.guardian.approval import ApprovalServer
+from genesis.guardian.alert.telegram import CONFLICT_SENTINEL, TelegramAlertChannel
 from genesis.guardian.collector import collect_diagnostics
 from genesis.guardian.config import GuardianConfig, load_config, load_secrets
 from genesis.guardian.diagnosis import DiagnosisEngine
@@ -565,68 +565,53 @@ async def _handle_cc_resolved(
     diagnosis: object,
     recovery_engine: RecoveryEngine | None = None,
 ) -> None:
-    """CC already fixed the problem — verify and report.
+    """FIREWALL: CC must never auto-resolve under propose-only mode.
 
-    When the agentic CC session resolves the issue itself (investigation +
-    recovery + verification), we skip the approval flow and just confirm
-    health has returned. If verification fails, falls through to approval-
-    gated recovery (never exits passively).
+    Under the propose-only redesign, CC investigates and PROPOSES — it never
+    executes recovery, so `outcome` should always be "proposed" and this
+    handler should never be reached. If CC ever returns `outcome == "resolved"`
+    anyway (a prompt regression, a stale response, or CC ignoring the
+    instruction and acting on its own), we MUST NOT silently confirm a
+    recovery we did not authorize. Instead we log a warning and route through
+    the human approval gate like any other diagnosis.
     """
-    # Verify by re-checking signals
-    await asyncio.sleep(config.recovery.verification_delay_s)
-    snapshot = await collect_all_signals(config)
-    sm.process(snapshot)
+    logger.warning(
+        "CC reported resolved under propose-only mode — routing to approval "
+        "gate (CC must not self-resolve; treating as an unauthorized claim)",
+    )
 
-    actions_str = ", ".join(diagnosis.actions_taken) if diagnosis.actions_taken else "unknown"
-
-    if sm.current_state == GuardianState.HEALTHY:
-        logger.info("CC-driven recovery verified — Genesis is healthy")
-        sm.clear_down_alert_sent()  # GUARD-R2-01: episode over (CC auto-resolved)
-        await dispatcher.send(Alert(
-            severity=AlertSeverity.INFO,
-            title="Genesis recovered (CC auto-resolved)",
-            body=f"Cause: {diagnosis.likely_cause}\n"
-                 f"Confidence: {diagnosis.confidence_pct}%\n"
-                 f"Actions: {actions_str}\n"
-                 f"Outcome: {diagnosis.outcome}",
-        ))
-        # Heartbeat is now written in run_check after the full cycle; no
-        # redundant write here.
-    else:
-        logger.warning(
-            "CC reported resolved but signals still failing — "
-            "falling back to approval-based recovery",
+    if recovery_engine is not None:
+        # Ensure state is CONFIRMED_DEAD before the approval flow — may still
+        # be in SURVEYING if called from _proceed_to_diagnosis.
+        if sm.current_state != GuardianState.CONFIRMED_DEAD:
+            sm.set_confirmed_dead()
+        await _execute_recovery_with_approval(
+            config, sm, dispatcher, recovery_engine, diagnosis,
         )
-        if recovery_engine is not None:
-            # Ensure state is CONFIRMED_DEAD before approval flow —
-            # may still be in SURVEYING if called from _proceed_to_diagnosis
-            if sm.current_state != GuardianState.CONFIRMED_DEAD:
-                sm.set_confirmed_dead()
-            # Route to approval gate — never exit passively
-            await _execute_recovery_with_approval(
-                config, sm, dispatcher, recovery_engine, diagnosis,
-            )
-        else:
-            # Defensive: should not happen (callers pass recovery_engine),
-            # but send alert rather than silently dropping
-            cname = config.container_name
-            await dispatcher.send(Alert(
-                severity=AlertSeverity.CRITICAL,
-                title="Genesis down — CC fix did not hold",
-                body=(
-                    f"CC diagnosed: {diagnosis.likely_cause}\n"
-                    f"CC actions taken: {actions_str}\n"
-                    "Post-fix health check: FAILED (signals still down)\n"
-                    "Approval-gated recovery pipeline unavailable.\n\n"
-                    "IMMEDIATE ACTION REQUIRED:\n"
-                    "1. SSH to host VM\n"
-                    "2. Check Guardian log: ~/.local/state/genesis-guardian/guardian.log\n"
-                    "3. Review latest diagnosis: ls -t "
-                    "~/.local/state/genesis-guardian/shared/findings/ | head -1\n"
-                    f"4. Manual restart: incus exec {cname} -- "
-                    f"su - ubuntu -c 'systemctl --user restart genesis-server'"
-                ),
-            ))
+        return
+
+    # Defensive: callers always pass recovery_engine, but never exit passively.
+    actions_str = (
+        ", ".join(diagnosis.actions_taken) if diagnosis.actions_taken else "unknown"
+    )
+    cname = config.container_name
+    await dispatcher.send(Alert(
+        severity=AlertSeverity.CRITICAL,
+        title="Genesis down — CC claimed resolved (no approval pipeline)",
+        body=(
+            f"CC diagnosed: {diagnosis.likely_cause}\n"
+            f"CC reported steps: {actions_str}\n"
+            "CC claimed 'resolved' under propose-only mode — NOT trusted.\n"
+            "Approval-gated recovery pipeline unavailable.\n\n"
+            "IMMEDIATE ACTION REQUIRED:\n"
+            "1. SSH to host VM\n"
+            "2. Check Guardian log: ~/.local/state/genesis-guardian/guardian.log\n"
+            "3. Review latest diagnosis: ls -t "
+            "~/.local/state/genesis-guardian/shared/findings/ | head -1\n"
+            f"4. Manual restart: incus exec {cname} -- "
+            f"su - ubuntu -c 'systemctl --user restart genesis-server'"
+        ),
+    ))
 
 
 async def _handle_confirmed_dead(
@@ -713,6 +698,109 @@ async def _handle_confirmed_dead(
     )
 
 
+def _find_telegram_channel(
+    dispatcher: AlertDispatcher,
+) -> TelegramAlertChannel | None:
+    """Locate the TelegramAlertChannel held by the dispatcher, if any.
+
+    The dispatcher owns its channel list (`_channels`). The keyword-approval
+    gate needs the Telegram channel directly to send a reply-target prompt and
+    long-poll getUpdates for the reply. Returns None when no Telegram channel
+    is configured (alerts-only / journal-only mode).
+    """
+    for channel in dispatcher._channels:
+        if isinstance(channel, TelegramAlertChannel):
+            return channel
+    return None
+
+
+# Liveness heartbeat cadence for the blocking approval wait. The Guardian is a
+# oneshot service with no other instance, so the wait can be long; we log a
+# liveness line roughly every this-many seconds so journald shows the wait is
+# alive (not hung) without spamming.
+_APPROVAL_LIVENESS_LOG_S = 1800  # ~30 min
+# Backoff between getUpdates long-poll windows when a 409 Conflict occurs (the
+# main bot is contending for the token). Short — we want to retry the gate, but
+# not hot-loop on the contended endpoint.
+_APPROVAL_CONFLICT_BACKOFF_S = 5
+# Consecutive 409s before we surface a "can't confirm Genesis is down" alert.
+_APPROVAL_CONFLICT_ALERT_THRESHOLD = 3
+
+
+async def _wait_for_gate_keyword(
+    config: GuardianConfig,
+    sm: ConfirmationStateMachine,
+    dispatcher: AlertDispatcher,
+    telegram_channel: TelegramAlertChannel,
+    gate_msg_id: int,
+    gate_label: str,
+) -> str | None:
+    """Block until the user replies APPROVE/DENY to the gate message.
+
+    Self-cancels (returns "__RECOVERED__") if health returns on its own while
+    waiting — no fixed timeout. Returns "APPROVE", "DENY", or "__RECOVERED__".
+
+    On each loop iteration:
+      1. Re-check health — if recovered, the caller stands down (no action).
+      2. Long-poll getUpdates for an APPROVE/DENY reply to gate_msg_id.
+      3. On 409 Conflict, count it; after N consecutive, alert that the main
+         bot appears alive (can't confirm Genesis is down), then back off.
+    """
+    keywords = frozenset({"APPROVE", "DENY"})
+    consecutive_conflicts = 0
+    waited_s = 0.0
+    last_liveness_log = 0.0
+
+    while True:
+        # 1. Self-cancel on genuine recovery (no fixed timeout — only health
+        #    recovery ends the wait, per spec).
+        recheck = await collect_all_signals(config)
+        if not recheck.failed_signals:
+            return "__RECOVERED__"
+
+        # 2. Long-poll for a reply keyword (blocks server-side ~25s).
+        kw = await telegram_channel.poll_for_keyword(gate_msg_id, keywords)
+
+        if kw == CONFLICT_SENTINEL:
+            consecutive_conflicts += 1
+            logger.warning(
+                "getUpdates 409 Conflict at %s gate (consecutive=%d) — main bot "
+                "is polling the same token",
+                gate_label, consecutive_conflicts,
+            )
+            if consecutive_conflicts >= _APPROVAL_CONFLICT_ALERT_THRESHOLD:
+                await dispatcher.send(Alert(
+                    severity=AlertSeverity.WARNING,
+                    title="Cannot confirm main bot is down (getUpdates conflict)",
+                    body=(
+                        "Guardian is trying to read your APPROVE/DENY reply, but "
+                        "the main Genesis Telegram bot is actively polling the "
+                        "same token — which means it may still be alive. Manual "
+                        "check needed: verify whether Genesis is actually down "
+                        "before approving recovery."
+                    ),
+                ))
+                consecutive_conflicts = 0  # re-arm; don't spam every loop
+            await asyncio.sleep(_APPROVAL_CONFLICT_BACKOFF_S)
+            waited_s += _APPROVAL_CONFLICT_BACKOFF_S
+            continue
+
+        consecutive_conflicts = 0
+
+        if kw in ("APPROVE", "DENY"):
+            return kw
+
+        # No reply this window — loop. Account ~25s poll for liveness logging.
+        waited_s += 25.0
+        if waited_s - last_liveness_log >= _APPROVAL_LIVENESS_LOG_S:
+            logger.info(
+                "Still awaiting %s approval reply (~%.0f min elapsed, Genesis "
+                "still down)",
+                gate_label, waited_s / 60.0,
+            )
+            last_liveness_log = waited_s
+
+
 async def _execute_recovery_with_approval(
     config: GuardianConfig,
     sm: ConfirmationStateMachine,
@@ -720,7 +808,17 @@ async def _execute_recovery_with_approval(
     recovery_engine: RecoveryEngine,
     diagnosis: object,
 ) -> None:
-    """Send alert with approval link, wait for approval, then recover."""
+    """Two-gate, blocking, keyword-reply Telegram approval, then recover.
+
+    Gate everything: nothing recovers before approval. No fixed timeout —
+    the wait self-cancels only when health returns on its own.
+
+    Gate 1 (investigate): authorize CC to investigate + propose an action.
+    Gate 2 (action): authorize executing the specific proposed action.
+
+    The Guardian is a oneshot service (no concurrent instance), so blocking
+    here is safe. The host-side Guardian reads the reply itself via getUpdates.
+    """
     from genesis.guardian.diagnosis import RecoveryAction
 
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
@@ -731,87 +829,172 @@ async def _execute_recovery_with_approval(
         await recovery_engine.execute(diagnosis)
         return
 
-    # Start approval server
-    approval = ApprovalServer(config.approval)
-    try:
-        approval_url = approval.start()
-
-        # Send alert with approval link
-        failed_signals = [s.name for s in (await collect_all_signals(config)).failed_signals]
-        first_failure = sm.state.first_failure_at or datetime.now(UTC).isoformat()
-        try:
-            duration = (datetime.now(UTC) - datetime.fromisoformat(first_failure)).total_seconds()
-        except (ValueError, TypeError):
-            duration = 0.0
-
+    telegram_channel = _find_telegram_channel(dispatcher)
+    if telegram_channel is None:
+        # No Telegram channel — we cannot run the keyword-reply gate. Fall
+        # back to alerts-only: report that recovery needs manual action.
+        # NEVER auto-recover without the approval gate (gate everything).
+        logger.warning(
+            "No Telegram channel — cannot run keyword-approval gate; "
+            "alerting for manual intervention instead of auto-recovering",
+        )
+        cname = config.container_name
         await dispatcher.send(Alert(
             severity=AlertSeverity.CRITICAL,
-            title=f"Genesis down — approve recovery: {diagnosis.recommended_action.value}",
-            body=f"Cause: {diagnosis.likely_cause}\n"
-                 f"Confidence: {diagnosis.confidence_pct}%\n"
-                 f"Source: {diagnosis.source}",
-            approval_url=approval_url,
-            failed_probes=failed_signals,
-            duration_s=duration,
-            likely_cause=diagnosis.likely_cause,
-            proposed_action=diagnosis.recommended_action.value,
+            title="Genesis down — approval gate unavailable (no Telegram)",
+            body=(
+                f"Proposed action: {diagnosis.recommended_action.value}\n"
+                f"Cause: {diagnosis.likely_cause}\n"
+                f"Confidence: {diagnosis.confidence_pct}%\n\n"
+                "Guardian cannot read an approval reply (no Telegram channel "
+                "configured) and will NOT auto-recover. Manual action:\n"
+                f"1. incus exec {cname} -- su - ubuntu -c "
+                f"'systemctl --user restart genesis-server'\n"
+                "2. Or re-trigger Guardian: systemctl --user restart "
+                "genesis-guardian.timer"
+            ),
         ))
+        return
 
-        # Wait for approval (blocks until approved or timeout)
-        approved = approval.wait_for_approval(
-            timeout_s=config.approval.token_expiry_s,
+    failed_signals = [s.name for s in (await collect_all_signals(config)).failed_signals]
+    failed_desc = ", ".join(failed_signals) if failed_signals else "unknown"
+
+    # ── Gate 1: authorize investigation ──────────────────────────────────
+    gate1_text = (
+        "\U0001f6a8 <b>Genesis down</b> — failed signals: "
+        f"{html_escape(failed_desc)}.\n"
+        f"Likely: {html_escape(diagnosis.likely_cause)}.\n\n"
+        "<b>Reply to this message</b> with APPROVE to authorize recovery, "
+        "or DENY."
+    )
+    gate1_msg_id = await telegram_channel.send_text(gate1_text)
+    if gate1_msg_id is None:
+        logger.error("Failed to send Gate 1 prompt — cannot run approval gate")
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.CRITICAL,
+            title="Genesis down — could not send approval prompt",
+            body=(
+                "Guardian could not send the Telegram approval prompt. "
+                f"Proposed action: {diagnosis.recommended_action.value}. "
+                "No automated recovery performed."
+            ),
+        ))
+        # A FAILED send is not a successful "alert once" — the user never saw a
+        # prompt. Clear the episode flag so the next cycle retries delivery
+        # rather than going permanently silent on a transient Telegram failure.
+        sm.clear_down_alert_sent()
+        return
+
+    kw = await _wait_for_gate_keyword(
+        config, sm, dispatcher, telegram_channel, gate1_msg_id, "Gate 1 (investigate)",
+    )
+
+    if kw == "__RECOVERED__":
+        await telegram_channel.send_text(
+            "✅ Genesis recovered on its own — standing down, no action taken"
         )
+        snapshot = await collect_all_signals(config)
+        sm.process(snapshot)  # transitions toward HEALTHY
+        sm.clear_down_alert_sent()  # GUARD-R2-01: episode over (self-recovered)
+        return
 
-        if approved:
-            # Re-verify signals before executing — Sentinel may have
-            # fixed the issue while the user was deciding on approval.
-            try:
-                recheck = await collect_all_signals(config)
-                if not recheck.failed_signals:
-                    logger.info(
-                        "All signals healthy at approval time — skipping recovery"
-                    )
-                    sm.process(recheck)  # Transitions to HEALTHY
-                    sm.clear_down_alert_sent()  # GUARD-R2-01: episode over
-                    await dispatcher.send(Alert(
-                        severity=AlertSeverity.INFO,
-                        title="Recovery cancelled — Genesis recovered",
-                        body="All health signals passed when re-verified after approval. "
-                             "No recovery action was executed.",
-                    ))
-                    return
-            except Exception:
-                logger.warning(
-                    "Re-verify failed — proceeding with approved recovery",
-                    exc_info=True,
-                )
-            logger.info("Recovery approved by user — signals still failing, executing")
-            await recovery_engine.execute(diagnosis)
-        else:
-            logger.warning("Recovery approval timed out — no action taken")
-            failed_desc = ", ".join(failed_signals) if failed_signals else "unknown"
-            timeout_h = config.approval.token_expiry_s // 3600
-            cname = config.container_name
-            await dispatcher.send(Alert(
-                severity=AlertSeverity.WARNING,
-                title="Recovery approval expired — Genesis still down",
-                body=(
-                    f"Proposed action: {diagnosis.recommended_action.value}\n"
-                    f"Cause: {diagnosis.likely_cause}\n"
-                    f"Failed signals: {failed_desc}\n"
-                    f"Approval link expired after {timeout_h}h with no response.\n\n"
-                    "No automated recovery was performed.\n"
-                    "Guardian will re-diagnose on next timer cycle.\n\n"
-                    "If you want to act now:\n"
-                    f"1. incus exec {cname} -- su - ubuntu -c "
-                    f"'systemctl --user restart genesis-server'\n"
-                    "2. Or re-trigger Guardian: systemctl --user restart "
-                    "genesis-guardian.timer"
-                ),
-                failed_probes=failed_signals,
-                duration_s=duration,
-                likely_cause=diagnosis.likely_cause,
-                proposed_action=diagnosis.recommended_action.value,
-            ))
-    finally:
-        approval.stop()
+    if kw == "DENY":
+        await telegram_channel.send_text("Recovery denied — no action taken.")
+        # Clear the episode flag so the next cycle can re-diagnose fresh.
+        sm.clear_down_alert_sent()
+        return
+
+    if kw != "APPROVE":
+        # Defensive: the wait-loop only returns APPROVE/DENY/__RECOVERED__ today.
+        # Never let an unexpected value fall through to recovery execution.
+        logger.error("Gate 1 unexpected reply %r — aborting without recovery", kw)
+        sm.clear_down_alert_sent()
+        return
+
+    # kw == "APPROVE" → proceed to diagnose/propose, then Gate 2.
+
+    # ── Diagnose (propose-only) ───────────────────────────────────────────
+    await telegram_channel.send_text("\U0001f50d Diagnosing…")
+
+    diagnosis_engine = DiagnosisEngine(config)
+    diagnostic = await collect_diagnostics(config)
+    signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
+    diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
+
+    logger.info(
+        "Gate-1 approved; diagnosis: %s (confidence=%d%%, action=%s, source=%s)",
+        diagnosis.likely_cause, diagnosis.confidence_pct,
+        diagnosis.recommended_action.value, diagnosis.source,
+    )
+
+    # Persist the proposed diagnosis to the shared mount for Genesis to ingest.
+    first_failure = sm.state.first_failure_at or datetime.now(UTC).isoformat()
+    try:
+        outage_s = (datetime.now(UTC) - datetime.fromisoformat(first_failure)).total_seconds()
+    except (ValueError, TypeError):
+        outage_s = 0.0
+    write_diagnosis_result(diagnosis, config, outage_duration_s=outage_s)
+
+    if diagnosis.recommended_action == RecoveryAction.ESCALATE:
+        # Investigation concluded there is no safe automated action — escalate
+        # (the recovery engine sends a manual-intervention alert).
+        await telegram_channel.send_text(
+            "Investigation complete — no safe automated recovery available. "
+            "Escalating for manual intervention."
+        )
+        await recovery_engine.execute(diagnosis)
+        return
+
+    # ── Gate 2: authorize the specific action ─────────────────────────────
+    gate2_text = (
+        f"Diagnosed: {html_escape(diagnosis.likely_cause)} "
+        f"({diagnosis.confidence_pct}%).\n"
+        f"Proposed: <b>{html_escape(diagnosis.recommended_action.value)}</b>.\n\n"
+        "<b>Reply</b> APPROVE to execute, or DENY."
+    )
+    gate2_msg_id = await telegram_channel.send_text(gate2_text)
+    if gate2_msg_id is None:
+        logger.error("Failed to send Gate 2 prompt — no recovery executed")
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.CRITICAL,
+            title="Genesis down — could not send action-approval prompt",
+            body=(
+                f"Proposed action: {diagnosis.recommended_action.value}. "
+                "Guardian could not send the Telegram prompt. No recovery performed."
+            ),
+        ))
+        # Failed delivery ≠ "already alerted" — let the next cycle retry.
+        sm.clear_down_alert_sent()
+        return
+
+    kw2 = await _wait_for_gate_keyword(
+        config, sm, dispatcher, telegram_channel, gate2_msg_id, "Gate 2 (action)",
+    )
+
+    if kw2 == "__RECOVERED__":
+        await telegram_channel.send_text(
+            "✅ Genesis recovered on its own — standing down, no action taken"
+        )
+        snapshot = await collect_all_signals(config)
+        sm.process(snapshot)
+        sm.clear_down_alert_sent()
+        return
+
+    if kw2 == "DENY":
+        await telegram_channel.send_text("Action rejected — no recovery performed.")
+        sm.clear_down_alert_sent()
+        return
+
+    if kw2 != "APPROVE":
+        # Defensive: never execute recovery on an unexpected gate reply. The
+        # APPROVE check below is positive, not a fall-through.
+        logger.error("Gate 2 unexpected reply %r — NOT executing recovery", kw2)
+        sm.clear_down_alert_sent()
+        return
+
+    # kw2 == "APPROVE" → execute the approved action.
+    logger.info(
+        "Gate-2 approved — executing recovery action %s",
+        diagnosis.recommended_action.value,
+    )
+    await recovery_engine.execute(diagnosis)

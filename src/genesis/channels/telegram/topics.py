@@ -292,4 +292,16 @@ class TopicManager:
             "approval": "approvals",
             "content": "content_review",
         }
-        return mapping.get(outreach_category, "surplus")
+        topic = mapping.get(outreach_category)
+        if topic is None:
+            # Unmapped category — route to the visible conversation topic,
+            # NOT surplus (the debug dump where the Jun 2026 ego_notification
+            # misroute silently landed). Log so a missing mapping surfaces
+            # instead of vanishing.
+            logger.warning(
+                "No topic mapping for outreach category %r — routing to "
+                "'conversation'. Add an explicit mapping if this is real.",
+                outreach_category,
+            )
+            return "conversation"
+        return topic

@@ -155,7 +155,10 @@ class ProviderHealthChecker:
         """Push probe findings to circuit breakers.
 
         Unreachable or rate-limited providers get tripped to HALF_OPEN
-        (probe = scout, CB = judge). Only downgrades — never closes a CB.
+        (probe = scout, CB = judge). A clean probe (reachable AND this provider's
+        model is listed) advances a HALF_OPEN breaker toward recovery so a
+        low/no-traffic fallback provider can heal instead of being stuck forever.
+        Only downgrades a CLOSED breaker; only heals a HALF_OPEN one.
         """
         if not self._breakers:
             return
@@ -170,6 +173,19 @@ class ProviderHealthChecker:
                     logger.debug("CB sync failed for probed provider %s", name, exc_info=True)
                 except Exception:
                     logger.debug("Unexpected CB sync error for %s", name, exc_info=True)
+            elif result.model_available is True:
+                # Positive confirmation (reachable + this model listed). record_probe_success
+                # is a no-op unless the breaker is HALF_OPEN, so this only heals a
+                # recovering provider — never closes a CLOSED one prematurely. Best-effort:
+                # a 200 on /v1/models is weaker than a real completion (hence the stricter
+                # probe_success_threshold), and a falsely-healed provider re-trips on its
+                # next real failure.
+                try:
+                    self._breakers.get(name).record_probe_success()
+                except (KeyError, OSError):
+                    logger.debug("CB heal sync failed for probed provider %s", name, exc_info=True)
+                except Exception:
+                    logger.debug("Unexpected CB heal sync error for %s", name, exc_info=True)
 
     async def _probe_one(self, cfg: ProviderConfig) -> ProviderProbeResult:
         """Probe a single provider's models endpoint."""

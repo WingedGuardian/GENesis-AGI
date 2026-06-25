@@ -86,12 +86,16 @@ class EgoCadenceManager:
         idle_detector: IdleDetector | None = None,
         db: aiosqlite.Connection,
         event_bus: GenesisEventBus | None = None,
+        autonomy_manager: object | None = None,
     ) -> None:
         self._session = session
         self._config = config
         self._idle_detector = idle_detector
         self._db = db
         self._event_bus = event_bus
+        # AutonomyManager (duck-typed: detect_earnback_candidates / promote),
+        # used by the user-ego earn-back check. None disables earn-back.
+        self._autonomy_manager = autonomy_manager
 
         self._scheduler = AsyncIOScheduler()
         self._paused = False
@@ -159,6 +163,21 @@ class EgoCadenceManager:
             max_instances=1,
             misfire_grace_time=300,
         )
+        # Liveness pulse: emit a heartbeat every 5 min on a fixed, never-
+        # rescheduled cadence so health monitoring tracks "ego subsystem alive"
+        # independent of the proactive _on_tick interval. _on_tick's interval
+        # stretches via adaptive backoff (up to 72h) and is deferred by
+        # reschedule_job on every completed cycle, so a heartbeat tied to it
+        # routinely exceeds the 4h overdue threshold during normal operation
+        # even while the ego is healthy and cycling. Mirrors the fixed-interval
+        # liveness ticks of awareness/surplus/dashboard.
+        self._scheduler.add_job(
+            self._on_heartbeat,
+            IntervalTrigger(minutes=5),
+            id="ego_heartbeat",
+            max_instances=1,
+            misfire_grace_time=60,
+        )
         # Goal staleness scanner: push goal_review signals for stale goals.
         # User ego only — genesis ego has no goal jurisdiction. Skipped at
         # runtime via source_tag check but also gate registration for clarity.
@@ -180,6 +199,10 @@ class EgoCadenceManager:
             logger=logger,
         )
         self._running = True
+        # Initial liveness pulse so a restart doesn't look stale to
+        # subsystem_heartbeats during the first 5-min ego_heartbeat window
+        # (mirrors awareness/surplus emitting a heartbeat at start).
+        self._emit_heartbeat("start")
         morning_str = (
             f", morning={self._config.morning_report_hour:02d}:"
             f"{self._config.morning_report_minute:02d} "
@@ -320,6 +343,15 @@ class EgoCadenceManager:
         # Deadline scanner: push reactive events for approaching deadlines
         await self._check_approaching_deadlines()
 
+        # Autonomy earn-back: propose restoring earned levels whose evidence
+        # now supports it (user ego only; no-op otherwise).
+        await self._check_earnback_opportunities()
+
+        # Cell promotion (WS-8 PR-D): propose standing autonomy for email
+        # capability cells whose approved competence now supports it (user ego
+        # only; the user approves each promotion).
+        await self._check_cell_promotion_opportunities()
+
     async def _check_approaching_deadlines(self) -> None:
         """Push reactive events for events approaching within 48h."""
         try:
@@ -362,7 +394,9 @@ class EgoCadenceManager:
             return
 
         try:
+            from genesis.db.crud import ego as ego_crud
             from genesis.db.crud import user_goals
+            from genesis.ego.types import GOAL_STUCK_EXECUTED_THRESHOLD
 
             goals = await user_goals.list_active(self._session._db)
             if not goals:
@@ -394,14 +428,38 @@ class EgoCadenceManager:
                 if days_stale < threshold_days:
                     continue
 
+                # Distinguish "stuck" (effort spent, no progress) from "stale"
+                # (untouched): a still-active goal with >= N executed proposals
+                # has been worked on without advancing. Stuck goals get a
+                # higher-priority signal so the ego replans rather than nudges.
+                # Best-effort — a query failure yields {} → treated as stale.
+                summary_counts = await ego_crud.get_goal_proposal_summary(
+                    self._session._db, g["id"],
+                )
+                executed = summary_counts.get("executed", 0)
+                is_stuck = executed >= GOAL_STUCK_EXECUTED_THRESHOLD
+
                 title = (g.get("title") or "?")[:80]
+                if is_stuck:
+                    sig_summary = (
+                        f"Goal stuck ({days_stale}d, {executed} executed, "
+                        f"not advancing): {title}"
+                    )
+                    sig_priority = "high"
+                else:
+                    sig_summary = f"Goal stale ({days_stale}d): {title}"
+                    sig_priority = "medium"
+
                 signal = EgoSignal(
                     signal_type="timer",
                     focus_category="goal_review",
-                    summary=f"Goal stale ({days_stale}d): {title}",
-                    priority="medium",
+                    summary=sig_summary,
+                    priority=sig_priority,
                     focus_id=g["id"],
-                    metadata={},
+                    metadata={
+                        "mode": "stuck" if is_stuck else "stale",
+                        "executed_proposals": executed,
+                    },
                 )
                 if self._signal_queue.push(signal):
                     pushed += 1
@@ -412,6 +470,216 @@ class EgoCadenceManager:
                 )
         except Exception:
             logger.debug("Goal staleness scanner failed", exc_info=True)
+
+    # -- Autonomy earn-back ------------------------------------------------
+
+    _EARNBACK_REJECT_COOLDOWN_DAYS = 7
+
+    async def _check_earnback_opportunities(self) -> None:
+        """Propose restoring earned autonomy for categories whose evidence now
+        supports it. User-ego only; evidence-gated; the user approves each
+        promotion. Never auto-promotes.
+        """
+        if self._session._source_tag != "user_ego_cycle":
+            return
+        if self._autonomy_manager is None:
+            return
+        try:
+            candidates = await self._autonomy_manager.detect_earnback_candidates()
+            if not candidates:
+                return
+
+            from genesis.db.crud import ego as ego_crud
+
+            # Anti-spam: skip categories that already have a pending earn-back
+            # proposal (also covered by create_batch content-hash dedup) or an
+            # active reject cooldown.
+            pending = await ego_crud.list_pending_proposals(self._session._db)
+            pending_cats = {
+                p.get("action_category")
+                for p in pending
+                if p.get("action_type") == "autonomy_earnback"
+            }
+
+            to_make: list[dict] = []
+            for cand in candidates:
+                category = cand["category"]
+                if category in pending_cats:
+                    continue
+                if await self._earnback_in_cooldown(category):
+                    continue
+                to_make.append(self._build_earnback_proposal(cand))
+
+            if not to_make:
+                return
+
+            batch_id, ids, _ = await self._session._proposals.create_batch(
+                to_make, ego_source="user_ego_cycle",
+            )
+            if ids:
+                await self._session._proposals.send_digest(
+                    batch_id, ego_source="user_ego_cycle",
+                )
+                logger.info(
+                    "Earn-back: proposed promotion for %d categor(ies)", len(ids),
+                )
+        except Exception:
+            logger.warning("Earn-back opportunity check failed", exc_info=True)
+
+    async def _earnback_in_cooldown(self, category: str) -> bool:
+        """True if *category*'s earn-back was rejected within the cooldown window."""
+        from genesis.db.crud import ego as ego_crud
+
+        ts = await ego_crud.get_state(
+            self._session._db, f"earnback_reject:{category}",
+        )
+        if not ts:
+            return False
+        try:
+            rejected_at = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            return False
+        if rejected_at.tzinfo is None:
+            rejected_at = rejected_at.replace(tzinfo=UTC)
+        age_days = (datetime.now(UTC) - rejected_at).days
+        return age_days < self._EARNBACK_REJECT_COOLDOWN_DAYS
+
+    @staticmethod
+    def _build_earnback_proposal(cand: dict) -> dict:
+        """Build a proposal dict for an earn-back candidate."""
+        category = cand["category"]
+        current = cand["current_level"]
+        target = cand["target_level"]
+        posterior = cand.get("posterior")
+        conf = round(float(posterior), 2) if posterior is not None else 0.7
+        regressed_on = (cand.get("last_regression_at") or "")[:10]
+        since = f" (demoted {regressed_on})" if regressed_on else ""
+        content = (
+            f"Restore {category} autonomy to L{target}. It was reduced to "
+            f"L{current}{since} after a Bayesian regression; the success record "
+            f"has since recovered enough to support L{target} again "
+            f"(posterior {conf})."
+        )
+        rationale = (
+            "Evidence-gated earn-back: the category's own success/correction "
+            "history now supports the earned level. Approve to restore it; "
+            "reject to keep it where it is."
+        )
+        return {
+            "action_type": "autonomy_earnback",
+            "action_category": category,
+            "content": content,
+            "rationale": rationale,
+            "confidence": conf,
+            "urgency": "low",
+            "expected_outputs": {"target_level": target},
+        }
+
+    # -- Cell promotion (WS-8 PR-D) ----------------------------------------
+
+    _CELL_PROMOTION_REJECT_COOLDOWN_DAYS = 7
+
+    async def _check_cell_promotion_opportunities(self) -> None:
+        """Propose promoting email capability cells whose approved competence now
+        supports standing autonomy. User-ego only; evidence-gated; the user
+        approves each promotion. Never auto-promotes.
+        """
+        if self._session._source_tag != "user_ego_cycle":
+            return
+        db = self._session._db
+        if db is None:
+            return
+        try:
+            from genesis.db.crud import capability_grants as cg
+            from genesis.db.crud import ego as ego_crud
+
+            candidates = await cg.detect_promotable_cells(db)
+            if not candidates:
+                return
+
+            # Anti-spam: skip cells that already have a pending promotion proposal
+            # or an active reject cooldown (the digest rate-limiter is disabled, so
+            # these guards are the only backstop).
+            pending = await ego_crud.list_pending_proposals(db)
+            pending_cells = {
+                p.get("action_category")
+                for p in pending
+                if p.get("action_type") == "cell_promotion"
+            }
+
+            to_make: list[dict] = []
+            for cand in candidates:
+                cell_id = cand["id"]
+                if cell_id in pending_cells:
+                    continue
+                if await self._cell_promotion_in_cooldown(cell_id):
+                    continue
+                to_make.append(self._build_cell_promotion_proposal(cand))
+
+            if not to_make:
+                return
+
+            batch_id, ids, _ = await self._session._proposals.create_batch(
+                to_make, ego_source="user_ego_cycle",
+            )
+            if ids:
+                await self._session._proposals.send_digest(
+                    batch_id, ego_source="user_ego_cycle",
+                )
+                logger.info(
+                    "Cell promotion: proposed standing autonomy for %d cell(s)",
+                    len(ids),
+                )
+        except Exception:
+            logger.warning("Cell promotion opportunity check failed", exc_info=True)
+
+    async def _cell_promotion_in_cooldown(self, cell_id: str) -> bool:
+        """True if *cell_id*'s promotion was rejected within the cooldown window."""
+        from genesis.db.crud import ego as ego_crud
+
+        ts = await ego_crud.get_state(
+            self._session._db, f"cell_promotion_reject:{cell_id}",
+        )
+        if not ts:
+            return False
+        try:
+            rejected_at = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            return False
+        if rejected_at.tzinfo is None:
+            rejected_at = rejected_at.replace(tzinfo=UTC)
+        age_days = (datetime.now(UTC) - rejected_at).days
+        return age_days < self._CELL_PROMOTION_REJECT_COOLDOWN_DAYS
+
+    @staticmethod
+    def _build_cell_promotion_proposal(cand: dict) -> dict:
+        """Build a proposal dict for a promotable capability cell."""
+        cell_id = cand["id"]
+        domain, verb, risk = cand["domain"], cand["verb"], cand["risk_class"]
+        successes = cand.get("successes", 0)
+        posterior = cand.get("posterior")
+        conf = round(float(posterior), 2) if posterior is not None else 0.7
+        content = (
+            f"Promote the {cell_id} capability to standing autonomy. I've handled "
+            f"this {successes} times with your approval (confidence {conf}); "
+            f"promoting it means routine {risk} {domain} {verb}s won't need your "
+            f"sign-off each time. The auto-revert net still applies — any harm "
+            f"signal immediately drops it back to needing your approval."
+        )
+        rationale = (
+            "Evidence-gated promotion: the cell's own approved-success history "
+            "supports standing autonomy. Approve to grant; reject to keep holding "
+            "each send for approval."
+        )
+        return {
+            "action_type": "cell_promotion",
+            "action_category": cell_id,
+            "content": content,
+            "rationale": rationale,
+            "confidence": conf,
+            "urgency": "low",
+            "expected_outputs": {"cell": [domain, verb, risk]},
+        }
 
     # -- Tick handlers -----------------------------------------------------
 
@@ -815,6 +1083,18 @@ class EgoCadenceManager:
 
     # -- Observability -----------------------------------------------------
 
+    async def _on_heartbeat(self) -> None:
+        """Fixed-interval liveness pulse (every 5 min), decoupled from the
+        proactive ``_on_tick`` work cadence.
+
+        Registered as the ``ego_heartbeat`` APScheduler job in :meth:`start`.
+        Pure liveness — emits regardless of pause/idle/circuit state so a
+        paused or quiet ego is not mistaken for a dead one. The only thing it
+        proves (and the only thing the heartbeat is for) is that the ego
+        subsystem's scheduler is alive. Best-effort via :meth:`_emit_heartbeat`.
+        """
+        self._emit_heartbeat("alive")
+
     def _emit_heartbeat(self, trigger: str) -> None:
         """Emit a DEBUG heartbeat event for the neural monitor."""
         if self._event_bus is None:
@@ -831,7 +1111,9 @@ class EgoCadenceManager:
                     f"ego_{trigger} (interval={self._current_interval}m, "
                     f"failures={self._consecutive_failures})",
                 ),
-                name="ego_heartbeat",
+                name=f"ego_heartbeat_{trigger}",
             )
         except Exception:
-            pass  # Heartbeat emission is best-effort
+            # Best-effort, but never silent — a dark heartbeat with a live
+            # scheduler is exactly the thing this method exists to prevent.
+            logger.debug("Ego heartbeat emission failed", exc_info=True)

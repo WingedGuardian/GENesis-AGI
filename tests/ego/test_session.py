@@ -357,14 +357,15 @@ class TestProcessExecutionBriefs:
             direct_session_runner=mock_direct_runner,
         )
 
-    async def _insert_proposal(self, db, proposal_id, status="approved"):
+    async def _insert_proposal(self, db, proposal_id, status="approved",
+                               action_type="investigate"):
         """Insert a proposal into the DB for testing."""
         await db.execute(
             "INSERT INTO ego_proposals "
             "(id, action_type, action_category, content, rationale, "
             "confidence, urgency, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-            (proposal_id, "investigate", "test", "test content",
+            (proposal_id, action_type, "test", "test content",
              "test rationale", 0.8, "normal", status),
         )
         await db.commit()
@@ -482,6 +483,49 @@ class TestProcessExecutionBriefs:
         await ego_with_runner._process_execution_briefs(briefs)
 
         mock_direct_runner.spawn.assert_not_called()
+
+    async def test_cognitive_variant_promotion_never_dispatched(
+        self, ego_with_runner, mock_direct_runner, db,
+    ):
+        """An approved cognitive_variant_promotion must NEVER be auto-dispatched
+        as a session via the execution-briefs path. This fixture has no autonomy
+        gate, so the assertion proves the explicit action_type blocklist (not the
+        gate) is the backstop — the fail-open path the architect flagged. The
+        proposal is applied only by its resolution handler at approval time."""
+        await self._insert_proposal(
+            db, "prop_cvp", action_type="cognitive_variant_promotion",
+        )
+
+        briefs = [{"proposal_id": "prop_cvp", "prompt": "apply winning prompt"}]
+        await ego_with_runner._process_execution_briefs(briefs)
+
+        mock_direct_runner.spawn.assert_not_called()
+        prop = await ego_crud.get_proposal(db, "prop_cvp")
+        assert prop["status"] == "approved"  # untouched by the dispatch path
+
+    async def test_cognitive_variant_not_dispatched_by_sweep(
+        self, ego_with_runner, mock_direct_runner, db,
+    ):
+        """The OTHER dispatch path — the approved-proposal sweep — must also skip
+        cognitive_variant_promotion (the blocklist fires before any spawn)."""
+        await self._insert_proposal(
+            db, "prop_cvp_sweep", action_type="cognitive_variant_promotion",
+        )
+        await ego_with_runner.sweep_approved_proposals()
+        mock_direct_runner.spawn.assert_not_called()
+        assert (await ego_crud.get_proposal(db, "prop_cvp_sweep"))["status"] == "approved"
+
+
+def test_never_dispatch_action_types_single_source_of_truth():
+    """Both dispatch paths (sweep + execution-briefs) read this one tuple.
+    cognitive_variant_promotion must be present (else an approved Evo promotion
+    could be auto-run as a session); the pre-existing apply-at-approval types
+    must remain (regression guard for the refactor to a shared constant)."""
+    from genesis.ego.session import _NEVER_DISPATCH_ACTION_TYPES
+
+    assert "cognitive_variant_promotion" in _NEVER_DISPATCH_ACTION_TYPES
+    for legacy in ("autonomy_earnback", "goal_status_change", "cell_promotion"):
+        assert legacy in _NEVER_DISPATCH_ACTION_TYPES
 
 
 # ---------------------------------------------------------------------------
@@ -690,3 +734,85 @@ class TestGoalAssessmentOutput:
         assert "goal_assessment" in contract
         assert "goal_status_recommendation" in contract
         assert "continue|pause|deprioritize|close" in contract
+
+
+class TestGoalStatusRecommendationRouting:
+    """_surface_goal_recommendation: reversible recs → approvable proposal;
+    terminal (close) → passive observation. Recommend-only — no goal writes."""
+
+    @pytest.fixture
+    async def goals_db(self, db):
+        await db.execute(TABLES["user_goals"])
+        await db.execute(TABLES["observations"])
+        await db.commit()
+        return db
+
+    @staticmethod
+    async def _insert_goal(conn, *, gid, status="active", priority="high"):
+        await conn.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, status, priority, created_at, updated_at) "
+            "VALUES (?, 'My Goal', 'project', ?, ?, '2026-06-01', '2026-06-01')",
+            (gid, status, priority),
+        )
+        await conn.commit()
+
+    async def test_pause_creates_status_change_proposal(self, ego_session, goals_db):
+        ego_session._source_tag = "user_ego_cycle"
+        await self._insert_goal(goals_db, gid="gA", priority="high")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="gA", recommendation="pause", assessment="stuck for weeks",
+        )
+
+        ego_session._proposals.create_batch.assert_awaited_once()
+        props = ego_session._proposals.create_batch.call_args[0][0]
+        assert len(props) == 1
+        p = props[0]
+        assert p["action_type"] == "goal_status_change"
+        assert p["goal_id"] == "gA"
+        assert p["expected_outputs"] == {"change": "status", "value": "paused"}
+        ego_session._proposals.send_digest.assert_awaited_once()
+
+    async def test_deprioritize_lowers_priority_one_notch(self, ego_session, goals_db):
+        ego_session._source_tag = "user_ego_cycle"
+        await self._insert_goal(goals_db, gid="gB", priority="high")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="gB", recommendation="deprioritize", assessment="lower it",
+        )
+
+        p = ego_session._proposals.create_batch.call_args[0][0][0]
+        assert p["expected_outputs"] == {"change": "priority", "value": "medium"}
+
+    async def test_close_creates_observation_not_proposal(self, ego_session, goals_db):
+        ego_session._source_tag = "user_ego_cycle"
+        await self._insert_goal(goals_db, gid="gC")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="gC", recommendation="close", assessment="done with it",
+        )
+
+        ego_session._proposals.create_batch.assert_not_awaited()
+        cursor = await goals_db.execute(
+            "SELECT type, category FROM observations WHERE source = 'user_ego'",
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["type"] == "goal_recommendation"
+
+    async def test_antispam_skips_when_proposal_open(self, ego_session, goals_db):
+        ego_session._source_tag = "user_ego_cycle"
+        await self._insert_goal(goals_db, gid="gD")
+        await goals_db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, content, status, goal_id, created_at) "
+            "VALUES ('open1', 'goal_status_change', 'x', 'pending', 'gD', '2026-06-01')",
+        )
+        await goals_db.commit()
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="gD", recommendation="pause", assessment="again",
+        )
+
+        ego_session._proposals.create_batch.assert_not_awaited()

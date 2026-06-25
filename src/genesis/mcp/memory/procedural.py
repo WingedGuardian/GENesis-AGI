@@ -18,6 +18,27 @@ def _memory_mod():
     return memory_mod
 
 
+def _rank_by_effective_confidence(results: list[dict]) -> list[dict]:
+    """Re-rank recall results so deliberately-read procedures surface first.
+
+    Reads count as fractional successes via ``effective_confidence``; a stable
+    sort preserves ``find_relevant``'s relevance order on ties. Isolated to the
+    recall path — ``find_relevant`` itself is unchanged (6 callers, incl.
+    autonomy outcome-attribution).
+    """
+    from genesis.learning.procedural.operations import effective_confidence
+
+    return sorted(
+        results,
+        key=lambda r: effective_confidence(
+            r.get("success_count", 0) or 0,
+            r.get("failure_count", 0) or 0,
+            r.get("invocation_count", 0) or 0,
+        ),
+        reverse=True,
+    )
+
+
 async def _embed_principle_for_hook(principle: str) -> bytes | None:
     """Best-effort: compute principle embedding for the proactive procedure
     hook. Returns None on any failure — the hook simply skips rows without
@@ -52,18 +73,20 @@ async def procedure_store(
 
     An MCP `procedure_store` call represents an *explicit teach* — the caller
     is asserting the procedure works. We seed it as already-confirmed
-    (speculative=0) with one Laplace-equivalent success (success_count=1,
-    confidence=2/3), and place it at L3 so it is immediately recallable AND
-    eligible for SessionStart injection. Subsequent organic
-    successes/failures via `record_success`/`record_failure` continue to
-    update the row via Laplace smoothing.
+    (draft=0) with one Laplace-equivalent success (success_count=1,
+    confidence=2/3), and place it at LIBRARY so it is immediately
+    recallable and eligible for proactive-hook surfacing. (Blind SessionStart
+    injection is CORE-only as of Surfacing v2, so an explicit teach reaches
+    a session via the proactive hook on the first prompt, not at session start.)
+    Subsequent organic successes/failures via `record_success`/`record_failure`
+    continue to update the row via Laplace smoothing.
 
     Computes a principle embedding for the proactive procedure hook. If the
     embedding stack is unavailable, the procedure stores without it and the
     hook skips that row.
 
     The auto-extraction path (`learning.procedural.extractor`) keeps its
-    speculative=1 / success_count=0 / confidence=0.0 / L4 defaults — those
+    draft=1 / success_count=0 / confidence=0.0 / DORMANT defaults — those
     procedures are LLM-hypothesized and must earn trust.
     """
     memory_mod = _memory_mod()
@@ -82,8 +105,8 @@ async def procedure_store(
         tools_used=tools_used,
         context_tags=context_tags,
         tool_trigger=tool_trigger,
-        activation_tier="L3",
-        speculative=0,
+        activation_tier="LIBRARY",
+        draft=0,
         success_count=1,
         confidence=2 / 3,
         source={"type": "explicit_teach"},
@@ -110,28 +133,42 @@ async def procedure_recall(
     memory_mod._require_init()
     assert memory_mod._db is not None
 
-    results = []
+    results: list[dict] = []
+    seen: set[str] = set()
 
     if context_tags:
         match = await find_best_match(memory_mod._db, task_description, context_tags)
         if match:
             results.append(_asdict(match))
+            seen.add(match.procedure_id)
 
     tags = context_tags or task_description.lower().replace("-", " ").split()
-    relevant = await find_relevant(memory_mod._db, tags, limit=3)
+    # Widen the candidate pool, then re-rank by reads (effective confidence) and
+    # cap — so a proven-useful procedure can surface, not just get reordered
+    # within an already-relevance-capped top 3.
+    relevant = await find_relevant(memory_mod._db, tags, limit=10)
     for m in relevant:
-        if not any(r.get("procedure_id") == m.procedure_id for r in results):
+        if m.procedure_id not in seen:
             results.append(_asdict(m))
-        if len(results) >= 3:
-            break
+            seen.add(m.procedure_id)
 
-    # J-9 eval: log procedure invocations for learning effectiveness tracking
+    results = _rank_by_effective_confidence(results)[:3]
+
+    # Count the read (usage signal) + log the J-9 invocation event. Returning a
+    # procedure means the model recalled it and it is surfaced into context.
     if results:
+        from genesis.db.crud import procedural
         from genesis.eval.j9_hooks import emit_procedure_invoked
         for r in results:
+            pid = r.get("procedure_id", "")
+            if not pid:
+                continue
+            # Keep the read counter and the J-9 event in lockstep — both gated
+            # on a real procedure_id so neither records an orphan.
+            await procedural.record_invocation(memory_mod._db, pid)
             await emit_procedure_invoked(
                 memory_mod._db,
-                procedure_id=r.get("procedure_id", ""),
+                procedure_id=pid,
                 confidence=r.get("confidence", 0.0),
                 matched_tags=tags[:10] if tags else [],
             )

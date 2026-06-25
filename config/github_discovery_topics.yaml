@@ -1,0 +1,16 @@
+# Topics for autonomous GitHub Discovery — the user's domains.
+#
+# Each entry is one `gh search repos` query per run. Keep the list SHORT: each
+# topic is a single search call and the GitHub search API allows only 30
+# requests/minute. Install-specific or experimental topics go in
+# github_discovery_topics.local.yaml (gitignored), which is merged in on top.
+#
+# The discovery job scores results by momentum/activity/maturity and files only
+# the top few new high-signal repos to the recon triage queue for review.
+topics:
+  - "AI agent memory"
+  - "LLM agent framework"
+  - "agent harness orchestration"
+  - "retrieval augmented generation"
+  - "MCP server"
+  - "autonomous coding agent"

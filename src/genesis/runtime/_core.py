@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from genesis.observability import GenesisEventBus
     from genesis.observability.health_data import HealthDataService
     from genesis.observability.provider_activity import ProviderActivityTracker
+    from genesis.observability.span_writer import SpanWriter
     from genesis.outreach.pipeline import OutreachPipeline
     from genesis.outreach.scheduler import OutreachScheduler
     from genesis.providers.registry import ProviderRegistry
@@ -202,6 +203,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._cc_budget_tracker: CCBudgetTracker | None = None
         self._health_data: HealthDataService | None = None
         self._activity_tracker: ProviderActivityTracker | None = None
+        self._span_writer: SpanWriter | None = None
         self._outreach_pipeline: OutreachPipeline | None = None
         self._outreach_scheduler: OutreachScheduler | None = None
         self._engagement_tracker = None

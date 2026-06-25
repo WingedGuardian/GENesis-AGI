@@ -19,6 +19,12 @@
 #   SECRETS_PATH               — Path to secrets.env (default: $GENESIS_DIR/secrets.env)
 set -euo pipefail
 
+# Pluggable Tier-2 (off-site) backend interface — selects none/local/smb at runtime
+# (backward-compat: a configured GENESIS_BACKUP_NAS with no selector → smb).
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/backup_backends.sh
+source "$_SCRIPT_DIR/lib/backup_backends.sh"
+
 # ── Status tracking ──────────────────────────────────────────────────
 _STATUS_FILE="$HOME/.genesis/backup_status.json"
 _STARTED_AT=$(date +%s)
@@ -37,12 +43,15 @@ _write_status() {
     # Escape failure reason for JSON safety (quotes, backslashes, newlines)
     local _safe_reason
     _safe_reason=$(printf '%s' "$_FAILURE_REASON" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g')
+    # offsite_confirmed: true only when the off-site copy fully succeeded.
+    local _offsite_confirmed=false
+    if [ "${_T2_STATUS:-}" = "ok" ]; then _offsite_confirmed=true; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}"}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed}
 STATUSEOF
 }
-trap '_write_status' EXIT
+trap '_write_status; backend_cleanup' EXIT
 
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
 BACKUP_DIR="$HOME/backups/genesis-backups"
@@ -65,6 +74,28 @@ fi
 log() { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 
 die() { _FAILURE_REASON="$*"; log "FATAL: $*"; exit 1; }
+
+# Send a Telegram message (no-op unless bot token + chat id are configured).
+# Shared by the backup-failed and off-site-replication-failed alerts.
+_send_telegram() {
+    [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || return 0
+    [ -n "${TELEGRAM_FORUM_CHAT_ID:-}" ] || return 0
+    curl -sf -X POST \
+        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        -H "Content-Type: application/json" \
+        -d "{\"chat_id\":\"${TELEGRAM_FORUM_CHAT_ID}\",\"text\":$(printf '%s' "$1" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"parse_mode\":\"Markdown\"}" \
+        > /dev/null 2>&1 || log "WARNING: Telegram alert failed to send"
+}
+
+# Large intermediate files (the multi-hundred-MB SQLite .dump) must NOT land in the
+# inherited TMPDIR: for a CC-launched run that is ~/.genesis/cc-tmp (the watchgod-policed
+# "oxygen" folder — filling it kills CC sessions); for the 6h cron it is /tmp (tmpfs/RAM).
+# Route them to a dedicated on-disk dir, per the tmp_filesystem_limit procedure ("use ~/tmp
+# for large temporary files"). We do NOT export TMPDIR — only the big files move; everything
+# else (and Claude Code) keeps its normal TMPDIR.
+GENESIS_BIG_TMP="${GENESIS_BACKUP_TMPDIR:-$HOME/tmp}"
+mkdir -p "$GENESIS_BIG_TMP"
+log "big-temp dir: $GENESIS_BIG_TMP"
 
 # ── Encryption helpers ───────────────────────────────────────────────
 # All PII-bearing payloads (SQLite dump, transcripts, memory) use the
@@ -126,7 +157,7 @@ if [ -f "$DB_FILE" ]; then
     if ! $_ENCRYPT_READY; then
         log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping SQLite backup (refusing plaintext)"
     else
-        _SQL_TMP=$(mktemp)
+        _SQL_TMP=$(mktemp -p "$GENESIS_BIG_TMP")  # ~269MB dump — keep off cc-tmp/RAM
         if sqlite3 "$DB_FILE" .dump > "$_SQL_TMP" 2>/dev/null; then
             _SQLITE_LINES=$(wc -l < "$_SQL_TMP")
             if encrypt_file "$_SQL_TMP" data/genesis.sql.gpg; then
@@ -187,9 +218,18 @@ for collection in episodic_memory knowledge_base; do
 done
 
 # --- 3. CC session transcripts (encrypted — contain conversation PII) ---
+#
+# RETENTION POLICY — KEEP FOREVER BY DEFAULT. Backed-up transcripts are Genesis's
+# durable long-term conversational memory. The LOCAL store (~/.claude/projects)
+# expires on Claude Code's cleanupPeriodDays, but the BACKUP is the permanent
+# archive: transcripts/*.gpg accumulate here and are NEVER auto-pruned (the only
+# delete below is the pre-encryption plaintext staging, not the .gpg archive).
+# Any future retention work (GFS snapshot pruning, local-staging prune) MUST
+# EXEMPT transcripts/ — a user may opt into expiry, but the system must never
+# auto-expire transcripts the way the local store does.
 log "Backing up CC transcripts..."
 mkdir -p transcripts
-# Purge any pre-encryption plaintext transcripts.
+# Purge any pre-encryption plaintext transcripts (staging only — NOT the .gpg).
 find transcripts -maxdepth 1 -name '*.jsonl' -type f -delete 2>/dev/null || true
 if [ -d "$TRANSCRIPT_DIR" ]; then
     if ! $_ENCRYPT_READY; then
@@ -278,75 +318,151 @@ else
     log "WARNING: secrets file not found at $SECRETS_FILE"
 fi
 
-# --- Tier 2: Upload large files to NAS (Qdrant, SQL, transcripts) ---
-_NAS_TARGET="${GENESIS_BACKUP_NAS:-}"
+# --- Tier 2: upload large files to the off-site backend (pluggable) ---
+# Destination is selectable (none/local/smb) via GENESIS_BACKUP_TIER2_BACKEND —
+# the public repo prescribes no provider. The dated snapshot tree
+# (Genesis/<host>/<UTC-stamp>/{data,qdrant,transcripts}/ + COMPLETE marker) is
+# written through the backend interface, not a backend binary directly. The
+# _T2_STATUS value strings (ok/partial/not_configured/no_smbclient) are unchanged
+# — they're read by the dashboard + health alerts.
 _T2_STATUS="skipped"
-if [ -n "$_NAS_TARGET" ]; then
-    _NAS_USER="${GENESIS_BACKUP_NAS_USER:-}"
-    _NAS_PASS="${GENESIS_BACKUP_NAS_PASS:-}"
-    _NAS_DIR="Genesis/$(hostname)"
-
-    if ! command -v smbclient >/dev/null 2>&1; then
+backend_init
+_T2_BACKEND="$(backend_name)"
+if [ "$_T2_BACKEND" = "none" ]; then
+    log "Tier 2 backup target not configured — large files are local-only"
+    _T2_STATUS="not_configured"
+elif ! backend_available; then
+    if [ "$_T2_BACKEND" = "smb" ]; then
         log "WARNING: smbclient not installed — Tier 2 backup skipped"
         _T2_STATUS="no_smbclient"
     else
-        # Write credentials to a temp file instead of passing on command line
-        # (avoids exposure in /proc/*/cmdline and ps output)
-        _SMB_CREDS=$(mktemp)
-        chmod 600 "$_SMB_CREDS"
-        printf 'username=%s\npassword=%s\n' "$_NAS_USER" "$_NAS_PASS" > "$_SMB_CREDS"
-
-        _smb() { smbclient "$_NAS_TARGET" -A "$_SMB_CREDS" "$@"; }
-
-        # Create directory structure on NAS
-        _smb -c "mkdir Genesis; mkdir \"${_NAS_DIR}\"; mkdir \"${_NAS_DIR}/qdrant\"; mkdir \"${_NAS_DIR}/data\"" \
-            2>/dev/null || true
-
-        _T2_OK=true
-
-        # Upload Qdrant snapshots
-        for f in data/qdrant/*.gpg; do
-            [ -f "$f" ] || continue
-            fname=$(basename "$f")
-            if _smb -c "cd \"${_NAS_DIR}/qdrant\"; put \"$f\" \"$fname\"" 2>/dev/null; then
-                log "  NAS: uploaded $fname"
-            else
-                log "WARNING: NAS upload failed for $fname"
-                _T2_OK=false
-            fi
-        done
-
-        # Upload SQL dump
-        if [ -f data/genesis.sql.gpg ]; then
-            if _smb -c "cd \"${_NAS_DIR}/data\"; put data/genesis.sql.gpg genesis.sql.gpg" 2>/dev/null; then
-                log "  NAS: uploaded genesis.sql.gpg"
-            else
-                log "WARNING: NAS upload failed for genesis.sql.gpg"
-                _T2_OK=false
-            fi
-        fi
-
-        rm -f "$_SMB_CREDS"
-
-        if [ "$_T2_OK" = true ]; then
-            _T2_STATUS="ok"
-            log "Tier 2 backup copied to NAS ($_NAS_TARGET)"
-        else
-            _T2_STATUS="partial"
-            log "WARNING: Tier 2 backup partially failed"
-        fi
+        log "WARNING: Tier 2 backend '$_T2_BACKEND' is not available — Tier 2 backup skipped"
+        _T2_STATUS="not_configured"
     fi
 else
-    log "Tier 2 backup target not configured — large files are local-only"
-    _T2_STATUS="not_configured"
+    _T2_HOST_DIR="Genesis/$(hostname)"
+    # Per-run DATED snapshot dir — a consistent point-in-time copy that restore.sh
+    # selects the latest COMPLETE of (and GFS retention prunes).
+    _T2_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+    _T2_DIR="${_T2_HOST_DIR}/${_T2_STAMP}"
+
+    # Create the snapshot directory tree (backend_mkdir creates ancestors;
+    # pre-existing levels are idempotent).
+    backend_mkdir "${_T2_DIR}/data"
+    backend_mkdir "${_T2_DIR}/qdrant"
+    backend_mkdir "${_T2_DIR}/transcripts"
+
+    _T2_OK=true
+
+    # Upload Qdrant snapshots
+    for f in data/qdrant/*.gpg; do
+        [ -f "$f" ] || continue
+        fname=$(basename "$f")
+        if backend_put "$f" "${_T2_DIR}/qdrant/$fname"; then
+            log "  off-site: uploaded $fname"
+        else
+            log "WARNING: off-site upload failed for $fname"
+            _T2_OK=false
+        fi
+    done
+
+    # Upload SQL dump
+    if [ -f data/genesis.sql.gpg ]; then
+        if backend_put "data/genesis.sql.gpg" "${_T2_DIR}/data/genesis.sql.gpg"; then
+            log "  off-site: uploaded genesis.sql.gpg"
+        else
+            log "WARNING: off-site upload failed for genesis.sql.gpg"
+            _T2_OK=false
+        fi
+    fi
+
+    # Upload transcripts (part of the off-site snapshot)
+    for f in transcripts/*.gpg; do
+        [ -f "$f" ] || continue
+        fname=$(basename "$f")
+        if backend_put "$f" "${_T2_DIR}/transcripts/$fname"; then
+            log "  off-site: uploaded transcripts/$fname"
+        else
+            log "WARNING: off-site upload failed for transcripts/$fname"
+            _T2_OK=false
+        fi
+    done
+
+    # Upload memory / config overlays / secrets — previously git-Tier-1 only. Including
+    # them here makes the off-site snapshot a COMPLETE copy, so a no-git fresh-box DR can
+    # rehydrate everything (restore.sh §4/§6/§7 read them from the pulled snapshot). Memory
+    # is flat (MEMORY_DIR has no subdirs); config overlays ship as-is (plaintext, mirroring
+    # the existing Tier-1 + private-repo posture); secrets is the encrypted blob. A failed
+    # upload of a present file flips _T2_OK so COMPLETE is gated on these landing too.
+    #
+    # Enumerate with `find` (not a `*.gpg` shell glob): §4/§6 stage these via `find`, which
+    # includes DOTFILES (e.g. a transient .consolidate-lock), so a glob would silently drop
+    # leading-dot names and leave the off-site copy short of Tier-1. Process substitution
+    # (not `find | while`) keeps the loop in THIS shell so the _T2_OK flip survives.
+    backend_mkdir "${_T2_DIR}/memory"
+    while IFS= read -r -d '' f; do
+        fname=$(basename "$f")
+        if backend_put "$f" "${_T2_DIR}/memory/$fname"; then
+            log "  off-site: uploaded memory/$fname"
+        else
+            log "WARNING: off-site upload failed for memory/$fname"
+            _T2_OK=false
+        fi
+    done < <(find memory -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
+
+    backend_mkdir "${_T2_DIR}/config_overrides"
+    while IFS= read -r -d '' f; do
+        fname=$(basename "$f")
+        if backend_put "$f" "${_T2_DIR}/config_overrides/$fname"; then
+            log "  off-site: uploaded config_overrides/$fname"
+        else
+            log "WARNING: off-site upload failed for config_overrides/$fname"
+            _T2_OK=false
+        fi
+    done < <(find config_overrides -maxdepth 1 -type f -name '*.local.yaml' -print0 2>/dev/null)
+
+    # Secrets is best-effort: a MISSING payload (no passphrase → no .gpg) is not an
+    # off-site failure (that path already fails the backup via _SQLITE_LINES=0); only a
+    # failed upload of a PRESENT payload flips _T2_OK.
+    if [ -f secrets/secrets.env.gpg ]; then
+        backend_mkdir "${_T2_DIR}/secrets"
+        if backend_put "secrets/secrets.env.gpg" "${_T2_DIR}/secrets/secrets.env.gpg"; then
+            log "  off-site: uploaded secrets/secrets.env.gpg"
+        else
+            log "WARNING: off-site upload failed for secrets/secrets.env.gpg"
+            _T2_OK=false
+        fi
+    fi
+
+    # Mark the snapshot COMPLETE only when every upload succeeded, so restore never
+    # picks a half-uploaded snapshot (it selects the latest COMPLETE one). If the
+    # marker itself fails to upload, the snapshot is unusable for restore — treat
+    # that as an off-site failure (partial + alert), not ok.
+    if [ "$_T2_OK" = true ]; then
+        _T2_MARKER=$(mktemp)  # empty marker, uploaded only after a full snapshot
+        if ! backend_put "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
+            log "WARNING: off-site upload failed for COMPLETE marker — snapshot unusable for restore"
+            _T2_OK=false
+        fi
+        rm -f "$_T2_MARKER"
+    fi
+
+    if [ "$_T2_OK" = true ]; then
+        _T2_STATUS="ok"
+        log "Tier 2 backup copied to off-site snapshot ${_T2_STAMP} (backend: ${_T2_BACKEND})"
+    else
+        _T2_STATUS="partial"
+        log "WARNING: Tier 2 backup partially failed"
+    fi
 fi
+backend_cleanup
 
 # --- Ensure .gitignore excludes Tier 2 files ---
 # Tier 1 (git): memory/, config_overrides/, secrets/
-# Tier 2 (NAS): data/, transcripts/
+# Tier 2 (off-site): data/, transcripts/
 if ! grep -q '^data/$' .gitignore 2>/dev/null; then
     cat >> .gitignore << 'GITIGNORE'
-# Tier 2 files — backed up to NAS, not GitHub
+# Tier 2 files — backed up off-site, not GitHub
 data/
 transcripts/
 GITIGNORE
@@ -386,18 +502,31 @@ fi
 
 # --- Alert on failure via Telegram ---
 if [ "$_SUCCESS" != "true" ]; then
-    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_FORUM_CHAT_ID:-}" ]; then
-        _TG_MSG="🚨 *Backup failed*
+    _send_telegram "🚨 *Backup failed*
 
 Reason: ${_FAILURE_REASON:-unknown}
 Time: $(date -Is)
 SQLite lines: $_SQLITE_LINES
 Duration: $(( $(date +%s) - _STARTED_AT ))s"
-        curl -sf -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -H "Content-Type: application/json" \
-            -d "{\"chat_id\":\"${TELEGRAM_FORUM_CHAT_ID}\",\"text\":$(printf '%s' "$_TG_MSG" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"parse_mode\":\"Markdown\"}" \
-            > /dev/null 2>&1 || log "WARNING: Telegram alert failed to send"
+fi
+
+# --- Alert on off-site replication failure (local backup still OK) ---
+# Distinct from a backup failure: the local + Tier-1 backup succeeded, but the
+# off-site copy did not fully land. Local-only installs (no off-site backend) are
+# a valid choice and do NOT alert.
+if [ "${_T2_BACKEND:-none}" != "none" ] && [ "$_T2_STATUS" != "ok" ]; then
+    # Dedup: alert only on the transition INTO off-site failure. The status file
+    # still holds the PREVIOUS run's state at this point (the EXIT trap rewrites
+    # it after). This avoids a 6-hourly alert while the off-site target stays down; it re-alerts
+    # once off-site recovers (offsite_confirmed flips true) and then fails again.
+    _prev_offsite=$(python3 -c "import json; print(json.load(open('$_STATUS_FILE')).get('offsite_confirmed', True))" 2>/dev/null || echo "True")
+    if [ "$_prev_offsite" != "False" ]; then
+        _send_telegram "⚠️ *Off-site replication failed*
+
+The local backup is OK, but it was NOT replicated off-site.
+Tier-2 status: ${_T2_STATUS}
+Time: $(date -Is)
+Off-site copies are missing — check the off-site target."
     fi
 fi
 log "Backup complete (success=$_SUCCESS)"

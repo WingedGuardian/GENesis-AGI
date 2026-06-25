@@ -159,28 +159,39 @@ class TestUpdateAndFormatTrail:
             result = _update_and_format_trail("s2", ["topic", "three"], "topic three stuff")
             assert result == "[Session trail] topic one → topic two → topic three"
 
-    def test_long_trail_truncated(self, tmp_path: Path) -> None:
+    def test_full_arc_shown_under_cap(self, tmp_path: Path) -> None:
+        """A long-but-under-cap session shows its FULL arc (no truncation) — early topics
+        must survive, not just the recent tail. Regression: the old 8-window dropped an
+        early audit phase before a later backup phase, so only the tail was visible."""
         with patch.object(_mod, "_TRAIL_DIR", tmp_path), \
              patch.object(_mod, "_DB_PATH", tmp_path / "fake.db"):
             pivots = [
                 {"idx": i, "label": f"topic {i}", "ts": "", "at_msg": i * 5}
-                for i in range(12)
+                for i in range(30)  # 30 < 50 cap → full arc
             ]
-            trail = {
-                "session_id": "s3",
-                "pivots": pivots,
-                "last_keywords": ["topic", "eleven"],
-                "msg_count": 60,
-            }
-            _save_trail("s3", trail)
-            # Use same keywords to avoid triggering a new pivot
-            result = _update_and_format_trail("s3", ["topic", "eleven"], "topic eleven")
+            _save_trail("s3", {"session_id": "s3", "pivots": pivots,
+                               "last_keywords": ["topic", "twentynine"], "msg_count": 150})
+            result = _update_and_format_trail("s3", ["topic", "twentynine"], "topic twentynine")
+            assert result is not None
+            assert not result.startswith("[Session trail] … → "), "under cap → no truncation"
+            assert "topic 0 " in result and "topic 29" in result, "full arc must show first+last"
+
+    def test_long_trail_truncated_at_cap(self, tmp_path: Path) -> None:
+        """Beyond the cap, show the most recent _MAX_TRAIL_DISPLAY pivots + a '… →' prefix."""
+        with patch.object(_mod, "_TRAIL_DIR", tmp_path), \
+             patch.object(_mod, "_DB_PATH", tmp_path / "fake.db"):
+            n = _mod._MAX_TRAIL_DISPLAY + 5
+            pivots = [
+                {"idx": i, "label": f"topic {i}", "ts": "", "at_msg": i * 5}
+                for i in range(n)
+            ]
+            _save_trail("s4", {"session_id": "s4", "pivots": pivots,
+                               "last_keywords": ["topic", "last"], "msg_count": n * 5})
+            result = _update_and_format_trail("s4", ["topic", "last"], "topic last")
             assert result is not None
             assert result.startswith("[Session trail] … → ")
-            # Should show last 8 (indices 4-11)
-            assert "topic 11" in result
-            assert "topic 4" in result
-            assert "topic 3" not in result
+            assert f"topic {n - 1}" in result                 # most recent shown
+            assert "topic 0 " not in result                   # earliest dropped beyond cap
 
 
 class TestObservationStorage:
@@ -212,3 +223,47 @@ class TestObservationStorage:
         assert row[2] == "conversation_pivot"  # type
         assert "memory search" in row[3]  # content
         assert row[6] is not None  # expires_at should be set
+
+
+class TestHarnessEnvelopeFiltering:
+    """#16: harness-injected prompts must not be recorded as pivots."""
+
+    def test_detects_task_notification(self) -> None:
+        assert _mod._is_harness_envelope(
+            "<task-notification><task-id>abc</task-id></task-notification>"
+        )
+
+    def test_detects_system_reminder(self) -> None:
+        assert _mod._is_harness_envelope("<system-reminder>do the thing</system-reminder>")
+
+    def test_detects_local_command(self) -> None:
+        assert _mod._is_harness_envelope("<local-command-stdout>output</local-command-stdout>")
+        assert _mod._is_harness_envelope("<local-command-caveat>note</local-command-caveat>")
+
+    def test_detects_slash_command(self) -> None:
+        assert _mod._is_harness_envelope("<command-name>/compact</command-name>")
+        assert _mod._is_harness_envelope("<command-flag>--all</command-flag>")
+
+    def test_detects_with_leading_whitespace(self) -> None:
+        assert _mod._is_harness_envelope("\n  <task-notification>x</task-notification>")
+
+    def test_false_for_genuine_user_prompt(self) -> None:
+        assert not _mod._is_harness_envelope("fix the executor pipeline bug")
+        # A user prompt that merely mentions a tag mid-text is NOT an envelope
+        assert not _mod._is_harness_envelope("can you look into the <foo> tag handling?")
+
+    def test_update_trail_skips_harness_prompt(self, tmp_path: Path) -> None:
+        """A harness turn records no pivot, no observation, and no trail state."""
+        with patch.object(_mod, "_TRAIL_DIR", tmp_path), \
+             patch.object(_mod, "_DB_PATH", tmp_path / "fake.db"):
+            result = _update_and_format_trail(
+                "s_harness", ["task", "notification"],
+                "<task-notification><task-id>abc</task-id></task-notification>",
+            )
+            assert result is None
+            # No pivot recorded and msg_count not incremented for a harness turn
+            trail = _load_trail("s_harness")
+            assert trail.get("pivots", []) == []
+            assert trail.get("msg_count", 0) == 0
+            # No observation DB written
+            assert not (tmp_path / "fake.db").exists()

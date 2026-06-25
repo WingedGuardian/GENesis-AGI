@@ -16,9 +16,16 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.cc.session_config import SessionConfigBuilder
-from genesis.inbox.scanner import compute_hash, detect_changes, read_content, scan_folder
+from genesis.inbox.scanner import (
+    compute_hash,
+    detect_changes,
+    normalize_url_line,
+    read_content,
+    scan_folder,
+)
 from genesis.inbox.types import CheckResult, InboxConfig, InboxItem
 from genesis.security import ContentSanitizer, ContentSource
+from genesis.util.tz import parse_utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -586,31 +593,34 @@ class InboxMonitor:
             # timeout_at=None blocks the inbox monitor indefinitely when
             # the user never responds and no new files arrive.
             created_str = pending.get("created_at", "")
-            if created_str:
-                try:
-                    created_dt = datetime.fromisoformat(created_str)
-                    age = self._clock() - created_dt
-                    if age > _MAX_APPROVAL_STALENESS:
-                        pending_id = pending.get("id")
-                        logger.info(
-                            "Cancelling stale inbox approval %s "
-                            "(%.1fh old, threshold %.1fh)",
+            created_dt = parse_utc_iso(created_str)
+            if created_str and created_dt is None:
+                logger.warning(
+                    "Staleness guard: unparseable approval created_at %r; "
+                    "skipping age-check this cycle (guard left intact)",
+                    created_str,
+                )
+            if created_dt is not None:
+                age = self._clock() - created_dt
+                if age > _MAX_APPROVAL_STALENESS:
+                    pending_id = pending.get("id")
+                    logger.info(
+                        "Cancelling stale inbox approval %s "
+                        "(%.1fh old, threshold %.1fh)",
+                        pending_id,
+                        age.total_seconds() / 3600,
+                        _MAX_APPROVAL_STALENESS.total_seconds() / 3600,
+                    )
+                    try:
+                        gate = self._autonomous_dispatcher.approval_gate
+                        await gate.approval_manager.cancel(pending_id)
+                    except Exception:
+                        logger.warning(
+                            "Failed to cancel stale approval %s",
                             pending_id,
-                            age.total_seconds() / 3600,
-                            _MAX_APPROVAL_STALENESS.total_seconds() / 3600,
+                            exc_info=True,
                         )
-                        try:
-                            gate = self._autonomous_dispatcher.approval_gate
-                            await gate.approval_manager.cancel(pending_id)
-                        except Exception:
-                            logger.warning(
-                                "Failed to cancel stale approval %s",
-                                pending_id,
-                                exc_info=True,
-                            )
-                        pending = None  # Cleared — proceed normally
-                except (ValueError, TypeError):
-                    pass
+                    pending = None  # Cleared — proceed normally
 
         if pending is not None:
             # Approval pending — scan anyway to detect new content.
@@ -799,24 +809,24 @@ class InboxMonitor:
                 self._db, str(f),
             )
             if last_at:
-                try:
-                    last_dt = datetime.fromisoformat(last_at)
-                    if now - last_dt < cooldown:
-                        logger.debug(
-                            "Cooldown: skipping %s (last eval %s ago)",
-                            f, now - last_dt,
-                        )
-                        await inbox_items.create(
-                            self._db,
-                            id=item_id,
-                            file_path=str(f),
-                            content_hash=h,
-                            status="completed",
-                            created_at=now_iso,
-                        )
-                        continue
-                except (ValueError, TypeError):
-                    pass  # Unparseable timestamp — proceed with evaluation
+                last_dt = parse_utc_iso(last_at)
+                if last_dt is None:
+                    logger.warning(
+                        "Cooldown check: unparseable last-eval timestamp "
+                        "%r for %s; proceeding with evaluation", last_at, f,
+                    )
+                elif now - last_dt < cooldown:
+                    # Defer WITHOUT consuming. Do NOT write a 'completed' row
+                    # here: that would advance the known content hash and the
+                    # modification would never be re-detected, stranding the
+                    # new content until the next edit. Skipping leaves the file
+                    # detectable, so the next check past the cooldown window
+                    # re-detects and evaluates it.
+                    logger.debug(
+                        "Cooldown: deferring %s (last eval %s ago)",
+                        f, now - last_dt,
+                    )
+                    continue
             existing = await inbox_items.get_by_file_path(self._db, str(f))
             if existing and existing["status"] == "pending":
                 await inbox_items.update_status(
@@ -1488,6 +1498,8 @@ class InboxMonitor:
                 strategy=strategy,
                 priority=priority,
                 pinned=pinned,
+                # The evaluator already judges each item genesis-vs-user; reuse it.
+                domain="internal" if rec.classification == "genesis" else "user_world",
             )
             created += 1
 
@@ -1500,14 +1512,23 @@ def _compute_new_content(old_content: str, new_content: str) -> str:
     Uses a set of non-empty stripped lines from the old content to identify
     which lines in the new content are genuinely new. Preserves order and
     blank lines between new items.
+
+    Lines are compared after URL tracking-param normalization, so the same
+    article re-pasted with different share/tracking params is not treated as
+    new. The original (un-normalized) line is kept in the output for evaluation.
     """
-    old_lines = {line.strip() for line in old_content.splitlines() if line.strip()}
+    old_lines = {
+        normalize_url_line(line.strip())
+        for line in old_content.splitlines()
+        if line.strip()
+    }
     new_lines = new_content.splitlines()
     result: list[str] = []
     for line in new_lines:
-        if line.strip() and line.strip() not in old_lines:
+        stripped = line.strip()
+        if stripped and normalize_url_line(stripped) not in old_lines:
             result.append(line)
-        elif not line.strip() and result:
+        elif not stripped and result:
             # Keep blank lines between new items for readability
             result.append(line)
     # Strip trailing blank lines

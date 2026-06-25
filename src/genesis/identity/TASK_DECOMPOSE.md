@@ -62,8 +62,10 @@ is deterministic; "fix the failing test" is a code step.
 ## Rules
 
 1. **Max 8 steps.** If the task needs more, consolidate related work.
-2. **Must end with verification.** The last step verifies the deliverable against
-   the plan's success criteria.
+2. **Must end with verification** — UNLESS the plan has a `## Deliverable Frame`
+   section (see "Deliverable tasks" below), in which case it ends with the
+   deliverable-builder synthesis step instead. Otherwise the last step verifies
+   the deliverable against the plan's success criteria.
 3. **Acyclic dependencies.** Steps can depend on prior steps only (no cycles).
    Use the `dependencies` array with step indices: `[0, 1]` means this step
    needs steps 0 and 1 to complete first.
@@ -73,6 +75,29 @@ is deterministic; "fix the failing test" is a code step.
 6. **required_tools hint.** List tools the step will likely need (Read, Write,
    Edit, Bash, WebSearch, WebFetch, Grep, Glob). This helps the executor
    configure the session correctly.
+
+## Deliverable tasks (plan has a "## Deliverable Frame")
+
+If the plan contains a `## Deliverable Frame` section, the task produces a
+**send-ready artifact** (report, deck, take-home, one-pager, proposal, document)
+that goes out under the user's name. For these, the FINAL step must be a
+`synthesis` step assigned the **deliverable-builder** skill — not a generic
+verification step:
+
+```json
+{
+  "idx": N,
+  "type": "synthesis",
+  "description": "Produce the final deliverable per the '## Deliverable Frame' (format, visual_style, authenticity_target, audience). Read the full deliverable-builder skill first; run structure -> voice -> anti-slop -> render and its own Gate-2.",
+  "dependencies": [N-1],
+  "skills": ["deliverable-builder"]
+}
+```
+
+This step is terminal: it runs the deliverable-builder pipeline and the skill's
+own verification, and its rendered file IS the deliverable. The executor appends
+this step automatically if you omit it, but place it yourself so it has the right
+dependencies (it should depend on the substance/analysis steps that precede it).
 
 ## If the Plan is Unclear
 

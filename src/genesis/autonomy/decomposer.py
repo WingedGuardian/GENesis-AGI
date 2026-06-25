@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -34,6 +35,49 @@ _MAX_STEPS = 8
 _DECOMPOSE_PROMPT_PATH = (
     Path(__file__).resolve().parent.parent / "identity" / "TASK_DECOMPOSE.md"
 )
+
+# --- Deliverable-builder v2: deterministic terminal-step append --------------
+# When a task plan declares a "## Deliverable Frame" section, the executor must
+# render the result through the deliverable-builder skill. The LLM decomposer is
+# hinted to add that step (TASK_DECOMPOSE.md), but we GUARANTEE it in code so a
+# framed task can never silently ship raw output if the model omits it.
+_DELIVERABLE_SKILL = "deliverable-builder"
+# Matches a markdown heading "Deliverable Frame" at any level (not prose mentions).
+_FRAME_RE = re.compile(r"(?im)^#{1,6}\s*deliverable\s+frame\b")
+# Exact text _validate_steps uses for its auto-appended generic verification step.
+_AUTO_VERIFY_DESC = "Verify deliverable against success criteria"
+_DELIVERABLE_STEP_DESC = (
+    "Produce the final send-ready deliverable using the deliverable-builder skill. "
+    "The skill copy injected into your resources is TRUNCATED, and the `Skill` tool will "
+    "NOT find it (this step runs outside the project). You MUST first Read the COMPLETE "
+    "skill — SKILL.md and its references/ — from the absolute skill directory shown in your "
+    "injected resources (the '### Skill: deliverable-builder (full skill dir: ...)' line). "
+    "Read the '## Deliverable Frame' section of the task plan for the format, visual_style, "
+    "authenticity_target, audience, and acceptance criteria. Run the full pipeline "
+    "(structure -> voice -> anti-slop -> render to the framed format). The `Task` subagent "
+    "tool is NOT available here, so run Gate-2 IN-SESSION: re-open your rendered file (Bash "
+    "pdftotext/pdfinfo, or `python -m fitz`) and verify it against the acceptance criteria "
+    "yourself. Emit two artifacts: the rendered deliverable file and a qa_summary.md "
+    "capturing the Gate-2 verdict + any assumptions. Return a compact result: the rendered "
+    "file path plus a one-line PASS/FAIL. Apply anti-slop in-session before rendering (do not "
+    "rely on loading other skills): the artifact MUST have zero spaced em-dashes (' — ') — the "
+    "#1 AI tell.\n\n"
+    "The FULL task plan is appended below as your source of truth (step prompts do not "
+    "otherwise include it): read its '## Deliverable Frame' for format / visual_style / "
+    "authenticity_target / audience / acceptance, and its '## Requirements' + "
+    "'## Success Criteria' for the substance to produce."
+)
+
+
+def has_deliverable_frame(plan_content: str) -> bool:
+    """True if the plan declares a ``## Deliverable Frame`` heading.
+
+    This is the single v2 trigger — used by the decomposer to attach the
+    deliverable-builder step AND by the executor to route delivery. It keys on
+    ``plan_content`` (always available) so it survives task resume, where the
+    reconstructed step dicts lack the ``skills`` key.
+    """
+    return bool(_FRAME_RE.search(plan_content or ""))
 
 
 class _Router(Protocol):
@@ -61,6 +105,23 @@ class TaskDecomposer:
         self._retriever = retriever
 
     async def decompose(
+        self,
+        plan_content: str,
+        task_description: str,
+    ) -> list[dict]:
+        """Decompose the plan into steps, guaranteeing a terminal
+        deliverable-builder step when the plan declares a Deliverable Frame.
+
+        The LLM decomposition (``_decompose_raw``) is the primary path; the
+        deterministic append (``_ensure_deliverable_step``) is a backstop that
+        runs on EVERY decomposition outcome — validated, single-step fallback,
+        or otherwise — so a framed task can never ship raw output because the
+        model forgot the render step. No-op for non-deliverable tasks.
+        """
+        steps = await self._decompose_raw(plan_content, task_description)
+        return self._ensure_deliverable_step(steps, plan_content)
+
+    async def _decompose_raw(
         self,
         plan_content: str,
         task_description: str,
@@ -303,7 +364,8 @@ class TaskDecomposer:
             validated.append({
                 "idx": len(validated),
                 "type": "verification",
-                "description": "Verify deliverable against success criteria",
+                # Same constant _ensure_deliverable_step strips by — keep coupled.
+                "description": _AUTO_VERIFY_DESC,
                 "required_tools": [],
                 "complexity": "medium",
                 "dependencies": [len(validated) - 1],
@@ -313,6 +375,76 @@ class TaskDecomposer:
             })
 
         return validated
+
+    def _ensure_deliverable_step(
+        self, steps: list[dict], plan_content: str
+    ) -> list[dict]:
+        """Guarantee a terminal deliverable-builder step for framed tasks.
+
+        No-op unless the plan declares a ``## Deliverable Frame`` heading. When
+        it does, ensure the LAST step is a deliverable-builder synthesis step —
+        its artifact IS the deliverable and it runs the skill's own Gate-2, so
+        nothing may run after it. Idempotent: if the LLM already placed the step
+        last, leave it; otherwise strip the generic auto-verification tail (which
+        ``_validate_steps`` adds) and append the canonical step.
+        """
+        if not has_deliverable_frame(plan_content):
+            return steps
+
+        result = list(steps)
+
+        # Strip a trailing generic auto-verification so it can't sit AFTER the
+        # deliverable step (which must be terminal).
+        if (
+            result
+            and result[-1].get("type") == "verification"
+            and result[-1].get("description") == _AUTO_VERIFY_DESC
+        ):
+            result = result[:-1]
+
+        # Idempotent: if a deliverable-builder step already exists ANYWHERE,
+        # don't append a second (which would run the skill twice). If the LLM
+        # mis-placed it (not terminal), leave it — its artifact is still
+        # captured at synthesis — but warn, since terminal is the invariant.
+        if any(_DELIVERABLE_SKILL in (s.get("skills") or []) for s in result):
+            if _DELIVERABLE_SKILL not in (result[-1].get("skills") or []):
+                logger.warning(
+                    "Plan has a deliverable-builder step that is not terminal; "
+                    "leaving as-is (artifact still captured at synthesis)",
+                )
+            return result
+
+        new_idx = len(result)
+        if new_idx >= _MAX_STEPS:
+            # The deliverable step is essential; allow one over the soft cap
+            # rather than dropping real work. Warn so it's visible in ops.
+            logger.warning(
+                "Appending deliverable-builder step beyond _MAX_STEPS=%d "
+                "(deliverable frame present)",
+                _MAX_STEPS,
+            )
+
+        # Embed the full plan in the step description: build_step_prompt does
+        # NOT pass the plan to steps, so this is the only way the frame +
+        # requirements reach the deliverable session.
+        description = _DELIVERABLE_STEP_DESC
+        if plan_content:
+            description = (
+                f"{_DELIVERABLE_STEP_DESC}\n\n"
+                f"## Full task plan (your source of truth)\n\n{plan_content}"
+            )
+        result.append({
+            "idx": new_idx,
+            "type": "synthesis",
+            "description": description,
+            "required_tools": [],
+            "complexity": "high",
+            "dependencies": [new_idx - 1] if new_idx > 0 else [],
+            "skills": [_DELIVERABLE_SKILL],
+            "procedures": [],
+            "mcp_guidance": [],
+        })
+        return result
 
     def _single_step_fallback(self, task_description: str) -> list[dict]:
         """Return a single verification step as fallback."""
@@ -326,4 +458,7 @@ class TaskDecomposer:
             "required_tools": [],
             "complexity": "high",
             "dependencies": [],
+            "skills": [],
+            "procedures": [],
+            "mcp_guidance": [],
         }]

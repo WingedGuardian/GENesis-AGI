@@ -74,6 +74,15 @@ order:
    auto-batches** (removed from the April 10 UX redesign) — if you
    reply "approve" to one message, only that message resolves.
 
+> **Inline buttons depend on `callback_query` delivery.** Telegram only sends
+> `callback_query` updates (button presses) when `callback_query` is in the bot's
+> `allowed_updates`. That setting is sticky and bot-global: the main poller re-asserts
+> a non-narrowing value (Telegram's default set, sent as `[]`) on every `start_polling`,
+> and any secondary poller sharing the token (e.g. the Guardian recovery gate in
+> `guardian/alert/telegram.py`) must never narrow it. Narrowing it to `["message"]`
+> silently disables every inline button until reset (the #666 regression that broke
+> button approvals for ~5 days).
+
 ## Call-site gating
 
 The gate implements *gating*, not deduplication: when an approval is

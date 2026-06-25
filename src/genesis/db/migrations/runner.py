@@ -291,17 +291,49 @@ class MigrationRunner:
 
             except Exception as exc:
                 duration_ms = int((time.monotonic() - t0) * 1000)
-                # Rollback the failed migration's changes via explicit SQL.
-                # Log rollback failures at ERROR — DB state is unknown if
-                # rollback fails.
+                # Roll back FIRST. A WAL COMMIT can return SQLITE_BUSY from a
+                # post-commit autocheckpoint AFTER the commit frame is durably
+                # written, so this error does NOT prove the migration failed.
+                # ROLLBACK is a harmless no-op ("no transaction is active") when
+                # the commit already landed, and undoes a genuinely open
+                # transaction otherwise — either way schema_migrations then holds
+                # the TRUE durable state.
                 try:
                     await self._db.execute("ROLLBACK")
                 except Exception as rb_exc:
-                    logger.error(
-                        "Rollback FAILED after migration %s error — "
-                        "database state is unknown: %s",
-                        name, rb_exc, exc_info=True,
+                    logger.debug(
+                        "ROLLBACK after migration %s error (expected when the "
+                        "commit already landed): %s", name, rb_exc,
                     )
+
+                # Reconcile against the source of truth: is the migration durably
+                # recorded? If so, the COMMIT-time error was post-commit noise —
+                # treat it as applied instead of reporting a false failure (which
+                # previously rolled back the code and left new-schema + old-code).
+                applied = False
+                try:
+                    cur = await self._db.execute(
+                        "SELECT 1 FROM schema_migrations WHERE id = ?", (mid,)
+                    )
+                    applied = await cur.fetchone() is not None
+                except Exception:
+                    logger.error(
+                        "Reconciliation read failed after migration %s error — "
+                        "treating as failed", name, exc_info=True,
+                    )
+                    applied = False
+
+                if applied:
+                    logger.warning(
+                        "Migration %s raised %r but is durably recorded in "
+                        "schema_migrations — treating as applied (likely a "
+                        "post-commit WAL autocheckpoint SQLITE_BUSY).",
+                        name, exc,
+                    )
+                    results.append(MigrationResult(
+                        id=mid, name=name, success=True, duration_ms=duration_ms,
+                    ))
+                    continue  # proceed to the next migration
 
                 results.append(MigrationResult(
                     id=mid, name=name, success=False,

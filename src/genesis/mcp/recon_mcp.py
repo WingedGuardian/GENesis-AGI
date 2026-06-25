@@ -24,9 +24,6 @@ mcp = FastMCP("genesis-recon")
 _REPO_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
 _USER_CONFIG_DIR = Path.home() / ".genesis" / "config"
 
-# Watchlist is read-only (curated by developer), always from repo
-_WATCHLIST_PATH = _REPO_CONFIG_DIR / "recon_watchlist.yaml"
-
 # Schedules and sources are user-modifiable — prefer user override
 _REPO_SCHEDULES = _REPO_CONFIG_DIR / "recon_schedules.yaml"
 _REPO_SOURCES = _REPO_CONFIG_DIR / "recon_sources.yaml"
@@ -64,12 +61,15 @@ def init_recon_mcp(
 
 
 def _load_watchlist() -> list[dict]:
-    """Load the hardcoded project watchlist from config/recon_watchlist.yaml."""
-    if not _WATCHLIST_PATH.exists():
-        return []
-    with open(_WATCHLIST_PATH) as f:
-        data = yaml.safe_load(f)
-    return data.get("projects", []) if data else []
+    """Active watchlist (base minus user-disabled + install overlay).
+
+    Delegates to the shared ``recon.watchlist`` store so the recon_config MCP
+    view reflects overlay edits made via the dashboard (previously this read
+    base-only, so those edits were invisible here). Read-only by design —
+    recon targets must not be self-modifiable from an autonomous loop.
+    """
+    from genesis.recon import watchlist
+    return watchlist.active_entries()
 
 
 def _load_schedules() -> dict[str, dict]:
@@ -349,4 +349,81 @@ async def recon_run_model_intelligence() -> dict:
     job = ModelIntelligenceJob(
         db=_db, profile_registry=profile_registry, surplus_queue=_surplus_queue,
     )
+    return await job.run()
+
+
+@mcp.tool()
+async def recon_run_skill_scan() -> dict:
+    """Run the skill-security scan on-demand (NVIDIA SkillSpector → recon findings).
+
+    Normally runs weekly (Monday 2am). Scans installed skills and files findings
+    for UNTRUSTED skills only — trusted-source skills (first-party + the
+    --seed-trusted allowlist) are scanned but kept out of recon to avoid noise.
+    Requires SkillSpector installed (see scripts/bootstrap.sh); returns a
+    {"skipped": ...} summary if the binary is missing.
+    """
+    if _db is None:
+        return {"error": "Database not initialized"}
+
+    from genesis.recon.skill_security_scan_job import SkillSecurityScanJob
+
+    job = SkillSecurityScanJob(db=_db)
+    return await job.run()
+
+
+@mcp.tool()
+async def recon_run_github_discovery(query: str, limit: int = 10) -> dict:
+    """Discover GitHub repos for a topic, ranked by momentum/activity/maturity.
+
+    On-demand foreground tool — searches GitHub (newest+most-starred pool),
+    scores each repo on three axes, and returns the top `limit` ranked
+    candidates. Files NOTHING (read-only). The composite `score` plus its
+    momentum/activity/maturity breakdown are returned so a fast-growing
+    lower-star repo can visibly outrank a stale high-star one.
+
+    momentum = stars-per-day-since-creation (log-damped); activity = push
+    recency; maturity = repo age. Forks and archived repos are excluded.
+    """
+    from genesis.recon.github_discovery import search_repos
+
+    candidates = await search_repos(query, limit=limit)
+    repos = [
+        {
+            "full_name": c.full_name,
+            "url": c.url,
+            "stars": c.stars,
+            "language": c.language,
+            "description": (c.description or "")[:200],
+            "created_at": c.created_at,
+            "pushed_at": c.pushed_at,
+            "score": round(c.score, 4),
+            "momentum": round(c.momentum, 4),
+            "activity": round(c.activity, 4),
+            "maturity": round(c.maturity, 4),
+        }
+        for c in candidates
+    ]
+    result = {"query": query, "count": len(repos), "repos": repos}
+    if not repos:
+        result["note"] = "no results — if unexpected, check gh auth / rate-limit (30/min) in logs"
+    return result
+
+
+@mcp.tool()
+async def recon_run_github_discovery_job() -> dict:
+    """Run the curated GitHub Discovery JOB on-demand (files new repos → triage).
+
+    Normally runs weekly (Wednesday 6am). Searches the configured topics
+    (config/github_discovery_topics.yaml), scores candidates, and files the top
+    few NEW high-signal repos as recon findings to the TRIAGE queue (surfaced via
+    recon_findings job_type="github_discovery") — never the knowledge base.
+    Curated by design: narrow topics, a hard per-run cap, a score threshold, and
+    dedup vs the watchlist + already-filed findings. Returns a count summary.
+    """
+    if _db is None:
+        return {"error": "Database not initialized"}
+
+    from genesis.recon.github_discovery import GitHubDiscoveryJob
+
+    job = GitHubDiscoveryJob(db=_db, router=_router)
     return await job.run()

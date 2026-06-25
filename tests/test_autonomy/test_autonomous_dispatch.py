@@ -364,7 +364,13 @@ async def test_dispatch_router_records_dead_letter_when_api_only(approval_gate):
     assert kwargs.get("suppress_dead_letter") is False
 
 
-def test_load_autonomous_cli_policy_from_yaml(tmp_path: Path):
+def test_load_autonomous_cli_policy_from_yaml(tmp_path: Path, monkeypatch):
+    # Isolate the user-config overlay dir. merge_local_overlay() resolves
+    # ``~/.genesis/config/<stem>.local.yaml`` user-dir-first, so on any live
+    # install a real autonomous_cli_policy.local.yaml deep-merges over this
+    # test's tmp file and inverts the asserted values. Point the overlay dir at
+    # tmp_path (no overlay there) so the loader sees only what we wrote.
+    monkeypatch.setattr("genesis._config_overlay._user_config_dir", lambda: tmp_path)
     path = tmp_path / "autonomous_cli_policy.yaml"
     path.write_text(
         "autonomous_cli_fallback_enabled: false\n"

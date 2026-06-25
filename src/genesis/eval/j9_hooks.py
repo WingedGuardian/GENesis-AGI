@@ -51,10 +51,18 @@ async def emit_recall_fired(
     graph_boost_applied: bool = False,
     mean_score: float | None = None,
     wing: str | None = None,
+    entrenchment_corr: float | None = None,
+    mean_retrieved_count: float | None = None,
+    mean_age_days: float | None = None,
 ) -> str | None:
     """Log a memory recall() invocation as an eval event.
 
     Returns the event id so callers can link diagnostics events.
+
+    ``entrenchment_corr`` / ``mean_retrieved_count`` / ``mean_age_days`` carry
+    the MEM-005 activation-entrenchment signal (monitor-only): the rank
+    correlation between a result's retrieval frequency and its final score,
+    plus the mean retrieval count and age of the returned set.
     """
     try:
         metrics: dict = {
@@ -76,6 +84,12 @@ async def emit_recall_fired(
             metrics["mean_score"] = round(mean_score, 4)
         if wing:
             metrics["wing"] = wing
+        if entrenchment_corr is not None:
+            metrics["entrenchment_corr"] = round(entrenchment_corr, 4)
+        if mean_retrieved_count is not None:
+            metrics["mean_retrieved_count"] = mean_retrieved_count
+        if mean_age_days is not None:
+            metrics["mean_age_days"] = mean_age_days
         return await j9_eval.insert_event(
             db,
             dimension="memory",
@@ -86,6 +100,23 @@ async def emit_recall_fired(
     except Exception:
         logger.debug("eval: failed to emit recall_fired", exc_info=True)
         return None
+
+
+async def update_recall_metrics(
+    db: aiosqlite.Connection, event_id: str, **fields: object,
+) -> None:
+    """Merge additional metrics into an already-emitted ``recall_fired`` event.
+
+    MEM-003: the MCP recall layer (memory_recall / knowledge_recall) enriches
+    the single event the retriever already emitted — adding mode, pipeline_used,
+    and post-filter counts — instead of emitting a second recall_fired event
+    that would double-count in the J-9 aggregator and batch judge. Fire-and-
+    forget: errors are logged, never propagated.
+    """
+    try:
+        await j9_eval.update_event_metrics(db, event_id, **fields)
+    except Exception:
+        logger.debug("eval: failed to update recall metrics", exc_info=True)
 
 
 async def emit_proposal_resolved(
@@ -230,6 +261,44 @@ async def emit_recall_diagnostics(
         )
     except Exception:
         logger.debug("eval: failed to emit recall_diagnostics", exc_info=True)
+
+
+async def emit_recall_corrected(
+    db: aiosqlite.Connection,
+    *,
+    recall_event_id: str | None,
+    bucket: str,
+    grades: list[float | None],
+    action_taken: str,
+    result_count_before: int,
+    result_count_after: int,
+    latency_ms: float,
+) -> None:
+    """Log a selective-corrective-retrieval (CRAG) decision for calibration.
+
+    Fired by ``genesis.memory.corrective.maybe_correct_recall`` for every graded
+    recall — including the dark ``Ambiguous`` branch that takes no action — so the
+    grader's bucket thresholds can be calibrated against real recalls before the
+    corrective loop is widened beyond the conservative ``Incorrect``-only action.
+    Linked to the originating recall via ``subject_id=recall_event_id``.
+    """
+    try:
+        await j9_eval.insert_event(
+            db,
+            dimension="memory",
+            event_type="recall_corrected",
+            subject_id=recall_event_id,
+            metrics={
+                "bucket": bucket,
+                "grades": [round(g, 3) if g is not None else None for g in grades],
+                "action_taken": action_taken,
+                "count_before": result_count_before,
+                "count_after": result_count_after,
+                "latency_ms": round(latency_ms, 1),
+            },
+        )
+    except Exception:
+        logger.debug("eval: failed to emit recall_corrected", exc_info=True)
 
 
 async def emit_recall_used(

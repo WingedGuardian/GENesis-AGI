@@ -71,6 +71,7 @@ class SkillEvolutionPipeline:
 
             result = await self._applicator.apply(
                 proposal, self._db, router=self._router,
+                current_content=content,
             )
 
             if result["action"] == "applied":
@@ -114,6 +115,7 @@ class SkillEvolutionPipeline:
 
         result = await self._applicator.apply(
             proposal, self._db, router=self._router,
+            current_content=content,
         )
 
         if result["action"] == "staged" and proposal.change_size != ChangeSize.MINOR:

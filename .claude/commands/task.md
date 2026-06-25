@@ -21,6 +21,13 @@ format (`src/genesis/identity/TASK_INTAKE.md`).
    - LLM provider preference (OpenAI/Anthropic/other) with SDK + env var + model
    - Risks and failure modes (specific, not vague)
    - Deliverable format and where output goes
+   - **If the outcome is a send-ready deliverable** (report, deck, take-home,
+     one-pager, proposal, document under the user's name): capture a Deliverable
+     Frame — format, visual_style, authenticity_target, audience, what_leads,
+     acceptance. Use the Gate-1 questions in
+     `.claude/skills/deliverable-builder/references/intake.md`. This frame is
+     un-recoverable after intake; the executor renders the result through the
+     deliverable-builder skill and needs it.
    - Any URLs, file paths, API details, or credentials the executor needs
 4. Enter plan mode and write the plan to `~/.genesis/plans/`
 5. Plan structure — `task_submit` **enforces** these four sections (rejects if missing):
@@ -32,6 +39,8 @@ format (`src/genesis/identity/TASK_INTAKE.md`).
    Also include these sections (best practice, caught by the LLM plan reviewer):
    - `## Context`
    - `## Deliverable Format`
+   - `## Deliverable Frame` (send-ready deliverables ONLY — its presence triggers
+     the deliverable-builder pipeline; omit for code/data/internal tasks)
    - `## Quality Checks` (achievable in the executor's environment)
    - `## Constraints`
 6. After user approves the plan:

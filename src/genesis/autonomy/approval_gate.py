@@ -41,6 +41,16 @@ def _context_dump(data: dict[str, Any]) -> str:
     return json.dumps(data, sort_keys=True)
 
 
+def _voice_action_label(req: dict[str, Any]) -> str:
+    """A short, speakable label for a pending approval (voice read-back)."""
+    desc = str(req.get("description") or "").strip()
+    if desc:
+        return desc[:120]
+    ctx = _json_loads(req.get("context"))
+    label = ctx.get("action_label") or req.get("action_type") or "a pending action"
+    return str(label)[:120]
+
+
 def _approval_key(
     *,
     subsystem: str,
@@ -106,6 +116,13 @@ async def _is_timed_out(row: dict[str, Any], approval_manager: Any) -> bool:
 
 class AutonomousCliApprovalGate:
     """Manual-approval gate for autonomous CLI fallback dispatch."""
+
+    # Approval types a voice "approve"/"reject" is allowed to resolve.
+    _VOICE_GATED_TYPES = frozenset({
+        "autonomous_cli_fallback",
+        "sentinel_dispatch",
+        "sentinel_action",
+    })
 
     def __init__(
         self,
@@ -375,54 +392,96 @@ class AutonomousCliApprovalGate:
             return request_id
         return None
 
-    async def resolve_most_recent_pending_voice(
-        self, *, decision: str, resolved_by: str,
-    ) -> str | None:
-        """Resolve the most-recent pending approval of ANY gated type.
+    async def pending_voice_actions(self) -> list[dict[str, str]]:
+        """Voice-gated pending approvals, oldest->newest.
 
-        Unlike :meth:`resolve_most_recent_pending` (which is intentionally
-        narrow to ``autonomous_cli_fallback`` for Telegram bare-text safety),
-        this method resolves sentinel_dispatch, sentinel_action, AND
-        autonomous_cli_fallback.  Appropriate for voice where the user
-        explicitly said "approve it" in response to a spoken notification.
+        Each item is ``{id, action_type, label}`` where *label* is a short
+        spoken-readback string.  Used to disambiguate when more than one
+        approval is pending and to let the caller read back what it resolved.
+        """
+        pending = await self._approval_manager.get_pending()
+        return [
+            {
+                "id": str(req["id"]),
+                "action_type": str(req.get("action_type") or ""),
+                "label": _voice_action_label(req),
+            }
+            for req in pending
+            if req.get("action_type") in self._VOICE_GATED_TYPES
+        ]
+
+    async def resolve_pending_voice(
+        self,
+        *,
+        decision: str,
+        resolved_by: str,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve a voice-gated pending approval, bound to a NAMED action.
+
+        Returns a structured result so the voice layer can read back what it
+        did and ask the user to disambiguate when needed:
+
+        - ``{"status": "resolved", "request_id": id, "label": label}``
+        - ``{"status": "none"}``        -- nothing pending
+        - ``{"status": "not_found"}``   -- *request_id* isn't a pending voice-gated request
+        - ``{"status": "ambiguous", "candidates": [{id, label}, ...]}``
+          -- more than one pending and no *request_id* given
+        - ``{"status": "invalid_decision"}``
+
+        When *request_id* is None this resolves ONLY when exactly one
+        voice-gated approval is pending.  With several pending it refuses to
+        guess -- the previous behaviour silently resolved the most-recent one,
+        which could be the wrong action.
         """
         if decision not in ("approved", "rejected"):
-            logger.warning(
-                "resolve_most_recent_pending_voice: invalid decision %r",
-                decision,
-            )
-            return None
-        _VOICE_GATED = {
-            "autonomous_cli_fallback",
-            "sentinel_dispatch",
-            "sentinel_action",
-        }
-        pending = await self._approval_manager.get_pending()
-        candidates = [
-            req for req in pending
-            if req.get("action_type") in _VOICE_GATED
-        ]
+            logger.warning("resolve_pending_voice: invalid decision %r", decision)
+            return {"status": "invalid_decision"}
+
+        candidates = await self.pending_voice_actions()
         if not candidates:
-            return None
-        most_recent = candidates[-1]
-        request_id = str(most_recent["id"])
-        ok = await self._approval_manager.resolve(
-            request_id, status=decision, resolved_by=resolved_by,
-        )
-        if ok:
-            logger.info(
-                "Resolved most-recent approval %s (%s) as %s via %s",
-                request_id, most_recent.get("action_type"), decision,
-                resolved_by,
+            return {"status": "none"}
+
+        if request_id is not None:
+            target = next(
+                (c for c in candidates if c["id"] == str(request_id)), None,
             )
-            return request_id
-        return None
+            if target is None:
+                return {"status": "not_found"}
+        elif len(candidates) == 1:
+            target = candidates[0]
+        else:
+            return {"status": "ambiguous", "candidates": candidates}
+
+        ok = await self._approval_manager.resolve(
+            target["id"], status=decision, resolved_by=resolved_by,
+        )
+        if not ok:
+            return {"status": "not_found"}
+        logger.info(
+            "Resolved voice approval %s (%s) as %s via %s",
+            target["id"], target["action_type"], decision, resolved_by,
+        )
+        return {
+            "status": "resolved",
+            "request_id": target["id"],
+            "label": target["label"],
+        }
 
     async def approve_all_pending(self, *, resolved_by: str) -> int:
-        """Approve every pending approval request.  Returns count approved."""
+        """Approve every pending approval request.  Returns count approved.
+
+        WS-8 email capability-gate holds are EXCLUDED: each held email is an
+        independent send decision and must be approved individually, never
+        swept by a batch "approve all".
+        """
+        from genesis.autonomy.email_gate import EMAIL_GATE_ACTION_TYPE
+
         pending = await self._approval_manager.get_pending()
         count = 0
         for req in pending:
+            if req.get("action_type") == EMAIL_GATE_ACTION_TYPE:
+                continue
             ok = await self._approval_manager.resolve(
                 req["id"], status="approved", resolved_by=resolved_by,
             )
@@ -582,11 +641,10 @@ class AutonomousCliApprovalGate:
         Used by ``_send_request`` to decide whether to include the
         "✅✅ Approve all N pending" batch button in the inline keyboard.
         """
-        _GATED_TYPES = {"autonomous_cli_fallback", "sentinel_dispatch", "sentinel_action"}
         pending = await self._approval_manager.get_pending()
         return sum(
             1 for req in pending
-            if req.get("action_type") in _GATED_TYPES
+            if req.get("action_type") in self._VOICE_GATED_TYPES
         )
 
     async def _maybe_resend(

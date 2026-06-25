@@ -298,21 +298,21 @@ async def test_store_procedure_explicit_teach_defaults(db):
         steps=["navigate", "fill", "click", "verify"],
         tools_used=["browser_navigate", "browser_fill", "browser_click"],
         context_tags=["discourse", "forum", "registration"],
-        activation_tier="L3",
-        speculative=0,
+        activation_tier="LIBRARY",
+        draft=0,
         success_count=1,
         confidence=2 / 3,
     )
     cursor = await db.execute(
-        "SELECT speculative, success_count, confidence, activation_tier "
+        "SELECT draft, success_count, confidence, activation_tier "
         "FROM procedural_memory WHERE id = ?",
         (pid,),
     )
     row = await cursor.fetchone()
-    assert row[0] == 0  # speculative
+    assert row[0] == 0  # draft
     assert row[1] == 1  # success_count
     assert abs(row[2] - 2 / 3) < 1e-9  # Laplace for 1 success
-    assert row[3] == "L3"  # activation_tier
+    assert row[3] == "LIBRARY"  # activation_tier
 
 
 @pytest.mark.asyncio
@@ -320,7 +320,7 @@ async def test_find_relevant_surfaces_explicit_teach(db):
     """An explicit-teach procedure must be visible to procedure_recall.
 
     Regression test for the bug where procedure_store wrote
-    speculative=1, confidence=0.0 — making the procedure invisible to
+    draft=1, confidence=0.0 — making the procedure invisible to
     find_relevant's confidence>=0.3 filter.
     """
     await store_procedure(
@@ -330,8 +330,8 @@ async def test_find_relevant_surfaces_explicit_teach(db):
         steps=["navigate", "fill", "click"],
         tools_used=["browser_navigate"],
         context_tags=["discourse", "forum", "registration"],
-        activation_tier="L3",
-        speculative=0,
+        activation_tier="LIBRARY",
+        draft=0,
         success_count=1,
         confidence=2 / 3,
     )
@@ -341,11 +341,11 @@ async def test_find_relevant_surfaces_explicit_teach(db):
 
 
 @pytest.mark.asyncio
-async def test_find_relevant_still_hides_speculative_extractor_writes(db):
-    """Auto-extracted procedures (speculative=1, confidence=0.0) stay hidden.
+async def test_find_relevant_still_hides_draft_extractor_writes(db):
+    """Auto-extracted procedures (draft=1, confidence=0.0) stay hidden.
 
     Protects the extractor pipeline from regression — only explicit-teach
-    writes should bypass the speculative quarantine.
+    writes should bypass the draft quarantine.
     """
     await store_procedure(
         db,
@@ -354,7 +354,7 @@ async def test_find_relevant_still_hides_speculative_extractor_writes(db):
         steps=["maybe-do-this"],
         tools_used=["Bash"],
         context_tags=["extracted", "hypothesis"],
-        # extractor defaults: speculative=1, success_count=0, confidence=0.0
+        # extractor defaults: draft=1, success_count=0, confidence=0.0
     )
     matches = await find_relevant(db, ["extracted", "hypothesis"], limit=3)
     assert all(m.task_type != "auto-extracted-task" for m in matches)
@@ -369,7 +369,7 @@ async def test_store_checked_exact_match_upserts(db):
     proc_id = await store_procedure(
         db, task_type="deploy-safety", principle="original",
         steps=["step-a"], tools_used=["Bash"], context_tags=["deploy"],
-        speculative=0, success_count=3, confidence=0.8,
+        draft=0, success_count=3, confidence=0.8,
     )
     result = await store_procedure_checked(
         db, task_type="deploy-safety", principle="updated principle",
@@ -394,12 +394,12 @@ async def test_store_checked_auto_skips_explicit(db):
     proc_id = await store_procedure(
         db, task_type="manual-task", principle="human taught",
         steps=["do-this"], tools_used=["Bash"], context_tags=["manual"],
-        speculative=0, success_count=1, confidence=2 / 3,
+        draft=0, success_count=1, confidence=2 / 3,
     )
     result = await store_procedure_checked(
         db, task_type="manual-task", principle="auto extracted",
         steps=["maybe-this"], tools_used=["Bash"],
-        context_tags=["manual"], speculative=1, confidence=0.0,
+        context_tags=["manual"], draft=1, confidence=0.0,
     )
     assert result.action == "skipped"
     assert proc_id in result.conflicting_ids
@@ -416,7 +416,7 @@ async def test_store_checked_context_overlap_warns(db):
         db, task_type="youtube-fetch", principle="fetch youtube",
         steps=["s1"], tools_used=["WebFetch"],
         context_tags=["youtube", "video", "transcript"],
-        speculative=0, success_count=1, confidence=2 / 3,
+        draft=0, success_count=1, confidence=2 / 3,
     )
     # Jaccard: 3/4 = 0.75 >= 0.7 threshold
     result = await store_procedure_checked(
@@ -507,8 +507,8 @@ async def test_promoter_records_promotion_history(db):
     proc_id = await store_procedure(
         db, task_type="promotable", principle="test",
         steps=["s1"], tools_used=["Bash"], context_tags=["test"],
-        speculative=0, success_count=5, confidence=0.78,
-        activation_tier="L4",
+        draft=0, success_count=5, confidence=0.78,
+        activation_tier="DORMANT",
     )
     # Mock regenerate to avoid clobbering the filesystem trigger cache
     with patch("genesis.learning.procedural.promoter.regenerate", new_callable=AsyncMock):
@@ -519,5 +519,5 @@ async def test_promoter_records_promotion_history(db):
     row = await get_by_id(db, proc_id)
     history = json.loads(row["promotion_history"])
     assert len(history) >= 1
-    assert history[0]["from_tier"] == "L4"
+    assert history[0]["from_tier"] == "DORMANT"
     assert history[0]["reason"] == "metrics_promotion"

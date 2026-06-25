@@ -1,4 +1,4 @@
-"""J-9 weekly eval aggregator — computes snapshots for all 5 dimensions.
+"""J-9 weekly eval aggregator — computes snapshots for all dimensions.
 
 Runs on a weekly CronTrigger. Reads eval_events and existing DB tables
 to compute metrics for each dimension, stores results in eval_snapshots.
@@ -9,6 +9,7 @@ Dimensions:
 3. Ego proposal quality (approval rate, confidence calibration)
 4. Cognitive loop value (recall vs no-recall session comparison)
 5. Procedural learning effectiveness (invocation rate, success rate)
+6. Cognitive drift (Phase 7, dark): dissent-rate + proposal-diversity
 """
 
 from __future__ import annotations
@@ -27,8 +28,66 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+async def _compute_cognitive_drift(
+    db: aiosqlite.Connection, period_start: str, period_end: str,
+) -> tuple[dict, int]:
+    """Dark drift metrics over ego_proposals (Phase 7 anti-overfitting baseline).
+
+    - dissent_rate: realist critic engagement = (amend + reject) / proposals with
+      a verdict. A FALLING rate is an overfitting alarm (the ego stops being
+      challenged / only proposes pre-vetted-safe work).
+    - alternative_rate: fraction of proposals that recorded a non-empty alternative.
+    - diversity_entropy: normalized Shannon entropy over action_type (mirrors the
+      j9 ``type_diversity`` convention). Falling = proposals collapsing/formulaic.
+
+    DARK: no cognitive path reads this; it establishes the baseline the future
+    personality-drift gates need. Self-silencing + exploration-floor are deferred
+    (statistically underpowered until more T1 negatives accrue).
+    """
+    import math
+    from collections import Counter
+
+    cursor = await db.execute(
+        """SELECT action_type, alternatives, realist_verdict
+           FROM ego_proposals
+           WHERE created_at >= ? AND created_at < ?""",
+        (period_start, period_end),
+    )
+    rows = [dict(r) for r in await cursor.fetchall()]
+    total = len(rows)
+    if total == 0:
+        return {
+            "dissent_rate": None, "alternative_rate": None,
+            "diversity_entropy": None, "n_proposals": 0,
+        }, 0
+
+    verdicts = [r["realist_verdict"] for r in rows if r["realist_verdict"]]
+    dissent = sum(1 for v in verdicts if v in ("amend", "reject"))
+    dissent_rate = (dissent / len(verdicts)) if verdicts else None
+
+    alt = sum(1 for r in rows if (r["alternatives"] or "").strip())
+
+    counts = Counter(r["action_type"] for r in rows)
+    k = len(counts)
+    if k <= 1:
+        entropy = 0.0
+    else:
+        h = -sum((c / total) * math.log(c / total) for c in counts.values())
+        entropy = h / math.log(k)  # normalize to [0, 1]
+
+    metrics = {
+        "dissent_rate": round(dissent_rate, 4) if dissent_rate is not None else None,
+        "alternative_rate": round(alt / total, 4),
+        "diversity_entropy": round(entropy, 4),
+        "distinct_action_types": k,
+        "n_proposals": total,
+        "n_with_verdict": len(verdicts),
+    }
+    return metrics, total
+
+
 async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
-    """Compute and store weekly snapshots for all 5 eval dimensions.
+    """Compute and store weekly snapshots for all 5 eval dimensions + drift.
 
     Returns dict of {dimension: metrics} for logging/inspection.
     """
@@ -44,6 +103,7 @@ async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
         ("ego", _compute_ego_quality),
         ("cognitive", _compute_cognitive_loop),
         ("procedure", _compute_procedural_effectiveness),
+        ("cognitive_drift", _compute_cognitive_drift),
     ]:
         try:
             metrics, sample_count = await fn(db, period_start, period_end)
@@ -139,10 +199,48 @@ def _dedupe_by_pair(events: list[dict]) -> list[dict]:
     return out
 
 
+async def _recall_entrenchment(
+    db: aiosqlite.Connection, since: str, until: str,
+) -> dict:
+    """MEM-005: weekly aggregation of the activation-entrenchment signal.
+
+    Reads ``recall_fired`` events (a separate read path from the relevance-based
+    quality metrics) and averages the per-recall ``entrenchment_corr`` (rank
+    correlation between a result's retrieval frequency and its final score),
+    plus mean retrieval count and mean recalled-memory age. Monitor-only (D7):
+    surfaced in the memory snapshot so a sustained rise can be spotted; it never
+    feeds the quality grade.
+    """
+    fired = await j9_eval.get_events(
+        db, dimension="memory", event_type="recall_fired",
+        since=since, until=until, limit=5000,
+    )
+    corrs = [m["entrenchment_corr"] for ev in fired
+             if (m := ev.get("metrics", {})).get("entrenchment_corr") is not None]
+    ret_counts = [ev.get("metrics", {})["mean_retrieved_count"] for ev in fired
+                  if ev.get("metrics", {}).get("mean_retrieved_count") is not None]
+    ages = [ev.get("metrics", {})["mean_age_days"] for ev in fired
+            if ev.get("metrics", {}).get("mean_age_days") is not None]
+    return {
+        "entrenchment_corr_mean": round(sum(corrs) / len(corrs), 4) if corrs else None,
+        "entrenchment_mean_retrieved_count": (
+            round(sum(ret_counts) / len(ret_counts), 2) if ret_counts else None),
+        "entrenchment_mean_age_days": (
+            round(sum(ages) / len(ages), 1) if ages else None),
+        "entrenchment_sample": len(corrs),
+    }
+
+
 async def _compute_memory_quality(
     db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
-    """Precision@5, hit rate, MRR from recall_relevance events."""
+    """Precision@5, hit rate, MRR from recall_relevance events.
+
+    Also folds in the MEM-005 entrenchment aggregation (separate read path over
+    recall_fired) as distinct ``entrenchment_*`` keys — monitor-only, not part
+    of the quality grade.
+    """
+    entrenchment = await _recall_entrenchment(db, since, until)
     relevance_events = await j9_eval.get_events(
         db, dimension="memory", event_type="recall_relevance",
         since=since, until=until, limit=5000,
@@ -153,7 +251,7 @@ async def _compute_memory_quality(
 
     if not relevance_events:
         return {"precision_at_5": None, "hit_rate": None, "mrr": None,
-                "usage_rate": None, "total_recalls": 0}, 0
+                "usage_rate": None, "total_recalls": 0, **entrenchment}, 0
 
     # Group by recall_event_id
     by_recall: dict[str, list[dict]] = defaultdict(list)
@@ -170,7 +268,11 @@ async def _compute_memory_quality(
     total_recalls = len(by_recall)
 
     for _rid, memories in by_recall.items():
-        # Sort by original position (memory_ids order in recall_fired)
+        # Sort by retrieval rank (the memory's memory_ids[:5] position, persisted
+        # in each event's metrics by j9_batch). Events arrive in concurrent-insert /
+        # timestamp-DESC order, so list order is NOT the rank — without this sort
+        # MRR is meaningless. Pre-fix historical events lack a rank → sort last.
+        memories.sort(key=lambda m: m.get("rank", 1 << 30))
         relevant_count = sum(1 for m in memories if m.get("relevance", 0) >= 0.5)
         precisions.append(relevant_count / max(len(memories), 1))
 
@@ -203,6 +305,8 @@ async def _compute_memory_quality(
         # Count only memories that actually fed the metrics (grouped under a
         # recall_event_id) — not orphan events that contribute nothing.
         "total_memories_judged": sum(len(v) for v in by_recall.values()),
+        # MEM-005 entrenchment signal (monitor-only, distinct from the grade).
+        **entrenchment,
     }
     return metrics, total_recalls
 
@@ -258,9 +362,12 @@ async def _compute_system_composite(
     obs_influenced = row["influenced"] if row else 0
     obs_influence_pct = round(obs_influenced / obs_total, 4) if obs_total else None
 
-    # Procedure mean confidence
+    # Procedure mean confidence — VALIDATED procedures only. Draft
+    # candidates (extracted at confidence ≈ 0, never invoked) measure extraction
+    # volume, not knowledge quality; including them tanked this composite signal.
     cursor = await db.execute(
-        "SELECT AVG(confidence) as avg_conf FROM procedural_memory WHERE deprecated = 0",
+        "SELECT AVG(confidence) as avg_conf FROM procedural_memory "
+        "WHERE deprecated = 0 AND draft = 0",
     )
     row = await cursor.fetchone()
     proc_mean_conf = round(row["avg_conf"], 4) if row and row["avg_conf"] else None
@@ -426,9 +533,12 @@ async def _compute_procedural_effectiveness(
     outcome_total = len(outcomes)
     success_rate = round(successes / outcome_total, 4) if outcome_total else None
 
-    # Overall procedure stats
+    # Overall procedure stats. total counts the whole store (consistent with
+    # tier_distribution below); mean_confidence averages VALIDATED procedures
+    # only (draft candidates start at ≈0 and would mask real quality).
     cursor = await db.execute(
-        """SELECT COUNT(*) as total, AVG(confidence) as avg_conf
+        """SELECT COUNT(*) as total,
+                  AVG(CASE WHEN draft = 0 THEN confidence END) as avg_conf
         FROM procedural_memory WHERE deprecated = 0""",
     )
     row = await cursor.fetchone()

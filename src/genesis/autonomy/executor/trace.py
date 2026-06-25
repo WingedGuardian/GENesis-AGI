@@ -458,8 +458,8 @@ class ExecutionTracer:
             steps=proc_data["steps"],
             tools_used=proc_data["tools_used"],
             context_tags=proc_data["context_tags"],
-            activation_tier="L3",
-            speculative=1,
+            activation_tier="LIBRARY",
+            draft=1,
             confidence=0.5,
             principle_embedding=principle_blob,
         )
@@ -643,6 +643,7 @@ class ExecutionTracer:
                 strategy="ego_judgment",
                 reason="Retrospective learning extraction failed — needs investigation",
                 priority="medium",
+                domain="internal",
             )
         except Exception:
             # Last resort — at least the log warning above was emitted

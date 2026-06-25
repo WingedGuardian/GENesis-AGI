@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 from pathlib import Path
 
@@ -156,3 +157,51 @@ def test_extract_topic_empty_messages():
     """Empty message list returns fallback."""
     assert _extract_topic([], fallback="fb") == "fb"
     assert _extract_topic([]) == ""
+
+
+# ── main() zero-message guard (RC-1: no ghost recent-session rows) ───────────
+
+
+def _run_main(monkeypatch, tmp_path, *, session_id, messages=None):
+    """Invoke the hook's main() with module paths redirected into tmp_path."""
+    genesis_dir = tmp_path / ".genesis"
+    (genesis_dir / "sessions" / session_id).mkdir(parents=True, exist_ok=True)
+    flag = genesis_dir / "cc_context_enabled"
+    flag.write_text("1")
+    patches = genesis_dir / "session_patches.json"
+    if messages:
+        (genesis_dir / "sessions" / session_id / "messages.jsonl").write_text(
+            "\n".join(json.dumps(m) for m in messages)
+        )
+    monkeypatch.setattr(_mod, "_GENESIS_DIR", genesis_dir)
+    monkeypatch.setattr(_mod, "_FLAG", flag)
+    monkeypatch.setattr(_mod, "_PATCHES_FILE", patches)
+    monkeypatch.setattr(_mod, "_LAST_SESSION_FILE", genesis_dir / "last.json")
+    monkeypatch.setattr(_mod, "_PENDING_BOOKMARK_FILE", genesis_dir / "pending.json")
+    monkeypatch.setattr(_mod, "_trigger_essential_knowledge_regen", lambda: None)
+    monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"session_id": session_id, "reason": "clear"})),
+    )
+    _mod.main()
+    return patches
+
+
+def test_main_skips_patch_for_zero_message_session(tmp_path, monkeypatch):
+    """A session that ended with no messages must NOT write a ghost patch row."""
+    patches = _run_main(monkeypatch, tmp_path, session_id="ghost1", messages=None)
+    assert not patches.exists()
+
+
+def test_main_writes_patch_for_session_with_messages(tmp_path, monkeypatch):
+    """A session with real messages still writes its patch (no regression)."""
+    patches = _run_main(
+        monkeypatch, tmp_path, session_id="real1",
+        messages=[{"text": "fix the memory leak in the awareness loop"}],
+    )
+    assert patches.exists()
+    data = json.loads(patches.read_text())
+    assert len(data) == 1
+    assert data[0]["session_id"] == "real1"
+    assert data[0]["message_count"] == 1

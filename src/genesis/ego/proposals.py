@@ -152,10 +152,14 @@ class ProposalWorkflow:
         db: aiosqlite.Connection,
         topic_manager: TopicManager | None = None,
         memory_store: MemoryStore | None = None,
+        autonomy_manager: object | None = None,
     ) -> None:
         self._db = db
         self._topic_manager = topic_manager
         self._memory_store = memory_store
+        # AutonomyManager (duck-typed) for the earn-back promote hook in
+        # resolve_proposals. None disables earn-back on the Telegram path.
+        self._autonomy_manager = autonomy_manager
 
     # -- Late-binding setters (wired in standalone.py after Telegram init) --
 
@@ -210,10 +214,18 @@ class ProposalWorkflow:
                 except (ValueError, TypeError):
                     rank_val = None
 
-            # Validate goal_id — drop if not a real active goal.
-            # If validation is degraded (valid_goal_ids is None), pass through.
+            # Validate goal_id — drop if not a real active goal (guards against
+            # hallucinated LLM goal_ids). If validation is degraded
+            # (valid_goal_ids is None), pass through.
+            # EXCEPT goal_status_change: its goal_id is code-generated for a
+            # specific (possibly just-paused, hence non-active) goal, never
+            # hallucinated — dropping it would silently no-op the approval.
             raw_goal_id = p.get("goal_id") or None
-            if raw_goal_id and valid_goal_ids is not None:
+            if (
+                raw_goal_id
+                and valid_goal_ids is not None
+                and p.get("action_type") != "goal_status_change"
+            ):
                 goal_id = raw_goal_id if raw_goal_id in valid_goal_ids else None
                 if not goal_id:
                     logger.warning(
@@ -373,12 +385,6 @@ class ProposalWorkflow:
             logger.warning("No proposals found for batch %s", batch_id)
             return None
 
-        # Skip quality-held proposals — stored in DB but not delivered
-        proposals = [p for p in proposals if p.get("realist_verdict") != "quality_hold"]
-        if not proposals:
-            logger.info("All proposals in batch %s quality-held — no digest", batch_id)
-            return None
-
         digest_html = self.format_digest(proposals, batch_id, ego_source=ego_source)
 
         # Prepend validation warnings if any
@@ -394,7 +400,6 @@ class ProposalWorkflow:
             other_pending = [
                 p for p in all_pending
                 if p.get("batch_id") != batch_id
-                and p.get("realist_verdict") != "quality_hold"
             ]
             if other_pending:
                 summary_lines = []
@@ -519,6 +524,72 @@ class ProposalWorkflow:
                 # Auto-store correction memory on rejection with reason
                 if status == ProposalStatus.REJECTED and reason and self._memory_store:
                     await self._store_correction(prop, reason)
+                # Autonomy earn-back: promote on approval / cooldown on reject.
+                # No-op unless this is an autonomy_earnback proposal. Wrapped so a
+                # failure here never aborts resolution of sibling proposals.
+                try:
+                    from genesis.ego.earnback import handle_earnback_resolution
+
+                    await handle_earnback_resolution(
+                        self._db, prop, status, self._autonomy_manager,
+                    )
+                except Exception:
+                    logger.warning(
+                        "earnback resolution hook failed for %s",
+                        prop.get("id"), exc_info=True,
+                    )
+                # Goal status change: apply pause/deprioritize on approval.
+                try:
+                    from genesis.ego.goal_actions import (
+                        handle_goal_status_change_resolution,
+                    )
+
+                    await handle_goal_status_change_resolution(
+                        self._db, prop, status,
+                    )
+                except Exception:
+                    logger.warning(
+                        "goal status-change hook failed for %s",
+                        prop.get("id"), exc_info=True,
+                    )
+                # Cell promotion (WS-8 PR-D): promote on approval / cooldown on reject.
+                try:
+                    from genesis.ego.cell_promotion import (
+                        handle_cell_promotion_resolution,
+                    )
+
+                    await handle_cell_promotion_resolution(self._db, prop, status)
+                except Exception:
+                    logger.warning(
+                        "cell promotion hook failed for %s",
+                        prop.get("id"), exc_info=True,
+                    )
+                # Cognitive variant promotion (Evo PR-B): apply the reflection
+                # prompt winner to the overlay on approval.
+                try:
+                    from genesis.ego.cognitive_variant import (
+                        handle_cognitive_variant_resolution,
+                    )
+
+                    await handle_cognitive_variant_resolution(self._db, prop, status)
+                except Exception:
+                    logger.warning(
+                        "cognitive-variant hook failed for %s",
+                        prop.get("id"), exc_info=True,
+                    )
+                # J-9 regression (informational): mark executed on approval, no
+                # side-effect. Never dispatched (blocklist + NOTIFY_USER gate).
+                try:
+                    from genesis.ego.j9_regression_actions import (
+                        handle_j9_regression_resolution,
+                    )
+
+                    await handle_j9_regression_resolution(self._db, prop, status)
+                except Exception:
+                    logger.warning(
+                        "j9 regression hook failed for %s",
+                        prop.get("id"), exc_info=True,
+                    )
             else:
                 logger.warning(
                     "Proposal %s not updated (already resolved?)",

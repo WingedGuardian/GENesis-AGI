@@ -15,6 +15,8 @@ from genesis.content.drafter import ContentDrafter
 from genesis.content.egress import gate
 from genesis.content.formatter import ContentFormatter
 from genesis.content.types import DraftRequest, FormatTarget, FormattedContent
+from genesis.db.crud import autonomous_email_sends as aes
+from genesis.db.crud import capability_grants as cg
 from genesis.db.crud import outreach as outreach_crud
 from genesis.outreach.config import OutreachConfig
 from genesis.outreach.fresh_eyes import FreshEyesReview
@@ -73,6 +75,14 @@ class OutreachPipeline:
         self._thread_tracker: object | None = None  # Set via set_thread_tracker()
         self._topic_manager = None
         self._forum_chat_id: str | None = None
+        # WS-8 email autonomy gate — injected via set_autonomy_gate() during
+        # autonomy init (runs after outreach init, so ApprovalManager exists).
+        # None ⇒ no gating (e.g. pre-wiring / standalone tests).
+        self._autonomy_gate: object | None = None
+        # WS-8 PR-D — per-send owner notification for autonomous (GRANTED-cell)
+        # email sends.  MUTED by default; the dashboard "Activity" ledger is the
+        # primary visibility path.  Toggled via set_autonomous_send_notify().
+        self._autonomous_send_notify: bool = False
 
     def set_reply_waiter(self, waiter: ReplyWaiter) -> None:
         """Attach a ReplyWaiter for bidirectional outreach."""
@@ -81,6 +91,71 @@ class OutreachPipeline:
     def set_thread_tracker(self, tracker: object) -> None:
         """Attach a ThreadTracker for email thread auto-registration."""
         self._thread_tracker = tracker
+
+    def set_autonomy_gate(self, gate: object) -> None:
+        """Attach the WS-8 email autonomy gate (deterministic owner-authorization
+        check applied to outbound email in ``_deliver``)."""
+        self._autonomy_gate = gate
+
+    def set_autonomous_send_notify(self, enabled: bool) -> None:
+        """Toggle the per-send owner notification for autonomous email sends
+        (WS-8 PR-D).  Muted by default; the dashboard Activity tab is primary."""
+        self._autonomous_send_notify = bool(enabled)
+
+    async def _record_autonomous_send(
+        self,
+        request: OutreachRequest,
+        cell: tuple[str, str, str],
+        recipient: str,
+        outreach_id: str,
+        sent_at: str,
+    ) -> None:
+        """Log an autonomous (GRANTED-cell) email send (WS-8 PR-D).  Best-effort:
+        the email is already delivered, so a ledger/notify failure must NEVER
+        unwind it.  Writes the owner-visible ledger row + bumps the cell's
+        ``last_used_at`` (an autonomous send is not a competence signal — only the
+        ABSENCE of corrections is — so it does NOT record a success)."""
+        domain, verb, risk = cell
+        try:
+            await aes.create(
+                self._db,
+                id=str(uuid.uuid4()),
+                recipient=recipient,
+                subject=request.topic or "",
+                thread_id=getattr(request, "thread_id", None),
+                outreach_id=outreach_id,
+                cell_domain=domain,
+                cell_verb=verb,
+                cell_risk_class=risk,
+                sent_at=sent_at,
+            )
+            await cg.touch_used(
+                self._db, domain=domain, verb=verb, risk_class=risk, used_at=sent_at,
+            )
+        except Exception:
+            logger.warning("autonomous-send ledger write failed", exc_info=True)
+        await self._maybe_notify_autonomous_send(request, recipient)
+
+    async def _maybe_notify_autonomous_send(
+        self, request: OutreachRequest, recipient: str,
+    ) -> None:
+        """Owner notification for an autonomous send — MUTED by default (WS-8
+        PR-D); the dashboard Activity tab is the primary visibility path."""
+        if not self._autonomous_send_notify:
+            return
+        adapter = self._channels.get("telegram")
+        owner = self._recipients.get("telegram")
+        if adapter is None or not owner:
+            return
+        subject = request.topic or "(no subject)"
+        try:
+            await adapter.send_message(
+                owner,
+                f'Autonomous email sent to {recipient} — "{subject}". '
+                "Review or flag it in the dashboard Activity tab.",
+            )
+        except Exception:
+            logger.warning("autonomous-send notification failed", exc_info=True)
 
     def reload_config(self, config: OutreachConfig) -> None:
         """Hot-reload outreach config on pipeline and governance gate."""
@@ -298,6 +373,7 @@ class OutreachPipeline:
         gov: object | None,
         *,
         reply_markup: object | None = None,
+        gate_cleared: bool = False,
     ) -> OutreachResult:
         adapter = self._channels.get(channel)
         recipient = request.validated_recipient or self._recipients.get(channel, "")
@@ -314,6 +390,35 @@ class OutreachPipeline:
                 message_content=formatted.text,
                 error=f"No adapter or recipient for {channel}",
             )
+
+        # WS-8 autonomy capability gate — deterministic owner-authorization for
+        # outbound email, BELOW the LLM tool call (Tenet 0). This is the sole
+        # unbypassable chokepoint: every send path converges on _deliver. A held
+        # send is recorded for owner approval and later resumed below the gate by
+        # the resolution watcher (gate_cleared=True). Non-email channels and the
+        # resume path skip it.
+        # WS-8 PR-D: capture whether this send is AUTONOMOUS (gate allowed a
+        # GRANTED cell) so the post-send block can log it to the owner-visible
+        # ledger.  Stays None for non-email, the gate_cleared resume path, no
+        # gate, or a held send.
+        gate_cell: tuple[str, str, str] | None = None
+        if channel == "email" and not gate_cleared and self._autonomy_gate is not None:
+            decision = await self._autonomy_gate.check(
+                request=request, recipient=recipient, message_text=formatted.text,
+            )
+            if not decision.allow:
+                logger.info(
+                    "Outreach %s HELD by email autonomy gate (pending=%s)",
+                    outreach_id, decision.pending_id,
+                )
+                return OutreachResult(
+                    outreach_id=outreach_id,
+                    status=OutreachStatus.HELD,
+                    channel=channel,
+                    message_content=formatted.text,
+                )
+            if decision.reason == "granted":
+                gate_cell = decision.cell
 
         # Determine delivery routing: supergroup, dm, or both
         routing = "supergroup"  # default
@@ -414,7 +519,12 @@ class OutreachPipeline:
                     logger.warning("DM copy failed for 'both' routing", exc_info=True)
         except Exception as exc:
             logger.error("Delivery failed on %s: %s", channel, exc, exc_info=True)
-            await self._defer(outreach_id, channel, formatted.text, request, str(exc))
+            if not gate_cleared:
+                # Gate-cleared (resume) sends are retried by the WS-8 email-gate
+                # drain, NOT the deferred-work queue: deferring here would route
+                # the retry back through _deliver and re-gate it. The drain owns
+                # resume retries (it leaves the hold 'held' on failure).
+                await self._defer(outreach_id, channel, formatted.text, request, str(exc))
             return OutreachResult(
                 outreach_id=outreach_id,
                 status=OutreachStatus.FAILED,
@@ -443,6 +553,15 @@ class OutreachPipeline:
                 content_hash=content_hash(request.context),
             )
             await outreach_crud.record_delivery(self._db, outreach_id, delivered_at=now)
+
+            # WS-8 PR-D: log autonomous (GRANTED-cell) email sends for owner
+            # visibility (Activity tab), the flag-as-bad correction, and the
+            # per-cell rate-limit guard.  Owner-APPROVED holds resume via
+            # deliver_approved (gate_cleared, gate_cell None) and are NOT logged.
+            if gate_cell is not None:
+                await self._record_autonomous_send(
+                    request, gate_cell, recipient, outreach_id, now,
+                )
 
         # Auto-register email threads for reply tracking
         if channel == "email" and self._thread_tracker is not None:
@@ -476,6 +595,32 @@ class OutreachPipeline:
             message_content=formatted.text,
             delivery_id=str(delivery_id),
             governance_result=gov,
+        )
+
+    async def deliver_approved(
+        self, pending: dict, *, subject: str | None = None,
+    ) -> OutreachResult:
+        """Send a previously-held email BELOW the autonomy gate.
+
+        Called ONLY by the resolution watcher after the owner approved the
+        hold.  The body was drafted + formatted when held, so it is delivered
+        verbatim (no re-draft, no governance).  ``gate_cleared=True`` skips
+        re-gating — the flag is set only here (trusted code), never by the LLM,
+        so it cannot be a re-entry / bypass vector.
+        """
+        req = OutreachRequest(
+            category=OutreachCategory(pending["category"]),
+            topic=subject or "",
+            context=pending["message"],
+            salience_score=0.5,
+            signal_type="email_gate_resume",
+            channel="email",
+            validated_recipient=pending["validated_recipient"],
+            thread_id=pending.get("thread_id"),
+        )
+        formatted = FormattedContent(text=pending["message"], target=FormatTarget.EMAIL)
+        return await self._deliver(
+            str(uuid.uuid4()), "email", formatted, req, None, gate_cleared=True,
         )
 
     def _should_voice(self, request: OutreachRequest) -> bool:

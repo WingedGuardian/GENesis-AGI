@@ -8,8 +8,14 @@ from datetime import UTC, datetime
 
 from genesis.memory.activation import compute_activation
 from genesis.memory.graph import traverse as graph_traverse
+from genesis.memory.provenance import (
+    is_external,
+    label_result_dicts,
+    provenance_descriptor,
+)
 
 from ..memory import mcp
+from ._scoring import DEFAULT_KB_FLOOR_RATIO, relative_kb_floor
 
 
 def _memory_mod():
@@ -57,6 +63,7 @@ async def memory_recall(
     only_subsystem: str | list[str] | None = None,
     rerank: bool = True,
     include_deprecated: bool = False,
+    corrective: bool = True,
 ) -> list[dict]:
     """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
 
@@ -145,6 +152,11 @@ async def memory_recall(
         except Exception:
             logger.warning("time_range event query failed", exc_info=True)
 
+    # MEM-003: collect the recall_fired event id the retriever emits (standard /
+    # auto_drift paths) so the single event is enriched below instead of a second
+    # one being emitted. Drift mode calls drift_recall (no emit) → stays empty.
+    recall_event_sink: list[str] = []
+
     if mode == "drift":
         # Direct DRIFT invocation — skip standard recall entirely
         from genesis.memory.drift import drift_recall
@@ -170,6 +182,7 @@ async def memory_recall(
             only_subsystem=only_subsystem,
             rerank=rerank,
             include_deprecated=include_deprecated,
+            event_id_sink=recall_event_sink,
         )
         pipeline_used = "standard"
 
@@ -230,6 +243,7 @@ async def memory_recall(
                         activation_score=0.0,
                         payload=row,
                         source_pipeline="event_calendar",
+                        collection=row.get("collection", "episodic_memory"),
                     ))
             except Exception:
                 logger.warning(
@@ -239,29 +253,70 @@ async def memory_recall(
 
     # KB noise control: when searching both collections, apply a score floor
     # to knowledge_base results to suppress low-relevance bulk intelligence.
-    # Episodic results are unfiltered. Score floor matches knowledge_recall's
-    # min_score=0.15 (post-authority-boost) as a conservative baseline.
-    _KB_MIN_SCORE = 0.15
+    # Episodic results are unfiltered. The floor is RELATIVE to the strongest
+    # KB hit (audit MEM-004) — scale-invariant across reranker-on (positional)
+    # and reranker-off (RRF) score scales, where the old absolute 0.15 floor
+    # dropped most/all KB. Keyed on the authoritative ``collection``
+    # discriminator (audit D12), not payload["scope"] — the latter is absent on
+    # FTS5-only / pre-scope rows, so the old check silently let low-relevance KB
+    # through that path.
     if source == "both":
-        results = [
-            r for r in results
-            if r.payload.get("scope") != "external" or r.score >= _KB_MIN_SCORE
-        ]
-
-    # MCP-layer instrumentation: emit with mode and pipeline attribution
-    try:
-        from genesis.eval.j9_hooks import emit_recall_fired
-        await emit_recall_fired(
-            memory_mod._db,
-            query=query,
-            result_count=len(results),
-            top_scores=[r.score for r in results[:5]],
-            memory_ids=[r.memory_id for r in results[:10]],
-            latency_ms=(_time.monotonic() - _t0) * 1000,
-            source=source,
-            mode=mode,
-            pipeline_used=pipeline_used,
+        results = relative_kb_floor(
+            results,
+            ratio=DEFAULT_KB_FLOOR_RATIO,
+            score_of=lambda r: r.score,
+            is_kb=lambda r: is_external(r.collection),
         )
+
+    # MCP-layer instrumentation: exactly ONE recall_fired per logical recall
+    # (MEM-003). The standard / auto_drift paths already emitted one inside
+    # recall() (its id is in recall_event_sink) — enrich THAT event in place with
+    # the MCP-layer attribution (mode / pipeline_used) and the final post-filter
+    # results. Drift mode emitted nothing (empty sink) → emit a fresh event here.
+    recall_event_id: str | None = (
+        recall_event_sink[0] if recall_event_sink else None
+    )
+    try:
+        _top_scores = [r.score for r in results[:5]]
+        _memory_ids = [r.memory_id for r in results[:10]]
+        _all_scores = [r.score for r in results]
+        _mean_score = (
+            round(sum(_all_scores) / len(_all_scores), 4) if _all_scores else None
+        )
+        _latency_ms = round((_time.monotonic() - _t0) * 1000, 1)
+        if recall_event_id is not None:
+            from genesis.eval.j9_hooks import update_recall_metrics
+            # Realign the retriever's event with the FINAL returned set — the KB
+            # floor and any auto_drift fallback change result_count / ids / scores
+            # after the inner emit. The MEM-005 entrenchment fields stay as the
+            # retriever computed them (they need per-memory retrieved_count not
+            # available here); on the rare auto_drift path they describe the
+            # sparse standard pool — pipeline_used="auto_drift" flags those events.
+            await update_recall_metrics(
+                memory_mod._db,
+                recall_event_id,
+                mode=mode,
+                pipeline_used=pipeline_used,
+                result_count=len(results),
+                top_scores=_top_scores,
+                memory_ids=_memory_ids,
+                mean_score=_mean_score,
+                latency_ms=_latency_ms,
+            )
+        else:
+            from genesis.eval.j9_hooks import emit_recall_fired
+            recall_event_id = await emit_recall_fired(
+                memory_mod._db,
+                query=query,
+                result_count=len(results),
+                top_scores=_top_scores,
+                memory_ids=_memory_ids,
+                latency_ms=_latency_ms,
+                source=source,
+                mode=mode,
+                pipeline_used=pipeline_used,
+                mean_score=_mean_score,
+            )
     except Exception:
         pass  # instrumentation must never break recall
 
@@ -277,6 +332,13 @@ async def memory_recall(
                 "room": r.payload.get("room", ""),
                 "source": r.source,
                 "source_pipeline": r.source_pipeline or "",
+                # Provenance (audit D12): first-party memory vs external-world KB,
+                # so the model never treats ingested content as its own truth.
+                "provenance": provenance_descriptor(
+                    collection=r.collection,
+                    source_pipeline=r.source_pipeline,
+                    source_doc=r.source,
+                ),
             }
             for r in results
         ]
@@ -307,6 +369,27 @@ async def memory_recall(
                     "Graph enrichment failed for %s", r.memory_id, exc_info=True,
                 )
         enriched.append(d)
+
+    # Selective corrective retrieval (CRAG) — high-stakes explicit recall path.
+    # Default ON; gated + fail-fast so a confident/healthy recall is untouched.
+    # NOTE: only the full (non-compact) path runs corrective — the compact branch
+    # above returns truncated previews with no gradeable content; those callers
+    # expand later via memory_expand. (compact-corrective: deferred follow-up.)
+    if corrective:
+        from genesis.memory.corrective import maybe_correct_recall
+        enriched = await maybe_correct_recall(
+            query=query,
+            results=enriched,
+            retriever=memory_mod._retriever,
+            db=memory_mod._db,
+            path="memory",
+            pipeline_used=pipeline_used,
+            recall_event_id=recall_event_id,
+        )
+    # Provenance pass (audit D12): label original + any CRAG-augmented items as
+    # first-party vs external-world. Runs regardless of `corrective` so the
+    # output contract is uniform.
+    label_result_dicts(enriched, default_collection="episodic_memory")
     return enriched
 
 
@@ -323,15 +406,22 @@ async def memory_expand(
     memory_mod._require_init()
     assert memory_mod._qdrant is not None and memory_mod._db is not None
 
-    # Batch retrieve from all collections (episodic_memory + knowledge_base)
+    # Batch retrieve from all collections (episodic_memory + knowledge_base).
+    # Track which collection each point came from — it's the authoritative
+    # first-party/external discriminator (audit D12) and is otherwise lost once
+    # the per-collection results are flattened into one list.
     points: list = []
+    point_collection: dict[str, str] = {}
     for coll in ("episodic_memory", "knowledge_base"):
         try:
-            points.extend(memory_mod._qdrant.retrieve(
+            got = memory_mod._qdrant.retrieve(
                 collection_name=coll,
                 ids=memory_ids,
                 with_payload=True,
-            ))
+            )
+            for p in got:
+                point_collection[str(p.id)] = coll
+            points.extend(got)
         except Exception:
             logger.warning("Qdrant retrieve from %s failed", coll, exc_info=True)
 
@@ -358,6 +448,7 @@ async def memory_expand(
     for point in points:
         mid = str(point.id)
         payload = point.payload or {}
+        _collection = point_collection.get(mid, "episodic_memory")
 
         d = {
             "memory_id": mid,
@@ -372,6 +463,13 @@ async def memory_expand(
             "source_pipeline": payload.get("source_pipeline", ""),
             "source_session_id": payload.get("source_session_id"),
             "created_at": payload.get("created_at"),
+            # Provenance (audit D12): first-party memory vs external-world KB.
+            "collection": _collection,
+            "provenance": provenance_descriptor(
+                collection=_collection,
+                source_pipeline=payload.get("source_pipeline"),
+                source_doc=payload.get("source"),
+            ),
         }
 
         # Graph enrichment

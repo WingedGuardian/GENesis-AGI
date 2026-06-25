@@ -33,6 +33,17 @@ _guardian_remote_config_checked: bool = False
 _guardian_ssh_cache: dict[str, tuple[float, ProbeResult]] = {}
 _GUARDIAN_SSH_TTL = 60.0
 
+# Ambient-edge SSH probe cache: {host_ip: (monotonic_timestamp, ProbeResult)}.
+# Mirrors the guardian TTL so repeated snapshot reads don't re-SSH the edge.
+_ambient_ssh_cache: dict[str, tuple[float, ProbeResult]] = {}
+_AMBIENT_SSH_TTL = 60.0
+
+# WAL size thresholds — mirror awareness/loop.py's _check_wal_health. Kept local
+# to avoid an observability→awareness import cycle (awareness imports
+# observability, not the reverse). 100 MB → DEGRADED, 500 MB → DOWN.
+_WAL_SIZE_WARN_BYTES = 100 * 1024 * 1024
+_WAL_SIZE_CRIT_BYTES = 500 * 1024 * 1024
+
 
 def _load_guardian_remote_from_config() -> object | None:
     """Lazy-load a GuardianRemote from ~/.genesis/guardian_remote.yaml.
@@ -280,6 +291,69 @@ async def probe_disk(
             message=f"Cannot stat {mount_path}: {exc}",
             checked_at=_clock().isoformat(),
         )
+
+
+async def probe_wal(
+    wal_path: str | Path | None = None,
+    *,
+    clock=None,
+) -> ProbeResult:
+    """Probe the SQLite WAL sidecar file size.
+
+    A bloated WAL is an early signal of DB-lock pressure: a long-lived
+    reader/MCP pinning an old snapshot prevents checkpoint, so the ``-wal``
+    file grows. Thresholds mirror the awareness loop's ``_check_wal_health``:
+    100 MB → DEGRADED, 500 MB → DOWN.
+
+    Returns ``details={"wal_mb": float}``. A missing WAL (DB in DELETE mode or
+    freshly checkpointed) is HEALTHY with ``wal_mb=0.0``.
+    """
+    from genesis.env import genesis_db_path
+
+    _clock = clock or (lambda: datetime.now(UTC))
+    start = time.monotonic()
+    path = Path(wal_path) if wal_path else Path(f"{genesis_db_path()}-wal")
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        latency = (time.monotonic() - start) * 1000
+        return ProbeResult(
+            name="wal",
+            status=ProbeStatus.HEALTHY,
+            latency_ms=round(latency, 2),
+            checked_at=_clock().isoformat(),
+            details={"wal_mb": 0.0},
+        )
+    except OSError as exc:
+        latency = (time.monotonic() - start) * 1000
+        return ProbeResult(
+            name="wal",
+            status=ProbeStatus.DOWN,
+            latency_ms=round(latency, 2),
+            message=f"Cannot stat WAL: {exc}",
+            checked_at=_clock().isoformat(),
+        )
+
+    latency = (time.monotonic() - start) * 1000
+    wal_mb = round(size / (1024 * 1024), 1)
+    if size >= _WAL_SIZE_CRIT_BYTES:
+        status = ProbeStatus.DOWN
+        msg = f"WAL is {wal_mb} MB (>{_WAL_SIZE_CRIT_BYTES // 1024 // 1024} MB)"
+    elif size >= _WAL_SIZE_WARN_BYTES:
+        status = ProbeStatus.DEGRADED
+        msg = f"WAL is {wal_mb} MB"
+    else:
+        status = ProbeStatus.HEALTHY
+        msg = ""
+
+    return ProbeResult(
+        name="wal",
+        status=status,
+        latency_ms=round(latency, 2),
+        message=msg,
+        checked_at=_clock().isoformat(),
+        details={"wal_mb": wal_mb},
+    )
 
 
 async def probe_guardian(
@@ -540,4 +614,78 @@ async def _probe_guardian_ssh(remote, latency_ms: float, clock) -> ProbeResult:
 
     # Update cache
     _guardian_ssh_cache[host_ip] = (now, result)
+    return result
+
+
+# Maps the ambient-health evaluator's verdict vocabulary to ProbeStatus.
+# "unknown" (edge unreachable / file unreadable) -> DEGRADED: we genuinely can't
+# tell, which is neither healthy nor a confirmed-dead bridge. The alert policy
+# (OutreachScheduler) deliberately does NOT alert on unknown; this is the
+# observability surface, where "can't reach the edge" is worth showing.
+_AMBIENT_VERDICT_TO_PROBE = {
+    "ok": ProbeStatus.HEALTHY,
+    "degraded": ProbeStatus.DEGRADED,
+    "down": ProbeStatus.DOWN,
+    "unknown": ProbeStatus.DEGRADED,
+}
+
+
+async def probe_ambient_health(clock=None) -> ProbeResult | None:
+    """Probe the ambient-capture edge bridge for the observability surface.
+
+    Reuses the existing ambient-health module: load the install-local config
+    (``~/.genesis/ambient_remote.yaml``), SSH-read the edge ``ambient_health.json``,
+    and evaluate it — so ambient health is queryable via the infrastructure
+    snapshot / ``health_status``, not just emitted as a transient Telegram alert.
+
+    Returns ``None`` when no ambient edge is configured (the install has no
+    ambient capture): the caller then omits ambient from the snapshot entirely
+    (unlike guardian, an absent ambient edge is not a fault). Mirrors
+    ``probe_guardian``'s SSH-with-TTL-cache so repeated snapshot reads don't
+    hammer the edge.
+    """
+    from genesis.observability.ambient_health import (
+        AmbientRemoteConfigError,
+        evaluate_ambient_health,
+        load_ambient_remote_config,
+        read_edge_health,
+    )
+
+    _clock = clock or (lambda: datetime.now(UTC))
+    try:
+        cfg = load_ambient_remote_config()
+    except AmbientRemoteConfigError as exc:
+        # Present-but-malformed config: surface a VISIBLE degraded card with the
+        # reason, instead of silently looking like "no ambient edge configured".
+        return ProbeResult(
+            name="ambient",
+            status=ProbeStatus.DEGRADED,
+            latency_ms=0.0,
+            message=f"ambient_remote.yaml misconfigured: {exc}",
+            checked_at=_clock().isoformat(),
+            details={"verdict": "misconfigured"},
+        )
+    if cfg is None:
+        return None  # no ambient edge configured — observability no-op
+
+    now_mono = time.monotonic()
+    cached = _ambient_ssh_cache.get(cfg.host_ip)
+    if cached is not None:
+        cache_time, cache_result = cached
+        if (now_mono - cache_time) < _AMBIENT_SSH_TTL:
+            return cache_result
+
+    start = time.monotonic()
+    data = await read_edge_health(cfg)
+    latency = (time.monotonic() - start) * 1000
+    verdict = evaluate_ambient_health(data, now=_clock())
+    result = ProbeResult(
+        name="ambient",
+        status=_AMBIENT_VERDICT_TO_PROBE.get(verdict.status, ProbeStatus.DEGRADED),
+        latency_ms=round(latency, 2),
+        message="; ".join(verdict.reasons) if verdict.reasons else "",
+        checked_at=_clock().isoformat(),
+        details={"verdict": verdict.status},
+    )
+    _ambient_ssh_cache[cfg.host_ip] = (now_mono, result)
     return result
