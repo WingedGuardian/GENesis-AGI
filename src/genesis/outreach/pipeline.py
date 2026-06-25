@@ -193,6 +193,7 @@ class OutreachPipeline:
                 channel="",
                 message_content="",
                 governance_result=gov,
+                error=gov.reason,  # surface the reason so retry logs aren't blank
             )
 
         if request.category == OutreachCategory.SURPLUS and self._fresh_eyes:

@@ -121,6 +121,10 @@ async def test_submit_governance_denied(config, db, mock_drafter, mock_formatter
     result = await pipeline.submit(req)
     assert result.status == OutreachStatus.REJECTED
     mock_channel.send_message.assert_not_called()
+    # The denial reason must reach result.error so the drain's "will retry"
+    # log is diagnosable (was blank: "not delivered (rejected: )").
+    assert result.error
+    assert result.error == result.governance_result.reason
 
 
 @pytest.mark.asyncio
