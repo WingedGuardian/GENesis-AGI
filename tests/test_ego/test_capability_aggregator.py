@@ -58,7 +58,7 @@ async def db(tmp_path):
             CREATE TABLE procedural_memory (
                 id TEXT PRIMARY KEY, task_type TEXT NOT NULL,
                 confidence REAL DEFAULT 0.0, deprecated INTEGER DEFAULT 0,
-                quarantined INTEGER DEFAULT 0, speculative INTEGER DEFAULT 1,
+                quarantined INTEGER DEFAULT 0, draft INTEGER DEFAULT 1,
                 success_count INTEGER DEFAULT 0, failure_count INTEGER DEFAULT 0,
                 invocation_count INTEGER DEFAULT 0,
                 activation_tier TEXT DEFAULT 'DORMANT',

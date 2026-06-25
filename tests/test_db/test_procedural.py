@@ -28,13 +28,13 @@ async def test_create_with_initial_counts(db):
     """Verify success_count and confidence kwargs are persisted on create."""
     await procedural.create(
         db, id="p_seed", success_count=1, confidence=2 / 3,
-        speculative=0, activation_tier="LIBRARY", **_COMMON,
+        draft=0, activation_tier="LIBRARY", **_COMMON,
     )
     row = await procedural.get_by_id(db, "p_seed")
     assert row is not None
     assert row["success_count"] == 1
     assert abs(row["confidence"] - 2 / 3) < 1e-9
-    assert row["speculative"] == 0
+    assert row["draft"] == 0
     assert row["activation_tier"] == "LIBRARY"
 
 

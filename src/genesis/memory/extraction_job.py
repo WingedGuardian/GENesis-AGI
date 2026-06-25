@@ -171,7 +171,7 @@ async def run_extraction_cycle(
         all_keywords: set[str] = set()
         latest_topic = ""
         session_extraction_count = 0
-        # Per-session cap on NEW speculative procedures (extraction + struggle
+        # Per-session cap on NEW draft procedures (extraction + struggle
         # streams). Without this, a single session can flood the store with
         # hundreds of conf≈0 candidates that never get validated.
         session_procs = 0

@@ -63,7 +63,7 @@ async def test_procedure_recall_registered():
 async def test_procedure_store_recall_roundtrip():
     """End-to-end regression test for the procedure_store→procedure_recall bug.
 
-    Pre-fix: procedure_store wrote speculative=1, success_count=0,
+    Pre-fix: procedure_store wrote draft=1, success_count=0,
     confidence=0.0 → find_relevant filtered it out → procedure_recall
     returned []. This test stores a procedure and verifies it comes back.
     """
@@ -95,12 +95,12 @@ async def test_procedure_store_recall_roundtrip():
 
             # Verify the row landed with explicit-teach defaults.
             cursor = await real_db.execute(
-                "SELECT speculative, success_count, confidence, activation_tier "
+                "SELECT draft, success_count, confidence, activation_tier "
                 "FROM procedural_memory WHERE id = ?",
                 (pid,),
             )
             row = await cursor.fetchone()
-            assert row[0] == 0  # speculative
+            assert row[0] == 0  # draft
             assert row[1] == 1  # success_count
             assert abs(row[2] - 2 / 3) < 1e-9  # Laplace
             assert row[3] == "LIBRARY"  # activation_tier

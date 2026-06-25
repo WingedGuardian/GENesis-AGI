@@ -26,7 +26,7 @@ TABLES = {
             deprecated        INTEGER NOT NULL DEFAULT 0,
             deprecated_reason TEXT,
             superseded_by     TEXT,                -- FK to procedural_memory.id
-            speculative       INTEGER NOT NULL DEFAULT 1,
+            draft             INTEGER NOT NULL DEFAULT 1,  -- untested draft (was: speculative)
             invocation_count  INTEGER NOT NULL DEFAULT 0,
             attempted_workarounds TEXT,            -- JSON: array of {description, outcome, conditions}
             version           INTEGER NOT NULL DEFAULT 1,
@@ -1503,7 +1503,7 @@ KNOWLEDGE_FTS5_DDL = """
 
 INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_procedural_task_type ON procedural_memory(task_type)",
-    "CREATE INDEX IF NOT EXISTS idx_procedural_speculative ON procedural_memory(speculative)",
+    "CREATE INDEX IF NOT EXISTS idx_procedural_draft ON procedural_memory(draft)",
     "CREATE INDEX IF NOT EXISTS idx_procedural_activation_tier ON procedural_memory(activation_tier)",
     "CREATE INDEX IF NOT EXISTS idx_observations_source ON observations(source)",
     "CREATE INDEX IF NOT EXISTS idx_observations_type ON observations(type)",

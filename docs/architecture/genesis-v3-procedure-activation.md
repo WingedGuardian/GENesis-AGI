@@ -61,13 +61,13 @@ CORE > ADVISORY > LIBRARY > DORMANT (CORE = most-proven; see `_TIER_RANK` in
 
 ```
 Auto-extracted (triage / extractor pipeline):
-  → DORMANT (speculative=1, success_count=0, conf=0.0, advisory only)
-  → LIBRARY (3+ successes, conf >= 0.65, speculative=0)
+  → DORMANT (draft=1, success_count=0, conf=0.0, advisory only)
+  → LIBRARY (3+ successes, conf >= 0.65, draft=0)
   → ADVISORY (5+ successes, conf >= 0.75, embedded in skills)
   → CORE (8+ successes, conf >= 0.85, tool trigger set)
 
 Explicit user teach (procedure_store MCP tool):
-  → LIBRARY (speculative=0, success_count=1, conf=2/3) — recallable and
+  → LIBRARY (draft=0, success_count=1, conf=2/3) — recallable and
        eligible for proactive-hook surfacing from the moment it is stored.
        Earns further promotion to ADVISORY/CORE organically via record_success.
 ```
@@ -96,9 +96,9 @@ treated as a *dampened* positive signal:
   by `effective_confidence` (read-heavy procedures surface first; ties keep
   relevance order). Isolated to the recall path — `find_relevant`'s global
   behavior is unchanged (it has 6 callers, incl. autonomy outcome-attribution).
-- **De-speculation:** a draft (`speculative=1`) graduates to validated
-  (`speculative=0`) on its first *real* success with no failures — closing the
-  prior gap where nothing ever cleared the flag. Reads alone do not de-speculate.
+- **Draft clearing:** a draft (`draft=1`) graduates to validated
+  (`draft=0`) on its first *real* success with no failures — closing the
+  prior gap where nothing ever cleared the flag. Reads alone do not clear the draft flag.
 
 The one-time migration `0035_backfill_procedure_invocation_count` seeds
 `invocation_count` from historical `procedure_invoked` events in `eval_events`
@@ -114,7 +114,7 @@ Demotion is **evidence-driven only** — never metric drift:
 
 > **Eval note:** the J-9 system composite's procedure-confidence signal and the
 > procedure dimension's `mean_confidence` average **validated** procedures
-> (speculative=0) only. Speculative candidates start at conf≈0 and would measure
+> (draft=0) only. Draft candidates start at conf≈0 and would measure
 > extraction *volume*, not knowledge *quality* (`total_procedures` still counts
 > the whole store, consistent with `tier_distribution`).
 
@@ -131,8 +131,8 @@ promoter runs.
 1. **Triage / extraction pipeline** — extracts procedures from
    APPROACH_FAILURE and WORKAROUND_SUCCESS outcomes via LLM (call site 34),
    plus the per-session extraction + struggle streams. Defaults to DORMANT /
-   speculative=1 — the LLM hypothesis must earn trust through real
-   organic successes before promotion. **Capped at 3 new speculative
+   draft=1 — the LLM hypothesis must earn trust through real
+   organic successes before promotion. **Capped at 3 new draft
    procedures per session** (`max_procedures_per_session`, shared across the
    extraction and struggle streams) so a single session cannot flood the store.
    **Scoping gate:** before storage, an LLM classifies each extracted procedure as a
@@ -143,7 +143,7 @@ promoter runs.
    real procedure is never suppressed (`scoping.py`).
 2. **MCP tool** — `procedure_store` for explicit user teaching. Treated
    as one Laplace-equivalent confirmed success — seeds at LIBRARY with
-   speculative=0, success_count=1, confidence=2/3. The caller asserting
+   draft=0, success_count=1, confidence=2/3. The caller asserting
    "this procedure works" is the evidence; the system trusts that
    assertion enough to make the procedure immediately recallable and
    eligible for proactive-hook surfacing.

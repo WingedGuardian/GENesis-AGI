@@ -73,7 +73,7 @@ async def procedure_store(
 
     An MCP `procedure_store` call represents an *explicit teach* — the caller
     is asserting the procedure works. We seed it as already-confirmed
-    (speculative=0) with one Laplace-equivalent success (success_count=1,
+    (draft=0) with one Laplace-equivalent success (success_count=1,
     confidence=2/3), and place it at LIBRARY so it is immediately
     recallable and eligible for proactive-hook surfacing. (Blind SessionStart
     injection is CORE-only as of Surfacing v2, so an explicit teach reaches
@@ -86,7 +86,7 @@ async def procedure_store(
     hook skips that row.
 
     The auto-extraction path (`learning.procedural.extractor`) keeps its
-    speculative=1 / success_count=0 / confidence=0.0 / DORMANT defaults — those
+    draft=1 / success_count=0 / confidence=0.0 / DORMANT defaults — those
     procedures are LLM-hypothesized and must earn trust.
     """
     memory_mod = _memory_mod()
@@ -106,7 +106,7 @@ async def procedure_store(
         context_tags=context_tags,
         tool_trigger=tool_trigger,
         activation_tier="LIBRARY",
-        speculative=0,
+        draft=0,
         success_count=1,
         confidence=2 / 3,
         source={"type": "explicit_teach"},

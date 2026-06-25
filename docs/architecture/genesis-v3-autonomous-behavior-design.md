@@ -1884,12 +1884,12 @@ down should absolutely be re-attempted when the service is back up.
 
 Procedure selection balances performance and novelty: ~90% of the time, use the highest-confidence procedure for the task type. ~10% of the time, deliberately try a novel (lower-confidence, higher-novelty) procedure and log the comparison. This explore-exploit ratio ensures the system doesn't stop discovering better approaches for tasks it already handles adequately.
 
-**Speculative tagging for new procedures:** Pattern 3 (speculative vs. grounded claims) applies to procedures, not just observations. A procedure extracted from a single successful task execution is speculative — it worked once, but is it generalizable?
+**Draft tagging for new procedures:** The idea behind Pattern 3 (speculative vs. grounded claims) applies to procedures too — though a procedure's unproven flag is named `draft`, not `speculative`, to keep the two concepts distinct (a procedure isn't *speculating about* anything; it's an untested draft). A procedure extracted from a single successful task execution is a draft — it worked once, but is it generalizable?
 
-- New procedures start with `speculative: true`, `success_count: 1`
+- New procedures start with `draft: true`, `success_count: 1`
 - Confirmed after `success_count >= 3` across different task contexts (not 3 successes on the same task — 3 successes in different situations)
-- Speculative procedures are available for use but do NOT override confirmed procedures for the same task type
-- Speculative procedures that fail 3 times before reaching confirmation are archived, not
+- Draft procedures are available for use but do NOT override confirmed procedures for the same task type
+- Draft procedures that fail 3 times before reaching confirmation are archived, not
   deleted (the failure data is valuable). Archived procedures remain accessible for
   re-evaluation — if conditions change (new tools available, service restored, different
   context), the LLM can re-consider an archived procedure. Archived ≠ forbidden.
