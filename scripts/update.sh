@@ -132,14 +132,18 @@ fi
 #
 # EXCEPTION — known-ephemeral tracked files (EPHEMERAL_DIRTY_RE): tracked files
 # that are routinely rewritten in place and are safe to ignore, because the
-# fast-forward merge never touches them and they regenerate themselves. Today
-# that's top-level `AGENTS.md` (GitNexus rewrites its auto-stat block). These no
-# longer block an update; REAL tracked changes still abort. The regex matches the
-# porcelain path (a single space precedes it), so only this exact top-level path
-# is excused — e.g. `src/AGENTS.md` would still abort.
+# fast-forward merge never touches them and they regenerate themselves. Today:
+#   - top-level `AGENTS.md` (GitNexus rewrites its auto-stat block)
+#   - `config/procedure_triggers.yaml` (the L1 trigger cache rewrites its own
+#     `generated_at` + entries in place; it's a committed seed default, so it
+#     can't simply be .gitignored without affecting fresh installs)
+# These no longer block an update; REAL tracked changes still abort. Each
+# alternative anchors the exact porcelain path (a single space precedes it), so
+# only these exact paths are excused — e.g. `src/AGENTS.md` or
+# `src/config/procedure_triggers.yaml` would still abort.
 # (`.claude/settings.local.json` is handled the right way — untracked + already
 # in .gitignore — so it never appears here.)
-EPHEMERAL_DIRTY_RE=' AGENTS\.md$'
+EPHEMERAL_DIRTY_RE=' AGENTS\.md$| config/procedure_triggers\.yaml$'
 if [[ "$POST_MERGE" == "false" ]]; then
     DIRTY_FILES=$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null \
         | grep -v "^??" \
