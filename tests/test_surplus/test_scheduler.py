@@ -257,3 +257,16 @@ async def test_run_db_integrity_check_healthy_db_no_alarm(db):
         "SELECT COUNT(*) FROM observations WHERE type = 'db_integrity_failure'"
     )
     assert (await cur.fetchone())[0] == 0
+
+
+async def test_start_registers_db_integrity_check(db):
+    """start() registers the deterministic weekly DB-integrity cron job.
+
+    Locks the wiring: the job enqueues no surplus task (CronTrigger), so the
+    pending_count assertions in the sibling start tests are unaffected.
+    """
+    sched, compute = _make_scheduler(db, idle=True)
+    with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):
+        await sched.start()
+    assert sched._scheduler.get_job("db_integrity_check") is not None
+    await sched.stop()

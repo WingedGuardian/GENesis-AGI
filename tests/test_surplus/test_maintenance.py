@@ -286,3 +286,16 @@ class TestCheckDbIntegrity:
         result = await check_db_integrity(db)
         assert result != "ok"
         assert "idx_x" in result and "idx_y" in result and "; " in result
+
+    @pytest.mark.asyncio
+    async def test_single_problem_row_is_not_ok(self):
+        """A single non-'ok' problem row is a failure, not 'ok'."""
+        from genesis.surplus.maintenance import check_db_integrity
+
+        cursor = AsyncMock()
+        cursor.fetchall = AsyncMock(return_value=[("database disk image is malformed",)])
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=cursor)
+        result = await check_db_integrity(db)
+        assert result != "ok"
+        assert "malformed" in result
