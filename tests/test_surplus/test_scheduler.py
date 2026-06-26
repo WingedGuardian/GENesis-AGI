@@ -218,3 +218,42 @@ async def test_dispatch_drains_expired_tasks(db):
     cursor = await db.execute("SELECT COUNT(*) FROM surplus_tasks WHERE id = 'old-task-1' AND status = 'pending'")
     row = await cursor.fetchone()
     assert row[0] == 0
+
+
+# ── DB integrity check (C1) ─────────────────────────────────────────────
+
+async def test_alarm_db_integrity_writes_observation_and_emits(db):
+    """Corruption detail is persisted as a critical observation AND emitted."""
+    from genesis.observability.types import Severity, Subsystem
+
+    sched, _ = _make_scheduler(db)
+    sched._event_bus = AsyncMock()
+
+    await sched._alarm_db_integrity("row 5 missing from index idx_x")
+
+    cur = await db.execute(
+        "SELECT priority, content FROM observations WHERE type = 'db_integrity_failure'"
+    )
+    rows = await cur.fetchall()
+    assert len(rows) == 1
+    assert rows[0]["priority"] == "critical"
+    assert "idx_x" in rows[0]["content"]
+
+    assert sched._event_bus.emit.await_count == 1
+    call = sched._event_bus.emit.await_args
+    assert call.args[0] == Subsystem.SURPLUS
+    assert call.args[1] == Severity.ERROR
+
+
+async def test_run_db_integrity_check_healthy_db_no_alarm(db):
+    """On a healthy DB the weekly job completes and raises no alarm."""
+    sched, _ = _make_scheduler(db)
+    sched._event_bus = AsyncMock()
+
+    await sched.run_db_integrity_check()
+
+    sched._event_bus.emit.assert_not_called()
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM observations WHERE type = 'db_integrity_failure'"
+    )
+    assert (await cur.fetchone())[0] == 0
