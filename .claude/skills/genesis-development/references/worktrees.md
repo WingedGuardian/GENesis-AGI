@@ -27,6 +27,25 @@ Multiple Claude Code sessions may work on this repo simultaneously. Rules:
   file in the diff belongs to your work. If you see files you didn't modify,
   STOP and investigate.
 
+## Testing code in a worktree
+
+`tests/conftest.py` pins `sys.path[0]` to the worktree's own `src`, so `pytest`
+run from a worktree always tests THAT worktree's code — you don't need
+`PYTHONPATH`, and setting it will NOT redirect pytest (the guard shadows the
+editable install and any env path). Consequence: to prove a new regression test
+actually fails on the unfixed code, you can't point pytest at old code via the
+environment — revert the source in place instead:
+
+```bash
+git stash push -- path/to/file.py        # restore the unfixed code
+pytest tests/.../test_x.py -k new_test    # expect RED
+git stash pop                             # restore the fix
+```
+
+A standalone `python -c "import genesis; print(genesis.__file__)"` DOES honor
+`PYTHONPATH`/the editable install, so it can misleadingly show main's path while
+pytest is using the worktree's. Trust the stash check, not the env var.
+
 ## Push/Merge Enforcement
 
 `git_push_guard.py` (PreToolUse hook) blocks:
