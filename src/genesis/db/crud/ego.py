@@ -1182,3 +1182,75 @@ async def compute_vcr(
         "vcr": round(vcr, 4),
         "dispatch_rate": round(dispatch_rate, 4),
     }
+
+
+# ---------------------------------------------------------------------------
+# ego_proposals — j9 eval analytical reads (read-only, time-windowed)
+# ---------------------------------------------------------------------------
+
+
+async def get_proposals_for_drift(
+    db: aiosqlite.Connection,
+    *,
+    start: str,
+    end: str,
+) -> list[dict]:
+    """Proposals in ``[start, end)`` for cognitive-drift metrics.
+
+    Returns ``action_type``, ``alternatives`` and ``realist_verdict`` per row —
+    the inputs to the j9 anti-overfitting baseline (dissent / alternative /
+    diversity rates).
+    """
+    cursor = await db.execute(
+        """SELECT action_type, alternatives, realist_verdict
+           FROM ego_proposals
+           WHERE created_at >= ? AND created_at < ?""",
+        (start, end),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_acceptance_counts(
+    db: aiosqlite.Connection,
+    *,
+    start: str,
+    end: str,
+) -> dict:
+    """Resolved-proposal acceptance counts in ``[start, end)``.
+
+    Excludes ``pending``/``expired``.  Returns ``{"total", "accepted"}`` where
+    ``accepted`` counts ``approved``/``executed`` proposals — the ego
+    acceptance-rate inputs for the j9 system composite.  ``accepted`` is
+    ``None`` when no proposals match (SUM over zero rows).
+    """
+    cursor = await db.execute(
+        """SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'approved' OR status = 'executed' THEN 1 ELSE 0 END) as accepted
+        FROM ego_proposals
+        WHERE created_at >= ? AND created_at < ?
+        AND status NOT IN ('pending', 'expired')""",
+        (start, end),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else {"total": 0, "accepted": 0}
+
+
+async def get_proposals_for_quality(
+    db: aiosqlite.Connection,
+    *,
+    start: str,
+    end: str,
+) -> list[dict]:
+    """Proposals in ``[start, end)`` for ego-quality metrics.
+
+    Returns ``id``, ``status``, ``confidence`` and ``action_type`` per row —
+    the inputs to approval-rate, execution-success and confidence-calibration.
+    """
+    cursor = await db.execute(
+        """SELECT id, status, confidence, action_type
+        FROM ego_proposals
+        WHERE created_at >= ? AND created_at < ?""",
+        (start, end),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
