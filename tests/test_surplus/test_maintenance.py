@@ -242,3 +242,60 @@ class TestFmtBytes:
 
     def test_gigabytes(self):
         assert "GB" in _fmt_bytes(2 * 1024 * 1024 * 1024)
+
+
+# ── check_db_integrity ──────────────────────────────────────────────────
+
+class TestCheckDbIntegrity:
+    @pytest.mark.asyncio
+    async def test_healthy_db_returns_ok(self):
+        """A real, healthy SQLite DB passes the full integrity_check."""
+        import aiosqlite
+
+        from genesis.surplus.maintenance import check_db_integrity
+
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            await db.execute("INSERT INTO t (v) VALUES ('x')")
+            await db.commit()
+            assert await check_db_integrity(db) == "ok"
+
+    @pytest.mark.asyncio
+    async def test_empty_result_returns_unknown(self):
+        """No rows back (shouldn't happen, but guard) → 'unknown', not 'ok'."""
+        from genesis.surplus.maintenance import check_db_integrity
+
+        cursor = AsyncMock()
+        cursor.fetchall = AsyncMock(return_value=[])
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=cursor)
+        assert await check_db_integrity(db) == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_corruption_joins_problem_rows(self):
+        """Multiple problem rows are joined into a non-'ok' summary."""
+        from genesis.surplus.maintenance import check_db_integrity
+
+        cursor = AsyncMock()
+        cursor.fetchall = AsyncMock(return_value=[
+            ("row 5 missing from index idx_x",),
+            ("wrong # of entries in index idx_y",),
+        ])
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=cursor)
+        result = await check_db_integrity(db)
+        assert result != "ok"
+        assert "idx_x" in result and "idx_y" in result and "; " in result
+
+    @pytest.mark.asyncio
+    async def test_single_problem_row_is_not_ok(self):
+        """A single non-'ok' problem row is a failure, not 'ok'."""
+        from genesis.surplus.maintenance import check_db_integrity
+
+        cursor = AsyncMock()
+        cursor.fetchall = AsyncMock(return_value=[("database disk image is malformed",)])
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=cursor)
+        result = await check_db_integrity(db)
+        assert result != "ok"
+        assert "malformed" in result
