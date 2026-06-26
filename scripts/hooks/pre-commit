@@ -79,6 +79,72 @@ if [ -n "$new_noncodes" ]; then
     echo ""
 fi
 
+# Strip GitNexus's auto-injected block from staged CLAUDE.md.
+# The post-commit hook runs `npx gitnexus analyze`, which re-injects a
+# <!-- gitnexus:start --> … <!-- gitnexus:end --> block into BOTH CLAUDE.md and
+# AGENTS.md on every commit (it has no per-file flag). We keep it in AGENTS.md
+# (read by cross-tool agents) but it must never enter CLAUDE.md. The hourly
+# run_gitnexus_strip job cleans the working tree, but a commit or worktree cut
+# in the window between re-inject and strip captures it — so strip it here, at
+# the index, where it can never reach a commit. Operates on the staged blob, so
+# unrelated working-tree edits to CLAUDE.md are left untouched.
+if git diff --cached --name-only --diff-filter=ACM | grep -qxF 'CLAUDE.md'; then
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - <<'PY'
+import re, subprocess, sys
+
+# Anchor the start marker to column 0 (re.MULTILINE) so authored prose that
+# merely *mentions* the markers mid-line is never matched; gitnexus always
+# injects the block at line start. surrogateescape keeps a non-UTF8 byte a
+# lossless no-op instead of hard-blocking an unrelated commit.
+PATTERN = re.compile(
+    r"\n*^<!-- gitnexus:start -->.*?<!-- gitnexus:end -->[^\n]*\n?",
+    re.DOTALL | re.MULTILINE,
+)
+
+staged = subprocess.run(
+    ["git", "cat-file", "blob", ":CLAUDE.md"], capture_output=True,
+).stdout.decode("utf-8", "surrogateescape")
+stripped = PATTERN.sub("\n", staged)
+if stripped == staged:
+    sys.exit(0)  # no block staged — nothing to do
+
+new_hash = subprocess.run(
+    ["git", "hash-object", "-w", "--stdin"],
+    input=stripped.encode("utf-8", "surrogateescape"), capture_output=True,
+).stdout.decode().strip()
+subprocess.run(
+    ["git", "update-index", "--cacheinfo", f"100644,{new_hash},CLAUDE.md"],
+    check=True,
+)
+
+# Mirror the strip to the working tree when it carries the same block, so the
+# file does not immediately re-appear as modified after the commit.
+try:
+    with open("CLAUDE.md", encoding="utf-8", errors="surrogateescape") as fh:
+        wt = fh.read()
+    wt_stripped = PATTERN.sub("\n", wt)
+    if wt_stripped != wt:
+        with open("CLAUDE.md", "w", encoding="utf-8", errors="surrogateescape") as fh:
+            fh.write(wt_stripped)
+except OSError:
+    pass
+
+sys.exit(10)  # signal: block was stripped
+PY
+        rc=$?
+        if [ "$rc" = "10" ]; then
+            echo "pre-commit: stripped auto-injected GitNexus block from staged CLAUDE.md (kept in AGENTS.md)."
+        elif [ "$rc" != "0" ]; then
+            echo "BLOCKED: failed to strip GitNexus block from CLAUDE.md (python3 exit $rc)." >&2
+            echo "Resolve manually, or commit with --no-verify if you are certain." >&2
+            exit 1
+        fi
+    else
+        echo "WARNING: python3 not found — cannot strip GitNexus block from CLAUDE.md."
+    fi
+fi
+
 # Phase 6 — verify tracked hook changes are recorded in .genesis-hook-versions
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 if [ -n "$REPO_ROOT" ] && [ -x "$REPO_ROOT/scripts/check_hook_versions.sh" ]; then
