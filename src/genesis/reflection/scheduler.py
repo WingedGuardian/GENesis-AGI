@@ -166,7 +166,7 @@ class ReflectionScheduler:
         except Exception:
             pass
         try:
-            if await self._already_ran_this_week("quality_calibration"):
+            if await self._already_ran_this_week("quality_calibration", "quality_drift"):
                 logger.info("Quality calibration already ran this week — skipping")
                 return
 
@@ -195,8 +195,18 @@ class ReflectionScheduler:
             logger.exception("Quality calibration error")
             await self._record_job_result("weekly_calibration", error=str(exc))
 
-    async def _already_ran_this_week(self, obs_type: str) -> bool:
-        """Check if an observation of this type exists from the current week."""
+    async def _already_ran_this_week(self, *obs_types: str) -> bool:
+        """Check if an observation of any of these types exists from this week.
+
+        Accepts multiple types because one logical run can land under more than
+        one observation type: quality calibration writes ``quality_calibration``
+        on a clean week but ``quality_drift`` on a drift week (see
+        ``output_router.route_calibration``). The guard must recognise either —
+        otherwise a drift week looks like "never ran" and the run could repeat.
+        The observation is written only on a *successful* run (a failure writes
+        nothing), so its presence is a last-success signal and a failed run
+        stays retriable.
+        """
         from genesis.db.crud import observations
 
         # Get start of current week (Monday 00:00)
@@ -205,8 +215,9 @@ class ReflectionScheduler:
         monday -= __import__("datetime").timedelta(days=now.weekday())
         monday_iso = monday.isoformat()
 
-        recent = await observations.query(self._db, type=obs_type, limit=1)
-        if not recent:
-            return False
+        for obs_type in obs_types:
+            recent = await observations.query(self._db, type=obs_type, limit=1)
+            if recent and recent[0].get("created_at", "") >= monday_iso:
+                return True
 
-        return recent[0].get("created_at", "") >= monday_iso
+        return False
