@@ -156,6 +156,36 @@ class TestCalibrationJob:
         mock_bridge.run_quality_calibration.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_skips_if_drift_ran_this_week(self, scheduler, mock_bridge, db):
+        # Drift weeks write a `quality_drift` observation (not `quality_calibration`).
+        # The guard must still recognise this week's run and skip — otherwise the
+        # expensive calibration repeats on every re-trigger during a drift week.
+        now = datetime.now(UTC).isoformat()
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES ('d1', 'quality_calibration', 'quality_drift', '{}', 'high', ?)",
+            (now,),
+        )
+        await db.commit()
+
+        await scheduler._run_calibration()
+        mock_bridge.run_quality_calibration.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runs_if_only_old_drift(self, scheduler, mock_bridge, db):
+        # A drift observation from last week must NOT suppress this week's run.
+        old = (datetime.now(UTC) - timedelta(days=8)).isoformat()
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES ('d1', 'quality_calibration', 'quality_drift', '{}', 'high', ?)",
+            (old,),
+        )
+        await db.commit()
+
+        await scheduler._run_calibration()
+        mock_bridge.run_quality_calibration.assert_called_once_with(db)
+
+    @pytest.mark.asyncio
     async def test_no_stability_monitor(self, db, mock_bridge):
         sched = ReflectionScheduler(
             bridge=mock_bridge,
@@ -183,6 +213,50 @@ class TestIdempotency:
         await db.commit()
         result = await scheduler._already_ran_this_week("self_assessment")
         assert result
+
+    @pytest.mark.asyncio
+    async def test_drift_type_counts_as_calibration_run(self, scheduler, db):
+        # The calibration guard passes both types; a this-week drift row counts.
+        now = datetime.now(UTC).isoformat()
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES ('d1', 'quality_calibration', 'quality_drift', '{}', 'high', ?)",
+            (now,),
+        )
+        await db.commit()
+        result = await scheduler._already_ran_this_week(
+            "quality_calibration", "quality_drift",
+        )
+        assert result
+
+    @pytest.mark.asyncio
+    async def test_clean_type_counts_as_calibration_run(self, scheduler, db):
+        now = datetime.now(UTC).isoformat()
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES ('c1', 'quality_calibration', 'quality_calibration', '{}', 'medium', ?)",
+            (now,),
+        )
+        await db.commit()
+        result = await scheduler._already_ran_this_week(
+            "quality_calibration", "quality_drift",
+        )
+        assert result
+
+    @pytest.mark.asyncio
+    async def test_multi_type_all_old_means_not_ran(self, scheduler, db):
+        old = (datetime.now(UTC) - timedelta(days=8)).isoformat()
+        for oid, otype in (("c1", "quality_calibration"), ("d1", "quality_drift")):
+            await db.execute(
+                "INSERT INTO observations (id, source, type, content, priority, created_at) "
+                "VALUES (?, 'quality_calibration', ?, '{}', 'medium', ?)",
+                (oid, otype, old),
+            )
+        await db.commit()
+        result = await scheduler._already_ran_this_week(
+            "quality_calibration", "quality_drift",
+        )
+        assert not result
 
 
 class TestRuntimeBootstrap:
