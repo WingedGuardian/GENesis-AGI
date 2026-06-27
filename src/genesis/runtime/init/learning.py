@@ -509,6 +509,17 @@ async def init(rt: GenesisRuntime) -> None:
             except Exception as exc:
                 rt.record_job_failure("procedure_promotion", str(exc))
                 logger.exception("Procedure promotion failed")
+            # Self-healing embedding backfill — independent of promotion so a
+            # backfill failure never fails the promotion job. Repairs procedures
+            # whose principle_embedding is NULL (transient embed failure at
+            # create) so they rejoin the proactive-surfacing pool.
+            try:
+                from genesis.learning.procedural.promoter import (
+                    backfill_missing_embeddings,
+                )
+                await backfill_missing_embeddings(rt._db)
+            except Exception:
+                logger.exception("Procedure embedding backfill failed")
 
         # CronTrigger instead of IntervalTrigger: IntervalTrigger resets its
         # countdown on every server restart, so under frequent restarts the job

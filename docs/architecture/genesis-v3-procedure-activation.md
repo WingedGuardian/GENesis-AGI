@@ -41,21 +41,26 @@ Reliability decreases as scope increases. Layers reinforce each other.
 
 Beyond the activation layers, the **proactive memory hook**
 (`scripts/proactive_memory_hook.py` → `_search_procedures`) surfaces the single
-best embedding match on each user message. v2 gates surfacing so each tier is an
-*additive* channel — a higher tier gets everything the lower tiers do, plus one
-more surface:
+best embedding match on each user message. Surfacing is gated so each *higher*
+channel is reserved for *more-proven* tiers:
 
 | Tier | recall (MCP) | proactive hook | tool advisor | session inject |
 |------|:---:|:---:|:---:|:---:|
-| DORMANT  | ✓ |   |   |   |
+| DORMANT  | ✓ | ✓ (strict bar) |   |   |
 | LIBRARY  | ✓ | ✓ |   |   |
 | ADVISORY | ✓ | ✓ | ✓ |   |
 | CORE     | ✓ | ✓ | ✓ | ✓ |
 
-So unproven DORMANT drafts are **recall-only** (never auto-injected), and only the
-proven CORE set is injected blindly at session start. The tiers are ranked
-CORE > ADVISORY > LIBRARY > DORMANT (CORE = most-proven; see `_TIER_RANK` in
-`promoter.py`).
+DORMANT drafts **are** eligible for the proactive hook, but each row is gated
+against its own tier's cosine bar: DORMANT (unproven, conf 0.0) must clear a
+**stricter** cutoff (`_DORMANT_SURFACE_THRESHOLD`, 0.78) than proven tiers
+(`_PROCEDURE_SURFACE_THRESHOLD`, 0.70), and a surfaced DORMANT row is framed to
+the model as an *unproven draft — suggestion, not authoritative*. This breaks the
+golden-dormant lockout (a draft that is never surfaced is never used, so never
+promoted out of DORMANT) while keeping false-positive risk bounded. The tool
+advisor and blind session-start inject remain proven-only (LIBRARY+/CORE). The
+tiers are ranked CORE > ADVISORY > LIBRARY > DORMANT (CORE = most-proven; see
+`_TIER_RANK` in `promoter.py`).
 
 ## Procedure Lifecycle
 

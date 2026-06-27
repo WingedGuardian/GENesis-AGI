@@ -204,3 +204,88 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
     if any(v > 0 for v in result.values()):
         logger.info("Promotion results: %s", result)
     return result
+
+
+# Bound per run: backfilling re-embeds via the network, so cap how many
+# missing-embedding rows we repair per hourly pass (the steady-state count is 0).
+_EMBED_BACKFILL_LIMIT = 10
+
+
+async def backfill_missing_embeddings(
+    db: aiosqlite.Connection, *, limit: int = _EMBED_BACKFILL_LIMIT
+) -> int:
+    """Re-embed active procedures whose ``principle_embedding`` is NULL.
+
+    Both create paths embed at store time, but the embed is best-effort — a
+    transient backend outage (or a pre-embedding legacy row) leaves the column
+    NULL, and a NULL-embedding procedure is invisible to the relevance-gated
+    proactive hook (never surfaced → never invoked → never promoted). This
+    self-healing pass repairs those rows so they rejoin the surfacing pool.
+
+    Network embeds are done FIRST (outside any write), then the quick UPDATEs are
+    applied — so the embedding round-trips never interleave with held DB state on
+    the shared connection. Fail-open: an embedder outage aborts the run cleanly
+    (retried next hour); a per-row failure is logged and skipped. Returns the
+    number of rows repaired.
+    """
+    try:
+        cur = await db.execute(
+            "SELECT id, principle FROM procedural_memory "
+            "WHERE principle_embedding IS NULL AND deprecated = 0 AND quarantined = 0 "
+            "AND principle IS NOT NULL AND principle != '' "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cur.fetchall()
+    except Exception:
+        logger.warning("Embedding backfill: query failed", exc_info=True)
+        return 0
+
+    if not rows:
+        return 0
+
+    try:
+        from genesis.learning.procedural.embedding import pack_embedding
+        from genesis.memory.embeddings import (
+            EmbeddingProvider,
+            EmbeddingUnavailableError,
+        )
+
+        provider = EmbeddingProvider()
+    except Exception:
+        logger.warning("Embedding backfill: provider unavailable — skipping run")
+        return 0
+
+    # Phase 1 — embed (network). Gather blobs without touching the DB so the
+    # round-trips don't interleave with held state on the shared connection.
+    pending: list[tuple[str, bytes]] = []
+    for row in rows:
+        pid, principle = row[0], row[1]
+        try:
+            blob = pack_embedding(await provider.embed(principle))
+        except EmbeddingUnavailableError:
+            # Backend outage — stop now, retry the whole batch next hour.
+            logger.warning("Embedding backfill: embedder unavailable, aborting run")
+            break
+        except Exception:
+            # Bad vector dim / pack error for this row — skip it, keep going.
+            logger.warning(
+                "Embedding backfill: failed to embed %s; skipping", pid, exc_info=True
+            )
+            continue
+        pending.append((pid, blob))
+
+    # Phase 2 — quick writes.
+    repaired = 0
+    for pid, blob in pending:
+        try:
+            if await procedural.update(db, pid, principle_embedding=blob):
+                repaired += 1
+        except Exception:
+            logger.warning(
+                "Embedding backfill: failed to write %s; skipping", pid, exc_info=True
+            )
+
+    if repaired:
+        logger.info("Embedding backfill: repaired %d procedure embedding(s)", repaired)
+    return repaired

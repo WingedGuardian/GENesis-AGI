@@ -456,21 +456,29 @@ def _search_fts5(
         return []
 
 
-_PROCEDURE_SURFACE_THRESHOLD = 0.7  # Cosine threshold for the procedure hook.
+_PROCEDURE_SURFACE_THRESHOLD = 0.7  # Cosine cutoff for PROVEN tiers (CORE/ADVISORY/LIBRARY).
 # "Recommend a procedure" carries higher risk of being a false positive than
 # "recommend a memory" (procedures are workflow assertions), so use a stricter
 # cosine cutoff. Top-1 only: most prompts have no relevant procedure.
+_DORMANT_SURFACE_THRESHOLD = 0.78  # Stricter bar for UNPROVEN drafts (DORMANT).
+# DORMANT procedures (0 invocations, confidence 0.0) are eligible for surfacing —
+# that's how golden-dormant drafts escape the never-seen → never-used → never-
+# promoted lockout — but they must clear a HIGHER relevance bar than proven tiers
+# before being auto-injected, and the caller frames them as unproven suggestions.
 
 
 def _search_procedures(
     db_path: Path, prompt_vector: list[float],
-) -> tuple[str, str, str] | None:
-    """Return (procedure_id, task_type, principle_snippet) if a procedure's
-    principle embedding clears the cosine threshold, else None.
+) -> tuple[str, str, str, str] | None:
+    """Return (procedure_id, task_type, principle_snippet, activation_tier) if a
+    procedure's principle embedding clears its tier-dependent cosine threshold,
+    else None.
 
-    Only LIBRARY+ tiers (CORE/ADVISORY/LIBRARY) are eligible for proactive
-    surfacing; the DORMANT tier (unproven drafts) is recall-only and never
-    auto-injected.
+    ALL non-deprecated, non-quarantined, embedded procedures are eligible —
+    including DORMANT drafts. Each row is gated against its OWN tier threshold
+    (DORMANT must clear the stricter ``_DORMANT_SURFACE_THRESHOLD``), then the
+    highest-similarity row that cleared its bar wins — so a high-similarity-but-
+    rejected DORMANT never shadows a proven LIBRARY match just below it.
 
     Best-effort: catches every failure mode and returns None so the parent
     hook (memory recall) is never blocked by this addition.
@@ -485,32 +493,45 @@ def _search_procedures(
         try:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, task_type, principle, principle_embedding "
+                "SELECT id, task_type, principle, principle_embedding, activation_tier "
                 "FROM procedural_memory "
                 "WHERE deprecated = 0 AND quarantined = 0 "
                 "AND principle_embedding IS NOT NULL "
-                # v2: gate proactive surfacing to LIBRARY+ (CORE/ADVISORY/
-                # LIBRARY) — DORMANT drafts are recall-only, never proactively
-                # auto-injected.
-                "AND activation_tier IN ('CORE', 'ADVISORY', 'LIBRARY') "
-                "ORDER BY confidence DESC LIMIT 100"
+                # All tiers eligible — including DORMANT drafts. The per-row tier
+                # threshold below (not the SQL) is what gates unproven drafts;
+                # surfacing them is how they escape the golden-dormant lockout.
+                # NB: DORMANT drafts have confidence 0.0, so they sort LAST under
+                # "confidence DESC" — a tight LIMIT would starve the exact rows
+                # we want to unlock. The bound is generous (procedures are sparse
+                # by design); the real selector is cosine, computed below over the
+                # whole fetched set. Revisit with a vector index if the pool nears
+                # this bound.
+                "ORDER BY confidence DESC LIMIT 1000"
             ).fetchall()
         finally:
             conn.close()
 
-        best: tuple[float, str, str, str] | None = None
+        best: tuple[float, str, str, str, str] | None = None
         for row in rows:
             existing_vec = unpack_embedding(row["principle_embedding"])
             if existing_vec is None:
                 continue
             sim = cosine_similarity(prompt_vector, existing_vec)
+            tier = row["activation_tier"] or "DORMANT"
+            threshold = (
+                _DORMANT_SURFACE_THRESHOLD
+                if tier == "DORMANT"
+                else _PROCEDURE_SURFACE_THRESHOLD
+            )
+            if sim < threshold:
+                continue  # row failed its OWN tier's bar — never let it win
             if best is None or sim > best[0]:
-                best = (sim, row["id"], row["task_type"] or "", row["principle"] or "")
+                best = (sim, row["id"], row["task_type"] or "", row["principle"] or "", tier)
 
-        if best is None or best[0] < _PROCEDURE_SURFACE_THRESHOLD:
+        if best is None:
             return None
-        _sim, proc_id, task_type, principle = best
-        return proc_id, task_type, principle[:200]
+        _sim, proc_id, task_type, principle, tier = best
+        return proc_id, task_type, principle[:200], tier
     except Exception:
         return None  # Never block the memory hook
 
@@ -1257,14 +1278,21 @@ async def _run(prompt: str, session_id: str = "") -> None:
             sys.stdout.flush()
 
     # Procedure surfacing — reuses the already-computed prompt embedding
-    # so there's no extra cloud call. Top-1 only, cosine >= 0.7. Wrapped in
-    # a broad try/except so a bad procedure read can't crash the memory hook.
+    # so there's no extra cloud call. Top-1 only, per-tier cosine bar. Wrapped
+    # in a broad try/except so a bad procedure read can't crash the memory hook.
     if vector:
         try:
             proc = _search_procedures(_DB_PATH, vector)
             if proc is not None:
-                proc_id, task_type, principle = proc
-                tag = f"Procedure | {task_type} | id:{proc_id[:8]}" if task_type else f"Procedure | id:{proc_id[:8]}"
+                proc_id, task_type, principle, tier = proc
+                # DORMANT drafts are unproven (0 invocations, conf 0.0): label
+                # them so the model treats them as a hint, not authoritative.
+                label = (
+                    "Procedure (unproven draft — suggestion, not authoritative)"
+                    if tier == "DORMANT"
+                    else "Procedure"
+                )
+                tag = f"{label} | {task_type} | id:{proc_id[:8]}" if task_type else f"{label} | id:{proc_id[:8]}"
                 print(f"[{tag}] {principle}")
                 sys.stdout.flush()
         except Exception as proc_exc:

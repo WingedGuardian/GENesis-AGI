@@ -47,13 +47,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
-- **Genesis no longer auto-surfaces unproven draft procedures.** Procedures it
-  has learned but not yet proven are now recall-only — Genesis can look them up
-  on demand, but they're no longer injected into its context automatically on
-  every message. And the session-start procedure list is trimmed to only the
-  most-proven, always-on procedures, instead of a mix of mid-tier ones of
-  uncertain relevance picked before it even knows what the session is about.
-  Net effect: less noise, and the procedures that do surface have earned it.
+- **Genesis surfaces its learned procedures by relevance — now including unproven
+  drafts, carefully.** A procedure Genesis has learned but not yet validated can be
+  surfaced when it's a strong match for what you're doing, but only on a higher
+  relevance bar than proven procedures and clearly flagged as an *unproven draft —
+  suggestion, not authoritative*. This lets a genuinely useful draft help (and earn
+  its way to proven status through use) instead of sitting unused forever, without
+  ever presenting it as settled guidance. Blind session-start injection still stays
+  limited to the most-proven, always-on procedures. Genesis also now repairs
+  procedures that were missing their embedding, so they stop being silently
+  invisible to this relevance matching.
 
 - **Procedures you actually use now earn their keep.** How often a learned
   procedure is recalled ("reads") now counts as a dampened usefulness signal:
