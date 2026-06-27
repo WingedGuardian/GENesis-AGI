@@ -85,3 +85,48 @@ async def test_advisor_missing_id_tolerated(_db):
 def test_advisor_empty_list_is_noop(_db):
     # No DB access at all when there are no matches.
     _record_procedures_surfaced([])
+
+
+# ── main()-level wiring: bump fires only on match; triggers w/o id are skipped ─
+
+@pytest.mark.asyncio
+async def test_advisor_main_bumps_only_matched_with_id(_db, monkeypatch, capsys):
+    import io
+    await _seed(_db, ["pa", "pz"])   # pa matches; pz is unrelated
+
+    # Crafted cache: one matching trigger WITH an id, one matching trigger
+    # WITHOUT an id (must be skipped from the bump, not crash), and pz absent.
+    triggers = [
+        {"tool": ["Bash"], "context_patterns": ["pip.*-e"], "procedure_id": "pa",
+         "task_type": "t", "principle": "p", "steps": [], "confidence": 0.9},
+        {"tool": ["Bash"], "context_patterns": ["pip.*-e"],
+         "task_type": "t", "principle": "p", "steps": [], "confidence": 0.9},
+    ]
+    monkeypatch.setattr(_mod, "_load_triggers", lambda: triggers)
+    stdin = io.StringIO('{"tool_name": "Bash", "tool_input": {"command": "pip install -e ."}}')
+    monkeypatch.setattr("sys.stdin", stdin)
+
+    rc = _mod.main()
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "PROCEDURE" in out          # the advisory was emitted
+
+    assert (await _counts(_db, "pa"))[0] == 1   # matched + had id → bumped
+    assert (await _counts(_db, "pz"))[0] == 0   # never matched → untouched
+
+
+@pytest.mark.asyncio
+async def test_advisor_main_no_match_does_not_write(_db, monkeypatch):
+    import io
+    await _seed(_db, ["pa"])
+    triggers = [
+        {"tool": ["Bash"], "context_patterns": ["pip.*-e"], "procedure_id": "pa",
+         "task_type": "t", "principle": "p", "steps": [], "confidence": 0.9},
+    ]
+    monkeypatch.setattr(_mod, "_load_triggers", lambda: triggers)
+    # A Bash command that does NOT match the pattern → no advisory, no bump.
+    stdin = io.StringIO('{"tool_name": "Bash", "tool_input": {"command": "ls -la"}}')
+    monkeypatch.setattr("sys.stdin", stdin)
+
+    assert _mod.main() == 0
+    assert (await _counts(_db, "pa"))[0] == 0
