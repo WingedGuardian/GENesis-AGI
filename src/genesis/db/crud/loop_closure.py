@@ -108,24 +108,68 @@ async def observation_funnel(db: aiosqlite.Connection, *, stale_before: str) -> 
     }
 
 
+# Reflection-OUTPUT observation types — the actuation-bearing reflection
+# artifacts. EXPLICIT allow-list, deliberately NOT a ``LIKE '%reflection%'``:
+# that would wrongly pull in ``quarantined_reflection`` (gatekept failures, not
+# actuation). ``learning`` is excluded too — it is shared with the learning
+# pipeline (``learning/pipeline.py``), so it isn't reflection-exclusive.
+_REFLECTION_OBS_TYPES = (
+    "light_reflection",
+    "micro_reflection",
+    "reflection_output",
+    "reflection_summary",
+    "reflection_observation",
+)
+
+
 async def reflection_funnel(db: aiosqlite.Connection) -> dict:
-    """Reflections: actuation signal = ``used_in_optimization``. Leak = generated
-    but never used to change anything."""
-    total = await _scalar(db, "SELECT COUNT(*) FROM reflection_corpus")
-    graded = await _scalar(
-        db, "SELECT COUNT(*) FROM reflection_corpus WHERE quality_label IS NOT NULL"
+    """Reflections actuate as OBSERVATIONS, not via ``reflection_corpus``.
+
+    ``reflection_corpus`` is the raw reflection-LLM transcript log; its
+    ``used_in_optimization`` column was reserved for a prompt-optimization
+    pipeline that was never built (zero writers in the codebase) — so a 0 there
+    is NOT a leak, it's an unbuilt arc. The real actuation flows through the
+    reflection-output observations (``_REFLECTION_OBS_TYPES``), measured by
+    ``influenced_action``.
+
+    This is a focused SUBSET view of rows already counted in
+    ``observation_funnel`` (they live in both), so it intentionally emits **no**
+    ``leak_`` key — the staleness/leak of those rows is owned by
+    ``observation_funnel`` and must not be double-counted in the umbrella's
+    open-seams. ``leaked`` here is internal to the loop label only.
+    """
+    placeholders = ",".join("?" for _ in _REFLECTION_OBS_TYPES)
+    captured = await _scalar(
+        db,
+        f"SELECT COUNT(*) FROM observations WHERE type IN ({placeholders})",
+        _REFLECTION_OBS_TYPES,
     )
-    used = await _scalar(
-        db, "SELECT COUNT(*) FROM reflection_corpus WHERE used_in_optimization = 1"
+    actuated = await _scalar(
+        db,
+        f"SELECT COUNT(*) FROM observations "
+        f"WHERE type IN ({placeholders}) AND influenced_action = 1",
+        _REFLECTION_OBS_TYPES,
     )
-    leak_unused = total - used
+    # Raw transcript capture log — context only, NOT the actuation signal.
+    corpus_captured = await _scalar(db, "SELECT COUNT(*) FROM reflection_corpus")
+    corpus_parsed = await _scalar(
+        db, "SELECT COUNT(*) FROM reflection_corpus WHERE parsed_ok = 1"
+    )
+    leaked = captured - actuated  # loop-label math only; never exposed as leak_
     return {
         "artifact": "reflection",
-        "captured": total,
-        "graded": graded,
-        "actuated": used,
-        "leak_unused": leak_unused,
-        "loop": _loop_label(total, flowing=used, leaked=leak_unused),
+        "captured": captured,
+        "actuated": actuated,
+        "corpus_captured": corpus_captured,
+        "corpus_parsed": corpus_parsed,
+        "optimization_pipeline": "not_built",
+        "loop": _loop_label(captured, flowing=actuated, leaked=leaked),
+        "note": (
+            "actuation measured via reflection-output observations (subset of "
+            "observation_funnel — not additive); reflection_corpus."
+            "used_in_optimization is reserved for an unbuilt optimization "
+            "pipeline, not a leak"
+        ),
     }
 
 

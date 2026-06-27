@@ -33,12 +33,12 @@ async def _proc(db, pid, *, invocation=0, success=0, failure=0, tier="DORMANT", 
     )
 
 
-async def _obs(db, oid, *, influenced=0, resolved=0, surfaced=0, created=_NEW):
+async def _obs(db, oid, *, otype="generic", influenced=0, resolved=0, surfaced=0, created=_NEW):
     await db.execute(
         "INSERT INTO observations "
         "(id, source, type, content, priority, created_at, influenced_action, resolved, surfaced_count) "
         "VALUES (?,?,?,?,?,?,?,?,?)",
-        (oid, "s", "generic", "c", "medium", created, influenced, resolved, surfaced),
+        (oid, "s", otype, "c", "medium", created, influenced, resolved, surfaced),
     )
 
 
@@ -109,20 +109,38 @@ async def test_observation_funnel_partial_with_leak(db):
     assert f["loop"] == "PARTIAL"
 
 
-# ── reflections: actuation = used_in_optimization ────────────────────────────
+# ── reflections: actuation measured via reflection-output observations ────────
 
-async def test_reflection_funnel_flags_unused(db):
-    await _refl(db, "r1", used=1, quality="good")
-    await _refl(db, "r2", used=0, quality="fair")
-    await _refl(db, "r3", used=0)               # ungraded too
+async def test_reflection_funnel_measures_observation_actuation(db):
+    # reflection-output observations carry the actuation signal
+    await _obs(db, "ro1", otype="micro_reflection", influenced=1)    # actuated
+    await _obs(db, "ro2", otype="reflection_summary", influenced=0)  # not actuated
+    await _obs(db, "ro3", otype="light_reflection", influenced=1)    # actuated
+    # quarantined_reflection is a gatekept failure → must NOT be counted
+    await _obs(db, "qr1", otype="quarantined_reflection", influenced=0)
+    # a non-reflection observation → must NOT be counted
+    await _obs(db, "g1", otype="generic", influenced=0)
+    # raw corpus transcripts: context only; used_in_optimization is a dead column
+    await _refl(db, "c1", used=0)
     await db.commit()
 
     f = await lc.reflection_funnel(db)
-    assert f["captured"] == 3
-    assert f["graded"] == 2
-    assert f["actuated"] == 1
-    assert f["leak_unused"] == 2
-    assert f["loop"] == "PARTIAL"
+    assert f["captured"] == 3            # ro1/ro2/ro3 only (not qr1, not g1)
+    assert f["actuated"] == 2            # ro1 + ro3
+    assert f["corpus_captured"] == 1     # transcript log, context only
+    assert f["optimization_pipeline"] == "not_built"
+    # emits NO leak_ key — those rows' staleness is owned by observation_funnel
+    assert not any(k.startswith("leak_") for k in f)
+    assert f["loop"] == "PARTIAL"        # some actuate, some don't — NOT OPEN
+
+
+async def test_reflection_funnel_open_only_when_no_actuation(db):
+    # genuinely OPEN (real, not a dead-column artifact) when nothing influenced
+    await _obs(db, "ro1", otype="reflection_observation", influenced=0)
+    await db.commit()
+    f = await lc.reflection_funnel(db)
+    assert f["captured"] == 1 and f["actuated"] == 0
+    assert f["loop"] == "OPEN"
 
 
 # ── follow-ups: actuated = scheduled/in_progress/completed; leak = stale pending ─
@@ -174,7 +192,9 @@ async def test_impl_assembly_and_open_seams(db, monkeypatch):
 
     monkeypatch.setattr(hm, "_service", SimpleNamespace(_db=db))
 
-    await _refl(db, "r1", used=0)        # reflection never used → OPEN seam
+    # reflections actuate via observations → NOT a false OPEN on the dead column
+    await _obs(db, "ro1", otype="micro_reflection", influenced=1)
+    await _refl(db, "r1", used=0)        # raw transcript (context only)
     await _proc(db, "p1", invocation=0)  # uninvoked procedure → leak seam
     await db.commit()
 
@@ -186,7 +206,9 @@ async def test_impl_assembly_and_open_seams(db, monkeypatch):
     assert "outcome_bus" in res
 
     seams = res["open_seams"]
-    assert any("reflection" in s and "OPEN" in s for s in seams)
+    # the procedure leak still surfaces honestly
     assert any("procedure" in s and "uninvoked" in s for s in seams)
+    # reflections must NOT be flagged OPEN any more (dead-column false positive gone)
+    assert not any("reflection" in s and "OPEN" in s for s in seams)
     # by_tier / by_status dicts must NEVER be rendered as a seam string
     assert all("{" not in s and "[" not in s for s in seams)
