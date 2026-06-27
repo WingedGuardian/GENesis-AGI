@@ -49,13 +49,30 @@ def _loop_label(total: int, *, flowing: int, leaked: int) -> str:
 
 
 async def procedure_funnel(db: aiosqlite.Connection) -> dict:
-    """Procedures are outcome-graded, but ``procedural_memory`` has NO 'surfaced'
-    counter — ``invocation_count`` is the actuation signal (the procedure
-    actually fired). So we report ``invoked`` (not 'surfaced'); the leak is
-    captured-but-never-invoked (the golden-dormant that never gets to mature)."""
+    """Procedures are outcome-graded. ``procedural_memory`` now carries TWO
+    distinct usage counters:
+
+    - ``surfaced_count`` — a contextual hook put the procedure into a model's
+      context (the proactive memory hook on a prompt, or the PreToolUse advisor
+      on a tool call). Passive exposure. NOT read by the promoter.
+    - ``invocation_count`` — the procedure was explicitly recalled/fired via the
+      ``procedure_recall`` MCP tool. Active actuation; the promoter's read-signal.
+
+    So the honest funnel is captured → **surfaced → invoked** → measured. A
+    procedure that has been neither surfaced nor invoked has never reached a
+    model at all — that is the real leak (golden-dormant that never gets to
+    mature). ``reached`` (surfaced OR invoked) is the loop's "flowing" signal."""
     total = await _scalar(db, "SELECT COUNT(*) FROM procedural_memory")
+    surfaced = await _scalar(
+        db, "SELECT COUNT(*) FROM procedural_memory WHERE surfaced_count > 0"
+    )
     invoked = await _scalar(
         db, "SELECT COUNT(*) FROM procedural_memory WHERE invocation_count > 0"
+    )
+    reached = await _scalar(
+        db,
+        "SELECT COUNT(*) FROM procedural_memory "
+        "WHERE surfaced_count > 0 OR invocation_count > 0",
     )
     measured = await _scalar(
         db,
@@ -67,16 +84,17 @@ async def procedure_funnel(db: aiosqlite.Connection) -> dict:
     by_tier = await _group_counts(
         db, "SELECT activation_tier, COUNT(*) FROM procedural_memory GROUP BY activation_tier"
     )
-    leak_uninvoked = total - invoked
+    leak_never_reached = total - reached
     return {
         "artifact": "procedure",
         "captured": total,
+        "surfaced": surfaced,
         "invoked": invoked,
         "measured": measured,
         "by_tier": by_tier,
         "deprecated": deprecated,
-        "leak_uninvoked": leak_uninvoked,
-        "loop": _loop_label(total, flowing=invoked, leaked=leak_uninvoked),
+        "leak_never_reached": leak_never_reached,
+        "loop": _loop_label(total, flowing=reached, leaked=leak_never_reached),
     }
 
 
