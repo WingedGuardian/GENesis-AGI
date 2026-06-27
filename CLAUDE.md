@@ -71,12 +71,14 @@ systemctl --user status genesis-server            # Verify server running
 
 ## Code Intelligence
 
-Four tool layers: (1) Grep/Glob/Read for text/configs, (2) Serena for
-Python LSP, (3) codebase-memory-mcp for code graph, (4) GitNexus for
-blast radius and impact analysis. Use GitNexus `impact` before editing
-symbols and `detect-changes` before committing. Use Serena or GitNexus
-for dependency questions, not manual file reads.
-Full decision matrix: `.claude/docs/code-intelligence.md`
+Pick the tool by the question (full matrix + freshness model:
+`.claude/docs/code-intelligence.md`): **Grep/Glob/Read** for text/configs;
+**Serena** (Python LSP) for symbols/references/rename — **always live**, the
+default for "who calls X / what breaks if I change Z"; **codebase-memory-mcp**
+for architecture/graph; **GitNexus** for deep blast-radius/flows/coupling —
+**snapshot-based, so `gitnexus analyze` first** when freshness matters (it
+drifts after pulling merged PRs). Prefer these over manual reads for dependency
+questions; none is a mandatory pre-edit gate.
 
 ## Skill Library
 

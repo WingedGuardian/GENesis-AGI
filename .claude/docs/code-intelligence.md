@@ -1,7 +1,10 @@
 # Code Intelligence — Decision Guide
 
-Four tool layers for code search and analysis, lightest to richest.
-Use the lightest layer that answers your question.
+Four tools for code search and analysis, each with a lane. Pick by the
+question, not a fixed hierarchy. One freshness rule cuts across all of them:
+**Serena is always live** (LSP — parses current files per query, never stale),
+while **CBM and GitNexus are indexed** and drift after you pull merged PRs —
+reindex before trusting them for anything load-bearing.
 
 ## Tool Layers
 
@@ -58,17 +61,23 @@ higher-confidence answers faster and catch things manual reads miss.
 
 ## Per-Tool Notes
 
-**Serena** — 1-2s LSP init on first call per session, then fast. Config:
-`.serena/project.yml`. Python-only (Pyright). Does not follow mock patterns
-in tests. Use Grep for non-Python files.
+**Serena** — **always live** (LSP via Pyright; parses current files per query,
+so it never goes stale — no index to rebuild). 1-2s init on first call per
+session, then fast. Config: `.serena/project.yml`. Python-only. Does not follow
+mock patterns in tests. Use Grep for non-Python files. Default for
+symbol/reference/impact questions.
 
 **codebase-memory-mcp** — Tree-sitter code graph, SQLite index (~48MB for
 Genesis). Supports 66 languages. 3D visualization at `localhost:9749`.
-Index rebuilds automatically on each commit (post-commit hook). If stale,
-run `index_repository` manually.
+Indexed (reindex on local commit); if stale, run `index_repository`.
 
-**GitNexus** — LadybugDB graph. All tools work including `query` (FTS
-fixed in 1.6.5). Auto-reindexes on commit + scheduled Mon/Thu 5am UTC.
+**GitNexus** — LadybugDB graph (v1.6.8). Snapshot-based: correct only when the
+index matches the working tree. Its reindex fires on local commit, **not** on
+`git pull` of merged PRs, so the index silently drifts after merges — a stale
+`impact` is confidently wrong exactly mid-change. **Reindex (`gitnexus analyze`)
+when you reach for it** for something load-bearing, and prefer Serena for live
+blast-radius. `query` (FTS) may be unavailable depending on the LadybugDB
+extension — it degrades gracefully (skips FTS, no crash).
 
 **Grep/Glob/Read** — Always available, zero overhead. Preferred for config
 files, markdown, YAML, JSON, shell scripts, SQL, and any non-code content.
