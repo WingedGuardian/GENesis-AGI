@@ -500,7 +500,13 @@ def _search_procedures(
                 # All tiers eligible — including DORMANT drafts. The per-row tier
                 # threshold below (not the SQL) is what gates unproven drafts;
                 # surfacing them is how they escape the golden-dormant lockout.
-                "ORDER BY confidence DESC LIMIT 100"
+                # NB: DORMANT drafts have confidence 0.0, so they sort LAST under
+                # "confidence DESC" — a tight LIMIT would starve the exact rows
+                # we want to unlock. The bound is generous (procedures are sparse
+                # by design); the real selector is cosine, computed below over the
+                # whole fetched set. Revisit with a vector index if the pool nears
+                # this bound.
+                "ORDER BY confidence DESC LIMIT 1000"
             ).fetchall()
         finally:
             conn.close()
