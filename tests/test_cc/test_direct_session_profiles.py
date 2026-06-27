@@ -345,3 +345,64 @@ def test_mail_profile_does_not_upgrade_model():
     req = DirectSessionRequest(prompt="test", profile="mail", model=CCModel.SONNET)
     inv = runner._build_invocation(req)
     assert inv.model == CCModel.SONNET
+
+
+# --- Steward profile: Bash-enabled, gh-scoped, upstream-PR stewardship ---
+
+def test_steward_profile_exists():
+    assert "steward" in PROFILES
+    assert "steward" in VALID_PROFILES
+
+
+def test_steward_grants_bash():
+    """The whole point of steward: Bash is NOT disallowed (it runs gh)."""
+    assert "Bash" not in PROFILES["steward"]
+
+
+def test_steward_blocks_other_universal_tools():
+    """Everything else in the universal block stays blocked (defense in depth)."""
+    for tool in _UNIVERSAL_BLOCKED - {"Bash"}:
+        assert tool in PROFILES["steward"], f"steward should still block {tool}"
+
+
+def test_steward_blocks_write_and_edit():
+    """Steward escalates code fixes — it does not write or edit files itself."""
+    assert "Write" in PROFILES["steward"]
+    assert "Edit" in PROFILES["steward"]
+
+
+def test_steward_blocks_browser_interaction():
+    assert "mcp__genesis-health__browser_click" in PROFILES["steward"]
+
+
+def test_steward_allows_outreach_send():
+    """Steward notifies via outreach_send after each action."""
+    assert "mcp__genesis-outreach__outreach_send" not in PROFILES["steward"]
+
+
+def test_steward_addendum_has_mission():
+    addendum = _build_profile_addendum("steward")
+    assert "Adapt and overcome" in addendum
+
+
+def test_steward_does_not_upgrade_model():
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="test", profile="steward", model=CCModel.SONNET)
+    inv = runner._build_invocation(req)
+    assert inv.model == CCModel.SONNET
+
+
+# --- Bash allowlist plumbing ---
+
+def test_steward_invocation_sets_gh_bash_allowlist():
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="test", profile="steward", model=CCModel.SONNET)
+    inv = runner._build_invocation(req)
+    assert inv.bash_allowlist == ("gh",)
+
+
+def test_non_steward_invocation_has_empty_bash_allowlist():
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="test", profile="research", model=CCModel.SONNET)
+    inv = runner._build_invocation(req)
+    assert inv.bash_allowlist == ()

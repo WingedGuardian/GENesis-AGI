@@ -129,6 +129,11 @@ class CCInvocation:
     skip_permissions: bool = False
     skill_tags: list[str] | None = None
     working_dir: str | None = None
+    # When non-empty, the session's Bash is restricted to these command binaries
+    # (enforced by scripts/bash_safety_hook.sh via the GENESIS_BASH_ALLOWLIST env
+    # var). Used by Bash-enabled background profiles (e.g. "steward") to scope
+    # shell access to a single tool (gh) without granting an open shell.
+    bash_allowlist: tuple[str, ...] = ()
     bare: bool = False
     append_system_prompt: bool = False
     stream_idle_timeout_ms: int | None = None

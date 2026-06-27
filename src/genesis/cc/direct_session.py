@@ -153,6 +153,17 @@ PROFILES: dict[str, list[str]] = {
     "campaign": (
         _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION
     ),
+    # ── Steward profile ──────────────────────────────────────────
+    # For the upstream-PR stewardship campaign. UNIQUE among profiles: it
+    # grants Bash (so it can run `gh`) — every other profile blocks Bash.
+    # The shell is NOT open, though: scripts/bash_safety_hook.sh restricts it
+    # to the `gh` binary only (via GENESIS_BASH_ALLOWLIST). Write/Edit/browser
+    # stay blocked — the campaign comments/reopens/closes PRs and ESCALATES
+    # code fixes rather than editing/pushing itself.
+    "steward": (
+        [t for t in _UNIVERSAL_DISALLOW if t != "Bash"]
+        + _NO_BROWSER_INTERACTION + _NO_FILE_WRITE
+    ),
     # ── Discord monitor profile ─────────────────────────────────
     # Reads Discord channels and responds via bot token API.
     # MCP config loads discord-bot + health + outreach (no memory server).
@@ -228,6 +239,22 @@ Your final message IS your deliverable. Write files to `~/.genesis/output/`.
 
 {_MISSION_INJECTION}
 """,
+    "steward": f"""
+
+## Session Profile: steward
+
+You have: Bash (restricted to the `gh` CLI only), memory MCP tools, outreach_send.
+You do NOT have: Write, Edit, NotebookEdit, browser tools, and Bash may ONLY run
+`gh` — any other command (curl, python, cat, pipes, redirects, chaining) is blocked.
+
+You steward Genesis's own upstream pull requests. Use `gh` to read PR state,
+reviews, and comments, and to comment / reopen / re-request review / close PRs.
+When a review asks for CODE changes, do NOT edit or push — draft the fix and
+escalate it to the user via outreach_send. Notify via outreach_send after every
+action you take on an external PR.
+
+{_MISSION_INJECTION}
+""",
     "discord-monitor": f"""
 
 ## Session Profile: discord-monitor
@@ -263,8 +290,17 @@ _PROFILE_SKILLS: dict[str, list[str]] = {
     "research": [],
     "observe": [],
     "campaign": ["voice-master"],
+    "steward": ["voice-master"],
     "discord-monitor": ["genesis-voice"],
     "mail": ["genesis-voice"],
+}
+
+# Profiles that grant Bash run it under an allowlist of permitted command
+# binaries, enforced by scripts/bash_safety_hook.sh (GENESIS_BASH_ALLOWLIST).
+# A profile absent from this map gets no allowlist (its Bash, if any, is
+# governed only by the global destructive-op blocks).
+_PROFILE_BASH_ALLOWLIST: dict[str, tuple[str, ...]] = {
+    "steward": ("gh",),
 }
 
 # Keyword triggers for content-related skills (scanned against prompt)
@@ -812,6 +848,7 @@ class DirectSessionRunner:
             "research": "reflection",
             "interact": "sentinel",
             "campaign": "campaign",
+            "steward": "campaign",  # health + memory + outreach (for notify)
             "discord-monitor": "discord-monitor",
             "mail": "mail",
         }
@@ -841,6 +878,7 @@ class DirectSessionRunner:
             disallowed_tools=disallowed,
             working_dir=background_session_dir(),
             mcp_config=mcp_config,
+            bash_allowlist=_PROFILE_BASH_ALLOWLIST.get(request.profile, ()),
         )
 
     async def _store_result(
