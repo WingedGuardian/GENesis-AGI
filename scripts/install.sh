@@ -613,18 +613,18 @@ curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/i
     || echo "    NOTE: codebase-memory-mcp unavailable (optional)"
 
 if _node_version_ok; then
-    # Exact pin to 1.6.4 — only ship versions we've actually verified.
-    # Bumping to 1.6.5+ or 1.7+ is an explicit decision in a follow-up
-    # PR (1.7 prereleases had FTS read-blocking issues that need
-    # re-verification).
+    # Exact pin to 1.6.8 — only ship versions we've actually verified. 1.6.8
+    # (stable): `analyze` works; text search (FTS) degrades gracefully when the
+    # LadybugDB extension is absent. The prior 1.6.4-rc line crashed `analyze`
+    # silently. Re-verify before bumping further.
     if ! command -v gitnexus &>/dev/null; then
-        npm install -g gitnexus@1.6.4 2>/dev/null \
+        npm install -g gitnexus@1.6.8 2>/dev/null \
             && echo "    + GitNexus installed ($(gitnexus --version 2>/dev/null))" \
             || echo "    NOTE: GitNexus unavailable (optional)"
     else
-        npm install -g gitnexus@1.6.4 2>/dev/null \
+        npm install -g gitnexus@1.6.8 2>/dev/null \
             && echo "    + GitNexus pin enforced ($(gitnexus --version 2>/dev/null))" \
-            || echo "    NOTE: GitNexus pin enforcement skipped (already at 1.6.4 or failed)"
+            || echo "    NOTE: GitNexus pin enforcement skipped (already at 1.6.8 or failed)"
     fi
 fi
 
