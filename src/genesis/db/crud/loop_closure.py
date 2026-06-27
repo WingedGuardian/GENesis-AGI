@@ -88,8 +88,11 @@ async def procedure_funnel(db: aiosqlite.Connection) -> dict:
     return {
         "artifact": "procedure",
         "captured": total,
-        "surfaced": surfaced,
-        "invoked": invoked,
+        # NOTE: surfaced and invoked OVERLAP (a procedure can be both). Do not
+        # sum them — use ``reached`` (the de-duped union) for total reach.
+        "surfaced": surfaced,   # surfaced_count > 0 (contextual hooks)
+        "invoked": invoked,     # invocation_count > 0 (explicit procedure_recall)
+        "reached": reached,     # surfaced OR invoked, de-duped — the flow signal
         "measured": measured,
         "by_tier": by_tier,
         "deprecated": deprecated,

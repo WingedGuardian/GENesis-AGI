@@ -74,17 +74,19 @@ async def test_procedure_funnel_counts_surfaced_invoked_and_leak(db):
     await _proc(db, "p2", surfaced=4, tier="DORMANT")               # surfaced only (NOT invoked)
     await _proc(db, "p3", invocation=0, tier="DORMANT")            # never reached — the real leak
     await _proc(db, "p4", invocation=0, tier="CORE", deprecated=1)  # never reached + deprecated
+    await _proc(db, "p5", surfaced=2, invocation=1, tier="LIBRARY")  # BOTH — must not double-count
     await db.commit()
 
     f = await lc.procedure_funnel(db)
-    assert f["captured"] == 4
-    assert f["surfaced"] == 1          # only p2 (surfaced_count > 0)
-    assert f["invoked"] == 1           # only p1 (invocation_count > 0)
+    assert f["captured"] == 5
+    assert f["surfaced"] == 2          # p2 + p5 (surfaced_count > 0)
+    assert f["invoked"] == 2           # p1 + p5 (invocation_count > 0)
+    assert f["reached"] == 3           # p1 + p2 + p5 — de-duped union (NOT surfaced+invoked=4)
     assert f["measured"] == 1          # only p1 has outcome counts
     assert f["leak_never_reached"] == 2  # p3 + p4 — neither surfaced nor invoked
     assert f["deprecated"] == 1
-    assert f["by_tier"] == {"ADVISORY": 1, "DORMANT": 2, "CORE": 1}
-    assert f["loop"] == "PARTIAL"      # p1 invoked + p2 surfaced flow; p3/p4 leak
+    assert f["by_tier"] == {"ADVISORY": 1, "DORMANT": 2, "CORE": 1, "LIBRARY": 1}
+    assert f["loop"] == "PARTIAL"      # p1/p2/p5 flow; p3/p4 leak
 
 
 async def test_procedure_surfaced_only_flips_loop_open_to_partial(db):

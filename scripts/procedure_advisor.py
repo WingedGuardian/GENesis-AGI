@@ -66,8 +66,8 @@ def _record_procedures_surfaced(proc_ids: list[str]) -> None:
             conn.commit()
         finally:
             conn.close()
-    except Exception:
-        pass  # Never disrupt the tool call
+    except Exception as exc:  # Never disrupt the tool call — but leave a trace.
+        print(f"procedure_advisor: surfaced_count update skipped: {exc}", file=sys.stderr)
 
 
 def _match_context(tool_input_str: str, context_patterns: list[str]) -> bool:
