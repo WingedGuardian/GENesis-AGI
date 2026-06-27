@@ -6,6 +6,33 @@
 CMD=$(jq -r '.tool_input.command // empty' 2>/dev/null)
 [ -z "$CMD" ] && exit 0
 
+# Bash allowlist gate — scoped background profiles (e.g. "steward") export
+# GENESIS_BASH_ALLOWLIST (comma-separated command binaries, e.g. "gh"). When set,
+# the command's first token must be one of them, and no chaining/piping/
+# substitution/redirection is permitted (those could escape the allowlist).
+# Unset → no effect (every other session behaves exactly as before).
+if [ -n "$GENESIS_BASH_ALLOWLIST" ]; then
+    # Reject embedded newlines first — a `case` glob does not reliably match
+    # $'\n', so use a line count (printf adds no trailing newline, so any count
+    # > 0 means an embedded newline → a second command on its own line).
+    if [ "$(printf '%s' "$CMD" | wc -l)" -gt 0 ]; then
+        echo "BLOCKED: multi-line commands are not permitted in an allowlisted session ($GENESIS_BASH_ALLOWLIST)." >&2
+        exit 2
+    fi
+    case "$CMD" in
+        *';'*|*'&&'*|*'||'*|*'|'*|*'`'*|*'$('*|*'>'*|*'<'*)
+            echo "BLOCKED: this session's Bash may not chain, pipe, substitute, or redirect (allowlist: $GENESIS_BASH_ALLOWLIST)." >&2
+            exit 2;;
+    esac
+    _first=$(printf '%s' "$CMD" | awk '{print $1}')
+    case ",$GENESIS_BASH_ALLOWLIST," in
+        *",$_first,"*) : ;;  # first token is allowlisted — fall through to the standard checks
+        *)
+            echo "BLOCKED: this session may only run [$GENESIS_BASH_ALLOWLIST] commands; got '$_first'." >&2
+            exit 2;;
+    esac
+fi
+
 # pip install -e from/to worktree — catches both explicit worktree paths AND
 # "pip install -e ." run from inside a worktree directory.
 if echo "$CMD" | grep -qE "pip install.*(-e|--editable)"; then
@@ -30,6 +57,24 @@ if echo "$CMD" | grep -qE "worktree remove.*(--force|-f )"; then
     echo "Use git worktree remove without --force, or ask the user first." >&2
     exit 2
 fi
+
+# Hard-blocked destructive commands — checked BEFORE the softer push/PR warnings
+# below, because the generic "git push" warning (exit 0) would otherwise
+# short-circuit a force-push before this block could hard-block it.
+case "$CMD" in
+    *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*|*"rm -rf .."*)
+        echo "BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user." >&2
+        exit 2;;
+    *"git push"*"--force"*|*"git push"*"-f"*)
+        echo "BLOCKED: Force push not allowed. Use a PR." >&2
+        exit 2;;
+    *"git reset --hard"*)
+        echo "BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user." >&2
+        exit 2;;
+    *"git clean -f"*|*"git clean -fd"*)
+        echo "BLOCKED: git clean removes untracked files permanently. Ask the user first." >&2
+        exit 2;;
+esac
 
 # Push / PR protection — remind to get explicit user approval
 if echo "$CMD" | grep -qE "^git push|[;&|] *git push"; then
@@ -61,19 +106,3 @@ if echo "$CMD" | grep -qE "^gh pr merge|[;&|] *gh pr merge"; then
     echo "⚠️  STOP: gh pr merge detected (mergeable=$_mergeable). Have you received explicit user approval for this merge?" >&2
     exit 0
 fi
-
-# Other destructive commands
-case "$CMD" in
-    *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*|*"rm -rf .."*)
-        echo "BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user." >&2
-        exit 2;;
-    *"git push"*"--force"*|*"git push"*"-f"*)
-        echo "BLOCKED: Force push not allowed. Use a PR." >&2
-        exit 2;;
-    *"git reset --hard"*)
-        echo "BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user." >&2
-        exit 2;;
-    *"git clean -f"*|*"git clean -fd"*)
-        echo "BLOCKED: git clean removes untracked files permanently. Ask the user first." >&2
-        exit 2;;
-esac

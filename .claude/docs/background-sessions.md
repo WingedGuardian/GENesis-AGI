@@ -23,12 +23,23 @@ the next few minutes → sub-agent.
 | `observe` | ✗ | ✗ | ✗ | ✗ | ✓ |
 | `research` | ✗ | ✓ | ✗ | ✓ | ✓ |
 | `interact` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `steward` | ✗ | ✓ | ✓ | ✓ | ✓ |
 
-All profiles block: Bash, Edit, Write, task_submit, settings_update,
+Most profiles block: Bash, Edit, Write, task_submit, settings_update,
 direct_session_run, module_call. Use `interact` for workflows that operate
 external platforms (publishing, form filling) and need to communicate with the
 user. Use `research` for investigation that writes observations/follow-ups.
 Use `observe` for read-only investigation.
+
+**`steward` is the one Bash-enabled profile** — and its Bash is restricted to the
+`gh` CLI only (no other command runs), enforced by `scripts/bash_safety_hook.sh`
+via the `GENESIS_BASH_ALLOWLIST` env var set from `CCInvocation.bash_allowlist`.
+It still blocks Edit/Write/browser. Built for the upstream-PR stewardship
+campaign: it reads/comments/reopens/closes Genesis's own PRs to external repos
+and escalates code-change requests rather than editing or pushing itself. A
+profile grants a scoped shell by appearing in `_PROFILE_BASH_ALLOWLIST`
+(`src/genesis/cc/direct_session.py`); without an entry there, a Bash-granting
+profile's shell is governed only by the global destructive-op blocks.
 
 ## Memory Access Policy
 

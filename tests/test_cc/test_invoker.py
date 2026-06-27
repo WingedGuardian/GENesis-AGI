@@ -183,6 +183,21 @@ def test_build_env_strips_parent_anthropic_base_url(invoker):
         assert "ANTHROPIC_BASE_URL" not in env
 
 
+def test_build_env_sets_bash_allowlist(invoker):
+    """Steward-style invocations export GENESIS_BASH_ALLOWLIST for the hook."""
+    inv = CCInvocation(prompt="hello", bash_allowlist=("gh",))
+    env = invoker._build_env(inv)
+    assert env["GENESIS_BASH_ALLOWLIST"] == "gh"
+
+
+def test_build_env_omits_bash_allowlist_when_empty(invoker):
+    """Default (no allowlist) must NOT set the env var, and must not leak parent."""
+    inv = CCInvocation(prompt="hello")
+    with patch.dict("os.environ", {"GENESIS_BASH_ALLOWLIST": "leaked"}):
+        env = invoker._build_env(inv)
+        assert "GENESIS_BASH_ALLOWLIST" not in env
+
+
 @pytest.mark.asyncio
 async def test_run_success(invoker):
     # Match real CLI JSON shape (verified 2026-03-08)

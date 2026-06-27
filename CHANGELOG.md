@@ -11,6 +11,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now stewards its own open-source pull requests instead of filing-and-forgetting.**
+  A new background campaign checks the upstream PRs Genesis has authored (e.g. to litellm,
+  Qwen-Agent) every couple of days, and acts on what changed: it nudges a stalled PR once,
+  pings you when a maintainer responds or merges, and closes PRs that have gone unanswered
+  past a grace window — so contributions don't quietly die of inactivity. It runs in a new
+  locked-down session profile whose shell is restricted to the `gh` CLI only; any code
+  changes a reviewer asks for are escalated to you rather than pushed automatically.
+
 - **Your morning report now shows Genesis's weekly cognitive-quality grades.** Each week
   Genesis grades its own subsystems (memory, ego, procedural, awareness, reflection) A–F;
   the morning report now surfaces them, so cognitive health is visible at a glance instead

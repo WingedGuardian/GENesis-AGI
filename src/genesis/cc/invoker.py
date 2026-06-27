@@ -298,6 +298,14 @@ class CCInvoker:
         # Prevent CC's alt-screen renderer from corrupting terminal scrollback
         # in Linux/tmux.  No-op on CC <2.1.132; required post-migration.
         env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] = "1"
+        # Restrict Bash to an allowlist of command binaries for scoped profiles
+        # (e.g. "steward" → gh only). scripts/bash_safety_hook.sh reads this and
+        # blocks any non-allowlisted command. Absent → no restriction (the var
+        # must not leak from the parent, so pop when the field is empty).
+        if inv and inv.bash_allowlist:
+            env["GENESIS_BASH_ALLOWLIST"] = ",".join(inv.bash_allowlist)
+        else:
+            env.pop("GENESIS_BASH_ALLOWLIST", None)
         return env
 
     def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:

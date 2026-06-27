@@ -460,7 +460,7 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - Best for burst scenarios or when Mistral's 2 RPM limit is too slow
 
 ### OpenRouter Free Tier
-- ~26 models available as free variants (`:free` suffix) on OpenRouter
+- ~27 models available as free variants (`:free` suffix) on OpenRouter
 - **Base rate limits:** 20 RPM, 200 RPD (shared across all free models)
 - **With $10 balance:** 1,000 RPD (5x increase, balance is not consumed by free models)
 - Includes Llama 4 Scout, DeepSeek-R1, Gemma 4 31B, Qwen3-Coder 480B, Nemotron 3 Ultra 550B, various community models
@@ -547,6 +547,10 @@ Models requiring benchmark or free-tier verification before routing decisions:
   benchmark given custom hardware claims.
 - **Cohere rerank-3.5** — 10 RPM free. Not a generative model — for retrieval
   reranking only. Evaluate for memory recall chain improvement.
+- **Cohere North Mini Code (free)** — `cohere/north-mini-code:free`, 256k context,
+  free on OpenRouter (detected June 2026). Coding-focused small model from a major
+  provider. Benchmark scores unverified — evaluate as a free coding fallback against
+  Qwen3-Coder 480B before routing.
 - **Voyage AI voyage-3** — 200M token one-time free embeddings. Evaluate for
   Qdrant embedding quality vs. current embeddings.
 - **NVIDIA Nemotron 3 Ultra 550B (free)** — 550B A55B MoE, 1M context, free on
@@ -653,7 +657,12 @@ High for adversarial review (#20) — without changing application code.
 ---
 
 ## Last Reviewed
-**2026-06-14** — OpenRouter free model count 27→26 (automated inventory:
+**2026-06-21** — OpenRouter free model count 26→27 (automated inventory:
+27 free, +1 new, −0 removed); detected new free model Cohere North Mini Code
+(`cohere/north-mini-code:free`, 256k context) — added to Pending Evaluation as a
+candidate free coding fallback (major provider, benchmarks unverified); updated
+OpenRouter Free Tier count ~26→~27.
+2026-06-14 — OpenRouter free model count 27→26 (automated inventory:
 26 free, +1 new, −2 removed); removed Kimi K2.6 (`moonshotai/kimi-k2.6:free`)
 and GLM-4.5-Air (`z-ai/glm-4.5-air:free`) free variants (delisted June 2026);
 updated Kimi 2.6 entry to drop the now-removed OpenRouter `:free` variant (NIM
