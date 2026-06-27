@@ -41,7 +41,8 @@ async def user_job_create(
         dispatch_prompt: The prompt to run in the background CC session
         description: Optional description of what the job does
         job_type: Job category (e.g., "generic", "maintenance")
-        profile: CC session profile — observe, interact, or research
+        profile: CC session profile — any registered DirectSession profile
+            (e.g. observe, research, interact, campaign, steward)
         model: CC model — sonnet, opus, or haiku
         effort: CC effort level — low, medium, high
     """
@@ -50,13 +51,17 @@ async def user_job_create(
     if _scheduler is None:
         return {"error": "User job scheduler not initialized"}
 
-    # Validate inputs before persisting
-    _VALID_PROFILES = {"observe", "interact", "research"}
+    # Validate inputs before persisting. Use the live profile registry (incl.
+    # campaign/steward/mail/discord-monitor + any install-local overlay
+    # profiles) rather than a stale hardcoded subset — matches
+    # direct_session_tools.py.
+    from genesis.cc.direct_session import VALID_PROFILES
+
     _VALID_MODELS = {"sonnet", "opus", "haiku"}
     _VALID_EFFORTS = {"low", "medium", "high"}
 
-    if profile not in _VALID_PROFILES:
-        return {"error": f"Invalid profile '{profile}'. Must be one of: {', '.join(sorted(_VALID_PROFILES))}"}
+    if profile not in VALID_PROFILES:
+        return {"error": f"Invalid profile '{profile}'. Must be one of: {', '.join(sorted(VALID_PROFILES))}"}
     if model not in _VALID_MODELS:
         return {"error": f"Invalid model '{model}'. Must be one of: {', '.join(sorted(_VALID_MODELS))}"}
     if effort not in _VALID_EFFORTS:

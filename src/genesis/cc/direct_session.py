@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -138,6 +139,12 @@ _NO_OUTREACH_EXTRAS = [
     "mcp__genesis-outreach__outreach_digest",
 ]
 
+# The venv Python interpreter running genesis-server. Exposed to profile
+# overlays (see _load_profile_overlays) so a locally-defined Bash profile can
+# allowlist exactly this path and run `<this> -m <module>`. Using
+# sys.executable keeps it install-agnostic (no hard-coded home path).
+_VENV_PYTHON = sys.executable
+
 PROFILES: dict[str, list[str]] = {
     "observe": (
         _UNIVERSAL_DISALLOW + _NO_FILE_WRITE + _NO_OUTREACH_SEND
@@ -185,8 +192,6 @@ PROFILES: dict[str, list[str]] = {
         + _NO_RECON_WRITES + _NO_WEB_TOOLS + _NO_OUTREACH_EXTRAS
     ),
 }
-
-VALID_PROFILES = frozenset(PROFILES.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +307,118 @@ _PROFILE_SKILLS: dict[str, list[str]] = {
 _PROFILE_BASH_ALLOWLIST: dict[str, tuple[str, ...]] = {
     "steward": ("gh",),
 }
+
+# Which Genesis MCP server set each profile gets. Unknown profiles fall back to
+# "reflection" (health + memory, read-leaning). Module-level (not inside
+# _build_invocation) so profile overlays can register their own mapping.
+_PROFILE_TO_MCP: dict[str, str] = {
+    "observe": "reflection",
+    "research": "reflection",
+    "interact": "sentinel",
+    "campaign": "campaign",
+    "steward": "campaign",  # health + memory + outreach (for notify)
+    "discord-monitor": "discord-monitor",
+    "mail": "mail",
+}
+
+
+# ---------------------------------------------------------------------------
+# Profile overlays — install-local profile registration
+# ---------------------------------------------------------------------------
+# A deployment can define extra background-session profiles (including
+# Bash-scoped ones) WITHOUT editing this tracked file, by providing an optional
+# ``genesis.cc.profile_overlay`` module that exposes ``register(ctx)``. This
+# mirrors how install-local modules plug in via the module registry: the
+# install-specific profile (its name, addendum, tool scope) stays local and
+# gitignored, while this generic loader is the only thing that ships upstream.
+
+
+@dataclass
+class ProfileOverlayContext:
+    """Handed to a profile overlay's ``register(ctx)`` so it can compose a
+    profile from the same building blocks the built-in profiles use, then
+    register it via :meth:`add_profile` — no need to import this module's
+    internals or duplicate the universal safety blocks."""
+
+    universal_disallow: list[str]
+    no_browser_interaction: list[str]
+    no_file_write: list[str]
+    no_outreach_send: list[str]
+    no_outreach_extras: list[str]
+    no_memory_writes: list[str]
+    no_follow_ups: list[str]
+    no_outreach_engagement: list[str]
+    no_recon_writes: list[str]
+    no_web_tools: list[str]
+    venv_python: str
+
+    def add_profile(
+        self,
+        name: str,
+        *,
+        disallow: list[str],
+        addendum: str,
+        bash_allowlist: tuple[str, ...] = (),
+        mcp_profile: str = "reflection",
+        skills: list[str] | None = None,
+    ) -> None:
+        """Register one overlay profile into the live profile dicts.
+
+        Refuses to clobber a built-in profile name, so an overlay can only add,
+        never silently redefine a shipped profile's tool scope.
+        """
+        if name in PROFILES:
+            raise ValueError(
+                f"profile overlay may not override built-in profile {name!r}"
+            )
+        PROFILES[name] = list(disallow)
+        _PROFILE_ADDENDA[name] = addendum
+        _PROFILE_BASH_ALLOWLIST[name] = tuple(bash_allowlist)
+        _PROFILE_TO_MCP[name] = mcp_profile
+        _PROFILE_SKILLS[name] = list(skills or [])
+
+
+def _load_profile_overlays() -> None:
+    """Merge install-local profiles from an optional ``genesis.cc.profile_overlay``.
+
+    No-op when the module is absent (the upstream/default case). Failures are
+    logged but never fatal — a broken overlay must not take down session
+    spawning entirely.
+    """
+    import importlib
+
+    try:
+        profile_overlay = importlib.import_module("genesis.cc.profile_overlay")
+    except ImportError:
+        return
+    ctx = ProfileOverlayContext(
+        universal_disallow=_UNIVERSAL_DISALLOW,
+        no_browser_interaction=_NO_BROWSER_INTERACTION,
+        no_file_write=_NO_FILE_WRITE,
+        no_outreach_send=_NO_OUTREACH_SEND,
+        no_outreach_extras=_NO_OUTREACH_EXTRAS,
+        no_memory_writes=_NO_MEMORY_WRITES,
+        no_follow_ups=_NO_FOLLOW_UPS,
+        no_outreach_engagement=_NO_OUTREACH_ENGAGEMENT,
+        no_recon_writes=_NO_RECON_WRITES,
+        no_web_tools=_NO_WEB_TOOLS,
+        venv_python=_VENV_PYTHON,
+    )
+    try:
+        profile_overlay.register(ctx)
+    except ValueError:
+        # Config error (e.g. an overlay trying to redefine a built-in profile)
+        # — surface it loudly at startup rather than silently dropping a
+        # profile the operator believes is registered.
+        raise
+    except Exception:  # pragma: no cover - defensive; never block spawning
+        logger.exception("profile overlay registration failed; ignoring overlay")
+
+
+_load_profile_overlays()
+
+# Computed AFTER overlay registration so locally-added profiles validate.
+VALID_PROFILES = frozenset(PROFILES.keys())
 
 # Keyword triggers for content-related skills (scanned against prompt)
 _CONTENT_SKILL_TRIGGERS: list[tuple[list[str], list[str]]] = [
@@ -840,18 +957,10 @@ class DirectSessionRunner:
             exceptions = set(request.tool_exceptions)
             disallowed = [t for t in disallowed if t not in exceptions]
 
-        # Give background sessions access to Genesis MCP servers.
-        # Profile determines which servers: campaign/interact get outreach,
+        # Give background sessions access to Genesis MCP servers. Profile
+        # determines which servers (see module-level _PROFILE_TO_MCP, which
+        # profile overlays may extend): campaign/interact get outreach,
         # observe/research get health + memory only.
-        _PROFILE_TO_MCP: dict[str, str] = {
-            "observe": "reflection",
-            "research": "reflection",
-            "interact": "sentinel",
-            "campaign": "campaign",
-            "steward": "campaign",  # health + memory + outreach (for notify)
-            "discord-monitor": "discord-monitor",
-            "mail": "mail",
-        }
         mcp_profile = _PROFILE_TO_MCP.get(request.profile, "reflection")
         mcp_config = self._config_builder.build_mcp_config(profile=mcp_profile)
 

@@ -78,6 +78,9 @@ data/genesis.sql
 # Local-only modules (not for public repo)
 src/genesis/modules/automaton_supervisor/
 config/modules/automaton-supervisor.yaml
+# Install-local DirectSession profile overlay (registers gitignored profiles
+# like automaton-brain; the generic loader in direct_session.py is upstream).
+src/genesis/cc/profile_overlay.py
 
 # Docs are private by default — opt-in for public.
 # Only directories listed with ! are tracked.
