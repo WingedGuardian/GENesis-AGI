@@ -94,9 +94,10 @@ def seeded_db(tmp_path: Path):
     assert vector is not None, "Embedding failed during test setup"
 
     proc_id = str(uuid.uuid4())
-    # activation_tier must be LIBRARY+ (CORE/ADVISORY/LIBRARY): Surfacing v2
-    # gates the proactive hook to those tiers, so a default-'DORMANT' procedure
-    # would be recall-only and never surfaced here. LIBRARY is the eligibility floor.
+    # Seed at LIBRARY for a deterministic proven-tier match. Since LC1-A, DORMANT
+    # drafts are ALSO eligible to surface (at a stricter cosine bar + 'unproven
+    # draft' framing); LIBRARY keeps this E2E assertion on the proven path so the
+    # exact `[Procedure |` prefix is expected (DORMANT carries a draft-note prefix).
     conn.execute(
         "INSERT INTO procedural_memory "
         "(id, task_type, principle, principle_embedding, confidence, activation_tier) "
