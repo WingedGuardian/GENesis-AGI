@@ -1,9 +1,12 @@
-"""Self-improvement status MCP tool — soak observability for the Outcome Bus.
+"""Outcome Bus soak observability — internal helper.
 
-Read-only surface for watching the Phase-1 DARK soak of the self-improvement
-control plane. It answers two questions a human needs while the bus accrues:
-how much ground-truth has it captured (tier/coverage), and how is the ego's
-calibration trending?
+Provides ``_impl_self_improvement_status``, the Outcome Bus / ego-calibration
+readout. As of the LC0 consolidation this is **no longer a standalone MCP tool**:
+its content is surfaced as the ``outcome_bus`` section of ``loop_closure_status``
+(one self-learning-health surface instead of two). Read-only.
+
+It answers: how much ground-truth has the bus captured (tier/coverage), and how
+is the ego's calibration trending?
 
 It reads three existing CRUD surfaces directly — the Outcome Bus ledger
 (``outcome_events``) and the measure-only ego calibration snapshots — and does
@@ -15,12 +18,6 @@ Raw numbers; the human reading them applies judgement.
 """
 
 from __future__ import annotations
-
-import logging
-
-from genesis.mcp.health import mcp
-
-logger = logging.getLogger(__name__)
 
 
 async def _impl_self_improvement_status() -> dict:
@@ -94,18 +91,3 @@ async def _impl_self_improvement_status() -> dict:
             "6th source only after the soak (deferred follow-up)."
         ),
     }
-
-
-@mcp.tool()
-async def self_improvement_status() -> dict:
-    """What is the self-improvement Outcome Bus accumulating, and how is the ego's
-    confidence calibration trending?
-
-    Read-only soak instrument for the self-improvement control plane: bus
-    coverage by quality tier (T1 ground-truth > T2 rationale > T3 coverage) and
-    by signal_type, the per-domain T1 success picture (actual execution
-    outcomes, not user-approval proxies), and the ego Expected Calibration Error
-    (ECE) trend. DARK — reading this does NOT change Genesis's behaviour. No
-    ranking or scoring; raw data only.
-    """
-    return await _impl_self_improvement_status()
