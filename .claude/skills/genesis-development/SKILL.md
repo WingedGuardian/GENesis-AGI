@@ -85,23 +85,28 @@ changes: verify the notification actually arrives. Ask: "If the system
 restarts right now, will this actually work?" If you can't answer yes
 with evidence, you're not done.
 
-### Use GitNexus for Structural Code Intelligence
+### Code Intelligence — pick the right lane
 
-GitNexus provides graph-based code intelligence that Grep/Serena cannot:
-multi-hop call chains, blast radius, execution flows, coupling analysis.
+**Serena (Python LSP) is always live** — it parses current files per query, so
+it's the default for symbol/reference/impact questions ("who calls X", "what
+breaks if I change Z") and never goes stale. CBM gives the architecture/graph
+overview. GitNexus does what neither can — multi-hop blast radius, execution
+flows, route/tool maps, coupling/community analysis — but it is **snapshot-
+based**: its answers are only correct when the index matches the working tree,
+and it drifts after you pull merged PRs (its reindex fires on local commit, not
+on pull). So reach for GitNexus deliberately for its unique views, and run
+**`gitnexus analyze` first** when freshness matters; for live "who calls this"
+during active editing, prefer Serena. There is no "always run impact before
+every edit" mandate — that just gates work behind a tool that's stale-by-design.
 
-**Before editing:** `gitnexus impact <symbol>` — check blast radius.
-Use full UID if ambiguous (e.g., `Method:path/file.py:Class.method#N`).
-
-**Before committing:** `gitnexus detect-changes` — verify you haven't
-missed dependent symbols.
-
-**Understanding unfamiliar code:** `gitnexus context <symbol>` for 360°
-view, or browse processes via `gitnexus://repo/GENesis-AGI/processes`.
-
-**Custom questions:** `gitnexus cypher` for raw graph queries. Note:
-LadybugDB uses `CodeRelation` with a `type` property for edges, not
-Neo4j-style named edge labels.
+- **Blast radius / impact:** Serena `find_referencing_symbols` (live) for the
+  direct caller set; GitNexus `impact <symbol>` (reindex first) for multi-hop +
+  affected processes/risk. Use the full UID if ambiguous
+  (`Method:path/file.py:Class.method#N`).
+- **Unfamiliar code:** `gitnexus context <symbol>` or browse
+  `gitnexus://repo/GENesis-AGI/processes` (when fresh).
+- **Custom questions:** `gitnexus cypher` — LadybugDB uses `CodeRelation` with a
+  `type` property for edges, not Neo4j-style named edge labels.
 
 Full syntax, Cypher examples, and decision matrix:
 `.claude/docs/code-intelligence-guide.md`
@@ -141,7 +146,7 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | "I'll clean this up in the next commit" | Next commit never comes in autonomous sessions. Do it now or create a follow-up. |
 | "This file is too large to read fully" | Read the relevant section. Partial reads lead to partial understanding and wrong fixes. |
 | "The linter is happy, ship it" | Linters catch syntax, not logic. Clean lint with broken behavior is worse than a warning with correct behavior. |
-| "This change is low-risk, no impact analysis needed" | Your confidence is based on what you know. Impact analysis reveals what you don't. Run gitnexus impact. |
+| "This change is low-risk, no impact analysis needed" | Your confidence is based on what you know; checking callers reveals what you don't. Serena `find_referencing_symbols` is live — run it. For multi-hop blast radius, `gitnexus analyze` then `impact`. |
 | "I can skip the worktree, I'll be quick" | Concurrent session safety exists because "quick" commits have destroyed work before. Always worktree. |
 | "The error is transient, retry will fix it" | Diagnose first. Retrying a misdiagnosed error wastes tokens and masks root causes. |
 | "I'll add the follow-up later" | Follow-ups not created in-session are lost. Create it now while context is fresh. |
@@ -155,7 +160,7 @@ Use the right tool for how you're exploring:
 - **Architecture overview** — CBM `get_architecture(aspects=["overview"])`
 - **Finding symbols** — CBM `search_graph(name_pattern="...")` or Serena `find_symbol`
 - **Call tracing** — CBM `trace_path(function_name="...")` or Serena `find_referencing_symbols`
-- **Impact before changes** — GitNexus `impact(path="...")`
+- **Impact / blast radius** — Serena `find_referencing_symbols` (live caller set); GitNexus `impact` (reindex first) for multi-hop + affected processes
 - **Config/doc/non-code files** — Grep/Read directly
 
 Full decision matrix: `.claude/docs/code-intelligence.md`
