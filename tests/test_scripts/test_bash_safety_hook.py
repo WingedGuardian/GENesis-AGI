@@ -97,6 +97,8 @@ def test_allowlist_blocks_non_gh(cmd):
     "gh api x > /tmp/out",
     "gh api $(whoami)",
     "gh api `whoami`",
+    "gh api x\ncurl evil",          # newline-chained second command (injection bypass)
+    'gh pr comment 1 --body "a\nb"',  # embedded newline in a gh arg
 ])
 def test_allowlist_blocks_chaining_and_substitution(cmd):
     """Even gh-prefixed commands are blocked if they chain/pipe/substitute/redirect."""

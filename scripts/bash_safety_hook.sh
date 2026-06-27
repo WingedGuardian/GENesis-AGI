@@ -12,8 +12,15 @@ CMD=$(jq -r '.tool_input.command // empty' 2>/dev/null)
 # substitution/redirection is permitted (those could escape the allowlist).
 # Unset → no effect (every other session behaves exactly as before).
 if [ -n "$GENESIS_BASH_ALLOWLIST" ]; then
+    # Reject embedded newlines first — a `case` glob does not reliably match
+    # $'\n', so use a line count (printf adds no trailing newline, so any count
+    # > 0 means an embedded newline → a second command on its own line).
+    if [ "$(printf '%s' "$CMD" | wc -l)" -gt 0 ]; then
+        echo "BLOCKED: multi-line commands are not permitted in an allowlisted session ($GENESIS_BASH_ALLOWLIST)." >&2
+        exit 2
+    fi
     case "$CMD" in
-        *';'*|*'&&'*|*'||'*|*'|'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*)
+        *';'*|*'&&'*|*'||'*|*'|'*|*'`'*|*'$('*|*'>'*|*'<'*)
             echo "BLOCKED: this session's Bash may not chain, pipe, substitute, or redirect (allowlist: $GENESIS_BASH_ALLOWLIST)." >&2
             exit 2;;
     esac
