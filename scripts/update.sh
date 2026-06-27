@@ -131,12 +131,15 @@ fi
 # git reset --hard in _do_rollback would silently discard uncommitted work.
 #
 # EXCEPTION — known-ephemeral tracked files (EPHEMERAL_DIRTY_RE): tracked files
-# that are routinely rewritten in place and are safe to ignore, because the
-# fast-forward merge never touches them and they regenerate themselves. Today:
+# that are routinely rewritten in place and are safe to ignore. They regenerate
+# themselves, and local edits to them are discarded right before the merge
+# (see "--- Fetching latest ---" below) so an incoming change to one of them
+# never aborts the merge with "local changes would be overwritten". Today:
 #   - top-level `AGENTS.md` (GitNexus rewrites its auto-stat block)
-#   - `config/procedure_triggers.yaml` (the L1 trigger cache rewrites its own
-#     `generated_at` + entries in place; it's a committed seed default, so it
-#     can't simply be .gitignored without affecting fresh installs)
+#   - `config/procedure_triggers.yaml` (the L1 trigger cache rewrites it in
+#     place). NOTE: this is now .gitignored and regenerated per-install at
+#     bootstrap (`seed_procedures.py`); the entry only matters transitionally for
+#     installs that still track it. AGENTS.md is the remaining tracked-ephemeral.
 # These no longer block an update; REAL tracked changes still abort. Each
 # alternative anchors the exact porcelain path (a single space precedes it), so
 # only these exact paths are excused — e.g. `src/AGENTS.md` or
@@ -527,6 +530,23 @@ _write_state "merging"
 # ── Fetch + Merge ────────────────────────────────────────
 echo "--- Fetching latest ---"
 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main
+
+# Clear local edits to known-ephemeral tracked files (EPHEMERAL_DIRTY_RE) before
+# merging. They are rewritten in place at runtime and regenerate themselves
+# (bootstrap seed / promoter / GitNexus), so an incoming change to one of them
+# (e.g. this release de-tracking config/procedure_triggers.yaml) must not abort
+# the merge. The pre-merge dirty guard EXCUSES these paths; clearing them here is
+# the matching half so the merge actually applies.
+for _eph in AGENTS.md config/procedure_triggers.yaml; do
+    if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_eph" &>/dev/null \
+       && ! git -C "$GENESIS_ROOT" diff --quiet HEAD -- "$_eph" 2>/dev/null; then
+        # `checkout HEAD --` (not `checkout --`) restores BOTH index and worktree
+        # from HEAD, so a staged edit is cleared too — `checkout --` alone would
+        # leave a staged change and the merge would still abort.
+        git -C "$GENESIS_ROOT" checkout HEAD -- "$_eph" 2>/dev/null \
+            && echo "  (discarded local edits to ephemeral $_eph before merge)"
+    fi
+done
 
 echo "--- Merging $UPDATE_REMOTE/main ---"
 MERGE_OUTPUT=""

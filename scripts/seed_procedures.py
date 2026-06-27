@@ -221,8 +221,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--db",
         type=Path,
-        default=Path.home() / "genesis" / "data" / "genesis.db",
-        help="Path to genesis.db",
+        default=None,
+        help="Path to genesis.db (default: the app's genesis_db_path() resolver)",
     )
     args = parser.parse_args()
-    asyncio.run(main(args.db))
+    # Resolve via the app's authoritative resolver (honors $GENESIS_DB_PATH /
+    # $GENESIS_REPO_ROOT) so a non-standard install seeds the DB the server reads.
+    from genesis.env import genesis_db_path
+    asyncio.run(main(args.db or genesis_db_path()))

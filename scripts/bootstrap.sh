@@ -396,6 +396,22 @@ echo "--- Seeding skill-security trusted allowlist ---"
 "$VENV_DIR/bin/python" -m genesis.security.skill_scan --seed-trusted 2>&1 | tail -1 || true
 echo
 
+# --- Baseline procedures ---
+# Seed procedural_memory with battle-tested baseline procedures (CORE/LIBRARY,
+# deterministic IDs, idempotent upsert) and regenerate the PreToolUse advisor's
+# trigger cache from the DB. Without this the shipped advisor cache references
+# procedure IDs that aren't DB rows, so advisory surfacing isn't tracked.
+echo "--- Seeding baseline procedures ---"
+# Non-fatal, but surface a failure instead of swallowing it (a silent miss would
+# leave advisory surfacing untracked with no signal). Capture, then check for the
+# success line rather than relying on the exit code through the pipe.
+SEED_OUT="$("$VENV_DIR/bin/python" "$GENESIS_ROOT/scripts/seed_procedures.py" 2>&1)" || true
+echo "$SEED_OUT" | tail -2
+if ! echo "$SEED_OUT" | grep -q "Seeded .* procedures"; then
+    echo "  WARNING: baseline procedure seeding did not complete — advisor surfacing tracking may be degraded."
+fi
+echo
+
 # --- Secrets ---
 echo "--- Checking secrets ---"
 SECRETS_FILE="$GENESIS_ROOT/secrets.env"
