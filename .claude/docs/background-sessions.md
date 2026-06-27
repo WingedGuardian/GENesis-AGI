@@ -31,15 +31,35 @@ external platforms (publishing, form filling) and need to communicate with the
 user. Use `research` for investigation that writes observations/follow-ups.
 Use `observe` for read-only investigation.
 
-**`steward` is the one Bash-enabled profile** — and its Bash is restricted to the
-`gh` CLI only (no other command runs), enforced by `scripts/bash_safety_hook.sh`
-via the `GENESIS_BASH_ALLOWLIST` env var set from `CCInvocation.bash_allowlist`.
-It still blocks Edit/Write/browser. Built for the upstream-PR stewardship
+**`steward` is the one built-in Bash-enabled profile** — its Bash is restricted
+to the `gh` CLI only, enforced by `scripts/bash_safety_hook.sh` via the
+`GENESIS_BASH_ALLOWLIST` env var set from `CCInvocation.bash_allowlist`. It
+still blocks Edit/Write/browser. Built for the upstream-PR stewardship
 campaign: it reads/comments/reopens/closes Genesis's own PRs to external repos
 and escalates code-change requests rather than editing or pushing itself. A
 profile grants a scoped shell by appearing in `_PROFILE_BASH_ALLOWLIST`
 (`src/genesis/cc/direct_session.py`); without an entry there, a Bash-granting
-profile's shell is governed only by the global destructive-op blocks.
+profile's shell is governed only by the global destructive-op blocks. The
+allowlist matches the command's **first token** and blocks all
+chaining/piping/substitution/redirection (`; && | $() ` ` > <`).
+
+### Install-local profiles (overlay)
+
+A deployment can register extra profiles — including Bash-scoped ones — without
+editing the tracked `direct_session.py`, by adding an optional, gitignored
+`genesis/cc/profile_overlay.py` exposing `register(ctx)`. The loader
+(`_load_profile_overlays`) is a no-op when that module is absent (the default).
+`ctx` is a `ProfileOverlayContext` that hands over the same building-block
+disallow lists the built-ins use plus the venv-Python path, and an
+`add_profile(name, *, disallow, addendum, bash_allowlist=(), mcp_profile=...,
+skills=...)` method. `add_profile` refuses to redefine a built-in profile, so an
+overlay can only add. This keeps install-specific session profiles (their names,
+prompts, and tool scope) out of the shared repo while the generic mechanism
+ships upstream. Note: allowlisting an interpreter (e.g. the venv Python) pins
+only the command's first token — `python -c`/`python <file>` still pass — so an
+interpreter-scoped overlay profile relies on its addendum for the
+behavioural "only run module X" restriction, appropriate only for trusted
+(Genesis-internal) sessions, not untrusted input.
 
 ## Memory Access Policy
 

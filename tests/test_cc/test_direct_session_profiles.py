@@ -3,7 +3,11 @@
 Validates that profile changes don't accidentally grant or revoke tool access.
 """
 
+import sys
+import types
 from unittest.mock import MagicMock
+
+import pytest
 
 from genesis.cc.direct_session import (
     _PROFILE_ADDENDA,
@@ -11,6 +15,7 @@ from genesis.cc.direct_session import (
     VALID_PROFILES,
     DirectSessionRequest,
     DirectSessionRunner,
+    ProfileOverlayContext,
     _build_profile_addendum,
 )
 from genesis.cc.types import CCModel
@@ -406,3 +411,170 @@ def test_non_steward_invocation_has_empty_bash_allowlist():
     req = DirectSessionRequest(prompt="test", profile="research", model=CCModel.SONNET)
     inv = runner._build_invocation(req)
     assert inv.bash_allowlist == ()
+
+
+# --- Profile overlay mechanism (generic; install-local profiles) ---
+# Install-specific profiles live in an optional, gitignored
+# genesis.cc.profile_overlay module — these tests exercise the loader + the
+# ProfileOverlayContext contract WITHOUT depending on any overlay being present
+# (upstream CI has none), so they assert the mechanism, not a specific profile.
+
+
+def _make_ctx(added):
+    """A ProfileOverlayContext wired to the real building blocks. `added`
+    accumulates registered names so the caller can clean the global dicts."""
+    from genesis.cc import direct_session as ds
+
+    ctx = ProfileOverlayContext(
+        universal_disallow=ds._UNIVERSAL_DISALLOW,
+        no_browser_interaction=ds._NO_BROWSER_INTERACTION,
+        no_file_write=ds._NO_FILE_WRITE,
+        no_outreach_send=ds._NO_OUTREACH_SEND,
+        no_outreach_extras=ds._NO_OUTREACH_EXTRAS,
+        no_memory_writes=ds._NO_MEMORY_WRITES,
+        no_follow_ups=ds._NO_FOLLOW_UPS,
+        no_outreach_engagement=ds._NO_OUTREACH_ENGAGEMENT,
+        no_recon_writes=ds._NO_RECON_WRITES,
+        no_web_tools=ds._NO_WEB_TOOLS,
+        venv_python=ds._VENV_PYTHON,
+    )
+    real_add = ctx.add_profile
+
+    def _tracking_add(name, **kw):
+        real_add(name, **kw)
+        added.append(name)
+
+    ctx.add_profile = _tracking_add  # type: ignore[method-assign]
+    return ctx
+
+
+def _drop(names):
+    from genesis.cc import direct_session as ds
+
+    for name in names:
+        ds.PROFILES.pop(name, None)
+        ds._PROFILE_ADDENDA.pop(name, None)
+        ds._PROFILE_BASH_ALLOWLIST.pop(name, None)
+        ds._PROFILE_TO_MCP.pop(name, None)
+        ds._PROFILE_SKILLS.pop(name, None)
+
+
+@pytest.fixture
+def overlay_ctx():
+    added: list[str] = []
+    try:
+        yield _make_ctx(added)
+    finally:
+        _drop(added)
+
+
+def test_overlay_add_profile_registers_into_all_dicts(overlay_ctx):
+    from genesis.cc import direct_session as ds
+
+    overlay_ctx.add_profile(
+        "ztest-profile",
+        disallow=["Edit", "Bash"],
+        addendum="hello",
+        bash_allowlist=("gh",),
+        mcp_profile="campaign",
+        skills=["voice-master"],
+    )
+    assert ds.PROFILES["ztest-profile"] == ["Edit", "Bash"]
+    assert ds._PROFILE_ADDENDA["ztest-profile"] == "hello"
+    assert ds._PROFILE_BASH_ALLOWLIST["ztest-profile"] == ("gh",)
+    assert ds._PROFILE_TO_MCP["ztest-profile"] == "campaign"
+    assert ds._PROFILE_SKILLS["ztest-profile"] == ["voice-master"]
+
+
+def test_overlay_add_profile_defaults(overlay_ctx):
+    """Omitted allowlist/skills default to empty; mcp defaults to reflection."""
+    from genesis.cc import direct_session as ds
+
+    overlay_ctx.add_profile("ztest-profile", disallow=["Bash"], addendum="x")
+    assert ds._PROFILE_BASH_ALLOWLIST["ztest-profile"] == ()
+    assert ds._PROFILE_TO_MCP["ztest-profile"] == "reflection"
+    assert ds._PROFILE_SKILLS["ztest-profile"] == []
+
+
+def test_overlay_cannot_override_builtin_profile(overlay_ctx):
+    """An overlay may only ADD profiles, never silently redefine a shipped one."""
+    with pytest.raises(ValueError, match="may not override"):
+        overlay_ctx.add_profile("steward", disallow=[], addendum="x")
+
+
+def test_overlay_profile_flows_through_build_invocation(overlay_ctx, monkeypatch):
+    """A registered overlay profile drives bash_allowlist + MCP selection in
+    _build_invocation (VALID_PROFILES is frozen at import, so patch it to admit
+    the test profile — the real load happens at import time)."""
+    from genesis.cc import direct_session as ds
+
+    overlay_ctx.add_profile(
+        "ztest-profile",
+        disallow=[t for t in ds._UNIVERSAL_DISALLOW if t != "Bash"],
+        addendum="x",
+        bash_allowlist=(ds._VENV_PYTHON,),
+        mcp_profile="campaign",
+    )
+    monkeypatch.setattr(ds, "VALID_PROFILES", ds.VALID_PROFILES | {"ztest-profile"})
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="t", profile="ztest-profile", model=CCModel.SONNET)
+    inv = runner._build_invocation(req)
+    assert inv.bash_allowlist == (ds._VENV_PYTHON,)
+    runner._config_builder.build_mcp_config.assert_called_with(profile="campaign")
+
+
+def test_load_profile_overlays_survives_broken_overlay(monkeypatch):
+    """A raising overlay is logged and ignored — it must not break spawning."""
+    from genesis.cc import direct_session as ds
+
+    def _boom(ctx):
+        raise RuntimeError("overlay is broken")
+
+    fake = types.SimpleNamespace(register=_boom)
+    monkeypatch.setitem(sys.modules, "genesis.cc.profile_overlay", fake)
+    before = set(ds.PROFILES)
+    ds._load_profile_overlays()  # must not raise
+    assert set(ds.PROFILES) == before  # built-ins untouched
+
+
+def test_load_profile_overlays_registers_from_module(monkeypatch):
+    """The loader wires the context and calls register(), so a profile added
+    there lands in the live dicts."""
+    from genesis.cc import direct_session as ds
+
+    def _register(ctx):
+        ctx.add_profile("zloaded-profile", disallow=["Bash"], addendum="x")
+
+    fake = types.SimpleNamespace(register=_register)
+    monkeypatch.setitem(sys.modules, "genesis.cc.profile_overlay", fake)
+    try:
+        ds._load_profile_overlays()
+        assert "zloaded-profile" in ds.PROFILES
+    finally:
+        _drop(["zloaded-profile"])
+
+
+def test_load_profile_overlays_raises_on_builtin_collision(monkeypatch):
+    """A config error (overlay redefining a built-in) surfaces — not swallowed
+    by the broad runtime-failure guard."""
+    from genesis.cc import direct_session as ds
+
+    def _register(ctx):
+        ctx.add_profile("steward", disallow=[], addendum="x")
+
+    fake = types.SimpleNamespace(register=_register)
+    monkeypatch.setitem(sys.modules, "genesis.cc.profile_overlay", fake)
+    with pytest.raises(ValueError, match="may not override"):
+        ds._load_profile_overlays()
+
+
+def test_load_profile_overlays_noop_when_absent(monkeypatch):
+    """With no overlay module importable, built-in profiles are unchanged."""
+    from genesis.cc import direct_session as ds
+
+    monkeypatch.setitem(sys.modules, "genesis.cc.profile_overlay", None)
+    # `from genesis.cc import profile_overlay` with a None entry raises
+    # ImportError, which the loader swallows.
+    before = set(ds.PROFILES)
+    ds._load_profile_overlays()
+    assert set(ds.PROFILES) == before
