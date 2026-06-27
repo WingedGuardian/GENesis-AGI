@@ -959,6 +959,29 @@ def _record_activity(db_path: Path, latency_ms: float, success: bool) -> None:
         pass  # Never block user prompt
 
 
+def _record_procedure_surfaced(db_path: Path, proc_id: str) -> None:
+    """Bump a procedure's ``surfaced_count`` after surfacing it into context.
+
+    HONEST funnel observability ONLY — deliberately bumps ``surfaced_count`` and
+    NOT ``invocation_count``, so passive surfacing never feeds the promoter
+    (which reads ``invocation_count``) and cannot promote an unproven draft.
+    Fire-and-forget: best-effort, never blocks the user prompt.
+    """
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=1)
+        try:
+            conn.execute(
+                "UPDATE procedural_memory "
+                "SET surfaced_count = surfaced_count + 1 WHERE id = ?",
+                (proc_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass  # Never block user prompt
+
+
 def _record_detail(
     fts_count: int,
     vector_count: int,
@@ -1280,11 +1303,13 @@ async def _run(prompt: str, session_id: str = "") -> None:
     # Procedure surfacing — reuses the already-computed prompt embedding
     # so there's no extra cloud call. Top-1 only, per-tier cosine bar. Wrapped
     # in a broad try/except so a bad procedure read can't crash the memory hook.
+    _surfaced_proc_id: str | None = None
     if vector:
         try:
             proc = _search_procedures(_DB_PATH, vector)
             if proc is not None:
                 proc_id, task_type, principle, tier = proc
+                _surfaced_proc_id = proc_id
                 # DORMANT drafts are unproven (0 invocations, conf 0.0): label
                 # them so the model treats them as a hint, not authoritative.
                 label = (
@@ -1313,6 +1338,10 @@ async def _run(prompt: str, session_id: str = "") -> None:
 
     had_results = fused_count > 0
     _record_activity(_DB_PATH, total_ms, success=had_results)
+    # Honest funnel signal: count that we surfaced this procedure into context
+    # (NOT an invocation — does not feed promotion). Fire-and-forget after flush.
+    if _surfaced_proc_id is not None:
+        _record_procedure_surfaced(_DB_PATH, _surfaced_proc_id)
     _record_detail(
         fts_count=len(fts_results),
         vector_count=len(vector_results),

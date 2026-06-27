@@ -109,6 +109,19 @@ The one-time migration `0035_backfill_procedure_invocation_count` seeds
 `invocation_count` from historical `procedure_invoked` events in `eval_events`
 so the signal doesn't start at zero.
 
+**Surfacing vs. invocation — two distinct counters.** `invocation_count` (above)
+tracks *explicit recall* via `procedure_recall` — the read-signal that feeds
+`effective_confidence` and tier promotion. Passive *contextual surfacing* — the
+proactive memory hook injecting a relevant procedure on a prompt, or the
+PreToolUse advisor on a tool call — is tracked separately on **`surfaced_count`**
+(migration `0039`). `surfaced_count` is HONEST funnel observability ONLY: it is
+deliberately **never** read by the promoter or `effective_confidence`, so passive
+exposure can never promote an unproven draft. The loop-closure funnel
+(`db/crud/loop_closure.py::procedure_funnel`) reports
+`captured → surfaced → invoked → measured`, so a draft that the proactive hook
+surfaces but that is never explicitly recalled reads honestly as *reached*, not
+as a leak.
+
 > **Limitation:** reads are a *proxy* for usefulness, not proof a procedure
 > worked. The discount, the ≥1-real-success gate for ADVISORY, and the FailureDetector
 > are the counterweights. A real recall-path outcome signal remains future work.

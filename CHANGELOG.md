@@ -56,7 +56,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   ever presenting it as settled guidance. Blind session-start injection still stays
   limited to the most-proven, always-on procedures. Genesis also now repairs
   procedures that were missing their embedding, so they stop being silently
-  invisible to this relevance matching.
+  invisible to this relevance matching. Genesis also now counts each time a
+  procedure is surfaced into context this way, so its own self-learning health
+  check reports learned procedures honestly as *reaching* its attention rather
+  than falsely flagging them as lost — and this surfacing count is kept strictly
+  separate from the signals that promote a procedure, so merely showing a draft
+  can never inflate its standing.
 
 - **Procedures you actually use now earn their keep.** How often a learned
   procedure is recalled ("reads") now counts as a dampened usefulness signal:

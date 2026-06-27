@@ -1096,6 +1096,15 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE procedural_memory ADD COLUMN principle_embedding BLOB",
         "procedural_memory.principle_embedding")
 
+    # C-honest: contextual-surfacing counter (proactive hook / tool advisor).
+    # Honest loop-closure funnel observability ONLY — NOT read by the promoter
+    # (which reads invocation_count), so passive surfacing can never promote an
+    # unproven draft. Existing rows backfill via DEFAULT 0. Numbered migration
+    # 0039 also adds this; both are idempotent (_try_alter suppresses dup-column).
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN surfaced_count INTEGER NOT NULL DEFAULT 0",
+        "procedural_memory.surfaced_count")
+
     # Rebuild cognitive_state table if CHECK constraint lacks resilience_degradation.
     # SQLite can't ALTER CHECK constraints — requires table rebuild.
     await _migrate_cognitive_state_check(db)

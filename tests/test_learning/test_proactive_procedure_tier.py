@@ -144,3 +144,64 @@ async def test_deprecated_and_quarantined_never_surface(tmp_path):
             )
         await conn.commit()
     assert _search_procedures(db, _QUERY) is None
+
+
+# ── C-honest: surfaced_count bump (honest funnel signal, promotion-inert) ─────
+
+_record_procedure_surfaced = _mod._record_procedure_surfaced
+
+
+async def _seed_one(db_path, pid="p", *, invocation=0):
+    async with aiosqlite.connect(str(db_path)) as conn:
+        await create_all_tables(conn)
+        await conn.execute(
+            "INSERT INTO procedural_memory "
+            "(id, task_type, principle, steps, tools_used, context_tags, created_at, "
+            " invocation_count, activation_tier) "
+            "VALUES (?, 't', 'p', '[]', '[]', '[]', '2026-01-01T00:00:00', ?, 'DORMANT')",
+            (pid, invocation),
+        )
+        await conn.commit()
+
+
+async def _read_counts(db_path, pid):
+    async with aiosqlite.connect(str(db_path)) as conn:
+        cur = await conn.execute(
+            "SELECT surfaced_count, invocation_count FROM procedural_memory WHERE id = ?",
+            (pid,),
+        )
+        return await cur.fetchone()
+
+
+@pytest.mark.asyncio
+async def test_record_procedure_surfaced_bumps_and_is_idempotent(tmp_path):
+    db = tmp_path / "t.db"
+    await _seed_one(db, "p")
+    _record_procedure_surfaced(db, "p")
+    assert (await _read_counts(db, "p"))[0] == 1
+    _record_procedure_surfaced(db, "p")          # second surface
+    assert (await _read_counts(db, "p"))[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_record_procedure_surfaced_does_not_touch_invocation(tmp_path):
+    """Promotion-safety: surfacing must NOT feed invocation_count (the promoter's
+    read-signal), or an unproven draft would promote on passive surfacing."""
+    db = tmp_path / "t.db"
+    await _seed_one(db, "p", invocation=0)
+    _record_procedure_surfaced(db, "p")
+    surfaced, invocation = await _read_counts(db, "p")
+    assert surfaced == 1 and invocation == 0
+
+
+@pytest.mark.asyncio
+async def test_record_procedure_surfaced_missing_id_is_noop(tmp_path):
+    db = tmp_path / "t.db"
+    await _seed_one(db, "p")
+    _record_procedure_surfaced(db, "does-not-exist")   # must not raise
+    assert (await _read_counts(db, "p"))[0] == 0
+
+
+def test_record_procedure_surfaced_bad_path_fails_open(tmp_path):
+    # A missing/locked DB must never raise out of the hook.
+    _record_procedure_surfaced(tmp_path / "nope.db", "p")

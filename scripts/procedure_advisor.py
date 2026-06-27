@@ -40,6 +40,36 @@ def _load_triggers() -> list[dict]:
         return []
 
 
+def _record_procedures_surfaced(proc_ids: list[str]) -> None:
+    """Bump ``surfaced_count`` for advisor-surfaced procedures (honest funnel).
+
+    Called ONLY on a match, AFTER the advisory is emitted. Bumps
+    ``surfaced_count`` and NOT ``invocation_count`` — passive advisory surfacing
+    must not feed the promoter (which reads ``invocation_count``) or promote an
+    unproven draft. Imports are local so the no-match hot path stays lean.
+    Fire-and-forget: never disrupts the tool call.
+    """
+    if not proc_ids:
+        return
+    try:
+        import importlib
+        import sqlite3
+        db_path = importlib.import_module("genesis.env").genesis_db_path()
+        placeholders = ",".join("?" for _ in proc_ids)
+        conn = sqlite3.connect(str(db_path), timeout=1)
+        try:
+            conn.execute(
+                f"UPDATE procedural_memory "
+                f"SET surfaced_count = surfaced_count + 1 WHERE id IN ({placeholders})",
+                proc_ids,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:  # Never disrupt the tool call — but leave a trace.
+        print(f"procedure_advisor: surfaced_count update skipped: {exc}", file=sys.stderr)
+
+
 def _match_context(tool_input_str: str, context_patterns: list[str]) -> bool:
     """Check if any context pattern matches the tool input."""
     lower = tool_input_str.lower()
@@ -148,6 +178,11 @@ def main() -> int:
     json.dump(output, sys.stdout)
     with __import__("contextlib").suppress(BrokenPipeError):
         sys.stdout.flush()
+    # Honest funnel signal: count advisory surfacing (NOT an invocation — does
+    # not feed promotion). After the advisory is already delivered.
+    _record_procedures_surfaced(
+        [t.get("procedure_id") for t in matched if t.get("procedure_id")]
+    )
     return 0
 
 

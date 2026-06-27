@@ -23,13 +23,13 @@ _NEW = "2099-01-01T00:00:00+00:00"   # after the stale cutoff
 _STALE_BEFORE = "2024-01-01T00:00:00+00:00"
 
 
-async def _proc(db, pid, *, invocation=0, success=0, failure=0, tier="DORMANT", deprecated=0):
+async def _proc(db, pid, *, surfaced=0, invocation=0, success=0, failure=0, tier="DORMANT", deprecated=0):
     await db.execute(
         "INSERT INTO procedural_memory "
         "(id, task_type, principle, steps, tools_used, context_tags, created_at, "
-        " invocation_count, success_count, failure_count, activation_tier, deprecated) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (pid, "t", "p", "[]", "[]", "[]", _OLD, invocation, success, failure, tier, deprecated),
+        " surfaced_count, invocation_count, success_count, failure_count, activation_tier, deprecated) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (pid, "t", "p", "[]", "[]", "[]", _OLD, surfaced, invocation, success, failure, tier, deprecated),
     )
 
 
@@ -67,22 +67,52 @@ async def _prop(db, pid, *, status, created=_NEW):
     )
 
 
-# ── procedures: invoked (not 'surfaced' — no such counter); leak = uninvoked ──
+# ── procedures: captured → surfaced/invoked → measured; leak = never reached ──
 
-async def test_procedure_funnel_counts_and_uninvoked_leak(db):
+async def test_procedure_funnel_counts_surfaced_invoked_and_leak(db):
     await _proc(db, "p1", invocation=5, success=3, tier="ADVISORY")  # invoked + measured
-    await _proc(db, "p2", invocation=0, tier="DORMANT")              # captured, never invoked
-    await _proc(db, "p3", invocation=0, tier="CORE", deprecated=1)
+    await _proc(db, "p2", surfaced=4, tier="DORMANT")               # surfaced only (NOT invoked)
+    await _proc(db, "p3", invocation=0, tier="DORMANT")            # never reached — the real leak
+    await _proc(db, "p4", invocation=0, tier="CORE", deprecated=1)  # never reached + deprecated
+    await _proc(db, "p5", surfaced=2, invocation=1, tier="LIBRARY")  # BOTH — must not double-count
     await db.commit()
 
     f = await lc.procedure_funnel(db)
-    assert f["captured"] == 3
-    assert f["invoked"] == 1            # only p1
+    assert f["captured"] == 5
+    assert f["surfaced"] == 2          # p2 + p5 (surfaced_count > 0)
+    assert f["invoked"] == 2           # p1 + p5 (invocation_count > 0)
+    assert f["reached"] == 3           # p1 + p2 + p5 — de-duped union (NOT surfaced+invoked=4)
     assert f["measured"] == 1          # only p1 has outcome counts
-    assert f["leak_uninvoked"] == 2    # p2 + p3 — the golden-dormant risk
+    assert f["leak_never_reached"] == 2  # p3 + p4 — neither surfaced nor invoked
     assert f["deprecated"] == 1
-    assert f["by_tier"] == {"ADVISORY": 1, "DORMANT": 1, "CORE": 1}
-    assert f["loop"] == "PARTIAL"      # some invoked, some leaked — NOT hardcoded
+    assert f["by_tier"] == {"ADVISORY": 1, "DORMANT": 2, "CORE": 1, "LIBRARY": 1}
+    assert f["loop"] == "PARTIAL"      # p1/p2/p5 flow; p3/p4 leak
+
+
+async def test_procedure_surfaced_only_flips_loop_open_to_partial(db):
+    # The C-honest fix: a DORMANT draft that the proactive hook surfaces (but is
+    # never explicitly invoked) now counts as 'reached' — the loop is no longer
+    # falsely OPEN just because invocation_count stayed 0.
+    await _proc(db, "p1", surfaced=2, invocation=0, tier="DORMANT")
+    await db.commit()
+
+    f = await lc.procedure_funnel(db)
+    assert f["surfaced"] == 1
+    assert f["invoked"] == 0
+    assert f["leak_never_reached"] == 0
+    assert f["loop"] == "CLOSED"       # the one procedure reached context; nothing leaks
+
+
+async def test_procedure_funnel_only_one_leak_key(db):
+    # open_seams iterates every ``leak_*`` key; the procedure funnel must emit
+    # exactly one so a single dark procedure isn't double-counted as a seam.
+    await _proc(db, "p1", invocation=0, tier="DORMANT")
+    await db.commit()
+
+    f = await lc.procedure_funnel(db)
+    leak_keys = [k for k in f if k.startswith("leak_")]
+    assert leak_keys == ["leak_never_reached"]
+    assert f["loop"] == "OPEN"         # nothing surfaced or invoked yet
 
 
 # ── observations: actuation = influenced_action ──────────────────────────────
@@ -195,7 +225,7 @@ async def test_impl_assembly_and_open_seams(db, monkeypatch):
     # reflections actuate via observations → NOT a false OPEN on the dead column
     await _obs(db, "ro1", otype="micro_reflection", influenced=1)
     await _refl(db, "r1", used=0)        # raw transcript (context only)
-    await _proc(db, "p1", invocation=0)  # uninvoked procedure → leak seam
+    await _proc(db, "p1", invocation=0)  # never-reached procedure → leak seam
     await db.commit()
 
     from genesis.mcp.health.loop_closure_status import _impl_loop_closure_status
@@ -206,8 +236,8 @@ async def test_impl_assembly_and_open_seams(db, monkeypatch):
     assert "outcome_bus" in res
 
     seams = res["open_seams"]
-    # the procedure leak still surfaces honestly
-    assert any("procedure" in s and "uninvoked" in s for s in seams)
+    # the procedure leak still surfaces honestly (now: never reached)
+    assert any("procedure" in s and "never reached" in s for s in seams)
     # reflections must NOT be flagged OPEN any more (dead-column false positive gone)
     assert not any("reflection" in s and "OPEN" in s for s in seams)
     # by_tier / by_status dicts must NEVER be rendered as a seam string

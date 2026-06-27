@@ -35,7 +35,8 @@ TABLES = {
             tool_trigger      TEXT,                        -- JSON array of tool names for CORE matching
             source            TEXT,                        -- JSON: {type, session_id?, observation_id?, triage_outcome?}
             promotion_history TEXT,                        -- JSON array: [{from_tier, to_tier, at, reason}]
-            principle_embedding BLOB                       -- qwen3-embedding(1024 float32) of `principle`, little-endian; read by proactive procedure hook
+            principle_embedding BLOB,                      -- qwen3-embedding(1024 float32) of `principle`, little-endian; read by proactive procedure hook
+            surfaced_count    INTEGER NOT NULL DEFAULT 0   -- contextual-hook surfacings (proactive hook / tool advisor); honest funnel signal, NOT read by promoter
         )
     """,
     "observations": """
