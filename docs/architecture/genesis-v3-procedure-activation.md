@@ -168,7 +168,12 @@ promoter runs.
 3. **Seed script** — `scripts/seed_procedures.py` for battle-tested
    procedures. Uses raw SQL upsert with hand-tuned counts and
    confidence (e.g., success_count=10, confidence=0.92, ADVISORY). Bypasses
-   the operations / CRUD layer entirely.
+   the operations / CRUD layer entirely. **Runs at bootstrap**
+   (`scripts/bootstrap.sh`, idempotent via deterministic UUID5 ids) so every
+   install gets the baseline procedures DB-resident and the advisor trigger
+   cache is regenerated from the DB — without this the shipped cache would
+   reference procedure ids that aren't DB rows, so advisory surfacing (and its
+   `surfaced_count` / outcome tracking) silently no-ops.
 
 ## Key Files
 
@@ -181,7 +186,7 @@ promoter runs.
 | `src/genesis/learning/procedural/promoter.py` | Tier promotion/demotion |
 | `scripts/procedure_advisor.py` | PreToolUse hook |
 | `scripts/seed_procedures.py` | Known procedure seeding |
-| `config/procedure_triggers.yaml` | CORE/ADVISORY trigger cache |
+| `config/procedure_triggers.yaml` | CORE/ADVISORY trigger cache (generated per-install from the DB; gitignored) |
 
 ## Hook Registration
 

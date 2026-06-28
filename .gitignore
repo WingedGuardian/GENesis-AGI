@@ -52,6 +52,9 @@ src/genesis/identity/EGO_NOTEPAD.md
 # Task-scoped notepad (ephemeral, seeded per-task in worktrees)
 TASK_NOTEPAD.md
 config/*.local.yaml
+# Install-specific generated state — regenerated from the DB by seed_procedures.py
+# / the procedure promoter; must not ship a stale cache whose IDs aren't DB rows.
+config/procedure_triggers.yaml
 .gstack/
 .context/
 .playwright-mcp/

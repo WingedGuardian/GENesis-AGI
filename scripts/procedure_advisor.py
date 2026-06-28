@@ -23,11 +23,18 @@ Emits SteerMessage for unified enforcement feedback.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-_CACHE_PATH = Path(__file__).resolve().parent.parent / "config" / "procedure_triggers.yaml"
+# The trigger cache is install-specific generated state (not a committed file).
+# $GENESIS_PROCEDURE_TRIGGERS lets a test or relocated install point at a
+# different path; default is <repo>/config/procedure_triggers.yaml.
+_CACHE_PATH = Path(
+    os.environ.get("GENESIS_PROCEDURE_TRIGGERS")
+    or (Path(__file__).resolve().parent.parent / "config" / "procedure_triggers.yaml")
+)
 
 
 def _load_triggers() -> list[dict]:
