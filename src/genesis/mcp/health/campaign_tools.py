@@ -231,28 +231,9 @@ async def _impl_campaign_pause(name: str) -> dict:
             return {"error": f"Database unavailable: {type(exc).__name__}: {exc}"}
 
     try:
-        from genesis.db.crud import campaigns as crud
+        from genesis.campaigns import control
 
-        campaign = await crud.get_campaign_by_name(db, name)
-        if not campaign:
-            return {"error": f"Campaign '{name}' not found"}
-
-        await crud.update_campaign(
-            db, campaign["id"],
-            status="paused",
-            paused_at=datetime.now(UTC).isoformat(),
-        )
-
-        if _runner:
-            await _runner.remove_campaign(name)
-
-        result: dict = {"name": name, "status": "paused"}
-        if not _runner:
-            result["note"] = (
-                "Paused in database. "
-                "Restart genesis-server for schedule changes to take effect."
-            )
-        return result
+        return await control.pause_campaign(db, _runner, name)
     finally:
         if own_db:
             await db.close()
@@ -271,29 +252,9 @@ async def _impl_campaign_resume(name: str) -> dict:
             return {"error": f"Database unavailable: {type(exc).__name__}: {exc}"}
 
     try:
-        from genesis.db.crud import campaigns as crud
+        from genesis.campaigns import control
 
-        campaign = await crud.get_campaign_by_name(db, name)
-        if not campaign:
-            return {"error": f"Campaign '{name}' not found"}
-
-        await crud.update_campaign(
-            db, campaign["id"],
-            status="active",
-            paused_at=None,
-        )
-
-        if _runner:
-            campaign = await crud.get_campaign(db, campaign["id"])
-            await _runner.add_campaign(campaign)
-
-        result: dict = {"name": name, "status": "active"}
-        if not _runner:
-            result["note"] = (
-                "Resumed in database. "
-                "Restart genesis-server for schedule changes to take effect."
-            )
-        return result
+        return await control.resume_campaign(db, _runner, name)
     finally:
         if own_db:
             await db.close()
@@ -303,27 +264,13 @@ async def _impl_campaign_trigger(name: str) -> dict:
     """Manually trigger a campaign tick.
 
     Requires the main Genesis server — the campaign runner is not
-    available in standalone MCP mode.
+    available in standalone MCP mode (control returns an informational error).
     """
-    if _runner is None:
-        return {
-            "error": (
-                "Campaign trigger requires the main Genesis server. "
-                "The campaign runner is not available in standalone MCP mode. "
-                "Use campaign_status to check campaign state, or restart "
-                "genesis-server to run campaigns on schedule."
-            ),
-        }
+    # When _runner is set, _db is guaranteed set (both wired by
+    # init_campaign_tools); when None, control short-circuits before using db.
+    from genesis.campaigns import control
 
-    # When _runner is set, _db is guaranteed set (both wired by init_campaign_tools)
-    from genesis.db.crud import campaigns as crud
-
-    campaign = await crud.get_campaign_by_name(_db, name)
-    if not campaign:
-        return {"error": f"Campaign '{name}' not found"}
-
-    result = await _runner.campaign_tick(campaign["id"], trigger_type="manual")
-    return {"name": name, **result}
+    return await control.trigger_campaign(_db, _runner, name)
 
 
 async def _impl_campaign_update(
@@ -333,6 +280,7 @@ async def _impl_campaign_update(
     model: str | None = None,
     effort: str | None = None,
     max_daily_cost_usd: float | None = None,
+    jitter_seconds: int | None = None,
 ) -> dict:
     """Update campaign configuration."""
     db = _db
@@ -346,40 +294,13 @@ async def _impl_campaign_update(
             return {"error": f"Database unavailable: {type(exc).__name__}: {exc}"}
 
     try:
-        from genesis.db.crud import campaigns as crud
+        from genesis.campaigns import control
 
-        campaign = await crud.get_campaign_by_name(db, name)
-        if not campaign:
-            return {"error": f"Campaign '{name}' not found"}
-
-        updates = {}
-        if cron_cadence is not None:
-            updates["cron_cadence"] = cron_cadence
-        if model is not None:
-            updates["model"] = model
-        if effort is not None:
-            updates["effort"] = effort
-        if max_daily_cost_usd is not None:
-            updates["max_daily_cost_usd"] = max_daily_cost_usd
-
-        if updates:
-            await crud.update_campaign(db, campaign["id"], **updates)
-
-            # Reschedule if cadence changed
-            if cron_cadence and _runner:
-                await _runner.remove_campaign(name)
-                updated = await crud.get_campaign(db, campaign["id"])
-                await _runner.add_campaign(updated)
-
-        result: dict = {"name": name, "updated": list(updates.keys())}
-
-        if cron_cadence and not _runner:
-            result["note"] = (
-                "Cadence updated in database. "
-                "Restart genesis-server for schedule changes to take effect."
-            )
-
-        return result
+        return await control.update_campaign_config(
+            db, _runner, name,
+            cron_cadence=cron_cadence, model=model, effort=effort,
+            max_daily_cost_usd=max_daily_cost_usd, jitter_seconds=jitter_seconds,
+        )
     finally:
         if own_db:
             await db.close()
@@ -481,17 +402,20 @@ async def campaign_update(
     model: str | None = None,
     effort: str | None = None,
     max_daily_cost_usd: float | None = None,
+    jitter_seconds: int | None = None,
 ) -> dict:
     """Update campaign configuration.
 
     Args:
         name: Campaign name slug.
         cron_cadence: New cron expression.
-        model: New LLM model.
-        effort: New effort level.
+        model: New LLM model (haiku/sonnet/opus).
+        effort: New effort level (low/medium/high).
         max_daily_cost_usd: New daily budget cap.
+        jitter_seconds: Randomized fire-time spread in seconds (0/None = off).
     """
     return await _impl_campaign_update(
         name, cron_cadence=cron_cadence, model=model,
         effort=effort, max_daily_cost_usd=max_daily_cost_usd,
+        jitter_seconds=jitter_seconds,
     )

@@ -14,10 +14,19 @@ import json
 import logging
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# How often the pending-session reaper checks for finished sessions to capture.
+# Short interval (IntervalTrigger resetting on restart is harmless at this
+# cadence — it just fires again shortly after startup).
+_REAPER_INTERVAL_SECONDS = 120
+# Grace window before a still-pending run is eligible for orphan reconciliation.
+# Protects a run that was just created but whose state pointer is still being
+# written (the create_run -> update_campaign_state dispatch window).
+_ORPHAN_GRACE_SECONDS = 300
 
 
 class CampaignRunner:
@@ -46,9 +55,24 @@ class CampaignRunner:
         for camp in campaigns:
             self._schedule_campaign(camp)
 
+        # Pending-session reaper: captures finished sessions promptly instead of
+        # waiting for the next (possibly days-apart) cron tick, and reconciles
+        # orphaned pending runs. Registered once, independent of any campaign.
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        self._scheduler.add_job(
+            self._reap_pending_sessions,
+            IntervalTrigger(seconds=_REAPER_INTERVAL_SECONDS),
+            id="campaign_pending_reaper",
+            max_instances=1,
+            misfire_grace_time=60,
+            replace_existing=True,
+        )
+
         self._scheduler.start()
         logger.info(
-            "CampaignRunner started with %d active campaign(s)", len(campaigns)
+            "CampaignRunner started with %d active campaign(s) + pending reaper",
+            len(campaigns),
         )
 
     async def stop(self) -> None:
@@ -72,6 +96,12 @@ class CampaignRunner:
                 "Invalid cron for campaign %s: %s", camp["name"], exc
             )
             return
+
+        # Optional jitter (seconds) for randomized fire times. from_crontab()
+        # does not accept a jitter kwarg, so set it on the built trigger.
+        jitter = camp.get("jitter_seconds")
+        if jitter:
+            trigger.jitter = int(jitter)
 
         job_id = f"campaign_{camp['name']}"
         self._scheduler.add_job(
@@ -244,6 +274,69 @@ class CampaignRunner:
         if self._scheduler and self._scheduler.get_job(job_id):
             self._scheduler.remove_job(job_id)
 
+    async def _reap_pending_sessions(self) -> None:
+        """Capture finished pending sessions + reconcile orphans for all campaigns.
+
+        Runs on a short interval so a campaign's completed DirectSession is
+        captured within minutes rather than waiting for its next cron tick
+        (which may be days away). Best-effort per campaign — one failure never
+        blocks the others.
+        """
+        from genesis.db.crud import campaigns as crud
+
+        try:
+            campaigns = await crud.list_campaigns(self._db)
+        except Exception:
+            logger.warning("Pending reaper: failed to list campaigns", exc_info=True)
+            return
+
+        for camp in campaigns:
+            try:
+                await self._reap_one(camp)
+            except Exception:
+                logger.warning(
+                    "Pending reaper: failed for campaign %s",
+                    camp.get("name"), exc_info=True,
+                )
+
+    async def _reap_one(self, campaign: dict) -> None:
+        """Capture one campaign's finished session and reconcile its orphans."""
+        from genesis.db.crud import campaigns as crud
+
+        campaign_id = campaign["id"]
+        state = _parse_state(campaign["state_json"])
+        pending_session_id = state.get("_pending_session_id")
+        pending_run_id = state.get("_pending_run_id")
+
+        if pending_session_id:
+            result = await _check_session_status(self._db, pending_session_id)
+            if result is not None:
+                # Session finished — capture now (idempotent vs. the cron tick).
+                await _capture_session_results(
+                    self._db, campaign, state, result, pending_run_id
+                )
+                # Reload to learn the post-capture pending marker (if any).
+                refreshed = await crud.get_campaign(self._db, campaign_id)
+                if refreshed:
+                    state = _parse_state(refreshed["state_json"])
+
+        # Reconcile orphaned pending runs (superseded dispatches), keeping the
+        # currently-active pending run and any run younger than the grace window.
+        now = datetime.now(UTC)
+        keep = state.get("_pending_run_id")
+        reconciled = await crud.mark_orphan_runs_superseded(
+            self._db,
+            campaign_id,
+            keep,
+            older_than=(now - timedelta(seconds=_ORPHAN_GRACE_SECONDS)).isoformat(),
+            finished_at=now.isoformat(),
+        )
+        if reconciled:
+            logger.info(
+                "Pending reaper reconciled %d orphan run(s) for %s",
+                reconciled, campaign["name"],
+            )
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -307,7 +400,12 @@ async def _check_session_status(db: Any, session_id: str) -> dict | None:
                 "cost_usd": row.get("cost_usd", 0.0),
             }
     except Exception:
-        logger.debug("Session status check failed for %s", session_id, exc_info=True)
+        # Surfaced at WARNING (not DEBUG): a persistent failure here silently
+        # stalls capture (caller treats None as "still running"), so it must be
+        # visible at production log levels.
+        logger.warning(
+            "Session status check failed for %s", session_id, exc_info=True
+        )
 
     return None
 
@@ -319,57 +417,62 @@ async def _capture_session_results(
     session_result: dict,
     pending_run_id: str | None,
 ) -> None:
-    """Capture completed session results into campaign state."""
+    """Capture completed session results into campaign state.
+
+    Idempotent under concurrency: the cron tick and the pending-session reaper
+    can both call this for the same run. The run row is *claimed* first via an
+    optimistic lock (``complete_run(only_if_pending=True)``); if another path
+    already captured it, this returns before mutating any campaign state or
+    totals, so nothing is double-counted.
+    """
     from genesis.db.crud import campaigns as crud
 
     output_text = session_result.get("output_text", "")
     cost_usd = session_result.get("cost_usd", 0.0)
     success = session_result.get("success", False)
 
-    # Parse structured output
+    # Capture session ID before any state mutation
+    completed_session_id = state.get("_pending_session_id")
+
+    # Build the summary (no state mutation yet)
     parsed = _extract_json(output_text)
-    summary = ""
-
     if parsed:
-        state_updates = parsed.get("state_updates", {})
         summary = parsed.get("summary", "")
-
-        # Validate and merge state updates
-        # Filter out internal keys before validation
-        current_public = {k: v for k, v in state.items() if not k.startswith("_")}
-        validated = _validate_state_updates(state_updates, current_public)
-        state.update(validated)
     else:
         # Couldn't parse — use raw text as summary
         summary = output_text[:500] if output_text else "No output"
 
-    # Capture session ID before clearing pending markers
-    completed_session_id = state.get("_pending_session_id")
-
-    # Clear pending markers
-    state.pop("_pending_session_id", None)
-    state.pop("_pending_run_id", None)
-
-    # Persist updated state
-    await crud.update_campaign_state(db, campaign["id"], json.dumps(state))
-
-    # Complete the pending run
+    # ── Claim the run FIRST (optimistic lock). Bail before touching state if
+    #    a concurrent capture path already completed it. ──
     if pending_run_id:
-        await crud.complete_run(
+        claimed = await crud.complete_run(
             db, pending_run_id,
             outcome="success" if success else "error",
             summary=summary,
             cost_usd=cost_usd,
             session_id=completed_session_id,
             finished_at=datetime.now(UTC).isoformat(),
+            only_if_pending=True,
         )
+        if claimed == 0:
+            # Already captured by the other path — do not re-apply state/totals.
+            return
 
-    # Update campaign totals
-    await crud.update_campaign(
-        db, campaign["id"],
-        total_runs=campaign["total_runs"] + 1,
-        total_cost_usd=campaign["total_cost_usd"] + cost_usd,
-    )
+    # ── We won the claim — merge validated state updates and clear markers. ──
+    if parsed:
+        state_updates = parsed.get("state_updates", {})
+        # Filter out internal keys before validation
+        current_public = {k: v for k, v in state.items() if not k.startswith("_")}
+        validated = _validate_state_updates(state_updates, current_public)
+        state.update(validated)
+
+    state.pop("_pending_session_id", None)
+    state.pop("_pending_run_id", None)
+    await crud.update_campaign_state(db, campaign["id"], json.dumps(state))
+
+    # Atomic counter bump (only when a run was actually claimed/counted).
+    if pending_run_id:
+        await crud.increment_campaign_totals(db, campaign["id"], cost_usd)
 
 
 def _extract_json(text: str) -> dict | None:

@@ -1396,7 +1396,8 @@ TABLES = {
             paused_at         TEXT,
             last_run_at       TEXT,
             total_runs        INTEGER NOT NULL DEFAULT 0,
-            total_cost_usd    REAL NOT NULL DEFAULT 0.0
+            total_cost_usd    REAL NOT NULL DEFAULT 0.0,
+            jitter_seconds    INTEGER
         )
     """,
     "campaign_runs": """
