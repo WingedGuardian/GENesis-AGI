@@ -23,10 +23,11 @@ import json
 
 import aiosqlite
 
-# Session statuses where a skill's outcome (success vs failure) is determinable,
-# so a success-rate is computable. 'active'/'checkpointed'/'expired' are not
-# terminal-for-outcome. Mirrors the success/failure model in
-# ``learning/skills/effectiveness.py`` (status == 'failed' vs everything else).
+# Session statuses where a skill's outcome is DETERMINABLE at all (so a
+# success-rate is computable) — the full terminal set, not just failures.
+# 'active'/'checkpointed'/'expired' are not terminal-for-outcome. NB:
+# ``learning/skills/effectiveness.py`` uses ``status == 'failed'`` as its
+# *failure* signal; here we use both terminals to mean "outcome is knowable".
 _TERMINAL_SESSION_STATUS = ("completed", "failed")
 
 
@@ -137,9 +138,18 @@ async def skill_funnel(db: aiosqlite.Connection) -> dict:
     """
     from genesis.learning.skills import wiring
 
+    # list_available_skills() is synchronous filesystem I/O (iterdir over 2 dirs).
+    # Acceptable on the loop here: the library is small (~30 entries), paths are
+    # local, and this tool is operator-invoked (no hot path). Would need
+    # run_in_executor only if the skills dir moved to slow/network storage.
     library = set(wiring.list_available_skills())
     captured = len(library)
 
+    # Unlike the sibling funnels (pure SQL-side COUNT via ``_scalar``), skill
+    # usage lives inside the ``metadata`` JSON blob, so we fetch the matching
+    # rows and intersect in Python. The ``LIKE`` bounds this to rows that carry
+    # skill_tags (background sessions only today) — a small set; no metadata
+    # index exists, but the scan stays cheap at this scale.
     cur = await db.execute(
         "SELECT metadata, status FROM cc_sessions WHERE metadata LIKE '%skill_tags%'"
     )
