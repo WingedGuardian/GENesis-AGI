@@ -131,6 +131,31 @@ class TestCaptureIdempotency:
         # pending markers cleared
         assert "_pending_session_id" not in json.loads(camp["state_json"])
 
+    @pytest.mark.anyio
+    async def test_malformed_state_updates_does_not_stall(self, db):
+        """LLM emits `state_updates: null` — capture must still complete the run
+        and clear markers (not crash after claiming, leaking pending state)."""
+        from genesis.campaigns.runner import _capture_session_results
+        from genesis.db.crud import campaigns as crud
+
+        state = {"k": 1, "_pending_session_id": "s", "_pending_run_id": "run-bad"}
+        cid = await _make_campaign(db, state=state)
+        await crud.create_run(
+            db, id="run-bad", campaign_id=cid,
+            started_at=datetime.now(UTC).isoformat(),
+        )
+        campaign = await crud.get_campaign(db, cid)
+        # state_updates explicitly null + a non-dict variant both must be safe
+        result = {"success": True, "output_text": '{"summary":"x","state_updates":null}', "cost_usd": 0.1}
+
+        await _capture_session_results(db, campaign, dict(state), result, "run-bad")
+
+        camp = await crud.get_campaign(db, cid)
+        assert (await crud.get_run(db, "run-bad"))["outcome"] == "success"
+        assert camp["total_runs"] == 1
+        # markers cleared → no permanent stall
+        assert "_pending_session_id" not in json.loads(camp["state_json"])
+
 
 # ── Reaper ──────────────────────────────────────────────────────────────────
 

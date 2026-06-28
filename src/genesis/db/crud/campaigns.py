@@ -73,6 +73,23 @@ async def list_campaigns(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def list_campaigns_with_pending_runs(db: Any) -> list[dict]:
+    """Campaigns that have at least one run still ``outcome='pending'``.
+
+    Drives the pending-session reaper so its cost is proportional to actual
+    in-flight/abandoned work rather than the total campaign count — a campaign
+    with no pending runs needs neither capture nor orphan reconciliation. A
+    dispatched-but-uncaptured session always has a pending run row, so this set
+    is exactly the reaper's work set.
+    """
+    cursor = await db.execute(
+        "SELECT DISTINCT c.* FROM campaigns c "
+        "JOIN campaign_runs r ON r.campaign_id = c.id "
+        "WHERE r.outcome = 'pending'"
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def update_campaign(db: Any, campaign_id: str, **fields: Any) -> None:
     """Update arbitrary fields on a campaign row."""
     if not fields:

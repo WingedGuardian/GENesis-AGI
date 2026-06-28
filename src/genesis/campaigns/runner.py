@@ -285,7 +285,10 @@ class CampaignRunner:
         from genesis.db.crud import campaigns as crud
 
         try:
-            campaigns = await crud.list_campaigns(self._db)
+            # Only campaigns with pending runs need capture/reconcile — keeps
+            # the reaper's cost proportional to in-flight work, not the total
+            # (incl. dead/paused) campaign count.
+            campaigns = await crud.list_campaigns_with_pending_runs(self._db)
         except Exception:
             logger.warning("Pending reaper: failed to list campaigns", exc_info=True)
             return
@@ -525,6 +528,12 @@ def _validate_state_updates(
     - Keys not present in current_state
     - Value type changes (except None → anything)
     """
+    # Defensive: an LLM may emit `"state_updates": null` (or a list/string)
+    # rather than an object. parsed.get("state_updates", {}) returns that
+    # non-dict as-is, so guard here — otherwise .items() raises AttributeError
+    # inside the (already-claimed) capture path and the update is lost.
+    if not isinstance(updates, dict):
+        return {}
     validated = {}
     for key, new_value in updates.items():
         if key not in current_state:
