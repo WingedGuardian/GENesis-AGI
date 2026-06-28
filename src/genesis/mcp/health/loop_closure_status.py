@@ -4,9 +4,11 @@ The umbrella "is the loop actually closed?" view. Two things in one read-only
 surface:
 
 1. A per-artifact **funnel** — captured → surfaced → actuated → measured → leak
-   — over the existing tables (procedures, observations, reflections,
+   — over the existing tables (procedures, skills, observations, reflections,
    follow-ups, ego proposals). It names each OPEN seam honestly: what's captured
    but never acted on or measured. This is the assurance the operator asked for.
+   (Skills are file-based and NOT outcome-graded by design, so their funnel
+   reports the honest instrumentation gap rather than a graded outcome.)
 2. The **Outcome Bus** section (tiers, per-domain T1 success, ego calibration) —
    subsumes the former ``self_improvement_status`` tool, so there is ONE
    self-learning-health surface instead of two overlapping ones.
@@ -46,6 +48,7 @@ async def _impl_loop_closure_status() -> dict:
 
     funnel = [
         await lc.procedure_funnel(db),
+        await lc.skill_funnel(db),
         await lc.observation_funnel(db, stale_before=stale_before),
         await lc.reflection_funnel(db),
         await lc.followup_funnel(db, stale_before=stale_before),
@@ -74,10 +77,6 @@ async def _impl_loop_closure_status() -> dict:
         "funnel": funnel,
         "open_seams": open_seams,
         "outcome_bus": outcome_bus,
-        "skills_note": (
-            "Skills are file-based; their effectiveness signal (failure_reason) "
-            "is a stub → measured=OPEN. Closing that is LC2."
-        ),
         "note": (
             "Self-learning loop health. funnel = captured→surfaced→actuated→"
             "measured per artifact; open_seams names what is leaking (captured "
@@ -94,9 +93,9 @@ async def loop_closure_status() -> dict:
     through the cracks?
 
     Per-artifact funnel — captured → surfaced → actuated → measured → leak —
-    across procedures, observations, reflections, follow-ups and ego proposals,
-    plus Outcome Bus health (signal tiers, per-domain success, ego calibration
-    ECE trend). ``open_seams`` names exactly what is captured but never acted on
-    or measured. Read-only; does NOT change behaviour.
+    across procedures, skills, observations, reflections, follow-ups and ego
+    proposals, plus Outcome Bus health (signal tiers, per-domain success, ego
+    calibration ECE trend). ``open_seams`` names exactly what is captured but
+    never acted on or measured. Read-only; does NOT change behaviour.
     """
     return await _impl_loop_closure_status()
