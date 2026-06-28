@@ -24,7 +24,12 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-_CACHE_PATH = Path(__file__).resolve().parents[4] / "config" / "procedure_triggers.yaml"
+# $GENESIS_PROCEDURE_TRIGGERS overrides the default cache location (tests /
+# relocated installs); the PreToolUse advisor reads the same env var.
+_CACHE_PATH = Path(
+    os.environ.get("GENESIS_PROCEDURE_TRIGGERS")
+    or (Path(__file__).resolve().parents[4] / "config" / "procedure_triggers.yaml")
+)
 
 
 def get_cache_path() -> Path:

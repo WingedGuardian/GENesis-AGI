@@ -11,13 +11,48 @@ Runs the hook as a subprocess with JSON piped to stdin, verifying:
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-_SCRIPT = Path(__file__).resolve().parent.parent.parent / "scripts" / "procedure_advisor.py"
+import pytest
+
+_REPO = Path(__file__).resolve().parent.parent.parent
+_SCRIPT = _REPO / "scripts" / "procedure_advisor.py"
+_SEED_SCRIPT = _REPO / "scripts" / "seed_procedures.py"
 _PYTHON = sys.executable
 _TIMEOUT = 10
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _trigger_cache():
+    """Provide the advisor's trigger cache for these tests.
+
+    The cache is install-specific generated state (no longer a committed file),
+    so a clean checkout has none. Seed a throwaway DB, which regenerates the
+    cache at a tmp path; point both the seed (writer) and the advisor subprocess
+    (reader) at it via $GENESIS_PROCEDURE_TRIGGERS.
+    """
+    tmp = tempfile.mkdtemp(prefix="ptc-")
+    cache = str(Path(tmp) / "procedure_triggers.yaml")
+    db = str(Path(tmp) / "seed.db")
+    prev = os.environ.get("GENESIS_PROCEDURE_TRIGGERS")
+    os.environ["GENESIS_PROCEDURE_TRIGGERS"] = cache
+    try:
+        subprocess.run(
+            [_PYTHON, str(_SEED_SCRIPT), "--db", db],
+            check=True, capture_output=True, text=True, env=os.environ,
+        )
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("GENESIS_PROCEDURE_TRIGGERS", None)
+        else:
+            os.environ["GENESIS_PROCEDURE_TRIGGERS"] = prev
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _run_hook(payload: dict | str | None = None) -> subprocess.CompletedProcess:
