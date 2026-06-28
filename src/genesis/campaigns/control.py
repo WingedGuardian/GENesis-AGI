@@ -94,7 +94,9 @@ async def trigger_campaign(db: Any, runner: Any | None, name: str) -> dict:
         return {
             "error": (
                 "Campaign trigger requires the main Genesis server. "
-                "The campaign runner is not available in standalone MCP mode."
+                "The campaign runner is not available in standalone MCP mode. "
+                "Use campaign_status to check campaign state, or restart "
+                "genesis-server to run campaigns on schedule."
             ),
         }
 
