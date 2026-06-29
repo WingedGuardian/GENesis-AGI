@@ -10258,12 +10258,12 @@
             <!-- Controls -->
             <div style="display:flex; gap:.5rem; margin-top:.85rem; flex-wrap:wrap;">
               <button class="btn-sm" x-show="c.status==='active'"
-                      :disabled="$store.genesisDashboard.campaignsMutating[c.name]"
+                      :disabled="!!$store.genesisDashboard.campaignsMutating[c.name]"
                       @click="$store.genesisDashboard.pauseCampaign(c.name)">Pause</button>
               <button class="btn-sm" x-show="c.status!=='active'"
-                      :disabled="$store.genesisDashboard.campaignsMutating[c.name]"
+                      :disabled="!!$store.genesisDashboard.campaignsMutating[c.name]"
                       @click="$store.genesisDashboard.resumeCampaign(c.name)">Resume</button>
-              <button class="btn-sm" :disabled="$store.genesisDashboard.campaignsMutating[c.name]"
+              <button class="btn-sm" :disabled="!!$store.genesisDashboard.campaignsMutating[c.name]"
                       @click="$store.genesisDashboard.triggerCampaign(c.name)">Trigger now</button>
               <button class="btn-sm" @click="$store.genesisDashboard.startCampaignEdit(c)">Edit</button>
               <button class="btn-sm" style="opacity:.8;" @click="$store.genesisDashboard.openCampaignDetail(c.name)">Details</button>
