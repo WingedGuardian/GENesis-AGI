@@ -11,6 +11,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The dashboard now has a Campaigns tab where you can see and control your autonomous campaigns.**
+  Each campaign shows its status, schedule (with next fire time), model/effort, today's spend
+  against its daily cap, completed runs vs. attempts, and whether a session is currently in
+  flight — plus recent run history and live state. You can pause/resume a campaign, run one
+  immediately, and edit its cadence, model, effort, daily cost cap, and a new optional
+  schedule "jitter" (randomized fire times so ticks aren't perfectly periodic). Until now the
+  only way to see or steer a campaign was through Genesis directly.
+
+### Fixed
+
+- **Campaign results no longer sit uncaptured until the next scheduled tick.** Previously a
+  campaign that ran every couple of days would finish its background session but not record
+  the outcome (or cost, or notify you) until the *following* tick — so a finished run could
+  stay invisible for days, and its spend went uncounted. A new reaper now captures finished
+  sessions within minutes and cleans up runs orphaned by past crashes, so campaign status and
+  cost stay accurate in near-real-time.
+
 - **Genesis now stewards its own open-source pull requests instead of filing-and-forgetting.**
   A new background campaign checks the upstream PRs Genesis has authored (e.g. to litellm,
   Qwen-Agent) every couple of days, and acts on what changed: it nudges a stalled PR once,

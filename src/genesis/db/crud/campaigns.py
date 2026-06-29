@@ -73,6 +73,23 @@ async def list_campaigns(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def list_campaigns_with_pending_runs(db: Any) -> list[dict]:
+    """Campaigns that have at least one run still ``outcome='pending'``.
+
+    Drives the pending-session reaper so its cost is proportional to actual
+    in-flight/abandoned work rather than the total campaign count — a campaign
+    with no pending runs needs neither capture nor orphan reconciliation. A
+    dispatched-but-uncaptured session always has a pending run row, so this set
+    is exactly the reaper's work set.
+    """
+    cursor = await db.execute(
+        "SELECT DISTINCT c.* FROM campaigns c "
+        "JOIN campaign_runs r ON r.campaign_id = c.id "
+        "WHERE r.outcome = 'pending'"
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def update_campaign(db: Any, campaign_id: str, **fields: Any) -> None:
     """Update arbitrary fields on a campaign row."""
     if not fields:
@@ -127,16 +144,91 @@ async def complete_run(
     cost_usd: float = 0.0,
     session_id: str | None = None,
     finished_at: str | None = None,
+    only_if_pending: bool = False,
+) -> int:
+    """Mark a run as completed with outcome details.
+
+    When ``only_if_pending`` is True the UPDATE is gated on the row still
+    being ``outcome='pending'`` — used as an optimistic lock so two concurrent
+    capture paths (the cron tick and the pending-session reaper) cannot both
+    "win" and double-process the same run. Returns the number of rows changed
+    (1 if this caller claimed the run, 0 if it was already completed).
+    """
+    sql = (
+        "UPDATE campaign_runs "
+        "SET outcome = ?, summary = ?, skip_reason = ?, cost_usd = ?, "
+        "    session_id = ?, finished_at = ? "
+        "WHERE id = ?"
+    )
+    params: list[Any] = [
+        outcome, summary, skip_reason, cost_usd, session_id, finished_at, run_id,
+    ]
+    if only_if_pending:
+        sql += " AND outcome = 'pending'"
+    cursor = await db.execute(sql, params)
+    await db.commit()
+    return cursor.rowcount
+
+
+async def increment_campaign_totals(
+    db: Any, campaign_id: str, cost_usd: float
 ) -> None:
-    """Mark a run as completed with outcome details."""
+    """Atomically bump a campaign's run/cost counters.
+
+    Uses a SQL-level increment (``total_runs = total_runs + 1``) rather than a
+    read-modify-write so concurrent capture paths cannot clobber each other's
+    update and lose a count.
+    """
     await db.execute(
-        """UPDATE campaign_runs
-           SET outcome = ?, summary = ?, skip_reason = ?, cost_usd = ?,
-               session_id = ?, finished_at = ?
-           WHERE id = ?""",
-        (outcome, summary, skip_reason, cost_usd, session_id, finished_at, run_id),
+        "UPDATE campaigns "
+        "SET total_runs = total_runs + 1, total_cost_usd = total_cost_usd + ? "
+        "WHERE id = ?",
+        (cost_usd, campaign_id),
     )
     await db.commit()
+
+
+async def get_run(db: Any, run_id: str) -> dict | None:
+    """Fetch a single campaign run by ID."""
+    cursor = await db.execute(
+        "SELECT * FROM campaign_runs WHERE id = ?", (run_id,)
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def mark_orphan_runs_superseded(
+    db: Any,
+    campaign_id: str,
+    keep_run_id: str | None,
+    older_than: str,
+    finished_at: str,
+) -> int:
+    """Resolve abandoned pending runs left by a crash/double-dispatch.
+
+    A run is orphaned when it is still ``outcome='pending'`` but is no longer
+    the campaign's active pending run (``id != keep_run_id``) — its dispatch
+    was superseded without ever being captured. Marks such rows
+    ``outcome='error', skip_reason='superseded'`` so attempt/run accounting
+    reconciles. ``keep_run_id`` of None resolves all (other) pending rows.
+
+    ``older_than`` (ISO timestamp) is a grace guard: only rows whose
+    ``started_at < older_than`` are eligible. This protects a run that is in
+    the middle of being dispatched (created, but its state pointer not yet
+    written) from being mistaken for an orphan. Returns rows reconciled.
+    """
+    sql = (
+        "UPDATE campaign_runs "
+        "SET outcome = 'error', skip_reason = 'superseded', finished_at = ? "
+        "WHERE campaign_id = ? AND outcome = 'pending' AND started_at < ?"
+    )
+    params: list[Any] = [finished_at, campaign_id, older_than]
+    if keep_run_id is not None:
+        sql += " AND id != ?"
+        params.append(keep_run_id)
+    cursor = await db.execute(sql, params)
+    await db.commit()
+    return cursor.rowcount
 
 
 async def list_runs(
@@ -153,6 +245,50 @@ async def list_runs(
         (campaign_id, limit),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def count_runs_by_outcome(db: Any, campaign_id: str) -> dict[str, int]:
+    """Return run counts grouped by outcome (pending/success/skip/error).
+
+    Lets the dashboard show honest "completed vs attempts" numbers rather than
+    conflating dispatched-but-uncaptured runs with completed ones.
+    """
+    cursor = await db.execute(
+        "SELECT outcome, COUNT(*) AS n FROM campaign_runs "
+        "WHERE campaign_id = ? GROUP BY outcome",
+        (campaign_id,),
+    )
+    return {row["outcome"]: int(row["n"]) for row in await cursor.fetchall()}
+
+
+async def count_runs_by_outcome_all(db: Any) -> dict[str, dict[str, int]]:
+    """Run-outcome counts for ALL campaigns in one grouped query.
+
+    Returns {campaign_id: {outcome: n}}. Lets the dashboard list endpoint avoid
+    an N-queries-per-campaign loop.
+    """
+    cursor = await db.execute(
+        "SELECT campaign_id, outcome, COUNT(*) AS n FROM campaign_runs "
+        "GROUP BY campaign_id, outcome"
+    )
+    out: dict[str, dict[str, int]] = {}
+    for row in await cursor.fetchall():
+        out.setdefault(row["campaign_id"], {})[row["outcome"]] = int(row["n"])
+    return out
+
+
+async def get_daily_cost_all(db: Any, date_str: str) -> dict[str, float]:
+    """Per-campaign cost for a given UTC day in one grouped query.
+
+    Returns {campaign_id: cost_usd} (only campaigns with runs that day).
+    """
+    cursor = await db.execute(
+        "SELECT campaign_id, COALESCE(SUM(cost_usd), 0.0) AS total "
+        "FROM campaign_runs WHERE started_at LIKE ? || '%' "
+        "GROUP BY campaign_id",
+        (date_str,),
+    )
+    return {row["campaign_id"]: float(row["total"]) for row in await cursor.fetchall()}
 
 
 async def get_daily_cost(

@@ -789,6 +789,12 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE cc_sessions ADD COLUMN keywords TEXT DEFAULT ''",
         "cc_sessions.keywords")
 
+    # Campaigns: per-campaign schedule jitter (seconds) for randomized fire
+    # times so campaign ticks are not perfectly periodic. NULL = no jitter.
+    await _try_alter(db,
+        "ALTER TABLE campaigns ADD COLUMN jitter_seconds INTEGER",
+        "campaigns.jitter_seconds")
+
     # Memory rebalance: add memory_class column to memory_metadata for
     # rule/fact/reference classification with activation weight boost.
     await _try_alter(db,

@@ -460,12 +460,13 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - Best for burst scenarios or when Mistral's 2 RPM limit is too slow
 
 ### OpenRouter Free Tier
-- ~27 models available as free variants (`:free` suffix) on OpenRouter
+- ~26 models available as free variants (`:free` suffix) on OpenRouter
 - **Base rate limits:** 20 RPM, 200 RPD (shared across all free models)
 - **With $10 balance:** 1,000 RPD (5x increase, balance is not consumed by free models)
 - Includes Llama 4 Scout, DeepSeek-R1, Gemma 4 31B, Qwen3-Coder 480B, Nemotron 3 Ultra 550B, various community models
 - Note: DeepSeek V4 Flash free variant removed as of June 2026; Kimi K2.6 and
-  GLM-4.5-Air free variants removed June 2026
+  GLM-4.5-Air free variants removed June 2026; Nex-N2-Pro (`nex-agi/nex-n2-pro:free`)
+  removed June 2026
 - Use as overflow when other free sources are exhausted, or as primary diversity source
 - Free models use `pricing.prompt == "0"` in API — detectable programmatically
 
@@ -657,7 +658,12 @@ High for adversarial review (#20) — without changing application code.
 ---
 
 ## Last Reviewed
-**2026-06-21** — OpenRouter free model count 26→27 (automated inventory:
+**2026-06-28** — OpenRouter free model count 27→26 (automated inventory:
+26 free, +0 new, −1 removed); removed Nex-N2-Pro (`nex-agi/nex-n2-pro:free`,
+delisted June 2026) — was never promoted to a tier or Pending Evaluation, so
+no roster entry to retire; updated OpenRouter Free Tier count ~27→~26 and noted
+the Nex-N2-Pro removal there. No new models detected this scan.
+2026-06-21 — OpenRouter free model count 26→27 (automated inventory:
 27 free, +1 new, −0 removed); detected new free model Cohere North Mini Code
 (`cohere/north-mini-code:free`, 256k context) — added to Pending Evaluation as a
 candidate free coding fallback (major provider, benchmarks unverified); updated
