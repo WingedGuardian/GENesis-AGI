@@ -63,6 +63,37 @@ def test_no_allowlist_still_blocks_destructive(cmd):
     assert _run(cmd).returncode == 2
 
 
+# --- Force-push detection: a FLAG token, not a branch-name substring ---
+
+@pytest.mark.parametrize("cmd", [
+    "git push -f origin main",
+    "git push --force origin main",
+    "git push origin main --force",
+    "git push --force-with-lease origin main",
+    "git push origin HEAD -f",
+    "git push -fv origin main",   # bundled short flags (force + verbose)
+    "git push -uf origin main",   # bundled (set-upstream + force)
+])
+def test_force_push_variants_blocked(cmd):
+    """Real force pushes (a standalone -f flag or any --force* variant) are
+    hard-blocked (exit 2)."""
+    assert _run(cmd).returncode == 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "git push origin learning/lc2-honest-skill-funnel",  # '-f' inside 'skill-funnel'
+    "git push origin bug-fix",                            # '-f' inside 'bug-fix'
+    "git push origin feature/new-flow",                  # '-f' inside 'new-flow'
+    "git push origin HEAD",
+    "git push origin main",
+])
+def test_normal_push_with_dash_f_in_branch_not_blocked(cmd):
+    """A branch name that merely CONTAINS the literal '-f' must NOT be treated as
+    a force push. These clear the hard-block (the soft approval reminder still
+    fires on stderr, but exit code is 0)."""
+    assert _run(cmd).returncode == 0
+
+
 # --- Allowlist mode (steward) ---
 
 ALLOW = {"GENESIS_BASH_ALLOWLIST": "gh"}
