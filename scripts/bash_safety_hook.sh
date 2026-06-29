@@ -65,9 +65,6 @@ case "$CMD" in
     *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*|*"rm -rf .."*)
         echo "BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user." >&2
         exit 2;;
-    *"git push"*"--force"*|*"git push"*"-f"*)
-        echo "BLOCKED: Force push not allowed. Use a PR." >&2
-        exit 2;;
     *"git reset --hard"*)
         echo "BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user." >&2
         exit 2;;
@@ -75,6 +72,18 @@ case "$CMD" in
         echo "BLOCKED: git clean removes untracked files permanently. Ask the user first." >&2
         exit 2;;
 esac
+
+# Force push — hard-block. MUST precede the soft "git push" warning below (which
+# exits 0). Match -f only as a FLAG token — a whitespace-delimited short-flag
+# cluster containing 'f' (so '-f', '-fv', '-uf' all count; 'f' is force-only
+# among push short flags). The leading start/space anchor is what keeps a branch
+# name that merely CONTAINS "-f" — e.g. "skill-funnel", "bug-fix" — from looking
+# like a force push. Also covers any --force* variant.
+if echo "$CMD" | grep -qE 'git push' \
+   && echo "$CMD" | grep -qE -- '(^|[[:space:]])-[a-zA-Z]*f[a-zA-Z]*([[:space:]]|$)|--force'; then
+    echo "BLOCKED: Force push not allowed. Use a PR." >&2
+    exit 2
+fi
 
 # Push / PR protection — remind to get explicit user approval
 if echo "$CMD" | grep -qE "^git push|[;&|] *git push"; then
