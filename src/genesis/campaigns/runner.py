@@ -17,6 +17,18 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+# State parsing + model/effort resolution live in control.py (shared with the
+# MCP tools and dashboard routes) so there is one source of truth.
+from genesis.campaigns.control import (
+    parse_state as _parse_state,
+)
+from genesis.campaigns.control import (
+    resolve_effort as _resolve_effort,
+)
+from genesis.campaigns.control import (
+    resolve_model as _resolve_model,
+)
+
 logger = logging.getLogger(__name__)
 
 # How often the pending-session reaper checks for finished sessions to capture.
@@ -344,13 +356,6 @@ class CampaignRunner:
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
-def _parse_state(state_json: str) -> dict:
-    """Parse campaign state JSON, returning empty dict on failure."""
-    with contextlib.suppress(json.JSONDecodeError, TypeError):
-        return json.loads(state_json)
-    return {}
-
-
 def _read_strategy_doc(path: str) -> str:
     """Read a strategy doc from disk. Returns empty string on failure."""
     try:
@@ -659,25 +664,3 @@ def _build_session_prompt(
     return "\n".join(parts)
 
 
-def _resolve_model(model_str: str) -> Any:
-    """Convert model string to CCModel enum."""
-    from genesis.cc.types import CCModel
-
-    mapping = {
-        "sonnet": CCModel.SONNET,
-        "opus": CCModel.OPUS,
-        "haiku": CCModel.HAIKU,
-    }
-    return mapping.get(model_str, CCModel.SONNET)
-
-
-def _resolve_effort(effort_str: str) -> Any:
-    """Convert effort string to EffortLevel enum."""
-    from genesis.cc.types import EffortLevel
-
-    mapping = {
-        "low": EffortLevel.LOW,
-        "medium": EffortLevel.MEDIUM,
-        "high": EffortLevel.HIGH,
-    }
-    return mapping.get(effort_str, EffortLevel.MEDIUM)

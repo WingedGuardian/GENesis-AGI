@@ -15,13 +15,53 @@ needed for the live schedule to reflect the change.
 
 from __future__ import annotations
 
+import contextlib
+import json
 from datetime import UTC, datetime
 from typing import Any
 
-# Valid values mirror what CampaignRunner._resolve_model / _resolve_effort
-# actually accept — anything else would silently fall back to sonnet/medium.
+# Single source of truth for the model/effort a campaign session may use.
+# resolve_model / resolve_effort below build their enum maps from these exact
+# keys, and CampaignRunner imports the resolvers from here — so the validator
+# and the dispatch-time resolution can never drift apart.
 VALID_MODELS = {"haiku", "sonnet", "opus"}
 VALID_EFFORTS = {"low", "medium", "high"}
+
+
+def parse_state(state_json: str | None) -> dict:
+    """Parse a campaign's ``state_json`` blob, returning {} on any failure.
+
+    Shared by the runner, the MCP tools, and the dashboard routes so all three
+    surfaces parse campaign state identically.
+    """
+    with contextlib.suppress(json.JSONDecodeError, TypeError):
+        if state_json:
+            return json.loads(state_json)
+    return {}
+
+
+def resolve_model(model_str: str) -> Any:
+    """Convert a campaign model string to a CCModel enum (default sonnet)."""
+    from genesis.cc.types import CCModel
+
+    mapping = {
+        "haiku": CCModel.HAIKU,
+        "sonnet": CCModel.SONNET,
+        "opus": CCModel.OPUS,
+    }
+    return mapping.get(model_str, CCModel.SONNET)
+
+
+def resolve_effort(effort_str: str) -> Any:
+    """Convert a campaign effort string to an EffortLevel enum (default medium)."""
+    from genesis.cc.types import EffortLevel
+
+    mapping = {
+        "low": EffortLevel.LOW,
+        "medium": EffortLevel.MEDIUM,
+        "high": EffortLevel.HIGH,
+    }
+    return mapping.get(effort_str, EffortLevel.MEDIUM)
 
 
 def _validate_cadence(cron_cadence: str) -> str | None:

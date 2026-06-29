@@ -79,6 +79,30 @@ class TestCrudIdempotency:
         assert counts == {"pending": 1, "success": 1, "skip": 1}
 
     @pytest.mark.anyio
+    async def test_batched_aggregates_match_per_campaign(self, db):
+        from genesis.db.crud import campaigns as crud
+
+        c1 = await _make_campaign(db, name="agg1", cid="agg1")
+        c2 = await _make_campaign(db, name="agg2", cid="agg2")
+        today = datetime.now(UTC).isoformat()[:10]
+        # c1: one success ($0.2), one pending; c2: one success ($0.5)
+        await crud.create_run(db, id="a1", campaign_id=c1, started_at=today + "T01:00:00+00:00")
+        await crud.complete_run(db, "a1", outcome="success", cost_usd=0.2, finished_at=today)
+        await crud.create_run(db, id="a2", campaign_id=c1, started_at=today + "T02:00:00+00:00")
+        await crud.create_run(db, id="b1", campaign_id=c2, started_at=today + "T03:00:00+00:00")
+        await crud.complete_run(db, "b1", outcome="success", cost_usd=0.5, finished_at=today)
+
+        counts_all = await crud.count_runs_by_outcome_all(db)
+        cost_all = await crud.get_daily_cost_all(db, today)
+        assert counts_all[c1] == {"success": 1, "pending": 1}
+        assert counts_all[c2] == {"success": 1}
+        assert abs(cost_all[c1] - 0.2) < 1e-9
+        assert abs(cost_all[c2] - 0.5) < 1e-9
+        # batched values equal the per-campaign helpers
+        assert cost_all[c1] == await crud.get_daily_cost(db, c1, today)
+        assert counts_all[c2] == await crud.count_runs_by_outcome(db, c2)
+
+    @pytest.mark.anyio
     async def test_mark_orphan_respects_keep_and_grace(self, db):
         from genesis.db.crud import campaigns as crud
 

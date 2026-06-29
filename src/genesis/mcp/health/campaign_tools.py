@@ -12,7 +12,6 @@ informational messages in standalone mode.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import uuid
@@ -177,6 +176,7 @@ async def _impl_campaign_status(name: str) -> dict:
             return {"error": f"Database unavailable: {type(exc).__name__}: {exc}"}
 
     try:
+        from genesis.campaigns import control
         from genesis.db.crud import campaigns as crud
 
         campaign = await crud.get_campaign_by_name(db, name)
@@ -184,9 +184,7 @@ async def _impl_campaign_status(name: str) -> dict:
             return {"error": f"Campaign '{name}' not found"}
 
         runs = await crud.list_runs(db, campaign["id"], limit=5)
-        state = {}
-        with contextlib.suppress(json.JSONDecodeError, TypeError):
-            state = json.loads(campaign["state_json"])
+        state = control.parse_state(campaign["state_json"])
 
         # Filter internal keys from state display
         visible_state = {k: v for k, v in state.items() if not k.startswith("_")}

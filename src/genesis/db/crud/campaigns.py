@@ -261,6 +261,36 @@ async def count_runs_by_outcome(db: Any, campaign_id: str) -> dict[str, int]:
     return {row["outcome"]: int(row["n"]) for row in await cursor.fetchall()}
 
 
+async def count_runs_by_outcome_all(db: Any) -> dict[str, dict[str, int]]:
+    """Run-outcome counts for ALL campaigns in one grouped query.
+
+    Returns {campaign_id: {outcome: n}}. Lets the dashboard list endpoint avoid
+    an N-queries-per-campaign loop.
+    """
+    cursor = await db.execute(
+        "SELECT campaign_id, outcome, COUNT(*) AS n FROM campaign_runs "
+        "GROUP BY campaign_id, outcome"
+    )
+    out: dict[str, dict[str, int]] = {}
+    for row in await cursor.fetchall():
+        out.setdefault(row["campaign_id"], {})[row["outcome"]] = int(row["n"])
+    return out
+
+
+async def get_daily_cost_all(db: Any, date_str: str) -> dict[str, float]:
+    """Per-campaign cost for a given UTC day in one grouped query.
+
+    Returns {campaign_id: cost_usd} (only campaigns with runs that day).
+    """
+    cursor = await db.execute(
+        "SELECT campaign_id, COALESCE(SUM(cost_usd), 0.0) AS total "
+        "FROM campaign_runs WHERE started_at LIKE ? || '%' "
+        "GROUP BY campaign_id",
+        (date_str,),
+    )
+    return {row["campaign_id"]: float(row["total"]) for row in await cursor.fetchall()}
+
+
 async def get_daily_cost(
     db: Any,
     campaign_id: str,

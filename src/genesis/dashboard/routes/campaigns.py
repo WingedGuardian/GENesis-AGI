@@ -19,11 +19,12 @@ default.
 
 from __future__ import annotations
 
-import json
 import logging
 
 from flask import jsonify, request
 
+from genesis.campaigns import control
+from genesis.campaigns.control import parse_state
 from genesis.dashboard._blueprint import _async_route, blueprint
 from genesis.dashboard.auth import is_authenticated
 
@@ -45,15 +46,6 @@ def _runtime_or_503():
     if not rt.is_bootstrapped or rt.db is None:
         return None, (jsonify({"error": "Not bootstrapped"}), 503)
     return rt, None
-
-
-def _parse_state(state_json: str | None) -> dict:
-    if not state_json:
-        return {}
-    try:
-        return json.loads(state_json)
-    except (json.JSONDecodeError, TypeError):
-        return {}
 
 
 def _next_fire(runner, name: str) -> str | None:
@@ -89,11 +81,14 @@ async def campaigns_list():
 
     try:
         rows = await crud.list_campaigns(rt.db)
+        # Two grouped queries for all campaigns instead of 2 per campaign.
+        counts_all = await crud.count_runs_by_outcome_all(rt.db)
+        cost_all = await crud.get_daily_cost_all(rt.db, today)
         items = []
         for c in rows:
-            state = _parse_state(c.get("state_json"))
-            counts = await crud.count_runs_by_outcome(rt.db, c["id"])
-            today_cost = await crud.get_daily_cost(rt.db, c["id"], today)
+            state = parse_state(c.get("state_json"))
+            counts = counts_all.get(c["id"], {})
+            today_cost = cost_all.get(c["id"], 0.0)
             items.append({
                 "id": c["id"],
                 "name": c["name"],
@@ -138,7 +133,7 @@ async def campaign_detail(name: str):
         if not c:
             return jsonify({"error": "Campaign not found"}), 404
 
-        state = _parse_state(c.get("state_json"))
+        state = parse_state(c.get("state_json"))
         visible_state = {k: v for k, v in state.items() if not k.startswith("_")}
         runs = await crud.list_runs(rt.db, c["id"], limit=15)
         counts = await crud.count_runs_by_outcome(rt.db, c["id"])
@@ -201,28 +196,24 @@ async def _control(name: str, action):
 @blueprint.route("/api/genesis/campaigns/<name>/pause", methods=["POST"])
 @_async_route
 async def campaign_pause(name: str):
-    from genesis.campaigns import control
     return await _control(name, lambda db, r: control.pause_campaign(db, r, name))
 
 
 @blueprint.route("/api/genesis/campaigns/<name>/resume", methods=["POST"])
 @_async_route
 async def campaign_resume(name: str):
-    from genesis.campaigns import control
     return await _control(name, lambda db, r: control.resume_campaign(db, r, name))
 
 
 @blueprint.route("/api/genesis/campaigns/<name>/trigger", methods=["POST"])
 @_async_route
 async def campaign_trigger(name: str):
-    from genesis.campaigns import control
     return await _control(name, lambda db, r: control.trigger_campaign(db, r, name))
 
 
 @blueprint.route("/api/genesis/campaigns/<name>/update", methods=["POST"])
 @_async_route
 async def campaign_update(name: str):
-    from genesis.campaigns import control
 
     body = request.get_json(silent=True) or {}
 
