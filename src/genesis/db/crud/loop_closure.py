@@ -19,7 +19,16 @@ same zone), so the lexicographic ``created_at < ?`` compare == chronological.
 
 from __future__ import annotations
 
+import json
+
 import aiosqlite
+
+# Session statuses where a skill's outcome is DETERMINABLE at all (so a
+# success-rate is computable) — the full terminal set, not just failures.
+# 'active'/'checkpointed'/'expired' are not terminal-for-outcome. NB:
+# ``learning/skills/effectiveness.py`` uses ``status == 'failed'`` as its
+# *failure* signal; here we use both terminals to mean "outcome is knowable".
+_TERMINAL_SESSION_STATUS = ("completed", "failed")
 
 
 async def _scalar(db: aiosqlite.Connection, sql: str, params: tuple = ()) -> int:
@@ -98,6 +107,88 @@ async def procedure_funnel(db: aiosqlite.Connection) -> dict:
         "deprecated": deprecated,
         "leak_never_reached": leak_never_reached,
         "loop": _loop_label(total, flowing=reached, leaked=leak_never_reached),
+    }
+
+
+async def skill_funnel(db: aiosqlite.Connection) -> dict:
+    """Skills are file-based (``SKILL.md``) and — by deliberate design — **NOT
+    outcome-graded**: there is no skill equivalent of the procedure promoter
+    (skills have no per-invocation execution outcome). This funnel therefore
+    reports the HONEST state of the skill feedback signal rather than a fake
+    "closed" one. It is the LC2-honest observability slice; it writes nothing.
+
+    - ``captured``      — every skill in the library (``list_available_skills``).
+    - ``instrumented``  — library skills appearing in ≥1 ``cc_sessions.skill_tags``.
+      That tag is set today only for background sessions (task + reflection);
+      foreground sessions (the bulk of usage) tag nothing, so most skills are
+      uninstrumented.
+    - ``measured``      — instrumented skills with ≥1 **terminal-status**
+      (completed/failed) session, so a success-rate is computable. A skill used
+      only in *successful* sessions IS measured (rate = 1.0) — ``measured`` means
+      "outcome is knowable", NOT "has a failure".
+    - ``leak_uninstrumented`` — ``captured − instrumented``: skills with no usage
+      signal at all. This is the real, large leak — the missing afferent nerve
+      (foreground usage capture + a graded outcome source). Closing it is the
+      separately-documented **LC2-maturity** build, not this read-only slice.
+
+    Tags are matched by exact membership against the library, so a non-skill tag
+    (e.g. a reflection pseudo-label like ``strategic-reflection``, or a ``profile``
+    value like ``research`` that happens to collide with a skill name) does not
+    inflate ``instrumented`` unless it is genuinely a library skill in the list.
+    """
+    from genesis.learning.skills import wiring
+
+    # list_available_skills() is synchronous filesystem I/O (iterdir over 2 dirs).
+    # Acceptable on the loop here: the library is small (~30 entries), paths are
+    # local, and this tool is operator-invoked (no hot path). Would need
+    # run_in_executor only if the skills dir moved to slow/network storage.
+    library = set(wiring.list_available_skills())
+    captured = len(library)
+
+    # Unlike the sibling funnels (pure SQL-side COUNT via ``_scalar``), skill
+    # usage lives inside the ``metadata`` JSON blob, so we fetch the matching
+    # rows and intersect in Python. The ``LIKE`` bounds this to rows that carry
+    # skill_tags (background sessions only today) — a small set; no metadata
+    # index exists, but the scan stays cheap at this scale.
+    cur = await db.execute(
+        "SELECT metadata, status FROM cc_sessions WHERE metadata LIKE '%skill_tags%'"
+    )
+    instrumented: set[str] = set()
+    measured: set[str] = set()
+    for raw, status in await cur.fetchall():
+        if not raw:
+            continue
+        try:
+            tags = json.loads(raw).get("skill_tags", [])
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            continue
+        if not isinstance(tags, list):
+            continue
+        hit = library.intersection(tags)
+        if not hit:
+            continue
+        instrumented |= hit
+        if status in _TERMINAL_SESSION_STATUS:
+            measured |= hit
+
+    leak_uninstrumented = captured - len(instrumented)
+    return {
+        "artifact": "skill",
+        "captured": captured,
+        "instrumented": len(instrumented),
+        "measured": len(measured),
+        "graded": False,  # skills are NOT outcome-graded (file-based, by design)
+        "leak_uninstrumented": leak_uninstrumented,
+        "loop": _loop_label(
+            captured, flowing=len(instrumented), leaked=leak_uninstrumented
+        ),
+        "note": (
+            "skills are file-based and NOT outcome-graded; instrumented = appears "
+            "in a session's skill_tags (only background sessions tag today), "
+            "measured = outcome computable (terminal-status session). "
+            "leak_uninstrumented = no usage signal at all (foreground usage "
+            "uncaptured + no graded outcome source) — closing it is LC2-maturity."
+        ),
     }
 
 
