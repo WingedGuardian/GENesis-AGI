@@ -7,6 +7,18 @@ Multiple Claude Code sessions may work on this repo simultaneously. Rules:
 - **MANDATORY: Use git worktrees** for isolation when ANY other session might
   be active. Each session works in its own worktree off `main` via
   `.claude/worktrees/`. Never commit directly to `main` from a worktree.
+- **Create worktrees with `git worktree add` — NOT the `EnterWorktree` tool.**
+  `EnterWorktree` *relocates the live session* into the worktree: the harness
+  re-roots the transcript under a separate `…--claude-worktrees-<name>` project
+  slug and leaves only a `wt-<id>.jsonl` stub behind, so the conversation
+  disappears from `/resume` in the main repo (it looks "lost"). A PreToolUse
+  hook (`worktree_cwd_guard.py --enter-worktree`) hard-blocks it. To isolate
+  work while staying findable: `git worktree add .claude/worktrees/<name> -b
+  <scope>/<desc> origin/main`, then edit via the worktree's ABSOLUTE paths and
+  run tests with `PYTHONPATH=<worktree>/src pytest <files>` — your session stays
+  in the main repo and in `/resume`. For parallel isolated work, dispatch a
+  subagent (Agent tool, `isolation="worktree"`). If a worktree-ROOTED session is
+  genuinely wanted, the USER launches Claude Code from that directory.
 - **NEVER commit directly to `main` when another session is active.** Pre-commit
   hook warns on direct-to-main commits.
 - **NEVER use `git add .` or `git add -A`.** Always stage specific files by
