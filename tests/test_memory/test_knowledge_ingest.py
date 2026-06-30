@@ -48,7 +48,7 @@ async def test_ingest_unit_scans_and_logs_injection(caplog):
 
     assert unit_id == "unit-1"  # stored
     assert any(
-        "Injection patterns in ingested knowledge unit" in r.message
+        "Injection patterns detected in ingested knowledge unit" in r.message
         for r in caplog.records
     )
 
@@ -60,7 +60,7 @@ async def test_ingest_unit_benign_no_warning(caplog):
 
     assert unit_id == "unit-1"
     assert not any(
-        "Injection patterns in ingested knowledge unit" in r.message
+        "Injection patterns detected in ingested knowledge unit" in r.message
         for r in caplog.records
     )
 

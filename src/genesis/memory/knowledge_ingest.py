@@ -83,16 +83,20 @@ async def ingest_knowledge_unit(
     try:
         scan = _SANITIZER.sanitize(content, ContentSource.UNKNOWN)
         if scan.detected_patterns:
-            # Log pattern names + provenance only — never the (untrusted) content.
+            # This chokepoint also ingests reference-store credentials, so the
+            # log MUST carry nothing derived from `content` — emit only a count
+            # and the numeric risk score (no pattern strings, no content).
             logger.warning(
-                "Injection patterns in ingested knowledge unit "
-                "(project=%s domain=%s): %s (risk=%.3f)",
-                project, domain, scan.detected_patterns, scan.risk_score,
+                "Injection patterns detected in ingested knowledge unit "
+                "(project=%s domain=%s, count=%d, risk=%.3f)",
+                project, domain, len(scan.detected_patterns), scan.risk_score,
             )
-    except Exception:
+    except Exception as exc:
+        # No exc_info / message — a traceback could embed the (possibly secret)
+        # content. The exception class name is enough to triage a scan failure.
         logger.warning(
-            "Injection scan failed for knowledge unit (project=%s domain=%s, fail-open)",
-            project, domain, exc_info=True,
+            "Injection scan failed for knowledge unit (project=%s domain=%s): %s (fail-open)",
+            project, domain, type(exc).__name__,
         )
 
     now_iso = datetime.now(UTC).isoformat()
