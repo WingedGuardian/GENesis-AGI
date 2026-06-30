@@ -29,33 +29,55 @@ _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 
+# A procedure is a concrete, replayable PLAYBOOK — `steps` carries the real
+# commands/paths/flags, `principle` is the specific problem solved (NOT a
+# "what this teaches" essay), `scenario` is the exact replay trigger.
 _JSON_SCHEMA_EXAMPLE = """\
 ```json
 {
   "worth_storing": true,
-  "reason": "why this is worth storing",
+  "reason": "why this is a concrete replayable playbook (or why not)",
   "task_type": "descriptive-kebab-slug",
-  "scenario": "When to use: <trigger condition>",
-  "principle": "What this teaches: <summary>",
-  "steps": ["1. ...", "2. ..."],
+  "scenario": "When <exact trigger condition for replaying this>",
+  "principle": "<the specific hard problem this solves, one line>",
+  "steps": ["<concrete step with the REAL command / path / flag used>", "..."],
   "tools_used": ["tool1", "tool2"],
   "context_tags": ["domain1", "domain2"],
   "tool_trigger": ["Bash", "Read"]
 }
 ```"""
 
+# Shared definition + skip criteria. A procedure is a step-by-step PLAYBOOK for a
+# specific hard-to-replicate scenario — NOT a directive, best-practice, pattern,
+# generic workflow, one-off, or essay. (Validated 2026-06-30 builder spike: this
+# framing yields grounded playbooks instead of "what this teaches" summaries.)
+_PROCEDURE_DEF = (
+    "A PROCEDURE is a specific, step-by-step PLAYBOOK for a specific, hard-to-replicate "
+    'scenario — concrete "do exactly this, then this" actions WITH THE REAL '
+    "commands / paths / flags used, capturing how a particular challenge was solved so it "
+    "can be REPLAYED the next time the SAME scenario occurs.\n"
+    "Write `steps` using ONLY commands/paths/values that actually appear in the material "
+    "below — never invent commands. `principle` is the specific problem solved (one line), "
+    "NOT a 'what this teaches' summary.\n\n"
+    "Set worth_storing=false (with a reason) if it is instead: a behavioral DIRECTIVE / "
+    "working habit (confidence, due diligence, planning, when to ask); a generic "
+    "BEST-PRACTICE or reminder; an engineering PATTERN or dev-TECHNIQUE (e.g. TDD, "
+    "decouple-for-testing); a generic dev/debug/deploy/audit WORKFLOW; a ONE-OFF "
+    "non-recurring event; or there is no concrete solution to replay. Those belong in a "
+    "skill, the knowledge base, or CLAUDE.md — not the procedure store.\n\n"
+)
+
 
 def _build_struggle_prompt(spine_text: str, score: float) -> str:
     """Build struggle judge prompt. Uses concatenation instead of str.format()
     to avoid KeyError on { } in transcript content (JSON tool args, etc.)."""
     return (
-        "Given this session's tool call history, extract a reusable procedure.\n\n"
-        "## Action Spine\n"
+        "Reconstruct a reusable PROCEDURE from this session's action spine "
+        "(tool calls with their arguments + outcomes).\n\n"
+        + _PROCEDURE_DEF
+        + "## Action Spine\n"
         + spine_text + "\n\n"
         "## Struggle Score: " + f"{score:.2f}" + "\n\n"
-        "Write a procedure that would prevent this struggle next time.\n"
-        "If this does NOT contain a genuinely reusable procedure, set "
-        "worth_storing to false.\n\n"
         "Return JSON in backticks:\n\n"
         + _JSON_SCHEMA_EXAMPLE
     )
@@ -67,15 +89,15 @@ def _build_extraction_prompt(
     """Build extraction-flag judge prompt. Uses concatenation to avoid
     KeyError on { } in transcript content."""
     return (
-        "A procedure candidate was flagged during transcript extraction.\n\n"
-        "## Candidate\n"
+        "A procedure candidate was flagged during transcript extraction. "
+        "Reconstruct it as a concrete playbook from the surrounding context.\n\n"
+        + _PROCEDURE_DEF
+        + "## Candidate\n"
         "Content: " + content + "\n"
         "Scenario: " + scenario + "\n"
         "Entities: " + entities + "\n\n"
         "## Surrounding Context\n"
         + chunk_context[:3000] + "\n\n"
-        "Evaluate: is this a genuinely reusable procedure worth storing?\n"
-        "If not, set worth_storing to false with a reason.\n\n"
         "Return JSON in backticks:\n\n"
         + _JSON_SCHEMA_EXAMPLE
     )
