@@ -625,24 +625,51 @@ def _validate_observability(changes: dict) -> list[str]:
 
 
 def _validate_cc_roster(changes: dict) -> list[str]:
-    """Validate cc_roster updates: a new `default` must be a known roster model."""
+    """Validate cc_roster updates: a new `default` must be a known roster model,
+    and — for a non-native model — must be actually usable (base_url/model_id set
+    and its auth_env present in the environment).
+
+    The runtime guardrail (roster.apply_active) degrades a misconfigured default to
+    native Claude rather than going dark; this validator surfaces that misconfig
+    LOUDLY at config-write time so a user never believes they're on GLM while
+    silently running on Claude (no-silent-degrade)."""
     errors: list[str] = []
     if "default" in changes:
         default = changes["default"]
         if not isinstance(default, str):
             errors.append("default must be a string (a roster model name)")
         else:
+            import os
+
             from genesis.cc.roster import load_roster
 
-            models = set(load_roster().get("models") or {})
+            model_defs = dict(load_roster().get("models") or {})
             chg_models = changes.get("models")
             if isinstance(chg_models, dict):
-                models |= set(chg_models)
-            if default not in models:
-                avail = ", ".join(sorted(models)) or "(none)"
+                model_defs.update(chg_models)
+            if default not in model_defs:
+                avail = ", ".join(sorted(model_defs)) or "(none)"
                 errors.append(
                     f"default '{default}' is not a roster model; available: {avail}"
                 )
+            else:
+                entry = model_defs[default] or {}
+                native = bool(entry.get("native_subscription")) or default == "claude"
+                if not native:
+                    base_url = entry.get("anthropic_base_url")
+                    model_id = entry.get("model_id")
+                    auth_env = entry.get("auth_env")
+                    if not (base_url and model_id and auth_env):
+                        errors.append(
+                            f"default '{default}' is missing "
+                            "anthropic_base_url/model_id/auth_env"
+                        )
+                    elif not os.environ.get(auth_env):
+                        errors.append(
+                            f"default '{default}' requires env var {auth_env}, "
+                            "which is not set — set it before routing or Genesis "
+                            "would silently run on native Claude"
+                        )
     return errors
 
 

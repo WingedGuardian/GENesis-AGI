@@ -725,12 +725,15 @@ class ConversationLoop:
             return {}, None
 
     async def _persist_roster_endpoint(self, session_id: str, output: Any) -> None:
-        """Persist the endpoint a ROUTED session actually ran on (ground truth from
-        CCOutput.model_used), so it resumes on the same provider. No-op for native
-        Claude runs. Token is never stored — only the auth-env NAME."""
-        if not getattr(output, "via_proxy", False) or not output.model_used:
+        """Persist the endpoint a ROUTED session ran on, so it resumes on the same
+        provider. Keyed off CCOutput.roster_model (the NAME the chokepoint actually
+        selected — ground truth), NOT the provider's self-reported model_used which
+        may be a variant string or empty. No-op for native Claude. Token is never
+        stored — only the auth-env NAME (see roster.endpoint_payload)."""
+        rm = getattr(output, "roster_model", "") or ""
+        if not rm or rm == roster.CLAUDE:
             return
-        payload = roster.endpoint_payload_for_model_id(output.model_used)
+        payload = roster.endpoint_payload(rm)
         if payload:
             await cc_sessions.merge_metadata(
                 self._db, session_id, {"roster_endpoint": payload},

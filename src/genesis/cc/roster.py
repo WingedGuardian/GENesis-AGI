@@ -2,9 +2,12 @@
 
 Maps roster names (e.g. "glm-5.2") to the CCInvocation overrides that point a
 Claude Code subprocess at a non-Anthropic provider's native Anthropic-compatible
-endpoint. This is the POLICY layer: call sites (ConversationLoop,
-DirectSessionRunner) resolve the active model here and apply the overrides to a
-CCInvocation before handing it to the (dumb) CCInvoker. The invoker never selects.
+endpoint. This is the POLICY layer.
+
+SELECTION runs at the CCInvoker chokepoint: ``apply_active`` is called at the top
+of ``CCInvoker.run``/``run_streaming`` and routes invocations that opt in via
+``roster_eligible``. ``failover_chain`` is GROUNDWORK for Phase 3 (automatic
+failover on rate-limit/quota) and is intentionally not wired yet.
 
 Config: ``config/cc_roster.yaml`` (+ ``cc_roster.local.yaml`` overlay), the same
 file backing the ``cc_roster`` settings domain. Auth tokens are resolved from the
@@ -160,6 +163,10 @@ def apply_active(
     try:
         if not inv.roster_eligible:
             return inv, CLAUDE
+        # ORDER IS LOAD-BEARING: the override-present check MUST precede the
+        # resume check. A reconstructed routed resume (conversation._reconstruct_
+        # _resume) arrives with BOTH override fields AND resume_session_id set; it
+        # must be respected (not forced native). Do not reorder these two guards.
         if inv.model_id_override or inv.anthropic_base_url:
             return inv, (inv.model_id_override or "routed")
         if inv.resume_session_id is not None:
@@ -194,24 +201,6 @@ def endpoint_payload(name: str, roster: dict | None = None) -> dict | None:
         "model_id": entry.model_id,
         "roster_model": name,
     }
-
-
-def endpoint_payload_for_model_id(
-    model_id: str, roster: dict | None = None,
-) -> dict | None:
-    """Persistable endpoint for the roster entry whose ``model_id`` matches the
-    model the subprocess *actually reported* (``CCOutput.model_used``).
-
-    Ground-truth based — reflects what really ran (e.g. a failover target), not
-    what config currently says. Returns ``None`` if no routed entry matches
-    (e.g. a native Claude run → nothing to persist).
-    """
-    r = roster if roster is not None else load_roster()
-    for name, raw in (r.get("models") or {}).items():
-        entry = _entry_from(name, raw)
-        if entry.model_id == model_id and not _is_native(entry):
-            return endpoint_payload(name, r)
-    return None
 
 
 def overrides_from_persisted(payload: dict) -> dict:

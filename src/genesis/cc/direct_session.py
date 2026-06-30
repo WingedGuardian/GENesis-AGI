@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from genesis.cc import roster
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
@@ -499,7 +500,7 @@ class DirectSessionResult:
     duration_s: float = 0.0
     tools_called: list[dict] = field(default_factory=list)
     model_used: str = ""
-    via_proxy: bool = False  # ran on a routed (non-Anthropic) roster endpoint
+    roster_model: str = ""  # roster NAME the chokepoint selected ("glm-5.2"/"claude")
 
 
 # ---------------------------------------------------------------------------
@@ -679,7 +680,7 @@ class DirectSessionRunner:
                 duration_s=round(elapsed, 1),
                 tools_called=telemetry,
                 model_used=output.model_used,
-                via_proxy=output.via_proxy,
+                roster_model=output.roster_model,
             )
 
             # Persist result in session metadata (merge, don't overwrite)
@@ -1010,7 +1011,11 @@ class DirectSessionRunner:
         existing = {}
         if row and row.get("metadata"):
             with contextlib.suppress(json.JSONDecodeError, TypeError):
-                existing = json.loads(row["metadata"])
+                loaded = json.loads(row["metadata"])
+                # Guard non-dict JSON roots (array/str/number) so existing.update
+                # below can't AttributeError on a malformed/foreign metadata blob.
+                if isinstance(loaded, dict):
+                    existing = loaded
 
         tool_counts = self._summarize_tools(result.tools_called)
 
@@ -1042,13 +1047,12 @@ class DirectSessionRunner:
             "duration_s": result.duration_s,
         })
 
-        # Roster resume continuity: record the endpoint a routed session actually
-        # ran on (ground truth from model_used), so a future resume can target the
-        # same provider. No-op for native Claude. Token never stored (NAME only).
-        if result.via_proxy and result.model_used:
-            from genesis.cc import roster
-
-            payload = roster.endpoint_payload_for_model_id(result.model_used)
+        # Roster resume continuity: record the endpoint a routed session ran on,
+        # keyed off the roster model NAME the chokepoint selected (ground truth),
+        # so a future resume can target the same provider. No-op for native Claude.
+        # Token never stored (NAME only).
+        if result.roster_model and result.roster_model != roster.CLAUDE:
+            payload = roster.endpoint_payload(result.roster_model)
             if payload:
                 existing["roster_endpoint"] = payload
 

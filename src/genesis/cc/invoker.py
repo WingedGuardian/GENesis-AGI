@@ -11,6 +11,7 @@ import shutil
 import signal
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 
 from genesis.cc import roster
@@ -293,17 +294,19 @@ class CCInvoker:
             env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(inv.stream_idle_timeout_ms)
         if inv and inv.anthropic_base_url:
             env["ANTHROPIC_BASE_URL"] = inv.anthropic_base_url
-            # Routing to a non-Anthropic endpoint: the inherited ANTHROPIC_API_KEY
-            # (from secrets.env) must NOT travel to a third-party URL. Auth is
-            # solely via ANTHROPIC_AUTH_TOKEN below. For the Claude-native default
-            # (no base_url) ANTHROPIC_API_KEY is left untouched (Max subscription).
-            env.pop("ANTHROPIC_API_KEY", None)
         else:
             env.pop("ANTHROPIC_BASE_URL", None)
         if inv and inv.anthropic_auth_token:
             env["ANTHROPIC_AUTH_TOKEN"] = inv.anthropic_auth_token
         else:
             env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        # Credential isolation (defense-in-depth): the inherited ANTHROPIC_API_KEY
+        # (from secrets.env) must NEVER travel to a non-Anthropic endpoint. Pop it
+        # whenever EITHER a third-party base_url OR auth_token is being injected —
+        # not just base_url — so an inconsistent field combination can't leak the
+        # Anthropic key. Native Claude (neither set) keeps it (Max subscription).
+        if inv and (inv.anthropic_base_url or inv.anthropic_auth_token):
+            env.pop("ANTHROPIC_API_KEY", None)
         # Roster model selection via env (NOT --model — see _build_args). Set all
         # default-model slots so CC's background/sub-calls use the roster model too.
         _model_vars = (
@@ -482,7 +485,9 @@ class CCInvoker:
                 "streaming": False,
             },
         ) as span:
-            output = await self._run_inner(invocation)
+            output = replace(
+                await self._run_inner(invocation), roster_model=roster_model,
+            )
             with contextlib.suppress(Exception):
                 span.set_attr("cost_usd", output.cost_usd)
                 span.set_attr("input_tokens", output.input_tokens)
@@ -633,7 +638,10 @@ class CCInvoker:
                 "streaming": True,
             },
         ) as span:
-            output = await self._run_streaming_inner(invocation, on_event)
+            output = replace(
+                await self._run_streaming_inner(invocation, on_event),
+                roster_model=roster_model,
+            )
             with contextlib.suppress(Exception):
                 span.set_attr("cost_usd", output.cost_usd)
                 span.set_attr("input_tokens", output.input_tokens)

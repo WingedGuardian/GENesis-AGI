@@ -59,6 +59,39 @@ async def test_update_activity(db, sess_fields):
     assert row["last_activity_at"] == "2026-03-07T09:00:00"
 
 
+async def test_roster_persist_reconstruct_loop(db, sess_fields, monkeypatch):
+    """Integration: the post-review resume-continuity loop end-to-end, hermetic
+    (no live provider). Mirrors what the call sites do: persist the endpoint a
+    routed run used (keyed off the roster NAME the chokepoint selected), then
+    reconstruct overrides on resume, then confirm apply_active respects the
+    pre-stamped routed resume. Closes the gap left when live GLM was unavailable."""
+    import json
+
+    from genesis.cc import roster
+    from genesis.cc.types import CCInvocation
+
+    monkeypatch.setenv("ZHIPU_API_KEY", "sk-live")
+    # (persist) what conversation/direct_session compute from output.roster_model:
+    payload = roster.endpoint_payload("glm-5.2")  # real config ships glm-5.2
+    assert payload and "token" not in payload  # NAME only, no secret
+    await cc_sessions.create(db, **sess_fields)
+    assert await cc_sessions.merge_metadata(db, "sess-1", {"roster_endpoint": payload})
+
+    # (reconstruct) what _reconstruct_resume does on the next turn:
+    row = await cc_sessions.get_by_id(db, "sess-1")
+    ep = json.loads(row["metadata"])["roster_endpoint"]
+    overrides = roster.overrides_from_persisted(ep)  # token re-read from env
+    assert overrides["model_id_override"] == "glm-5.2"
+    assert overrides["anthropic_auth_token"] == "sk-live"
+
+    # (chokepoint) a pre-stamped routed resume is respected, never rerouted:
+    inv = CCInvocation(
+        prompt="x", roster_eligible=True, resume_session_id="cc-x", **overrides,
+    )
+    out_inv, name = roster.apply_active(inv)
+    assert out_inv is inv and name == "glm-5.2"
+
+
 async def test_merge_metadata_round_trip(db, sess_fields):
     # roster-endpoint persistence: shallow merge into JSON metadata, no migration.
     await cc_sessions.create(db, **{**sess_fields, "metadata": '{"existing": 1}'})

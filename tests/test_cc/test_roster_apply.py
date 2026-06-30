@@ -119,11 +119,6 @@ def test_endpoint_payload_native_is_none(roster_dir):
     assert R.endpoint_payload("claude", _load(roster_dir)) is None
 
 
-def test_endpoint_payload_for_model_id(roster_dir):
-    assert R.endpoint_payload_for_model_id("glm-5.2", _load(roster_dir))["roster_model"] == "glm-5.2"
-    assert R.endpoint_payload_for_model_id("unknown-xyz", _load(roster_dir)) is None
-
-
 def test_overrides_from_persisted_round_trip(roster_dir, monkeypatch):
     monkeypatch.setenv("ZHIPU_TEST_KEY", "sk-live")
     payload = R.endpoint_payload("glm-5.2", _load(roster_dir))

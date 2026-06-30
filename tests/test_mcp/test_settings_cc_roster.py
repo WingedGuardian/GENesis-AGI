@@ -17,10 +17,22 @@ def test_cc_roster_domain_registered():
     assert "cc_roster" in _DOMAIN_VALIDATORS
 
 
-def test_validate_accepts_known_default():
-    # config/cc_roster.yaml ships claude + glm-5.2.
+def test_validate_accepts_native_default():
+    # claude is native — no auth_env needed.
     assert _validate_cc_roster({"default": "claude"}) == []
+
+
+def test_validate_accepts_routed_default_when_auth_present(monkeypatch):
+    # config/cc_roster.yaml ships glm-5.2 with auth_env ZHIPU_API_KEY.
+    monkeypatch.setenv("ZHIPU_API_KEY", "sk-test")
     assert _validate_cc_roster({"default": "glm-5.2"}) == []
+
+
+def test_validate_rejects_routed_default_when_auth_missing(monkeypatch):
+    # no-silent-degrade: setting a routed default with no key must be loud.
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+    errs = _validate_cc_roster({"default": "glm-5.2"})
+    assert errs and "ZHIPU_API_KEY" in errs[0]
 
 
 def test_validate_rejects_unknown_default():
