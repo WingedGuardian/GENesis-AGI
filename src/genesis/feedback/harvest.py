@@ -24,6 +24,11 @@ Source authority (no double-counting):
 
 Each source read is wrapped independently (``_safe``) so one bad source can never
 abort the others.
+
+Note: this module is a read-only ETL pipeline — its per-source ``SELECT``s are
+intentional raw SQL (dynamic, filtered reads that don't map to a standard crud
+API), NOT a crud-layer violation. The only write path is ``record_outcome`` via
+``genesis.feedback.bus``; the authoritative source tables are never mutated.
 """
 
 from __future__ import annotations
