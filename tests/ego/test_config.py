@@ -112,6 +112,22 @@ class TestValidateEgoConfig:
         errors = validate_ego_config({"proposal_expiry_minutes": 240})
         assert errors == []  # unknown key, ignored
 
+    def test_outcome_bus_capability_feed_rejects_non_bool(self):
+        for bad in ("yes", 1, 0, None):
+            errors = validate_ego_config({"outcome_bus_capability_feed": bad})
+            assert len(errors) == 1
+            assert "outcome_bus_capability_feed must be a boolean" in errors[0]
+
+    def test_outcome_bus_capability_feed_accepts_bool(self):
+        assert validate_ego_config({"outcome_bus_capability_feed": True}) == []
+        assert validate_ego_config({"outcome_bus_capability_feed": False}) == []
+
+    def test_calibration_injection_enabled_rejects_non_bool(self):
+        # Sibling bool validator — equally untested before this PR.
+        errors = validate_ego_config({"calibration_injection_enabled": "on"})
+        assert len(errors) == 1
+        assert "calibration_injection_enabled must be a boolean" in errors[0]
+
     def test_multiple_errors(self):
         errors = validate_ego_config({
             "cadence_minutes": -1,

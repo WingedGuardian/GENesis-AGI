@@ -227,6 +227,38 @@ class TestAggregates:
         assert d["n"] == 1
 
     @pytest.mark.asyncio
+    async def test_aggregate_source_filter(self, db):
+        # source= restricts the rollup to one producer so a consumer can fold in
+        # a single clean domain (surplus) without double-counting producers it
+        # already aggregates elsewhere (ego/cc_sessions).
+        await oe.record(
+            db, source="surplus", ref_type="task", ref_id="s1",
+            signal_type="execution_outcome", signal_tier=1, domain="code_audit",
+            polarity="positive", value=1.0,
+        )
+        await oe.record(
+            db, source="surplus", ref_type="task", ref_id="s2",
+            signal_type="execution_outcome", signal_tier=1, domain="code_audit",
+            polarity="negative", value=0.0,
+        )
+        await oe.record(
+            db, source="ego", ref_type="proposal", ref_id="e1",
+            signal_type="execution_outcome", signal_tier=1, domain="code_audit",
+            polarity="positive", value=1.0,
+        )
+        # Unfiltered: both producers contribute to the same domain.
+        unfiltered = await oe.aggregate_by_domain(db, tier=1)
+        assert next(a for a in unfiltered if a["domain"] == "code_audit")["n"] == 3
+        # source='surplus' sees only the two surplus rows.
+        surplus = await oe.aggregate_by_domain(db, tier=1, source="surplus")
+        srow = next(a for a in surplus if a["domain"] == "code_audit")
+        assert srow["n"] == 2
+        assert srow["positive"] == 1
+        assert srow["negative"] == 1
+        # An unknown source yields nothing — no accidental all-source fallthrough.
+        assert await oe.aggregate_by_domain(db, tier=1, source="nope") == []
+
+    @pytest.mark.asyncio
     async def test_count_by_tier(self, db):
         # Two T1, one T3 — tier cannot be derived from signal_type alone, so
         # this needs its own GROUP BY (the soak instrument relies on it).

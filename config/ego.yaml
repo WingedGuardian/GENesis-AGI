@@ -46,3 +46,13 @@ failure_backoff_minutes: 60  # pause after N consecutive failures
 # so it can self-correct (informational only, never a mechanical rescale).
 # Live — takes effect next cycle. Set false to turn off instantly.
 calibration_injection_enabled: true
+
+# LC3-B go-live gate (default OFF): fold Outcome Bus tier-1 execution ground
+# truth (source='surplus') into the capability map as a 6th source. While false,
+# the capability map is unchanged (original 5 sources). capability_map is
+# display-only, so enabling this only adjusts the self-performance numbers the
+# ego sees in its context — no control-flow gate keys off it. Live — takes
+# effect at the next capability-map refresh (9:15/21:15), no restart needed.
+# NOTE: settings_update marks the whole ego domain "restart required"; that is
+# not true for THIS field — the refresh job re-reads the config each run.
+outcome_bus_capability_feed: false
