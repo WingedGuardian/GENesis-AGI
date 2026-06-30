@@ -3072,8 +3072,15 @@
           const cc = this.health.cc_sessions;
           if (!cc) return { state: "unknown", reason: "CC session data unavailable" };
           const rt = cc.realtime_status;
+          // A hard contingency outage (UNAVAILABLE, never auto-reconciled) outranks
+          // fallback: don't paint a red outage yellow if is_fallback is stale.
           if (rt === "UNAVAILABLE") {
             return { state: "error", reason: "CC is unavailable — contingency mode active" };
+          }
+          // Fallback is more specific than the rate-limit that triggered it, so it
+          // takes precedence over the RATE_LIMITED/THROTTLED branch below.
+          if (cc.fallback?.is_fallback) {
+            return { state: "fallback", reason: `running on ${cc.fallback.fallback || 'a roster peer'} (Claude ${(cc.fallback.reason || 'unavailable').replace(/_/g, ' ')})` };
           }
           if (rt === "RATE_LIMITED" || rt === "THROTTLED") {
             return { state: "degraded", reason: `CC is ${rt.toLowerCase().replace('_', '-')}` };
@@ -4537,6 +4544,15 @@
               @click="location.hash = 'backup'">Backup & Updates</button>
     </nav>
 
+    <!-- CC model-fallback banner (page-top, full-width, visible on every tab):
+         the server-side conversation is failed over to a roster peer because the
+         home model (Claude) is rate-limited account-wide. Placed here (block flow,
+         outside the flex-row .panel) so it renders as a slim top bar, not a column. -->
+    <template x-if="$store.genesisDashboard.health.cc_sessions?.fallback?.is_fallback">
+      <div style="background: #f0ad4e; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;"
+           x-text="'⚠ Running on ' + ($store.genesisDashboard.health.cc_sessions.fallback.fallback || 'a roster peer') + ' — Claude ' + ($store.genesisDashboard.health.cc_sessions.fallback.reason || 'unavailable').replace(/_/g, ' ') + ' since ' + (($store.genesisDashboard.health.cc_sessions.fallback.since || '').replace('T', ' ').slice(0, 16) || 'unknown')"></div>
+    </template>
+
     <!-- Panel 1: System Health [Tab: overview] -->
     <div class="panel" x-show="$store.genesisDashboard.activeTab === 'overview'">
       <div class="panel-header">
@@ -4677,6 +4693,10 @@
             <template x-if="($store.genesisDashboard.health.cc_sessions?.failed_24h || 0) > 0">
               <div class="health-card-detail" style="color: #d9534f; font-weight: 600;"
                    x-text="$store.genesisDashboard.health.cc_sessions.failed_24h + ' failed (24h)'"></div>
+            </template>
+            <template x-if="$store.genesisDashboard.health.cc_sessions?.fallback?.is_fallback">
+              <div class="health-card-detail" style="color: #f0ad4e; font-weight: 600;"
+                   x-text="'on ' + ($store.genesisDashboard.health.cc_sessions.fallback.fallback || 'roster peer') + ' since ' + (($store.genesisDashboard.health.cc_sessions.fallback.since || '').replace('T', ' ').slice(0, 16) || 'unknown')"></div>
             </template>
             <div class="health-card-reason" x-text="$store.genesisDashboard.ccSemantic().reason"></div>
           </div>
