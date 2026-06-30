@@ -149,5 +149,12 @@ class EgoConfig:
     # self-correct (informational, never a mechanical rescale). Live-read each
     # cycle; default ON. Genesis ego only for now.
     calibration_injection_enabled: bool = True
+    # LC3-B go-live gate: fold Outcome Bus tier-1 execution ground truth
+    # (source='surplus') into the capability map as a 6th aggregator source.
+    # Default OFF — until an operator flips this, the capability map is computed
+    # from the original 5 sources and behaviour is unchanged. capability_map is
+    # display-only (rendered into ego-context sections, no code gate), so even ON
+    # only nudges the numbers the ego sees about itself. Live-read each refresh.
+    outcome_bus_capability_feed: bool = False
 
 

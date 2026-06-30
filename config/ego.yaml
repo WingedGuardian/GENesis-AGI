@@ -46,3 +46,11 @@ failure_backoff_minutes: 60  # pause after N consecutive failures
 # so it can self-correct (informational only, never a mechanical rescale).
 # Live — takes effect next cycle. Set false to turn off instantly.
 calibration_injection_enabled: true
+
+# LC3-B go-live gate (default OFF): fold Outcome Bus tier-1 execution ground
+# truth (source='surplus') into the capability map as a 6th source. While false,
+# the capability map is unchanged (original 5 sources). capability_map is
+# display-only, so enabling this only adjusts the self-performance numbers the
+# ego sees in its context — no control-flow gate keys off it. Live — takes
+# effect next capability-map refresh.
+outcome_bus_capability_feed: false

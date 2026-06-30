@@ -148,6 +148,7 @@ async def aggregate_by_domain(
     *,
     days: int | None = 30,
     tier: int | None = None,
+    source: str | None = None,
 ) -> list[dict]:
     """Per-domain outcome rollup.
 
@@ -155,7 +156,10 @@ async def aggregate_by_domain(
     all-time rollup (so the per-domain breakdown reconciles with the lifetime
     ``count_by_tier``/``count_by_signal_type`` totals). ``tier`` optionally
     restricts to one signal tier (e.g. tier=1 for the ground-truth view that
-    downstream quality scoring should weight highest).
+    downstream quality scoring should weight highest). ``source`` optionally
+    restricts to a single producer (e.g. ``source='surplus'``) so a consumer can
+    fold in one clean domain without double-counting producers it already
+    aggregates by other means.
     """
     sql = """
         SELECT domain,
@@ -175,6 +179,9 @@ async def aggregate_by_domain(
     if tier is not None:
         clauses.append("signal_tier = ?")
         params.append(tier)
+    if source is not None:
+        clauses.append("source = ?")
+        params.append(source)
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " GROUP BY domain ORDER BY n DESC"
