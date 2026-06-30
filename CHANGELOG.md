@@ -19,6 +19,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   schedule "jitter" (randomized fire times so ticks aren't perfectly periodic). Until now the
   only way to see or steer a campaign was through Genesis directly.
 
+### Changed
+
+- **The procedures Genesis learns are now concrete, replayable playbooks instead of vague
+  summaries.** Previously every learned procedure was written as a "what this teaches: …"
+  summary, and the learner only saw a heavily-truncated view of what happened (each tool's
+  arguments cut to 80 characters), so the real commands, paths, and flags were lost. Now the
+  learner reconstructs the actual step-by-step playbook — with the real commands used — for a
+  specific recurring scenario, and skips things that aren't procedures (general best-practices,
+  engineering patterns, one-off events, broad workflows; those belong in skills/CLAUDE.md). The
+  result is a smaller, higher-signal procedure store.
+
 ### Fixed
 
 - **Campaign results no longer sit uncaptured until the next scheduled tick.** Previously a

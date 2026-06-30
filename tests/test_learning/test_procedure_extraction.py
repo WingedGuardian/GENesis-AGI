@@ -586,3 +586,56 @@ async def test_extract_procedures_no_cap_when_max_new_none(db, monkeypatch):
     exts = [_proc_candidate_extraction() for _ in range(5)]
     count = await pe.extract_procedures_from_chunk(exts, db=db, router=None)
     assert count == 5
+
+
+class TestSummarizeArgs:
+    """Per-tool-type arg caps for the action spine (C2a builder fix). Replaces
+    the old flat 80-char truncation that destroyed real commands."""
+
+    def test_bash_keeps_full_command(self):
+        from genesis.learning.procedural.struggle_detector import _summarize_args
+        cmd = ("openssl s_client -connect api.openai.com:443 -showcerts 2>/dev/null "
+               "| grep -A3 'subject\\|issuer'")
+        out = _summarize_args("Bash", {"command": cmd})
+        # Old 80-char cap would have cut at "...openai.com:443 -showc"; now intact.
+        assert "grep -A3" in out
+
+    def test_exitplanmode_dropped(self):
+        from genesis.learning.procedural.struggle_detector import _summarize_args
+        assert _summarize_args("ExitPlanMode", {"plan": "x" * 500}) == ""
+
+    def test_edit_symmetric_keeps_old_and_new(self):
+        from genesis.learning.procedural.struggle_detector import _summarize_args
+        out = _summarize_args(
+            "Edit", {"file_path": "/x.py", "old_string": "A" * 1000, "new_string": "B" * 1000},
+        )
+        d = json.loads(out)
+        assert d["file_path"] == "/x.py"
+        assert len(d["old"]) == 400 and len(d["new"]) == 400  # both ends preserved
+
+    def test_mcp_tool_moderate_cap(self):
+        from genesis.learning.procedural.struggle_detector import _summarize_args
+        out = _summarize_args("mcp__genesis_health__foo", {"q": "z" * 1000})
+        assert len(out) == 400
+
+    def test_unknown_tool_default_cap(self):
+        from genesis.learning.procedural.struggle_detector import _summarize_args
+        out = _summarize_args("SomeNewTool", {"q": "z" * 1000})
+        assert len(out) == 300
+
+
+def test_format_spine_caps_pathological_size():
+    """A huge spine is truncated to fit the judge context, keeping the END."""
+    from genesis.learning.procedural.struggle_detector import (
+        _MAX_SPINE_CHARS,
+        format_spine_for_judge,
+    )
+    spine = [{"turn": i, "type": "tool", "tool": "Bash",
+              "args_summary": "x" * 500, "outcome": "ok", "error_text": ""}
+             for i in range(2000)]
+    spine.append({"turn": 9999, "type": "tool", "tool": "Bash",
+                  "args_summary": "THE_FINAL_FIX_COMMAND", "outcome": "ok", "error_text": ""})
+    out = format_spine_for_judge(spine)
+    assert len(out) <= _MAX_SPINE_CHARS + 64
+    assert "earlier turns truncated" in out
+    assert "THE_FINAL_FIX_COMMAND" in out  # resolution (end) preserved
