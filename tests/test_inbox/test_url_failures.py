@@ -99,7 +99,9 @@ class TestMarkUrlFailure:
                     processed_at TEXT,
                     error_message TEXT,
                     retry_count INTEGER DEFAULT 0,
-                    evaluated_content TEXT
+                    evaluated_content TEXT,
+                    drop_id TEXT,
+                    batch_items TEXT
                 )
             """)
             await conn.commit()
@@ -215,7 +217,9 @@ class TestCountUrlFailures:
                     processed_at TEXT,
                     error_message TEXT,
                     retry_count INTEGER DEFAULT 0,
-                    evaluated_content TEXT
+                    evaluated_content TEXT,
+                    drop_id TEXT,
+                    batch_items TEXT
                 )
             """)
             await conn.commit()

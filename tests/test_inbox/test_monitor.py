@@ -163,13 +163,16 @@ async def test_already_processed_skipped(monitor, inbox_dir, mock_invoker):
 
 @pytest.mark.asyncio
 async def test_batching_multiple_batches(monitor, inbox_dir, mock_invoker, config):
-    # Create 12 files → should create 3 batches (batch_size=5)
+    # 12 separate files → 12 drops (a drop = ONE file's delta; there is no
+    # cross-file batching). Each single-line file segments to one item → one
+    # batch → one eval. (Within-file batching of ~items_per_eval is covered by
+    # test_drop_dispatch.py.)
     for i in range(12):
         (inbox_dir / f"item-{i:02d}.md").write_text(f"content {i}")
     result = await monitor.check_once()
     assert result.items_new == 12
-    assert result.batches_dispatched == 3
-    assert mock_invoker.run.call_count == 3
+    assert result.batches_dispatched == 12
+    assert mock_invoker.run.call_count == 12
 
 
 @pytest.mark.asyncio
@@ -965,15 +968,15 @@ async def test_dispatch_request_omits_volatile_context(
 
 
 @pytest.mark.asyncio
-async def test_resume_produces_stable_dispatch_across_scans(
+async def test_resume_does_not_reroute_across_scans(
     monitor, inbox_dir, mock_invoker,
 ):
-    """Two scans against the same unchanged pending-approval item must
-    produce dispatch requests with identical prompts, messages, and
-    contexts — the inputs to ``_approval_key``.  This is what guarantees
-    ApprovalManager dedup finds the existing pending request on scan 2
-    and skips the Telegram resend.  Regression guard for the whole
-    fix-it-now motivation: no new Telegram per scan."""
+    """A parked drop is dispatched DIRECTLY on resume — it does not re-enter
+    ``route()`` — so re-scanning a pending item never fires a duplicate
+    approval/Telegram. Regression guard for the whole fix-it-now motivation:
+    exactly ONE route() call across scans for the same content (the old design
+    re-routed every scan and depended on stable-key dedup to suppress the
+    duplicate; the new design simply doesn't re-route)."""
     captured: list[object] = []
 
     async def capture_route(request):
@@ -990,28 +993,24 @@ async def test_resume_produces_stable_dispatch_across_scans(
 
     (inbox_dir / "stable.md").write_text("some content to evaluate")
 
-    # First scan: row created, dispatched, parked
+    # First scan: row created, one approval requested, drop parked.
     await monitor.check_once()
-    # Second scan: resume pass picks up the same row, re-dispatches
+    # Second scan: resume pass dispatches the parked drop directly (no route()).
     await monitor.check_once()
 
-    assert len(captured) == 2, (
-        f"expected 2 dispatch calls, got {len(captured)}"
+    assert len(captured) == 1, (
+        f"expected 1 route() call (resume dispatches directly), "
+        f"got {len(captured)}"
     )
-    req1, req2 = captured[0], captured[1]
-
-    # The fields that feed _approval_key must be byte-identical between
-    # scans.  Any divergence would cause ApprovalManager._find_existing
-    # to miss the match and fire a fresh Telegram.
-    assert req1.subsystem == req2.subsystem
-    assert req1.policy_id == req2.policy_id
-    assert req1.action_label == req2.action_label
-    assert req1.messages == req2.messages
-    assert req1.cli_invocation.prompt == req2.cli_invocation.prompt
-    assert req1.cli_invocation.system_prompt == req2.cli_invocation.system_prompt
-    assert req1.cli_invocation.model == req2.cli_invocation.model
-    assert req1.cli_invocation.effort == req2.cli_invocation.effort
-    assert req1.context == req2.context  # both should be None or equal
+    req = captured[0]
+    # The single request carries the stable-key inputs + null context that keep
+    # the approval content-agnostic and dedupable.
+    assert req.subsystem == "inbox"
+    assert req.policy_id == "inbox_evaluation"
+    assert req.action_label == "inbox evaluation"
+    assert req.approval_key_stable is True
+    assert req.api_call_site_id is None
+    assert req.context is None
 
 
 @pytest.mark.asyncio

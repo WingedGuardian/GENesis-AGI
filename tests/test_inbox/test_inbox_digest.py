@@ -38,7 +38,8 @@ async def db():
         pinned INTEGER DEFAULT 0,
         kind TEXT NOT NULL DEFAULT 'follow_up',
         domain TEXT,
-        goal_id TEXT
+        goal_id TEXT,
+        dedup_key TEXT
     )""")
     await conn.execute("""CREATE TABLE inbox_items (
         id TEXT PRIMARY KEY,
@@ -51,7 +52,9 @@ async def db():
         processed_at TEXT,
         error_message TEXT,
         retry_count INTEGER NOT NULL DEFAULT 0,
-        evaluated_content TEXT
+        evaluated_content TEXT,
+        drop_id TEXT,
+        batch_items TEXT
     )""")
     await conn.commit()
     yield conn
