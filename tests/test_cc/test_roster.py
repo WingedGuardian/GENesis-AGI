@@ -97,6 +97,60 @@ def test_failover_chain_excludes_active(roster_dir, monkeypatch):
     assert "claude" in chain  # native peer always available
 
 
+def test_failover_invocations_stamps_fresh_peer(roster_dir, monkeypatch):
+    from genesis.cc.types import CCInvocation
+
+    monkeypatch.setenv("ZHIPU_TEST_KEY", "sk-secret")
+    monkeypatch.delenv("DEEPSEEK_TEST_KEY", raising=False)
+    base = CCInvocation(
+        prompt="hi", resume_session_id="cc-home", roster_eligible=True,
+        session_key="k1",
+    )
+    invs = R.failover_invocations("claude", base, R.load_roster(roster_dir))
+    assert [name for name, _ in invs] == ["glm-5.2"]  # deepseek unconfigured
+    _, peer = invs[0]
+    # FRESH session, chokepoint re-selection disabled, peer overrides stamped.
+    assert peer.resume_session_id is None
+    assert peer.roster_eligible is False
+    assert peer.model_id_override == "glm-5.2"
+    assert peer.anthropic_base_url == "https://open.bigmodel.cn/api/anthropic"
+    assert peer.anthropic_auth_token == "sk-secret"
+    assert peer.session_key == "k1"  # /stop targeting preserved
+    assert peer.prompt == "hi"  # rest of the invocation preserved
+
+
+def test_failover_invocations_native_peer_has_no_overrides_but_disables_reselect(
+    roster_dir, monkeypatch,
+):
+    # When GLM is active and fails, Claude (native) is the peer: empty overrides,
+    # but roster_eligible MUST be False so the chokepoint can't re-route it back
+    # to the global default (the loop-back bug guard).
+    monkeypatch.setenv("ZHIPU_TEST_KEY", "sk-secret")
+    monkeypatch.delenv("DEEPSEEK_TEST_KEY", raising=False)
+    from genesis.cc.types import CCInvocation
+
+    base = CCInvocation(prompt="hi", roster_eligible=True)
+    invs = R.failover_invocations("glm-5.2", base, R.load_roster(roster_dir))
+    names = [name for name, _ in invs]
+    assert names[0] == "claude"
+    _, claude_peer = invs[0]
+    assert claude_peer.roster_eligible is False  # load-bearing
+    assert claude_peer.model_id_override is None
+    assert claude_peer.anthropic_base_url is None
+
+
+def test_failover_invocations_skips_unusable_peer(roster_dir, monkeypatch):
+    # deepseek present in chain only if keyed; with no key it never appears.
+    monkeypatch.setenv("ZHIPU_TEST_KEY", "sk-secret")
+    monkeypatch.delenv("DEEPSEEK_TEST_KEY", raising=False)
+    from genesis.cc.types import CCInvocation
+
+    invs = R.failover_invocations(
+        "claude", CCInvocation(prompt="x"), R.load_roster(roster_dir),
+    )
+    assert [name for name, _ in invs] == ["glm-5.2"]
+
+
 def test_local_overlay_merges(tmp_path, monkeypatch):
     _write_roster(
         tmp_path,

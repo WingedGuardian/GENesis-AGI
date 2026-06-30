@@ -6,8 +6,9 @@ endpoint. This is the POLICY layer.
 
 SELECTION runs at the CCInvoker chokepoint: ``apply_active`` is called at the top
 of ``CCInvoker.run``/``run_streaming`` and routes invocations that opt in via
-``roster_eligible``. ``failover_chain`` is GROUNDWORK for Phase 3 (automatic
-failover on rate-limit/quota) and is intentionally not wired yet.
+``roster_eligible``. FAILOVER selection (``failover_chain`` / ``failover_invocations``)
+builds peer invocations for the conversation layer's outage retry loop — selection
+only; the failover ORCHESTRATION lives at the call site, never in the invoker.
 
 Config: ``config/cc_roster.yaml`` (+ ``cc_roster.local.yaml`` overlay), the same
 file backing the ``cc_roster`` settings domain. Auth tokens are resolved from the
@@ -243,3 +244,41 @@ def failover_chain(active: str, roster: dict | None = None) -> list[str]:
             peers.append((entry.failover_order, name))
     peers.sort()
     return [name for _, name in peers]
+
+
+def failover_invocations(
+    active: str, base_inv: CCInvocation, roster: dict | None = None,
+) -> list[tuple[str, CCInvocation]]:
+    """FRESH peer invocations to try, in order, when ``active`` is unavailable.
+
+    For each usable peer in :func:`failover_chain`, returns ``(peer_name,
+    peer_inv)`` where ``peer_inv`` is ``base_inv`` re-pointed at that peer:
+    a fresh session (``resume_session_id=None`` — a CC session can't resume across
+    providers), with the peer's routing overrides stamped on. The caller owns the
+    retry loop (selection-only here; failover ORCHESTRATION must not live in the
+    invoker).
+
+    ``roster_eligible=False`` is LOAD-BEARING: selection is already explicit here,
+    so the chokepoint must NOT re-select on these invocations. Without it, the
+    NATIVE/Claude peer (whose ``overrides_for`` is empty) would reach the chokepoint
+    with no override fields + ``roster_eligible=True`` and get re-routed back to the
+    global default — i.e. straight back to the model that just failed.
+
+    Misconfigured peers (``overrides_for`` raises) are skipped, not fatal.
+    """
+    r = roster if roster is not None else load_roster()
+    out: list[tuple[str, CCInvocation]] = []
+    for name in failover_chain(active, r):
+        try:
+            overrides = overrides_for(name, r)
+        except RosterError:
+            logger.warning("failover peer %r unusable — skipping", name, exc_info=True)
+            continue
+        peer_inv = replace(
+            base_inv,
+            resume_session_id=None,
+            roster_eligible=False,
+            **overrides,
+        )
+        out.append((name, peer_inv))
+    return out
