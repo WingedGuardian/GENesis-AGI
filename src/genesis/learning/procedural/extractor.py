@@ -26,10 +26,17 @@ from __future__ import annotations
 
 import json
 import logging
-import math
+import re
 import time
 from typing import TYPE_CHECKING, Any, Protocol
 
+from genesis.learning.procedural.embedding import (
+    FAIL_OPEN_COOLDOWN_SECS,
+    _fail_open_timestamps,
+    cosine_similarity,
+    get_embedding_provider,
+    unpack_embedding,
+)
 from genesis.learning.procedural.operations import store_procedure
 
 if TYPE_CHECKING:
@@ -45,43 +52,121 @@ logger = logging.getLogger(__name__)
 # after 30 days of extraction data.
 NOVELTY_THRESHOLD = 0.85
 
-# Fail-open rate limiter: when the embedder is unavailable, at most one
-# procedure per task_type per cooldown window is stored without novelty
-# filtering.  Prevents table flooding during extended embedding outages.
-_FAIL_OPEN_COOLDOWN_SECS = 3600  # 1 hour
-_fail_open_timestamps: dict[str, float] = {}
+# ── Cross-type novelty (LLM dedup) ─────────────────────────────────────────
+# The same-task_type cosine gate (NOVELTY_THRESHOLD) cannot catch a paraphrase
+# stored under a DIFFERENT slug. After the same-type gate passes, scan ALL active
+# procedures by stored-embedding cosine, prefilter the nearest, and ask ONE LLM
+# "is the new procedure redundant with any of these?". Precision-first (the dedup
+# spike found 0 false-merges on S-tier); fail-open (any error → treat as novel).
+_NOVELTY_CALL_SITE = "38a_procedure_novelty_llm"
+CROSS_TYPE_PREFILTER = 0.62   # cosine floor for candidates (spike found dups @0.66)
+CROSS_TYPE_TOPK = 10          # cap candidates sent to the LLM (bounds cost)
+_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
-_EMBEDDING_PROVIDER: EmbeddingProvider | None = None
+_CROSS_TYPE_DEDUP_PROMPT = """\
+You are deduplicating an AI agent's PROCEDURE store. A NEW procedure was just built. Decide whether it is REDUNDANT with any EXISTING procedure listed below.
+
+REDUNDANT = the same goal achieved with essentially the same commands; OR the new one is a paraphrase of an existing one; OR an existing one FULLY CONTAINS the new one (a superset) so the new one adds nothing on its own.
+DISTINCT (keep the new one) = a different goal, different tools/commands, OR each is independently useful in its own distinct situation (even within the same domain). A genuinely reusable sub-step that stands on its own is DISTINCT from a parent that contains it. When unsure, answer DISTINCT.
+
+NEW procedure:
+  task_type: {nt}
+  principle: {np}
+  steps: {ns}
+
+EXISTING procedures:
+{candidates}
+
+Return ONLY this JSON in backticks:
+```json
+{{"redundant_with": <number of the existing procedure it duplicates, or null>, "reason": "<one line>"}}
+```"""
 
 
-def _get_embedding_provider() -> EmbeddingProvider | None:
-    """Lazy module-level singleton. Returns None if no embedding backend is
-    configured (extractor falls open and stores without novelty filtering).
+def _row_get(row: object, key: str) -> object:
+    return row.get(key) if isinstance(row, dict) else row[key]
+
+
+async def _cross_type_duplicate(
+    db: aiosqlite.Connection,
+    *,
+    task_type: str,
+    principle: str,
+    new_steps: list[str] | None,
+    new_emb: list[float] | None,
+    router: object | None,
+) -> tuple[bool, float]:
+    """Best-effort cross-task_type dedup. Returns (is_duplicate, max_cross_sim).
+
+    Fail-open: no router, no embedding, or any error → (False, …) so storage is
+    never blocked by a dedup failure. Precision over recall — when unsure, store.
     """
-    global _EMBEDDING_PROVIDER
-    if _EMBEDDING_PROVIDER is None:
+    if router is None or new_emb is None:
+        return False, 0.0
+    try:
+        from genesis.db.crud.procedural import list_active
+
+        active = await list_active(db, limit=500)
+    except Exception:
+        logger.warning(
+            "Cross-type dedup: list_active failed; treating as novel", exc_info=True,
+        )
+        return False, 0.0
+
+    scored: list[tuple[float, object]] = []
+    for row in active:
+        if _row_get(row, "task_type") == task_type:
+            continue  # same-type already handled by the cosine gate
+        vec = unpack_embedding(_row_get(row, "principle_embedding"))
+        if vec is None:
+            continue  # no stored embedding → skip (cross-type is best-effort)
+        sim = cosine_similarity(new_emb, vec)
+        if sim >= CROSS_TYPE_PREFILTER:
+            scored.append((sim, row))
+    if not scored:
+        return False, 0.0
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:CROSS_TYPE_TOPK]
+    max_cross_sim = top[0][0]
+
+    lines = []
+    for i, (_sim, row) in enumerate(top, 1):
         try:
-            from genesis.memory.embeddings import EmbeddingProvider
-
-            _EMBEDDING_PROVIDER = EmbeddingProvider()
+            steps = json.loads(_row_get(row, "steps")) if _row_get(row, "steps") else []
         except Exception:
-            logger.warning(
-                "EmbeddingProvider unavailable; procedure novelty gate disabled",
-                exc_info=True,
+            steps = []
+        steps_txt = " | ".join(str(s)[:160] for s in (steps or [])[:6])
+        lines.append(
+            f"  [{i}] task_type: {_row_get(row, 'task_type')}\n"
+            f"      principle: {_row_get(row, 'principle') or ''}\n"
+            f"      steps: {steps_txt}"
+        )
+    ns_txt = " | ".join(str(s)[:160] for s in (new_steps or [])[:6])
+    prompt = _CROSS_TYPE_DEDUP_PROMPT.format(
+        nt=task_type, np=principle, ns=ns_txt, candidates="\n".join(lines),
+    )
+
+    try:
+        result = await router.route_call(
+            call_site_id=_NOVELTY_CALL_SITE,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if not getattr(result, "success", False):
+            return False, max_cross_sim
+        match = _JSON_BLOCK_RE.search(result.content or "")
+        data = json.loads(match.group(1) if match else (result.content or ""))
+        rw = data.get("redundant_with")
+        if isinstance(rw, int) and 1 <= rw <= len(top):
+            dup = top[rw - 1][1]
+            logger.info(
+                "Cross-type duplicate: new '%s' ~ existing '%s' (cosine=%.3f): %s",
+                task_type, _row_get(dup, "task_type"), top[rw - 1][0],
+                data.get("reason", ""),
             )
-            return None
-    return _EMBEDDING_PROVIDER
-
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    if len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b, strict=True))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(y * y for y in b))
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return dot / (na * nb)
+            return True, max_cross_sim
+    except Exception:
+        logger.warning("Cross-type dedup LLM failed; treating as novel", exc_info=True)
+    return False, max_cross_sim
 
 
 async def _principle_is_novel(
@@ -90,12 +175,20 @@ async def _principle_is_novel(
     task_type: str,
     new_principle: str,
     embedder: EmbeddingProvider | None,
+    router: object | None = None,
+    new_steps: list[str] | None = None,
 ) -> tuple[bool, float, list[float] | None, bool]:
     """Return (is_novel, max_similarity_seen, new_principle_vector, fell_open).
 
-    ``fell_open`` is True when the novelty gate could not perform a real
-    check (embedder unavailable, lookup failed, etc.) and defaulted to
-    "novel".  Callers use this to apply the fail-open rate limiter.
+    Two layers: (1) same-task_type cosine gate (BLOB-first — uses each row's
+    stored embedding, falling back to a live embed only when the BLOB is NULL);
+    (2) when ``router`` is supplied, a cross-task_type LLM dedup that catches a
+    paraphrase stored under a different slug (the same-type gate's blind spot).
+
+    ``fell_open`` is True when the gate could not perform a real check (embedder
+    unavailable, lookup failed) and defaulted to "novel". Callers use it to apply
+    the fail-open rate limiter. The cross-type layer is best-effort and never
+    sets ``fell_open`` (a dedup-LLM failure just stores, it isn't an outage).
     """
     if embedder is None:
         return True, 0.0, None, True
@@ -119,28 +212,45 @@ async def _principle_is_novel(
         )
         return True, 0.0, None, True
 
-    if not existing:
-        return True, 0.0, new_emb, False
-
+    # ── Layer 1: same-task_type cosine gate (BLOB-first) ──
+    max_sim = 0.0
     try:
-        max_sim = 0.0
         for row in existing:
-            existing_principle = (
-                row.get("principle") if isinstance(row, dict) else row["principle"]
-            )
+            existing_principle = _row_get(row, "principle")
             if not existing_principle:
                 continue
-            existing_emb = await embedder.embed(existing_principle)
-            sim = _cosine_similarity(new_emb, existing_emb)
+            existing_emb = unpack_embedding(_row_get(row, "principle_embedding"))
+            if existing_emb is None:
+                try:
+                    existing_emb = await embedder.embed(existing_principle)
+                except Exception:
+                    continue  # skip this row, keep checking the rest
+            sim = cosine_similarity(new_emb, existing_emb)
             if sim > max_sim:
                 max_sim = sim
-        return max_sim < NOVELTY_THRESHOLD, max_sim, new_emb, False
     except Exception:
         logger.warning(
             "Embedding/cosine failed in novelty gate; allowing storage",
             exc_info=True,
         )
-        return True, 0.0, new_emb, True
+        return True, max_sim, new_emb, True
+
+    if max_sim >= NOVELTY_THRESHOLD:
+        return False, max_sim, new_emb, False
+
+    # ── Layer 2: cross-task_type LLM dedup (best-effort, fail-open) ──
+    is_dup, cross_sim = await _cross_type_duplicate(
+        db,
+        task_type=task_type,
+        principle=new_principle,
+        new_steps=new_steps,
+        new_emb=new_emb,
+        router=router,
+    )
+    seen = max(max_sim, cross_sim)
+    if is_dup:
+        return False, seen, new_emb, False
+    return True, seen, new_emb, False
 
 # 38_procedure_extraction — extracts reusable procedures from interaction outcomes.
 # Currently in the learning-pipeline-only path (partially wired per _call_site_meta.py).
@@ -281,12 +391,14 @@ async def extract_procedure(
     # ── Same-type novelty gate ───────────────────────────────────────────
     # Skip if a near-duplicate principle already exists for this task_type.
     # Fail-open when embeddings are unavailable (rate-limited below).
-    embedder = embedding_provider if embedding_provider is not None else _get_embedding_provider()
+    embedder = embedding_provider if embedding_provider is not None else get_embedding_provider()
     is_novel, max_sim, principle_vec, fell_open = await _principle_is_novel(
         db,
         task_type=data["task_type"],
         new_principle=data["principle"],
         embedder=embedder,
+        router=router,
+        new_steps=data["steps"],
     )
     if not is_novel:
         logger.info(
@@ -301,7 +413,7 @@ async def extract_procedure(
     if fell_open:
         now = time.monotonic()
         task_type_key = data["task_type"]
-        if task_type_key in _fail_open_timestamps and now - _fail_open_timestamps[task_type_key] < _FAIL_OPEN_COOLDOWN_SECS:
+        if task_type_key in _fail_open_timestamps and now - _fail_open_timestamps[task_type_key] < FAIL_OPEN_COOLDOWN_SECS:
             logger.warning(
                 "Fail-open rate limited for %s: cooldown active",
                 task_type_key,
@@ -329,7 +441,7 @@ async def extract_procedure(
             ):
                 try:
                     ov_emb = await embedder.embed(ov["principle"])
-                    sim = _cosine_similarity(principle_vec, ov_emb)
+                    sim = cosine_similarity(principle_vec, ov_emb)
                     if sim >= NOVELTY_THRESHOLD:
                         logger.info(
                             "Cross-type duplicate: '%s' vs existing '%s' "

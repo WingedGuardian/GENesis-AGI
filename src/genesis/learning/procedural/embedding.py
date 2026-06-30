@@ -11,11 +11,51 @@ cosine across all procedures crosses the activation threshold.
 
 from __future__ import annotations
 
+import logging
 import math
 import struct
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from genesis.memory.embeddings import EmbeddingProvider
+
+logger = logging.getLogger(__name__)
 
 # qwen3-embedding output dimensionality. Matches genesis.memory.embeddings.
 EMBEDDING_DIM = 1024
+
+# ── Shared novelty-gate state ──────────────────────────────────────────────────
+# Both procedure-extraction paths (learning/procedural/extractor.py and judge.py)
+# share ONE embedder singleton and ONE fail-open rate-limiter, so they don't each
+# spin up a provider or independently flood the table during an embedding outage.
+_EMBEDDING_PROVIDER: EmbeddingProvider | None = None
+
+# Fail-open rate limiter: when the embedder is unavailable the novelty gate can't
+# check, so it defaults to "novel". This per-task_type cooldown caps stores to one
+# per window to prevent table flooding during extended outages. Keyed by task_type
+# → time.monotonic() of the last fail-open store. SHARED across both paths.
+FAIL_OPEN_COOLDOWN_SECS = 3600  # 1 hour
+_fail_open_timestamps: dict[str, float] = {}
+
+
+def get_embedding_provider() -> EmbeddingProvider | None:
+    """Lazy shared singleton embedder for the procedure novelty gate. Returns
+    None if no embedding backend is configured (callers fall open and store
+    without novelty filtering, rate-limited via _fail_open_timestamps).
+    """
+    global _EMBEDDING_PROVIDER
+    if _EMBEDDING_PROVIDER is None:
+        try:
+            from genesis.memory.embeddings import EmbeddingProvider
+
+            _EMBEDDING_PROVIDER = EmbeddingProvider()
+        except Exception:
+            logger.warning(
+                "EmbeddingProvider unavailable; procedure novelty gate disabled",
+                exc_info=True,
+            )
+            return None
+    return _EMBEDDING_PROVIDER
 
 
 def pack_embedding(vector: list[float]) -> bytes:

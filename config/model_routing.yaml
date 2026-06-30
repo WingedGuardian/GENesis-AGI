@@ -487,6 +487,15 @@ call_sites:
     default_paid: true
     description: Judge + store procedures from struggle detection and extraction
       pipeline candidates
+  38a_procedure_novelty_llm:
+    chain:
+    - nvidia-nim-deepseek
+    - openrouter-deepseek-v4
+    default_paid: true
+    description: Cross-task_type procedure dedup judgment (is a new procedure
+      redundant with existing ones). S-tier only — precision is the safety
+      property (validated 0 false-merges on deepseek-v4); fires per novel
+      procedure, low volume.
   40_ego_focus_selection:
     chain:
     - groq-free
