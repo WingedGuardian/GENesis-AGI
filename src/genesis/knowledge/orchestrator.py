@@ -18,8 +18,12 @@ from genesis.knowledge.distillation import MIN_EXTRACTION_RATIO, DistillationPip
 from genesis.knowledge.manifest import ManifestManager
 from genesis.knowledge.processors.base import ProcessedContent
 from genesis.knowledge.processors.registry import ContentProcessorRegistry
+from genesis.security.sanitizer import ContentSanitizer, ContentSource
 
 logger = logging.getLogger(__name__)
+
+# Module-level singleton (load_default_patterns() does filesystem I/O).
+_SANITIZER = ContentSanitizer()
 
 
 @dataclass
@@ -105,6 +109,25 @@ class KnowledgeOrchestrator:
                 quality_flags=["empty_content"],
             )
 
+        # 3a. Injection-pattern scan (detect-and-flag, NEVER block; fail-open).
+        # content_source carries the trust-origin (URL vs local file) down to
+        # distillation, which boundary-wraps each chunk so the LLM treats the
+        # external text as data, not instructions. The scan here surfaces a
+        # reviewable quality flag without ever aborting the ingest.
+        content_source = (
+            ContentSource.WEB_FETCH
+            if source.startswith(("http://", "https://"))
+            else ContentSource.UNKNOWN
+        )
+        scan_result = None
+        try:
+            scan_result = _SANITIZER.sanitize(content.text, content_source)
+        except Exception:
+            logger.warning(
+                "Injection scan failed for %s (fail-open, ingest continues)",
+                source, exc_info=True,
+            )
+
         # 3b. Kick off tree indexing in parallel (if applicable)
         tree_task: asyncio.Task | None = None
         source_resolved = None
@@ -143,6 +166,7 @@ class KnowledgeOrchestrator:
             content, project_type=project_type, domain=domain,
             user_context=user_context,
             on_chunk_done=on_chunk_done,
+            content_source=content_source,
         )
 
         if not units:
@@ -196,6 +220,15 @@ class KnowledgeOrchestrator:
         )
 
         quality_flags = []
+        if scan_result and scan_result.detected_patterns:
+            quality_flags.append(
+                f"injection_patterns_detected:{len(scan_result.detected_patterns)}"
+            )
+            logger.warning(
+                "Injection patterns in ingested source %s: %s (risk=%.3f)",
+                source, scan_result.detected_patterns, scan_result.risk_score,
+            )
+
         low_conf = [u for u in units if u.confidence < 0.5]
         if low_conf:
             quality_flags.append(f"{len(low_conf)}_low_confidence_units")

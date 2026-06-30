@@ -16,7 +16,12 @@ import logging
 import shutil
 from pathlib import Path
 
+from genesis.security.sanitizer import ContentSanitizer, ContentSource
+
 logger = logging.getLogger(__name__)
+
+# Module-level singleton (load_default_patterns() does filesystem I/O).
+_SANITIZER = ContentSanitizer()
 
 _COMPLETED_DIR = Path.home() / ".genesis" / "knowledge" / "completed"
 
@@ -125,6 +130,19 @@ async def _store_as_is(
             "Use 'Extract & distill' for large documents."
         )
     file_content = path.read_text(encoding="utf-8", errors="replace")
+
+    # Injection-pattern scan (detect-and-log, fail-open). store-as-is bypasses
+    # distillation, so there is no LLM to wrap here; the stored body's recall-
+    # side boundary-wrapping is handled by the recall-side defense (separate PR).
+    try:
+        scan = _SANITIZER.sanitize(file_content, ContentSource.UNKNOWN)
+        if scan.detected_patterns:
+            logger.warning(
+                "Injection patterns in store-as-is upload %s: %s (risk=%.3f)",
+                filename, scan.detected_patterns, scan.risk_score,
+            )
+    except Exception:
+        logger.warning("Injection scan failed for upload %s (fail-open)", filename, exc_info=True)
 
     # Use context or filename as concept
     concept = context[:200] if context else filename

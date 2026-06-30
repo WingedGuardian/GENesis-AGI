@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import knowledge as knowledge_crud
+from genesis.security.sanitizer import ContentSanitizer, ContentSource
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -25,6 +26,9 @@ if TYPE_CHECKING:
     from genesis.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
+
+# Module-level singleton (load_default_patterns() does filesystem I/O).
+_SANITIZER = ContentSanitizer()
 
 
 async def ingest_knowledge_unit(
@@ -69,6 +73,28 @@ async def ingest_knowledge_unit(
     string when the caller needs reference-specific tag layout.
     """
     resolved_concept = concept if concept is not None else content[:200]
+
+    # Injection-pattern scan (detect-and-log, fail-open). This is the second
+    # ingestion chokepoint — covering the knowledge_ingest MCP tool (allow-listed
+    # into background/direct sessions), surplus intake, and reference extraction,
+    # all of which bypass the orchestrator. Detection-only here: the stored body's
+    # recall-side boundary-wrapping is handled by the recall-side defense (separate
+    # PR); ingestion is never blocked.
+    try:
+        scan = _SANITIZER.sanitize(content, ContentSource.UNKNOWN)
+        if scan.detected_patterns:
+            # Log pattern names + provenance only — never the (untrusted) content.
+            logger.warning(
+                "Injection patterns in ingested knowledge unit "
+                "(project=%s domain=%s): %s (risk=%.3f)",
+                project, domain, scan.detected_patterns, scan.risk_score,
+            )
+    except Exception:
+        logger.warning(
+            "Injection scan failed for knowledge unit (project=%s domain=%s, fail-open)",
+            project, domain, exc_info=True,
+        )
+
     now_iso = datetime.now(UTC).isoformat()
     source_doc = "manual"
     if provenance and provenance.get("source_doc"):
