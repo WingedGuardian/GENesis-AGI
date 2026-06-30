@@ -24,6 +24,7 @@ async def enqueue(
     notify: bool = True,
     notify_on_failure_only: bool = False,
     caller_context: str | None = None,
+    roster_model: str | None = None,
 ) -> str:
     """Insert a new queue item. Returns the queue_id."""
     queue_id = f"dsq-{uuid.uuid4().hex[:12]}"
@@ -36,6 +37,7 @@ async def enqueue(
         "notify": notify,
         "notify_on_failure_only": notify_on_failure_only,
         "caller_context": caller_context,
+        "roster_model": roster_model,
     }
     await db.execute(
         """INSERT INTO direct_session_queue

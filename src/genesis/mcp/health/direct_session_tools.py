@@ -56,6 +56,7 @@ async def _impl_direct_session_run(
     effort: str = "high",
     timeout_minutes: int = 15,
     notify: bool = True,
+    roster_model: str | None = None,
 ) -> dict:
     """Enqueue a directed background CC session for dispatch."""
     if _db is None:
@@ -82,6 +83,15 @@ async def _impl_direct_session_run(
     except ValueError:
         return {"error": f"Invalid effort '{effort}'. Must be one of: low, medium, high, xhigh, max"}
 
+    # Early validation for an explicit roster_model so the caller gets immediate
+    # feedback on a typo (key-presence is re-checked at dispatch = fail-loud).
+    if roster_model is not None:
+        from genesis.cc import roster as _roster
+
+        if _roster.resolve(roster_model) is None:
+            known = ", ".join((_roster.load_roster().get("models") or {}).keys())
+            return {"error": f"Unknown roster_model '{roster_model}'. Known: {known}"}
+
     try:
         from genesis.db.crud import direct_session_queue as dsq
 
@@ -94,6 +104,7 @@ async def _impl_direct_session_run(
             timeout_s=min(timeout_minutes * 60, 3600),  # cap at 1 hour
             notify=notify,
             caller_context="mcp_tool",
+            roster_model=roster_model,
         )
         return {
             "queue_id": queue_id,
@@ -272,6 +283,7 @@ async def direct_session_run(
     effort: str = "high",
     timeout_minutes: int = 15,
     notify: bool = True,
+    roster_model: str | None = None,
 ) -> dict:
     """Spawn a directed background CC session with profile-based tool restrictions.
 
@@ -293,9 +305,13 @@ async def direct_session_run(
         effort: Effort level (low, medium, high, xhigh, max)
         timeout_minutes: Max runtime in minutes (default 15, max 60)
         notify: Send Telegram notification on completion/failure
+        roster_model: Optionally run this session on a specific roster model
+            (e.g. "glm-5.2") instead of the default — intentional model
+            selection. Omit/None to use the active default. Fails the session
+            if the named model is unknown or its API key is not configured.
     """
     return await _impl_direct_session_run(
-        prompt, profile, model, effort, timeout_minutes, notify,
+        prompt, profile, model, effort, timeout_minutes, notify, roster_model,
     )
 
 

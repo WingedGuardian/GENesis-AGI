@@ -476,6 +476,10 @@ class DirectSessionRequest:
     planning_instruction: str | None = None  # opt-in: prepended to prompt
     skills: list[str] | None = None  # explicit skill injection (overrides auto-detect)
     tool_exceptions: tuple[str, ...] = ()  # tools to UN-block from the profile disallow list
+    # Intentional per-dispatch model SELECTION (not failover): a roster name
+    # (e.g. "glm-5.2") to run this background session on instead of the global
+    # default. None → the chokepoint applies the active default as usual.
+    roster_model: str | None = None
 
     def __post_init__(self) -> None:
         if self.profile not in VALID_PROFILES:
@@ -979,6 +983,20 @@ class DirectSessionRunner:
             logger.info("interact profile: upgrading model %s → opus", model)
             model = CCModel.OPUS
 
+        # Intentional per-dispatch model SELECTION. When a roster_model is named,
+        # pin it: stamp its overrides and set roster_eligible only when ROUTED, so
+        # the chokepoint honors the endpoint with correct attribution (routed peer)
+        # or runs native without re-selecting the global default (claude). With no
+        # roster_model, roster_eligible=True lets the chokepoint apply the global
+        # active model as before. overrides_for raises RosterError for an
+        # unknown/keyless model → propagates to _run_session → recorded as a FAILED
+        # result (fail loud; never silently run the default for an explicit ask).
+        routing: dict = {}
+        roster_eligible = True
+        if request.roster_model is not None:
+            routing = roster.overrides_for(request.roster_model)
+            roster_eligible = bool(routing)
+
         return CCInvocation(
             prompt=prompt,
             model=model,
@@ -991,7 +1009,8 @@ class DirectSessionRunner:
             working_dir=background_session_dir(),
             mcp_config=mcp_config,
             bash_allowlist=_PROFILE_BASH_ALLOWLIST.get(request.profile, ()),
-            roster_eligible=True,  # background = an activated roster surface
+            roster_eligible=roster_eligible,
+            **routing,
         )
 
     async def _store_result(

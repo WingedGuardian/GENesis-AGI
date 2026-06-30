@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -234,6 +235,13 @@ class ConversationLoop:
                     )
                 except Exception:
                     logger.error("Failed to record rate limit", exc_info=True)
+                # Phase 3: real CC failover to a roster peer (full tools) BEFORE
+                # the degraded contingency path. None → fall through to contingency.
+                roster_reply = await self._try_roster_failover(
+                    invocation, session=session, channel=channel,
+                )
+                if roster_reply is not None:
+                    return roster_reply
                 fallback = await self._try_contingency(
                     prompt_text, system_prompt, channel,
                     session_id=session["id"],
@@ -267,6 +275,11 @@ class ConversationLoop:
                     await self._persist_roster_endpoint(session["id"], output)
                 except Exception:
                     logger.warning("Failed to store cc_session_id", exc_info=True)
+
+            # Phase 3: reaching here means the HOME model succeeded — if we were in
+            # a fallback, that's recovery. Clear the account-wide flag + this
+            # session's sticky peer session (failover returns early, never here).
+            await self._maybe_clear_fallback(session)
 
             # Activity timestamp — non-critical, but reap_stale() uses it so
             # persistent failures deserve monitoring (WARNING, not debug).
@@ -478,12 +491,23 @@ class ConversationLoop:
                 **resume_overrides,
             )
 
+            # Phase 3: track whether any answer TEXT streamed this turn. If it did,
+            # we must NOT fail over (re-streaming a peer's reply would double-output
+            # to the user); tool_use/system_notice progress is fine before a failover.
+            streamed = {"text": False}
+
+            async def _failover_tracked(ev: StreamEvent) -> None:
+                if ev.event_type == "text" and ev.text:
+                    streamed["text"] = True
+                if on_event:
+                    await on_event(ev)
+
             try:
                 output, session = await self._try_invoke_streaming(
                     invocation, session=session, was_resume=bool(cc_sid),
                     prompt_text=prompt_text, model=model, effort=effort,
                     user_id=user_id, channel=channel, thread_id=thread_id,
-                    on_event=on_event,
+                    on_event=_failover_tracked,
                 )
             except CCTimeoutError:
                 self._fire_failure_detection("timeout")
@@ -508,6 +532,16 @@ class ConversationLoop:
                     )
                 except Exception:
                     logger.error("Failed to record rate limit", exc_info=True)
+                # Phase 3: failover to a roster peer (full tools) BEFORE contingency
+                # — but only if NO answer text streamed yet (else re-streaming the
+                # peer's reply would double-output to the user).
+                if not streamed["text"]:
+                    roster_reply = await self._try_roster_failover(
+                        invocation, session=session, channel=channel,
+                        on_event=_failover_tracked,
+                    )
+                    if roster_reply is not None:
+                        return roster_reply
                 fallback = await self._try_contingency(
                     prompt_text, system_prompt, channel,
                     session_id=session["id"],
@@ -541,6 +575,11 @@ class ConversationLoop:
                     await self._persist_roster_endpoint(session["id"], output)
                 except Exception:
                     logger.warning("Failed to store cc_session_id", exc_info=True)
+
+            # Phase 3: reaching here means the HOME model succeeded — if we were in
+            # a fallback, that's recovery. Clear the account-wide flag + this
+            # session's sticky peer session (failover returns early, never here).
+            await self._maybe_clear_fallback(session)
 
             # Activity timestamp — non-critical, but reap_stale() uses it so
             # persistent failures deserve monitoring (WARNING, not debug).
@@ -691,18 +730,31 @@ class ConversationLoop:
         )
 
     @staticmethod
-    def _session_roster_endpoint(session: dict) -> dict | None:
-        """Parse a persisted ``roster_endpoint`` payload from a session's JSON
-        metadata, or None (native session / no payload / corrupt)."""
+    def _parse_session_metadata(session: dict) -> dict:
+        """Parse a session row's JSON ``metadata`` to a dict ({} on missing/corrupt)."""
         raw = session.get("metadata")
         if not raw:
-            return None
+            return {}
         try:
             md = json.loads(raw) if isinstance(raw, str) else raw
         except (json.JSONDecodeError, TypeError):
-            return None
-        ep = md.get("roster_endpoint") if isinstance(md, dict) else None
+            return {}
+        return md if isinstance(md, dict) else {}
+
+    @classmethod
+    def _session_roster_endpoint(cls, session: dict) -> dict | None:
+        """Parse a persisted ``roster_endpoint`` payload from a session's JSON
+        metadata, or None (native session / no payload / corrupt)."""
+        ep = cls._parse_session_metadata(session).get("roster_endpoint")
         return ep if isinstance(ep, dict) else None
+
+    @classmethod
+    def _session_fallback_session(cls, session: dict) -> dict | None:
+        """Parse the per-session STICKY peer-session payload (``fallback_session``)
+        from JSON metadata, or None. Holds ``{cc_session_id, roster_model}`` for the
+        peer continuation resumed across consecutive outage turns."""
+        fs = cls._parse_session_metadata(session).get("fallback_session")
+        return fs if isinstance(fs, dict) else None
 
     def _reconstruct_resume(
         self, session: dict, cc_sid: str,
@@ -738,6 +790,155 @@ class ConversationLoop:
             await cc_sessions.merge_metadata(
                 self._db, session_id, {"roster_endpoint": payload},
             )
+
+    # ---- Phase 3: conversation failover (STICKY) ------------------------------
+
+    async def _merge_session_metadata(self, session_id: str, patch: dict) -> None:
+        """Shallow-merge a patch into a session's JSON metadata (best-effort)."""
+        try:
+            await cc_sessions.merge_metadata(self._db, session_id, patch)
+        except Exception:
+            logger.warning("Failed to merge session metadata", exc_info=True)
+
+    async def _invoke_peer(
+        self,
+        inv: CCInvocation,
+        on_event: Callable[[StreamEvent], Awaitable[None]] | None,
+    ) -> Any:
+        """Invoke a failover peer — streaming when the turn is streaming, else not."""
+        if on_event is not None:
+            return await self._invoker.run_streaming(inv, on_event=on_event)
+        return await self._invoker.run(inv)
+
+    async def _run_failover_peer(
+        self,
+        peer_name: str,
+        peer_inv: CCInvocation,
+        *,
+        sticky: dict | None,
+        on_event: Callable[[StreamEvent], Awaitable[None]] | None,
+    ) -> Any:
+        """Run one peer turn. If this conversation has a STICKY session for THIS
+        peer, resume it for continuity; on a stale resume (non-rate-limit CCError)
+        retry once FRESH on the same peer. Rate-limit/quota propagate to the caller
+        (which moves to the next peer)."""
+        inv = peer_inv  # fresh by default (failover_invocations set resume=None)
+        if (
+            sticky
+            and sticky.get("roster_model") == peer_name
+            and sticky.get("cc_session_id")
+        ):
+            inv = replace(peer_inv, resume_session_id=sticky["cc_session_id"])
+        try:
+            return await self._invoke_peer(inv, on_event)
+        except (CCRateLimitError, CCQuotaExhaustedError):
+            raise
+        except CCError:
+            if inv.resume_session_id is None:
+                raise  # already fresh — nothing to recover
+            logger.warning(
+                "failover peer %s sticky resume failed — retrying fresh", peer_name,
+            )
+            return await self._invoke_peer(peer_inv, on_event)
+
+    async def _try_roster_failover(
+        self,
+        base_inv: CCInvocation,
+        *,
+        session: dict,
+        channel: ChannelType,
+        on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+    ) -> str | None:
+        """STICKY conversation failover. During an account-wide home-model outage,
+        run the turn on a roster peer (full tools) BEFORE the degraded contingency
+        path. Returns the formatted reply on success, or None to fall through to
+        contingency. Never raises (failover must not break the turn)."""
+        try:
+            from genesis.cc import fallback_state
+            home = roster.active_model()
+            peers = roster.failover_invocations(home, base_inv)
+            if not peers:
+                return None
+            sticky = self._session_fallback_session(session)
+            for peer_name, peer_inv in peers:
+                try:
+                    output = await self._run_failover_peer(
+                        peer_name, peer_inv, sticky=sticky, on_event=on_event,
+                    )
+                except (CCRateLimitError, CCQuotaExhaustedError):
+                    continue  # this peer is also down → try the next one
+                except CCError:
+                    logger.warning("failover peer %s failed", peer_name, exc_info=True)
+                    continue
+                # Success on this peer — persist the sticky session for continuity
+                # (per-session, NOT the global flag; home identity stays unchanged).
+                transitioned = fallback_state.enter(home, peer_name, "rate_limit")
+                await self._merge_session_metadata(
+                    session["id"],
+                    {"fallback_session": {
+                        "cc_session_id": output.session_id,
+                        "roster_model": peer_name,
+                    }},
+                )
+                if transitioned:
+                    await self._fire_fallback_alert(
+                        topic="cc_fallback_switch",
+                        context=(
+                            f"<b>CC failover</b>\n\n{home} is rate-limited — replies "
+                            f"are now running on <b>{peer_name}</b> with full tools. "
+                            f"Genesis returns to {home} automatically on recovery."
+                        ),
+                    )
+                parts = self._formatter.format(output.text, channel=channel)
+                return "\n".join(parts)
+            return None
+        except Exception:
+            logger.error(
+                "roster failover errored — falling through to contingency",
+                exc_info=True,
+            )
+            return None
+
+    async def _maybe_clear_fallback(self, session: dict) -> None:
+        """On a successful HOME-model turn, clear any prior fallback — the account-
+        wide flag AND this session's sticky peer session — and fire one recovery
+        ALERT. Reached only when the home invocation actually succeeded (= genuine
+        recovery; failover returns early and never falls through to here)."""
+        try:
+            from genesis.cc import fallback_state
+            if self._session_fallback_session(session) is not None:
+                await self._merge_session_metadata(
+                    session["id"], {"fallback_session": None},
+                )
+            if fallback_state.clear():
+                await self._fire_fallback_alert(
+                    topic="cc_fallback_recovery",
+                    context=(
+                        "<b>CC recovered</b>\n\nThe home model is back — replies are "
+                        "running on it again."
+                    ),
+                )
+        except Exception:
+            logger.warning("fallback recovery handling failed", exc_info=True)
+
+    async def _fire_fallback_alert(self, *, topic: str, context: str) -> None:
+        """Fire-and-forget ALERT via the outreach pipeline (never crash the turn).
+        ConversationLoop holds no outreach ref, so reach it via the runtime
+        singleton — mirrors the idle-detector access pattern in handle_message."""
+        try:
+            from genesis.runtime import GenesisRuntime
+            pipeline = getattr(GenesisRuntime.instance(), "_outreach_pipeline", None)
+            if pipeline is None:
+                return
+            from genesis.outreach.types import OutreachCategory, OutreachRequest
+            await pipeline.submit(OutreachRequest(
+                category=OutreachCategory.ALERT,
+                topic=topic,
+                context=context,
+                salience_score=0.9,
+            ))
+        except Exception:
+            logger.debug("fallback ALERT dispatch failed", exc_info=True)
 
     async def _recover_stale_resume(
         self,

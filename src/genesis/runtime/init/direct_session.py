@@ -68,6 +68,7 @@ async def _direct_session_poll(runner: DirectSessionRunner, db) -> None:
                     notify=payload.get("notify", True),
                     notify_on_failure_only=payload.get("notify_on_failure_only", False),
                     caller_context=payload.get("caller_context"),
+                    roster_model=payload.get("roster_model"),
                 )
                 session_id = await runner.spawn(request)
                 await dsq.mark_dispatched(db, queue_id, session_id)
