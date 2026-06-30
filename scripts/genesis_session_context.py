@@ -232,6 +232,40 @@ def main() -> None:
             except (OSError, ValueError):
                 pass  # Never block session start
 
+        # Fallback NOTICE (advisory): Genesis's server-side ConversationLoop is
+        # currently running on a roster peer (e.g. GLM) because the home model
+        # (Claude) is rate-limited/exhausted account-wide. This interactive CLI
+        # session runs on CC-native pinned Claude and does NOT fail over itself
+        # (failover is server-side, a different process) — so the [model] header
+        # stays honest and we surface the server's degraded condition here as a
+        # separate block. Read the cross-process state file directly (import-free,
+        # fail-open), mirroring the status.json read above.
+        # Writer: src/genesis/cc/fallback_state.py.
+        _fallback_file = Path.home() / ".genesis" / "cc_fallback_state.json"
+        if _fallback_file.exists():
+            try:
+                import json as _json_fb
+                fb = _json_fb.loads(_fallback_file.read_text())
+                if isinstance(fb, dict) and fb.get("is_fallback"):
+                    peer = fb.get("fallback") or "a roster peer"
+                    home = fb.get("original") or "Claude"
+                    reason = (fb.get("reason") or "unknown").replace("_", " ")
+                    since = str(fb.get("since") or "")
+                    since_disp = (since.replace("T", " ")[:16] + " UTC") if since else "unknown"
+                    if not first:
+                        _emit("\n\n---\n\n")
+                    _emit(
+                        "## ⚠ Genesis Fallback Active\n\n"
+                        f"Genesis's server-side conversation is running on **{peer}** "
+                        f"because **{home}** is unavailable (reason: {reason}; since "
+                        f"{since_disp}). This is account-wide. *Your* interactive session "
+                        "here still runs on native Claude — this notice reflects the "
+                        "Genesis server's state, not this CLI session."
+                    )
+                    first = False
+            except (OSError, ValueError):
+                pass  # Advisory only — never block session start
+
     # 2.5. Active procedures (advisory, silent failure is correct)
     try:
         from genesis.learning.procedural.session_inject import load_active_procedures

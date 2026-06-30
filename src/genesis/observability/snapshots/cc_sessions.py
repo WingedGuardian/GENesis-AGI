@@ -15,13 +15,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _fallback_snapshot() -> dict:
+    """Account-wide CC fallback state for the dashboard CC card. Never raises.
+
+    Reads the cross-process record written by the conversation-failover path
+    (``genesis/cc/fallback_state.py``). Cheap (one small file read, no DB) and
+    safe on the snapshot hot path — any error degrades to "not in fallback".
+    """
+    try:
+        from genesis.cc.fallback_state import read as read_fallback_state
+
+        st = read_fallback_state()
+        return {
+            "is_fallback": st.is_fallback,
+            "original": st.original,
+            "fallback": st.fallback,
+            "reason": st.reason,
+            "since": st.since,
+        }
+    except Exception:
+        logger.debug("fallback_state read failed", exc_info=True)
+        return {"is_fallback": False, "original": "", "fallback": "", "reason": "", "since": ""}
+
+
 async def cc_sessions(
     db: aiosqlite.Connection | None,
     cc_budget: CCBudgetTracker | None,
     state_machine: ResilienceStateMachine | None,
 ) -> dict:
     if not db:
-        return {"foreground": {"status": "unknown"}, "background": {"status": "unknown"}}
+        return {
+            "foreground": {"status": "unknown"},
+            "background": {"status": "unknown"},
+            "fallback": _fallback_snapshot(),
+        }
 
     try:
         cursor = await db.execute(
@@ -175,4 +202,5 @@ async def cc_sessions(
         "total_tokens_today": total_tokens_today,
         "rate_limited_24h": rate_limited_24h,
         "realtime_status": cc_realtime_status,
+        "fallback": _fallback_snapshot(),
     }
