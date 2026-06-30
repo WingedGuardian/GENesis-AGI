@@ -321,6 +321,94 @@ async def test_follow_up_dedup_same_rec_created_once(
     assert len(rows) == 1, f"expected 1 deduped follow-up, got {len(rows)}"
 
 
+_TWO_RECS = """# Inbox Evaluation — test
+
+## https://a.com/x
+
+**Classification:** Genesis-relevant | **Decision:** Research
+
+### Recommendation
+
+```yaml
+action: ADAPT
+next_step: "do thing A"
+effort: Small
+scope: V4
+confidence: high
+architecture_impact: extends
+```
+
+## https://b.com/y
+
+**Classification:** Genesis-relevant | **Decision:** Research
+
+### Recommendation
+
+```yaml
+action: WATCH
+next_step: "do thing B"
+effort: Small
+scope: V5
+confidence: medium
+architecture_impact: extends
+```
+"""
+
+
+@pytest.mark.asyncio
+async def test_followup_integrity_error_does_not_abort_remaining_recs(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, monkeypatch,
+):
+    """If follow_ups.create raises IntegrityError (lost a dedup_key race) on one
+    recommendation, the loop must keep processing the REST of the evaluation's
+    recommendations — previously the exception aborted the whole loop."""
+    import sqlite3
+
+    from genesis.db.crud import follow_ups as fu
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    # Force the create() path (bypass the exists pre-check).
+    monkeypatch.setattr(fu, "exists_by_dedup_key", AsyncMock(return_value=False))
+    real_create = fu.create
+    calls = {"n": 0}
+
+    async def flaky_create(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.IntegrityError(
+                "UNIQUE constraint failed: follow_ups.dedup_key"
+            )
+        return await real_create(*a, **k)
+
+    monkeypatch.setattr(fu, "create", flaky_create)
+
+    created = await mon._create_follow_ups_from_eval(
+        evaluation_text=_TWO_RECS, batch_id="b1",
+        source_files=[str(inbox_dir / "Genesis.md")],
+    )
+    assert calls["n"] == 2, "both recs attempted (loop not aborted by the first IntegrityError)"
+    assert created == 1, "first raised+caught, second created"
+
+
+@pytest.mark.asyncio
+async def test_consume_approval_returns_bool(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path):
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    # No dispatcher wired → nothing to consume → True (proceed).
+    assert await mon._consume_approval("req") is True
+    # mark_consumed returns False (already consumed) → False.
+    mon._autonomous_dispatcher = SimpleNamespace(
+        approval_gate=SimpleNamespace(mark_consumed=AsyncMock(return_value=False)),
+    )
+    assert await mon._consume_approval("req") is False
+    # mark_consumed raises (transient) → False (not swallowed silently).
+    mon._autonomous_dispatcher = SimpleNamespace(
+        approval_gate=SimpleNamespace(
+            mark_consumed=AsyncMock(side_effect=RuntimeError("db lock")),
+        ),
+    )
+    assert await mon._consume_approval("req") is False
+
+
 @pytest.mark.asyncio
 async def test_follow_up_dedup_key_persisted(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path):
     mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)

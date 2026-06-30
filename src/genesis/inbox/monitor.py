@@ -1134,20 +1134,39 @@ class InboxMonitor:
             )
         return "approved"
 
-    async def _consume_approval(self, request_id: str) -> None:
+    async def _consume_approval(self, request_id: str) -> bool:
         """Consume a resume drop's approval so the next drop cannot ride the
-        same (content-agnostic, stable-key) approval."""
+        same (content-agnostic, stable-key) approval.
+
+        Returns True if the approval was consumed (or there is no gate to
+        consume against), False if the consume failed or the approval was
+        already consumed. A failure is logged at WARNING (it was previously
+        swallowed at debug) because a non-consumed approval can be ridden by a
+        later inbox drop until the gate's 24h staleness window expires.
+
+        NOTE: the resume caller currently dispatches regardless of this result.
+        Acting on a False — skip-and-retry on transient failure, or fail-and-
+        re-detect when the approval is already consumed — requires the
+        at-most-once dispatch state machine tracked in follow-up 0b68d341.
+        """
         gate = getattr(self._autonomous_dispatcher, "approval_gate", None)
         consume = getattr(gate, "mark_consumed", None)
         if consume is None:
-            return
+            return True
         try:
-            await consume(request_id)
+            ok = bool(await consume(request_id))
         except Exception:
-            logger.debug(
-                "Failed to consume approval %s after resume", request_id,
-                exc_info=True,
+            logger.warning(
+                "Inbox resume: failed to consume approval %s — it may remain "
+                "rideable by a later drop until the 24h staleness window",
+                request_id, exc_info=True,
             )
+            return False
+        if not ok:
+            logger.warning(
+                "Inbox resume: approval %s was already consumed", request_id,
+            )
+        return ok
 
     async def _dispatch_one_batch(
         self, item, *, model, effort, system_prompt, now_iso, errors,
@@ -1528,6 +1547,7 @@ class InboxMonitor:
         Returns the number of follow-ups created.
         """
         import hashlib
+        import sqlite3
 
         from genesis.db.crud import follow_ups
         from genesis.inbox.recommendation import parse_recommendations
@@ -1574,18 +1594,33 @@ class InboxMonitor:
                 logger.debug("Skipping duplicate inbox follow-up: %s", title)
                 continue
 
-            await follow_ups.create(
-                self._db,
-                content=content,
-                source="inbox_evaluation",
-                reason=reason,
-                strategy=strategy,
-                priority=priority,
-                pinned=pinned,
-                # The evaluator already judges each item genesis-vs-user; reuse it.
-                domain="internal" if rec.classification == "genesis" else "user_world",
-                dedup_key=dedup_key,
-            )
+            try:
+                await follow_ups.create(
+                    self._db,
+                    content=content,
+                    source="inbox_evaluation",
+                    reason=reason,
+                    strategy=strategy,
+                    priority=priority,
+                    pinned=pinned,
+                    # The evaluator judges each item genesis-vs-user; reuse it.
+                    domain=(
+                        "internal" if rec.classification == "genesis"
+                        else "user_world"
+                    ),
+                    dedup_key=dedup_key,
+                )
+            except sqlite3.IntegrityError:
+                # Lost a race on the partial-unique dedup_key index — another
+                # writer created this exact recommendation between the
+                # exists check and the insert. Treat as deduped and KEEP
+                # processing the rest of this evaluation's recommendations
+                # (previously this propagated and aborted the loop, silently
+                # dropping every later recommendation in the same eval).
+                logger.debug(
+                    "Duplicate dedup_key race for inbox follow-up: %s", title,
+                )
+                continue
             created += 1
 
         return created
