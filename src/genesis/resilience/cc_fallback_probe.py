@@ -40,6 +40,7 @@ class CCFallbackProbeWorker:
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
+        """Start the probe loop (idempotent — no-op if a task is already running)."""
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._loop())
             logger.info(
@@ -47,6 +48,7 @@ class CCFallbackProbeWorker:
             )
 
     async def stop(self) -> None:
+        """Cancel the probe loop and wait for it to unwind (idempotent)."""
         if self._task is not None:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

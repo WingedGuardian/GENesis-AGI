@@ -211,19 +211,23 @@ class TestBackgroundFallbackRecovery:
         fallback_state.clear()
         return state
 
+    @pytest.mark.asyncio
     async def test_home_claude_success_clears(self, db, tmp_path, monkeypatch):
         state = await self._run(db, tmp_path, monkeypatch, home="claude", roster_model="claude")
         assert state.is_fallback is False  # home (claude) success → cleared
 
+    @pytest.mark.asyncio
     async def test_peer_success_with_claude_home_does_not_clear(self, db, tmp_path, monkeypatch):
         state = await self._run(db, tmp_path, monkeypatch, home="claude", roster_model="glm-5.2")
         assert state.is_fallback is True  # glm run doesn't prove claude back
 
+    @pytest.mark.asyncio
     async def test_home_peer_success_clears(self, db, tmp_path, monkeypatch):
         # default=peer: home is glm-5.2; a successful glm run is the recovery signal.
         state = await self._run(db, tmp_path, monkeypatch, home="glm-5.2", roster_model="glm-5.2")
         assert state.is_fallback is False
 
+    @pytest.mark.asyncio
     async def test_native_claude_success_with_peer_home_does_not_clear(self, db, tmp_path, monkeypatch):
         # The bug case: home is glm-5.2 (down); an intentional native-Claude run
         # succeeds but must NOT clear the glm fallback (Claude is ~always up).
