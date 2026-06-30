@@ -4544,6 +4544,15 @@
               @click="location.hash = 'backup'">Backup & Updates</button>
     </nav>
 
+    <!-- CC model-fallback banner (page-top, full-width, visible on every tab):
+         the server-side conversation is failed over to a roster peer because the
+         home model (Claude) is rate-limited account-wide. Placed here (block flow,
+         outside the flex-row .panel) so it renders as a slim top bar, not a column. -->
+    <template x-if="$store.genesisDashboard.health.cc_sessions?.fallback?.is_fallback">
+      <div style="background: #f0ad4e; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;"
+           x-text="'⚠ Running on ' + ($store.genesisDashboard.health.cc_sessions.fallback.fallback || 'a roster peer') + ' — Claude ' + ($store.genesisDashboard.health.cc_sessions.fallback.reason || 'unavailable').replace(/_/g, ' ') + ' since ' + (($store.genesisDashboard.health.cc_sessions.fallback.since || '').replace('T', ' ').slice(0, 16) || 'unknown')"></div>
+    </template>
+
     <!-- Panel 1: System Health [Tab: overview] -->
     <div class="panel" x-show="$store.genesisDashboard.activeTab === 'overview'">
       <div class="panel-header">
@@ -4570,11 +4579,6 @@
         <div style="background: #f0ad4e; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;">
           Genesis is paused — background processing suspended. Use the pause button or /pause off in Telegram to resume.
         </div>
-      </template>
-      <!-- CC model-fallback banner: conversation failover to a roster peer (Claude unavailable) -->
-      <template x-if="$store.genesisDashboard.health.cc_sessions?.fallback?.is_fallback">
-        <div style="background: #f0ad4e; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;"
-             x-text="'⚠ Running on ' + ($store.genesisDashboard.health.cc_sessions.fallback.fallback || 'a roster peer') + ' — Claude ' + ($store.genesisDashboard.health.cc_sessions.fallback.reason || 'unavailable').replace(/_/g, ' ') + ' since ' + (($store.genesisDashboard.health.cc_sessions.fallback.since || '').replace('T', ' ').slice(0, 16) || 'unknown')"></div>
       </template>
       <!-- Resilience degradation banner -->
       <template x-if="$store.genesisDashboard.health.resilience?.level && $store.genesisDashboard.health.resilience.level !== 'L0' && $store.genesisDashboard.health.resilience.level !== 'not configured'">
