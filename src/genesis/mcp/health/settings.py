@@ -49,6 +49,17 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,
     ),
+    "cc_roster": SettingsDomain(
+        name="cc_roster",
+        description=(
+            "CC model roster — active model + roster members for running "
+            "non-Anthropic models behind Claude Code. `default` selects the "
+            "active model (Claude unless overridden)."
+        ),
+        config_filename="cc_roster.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per-invocation by genesis.cc.roster
+    ),
     "resilience": SettingsDomain(
         name="resilience",
         description="Resilience thresholds (flapping detection, recovery, CC rate limits)",
@@ -613,8 +624,31 @@ def _validate_observability(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_cc_roster(changes: dict) -> list[str]:
+    """Validate cc_roster updates: a new `default` must be a known roster model."""
+    errors: list[str] = []
+    if "default" in changes:
+        default = changes["default"]
+        if not isinstance(default, str):
+            errors.append("default must be a string (a roster model name)")
+        else:
+            from genesis.cc.roster import load_roster
+
+            models = set(load_roster().get("models") or {})
+            chg_models = changes.get("models")
+            if isinstance(chg_models, dict):
+                models |= set(chg_models)
+            if default not in models:
+                avail = ", ".join(sorted(models)) or "(none)"
+                errors.append(
+                    f"default '{default}' is not a roster model; available: {avail}"
+                )
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "tts": _validate_tts,
+    "cc_roster": _validate_cc_roster,
     "resilience": _validate_resilience,
     "inbox_monitor": _validate_inbox_monitor,
     "autonomous_cli_policy": _validate_autonomous_cli_policy,

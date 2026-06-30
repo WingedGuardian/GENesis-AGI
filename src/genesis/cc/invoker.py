@@ -211,7 +211,12 @@ class CCInvoker:
 
     def _build_args(self, inv: CCInvocation) -> list[str]:
         args = [self._claude_path, "-p"]
-        args += ["--model", str(inv.model)]
+        # Roster routing: when model_id_override is set, model selection comes
+        # entirely from ANTHROPIC_MODEL (set in _build_env). A --model flag here
+        # would override that env var (CLI wins) and force the Anthropic tier
+        # instead of the roster model — so omit it in that case.
+        if inv.model_id_override is None:
+            args += ["--model", str(inv.model)]
         args += ["--output-format", inv.output_format]
         effort = clamp_effort(inv.model, inv.effort)
         if effort != inv.effort:
@@ -287,8 +292,29 @@ class CCInvoker:
             env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(inv.stream_idle_timeout_ms)
         if inv and inv.anthropic_base_url:
             env["ANTHROPIC_BASE_URL"] = inv.anthropic_base_url
+            # Routing to a non-Anthropic endpoint: the inherited ANTHROPIC_API_KEY
+            # (from secrets.env) must NOT travel to a third-party URL. Auth is
+            # solely via ANTHROPIC_AUTH_TOKEN below. For the Claude-native default
+            # (no base_url) ANTHROPIC_API_KEY is left untouched (Max subscription).
+            env.pop("ANTHROPIC_API_KEY", None)
         else:
             env.pop("ANTHROPIC_BASE_URL", None)
+        if inv and inv.anthropic_auth_token:
+            env["ANTHROPIC_AUTH_TOKEN"] = inv.anthropic_auth_token
+        else:
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        # Roster model selection via env (NOT --model — see _build_args). Set all
+        # default-model slots so CC's background/sub-calls use the roster model too.
+        _model_vars = (
+            "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        )
+        if inv and inv.model_id_override:
+            for _mv in _model_vars:
+                env[_mv] = inv.model_id_override
+        else:
+            for _mv in _model_vars:
+                env.pop(_mv, None)
         # Move CC's Bash sandbox off /tmp (512MB tmpfs) onto persistent disk.
         # CC reads CLAUDE_CODE_TMPDIR to choose where it creates
         # /claude-<uid>/<cwd>/<session-id>/ for each Bash invocation.

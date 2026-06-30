@@ -138,6 +138,14 @@ class CCInvocation:
     append_system_prompt: bool = False
     stream_idle_timeout_ms: int | None = None
     anthropic_base_url: str | None = None  # Proxy URL override (ANTHROPIC_BASE_URL)
+    # Model-roster routing (model diversification). When set, the CC subprocess
+    # is pointed at a non-Anthropic provider via its native Anthropic-compatible
+    # endpoint: anthropic_auth_token → ANTHROPIC_AUTH_TOKEN; model_id_override →
+    # the provider's model id via ANTHROPIC_MODEL (NOT --model, which the CLI
+    # would let win over the env var). Resolved at the call-site policy layer
+    # (genesis.cc.roster); the invoker only honors these fields, never selects.
+    anthropic_auth_token: str | None = None
+    model_id_override: str | None = None
     # cc-loop-01: opaque per-session key for the invoker's proc registry, so an
     # interrupt (e.g. Telegram /stop) targets THIS session's subprocess and not
     # a concurrent background one. None → keyed by pid (never cross-fired).
