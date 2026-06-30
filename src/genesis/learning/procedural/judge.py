@@ -366,11 +366,11 @@ async def judge_multi_procedure(
         return []
 
     stored: list[str] = []
-    for data in procedures:
+    for idx, data in enumerate(procedures):
         if max_new is not None and len(stored) >= max_new:
             logger.info(
-                "Multi-procedure builder hit per-session cap (%d); %d more not stored",
-                max_new, len(procedures) - len(stored),
+                "Multi-procedure builder hit per-session cap (%d); %d candidate(s) "
+                "not evaluated", max_new, len(procedures) - idx,
             )
             break
 

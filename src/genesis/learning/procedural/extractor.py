@@ -142,6 +142,9 @@ async def _cross_type_duplicate(
             f"      steps: {steps_txt}"
         )
     ns_txt = " | ".join(str(s)[:160] for s in (new_steps or [])[:6])
+    # str.format() does NOT re-scan substituted VALUES, so brace literals in
+    # principle/steps/candidates (e.g. shell `{src,tests}` or `${VAR}`) are safe —
+    # only the template's own {fields} are interpolated. (Verified; do not "fix".)
     prompt = _CROSS_TYPE_DEDUP_PROMPT.format(
         nt=task_type, np=principle, ns=ns_txt, candidates="\n".join(lines),
     )

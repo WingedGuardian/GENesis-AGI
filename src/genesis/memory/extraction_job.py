@@ -12,6 +12,7 @@ Extraction scope:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -487,10 +488,17 @@ async def run_extraction_cycle(
                         len(stored_ids),
                     )
             except TimeoutError:
+                # The build was cancelled mid-flight; discard any half-written
+                # store so a partial transaction can't block the shared connection.
+                # (Completed per-procedure stores already auto-committed.)
+                with contextlib.suppress(Exception):
+                    await db.rollback()
                 logger.warning(
                     "Procedure builder timed out for session %s", session_id,
                 )
             except Exception:
+                with contextlib.suppress(Exception):
+                    await db.rollback()
                 logger.warning(
                     "Procedure builder failed for session %s",
                     session_id, exc_info=True,
