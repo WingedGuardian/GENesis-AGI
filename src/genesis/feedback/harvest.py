@@ -24,6 +24,11 @@ Source authority (no double-counting):
 
 Each source read is wrapped independently (``_safe``) so one bad source can never
 abort the others.
+
+Note: this module is a read-only ETL pipeline — its per-source ``SELECT``s are
+intentional raw SQL (dynamic, filtered reads that don't map to a standard crud
+API), NOT a crud-layer violation. The only write path is ``record_outcome`` via
+``genesis.feedback.bus``; the authoritative source tables are never mutated.
 """
 
 from __future__ import annotations
@@ -39,6 +44,14 @@ from genesis.feedback.bus import SignalType, record_outcome
 logger = logging.getLogger(__name__)
 
 BACKFILL_MARKER = "outcome_backfill_done"
+# Bumped whenever a NEW harvest source is added AFTER installs have already set
+# the marker — forces a one-time re-backfill so the new source's history lands.
+# The stored value is "v{N}:{iso}"; a bare ISO (no "v" prefix) is the legacy v1
+# stamp (proposals + outreach only). Re-running is safe: every source is
+# idempotent on the (source, ref_type, ref_id, signal_type) unique key, so
+# already-harvested rows are INSERT-OR-IGNORE no-ops (read I/O, no WAL write).
+# v2 (2026-06-29): added the surplus_tasks source.
+BACKFILL_VERSION = 2
 
 # Markers update_proposal_outcome appends to ego_proposals.user_response.
 # Two forms exist: "<session_id>|completed:<summary>" and a bare
@@ -82,6 +95,27 @@ def _parse_execution_suffix(user_response: str | None) -> tuple[str, float, str]
     return None
 
 
+def _marker_version(value: str | None) -> int:
+    """Parse the backfill schema-version from a stored marker value.
+
+    The current stamp is ``"v{N}:{iso}"``; a bare ISO timestamp (no ``v``
+    prefix) is the legacy v1 stamp. ISO dates start with ``"2"``, so there is no
+    ambiguity with the ``"v"`` prefix. ``None`` (never backfilled) → 0 so the
+    guard runs the first backfill.
+    """
+    if not value:
+        return 0
+    if value.startswith("v") and ":" in value:
+        try:
+            n = int(value.split(":", 1)[0][1:])
+        except ValueError:
+            return 1
+        # Clamp malformed sub-v1 values (e.g. a hand-edited "v0:"/"v-1:") to the
+        # legacy fallback so a corrupt marker re-runs once, not forever.
+        return n if n >= 1 else 1
+    return 1  # legacy bare-ISO stamp = v1
+
+
 class OutcomeHarvester:
     """Idempotently folds existing outcome signals into ``outcome_events``."""
 
@@ -96,6 +130,7 @@ class OutcomeHarvester:
         return {
             "proposals": await self._safe(self._harvest_proposals, cutoff),
             "outreach": await self._safe(self._harvest_outreach, cutoff),
+            "surplus": await self._safe(self._harvest_surplus_tasks, cutoff),
         }
 
     async def run_backfill(self) -> dict:
@@ -107,14 +142,20 @@ class OutcomeHarvester:
         rows. A clean run over genuinely-empty tables (0 rows, no error) DOES
         set the marker — there is nothing to backfill.
         """
-        if await ego_crud.get_state(self._db, BACKFILL_MARKER):
+        stored = await ego_crud.get_state(self._db, BACKFILL_MARKER)
+        if stored and _marker_version(stored) >= BACKFILL_VERSION:
             return {"skipped": True}
 
         failures = 0
         counts: dict[str, int] = {}
+        # NB: surplus goes in THIS loop (which increments ``failures`` on error),
+        # NOT via ``_safe`` — ``_safe`` swallows the exception, which would let
+        # the marker be set despite a surplus failure and permanently lose its
+        # history. The marker is set ONLY when failures == 0 (see below).
         for name, fn in (
             ("proposals", self._harvest_proposals),
             ("outreach", self._harvest_outreach),
+            ("surplus", self._harvest_surplus_tasks),
         ):
             try:
                 counts[name] = await fn(None)
@@ -126,7 +167,9 @@ class OutcomeHarvester:
         result = {"skipped": False, **counts}
         if failures == 0:
             await ego_crud.set_state(
-                self._db, key=BACKFILL_MARKER, value=datetime.now(UTC).isoformat()
+                self._db,
+                key=BACKFILL_MARKER,
+                value=f"v{BACKFILL_VERSION}:{datetime.now(UTC).isoformat()}",
             )
             logger.info("Outcome backfill complete: %s", result)
         else:
@@ -266,6 +309,64 @@ class OutcomeHarvester:
                 polarity=polarity,
                 value=value,
                 reason_text=r["user_response"],
+            )
+            if eid:
+                inserted += 1
+        return inserted
+
+    async def _harvest_surplus_tasks(self, cutoff: str | None) -> int:
+        """surplus_tasks → execution_outcome (T1 ground truth).
+
+        Background autonomous work (reapers, audits, indexing, …) is the richest
+        execution-outcome silo Genesis has: a terminal ``status`` of
+        ``completed``/``failed`` is a real "did the work run to completion"
+        signal. ``cutoff`` (ISO) limits to recent rows; ``None`` = all history.
+
+        Maintainer notes (deliberate asymmetries):
+        - ``cancelled`` (and non-terminal pending/running) tasks are NOT
+          recorded — a cancel is a lifecycle event, not an execution outcome.
+          Unlike tabled/withdrawn proposals (which get LIFECYCLE_* rows), surplus
+          has no lifecycle signal type and a cancel carries no quality info.
+        - ``stated_confidence`` is left NULL: surplus tasks carry no
+          pre-execution confidence, so they are CORRECTLY excluded from
+          ``calibration_pairs`` (which requires a non-NULL confidence). Do NOT
+          add a synthetic value to "fill" it.
+        - ``domain`` = ``task_type``. ``aggregate_by_domain`` groups by ``domain``
+          across all sources, so a surplus ``task_type`` shares that namespace
+          with ego ``action_type``; no collision exists today, and any future
+          one is read-only observability noise (``calibration_pairs`` is
+          source-filtered, so ego calibration never mixes in surplus rows).
+        """
+        sql = (
+            "SELECT id, task_type, status, failure_reason, completed_at, "
+            "       created_at "
+            "FROM surplus_tasks WHERE status IN ('completed', 'failed')"
+        )
+        params: list = []
+        if cutoff is not None:
+            sql += " AND COALESCE(completed_at, created_at) >= ?"
+            params.append(cutoff)
+
+        cur = await self._db.execute(sql, params)
+        rows = await cur.fetchall()
+        cols = [d[0] for d in cur.description]
+
+        inserted = 0
+        for raw in rows:
+            r = dict(zip(cols, raw, strict=False))
+            completed = r["status"] == "completed"
+            eid = await record_outcome(
+                self._db,
+                source="surplus",
+                ref_type="task",
+                ref_id=r["id"],
+                domain=r["task_type"],
+                signal_type=SignalType.EXECUTION_OUTCOME,
+                polarity="positive" if completed else "negative",
+                value=1.0 if completed else 0.0,
+                reason_text=None if completed else r["failure_reason"],
+                occurred_at=r["completed_at"] or r["created_at"],
+                harvested_from="surplus_tasks",
             )
             if eid:
                 inserted += 1
