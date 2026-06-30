@@ -36,27 +36,6 @@ async def test_create_persists_drop_id_and_batch_items(db):
 
 
 @pytest.mark.asyncio
-async def test_get_drop_rows_returns_only_that_drop_ordered(db):
-    await _mk(db, id="a", drop_id="D1", created_at="2026-06-30T00:00:01+00:00")
-    await _mk(db, id="b", drop_id="D1", created_at="2026-06-30T00:00:02+00:00")
-    await _mk(db, id="c", drop_id="D2", created_at="2026-06-30T00:00:03+00:00")
-    rows = await inbox_items.get_drop_rows(db, "D1")
-    assert [r["id"] for r in rows] == ["a", "b"]
-
-
-@pytest.mark.asyncio
-async def test_get_pending_drop_rows_excludes_completed(db):
-    await _mk(db, id="a", drop_id="D1", status="completed",
-              created_at="2026-06-30T00:00:01+00:00")
-    await _mk(db, id="b", drop_id="D1", status="pending",
-              created_at="2026-06-30T00:00:02+00:00")
-    await _mk(db, id="c", drop_id="D1", status="processing",
-              created_at="2026-06-30T00:00:03+00:00")
-    rows = await inbox_items.get_pending_drop_rows(db, "D1")
-    assert sorted(r["id"] for r in rows) == ["b", "c"]
-
-
-@pytest.mark.asyncio
 async def test_update_status_for_drop_only_touches_pending_processing(db):
     await _mk(db, id="a", drop_id="D1", status="completed",
               created_at="2026-06-30T00:00:01+00:00")

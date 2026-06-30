@@ -110,38 +110,6 @@ async def get_awaiting_approval(db: aiosqlite.Connection) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-async def get_drop_rows(
-    db: aiosqlite.Connection, drop_id: str,
-) -> list[dict]:
-    """Return all inbox rows belonging to *drop_id*, oldest first.
-
-    Ordered by ``created_at, id`` so the batch order within a drop is stable
-    (sibling batches share the same detection ``created_at``; ``id`` breaks ties).
-    """
-    cursor = await db.execute(
-        "SELECT * FROM inbox_items WHERE drop_id = ? ORDER BY created_at, id",
-        (drop_id,),
-    )
-    return [dict(row) for row in await cursor.fetchall()]
-
-
-async def get_pending_drop_rows(
-    db: aiosqlite.Connection, drop_id: str,
-) -> list[dict]:
-    """Return the not-yet-completed rows of *drop_id* (pending or processing).
-
-    Used by the resume pass to fan out only the batches of a drop that still
-    need to run — completed batches (whose baseline already landed) are left
-    untouched, and failed batches are excluded (they retry via the delta path).
-    """
-    cursor = await db.execute(
-        "SELECT * FROM inbox_items WHERE drop_id = ? "
-        "AND status IN ('pending', 'processing') ORDER BY created_at, id",
-        (drop_id,),
-    )
-    return [dict(row) for row in await cursor.fetchall()]
-
-
 async def update_status_for_drop(
     db: aiosqlite.Connection,
     drop_id: str,

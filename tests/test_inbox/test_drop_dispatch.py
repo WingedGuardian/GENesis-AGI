@@ -205,6 +205,31 @@ async def test_one_approval_per_drop_then_resume_dispatches_all(
 
 
 @pytest.mark.asyncio
+async def test_gate_error_fails_drop_not_stuck_processing(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """If the approval gate's route() raises (transient: net/DB/timeout), the
+    drop's rows are failed (retriable) — NOT left stuck in 'processing' where
+    they'd be invisible to detection until expire_stuck fires."""
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=2)
+    disp = _wired(decision=AutonomousDispatchDecision(mode="blocked", reason="x"))
+    disp.route = AsyncMock(side_effect=RuntimeError("gate boom"))
+    mon._autonomous_dispatcher = disp
+    (inbox_dir / "Genesis.md").write_text(_urls(4))  # 2 batches
+
+    result = await mon.check_once()
+
+    rows = [dict(r) for r in await (await db.execute(
+        "SELECT status, retry_count FROM inbox_items WHERE file_path LIKE '%Genesis.md'",
+    )).fetchall()]
+    assert rows and all(r["status"] == "failed" for r in rows)
+    # Retriable (not permanently capped) — a transient gate error should retry.
+    assert all(r["retry_count"] < mon._config.max_retries for r in rows)
+    assert any("gate error" in e.lower() for e in result.errors)
+    assert mock_invoker.run.call_count == 0
+
+
+@pytest.mark.asyncio
 async def test_gate_off_dispatches_every_batch(
     db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
 ):

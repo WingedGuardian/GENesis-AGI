@@ -309,7 +309,7 @@ class InboxMonitor:
         now_iso = now.isoformat()
 
         # Phase 1: Resume approval-parked items
-        resume_items, resumed_ids, resumed_paths = await self._phase_resume(
+        resume_items, _resumed_ids, resumed_paths = await self._phase_resume(
             now, now_iso,
         )
 
@@ -333,7 +333,7 @@ class InboxMonitor:
 
         # Phase 4: Batch and dispatch
         batches_dispatched = await self._phase_dispatch_batches(
-            resume_items, pending_items, resumed_ids, now_iso, errors,
+            resume_items, pending_items, now_iso, errors,
         )
 
         return CheckResult(
@@ -900,7 +900,6 @@ class InboxMonitor:
         self,
         resume_items: list[InboxItem],
         pending_items: list[InboxItem],
-        resumed_ids: set[str],
         now_iso: str,
         errors: list[str],
     ) -> int:
@@ -931,19 +930,21 @@ class InboxMonitor:
 
         batches_dispatched = 0
 
-        # --- Resume drops: approval already resolved -> dispatch directly. ---
-        reqids_to_consume: set[str] = set()
+        # --- Resume drops: approval already resolved -> consume then dispatch. ---
         for _drop_id, items in self._group_by_drop(resume_items):
+            # Consume the drop's approval BEFORE dispatching so a restart
+            # mid-drop cannot leave an unconsumed approval that a later drop
+            # rides via the content-agnostic stable key. mark_consumed is
+            # idempotent; the parked rows still drive re-dispatch on restart.
+            reqid = items[0].approval_reqid if items else ""
+            if reqid:
+                await self._consume_approval(reqid)
             for item in items:
                 if await self._dispatch_one_batch(
                     item, model=model, effort=effort,
                     system_prompt=system_prompt, now_iso=now_iso, errors=errors,
                 ):
                     batches_dispatched += 1
-                if item.approval_reqid:
-                    reqids_to_consume.add(item.approval_reqid)
-        for reqid in reqids_to_consume:
-            await self._consume_approval(reqid)
 
         # --- New drops: ONE approval per drop, then dispatch each batch. ---
         for _drop_id, items in self._group_by_drop(pending_items):
@@ -995,17 +996,47 @@ class InboxMonitor:
         except Exception:
             logger.debug("Failed to record inbox prompt version", exc_info=True)
 
-    def _build_invocation(self, prompt: str, model, effort):
-        """Build a CCInvocation for an inbox evaluation."""
+    def _build_invocation(self, prompt: str, model, effort, system_prompt: str):
+        """Build a CCInvocation for an inbox evaluation.
+
+        ``system_prompt`` is passed in (loaded+hashed once per cycle in
+        ``_phase_dispatch_batches``) so the invocation's system prompt is the
+        SAME value used to build the approval request's message list.
+        """
         from genesis.cc.types import CCInvocation, background_session_dir
         mcp_path = SessionConfigBuilder().build_mcp_config("reflection")
         return CCInvocation(
             prompt=prompt, model=model, effort=effort,
-            system_prompt=self._load_system_prompt(),
+            system_prompt=system_prompt,
             timeout_s=self._config.timeout_s, skip_permissions=True,
             disallowed_tools=["Write", "Edit", "Agent", "NotebookEdit"],
             working_dir=background_session_dir(), mcp_config=mcp_path,
         )
+
+    async def _set_drop_status(
+        self, items, drop_id, *, status, error_message=None, processed_at=None,
+    ) -> None:
+        """Set status on all of a drop's live (pending/processing) rows.
+
+        Uses the atomic ``update_status_for_drop`` when a real ``drop_id`` is
+        present; falls back to per-row updates for legacy/solo rows (empty
+        drop_id) to avoid a drop_id='' UPDATE matching unrelated legacy rows.
+        Note: does not increment retry_count — callers that need the
+        permanent-fail cap update those rows explicitly.
+        """
+        from genesis.db.crud import inbox_items
+
+        if drop_id:
+            await inbox_items.update_status_for_drop(
+                self._db, drop_id, status=status,
+                error_message=error_message, processed_at=processed_at,
+            )
+        else:
+            for item in items:
+                await inbox_items.update_status(
+                    self._db, item.id, status=status,
+                    error_message=error_message, processed_at=processed_at,
+                )
 
     async def _acquire_drop_approval(
         self, items, *, model, effort, system_prompt, now_iso, errors,
@@ -1020,32 +1051,45 @@ class InboxMonitor:
         """
         from genesis.db.crud import inbox_items
 
+        drop_id = items[0].drop_id if items else ""
+
         # Claim the drop's rows for this cycle before the gate decision.
         batch_id = str(uuid.uuid4())
         for item in items:
             await inbox_items.set_batch(self._db, item.id, batch_id=batch_id)
-            await inbox_items.update_status(
-                self._db, item.id, status="processing",
-            )
+        await self._set_drop_status(items, drop_id, status="processing")
 
         if self._autonomous_dispatcher is None:
             return "approved"
 
         prompt = self._build_prompt(items)
-        invocation = self._build_invocation(prompt, model, effort)
-        decision = await self._autonomous_dispatcher.route(
-            AutonomousDispatchRequest(
-                subsystem="inbox", policy_id="inbox_evaluation",
-                action_label="inbox evaluation",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
-                cli_invocation=invocation, api_call_site_id=None,
-                cli_fallback_allowed=True, approval_required_for_cli=True,
-                approval_key_stable=True, context=None,
-            ),
-        )
+        invocation = self._build_invocation(prompt, model, effort, system_prompt)
+        try:
+            decision = await self._autonomous_dispatcher.route(
+                AutonomousDispatchRequest(
+                    subsystem="inbox", policy_id="inbox_evaluation",
+                    action_label="inbox evaluation",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    cli_invocation=invocation, api_call_site_id=None,
+                    cli_fallback_allowed=True, approval_required_for_cli=True,
+                    approval_key_stable=True, context=None,
+                ),
+            )
+        except Exception as exc:
+            # The gate raised (transient: network / DB lock / timeout). Fail the
+            # drop's rows (retriable — no permanent cap) so they don't sit stuck
+            # in 'processing' invisible to detection until expire_stuck fires.
+            err = f"Inbox approval gate error: {exc}"
+            logger.error(err, exc_info=True)
+            errors.append(err)
+            await self._set_drop_status(
+                items, drop_id, status="failed",
+                error_message=err, processed_at=now_iso,
+            )
+            return "failed"
         if decision.mode == "blocked":
             reason_lower = decision.reason.lower()
             is_pending = (
@@ -1062,12 +1106,13 @@ class InboxMonitor:
                     f"{inbox_items.AWAITING_APPROVAL_PREFIX}"
                     f"{decision.approval_request_id}"
                 )
-                for item in items:
-                    await inbox_items.update_status(
-                        self._db, item.id, status="processing",
-                        error_message=marker, processed_at=now_iso,
-                    )
+                await self._set_drop_status(
+                    items, drop_id, status="processing",
+                    error_message=marker, processed_at=now_iso,
+                )
                 return "parked"
+            # Hard rejection / CLI fallback disabled — do NOT retry this drop:
+            # set retry_count to the cap so get_all_known treats it permanent.
             err = f"CLI fallback blocked: {decision.reason}"
             errors.append(err)
             logger.warning(err)
@@ -1075,6 +1120,7 @@ class InboxMonitor:
                 await inbox_items.update_status(
                     self._db, item.id, status="failed",
                     error_message=err, processed_at=now_iso,
+                    retry_count=self._config.max_retries,
                 )
             return "rejected"
         if decision.mode == "api":
@@ -1120,7 +1166,7 @@ class InboxMonitor:
         batch_id = str(uuid.uuid4())
         await inbox_items.set_batch(self._db, item.id, batch_id=batch_id)
         prompt = self._build_prompt([item])
-        invocation = self._build_invocation(prompt, model, effort)
+        invocation = self._build_invocation(prompt, model, effort, system_prompt)
 
         session_id: str | None = None
         try:
