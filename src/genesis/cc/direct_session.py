@@ -499,6 +499,7 @@ class DirectSessionResult:
     duration_s: float = 0.0
     tools_called: list[dict] = field(default_factory=list)
     model_used: str = ""
+    via_proxy: bool = False  # ran on a routed (non-Anthropic) roster endpoint
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +679,7 @@ class DirectSessionRunner:
                 duration_s=round(elapsed, 1),
                 tools_called=telemetry,
                 model_used=output.model_used,
+                via_proxy=output.via_proxy,
             )
 
             # Persist result in session metadata (merge, don't overwrite)
@@ -988,6 +990,7 @@ class DirectSessionRunner:
             working_dir=background_session_dir(),
             mcp_config=mcp_config,
             bash_allowlist=_PROFILE_BASH_ALLOWLIST.get(request.profile, ()),
+            roster_eligible=True,  # background = an activated roster surface
         )
 
     async def _store_result(
@@ -1038,6 +1041,16 @@ class DirectSessionRunner:
             "model_used": result.model_used,
             "duration_s": result.duration_s,
         })
+
+        # Roster resume continuity: record the endpoint a routed session actually
+        # ran on (ground truth from model_used), so a future resume can target the
+        # same provider. No-op for native Claude. Token never stored (NAME only).
+        if result.via_proxy and result.model_used:
+            from genesis.cc import roster
+
+            payload = roster.endpoint_payload_for_model_id(result.model_used)
+            if payload:
+                existing["roster_endpoint"] = payload
 
         await db.execute(
             "UPDATE cc_sessions SET metadata = ? WHERE id = ?",

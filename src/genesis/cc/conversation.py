@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from genesis.cc import roster
 from genesis.cc.context_injector import ContextInjector
 from genesis.cc.exceptions import (
     CCError,
@@ -171,6 +173,13 @@ class ConversationLoop:
             # First message: full system prompt, no resume
             # Subsequent: resume with cc_session_id, no system prompt
             cc_sid = session.get("cc_session_id")
+            # Roster resume continuity: if this session was created on a routed
+            # (non-Anthropic) endpoint, reconstruct those overrides so it resumes
+            # on the SAME endpoint. If reconstruction fails (token gone), degrade
+            # to a fresh session — never resume a routed session on native Claude.
+            resume_overrides: dict = {}
+            if cc_sid:
+                resume_overrides, cc_sid = self._reconstruct_resume(session, cc_sid)
             if cc_sid:
                 system_prompt = None
                 resume_id = cc_sid
@@ -192,6 +201,8 @@ class ConversationLoop:
                 resume_session_id=resume_id,
                 skip_permissions=True,
                 append_system_prompt=True,
+                roster_eligible=True,
+                **resume_overrides,
             )
 
             try:
@@ -253,6 +264,7 @@ class ConversationLoop:
                     await cc_sessions.update_cc_session_id(
                         self._db, session["id"], cc_session_id=output.session_id,
                     )
+                    await self._persist_roster_endpoint(session["id"], output)
                 except Exception:
                     logger.warning("Failed to store cc_session_id", exc_info=True)
 
@@ -418,6 +430,9 @@ class ConversationLoop:
                         text="Session restarted — injecting recent context.",
                     ))
 
+            resume_overrides: dict = {}
+            if cc_sid:
+                resume_overrides, cc_sid = self._reconstruct_resume(session, cc_sid)
             if cc_sid:
                 system_prompt = None
                 resume_id = cc_sid
@@ -459,6 +474,8 @@ class ConversationLoop:
                 skip_permissions=True,
                 append_system_prompt=True,
                 session_key=session_key,
+                roster_eligible=True,
+                **resume_overrides,
             )
 
             try:
@@ -521,6 +538,7 @@ class ConversationLoop:
                     await cc_sessions.update_cc_session_id(
                         self._db, session["id"], cc_session_id=output.session_id,
                     )
+                    await self._persist_roster_endpoint(session["id"], output)
                 except Exception:
                     logger.warning("Failed to store cc_session_id", exc_info=True)
 
@@ -669,7 +687,54 @@ class ConversationLoop:
             skip_permissions=True,
             append_system_prompt=True,
             session_key=session_key,  # cc-loop-01: keep /stop working on retry
+            roster_eligible=True,  # fresh retry stays roster-routable (no resume)
         )
+
+    @staticmethod
+    def _session_roster_endpoint(session: dict) -> dict | None:
+        """Parse a persisted ``roster_endpoint`` payload from a session's JSON
+        metadata, or None (native session / no payload / corrupt)."""
+        raw = session.get("metadata")
+        if not raw:
+            return None
+        try:
+            md = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            return None
+        ep = md.get("roster_endpoint") if isinstance(md, dict) else None
+        return ep if isinstance(ep, dict) else None
+
+    def _reconstruct_resume(
+        self, session: dict, cc_sid: str,
+    ) -> tuple[dict, str | None]:
+        """Rebuild roster overrides for resuming a routed session on its ORIGINAL
+        endpoint. Returns (override_kwargs, cc_sid) — cc_sid is set to None (force
+        fresh) if the session was routed but its endpoint can't be reconstructed,
+        so we never resume a routed session on native Claude (corruption)."""
+        ep = self._session_roster_endpoint(session)
+        if ep is None:
+            return {}, cc_sid  # native session — resume as-is
+        try:
+            return roster.overrides_from_persisted(ep), cc_sid
+        except roster.RosterError:
+            logger.error(
+                "Cannot reconstruct routed endpoint for session %s — starting "
+                "fresh (refusing native resume of a routed session)",
+                session["id"][:8], exc_info=True,
+            )
+            return {}, None
+
+    async def _persist_roster_endpoint(self, session_id: str, output: Any) -> None:
+        """Persist the endpoint a ROUTED session actually ran on (ground truth from
+        CCOutput.model_used), so it resumes on the same provider. No-op for native
+        Claude runs. Token is never stored — only the auth-env NAME."""
+        if not getattr(output, "via_proxy", False) or not output.model_used:
+            return
+        payload = roster.endpoint_payload_for_model_id(output.model_used)
+        if payload:
+            await cc_sessions.merge_metadata(
+                self._db, session_id, {"roster_endpoint": payload},
+            )
 
     async def _recover_stale_resume(
         self,

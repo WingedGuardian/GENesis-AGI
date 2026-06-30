@@ -59,6 +59,31 @@ async def test_update_activity(db, sess_fields):
     assert row["last_activity_at"] == "2026-03-07T09:00:00"
 
 
+async def test_merge_metadata_round_trip(db, sess_fields):
+    # roster-endpoint persistence: shallow merge into JSON metadata, no migration.
+    await cc_sessions.create(db, **{**sess_fields, "metadata": '{"existing": 1}'})
+    ok = await cc_sessions.merge_metadata(
+        db, "sess-1", {"roster_endpoint": {"model_id": "glm-5.2"}},
+    )
+    assert ok
+    row = await cc_sessions.get_by_id(db, "sess-1")
+    import json
+    md = json.loads(row["metadata"])
+    assert md["existing"] == 1  # preserved
+    assert md["roster_endpoint"] == {"model_id": "glm-5.2"}  # merged
+
+
+async def test_merge_metadata_tolerates_corrupt_and_missing(db, sess_fields):
+    await cc_sessions.create(db, **{**sess_fields, "metadata": "not-json"})
+    ok = await cc_sessions.merge_metadata(db, "sess-1", {"k": "v"})
+    assert ok
+    import json
+    row = await cc_sessions.get_by_id(db, "sess-1")
+    assert json.loads(row["metadata"]) == {"k": "v"}  # corrupt treated as {}
+    # missing row → False, no raise
+    assert await cc_sessions.merge_metadata(db, "nope", {"k": "v"}) is False
+
+
 async def test_query_active(db, sess_fields):
     await cc_sessions.create(db, **sess_fields)
     await cc_sessions.create(db, **{**sess_fields, "id": "sess-2", "status": "completed"})

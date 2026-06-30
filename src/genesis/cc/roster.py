@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
 
 from genesis._config_overlay import merge_local_overlay
+from genesis.cc.types import CCInvocation
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,102 @@ def overrides_for(name: str, roster: dict | None = None) -> dict:
         "anthropic_base_url": entry.anthropic_base_url,
         "anthropic_auth_token": token,
         "model_id_override": entry.model_id,
+    }
+
+
+def apply_active(
+    inv: CCInvocation, roster: dict | None = None,
+) -> tuple[CCInvocation, str]:
+    """Resolve the active roster model and stamp its overrides onto ``inv``.
+
+    This is the SELECTION chokepoint, called at the top of ``CCInvoker.run`` /
+    ``run_streaming``. Returns ``(possibly_new_inv, roster_model_name)`` — the
+    name is for honest span attribution.
+
+    **Never raises** — it sits on the universal CC path, so any failure degrades
+    to native Claude (logged) rather than breaking every invocation. No-ops for:
+    non-opted-in invocations (``roster_eligible=False`` — the default), already-
+    routed invocations (a resume reconstruction or failover pre-stamped the
+    override fields), and bare resumes (never reroute an existing session onto a
+    different endpoint — the resume-safety invariant; routed resumes are
+    reconstructed by the call site before reaching here).
+    """
+    try:
+        if not inv.roster_eligible:
+            return inv, CLAUDE
+        if inv.model_id_override or inv.anthropic_base_url:
+            return inv, (inv.model_id_override or "routed")
+        if inv.resume_session_id is not None:
+            return inv, CLAUDE
+        active = active_model(roster)
+        overrides = overrides_for(active, roster)
+        if not overrides:
+            return inv, active
+        return replace(inv, **overrides), active
+    except Exception:
+        logger.error(
+            "roster apply_active failed — running native Claude", exc_info=True,
+        )
+        return inv, CLAUDE
+
+
+def endpoint_payload(name: str, roster: dict | None = None) -> dict | None:
+    """Persistable endpoint context for roster model ``name`` (NEVER the token).
+
+    Stored with a routed session so it can be resumed on the SAME endpoint.
+    Returns ``None`` for native/Claude or a misconfigured entry (nothing to
+    persist → the session resumes native, which is correct).
+    """
+    entry = resolve(name, roster)
+    if entry is None or _is_native(entry):
+        return None
+    if not (entry.anthropic_base_url and entry.model_id and entry.auth_env):
+        return None
+    return {
+        "base_url": entry.anthropic_base_url,
+        "auth_env": entry.auth_env,  # NAME only — token resolved at resume time
+        "model_id": entry.model_id,
+        "roster_model": name,
+    }
+
+
+def endpoint_payload_for_model_id(
+    model_id: str, roster: dict | None = None,
+) -> dict | None:
+    """Persistable endpoint for the roster entry whose ``model_id`` matches the
+    model the subprocess *actually reported* (``CCOutput.model_used``).
+
+    Ground-truth based — reflects what really ran (e.g. a failover target), not
+    what config currently says. Returns ``None`` if no routed entry matches
+    (e.g. a native Claude run → nothing to persist).
+    """
+    r = roster if roster is not None else load_roster()
+    for name, raw in (r.get("models") or {}).items():
+        entry = _entry_from(name, raw)
+        if entry.model_id == model_id and not _is_native(entry):
+            return endpoint_payload(name, r)
+    return None
+
+
+def overrides_from_persisted(payload: dict) -> dict:
+    """Rebuild CCInvocation override kwargs from a persisted endpoint payload.
+
+    Token is re-read from ``os.environ[auth_env]`` (never stored). Raises
+    :class:`RosterError` if the payload is incomplete or the token is now absent
+    — callers must surface this rather than silently resume on the wrong model.
+    """
+    base_url = payload.get("base_url")
+    auth_env = payload.get("auth_env")
+    model_id = payload.get("model_id")
+    if not (base_url and auth_env and model_id):
+        raise RosterError(f"incomplete persisted endpoint payload: {payload!r}")
+    token = os.environ.get(auth_env)
+    if not token:
+        raise RosterError(f"persisted endpoint auth env {auth_env} is not set")
+    return {
+        "anthropic_base_url": base_url,
+        "anthropic_auth_token": token,
+        "model_id_override": model_id,
     }
 
 

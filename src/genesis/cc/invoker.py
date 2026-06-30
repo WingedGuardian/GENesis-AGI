@@ -13,6 +13,7 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from genesis.cc import roster
 from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
@@ -470,11 +471,13 @@ class CCInvoker:
         and (b) any LLM/operation spans share one trace. Best-effort — a no-op
         when capture is disabled.
         """
+        invocation, roster_model = roster.apply_active(invocation)
         with start_span(
             "cc.session",
             SpanKind.CC_SESSION,
             attributes={
                 "model": invocation.model,
+                "roster_model": roster_model,
                 "effort": invocation.effort,
                 "streaming": False,
             },
@@ -619,11 +622,13 @@ class CCInvoker:
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
         """Run CC with stream-json output (traced — see run() for span rationale)."""
+        invocation, roster_model = roster.apply_active(invocation)
         with start_span(
             "cc.session",
             SpanKind.CC_SESSION,
             attributes={
                 "model": invocation.model,
+                "roster_model": roster_model,
                 "effort": invocation.effort,
                 "streaming": True,
             },
