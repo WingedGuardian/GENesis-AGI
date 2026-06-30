@@ -109,9 +109,10 @@ def test_failover_invocations_stamps_fresh_peer(roster_dir, monkeypatch):
     invs = R.failover_invocations("claude", base, R.load_roster(roster_dir))
     assert [name for name, _ in invs] == ["glm-5.2"]  # deepseek unconfigured
     _, peer = invs[0]
-    # FRESH session, chokepoint re-selection disabled, peer overrides stamped.
+    # FRESH session; routed peer stays roster_eligible=True so the chokepoint's
+    # override-present guard honors the endpoint AND reports the correct name.
     assert peer.resume_session_id is None
-    assert peer.roster_eligible is False
+    assert peer.roster_eligible is True
     assert peer.model_id_override == "glm-5.2"
     assert peer.anthropic_base_url == "https://open.bigmodel.cn/api/anthropic"
     assert peer.anthropic_auth_token == "sk-secret"
@@ -129,14 +130,22 @@ def test_failover_invocations_native_peer_has_no_overrides_but_disables_reselect
     monkeypatch.delenv("DEEPSEEK_TEST_KEY", raising=False)
     from genesis.cc.types import CCInvocation
 
-    base = CCInvocation(prompt="hi", roster_eligible=True)
+    # base carries GLM routing (as a routed-resume would when default=glm) — the
+    # native Claude peer MUST clear it, not leak it through.
+    base = CCInvocation(
+        prompt="hi", roster_eligible=True,
+        anthropic_base_url="https://open.bigmodel.cn/api/anthropic",
+        anthropic_auth_token="sk-secret",
+        model_id_override="glm-5.2",
+    )
     invs = R.failover_invocations("glm-5.2", base, R.load_roster(roster_dir))
     names = [name for name, _ in invs]
     assert names[0] == "claude"
     _, claude_peer = invs[0]
     assert claude_peer.roster_eligible is False  # load-bearing
-    assert claude_peer.model_id_override is None
+    assert claude_peer.model_id_override is None  # routing CLEARED for native peer
     assert claude_peer.anthropic_base_url is None
+    assert claude_peer.anthropic_auth_token is None
 
 
 def test_failover_invocations_skips_unusable_peer(roster_dir, monkeypatch):

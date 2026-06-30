@@ -258,11 +258,14 @@ def failover_invocations(
     retry loop (selection-only here; failover ORCHESTRATION must not live in the
     invoker).
 
-    ``roster_eligible=False`` is LOAD-BEARING: selection is already explicit here,
-    so the chokepoint must NOT re-select on these invocations. Without it, the
-    NATIVE/Claude peer (whose ``overrides_for`` is empty) would reach the chokepoint
-    with no override fields + ``roster_eligible=True`` and get re-routed back to the
-    global default — i.e. straight back to the model that just failed.
+    ``roster_eligible`` is set to ``bool(overrides)`` — LOAD-BEARING:
+    - A ROUTED peer (overrides present) keeps ``roster_eligible=True`` so the
+      chokepoint's override-present guard honors the pre-stamped endpoint AND
+      reports the correct model name (``apply_active`` returns CLAUDE for any
+      ``roster_eligible=False`` invocation, which would mis-attribute a routed run).
+    - A NATIVE peer (empty overrides, e.g. Claude when default=glm) gets
+      ``roster_eligible=False`` so the chokepoint does NOT re-select the global
+      default and loop straight back to the model that just failed.
 
     Misconfigured peers (``overrides_for`` raises) are skipped, not fatal.
     """
@@ -274,11 +277,20 @@ def failover_invocations(
         except RosterError:
             logger.warning("failover peer %r unusable — skipping", name, exc_info=True)
             continue
+        # Always set ALL routing fields so a native peer (empty overrides) CLEARS
+        # any routing the base invocation carried (e.g. a routed resume when
+        # default=glm failing over to native Claude) instead of leaking it through.
+        routing: dict = {
+            "anthropic_base_url": None,
+            "anthropic_auth_token": None,
+            "model_id_override": None,
+        }
+        routing.update(overrides)
         peer_inv = replace(
             base_inv,
             resume_session_id=None,
-            roster_eligible=False,
-            **overrides,
+            roster_eligible=bool(overrides),
+            **routing,
         )
         out.append((name, peer_inv))
     return out
