@@ -85,15 +85,15 @@ async def ingest_knowledge_unit(
         detected = bool(scan.detected_patterns)
     except Exception:
         detected = False
-    # This chokepoint also ingests reference-store credentials. The
-    # SanitizationResult holds the original content, so NOTHING derived from the
-    # scan (patterns, risk score, exception) may be logged — emit provenance
-    # (project/domain) only, which carries no content. Detection is never blocked.
+    # This chokepoint also ingests reference-store credentials, where even the
+    # project/domain can be credential-derived. The detection log is therefore
+    # FULLY STATIC — no content, no scan data, no identifiers — so a secret can
+    # never reach the log. Detection is never blocked; the non-sensitive
+    # orchestrator path carries the richer per-source detail.
     if detected:
         logger.warning(
-            "Injection patterns detected in ingested knowledge unit "
-            "(project=%s domain=%s)",
-            project, domain,
+            "Injection pattern detected in an ingested knowledge unit "
+            "(see orchestrator logs for non-credential source detail)."
         )
 
     now_iso = datetime.now(UTC).isoformat()
