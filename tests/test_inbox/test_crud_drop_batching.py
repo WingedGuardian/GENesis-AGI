@@ -76,3 +76,132 @@ async def test_follow_up_dedup_key_create_and_exists(db):
     )
     assert await follow_ups.exists_by_dedup_key(db, "k1") is True
     assert await follow_ups.exists_by_dedup_key(db, "k2") is False
+
+
+# --- baseline read must key on completion time, not created_at ---
+# Regression: _queue_drop reuses retriable-failed rows via reuse_as_pending,
+# which preserves the reused row's OLD created_at. The current baseline is the
+# most-recently-COMPLETED row (max processed_at), so ordering the read by
+# created_at returned a stale row and dropped the just-evaluated lines →
+# re-evaluation on the next scan. (Observed live: a reused row created
+# 2026-03-18 but processed today held the full baseline, yet a row created
+# today/processed earlier won the created_at sort.)
+
+_FP = "/home/ubuntu/inbox/Genesis.md"
+
+
+async def _completed(db, *, id, created_at, processed_at, content):
+    await inbox_items.create(
+        db, id=id, file_path=_FP, content_hash="h",
+        status="completed", created_at=created_at,
+    )
+    await inbox_items.set_response_path(
+        db, id, response_path=f"r-{id}", processed_at=processed_at,
+        evaluated_content=content,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_evaluated_content_returns_latest_by_processed_at(db):
+    # Reused row: OLD created_at, LATEST processed_at, fullest baseline.
+    await _completed(db, id="reused", created_at="2026-03-18T00:00:00+00:00",
+                     processed_at="2026-06-30T17:39:00+00:00",
+                     content="urlA\nurlB")
+    # Competing row: NEWER created_at but EARLIER processed_at, less content.
+    await _completed(db, id="fresh", created_at="2026-06-30T14:00:00+00:00",
+                     processed_at="2026-06-30T16:00:00+00:00",
+                     content="urlA")
+    base = await inbox_items.get_evaluated_content(db, _FP)
+    assert "urlB" in base, (
+        "baseline must come from the latest-PROCESSED completed row "
+        "(reuse preserves old created_at, so created_at ordering is wrong)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_last_completed_at_uses_processed_at(db):
+    await _completed(db, id="reused", created_at="2026-03-18T00:00:00+00:00",
+                     processed_at="2026-06-30T17:39:00+00:00", content="x")
+    await _completed(db, id="fresh", created_at="2026-06-30T14:00:00+00:00",
+                     processed_at="2026-06-30T16:00:00+00:00", content="x")
+    last = await inbox_items.get_last_completed_at(db, _FP)
+    assert last == "2026-06-30T17:39:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_reuse_as_pending_resets_created_at(db):
+    # Root-cause fix: re-arming a failed row resets created_at to now, so all
+    # created_at-ordered "latest row" / recency / expiry reads stay correct.
+    await inbox_items.create(
+        db, id="r", file_path=_FP, content_hash="h0", status="failed",
+        created_at="2026-03-18T00:00:00+00:00", drop_id="OLD",
+        batch_items="old",
+    )
+    await inbox_items.reuse_as_pending(
+        db, "r", drop_id="NEW", batch_items="new", content_hash="h1",
+        created_at="2026-06-30T18:00:00+00:00",
+    )
+    row = await inbox_items.get_by_id(db, "r")
+    assert row["status"] == "pending"
+    assert row["created_at"] == "2026-06-30T18:00:00+00:00"  # reset, not 03-18
+    assert row["drop_id"] == "NEW"
+    assert row["batch_items"] == "new"
+    assert row["content_hash"] == "h1"
+
+
+@pytest.mark.asyncio
+async def test_get_by_file_path_returns_rearmed_reused_row(db):
+    # The created_at-class fix proven end-to-end: get_by_file_path (still
+    # created_at-ordered, used for the supersede check) must return the freshly
+    # re-armed reused row, not an older completed row — because reuse reset
+    # created_at to now.
+    await _completed(db, id="done", created_at="2026-06-30T10:00:00+00:00",
+                     processed_at="2026-06-30T10:05:00+00:00", content="x")
+    await inbox_items.create(
+        db, id="reused", file_path=_FP, content_hash="h", status="failed",
+        created_at="2026-03-18T00:00:00+00:00",
+    )
+    await inbox_items.reuse_as_pending(
+        db, "reused", drop_id="D", batch_items="new", content_hash="h",
+        created_at="2026-06-30T18:00:00+00:00",
+    )
+    latest = await inbox_items.get_by_file_path(db, _FP)
+    assert latest["id"] == "reused", (
+        "the re-armed pending row (created_at=now) must be 'latest' so the "
+        "supersede check targets it, not a stale older completed row"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_last_completed_at_skips_null_processed_at_meta_rows(db):
+    # A real completion, plus a NEWER-created meta completed row (empty/no-delta
+    # path) that has NULL processed_at. Must return the real completion time.
+    await _completed(db, id="real", created_at="2026-06-30T10:00:00+00:00",
+                     processed_at="2026-06-30T10:05:00+00:00", content="x")
+    await inbox_items.create(
+        db, id="meta", file_path=_FP, content_hash="h", status="completed",
+        created_at="2026-06-30T12:00:00+00:00",  # NO processed_at
+    )
+    last = await inbox_items.get_last_completed_at(db, _FP)
+    assert last == "2026-06-30T10:05:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_get_recent_completed_windows_on_processed_at(db):
+    # A reused row keeps an ancient created_at but is COMPLETED now. The digest
+    # windows on the last N days; ordering/filtering by created_at would drop it.
+    from datetime import UTC, datetime
+    now = datetime.now(UTC).isoformat()
+    await inbox_items.create(
+        db, id="reused", file_path=_FP, content_hash="h", status="completed",
+        created_at="2026-03-18T00:00:00+00:00",
+    )
+    await inbox_items.set_response_path(
+        db, "reused", response_path="r-reused", processed_at=now,
+        evaluated_content="x",
+    )
+    recent = await inbox_items.get_recent_completed(db, days=7)
+    assert any(r["id"] == "reused" for r in recent), (
+        "a reused eval completed today must appear in the digest even though "
+        "its created_at is old"
+    )
