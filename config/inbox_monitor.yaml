@@ -7,6 +7,13 @@ inbox_monitor:
   # the source (e.g. Untitled.md → Untitled.genesis.md).
   response_dir: "_genesis"
   check_interval_seconds: 1800
+  # items_per_eval: how many items (URLs / prose blocks) go into ONE Claude
+  # evaluation. A file's NEW content is segmented into items and grouped into
+  # batches of this size, so a 16-URL drop becomes ~4 evals (each its own
+  # Genesis-N.genesis.md), not one mega-evaluation. Default 5.
+  items_per_eval: 5
+  # batch_size is LEGACY (files-per-cycle) and no longer governs eval grouping;
+  # items_per_eval replaces it. Kept for backward compatibility.
   batch_size: 1
   model: "sonnet"
   effort: "medium"

@@ -21,6 +21,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Inbox evaluations no longer cram a whole batch of links into one giant pass — and stop
+  re-evaluating links they've already covered.** When you drop many URLs into an inbox note,
+  Genesis now evaluates them in small groups (≈5 at a time, configurable via
+  `items_per_eval`), each producing its own `…-N.genesis.md` response file, instead of one
+  sprawling evaluation of everything at once. Crucially, once a link has been evaluated it is
+  not re-evaluated when you add new links to the same note — only the genuinely new links are
+  processed (previously an approved evaluation could re-chew the entire file). When the CLI
+  approval gate is on, you approve a drop once and all its groups run under that single
+  approval. Duplicate follow-up items from the same recommendation are now also prevented.
+
 - **Campaign results no longer sit uncaptured until the next scheduled tick.** Previously a
   campaign that ran every couple of days would finish its background session but not record
   the outcome (or cost, or notify you) until the *following* tick — so a finished run could
