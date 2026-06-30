@@ -268,18 +268,21 @@ async def get_evaluated_content(
     Filters out NULL and empty-string values so callers can rely on a
     non-empty return meaning "real prior content exists."
     """
-    # Tie-break on processed_at then rowid: when a drop's batches complete in
-    # the SAME check cycle they share ``created_at``, and each batch merges its
-    # lines on top of the prior batch's baseline, so the LAST-completed batch
-    # (highest processed_at; highest rowid as final tiebreak since batches are
-    # created in order) holds the fullest cumulative baseline. Ordering by
-    # created_at alone returned an arbitrary partial baseline among ties.
+    # Order by processed_at (COMPLETION time), not created_at: the current
+    # baseline is the most-recently-COMPLETED row, and each completion merges
+    # its lines on top of the prior baseline. created_at is unreliable here
+    # because _queue_drop reuses retriable-failed rows (reuse_as_pending
+    # preserves their OLD created_at), so a freshly-completed reused row can
+    # have an ancient created_at — ordering by created_at would return a stale,
+    # partial baseline and cause re-evaluation. rowid is the final tiebreak for
+    # same-cycle batches that share processed_at (fake-clock tests; production
+    # completions are sequential so processed_at already differs).
     cursor = await db.execute(
         """SELECT evaluated_content FROM inbox_items
            WHERE file_path = ? AND status = 'completed'
              AND evaluated_content IS NOT NULL
              AND evaluated_content != ''
-           ORDER BY created_at DESC, processed_at DESC, rowid DESC LIMIT 1""",
+           ORDER BY processed_at DESC, created_at DESC, rowid DESC LIMIT 1""",
         (file_path,),
     )
     row = await cursor.fetchone()
@@ -294,11 +297,15 @@ async def get_last_completed_at(
     Used for cooldown checks — skip re-evaluation if too recent.
     Includes both normal evaluations (with response files) and Acknowledged
     items (no response file) so cooldown applies uniformly.
+
+    Orders by processed_at (completion time), not created_at, so a reused row
+    (which keeps its old created_at via reuse_as_pending) doesn't make the
+    cooldown read a stale completion time. See get_evaluated_content.
     """
     cursor = await db.execute(
         """SELECT processed_at FROM inbox_items
            WHERE file_path = ? AND status = 'completed'
-           ORDER BY created_at DESC LIMIT 1""",
+           ORDER BY processed_at DESC, created_at DESC LIMIT 1""",
         (file_path,),
     )
     row = await cursor.fetchone()

@@ -76,3 +76,53 @@ async def test_follow_up_dedup_key_create_and_exists(db):
     )
     assert await follow_ups.exists_by_dedup_key(db, "k1") is True
     assert await follow_ups.exists_by_dedup_key(db, "k2") is False
+
+
+# --- baseline read must key on completion time, not created_at ---
+# Regression: _queue_drop reuses retriable-failed rows via reuse_as_pending,
+# which preserves the reused row's OLD created_at. The current baseline is the
+# most-recently-COMPLETED row (max processed_at), so ordering the read by
+# created_at returned a stale row and dropped the just-evaluated lines →
+# re-evaluation on the next scan. (Observed live: a reused row created
+# 2026-03-18 but processed today held the full baseline, yet a row created
+# today/processed earlier won the created_at sort.)
+
+_FP = "/home/ubuntu/inbox/Genesis.md"
+
+
+async def _completed(db, *, id, created_at, processed_at, content):
+    await inbox_items.create(
+        db, id=id, file_path=_FP, content_hash="h",
+        status="completed", created_at=created_at,
+    )
+    await inbox_items.set_response_path(
+        db, id, response_path=f"r-{id}", processed_at=processed_at,
+        evaluated_content=content,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_evaluated_content_returns_latest_by_processed_at(db):
+    # Reused row: OLD created_at, LATEST processed_at, fullest baseline.
+    await _completed(db, id="reused", created_at="2026-03-18T00:00:00+00:00",
+                     processed_at="2026-06-30T17:39:00+00:00",
+                     content="urlA\nurlB")
+    # Competing row: NEWER created_at but EARLIER processed_at, less content.
+    await _completed(db, id="fresh", created_at="2026-06-30T14:00:00+00:00",
+                     processed_at="2026-06-30T16:00:00+00:00",
+                     content="urlA")
+    base = await inbox_items.get_evaluated_content(db, _FP)
+    assert "urlB" in base, (
+        "baseline must come from the latest-PROCESSED completed row "
+        "(reuse preserves old created_at, so created_at ordering is wrong)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_last_completed_at_uses_processed_at(db):
+    await _completed(db, id="reused", created_at="2026-03-18T00:00:00+00:00",
+                     processed_at="2026-06-30T17:39:00+00:00", content="x")
+    await _completed(db, id="fresh", created_at="2026-06-30T14:00:00+00:00",
+                     processed_at="2026-06-30T16:00:00+00:00", content="x")
+    last = await inbox_items.get_last_completed_at(db, _FP)
+    assert last == "2026-06-30T17:39:00+00:00"
