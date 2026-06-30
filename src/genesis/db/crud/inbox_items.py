@@ -28,12 +28,16 @@ async def create(
     status: str = "pending",
     created_at: str,
     batch_id: str | None = None,
+    drop_id: str | None = None,
+    batch_items: str | None = None,
 ) -> str:
     await db.execute(
         """INSERT INTO inbox_items
-           (id, file_path, content_hash, status, batch_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (id, file_path, content_hash, status, batch_id, created_at),
+           (id, file_path, content_hash, status, batch_id, created_at,
+            drop_id, batch_items)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (id, file_path, content_hash, status, batch_id, created_at,
+         drop_id, batch_items),
     )
     await db.commit()
     return id
@@ -95,7 +99,7 @@ async def get_awaiting_approval(db: aiosqlite.Connection) -> list[dict]:
     """
     cursor = await db.execute(
         """SELECT id, file_path, content_hash, batch_id, error_message,
-                  created_at
+                  created_at, drop_id, batch_items
            FROM inbox_items
            WHERE status = 'processing'
              AND error_message LIKE ? || '%'
@@ -104,6 +108,64 @@ async def get_awaiting_approval(db: aiosqlite.Connection) -> list[dict]:
     )
     rows = await cursor.fetchall()
     return [dict(row) for row in rows]
+
+
+async def get_drop_rows(
+    db: aiosqlite.Connection, drop_id: str,
+) -> list[dict]:
+    """Return all inbox rows belonging to *drop_id*, oldest first.
+
+    Ordered by ``created_at, id`` so the batch order within a drop is stable
+    (sibling batches share the same detection ``created_at``; ``id`` breaks ties).
+    """
+    cursor = await db.execute(
+        "SELECT * FROM inbox_items WHERE drop_id = ? ORDER BY created_at, id",
+        (drop_id,),
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_pending_drop_rows(
+    db: aiosqlite.Connection, drop_id: str,
+) -> list[dict]:
+    """Return the not-yet-completed rows of *drop_id* (pending or processing).
+
+    Used by the resume pass to fan out only the batches of a drop that still
+    need to run — completed batches (whose baseline already landed) are left
+    untouched, and failed batches are excluded (they retry via the delta path).
+    """
+    cursor = await db.execute(
+        "SELECT * FROM inbox_items WHERE drop_id = ? "
+        "AND status IN ('pending', 'processing') ORDER BY created_at, id",
+        (drop_id,),
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
+async def update_status_for_drop(
+    db: aiosqlite.Connection,
+    drop_id: str,
+    *,
+    status: str,
+    error_message: str | None = None,
+    processed_at: str | None = None,
+) -> int:
+    """Set status/error_message/processed_at on the live rows of a drop.
+
+    Targets only rows currently ``pending`` or ``processing`` (so completed
+    batches are never disturbed). Used to park a whole drop on one approval
+    (status='processing' + awaiting marker) or fail a whole drop on rejection.
+    Does NOT touch ``retry_count`` — callers manage retry semantics explicitly.
+    Returns the number of rows updated.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET status = ?, error_message = ?, processed_at = ?
+           WHERE drop_id = ? AND status IN ('pending', 'processing')""",
+        (status, error_message, processed_at, drop_id),
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 async def get_all_known(
