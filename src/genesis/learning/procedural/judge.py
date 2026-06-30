@@ -244,8 +244,13 @@ async def _store_judged_procedure(
     if fell_open:
         import time
 
-        last = _fail_open_timestamps.get(task_type, 0.0)
-        if time.monotonic() - last < FAIL_OPEN_COOLDOWN_SECS:
+        # Only rate-limit if a fail-open store for this task_type ACTUALLY happened
+        # before. A 0.0 default would wrongly rate-limit the FIRST store whenever
+        # time.monotonic() (uptime-based on Linux) < cooldown — i.e. on a freshly
+        # booted host (the failure mode CI's fresh runners hit). Matches the
+        # membership-guarded check in extractor._fail_open.
+        last = _fail_open_timestamps.get(task_type)
+        if last is not None and time.monotonic() - last < FAIL_OPEN_COOLDOWN_SECS:
             logger.info(
                 "Judge: rate-limited fail-open store for %s (cooldown active)",
                 task_type,
