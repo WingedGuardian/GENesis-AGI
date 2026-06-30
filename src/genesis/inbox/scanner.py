@@ -4,10 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 RESPONSE_SUFFIX = ".genesis.md"
+
+# URL extraction (canonical): matches https?://... and bare domain/path
+# patterns like ``search.app/XYZ``. Lives here (the stateless module) so both
+# the monitor and the segmenter share one definition; the monitor re-exports
+# ``extract_urls`` as ``_extract_urls`` for backward compatibility.
+_URL_RE = re.compile(
+    r"(?:https?://[^\s<>\]\)]+)"
+    r"|"
+    r"(?:(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/[^\s<>\]\)]+)",
+    re.IGNORECASE,
+)
 
 # URL deduplication: strip volatile tracking/share params so the same article
 # re-pasted with different params (e.g. a LinkedIn share from android vs
@@ -152,3 +164,81 @@ def detect_changes(
         elif known_items[key] != current_hash:
             modified.append(f)
     return new, modified
+
+
+def extract_urls(text: str) -> list[str]:
+    """Extract unique URLs from *text*, preserving order of first appearance.
+
+    Trailing sentence punctuation is stripped. Matches both ``https?://`` URLs
+    and bare domain/path forms (e.g. ``search.app/XYZ``). Canonical home for
+    URL extraction; ``monitor._extract_urls`` re-exports this.
+    """
+    seen: set[str] = set()
+    urls: list[str] = []
+    for match in _URL_RE.finditer(text):
+        url = match.group(0).rstrip(".,;:!?)'\"")
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+@dataclass(frozen=True)
+class Item:
+    """A single unit of inbox evaluation carved out of a file's delta.
+
+    ``kind`` is ``"url"`` for a line containing one or more URLs, or
+    ``"note"`` for a contiguous block of non-URL prose. ``text`` is the
+    original (un-normalized) content used for evaluation and for the
+    per-item baseline; ``urls`` lists every URL found in a ``"url"`` item.
+    """
+
+    text: str
+    kind: str
+    urls: list[str] = field(default_factory=list)
+
+
+def segment_items(delta_text: str) -> list[Item]:
+    """Split a file's delta into evaluation items.
+
+    Rules:
+    - A line containing >=1 URL becomes its own ``"url"`` item (a multi-URL
+      line stays one item; all its URLs are listed in ``Item.urls``).
+    - A contiguous run of non-URL, non-blank lines becomes one ``"note"`` item.
+    - Blank lines separate note blocks and are not items themselves.
+    - Within the delta, a URL line is de-duplicated by its tracking-normalized
+      form (the same article re-pasted with different share params → one item),
+      mirroring ``normalize_url_line`` used elsewhere for dedup.
+
+    Order of first appearance is preserved.
+    """
+    items: list[Item] = []
+    note_buf: list[str] = []
+    seen_urls: set[str] = set()
+
+    def _flush_note() -> None:
+        if note_buf:
+            text = "\n".join(note_buf).strip()
+            if text:
+                items.append(Item(text=text, kind="note"))
+            note_buf.clear()
+
+    for raw_line in delta_text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            _flush_note()
+            continue
+        urls = extract_urls(stripped)
+        if urls:
+            # A URL line ends any pending prose block before it.
+            _flush_note()
+            norm = normalize_url_line(stripped)
+            if norm in seen_urls:
+                continue
+            seen_urls.add(norm)
+            items.append(Item(text=stripped, kind="url", urls=urls))
+        else:
+            note_buf.append(line)
+    _flush_note()
+    return items

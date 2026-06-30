@@ -77,6 +77,23 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE inbox_items ADD COLUMN evaluated_content TEXT",
         "inbox_items.evaluated_content")
 
+    # Inbox URL-level batching: drop_id groups the eval-batches carved from one
+    # file's delta; batch_items stores that batch's exact item lines so resume
+    # re-dispatches the delta (not a full-file re-read) and survives restart.
+    await _try_alter(db,
+        "ALTER TABLE inbox_items ADD COLUMN drop_id TEXT",
+        "inbox_items.drop_id")
+    await _try_alter(db,
+        "ALTER TABLE inbox_items ADD COLUMN batch_items TEXT",
+        "inbox_items.batch_items")
+
+    # Follow-up dedup: idempotent re-evaluation guard. dedup_key = hash of
+    # (source, normalized url/title, next_step) so re-evaluating the same URL
+    # does not pile duplicate follow-up rows.
+    await _try_alter(db,
+        "ALTER TABLE follow_ups ADD COLUMN dedup_key TEXT",
+        "follow_ups.dedup_key")
+
     # Phase 9: thread_id on cc_sessions (for forum topic multi-session)
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN thread_id TEXT",

@@ -28,12 +28,16 @@ async def create(
     status: str = "pending",
     created_at: str,
     batch_id: str | None = None,
+    drop_id: str | None = None,
+    batch_items: str | None = None,
 ) -> str:
     await db.execute(
         """INSERT INTO inbox_items
-           (id, file_path, content_hash, status, batch_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (id, file_path, content_hash, status, batch_id, created_at),
+           (id, file_path, content_hash, status, batch_id, created_at,
+            drop_id, batch_items)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (id, file_path, content_hash, status, batch_id, created_at,
+         drop_id, batch_items),
     )
     await db.commit()
     return id
@@ -95,7 +99,7 @@ async def get_awaiting_approval(db: aiosqlite.Connection) -> list[dict]:
     """
     cursor = await db.execute(
         """SELECT id, file_path, content_hash, batch_id, error_message,
-                  created_at
+                  created_at, drop_id, batch_items
            FROM inbox_items
            WHERE status = 'processing'
              AND error_message LIKE ? || '%'
@@ -104,6 +108,32 @@ async def get_awaiting_approval(db: aiosqlite.Connection) -> list[dict]:
     )
     rows = await cursor.fetchall()
     return [dict(row) for row in rows]
+
+
+async def update_status_for_drop(
+    db: aiosqlite.Connection,
+    drop_id: str,
+    *,
+    status: str,
+    error_message: str | None = None,
+    processed_at: str | None = None,
+) -> int:
+    """Set status/error_message/processed_at on the live rows of a drop.
+
+    Targets only rows currently ``pending`` or ``processing`` (so completed
+    batches are never disturbed). Used to park a whole drop on one approval
+    (status='processing' + awaiting marker) or fail a whole drop on rejection.
+    Does NOT touch ``retry_count`` — callers manage retry semantics explicitly.
+    Returns the number of rows updated.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET status = ?, error_message = ?, processed_at = ?
+           WHERE drop_id = ? AND status IN ('pending', 'processing')""",
+        (status, error_message, processed_at, drop_id),
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 async def get_all_known(
@@ -238,12 +268,18 @@ async def get_evaluated_content(
     Filters out NULL and empty-string values so callers can rely on a
     non-empty return meaning "real prior content exists."
     """
+    # Tie-break on processed_at then rowid: when a drop's batches complete in
+    # the SAME check cycle they share ``created_at``, and each batch merges its
+    # lines on top of the prior batch's baseline, so the LAST-completed batch
+    # (highest processed_at; highest rowid as final tiebreak since batches are
+    # created in order) holds the fullest cumulative baseline. Ordering by
+    # created_at alone returned an arbitrary partial baseline among ties.
     cursor = await db.execute(
         """SELECT evaluated_content FROM inbox_items
            WHERE file_path = ? AND status = 'completed'
              AND evaluated_content IS NOT NULL
              AND evaluated_content != ''
-           ORDER BY created_at DESC LIMIT 1""",
+           ORDER BY created_at DESC, processed_at DESC, rowid DESC LIMIT 1""",
         (file_path,),
     )
     row = await cursor.fetchone()
@@ -363,6 +399,54 @@ async def get_retriable_failed(
     )
     row = await cursor.fetchone()
     return dict(row) if row else None
+
+
+async def get_retriable_failed_rows(
+    db: aiosqlite.Connection, file_path: str, *, max_retries: int = 3,
+) -> list[dict]:
+    """Return ALL retriable failed rows for *file_path*, oldest first.
+
+    Like :func:`get_retriable_failed` but returns every retriable row, so the
+    monitor can reuse one per batch when a multi-batch drop is retried —
+    preventing duplicate-row accumulation while preserving each row's
+    ``retry_count`` (so the permanent-failure cap still applies). Excludes
+    approval-invalidated rows (those need fresh rows + fresh approvals).
+    """
+    cursor = await db.execute(
+        """SELECT * FROM inbox_items
+           WHERE file_path = ? AND status = 'failed' AND retry_count < ?
+             AND (error_message IS NULL
+                  OR error_message NOT LIKE ? || '%')
+           ORDER BY created_at ASC""",
+        (file_path, max_retries, APPROVAL_INVALIDATED_PREFIX),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def reuse_as_pending(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    drop_id: str,
+    batch_items: str,
+    content_hash: str,
+) -> bool:
+    """Re-arm a retriable failed row as a fresh pending batch.
+
+    Preserves ``retry_count`` (the cap survives) but re-points the row at the
+    new drop, batch slice and content hash and clears the error. This is the
+    per-batch analogue of the old single-row reuse — it keeps retries from
+    piling up duplicate rows.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET status = 'pending', error_message = NULL,
+               drop_id = ?, batch_items = ?, content_hash = ?
+           WHERE id = ?""",
+        (drop_id, batch_items, content_hash, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
 
 async def query_pending(db: aiosqlite.Connection, *, limit: int = 50) -> list[dict]:

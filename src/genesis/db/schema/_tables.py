@@ -429,7 +429,9 @@ TABLES = {
             processed_at   TEXT,
             error_message  TEXT,
             retry_count    INTEGER NOT NULL DEFAULT 0,
-            evaluated_content TEXT
+            evaluated_content TEXT,
+            drop_id        TEXT,
+            batch_items    TEXT
         )
     """,
     "processed_emails": """
@@ -1108,7 +1110,8 @@ TABLES = {
             domain           TEXT CHECK (
                 domain IN ('internal', 'user_world')
             ),
-            goal_id          TEXT
+            goal_id          TEXT,
+            dedup_key        TEXT
         )
     """,
     "file_modifications": """
@@ -1581,6 +1584,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_inbox_items_status ON inbox_items(status)",
     "CREATE INDEX IF NOT EXISTS idx_inbox_items_file_path ON inbox_items(file_path)",
     "CREATE INDEX IF NOT EXISTS idx_inbox_items_batch_id ON inbox_items(batch_id)",
+    "CREATE INDEX IF NOT EXISTS idx_inbox_items_drop ON inbox_items(drop_id)",
     # processed emails
     "CREATE INDEX IF NOT EXISTS idx_processed_emails_status ON processed_emails(status)",
     "CREATE INDEX IF NOT EXISTS idx_processed_emails_message_id ON processed_emails(message_id)",
@@ -1698,6 +1702,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_follow_ups_scheduled ON follow_ups(scheduled_at)",
     "CREATE INDEX IF NOT EXISTS idx_follow_ups_source ON follow_ups(source)",
     "CREATE INDEX IF NOT EXISTS idx_follow_ups_linked_task ON follow_ups(linked_task_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_follow_ups_dedup ON follow_ups(dedup_key) WHERE dedup_key IS NOT NULL",
     # file modification audit trail
     "CREATE INDEX IF NOT EXISTS idx_file_mod_path ON file_modifications(file_path)",
     "CREATE INDEX IF NOT EXISTS idx_file_mod_session ON file_modifications(session_id)",

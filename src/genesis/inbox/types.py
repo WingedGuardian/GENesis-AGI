@@ -35,6 +35,11 @@ class InboxConfig:
     response_dir: str = "_genesis"
     check_interval_seconds: int = 1800
     batch_size: int = 5
+    # Max evaluation *items* (URLs / prose blocks) per CC call. A file's delta
+    # is segmented into items and grouped into batches of this size, so a
+    # 16-URL drop becomes ~4 evals instead of one mega-batch. ``batch_size``
+    # above is legacy (files-per-cycle) and no longer governs eval grouping.
+    items_per_eval: int = 5
     enabled: bool = True
     model: str = "sonnet"
     effort: str = "high"
@@ -55,15 +60,21 @@ class InboxItem:
     content_hash: str
     detected_at: str
     source_content: str = ""
-    """Full file content at detection time.
+    """The lines this item/batch owns, used both for the eval prompt and for
+    the per-batch baseline merge at completion.
 
-    For new files this equals ``content``.  For modified files
-    ``content`` holds only the delta while ``source_content``
-    preserves the complete file snapshot captured during Phase 3.
-    Used at completion to build a cumulative evaluated-content
-    baseline that survives mid-evaluation file changes (e.g. rclone
-    sync clearing the source while a CC session is running).
+    In the URL-level model an item is ONE eval-batch (<= items_per_eval
+    segmented items from a file's delta), so ``content`` and ``source_content``
+    are the same batch slice — merging ``source_content`` into the file
+    baseline marks exactly this batch's lines evaluated, leaving a failed
+    sibling batch's lines un-baselined for retry.
     """
+    drop_id: str = ""
+    """Groups the eval-batches carved from one file's delta. All batches of a
+    drop share one approval; empty for legacy/singleton rows."""
+    approval_reqid: str = ""
+    """For resume batches: the approval request id (from the awaiting marker)
+    so the drop's approval is consumed once after dispatch."""
 
 
 @dataclass(frozen=True)
