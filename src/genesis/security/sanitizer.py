@@ -9,11 +9,28 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 from dataclasses import dataclass
 
 from genesis.security.patterns import InjectionPattern, load_default_patterns
 
 logger = logging.getLogger(__name__)
+
+# Matches an <external-content …> open tag or its closing tag. Used to strip
+# any pre-existing boundary markers before (re-)wrapping, so content that was
+# already wrapped at an upstream ingestion point (e.g. WebFetcher) is never
+# double-wrapped into nested tags that blur the data/instruction boundary.
+_BOUNDARY_MARKER_RE = re.compile(r"<external-content[^>]*>|</external-content>")
+
+
+def strip_boundary_markers(text: str) -> str:
+    """Remove any existing ``<external-content>`` boundary markers from text.
+
+    Idempotent companion to :meth:`ContentSanitizer.wrap_content` — call this
+    before wrapping content that may already carry markers from an upstream
+    ingestion point, to avoid nested wrappers that confuse the LLM boundary.
+    """
+    return _BOUNDARY_MARKER_RE.sub("", text)
 
 
 class ContentSource(enum.Enum):

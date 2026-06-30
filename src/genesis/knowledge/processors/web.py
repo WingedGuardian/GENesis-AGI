@@ -11,6 +11,7 @@ import os
 import re
 
 from genesis.knowledge.processors.base import ProcessedContent
+from genesis.security.sanitizer import strip_boundary_markers
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ class WebProcessor:
         text = result.text
         title = result.title
         escalated = False
-        stripped = re.sub(r"<external-content[^>]*>|</external-content>", "", text).strip()
+        stripped = strip_boundary_markers(text).strip()
         if len(stripped) < _THIN_CONTENT_THRESHOLD:
             cf_text = await self._try_cloudflare_markdown(source)
             if cf_text:

@@ -14,7 +14,36 @@ from genesis.security.sanitizer import (
     ContentSanitizer,
     ContentSource,
     SanitizationResult,
+    strip_boundary_markers,
 )
+
+
+# ---------------------------------------------------------------------------
+# strip_boundary_markers — idempotent un-wrap helper
+# ---------------------------------------------------------------------------
+class TestStripBoundaryMarkers:
+    def test_no_markers_unchanged(self):
+        assert strip_boundary_markers("plain text") == "plain text"
+
+    def test_single_wrapper_stripped(self):
+        wrapped = '<external-content source="web_fetch" risk="0.6">hi</external-content>'
+        assert strip_boundary_markers(wrapped) == "hi"
+
+    def test_nested_wrappers_all_stripped(self):
+        nested = (
+            '<external-content source="unknown" risk="0.5">'
+            '<external-content source="web_fetch" risk="0.6">payload</external-content>'
+            '</external-content>'
+        )
+        assert strip_boundary_markers(nested) == "payload"
+
+    def test_strip_then_wrap_is_single(self):
+        """ContentSanitizer.wrap_content(strip(...)) never nests."""
+        s = ContentSanitizer()
+        once = s.wrap_content("data", ContentSource.WEB_FETCH)
+        twice = s.wrap_content(strip_boundary_markers(once), ContentSource.WEB_FETCH)
+        assert twice.count("<external-content") == 1
+        assert twice.count("</external-content>") == 1
 
 
 # ---------------------------------------------------------------------------
