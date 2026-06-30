@@ -82,21 +82,18 @@ async def ingest_knowledge_unit(
     # PR); ingestion is never blocked.
     try:
         scan = _SANITIZER.sanitize(content, ContentSource.UNKNOWN)
-        if scan.detected_patterns:
-            # This chokepoint also ingests reference-store credentials, so the
-            # log MUST carry nothing derived from `content` — emit only a count
-            # and the numeric risk score (no pattern strings, no content).
-            logger.warning(
-                "Injection patterns detected in ingested knowledge unit "
-                "(project=%s domain=%s, count=%d, risk=%.3f)",
-                project, domain, len(scan.detected_patterns), scan.risk_score,
-            )
-    except Exception as exc:
-        # No exc_info / message — a traceback could embed the (possibly secret)
-        # content. The exception class name is enough to triage a scan failure.
+        detected = bool(scan.detected_patterns)
+    except Exception:
+        detected = False
+    # This chokepoint also ingests reference-store credentials. The
+    # SanitizationResult holds the original content, so NOTHING derived from the
+    # scan (patterns, risk score, exception) may be logged — emit provenance
+    # (project/domain) only, which carries no content. Detection is never blocked.
+    if detected:
         logger.warning(
-            "Injection scan failed for knowledge unit (project=%s domain=%s): %s (fail-open)",
-            project, domain, type(exc).__name__,
+            "Injection patterns detected in ingested knowledge unit "
+            "(project=%s domain=%s)",
+            project, domain,
         )
 
     now_iso = datetime.now(UTC).isoformat()
