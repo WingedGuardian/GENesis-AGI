@@ -88,6 +88,46 @@ async def test_failover_returns_peer_reply_and_records_state(loop, invoker, db):
 
 
 @pytest.mark.asyncio
+async def test_failover_reassembles_identity_on_resume(loop, invoker, monkeypatch):
+    # A RESUME turn carries system_prompt=None; the fresh peer session must get
+    # Genesis identity re-assembled, not run as a vanilla agent.
+    captured: dict = {}
+
+    def _spy(home, base, *a, **k):
+        captured["system_prompt"] = base.system_prompt
+        return [("glm-5.2", _PEER_INV)]
+
+    # Turn 1: establish a resumable session (home=claude success, no routing persist).
+    invoker.run = AsyncMock(return_value=_output(
+        text="hi", session_id="cc-1", roster_model="claude",
+    ))
+    await loop.handle_message("hello", user_id="u1", channel=ChannelType.TERMINAL)
+
+    # Turn 2: the resume turn is rate-limited (system_prompt=None) → failover.
+    monkeypatch.setattr(roster, "failover_invocations", _spy)
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"), _output(text="peer reply", session_id="glm-1"),
+    ])
+    result = await loop.handle_message("again", user_id="u1", channel=ChannelType.TERMINAL)
+    assert "peer reply" in result
+    assert captured["system_prompt"] is not None  # identity re-assembled
+    assert "You are Genesis." in captured["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_failover_skips_sticky_persist_without_session_id(loop, invoker, db):
+    # A peer that returns no session_id must NOT persist an unusable sticky entry.
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"), _output(text="peer", session_id=""),
+    ])
+    result = await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+    assert "peer" in result
+    row = await cc_sessions.get_active_foreground(db, user_id="u1", channel="terminal")
+    assert ConversationLoop._session_fallback_session(row) is None
+    assert fallback_state.read().is_fallback is True  # account-wide flag still set
+
+
+@pytest.mark.asyncio
 async def test_all_peers_fail_falls_through_to_contingency(loop, invoker):
     # Home AND peer rate-limited → no successful switch → degraded path, no state.
     invoker.run = AsyncMock(side_effect=CCRateLimitError("limit"))

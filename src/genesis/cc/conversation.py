@@ -239,6 +239,7 @@ class ConversationLoop:
                 # the degraded contingency path. None → fall through to contingency.
                 roster_reply = await self._try_roster_failover(
                     invocation, session=session, channel=channel,
+                    model=model, effort=effort, prompt_text=prompt_text,
                 )
                 if roster_reply is not None:
                     return roster_reply
@@ -538,7 +539,8 @@ class ConversationLoop:
                 if not streamed["text"]:
                     roster_reply = await self._try_roster_failover(
                         invocation, session=session, channel=channel,
-                        on_event=_failover_tracked,
+                        model=model, effort=effort, prompt_text=prompt_text,
+                        on_event=_failover_tracked, streamed=streamed,
                     )
                     if roster_reply is not None:
                         return roster_reply
@@ -817,11 +819,13 @@ class ConversationLoop:
         *,
         sticky: dict | None,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None,
+        streamed: dict | None = None,
     ) -> Any:
         """Run one peer turn. If this conversation has a STICKY session for THIS
         peer, resume it for continuity; on a stale resume (non-rate-limit CCError)
-        retry once FRESH on the same peer. Rate-limit/quota propagate to the caller
-        (which moves to the next peer)."""
+        retry once FRESH on the same peer — UNLESS answer text already streamed (a
+        fresh retry would re-stream and double-output). Rate-limit/quota propagate
+        to the caller (which moves to the next peer)."""
         inv = peer_inv  # fresh by default (failover_invocations set resume=None)
         if (
             sticky
@@ -834,8 +838,10 @@ class ConversationLoop:
         except (CCRateLimitError, CCQuotaExhaustedError):
             raise
         except CCError:
-            if inv.resume_session_id is None:
-                raise  # already fresh — nothing to recover
+            # Don't re-stream: nothing to recover if already fresh, and never retry
+            # once answer text has reached the user (would double-output).
+            if inv.resume_session_id is None or (streamed and streamed.get("text")):
+                raise
             logger.warning(
                 "failover peer %s sticky resume failed — retrying fresh", peer_name,
             )
@@ -847,7 +853,11 @@ class ConversationLoop:
         *,
         session: dict,
         channel: ChannelType,
+        model: CCModel,
+        effort: EffortLevel,
+        prompt_text: str,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+        streamed: dict | None = None,
     ) -> str | None:
         """STICKY conversation failover. During an account-wide home-model outage,
         run the turn on a roster peer (full tools) BEFORE the degraded contingency
@@ -856,30 +866,57 @@ class ConversationLoop:
         try:
             from genesis.cc import fallback_state
             home = roster.active_model()
+            # A resume turn carries no system prompt (identity lives in the home CC
+            # session being resumed). The peer runs a FRESH session, so re-assemble
+            # the identity/context — otherwise the peer answers with no Genesis
+            # persona/instructions.
+            if base_inv.system_prompt is None:
+                system_prompt = await self._assembler.assemble(
+                    db=self._db, model=str(model), effort=str(effort),
+                    session_id=session["id"],
+                )
+                system_prompt = await self._enrich_with_context(
+                    system_prompt, prompt_text,
+                )
+                base_inv = replace(base_inv, system_prompt=system_prompt)
             peers = roster.failover_invocations(home, base_inv)
             if not peers:
                 return None
             sticky = self._session_fallback_session(session)
             for peer_name, peer_inv in peers:
+                if streamed and streamed.get("text"):
+                    break  # a prior peer already streamed answer text — can't fail
+                    # over to another without double-output; degrade instead.
                 try:
                     output = await self._run_failover_peer(
-                        peer_name, peer_inv, sticky=sticky, on_event=on_event,
+                        peer_name, peer_inv, sticky=sticky,
+                        on_event=on_event, streamed=streamed,
                     )
                 except (CCRateLimitError, CCQuotaExhaustedError):
                     continue  # this peer is also down → try the next one
                 except CCError:
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
                     continue
-                # Success on this peer — persist the sticky session for continuity
-                # (per-session, NOT the global flag; home identity stays unchanged).
+                # Success on this peer. Record the account-wide flag + this session's
+                # sticky peer session (only with a real session id, else continuity
+                # can't resume). Home identity in cc_sessions stays on Claude.
                 transitioned = fallback_state.enter(home, peer_name, "rate_limit")
-                await self._merge_session_metadata(
-                    session["id"],
-                    {"fallback_session": {
-                        "cc_session_id": output.session_id,
-                        "roster_model": peer_name,
-                    }},
-                )
+                if output.session_id:
+                    await self._merge_session_metadata(
+                        session["id"],
+                        {"fallback_session": {
+                            "cc_session_id": output.session_id,
+                            "roster_model": peer_name,
+                        }},
+                    )
+                # Keep the session fresh. Cost + triage are intentionally NOT recorded
+                # for failover turns: CC's cost_usd is bogus for routed models, and
+                # triage must not attribute a peer model's output to the home model's
+                # learning signal.
+                try:
+                    await self._session_mgr.update_activity(session["id"])
+                except Exception:
+                    logger.debug("activity update on failover failed", exc_info=True)
                 if transitioned:
                     await self._fire_fallback_alert(
                         topic="cc_fallback_switch",

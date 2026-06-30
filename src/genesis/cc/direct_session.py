@@ -996,6 +996,16 @@ class DirectSessionRunner:
         if request.roster_model is not None:
             routing = roster.overrides_for(request.roster_model)
             roster_eligible = bool(routing)
+            # interact forces Opus for browser/ATS reasoning; a routed roster_model
+            # overrides the endpoint and defeats that guarantee — surface it loudly
+            # rather than silently running the peer model for a capability-sensitive
+            # profile.
+            if routing and request.profile == "interact":
+                logger.warning(
+                    "interact profile dispatched with roster_model=%s — running on "
+                    "the peer model instead of Opus; browser/ATS reasoning may degrade",
+                    request.roster_model,
+                )
 
         return CCInvocation(
             prompt=prompt,
