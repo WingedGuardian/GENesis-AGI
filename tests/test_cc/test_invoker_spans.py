@@ -93,7 +93,11 @@ async def test_run_records_cc_session_span_with_output_cost(tmp_path, monkeypatc
 
             monkeypatch.setattr(invoker, "_run_inner", _fake_inner)
             out = await invoker.run(CCInvocation(prompt="hi"))
-            assert out is fake
+            # run() stamps the selected roster model onto the output (native here).
+            assert out.roster_model == "claude"
+            assert (out.session_id, out.cost_usd, out.model_used) == (
+                fake.session_id, fake.cost_usd, fake.model_used,
+            )
 
             if writer._flush_task is not None:
                 with contextlib.suppress(Exception):

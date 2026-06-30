@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import aiosqlite
 
 
@@ -182,6 +184,40 @@ async def clear_cc_session_id(
     cursor = await db.execute(
         "UPDATE cc_sessions SET cc_session_id = NULL WHERE id = ?",
         (id,),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def merge_metadata(
+    db: aiosqlite.Connection,
+    id: str,
+    patch: dict,
+) -> bool:
+    """Shallow read-merge-write a patch into the session's JSON ``metadata``.
+
+    Used to persist roster endpoint context (model-diversification) without a
+    migration. Tolerates absent/corrupt existing metadata (treats as ``{}``).
+    Returns True if the row exists and was updated.
+    """
+    cursor = await db.execute(
+        "SELECT metadata FROM cc_sessions WHERE id = ?", (id,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return False
+    existing: dict = {}
+    if row[0]:
+        try:
+            loaded = json.loads(row[0])
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (json.JSONDecodeError, TypeError):
+            existing = {}
+    existing.update(patch)
+    cursor = await db.execute(
+        "UPDATE cc_sessions SET metadata = ? WHERE id = ?",
+        (json.dumps(existing), id),
     )
     await db.commit()
     return cursor.rowcount > 0

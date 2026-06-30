@@ -1,0 +1,26 @@
+# CC model roster — first-class model diversification (run non-Anthropic models
+# behind Claude Code). Managed via the `cc_roster` settings domain.
+#
+# `default` is the active model when none is chosen. `models` defines each
+# roster member. Claude = the native Anthropic Max subscription (no overrides).
+# Other members are reached via their NATIVE Anthropic-compatible endpoint:
+#   anthropic_base_url — the provider's Anthropic-compatible base URL
+#   auth_env           — name of the secrets.env var holding the API key
+#                        (the token VALUE is never stored here)
+#   model_id           — the provider's model id (sent via ANTHROPIC_MODEL)
+# Selection + failover happen in genesis.cc.roster (policy layer); the invoker
+# only honors the resolved fields. failover_order: lower = tried first when the
+# active model rate-limits/exhausts (0 = primary; skipped as a failover peer is
+# not done — claude IS a valid peer when something else is active).
+default: claude
+models:
+  claude:
+    native_subscription: true
+    failover_order: 0
+    validated: "2026-06-29"
+  glm-5.2:
+    anthropic_base_url: "https://open.bigmodel.cn/api/anthropic"
+    auth_env: ZHIPU_API_KEY
+    model_id: glm-5.2
+    failover_order: 1
+    validated: "2026-06-29"

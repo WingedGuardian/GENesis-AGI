@@ -138,6 +138,22 @@ class CCInvocation:
     append_system_prompt: bool = False
     stream_idle_timeout_ms: int | None = None
     anthropic_base_url: str | None = None  # Proxy URL override (ANTHROPIC_BASE_URL)
+    # Model-roster routing (model diversification). When set, the CC subprocess
+    # is pointed at a non-Anthropic provider via its native Anthropic-compatible
+    # endpoint: anthropic_auth_token → ANTHROPIC_AUTH_TOKEN; model_id_override →
+    # the provider's model id via ANTHROPIC_MODEL (NOT --model, which the CLI
+    # would let win over the env var). Resolved by the roster policy layer
+    # (genesis.cc.roster.apply_active) at the CCInvoker chokepoint; the invoker
+    # only honors these fields, never selects.
+    # anthropic_auth_token is repr=False: it holds a live provider token at
+    # runtime, so it must never surface in an accidental log/repr of the invocation.
+    anthropic_auth_token: str | None = field(default=None, repr=False)
+    model_id_override: str | None = None
+    # Opt-in to roster routing. apply_active() (at the invoker chokepoint) is a
+    # no-op for invocations with roster_eligible=False — so only the surfaces that
+    # opt in (foreground conversation, background DirectSession) are routed; every
+    # other CC call site stays Claude-native until a dedicated activation pass.
+    roster_eligible: bool = False
     # cc-loop-01: opaque per-session key for the invoker's proc registry, so an
     # interrupt (e.g. Telegram /stop) targets THIS session's subprocess and not
     # a concurrent background one. None → keyed by pid (never cross-fired).
@@ -197,6 +213,11 @@ class CCOutput:
     model_requested: str = ""
     downgraded: bool = False
     via_proxy: bool = False
+    # The roster model NAME selected at the chokepoint (genesis.cc.roster) — e.g.
+    # "claude" (native) or "glm-5.2". Ground truth for what we ROUTED to (set from
+    # apply_active), independent of the provider's self-reported model_used, which
+    # may be a variant string or empty. Used for resume-endpoint persistence.
+    roster_model: str = ""
 
 
 @dataclass(frozen=True)
