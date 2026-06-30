@@ -52,5 +52,7 @@ calibration_injection_enabled: true
 # the capability map is unchanged (original 5 sources). capability_map is
 # display-only, so enabling this only adjusts the self-performance numbers the
 # ego sees in its context — no control-flow gate keys off it. Live — takes
-# effect next capability-map refresh.
+# effect at the next capability-map refresh (9:15/21:15), no restart needed.
+# NOTE: settings_update marks the whole ego domain "restart required"; that is
+# not true for THIS field — the refresh job re-reads the config each run.
 outcome_bus_capability_feed: false

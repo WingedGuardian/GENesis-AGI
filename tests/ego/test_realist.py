@@ -273,9 +273,17 @@ class TestTabledProposalBoard:
 
 class TestCapabilityMapFix:
     @pytest.mark.asyncio
-    async def test_withdrawn_excluded_from_denominator(self, db):
+    async def test_withdrawn_excluded_from_denominator(self, db, monkeypatch):
         """Withdrawn/tabled proposals don't inflate failure rate."""
         from genesis.ego.capability_aggregator import compute_capability_map
+        from genesis.ego.types import EgoConfig
+
+        # Hermetic: pin the Outcome Bus 6th-source flag OFF so this test never
+        # reads a live ego.local.yaml that has it enabled.
+        monkeypatch.setattr(
+            "genesis.ego.config.load_ego_config",
+            lambda *a, **k: EgoConfig(outcome_bus_capability_feed=False),
+        )
 
         # Create proposals: 1 approved, 1 rejected, 3 withdrawn
         await ego_crud.create_proposal(

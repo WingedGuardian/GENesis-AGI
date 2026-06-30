@@ -126,13 +126,23 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
     # unchanged. Scoped to source='surplus' — the only clean-new tier-1 domain.
     # ego_proposals + cc_sessions tier-1 rows are ALREADY sources #2/#5, so an
     # all-source read would double-count them; the source filter prevents that.
+    # Config read and the DB read are in SEPARATE try blocks so a config failure
+    # (which keeps the flag OFF) is not misdiagnosed as "outcome_events missing".
+    outcome_bus_enabled = False
     try:
         from genesis.ego.config import load_ego_config
 
         cfg = load_ego_config()
         # Default OFF: enable ONLY on an explicit True (a YAML null / missing key
         # / falsey value all keep it off, so it can't be silently enabled).
-        if getattr(cfg, "outcome_bus_capability_feed", False) is True:
+        outcome_bus_enabled = (
+            getattr(cfg, "outcome_bus_capability_feed", False) is True
+        )
+    except Exception:
+        logger.debug("Capability aggregation: ego config unreadable; outcome bus OFF")
+
+    if outcome_bus_enabled:
+        try:
             from genesis.db.crud import outcome_events as oe_crud
 
             rows = await oe_crud.aggregate_by_domain(
@@ -153,8 +163,8 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
                     continue
                 acc = domains.setdefault(domain, _DomainAccumulator(domain))
                 acc.add_signal("outcomes", rate, n)
-    except Exception:
-        logger.debug("Capability aggregation: outcome_events unavailable")
+        except Exception:
+            logger.debug("Capability aggregation: outcome_events unavailable")
 
     # Compute composite scores
     results = []
