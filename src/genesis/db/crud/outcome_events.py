@@ -160,6 +160,14 @@ async def aggregate_by_domain(
     restricts to a single producer (e.g. ``source='surplus'``) so a consumer can
     fold in one clean domain without double-counting producers it already
     aggregates by other means.
+
+    Note on surplus "hollow" tasks: an insight task that ran but produced nothing
+    useful emits TWO tier-1 rows — a positive EXECUTION_OUTCOME ("it ran") and a
+    negative VERIFICATION_FAILED ("output was useless") — so it shows up here as
+    ``n=2, positive=1, negative=1, avg_value≈0.5`` by design. A useful task is
+    ``n=1, avg_value=1.0``; a hard failure is ``n=1, avg_value=0.0``. Read
+    ``avg_value`` (or ``positive``/``negative``), not ``positive/n``, to rank
+    domain quality — the latter understates useful tasks relative to hollow ones.
     """
     sql = """
         SELECT domain,

@@ -98,6 +98,25 @@ async def test_mark_completed(db):
     assert row["status"] == "completed"
     assert row["completed_at"] == "2026-03-04T00:02:00Z"
     assert row["result_staging_id"] == "rs-1"
+    # Backward-compatible default: no verdict passed → NULL.
+    assert row["outcome_quality"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["useful", "hollow"])
+async def test_mark_completed_records_outcome_quality(db, verdict):
+    await surplus_tasks.create(
+        db, id="st-q", task_type="brainstorm_self", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-03-04T00:00:00Z",
+    )
+    ok = await surplus_tasks.mark_completed(
+        db, "st-q", completed_at="2026-03-04T00:02:00Z",
+        result_staging_id="rs-q", outcome_quality=verdict,
+    )
+    assert ok is True
+    row = await surplus_tasks.get_by_id(db, "st-q")
+    assert row["status"] == "completed"
+    assert row["outcome_quality"] == verdict
 
 
 @pytest.mark.asyncio

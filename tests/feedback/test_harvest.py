@@ -80,16 +80,17 @@ async def _add_outreach(
 
 async def _add_surplus(
     db, *, tid, status, task_type="code_audit", failure_reason=None,
-    completed_at=None, created_at=None,
+    completed_at=None, created_at=None, outcome_quality=None,
 ):
     created_at = created_at or _recent(hours=2)
     completed_at = completed_at if completed_at is not None else _recent(hours=1)
     await db.execute(
         "INSERT INTO surplus_tasks "
         "(id, task_type, compute_tier, priority, drive_alignment, status, "
-        " failure_reason, created_at, completed_at) "
-        "VALUES (?, ?, 'local', 0.5, 'curiosity', ?, ?, ?, ?)",
-        (tid, task_type, status, failure_reason, created_at, completed_at),
+        " failure_reason, created_at, completed_at, outcome_quality) "
+        "VALUES (?, ?, 'local', 0.5, 'curiosity', ?, ?, ?, ?, ?)",
+        (tid, task_type, status, failure_reason, created_at, completed_at,
+         outcome_quality),
     )
     await db.commit()
 
@@ -306,6 +307,84 @@ class TestHarvestSurplusTasks:
         assert await oe.count(db) == 0
         await OutcomeHarvester(db).run_backfill()
         assert await oe.count(db) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Surplus verified-correctness (#4 — the second, orthogonal axis)
+# --------------------------------------------------------------------------- #
+class TestSurplusVerifiedCorrectness:
+    @pytest.mark.asyncio
+    async def test_hollow_emits_positive_AND_verification_failed(self, db):
+        # A completed insight task whose output was hollow gets BOTH the usual
+        # EXECUTION_OUTCOME positive ("it ran") and an additional, discriminative
+        # VERIFICATION_FAILED negative ("output was useless").
+        await _add_surplus(
+            db, tid="h1", status="completed", task_type="brainstorm_self",
+            outcome_quality="hollow",
+        )
+        await OutcomeHarvester(db).run_backfill()
+
+        assert await oe.count_by_signal_type(db) == {
+            "execution_outcome": 1, "verification_failed": 1,
+        }
+        rows = await oe.recent(db, limit=10)
+        vf = next(r for r in rows if r["signal_type"] == "verification_failed")
+        assert vf["signal_tier"] == 1
+        assert vf["polarity"] == "negative"
+        assert vf["value"] == 0.0
+        assert vf["domain"] == "brainstorm_self"
+        assert vf["source"] == "surplus"
+        assert vf["harvested_from"] == "surplus_tasks"
+        assert vf["stated_confidence"] is None  # excluded from calibration
+        eo = next(r for r in rows if r["signal_type"] == "execution_outcome")
+        assert eo["polarity"] == "positive" and eo["value"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_useful_is_positive_only(self, db):
+        await _add_surplus(
+            db, tid="u1", status="completed", task_type="brainstorm_self",
+            outcome_quality="useful",
+        )
+        await OutcomeHarvester(db).run_backfill()
+        assert await oe.count_by_signal_type(db) == {"execution_outcome": 1}
+
+    @pytest.mark.asyncio
+    async def test_legacy_null_is_positive_only(self, db):
+        # Legacy / action / intake-failure / empty rows (NULL outcome_quality)
+        # keep the original positive-only behaviour — no retroactive negatives.
+        await _add_surplus(
+            db, tid="l1", status="completed", task_type="code_audit",
+            outcome_quality=None,
+        )
+        await OutcomeHarvester(db).run_backfill()
+        assert await oe.count_by_signal_type(db) == {"execution_outcome": 1}
+
+    @pytest.mark.asyncio
+    async def test_failed_hollow_does_not_double_emit(self, db):
+        # Defensive: outcome_quality is only ever set on completed rows, but a
+        # (failed, hollow) row must NOT add a verification_failed — a failure is
+        # already the negative; verification applies to COMPLETED work only.
+        await _add_surplus(
+            db, tid="f1", status="failed", task_type="code_audit",
+            outcome_quality="hollow", failure_reason="boom",
+        )
+        await OutcomeHarvester(db).run_backfill()
+        assert await oe.count_by_signal_type(db) == {"execution_outcome": 1}
+
+    @pytest.mark.asyncio
+    async def test_hollow_idempotent_across_reruns(self, db):
+        # The two signals coexist under the (source, ref_type, ref_id, signal_type)
+        # unique key and neither dup-suppresses the other on incremental re-scan.
+        await _add_surplus(
+            db, tid="h2", status="completed", task_type="code_audit",
+            outcome_quality="hollow",
+        )
+        await OutcomeHarvester(db).run()
+        await OutcomeHarvester(db).run()  # re-scan same window
+        assert await oe.count(db) == 2
+        assert await oe.count_by_signal_type(db) == {
+            "execution_outcome": 1, "verification_failed": 1,
+        }
 
 
 # --------------------------------------------------------------------------- #
