@@ -481,6 +481,12 @@ async def get_recent_completed(
     """Return recently completed inbox items with response paths.
 
     Used by the inbox digest tool to show what was evaluated recently.
+
+    Windows and orders by processed_at (completion time), not created_at: a
+    reused retriable-failed row keeps its old created_at (reuse_as_pending), so
+    a freshly-completed reused eval would otherwise fall outside the day window
+    and disappear from the digest. Rows here always have a response_path, hence
+    a non-null processed_at. See get_evaluated_content.
     """
     cursor = await db.execute(
         """SELECT id, file_path, response_path, batch_id,
@@ -488,8 +494,8 @@ async def get_recent_completed(
            FROM inbox_items
            WHERE status = 'completed'
              AND response_path IS NOT NULL
-             AND created_at >= datetime('now', ? || ' days')
-           ORDER BY created_at DESC LIMIT ?""",
+             AND processed_at >= datetime('now', ? || ' days')
+           ORDER BY processed_at DESC LIMIT ?""",
         (f"-{days}", limit),
     )
     return [dict(row) for row in await cursor.fetchall()]

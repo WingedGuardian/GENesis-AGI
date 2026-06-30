@@ -126,3 +126,24 @@ async def test_get_last_completed_at_uses_processed_at(db):
                      processed_at="2026-06-30T16:00:00+00:00", content="x")
     last = await inbox_items.get_last_completed_at(db, _FP)
     assert last == "2026-06-30T17:39:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_get_recent_completed_windows_on_processed_at(db):
+    # A reused row keeps an ancient created_at but is COMPLETED now. The digest
+    # windows on the last N days; ordering/filtering by created_at would drop it.
+    from datetime import UTC, datetime
+    now = datetime.now(UTC).isoformat()
+    await inbox_items.create(
+        db, id="reused", file_path=_FP, content_hash="h", status="completed",
+        created_at="2026-03-18T00:00:00+00:00",
+    )
+    await inbox_items.set_response_path(
+        db, "reused", response_path="r-reused", processed_at=now,
+        evaluated_content="x",
+    )
+    recent = await inbox_items.get_recent_completed(db, days=7)
+    assert any(r["id"] == "reused" for r in recent), (
+        "a reused eval completed today must appear in the digest even though "
+        "its created_at is old"
+    )
