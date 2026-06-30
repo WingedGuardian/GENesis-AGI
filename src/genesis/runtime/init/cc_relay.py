@@ -81,6 +81,18 @@ async def init(rt: GenesisRuntime) -> None:
             on_cc_status_change=_on_cc_status_change,
             on_model_downgrade=_on_model_downgrade,
         )
+
+        # CC fallback recovery safety probe — clears a stale account-wide fallback
+        # flag during total idle (no foreground/background home calls to detect
+        # Anthropic recovery on their own). Slow cadence; no-op unless in fallback.
+        try:
+            from genesis.resilience.cc_fallback_probe import CCFallbackProbeWorker
+
+            rt._cc_fallback_probe_worker = CCFallbackProbeWorker(invoker=rt._cc_invoker)
+            rt._cc_fallback_probe_worker.start()
+        except Exception:
+            logger.warning("Failed to start CC fallback probe worker", exc_info=True)
+
         rt._session_manager = SessionManager(
             db=rt._db,
             invoker=rt._cc_invoker,

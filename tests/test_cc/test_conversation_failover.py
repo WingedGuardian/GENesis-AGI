@@ -178,17 +178,21 @@ async def test_streaming_failover_when_nothing_streamed(loop, invoker):
 
 
 @pytest.mark.asyncio
-async def test_recovery_clears_state_and_alerts(loop, invoker):
+async def test_recovery_clears_state_and_alerts(loop, invoker, monkeypatch):
     # Pre-existing fallback → a successful HOME turn clears it + fires recovery ALERT.
+    # Recovery now routes through the shared helper (foreground/background/probe all
+    # share genesis.cc.fallback_recovery), so assert on that module function.
     fallback_state.enter("claude", "glm-5.2", "rate_limit")
     assert fallback_state.read().is_fallback is True
+    fired = AsyncMock()
+    monkeypatch.setattr("genesis.cc.fallback_recovery.fire_fallback_alert", fired)
     invoker.run = AsyncMock(return_value=_output(
         text="home reply", roster_model="claude", session_id="cc-home",
     ))
     result = await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
     assert "home reply" in result
     assert fallback_state.read().is_fallback is False
-    loop._fire_fallback_alert.assert_awaited()  # recovery ALERT
+    fired.assert_awaited()  # recovery ALERT via shared helper
 
 
 @pytest.mark.asyncio

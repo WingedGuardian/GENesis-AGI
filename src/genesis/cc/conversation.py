@@ -937,45 +937,27 @@ class ConversationLoop:
             return None
 
     async def _maybe_clear_fallback(self, session: dict) -> None:
-        """On a successful HOME-model turn, clear any prior fallback — the account-
-        wide flag AND this session's sticky peer session — and fire one recovery
-        ALERT. Reached only when the home invocation actually succeeded (= genuine
-        recovery; failover returns early and never falls through to here)."""
+        """On a successful HOME-model turn, clear any prior fallback — this session's
+        sticky peer session (foreground-specific) AND the account-wide flag (via the
+        shared helper, which fires one recovery ALERT). Reached only when the home
+        invocation actually succeeded (= genuine recovery; failover returns early and
+        never falls through to here)."""
         try:
-            from genesis.cc import fallback_state
             if self._session_fallback_session(session) is not None:
                 await self._merge_session_metadata(
                     session["id"], {"fallback_session": None},
                 )
-            if fallback_state.clear():
-                await self._fire_fallback_alert(
-                    topic="cc_fallback_recovery",
-                    context=(
-                        "<b>CC recovered</b>\n\nThe home model is back — replies are "
-                        "running on it again."
-                    ),
-                )
+            from genesis.cc.fallback_recovery import note_home_recovery
+            await note_home_recovery()
         except Exception:
             logger.warning("fallback recovery handling failed", exc_info=True)
 
     async def _fire_fallback_alert(self, *, topic: str, context: str) -> None:
-        """Fire-and-forget ALERT via the outreach pipeline (never crash the turn).
-        ConversationLoop holds no outreach ref, so reach it via the runtime
-        singleton — mirrors the idle-detector access pattern in handle_message."""
-        try:
-            from genesis.runtime import GenesisRuntime
-            pipeline = getattr(GenesisRuntime.instance(), "_outreach_pipeline", None)
-            if pipeline is None:
-                return
-            from genesis.outreach.types import OutreachCategory, OutreachRequest
-            await pipeline.submit(OutreachRequest(
-                category=OutreachCategory.ALERT,
-                topic=topic,
-                context=context,
-                salience_score=0.9,
-            ))
-        except Exception:
-            logger.debug("fallback ALERT dispatch failed", exc_info=True)
+        """Fire-and-forget CC-fallback ALERT (never crash the turn). Delegates to the
+        shared module helper — same impl used for the switch alert here and for
+        background/probe recovery in genesis.cc.fallback_recovery."""
+        from genesis.cc.fallback_recovery import fire_fallback_alert
+        await fire_fallback_alert(topic=topic, context=context)
 
     async def _recover_stale_resume(
         self,

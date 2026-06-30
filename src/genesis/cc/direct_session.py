@@ -690,6 +690,20 @@ class DirectSessionRunner:
             # Persist result in session metadata (merge, don't overwrite)
             await self._store_result(session_id, request, result)
 
+            # Turn-independent fallback recovery: a successful run on the HOME model
+            # proves it's back (no foreground conversation turn needed). "Home" is the
+            # rate-limited model recorded at failover (state.original) — which may be a
+            # roster PEER when the configured default is non-Claude, NOT necessarily
+            # native Claude. A success on any OTHER model (incl. an intentional native
+            # pin while a peer is the down home) must NOT clear the fallback.
+            if result.success:
+                from genesis.cc import fallback_state
+                from genesis.cc.fallback_recovery import note_home_recovery
+
+                st = fallback_state.read()
+                if st.is_fallback and result.roster_model == (st.original or roster.CLAUDE):
+                    await note_home_recovery()
+
             # Feed outcome back to ego proposal if this was a proposal dispatch
             await self._record_proposal_outcome(request, result)
 
