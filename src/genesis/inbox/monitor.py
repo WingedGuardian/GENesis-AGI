@@ -873,6 +873,7 @@ class InboxMonitor:
                 await inbox_items.reuse_as_pending(
                     self._db, row_id, drop_id=drop_id,
                     batch_items=batch_text, content_hash=content_hash,
+                    created_at=now_iso,
                 )
             else:
                 row_id = str(uuid.uuid4())

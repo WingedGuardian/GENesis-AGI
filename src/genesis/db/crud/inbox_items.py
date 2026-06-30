@@ -298,13 +298,17 @@ async def get_last_completed_at(
     Includes both normal evaluations (with response files) and Acknowledged
     items (no response file) so cooldown applies uniformly.
 
-    Orders by processed_at (completion time), not created_at, so a reused row
-    (which keeps its old created_at via reuse_as_pending) doesn't make the
-    cooldown read a stale completion time. See get_evaluated_content.
+    Orders by processed_at (completion time), not created_at, so a row that was
+    detected long ago but completed recently (e.g. parked for approval, then
+    approved) reports its true completion time. The ``processed_at IS NOT NULL``
+    guard excludes the meta completed rows (empty-file / no-new-content) that
+    are written without a processed_at — without it those NULLs (which sort last
+    under DESC) could leak as the return value when no real completion exists.
     """
     cursor = await db.execute(
         """SELECT processed_at FROM inbox_items
            WHERE file_path = ? AND status = 'completed'
+             AND processed_at IS NOT NULL
            ORDER BY processed_at DESC, created_at DESC LIMIT 1""",
         (file_path,),
     )
@@ -437,20 +441,29 @@ async def reuse_as_pending(
     drop_id: str,
     batch_items: str,
     content_hash: str,
+    created_at: str,
 ) -> bool:
     """Re-arm a retriable failed row as a fresh pending batch.
 
     Preserves ``retry_count`` (the cap survives) but re-points the row at the
-    new drop, batch slice and content hash and clears the error. This is the
-    per-batch analogue of the old single-row reuse — it keeps retries from
-    piling up duplicate rows.
+    new drop, batch slice and content hash, clears the error, and **resets
+    ``created_at`` to now** — the row represents a NEW evaluation attempt as of
+    now, so its created_at must reflect the re-arm time. This restores the
+    invariant "created_at = this row's current detection/arming time" that the
+    rest of the system relies on for created_at-ordered "latest row" reads
+    (get_by_file_path → supersede), recency windows (count_url_failures), and
+    expire_stuck_processing's age cutoff. Without this reset, a reused row kept
+    an ancient created_at and broke all of those (the baseline reads switched
+    to processed_at ordering for completion-keyed correctness; this fixes the
+    created_at-keyed consumers at the source).
     """
     cursor = await db.execute(
         """UPDATE inbox_items
            SET status = 'pending', error_message = NULL,
-               drop_id = ?, batch_items = ?, content_hash = ?
+               drop_id = ?, batch_items = ?, content_hash = ?,
+               created_at = ?
            WHERE id = ?""",
-        (drop_id, batch_items, content_hash, id),
+        (drop_id, batch_items, content_hash, created_at, id),
     )
     await db.commit()
     return cursor.rowcount > 0
