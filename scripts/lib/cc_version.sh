@@ -62,12 +62,18 @@ cc_ensure_local() {
             return 0
         fi
         echo "--- Claude Code drift: ${current:-unknown} -> $pin (aligning) ---"
-        # Reinstall to the existing binary's OWN prefix so `which claude` updates.
+        # Reinstall to the existing binary's OWN prefix so `which claude` updates
+        # (npm config prefix can differ, which would install a 2nd copy and leave
+        # `which claude` stale). Assumes an npm-global install (Genesis has no
+        # native-installer path — see docs/reference/cc-compatibility.md); a
+        # non-npm launcher would be reinstalled to the wrong place, but the
+        # post-install verify below downgrades that to a non-fatal warning.
         prefix="$(dirname "$(dirname "$existing")")"   # /usr/local/bin/claude -> /usr/local
     else
         echo "  Claude Code not installed — installing pinned $pin"
-        prefix="$(npm config get prefix 2>/dev/null || echo /usr/local)"
-        [ "$prefix" = "/usr" ] && prefix="/usr/local"
+        prefix="$(npm config get prefix 2>/dev/null)"
+        [ -n "$prefix" ] || prefix="/usr/local"        # guard empty-but-rc-0 output
+        [ "$prefix" = "/usr" ] && prefix="/usr/local"  # avoid /usr/lib misrouting
     fi
 
     # Always pass --prefix explicitly (deterministic target). sudo only for

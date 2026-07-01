@@ -37,7 +37,7 @@ new_prefix() {
     local bin="$pfx/bin"
     mkdir -p "$bin"
     local c
-    for c in awk dirname id timeout sudo bash; do
+    for c in awk dirname id timeout bash env; do   # NOT sudo — write_sudo_stub creates it fresh
         local real; real="$(command -v "$c" 2>/dev/null || true)"
         [ -n "$real" ] && ln -sf "$real" "$bin/$c"
     done
@@ -57,6 +57,18 @@ case " $* " in *" install "*) echo "npm $*" >> "$CALLS"; : > "$INSTALLED_FLAG";;
 exit 0
 EOF
     chmod +x "$bin/npm"
+}
+
+# Write a sudo stub that records the call then execs the rest (so the wrapped npm
+# stub still runs) — lets us assert the sudo-prepend on the system-prefix branch.
+write_sudo_stub() {
+    local bin="$1/bin"
+    cat > "$bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+echo "sudo $*" >> "$CALLS"
+exec "$@"
+EOF
+    chmod +x "$bin/sudo"
 }
 
 # Write the claude stub: reports $START_VER until $INSTALLED_FLAG appears, then $PIN.
@@ -151,6 +163,43 @@ run_ensure() {
         pass "E: '2.1.170 (Claude Code)' parsed as drift → install fired"
     else
         fail "E: version-suffix parse failed — drift not detected"
+    fi
+}
+
+# ── F. fresh, SYSTEM prefix → sudo env "PATH=..." prepended ───────────────
+{
+    pfx="$(new_prefix f)"; rm -f "$pfx/bin/claude"     # claude absent → fresh path
+    export CALLS="$pfx/calls"; : > "$CALLS"; export INSTALLED_FLAG="$pfx/flag"; rm -f "$INSTALLED_FLAG"
+    export PIN START_VER="0.0.0" NPM_CFG_PREFIX="/opt/cctest"   # matches /opt/* → sudo branch
+    write_npm_stub "$pfx"; write_sudo_stub "$pfx"
+    run_ensure "$pfx" >/dev/null 2>&1 || true
+    line="$(cat "$CALLS")"
+    if grep -q "^sudo " <<<"$line" && grep -q -- "--prefix /opt/cctest" <<<"$line" && grep -q -- "@anthropic-ai/claude-code@${PIN}" <<<"$line"; then
+        pass "F: system prefix → sudo env prepended, --prefix /opt/cctest @$PIN"
+    else
+        fail "F: sudo/system-prefix branch wrong: $line"
+    fi
+}
+
+# ── G. post-install verify fails (install didn't reach pin) → return 1 ─────
+{
+    pfx="$(new_prefix g)"
+    export CALLS="$pfx/calls"; : > "$CALLS"; export INSTALLED_FLAG="$pfx/flag"; rm -f "$INSTALLED_FLAG"
+    export PIN START_VER="2.1.170" NPM_CFG_PREFIX="$pfx"
+    # npm stub that logs install but does NOT flip the version (no INSTALLED_FLAG),
+    # so the post-install re-check still sees START_VER != pin.
+    cat > "$pfx/bin/npm" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" = "config" ] && { echo "${NPM_CFG_PREFIX:-/usr/local}"; exit 0; }
+case " $* " in *" install "*) echo "npm $*" >> "$CALLS";; esac
+exit 0
+EOF
+    chmod +x "$pfx/bin/npm"
+    write_claude_stub "$pfx"     # always reports START_VER (flag never set)
+    if run_ensure "$pfx" >/dev/null 2>&1; then
+        fail "G: expected non-zero return when install didn't reach pin"
+    else
+        pass "G: post-install mismatch → return 1 (non-fatal for callers)"
     fi
 }
 
