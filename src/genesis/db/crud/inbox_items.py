@@ -18,6 +18,17 @@ AWAITING_APPROVAL_PREFIX = "awaiting_approval:"
 # invalidated-failed rows with still-awaiting rows.
 APPROVAL_INVALIDATED_PREFIX = "approval_invalidated:"
 
+# Prefix marking a row that has been CLAIMED for an in-flight dispatch (the CC
+# call is about to run / is running).  The resume pass flips a parked row from
+# ``awaiting_approval:`` to ``dispatching:`` via ``claim_for_dispatch`` BEFORE
+# the CC call — this is the at-most-once dispatch authority.  Deliberately a
+# distinct prefix so a claimed row is NOT re-found by ``get_awaiting_approval``
+# (which matches ``awaiting_approval:%``) yet IS reaped by
+# ``expire_stuck_processing`` (which excludes only ``awaiting_approval:%``) —
+# so a crash mid-dispatch cannot re-resume, and a stranded claim is recovered
+# into the retry path.
+DISPATCHING_PREFIX = "dispatching:"
+
 
 async def create(
     db: aiosqlite.Connection,
@@ -108,6 +119,36 @@ async def get_awaiting_approval(db: aiosqlite.Connection) -> list[dict]:
     )
     rows = await cursor.fetchall()
     return [dict(row) for row in rows]
+
+
+async def claim_for_dispatch(
+    db: aiosqlite.Connection, id: str, *, reqid: str,
+) -> bool:
+    """Atomically claim a parked row for an in-flight dispatch (at-most-once).
+
+    Transitions ``error_message`` from ``awaiting_approval:<reqid>`` to
+    ``dispatching:<reqid>`` (status stays ``processing``), but ONLY for the row
+    still parked on exactly this approval. Returns True iff this call won the
+    claim (``rowcount == 1``).
+
+    This is the dispatch at-most-once gate. A row already claimed (``dispatching:``
+    — e.g. by a prior scan whose CC call is still running, or a concurrent scan),
+    already completed/failed, or parked on a different approval, does NOT match
+    and returns False, so the caller skips it. Because the claimed row is now
+    ``dispatching:`` it is invisible to :func:`get_awaiting_approval`, so a crash
+    between the claim and completion cannot re-resume and duplicate the dispatch;
+    :func:`expire_stuck_processing` reaps a stranded ``dispatching:`` row after
+    its timeout, returning it to the retry path.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET error_message = ? || ?
+           WHERE id = ? AND status = 'processing'
+             AND error_message = ? || ?""",
+        (DISPATCHING_PREFIX, reqid, id, AWAITING_APPROVAL_PREFIX, reqid),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
 
 async def update_status_for_drop(
@@ -261,7 +302,7 @@ async def set_response_path(
     cursor = await db.execute(
         """UPDATE inbox_items
            SET response_path = ?, processed_at = ?, status = 'completed',
-               evaluated_content = ?
+               evaluated_content = ?, error_message = NULL
            WHERE id = ?""",
         (response_path, processed_at, evaluated_content, id),
     )

@@ -205,3 +205,106 @@ async def test_get_recent_completed_windows_on_processed_at(db):
         "a reused eval completed today must appear in the digest even though "
         "its created_at is old"
     )
+
+
+# --- claim_for_dispatch: at-most-once dispatch authority (PR-2b) ---
+
+
+async def _park(db, id, reqid, *, created_at="2026-06-30T00:00:01+00:00"):
+    """Create a row parked on an approval (processing + awaiting marker)."""
+    await inbox_items.create(
+        db, id=id, file_path=_FP, content_hash="h", status="processing",
+        created_at=created_at, drop_id="D", batch_items="url",
+    )
+    await inbox_items.update_status(
+        db, id, status="processing",
+        error_message=f"{inbox_items.AWAITING_APPROVAL_PREFIX}{reqid}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_claim_for_dispatch_transitions_awaiting_to_dispatching(db):
+    await _park(db, "a", "req-1")
+    won = await inbox_items.claim_for_dispatch(db, "a", reqid="req-1")
+    assert won is True
+    row = await inbox_items.get_by_id(db, "a")
+    assert row["status"] == "processing"
+    assert row["error_message"] == f"{inbox_items.DISPATCHING_PREFIX}req-1"
+
+
+@pytest.mark.asyncio
+async def test_claim_for_dispatch_is_single_winner(db):
+    await _park(db, "a", "req-1")
+    assert await inbox_items.claim_for_dispatch(db, "a", reqid="req-1") is True
+    # A second claim (e.g. a re-resume after a crash, or a concurrent scan)
+    # loses — the row is already 'dispatching:', not awaiting.
+    assert await inbox_items.claim_for_dispatch(db, "a", reqid="req-1") is False
+
+
+@pytest.mark.asyncio
+async def test_claim_for_dispatch_rejects_wrong_reqid_and_nonparked(db):
+    await _park(db, "a", "req-1")
+    # Wrong approval id -> not this row's parked approval -> no claim.
+    assert await inbox_items.claim_for_dispatch(db, "a", reqid="req-OTHER") is False
+    # A plain pending row (never parked on an approval) -> no claim.
+    await _mk(db, id="b", drop_id="D2", status="pending",
+              created_at="2026-06-30T00:00:02+00:00")
+    assert await inbox_items.claim_for_dispatch(db, "b", reqid="req-1") is False
+    # A completed row -> no claim.
+    await _mk(db, id="c", drop_id="D3", status="completed",
+              created_at="2026-06-30T00:00:03+00:00")
+    assert await inbox_items.claim_for_dispatch(db, "c", reqid="req-1") is False
+
+
+@pytest.mark.asyncio
+async def test_get_awaiting_approval_excludes_claimed_dispatching(db):
+    await _park(db, "a", "req-1")
+    assert len(await inbox_items.get_awaiting_approval(db)) == 1
+    await inbox_items.claim_for_dispatch(db, "a", reqid="req-1")
+    # Once claimed, the row is 'dispatching:' -> get_awaiting_approval no longer
+    # returns it, so a crash before completion cannot re-resume + re-dispatch it.
+    assert await inbox_items.get_awaiting_approval(db) == []
+
+
+@pytest.mark.asyncio
+async def test_completion_clears_inflight_marker(db):
+    # A completed row must NOT retain its in-flight dispatching:/awaiting:
+    # marker in error_message — it would surface as internal dispatch state on a
+    # finished item (e.g. in the dashboard).
+    await _park(db, "a", "req-1")
+    await inbox_items.claim_for_dispatch(db, "a", reqid="req-1")
+    await inbox_items.set_response_path(
+        db, "a", response_path="r", processed_at="2026-06-30T01:00:00+00:00",
+        evaluated_content="x",
+    )
+    row = await inbox_items.get_by_id(db, "a")
+    assert row["status"] == "completed"
+    assert row["error_message"] is None
+
+
+@pytest.mark.asyncio
+async def test_expire_stuck_reaps_dispatching_not_awaiting(db):
+    # A claimed row whose CC call crashed sits in 'dispatching:'. It must be
+    # reaped (back to retriable failed) after the timeout so the drop retries;
+    # an 'awaiting:' row must NOT be reaped (it waits for the user arbitrarily).
+    old = "2026-01-01T00:00:00+00:00"  # far past the 2h cutoff
+    await inbox_items.create(
+        db, id="disp", file_path="/inbox/A.md", content_hash="h",
+        status="processing", created_at=old,
+    )
+    await inbox_items.update_status(
+        db, "disp", status="processing",
+        error_message=f"{inbox_items.DISPATCHING_PREFIX}req-1",
+    )
+    await inbox_items.create(
+        db, id="await_row", file_path="/inbox/B.md", content_hash="h",
+        status="processing", created_at=old,
+    )
+    await inbox_items.update_status(
+        db, "await_row", status="processing",
+        error_message=f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-2",
+    )
+    n = await inbox_items.expire_stuck_processing(db)
+    assert n == 1
+    assert (await inbox_items.get_by_id(db, "disp"))["status"] == "failed"
+    assert (await inbox_items.get_by_id(db, "await_row"))["status"] == "processing"
