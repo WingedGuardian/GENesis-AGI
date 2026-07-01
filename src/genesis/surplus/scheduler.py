@@ -24,7 +24,7 @@ from genesis.surplus.compute_availability import ComputeAvailability
 from genesis.surplus.executor import StubExecutor
 from genesis.surplus.idle_detector import IdleDetector
 from genesis.surplus.queue import SurplusQueue
-from genesis.surplus.types import SurplusExecutor
+from genesis.surplus.types import INSIGHT_PRODUCING_TASK_TYPES, SurplusExecutor
 
 if TYPE_CHECKING:
     from genesis.memory.store import MemoryStore
@@ -1595,7 +1595,6 @@ class SurplusScheduler:
         logger.info("Dispatching surplus task %s (%s)", task.id, task.task_type)
         await self._queue.mark_running(task.id)
 
-        from genesis.surplus.types import INSIGHT_PRODUCING_TASK_TYPES
         from genesis.surplus.types import TaskType as _TT
 
         executor = self._executor
