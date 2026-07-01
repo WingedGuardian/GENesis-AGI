@@ -14,6 +14,10 @@ class ScorerType(StrEnum):
     SLOP_DETECTION = "slop_detection"
     LLM_JUDGE = "llm_judge"
     OUTPUT_QUALITY = "output_quality"
+    # Agentic gauntlet: score = did CC (driving a roster model) fix a broken
+    # project so its pytest suite goes green without mutating the protected
+    # (tests/config) surface. A filesystem side-effect scorer, not a text scorer.
+    AGENTIC_PYTEST = "agentic_pytest"
 
 
 class EvalTrigger(StrEnum):
@@ -29,6 +33,7 @@ class TaskCategory(StrEnum):
     STRUCTURED_OUTPUT = "structured_output"
     SUMMARIZATION = "summarization"
     REASONING = "reasoning"
+    AGENTIC = "agentic"  # multi-turn tool-driving fix-loop (the model roster gauntlet)
 
 
 @dataclass(frozen=True)

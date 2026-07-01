@@ -22,6 +22,7 @@ EXPECTED_TABLES = [
     "cost_events",
     "budgets",
     "awareness_ticks",
+    "attention_events",
     "depth_thresholds",
     "dead_letter",
     "surplus_tasks",

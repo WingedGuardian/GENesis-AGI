@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
+from genesis.autonomy.proposal_gate import gate_failure_is_blocking
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
@@ -72,6 +73,9 @@ _NEVER_DISPATCH_ACTION_TYPES = (
     # j9_regression is informational (NOTIFY_USER); its handler marks it executed
     # on approval. Blocklisted so it can never be dispatched as a session.
     "j9_regression",
+    # gauntlet_regression: same informational contract — the model-roster gauntlet
+    # flagged a PASS→FAIL; advisory only, never auto-acts. Blocklisted from dispatch.
+    "gauntlet_regression",
 )
 
 
@@ -1415,6 +1419,11 @@ class EgoSession:
             # autonomy level. Gate fires BEFORE the atomic claim so blocked
             # proposals stay 'approved' (ego-invisible).
             if self._proposal_gate is not None:
+                # Bind before the try so the except handler can't hit an
+                # UnboundLocalError (or read a stale prior-iteration value) if
+                # get_proposal() itself raises. None => unresolved => the except
+                # treats it as high-risk (fail-closed).
+                prop_row = None
                 try:
                     prop_row = await ego_crud.get_proposal(self._db, proposal_id)
                     if prop_row is None:
@@ -1445,8 +1454,29 @@ class EgoSession:
                                 )
                             continue
                 except Exception:
+                    # Gate eval raised. Fail CLOSED for high-risk domains
+                    # (external / self-modify), stay resilient (allow) for benign
+                    # ones so a transient error can't wedge the ego cycle.
+                    if prop_row is None or gate_failure_is_blocking(prop_row):
+                        logger.error(
+                            "Proposal gate failed for execution brief %s — "
+                            "BLOCKING dispatch (fail-closed, high-risk domain)",
+                            proposal_id,
+                            exc_info=True,
+                        )
+                        if self._event_bus:
+                            from genesis.observability.types import Severity, Subsystem
+                            await self._event_bus.emit(
+                                Subsystem.AUTONOMY,
+                                Severity.ERROR,
+                                "autonomy.dispatch_gate.fail_closed",
+                                "Gate eval error — execution brief blocked (fail-closed)",
+                                proposal_id=proposal_id,
+                            )
+                        continue
                     logger.error(
-                        "Proposal gate failed for execution brief %s — allowing dispatch",
+                        "Proposal gate failed for execution brief %s — allowing "
+                        "dispatch (resilient: benign domain)",
                         proposal_id,
                         exc_info=True,
                     )
@@ -1856,10 +1886,29 @@ class EgoSession:
                             )
                         continue
                 except Exception:
-                    # Gate failure is non-fatal — default to allowing dispatch
-                    # (fail-open, log the error for investigation)
+                    # Gate eval raised. Fail CLOSED for high-risk domains,
+                    # stay resilient (allow) for benign ones — same risk-tiered
+                    # policy as the execution-brief path above.
+                    if gate_failure_is_blocking(prop):
+                        logger.error(
+                            "Proposal gate evaluation failed for %s — BLOCKING "
+                            "dispatch (fail-closed, high-risk domain)",
+                            prop["id"],
+                            exc_info=True,
+                        )
+                        if self._event_bus:
+                            from genesis.observability.types import Severity, Subsystem
+                            await self._event_bus.emit(
+                                Subsystem.AUTONOMY,
+                                Severity.ERROR,
+                                "autonomy.dispatch_gate.fail_closed",
+                                "Gate eval error — proposal blocked (fail-closed)",
+                                proposal_id=prop["id"],
+                            )
+                        continue
                     logger.error(
-                        "Proposal gate evaluation failed for %s — allowing dispatch",
+                        "Proposal gate evaluation failed for %s — allowing "
+                        "dispatch (resilient: benign domain)",
                         prop["id"],
                         exc_info=True,
                     )

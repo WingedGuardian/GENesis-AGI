@@ -35,6 +35,56 @@ _ROSTER_FILE = "cc_roster.yaml"
 #: The native-subscription default. Never carries routing overrides.
 CLAUDE = "claude"
 
+#: Env slots that select the model for a routed Claude Code subprocess. ALL are set
+#: (not just ANTHROPIC_MODEL) so CC's background/sub-agent calls also use the peer.
+_ROSTER_MODEL_ENV_VARS = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
+
+
+def apply_routing_env(
+    env: dict[str, str],
+    *,
+    base_url: str | None,
+    auth_token: str | None,
+    model_id: str | None,
+) -> dict[str, str]:
+    """Mutate ``env`` in place to route (or un-route) a Claude Code subprocess.
+
+    Shared by :class:`~genesis.cc.invoker.CCInvoker._build_env` and the foreground
+    ``scripts/gmodel`` launcher so the routing-env contract lives in ONE place.
+
+    - Set ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_AUTH_TOKEN`` / the four model slots
+      when the corresponding value is provided; **pop** them when it is ``None`` so
+      a reused environment can never leak stale routing.
+    - **Credential isolation:** pop ``ANTHROPIC_API_KEY`` whenever routing to a peer
+      (either ``base_url`` or ``auth_token`` present) so the Anthropic key never
+      travels to a third-party endpoint. Native Claude (neither set) keeps whatever
+      the caller's env had — the caller decides Max-vs-key for the native path.
+
+    Returns ``env`` for convenience.
+    """
+    if base_url:
+        env["ANTHROPIC_BASE_URL"] = base_url
+    else:
+        env.pop("ANTHROPIC_BASE_URL", None)
+    if auth_token:
+        env["ANTHROPIC_AUTH_TOKEN"] = auth_token
+    else:
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    if base_url or auth_token:
+        env.pop("ANTHROPIC_API_KEY", None)
+    if model_id:
+        for _var in _ROSTER_MODEL_ENV_VARS:
+            env[_var] = model_id
+    else:
+        for _var in _ROSTER_MODEL_ENV_VARS:
+            env.pop(_var, None)
+    return env
+
 
 class RosterError(RuntimeError):
     """Roster resolution failure (unknown model, misconfig, or missing auth)."""

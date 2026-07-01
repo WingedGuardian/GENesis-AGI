@@ -454,6 +454,56 @@ async def test_e2e_url_repaste_different_tracking_not_reevaluated(
     mock_invoker.run.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_phantom_modified_within_cooldown_advances_hash(
+    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+):
+    """A file modified within cooldown but with NO new content (empty delta)
+    must write a completing row that ADVANCES the known hash, so it is not
+    re-detected as modified on every subsequent scan.
+
+    Regression (detection storm): the cooldown branch used to `continue`
+    before the delta check, so an empty-delta phantom-modification never
+    advanced the hash and was re-detected every scan for hours.
+    """
+    clock = _FakeClock()
+    config = InboxConfig(
+        watch_path=inbox_dir, batch_size=5, evaluation_cooldown_seconds=3600,
+    )
+    writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
+    mon = InboxMonitor(
+        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
+        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+    )
+    f = inbox_dir / "Genesis.md"
+    base = "https://www.linkedin.com/posts/foo-share-123-1G81/"
+
+    # First paste -> evaluated (baseline set).
+    f.write_text(base + "?utm_source=share&utm_medium=member_android")
+    assert (await mon.check_once()).batches_dispatched == 1
+    mock_invoker.run.reset_mock()
+
+    # WITHIN cooldown, re-paste the SAME post with different tracking params:
+    # hash changes (detected modified) but the delta is empty. Must NOT
+    # dispatch, but MUST advance the known hash.
+    clock.now = clock.now + timedelta(minutes=10)
+    f.write_text(base + "?utm_source=share&utm_medium=member_desktop")
+    r2 = await mon.check_once()
+    assert r2.items_modified == 1
+    assert r2.batches_dispatched == 0
+    mock_invoker.run.assert_not_called()
+
+    # Next scan, file UNCHANGED: must NOT be re-detected as modified — the
+    # empty-delta write advanced the known hash even though we were in cooldown.
+    clock.now = clock.now + timedelta(minutes=10)
+    r3 = await mon.check_once()
+    assert r3.items_modified == 0, (
+        "phantom-modified re-detected: the empty-delta write did not advance "
+        "the known hash within cooldown (storm)"
+    )
+    assert r3.batches_dispatched == 0
+
+
 # --- URL extraction tests ---
 
 

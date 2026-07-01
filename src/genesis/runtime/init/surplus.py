@@ -148,6 +148,16 @@ async def init(rt: GenesisRuntime) -> None:
             logger.error("Unexpected error wiring GitHubDiscoveryJob", exc_info=True)
             await _degraded(rt, "GitHubDiscoveryJob")
 
+        # Measurement-only quality judge (surplus.quality_judge) grades insight
+        # outputs so the Outcome Bus gains a two-sided signal. Wired BEFORE start()
+        # so the router is guaranteed present before any dispatch could run (the
+        # dispatch loop is interval-triggered, never zero-delay, but wiring first
+        # removes the ordering dependency). If no router exists the judge records
+        # NULL verdicts (no-op).
+        if rt._router is not None:
+            rt._surplus_scheduler.set_judge_router(rt._router)
+            logger.info("Surplus quality judge router wired")
+
         await rt._surplus_scheduler.start()
         logger.info("Genesis surplus scheduler started")
 

@@ -1,0 +1,6 @@
+{
+  "name": "calc_longhorizon",
+  "difficulty": "long_horizon",
+  "task": "This Python project (the calc package: lexer -> parser -> evaluator) has a failing test suite. Run 'python -m pytest -q' to see the failures. There are multiple bugs spread across the modules AND a feature that is not implemented yet: the ^ exponentiation operator (described in calc/api.py's docstring) which spans the lexer, parser, and evaluator. Fix all the bugs and implement the feature so that ALL tests pass. Do NOT modify anything under tests/. When all tests pass you are done.",
+  "timeout_s": 1200
+}

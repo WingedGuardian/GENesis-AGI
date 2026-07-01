@@ -93,5 +93,6 @@ class CheckResult:
     items_found: int = 0
     items_new: int = 0
     items_modified: int = 0
+    items_retried: int = 0
     batches_dispatched: int = 0
     errors: list[str] = field(default_factory=list)

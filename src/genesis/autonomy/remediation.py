@@ -14,7 +14,9 @@ Design:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import sys
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
@@ -42,6 +44,7 @@ class RemediationAction:
     reversible: bool = True
     cooldown_s: int = 300    # Min seconds between runs
     max_attempts: int = 3    # Max consecutive attempts before giving up
+    timeout_s: int = 30      # Max seconds for the command (see _run_command)
 
 
 @dataclass
@@ -287,7 +290,7 @@ class RemediationRegistry:
                 env=systemctl_env(),
             )
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=30,
+                proc.communicate(), timeout=action.timeout_s,
             )
             if proc.returncode == 0:
                 logger.info("Remediation %s completed (rc=0)", action.name)
@@ -300,8 +303,15 @@ class RemediationRegistry:
             )
             return False
         except TimeoutError:
+            # Kill the hung child AND reap it so it can't leak a zombie / an
+            # unclosed subprocess transport after we give up.
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
             logger.error(
-                "Remediation %s timed out after 30s", action.name, exc_info=True,
+                "Remediation %s timed out after %ds",
+                action.name, action.timeout_s, exc_info=True,
             )
             return False
         except FileNotFoundError:
@@ -344,6 +354,25 @@ def _extract_status(probe: Any) -> ProbeStatus:
 # Default remediation actions
 # ---------------------------------------------------------------------------
 
+
+def _disk_reclaim_command() -> list[str]:
+    """Build the reactive disk-reclaim command (absolute, venv-python).
+
+    Runs from the genesis-server context (has passwordless sudo), so --system
+    also clears /var (apt/journald). ``--if-above 90`` gates the reindex-heavy
+    MEDIUM tier; the CHEAP tier (regenerable package caches) always clears.
+    ``--fail-above 90`` makes the script exit non-zero if the disk is still
+    critical afterwards, so the registry escalates via max_attempts.
+    """
+    from genesis.env import repo_root
+
+    script = repo_root() / "scripts" / "disk_reclaim.py"
+    return [
+        sys.executable, str(script),
+        "--apply", "--if-above", "90", "--fail-above", "90", "--system",
+    ]
+
+
 DEFAULT_REMEDIATIONS: list[RemediationAction] = [
     RemediationAction(
         name="qdrant_restart",
@@ -378,12 +407,24 @@ DEFAULT_REMEDIATIONS: list[RemediationAction] = [
     RemediationAction(
         name="disk_cleanup",
         probe_name="disk",
-        condition="Root filesystem usage exceeds 90%",
-        command=["sudo", "journalctl", "--vacuum-size=100M"],
-        governance_level=3,
+        condition=(
+            "Disk DEGRADED (>=85%): clear regenerable caches + /var. "
+            "At >=90% also clears reindex-heavy caches (CBM/GitNexus). "
+            "Escalates if still >=90% after cleanup."
+        ),
+        # L2 auto-run: deletes ONLY regenerable caches (package caches,
+        # reindexable graph caches) + journald/apt vacuum. Self-gated by
+        # --if-above so the expensive tier only clears under real pressure.
+        command=_disk_reclaim_command(),
+        governance_level=2,
         reversible=True,
-        cooldown_s=86400,
+        # Short cooldown + low attempts so a genuinely-stuck disk (caches can't
+        # relieve it) escalates to a critical alert in ~30-60min, not ~18h —
+        # well before it can climb to 100%. Re-runs are cheap (caches already
+        # cleared → fast no-op).
+        cooldown_s=1800,    # 30min
         max_attempts=2,
+        timeout_s=300,      # multi-GB rmtree legitimately exceeds the 30s default
     ),
     RemediationAction(
         name="stale_browser_alert",

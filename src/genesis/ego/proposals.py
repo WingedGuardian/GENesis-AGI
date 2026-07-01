@@ -590,6 +590,19 @@ class ProposalWorkflow:
                         "j9 regression hook failed for %s",
                         prop.get("id"), exc_info=True,
                     )
+                # Gauntlet regression (informational): mark executed on approval,
+                # no side-effect. Never dispatched (blocklist + NOTIFY_USER gate).
+                try:
+                    from genesis.ego.gauntlet_regression_actions import (
+                        handle_gauntlet_regression_resolution,
+                    )
+
+                    await handle_gauntlet_regression_resolution(self._db, prop, status)
+                except Exception:
+                    logger.warning(
+                        "gauntlet regression hook failed for %s",
+                        prop.get("id"), exc_info=True,
+                    )
             else:
                 logger.warning(
                     "Proposal %s not updated (already resolved?)",

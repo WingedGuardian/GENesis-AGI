@@ -135,6 +135,11 @@ class CCInvocation:
     skip_permissions: bool = False
     skill_tags: list[str] | None = None
     working_dir: str | None = None
+    # Per-invocation override for CC's Bash sandbox root (CLAUDE_CODE_TMPDIR).
+    # None → the shared default (~/.genesis/cc-tmp). Set by throwaway sessions
+    # (e.g. the model-roster gauntlet) to isolate their tmp blast radius from
+    # live sessions policed by genesis-tmp-watchgod.
+    claude_code_tmpdir: str | None = None
     # When non-empty, the session's Bash is restricted to these command binaries
     # (enforced by scripts/bash_safety_hook.sh via the GENESIS_BASH_ALLOWLIST env
     # var). Used by Bash-enabled background profiles (e.g. "steward") to scope

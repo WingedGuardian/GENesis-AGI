@@ -292,39 +292,30 @@ class CCInvoker:
             env.pop("GENESIS_PARENT_SPAN_ID", None)
         if inv and inv.stream_idle_timeout_ms is not None:
             env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(inv.stream_idle_timeout_ms)
-        if inv and inv.anthropic_base_url:
-            env["ANTHROPIC_BASE_URL"] = inv.anthropic_base_url
-        else:
-            env.pop("ANTHROPIC_BASE_URL", None)
-        if inv and inv.anthropic_auth_token:
-            env["ANTHROPIC_AUTH_TOKEN"] = inv.anthropic_auth_token
-        else:
-            env.pop("ANTHROPIC_AUTH_TOKEN", None)
-        # Credential isolation (defense-in-depth): the inherited ANTHROPIC_API_KEY
-        # (from secrets.env) must NEVER travel to a non-Anthropic endpoint. Pop it
-        # whenever EITHER a third-party base_url OR auth_token is being injected —
-        # not just base_url — so an inconsistent field combination can't leak the
-        # Anthropic key. Native Claude (neither set) keeps it (Max subscription).
-        if inv and (inv.anthropic_base_url or inv.anthropic_auth_token):
-            env.pop("ANTHROPIC_API_KEY", None)
-        # Roster model selection via env (NOT --model — see _build_args). Set all
-        # default-model slots so CC's background/sub-calls use the roster model too.
-        _model_vars = (
-            "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
-            "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        # Roster routing (base_url / auth_token / model slots) + credential
+        # isolation. Shared with the foreground `gmodel` launcher via
+        # roster.apply_routing_env so the contract lives in ONE place. Native
+        # Claude (no override fields) → all routing vars popped, ANTHROPIC_API_KEY
+        # kept (Max subscription) — identical to the prior inline behavior.
+        roster.apply_routing_env(
+            env,
+            base_url=inv.anthropic_base_url if inv else None,
+            auth_token=inv.anthropic_auth_token if inv else None,
+            model_id=inv.model_id_override if inv else None,
         )
-        if inv and inv.model_id_override:
-            for _mv in _model_vars:
-                env[_mv] = inv.model_id_override
-        else:
-            for _mv in _model_vars:
-                env.pop(_mv, None)
         # Move CC's Bash sandbox off /tmp (512MB tmpfs) onto persistent disk.
         # CC reads CLAUDE_CODE_TMPDIR to choose where it creates
         # /claude-<uid>/<cwd>/<session-id>/ for each Bash invocation.
         # Without this, the sandbox lives on /tmp where intermittent ENOENT
         # failures break the Bash tool for entire sessions.
-        env["CLAUDE_CODE_TMPDIR"] = str(self._CC_SANDBOX_TMPDIR)
+        # A per-invocation override isolates blast radius: e.g. the model-roster
+        # gauntlet points its throwaway CC sessions at a separate sandbox so a
+        # fixture that fills it can't trip genesis-tmp-watchgod into SIGKILLing a
+        # LIVE foreground/background session sharing the default cc-tmp.
+        env["CLAUDE_CODE_TMPDIR"] = str(
+            (inv.claude_code_tmpdir if inv and inv.claude_code_tmpdir else None)
+            or self._CC_SANDBOX_TMPDIR
+        )
         # Prevent CC's alt-screen renderer from corrupting terminal scrollback
         # in Linux/tmux.  No-op on CC <2.1.132; required post-migration.
         env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] = "1"

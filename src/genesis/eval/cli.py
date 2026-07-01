@@ -96,6 +96,28 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     # -- eval datasets --
     eval_sub.add_parser("datasets", help="List available eval datasets")
 
+    # -- eval gauntlet --
+    gauntlet_cmd = eval_sub.add_parser(
+        "gauntlet",
+        help="Run the agentic model-roster gauntlet (drive CC through a fix-loop)",
+        description=(
+            "Validate a roster model by having Claude Code, driving that model, "
+            "fix broken Python fixtures scored by pytest. Advisory only."
+        ),
+    )
+    gauntlet_cmd.add_argument(
+        "--model", "-m", required=True,
+        help="Roster model name (e.g. claude, glm-5.2)",
+    )
+    gauntlet_cmd.add_argument(
+        "--no-db", action="store_true",
+        help="Skip storing results in the database",
+    )
+    gauntlet_cmd.add_argument(
+        "--check-regression", action="store_true",
+        help="Also run the advisory PASS->FAIL regression check (files a proposal)",
+    )
+
     eval_cmd.set_defaults(func=_run_eval_cli)
 
 
@@ -131,8 +153,13 @@ def _run_eval_cli(args: argparse.Namespace) -> int:
         return asyncio.run(_cmd_export(args))
     elif args.eval_command == "datasets":
         return _cmd_datasets()
+    elif args.eval_command == "gauntlet":
+        return asyncio.run(_cmd_gauntlet(args))
     else:
-        print("usage: genesis eval {run|benchmark|results|compare|export|datasets}", file=sys.stderr)
+        print(
+            "usage: genesis eval {run|benchmark|results|compare|export|datasets|gauntlet}",
+            file=sys.stderr,
+        )
         return 1
 
 
@@ -175,6 +202,49 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         if db is not None:
             await db.close()
     return 0
+
+
+async def _cmd_gauntlet(args: argparse.Namespace) -> int:
+    from genesis.cc.roster import RosterError
+    from genesis.eval.gauntlet import GauntletBusyError, run_gauntlet
+
+    db = None
+    if not args.no_db:
+        try:
+            import aiosqlite  # noqa: I001
+
+            from genesis.env import genesis_db_path
+            db = await aiosqlite.connect(str(genesis_db_path()))
+            await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        except Exception as e:
+            print(f"warning: could not open DB ({e}), results won't be stored")
+
+    summary = None
+    try:
+        print(f"\n{'='*60}")
+        print(f"  Gauntlet: {args.model}")
+        print(f"{'='*60}\n")
+        summary = await run_gauntlet(args.model, db=db, trigger=EvalTrigger.MANUAL)
+        _print_summary(summary)
+        for r in summary.results:
+            print(f"  - {r.case_id}: {r.scorer_detail}")
+        if db is not None and args.check_regression:
+            from genesis.eval.gauntlet_regression import check_gauntlet_regression
+
+            reg = await check_gauntlet_regression(db, summary, outreach_pipeline=None)
+            if reg:
+                print(f"\n  ⚠ regression surfaced (proposal {reg['proposal_id']})")
+    except RosterError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except GauntletBusyError as e:
+        print(f"busy: {e}", file=sys.stderr)
+        return 3
+    finally:
+        if db is not None:
+            await db.close()
+    # Non-zero exit only on a GENUINE failure (skips are infra, not failures).
+    return 1 if summary is not None and summary.failed_cases > 0 else 0
 
 
 async def _cmd_benchmark(args: argparse.Namespace) -> int:
