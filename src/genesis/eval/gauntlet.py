@@ -338,13 +338,15 @@ async def run_gauntlet(
 
     run_id = uuid.uuid4().hex
     tmp_root = _GAUNTLET_ROOT / run_id
-    tmp_root.mkdir(parents=True, exist_ok=True)
-    invoker = CCInvoker()  # fresh, no callbacks → side-effect-free
 
+    # Acquire the lock BEFORE creating any tmp state so a busy collision
+    # (GauntletBusyError) can't orphan an empty workdir under ~/tmp.
     lock = _acquire_lock(model_name)
     results: list[ScoredOutput] = []
     start = time.monotonic()
     try:
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        invoker = CCInvoker()  # fresh, no callbacks → side-effect-free
         for fx in fixtures:
             logger.info("gauntlet[%s]: running fixture %s", model_name, fx.name)
             results.append(await _run_one_fixture(invoker, overrides, mcp_config, fx, tmp_root))

@@ -170,6 +170,21 @@ def test_file_lock_is_mutually_exclusive():
     G._release_lock(fh2)
 
 
+async def test_run_gauntlet_busy_raises_without_orphaning_tmp(monkeypatch, tmp_path):
+    """A busy collision must raise before any tmp workdir is created."""
+    monkeypatch.setattr(G, "_GAUNTLET_ROOT", tmp_path / "groot")
+    fh = G._acquire_lock("claude")
+    try:
+        with pytest.raises(G.GauntletBusyError):
+            await G.run_gauntlet(
+                "claude", db=None, fixtures=G.load_gauntlet_fixtures()[:1],
+            )
+    finally:
+        G._release_lock(fh)
+    root = tmp_path / "groot"
+    assert not root.exists() or not any(root.iterdir())
+
+
 def test_load_committed_fixtures():
     fx = {f.name for f in G.load_gauntlet_fixtures()}
     assert {"statslib_bugs", "intervals_multifile", "calc_longhorizon"} <= fx
