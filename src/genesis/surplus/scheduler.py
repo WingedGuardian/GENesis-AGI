@@ -24,7 +24,7 @@ from genesis.surplus.compute_availability import ComputeAvailability
 from genesis.surplus.executor import StubExecutor
 from genesis.surplus.idle_detector import IdleDetector
 from genesis.surplus.queue import SurplusQueue
-from genesis.surplus.types import SurplusExecutor
+from genesis.surplus.types import INSIGHT_PRODUCING_TASK_TYPES, SurplusExecutor
 
 if TYPE_CHECKING:
     from genesis.memory.store import MemoryStore
@@ -1669,6 +1669,11 @@ class SurplusScheduler:
 
         # 6. Route through intake pipeline (atomize → score → route to knowledge)
         staging_id = None
+        # Verified-correctness verdict (insight-producing types only). Stays NULL
+        # for action tasks, intake failures, and empty/too-short output — all
+        # ambiguous or not-a-quality-signal, so they keep the positive-only
+        # behaviour. Only set to 'useful'/'hollow' once intake has actually run.
+        outcome_quality: str | None = None
         if result.insights:
             insight = result.insights[0]
             content = result.content or ""
@@ -1700,6 +1705,17 @@ class SurplusScheduler:
                         intake_stats.routed_discard,
                         task.id[:8],
                     )
+                    # Verified-correctness verdict: for insight-producing types,
+                    # intake having routed nothing to knowledge/observations means
+                    # the work ran but produced nothing of value (hollow). This is
+                    # the only path that sets the verdict — empty/too-short output
+                    # and intake failures stay NULL on purpose (see above).
+                    if task.task_type in INSIGHT_PRODUCING_TASK_TYPES:
+                        kept = (
+                            intake_stats.routed_knowledge
+                            + intake_stats.routed_observation
+                        )
+                        outcome_quality = "useful" if kept > 0 else "hollow"
                     # Use a synthetic staging_id for tracking
                     content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
                     staging_id = f"{task.task_type.value}-{content_hash}"
@@ -1726,7 +1742,9 @@ class SurplusScheduler:
                         ttl=ttl,
                     )
 
-        await self._queue.mark_completed(task.id, staging_id=staging_id)
+        await self._queue.mark_completed(
+            task.id, staging_id=staging_id, outcome_quality=outcome_quality,
+        )
 
         # Pipeline chaining — enqueue next step if this was a pipeline task.
         # Note: if a step returns NOMINAL (empty content), chaining still

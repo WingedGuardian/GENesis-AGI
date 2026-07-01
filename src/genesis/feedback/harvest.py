@@ -51,6 +51,11 @@ BACKFILL_MARKER = "outcome_backfill_done"
 # idempotent on the (source, ref_type, ref_id, signal_type) unique key, so
 # already-harvested rows are INSERT-OR-IGNORE no-ops (read I/O, no WAL write).
 # v2 (2026-06-29): added the surplus_tasks source.
+# NO bump for the surplus verified-correctness signal (2026-06-30): the new
+# VERIFICATION_FAILED rows only exist for tasks completed AFTER deploy (legacy
+# rows have NULL outcome_quality and so can never be hollow). There is nothing
+# historical to re-backfill, and new hollow tasks are picked up by the normal
+# incremental window — a forced full re-backfill would be pure wasted I/O.
 BACKFILL_VERSION = 2
 
 # Markers update_proposal_outcome appends to ego_proposals.user_response.
@@ -322,6 +327,14 @@ class OutcomeHarvester:
         ``completed``/``failed`` is a real "did the work run to completion"
         signal. ``cutoff`` (ISO) limits to recent rows; ``None`` = all history.
 
+        Two orthogonal signals per task: EXECUTION_OUTCOME ("did the work run")
+        and — for insight-producing types whose output was hollow — an additional
+        VERIFICATION_FAILED ("was the output useful"). A hollow task therefore
+        yields BOTH a positive (it ran) and a negative (it produced nothing),
+        netting ~0.5 in ``aggregate_by_domain`` — below a useful task (1.0) and
+        above a hard failure (0.0). See ``surplus.types.INSIGHT_PRODUCING_TASK_TYPES``
+        and ``surplus_tasks.outcome_quality``.
+
         Maintainer notes (deliberate asymmetries):
         - ``cancelled`` (and non-terminal pending/running) tasks are NOT
           recorded — a cancel is a lifecycle event, not an execution outcome.
@@ -339,7 +352,7 @@ class OutcomeHarvester:
         """
         sql = (
             "SELECT id, task_type, status, failure_reason, completed_at, "
-            "       created_at "
+            "       created_at, outcome_quality "
             "FROM surplus_tasks WHERE status IN ('completed', 'failed')"
         )
         params: list = []
@@ -370,6 +383,33 @@ class OutcomeHarvester:
             )
             if eid:
                 inserted += 1
+
+            # Verified-correctness (second, orthogonal axis). EXECUTION_OUTCOME
+            # above answers "did it run"; this answers "was the output useful".
+            # A completed insight task whose intake routed EVERYTHING to discard
+            # is hollow — it ran but produced nothing of value — so it earns an
+            # ADDITIONAL tier-1 negative. Because VERIFICATION_FAILED is a
+            # distinct signal_type, it coexists with the positive EXECUTION_OUTCOME
+            # on the same (source, ref_type, ref_id) under the unique key; the two
+            # never dup-suppress each other across incremental re-harvests.
+            # NULL outcome_quality (action tasks, legacy rows, intake failures,
+            # empty/too-short output) adds nothing here — positive-only, unchanged.
+            if completed and r["outcome_quality"] == "hollow":
+                veid = await record_outcome(
+                    self._db,
+                    source="surplus",
+                    ref_type="task",
+                    ref_id=r["id"],
+                    domain=r["task_type"],
+                    signal_type=SignalType.VERIFICATION_FAILED,
+                    polarity="negative",
+                    value=0.0,
+                    reason_text="intake routed all findings to discard (hollow)",
+                    occurred_at=r["completed_at"] or r["created_at"],
+                    harvested_from="surplus_tasks",
+                )
+                if veid:
+                    inserted += 1
         return inserted
 
     # -- helper ------------------------------------------------------------- #

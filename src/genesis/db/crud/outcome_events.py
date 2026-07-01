@@ -160,6 +160,17 @@ async def aggregate_by_domain(
     restricts to a single producer (e.g. ``source='surplus'``) so a consumer can
     fold in one clean domain without double-counting producers it already
     aggregates by other means.
+
+    Note on surplus "hollow" tasks: an insight task that ran but produced nothing
+    useful emits TWO tier-1 rows — a positive EXECUTION_OUTCOME ("it ran") and a
+    negative VERIFICATION_FAILED ("output was useless") — so it contributes ``n=2``
+    (one positive, one negative) to its domain. For the ``source='surplus'`` feed,
+    every ``value`` is 0.0/1.0 and aligned with ``polarity``, so ``avg_value`` and
+    ``positive/n`` are IDENTICAL here; both already fold in the hollow penalty.
+    Ordering still holds — a domain of U useful / H hollow / F failed scores
+    ``(U+H)/(U+2H+F)``, i.e. all-useful=1.0 > hollow-mixed > all-failed=0.0. The
+    n=2 weighting makes a hollow task count as ~1/3 effective credit, not 1/2; a
+    consumer that needs exact per-task semantics must dedup by ``ref_id``.
     """
     sql = """
         SELECT domain,

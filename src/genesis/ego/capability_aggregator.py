@@ -157,6 +157,11 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
                 # rate = positive / n is provably in [0, 1]; passing an
                 # out-of-range value would make inverse_confidence_weight raise
                 # and silently degrade the WHOLE domain to an arithmetic mean.
+                # NB (LC3-B go-live tuning): a surplus "hollow" task contributes
+                # two rows (pos EXECUTION_OUTCOME + neg VERIFICATION_FAILED), so it
+                # inflates ``n`` by 2 and counts as ~1/3 effective credit here, not
+                # 1/2. Discrimination is correct (useful > hollow > failed); revisit
+                # the exact hollow weight / per-task dedup when enabling this feed.
                 rate = positive / n
                 domain = row.get("domain")
                 if not domain:
