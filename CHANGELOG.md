@@ -11,6 +11,30 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **You can now start an interactive Claude Code session on a different model with one command.**
+  `gmodel <name>` launches `claude` on the model you pick: a Claude tier (`gmodel opus`) runs on
+  your normal Max subscription, while a roster peer (`gmodel glm-5.2`) runs on that provider's
+  native endpoint and its own API key. Plain `claude` is untouched. `gmodel` on its own lists the
+  models and which have keys configured; `gmodel --print-env <name>` shows what it would do without
+  launching. Your Anthropic subscription is protected — the launcher never lets a stray API key
+  quietly switch you to per-token billing, and never sends your Anthropic key to a third-party
+  endpoint. (Switch models by relaunching; each session is pinned to one model.)
+- **You can now put a model through a "gauntlet" to prove it can actually drive Claude Code
+  before you rely on it.** `genesis eval gauntlet --model <name>` has the model (native Claude,
+  or a routed roster peer like GLM) fix real broken Python projects inside a live Claude Code
+  session, then scores it objectively by running the project's tests — and catches cheating
+  (editing the tests or pytest config to fake a pass). Results are recorded so quality can be
+  tracked over time. An optional weekly run (off by default, opt-in via the roster's
+  `gauntlet.scheduled`) re-checks each roster model and, if one that used to pass starts
+  failing, alerts you and files a proposal for your review — it never silently drops a model
+  from failover on its own.
+- **Genesis now keeps its own disk clean automatically, so it won't quietly fill up and stall.**
+  A daily hygiene job reaps git worktrees whose branches have already merged (moving them to a
+  7-day recovery trash bin, never deleting work in progress) and clears regenerable caches that
+  otherwise creep up over time. If the disk still climbs toward full, Genesis clears the heavier
+  reindexable caches automatically at 90% — before the disk hits 100% and disrupts the server,
+  its write-ahead log, or backups. Previously the worktree cleanup existed but was never
+  scheduled, so it never actually ran.
 - **The dashboard now has a Campaigns tab where you can see and control your autonomous campaigns.**
   Each campaign shows its status, schedule (with next fire time), model/effort, today's spend
   against its daily cap, completed runs vs. attempts, and whether a session is currently in
@@ -39,6 +63,29 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Genesis no longer mistakes your status updates for its own failures.** When you tell Genesis
+  how your own projects, plans, or deadlines are going ("the offer fell through", "I didn't attend
+  the conference", "let's keep going on the paper — it's never too late"), it sometimes scored the
+  whole interaction as its own "approach failure" — which could trigger a spurious learned rule in
+  STEERING.md and dock the autonomy it had earned. Genesis now judges an interaction only by the
+  concrete tasks it actually attempted that turn, so sharing context, expressing a future intent, or
+  getting a clarifying question back before it acts is correctly treated as success. Genuine
+  shortfalls on tasks it did attempt — including when they're mixed into the same message as a status
+  update — are still caught.
+
+- **Inbox notes that change without adding anything new no longer get re-scanned over and over.**
+  Editing an inbox note in a way that changes its bytes but not its actual content — re-pasting a
+  link with different tracking/share parameters, reordering lines, tweaking whitespace — used to
+  leave the note looking "modified" on every scan, which (while a link approval was pending) could
+  repeatedly cancel and recreate that approval. Genesis now recognizes there's no new content and
+  marks the note current in a single scan, so it settles instead of churning.
+
+- **Links that fail partway through an evaluation now retry themselves.** When only some of the
+  links in a note evaluate successfully and the rest fail (for example, a few get rate-limited),
+  the failed links used to sit untouched until you edited the note again. Genesis now
+  automatically re-attempts the stranded links on a later scan on its own — bounded so a link that
+  keeps failing eventually stops retrying rather than looping.
+
 - **Inbox evaluations no longer cram a whole batch of links into one giant pass — and stop
   re-evaluating links they've already covered.** When you drop many URLs into an inbox note,
   Genesis now evaluates them in small groups (≈5 at a time, configurable via
@@ -48,6 +95,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   processed (previously an approved evaluation could re-chew the entire file). When the CLI
   approval gate is on, you approve a drop once and all its groups run under that single
   approval. Duplicate follow-up items from the same recommendation are now also prevented.
+
+- **An approved inbox evaluation that gets interrupted mid-run can no longer be evaluated
+  twice.** If the server restarted (or crashed) in the narrow window right after you approved a
+  link evaluation but before it finished, the next scan could re-run the same evaluation and
+  write a duplicate `…-N.genesis.md` file. Genesis now claims each evaluation the moment it
+  starts, so an interrupted one is recovered and retried rather than run a second time.
 
 - **Campaign results no longer sit uncaptured until the next scheduled tick.** Previously a
   campaign that ran every couple of days would finish its background session but not record

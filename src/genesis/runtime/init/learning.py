@@ -1044,6 +1044,70 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        # Model-roster gauntlet (weekly, Sat 5am). Validates each runnable roster
+        # member can still drive CC through a coding fix-loop; a PASS->FAIL
+        # regression surfaces an advisory BLOCKER alert + human-gated proposal
+        # (NEVER auto-removes a model). OFF by default (spends inference on paid
+        # peers) — gated on roster `gauntlet.scheduled`; manual CLI always works.
+        async def _run_model_gauntlet() -> None:
+            try:
+                if rt.paused:
+                    logger.debug("Model gauntlet skipped (Genesis paused)")
+                    return
+            except Exception:
+                logger.warning("Pause check failed — skipping model gauntlet", exc_info=True)
+                return
+            try:
+                from genesis.cc.roster import RosterError, load_roster
+                from genesis.eval.gauntlet import GauntletBusyError, run_gauntlet
+                from genesis.eval.gauntlet_regression import check_gauntlet_regression
+                from genesis.eval.types import EvalTrigger
+
+                roster_cfg = load_roster()
+                if not (roster_cfg.get("gauntlet") or {}).get("scheduled", False):
+                    logger.debug("Model gauntlet: scheduled auto-run disabled")
+                    rt.record_job_success("model_gauntlet")
+                    return
+
+                models = list((roster_cfg.get("models") or {}).keys())
+                ran = 0
+                for model in models:
+                    try:
+                        summary = await run_gauntlet(
+                            model, db=rt._db, trigger=EvalTrigger.SCHEDULE,
+                        )
+                    except RosterError:
+                        logger.info(
+                            "gauntlet: %s not runnable (unconfigured/keyless) — skipping",
+                            model,
+                        )
+                        continue
+                    except GauntletBusyError:
+                        logger.info("gauntlet: %s already running — skipping", model)
+                        continue
+                    ran += 1
+                    try:
+                        await check_gauntlet_regression(
+                            rt._db, summary, getattr(rt, "_outreach_pipeline", None),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "gauntlet regression check failed for %s", model, exc_info=True,
+                        )
+                logger.info("Model gauntlet: ran %d/%d roster model(s)", ran, len(models))
+                rt.record_job_success("model_gauntlet")
+            except Exception as exc:
+                rt.record_job_failure("model_gauntlet", str(exc))
+                logger.exception("Model gauntlet job failed")
+
+        rt._learning_scheduler.add_job(
+            _run_model_gauntlet,
+            CronTrigger(day_of_week="sat", hour=5, minute=0, timezone=user_timezone()),
+            id="model_gauntlet",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         rt._learning_scheduler.start()
         logger.info("Genesis learning scheduler started")
 

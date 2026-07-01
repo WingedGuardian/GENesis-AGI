@@ -143,6 +143,198 @@ async def test_partial_batch_failure_baselines_only_successes(
     assert statuses == ["completed", "failed"]
 
 
+@pytest.mark.asyncio
+async def test_partial_failure_auto_retries_without_edit(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """A partially-failed drop's failed batch is auto-retried on a LATER scan
+    WITHOUT the user editing the file. A completed sibling keeps the file's hash
+    'known', so detection alone would never re-surface it (the stranding gap)."""
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=3)
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(6))  # 6 URLs -> 2 batches
+    mock_invoker.run.side_effect = [_ok(), _err("rate limited")]
+    await mon.check_once()  # scan 1: batch1 ok, batch2 fails (stranded)
+    assert sorted(r["status"] for r in [dict(x) for x in await (await db.execute(
+        "SELECT status FROM inbox_items WHERE file_path=?", (str(fp),))).fetchall()]) == ["completed", "failed"]
+
+    # Scan 2: file UNCHANGED. The stranded batch2 must auto-retry and succeed.
+    mock_invoker.run.reset_mock()
+    mock_invoker.run.side_effect = None
+    mock_invoker.run.return_value = _ok()
+    r2 = await mon.check_once()
+    assert r2.items_new == 0
+    assert r2.items_modified == 0, "must NOT be re-detected via hash — it's a retry, not a modification"
+    assert r2.items_retried == 1
+    assert r2.batches_dispatched == 1, "the stranded batch2 was re-dispatched"
+    baseline = await inbox_items.get_evaluated_content(db, str(fp)) or ""
+    for i in range(6):
+        assert f"https://example.com/a{i}" in baseline, f"a{i} missing from baseline after retry"
+
+
+@pytest.mark.asyncio
+async def test_retry_is_cooldown_exempt(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """A partial-failure retry fires even within the evaluation cooldown window
+    — a retry is failure recovery, not a re-eval on a user edit, so the cooldown
+    (which throttles re-evals of edited files) must not defer it."""
+    cfg = InboxConfig(
+        watch_path=inbox_dir, items_per_eval=3, evaluation_cooldown_seconds=3600,
+    )
+    mon = InboxMonitor(
+        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
+        config=cfg, writer=ResponseWriter(watch_path=inbox_dir, timezone="UTC"),
+        clock=_FakeClock(), prompt_dir=tmp_path,
+    )
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(6))
+    mock_invoker.run.side_effect = [_ok(), _err("rate limited")]
+    await mon.check_once()  # batch1 completes at clock T (within cooldown of T)
+
+    mock_invoker.run.reset_mock()
+    mock_invoker.run.side_effect = None
+    mock_invoker.run.return_value = _ok()
+    r2 = await mon.check_once()  # SAME clock -> still inside cooldown
+    assert r2.items_retried == 1, "retry must be cooldown-exempt"
+    assert r2.batches_dispatched == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_is_bounded_by_retry_count(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """A retry that KEEPS failing stops after retry_count hits the cap — the
+    load-bearing bound is retry_count (not the URL-failure guard, which here
+    never fires because the errors aren't 'partial_url_failure'). No infinite
+    retry loop, no row proliferation."""
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=3)
+    max_r = mon._config.max_retries
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(6))  # 2 batches
+    # Scan 1: batch1 ok, batch2 fails (retry_count -> 1).
+    mock_invoker.run.side_effect = [_ok(), _err("rate limited")]
+    await mon.check_once()
+
+    # Every subsequent scan the retry keeps failing; it MUST stop at the cap.
+    mock_invoker.run.side_effect = None
+    mock_invoker.run.return_value = _err("still rate limited")
+    total_retries = 0
+    for _ in range(max_r + 5):  # far more scans than the cap
+        total_retries += (await mon.check_once()).items_retried
+    assert total_retries <= max_r, (
+        f"retried {total_retries}x, exceeds cap {max_r} — unbounded/proliferating"
+    )
+    # And it has stopped being a candidate (no further retries).
+    assert (await mon.check_once()).items_retried == 0
+    # No row proliferation: the file's row count stayed bounded (2 batches).
+    n = (await (await db.execute(
+        "SELECT COUNT(*) FROM inbox_items WHERE file_path=?", (str(fp),))).fetchone())[0]
+    assert n <= 4, f"row proliferation: {n} rows for a 2-batch file"
+
+
+@pytest.mark.asyncio
+async def test_retry_respects_url_failure_storm_guard(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """A file that persistently fails URL fetches (>= max_retries
+    partial_url_failure in 48h) is NOT retried — the storm guard applies on the
+    retry path just as on the new-files path."""
+    from datetime import UTC, datetime
+
+    from genesis.inbox.scanner import compute_hash
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=3)
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(3))
+    h = compute_hash(fp)
+    recent = datetime.now(UTC).isoformat()  # count_url_failures windows on REAL now
+    # A completed row with the current hash keeps the file 'known' (undetected),
+    # so it reaches the retry path rather than the new-files path.
+    await inbox_items.create(
+        db, id="done", file_path=str(fp), content_hash=h, status="completed",
+        created_at=recent,
+    )
+    for i in range(3):  # 3 == max_retries -> storm
+        await inbox_items.create(
+            db, id=f"puf{i}", file_path=str(fp), content_hash=h,
+            status="pending", created_at=recent,
+        )
+        await inbox_items.update_status(
+            db, f"puf{i}", status="failed", error_message="partial_url_failure",
+        )
+    r = await mon.check_once()
+    assert r.items_modified == 0  # completed row keeps it known
+    assert r.items_retried == 0, "storm guard must skip a persistently URL-failing file"
+    assert mock_invoker.run.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_candidate_vanished_file_is_abandoned(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """A retry candidate whose SOURCE FILE was deleted is abandoned — its
+    stranded failed rows are flipped to approval_invalidated so it stops being a
+    candidate (no 'File vanished before retry read' every scan, forever)."""
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=3)
+    gone = inbox_dir / "Deleted.md"  # never created on disk
+    # A retriable-failed row for a file that does not exist -> pure retry
+    # candidate (not detected as new/modified, since it isn't on disk).
+    await inbox_items.create(
+        db, id="f1", file_path=str(gone), content_hash="h", status="pending",
+        created_at="2026-06-30T00:00:01+00:00",
+    )
+    await inbox_items.update_status(db, "f1", status="failed", error_message="rate limited")
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=3) == [str(gone)]
+
+    await mon.check_once()  # retry loop hits FileNotFoundError -> abandons it
+
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=3) == [], (
+        "a vanished-file candidate must be abandoned, not recur every scan"
+    )
+    row = await inbox_items.get_by_id(db, "f1")
+    # The reason flows through end-to-end (distinct from the empty-delta case).
+    assert row["error_message"] == (
+        f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}source file deleted"
+    )
+    assert mock_invoker.run.call_count == 0  # nothing dispatched (file is gone)
+
+
+@pytest.mark.asyncio
+async def test_retry_candidate_empty_file_is_abandoned(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """A retry candidate whose file exists but is now EMPTY is abandoned too —
+    another terminal state (no content to ever retry), same as a deleted file."""
+    from genesis.inbox.scanner import compute_hash
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=3)
+    empty = inbox_dir / "Emptied.md"
+    empty.write_text("")
+    h = compute_hash(empty)
+    # A completed row with the current (empty) hash keeps the file 'known', so it
+    # reaches the RETRY path (not re-detected as new/modified).
+    await inbox_items.create(
+        db, id="done", file_path=str(empty), content_hash=h, status="completed",
+        created_at="2026-06-30T00:00:01+00:00",
+    )
+    await inbox_items.create(
+        db, id="f1", file_path=str(empty), content_hash="oldh", status="pending",
+        created_at="2026-06-30T00:00:02+00:00",
+    )
+    await inbox_items.update_status(db, "f1", status="failed", error_message="rate limited")
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=3) == [str(empty)]
+
+    await mon.check_once()
+
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=3) == []
+    row = await inbox_items.get_by_id(db, "f1")
+    assert row["error_message"] == (
+        f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}source file is empty"
+    )
+    assert mock_invoker.run.call_count == 0
+
+
 # ── One approval per drop (gate ON) ──────────────────────────────────────
 
 
@@ -202,6 +394,56 @@ async def test_one_approval_per_drop_then_resume_dispatches_all(
     assert mock_invoker.run.call_count == 2, "both batches dispatched on resume"
     assert disp.route.call_count == 1, "resume does NOT re-route"
     disp.approval_gate.mark_consumed.assert_awaited_once_with("req-1")
+
+
+@pytest.mark.asyncio
+async def test_resume_claim_prevents_double_dispatch_on_crash(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, monkeypatch,
+):
+    """A crash between dispatch and completion must NOT duplicate the eval.
+
+    The resume pass claims each row (awaiting_approval: -> dispatching:) BEFORE
+    the CC call, so a re-run (restart) finds the rows already 'dispatching:'
+    (excluded from get_awaiting_approval) and does not re-dispatch them. Without
+    the claim, the rows stay 'awaiting_approval:' and the next scan re-resumes
+    and re-dispatches -> duplicate eval + duplicate Genesis-N file.
+    """
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=3)
+    approvals: dict[str, dict] = {}
+    disp = _wired(
+        decision=AutonomousDispatchDecision(
+            mode="blocked", reason="approval requested",
+            approval_request_id="req-1",
+        ),
+        approval_by_id=approvals,
+    )
+    mon._autonomous_dispatcher = disp
+    (inbox_dir / "Genesis.md").write_text(_urls(6))  # 6 URLs -> 1 drop, 2 batches
+
+    await mon.check_once()  # scan 1: parked awaiting approval
+    assert len(await inbox_items.get_awaiting_approval(db)) == 2
+
+    # Simulate a crash AFTER dispatch but BEFORE completion: the resume loop
+    # claims the row first, then calls _dispatch_one_batch — stub it so the row
+    # is never marked completed (as if the process died mid-eval).
+    dispatch_calls: list[str] = []
+
+    async def _crash_dispatch(item, **kw):
+        dispatch_calls.append(item.id)
+        return True  # "dispatched" but leaves the row in its claimed state
+
+    monkeypatch.setattr(mon, "_dispatch_one_batch", _crash_dispatch)
+
+    approvals["req-1"] = {"status": "approved"}
+    await mon.check_once()  # scan 2: claim + (crashed) dispatch
+    assert len(dispatch_calls) == 2, "both batches dispatched once on resume"
+    # Claimed rows are 'dispatching:' now -> no longer awaiting.
+    assert await inbox_items.get_awaiting_approval(db) == []
+
+    await mon.check_once()  # scan 3: restart — must NOT re-dispatch the claimed rows
+    assert len(dispatch_calls) == 2, (
+        "claimed rows were re-dispatched after a crash (double dispatch)"
+    )
 
 
 @pytest.mark.asyncio

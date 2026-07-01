@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -104,6 +104,17 @@ class TestRegistration:
         assert "awareness_restart" in names
         assert "ollama_alert" in names
         assert "disk_cleanup" in names
+
+    def test_default_timeout_s(self):
+        # New per-action timeout defaults to 30s (no behavior change for others).
+        assert _l2_action().timeout_s == 30
+
+    def test_disk_cleanup_is_autorun_reclaim(self):
+        disk = [a for a in DEFAULT_REMEDIATIONS if a.name == "disk_cleanup"][0]
+        assert disk.governance_level == 2          # auto-run (regenerable only)
+        assert disk.timeout_s == 300               # multi-GB rmtree needs > 30s
+        assert any("disk_reclaim.py" in part for part in disk.command)
+        assert "--if-above" in disk.command and "--fail-above" in disk.command
 
 
 # ---------------------------------------------------------------------------
@@ -277,10 +288,12 @@ class TestCommandFailures:
         reg.register(_l2_action())
         mock_proc = AsyncMock()
         mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
+        mock_proc.kill = MagicMock()  # real asyncio Process.kill() is synchronous
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             outcomes = await reg.check_and_remediate({"qdrant": _down_probe()})
         assert outcomes[0].executed
         assert outcomes[0].success is False
+        mock_proc.kill.assert_called_once()  # hung child is killed on timeout
 
     @pytest.mark.asyncio
     async def test_command_not_found(self):

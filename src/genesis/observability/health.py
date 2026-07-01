@@ -242,7 +242,7 @@ async def probe_scheduler(
 async def probe_disk(
     mount_path: str = "/",
     *,
-    warn_pct: float = 80.0,
+    warn_pct: float = 85.0,
     critical_pct: float = 90.0,
     clock=None,
 ) -> ProbeResult:

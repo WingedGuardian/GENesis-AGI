@@ -1,0 +1,11 @@
+[Unit]
+Description=Genesis Disk Hygiene — daily schedule
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+AccuracySec=1h
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

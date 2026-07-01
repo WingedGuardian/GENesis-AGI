@@ -591,7 +591,13 @@ async def web_agent(
             if hasattr(status, "value"):
                 status = status.value
             if status == "EXCEEDED":
-                return {"error": "Daily budget exceeded. web_agent costs ~$0.015/step."}
+                # Design Principle 3: cost is OBSERVABILITY, never automatic
+                # control. Log the exceeded budget but PROCEED — the user
+                # decides tradeoffs; Genesis never auto-throttles itself.
+                logger.warning(
+                    "web_agent daily budget EXCEEDED — proceeding anyway "
+                    "(cost is observability, not a throttle; ~$0.015/step)",
+                )
     except Exception as exc:
         logger.debug("Budget check skipped: %s", exc)
 

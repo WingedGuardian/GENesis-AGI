@@ -318,7 +318,25 @@ class InboxMonitor:
             watch, resumed_paths,
         )
 
-        if not (new_files + modified_files) and not resume_items:
+        # Phase 2b: partial-failure retry candidates — files with a stranded
+        # retriable-failed batch and no in-flight row. They are NOT detected as
+        # new/modified (a completed sibling keeps their hash "known"), so surface
+        # them here and let _phase_create_records re-queue them independently of
+        # change detection. Exclude files already handled this scan.
+        detected = (
+            {str(p) for p in new_files}
+            | {str(p) for p in modified_files}
+            | set(resumed_paths)
+        )
+        retry_files = [
+            Path(fp)
+            for fp in await inbox_items.get_retriable_failure_files(
+                self._db, max_retries=self._config.max_retries,
+            )
+            if fp not in detected
+        ]
+
+        if not (new_files + modified_files + retry_files) and not resume_items:
             return CheckResult(
                 items_found=len(scan_folder(
                     watch, self._config.response_dir,
@@ -326,9 +344,9 @@ class InboxMonitor:
                 )),
             )
 
-        # Phase 3: Create/update DB records for changed files
-        pending_items = await self._phase_create_records(
-            new_files, modified_files, now, now_iso,
+        # Phase 3: Create/update DB records for changed + retry-candidate files
+        pending_items, items_retried = await self._phase_create_records(
+            new_files, modified_files, retry_files, now, now_iso,
         )
 
         # Phase 4: Batch and dispatch
@@ -343,6 +361,7 @@ class InboxMonitor:
             )),
             items_new=len(new_files),
             items_modified=len(modified_files),
+            items_retried=items_retried,
             batches_dispatched=batches_dispatched,
             errors=errors,
         )
@@ -700,13 +719,15 @@ class InboxMonitor:
         self,
         new_files: list[Path],
         modified_files: list[Path],
+        retry_files: list[Path],
         now: datetime,
         now_iso: str,
-    ) -> list[InboxItem]:
-        """Create/update DB rows for new and modified files.
+    ) -> tuple[list[InboxItem], int]:
+        """Create/update DB rows for new, modified, and retry-candidate files.
 
-        Returns ``pending_items`` — items queued for dispatch.
-        Resume items are NOT included (they're dispatched separately).
+        Returns ``(pending_items, retried_count)`` — items queued for dispatch,
+        and how many retry-candidate files were actually re-queued. Resume items
+        are NOT included (they're dispatched separately).
         """
         from genesis.db.crud import inbox_items
 
@@ -777,28 +798,49 @@ class InboxMonitor:
                     created_at=now_iso,
                 )
                 continue
-            last_at = await inbox_items.get_last_completed_at(
+            # Compute the delta BEFORE the cooldown check. Cooldown must gate
+            # only GENUINELY-new content; an empty delta (file bytes changed but
+            # no new content vs the baseline — e.g. a re-pasted URL with
+            # different tracking params, or a whitespace/reorder edit) must
+            # ALWAYS advance the known hash, even inside the cooldown window, so
+            # the file is not re-detected as "modified" on every scan (the
+            # detection storm — a stale known hash never caught up because the
+            # cooldown branch used to `continue` before writing any row).
+            prev_content = await inbox_items.get_evaluated_content(
                 self._db, str(f),
             )
-            if last_at:
-                last_dt = parse_utc_iso(last_at)
-                if last_dt is None:
-                    logger.warning(
-                        "Cooldown check: unparseable last-eval timestamp "
-                        "%r for %s; proceeding with evaluation", last_at, f,
-                    )
-                elif now - last_dt < cooldown:
-                    # Defer WITHOUT consuming. Do NOT write a 'completed' row
-                    # here: that would advance the known content hash and the
-                    # modification would never be re-detected, stranding the
-                    # new content until the next edit. Skipping leaves the file
-                    # detectable, so the next check past the cooldown window
-                    # re-detects and evaluates it.
-                    logger.debug(
-                        "Cooldown: deferring %s (last eval %s ago)",
-                        f, now - last_dt,
-                    )
-                    continue
+            if prev_content:
+                delta = _compute_new_content(prev_content, content)
+                is_empty_delta = not delta.strip()
+                eval_content = delta
+            else:
+                is_empty_delta = False
+                eval_content = content
+            # Cooldown gates ONLY genuinely-new content (non-empty delta).
+            if not is_empty_delta:
+                last_at = await inbox_items.get_last_completed_at(
+                    self._db, str(f),
+                )
+                if last_at:
+                    last_dt = parse_utc_iso(last_at)
+                    if last_dt is None:
+                        logger.warning(
+                            "Cooldown check: unparseable last-eval timestamp "
+                            "%r for %s; proceeding with evaluation", last_at, f,
+                        )
+                    elif now - last_dt < cooldown:
+                        # Defer WITHOUT writing a row: the new content must stay
+                        # detectable so the next scan past the cooldown window
+                        # re-detects and evaluates it (do not strand it).
+                        logger.debug(
+                            "Cooldown: deferring %s (last eval %s ago)",
+                            f, now - last_dt,
+                        )
+                        continue
+            # Past the gate (or empty delta): supersede a stale pending drop so
+            # a fresh modification replaces an undispatched one — and an orphaned
+            # pending row from an interrupted scan is cleaned up (shared across
+            # both the empty-delta and new-content paths).
             existing = await inbox_items.get_by_file_path(self._db, str(f))
             if existing and existing["status"] == "pending":
                 await inbox_items.update_status(
@@ -806,33 +848,102 @@ class InboxMonitor:
                     status="failed",
                     error_message="superseded_by_modification",
                 )
-            prev_content = await inbox_items.get_evaluated_content(
-                self._db, str(f),
-            )
-            if prev_content:
-                delta = _compute_new_content(prev_content, content)
-                if not delta.strip():
-                    logger.debug(
-                        "No new content in modified file: %s", f,
-                    )
-                    await inbox_items.create(
-                        self._db,
-                        id=item_id,
-                        file_path=str(f),
-                        content_hash=h,
-                        status="completed",
-                        created_at=now_iso,
-                    )
-                    continue
-                eval_content = delta
-            else:
-                eval_content = content
-            # Segment the delta into per-batch rows under one drop.
+            if is_empty_delta:
+                # No new content vs the baseline: write a completing row to
+                # ADVANCE the known hash (no evaluation). This runs regardless
+                # of cooldown — it is the storm fix.
+                logger.debug("No new content in modified file: %s", f)
+                await inbox_items.create(
+                    self._db,
+                    id=item_id,
+                    file_path=str(f),
+                    content_hash=h,
+                    status="completed",
+                    created_at=now_iso,
+                )
+                continue
+            # Genuinely new content -> segment the delta into per-batch rows.
             await self._queue_drop(
                 str(f), eval_content, h, now_iso, pending_items,
             )
 
-        return pending_items
+        # --- Partial-failure auto-retry (PR-2c) ---
+        # Re-queue stranded retriable-failed batches for files with no in-flight
+        # row. These aren't detected as new/modified (a completed sibling keeps
+        # the file's hash "known"), so we re-derive the delta and reuse the
+        # failed rows via _queue_drop. Cooldown-EXEMPT — a retry is failure
+        # recovery, not a re-eval on a user edit; bounded per row by retry_count
+        # (get_retriable_failed_rows excludes rows at the cap) plus the
+        # URL-failure storm guard below.
+        retried = 0
+        for f in retry_files:
+            try:
+                content = read_content(f)
+                h = compute_hash(f)
+            except FileNotFoundError:
+                # The source file was deleted since it failed — its stranded
+                # retriable-failed rows can never be re-evaluated. Abandon them
+                # so the file stops being a retry candidate; otherwise it recurs
+                # (and re-logs) every scan forever. (If the file is ever
+                # re-created it is detected as new and evaluated fresh.)
+                logger.info(
+                    "Retry candidate %s no longer exists; abandoning its "
+                    "stale failed rows", f,
+                )
+                await inbox_items.mark_file_failures_abandoned(
+                    self._db, str(f), max_retries=self._config.max_retries,
+                    reason="source file deleted",
+                )
+                continue
+            except PermissionError:
+                # Possibly transient (e.g. locked mid-write) — skip WITHOUT
+                # abandoning; a later scan's read may succeed.
+                logger.warning(
+                    "Permission error reading retry candidate %s; skipping", f,
+                )
+                continue
+            if not content.strip():
+                # Empty source file — nothing to ever retry; abandon so it stops
+                # being a candidate (same terminal state as a deleted file).
+                await inbox_items.mark_file_failures_abandoned(
+                    self._db, str(f), max_retries=self._config.max_retries,
+                    reason="source file is empty",
+                )
+                continue
+            url_fail_count = await inbox_items.count_url_failures(
+                self._db, str(f), since_hours=48,
+            )
+            if url_fail_count >= self._config.max_retries:
+                logger.warning(
+                    "Retry storm: %s has %d URL failures in 48h, skipping retry",
+                    f, url_fail_count,
+                )
+                continue
+            prev_content = await inbox_items.get_evaluated_content(
+                self._db, str(f),
+            )
+            delta = (
+                _compute_new_content(prev_content, content)
+                if prev_content else content
+            )
+            if not delta.strip():
+                # The failed batch's URLs are no longer in the file (removed) —
+                # nothing to retry. Abandon the stale failed rows so the file
+                # stops being a retry candidate forever.
+                logger.debug(
+                    "Retry candidate %s has no un-evaluated content; "
+                    "abandoning stale failed rows", f,
+                )
+                await inbox_items.mark_file_failures_abandoned(
+                    self._db, str(f), max_retries=self._config.max_retries,
+                )
+                continue
+            before = len(pending_items)
+            await self._queue_drop(str(f), delta, h, now_iso, pending_items)
+            if len(pending_items) > before:
+                retried += 1
+
+        return pending_items, retried
 
     async def _queue_drop(
         self,
@@ -917,6 +1028,7 @@ class InboxMonitor:
         Returns the number of batches successfully dispatched.
         """
         from genesis.cc.types import CCModel, EffortLevel
+        from genesis.db.crud import inbox_items
 
         try:
             model = CCModel(self._config.model)
@@ -931,16 +1043,32 @@ class InboxMonitor:
 
         batches_dispatched = 0
 
-        # --- Resume drops: approval already resolved -> consume then dispatch. ---
+        # --- Resume drops: claim (at-most-once) -> consume -> dispatch. ---
         for _drop_id, items in self._group_by_drop(resume_items):
-            # Consume the drop's approval BEFORE dispatching so a restart
-            # mid-drop cannot leave an unconsumed approval that a later drop
-            # rides via the content-agnostic stable key. mark_consumed is
-            # idempotent; the parked rows still drive re-dispatch on restart.
-            reqid = items[0].approval_reqid if items else ""
+            # CLAIM each batch row out of the awaiting-approval parked state
+            # BEFORE the CC call. The claim (awaiting_approval: -> dispatching:)
+            # is the at-most-once authority: a row already claimed (a prior scan
+            # still dispatching, or a concurrent scan) or no longer parked loses
+            # the claim and is skipped. A crash between the claim and completion
+            # therefore cannot duplicate the dispatch — the claimed row is
+            # 'dispatching:' (invisible to get_awaiting_approval), and a stranded
+            # one is reaped by expire_stuck_processing back into the retry path.
+            claimed = [
+                item for item in items
+                if await inbox_items.claim_for_dispatch(
+                    self._db, item.id, reqid=item.approval_reqid,
+                )
+            ]
+            if not claimed:
+                continue
+            # Consume the drop's approval (best-effort). The row-state claim above
+            # is the real gate, so a consume failure neither strands the drop nor
+            # bypasses at-most-once; it only leaves the content-agnostic approval
+            # rideable until the gate's 24h staleness window (WARNING-logged).
+            reqid = claimed[0].approval_reqid
             if reqid:
                 await self._consume_approval(reqid)
-            for item in items:
+            for item in claimed:
                 if await self._dispatch_one_batch(
                     item, model=model, effort=effort,
                     system_prompt=system_prompt, now_iso=now_iso, errors=errors,

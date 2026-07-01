@@ -386,14 +386,15 @@ class OutcomeHarvester:
 
             # Verified-correctness (second, orthogonal axis). EXECUTION_OUTCOME
             # above answers "did it run"; this answers "was the output useful".
-            # A completed insight task whose intake routed EVERYTHING to discard
-            # is hollow — it ran but produced nothing of value — so it earns an
-            # ADDITIONAL tier-1 negative. Because VERIFICATION_FAILED is a
-            # distinct signal_type, it coexists with the positive EXECUTION_OUTCOME
-            # on the same (source, ref_type, ref_id) under the unique key; the two
-            # never dup-suppress each other across incremental re-harvests.
-            # NULL outcome_quality (action tasks, legacy rows, intake failures,
-            # empty/too-short output) adds nothing here — positive-only, unchanged.
+            # A completed insight task whose output the measurement-only quality
+            # judge FAILED (score below the output_quality threshold) is hollow —
+            # it ran but produced nothing of value — so it earns an ADDITIONAL
+            # tier-1 negative. Because VERIFICATION_FAILED is a distinct
+            # signal_type, it coexists with the positive EXECUTION_OUTCOME on the
+            # same (source, ref_type, ref_id) under the unique key; the two never
+            # dup-suppress each other across incremental re-harvests. NULL
+            # outcome_quality (action tasks, legacy rows, judge outages, unknown
+            # types, empty/too-short output) adds nothing — positive-only, unchanged.
             if completed and r["outcome_quality"] == "hollow":
                 veid = await record_outcome(
                     self._db,
@@ -404,7 +405,7 @@ class OutcomeHarvester:
                     signal_type=SignalType.VERIFICATION_FAILED,
                     polarity="negative",
                     value=0.0,
-                    reason_text="intake routed all findings to discard (hollow)",
+                    reason_text="quality judge scored output below threshold (hollow)",
                     occurred_at=r["completed_at"] or r["created_at"],
                     harvested_from="surplus_tasks",
                 )

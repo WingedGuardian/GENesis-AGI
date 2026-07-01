@@ -74,11 +74,15 @@ async def mark_completed(
     completed_at: str,
     result_staging_id: str | None = None,
     outcome_quality: str | None = None,
+    judge_score: float | None = None,
+    judge_detail: str | None = None,
 ) -> bool:
     cursor = await db.execute(
         "UPDATE surplus_tasks SET status = 'completed', completed_at = ?, "
-        "result_staging_id = ?, outcome_quality = ? WHERE id = ?",
-        (completed_at, result_staging_id, outcome_quality, id),
+        "result_staging_id = ?, outcome_quality = ?, judge_score = ?, "
+        "judge_detail = ? WHERE id = ?",
+        (completed_at, result_staging_id, outcome_quality, judge_score,
+         judge_detail, id),
     )
     await db.commit()
     return cursor.rowcount > 0

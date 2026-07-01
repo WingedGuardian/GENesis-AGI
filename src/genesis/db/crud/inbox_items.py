@@ -18,6 +18,17 @@ AWAITING_APPROVAL_PREFIX = "awaiting_approval:"
 # invalidated-failed rows with still-awaiting rows.
 APPROVAL_INVALIDATED_PREFIX = "approval_invalidated:"
 
+# Prefix marking a row that has been CLAIMED for an in-flight dispatch (the CC
+# call is about to run / is running).  The resume pass flips a parked row from
+# ``awaiting_approval:`` to ``dispatching:`` via ``claim_for_dispatch`` BEFORE
+# the CC call — this is the at-most-once dispatch authority.  Deliberately a
+# distinct prefix so a claimed row is NOT re-found by ``get_awaiting_approval``
+# (which matches ``awaiting_approval:%``) yet IS reaped by
+# ``expire_stuck_processing`` (which excludes only ``awaiting_approval:%``) —
+# so a crash mid-dispatch cannot re-resume, and a stranded claim is recovered
+# into the retry path.
+DISPATCHING_PREFIX = "dispatching:"
+
 
 async def create(
     db: aiosqlite.Connection,
@@ -110,6 +121,36 @@ async def get_awaiting_approval(db: aiosqlite.Connection) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+async def claim_for_dispatch(
+    db: aiosqlite.Connection, id: str, *, reqid: str,
+) -> bool:
+    """Atomically claim a parked row for an in-flight dispatch (at-most-once).
+
+    Transitions ``error_message`` from ``awaiting_approval:<reqid>`` to
+    ``dispatching:<reqid>`` (status stays ``processing``), but ONLY for the row
+    still parked on exactly this approval. Returns True iff this call won the
+    claim (``rowcount == 1``).
+
+    This is the dispatch at-most-once gate. A row already claimed (``dispatching:``
+    — e.g. by a prior scan whose CC call is still running, or a concurrent scan),
+    already completed/failed, or parked on a different approval, does NOT match
+    and returns False, so the caller skips it. Because the claimed row is now
+    ``dispatching:`` it is invisible to :func:`get_awaiting_approval`, so a crash
+    between the claim and completion cannot re-resume and duplicate the dispatch;
+    :func:`expire_stuck_processing` reaps a stranded ``dispatching:`` row after
+    its timeout, returning it to the retry path.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET error_message = ? || ?
+           WHERE id = ? AND status = 'processing'
+             AND error_message = ? || ?""",
+        (DISPATCHING_PREFIX, reqid, id, AWAITING_APPROVAL_PREFIX, reqid),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def update_status_for_drop(
     db: aiosqlite.Connection,
     drop_id: str,
@@ -152,9 +193,17 @@ async def get_all_known(
     """
     from pathlib import Path
 
+    # ORDER BY created_at ASC, rowid ASC so the per-file dict-overwrite loop
+    # below deterministically keeps the NEWEST row's hash. A file has many rows
+    # (one per batch, plus reused rows), and `reuse_as_pending` resets created_at
+    # to now while KEEPING the old (low) rowid — so insertion/rowid order is NOT
+    # recency. Without this ORDER BY an arbitrary (stale) row's hash could win,
+    # so the file's current hash never matches "known" → phantom "modified"
+    # every scan (the detection storm).
     cursor = await db.execute(
         "SELECT file_path, content_hash, status, response_path, retry_count "
-        "FROM inbox_items WHERE status != 'failed'",
+        "FROM inbox_items WHERE status != 'failed' "
+        "ORDER BY created_at ASC, rowid ASC",
     )
     rows = await cursor.fetchall()
     result: dict[str, str] = {}
@@ -170,7 +219,8 @@ async def get_all_known(
     # Permanently failed items (exhausted retries) should also block reprocessing
     cursor2 = await db.execute(
         "SELECT file_path, content_hash FROM inbox_items "
-        "WHERE status = 'failed' AND retry_count >= ?",
+        "WHERE status = 'failed' AND retry_count >= ? "
+        "ORDER BY created_at ASC, rowid ASC",
         (max_retries,),
     )
     for row in await cursor2.fetchall():
@@ -252,7 +302,7 @@ async def set_response_path(
     cursor = await db.execute(
         """UPDATE inbox_items
            SET response_path = ?, processed_at = ?, status = 'completed',
-               evaluated_content = ?
+               evaluated_content = ?, error_message = NULL
            WHERE id = ?""",
         (response_path, processed_at, evaluated_content, id),
     )
@@ -432,6 +482,62 @@ async def get_retriable_failed_rows(
         (file_path, max_retries, APPROVAL_INVALIDATED_PREFIX),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_retriable_failure_files(
+    db: aiosqlite.Connection, *, max_retries: int = 3,
+) -> list[str]:
+    """Return file_paths that have a stranded retriable-failed batch to retry.
+
+    A file qualifies for partial-failure AUTO-RETRY when it has >=1 failed row
+    that is still retriable (``retry_count < max_retries`` and not
+    ``approval_invalidated:``) AND it has NO row currently ``pending`` or
+    ``processing`` (nothing in flight for it). Such files are otherwise stranded:
+    when only SOME batches of a drop fail, a completed sibling keeps the file's
+    hash in :func:`get_all_known`, so detection never re-surfaces the file and
+    the failed batch would only retry on the next user edit. The monitor uses
+    this to re-queue the failed batches independently of file-change detection.
+    Excludes approval-invalidated rows (those need a fresh approval, not a retry).
+    """
+    cursor = await db.execute(
+        """SELECT DISTINCT file_path FROM inbox_items
+           WHERE status = 'failed' AND retry_count < ?
+             AND (error_message IS NULL
+                  OR error_message NOT LIKE ? || '%')
+             AND file_path NOT IN (
+                 SELECT file_path FROM inbox_items
+                 WHERE status IN ('pending', 'processing')
+             )""",
+        (max_retries, APPROVAL_INVALIDATED_PREFIX),
+    )
+    return [row[0] for row in await cursor.fetchall()]
+
+
+async def mark_file_failures_abandoned(
+    db: aiosqlite.Connection, file_path: str, *, max_retries: int = 3,
+    reason: str = "content removed before retry",
+) -> int:
+    """Mark a file's retriable failed rows as approval-invalidated (abandoned).
+
+    Used when a retry candidate can never be retried again — either its failed
+    content was removed from the file (empty delta; the default ``reason``), or
+    the source file itself was deleted (``reason="source file deleted"``). The
+    retriable-failed rows would otherwise keep the file a retry candidate
+    forever; flipping them to the ``approval_invalidated:<reason>`` prefix
+    excludes them from :func:`get_retriable_failure_files` /
+    :func:`get_retriable_failed_rows`. Returns the number of rows updated.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET error_message = ? || ?
+           WHERE file_path = ? AND status = 'failed' AND retry_count < ?
+             AND (error_message IS NULL
+                  OR error_message NOT LIKE ? || '%')""",
+        (APPROVAL_INVALIDATED_PREFIX, reason, file_path, max_retries,
+         APPROVAL_INVALIDATED_PREFIX),
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 async def reuse_as_pending(

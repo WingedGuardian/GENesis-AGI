@@ -12,7 +12,18 @@
 # only honors the resolved fields. failover_order: lower = tried first when the
 # active model rate-limits/exhausts (0 = primary; skipped as a failover peer is
 # not done — claude IS a valid peer when something else is active).
+#
+# Interactive use: `gmodel` (scripts/gmodel) launches a foreground `claude`
+# session on any model here — `gmodel glm-5.2` (peer), `gmodel opus` (native Max
+# tier), `gmodel` alone lists them. `gmodel --print-env <name>` previews the env.
 default: claude
+# Agentic gauntlet (genesis.eval.gauntlet) — validates that a roster member can
+# still drive Claude Code through a coding fix-loop. `genesis eval gauntlet run
+# <model>` runs on demand anytime. The WEEKLY auto-run is OFF by default because
+# it spends inference on paid peers (e.g. GLM); flip `scheduled: true` (here or
+# via the cc_roster settings domain) to enable it for all runnable roster models.
+gauntlet:
+  scheduled: false
 models:
   claude:
     native_subscription: true

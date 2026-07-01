@@ -188,3 +188,54 @@ def test_user_dir_overlay_controls_default(roster_dir, tmp_path):
 def test_non_dict_config_is_ignored(tmp_path):
     (tmp_path / "cc_roster.yaml").write_text("- just\n- a\n- list\n")
     assert R.load_roster(tmp_path) == {}  # no crash on malformed config
+
+
+# --- apply_routing_env: the shared invoker/gmodel routing-env contract ----------
+
+_MODEL_SLOTS = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
+
+
+def test_apply_routing_env_peer_sets_all_and_drops_api_key():
+    env = {"ANTHROPIC_API_KEY": "sk-anthropic", "PATH": "/x"}
+    out = R.apply_routing_env(
+        env,
+        base_url="https://open.bigmodel.cn/api/anthropic",
+        auth_token="zk-secret",
+        model_id="glm-5.2",
+    )
+    assert out is env  # mutates in place
+    assert env["ANTHROPIC_BASE_URL"] == "https://open.bigmodel.cn/api/anthropic"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "zk-secret"
+    assert all(env[s] == "glm-5.2" for s in _MODEL_SLOTS)
+    assert "ANTHROPIC_API_KEY" not in env  # credential isolation
+    assert env["PATH"] == "/x"  # unrelated vars untouched
+
+
+def test_apply_routing_env_native_pops_routing_keeps_api_key():
+    # Native Claude: no override fields → all routing popped, but the Anthropic key
+    # is preserved (the caller decides Max-vs-key for the native path).
+    env = {
+        "ANTHROPIC_API_KEY": "sk-anthropic",
+        "ANTHROPIC_BASE_URL": "stale",
+        "ANTHROPIC_AUTH_TOKEN": "stale",
+        "ANTHROPIC_MODEL": "stale",
+    }
+    R.apply_routing_env(env, base_url=None, auth_token=None, model_id=None)
+    assert "ANTHROPIC_BASE_URL" not in env
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+    assert all(s not in env for s in _MODEL_SLOTS)
+    assert env["ANTHROPIC_API_KEY"] == "sk-anthropic"  # kept for native
+
+
+def test_apply_routing_env_auth_token_only_still_drops_api_key():
+    # Defense-in-depth: an inconsistent combo (token but no base_url) must still
+    # drop the Anthropic key so it can't leak to a third-party endpoint.
+    env = {"ANTHROPIC_API_KEY": "sk-anthropic"}
+    R.apply_routing_env(env, base_url=None, auth_token="zk-secret", model_id=None)
+    assert "ANTHROPIC_API_KEY" not in env
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "zk-secret"

@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""gmodel — launch an interactive Claude Code session on a chosen model.
+
+    gmodel                 list the roster (models, default, key status)
+    gmodel <name>          launch `claude` on <name>
+    gmodel <name> …args    pass extra args straight through to `claude`
+    gmodel --print-env <n> show the env `claude` would get, then exit (no launch)
+
+<name> is either:
+  • a Claude tier — opus / sonnet / haiku — → native `claude --model <tier>` on
+    your Max subscription (OAuth); or
+  • a roster model from config/cc_roster.yaml — `claude` (a peer runs on that
+    provider's native Anthropic endpoint + its API key).
+
+Anthropic always runs on Max (native OAuth — `ANTHROPIC_API_KEY` is dropped so a
+stray key can't silently switch you to per-token billing). A session is pinned to
+one endpoint: to change model, relaunch. Plain `claude` is untouched (native Max).
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_VENV_PYTHON = _REPO_ROOT / ".venv" / "bin" / "python"
+
+# Re-exec under the Genesis venv so `import genesis` + yaml/dotenv resolve, no
+# matter how gmodel was invoked (symlink on PATH, bare python3, etc.).
+if _VENV_PYTHON.is_file() and Path(sys.executable).resolve() != _VENV_PYTHON.resolve():
+    os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+# Source checkout fallback (pip -e installs also satisfy the import directly).
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+# Load secrets.env into THIS process only so peer auth_env tokens (e.g.
+# ZHIPU_API_KEY) resolve for roster.overrides_for. The child's env is built
+# explicitly below — we never blanket-forward every secret, and ANTHROPIC_API_KEY
+# is always dropped from the child.
+_SECRETS = _REPO_ROOT / "secrets.env"
+if _SECRETS.is_file():
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(str(_SECRETS), override=False)
+    except ImportError:
+        pass
+
+from genesis.cc import roster  # noqa: E402
+
+#: Native Claude tiers — resolved to `claude --model <tier>` on Max, not the roster.
+_CLAUDE_TIERS = {"opus", "sonnet", "haiku", "default"}
+
+
+def _list_models() -> int:
+    r = roster.load_roster()
+    default = roster.active_model(r)
+    models = r.get("models") or {}
+    if not models:
+        print("No roster models configured (config/cc_roster.yaml).", file=sys.stderr)
+        return 1
+    print("Models (gmodel <name> to launch):\n")
+    print("  claude tiers:  opus  sonnet  haiku   (native Max, via --model)\n")
+    print("  roster:")
+    for name in models:
+        entry = roster.resolve(name, r)
+        tags = ["default"] if name == default else []
+        if entry and (entry.native_subscription or name == roster.CLAUDE):
+            tags.append("native Max")
+        else:
+            tags.append(entry.anthropic_base_url if entry and entry.anthropic_base_url else "no endpoint")
+            key_ok = bool(entry and entry.auth_env and os.environ.get(entry.auth_env))
+            tags.append("key ✓" if key_ok else f"key ✗ ({entry.auth_env if entry else '?'})")
+        print(f"    {name:<14} {'  ·  '.join(tags)}")
+    print(f"\nDefault: {default}. Plain `claude` always runs native Max.")
+    return 0
+
+
+def _resolve(name: str) -> tuple[dict, list[str]]:
+    """Return ``(routing_overrides, tier_passthrough_args)`` for ``name``.
+
+    Raises :class:`roster.RosterError` for an unknown, non-tier name.
+    """
+    r = roster.load_roster()
+    if roster.resolve(name, r) is None and name in _CLAUDE_TIERS:
+        # Native Claude tier: no routing, launch `claude --model <tier>` (Max).
+        return {}, ([] if name == "default" else ["--model", name])
+    return roster.overrides_for(name, r), []
+
+
+def _build_child_env(overrides: dict, name: str) -> dict[str, str]:
+    env = dict(os.environ)
+    # Avoid CC-in-CC nesting confusion when launched from inside a CC session
+    # (mirrors CCInvoker._build_env / experimentation.cc_router).
+    env.pop("CLAUDECODE", None)
+    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    # ALWAYS drop the Anthropic API key:
+    #   native → forces the Max subscription (a stray ANTHROPIC_API_KEY silently
+    #            overrides OAuth and bills per token);
+    #   peer   → credential isolation (apply_routing_env drops it again anyway).
+    env.pop("ANTHROPIC_API_KEY", None)
+    roster.apply_routing_env(
+        env,
+        base_url=overrides.get("anthropic_base_url") if overrides else None,
+        auth_token=overrides.get("anthropic_auth_token") if overrides else None,
+        model_id=overrides.get("model_id_override") if overrides else None,
+    )
+    if overrides:
+        # Tell the SessionStart hook this window is on a peer — CC's self-reported
+        # model header would otherwise say "Claude". (Native → no flag, no notice.)
+        env["GENESIS_ROSTER_MODEL"] = name
+    else:
+        env.pop("GENESIS_ROSTER_MODEL", None)
+    return env
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("--list",):
+        return _list_models()
+    if argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+
+    print_env = False
+    if argv[0] == "--print-env":
+        print_env = True
+        argv = argv[1:]
+        if not argv:
+            print("gmodel: --print-env needs a model name.", file=sys.stderr)
+            return 2
+
+    name, *passthrough = argv
+    try:
+        overrides, tier_args = _resolve(name)
+    except roster.RosterError as exc:
+        print(f"gmodel: {exc}", file=sys.stderr)
+        print("Run `gmodel` (no args) to list models; tiers: opus/sonnet/haiku.", file=sys.stderr)
+        return 1
+
+    env = _build_child_env(overrides, name)
+
+    if print_env:
+        # Pure diagnostic — never launches, so it must NOT require `claude` on PATH
+        # (e.g. CI, or previewing before install).
+        for k in (
+            "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_API_KEY", "GENESIS_ROSTER_MODEL",
+        ):
+            if k == "ANTHROPIC_AUTH_TOKEN":
+                print(f"{k}={'<set>' if env.get(k) else '<unset>'}")
+            else:
+                print(f"{k}={env.get(k, '<unset>')}")
+        target = overrides["anthropic_base_url"] if overrides else "native Claude (Max)"
+        print(f"# would exec: claude {' '.join(tier_args + passthrough)}  → {target}")
+        return 0
+
+    claude = shutil.which("claude")
+    if not claude:
+        print("gmodel: `claude` not found on PATH.", file=sys.stderr)
+        return 127
+
+    if overrides:
+        print(f"gmodel: launching claude on {name} ({overrides['anthropic_base_url']})", file=sys.stderr)
+    else:
+        label = name if name in _CLAUDE_TIERS else "native Claude"
+        print(f"gmodel: launching {label} (Max)", file=sys.stderr)
+
+    os.execve(claude, [claude, *tier_args, *passthrough], env)
+    return 0  # unreachable (execve replaces the process)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
