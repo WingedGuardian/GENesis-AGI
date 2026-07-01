@@ -131,6 +131,16 @@ def print_report(r: ShadowReport) -> None:
         print(f"             text: {s['text'][:150]!r}")
 
 
+def _snapshot_id_from_path(path: Path) -> str:
+    """Canonical BARE snapshot_id from a snapshot filename.
+
+    ``pull_snapshot()`` names files ``ambient_{id}.db`` but stores the bare ``id`` in
+    ``attention_events.snapshot_id`` / ``window_ref``. So ``--snapshot`` must strip the
+    ``ambient_`` prefix to match — otherwise the dashboard reveal (which reconstructs
+    ``ambient_{snapshot_id}.db``) would look for ``ambient_ambient_...db`` and 410."""
+    return path.stem.removeprefix("ambient_")
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     ap = argparse.ArgumentParser(description="Attention engine offline shadow runner")
@@ -149,7 +159,7 @@ async def _run_cli(args) -> None:
     logger.info("config version=%s aliases=%s domain_kw=%d", cfg.version, cfg.aliases, len(cfg.domain_keywords))
     if args.snapshot:
         path = Path(args.snapshot).expanduser()
-        sid = path.stem
+        sid = _snapshot_id_from_path(path)
     else:
         sid, path = await pull_snapshot()
 

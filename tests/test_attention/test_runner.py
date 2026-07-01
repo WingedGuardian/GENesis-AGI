@@ -1,12 +1,18 @@
 """Offline shadow runner: config resolution + run_shadow over a synthetic snapshot."""
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from genesis.attention import runner
 from genesis.attention.config import AttentionConfig, default_config_dict
-from genesis.attention.runner import ShadowReport, load_runner_config, run_shadow
+from genesis.attention.runner import (
+    ShadowReport,
+    _snapshot_id_from_path,
+    load_runner_config,
+    run_shadow,
+)
 
 
 def _meta(rms=0.2, ntok=20) -> str:
@@ -27,6 +33,13 @@ def _make_ambient(path, rows) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def test_snapshot_id_from_path_strips_ambient_prefix():
+    # --snapshot must yield the BARE id so the dashboard reveal can reconstruct the file.
+    assert _snapshot_id_from_path(Path("/x/ambient_20260701T013412Z.db")) == "20260701T013412Z"
+    assert _snapshot_id_from_path(Path("/x/20260701T013412Z.db")) == "20260701T013412Z"
+    assert _snapshot_id_from_path(Path("/x/custom.db")) == "custom"
 
 
 def test_load_runner_config_from_explicit_file(tmp_path):

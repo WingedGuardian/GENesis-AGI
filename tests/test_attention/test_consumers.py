@@ -96,7 +96,36 @@ async def test_idempotent_reflush_same_snapshot_and_config(tmp_path):
         for ev in evs:
             c.add(ev)
         await c.flush()
-    assert _rows(db) == len(evs)  # INSERT OR REPLACE keyed on snapshot:config:utt
+    assert _rows(db) == len(evs)  # label-preserving upsert keyed on snapshot:config:utt
+
+
+@pytest.mark.asyncio
+async def test_reflush_preserves_human_label(tmp_path):
+    # B1 regression: persist -> a human labels a row -> re-run the SAME snapshot+config
+    # (the runner always writes acceptance_signal=NULL) must NOT clobber the label.
+    db = tmp_path / "g.db"
+    _make_db(db)
+    cfg = AttentionConfig.from_dict(default_config_dict())
+    evs = _run_events([_utt(1, 100.0, "what do you think?")], cfg)
+    assert evs
+
+    async def _persist():
+        c = ShadowStoreConsumer(db, snapshot_id="s", config_version=cfg.version)
+        for ev in evs:
+            c.add(ev)
+        await c.flush()
+
+    await _persist()
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE attention_events SET acceptance_signal = 'should'")
+    conn.commit()
+    conn.close()
+
+    await _persist()  # re-run over the same snapshot+config
+    conn = sqlite3.connect(db)
+    labels = [r[0] for r in conn.execute("SELECT acceptance_signal FROM attention_events")]
+    conn.close()
+    assert labels and all(v == "should" for v in labels)  # label survived the re-run
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,15 @@
-"""ambient_transcripts row -> AmbientUtterance mapping (pure, no DB)."""
+"""ambient_transcripts row -> AmbientUtterance mapping (pure, no DB) + snapshot text reveal."""
 import json
+import sqlite3
 
-from genesis.attention.sources import _parse_ts, _speaker_total, row_to_utterance
+import pytest
+
+from genesis.attention.sources import (
+    _parse_ts,
+    _speaker_total,
+    resolve_window_text,
+    row_to_utterance,
+)
 
 
 def _row(**over) -> dict:
@@ -52,3 +60,58 @@ def test_speaker_total_parse():
 
 def test_parse_ts_naive_assumed_utc_equals_explicit_utc():
     assert _parse_ts("2026-06-30T12:00:00") == _parse_ts("2026-06-30T12:00:00+00:00")
+
+
+# ── resolve_window_text: reveal transcript text from the transient snapshot ──────
+
+def _make_snapshot(dir_, snapshot_id, rows) -> None:
+    conn = sqlite3.connect(dir_ / f"ambient_{snapshot_id}.db")
+    conn.execute(
+        "CREATE TABLE ambient_transcripts (id INTEGER PRIMARY KEY, ts TEXT, text TEXT, "
+        "duration_s REAL, speaker_label TEXT, provenance TEXT, source TEXT, meta TEXT, "
+        "is_user INTEGER, speaker_name TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO ambient_transcripts (id, ts, text, speaker_label, is_user) "
+        "VALUES (?, ?, ?, ?, ?)", rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_window_text_orders_and_flags_trigger(tmp_path):
+    _make_snapshot(tmp_path, "20260701T013412Z", [
+        (10, "2026-07-01T00:00:02+00:00", "second", "w1:1/2", 0),
+        (11, "2026-07-01T00:00:01+00:00", "first", "w1:1/2", 1),
+        (12, "2026-07-01T00:00:03+00:00", "trigger utt", "w1:1/2", 0),
+    ])
+    win = await resolve_window_text("20260701T013412Z", [11, 10, 12], snapshots_dir=tmp_path)
+    assert [w["text"] for w in win] == ["first", "second", "trigger utt"]  # ts-ordered
+    assert [w["is_trigger"] for w in win] == [False, False, True]          # last utt_id
+    assert win[0]["is_user"] == 1 and win[0]["speaker_label"] == "w1:1/2"
+
+
+@pytest.mark.asyncio
+async def test_resolve_window_text_missing_snapshot_returns_none(tmp_path):
+    assert await resolve_window_text("gone", [1, 2], snapshots_dir=tmp_path) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_window_text_bare_filename_form(tmp_path):
+    # tolerate a snapshot stored WITHOUT the ambient_ prefix
+    conn = sqlite3.connect(tmp_path / "bareid.db")
+    conn.execute("CREATE TABLE ambient_transcripts (id INTEGER PRIMARY KEY, ts TEXT, text TEXT, "
+                 "speaker_label TEXT, is_user INTEGER)")
+    conn.execute("INSERT INTO ambient_transcripts VALUES (1, '2026-07-01T00:00:00+00:00', 'x', 'w1', 1)")
+    conn.commit()
+    conn.close()
+    win = await resolve_window_text("bareid", [1], snapshots_dir=tmp_path)
+    assert win and win[0]["text"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_resolve_window_text_rejects_non_int_ids(tmp_path):
+    _make_snapshot(tmp_path, "sid", [(1, "2026-07-01T00:00:00+00:00", "x", "w1", 1)])
+    with pytest.raises(ValueError):
+        await resolve_window_text("sid", ["1; DROP TABLE ambient_transcripts"], snapshots_dir=tmp_path)
