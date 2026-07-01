@@ -156,3 +156,85 @@ class ProposalDispatchGate:
                 highest = ProtectionLevel.SENSITIVE
 
         return highest if highest != ProtectionLevel.NORMAL else None
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed fallback (Stage-1 hardening)
+# ---------------------------------------------------------------------------
+# The dispatch gate is the last safety check before an already-user-approved
+# proposal runs autonomously in the background.  Previously, if the real gate
+# could not be built (init failure) or raised while evaluating, the caller
+# SILENTLY dispatched — a fail-OPEN hole.  These primitives give a
+# deterministic, dependency-free risk tier so a degraded gate fails CLOSED for
+# high-consequence domains while staying resilient (allow) for benign ones —
+# the latter avoids wedging the whole ego proposal cycle on a transient error.
+
+#: Domains that act on outside parties or on Genesis's own code/identity.  This
+#: is exactly the set whose ``ACTION_DOMAIN_MIN_LEVEL`` is >= 2 (or ``None``),
+#: i.e. the domains the real gate would block below the earned autonomy level.
+#: KEEP IN SYNC when adding an ``ActionDomain``: ``classify_domain``'s fallback
+#: is ``EXTERNAL_READ`` (benign), so an UNMAPPED action is ALLOWED under a
+#: degraded gate — any new external/self-modify domain MUST be added here.
+HIGH_RISK_DOMAINS: frozenset[ActionDomain] = frozenset({
+    ActionDomain.EXTERNAL_WRITE,
+    ActionDomain.REPRESENT_USER,
+    ActionDomain.FINANCIAL,
+    ActionDomain.SELF_MODIFY,
+})
+
+
+def is_high_risk_domain(domain: ActionDomain) -> bool:
+    """True if *domain* touches external parties or Genesis's own code/identity."""
+    return domain in HIGH_RISK_DOMAINS
+
+
+def gate_failure_is_blocking(proposal: dict) -> bool:
+    """Decide fail-closed (True) vs resilient-allow (False) when the dispatch
+    gate is unavailable or raised while evaluating *proposal*.
+
+    Re-derives the action domain from the proposal via the PURE
+    :func:`classify_domain` (no I/O).  Any error deriving it — including
+    ``classify_domain`` itself having been the failure — returns ``True``
+    (block): an undeterminable action is treated as high-risk.  Only
+    clearly-benign domains (OBSERVE / EXTERNAL_READ / INTERNAL_WRITE /
+    NOTIFY_USER) are allowed through, so a transient gate error can't wedge
+    routine (non-external) autonomy.
+    """
+    try:
+        domain = classify_domain(
+            proposal.get("action_type", ""),
+            proposal.get("execution_plan") or "",
+        )
+    except Exception:  # noqa: BLE001 — undeterminable domain => fail closed
+        return True
+    return is_high_risk_domain(domain)
+
+
+class DenyHighRiskSentinel:
+    """Fail-closed stand-in for :class:`ProposalDispatchGate`.
+
+    Installed by ``runtime/init`` when the real gate cannot be constructed, so
+    ``_proposal_dispatch_gate`` is NEVER left unset — which the ego would read
+    as "no gate" and dispatch every approved proposal ungated.  Blocks
+    HIGH_RISK_DOMAINS, allows benign domains.  Stateless; satisfies the same
+    ``evaluate(proposal) -> DispatchDecision`` contract the ego consumes.
+    """
+
+    async def evaluate(self, proposal: dict) -> DispatchDecision:
+        domain = classify_domain(
+            proposal.get("action_type", ""),
+            proposal.get("execution_plan") or "",
+        )
+        if is_high_risk_domain(domain):
+            return DispatchDecision(
+                allowed=False,
+                reason="degraded mode: real dispatch gate unavailable",
+                rule_id="deny_high_risk_sentinel",
+                action_domain=domain,
+            )
+        return DispatchDecision(
+            allowed=True,
+            reason="degraded mode: benign domain allowed",
+            rule_id="deny_high_risk_sentinel",
+            action_domain=domain,
+        )
