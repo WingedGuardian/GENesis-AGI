@@ -190,6 +190,42 @@ def test_load_committed_fixtures():
     assert {"statslib_bugs", "intervals_multifile", "calc_longhorizon"} <= fx
 
 
+async def test_run_gauntlet_persists_to_db(db, monkeypatch, tmp_path):
+    """Full run_gauntlet → insert_run round-trip (fake CC): the AGENTIC run
+    persists to eval_runs/eval_results and reads back with the new enum values."""
+    import importlib
+
+    from genesis.eval.db import get_latest_run, get_run_results
+
+    # eval_runs/eval_results come from migrations, not create_all_tables.
+    for _mig in (
+        "0002_add_eval_tables",
+        "0003_eval_results_skipped",
+        "0014_eval_results_metadata",
+    ):
+        await importlib.import_module(f"genesis.db.migrations.{_mig}").up(db)
+    await db.commit()
+
+    fx = _make_fixture(tmp_path / "fx", green=True)
+    monkeypatch.setattr(G, "_GAUNTLET_ROOT", tmp_path / "groot")
+
+    async def noop(inv):
+        return _cc_output(via_proxy=False)
+
+    monkeypatch.setattr(G, "CCInvoker", lambda: _FakeInvoker(noop))
+
+    summary = await G.run_gauntlet("claude", db=db, fixtures=[fx])
+    assert summary.passed_cases == 1 and summary.failed_cases == 0
+
+    row = await get_latest_run(db, "claude", "gauntlet")
+    assert row is not None
+    assert row["task_category"] == "agentic"
+    assert row["passed_cases"] == 1
+    results = await get_run_results(db, summary.run_id)
+    assert results[0]["scorer_type"] == "agentic_pytest"
+    assert results[0]["passed"] == 1
+
+
 # ---- regression detection ----
 
 def _summary(model, run_id, *, passed, failed, skipped=0, results=None):
