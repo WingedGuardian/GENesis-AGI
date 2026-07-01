@@ -11,8 +11,10 @@ Configuration precedence (highest to lowest):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -97,6 +99,99 @@ def genesis_home() -> Path:
     """Resolve the Genesis runtime home (~/.genesis): output, sessions, config."""
     value = os.environ.get("GENESIS_HOME")
     return Path(value).expanduser() if value else Path.home() / ".genesis"
+
+
+# A real deploy completes in minutes (update.sh's health-check phase caps at
+# ~3 min). A state file whose start is older than this cutoff is a crashed or
+# abandoned deploy, not a live one — treating it as stale bounds the (rare)
+# PID-reuse window in which a leftover state file could otherwise suppress the
+# watchdog's restart guard indefinitely.
+_UPDATE_STALE_AFTER_S = 4 * 3600  # 4 hours
+
+
+def _deploy_state_is_recent(state: dict) -> bool:
+    """False if update_state.json's ``started_at`` is older than the stale cutoff.
+
+    Absent/unparseable timestamp → True (fall back to PID liveness alone; never
+    let a formatting quirk be the thing that suppresses the watchdog).
+    """
+    started_at = state.get("started_at")
+    if not started_at:
+        return True
+    try:
+        started = datetime.fromisoformat(started_at)
+    except (ValueError, TypeError):
+        return True
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - started).total_seconds() < _UPDATE_STALE_AFTER_S
+
+
+def update_in_progress() -> bool:
+    """True while a Genesis self-update (deploy) is actively running.
+
+    Read by the autonomy watchdog to DEFER restarting genesis-server during a
+    deploy. ``update.sh`` intentionally stops the server for its
+    merge/bootstrap/migrate window; a mid-deploy revival takes the DB write lock
+    and deadlocks bootstrap's procedure seed (incident IR-2). Two independent
+    deploy signals are honored — either one alive → in progress:
+
+    * ``~/.genesis/update_in_progress.pid`` — a bare-integer PID written by the
+      dashboard-orchestrated update path (``dashboard/routes/updates.py``).
+      Present ONLY for dashboard-triggered updates; a CLI ``./scripts/update.sh``
+      run never writes it.
+    * ``~/.genesis/update_state.json`` — ``{phase, pid, started_at, ...}`` written
+      per-phase by ``update.sh::_write_state`` (the CLI path; the incident path).
+      Counts only while ``phase != "done"`` (``done`` is written immediately
+      before the file is removed) and ``started_at`` is recent.
+
+    A signal counts only if its PID is > 1 (an ``AsyncMock().pid`` is 1) AND
+    still alive (``os.kill(pid, 0)``). Any dead / absent / corrupt / ``done`` /
+    expired signal is treated as "no deploy", so a stale file can never
+    permanently disable the watchdog. This check is defensive by contract: it
+    NEVER raises into the caller (the watchdog restart path).
+    """
+    try:
+        home = genesis_home()
+
+        # Dashboard path: bare-int PID file (dashboard-only; absent for CLI runs).
+        pid_file = home / "update_in_progress.pid"
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text().strip())
+                if pid > 1:
+                    os.kill(pid, 0)
+                    return True
+            except (ProcessLookupError, ValueError, OSError):
+                pass  # dead / invalid PID — not an active deploy
+
+        # CLI path: update.sh state file with phase + owning PID + start time.
+        state_file = home / "update_state.json"
+        if state_file.exists():
+            try:
+                state = json.loads(state_file.read_text())
+            except (json.JSONDecodeError, OSError, ValueError, UnicodeDecodeError):
+                state = None
+            if (
+                isinstance(state, dict)
+                and state.get("phase") != "done"
+                and _deploy_state_is_recent(state)
+            ):
+                pid = state.get("pid")
+                if isinstance(pid, int) and pid > 1:
+                    try:
+                        os.kill(pid, 0)
+                        return True
+                    except (ProcessLookupError, OSError):
+                        pass  # owning process gone — stale state file
+
+        return False
+    except Exception:  # never raise into the watchdog loop — fail open to "no deploy"
+        logger.warning(
+            "update_in_progress() check failed — assuming no deploy in progress",
+            exc_info=True,
+        )
+        return False
 
 
 def claude_home() -> Path:

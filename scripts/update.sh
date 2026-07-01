@@ -509,6 +509,12 @@ with open(sys.argv[11], 'w') as f:
   "$(date -Iseconds)" \
   "$HOME/.genesis/last_update_failure.json"
 
+    # Clear the in-progress signal files (mirrors the success-path cleanup) so a
+    # leftover entry can't suppress the watchdog's deploy-restart guard after a
+    # rollback. The server is back up (above); once this invocation exits its PID
+    # dies anyway, but removing the files closes the PID-reuse window proactively.
+    rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
+
     echo ""
     echo "  ──────────────────────────────────────"
     echo "  Rolled back: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"
@@ -626,6 +632,9 @@ if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
             systemctl --user start "$svc.service" 2>/dev/null || true
         fi
     done
+    # Nothing changed and no --post-merge continuation follows, so clear the
+    # in-progress signals (like the success path) — a leftover must never linger.
+    rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
     echo ""
     echo "  Nothing to do."
     exit 0

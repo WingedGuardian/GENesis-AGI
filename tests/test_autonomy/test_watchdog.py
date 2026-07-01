@@ -30,6 +30,16 @@ def _mock_bridge_active():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_deploy_in_progress():
+    """Default every watchdog test to 'no deploy running' so the restart gate is
+    deterministic regardless of a real ~/.genesis/update_state.json on the host.
+    The IR-2 deploy-guard tests override this to True.
+    """
+    with patch("genesis.autonomy.watchdog.update_in_progress", return_value=False):
+        yield
+
+
 @pytest.fixture()
 def fresh_status(tmp_path: Path) -> Path:
     """Write a fresh status.json and return the path."""
@@ -76,6 +86,46 @@ def _make_checker(
         state_file=str(tmp_path / "watchdog_state.json"),
         stabilization_s=kwargs.get("stabilization_s", 600),
     )
+
+
+class TestDeployInProgress:
+    """IR-2: the watchdog must DEFER restarts while a deploy is running.
+
+    A mid-deploy revival takes the DB write lock and deadlocks bootstrap's
+    procedure seed. update.sh stops genesis-server on purpose during the
+    merge/bootstrap/migrate window; the guard keeps it down until the deploy ends.
+    """
+
+    def test_stale_status_defers_when_deploy_in_progress(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # A stale status normally RESTARTs (see TestStale); during a deploy → SKIP.
+        checker = _make_checker(tmp_path, stale_status)
+        with patch("genesis.autonomy.watchdog.update_in_progress", return_value=True):
+            assert checker.check() is WatchdogAction.SKIP
+
+    def test_deploy_guard_does_not_trip_failure_counter(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # SKIP returns BEFORE _record_failure, so the backoff / max-restart
+        # counter is never burned during a deploy window.
+        checker = _make_checker(tmp_path, stale_status)
+        state_file = tmp_path / "watchdog_state.json"
+        state_file.write_text(json.dumps({
+            "consecutive_failures": 2, "next_attempt_after": None, "last_reason": "x",
+        }))
+        with patch("genesis.autonomy.watchdog.update_in_progress", return_value=True):
+            checker.check()
+        state = json.loads(state_file.read_text())
+        assert state["consecutive_failures"] == 2  # unchanged — guard skipped the failure path
+
+    def test_restarts_normally_when_no_deploy(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # Sanity: with the (default) no-deploy state, stale still RESTARTs — the
+        # guard adds zero behavior change outside a deploy window.
+        checker = _make_checker(tmp_path, stale_status)
+        assert checker.check() is WatchdogAction.RESTART
 
 
 class TestHealthy:

@@ -285,6 +285,24 @@ class TestFailureArchive:
         self.fake_failure = fake_failure
         self.fake_archive_dir = fake_archive_dir
 
+    @pytest.mark.asyncio
+    async def test_check_failure_file_defers_during_deploy(self, collector, db) -> None:
+        """IR-2 wiring: with a deploy in progress, a present failure file is NOT
+        consumed — the observation defers (shared genesis.env.update_in_progress).
+        """
+        self.fake_failure.write_text('{"timestamp": "2026-07-01T00:00:00Z"}')
+        with patch(
+            "genesis.learning.signals.genesis_version.update_in_progress",
+            return_value=True,
+        ):
+            await collector._check_failure_file()
+        # Deferred: the live failure file is left in place (not archived/consumed)...
+        assert self.fake_failure.exists()
+        # ...and no observation row was written.
+        cursor = await db.execute("SELECT COUNT(*) FROM observations")
+        (count,) = await cursor.fetchone()
+        assert count == 0
+
     def test_archive_creates_timestamped_file(self) -> None:
         self.fake_failure.write_text('{"timestamp": "2026-04-10T12:00:00Z"}')
         GenesisVersionCollector._archive_failure_file()
