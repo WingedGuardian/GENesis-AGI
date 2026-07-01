@@ -318,7 +318,25 @@ class InboxMonitor:
             watch, resumed_paths,
         )
 
-        if not (new_files + modified_files) and not resume_items:
+        # Phase 2b: partial-failure retry candidates — files with a stranded
+        # retriable-failed batch and no in-flight row. They are NOT detected as
+        # new/modified (a completed sibling keeps their hash "known"), so surface
+        # them here and let _phase_create_records re-queue them independently of
+        # change detection. Exclude files already handled this scan.
+        detected = (
+            {str(p) for p in new_files}
+            | {str(p) for p in modified_files}
+            | set(resumed_paths)
+        )
+        retry_files = [
+            Path(fp)
+            for fp in await inbox_items.get_retriable_failure_files(
+                self._db, max_retries=self._config.max_retries,
+            )
+            if fp not in detected
+        ]
+
+        if not (new_files + modified_files + retry_files) and not resume_items:
             return CheckResult(
                 items_found=len(scan_folder(
                     watch, self._config.response_dir,
@@ -326,9 +344,9 @@ class InboxMonitor:
                 )),
             )
 
-        # Phase 3: Create/update DB records for changed files
-        pending_items = await self._phase_create_records(
-            new_files, modified_files, now, now_iso,
+        # Phase 3: Create/update DB records for changed + retry-candidate files
+        pending_items, items_retried = await self._phase_create_records(
+            new_files, modified_files, retry_files, now, now_iso,
         )
 
         # Phase 4: Batch and dispatch
@@ -343,6 +361,7 @@ class InboxMonitor:
             )),
             items_new=len(new_files),
             items_modified=len(modified_files),
+            items_retried=items_retried,
             batches_dispatched=batches_dispatched,
             errors=errors,
         )
@@ -700,13 +719,15 @@ class InboxMonitor:
         self,
         new_files: list[Path],
         modified_files: list[Path],
+        retry_files: list[Path],
         now: datetime,
         now_iso: str,
-    ) -> list[InboxItem]:
-        """Create/update DB rows for new and modified files.
+    ) -> tuple[list[InboxItem], int]:
+        """Create/update DB rows for new, modified, and retry-candidate files.
 
-        Returns ``pending_items`` — items queued for dispatch.
-        Resume items are NOT included (they're dispatched separately).
+        Returns ``(pending_items, retried_count)`` — items queued for dispatch,
+        and how many retry-candidate files were actually re-queued. Resume items
+        are NOT included (they're dispatched separately).
         """
         from genesis.db.crud import inbox_items
 
@@ -846,7 +867,58 @@ class InboxMonitor:
                 str(f), eval_content, h, now_iso, pending_items,
             )
 
-        return pending_items
+        # --- Partial-failure auto-retry (PR-2c) ---
+        # Re-queue stranded retriable-failed batches for files with no in-flight
+        # row. These aren't detected as new/modified (a completed sibling keeps
+        # the file's hash "known"), so we re-derive the delta and reuse the
+        # failed rows via _queue_drop. Cooldown-EXEMPT — a retry is failure
+        # recovery, not a re-eval on a user edit; bounded per row by retry_count
+        # (get_retriable_failed_rows excludes rows at the cap) plus the
+        # URL-failure storm guard below.
+        retried = 0
+        for f in retry_files:
+            try:
+                content = read_content(f)
+                h = compute_hash(f)
+            except (FileNotFoundError, PermissionError):
+                logger.warning("File vanished before retry read: %s", f)
+                continue
+            if not content.strip():
+                continue
+            url_fail_count = await inbox_items.count_url_failures(
+                self._db, str(f), since_hours=48,
+            )
+            if url_fail_count >= self._config.max_retries:
+                logger.warning(
+                    "Retry storm: %s has %d URL failures in 48h, skipping retry",
+                    f, url_fail_count,
+                )
+                continue
+            prev_content = await inbox_items.get_evaluated_content(
+                self._db, str(f),
+            )
+            delta = (
+                _compute_new_content(prev_content, content)
+                if prev_content else content
+            )
+            if not delta.strip():
+                # The failed batch's URLs are no longer in the file (removed) —
+                # nothing to retry. Abandon the stale failed rows so the file
+                # stops being a retry candidate forever.
+                logger.debug(
+                    "Retry candidate %s has no un-evaluated content; "
+                    "abandoning stale failed rows", f,
+                )
+                await inbox_items.mark_file_failures_abandoned(
+                    self._db, str(f), max_retries=self._config.max_retries,
+                )
+                continue
+            before = len(pending_items)
+            await self._queue_drop(str(f), delta, h, now_iso, pending_items)
+            if len(pending_items) > before:
+                retried += 1
+
+        return pending_items, retried
 
     async def _queue_drop(
         self,

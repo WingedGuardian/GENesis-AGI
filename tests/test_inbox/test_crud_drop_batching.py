@@ -222,6 +222,20 @@ async def _park(db, id, reqid, *, created_at="2026-06-30T00:00:01+00:00"):
     )
 
 
+# --- partial-failure auto-retry candidate selection (PR-2c) ---
+
+
+async def _failed(db, id, file_path, *, retry_count=0, error="rate limit",
+                  created_at="2026-06-30T00:00:01+00:00"):
+    await inbox_items.create(
+        db, id=id, file_path=file_path, content_hash="h", status="pending",
+        created_at=created_at,
+    )
+    await inbox_items.update_status(
+        db, id, status="failed", error_message=error, retry_count=retry_count,
+    )
+
+
 @pytest.mark.asyncio
 async def test_claim_for_dispatch_transitions_awaiting_to_dispatching(db):
     await _park(db, "a", "req-1")
@@ -308,3 +322,50 @@ async def test_expire_stuck_reaps_dispatching_not_awaiting(db):
     assert n == 1
     assert (await inbox_items.get_by_id(db, "disp"))["status"] == "failed"
     assert (await inbox_items.get_by_id(db, "await_row"))["status"] == "processing"
+
+
+@pytest.mark.asyncio
+async def test_get_retriable_failure_files_returns_stranded(db):
+    # A file with a completed batch + a retriable-failed batch, no in-flight row.
+    await inbox_items.create(
+        db, id="done", file_path="/inbox/A.md", content_hash="h",
+        status="completed", created_at="2026-06-30T00:00:01+00:00",
+    )
+    await _failed(db, "fail", "/inbox/A.md", created_at="2026-06-30T00:00:02+00:00")
+    files = await inbox_items.get_retriable_failure_files(db, max_retries=3)
+    assert files == ["/inbox/A.md"]
+
+
+@pytest.mark.asyncio
+async def test_get_retriable_failure_files_excludes_inflight(db):
+    # A retriable-failed row AND a pending row for the same file -> in flight,
+    # so NOT a retry candidate (a drop is already queued/processing).
+    await _failed(db, "fail", "/inbox/A.md")
+    await inbox_items.create(
+        db, id="pend", file_path="/inbox/A.md", content_hash="h",
+        status="pending", created_at="2026-06-30T00:00:02+00:00",
+    )
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=3) == []
+
+
+@pytest.mark.asyncio
+async def test_get_retriable_failure_files_excludes_invalidated_and_exhausted(db):
+    # approval_invalidated failed row -> needs fresh approval, not a retry.
+    await _failed(db, "inv", "/inbox/A.md",
+                  error=f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}gone")
+    # retry_count at the cap -> exhausted, not retriable.
+    await _failed(db, "exh", "/inbox/B.md", retry_count=3)
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=3) == []
+
+
+@pytest.mark.asyncio
+async def test_mark_file_failures_abandoned_stops_candidacy(db):
+    # When a retry candidate's failed content is gone from the file, its stale
+    # failed rows are marked approval_invalidated so it stops being a candidate.
+    await _failed(db, "f1", "/inbox/A.md")
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=3) == ["/inbox/A.md"]
+    n = await inbox_items.mark_file_failures_abandoned(db, "/inbox/A.md", max_retries=3)
+    assert n == 1
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=3) == []
+    row = await inbox_items.get_by_id(db, "f1")
+    assert row["error_message"].startswith(inbox_items.APPROVAL_INVALIDATED_PREFIX)
