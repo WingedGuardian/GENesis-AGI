@@ -536,6 +536,18 @@ class OutreachPipeline:
             if egress.fixes_applied:
                 formatted = replace(formatted, text=egress.text)
 
+        # WS5 Discord capability SHADOW-gate: observe (never hold) autonomous Discord
+        # sends — record what a capability gate WOULD decide. Read-only + best-effort;
+        # never blocks the send. The gate_cleared resume path is below-the-gate, so it
+        # is not observed (mirrors the email gate's gate_cleared skip above).
+        if channel == "discord" and not gate_cleared:
+            from genesis.autonomy.shadow_gate import observe_discord_send
+
+            await observe_discord_send(
+                self._db, path="deliver", verb="send", risk_class="bulk",
+                target=str(delivery_recipient), content=formatted.text,
+            )
+
         try:
             delivery_id = await adapter.send_message(
                 delivery_recipient, formatted.text,

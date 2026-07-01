@@ -361,8 +361,10 @@ def _bootstrap_outreach(transport_kwargs: dict) -> None:
 def _bootstrap_discord_bot(transport_kwargs: dict) -> None:
     """Bootstrap and run the discord-bot MCP server.
 
-    Provides read/write Discord access via bot token for campaign
-    sessions. No DB connection needed — fully stateless.
+    Provides read/write Discord access via bot token for campaign sessions.
+    Opens a BEST-EFFORT genesis.db connection (WS5) so send_reply can record
+    capability-shadow observations — the server stays fully functional if the
+    DB is missing or fails to open (db=None => shadow is a no-op).
     """
     import os
 
@@ -373,8 +375,31 @@ def _bootstrap_discord_bot(transport_kwargs: dict) -> None:
         logger.error("DISCORD_BOT_TOKEN not set — discord-bot cannot start")
         return
 
-    init_discord_bot(bot_token=bot_token)
-    clear_mcp_crash("discord-bot")
+    @asynccontextmanager
+    async def _lifespan(server) -> AsyncIterator[None]:
+        from genesis.db.connection import get_db
+
+        # WS5 capability-shadow DB — opened ONCE for the server's lifetime (never
+        # per-call, to avoid a WAL-lock hang on the reply path). NON-fatal: the
+        # discord-bot's core job (send_reply) must work even with no shadow DB.
+        db = None
+        if _DEFAULT_DB.exists():
+            try:
+                db = await get_db(_DEFAULT_DB, foreign_keys=False)
+            except Exception:
+                logger.warning(
+                    "discord-bot: shadow DB open failed — continuing without shadow",
+                    exc_info=True,
+                )
+        init_discord_bot(bot_token=bot_token, db=db)
+        clear_mcp_crash("discord-bot")
+        try:
+            yield
+        finally:
+            if db is not None:
+                await db.close()
+
+    mcp._lifespan = _lifespan
     _run_mcp(mcp, transport_kwargs)
 
 
