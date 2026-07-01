@@ -42,10 +42,20 @@ def test_genuine_directives_pass(text: str) -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        _INCIDENT_MESSAGE,  # the exact incident message
+        _INCIDENT_MESSAGE,  # incident-shaped synthetic status message
         "I was wrong about that approach",  # no imperative opener; 'wrong' dropped
         "yeah that went well, thanks",  # chatty acknowledgement
         "the write-up didn't ship out",  # status update, not a directive
+        # More chatty, positive status updates — non-imperative openers, so the
+        # guard must reject them (context to note, never a hard directive).
+        "Hey, good news on my end — the review went really well and they want to "
+        "keep going. No action needed from you, just looping you in.",
+        "Quick update: got some strong signal this week and a couple of doors "
+        "opened up. Feeling good about where things are headed.",
+        "Yeah that landed better than I expected, appreciate the patience. Let's "
+        "build on it when there's time.",
+        "Great milestone today — the Vessridge pilot cleared its first review and "
+        "the team is thrilled. Nothing needed from you, just sharing the win.",
         "",  # empty
         "   ",  # whitespace only
         # opens with a directive word but rambles past 2 sentences → rejected
