@@ -16,8 +16,16 @@
 ## Current CC Version
 
 **Installed:** Claude Code 2.1.173 on the **container** (upgraded 2026-06-11 from 2.1.170 — Fable 5 `[1m]` model-ID normalization fix + 2.1.172 long-conversation render perf). The **host VM** runs **2.1.87** — deliberately held there after the 2.1.90 Linux scrollback regression (see the 2.1.90 row below). 2.1.173 (the fullscreen-renderer scrollback fix) is the version the host is now being moved to via the unified updater. **Both** container and host install Claude Code **via npm-global** (`npm install -g @anthropic-ai/claude-code@<version>` — the container auto-detects its npm prefix, the host uses `sudo npm install -g`). There is no native-installer path.
-**Pin (single source of truth):** `CC_VERSION` in `scripts/lib/cc_version.sh`, sourced by `scripts/install.sh`, `scripts/host-setup.sh`, and `scripts/update.sh`. Bump it in one place; the next `update.sh` run syncs the host (see "Updating Claude Code" below).
-**Minimum required by Genesis:** intentionally **not enforced** at runtime (all current code works with 2.0+). A managed-settings `requiredMinimumVersion` floor (`/etc/claude-code/managed-settings.json`, Linux-only — never read from user/project `settings.json`) was evaluated and **deliberately rejected**: a hard floor removes the incident-recovery downgrade path the project has actually used (the 2.1.90→2.1.87 scrollback rollback) and can brick CC if the floor is written above the installed version. Drift is prevented instead by the npm pin + the unified `update-cc` updater + `DISABLE_AUTOUPDATER`/`DISABLE_UPDATES` (so CC never self-bumps).
+**Pin (single source of truth):** `CC_VERSION` in `scripts/lib/cc_version.sh`, which
+also exports the shared **`cc_ensure_local`** aligner. Sourced by `scripts/install.sh`,
+`scripts/host-setup.sh`, `scripts/bootstrap.sh`, and `scripts/update.sh`. Bump it in one
+place; the next `install.sh`/`bootstrap.sh`/`update.sh` run aligns the **container's**
+own Claude Code to the pin via `cc_ensure_local` (installs when absent AND upgrades/
+downgrades a drifted-but-present CC — the earlier scripts only installed when CC was
+*missing*, so a bumped pin never reached an already-installed container). `update.sh`
+additionally syncs the **host VM** via the guardian `update-cc` op (see "Updating Claude
+Code" below).
+**Minimum required by Genesis:** intentionally **not enforced** at runtime (all current code works with 2.0+). A managed-settings `requiredMinimumVersion` floor (`/etc/claude-code/managed-settings.json`, Linux-only — never read from user/project `settings.json`) was evaluated and **deliberately rejected**: a hard floor removes the incident-recovery downgrade path the project has actually used (the 2.1.90→2.1.87 scrollback rollback) and can brick CC if the floor is written above the installed version. Drift is prevented instead by the npm pin + `cc_ensure_local` (aligns the local CC to the pin on every install/bootstrap/update — exact-match, so a downgrade pin also applies) + the unified `update-cc` updater for the host + `DISABLE_AUTOUPDATER`/`DISABLE_UPDATES` (so CC never self-bumps).
 
 ---
 

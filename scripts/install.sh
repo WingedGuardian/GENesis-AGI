@@ -1167,35 +1167,12 @@ fi
 source "$_cc_env"
 echo "  [12/$TOTAL_STEPS] Setting up Claude Code (v${CC_VERSION})..."
 
-if command -v claude &>/dev/null; then
-    cc_ver=$(claude --version 2>/dev/null || echo "unknown")
-    echo "    . Claude Code already installed ($cc_ver)"
-else
-    echo "    Installing Claude Code via npm..."
-    # Detect the npm prefix that PATH will actually resolve. The user may have
-    # a custom prefix (~/.npm-global) that shadows /usr/local. Install to
-    # whichever prefix `npm config get prefix` returns so `which claude` finds
-    # the new binary. See docs/reference/cc-compatibility.md.
-    _npm_prefix="$(npm config get prefix 2>/dev/null)"
-    if [ -n "$_npm_prefix" ] && [ "$_npm_prefix" != "/usr/local" ] && [ "$_npm_prefix" != "/usr" ]; then
-        # User-level prefix (e.g. ~/.npm-global) — no sudo needed
-        _npm_cmd="npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
-        echo "    Using user npm prefix: $_npm_prefix"
-    else
-        # System prefix — use sudo + explicit /usr/local to avoid /usr/lib misrouting
-        _npm_cmd="npm install -g --prefix /usr/local @anthropic-ai/claude-code@${CC_VERSION}"
-        if [ "$(id -u)" != "0" ] && command -v sudo &>/dev/null; then
-            _npm_cmd="sudo npm install -g --prefix /usr/local @anthropic-ai/claude-code@${CC_VERSION}"
-        fi
-    fi
-    if timeout 300 $_npm_cmd; then
-        cc_ver=$(claude --version 2>/dev/null || echo "unknown")
-        echo "    + Claude Code installed ($cc_ver)"
-    else
-        echo "    WARNING: Claude Code installation failed"
-        echo "    Install manually: npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
-        SETUP_WARNINGS=1
-    fi
+# Install OR align to the pin — cc_ensure_local (scripts/lib/cc_version.sh, sourced
+# above) installs when absent AND upgrades/downgrades a drifted-but-present CC to
+# the pin (the prior "already installed → skip" check never re-aligned drift).
+if ! cc_ensure_local; then
+    echo "    Install manually: npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
+    SETUP_WARNINGS=1
 fi
 
 # Genesis wrapper — lets users type 'genesis' from anywhere inside the container
