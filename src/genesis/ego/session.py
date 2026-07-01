@@ -72,6 +72,9 @@ _NEVER_DISPATCH_ACTION_TYPES = (
     # j9_regression is informational (NOTIFY_USER); its handler marks it executed
     # on approval. Blocklisted so it can never be dispatched as a session.
     "j9_regression",
+    # gauntlet_regression: same informational contract — the model-roster gauntlet
+    # flagged a PASS→FAIL; advisory only, never auto-acts. Blocklisted from dispatch.
+    "gauntlet_regression",
 )
 
 
