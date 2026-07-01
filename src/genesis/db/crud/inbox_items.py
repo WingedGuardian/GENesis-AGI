@@ -484,6 +484,61 @@ async def get_retriable_failed_rows(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def get_retriable_failure_files(
+    db: aiosqlite.Connection, *, max_retries: int = 3,
+) -> list[str]:
+    """Return file_paths that have a stranded retriable-failed batch to retry.
+
+    A file qualifies for partial-failure AUTO-RETRY when it has >=1 failed row
+    that is still retriable (``retry_count < max_retries`` and not
+    ``approval_invalidated:``) AND it has NO row currently ``pending`` or
+    ``processing`` (nothing in flight for it). Such files are otherwise stranded:
+    when only SOME batches of a drop fail, a completed sibling keeps the file's
+    hash in :func:`get_all_known`, so detection never re-surfaces the file and
+    the failed batch would only retry on the next user edit. The monitor uses
+    this to re-queue the failed batches independently of file-change detection.
+    Excludes approval-invalidated rows (those need a fresh approval, not a retry).
+    """
+    cursor = await db.execute(
+        """SELECT DISTINCT file_path FROM inbox_items
+           WHERE status = 'failed' AND retry_count < ?
+             AND (error_message IS NULL
+                  OR error_message NOT LIKE ? || '%')
+             AND file_path NOT IN (
+                 SELECT file_path FROM inbox_items
+                 WHERE status IN ('pending', 'processing')
+             )""",
+        (max_retries, APPROVAL_INVALIDATED_PREFIX),
+    )
+    return [row[0] for row in await cursor.fetchall()]
+
+
+async def mark_file_failures_abandoned(
+    db: aiosqlite.Connection, file_path: str, *, max_retries: int = 3,
+) -> int:
+    """Mark a file's retriable failed rows as approval-invalidated (abandoned).
+
+    Used when a retry candidate's failed content is no longer present in the
+    file (the user removed those URLs before the retry ran): the recomputed
+    delta is empty, so there is nothing to re-queue, but the retriable-failed
+    rows would otherwise keep the file a retry candidate forever. Flipping them
+    to the ``approval_invalidated:`` prefix excludes them from
+    :func:`get_retriable_failure_files` / :func:`get_retriable_failed_rows`.
+    Returns the number of rows updated.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET error_message = ? || 'content removed before retry'
+           WHERE file_path = ? AND status = 'failed' AND retry_count < ?
+             AND (error_message IS NULL
+                  OR error_message NOT LIKE ? || '%')""",
+        (APPROVAL_INVALIDATED_PREFIX, file_path, max_retries,
+         APPROVAL_INVALIDATED_PREFIX),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def reuse_as_pending(
     db: aiosqlite.Connection,
     id: str,

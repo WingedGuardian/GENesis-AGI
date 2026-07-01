@@ -62,6 +62,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   repeatedly cancel and recreate that approval. Genesis now recognizes there's no new content and
   marks the note current in a single scan, so it settles instead of churning.
 
+- **Links that fail partway through an evaluation now retry themselves.** When only some of the
+  links in a note evaluate successfully and the rest fail (for example, a few get rate-limited),
+  the failed links used to sit untouched until you edited the note again. Genesis now
+  automatically re-attempts the stranded links on a later scan on its own — bounded so a link that
+  keeps failing eventually stops retrying rather than looping.
+
 - **Inbox evaluations no longer cram a whole batch of links into one giant pass — and stop
   re-evaluating links they've already covered.** When you drop many URLs into an inbox note,
   Genesis now evaluates them in small groups (≈5 at a time, configurable via
