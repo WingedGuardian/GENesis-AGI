@@ -15,6 +15,16 @@ logger = logging.getLogger("genesis.runtime")
 async def init(rt: GenesisRuntime) -> None:
     """Initialize autonomy: protection, state machine, classification, verification."""
     try:
+        # Fail-CLOSED default: the proposal dispatch gate must NEVER be left
+        # unset. If the real gate can't be built below (missing DB/manager or a
+        # ctor error), the ego reads a None gate as "no gate" and dispatches
+        # every approved proposal UNGATED. Install a blocking sentinel FIRST so
+        # any later failure degrades to fail-closed; the real gate replaces it
+        # on success further down.
+        from genesis.autonomy.proposal_gate import DenyHighRiskSentinel
+
+        rt._proposal_dispatch_gate = DenyHighRiskSentinel()
+
         from genesis.autonomy.classification import ActionClassifier
         from genesis.autonomy.protection import ProtectedPathRegistry
         from genesis.autonomy.verification import TaskVerifier
@@ -189,7 +199,22 @@ async def init(rt: GenesisRuntime) -> None:
                 )
                 logger.info("Proposal dispatch gate initialized")
             except Exception:
-                logger.warning("Failed to initialize proposal dispatch gate", exc_info=True)
+                # Keep the fail-closed sentinel installed at the top of init()
+                # (do NOT clear it) and surface the degradation loudly.
+                logger.error(
+                    "Failed to initialize proposal dispatch gate — running on "
+                    "the fail-closed DenyHighRiskSentinel",
+                    exc_info=True,
+                )
+                if rt._event_bus is not None:
+                    from genesis.observability.types import Severity, Subsystem
+
+                    await rt._event_bus.emit(
+                        Subsystem.AUTONOMY,
+                        Severity.ERROR,
+                        "autonomy.gate_init_failed",
+                        "Proposal dispatch gate init failed; using fail-closed sentinel",
+                    )
 
         # Post-execution auditor — parses transcripts, feeds autonomy signals.
         # Wired into DirectSessionRunner in init/direct_session.py.
@@ -204,7 +229,20 @@ async def init(rt: GenesisRuntime) -> None:
                 )
                 logger.info("Post-execution auditor initialized")
             except Exception:
-                logger.warning("Failed to initialize post-execution auditor", exc_info=True)
+                # Auditor is observability, not a gate — no fail-closed here;
+                # just surface the degraded autonomy signal loudly.
+                logger.error(
+                    "Failed to initialize post-execution auditor", exc_info=True,
+                )
+                if rt._event_bus is not None:
+                    from genesis.observability.types import Severity, Subsystem
+
+                    await rt._event_bus.emit(
+                        Subsystem.AUTONOMY,
+                        Severity.WARNING,
+                        "autonomy.auditor_init_failed",
+                        "Post-execution auditor init failed (autonomy signals degraded)",
+                    )
 
         # Remediation registry — mechanical reflex layer for health probes
         try:
