@@ -74,11 +74,17 @@ class SurplusQueue:
             self._db, task_id, started_at=self._clock().isoformat(),
         )
 
-    async def mark_completed(self, task_id: str, staging_id: str | None = None) -> None:
+    async def mark_completed(
+        self,
+        task_id: str,
+        staging_id: str | None = None,
+        outcome_quality: str | None = None,
+    ) -> None:
         await surplus_tasks.mark_completed(
             self._db, task_id,
             completed_at=self._clock().isoformat(),
             result_staging_id=staging_id,
+            outcome_quality=outcome_quality,
         )
 
     async def mark_failed(self, task_id: str, reason: str) -> None:

@@ -20,6 +20,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `gauntlet.scheduled`) re-checks each roster model and, if one that used to pass starts
   failing, alerts you and files a proposal for your review — it never silently drops a model
   from failover on its own.
+- **Genesis now keeps its own disk clean automatically, so it won't quietly fill up and stall.**
+  A daily hygiene job reaps git worktrees whose branches have already merged (moving them to a
+  7-day recovery trash bin, never deleting work in progress) and clears regenerable caches that
+  otherwise creep up over time. If the disk still climbs toward full, Genesis clears the heavier
+  reindexable caches automatically at 90% — before the disk hits 100% and disrupts the server,
+  its write-ahead log, or backups. Previously the worktree cleanup existed but was never
+  scheduled, so it never actually ran.
 - **The dashboard now has a Campaigns tab where you can see and control your autonomous campaigns.**
   Each campaign shows its status, schedule (with next fire time), model/effort, today's spend
   against its daily cap, completed runs vs. attempts, and whether a session is currently in
@@ -47,6 +54,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   duplicate. Together these keep the procedure store both more complete and less cluttered.
 
 ### Fixed
+
+- **Inbox notes that change without adding anything new no longer get re-scanned over and over.**
+  Editing an inbox note in a way that changes its bytes but not its actual content — re-pasting a
+  link with different tracking/share parameters, reordering lines, tweaking whitespace — used to
+  leave the note looking "modified" on every scan, which (while a link approval was pending) could
+  repeatedly cancel and recreate that approval. Genesis now recognizes there's no new content and
+  marks the note current in a single scan, so it settles instead of churning.
 
 - **Inbox evaluations no longer cram a whole batch of links into one giant pass — and stop
   re-evaluating links they've already covered.** When you drop many URLs into an inbox note,

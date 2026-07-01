@@ -82,6 +82,79 @@ async def test_get_all_known_excludes_failed(db):
 
 
 @pytest.mark.asyncio
+async def test_get_all_known_newest_created_at_wins(db):
+    """When a file has multiple non-failed rows, get_all_known must return the
+    NEWEST-created_at row's hash, not an arbitrary (insertion-order) one.
+
+    Regression (detection storm): a reused row resets created_at to now but
+    keeps its old (low) rowid, so rowid/insertion order != recency. Without a
+    deterministic ORDER BY, a stale row's hash could win -> the file's current
+    hash never matches 'known' -> phantom-modified every scan.
+    """
+    # Insert the NEWER-created_at row FIRST (lower rowid) to prove ORDER BY
+    # (recency), not insertion order, decides the winner.
+    await inbox_items.create(
+        db, id="new", file_path="/inbox/a.md", content_hash="NEWHASH",
+        status="completed", created_at="2026-03-10T20:00:00+00:00",
+    )
+    await inbox_items.create(
+        db, id="old", file_path="/inbox/a.md", content_hash="OLDHASH",
+        status="completed", created_at="2026-03-10T10:00:00+00:00",
+    )
+    known = await inbox_items.get_all_known(db)
+    assert known["/inbox/a.md"] == "NEWHASH"
+
+
+@pytest.mark.asyncio
+async def test_get_all_known_excludes_retriable_failed_keeps_completed(db):
+    """A retriable-failed row (retry_count < max) is excluded from 'known' so
+    the file stays re-detectable for retry — even when a completed sibling of
+    the same file exists (which supplies the known hash)."""
+    await inbox_items.create(
+        db, id="done", file_path="/inbox/a.md", content_hash="H",
+        status="completed", created_at="2026-03-10T10:00:00+00:00",
+    )
+    await inbox_items.create(
+        db, id="failed", file_path="/inbox/a.md", content_hash="H2",
+        status="pending", created_at="2026-03-10T20:00:00+00:00",
+    )
+    await inbox_items.update_status(db, "failed", status="failed", error_message="rate limit")
+    known = await inbox_items.get_all_known(db)
+    # Completed sibling supplies the hash; the retriable-failed newer row is excluded.
+    assert known["/inbox/a.md"] == "H"
+
+
+@pytest.mark.asyncio
+async def test_get_all_known_reused_row_wins_over_older_completed(db):
+    """The exact live storm trigger: reuse_as_pending re-arms a failed row —
+    resetting created_at to now but KEEPING its old (low) rowid — and re-points
+    it at the current drop's hash. get_all_known must return that re-armed row's
+    (current) hash, not an older completed sibling's, or the file's on-disk hash
+    never matches 'known' and it re-detects as modified every scan.
+    """
+    # The to-be-reused row is inserted FIRST -> low rowid. It will be re-armed
+    # to created_at=now (newest) while keeping that low rowid, so rowid order
+    # would pick the WRONG (older completed) row without the created_at ORDER BY.
+    await inbox_items.create(
+        db, id="reused", file_path="/inbox/a.md", content_hash="STALE",
+        status="pending", created_at="2026-01-01T00:00:00+00:00",
+    )
+    await inbox_items.update_status(db, "reused", status="failed", error_message="rate limit")
+    # Older completed sibling inserted SECOND -> higher rowid, older created_at.
+    await inbox_items.create(
+        db, id="done", file_path="/inbox/a.md", content_hash="OLDHASH",
+        status="completed", created_at="2026-03-10T10:00:00+00:00",
+    )
+    # Re-arm the failed row for the current drop: created_at=now (newest).
+    await inbox_items.reuse_as_pending(
+        db, "reused", drop_id="D", batch_items="new-url",
+        content_hash="CURRENT", created_at="2026-03-10T20:00:00+00:00",
+    )
+    known = await inbox_items.get_all_known(db)
+    assert known["/inbox/a.md"] == "CURRENT"
+
+
+@pytest.mark.asyncio
 async def test_update_status(db):
     await inbox_items.create(
         db, id="i1", file_path="/inbox/a.md",

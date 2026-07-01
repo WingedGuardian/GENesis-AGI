@@ -344,7 +344,13 @@ TABLES = {
             result_staging_id TEXT,
             failure_reason    TEXT,
             attempt_count     INTEGER NOT NULL DEFAULT 0,
-            not_before        TEXT
+            not_before        TEXT,
+            -- Verified-correctness verdict for insight-producing tasks (see
+            -- surplus.types.INSIGHT_PRODUCING_TASK_TYPES). 'useful' = intake
+            -- routed >=1 finding to knowledge/observation; 'hollow' = intake
+            -- ran but routed everything to discard. NULL = action task, legacy
+            -- row, intake-failure, or empty/too-short output (not penalized).
+            outcome_quality   TEXT CHECK (outcome_quality IN ('useful', 'hollow'))
         )
     """,
     "drive_weights": """

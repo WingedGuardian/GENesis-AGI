@@ -43,6 +43,43 @@ class TaskType(StrEnum):
     FRESH_SESSION_TEST = "fresh_session_test"
 
 
+# Task types whose *success* means "produced a useful insight that belongs in the
+# knowledge base", as opposed to "an action ran to completion". Only these are
+# eligible for the verified-correctness verdict (``outcome_quality``): when one of
+# them completes but the intake pipeline routes ALL of its findings to discard
+# (nothing reached knowledge or observations), the work was hollow — it ran but
+# produced nothing of value — and the Outcome Bus records a VERIFICATION_FAILED
+# negative alongside the usual EXECUTION_OUTCOME positive.
+#
+# Deliberately EXCLUDED (would manufacture false negatives):
+#   - Action tasks (CODE_INDEX, MODEL_EVAL, DISK_CLEANUP, DB_MAINTENANCE,
+#     DEAD_LETTER_REPLAY, BACKUP_VERIFICATION, J9_EVAL_BATCH, FRESH_SESSION_TEST):
+#     success = the action ran; they don't target the KB, so all-discard is normal.
+#   - Pipeline intermediates (RESEARCH_QUERY_GEN, PROMPT_REVIEW_CATALOG,
+#     PROMPT_REVIEW_SAMPLE): their output feeds the *next* pipeline step, not the
+#     KB, so intake legitimately discards it. Only the pipeline *terminals*
+#     (ANTICIPATORY_RESEARCH, PROMPT_EFFECTIVENESS_REVIEW) produce KB-bound insight.
+#   - Monitoring/probe types (INFRASTRUCTURE_MONITOR, CC_MEMORY_STALENESS): a
+#     "nothing noteworthy / all healthy" pass is the EXPECTED good outcome, and
+#     their status content isn't durable knowledge — all-discard isn't a failure.
+#   - BOOKMARK_ENRICHMENT: uses a dedicated executor whose intake routing is not
+#     yet validated (no live volume). Excluded NULL-on-uncertainty (matches the
+#     codebase's conservative-classification norm); add once its routing is proven.
+INSIGHT_PRODUCING_TASK_TYPES: frozenset[TaskType] = frozenset({
+    TaskType.BRAINSTORM_USER,
+    TaskType.BRAINSTORM_SELF,
+    TaskType.META_BRAINSTORM,
+    TaskType.MEMORY_AUDIT,
+    TaskType.PROCEDURE_AUDIT,
+    TaskType.GAP_CLUSTERING,
+    TaskType.SELF_UNBLOCK,
+    TaskType.ANTICIPATORY_RESEARCH,
+    TaskType.PROMPT_EFFECTIVENESS_REVIEW,
+    TaskType.CODE_AUDIT,
+    TaskType.WING_AUDIT,
+})
+
+
 class ComputeTier(StrEnum):
     LOCAL_30B = "local_30b"
     FREE_API = "free_api"
