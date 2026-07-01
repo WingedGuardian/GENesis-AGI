@@ -17,7 +17,7 @@
 # removes the incident-recovery downgrade path and can brick CC.
 #
 # Honors an inherited CC_VERSION (e.g. `CC_VERSION=2.1.180 ./install.sh`).
-CC_VERSION="${CC_VERSION:-2.1.173}"
+CC_VERSION="${CC_VERSION:-2.1.198}"
 
 
 # cc_ensure_local — install or align the LOCAL Claude Code CLI to $CC_VERSION.
