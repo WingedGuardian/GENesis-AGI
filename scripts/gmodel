@@ -138,14 +138,11 @@ def main(argv: list[str]) -> int:
         print("Run `gmodel` (no args) to list models; tiers: opus/sonnet/haiku.", file=sys.stderr)
         return 1
 
-    claude = shutil.which("claude")
-    if not claude:
-        print("gmodel: `claude` not found on PATH.", file=sys.stderr)
-        return 127
-
     env = _build_child_env(overrides, name)
 
     if print_env:
+        # Pure diagnostic — never launches, so it must NOT require `claude` on PATH
+        # (e.g. CI, or previewing before install).
         for k in (
             "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL",
             "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_API_KEY", "GENESIS_ROSTER_MODEL",
@@ -157,6 +154,11 @@ def main(argv: list[str]) -> int:
         target = overrides["anthropic_base_url"] if overrides else "native Claude (Max)"
         print(f"# would exec: claude {' '.join(tier_args + passthrough)}  → {target}")
         return 0
+
+    claude = shutil.which("claude")
+    if not claude:
+        print("gmodel: `claude` not found on PATH.", file=sys.stderr)
+        return 127
 
     if overrides:
         print(f"gmodel: launching claude on {name} ({overrides['anthropic_base_url']})", file=sys.stderr)
