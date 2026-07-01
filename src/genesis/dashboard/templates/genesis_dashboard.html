@@ -10701,11 +10701,11 @@
                   <span class="material-symbols-outlined" style="font-size:1rem; vertical-align:middle;"
                         x-text="$store.genesisDashboard.attentionRevealed[ev.id] !== undefined ? 'visibility_off' : 'visibility'"></span>
                 </button>
-                <button class="btn-sm" style="padding:.15rem .5rem;" :disabled="$store.genesisDashboard.attentionLabeling[ev.id]"
+                <button class="btn-sm" style="padding:.15rem .5rem;" :disabled="$store.genesisDashboard.attentionLabeling[ev.id] === true"
                         @click="$store.genesisDashboard.labelAttentionEvent(ev.id, 'should')">should</button>
-                <button class="btn-sm" style="padding:.15rem .5rem;" :disabled="$store.genesisDashboard.attentionLabeling[ev.id]"
+                <button class="btn-sm" style="padding:.15rem .5rem;" :disabled="$store.genesisDashboard.attentionLabeling[ev.id] === true"
                         @click="$store.genesisDashboard.labelAttentionEvent(ev.id, 'shouldnt')">shouldn't</button>
-                <button class="btn-sm" style="padding:.15rem .5rem; opacity:.7;" :disabled="$store.genesisDashboard.attentionLabeling[ev.id]"
+                <button class="btn-sm" style="padding:.15rem .5rem; opacity:.7;" :disabled="$store.genesisDashboard.attentionLabeling[ev.id] === true"
                         @click="$store.genesisDashboard.labelAttentionEvent(ev.id, 'skip')">skip</button>
               </div>
             </div>
