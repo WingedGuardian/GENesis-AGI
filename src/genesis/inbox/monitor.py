@@ -880,10 +880,35 @@ class InboxMonitor:
             try:
                 content = read_content(f)
                 h = compute_hash(f)
-            except (FileNotFoundError, PermissionError):
-                logger.warning("File vanished before retry read: %s", f)
+            except FileNotFoundError:
+                # The source file was deleted since it failed — its stranded
+                # retriable-failed rows can never be re-evaluated. Abandon them
+                # so the file stops being a retry candidate; otherwise it recurs
+                # (and re-logs) every scan forever. (If the file is ever
+                # re-created it is detected as new and evaluated fresh.)
+                logger.info(
+                    "Retry candidate %s no longer exists; abandoning its "
+                    "stale failed rows", f,
+                )
+                await inbox_items.mark_file_failures_abandoned(
+                    self._db, str(f), max_retries=self._config.max_retries,
+                    reason="source file deleted",
+                )
+                continue
+            except PermissionError:
+                # Possibly transient (e.g. locked mid-write) — skip WITHOUT
+                # abandoning; a later scan's read may succeed.
+                logger.warning(
+                    "Permission error reading retry candidate %s; skipping", f,
+                )
                 continue
             if not content.strip():
+                # Empty source file — nothing to ever retry; abandon so it stops
+                # being a candidate (same terminal state as a deleted file).
+                await inbox_items.mark_file_failures_abandoned(
+                    self._db, str(f), max_retries=self._config.max_retries,
+                    reason="source file is empty",
+                )
                 continue
             url_fail_count = await inbox_items.count_url_failures(
                 self._db, str(f), since_hours=48,

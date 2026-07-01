@@ -515,24 +515,25 @@ async def get_retriable_failure_files(
 
 async def mark_file_failures_abandoned(
     db: aiosqlite.Connection, file_path: str, *, max_retries: int = 3,
+    reason: str = "content removed before retry",
 ) -> int:
     """Mark a file's retriable failed rows as approval-invalidated (abandoned).
 
-    Used when a retry candidate's failed content is no longer present in the
-    file (the user removed those URLs before the retry ran): the recomputed
-    delta is empty, so there is nothing to re-queue, but the retriable-failed
-    rows would otherwise keep the file a retry candidate forever. Flipping them
-    to the ``approval_invalidated:`` prefix excludes them from
-    :func:`get_retriable_failure_files` / :func:`get_retriable_failed_rows`.
-    Returns the number of rows updated.
+    Used when a retry candidate can never be retried again — either its failed
+    content was removed from the file (empty delta; the default ``reason``), or
+    the source file itself was deleted (``reason="source file deleted"``). The
+    retriable-failed rows would otherwise keep the file a retry candidate
+    forever; flipping them to the ``approval_invalidated:<reason>`` prefix
+    excludes them from :func:`get_retriable_failure_files` /
+    :func:`get_retriable_failed_rows`. Returns the number of rows updated.
     """
     cursor = await db.execute(
         """UPDATE inbox_items
-           SET error_message = ? || 'content removed before retry'
+           SET error_message = ? || ?
            WHERE file_path = ? AND status = 'failed' AND retry_count < ?
              AND (error_message IS NULL
                   OR error_message NOT LIKE ? || '%')""",
-        (APPROVAL_INVALIDATED_PREFIX, file_path, max_retries,
+        (APPROVAL_INVALIDATED_PREFIX, reason, file_path, max_retries,
          APPROVAL_INVALIDATED_PREFIX),
     )
     await db.commit()
