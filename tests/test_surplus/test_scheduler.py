@@ -124,7 +124,7 @@ async def test_dispatch_handles_executor_error(db):
 
 
 # --------------------------------------------------------------------------- #
-# Verified-correctness verdict (#4 — producer side)
+# Verified-correctness verdict (measurement-only quality judge — producer side)
 # --------------------------------------------------------------------------- #
 async def _completed_verdict(db) -> str | None:
     cur = await db.execute(
@@ -134,68 +134,110 @@ async def _completed_verdict(db) -> str | None:
     return row[0]
 
 
-async def _dispatch_with_intake(db, task_type, intake_stats):
-    """Dispatch one task of ``task_type`` through the stub executor with
-    ``run_intake`` patched to return ``intake_stats``; return its verdict."""
+async def _dispatch_with_judge(db, task_type, judge_return):
+    """Dispatch one ``task_type`` through the stub executor with the quality
+    judge patched to return ``judge_return``.
+
+    Intake is stubbed benign — the verdict no longer depends on intake routing
+    (it comes from the judge). Returns ``(completed_row, judge_mock)`` so callers
+    can assert the persisted columns AND whether the judge was invoked at all.
+    """
+    from genesis.surplus.intake import IntakeStats
+
     sched, compute = _make_scheduler(db, idle=True)
     await sched._queue.enqueue(task_type, ComputeTier.FREE_API, 0.8, "curiosity")
+    benign = IntakeStats(
+        findings_count=1, routed_knowledge=1, routed_observation=0, routed_discard=0,
+    )
+    judge = AsyncMock(return_value=judge_return)
     with patch.object(
         compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False,
     ), patch(
         "genesis.surplus.intake.run_intake",
-        new_callable=AsyncMock, return_value=intake_stats,
+        new_callable=AsyncMock, return_value=benign,
+    ), patch(
+        "genesis.surplus.quality_judge.run_quality_judge", judge,
     ):
         assert await sched.dispatch_once() is True
-    return await _completed_verdict(db)
-
-
-async def test_dispatch_records_hollow_when_intake_all_discard(db):
-    from genesis.surplus.intake import IntakeStats
-
-    hollow = IntakeStats(
-        findings_count=2, routed_knowledge=0, routed_observation=0, routed_discard=2,
+    cur = await db.execute(
+        "SELECT outcome_quality, judge_score, judge_detail "
+        "FROM surplus_tasks WHERE status='completed'"
     )
-    assert await _dispatch_with_intake(db, TaskType.BRAINSTORM_USER, hollow) == "hollow"
+    return await cur.fetchone(), judge
 
 
-async def test_dispatch_records_useful_when_intake_routes(db):
-    from genesis.surplus.intake import IntakeStats
-
-    useful = IntakeStats(
-        findings_count=2, routed_knowledge=1, routed_observation=0, routed_discard=1,
+async def test_dispatch_records_useful_when_judge_passes(db):
+    detail = '{"judge_score": 0.82, "rationale": "solid"}'
+    row, judge = await _dispatch_with_judge(
+        db, TaskType.BRAINSTORM_USER, ("useful", 0.82, detail),
     )
-    assert await _dispatch_with_intake(db, TaskType.BRAINSTORM_USER, useful) == "useful"
+    assert row["outcome_quality"] == "useful"
+    assert row["judge_score"] == 0.82
+    assert row["judge_detail"] == detail
+    judge.assert_awaited_once()
 
 
-async def test_dispatch_useful_via_observation_only(db):
-    # routed_observation alone (no knowledge) still counts as useful.
-    from genesis.surplus.intake import IntakeStats
-
-    obs = IntakeStats(
-        findings_count=1, routed_knowledge=0, routed_observation=1, routed_discard=0,
+async def test_dispatch_records_hollow_when_judge_fails(db):
+    row, _ = await _dispatch_with_judge(
+        db, TaskType.CODE_AUDIT, ("hollow", 0.30, '{"judge_score": 0.30}'),
     )
-    assert await _dispatch_with_intake(db, TaskType.WING_AUDIT, obs) == "useful"
+    assert row["outcome_quality"] == "hollow"
+    assert row["judge_score"] == 0.30
 
 
-async def test_dispatch_non_insight_type_stays_null(db):
-    # An action / non-insight type must NOT get a verdict even if intake discards
-    # everything — all-discard is normal for tasks that don't target the KB.
-    from genesis.surplus.intake import IntakeStats
-
-    hollow = IntakeStats(
-        findings_count=2, routed_knowledge=0, routed_observation=0, routed_discard=2,
+async def test_dispatch_judge_outage_stays_null(db):
+    # Judge unavailable → (None, None, None) → positive-only, no false hollow.
+    row, _ = await _dispatch_with_judge(
+        db, TaskType.WING_AUDIT, (None, None, None),
     )
-    assert await _dispatch_with_intake(db, TaskType.CODE_INDEX, hollow) is None
+    assert row["outcome_quality"] is None
+    assert row["judge_score"] is None
+    assert row["judge_detail"] is None
 
 
-async def test_dispatch_pipeline_intermediate_stays_null(db):
+async def test_dispatch_non_insight_type_skips_judge(db):
+    # An action / non-insight type must NOT invoke the judge (cost) and stays NULL.
+    row, judge = await _dispatch_with_judge(
+        db, TaskType.CODE_INDEX, ("hollow", 0.1, "{}"),
+    )
+    assert row["outcome_quality"] is None
+    judge.assert_not_awaited()
+
+
+async def test_dispatch_pipeline_intermediate_skips_judge(db):
     # Pipeline-intermediate output feeds the next step, not the KB; excluded.
-    from genesis.surplus.intake import IntakeStats
-
-    hollow = IntakeStats(
-        findings_count=1, routed_knowledge=0, routed_observation=0, routed_discard=1,
+    row, judge = await _dispatch_with_judge(
+        db, TaskType.RESEARCH_QUERY_GEN, ("hollow", 0.1, "{}"),
     )
-    assert await _dispatch_with_intake(db, TaskType.RESEARCH_QUERY_GEN, hollow) is None
+    assert row["outcome_quality"] is None
+    judge.assert_not_awaited()
+
+
+async def test_dispatch_short_content_skips_judge(db):
+    # Output shorter than the 50-char quality gate must NOT invoke the judge —
+    # the verdict stays NULL (too little to grade), never hollow.
+    from genesis.surplus.types import ExecutorResult
+
+    sched, compute = _make_scheduler(db, idle=True)
+    await sched._queue.enqueue(
+        TaskType.BRAINSTORM_USER, ComputeTier.FREE_API, 0.8, "curiosity",
+    )
+
+    async def _short(task):
+        return ExecutorResult(
+            success=True,
+            content="too short",
+            insights=[{"generating_model": "x"}],
+        )
+
+    sched._executor.execute = _short
+    judge = AsyncMock(return_value=("hollow", 0.1, "{}"))
+    with patch.object(
+        compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False,
+    ), patch("genesis.surplus.quality_judge.run_quality_judge", judge):
+        await sched.dispatch_once()
+    judge.assert_not_awaited()
+    assert await _completed_verdict(db) is None
 
 
 async def test_dispatch_empty_insights_stays_null(db):
