@@ -66,6 +66,9 @@ where = ["src"]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+# Agentic-gauntlet fixtures are INTENTIONALLY broken Python projects (the model's
+# job is to fix them) — never lint them, or CI would fail on the planted bugs.
+extend-exclude = ["src/genesis/eval/gauntlet_fixtures"]
 
 [tool.ruff.lint]
 select = [
