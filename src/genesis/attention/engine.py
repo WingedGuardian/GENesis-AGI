@@ -59,7 +59,9 @@ def evaluate(
     # ── triggers ──
     hard = _run(HARD_TRIGGERS, utt, window, config)
     soft = _run(SOFT_TRIGGERS, utt, window, config)
-    supp = _run(SUPPRESSORS, utt, window, config, enabled=config.suppressors_enabled or None)
+    # suppressors_enabled is an ALLOWLIST: empty tuple -> no suppressors run (NOT "all").
+    # Pass it straight through (no `or None`, which would misread [] as "run everything").
+    supp = _run(SUPPRESSORS, utt, window, config, enabled=config.suppressors_enabled)
 
     # ── score ──
     relevance = soft_relevance(soft)

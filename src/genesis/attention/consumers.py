@@ -81,10 +81,10 @@ class ShadowStoreConsumer:
         conn = sqlite3.connect(self.db_path, timeout=self.timeout_s)
         try:
             conn.execute("PRAGMA busy_timeout=30000")
-            conn.executemany(sql, self._rows)
-            conn.commit()
+            with conn:  # explicit txn: commit on success, ROLLBACK on any error (no partial batch)
+                conn.executemany(sql, self._rows)
         finally:
-            conn.close()
+            conn.close()  # __exit__ manages the txn, not the connection lifecycle
         n = len(self._rows)
         logger.info("persisted %d attention_events (snapshot=%s config=%s)",
                     n, self.snapshot_id, self.config_version)

@@ -89,6 +89,14 @@ def test_lone_suppressor_emits_nothing():
     assert run([make_utt(1, 100.0, "never mind")], make_config()) == []
 
 
+def test_empty_suppressors_enabled_disables_all_suppressors():
+    # allowlist semantics: [] means NO suppressors run (regression: `or None` misread [] as "all").
+    cfg = make_config(suppressors_enabled=[])
+    ev = run([make_utt(1, 100.0, "what do you think? never mind", speaker_total=2)], cfg)
+    assert len(ev) == 1 and ev[0].activation == Activation.SOFT  # dismissal ignored -> soft fire stands
+    assert ev[0].suppressors == ()
+
+
 def test_blip_ignored_and_not_windowed():
     cfg = make_config()
     state = EngineState()
@@ -122,12 +130,12 @@ def test_cooldown_raises_threshold():
         state_modifiers={"cooldown_s": 30, "cooldown_raise": 0.3,
                          "session_stickiness_mult": 1.0, "session_gap_s": 300, "context_cap_s": 12},
     )
-    state = EngineState()
-    _, e1 = evaluate(make_utt(1, 100.0, "q?"), state, cfg)
+    state = EngineState()  # thread state explicitly (the fold contract), not via in-place mutation
+    state, e1 = evaluate(make_utt(1, 100.0, "q?"), state, cfg)
     assert e1.activation == Activation.SOFT                    # .5 >= .4
-    _, e2 = evaluate(make_utt(2, 105.0, "q?"), state, cfg)
+    state, e2 = evaluate(make_utt(2, 105.0, "q?"), state, cfg)
     assert e2 is None                                          # in cooldown -> bar .7, .5 < .7
-    _, e3 = evaluate(make_utt(3, 140.0, "q?"), state, cfg)
+    state, e3 = evaluate(make_utt(3, 140.0, "q?"), state, cfg)
     assert e3 is not None and e3.activation == Activation.SOFT  # 40s > cooldown -> fires again
 
 

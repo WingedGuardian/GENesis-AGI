@@ -21,8 +21,8 @@ class StateModifiers:
     """The state dials that bend the threshold / shape the window (all in seconds
     or unitless multipliers; keyed off event-ts deltas, never wall-clock)."""
 
-    context_window_s: float = 8.0          # rolling context window (SAS §10-E)
-    context_cap_s: float = 12.0            # stale past this — drop from window
+    context_window_s: float = 8.0          # RESERVED (PR3): the SAS 8s active-signal window
+    context_cap_s: float = 12.0            # v1 window-eviction boundary — drop utterances older than this
     session_gap_s: float = 30.0            # silence gap that starts a NEW attention session
     session_stickiness_mult: float = 1.3   # in-session soft-score multiplier (stickiness)
     cooldown_s: float = 30.0               # refractory window after a perk
