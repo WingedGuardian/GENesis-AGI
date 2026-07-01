@@ -29,6 +29,7 @@ _TABLES_WITH_CREATED_AT = {
     "awareness_ticks", "pending_embeddings", "outreach_history",
     "surplus_tasks", "surplus_insights", "inbox_items",
     "session_bookmarks", "telegram_messages", "activity_log",
+    "attention_events",  # shadow store — rows_24h gives fire-rate visibility pre-PR2 tab
 }
 
 # Known MCP servers — shown even with zero activity so user sees full inventory.

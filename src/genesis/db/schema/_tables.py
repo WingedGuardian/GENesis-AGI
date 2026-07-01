@@ -39,6 +39,28 @@ TABLES = {
             surfaced_count    INTEGER NOT NULL DEFAULT 0   -- contextual-hook surfacings (proactive hook / tool advisor); honest funnel signal, NOT read by promoter
         )
     """,
+    "attention_events": """
+        CREATE TABLE IF NOT EXISTS attention_events (
+            id                TEXT PRIMARY KEY,
+            ts                TEXT NOT NULL,               -- event ts (utterance end), ISO8601 UTC
+            session_id        TEXT NOT NULL,
+            activation        TEXT NOT NULL,               -- hard | soft | suppressed
+            score             REAL NOT NULL,
+            triggers_fired    TEXT NOT NULL DEFAULT '[]',  -- JSON [{name,kind,contribution}] — NO transcript text
+            suppressors       TEXT NOT NULL DEFAULT '[]',  -- JSON [name]
+            window_ref        TEXT NOT NULL,               -- JSON {snapshot_id,session_id,utt_ids,ts_start,ts_end} — REFS ONLY
+            mode_state        TEXT,
+            clarity           REAL,
+            l15_verdict       TEXT,                        -- JSON {real,perk}; NULL in v1 (L1.5 stubbed)
+            acceptance_signal TEXT,                        -- should|shouldnt|skip; back-filled at shadow review (PR2)
+            snapshot_id       TEXT,
+            config_version    TEXT,
+            created_at        TEXT NOT NULL
+            -- SHADOW/OFFLINE-ONLY firewall table: attention DECISIONS + REFERENCES only,
+            -- NEVER ambient transcript text (that lives+dies in ambient.db on the edge).
+            -- Not read by any cognition job (dream/ego/memory-synthesis).
+        )
+    """,
     "observations": """
         CREATE TABLE IF NOT EXISTS observations (
             id               TEXT PRIMARY KEY,
@@ -1515,6 +1537,9 @@ KNOWLEDGE_FTS5_DDL = """
 # ─── Indexes ──────────────────────────────────────────────────────────────────
 
 INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_attention_events_session ON attention_events(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_attention_events_ts ON attention_events(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_attention_events_unlabeled ON attention_events(acceptance_signal) WHERE acceptance_signal IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_procedural_task_type ON procedural_memory(task_type)",
     "CREATE INDEX IF NOT EXISTS idx_procedural_draft ON procedural_memory(draft)",
     "CREATE INDEX IF NOT EXISTS idx_procedural_activation_tier ON procedural_memory(activation_tier)",

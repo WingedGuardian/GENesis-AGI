@@ -26,6 +26,7 @@ from genesis.attention.config import (
     default_config_dict,
     load_config,
 )
+from genesis.attention.consumers import ShadowStoreConsumer
 from genesis.attention.engine import evaluate
 from genesis.attention.snapshot import pull_snapshot
 from genesis.attention.sources import SnapshotSource
@@ -44,6 +45,7 @@ class ShadowReport:
     by_trigger: dict = field(default_factory=dict)
     by_suppressor: dict = field(default_factory=dict)
     samples: list = field(default_factory=list)
+    persisted: int = 0
 
     @property
     def fire_rate(self) -> float:
@@ -61,7 +63,12 @@ def load_runner_config(path: str | None) -> AttentionConfig:
 
 
 def run_shadow(
-    snapshot_path: str | Path, config: AttentionConfig, *, snapshot_id: str = "adhoc", sample_n: int = 25,
+    snapshot_path: str | Path,
+    config: AttentionConfig,
+    *,
+    snapshot_id: str = "adhoc",
+    sample_n: int = 25,
+    consumer: ShadowStoreConsumer | None = None,
 ) -> ShadowReport:
     src = SnapshotSource(snapshot_path)
     state = EngineState()
@@ -80,12 +87,15 @@ def run_shadow(
         if ev is None:
             continue
         events.append(ev)
+        if consumer is not None:
+            consumer.add(ev)
         by_act[ev.activation.value] += 1
         for h in ev.triggers_fired:
             by_trig[h.name] += 1
         for s in ev.suppressors:
             by_supp[s] += 1
 
+    persisted = consumer.flush() if consumer is not None else 0
     samples = []
     step = max(1, len(events) // sample_n) if events else 1
     for ev in events[::step][:sample_n]:
@@ -102,14 +112,15 @@ def run_shadow(
         })
     return ShadowReport(
         snapshot_id, total, evaluated, len(events),
-        dict(by_act), dict(by_trig), dict(by_supp), samples,
+        dict(by_act), dict(by_trig), dict(by_supp), samples, persisted,
     )
 
 
 def print_report(r: ShadowReport) -> None:
     print(f"\n=== ATTENTION SHADOW — snapshot {r.snapshot_id} ===")
     print(f"rows={r.total_rows}  evaluated(non-blip)={r.evaluated}  "
-          f"blips_skipped={r.total_rows - r.evaluated}  events={r.events}  fire_rate={r.fire_rate:.1%}")
+          f"blips_skipped={r.total_rows - r.evaluated}  events={r.events}  "
+          f"fire_rate={r.fire_rate:.1%}  persisted={r.persisted}")
     print(f"by_activation: {r.by_activation}")
     print(f"by_trigger:    {dict(sorted(r.by_trigger.items(), key=lambda x: -x[1]))}")
     print(f"by_suppressor: {r.by_suppressor}")
@@ -126,6 +137,8 @@ def main() -> None:
     ap.add_argument("--snapshot", help="use an existing snapshot .db instead of pulling")
     ap.add_argument("--config", help="attention_config.json (default: ~/.genesis overlay or built-in)")
     ap.add_argument("--samples", type=int, default=25)
+    ap.add_argument("--persist", action="store_true", help="write events to attention_events")
+    ap.add_argument("--db", help="genesis.db path for --persist (default: genesis_db_path())")
     args = ap.parse_args()
 
     cfg = load_runner_config(args.config)
@@ -135,7 +148,14 @@ def main() -> None:
         sid = path.stem
     else:
         sid, path = asyncio.run(pull_snapshot())
-    report = run_shadow(path, cfg, snapshot_id=sid, sample_n=args.samples)
+
+    consumer = None
+    if args.persist:
+        from genesis.env import genesis_db_path
+        db_path = args.db or str(genesis_db_path())
+        consumer = ShadowStoreConsumer(db_path, snapshot_id=sid, config_version=cfg.version)
+        logger.info("persisting to %s", db_path)
+    report = run_shadow(path, cfg, snapshot_id=sid, sample_n=args.samples, consumer=consumer)
     print_report(report)
 
 
