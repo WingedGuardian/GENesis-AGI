@@ -13,12 +13,12 @@ from genesis.observability.ambient_health import AmbientRemoteConfig
 
 
 def _cfg() -> AmbientRemoteConfig:
-    return AmbientRemoteConfig(host_ip="10.0.0.1", host_user="edge", ssh_key="~/.ssh/id_ed25519")
+    return AmbientRemoteConfig(host_ip="192.0.2.1", host_user="edge", ssh_key="~/.ssh/id_ed25519")
 
 
 def test_ssh_base_has_batchmode_and_target():
     b = _ssh_base(_cfg())
-    assert b[0] == "ssh" and "BatchMode=yes" in b and "edge@10.0.0.1" in b
+    assert b[0] == "ssh" and "BatchMode=yes" in b and "edge@192.0.2.1" in b
 
 
 def test_backup_py_is_readonly_and_expands_home():
@@ -28,7 +28,7 @@ def test_backup_py_is_readonly_and_expands_home():
 
 def test_scp_cmd_pulls_remote_to_local():
     c = _scp_cmd(_cfg(), "~/.ambient_snap.db", Path("/tmp/x.db"))
-    assert c[0] == "scp" and "edge@10.0.0.1:~/.ambient_snap.db" in c and "/tmp/x.db" in c
+    assert c[0] == "scp" and "edge@192.0.2.1:~/.ambient_snap.db" in c and "/tmp/x.db" in c
 
 
 def test_timeout_more_generous_than_health_cat():
