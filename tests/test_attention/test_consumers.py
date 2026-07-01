@@ -1,6 +1,8 @@
-"""ShadowStoreConsumer persistence + the refs-not-text firewall (E2E to a temp DB)."""
+"""ShadowStoreConsumer persistence (via the crud layer) + the refs-not-text firewall."""
 import json
 import sqlite3
+
+import pytest
 
 from genesis.attention.config import AttentionConfig, default_config_dict
 from genesis.attention.consumers import ShadowStoreConsumer
@@ -35,7 +37,15 @@ def _run_events(utts, cfg):
     return evs
 
 
-def test_persist_writes_rows_and_no_text_column(tmp_path):
+def _rows(db) -> int:
+    conn = sqlite3.connect(db)
+    n = conn.execute("SELECT COUNT(*) FROM attention_events").fetchone()[0]
+    conn.close()
+    return n
+
+
+@pytest.mark.asyncio
+async def test_persist_writes_rows_and_no_text_column(tmp_path):
     db = tmp_path / "g.db"
     _make_db(db)
     cfg = AttentionConfig.from_dict(default_config_dict())
@@ -44,7 +54,7 @@ def test_persist_writes_rows_and_no_text_column(tmp_path):
     c = ShadowStoreConsumer(db, snapshot_id="snapX", config_version=cfg.version)
     for ev in evs:
         c.add(ev)
-    assert c.flush() == len(evs)
+    assert await c.flush() == len(evs)
 
     conn = sqlite3.connect(db)
     cols = [r[1] for r in conn.execute("PRAGMA table_info(attention_events)")]
@@ -57,7 +67,8 @@ def test_persist_writes_rows_and_no_text_column(tmp_path):
     assert rows[0][2] == cfg.version
 
 
-def test_firewall_no_transcript_text_persisted(tmp_path):
+@pytest.mark.asyncio
+async def test_firewall_no_transcript_text_persisted(tmp_path):
     db = tmp_path / "g.db"
     _make_db(db)
     cfg = AttentionConfig.from_dict(default_config_dict())
@@ -67,14 +78,15 @@ def test_firewall_no_transcript_text_persisted(tmp_path):
     c = ShadowStoreConsumer(db, snapshot_id="snapX", config_version=cfg.version)
     for ev in evs:
         c.add(ev)
-    c.flush()
+    await c.flush()
     conn = sqlite3.connect(db)
     dump = " ".join(str(v) for row in conn.execute("SELECT * FROM attention_events") for v in row)
     conn.close()
     assert secret not in dump  # transcript text NEVER reaches genesis.db
 
 
-def test_idempotent_reflush_same_snapshot_and_config(tmp_path):
+@pytest.mark.asyncio
+async def test_idempotent_reflush_same_snapshot_and_config(tmp_path):
     db = tmp_path / "g.db"
     _make_db(db)
     cfg = AttentionConfig.from_dict(default_config_dict())
@@ -83,14 +95,12 @@ def test_idempotent_reflush_same_snapshot_and_config(tmp_path):
         c = ShadowStoreConsumer(db, snapshot_id="s", config_version=cfg.version)
         for ev in evs:
             c.add(ev)
-        c.flush()
-    conn = sqlite3.connect(db)
-    count = conn.execute("SELECT COUNT(*) FROM attention_events").fetchone()[0]
-    conn.close()
-    assert count == len(evs)  # INSERT OR REPLACE keyed on snapshot:config:utt
+        await c.flush()
+    assert _rows(db) == len(evs)  # INSERT OR REPLACE keyed on snapshot:config:utt
 
 
-def test_new_config_version_writes_new_rows(tmp_path):
+@pytest.mark.asyncio
+async def test_new_config_version_writes_new_rows(tmp_path):
     db = tmp_path / "g.db"
     _make_db(db)
     utts = [_utt(1, 100.0, "what do you think?")]
@@ -100,8 +110,5 @@ def test_new_config_version_writes_new_rows(tmp_path):
         c = ShadowStoreConsumer(db, snapshot_id="s", config_version=ver)
         for ev in evs:
             c.add(ev)
-        c.flush()
-    conn = sqlite3.connect(db)
-    count = conn.execute("SELECT COUNT(*) FROM attention_events").fetchone()[0]
-    conn.close()
-    assert count == 2  # different config_version -> distinct rows (labels preserved)
+        await c.flush()
+    assert _rows(db) == 2  # different config_version -> distinct rows (labels preserved)

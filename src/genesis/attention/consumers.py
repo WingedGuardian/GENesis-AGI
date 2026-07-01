@@ -1,26 +1,22 @@
 """Sink adapters for ``AttentionEvent``. ``ShadowStoreConsumer`` persists refs + derived
-features to genesis.db ``attention_events`` — NEVER transcript text (firewall). Events are
-buffered and flushed in ONE short transaction: the offline runner is a 2nd writer to the
-WAL DB while the server writes on its ticks, so ``timeout`` + ``busy_timeout`` + a single
-write window absorb lock contention. A ``JSONLConsumer`` (the edge sink) slots in beside
-this later (PR3).
+features to genesis.db ``attention_events`` via the crud layer (``genesis.db.crud.attention``)
+— NEVER transcript text (firewall). Events are buffered and written in ONE transaction: the
+offline runner is a 2nd writer to the WAL DB while the server writes on its ticks, so the
+connection's ``timeout`` + ``busy_timeout`` + a single write window absorb lock contention.
+A ``JSONLConsumer`` (the edge sink) slots in beside this later (PR3).
 """
 from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 from datetime import UTC, datetime
 
+import aiosqlite
+
 from genesis.attention.types import AttentionEvent
+from genesis.db.crud import attention as attention_crud
 
 logger = logging.getLogger(__name__)
-
-_COLUMNS = (
-    "id", "ts", "session_id", "activation", "score", "triggers_fired", "suppressors",
-    "window_ref", "mode_state", "clarity", "l15_verdict", "acceptance_signal",
-    "snapshot_id", "config_version", "created_at",
-)
 
 
 def _iso(epoch: float) -> str:
@@ -28,7 +24,7 @@ def _iso(epoch: float) -> str:
 
 
 class ShadowStoreConsumer:
-    """Buffer AttentionEvents; flush them to ``attention_events`` in one transaction.
+    """Buffer AttentionEvents; flush them to ``attention_events`` (via crud) in one txn.
 
     Row id = ``snapshot_id:config_version:trigger_utt_id`` — idempotent per (snapshot,
     config) so re-running the same snapshot yields identical rows, while a NEW
@@ -47,6 +43,7 @@ class ShadowStoreConsumer:
         self._rows.append(self._to_row(ev))
 
     def _to_row(self, ev: AttentionEvent) -> tuple:
+        # Order MUST match genesis.db.crud.attention.COLUMNS.
         wr = ev.window_ref
         trig_id = wr.utt_ids[-1] if wr.utt_ids else "x"
         row_id = f"{self.snapshot_id}:{self.config_version}:{trig_id}"
@@ -69,23 +66,16 @@ class ShadowStoreConsumer:
             self.snapshot_id, self.config_version, self._created_at,
         )
 
-    def flush(self) -> int:
-        """Write all buffered rows in one transaction; returns the count written."""
+    async def flush(self) -> int:
+        """Write all buffered rows via the crud layer in one transaction; returns count."""
         if not self._rows:
             return 0
-        placeholders = ", ".join(["?"] * len(_COLUMNS))
-        sql = (  # columns/placeholders are constants, not user input
-            f"INSERT OR REPLACE INTO attention_events ({', '.join(_COLUMNS)}) "  # noqa: S608
-            f"VALUES ({placeholders})"
-        )
-        conn = sqlite3.connect(self.db_path, timeout=self.timeout_s)
+        conn = await aiosqlite.connect(self.db_path, timeout=self.timeout_s)
         try:
-            conn.execute("PRAGMA busy_timeout=30000")
-            with conn:  # explicit txn: commit on success, ROLLBACK on any error (no partial batch)
-                conn.executemany(sql, self._rows)
+            await conn.execute("PRAGMA busy_timeout=30000")
+            n = await attention_crud.bulk_upsert_events(conn, self._rows)
         finally:
-            conn.close()  # __exit__ manages the txn, not the connection lifecycle
-        n = len(self._rows)
+            await conn.close()
         logger.info("persisted %d attention_events (snapshot=%s config=%s)",
                     n, self.snapshot_id, self.config_version)
         self._rows = []

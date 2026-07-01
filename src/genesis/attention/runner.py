@@ -62,7 +62,7 @@ def load_runner_config(path: str | None) -> AttentionConfig:
     return AttentionConfig.from_dict(default_config_dict())
 
 
-def run_shadow(
+async def run_shadow(
     snapshot_path: str | Path,
     config: AttentionConfig,
     *,
@@ -95,7 +95,7 @@ def run_shadow(
         for s in ev.suppressors:
             by_supp[s] += 1
 
-    persisted = consumer.flush() if consumer is not None else 0
+    persisted = await consumer.flush() if consumer is not None else 0
     samples = []
     step = max(1, len(events) // sample_n) if events else 1
     for ev in events[::step][:sample_n]:
@@ -141,13 +141,17 @@ def main() -> None:
     ap.add_argument("--db", help="genesis.db path for --persist (default: genesis_db_path())")
     args = ap.parse_args()
 
+    asyncio.run(_run_cli(args))
+
+
+async def _run_cli(args) -> None:
     cfg = load_runner_config(args.config)
     logger.info("config version=%s aliases=%s domain_kw=%d", cfg.version, cfg.aliases, len(cfg.domain_keywords))
     if args.snapshot:
         path = Path(args.snapshot).expanduser()
         sid = path.stem
     else:
-        sid, path = asyncio.run(pull_snapshot())
+        sid, path = await pull_snapshot()
 
     consumer = None
     if args.persist:
@@ -155,7 +159,7 @@ def main() -> None:
         db_path = args.db or str(genesis_db_path())
         consumer = ShadowStoreConsumer(db_path, snapshot_id=sid, config_version=cfg.version)
         logger.info("persisting to %s", db_path)
-    report = run_shadow(path, cfg, snapshot_id=sid, sample_n=args.samples, consumer=consumer)
+    report = await run_shadow(path, cfg, snapshot_id=sid, sample_n=args.samples, consumer=consumer)
     print_report(report)
 
 
