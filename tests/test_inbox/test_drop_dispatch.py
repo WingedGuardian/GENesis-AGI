@@ -269,6 +269,72 @@ async def test_retry_respects_url_failure_storm_guard(
     assert mock_invoker.run.call_count == 0
 
 
+@pytest.mark.asyncio
+async def test_retry_candidate_vanished_file_is_abandoned(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """A retry candidate whose SOURCE FILE was deleted is abandoned — its
+    stranded failed rows are flipped to approval_invalidated so it stops being a
+    candidate (no 'File vanished before retry read' every scan, forever)."""
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=3)
+    gone = inbox_dir / "Deleted.md"  # never created on disk
+    # A retriable-failed row for a file that does not exist -> pure retry
+    # candidate (not detected as new/modified, since it isn't on disk).
+    await inbox_items.create(
+        db, id="f1", file_path=str(gone), content_hash="h", status="pending",
+        created_at="2026-06-30T00:00:01+00:00",
+    )
+    await inbox_items.update_status(db, "f1", status="failed", error_message="rate limited")
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=3) == [str(gone)]
+
+    await mon.check_once()  # retry loop hits FileNotFoundError -> abandons it
+
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=3) == [], (
+        "a vanished-file candidate must be abandoned, not recur every scan"
+    )
+    row = await inbox_items.get_by_id(db, "f1")
+    # The reason flows through end-to-end (distinct from the empty-delta case).
+    assert row["error_message"] == (
+        f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}source file deleted"
+    )
+    assert mock_invoker.run.call_count == 0  # nothing dispatched (file is gone)
+
+
+@pytest.mark.asyncio
+async def test_retry_candidate_empty_file_is_abandoned(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """A retry candidate whose file exists but is now EMPTY is abandoned too —
+    another terminal state (no content to ever retry), same as a deleted file."""
+    from genesis.inbox.scanner import compute_hash
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=3)
+    empty = inbox_dir / "Emptied.md"
+    empty.write_text("")
+    h = compute_hash(empty)
+    # A completed row with the current (empty) hash keeps the file 'known', so it
+    # reaches the RETRY path (not re-detected as new/modified).
+    await inbox_items.create(
+        db, id="done", file_path=str(empty), content_hash=h, status="completed",
+        created_at="2026-06-30T00:00:01+00:00",
+    )
+    await inbox_items.create(
+        db, id="f1", file_path=str(empty), content_hash="oldh", status="pending",
+        created_at="2026-06-30T00:00:02+00:00",
+    )
+    await inbox_items.update_status(db, "f1", status="failed", error_message="rate limited")
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=3) == [str(empty)]
+
+    await mon.check_once()
+
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=3) == []
+    row = await inbox_items.get_by_id(db, "f1")
+    assert row["error_message"] == (
+        f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}source file is empty"
+    )
+    assert mock_invoker.run.call_count == 0
+
+
 # ── One approval per drop (gate ON) ──────────────────────────────────────
 
 
