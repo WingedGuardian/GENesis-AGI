@@ -134,7 +134,7 @@ def test_cooldown_raises_threshold():
     state, e1 = evaluate(make_utt(1, 100.0, "q?"), state, cfg)
     assert e1.activation == Activation.SOFT                    # .5 >= .4
     state, e2 = evaluate(make_utt(2, 105.0, "q?"), state, cfg)
-    assert e2 is None                                          # in cooldown -> bar .7, .5 < .7
+    assert e2 is None                                          # cooldown bar .7; .5 + topic_continuation .15 = .65 < .7
     state, e3 = evaluate(make_utt(3, 140.0, "q?"), state, cfg)
     assert e3 is not None and e3.activation == Activation.SOFT  # 40s > cooldown -> fires again
 
@@ -145,3 +145,84 @@ def test_event_carries_refs_not_text():
     assert ev.window_ref.utt_ids == (7,)
     assert not hasattr(ev, "text")
     assert "secret plan" not in repr(ev.window_ref)
+
+
+# ── PR3a: decay, dilution, new suppressors, look-ahead, determinism ──
+
+def test_new_triggers_dilute_multi_speaker():
+    cfg = make_config(
+        weights={"multi_speaker": 0.4, "question": 0.3, "decision": 0.3},
+        lexical_patterns={"question": [r"\?"], "decision": [r"\bwe should\b"]},
+    )
+    # a bare multi-speaker window no longer clears the 0.6 bar on its own (0.40 < 0.60)
+    assert run([make_utt(1, 100.0, "some chatter", speaker_total=2)], cfg) == []
+    # multi-speaker + real intent does (0.40 + 0.30 + 0.30 = 1.00)
+    rich = run([make_utt(1, 100.0, "we should ship?", speaker_total=2)], cfg)
+    assert len(rich) == 1 and rich[0].activation == Activation.SOFT
+
+
+def test_decay_reduces_stickiness_over_off_topic_gap():
+    cfg = make_config(
+        weights={"question": 0.5, "topic_continuation": 0.15},
+        lexical_patterns={"question": [r"\?"]},
+        thresholds={"soft_perk": 0.6, "l15_graduation": 0.4},
+        # unanswered_question pushed out of range so decay is ISOLATED from that bonus
+        # (a lingering "?" would otherwise add +unanswered_question to the far case and mask decay).
+        state_modifiers={"session_gap_s": 300, "cooldown_s": 0, "session_stickiness_mult": 1.3,
+                         "decay_window_s": 30, "decay_floor_mult": 1.0, "context_cap_s": 300,
+                         "unanswered_question_s": 100000},
+    )
+    near = run([make_utt(1, 100.0, "q?"), make_utt(2, 101.0, "q?")], cfg)   # 1s gap: near-full stickiness
+    far = run([make_utt(1, 100.0, "q?"), make_utt(2, 128.0, "q?")], cfg)    # 28s gap: decayed toward 1.0
+    assert near[-1].score > far[-1].score
+
+
+def test_last_relevance_ts_advances_only_on_relevant():
+    cfg = make_config(weights={"question": 0.5}, lexical_patterns={"question": [r"\?"]})
+    state = EngineState()
+    state, _ = evaluate(make_utt(1, 100.0, "nothing here"), state, cfg)   # no trigger, window len 1
+    assert state.last_relevance_ts is None                                # clock NOT advanced
+    state, _ = evaluate(make_utt(2, 101.0, "q?"), state, cfg)             # question fires
+    assert state.last_relevance_ts == 101.0                               # advanced on the relevant utt
+
+
+def test_low_asr_suppressor_off_by_default_on_by_config():
+    garbled = make_utt(1, 100.0, "what do you think?", speaker_total=2,
+                       frac_lt_1=0.5, rms=0.2, duration_s=5.0, n_tokens=20)
+    off = run([garbled], make_config(suppressors_enabled=["explicit_dismissal"]))
+    assert off and all(e.activation != Activation.SUPPRESSED for e in off)   # clarity dampens, no veto
+    on = run([garbled], make_config(suppressors_enabled=["explicit_dismissal", "low_asr_confidence"]))
+    assert len(on) == 1 and on[0].activation == Activation.SUPPRESSED         # frac_lt_1 0.5 >= 0.35
+
+
+def test_mode_suppressor_inert_offline_but_vetoes_when_active():
+    cfg = make_config(suppressors_enabled=["explicit_dismissal", "mode_active_listen"])
+    # offline default mode_state="unknown" -> inert -> the soft fire stands
+    assert run([make_utt(1, 100.0, "what do you think?", speaker_total=2)], cfg)[0].activation == Activation.SOFT
+    # edge mode set -> veto
+    active = make_utt(1, 100.0, "what do you think?", speaker_total=2, mode_state="listen_active")
+    assert run([active], cfg)[0].activation == Activation.SUPPRESSED
+
+
+def test_unanswered_question_fires_in_fold():
+    cfg = make_config(
+        weights={"unanswered_question": 0.7},
+        lexical_patterns={"question": [r"\?"]},
+        state_modifiers={"unanswered_question_s": 5, "session_gap_s": 300, "cooldown_s": 0,
+                         "session_stickiness_mult": 1.0, "context_cap_s": 300},
+        thresholds={"soft_perk": 0.6, "l15_graduation": 0.4},
+    )
+    ev = run([make_utt(1, 100.0, "did it work?"), make_utt(2, 108.0, "yeah anyway")], cfg)  # 8s > 5s
+    assert any(h.name == "unanswered_question" for e in ev for h in e.triggers_fired)
+
+
+def test_determinism_with_pending_and_decay():
+    cfg = make_config(
+        weights={"question": 0.5, "decision": 0.3, "unanswered_question": 0.4, "topic_continuation": 0.15},
+        lexical_patterns={"question": [r"\?"], "decision": [r"\bwe should\b"]},
+        state_modifiers={"session_gap_s": 300, "cooldown_s": 30, "session_stickiness_mult": 1.3,
+                         "decay_window_s": 30, "context_cap_s": 300},
+    )
+    utts = [make_utt(1, 100.0, "should we go?"), make_utt(2, 103.0, "we should decide", speaker_total=2),
+            make_utt(3, 110.0, "hmm not sure"), make_utt(4, 118.0, "we should go?")]
+    assert run(utts, cfg) == run(utts, cfg)

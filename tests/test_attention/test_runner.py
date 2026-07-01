@@ -50,7 +50,7 @@ def test_load_runner_config_from_explicit_file(tmp_path):
 
 def test_load_runner_config_falls_back_to_builtin(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "DEFAULT_CONFIG_PATH", str(tmp_path / "absent.json"))
-    assert load_runner_config(None).version == "0.1.0-default"
+    assert load_runner_config(None).version == "0.2.0-taxonomy"
 
 
 @pytest.mark.asyncio

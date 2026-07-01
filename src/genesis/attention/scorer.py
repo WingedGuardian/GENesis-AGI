@@ -16,6 +16,28 @@ def soft_relevance(hits: Sequence[TriggerHit]) -> float:
     return sum(h.contribution for h in hits)
 
 
+def stickiness_multiplier(
+    base: float, off_topic_s: float | None, decay_window_s: float, floor: float = 1.0,
+) -> float:
+    """In-session stickiness that DECAYS as the conversation drifts off-topic (§4/§9).
+
+    ``off_topic_s`` = ``utt.ts - last_relevance_ts`` (seconds since the last utterance
+    that carried ANY soft relevance). Returns ``base`` when fully on-topic (0s) and
+    linearly decays toward ``floor``, reaching ``floor`` at ``decay_window_s``; clamped —
+    it removes the bonus, never penalizes below ``floor``.
+
+    ``off_topic_s is None`` (first utt of a session — no prior relevant utt yet) or a
+    non-positive ``decay_window_s`` -> ``floor`` (no bonus, no crash). Returning ``floor``
+    on the first utt matches the pre-PR3a "first-utt gets no stickiness" behaviour.
+    """
+    if off_topic_s is None or decay_window_s <= 0.0:
+        return floor
+    frac = min(max(off_topic_s, 0.0) / decay_window_s, 1.0)
+    # clamp to floor: decay removes the bonus, never dips below floor — and guards a
+    # misconfig where base < floor (plus any float undershoot at frac == 1.0).
+    return max(floor, base - (base - floor) * frac)
+
+
 def resolve_activation(
     *,
     hard_hits: Sequence[TriggerHit],

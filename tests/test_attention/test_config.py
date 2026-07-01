@@ -2,7 +2,13 @@
 import json
 import re
 
-from genesis.attention.config import AttentionConfig, StateModifiers, Thresholds, load_config
+from genesis.attention.config import (
+    AttentionConfig,
+    StateModifiers,
+    Thresholds,
+    default_config_dict,
+    load_config,
+)
 
 
 def _raw() -> dict:
@@ -65,3 +71,31 @@ def test_default_config_dict_compiles():
     assert c.thresholds.soft_perk == 0.6            # Thresholds default (empty dict -> defaults)
     assert "explicit_dismissal" in c.suppressors_enabled
     assert c.lexical_patterns["question"]           # compiled non-empty
+
+
+# ── PR3a ──
+
+def test_new_state_modifier_defaults():
+    sm = StateModifiers()
+    assert sm.decay_window_s == 30.0
+    assert sm.decay_floor_mult == 1.0
+    assert sm.low_asr_frac_lt_1 == 0.35
+    assert sm.lexical_repetition_min_tokens == 3
+
+
+def test_default_config_has_all_pr3a_weights():
+    w = default_config_dict()["weights"]
+    for name in ("decision", "task_reminder", "temporal_deadline", "quantity_money",
+                 "recall_cue", "dispute", "emotional", "topic_continuation",
+                 "lexical_repetition", "unanswered_question"):
+        assert isinstance(w[name], float), name
+    assert w["multi_speaker"] == 0.40  # unchanged — diluted, not down-weighted
+
+
+def test_default_suppressors_enabled_excludes_low_asr_and_mode():
+    # the double-count / inert-offline suppressors are REGISTERED but OFF by default.
+    enabled = default_config_dict()["suppressors_enabled"]
+    assert "explicit_dismissal" in enabled
+    assert "sensitive_topic" in enabled           # on, but its bank ships empty (inert)
+    for off in ("low_asr_confidence", "mode_active_listen", "mode_active_s2s", "mode_global_mute"):
+        assert off not in enabled, off
