@@ -147,9 +147,11 @@ def test_load_full_yaml(monkeypatch):
     # 2026-06-06: 49 → 51 after dream_cycle_synthesis_challenge + dream_cycle_entity_challenge (immune system PR).
     # 2026-06-20: 51 → 52 after crag_grade added (W-CRAG selective corrective retrieval, PR #711).
     # 2026-06-30: 52 → 53 after 38a_procedure_novelty_llm added (C2b cross-type procedure dedup).
-    assert len(cfg.call_sites) == 53
+    # 2026-07-01: 53 → 54 after attention_salience added (PR3b L1.5 salience gate).
+    assert len(cfg.call_sites) == 54
     assert "crag_grade" in cfg.call_sites  # W-CRAG runtime grader (2026-06-20)
     assert "38a_procedure_novelty_llm" in cfg.call_sites  # C2b cross-type dedup (2026-06-30)
+    assert "attention_salience" in cfg.call_sites  # PR3b L1.5 salience gate (2026-07-01)
     assert "models_md_synthesis" not in cfg.call_sites  # removed 2026-05-24
     assert "2_triage" not in cfg.call_sites  # removed 2026-05-10
     assert "7_task_retrospective" not in cfg.call_sites  # removed 2026-05-10 (duplicate; live one is 43_task_retrospective)

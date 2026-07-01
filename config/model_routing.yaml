@@ -684,6 +684,21 @@ call_sites:
     description: "Voice channel conversation \u2014 low-latency free-tier chain\
       \ for HA voice assistant. Groq first for speed (~1s), Gemini/Mistral\
       \ as fallbacks."
+  attention_salience:
+    chain:
+    - mistral-small-free
+    - nvidia-nim-deepseek
+    never_pays: true
+    retry_profile: user_facing
+    description: >-
+      Attention engine L1.5 salience gate (offline shadow tool, opt-in via the runner's
+      --l15 flag): scores a graduated ~8s ambient window into {real, perk} floats. PRIVACY
+      \u2014 this sends the window's household transcript text to an external free LLM; only the
+      float verdict is persisted (never the text). Provider bake-off 2026-07-01 over real
+      garbled windows: mistral-small-latest (100% clean JSON, ~0.8s) primary + nvidia-nim
+      deepseek-v4-pro (100% clean, different vendor) fallback; both free, so never_pays
+      keeps a valid chain. NON-Groq deliberately \u2014 Groq's 8B is EOL 2026-08-16 and its
+      gpt-oss-20b replacement breaks strict JSON.
 retry:
   # max_total_s: aggregate wall-clock ceiling (seconds) across a single
   # route_call's retries x chain length. A safety net against pathological
