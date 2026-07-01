@@ -124,6 +124,13 @@ class TestProbeDisk:
         assert result.details["pct_used"] == 50.0
 
     @pytest.mark.asyncio
+    async def test_healthy_below_warn(self):
+        # 82% used — below the 85% warn threshold (was DEGRADED under old 80%)
+        with patch("os.statvfs", return_value=_fake_statvfs(1000000, 180000)):
+            result = await probe_disk(clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.HEALTHY
+
+    @pytest.mark.asyncio
     async def test_degraded_at_warn(self):
         # 85% used
         with patch("os.statvfs", return_value=_fake_statvfs(1000000, 150000)):

@@ -15,8 +15,8 @@ Usage:
     worktree_lifecycle.py --list-trash       # Show trash contents with age
     worktree_lifecycle.py --recover <name>   # Recover a trashed worktree
 
-Designed for daily cron:
-    0 4 * * * .venv/bin/python scripts/worktree_lifecycle.py
+Run daily by the genesis-disk-hygiene.timer systemd unit (via
+scripts/disk_hygiene.sh, alongside disk_reclaim.py). Also runnable by hand.
 
 Stdlib-only (no genesis package imports). Uses gh CLI for PR status.
 """
