@@ -46,12 +46,18 @@ class TaskType(StrEnum):
 # Task types whose *success* means "produced a useful insight that belongs in the
 # knowledge base", as opposed to "an action ran to completion". Only these are
 # eligible for the verified-correctness verdict (``outcome_quality``): when one of
-# them completes but the intake pipeline routes ALL of its findings to discard
-# (nothing reached knowledge or observations), the work was hollow — it ran but
-# produced nothing of value — and the Outcome Bus records a VERIFICATION_FAILED
-# negative alongside the usual EXECUTION_OUTCOME positive.
+# them completes, its FULL output is graded by the measurement-only LLM quality
+# judge (surplus.quality_judge). 'useful' = the judge passed the output; 'hollow'
+# = the judge scored it below the output_quality threshold (it ran but produced
+# nothing of value) — and the Outcome Bus records a VERIFICATION_FAILED negative
+# alongside the usual EXECUTION_OUTCOME positive. NULL = a judge outage, a
+# non-insight type, or empty/too-short output (positive-only, not penalized).
+# (The judge REPLACED an earlier intake-routing heuristic — 'hollow' = intake
+# discarded every finding — which was structurally unreachable: curated surplus
+# sources skip scoring and route at a fixed 0.6 confidence, so intake never
+# discarded everything, so 'hollow' could never fire.)
 #
-# Deliberately EXCLUDED (would manufacture false negatives):
+# Deliberately EXCLUDED (would manufacture false negatives / are not KB-bound):
 #   - Action tasks (CODE_INDEX, MODEL_EVAL, DISK_CLEANUP, DB_MAINTENANCE,
 #     DEAD_LETTER_REPLAY, BACKUP_VERIFICATION, J9_EVAL_BATCH, FRESH_SESSION_TEST):
 #     success = the action ran; they don't target the KB, so all-discard is normal.

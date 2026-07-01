@@ -132,6 +132,10 @@ class SurplusScheduler:
         self._github_discovery_job = None  # Set via set_github_discovery_job()
         self._extraction_store: MemoryStore | None = None
         self._extraction_router: Router | None = None
+        # Router for the measurement-only surplus quality judge (set via
+        # set_judge_router). Independent of extraction deps so the judge is
+        # available whenever a router exists; None => judge records NULL verdicts.
+        self._judge_router: Router | None = None
         self._follow_up_dispatcher = None  # Set via set_follow_up_dispatcher()
         self._topic_manager = None
         self._scheduler = AsyncIOScheduler()
@@ -236,6 +240,16 @@ class SurplusScheduler:
         """Set dependencies for the memory extraction job."""
         self._extraction_store = store
         self._extraction_router = router
+
+    def set_judge_router(self, router: Router) -> None:
+        """Wire the router used by the measurement-only surplus quality judge
+        (surplus.quality_judge).
+
+        Kept separate from set_extraction_deps so the judge is available whenever
+        a router exists, even if memory extraction was not wired. If never set
+        (degraded init with no router), the judge records NULL verdicts.
+        """
+        self._judge_router = router
 
     def set_follow_up_dispatcher(self, dispatcher) -> None:
         """Set the follow-up dispatcher for accountability tracking.
@@ -1669,11 +1683,16 @@ class SurplusScheduler:
 
         # 6. Route through intake pipeline (atomize → score → route to knowledge)
         staging_id = None
-        # Verified-correctness verdict (insight-producing types only). Stays NULL
-        # for action tasks, intake failures, and empty/too-short output — all
-        # ambiguous or not-a-quality-signal, so they keep the positive-only
-        # behaviour. Only set to 'useful'/'hollow' once intake has actually run.
+        # Verified-correctness verdict (insight-producing types only), produced by
+        # the measurement-only quality judge (surplus.quality_judge). Stays NULL for
+        # action tasks, empty/too-short output, unknown types, and judge outages —
+        # all ambiguous or not-a-quality-signal — so they keep the positive-only
+        # behaviour. 'useful' = judge passed the output; 'hollow' = judge failed it
+        # (harvested as a VERIFICATION_FAILED negative). judge_score/judge_detail
+        # persist the continuous score + rationale for calibration/display.
         outcome_quality: str | None = None
+        judge_score: float | None = None
+        judge_detail: str | None = None
         if result.insights:
             insight = result.insights[0]
             content = result.content or ""
@@ -1705,17 +1724,6 @@ class SurplusScheduler:
                         intake_stats.routed_discard,
                         task.id[:8],
                     )
-                    # Verified-correctness verdict: for insight-producing types,
-                    # intake having routed nothing to knowledge/observations means
-                    # the work ran but produced nothing of value (hollow). This is
-                    # the only path that sets the verdict — empty/too-short output
-                    # and intake failures stay NULL on purpose (see above).
-                    if task.task_type in INSIGHT_PRODUCING_TASK_TYPES:
-                        kept = (
-                            intake_stats.routed_knowledge
-                            + intake_stats.routed_observation
-                        )
-                        outcome_quality = "useful" if kept > 0 else "hollow"
                     # Use a synthetic staging_id for tracking
                     content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
                     staging_id = f"{task.task_type.value}-{content_hash}"
@@ -1742,8 +1750,24 @@ class SurplusScheduler:
                         ttl=ttl,
                     )
 
+                # Measurement-only verified-correctness verdict. Runs whether
+                # intake succeeded or fell back (content is valid to judge either
+                # way); insight-producing types only. Grades the FULL output with
+                # the eval LLM-judge — decoupled from intake routing (curated
+                # sources stay trusted for storage; the judge only measures quality
+                # so the Outcome Bus gains a real two-sided signal). NEVER raises;
+                # a judge outage yields a NULL verdict, never a false 'hollow'.
+                if task.task_type in INSIGHT_PRODUCING_TASK_TYPES:
+                    from genesis.surplus.quality_judge import run_quality_judge
+                    outcome_quality, judge_score, judge_detail = (
+                        await run_quality_judge(
+                            content, task.task_type, self._judge_router,
+                        )
+                    )
+
         await self._queue.mark_completed(
             task.id, staging_id=staging_id, outcome_quality=outcome_quality,
+            judge_score=judge_score, judge_detail=judge_detail,
         )
 
         # Pipeline chaining — enqueue next step if this was a pipeline task.

@@ -368,11 +368,16 @@ TABLES = {
             attempt_count     INTEGER NOT NULL DEFAULT 0,
             not_before        TEXT,
             -- Verified-correctness verdict for insight-producing tasks (see
-            -- surplus.types.INSIGHT_PRODUCING_TASK_TYPES). 'useful' = intake
-            -- routed >=1 finding to knowledge/observation; 'hollow' = intake
-            -- ran but routed everything to discard. NULL = action task, legacy
-            -- row, intake-failure, or empty/too-short output (not penalized).
-            outcome_quality   TEXT CHECK (outcome_quality IN ('useful', 'hollow'))
+            -- surplus.types.INSIGHT_PRODUCING_TASK_TYPES), set by the
+            -- measurement-only quality judge (surplus.quality_judge). 'useful' =
+            -- judge passed the output; 'hollow' = judge failed it (harvested as a
+            -- VERIFICATION_FAILED negative). NULL = action task, legacy row,
+            -- unknown type, judge outage, or empty/too-short output (not penalized).
+            outcome_quality   TEXT CHECK (outcome_quality IN ('useful', 'hollow')),
+            -- Continuous [0,1] quality score + JSON rationale from the judge, for
+            -- calibration/display (NOT read by the Outcome Bus harvester).
+            judge_score       REAL,
+            judge_detail      TEXT
         )
     """,
     "drive_weights": """
