@@ -28,7 +28,7 @@ from genesis.awareness.classifier import classify_depth
 from genesis.awareness.scorer import compute_scores, get_staleness_context
 from genesis.awareness.signals import SignalCollector, collect_all
 from genesis.awareness.types import Depth, TickResult
-from genesis.cc.contingency import RATE_LIMIT_DEFERRAL_TTL_S
+from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.db.crud import awareness_ticks, observations
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.types import Severity, Subsystem
