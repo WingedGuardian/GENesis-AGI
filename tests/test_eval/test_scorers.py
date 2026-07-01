@@ -144,7 +144,13 @@ class TestSlopDetection:
 
 class TestGetScorer:
     def test_all_types_registered(self):
+        # AGENTIC_PYTEST is not a text scorer registered in the get_scorer
+        # factory — the agentic gauntlet scores by running pytest on the model's
+        # filesystem edits (genesis.eval.gauntlet), and the enum value is only a
+        # result label. Exempt it from the factory-registration invariant.
         for st in ScorerType:
+            if st is ScorerType.AGENTIC_PYTEST:
+                continue
             scorer = get_scorer(st)
             assert scorer is not None
 
