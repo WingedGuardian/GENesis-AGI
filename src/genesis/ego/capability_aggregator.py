@@ -1,7 +1,10 @@
 """Capability aggregator — builds the ego's self-model from multiple data sources.
 
 Queries intervention journal, ego proposals, autonomy state, procedural
-memory, and CC sessions to compute per-domain confidence scores.
+memory, and CC sessions to compute per-domain confidence scores. An optional
+6th source — Outcome Bus tier-1 execution ground truth (``source='surplus'``) —
+is folded in only when the ``outcome_bus_capability_feed`` ego flag is enabled
+(default OFF, the LC3-B go-live gate).
 """
 
 from __future__ import annotations
@@ -14,10 +17,13 @@ logger = logging.getLogger(__name__)
 
 
 async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
-    """Aggregate data from 5 sources into domain-level capability scores.
+    """Aggregate data from up to 6 sources into domain-level capability scores.
 
     Returns a list of dicts: {domain, confidence, sample_size, trend, evidence}.
-    Each source is queried independently — failures are logged and skipped.
+    Each source is queried independently — failures are logged and skipped. The
+    6th source (Outcome Bus tier-1 ground truth) is gated behind the
+    ``outcome_bus_capability_feed`` ego flag (default OFF); while disabled the
+    output is identical to the original 5-source computation.
     """
     domains: dict[str, _DomainAccumulator] = {}
 
@@ -113,6 +119,57 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
             acc.add_signal("sessions", rate, total)
     except Exception:
         logger.debug("Capability aggregation: cc_sessions unavailable")
+
+    # 6. Outcome Bus — tier-1 execution ground truth per domain (LC3-B go-live).
+    # Gated behind the default-OFF ``outcome_bus_capability_feed`` flag: until an
+    # operator flips it this adds NO signal, so the 5-source output above is
+    # unchanged. Scoped to source='surplus' — the only clean-new tier-1 domain.
+    # ego_proposals + cc_sessions tier-1 rows are ALREADY sources #2/#5, so an
+    # all-source read would double-count them; the source filter prevents that.
+    # Config read and the DB read are in SEPARATE try blocks so a config failure
+    # (which keeps the flag OFF) is not misdiagnosed as "outcome_events missing".
+    outcome_bus_enabled = False
+    try:
+        from genesis.ego.config import load_ego_config
+
+        cfg = load_ego_config()
+        # Default OFF: enable ONLY on an explicit True (a YAML null / missing key
+        # / falsey value all keep it off, so it can't be silently enabled).
+        outcome_bus_enabled = (
+            getattr(cfg, "outcome_bus_capability_feed", False) is True
+        )
+    except Exception:
+        logger.debug("Capability aggregation: ego config unreadable; outcome bus OFF")
+
+    if outcome_bus_enabled:
+        try:
+            from genesis.db.crud import outcome_events as oe_crud
+
+            rows = await oe_crud.aggregate_by_domain(
+                db, tier=1, source="surplus", days=30
+            )
+            for row in rows:
+                n = row.get("n") or 0
+                # Noise gate — mirrors cc_sessions' HAVING total >= 3.
+                if n < 3:
+                    continue
+                positive = row.get("positive") or 0
+                # rate = positive / n is provably in [0, 1]; passing an
+                # out-of-range value would make inverse_confidence_weight raise
+                # and silently degrade the WHOLE domain to an arithmetic mean.
+                # NB (LC3-B go-live tuning): a surplus "hollow" task contributes
+                # two rows (pos EXECUTION_OUTCOME + neg VERIFICATION_FAILED), so it
+                # inflates ``n`` by 2 and counts as ~1/3 effective credit here, not
+                # 1/2. Discrimination is correct (useful > hollow > failed); revisit
+                # the exact hollow weight / per-task dedup when enabling this feed.
+                rate = positive / n
+                domain = row.get("domain")
+                if not domain:
+                    continue
+                acc = domains.setdefault(domain, _DomainAccumulator(domain))
+                acc.add_signal("outcomes", rate, n)
+        except Exception:
+            logger.debug("Capability aggregation: outcome_events unavailable")
 
     # Compute composite scores
     results = []

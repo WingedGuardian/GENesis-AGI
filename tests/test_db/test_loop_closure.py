@@ -10,6 +10,7 @@ covered too.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -65,6 +66,28 @@ async def _prop(db, pid, *, status, created=_NEW):
         "VALUES (?,?,?,?,?)",
         (pid, "investigate", "do y", status, created),
     )
+
+
+async def _sess(db, sid, *, skill_tags, status="completed", session_type="background_task"):
+    """Insert a cc_sessions row whose metadata carries ``skill_tags`` (the only
+    skill-usage signal the funnel can read today)."""
+    meta = None if skill_tags is None else json.dumps({"skill_tags": list(skill_tags)})
+    await db.execute(
+        "INSERT INTO cc_sessions "
+        "(id, session_type, model, status, started_at, last_activity_at, metadata) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (sid, session_type, "m", status, _NEW, _NEW, meta),
+    )
+
+
+# A fixed library so skill-funnel tests don't depend on the real on-disk skill set.
+_LIB = ["alpha", "beta", "gamma"]
+
+
+def _patch_library(monkeypatch, names=_LIB):
+    import genesis.learning.skills.wiring as wiring
+
+    monkeypatch.setattr(wiring, "list_available_skills", lambda: list(names))
 
 
 # ── procedures: captured → surfaced/invoked → measured; leak = never reached ──
@@ -204,6 +227,101 @@ async def test_proposal_funnel(db):
     assert f["leak_pending_stale"] == 1
 
 
+# ── skills: file-based, NOT outcome-graded; honest instrumentation funnel ─────
+
+async def test_skill_funnel_uninstrumented_is_leak(db, monkeypatch):
+    # No session tags any skill → every library skill is uninstrumented (the leak).
+    _patch_library(monkeypatch)
+    f = await lc.skill_funnel(db)
+    assert f["captured"] == 3
+    assert f["instrumented"] == 0
+    assert f["measured"] == 0
+    assert f["leak_uninstrumented"] == 3
+    assert f["graded"] is False
+    assert f["loop"] == "OPEN"            # nothing instrumented → loop open
+
+
+async def test_skill_funnel_instrumented_and_measured(db, monkeypatch):
+    _patch_library(monkeypatch)
+    await _sess(db, "s1", skill_tags=["alpha"], status="completed")  # measured
+    await _sess(db, "s2", skill_tags=["beta"], status="failed")      # measured (failed IS terminal)
+    await db.commit()
+    f = await lc.skill_funnel(db)
+    assert f["instrumented"] == 2          # alpha + beta
+    assert f["measured"] == 2              # both in terminal-status sessions
+    assert f["leak_uninstrumented"] == 1   # gamma untouched
+    assert f["loop"] == "PARTIAL"          # some flow, some leak
+
+
+async def test_skill_funnel_success_only_skill_is_measured(db, monkeypatch):
+    # Regression guard for the DISCARDED plan's design bug: a 100%-success skill
+    # (never failed) MUST still count as measured — 'measured' means outcome is
+    # knowable, NOT 'has a failure'.
+    _patch_library(monkeypatch)
+    await _sess(db, "s1", skill_tags=["alpha"], status="completed")
+    await _sess(db, "s2", skill_tags=["alpha"], status="completed")
+    await db.commit()
+    f = await lc.skill_funnel(db)
+    assert f["instrumented"] == 1
+    assert f["measured"] == 1              # alpha measured despite zero failures
+
+
+async def test_skill_funnel_non_terminal_is_instrumented_not_measured(db, monkeypatch):
+    # An 'active' (non-terminal) session tags a skill: usage signal exists
+    # (instrumented) but no determinable outcome yet (not measured).
+    _patch_library(monkeypatch)
+    await _sess(db, "s1", skill_tags=["alpha"], status="active")
+    await db.commit()
+    f = await lc.skill_funnel(db)
+    assert f["instrumented"] == 1
+    assert f["measured"] == 0
+    assert f["leak_uninstrumented"] == 2
+
+
+async def test_skill_funnel_non_library_tag_does_not_inflate(db, monkeypatch):
+    # A pseudo-label that is not a real library skill (e.g. a reflection depth
+    # label, or a 'profile' value) must NOT count as instrumented — exact
+    # membership against the library, not a loose substring.
+    _patch_library(monkeypatch)
+    await _sess(db, "s1", skill_tags=["strategic-reflection", "research"], status="completed")
+    await db.commit()
+    f = await lc.skill_funnel(db)
+    assert f["instrumented"] == 0
+    assert f["leak_uninstrumented"] == 3
+
+
+async def test_skill_funnel_ignores_malformed_metadata(db, monkeypatch):
+    # A row matching the LIKE filter but carrying invalid JSON must be skipped
+    # silently (fail-safe), not crash the funnel.
+    _patch_library(monkeypatch)
+    await db.execute(
+        "INSERT INTO cc_sessions "
+        "(id, session_type, model, status, started_at, last_activity_at, metadata) "
+        "VALUES (?,?,?,?,?,?,?)",
+        ("bad", "background_task", "m", "completed", _NEW, _NEW, '{"skill_tags": not json'),
+    )
+    await _sess(db, "ok", skill_tags=["alpha"], status="completed")
+    await db.commit()
+    f = await lc.skill_funnel(db)
+    assert f["instrumented"] == 1          # only the valid row counted; bad row skipped
+
+
+async def test_skill_funnel_exactly_one_leak_key(db, monkeypatch):
+    # open_seams iterates every leak_* key; the skill funnel must emit exactly one.
+    _patch_library(monkeypatch)
+    f = await lc.skill_funnel(db)
+    leak_keys = [k for k in f if k.startswith("leak_")]
+    assert leak_keys == ["leak_uninstrumented"]
+
+
+async def test_skill_funnel_empty_library(db, monkeypatch):
+    _patch_library(monkeypatch, names=[])
+    f = await lc.skill_funnel(db)
+    assert f["captured"] == 0
+    assert f["leak_uninstrumented"] == 0
+    assert f["loop"] == "EMPTY"
+
+
 # ── empty DB: every funnel returns zeros + EMPTY label, no error ──────────────
 
 async def test_funnels_on_empty_db(db):
@@ -221,23 +339,29 @@ async def test_impl_assembly_and_open_seams(db, monkeypatch):
     import genesis.mcp.health_mcp as hm
 
     monkeypatch.setattr(hm, "_service", SimpleNamespace(_db=db))
+    _patch_library(monkeypatch)          # deterministic skill funnel (3-skill library)
 
     # reflections actuate via observations → NOT a false OPEN on the dead column
     await _obs(db, "ro1", otype="micro_reflection", influenced=1)
     await _refl(db, "r1", used=0)        # raw transcript (context only)
     await _proc(db, "p1", invocation=0)  # never-reached procedure → leak seam
+    await _sess(db, "s1", skill_tags=["alpha"], status="completed")  # 1 skill instrumented
     await db.commit()
 
     from genesis.mcp.health.loop_closure_status import _impl_loop_closure_status
 
     res = await _impl_loop_closure_status()
     assert res["status"] == "ok"
-    assert isinstance(res["funnel"], list) and len(res["funnel"]) == 5
+    assert isinstance(res["funnel"], list) and len(res["funnel"]) == 6
+    assert any(f["artifact"] == "skill" for f in res["funnel"])
     assert "outcome_bus" in res
+    assert "skills_note" not in res       # the hardcoded stub note is gone
 
     seams = res["open_seams"]
     # the procedure leak still surfaces honestly (now: never reached)
     assert any("procedure" in s and "never reached" in s for s in seams)
+    # the skill instrumentation gap surfaces honestly (2 of 3 skills uninstrumented)
+    assert any("skill" in s and "uninstrumented" in s for s in seams)
     # reflections must NOT be flagged OPEN any more (dead-column false positive gone)
     assert not any("reflection" in s and "OPEN" in s for s in seams)
     # by_tier / by_status dicts must NEVER be rendered as a seam string

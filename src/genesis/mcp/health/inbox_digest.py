@@ -131,10 +131,15 @@ def _format_digest(
         lines.append("| Date | Source | Response |")
         lines.append("|------|--------|----------|")
         for ev in evals:
-            created = ev.get("created_at", "")[:10]
+            # Show the COMPLETION date (processed_at) — get_recent_completed
+            # windows/orders by processed_at, and a reused row's created_at is
+            # its (recent) re-arm time but a long-parked row's created_at is its
+            # old detection time, so processed_at is the accurate "evaluated on"
+            # date. Fall back to created_at if processed_at is somehow absent.
+            date = (ev.get("processed_at") or ev.get("created_at") or "")[:10]
             source_file = Path(ev.get("file_path", "")).name
             response = Path(ev.get("response_path", "")).name if ev.get("response_path") else "—"
-            lines.append(f"| {created} | {source_file} | {response} |")
+            lines.append(f"| {date} | {source_file} | {response} |")
         lines.append("")
 
     if not pending and not resolved and not evals:

@@ -19,9 +19,11 @@ from genesis.cc.session_config import SessionConfigBuilder
 from genesis.inbox.scanner import (
     compute_hash,
     detect_changes,
+    extract_urls,
     normalize_url_line,
     read_content,
     scan_folder,
+    segment_items,
 )
 from genesis.inbox.types import CheckResult, InboxConfig, InboxItem
 from genesis.security import ContentSanitizer, ContentSource
@@ -49,25 +51,9 @@ _FALLBACK_SYSTEM_PROMPT = (
     "Output readable markdown with per-item evaluation."
 )
 
-# URL extraction: matches https?://... and bare domain/path patterns like search.app/XYZ
-_URL_RE = re.compile(
-    r'(?:https?://[^\s<>\]\)]+)'
-    r'|'
-    r'(?:(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/[^\s<>\]\)]+)',
-    re.IGNORECASE,
-)
-
-
-def _extract_urls(text: str) -> list[str]:
-    """Extract unique URLs from text, preserving order of first appearance."""
-    seen: set[str] = set()
-    urls: list[str] = []
-    for match in _URL_RE.finditer(text):
-        url = match.group(0).rstrip(".,;:!?)'\"")
-        if url not in seen:
-            seen.add(url)
-            urls.append(url)
-    return urls
+# URL extraction now lives in scanner.py (canonical). Kept as a module-level
+# alias because tests and call sites import ``_extract_urls`` from monitor.
+_extract_urls = extract_urls
 
 
 # Patterns indicating the evaluation GAVE UP on URLs (not just encountered errors).
@@ -323,7 +309,7 @@ class InboxMonitor:
         now_iso = now.isoformat()
 
         # Phase 1: Resume approval-parked items
-        resume_items, resumed_ids, resumed_paths = await self._phase_resume(
+        resume_items, _resumed_ids, resumed_paths = await self._phase_resume(
             now, now_iso,
         )
 
@@ -347,7 +333,7 @@ class InboxMonitor:
 
         # Phase 4: Batch and dispatch
         batches_dispatched = await self._phase_dispatch_batches(
-            resume_items, pending_items, resumed_ids, now_iso, errors,
+            resume_items, pending_items, now_iso, errors,
         )
 
         return CheckResult(
@@ -517,16 +503,22 @@ class InboxMonitor:
                     processed_at=now_iso,
                 )
                 continue
-            # source_content = re-read at resume time, not original
-            # detection.  Safe: hash guard above ensures file is unchanged
-            # since it was parked for approval.
+            # Re-dispatch the EXACT delta this batch owns (persisted in
+            # batch_items at detection), NOT a full-file re-read — re-reading
+            # the whole file was the bug that made an approved eval re-chew
+            # every URL (Genesis-85). Legacy rows (pre-migration, no
+            # batch_items) fall back to the full re-read. The hash guard above
+            # ensures the file is unchanged since parking.
+            batch_text = str(row.get("batch_items") or "") or content
             resume_items.append(InboxItem(
                 id=row_id,
                 file_path=file_path,
-                content=content,
+                content=batch_text,
                 content_hash=stored_hash,
                 detected_at=str(row["created_at"]),
-                source_content=content,
+                source_content=batch_text,
+                drop_id=str(row.get("drop_id") or ""),
+                approval_reqid=request_id,
             ))
 
         resumed_ids: set[str] = {item.id for item in resume_items}
@@ -555,6 +547,23 @@ class InboxMonitor:
             modified_files = [
                 f for f in modified_files if str(f) not in resumed_paths
             ]
+        # STORM DIAGNOSTIC (read-only): the rate-limit-window "superseded by new
+        # inbox scan" churn re-detected an *unchanged* file as modified every
+        # scan, for reasons not yet reproduced. Log the known-vs-current hash
+        # and which row supplied the known hash so the next occurrence is
+        # diagnosable. No behaviour change — this only logs.
+        if modified_files:
+            for f in modified_files:
+                try:
+                    current = compute_hash(f)
+                except (FileNotFoundError, PermissionError):
+                    continue
+                known_hash = known.get(str(f), "<none>")
+                logger.info(
+                    "STORM_DIAG: %s detected modified — known_hash=%s "
+                    "current_hash=%s",
+                    f.name, str(known_hash)[:8], current[:8],
+                )
         return new_files, modified_files
 
     async def _phase_detect_changes(
@@ -739,50 +748,13 @@ class InboxMonitor:
                     created_at=now_iso,
                 )
                 continue
-            # Dedup: reuse existing retriable failed item instead of
-            # creating a duplicate row with retry_count=0.
-            existing_failed = await inbox_items.get_retriable_failed(
-                self._db, str(f), max_retries=self._config.max_retries,
+            # Segment the (full, for a new file) content into per-batch rows
+            # under one drop. Failed batches retry via the delta path next
+            # cycle (their lines stay un-baselined), so the old
+            # get_retriable_failed single-row reuse is no longer needed.
+            await self._queue_drop(
+                str(f), content, h, now_iso, pending_items,
             )
-            if existing_failed:
-                logger.info(
-                    "Reusing failed item %s for %s (retry_count=%d)",
-                    existing_failed["id"][:8], f,
-                    existing_failed["retry_count"],
-                )
-                await inbox_items.update_status(
-                    self._db, existing_failed["id"],
-                    status="pending",
-                    error_message=None,
-                )
-                # Update content_hash so the resume pass hash-check
-                # doesn't false-positive if this enters the approval gate.
-                if existing_failed["content_hash"] != h:
-                    await self._db.execute(
-                        "UPDATE inbox_items SET content_hash = ? WHERE id = ?",
-                        (h, existing_failed["id"]),
-                    )
-                    await self._db.commit()
-                pending_items.append(InboxItem(
-                    id=existing_failed["id"], file_path=str(f),
-                    content=content, content_hash=h, detected_at=now_iso,
-                    source_content=content,
-                ))
-                continue
-
-            await inbox_items.create(
-                self._db,
-                id=item_id,
-                file_path=str(f),
-                content_hash=h,
-                status="pending",
-                created_at=now_iso,
-            )
-            pending_items.append(InboxItem(
-                id=item_id, file_path=str(f), content=content,
-                content_hash=h, detected_at=now_iso,
-                source_content=content,
-            ))
 
         cooldown = timedelta(seconds=self._config.evaluation_cooldown_seconds)
 
@@ -855,21 +827,71 @@ class InboxMonitor:
                 eval_content = delta
             else:
                 eval_content = content
-            await inbox_items.create(
-                self._db,
-                id=item_id,
-                file_path=str(f),
-                content_hash=h,
-                status="pending",
-                created_at=now_iso,
+            # Segment the delta into per-batch rows under one drop.
+            await self._queue_drop(
+                str(f), eval_content, h, now_iso, pending_items,
             )
-            pending_items.append(InboxItem(
-                id=item_id, file_path=str(f), content=eval_content,
-                content_hash=h, detected_at=now_iso,
-                source_content=content,
-            ))
 
         return pending_items
+
+    async def _queue_drop(
+        self,
+        file_path: str,
+        eval_content: str,
+        content_hash: str,
+        now_iso: str,
+        pending_items: list[InboxItem],
+    ) -> None:
+        """Segment a file's delta into items, group into batches of
+        ``items_per_eval``, and create one pending row per batch under a shared
+        ``drop_id``. Appends one InboxItem per batch to ``pending_items``.
+
+        Each batch's lines are stored verbatim in ``batch_items`` so the resume
+        pass re-dispatches the exact delta (not a full-file re-read) and a
+        restart mid-drop can reconstruct the not-yet-completed batches.
+        """
+        from genesis.db.crud import inbox_items
+
+        items = segment_items(eval_content)
+        if not items:
+            return
+        size = max(1, self._config.items_per_eval)
+        batches = [items[i : i + size] for i in range(0, len(items), size)]
+        # Reuse retriable failed rows for this file (one per batch) so retries
+        # don't accumulate duplicate rows — the row's retry_count is preserved
+        # so the permanent-failure cap still applies. (A file is re-detected for
+        # retry when ALL its rows failed; partially-failed batches re-enter the
+        # delta on the next file edit.)
+        reusable = await inbox_items.get_retriable_failed_rows(
+            self._db, file_path, max_retries=self._config.max_retries,
+        )
+        drop_id = str(uuid.uuid4())
+        for idx, batch in enumerate(batches):
+            batch_text = "\n".join(it.text for it in batch)
+            if idx < len(reusable):
+                row_id = str(reusable[idx]["id"])
+                await inbox_items.reuse_as_pending(
+                    self._db, row_id, drop_id=drop_id,
+                    batch_items=batch_text, content_hash=content_hash,
+                    created_at=now_iso,
+                )
+            else:
+                row_id = str(uuid.uuid4())
+                await inbox_items.create(
+                    self._db,
+                    id=row_id,
+                    file_path=file_path,
+                    content_hash=content_hash,
+                    status="pending",
+                    created_at=now_iso,
+                    drop_id=drop_id,
+                    batch_items=batch_text,
+                )
+            pending_items.append(InboxItem(
+                id=row_id, file_path=file_path, content=batch_text,
+                content_hash=content_hash, detected_at=now_iso,
+                source_content=batch_text, drop_id=drop_id,
+            ))
 
     # =================================================================
     # Phase 4: Batch and dispatch
@@ -879,472 +901,534 @@ class InboxMonitor:
         self,
         resume_items: list[InboxItem],
         pending_items: list[InboxItem],
-        resumed_ids: set[str],
         now_iso: str,
         errors: list[str],
     ) -> int:
-        """Build batches and dispatch to CC sessions.
+        """Dispatch evaluation batches to CC sessions.
+
+        Each row is one eval-batch (<= items_per_eval items) carved from a
+        file's delta; rows sharing a ``drop_id`` form one drop. Approval is
+        acquired ONCE per drop (a single ``route()`` call); on approval every
+        batch in the drop is dispatched directly as its own CC session, so a
+        16-URL file becomes ~4 small evals + 4 response files under a single
+        approval. Resume batches (their drop's approval already resolved) are
+        dispatched directly and their approval is consumed once per drop.
 
         Returns the number of batches successfully dispatched.
-        Appends errors to the ``errors`` list in-place.
         """
-        from genesis.cc.types import (
-            CCInvocation,
-            CCModel,
-            EffortLevel,
-            SessionType,
-            background_session_dir,
-        )
-        from genesis.db.crud import inbox_items, message_queue
+        from genesis.cc.types import CCModel, EffortLevel
+
+        try:
+            model = CCModel(self._config.model)
+        except ValueError:
+            model = CCModel.SONNET
+        try:
+            effort = EffortLevel(self._config.effort)
+        except ValueError:
+            effort = EffortLevel.MEDIUM
+        system_prompt = self._load_system_prompt()
+        await self._record_prompt_version(system_prompt)
 
         batches_dispatched = 0
-        batch_size = self._config.batch_size
-        mcp_path = SessionConfigBuilder().build_mcp_config("reflection")
 
-        # Resume items as singletons first, then new/modified in batches.
-        scheduled_batches: list[list[InboxItem]] = [
-            [item] for item in resume_items
-        ]
-        for i in range(0, len(pending_items), batch_size):
-            scheduled_batches.append(pending_items[i : i + batch_size])
+        # --- Resume drops: approval already resolved -> consume then dispatch. ---
+        for _drop_id, items in self._group_by_drop(resume_items):
+            # Consume the drop's approval BEFORE dispatching so a restart
+            # mid-drop cannot leave an unconsumed approval that a later drop
+            # rides via the content-agnostic stable key. mark_consumed is
+            # idempotent; the parked rows still drive re-dispatch on restart.
+            reqid = items[0].approval_reqid if items else ""
+            if reqid:
+                await self._consume_approval(reqid)
+            for item in items:
+                if await self._dispatch_one_batch(
+                    item, model=model, effort=effort,
+                    system_prompt=system_prompt, now_iso=now_iso, errors=errors,
+                ):
+                    batches_dispatched += 1
 
-        for batch in scheduled_batches:
-            batch_id = str(uuid.uuid4())
-
-            for item in batch:
-                await inbox_items.set_batch(self._db, item.id, batch_id=batch_id)
-                if item.id not in resumed_ids:
-                    await inbox_items.update_status(
-                        self._db, item.id, status="processing",
-                    )
-
-            prompt = self._build_prompt(batch)
-            system_prompt = self._load_system_prompt()
-
-            # Record prompt version on first dispatch
-            if not self._prompt_version_recorded and self._db is not None:
-                try:
-                    from genesis.db.crud.prompt_versions import record_version
-                    await record_version(
-                        self._db,
-                        prompt_hash=self._prompt_hash,
-                        call_site="inbox_evaluate",
-                        content_preview=system_prompt[:200],
-                    )
-                    self._prompt_version_recorded = True
-                except Exception:
-                    logger.debug(
-                        "Failed to record inbox prompt version",
-                        exc_info=True,
-                    )
-
-            try:
-                model = CCModel(self._config.model)
-            except ValueError:
-                model = CCModel.SONNET
-
-            try:
-                effort = EffortLevel(self._config.effort)
-            except ValueError:
-                effort = EffortLevel.MEDIUM
-
-            invocation = CCInvocation(
-                prompt=prompt,
-                model=model,
-                effort=effort,
-                system_prompt=system_prompt,
-                timeout_s=self._config.timeout_s,
-                skip_permissions=True,
-                disallowed_tools=["Write", "Edit", "Agent", "NotebookEdit"],
-                working_dir=background_session_dir(),
-                mcp_config=mcp_path,
+        # --- New drops: ONE approval per drop, then dispatch each batch. ---
+        for _drop_id, items in self._group_by_drop(pending_items):
+            outcome = await self._acquire_drop_approval(
+                items, model=model, effort=effort,
+                system_prompt=system_prompt, now_iso=now_iso, errors=errors,
             )
-
-            output = None
-            used_cli = True
-            session_id: str | None = None
-            if self._autonomous_dispatcher is not None:
-                decision = await self._autonomous_dispatcher.route(
-                    AutonomousDispatchRequest(
-                        subsystem="inbox",
-                        policy_id="inbox_evaluation",
-                        action_label="inbox evaluation",
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": prompt},
-                        ],
-                        cli_invocation=invocation,
-                        api_call_site_id=None,
-                        cli_fallback_allowed=True,
-                        approval_required_for_cli=True,
-                        approval_key_stable=True,
-                        context=None,
-                    ),
-                )
-                if decision.mode == "blocked":
-                    err = f"CLI fallback blocked: {decision.reason}"
-                    reason_lower = decision.reason.lower()
-                    is_pending_approval = (
-                        decision.approval_request_id is not None
-                        and "reject" not in reason_lower
-                    )
-                    if is_pending_approval:
-                        logger.info(
-                            "Inbox batch %s parked awaiting approval %s",
-                            batch_id[:8], decision.approval_request_id,
-                        )
-                        marker = (
-                            f"{inbox_items.AWAITING_APPROVAL_PREFIX}"
-                            f"{decision.approval_request_id}"
-                        )
-                        for item in batch:
-                            await inbox_items.update_status(
-                                self._db, item.id, status="processing",
-                                error_message=marker, processed_at=now_iso,
-                            )
-                    else:
-                        errors.append(err)
-                        logger.warning(err)
-                        for item in batch:
-                            await inbox_items.update_status(
-                                self._db, item.id, status="failed",
-                                error_message=err, processed_at=now_iso,
-                            )
-                    continue
-                if decision.mode == "api":
-                    output = decision.output
-                    used_cli = False
-
-            if output is None:
-                try:
-                    sess = await self._session_manager.create_background(
-                        session_type=SessionType.BACKGROUND_TASK,
-                        model=model,
-                        effort=effort,
-                        source_tag="inbox_evaluation",
-                    )
-                    session_id = sess["id"]
-                except Exception as exc:
-                    err = f"Session creation failed: {exc}"
-                    errors.append(err)
-                    logger.error(err, exc_info=True)
-                    for item in batch:
-                        await inbox_items.update_status(
-                            self._db, item.id, status="failed",
-                            error_message=err, processed_at=now_iso,
-                        )
-                    continue
-
-                try:
-                    output = await self._invoker.run(invocation)
-                except Exception as exc:
-                    err = f"CC invocation failed: {exc}"
-                    errors.append(err)
-                    logger.error(err, exc_info=True)
-                    await self._session_manager.fail(session_id, reason=err)
-                    for item in batch:
-                        await inbox_items.update_status(
-                            self._db, item.id, status="failed",
-                            error_message=err, processed_at=now_iso,
-                        )
-                    continue
-
-            if output.is_error:
-                err = f"CC error: {output.error_message}"
-                errors.append(err)
-                logger.error(err)
-                if used_cli and session_id is not None:
-                    await self._session_manager.fail(
-                        session_id, reason=output.error_message,
-                    )
-                for item in batch:
-                    await inbox_items.update_status(
-                        self._db, item.id, status="failed",
-                        error_message=err, processed_at=now_iso,
-                    )
+            if outcome != "approved":
                 continue
+            for item in items:
+                if await self._dispatch_one_batch(
+                    item, model=model, effort=effort,
+                    system_prompt=system_prompt, now_iso=now_iso, errors=errors,
+                ):
+                    batches_dispatched += 1
 
-            if not output.text or not output.text.strip():
-                err = "CC invocation returned empty evaluation text"
-                errors.append(err)
-                logger.error(
-                    "Inbox batch %s returned empty text — marking as "
-                    "failed (text_len=%d)",
-                    batch_id[:8], len(output.text or ""),
+        return batches_dispatched
+
+    @staticmethod
+    def _group_by_drop(
+        items: list[InboxItem],
+    ) -> list[tuple[str, list[InboxItem]]]:
+        """Group InboxItems by drop_id, preserving first-seen order.
+
+        Items with an empty drop_id (legacy/singleton rows) each form their own
+        one-item group keyed by their row id.
+        """
+        groups: dict[str, list[InboxItem]] = {}
+        order: list[str] = []
+        for item in items:
+            key = item.drop_id or f"_solo:{item.id}"
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(item)
+        return [(k, groups[k]) for k in order]
+
+    async def _record_prompt_version(self, system_prompt: str) -> None:
+        """Record the inbox prompt version once per monitor lifetime."""
+        if self._prompt_version_recorded or self._db is None:
+            return
+        try:
+            from genesis.db.crud.prompt_versions import record_version
+            await record_version(
+                self._db, prompt_hash=self._prompt_hash,
+                call_site="inbox_evaluate", content_preview=system_prompt[:200],
+            )
+            self._prompt_version_recorded = True
+        except Exception:
+            logger.debug("Failed to record inbox prompt version", exc_info=True)
+
+    def _build_invocation(self, prompt: str, model, effort, system_prompt: str):
+        """Build a CCInvocation for an inbox evaluation.
+
+        ``system_prompt`` is passed in (loaded+hashed once per cycle in
+        ``_phase_dispatch_batches``) so the invocation's system prompt is the
+        SAME value used to build the approval request's message list.
+        """
+        from genesis.cc.types import CCInvocation, background_session_dir
+        mcp_path = SessionConfigBuilder().build_mcp_config("reflection")
+        return CCInvocation(
+            prompt=prompt, model=model, effort=effort,
+            system_prompt=system_prompt,
+            timeout_s=self._config.timeout_s, skip_permissions=True,
+            disallowed_tools=["Write", "Edit", "Agent", "NotebookEdit"],
+            working_dir=background_session_dir(), mcp_config=mcp_path,
+        )
+
+    async def _set_drop_status(
+        self, items, drop_id, *, status, error_message=None, processed_at=None,
+    ) -> None:
+        """Set status on all of a drop's live (pending/processing) rows.
+
+        Uses the atomic ``update_status_for_drop`` when a real ``drop_id`` is
+        present; falls back to per-row updates for legacy/solo rows (empty
+        drop_id) to avoid a drop_id='' UPDATE matching unrelated legacy rows.
+        Note: does not increment retry_count — callers that need the
+        permanent-fail cap update those rows explicitly.
+        """
+        from genesis.db.crud import inbox_items
+
+        if drop_id:
+            await inbox_items.update_status_for_drop(
+                self._db, drop_id, status=status,
+                error_message=error_message, processed_at=processed_at,
+            )
+        else:
+            for item in items:
+                await inbox_items.update_status(
+                    self._db, item.id, status=status,
+                    error_message=error_message, processed_at=processed_at,
                 )
-                if used_cli and session_id is not None:
-                    await self._session_manager.fail(session_id, reason=err)
-                for item in batch:
-                    await inbox_items.update_status(
-                        self._db, item.id, status="failed",
-                        error_message=err, processed_at=now_iso,
-                    )
-                if self._event_bus:
-                    from genesis.observability.types import Severity, Subsystem
-                    await self._event_bus.emit(
-                        Subsystem.INBOX, Severity.ERROR,
-                        "evaluation.empty_output",
-                        f"Batch {batch_id[:8]} returned empty evaluation "
-                        f"text (used_cli={used_cli})",
-                        batch_id=batch_id, used_cli=used_cli,
-                    )
-                continue
 
-            if len(batch) == 1 and _is_acknowledged(output.text):
+    async def _acquire_drop_approval(
+        self, items, *, model, effort, system_prompt, now_iso, errors,
+    ) -> str:
+        """Acquire ONE approval for a drop.
+
+        Returns ``"approved"``, ``"parked"``, ``"rejected"`` or ``"failed"``.
+        On park, all the drop's rows are set to processing + an awaiting marker.
+        On reject/failure, all rows are failed. When no dispatcher is wired (or
+        the gate is disabled, surfaced as cli_approved), returns ``"approved"``
+        so the gate-OFF direct path dispatches every batch.
+        """
+        from genesis.db.crud import inbox_items
+
+        drop_id = items[0].drop_id if items else ""
+
+        # Claim the drop's rows for this cycle before the gate decision.
+        batch_id = str(uuid.uuid4())
+        for item in items:
+            await inbox_items.set_batch(self._db, item.id, batch_id=batch_id)
+        await self._set_drop_status(items, drop_id, status="processing")
+
+        if self._autonomous_dispatcher is None:
+            return "approved"
+
+        prompt = self._build_prompt(items)
+        invocation = self._build_invocation(prompt, model, effort, system_prompt)
+        try:
+            decision = await self._autonomous_dispatcher.route(
+                AutonomousDispatchRequest(
+                    subsystem="inbox", policy_id="inbox_evaluation",
+                    action_label="inbox evaluation",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    cli_invocation=invocation, api_call_site_id=None,
+                    cli_fallback_allowed=True, approval_required_for_cli=True,
+                    approval_key_stable=True, context=None,
+                ),
+            )
+        except Exception as exc:
+            # The gate raised (transient: network / DB lock / timeout). Fail the
+            # drop's rows (retriable — no permanent cap) so they don't sit stuck
+            # in 'processing' invisible to detection until expire_stuck fires.
+            err = f"Inbox approval gate error: {exc}"
+            logger.error(err, exc_info=True)
+            errors.append(err)
+            await self._set_drop_status(
+                items, drop_id, status="failed",
+                error_message=err, processed_at=now_iso,
+            )
+            return "failed"
+        if decision.mode == "blocked":
+            reason_lower = decision.reason.lower()
+            is_pending = (
+                decision.approval_request_id is not None
+                and "reject" not in reason_lower
+            )
+            if is_pending:
+                drop_label = str(items[0].drop_id or items[0].id)[:8]
                 logger.info(
-                    "Item(s) classified as Acknowledged — no response file "
-                    "written (batch %s)",
-                    batch_id[:8],
+                    "Inbox drop %s parked awaiting approval %s",
+                    drop_label, decision.approval_request_id,
                 )
-                completed_at = self._clock().isoformat()
-                for item in batch:
-                    source = item.source_content or item.content
-                    prev = await inbox_items.get_evaluated_content(
-                        self._db, item.file_path,
-                    )
-                    full_content = _merge_evaluated_content(prev, source)
-                    # Diagnostic: detect file changes during evaluation
-                    try:
-                        current_content = read_content(Path(item.file_path))
-                    except (FileNotFoundError, PermissionError):
-                        current_content = None
-                    if current_content is not None and current_content != source:
-                        logger.warning(
-                            "BASELINE_GUARD: file changed during eval "
-                            "for %s (detection=%d chars, completion=%d "
-                            "chars, merge_baseline=%d chars)",
-                            item.file_path,
-                            len(source), len(current_content),
-                            len(full_content),
-                        )
-                        if self._event_bus:
-                            try:
-                                from genesis.observability.types import (
-                                    Severity,
-                                    Subsystem,
-                                )
-                                await self._event_bus.emit(
-                                    Subsystem.INBOX, Severity.WARNING,
-                                    "baseline_guard.file_changed",
-                                    f"File changed during evaluation: "
-                                    f"detection={len(source)}, "
-                                    f"completion={len(current_content)}",
-                                    file_path=item.file_path,
-                                )
-                            except Exception:
-                                logger.debug(
-                                    "BASELINE_GUARD event emit failed",
-                                    exc_info=True,
-                                )
-                    await inbox_items.update_status(
-                        self._db, item.id, status="completed",
-                        processed_at=completed_at,
-                        evaluated_content=full_content,
-                    )
-                if used_cli and session_id is not None:
-                    await self._session_manager.complete(session_id)
-
-                try:
-                    source_names = ", ".join(
-                        Path(item.file_path).name for item in batch
-                    )
-                    await message_queue.create(
-                        self._db,
-                        id=str(uuid.uuid4()),
-                        source="cc_background",
-                        target="cc_foreground",
-                        message_type="finding",
-                        content=(
-                            f"Inbox item acknowledged (no response needed): "
-                            f"{source_names}"
-                        ),
-                        created_at=completed_at,
-                        priority="low",
-                    )
-                except Exception:
-                    logger.exception("Failed to write message_queue entry")
-
-                if self._event_bus:
-                    from genesis.observability.types import Severity, Subsystem
-                    await self._event_bus.emit(
-                        Subsystem.INBOX, Severity.INFO,
-                        "check.acknowledged",
-                        f"Batch {batch_id[:8]} acknowledged ({len(batch)} items)",
-                        batch_id=batch_id, items=len(batch),
-                    )
-
-                batches_dispatched += 1
-                continue
-
-            # Coherence check: annotate low-quality evaluations
-            batch_content = "\n".join(item.content for item in batch)
-            if not _passes_coherence_check(output.text, batch_content):
-                logger.warning(
-                    "Inbox batch %s failed coherence check — annotating",
-                    batch_id[:8],
+                marker = (
+                    f"{inbox_items.AWAITING_APPROVAL_PREFIX}"
+                    f"{decision.approval_request_id}"
                 )
-                output_text = (
-                    "\u26a0\ufe0f **Low-confidence evaluation** "
-                    "(failed structural coherence check)\n\n"
-                    + output.text
+                await self._set_drop_status(
+                    items, drop_id, status="processing",
+                    error_message=marker, processed_at=now_iso,
                 )
-            else:
-                output_text = output.text
-
-            # Write response file
-            response_path = None
-            if self._writer:
-                try:
-                    response_path = await self._writer.write_response(
-                        batch_id=batch_id,
-                        source_files=[item.file_path for item in batch],
-                        evaluation_text=output_text,
-                        item_count=len(batch),
-                    )
-                except Exception as exc:
-                    err = f"Response write failed: {exc}"
-                    errors.append(err)
-                    logger.error(err)
-
-            # Create follow-ups from Recommendation blocks (non-fatal)
-            if output_text:
-                try:
-                    fu_count = await self._create_follow_ups_from_eval(
-                        evaluation_text=output_text,
-                        batch_id=batch_id,
-                        source_files=[item.file_path for item in batch],
-                    )
-                    if fu_count:
-                        logger.info(
-                            "Created %d follow-up(s) from inbox eval %s",
-                            fu_count, batch_id[:8],
-                        )
-                except Exception:
-                    logger.warning(
-                        "Follow-up creation from inbox eval failed (non-fatal)",
-                        exc_info=True,
-                    )
-
-            url_failures = _has_url_failures(output_text, batch_content)
-            if url_failures:
-                logger.warning(
-                    "URL failures detected in batch %s — marking as failed "
-                    "to enable retry (response file still written for user)",
-                    batch_id[:8],
+                return "parked"
+            # Hard rejection / CLI fallback disabled — do NOT retry this drop:
+            # set retry_count to the cap so get_all_known treats it permanent.
+            err = f"CLI fallback blocked: {decision.reason}"
+            errors.append(err)
+            logger.warning(err)
+            for item in items:
+                await inbox_items.update_status(
+                    self._db, item.id, status="failed",
+                    error_message=err, processed_at=now_iso,
+                    retry_count=self._config.max_retries,
                 )
+            return "rejected"
+        if decision.mode == "api":
+            # Inbox sets api_call_site_id=None so the router never hits the API
+            # chain. If that invariant ever breaks, do NOT silently drop the
+            # batches — fall through to direct CLI dispatch.
+            logger.error(
+                "Inbox drop unexpectedly received an API decision "
+                "(api_call_site_id should be None) — dispatching via CLI",
+            )
+        return "approved"
 
-            completed_at = self._clock().isoformat()
-            for item in batch:
-                if url_failures:
-                    await inbox_items.mark_url_failure(
-                        self._db, item.id,
-                        response_path=str(response_path) if response_path else None,
-                        processed_at=completed_at,
-                    )
-                else:
-                    source = item.source_content or item.content
-                    prev = await inbox_items.get_evaluated_content(
-                        self._db, item.file_path,
-                    )
-                    full_content = _merge_evaluated_content(prev, source)
-                    # Diagnostic: detect file changes during evaluation
-                    try:
-                        current_content = read_content(
-                            Path(item.file_path),
-                        )
-                    except (FileNotFoundError, PermissionError):
-                        current_content = None
-                    if (current_content is not None
-                            and current_content != source):
-                        logger.warning(
-                            "BASELINE_GUARD: file changed during eval "
-                            "for %s (detection=%d chars, completion=%d "
-                            "chars, merge_baseline=%d chars)",
-                            item.file_path,
-                            len(source), len(current_content),
-                            len(full_content),
-                        )
-                        if self._event_bus:
-                            try:
-                                from genesis.observability.types import (
-                                    Severity,
-                                    Subsystem,
-                                )
-                                await self._event_bus.emit(
-                                    Subsystem.INBOX, Severity.WARNING,
-                                    "baseline_guard.file_changed",
-                                    f"File changed during evaluation: "
-                                    f"detection={len(source)}, "
-                                    f"completion={len(current_content)}",
-                                    file_path=item.file_path,
-                                )
-                            except Exception:
-                                logger.debug(
-                                    "BASELINE_GUARD event emit failed",
-                                    exc_info=True,
-                                )
-                    if response_path:
-                        await inbox_items.set_response_path(
-                            self._db, item.id,
-                            response_path=str(response_path),
-                            processed_at=completed_at,
-                            evaluated_content=full_content,
-                        )
-                    else:
-                        await inbox_items.update_status(
-                            self._db, item.id, status="completed",
-                            processed_at=completed_at,
-                            evaluated_content=full_content,
-                        )
+    async def _consume_approval(self, request_id: str) -> bool:
+        """Consume a resume drop's approval so the next drop cannot ride the
+        same (content-agnostic, stable-key) approval.
 
-            if used_cli and session_id is not None:
-                await self._session_manager.complete(session_id)
+        Returns True if the approval was consumed (or there is no gate to
+        consume against), False if the consume failed or the approval was
+        already consumed. A failure is logged at WARNING (it was previously
+        swallowed at debug) because a non-consumed approval can be ridden by a
+        later inbox drop until the gate's 24h staleness window expires.
 
-            try:
-                source_names = ", ".join(
-                    Path(item.file_path).name for item in batch
+        NOTE: the resume caller currently dispatches regardless of this result.
+        Acting on a False — skip-and-retry on transient failure, or fail-and-
+        re-detect when the approval is already consumed — requires the
+        at-most-once dispatch state machine tracked in follow-up 0b68d341.
+        """
+        gate = getattr(self._autonomous_dispatcher, "approval_gate", None)
+        consume = getattr(gate, "mark_consumed", None)
+        if consume is None:
+            return True
+        try:
+            ok = bool(await consume(request_id))
+        except Exception:
+            logger.warning(
+                "Inbox resume: failed to consume approval %s — it may remain "
+                "rideable by a later drop until the 24h staleness window",
+                request_id, exc_info=True,
+            )
+            return False
+        if not ok:
+            logger.warning(
+                "Inbox resume: approval %s was already consumed", request_id,
+            )
+        return ok
+
+    async def _dispatch_one_batch(
+        self, item, *, model, effort, system_prompt, now_iso, errors,
+    ) -> bool:
+        """Run one eval-batch as its own CC session and post-process the result.
+
+        Approval is already cleared at the drop level, so this dispatches
+        directly (create_background + invoker.run). On success it merges ONLY
+        this batch's lines (``item.source_content``) into the file's
+        ``evaluated_content`` baseline, so a failed sibling batch's lines stay
+        un-baselined and resurface in the next delta for retry. Returns True iff
+        the batch produced a completed/acknowledged result.
+        """
+        from genesis.cc.types import SessionType
+        from genesis.db.crud import inbox_items, message_queue
+
+        batch_id = str(uuid.uuid4())
+        await inbox_items.set_batch(self._db, item.id, batch_id=batch_id)
+        prompt = self._build_prompt([item])
+        invocation = self._build_invocation(prompt, model, effort, system_prompt)
+
+        session_id: str | None = None
+        try:
+            sess = await self._session_manager.create_background(
+                session_type=SessionType.BACKGROUND_TASK,
+                model=model, effort=effort, source_tag="inbox_evaluation",
+            )
+            session_id = sess["id"]
+        except Exception as exc:
+            err = f"Session creation failed: {exc}"
+            errors.append(err)
+            logger.error(err, exc_info=True)
+            await inbox_items.update_status(
+                self._db, item.id, status="failed",
+                error_message=err, processed_at=now_iso,
+            )
+            return False
+
+        try:
+            output = await self._invoker.run(invocation)
+        except Exception as exc:
+            err = f"CC invocation failed: {exc}"
+            errors.append(err)
+            logger.error(err, exc_info=True)
+            await self._session_manager.fail(session_id, reason=err)
+            await inbox_items.update_status(
+                self._db, item.id, status="failed",
+                error_message=err, processed_at=now_iso,
+            )
+            return False
+
+        if output.is_error:
+            err = f"CC error: {output.error_message}"
+            errors.append(err)
+            logger.error(err)
+            if session_id is not None:
+                await self._session_manager.fail(
+                    session_id, reason=output.error_message,
                 )
-                await message_queue.create(
-                    self._db,
-                    id=str(uuid.uuid4()),
-                    source="cc_background",
-                    target="cc_foreground",
-                    message_type="finding",
-                    content=(
-                        f"Inbox evaluation completed for {len(batch)} item(s): "
-                        f"{source_names}. "
-                        f"Response: {response_path or 'no file written'}"
-                    ),
-                    created_at=completed_at,
-                    priority="low",
-                )
-            except Exception:
-                logger.exception("Failed to write message_queue entry")
+            await inbox_items.update_status(
+                self._db, item.id, status="failed",
+                error_message=err, processed_at=now_iso,
+            )
+            return False
 
-            if self._triage_pipeline is not None:
-                from genesis.observability.types import Subsystem
-                from genesis.util.tasks import tracked_task
-
-                user_text = "\n".join(item.content for item in batch)
-                tracked_task(
-                    self._fire_triage(output, user_text),
-                    name="inbox-triage",
-                    event_bus=self._event_bus,
-                    subsystem=Subsystem.INBOX,
-                )
-
-            batches_dispatched += 1
-
+        if not output.text or not output.text.strip():
+            err = "CC invocation returned empty evaluation text"
+            errors.append(err)
+            logger.error(
+                "Inbox batch %s returned empty text — marking failed",
+                batch_id[:8],
+            )
+            if session_id is not None:
+                await self._session_manager.fail(session_id, reason=err)
+            await inbox_items.update_status(
+                self._db, item.id, status="failed",
+                error_message=err, processed_at=now_iso,
+            )
             if self._event_bus:
                 from genesis.observability.types import Severity, Subsystem
                 await self._event_bus.emit(
-                    Subsystem.INBOX, Severity.INFO,
-                    "check.complete",
-                    f"Batch {batch_id[:8]} evaluated ({len(batch)} items)",
-                    batch_id=batch_id, items=len(batch),
+                    Subsystem.INBOX, Severity.ERROR, "evaluation.empty_output",
+                    f"Batch {batch_id[:8]} returned empty evaluation text",
+                    batch_id=batch_id,
+                )
+            return False
+
+        completed_at = self._clock().isoformat()
+
+        # Acknowledged: pure-meta note, no response file.
+        if _is_acknowledged(output.text):
+            logger.info(
+                "Item classified as Acknowledged — no response file (batch %s)",
+                batch_id[:8],
+            )
+            await self._complete_batch_baseline(item, completed_at)
+            if session_id is not None:
+                await self._session_manager.complete(session_id)
+            await self._notify_batch(
+                message_queue, item, completed_at,
+                "Inbox item acknowledged (no response needed): "
+                f"{Path(item.file_path).name}",
+            )
+            if self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+                await self._event_bus.emit(
+                    Subsystem.INBOX, Severity.INFO, "check.acknowledged",
+                    f"Batch {batch_id[:8]} acknowledged", batch_id=batch_id,
+                )
+            return True
+
+        # Coherence annotation (non-blocking).
+        if not _passes_coherence_check(output.text, item.content):
+            logger.warning(
+                "Inbox batch %s failed coherence check — annotating",
+                batch_id[:8],
+            )
+            output_text = (
+                "⚠️ **Low-confidence evaluation** "
+                "(failed structural coherence check)\n\n" + output.text
+            )
+        else:
+            output_text = output.text
+
+        # Response file: one per batch -> numbered Genesis-N sibling
+        # (item_count=1 selects the sibling-naming path in the writer).
+        response_path = None
+        if self._writer:
+            try:
+                response_path = await self._writer.write_response(
+                    batch_id=batch_id, source_files=[item.file_path],
+                    evaluation_text=output_text, item_count=1,
+                )
+            except Exception as exc:
+                err = f"Response write failed: {exc}"
+                errors.append(err)
+                logger.error(err)
+
+        # Follow-ups (deduped per recommendation; non-fatal).
+        if output_text:
+            try:
+                fu_count = await self._create_follow_ups_from_eval(
+                    evaluation_text=output_text, batch_id=batch_id,
+                    source_files=[item.file_path],
+                )
+                if fu_count:
+                    logger.info(
+                        "Created %d follow-up(s) from inbox eval %s",
+                        fu_count, batch_id[:8],
+                    )
+            except Exception:
+                logger.warning(
+                    "Follow-up creation from inbox eval failed (non-fatal)",
+                    exc_info=True,
                 )
 
-        return batches_dispatched
+        # URL-fetch give-up -> mark failed (retry); do NOT baseline these lines.
+        if _has_url_failures(output_text, item.content):
+            logger.warning(
+                "URL failures in batch %s — marking failed to retry "
+                "(response kept)", batch_id[:8],
+            )
+            await inbox_items.mark_url_failure(
+                self._db, item.id,
+                response_path=str(response_path) if response_path else None,
+                processed_at=completed_at,
+            )
+            if session_id is not None:
+                await self._session_manager.complete(session_id)
+            return False
+
+        # Success: baseline ONLY this batch's lines.
+        await self._complete_batch_baseline(
+            item, completed_at, response_path=response_path,
+        )
+        if session_id is not None:
+            await self._session_manager.complete(session_id)
+        await self._notify_batch(
+            message_queue, item, completed_at,
+            f"Inbox evaluation completed: {Path(item.file_path).name}. "
+            f"Response: {response_path or 'no file written'}",
+        )
+        if self._triage_pipeline is not None:
+            from genesis.observability.types import Subsystem
+            from genesis.util.tasks import tracked_task
+            tracked_task(
+                self._fire_triage(output, item.content),
+                name="inbox-triage", event_bus=self._event_bus,
+                subsystem=Subsystem.INBOX,
+            )
+        if self._event_bus:
+            from genesis.observability.types import Severity, Subsystem
+            await self._event_bus.emit(
+                Subsystem.INBOX, Severity.INFO, "check.complete",
+                f"Batch {batch_id[:8]} evaluated", batch_id=batch_id,
+            )
+        return True
+
+    async def _complete_batch_baseline(
+        self, item, completed_at, *, response_path=None,
+    ) -> None:
+        """Mark a batch row completed, merging ONLY its lines into the baseline.
+
+        The per-batch merge is what makes partial-failure safe: a failed sibling
+        batch never contributes to ``evaluated_content``, so its lines reappear
+        in the next delta and retry, while completed batches stay evaluated.
+        """
+        from genesis.db.crud import inbox_items
+
+        source = item.source_content or item.content
+        prev = await inbox_items.get_evaluated_content(self._db, item.file_path)
+        full_content = _merge_evaluated_content(prev, source)
+        # Diagnostic: detect the source FILE changing during evaluation by
+        # comparing the drop's detection hash to the current file hash. (The
+        # whole file legitimately differs from a single batch's slice now, so
+        # the guard keys on the file hash, not a full-text equality check.)
+        try:
+            current_hash = compute_hash(Path(item.file_path))
+        except (FileNotFoundError, PermissionError):
+            current_hash = None
+        if current_hash is not None and current_hash != item.content_hash:
+            logger.warning(
+                "BASELINE_GUARD: file %s changed during eval "
+                "(detection_hash=%s current_hash=%s)",
+                item.file_path, item.content_hash[:8], current_hash[:8],
+            )
+            if self._event_bus:
+                try:
+                    from genesis.observability.types import Severity, Subsystem
+                    await self._event_bus.emit(
+                        Subsystem.INBOX, Severity.WARNING,
+                        "baseline_guard.file_changed",
+                        f"File changed during evaluation: {item.file_path}",
+                        file_path=item.file_path,
+                    )
+                except Exception:
+                    logger.debug(
+                        "BASELINE_GUARD event emit failed", exc_info=True,
+                    )
+        if response_path:
+            await inbox_items.set_response_path(
+                self._db, item.id, response_path=str(response_path),
+                processed_at=completed_at, evaluated_content=full_content,
+            )
+        else:
+            await inbox_items.update_status(
+                self._db, item.id, status="completed",
+                processed_at=completed_at, evaluated_content=full_content,
+            )
+
+    async def _notify_batch(
+        self, message_queue, item, completed_at, content: str,
+    ) -> None:
+        """Write a cc_background -> cc_foreground finding for a dispatched batch."""
+        try:
+            await message_queue.create(
+                self._db, id=str(uuid.uuid4()), source="cc_background",
+                target="cc_foreground", message_type="finding",
+                content=content, created_at=completed_at, priority="low",
+            )
+        except Exception:
+            logger.exception("Failed to write message_queue entry")
 
     def _build_prompt(self, items: list[InboxItem]) -> str:
         """Build the evaluation prompt from a batch of items.
@@ -1462,6 +1546,9 @@ class InboxMonitor:
 
         Returns the number of follow-ups created.
         """
+        import hashlib
+        import sqlite3
+
         from genesis.db.crud import follow_ups
         from genesis.inbox.recommendation import parse_recommendations
 
@@ -1490,17 +1577,50 @@ class InboxMonitor:
                 f"Confidence: {rec.confidence}. Effort: {rec.effort}."
             )
 
-            await follow_ups.create(
-                self._db,
-                content=content,
-                source="inbox_evaluation",
-                reason=reason,
-                strategy=strategy,
-                priority=priority,
-                pinned=pinned,
-                # The evaluator already judges each item genesis-vs-user; reuse it.
-                domain="internal" if rec.classification == "genesis" else "user_world",
+            # Dedup: skip if an identical recommendation already exists so that
+            # re-evaluating the same URL (or overlapping drops) never piles up
+            # duplicate follow-up rows. Key on the item's primary URL
+            # (tracking-normalized) or title + the next_step.
+            urls_in_title = extract_urls(title)
+            primary = (
+                normalize_url_line(urls_in_title[0])
+                if urls_in_title else title.strip().lower()
             )
+            dedup_key = hashlib.sha256(
+                f"inbox_evaluation|{primary}|"
+                f"{(rec.next_step or '').strip().lower()}".encode()
+            ).hexdigest()
+            if await follow_ups.exists_by_dedup_key(self._db, dedup_key):
+                logger.debug("Skipping duplicate inbox follow-up: %s", title)
+                continue
+
+            try:
+                await follow_ups.create(
+                    self._db,
+                    content=content,
+                    source="inbox_evaluation",
+                    reason=reason,
+                    strategy=strategy,
+                    priority=priority,
+                    pinned=pinned,
+                    # The evaluator judges each item genesis-vs-user; reuse it.
+                    domain=(
+                        "internal" if rec.classification == "genesis"
+                        else "user_world"
+                    ),
+                    dedup_key=dedup_key,
+                )
+            except sqlite3.IntegrityError:
+                # Lost a race on the partial-unique dedup_key index — another
+                # writer created this exact recommendation between the
+                # exists check and the insert. Treat as deduped and KEEP
+                # processing the rest of this evaluation's recommendations
+                # (previously this propagated and aborted the loop, silently
+                # dropping every later recommendation in the same eval).
+                logger.debug(
+                    "Duplicate dedup_key race for inbox follow-up: %s", title,
+                )
+                continue
             created += 1
 
         return created

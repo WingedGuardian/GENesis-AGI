@@ -11,8 +11,10 @@ import shutil
 import signal
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 
+from genesis.cc import roster
 from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
@@ -211,7 +213,12 @@ class CCInvoker:
 
     def _build_args(self, inv: CCInvocation) -> list[str]:
         args = [self._claude_path, "-p"]
-        args += ["--model", str(inv.model)]
+        # Roster routing: when model_id_override is set, model selection comes
+        # entirely from ANTHROPIC_MODEL (set in _build_env). A --model flag here
+        # would override that env var (CLI wins) and force the Anthropic tier
+        # instead of the roster model — so omit it in that case.
+        if inv.model_id_override is None:
+            args += ["--model", str(inv.model)]
         args += ["--output-format", inv.output_format]
         effort = clamp_effort(inv.model, inv.effort)
         if effort != inv.effort:
@@ -289,6 +296,29 @@ class CCInvoker:
             env["ANTHROPIC_BASE_URL"] = inv.anthropic_base_url
         else:
             env.pop("ANTHROPIC_BASE_URL", None)
+        if inv and inv.anthropic_auth_token:
+            env["ANTHROPIC_AUTH_TOKEN"] = inv.anthropic_auth_token
+        else:
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        # Credential isolation (defense-in-depth): the inherited ANTHROPIC_API_KEY
+        # (from secrets.env) must NEVER travel to a non-Anthropic endpoint. Pop it
+        # whenever EITHER a third-party base_url OR auth_token is being injected —
+        # not just base_url — so an inconsistent field combination can't leak the
+        # Anthropic key. Native Claude (neither set) keeps it (Max subscription).
+        if inv and (inv.anthropic_base_url or inv.anthropic_auth_token):
+            env.pop("ANTHROPIC_API_KEY", None)
+        # Roster model selection via env (NOT --model — see _build_args). Set all
+        # default-model slots so CC's background/sub-calls use the roster model too.
+        _model_vars = (
+            "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        )
+        if inv and inv.model_id_override:
+            for _mv in _model_vars:
+                env[_mv] = inv.model_id_override
+        else:
+            for _mv in _model_vars:
+                env.pop(_mv, None)
         # Move CC's Bash sandbox off /tmp (512MB tmpfs) onto persistent disk.
         # CC reads CLAUDE_CODE_TMPDIR to choose where it creates
         # /claude-<uid>/<cwd>/<session-id>/ for each Bash invocation.
@@ -444,16 +474,20 @@ class CCInvoker:
         and (b) any LLM/operation spans share one trace. Best-effort — a no-op
         when capture is disabled.
         """
+        invocation, roster_model = roster.apply_active(invocation)
         with start_span(
             "cc.session",
             SpanKind.CC_SESSION,
             attributes={
                 "model": invocation.model,
+                "roster_model": roster_model,
                 "effort": invocation.effort,
                 "streaming": False,
             },
         ) as span:
-            output = await self._run_inner(invocation)
+            output = replace(
+                await self._run_inner(invocation), roster_model=roster_model,
+            )
             with contextlib.suppress(Exception):
                 span.set_attr("cost_usd", output.cost_usd)
                 span.set_attr("input_tokens", output.input_tokens)
@@ -593,16 +627,21 @@ class CCInvoker:
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
         """Run CC with stream-json output (traced — see run() for span rationale)."""
+        invocation, roster_model = roster.apply_active(invocation)
         with start_span(
             "cc.session",
             SpanKind.CC_SESSION,
             attributes={
                 "model": invocation.model,
+                "roster_model": roster_model,
                 "effort": invocation.effort,
                 "streaming": True,
             },
         ) as span:
-            output = await self._run_streaming_inner(invocation, on_event)
+            output = replace(
+                await self._run_streaming_inner(invocation, on_event),
+                roster_model=roster_model,
+            )
             with contextlib.suppress(Exception):
                 span.set_attr("cost_usd", output.cost_usd)
                 span.set_attr("input_tokens", output.input_tokens)

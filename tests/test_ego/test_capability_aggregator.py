@@ -76,8 +76,44 @@ async def db(tmp_path):
                 completed_at TEXT, metadata TEXT
             )
         """)
+        # outcome_events (6th source — tier-1 ground truth, surplus-scoped)
+        await conn.execute("""
+            CREATE TABLE outcome_events (
+                id TEXT PRIMARY KEY, source TEXT NOT NULL,
+                ref_type TEXT NOT NULL, ref_id TEXT NOT NULL, domain TEXT,
+                signal_type TEXT NOT NULL,
+                signal_class TEXT NOT NULL DEFAULT 'implicit',
+                signal_tier INTEGER NOT NULL,
+                polarity TEXT, value REAL, stated_confidence REAL,
+                prediction_error REAL, reason TEXT, reason_text TEXT,
+                metadata TEXT, harvested_from TEXT,
+                occurred_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE (source, ref_type, ref_id, signal_type)
+            )
+        """)
         await conn.commit()
         yield conn
+
+
+async def _add_surplus_outcomes(db, domain, *, positive, negative):
+    """Seed N tier-1 surplus execution-outcome rows for a domain (recent)."""
+    from datetime import UTC, datetime
+    now = datetime.now(UTC).isoformat()
+    i = 0
+    for pol, count in (("positive", positive), ("negative", negative)):
+        for _ in range(count):
+            await db.execute(
+                "INSERT INTO outcome_events "
+                "(id, source, ref_type, ref_id, domain, signal_type, "
+                " signal_tier, polarity, value, occurred_at) "
+                "VALUES (?, 'surplus', 'task', ?, ?, 'execution_outcome', "
+                " 1, ?, ?, ?)",
+                (f"oe-{domain}-{i}", f"t-{domain}-{i}", domain, pol,
+                 1.0 if pol == "positive" else 0.0, now),
+            )
+            i += 1
+    await db.commit()
 
 
 class TestComputeCapabilityMap:
@@ -175,3 +211,96 @@ class TestComputeCapabilityMap:
         assert len(results) == 2
         assert results[0]["domain"] == "high_domain"
         assert results[1]["domain"] == "low_domain"
+
+
+class TestOutcomeBusSource:
+    """The 6th source (Outcome Bus tier-1) is gated behind the default-OFF
+    ``outcome_bus_capability_feed`` ego flag. OFF = behaviour-neutral; ON folds
+    surplus-scoped ground truth in. ``load_ego_config`` is patched so the tests
+    are hermetic regardless of the machine's ego.yaml."""
+
+    def _patch_flag(self, monkeypatch, enabled):
+        from genesis.ego.types import EgoConfig
+        monkeypatch.setattr(
+            "genesis.ego.config.load_ego_config",
+            lambda *a, **k: EgoConfig(outcome_bus_capability_feed=enabled),
+        )
+
+    @pytest.mark.asyncio
+    async def test_flag_off_no_surplus_signal(self, db, monkeypatch):
+        """Default OFF: surplus rows exist but contribute nothing."""
+        self._patch_flag(monkeypatch, False)
+        await _add_surplus_outcomes(db, "code_audit", positive=7, negative=1)
+
+        results = await compute_capability_map(db)
+        # surplus-only domain must NOT appear, and no 'outcomes:' evidence anywhere.
+        assert not any(r["domain"] == "code_audit" for r in results)
+        assert not any("outcomes:" in r.get("evidence", "") for r in results)
+
+    @pytest.mark.asyncio
+    async def test_flag_off_output_identical_to_baseline(self, db, monkeypatch):
+        """OFF output is byte-identical to the no-surplus baseline — proves the
+        6th source is truly inert when disabled."""
+        await db.execute(
+            "INSERT INTO autonomy_state (id, category, total_successes, "
+            "total_corrections) VALUES ('a1', 'outreach', 8, 2)"
+        )
+        await db.commit()
+
+        self._patch_flag(monkeypatch, False)
+        baseline = await compute_capability_map(db)
+        # Now add surplus rows; with the flag OFF the result must not change.
+        await _add_surplus_outcomes(db, "code_audit", positive=7, negative=1)
+        after = await compute_capability_map(db)
+        assert after == baseline
+
+    @pytest.mark.asyncio
+    async def test_flag_on_adds_surplus_domain(self, db, monkeypatch):
+        """ON: a surplus-only domain appears with 'outcomes:' evidence and the
+        correct success rate (7/8 = 87.5%)."""
+        self._patch_flag(monkeypatch, True)
+        await _add_surplus_outcomes(db, "code_audit", positive=7, negative=1)
+
+        results = await compute_capability_map(db)
+        ca = next((r for r in results if r["domain"] == "code_audit"), None)
+        assert ca is not None
+        assert "outcomes:" in ca["evidence"]
+        # Single source → composite == the surplus rate 7/8 = 0.875.
+        assert abs(ca["confidence"] - 0.875) < 0.01
+        assert ca["sample_size"] == 8
+
+    @pytest.mark.asyncio
+    async def test_flag_on_noise_gate_skips_thin_domains(self, db, monkeypatch):
+        """ON: a domain with n < 3 surplus rows is skipped (mirrors the
+        cc_sessions HAVING total >= 3 gate)."""
+        self._patch_flag(monkeypatch, True)
+        await _add_surplus_outcomes(db, "thin", positive=2, negative=0)   # n=2
+        await _add_surplus_outcomes(db, "thick", positive=3, negative=0)  # n=3
+
+        results = await compute_capability_map(db)
+        assert not any(r["domain"] == "thin" for r in results)
+        assert any(r["domain"] == "thick" for r in results)
+
+    @pytest.mark.asyncio
+    async def test_flag_on_combines_with_existing_source(self, db, monkeypatch):
+        """ON: when a domain has BOTH a non-surplus source and surplus rows, the
+        composite reflects both signals (evidence carries both tags)."""
+        from datetime import UTC, datetime
+        now = datetime.now(UTC).isoformat()
+        # 10 'investigate' proposals, 5 approved → proposals signal 50%.
+        for i in range(10):
+            status = "approved" if i < 5 else "rejected"
+            await db.execute(
+                "INSERT INTO ego_proposals (id, action_type, content, status, "
+                "created_at) VALUES (?, 'investigate', 'test', ?, ?)",
+                (f"p{i}", status, now),
+            )
+        await db.commit()
+        self._patch_flag(monkeypatch, True)
+        await _add_surplus_outcomes(db, "investigate", positive=8, negative=0)
+
+        results = await compute_capability_map(db)
+        inv = next((r for r in results if r["domain"] == "investigate"), None)
+        assert inv is not None
+        assert "proposals:" in inv["evidence"]
+        assert "outcomes:" in inv["evidence"]

@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from genesis.cc import roster
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
@@ -475,6 +476,10 @@ class DirectSessionRequest:
     planning_instruction: str | None = None  # opt-in: prepended to prompt
     skills: list[str] | None = None  # explicit skill injection (overrides auto-detect)
     tool_exceptions: tuple[str, ...] = ()  # tools to UN-block from the profile disallow list
+    # Intentional per-dispatch model SELECTION (not failover): a roster name
+    # (e.g. "glm-5.2") to run this background session on instead of the global
+    # default. None → the chokepoint applies the active default as usual.
+    roster_model: str | None = None
 
     def __post_init__(self) -> None:
         if self.profile not in VALID_PROFILES:
@@ -499,6 +504,7 @@ class DirectSessionResult:
     duration_s: float = 0.0
     tools_called: list[dict] = field(default_factory=list)
     model_used: str = ""
+    roster_model: str = ""  # roster NAME the chokepoint selected ("glm-5.2"/"claude")
 
 
 # ---------------------------------------------------------------------------
@@ -678,10 +684,25 @@ class DirectSessionRunner:
                 duration_s=round(elapsed, 1),
                 tools_called=telemetry,
                 model_used=output.model_used,
+                roster_model=output.roster_model,
             )
 
             # Persist result in session metadata (merge, don't overwrite)
             await self._store_result(session_id, request, result)
+
+            # Turn-independent fallback recovery: a successful run on the HOME model
+            # proves it's back (no foreground conversation turn needed). "Home" is the
+            # rate-limited model recorded at failover (state.original) — which may be a
+            # roster PEER when the configured default is non-Claude, NOT necessarily
+            # native Claude. A success on any OTHER model (incl. an intentional native
+            # pin while a peer is the down home) must NOT clear the fallback.
+            if result.success:
+                from genesis.cc import fallback_state
+                from genesis.cc.fallback_recovery import note_home_recovery
+
+                st = fallback_state.read()
+                if st.is_fallback and result.roster_model == (st.original or roster.CLAUDE):
+                    await note_home_recovery()
 
             # Feed outcome back to ego proposal if this was a proposal dispatch
             await self._record_proposal_outcome(request, result)
@@ -976,6 +997,30 @@ class DirectSessionRunner:
             logger.info("interact profile: upgrading model %s → opus", model)
             model = CCModel.OPUS
 
+        # Intentional per-dispatch model SELECTION. When a roster_model is named,
+        # pin it: stamp its overrides and set roster_eligible only when ROUTED, so
+        # the chokepoint honors the endpoint with correct attribution (routed peer)
+        # or runs native without re-selecting the global default (claude). With no
+        # roster_model, roster_eligible=True lets the chokepoint apply the global
+        # active model as before. overrides_for raises RosterError for an
+        # unknown/keyless model → propagates to _run_session → recorded as a FAILED
+        # result (fail loud; never silently run the default for an explicit ask).
+        routing: dict = {}
+        roster_eligible = True
+        if request.roster_model is not None:
+            routing = roster.overrides_for(request.roster_model)
+            roster_eligible = bool(routing)
+            # interact forces Opus for browser/ATS reasoning; a routed roster_model
+            # overrides the endpoint and defeats that guarantee — surface it loudly
+            # rather than silently running the peer model for a capability-sensitive
+            # profile.
+            if routing and request.profile == "interact":
+                logger.warning(
+                    "interact profile dispatched with roster_model=%s — running on "
+                    "the peer model instead of Opus; browser/ATS reasoning may degrade",
+                    request.roster_model,
+                )
+
         return CCInvocation(
             prompt=prompt,
             model=model,
@@ -988,6 +1033,8 @@ class DirectSessionRunner:
             working_dir=background_session_dir(),
             mcp_config=mcp_config,
             bash_allowlist=_PROFILE_BASH_ALLOWLIST.get(request.profile, ()),
+            roster_eligible=roster_eligible,
+            **routing,
         )
 
     async def _store_result(
@@ -1007,7 +1054,11 @@ class DirectSessionRunner:
         existing = {}
         if row and row.get("metadata"):
             with contextlib.suppress(json.JSONDecodeError, TypeError):
-                existing = json.loads(row["metadata"])
+                loaded = json.loads(row["metadata"])
+                # Guard non-dict JSON roots (array/str/number) so existing.update
+                # below can't AttributeError on a malformed/foreign metadata blob.
+                if isinstance(loaded, dict):
+                    existing = loaded
 
         tool_counts = self._summarize_tools(result.tools_called)
 
@@ -1038,6 +1089,15 @@ class DirectSessionRunner:
             "model_used": result.model_used,
             "duration_s": result.duration_s,
         })
+
+        # Roster resume continuity: record the endpoint a routed session ran on,
+        # keyed off the roster model NAME the chokepoint selected (ground truth),
+        # so a future resume can target the same provider. No-op for native Claude.
+        # Token never stored (NAME only).
+        if result.roster_model and result.roster_model != roster.CLAUDE:
+            payload = roster.endpoint_payload(result.roster_model)
+            if payload:
+                existing["roster_endpoint"] = payload
 
         await db.execute(
             "UPDATE cc_sessions SET metadata = ? WHERE id = ?",

@@ -169,3 +169,67 @@ class TestSpawnRecordsSkillSignal:
 
         report = await SkillEffectivenessAnalyzer().analyze(db, "research")
         assert report.usage_count == 0  # profile match must not count as skill usage
+
+
+class TestBackgroundFallbackRecovery:
+    """A successful background run clears account-wide CC fallback only when it ran
+    on the HOME model (the rate-limited one recorded at failover, state.original) —
+    which may be a roster PEER when the default is non-Claude. A success on any
+    OTHER model must NOT clear. GENESIS_HOME is redirected so the real state file is
+    untouched."""
+
+    async def _run(self, db, tmp_path, monkeypatch, *, home: str, roster_model: str):
+        from types import SimpleNamespace
+
+        from genesis.cc import fallback_state
+        from genesis.cc.types import CCInvocation, CCModel, CCOutput, EffortLevel, SessionType
+
+        monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
+        fallback_state.clear()
+        peer = "glm-5.2" if home == "claude" else "claude"
+        fallback_state.enter(home, peer, "rate_limit")  # original=home
+
+        sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+        invoker = AsyncMock()
+        invoker.run_streaming = AsyncMock(return_value=CCOutput(
+            session_id="cc-bg", text="done", model_used=roster_model or "claude",
+            cost_usd=0.0, input_tokens=1, output_tokens=1, duration_ms=1, exit_code=0,
+            is_error=False, roster_model=roster_model,
+        ))
+        runner = DirectSessionRunner(
+            invoker=invoker, session_manager=sm, config_builder=AsyncMock(),
+            runtime=SimpleNamespace(_db=db),
+        )
+        runner._build_invocation = lambda _req: CCInvocation(prompt="x")
+        sess = await sm.create_background(
+            session_type=SessionType.BACKGROUND_TASK,
+            model=CCModel.SONNET, effort=EffortLevel.MEDIUM,
+        )
+        result = await runner._run_session(DirectSessionRequest(prompt="t"), sess["id"])
+        assert result.success is True
+        state = fallback_state.read()
+        fallback_state.clear()
+        return state
+
+    @pytest.mark.asyncio
+    async def test_home_claude_success_clears(self, db, tmp_path, monkeypatch):
+        state = await self._run(db, tmp_path, monkeypatch, home="claude", roster_model="claude")
+        assert state.is_fallback is False  # home (claude) success → cleared
+
+    @pytest.mark.asyncio
+    async def test_peer_success_with_claude_home_does_not_clear(self, db, tmp_path, monkeypatch):
+        state = await self._run(db, tmp_path, monkeypatch, home="claude", roster_model="glm-5.2")
+        assert state.is_fallback is True  # glm run doesn't prove claude back
+
+    @pytest.mark.asyncio
+    async def test_home_peer_success_clears(self, db, tmp_path, monkeypatch):
+        # default=peer: home is glm-5.2; a successful glm run is the recovery signal.
+        state = await self._run(db, tmp_path, monkeypatch, home="glm-5.2", roster_model="glm-5.2")
+        assert state.is_fallback is False
+
+    @pytest.mark.asyncio
+    async def test_native_claude_success_with_peer_home_does_not_clear(self, db, tmp_path, monkeypatch):
+        # The bug case: home is glm-5.2 (down); an intentional native-Claude run
+        # succeeds but must NOT clear the glm fallback (Claude is ~always up).
+        state = await self._run(db, tmp_path, monkeypatch, home="glm-5.2", roster_model="claude")
+        assert state.is_fallback is True

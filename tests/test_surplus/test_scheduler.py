@@ -123,6 +123,106 @@ async def test_dispatch_handles_executor_error(db):
     assert await queue.pending_count() == 0
 
 
+# --------------------------------------------------------------------------- #
+# Verified-correctness verdict (#4 — producer side)
+# --------------------------------------------------------------------------- #
+async def _completed_verdict(db) -> str | None:
+    cur = await db.execute(
+        "SELECT outcome_quality FROM surplus_tasks WHERE status='completed'"
+    )
+    row = await cur.fetchone()
+    return row[0]
+
+
+async def _dispatch_with_intake(db, task_type, intake_stats):
+    """Dispatch one task of ``task_type`` through the stub executor with
+    ``run_intake`` patched to return ``intake_stats``; return its verdict."""
+    sched, compute = _make_scheduler(db, idle=True)
+    await sched._queue.enqueue(task_type, ComputeTier.FREE_API, 0.8, "curiosity")
+    with patch.object(
+        compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False,
+    ), patch(
+        "genesis.surplus.intake.run_intake",
+        new_callable=AsyncMock, return_value=intake_stats,
+    ):
+        assert await sched.dispatch_once() is True
+    return await _completed_verdict(db)
+
+
+async def test_dispatch_records_hollow_when_intake_all_discard(db):
+    from genesis.surplus.intake import IntakeStats
+
+    hollow = IntakeStats(
+        findings_count=2, routed_knowledge=0, routed_observation=0, routed_discard=2,
+    )
+    assert await _dispatch_with_intake(db, TaskType.BRAINSTORM_USER, hollow) == "hollow"
+
+
+async def test_dispatch_records_useful_when_intake_routes(db):
+    from genesis.surplus.intake import IntakeStats
+
+    useful = IntakeStats(
+        findings_count=2, routed_knowledge=1, routed_observation=0, routed_discard=1,
+    )
+    assert await _dispatch_with_intake(db, TaskType.BRAINSTORM_USER, useful) == "useful"
+
+
+async def test_dispatch_useful_via_observation_only(db):
+    # routed_observation alone (no knowledge) still counts as useful.
+    from genesis.surplus.intake import IntakeStats
+
+    obs = IntakeStats(
+        findings_count=1, routed_knowledge=0, routed_observation=1, routed_discard=0,
+    )
+    assert await _dispatch_with_intake(db, TaskType.WING_AUDIT, obs) == "useful"
+
+
+async def test_dispatch_non_insight_type_stays_null(db):
+    # An action / non-insight type must NOT get a verdict even if intake discards
+    # everything — all-discard is normal for tasks that don't target the KB.
+    from genesis.surplus.intake import IntakeStats
+
+    hollow = IntakeStats(
+        findings_count=2, routed_knowledge=0, routed_observation=0, routed_discard=2,
+    )
+    assert await _dispatch_with_intake(db, TaskType.CODE_INDEX, hollow) is None
+
+
+async def test_dispatch_pipeline_intermediate_stays_null(db):
+    # Pipeline-intermediate output feeds the next step, not the KB; excluded.
+    from genesis.surplus.intake import IntakeStats
+
+    hollow = IntakeStats(
+        findings_count=1, routed_knowledge=0, routed_observation=0, routed_discard=1,
+    )
+    assert await _dispatch_with_intake(db, TaskType.RESEARCH_QUERY_GEN, hollow) is None
+
+
+async def test_dispatch_empty_insights_stays_null(db):
+    # NOMINAL / clean-pass (executor returns no insights) is NOT hollow — a
+    # monitoring/scan type reporting "nothing noteworthy" is a valid success.
+    from genesis.surplus.types import ExecutorResult
+
+    sched, compute = _make_scheduler(db, idle=True)
+    await sched._queue.enqueue(
+        TaskType.BRAINSTORM_SELF, ComputeTier.FREE_API, 0.8, "curiosity",
+    )
+
+    async def _nominal(task):
+        return ExecutorResult(
+            success=True,
+            content="All clear — nothing noteworthy to capture in this pass today.",
+            insights=[],
+        )
+
+    sched._executor.execute = _nominal
+    with patch.object(
+        compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False,
+    ):
+        await sched.dispatch_once()
+    assert await _completed_verdict(db) is None
+
+
 async def test_brainstorm_check_schedules_sessions(db):
     sched, compute = _make_scheduler(db, idle=True)
     with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):

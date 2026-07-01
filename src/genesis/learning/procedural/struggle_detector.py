@@ -29,9 +29,60 @@ _WEIGHTS = {
     "length_with_errors": 0.10,
 }
 
+# Per-tool-type argument caps for the action spine. The builder needs the REAL
+# commands/paths to reconstruct a replayable playbook, so action tools keep
+# generous args (Edit truncated symmetrically to preserve both old+new), plan
+# text (ExitPlanMode) is dropped (not an action), and unknown/MCP tools get a
+# moderate cap. (Replaces a flat 80-char truncation that destroyed every command
+# — verified 2026-06-30 to be the reason the builder wrote essays, not playbooks.)
+_ARG_CAPS = {
+    "Bash": 800, "Edit": 800, "Write": 800, "Read": 800, "NotebookEdit": 800,
+    "Grep": 400, "Glob": 300,
+    # ExitPlanMode is handled by an early return in _summarize_args (plan prose,
+    # not an action); kept here as defense if that early return is ever removed.
+    "ExitPlanMode": 0,
+}
+_MCP_ARG_CAP = 400
+_DEFAULT_ARG_CAP = 300
 
-def build_action_spine(transcript_path: Path) -> list[dict]:
-    """Parse JSONL into a compact action spine.
+# Cap on the formatted spine handed to the judge, to keep even pathological
+# sessions (thousands of tool calls) safely inside the model context window
+# (~25k tokens; lead judge window is 131k). When exceeded, keep the END — a
+# struggle's resolution is usually in the final turns.
+_MAX_SPINE_CHARS = 100_000
+
+
+def _summarize_args(tool_name: str, tool_input: object) -> str:
+    """Compact but faithful arg summary for the spine. Preserves real
+    commands/paths up to a per-tool cap; symmetric for Edit (keep old+new)."""
+    if tool_name == "ExitPlanMode":
+        return ""  # plan prose, not an action
+    if isinstance(tool_input, dict):
+        if tool_name == "Edit" and "old_string" in tool_input:
+            return json.dumps({
+                "file_path": tool_input.get("file_path", ""),
+                "old": str(tool_input.get("old_string", ""))[:400],
+                "new": str(tool_input.get("new_string", ""))[:400],
+            }, ensure_ascii=False)
+        args_text = json.dumps(tool_input, ensure_ascii=False)
+    else:
+        args_text = str(tool_input)
+    cap = _ARG_CAPS.get(
+        tool_name, _MCP_ARG_CAP if tool_name.startswith("mcp__") else _DEFAULT_ARG_CAP
+    )
+    return args_text[:cap]
+
+
+def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
+    """Parse JSONL into a compact action spine AND a grounding haystack.
+
+    The haystack is the newline-joined, UNCAPPED ``json.dumps`` of every
+    tool_use's input — the record of what Genesis actually RAN. The grounding
+    gate matches a built procedure's step command-tokens against it (a command
+    that was truly executed appears here; a fabricated or merely-discussed one
+    does not). Distinct from the spine's per-tool-capped ``args_summary``.
+
+    Parse JSONL into a compact action spine.
 
     Each entry: {
         "turn": int,            # sequential turn number
@@ -46,6 +97,7 @@ def build_action_spine(transcript_path: Path) -> list[dict]:
     that read_transcript_messages() intentionally strips.
     """
     spine: list[dict] = []
+    haystack_parts: list[str] = []  # uncapped tool inputs → grounding record
     pending_tools: dict[str, dict] = {}  # tool_use_id → spine entry (awaiting result)
     turn = 0
 
@@ -91,12 +143,15 @@ def build_action_spine(transcript_path: Path) -> list[dict]:
                         tool_name = block.get("name", "unknown")
                         tool_input = block.get("input", {})
 
-                        # Compact args summary
-                        if isinstance(tool_input, dict):
-                            args_text = json.dumps(tool_input, ensure_ascii=False)
-                        else:
-                            args_text = str(tool_input)
-                        args_summary = args_text[:80]
+                        # Grounding record: the FULL command/args Genesis ran,
+                        # uncapped (the spine's args_summary is per-tool capped).
+                        # ExitPlanMode is plan prose, not an action — exclude it.
+                        if tool_name != "ExitPlanMode":
+                            haystack_parts.append(
+                                json.dumps(tool_input, ensure_ascii=False, default=str)
+                            )
+
+                        args_summary = _summarize_args(tool_name, tool_input)
 
                         spine_entry = {
                             "turn": turn,
@@ -126,7 +181,7 @@ def build_action_spine(transcript_path: Path) -> list[dict]:
                             entry_ref = pending_tools.pop(tool_id)
                             if is_error:
                                 entry_ref["outcome"] = "error"
-                                entry_ref["error_text"] = str(result_content)[:200]
+                                entry_ref["error_text"] = str(result_content)[:400]
 
                     elif block_type == "text" and msg_type == "user":
                         text = block.get("text", "")
@@ -152,7 +207,15 @@ def build_action_spine(transcript_path: Path) -> list[dict]:
         entry["outcome"] = "error"
         entry["error_text"] = "no result received (session may have crashed)"
 
-    return spine
+    return spine, "\n".join(haystack_parts)
+
+
+def build_action_spine(transcript_path: Path) -> list[dict]:
+    """Back-compat thin wrapper: returns the action spine only (drops the
+    haystack). Retained so existing callers (score_struggle and its tests) keep
+    their ``list[dict]`` contract; the builder path uses build_spine_and_haystack.
+    """
+    return build_spine_and_haystack(transcript_path)[0]
 
 
 def score_struggle(spine: list[dict]) -> float:
@@ -241,22 +304,29 @@ def score_struggle(spine: list[dict]) -> float:
 
 
 def format_spine_for_judge(spine: list[dict]) -> str:
-    """Format action spine as compact text for the Judge LLM.
+    """Format the action spine as compact text for the Judge LLM — TOOL ACTIONS
+    ONLY (user turns are dropped).
+
+    A procedure is about what GENESIS DID, never what the user said. Dropping
+    user turns was the single biggest noise cut in the C2b builder spike: it
+    stops the builder reconstructing "procedures" from the user's requests or
+    corrections. (score_struggle still sees user corrections — it reads the full
+    spine from build_action_spine, not this formatted view.)
 
     Output:
     [T=1] TOOL: Bash {"command": "ssh root@..."} -> OK
     [T=2] TOOL: Read {"file_path": "/home..."} -> ERR: not found
-    [T=5] USER: "that didn't work, try again"
     """
     lines: list[str] = []
     for entry in spine:
+        if entry["type"] != "tool":
+            continue
         turn = entry["turn"]
-        if entry["type"] == "tool":
-            outcome = "OK" if entry["outcome"] == "ok" else f"ERR: {entry['error_text'][:60]}"
-            lines.append(
-                f"[T={turn}] TOOL: {entry['tool']} {entry['args_summary']} -> {outcome}"
-            )
-        elif entry["type"] == "user":
-            text = entry["args_summary"][:80]
-            lines.append(f'[T={turn}] USER: "{text}"')
-    return "\n".join(lines)
+        outcome = "OK" if entry["outcome"] == "ok" else f"ERR: {entry['error_text'][:300]}"
+        lines.append(
+            f"[T={turn}] TOOL: {entry['tool']} {entry['args_summary']} -> {outcome}"
+        )
+    text = "\n".join(lines)
+    if len(text) > _MAX_SPINE_CHARS:
+        text = "...[earlier turns truncated]...\n" + text[-_MAX_SPINE_CHARS:]
+    return text

@@ -28,12 +28,16 @@ async def create(
     status: str = "pending",
     created_at: str,
     batch_id: str | None = None,
+    drop_id: str | None = None,
+    batch_items: str | None = None,
 ) -> str:
     await db.execute(
         """INSERT INTO inbox_items
-           (id, file_path, content_hash, status, batch_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (id, file_path, content_hash, status, batch_id, created_at),
+           (id, file_path, content_hash, status, batch_id, created_at,
+            drop_id, batch_items)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (id, file_path, content_hash, status, batch_id, created_at,
+         drop_id, batch_items),
     )
     await db.commit()
     return id
@@ -95,7 +99,7 @@ async def get_awaiting_approval(db: aiosqlite.Connection) -> list[dict]:
     """
     cursor = await db.execute(
         """SELECT id, file_path, content_hash, batch_id, error_message,
-                  created_at
+                  created_at, drop_id, batch_items
            FROM inbox_items
            WHERE status = 'processing'
              AND error_message LIKE ? || '%'
@@ -104,6 +108,32 @@ async def get_awaiting_approval(db: aiosqlite.Connection) -> list[dict]:
     )
     rows = await cursor.fetchall()
     return [dict(row) for row in rows]
+
+
+async def update_status_for_drop(
+    db: aiosqlite.Connection,
+    drop_id: str,
+    *,
+    status: str,
+    error_message: str | None = None,
+    processed_at: str | None = None,
+) -> int:
+    """Set status/error_message/processed_at on the live rows of a drop.
+
+    Targets only rows currently ``pending`` or ``processing`` (so completed
+    batches are never disturbed). Used to park a whole drop on one approval
+    (status='processing' + awaiting marker) or fail a whole drop on rejection.
+    Does NOT touch ``retry_count`` — callers manage retry semantics explicitly.
+    Returns the number of rows updated.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET status = ?, error_message = ?, processed_at = ?
+           WHERE drop_id = ? AND status IN ('pending', 'processing')""",
+        (status, error_message, processed_at, drop_id),
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 async def get_all_known(
@@ -238,12 +268,21 @@ async def get_evaluated_content(
     Filters out NULL and empty-string values so callers can rely on a
     non-empty return meaning "real prior content exists."
     """
+    # Order by processed_at (COMPLETION time), not created_at: the current
+    # baseline is the most-recently-COMPLETED row, and each completion merges
+    # its lines on top of the prior baseline. created_at is unreliable here
+    # because _queue_drop reuses retriable-failed rows (reuse_as_pending
+    # preserves their OLD created_at), so a freshly-completed reused row can
+    # have an ancient created_at — ordering by created_at would return a stale,
+    # partial baseline and cause re-evaluation. rowid is the final tiebreak for
+    # same-cycle batches that share processed_at (fake-clock tests; production
+    # completions are sequential so processed_at already differs).
     cursor = await db.execute(
         """SELECT evaluated_content FROM inbox_items
            WHERE file_path = ? AND status = 'completed'
              AND evaluated_content IS NOT NULL
              AND evaluated_content != ''
-           ORDER BY created_at DESC LIMIT 1""",
+           ORDER BY processed_at DESC, created_at DESC, rowid DESC LIMIT 1""",
         (file_path,),
     )
     row = await cursor.fetchone()
@@ -258,11 +297,19 @@ async def get_last_completed_at(
     Used for cooldown checks — skip re-evaluation if too recent.
     Includes both normal evaluations (with response files) and Acknowledged
     items (no response file) so cooldown applies uniformly.
+
+    Orders by processed_at (completion time), not created_at, so a row that was
+    detected long ago but completed recently (e.g. parked for approval, then
+    approved) reports its true completion time. The ``processed_at IS NOT NULL``
+    guard excludes the meta completed rows (empty-file / no-new-content) that
+    are written without a processed_at — without it those NULLs (which sort last
+    under DESC) could leak as the return value when no real completion exists.
     """
     cursor = await db.execute(
         """SELECT processed_at FROM inbox_items
            WHERE file_path = ? AND status = 'completed'
-           ORDER BY created_at DESC LIMIT 1""",
+             AND processed_at IS NOT NULL
+           ORDER BY processed_at DESC, created_at DESC LIMIT 1""",
         (file_path,),
     )
     row = await cursor.fetchone()
@@ -365,6 +412,63 @@ async def get_retriable_failed(
     return dict(row) if row else None
 
 
+async def get_retriable_failed_rows(
+    db: aiosqlite.Connection, file_path: str, *, max_retries: int = 3,
+) -> list[dict]:
+    """Return ALL retriable failed rows for *file_path*, oldest first.
+
+    Like :func:`get_retriable_failed` but returns every retriable row, so the
+    monitor can reuse one per batch when a multi-batch drop is retried —
+    preventing duplicate-row accumulation while preserving each row's
+    ``retry_count`` (so the permanent-failure cap still applies). Excludes
+    approval-invalidated rows (those need fresh rows + fresh approvals).
+    """
+    cursor = await db.execute(
+        """SELECT * FROM inbox_items
+           WHERE file_path = ? AND status = 'failed' AND retry_count < ?
+             AND (error_message IS NULL
+                  OR error_message NOT LIKE ? || '%')
+           ORDER BY created_at ASC""",
+        (file_path, max_retries, APPROVAL_INVALIDATED_PREFIX),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def reuse_as_pending(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    drop_id: str,
+    batch_items: str,
+    content_hash: str,
+    created_at: str,
+) -> bool:
+    """Re-arm a retriable failed row as a fresh pending batch.
+
+    Preserves ``retry_count`` (the cap survives) but re-points the row at the
+    new drop, batch slice and content hash, clears the error, and **resets
+    ``created_at`` to now** — the row represents a NEW evaluation attempt as of
+    now, so its created_at must reflect the re-arm time. This restores the
+    invariant "created_at = this row's current detection/arming time" that the
+    rest of the system relies on for created_at-ordered "latest row" reads
+    (get_by_file_path → supersede), recency windows (count_url_failures), and
+    expire_stuck_processing's age cutoff. Without this reset, a reused row kept
+    an ancient created_at and broke all of those (the baseline reads switched
+    to processed_at ordering for completion-keyed correctness; this fixes the
+    created_at-keyed consumers at the source).
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET status = 'pending', error_message = NULL,
+               drop_id = ?, batch_items = ?, content_hash = ?,
+               created_at = ?
+           WHERE id = ?""",
+        (drop_id, batch_items, content_hash, created_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def query_pending(db: aiosqlite.Connection, *, limit: int = 50) -> list[dict]:
     cursor = await db.execute(
         "SELECT * FROM inbox_items WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
@@ -390,6 +494,12 @@ async def get_recent_completed(
     """Return recently completed inbox items with response paths.
 
     Used by the inbox digest tool to show what was evaluated recently.
+
+    Windows and orders by processed_at (completion time), not created_at: a
+    reused retriable-failed row keeps its old created_at (reuse_as_pending), so
+    a freshly-completed reused eval would otherwise fall outside the day window
+    and disappear from the digest. Rows here always have a response_path, hence
+    a non-null processed_at. See get_evaluated_content.
     """
     cursor = await db.execute(
         """SELECT id, file_path, response_path, batch_id,
@@ -397,8 +507,8 @@ async def get_recent_completed(
            FROM inbox_items
            WHERE status = 'completed'
              AND response_path IS NOT NULL
-             AND created_at >= datetime('now', ? || ' days')
-           ORDER BY created_at DESC LIMIT ?""",
+             AND processed_at >= datetime('now', ? || ' days')
+           ORDER BY processed_at DESC LIMIT ?""",
         (f"-{days}", limit),
     )
     return [dict(row) for row in await cursor.fetchall()]

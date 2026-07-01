@@ -53,27 +53,48 @@ async def create(
     kind: str = "follow_up",
     domain: str | None = None,
     goal_id: str | None = None,
+    dedup_key: str | None = None,
     id: str | None = None,
 ) -> str:
     """Create a follow-up and return its ID.
 
-    kind:    'follow_up' (intended for action) or 'tabled' (tracked, not for action).
-    domain:  'internal' | 'user_world' | None (None = not yet classified).
-    goal_id: optional link to a unified goal (user_goals.id) for future promotion.
+    kind:     'follow_up' (intended for action) or 'tabled' (tracked, not for action).
+    domain:   'internal' | 'user_world' | None (None = not yet classified).
+    goal_id:  optional link to a unified goal (user_goals.id) for future promotion.
+    dedup_key: optional idempotency key. Callers that may re-run (e.g. inbox
+              re-evaluation) pass a stable hash so the same recommendation does
+              not create duplicate rows; a partial unique index backstops races.
     """
     fid = id or _new_id()
     await db.execute(
         """INSERT INTO follow_ups
            (id, source, source_session, content, reason, strategy,
             scheduled_at, status, priority, pinned, kind, domain, goal_id,
-            created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)""",
+            dedup_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
         (fid, source, source_session, content, reason, strategy,
          _normalize_scheduled_at(scheduled_at), priority, int(pinned),
-         kind, domain, goal_id, _now_iso()),
+         kind, domain, goal_id, dedup_key, _now_iso()),
     )
     await db.commit()
     return fid
+
+
+async def exists_by_dedup_key(
+    db: aiosqlite.Connection, dedup_key: str,
+) -> bool:
+    """Return True if any follow-up already exists with *dedup_key*.
+
+    Dedup spans all statuses so a re-evaluation never recreates a follow-up the
+    user already completed/dismissed. NULL/empty keys never match.
+    """
+    if not dedup_key:
+        return False
+    cursor = await db.execute(
+        "SELECT 1 FROM follow_ups WHERE dedup_key = ? LIMIT 1",
+        (dedup_key,),
+    )
+    return await cursor.fetchone() is not None
 
 
 async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:

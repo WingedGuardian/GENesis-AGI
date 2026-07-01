@@ -149,4 +149,8 @@ def validate_ego_config(changes: dict) -> list[str]:
         changes["calibration_injection_enabled"], bool
     ):
         errors.append("calibration_injection_enabled must be a boolean")
+    if "outcome_bus_capability_feed" in changes and not isinstance(
+        changes["outcome_bus_capability_feed"], bool
+    ):
+        errors.append("outcome_bus_capability_feed must be a boolean")
     return errors

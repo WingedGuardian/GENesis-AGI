@@ -178,6 +178,50 @@ class TestCCSessions:
         # 2 background_reflection + 1 background_task = 3 background
         assert snap["cc_sessions"]["background"]["active"] == 3
 
+    @pytest.mark.asyncio
+    async def test_cc_sessions_fallback_active_and_cleared(self, db, tmp_path, monkeypatch):
+        """The snapshot exposes account-wide CC fallback state for the dashboard.
+
+        GENESIS_HOME is redirected to a temp dir so this never touches the real
+        ~/.genesis/cc_fallback_state.json (the live server reads it).
+        """
+        from genesis.cc import fallback_state
+
+        monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
+        fallback_state.clear()  # clean slate in the temp home
+
+        svc = HealthDataService(db=db)
+        snap = await svc.snapshot()
+        assert snap["cc_sessions"]["fallback"]["is_fallback"] is False
+
+        fallback_state.enter("claude", "glm-5.2", "rate_limit")
+        snap2 = await svc.snapshot()
+        fb = snap2["cc_sessions"]["fallback"]
+        assert fb["is_fallback"] is True
+        assert fb["fallback"] == "glm-5.2"
+        assert fb["original"] == "claude"
+        assert fb["reason"] == "rate_limit"
+        assert fb["since"]  # non-empty ISO timestamp
+
+        fallback_state.clear()
+        snap3 = await svc.snapshot()
+        assert snap3["cc_sessions"]["fallback"]["is_fallback"] is False
+
+    @pytest.mark.asyncio
+    async def test_cc_sessions_fallback_present_without_db(self, tmp_path, monkeypatch):
+        """The no-db early return still carries the fallback key (shape consistency)."""
+        from genesis.cc import fallback_state
+        from genesis.observability.snapshots.cc_sessions import cc_sessions as cc_snapshot
+
+        monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
+        fallback_state.enter("claude", "glm-5.2", "rate_limit")
+        try:
+            snap = await cc_snapshot(None, None, None)
+            assert snap["fallback"]["is_fallback"] is True
+            assert snap["fallback"]["fallback"] == "glm-5.2"
+        finally:
+            fallback_state.clear()
+
 
 class TestInfrastructure:
     @pytest.mark.asyncio

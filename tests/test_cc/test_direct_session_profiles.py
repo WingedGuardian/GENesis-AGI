@@ -283,6 +283,78 @@ def test_observe_profile_does_not_upgrade_model():
     assert inv.model == CCModel.HAIKU
 
 
+# --- Roster model SELECTION (Phase 3 Part E) ---
+
+_HERMETIC_ROSTER = {
+    "default": "claude",
+    "models": {
+        "claude": {"native_subscription": True, "failover_order": 0},
+        "glm-5.2": {
+            "anthropic_base_url": "https://open.bigmodel.cn/api/anthropic",
+            "auth_env": "ZHIPU_TEST_KEY",
+            "model_id": "glm-5.2",
+            "failover_order": 1,
+        },
+    },
+}
+
+
+def _patch_roster(monkeypatch):
+    from genesis.cc import roster
+    monkeypatch.setattr(roster, "load_roster", lambda *a, **k: _HERMETIC_ROSTER)
+    return roster
+
+
+def test_roster_model_routes_to_peer(monkeypatch):
+    _patch_roster(monkeypatch)
+    monkeypatch.setenv("ZHIPU_TEST_KEY", "sk-secret")
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="t", profile="observe", roster_model="glm-5.2")
+    inv = runner._build_invocation(req)
+    assert inv.model_id_override == "glm-5.2"
+    assert inv.anthropic_base_url == "https://open.bigmodel.cn/api/anthropic"
+    assert inv.anthropic_auth_token == "sk-secret"
+    # routed → eligible so the chokepoint honors it AND attributes the right name.
+    assert inv.roster_eligible is True
+
+
+def test_roster_model_claude_pins_native(monkeypatch):
+    _patch_roster(monkeypatch)
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="t", profile="observe", roster_model="claude")
+    inv = runner._build_invocation(req)
+    assert inv.model_id_override is None
+    assert inv.anthropic_base_url is None
+    # native pin → NOT eligible so the chokepoint can't re-select the global default.
+    assert inv.roster_eligible is False
+
+
+def test_no_roster_model_uses_chokepoint_default(monkeypatch):
+    _patch_roster(monkeypatch)
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="t", profile="observe")  # no roster_model
+    inv = runner._build_invocation(req)
+    assert inv.roster_eligible is True  # chokepoint selects at invoke time
+    assert inv.model_id_override is None
+
+
+def test_unknown_roster_model_fails_loud(monkeypatch):
+    roster = _patch_roster(monkeypatch)
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="t", profile="observe", roster_model="nope")
+    with pytest.raises(roster.RosterError):
+        runner._build_invocation(req)
+
+
+def test_keyless_roster_model_fails_loud(monkeypatch):
+    roster = _patch_roster(monkeypatch)
+    monkeypatch.delenv("ZHIPU_TEST_KEY", raising=False)
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="t", profile="observe", roster_model="glm-5.2")
+    with pytest.raises(roster.RosterError):
+        runner._build_invocation(req)
+
+
 # --- Mail profile: perimeter session restrictions ---
 
 def test_mail_profile_exists():

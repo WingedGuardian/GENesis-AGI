@@ -3072,8 +3072,15 @@
           const cc = this.health.cc_sessions;
           if (!cc) return { state: "unknown", reason: "CC session data unavailable" };
           const rt = cc.realtime_status;
+          // A hard contingency outage (UNAVAILABLE, never auto-reconciled) outranks
+          // fallback: don't paint a red outage yellow if is_fallback is stale.
           if (rt === "UNAVAILABLE") {
             return { state: "error", reason: "CC is unavailable — contingency mode active" };
+          }
+          // Fallback is more specific than the rate-limit that triggered it, so it
+          // takes precedence over the RATE_LIMITED/THROTTLED branch below.
+          if (cc.fallback?.is_fallback) {
+            return { state: "fallback", reason: `running on ${cc.fallback.fallback || 'a roster peer'} (Claude ${(cc.fallback.reason || 'unavailable').replace(/_/g, ' ')})` };
           }
           if (rt === "RATE_LIMITED" || rt === "THROTTLED") {
             return { state: "degraded", reason: `CC is ${rt.toLowerCase().replace('_', '-')}` };
@@ -4537,6 +4544,43 @@
               @click="location.hash = 'backup'">Backup & Updates</button>
     </nav>
 
+    <!-- Global system banners (page-top, full-width block flow, visible on every
+         tab). Kept OUTSIDE the flex-row .panel so each renders as a slim top bar,
+         not a stretched column, and so these global conditions surface on all tabs. -->
+    <!-- Stale data warning -->
+    <template x-if="$store.genesisDashboard.healthStale">
+      <div style="background: #d9534f; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;">
+        Health data stale — API unreachable. Data shown may be outdated.
+      </div>
+    </template>
+    <!-- Genesis paused banner -->
+    <template x-if="$store.genesisDashboard.pauseState.paused">
+      <div style="background: #f0ad4e; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;">
+        Genesis is paused — background processing suspended. Use the pause button or /pause off in Telegram to resume.
+      </div>
+    </template>
+    <!-- CC model-fallback banner: the server-side conversation is failed over to a
+         roster peer because the home model (Claude) is rate-limited account-wide. -->
+    <template x-if="$store.genesisDashboard.health.cc_sessions?.fallback?.is_fallback">
+      <div style="background: #f0ad4e; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;"
+           x-text="'⚠ Running on ' + ($store.genesisDashboard.health.cc_sessions.fallback.fallback || 'a roster peer') + ' — Claude ' + ($store.genesisDashboard.health.cc_sessions.fallback.reason || 'unavailable').replace(/_/g, ' ') + ' since ' + (($store.genesisDashboard.health.cc_sessions.fallback.since || '').replace('T', ' ').slice(0, 16) || 'unknown')"></div>
+    </template>
+    <!-- Resilience degradation banner -->
+    <template x-if="$store.genesisDashboard.health.resilience?.level && $store.genesisDashboard.health.resilience.level !== 'L0' && $store.genesisDashboard.health.resilience.level !== 'not configured'">
+      <div :style="`background: ${['L3', 'L4', 'L5', 'error'].includes($store.genesisDashboard.health.resilience.level) ? '#d9534f' : '#f0ad4e'}; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center; overflow-wrap: break-word; white-space: normal; line-height: 1.3;`"
+           x-text="'Resilience: ' + $store.genesisDashboard.health.resilience.level + ' — ' + ($store.genesisDashboard.health.resilience.summary || 'system is operating in degraded mode')">
+      </div>
+    </template>
+    <!-- Provider alert banners (credit exhaustion, missing critical keys) -->
+    <template x-for="alert in ($store.genesisDashboard.health.api_keys?.alerts || []).filter(a => a.severity === 'critical')" :key="'prov-crit-' + alert.provider_type">
+      <div style="background: rgba(217,83,79,0.15); border: 1px solid #d9534f; border-radius: 6px; padding: 0.5rem 1rem; margin: 0.25rem 0.5rem; font-size: 0.82rem; font-weight: 600; color: #d9534f; text-align: center;"
+           x-text="alert.message"></div>
+    </template>
+    <template x-for="alert in ($store.genesisDashboard.health.api_keys?.alerts || []).filter(a => a.severity === 'warning')" :key="'prov-warn-' + alert.provider_type">
+      <div style="background: rgba(240,173,78,0.15); border: 1px solid #f0ad4e; border-radius: 6px; padding: 0.5rem 1rem; margin: 0.25rem 0.5rem; font-size: 0.82rem; font-weight: 600; color: #f0ad4e; text-align: center;"
+           x-text="alert.message"></div>
+    </template>
+
     <!-- Panel 1: System Health [Tab: overview] -->
     <div class="panel" x-show="$store.genesisDashboard.activeTab === 'overview'">
       <div class="panel-header">
@@ -4552,33 +4596,6 @@
             : $store.genesisDashboard.overallHealthSemantic().state"></span>
         </span>
       </div>
-      <!-- Stale data warning -->
-      <template x-if="$store.genesisDashboard.healthStale">
-        <div style="background: #d9534f; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;">
-          Health data stale — API unreachable. Data shown may be outdated.
-        </div>
-      </template>
-      <!-- Genesis paused banner -->
-      <template x-if="$store.genesisDashboard.pauseState.paused">
-        <div style="background: #f0ad4e; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;">
-          Genesis is paused — background processing suspended. Use the pause button or /pause off in Telegram to resume.
-        </div>
-      </template>
-      <!-- Resilience degradation banner -->
-      <template x-if="$store.genesisDashboard.health.resilience?.level && $store.genesisDashboard.health.resilience.level !== 'L0' && $store.genesisDashboard.health.resilience.level !== 'not configured'">
-        <div :style="`background: ${['L3', 'L4', 'L5', 'error'].includes($store.genesisDashboard.health.resilience.level) ? '#d9534f' : '#f0ad4e'}; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center; overflow-wrap: break-word; white-space: normal; line-height: 1.3;`"
-             x-text="'Resilience: ' + $store.genesisDashboard.health.resilience.level + ' — ' + ($store.genesisDashboard.health.resilience.summary || 'system is operating in degraded mode')">
-        </div>
-      </template>
-      <!-- Provider alert banners (credit exhaustion, missing critical keys) -->
-      <template x-for="alert in ($store.genesisDashboard.health.api_keys?.alerts || []).filter(a => a.severity === 'critical')" :key="'prov-crit-' + alert.provider_type">
-        <div style="background: rgba(217,83,79,0.15); border: 1px solid #d9534f; border-radius: 6px; padding: 0.5rem 1rem; margin: 0.25rem 0.5rem; font-size: 0.82rem; font-weight: 600; color: #d9534f; text-align: center;"
-             x-text="alert.message"></div>
-      </template>
-      <template x-for="alert in ($store.genesisDashboard.health.api_keys?.alerts || []).filter(a => a.severity === 'warning')" :key="'prov-warn-' + alert.provider_type">
-        <div style="background: rgba(240,173,78,0.15); border: 1px solid #f0ad4e; border-radius: 6px; padding: 0.5rem 1rem; margin: 0.25rem 0.5rem; font-size: 0.82rem; font-weight: 600; color: #f0ad4e; text-align: center;"
-             x-text="alert.message"></div>
-      </template>
       <div class="panel-body">
         <template x-if="$store.genesisDashboard.panelStatusDetail('health')">
           <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('health')"></div>
@@ -4677,6 +4694,10 @@
             <template x-if="($store.genesisDashboard.health.cc_sessions?.failed_24h || 0) > 0">
               <div class="health-card-detail" style="color: #d9534f; font-weight: 600;"
                    x-text="$store.genesisDashboard.health.cc_sessions.failed_24h + ' failed (24h)'"></div>
+            </template>
+            <template x-if="$store.genesisDashboard.health.cc_sessions?.fallback?.is_fallback">
+              <div class="health-card-detail" style="color: #f0ad4e; font-weight: 600;"
+                   x-text="'on ' + ($store.genesisDashboard.health.cc_sessions.fallback.fallback || 'roster peer') + ' since ' + (($store.genesisDashboard.health.cc_sessions.fallback.since || '').replace('T', ' ').slice(0, 16) || 'unknown')"></div>
             </template>
             <div class="health-card-reason" x-text="$store.genesisDashboard.ccSemantic().reason"></div>
           </div>

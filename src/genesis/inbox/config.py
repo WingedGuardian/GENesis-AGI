@@ -52,6 +52,7 @@ def _parse(raw: dict) -> InboxConfig:
         response_dir=section.get("response_dir", "_genesis"),
         check_interval_seconds=int(section.get("check_interval_seconds", 1800)),
         batch_size=int(section.get("batch_size", 5)),
+        items_per_eval=int(section.get("items_per_eval", 5)),
         enabled=bool(section.get("enabled", True)),
         model=str(section.get("model", "sonnet")),
         effort=str(section.get("effort", "high")),

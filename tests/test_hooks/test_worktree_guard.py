@@ -5,6 +5,7 @@ Tests the enhanced guard hook that:
 2. Blocks removal if the current session's CWD is the target (self-brick)
 3. Blocks ALL direct worktree removal (redirects to lifecycle manager)
 4. Handles ExitWorktree tool (--exit-worktree mode)
+5. Hard-blocks EnterWorktree relocation (--enter-worktree mode)
 
 Exit codes: 0 = allowed, 2 = blocked.
 """
@@ -222,6 +223,69 @@ class TestExitWorktree:
             finally:
                 proc.terminate()
                 proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# EnterWorktree mode — relocation block (keeps sessions findable)
+# ---------------------------------------------------------------------------
+
+
+class TestEnterWorktree:
+    def test_enter_with_name_blocked(self, guard_cmd: str) -> None:
+        """EnterWorktree creating a named worktree is hard-blocked."""
+        result = _run_guard(
+            guard_cmd, {"name": "my-feature"}, extra_args="--enter-worktree",
+        )
+        assert result.returncode == 2
+        assert "BLOCKED" in result.stderr
+        assert "my-feature" in result.stderr
+
+    def test_enter_with_path_blocked(self, guard_cmd: str) -> None:
+        """EnterWorktree switching into an existing worktree is hard-blocked."""
+        result = _run_guard(
+            guard_cmd,
+            {"path": ".claude/worktrees/existing"},
+            extra_args="--enter-worktree",
+        )
+        assert result.returncode == 2
+        assert "BLOCKED" in result.stderr
+
+    def test_enter_empty_input_blocked(self, guard_cmd: str) -> None:
+        """EnterWorktree with no args (auto-named) is still hard-blocked."""
+        result = _run_guard(guard_cmd, {}, extra_args="--enter-worktree")
+        assert result.returncode == 2
+        assert "BLOCKED" in result.stderr
+
+    def test_block_message_redirects_to_findable_pattern(
+        self, guard_cmd: str,
+    ) -> None:
+        """Message must point to the non-relocating alternative + /resume."""
+        result = _run_guard(
+            guard_cmd, {"name": "x"}, extra_args="--enter-worktree",
+        )
+        err = result.stderr.lower()
+        assert "git worktree add" in err
+        assert "/resume" in err
+
+    def test_enter_blocked_with_missing_env(self, guard_cmd: str) -> None:
+        """Hard block holds even when CLAUDE_TOOL_INPUT is unset (no fail-open)."""
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_TOOL_INPUT"}
+        result = subprocess.run(
+            f"{guard_cmd} --enter-worktree",
+            shell=True, env=env, capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 2
+        assert "BLOCKED" in result.stderr
+
+    def test_enter_blocked_with_malformed_env(self, guard_cmd: str) -> None:
+        """Hard block holds even when CLAUDE_TOOL_INPUT is not valid JSON."""
+        env = {**os.environ, "CLAUDE_TOOL_INPUT": "not-json"}
+        result = subprocess.run(
+            f"{guard_cmd} --enter-worktree",
+            shell=True, env=env, capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 2
+        assert "BLOCKED" in result.stderr
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""PreToolUse hook: block worktree removal to protect active sessions.
+"""PreToolUse hook: worktree safety guard (removal protection + relocation block).
 
-Two modes:
+Three modes:
   1. Bash matcher (default) — intercepts `git worktree remove` commands.
   2. ExitWorktree matcher (--exit-worktree) — intercepts ExitWorktree tool
      with action "remove".
+  3. EnterWorktree matcher (--enter-worktree) — hard-blocks the EnterWorktree
+     tool, which would RELOCATE the session into a worktree and make the
+     conversation unfindable via /resume (see _handle_enter_worktree).
 
-In both modes:
+Removal modes (1 + 2):
   - If another process has its CWD inside the target worktree → hard block
     with PID list (cross-session safety).
   - If the current session's CWD IS the target → hard block (self-brick
@@ -18,6 +21,10 @@ In both modes:
 Incident 1: 2026-05-27 — Session bricked after deleting its own worktree.
 Incident 2: 2026-06-09 — Session B deleted worktree still used by Session A,
 turning A into a zombie.
+Incident 3: 2026-06-29 — EnterWorktree silently relocated a multi-day session
+into the `morning-report-nextsteps` worktree; its transcript moved to a
+separate Claude Code project slug, so /resume from the main repo no longer
+listed it (11 such `wt-*` relocation stubs had accumulated).
 
 Stdlib-only. Fail-open on parse errors.
 """
@@ -206,7 +213,71 @@ def _handle_exit_worktree(data: dict) -> int:
     return 2
 
 
+def _handle_enter_worktree(data: dict) -> int:
+    """Handle EnterWorktree tool — hard-block to keep sessions findable.
+
+    EnterWorktree re-roots the live session into a git worktree: the harness
+    mints a NEW session id whose transcript is written under a DIFFERENT Claude
+    Code project slug (``…<repo>--claude-worktrees-<name>/``), leaving only a
+    ``wt-<id>.jsonl`` pointer stub behind in the original project dir. The
+    conversation continues seamlessly on screen, but ``/resume`` launched from
+    the original directory no longer lists it — the session is, in effect, lost.
+
+    Worktree *isolation* never requires relocating the session, so block
+    unconditionally and redirect to non-relocating alternatives. Always returns
+    exit code 2 regardless of input (``name`` / ``path`` / empty).
+    """
+    target = "(auto-named worktree)"
+    if isinstance(data, dict):
+        target = data.get("name") or data.get("path") or target
+    print(
+        f"BLOCKED: EnterWorktree is disabled — entering '{target}' would "
+        "relocate this session into a worktree and make it unfindable.",
+        file=sys.stderr,
+    )
+    print(
+        "Why: the harness re-roots the session and writes its transcript under "
+        "a separate '<repo>--claude-worktrees-<name>' project dir, leaving only "
+        "a 'wt-<id>.jsonl' stub behind. /resume from the original directory will "
+        "no longer list this conversation.",
+        file=sys.stderr,
+    )
+    print("Keep the session findable — do this instead:", file=sys.stderr)
+    print(
+        "  - Isolated file changes: `git worktree add .claude/worktrees/<name> "
+        "-b <scope>/<desc> origin/main`, then edit via the worktree's ABSOLUTE "
+        "paths and test with `PYTHONPATH=<worktree>/src pytest <files>`. Your "
+        "session stays in the main repo and in /resume.",
+        file=sys.stderr,
+    )
+    print(
+        "  - Parallel isolated work: dispatch a subagent (Agent tool, "
+        'isolation="worktree") — the child runs in its own worktree; your '
+        "session is untouched.",
+        file=sys.stderr,
+    )
+    print(
+        "  - If a worktree-ROOTED session is genuinely wanted, the USER should "
+        "launch Claude Code from that directory, so it is findable there from "
+        "the start.",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def main() -> int:
+    # EnterWorktree is hard-blocked UNCONDITIONALLY: it relocates the session
+    # regardless of arguments or input, so block before any parse that could
+    # otherwise fail-open (empty/missing/malformed CLAUDE_TOOL_INPUT) and let
+    # the relocation through. Input is parsed only to name the worktree in the
+    # message; failure to parse still blocks.
+    if "--enter-worktree" in sys.argv:
+        try:
+            data = json.loads(os.environ.get("CLAUDE_TOOL_INPUT") or "{}")
+        except (json.JSONDecodeError, ValueError):
+            data = {}
+        return _handle_enter_worktree(data)
+
     try:
         raw = os.environ.get("CLAUDE_TOOL_INPUT", "")
         if not raw:

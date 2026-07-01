@@ -178,6 +178,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._router: Router | None = None
         self._reflection_engine: object | None = None
         self._cc_invoker: AgentProvider | None = None
+        self._cc_fallback_probe_worker: object | None = None
         self._session_manager: SessionManager | None = None
         self._checkpoint_manager: CheckpointManager | None = None
         self._cc_reflection_bridge: CCReflectionBridge | None = None
@@ -510,6 +511,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             ("learning_scheduler", self._learning_scheduler),
             ("campaign_runner", self._campaign_runner),
             ("awareness_loop", self._awareness_loop),
+            ("cc_fallback_probe", self._cc_fallback_probe_worker),
         ]:
             if component is None:
                 continue

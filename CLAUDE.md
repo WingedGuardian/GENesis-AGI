@@ -177,6 +177,11 @@ Applies to both CC sessions and Genesis autonomy decisions.
 
 ## Memory System — Layer Model
 
+**Two memory systems:** a **fact, decision, or plan** to store for later →
+*Genesis memory* (`memory_store` MCP, system-wide). Something that must **affect
+behavior during the conversation** → *CC file memory* (`~/.claude/.../memory/`,
+foreground-only). Unsure → ask.
+
 Genesis memory operates in 4 layers. Each has a role — use the lightest layer
 that answers your question before escalating.
 

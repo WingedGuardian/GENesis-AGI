@@ -12,6 +12,7 @@ Extraction scope:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -104,7 +105,7 @@ async def run_extraction_cycle(
     start_line_override: int | None = None,
     session_filter: set[str] | None = None,
     max_extractions_per_session: int = 30,
-    max_procedures_per_session: int = 3,
+    max_procedures_per_session: int = 7,
 ) -> dict:
     """Run one extraction cycle across all eligible sessions.
 
@@ -175,6 +176,7 @@ async def run_extraction_cycle(
         # streams). Without this, a single session can flood the store with
         # hundreds of conf≈0 candidates that never get validated.
         session_procs = 0
+        session_candidates: list[dict] = []  # flag-only chunk signal (C2b)
 
         for chunk in chunks:
             chunk_start = chunk[0].line_number
@@ -242,31 +244,25 @@ async def run_extraction_cycle(
                     session_id, chunk_start, chunk_end, exc_info=True,
                 )
 
-            # Stream 2: procedure candidate extraction (same pattern as
-            # references). Only in normal mode — procedure candidates are
-            # a new extraction type flagged by the SLM, routed to the Judge
-            # LLM for validation. Each Judge call is timeout-guarded.
-            if not reference_only_mode and session_procs < max_procedures_per_session:
+            # Stream 2: procedure candidate flagging (C2b — flag-only). The SLM
+            # flags procedure_candidate extractions; we classify them and
+            # ACCUMULATE them as a session-level signal. No Judge call and no
+            # storage here — the whole-session builder (Stream 1) does the
+            # reconstruction. This fixes the prior priority inversion, where the
+            # chunk path could exhaust the per-session cap before the
+            # higher-fidelity struggle builder ran.
+            if not reference_only_mode:
                 try:
                     from genesis.memory.procedure_extraction import (
                         extract_procedures_from_chunk,
                     )
 
-                    proc_count = await extract_procedures_from_chunk(
-                        result.extractions,
-                        db=db,
-                        router=router,
-                        source_session_id=cc_session_id,
-                        chunk_context=format_chunk_for_extraction(chunk),
-                        max_new=max_procedures_per_session - session_procs,
-                    )
-                    session_procs += proc_count
-                    summary["procedures_extracted"] = (
-                        summary.get("procedures_extracted", 0) + proc_count
+                    session_candidates.extend(
+                        extract_procedures_from_chunk(result.extractions)
                     )
                 except Exception:
                     logger.warning(
-                        "Procedure extraction failed on session %s chunk %d-%d",
+                        "Procedure candidate flagging failed on session %s chunk %d-%d",
                         session_id, chunk_start, chunk_end, exc_info=True,
                     )
 
@@ -437,51 +433,74 @@ async def run_extraction_cycle(
                     keywords=all_keywords, topic=latest_topic,
                 )
 
-            # Stream 1: struggle detection (runs once per session, after all
-            # chunks). Parses the full JSONL into an action spine, scores
-            # struggle heuristics, and routes to Judge if above threshold.
+            # Stream 1: the whole-session procedure BUILDER (runs once per
+            # session, after all chunks). Parses the full JSONL into a user-blind
+            # action spine + a grounding haystack, scores struggle, and runs the
+            # multi-procedure builder when EITHER the struggle score crosses the
+            # threshold OR the chunk path flagged candidates. Returns 0..N
+            # topic-segmented playbooks.
             try:
                 import asyncio
 
                 from genesis.learning.procedural.struggle_detector import (
                     STRUGGLE_THRESHOLD,
-                    build_action_spine,
+                    build_spine_and_haystack,
                     score_struggle,
                 )
 
-                spine = build_action_spine(transcript_path)
+                spine, haystack = build_spine_and_haystack(transcript_path)
                 struggle_score = score_struggle(spine)
+                struggle_triggered = struggle_score >= STRUGGLE_THRESHOLD
                 if (
-                    struggle_score >= STRUGGLE_THRESHOLD
+                    (struggle_triggered or session_candidates)
                     and session_procs < max_procedures_per_session
                 ):
                     from genesis.learning.procedural.judge import (
                         JUDGE_TIMEOUT_SECS,
-                        judge_struggle_procedure,
+                        judge_multi_procedure,
                     )
 
-                    proc_id = await asyncio.wait_for(
-                        judge_struggle_procedure(
-                            db, spine, struggle_score, transcript_path, router,
+                    stored_ids = await asyncio.wait_for(
+                        judge_multi_procedure(
+                            db, spine, haystack, struggle_score, router,
                             source_session_id=cc_session_id,
+                            max_new=max_procedures_per_session - session_procs,
                         ),
                         timeout=JUDGE_TIMEOUT_SECS,
                     )
-                    if proc_id:
+                    session_procs += len(stored_ids)
+                    if stored_ids:
                         summary["struggle_procedures"] = (
-                            summary.get("struggle_procedures", 0) + 1
+                            summary.get("struggle_procedures", 0) + len(stored_ids)
+                        )
+                    # Measure SLM over-flagging: the builder fired on chunk
+                    # candidates alone, with no struggle signal.
+                    if session_candidates and not struggle_triggered:
+                        logger.info(
+                            "Procedure builder fired on candidates-only for %s "
+                            "(%d candidates, score=%.2f): stored=%d",
+                            session_id, len(session_candidates), struggle_score,
+                            len(stored_ids),
                         )
                     logger.info(
-                        "Struggle detection for %s: score=%.2f, stored=%s",
-                        session_id, struggle_score, proc_id is not None,
+                        "Procedure builder for %s: score=%.2f, candidates=%d, stored=%d",
+                        session_id, struggle_score, len(session_candidates),
+                        len(stored_ids),
                     )
             except TimeoutError:
+                # The build was cancelled mid-flight; discard any half-written
+                # store so a partial transaction can't block the shared connection.
+                # (Completed per-procedure stores already auto-committed.)
+                with contextlib.suppress(Exception):
+                    await db.rollback()
                 logger.warning(
-                    "Struggle judge timed out for session %s", session_id,
+                    "Procedure builder timed out for session %s", session_id,
                 )
             except Exception:
+                with contextlib.suppress(Exception):
+                    await db.rollback()
                 logger.warning(
-                    "Struggle detection failed for session %s",
+                    "Procedure builder failed for session %s",
                     session_id, exc_info=True,
                 )
 

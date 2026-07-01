@@ -8,10 +8,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from genesis.learning.procedural import extractor as extractor_mod
+from genesis.learning.procedural import embedding as embedding_mod
+from genesis.learning.procedural.embedding import cosine_similarity
 from genesis.learning.procedural.extractor import (
     NOVELTY_THRESHOLD,
-    _cosine_similarity,
     extract_procedure,
 )
 from genesis.learning.procedural.operations import store_procedure
@@ -19,12 +19,13 @@ from genesis.learning.procedural.operations import store_procedure
 
 @pytest.fixture(autouse=True)
 def _reset_module_state():
-    """Reset module-level singletons between tests so state can't leak."""
-    extractor_mod._EMBEDDING_PROVIDER = None
-    extractor_mod._fail_open_timestamps.clear()
+    """Reset the SHARED procedure-novelty singletons (now in embedding.py)
+    between tests so state can't leak."""
+    embedding_mod._EMBEDDING_PROVIDER = None
+    embedding_mod._fail_open_timestamps.clear()
     yield
-    extractor_mod._EMBEDDING_PROVIDER = None
-    extractor_mod._fail_open_timestamps.clear()
+    embedding_mod._EMBEDDING_PROVIDER = None
+    embedding_mod._fail_open_timestamps.clear()
 
 
 @dataclass
@@ -76,12 +77,12 @@ def _valid_payload(task_type: str = "deploy-service", principle: str = "always v
 
 
 def test_cosine_similarity_basic():
-    assert _cosine_similarity([1.0, 0.0], [1.0, 0.0]) == pytest.approx(1.0)
-    assert _cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
+    assert cosine_similarity([1.0, 0.0], [1.0, 0.0]) == pytest.approx(1.0)
+    assert cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
     # Length mismatch returns 0 (defensive)
-    assert _cosine_similarity([1.0], [1.0, 0.0]) == 0.0
+    assert cosine_similarity([1.0], [1.0, 0.0]) == 0.0
     # Zero vector returns 0
-    assert _cosine_similarity([0.0, 0.0], [1.0, 1.0]) == 0.0
+    assert cosine_similarity([0.0, 0.0], [1.0, 1.0]) == 0.0
 
 
 @pytest.mark.asyncio
@@ -200,7 +201,7 @@ async def test_extract_fails_open_when_embedder_is_none(db):
         router=router,
         embedding_provider=None,
     )
-    # With embedder=None, _get_embedding_provider() is consulted. In test
+    # With embedder=None, embedding.get_embedding_provider() is consulted. In test
     # environments without an embedding backend it returns None and we
     # fail-open. The procedure should store.
     # (Note: if a backend IS available in the test env, this test would still

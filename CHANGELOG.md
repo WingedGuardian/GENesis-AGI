@@ -19,7 +19,35 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   schedule "jitter" (randomized fire times so ticks aren't perfectly periodic). Until now the
   only way to see or steer a campaign was through Genesis directly.
 
+### Changed
+
+- **The procedures Genesis learns are now concrete, replayable playbooks instead of vague
+  summaries.** Previously every learned procedure was written as a "what this teaches: …"
+  summary, and the learner only saw a heavily-truncated view of what happened (each tool's
+  arguments cut to 80 characters), so the real commands, paths, and flags were lost. Now the
+  learner reconstructs the actual step-by-step playbook — with the real commands used — for a
+  specific recurring scenario, and skips things that aren't procedures (general best-practices,
+  engineering patterns, one-off events, broad workflows; those belong in skills/CLAUDE.md). The
+  result is a smaller, higher-signal procedure store.
+
+- **Genesis now learns several distinct playbooks from one session, and stops storing duplicates.**
+  A session that accomplished several different things now yields a separate playbook for each
+  (instead of one muddled procedure), and a genuinely reusable sub-step can be captured on its own.
+  At the same time, before saving a new procedure Genesis checks whether it already knows
+  essentially the same one — even if it would be filed under a different name — and skips the
+  duplicate. Together these keep the procedure store both more complete and less cluttered.
+
 ### Fixed
+
+- **Inbox evaluations no longer cram a whole batch of links into one giant pass — and stop
+  re-evaluating links they've already covered.** When you drop many URLs into an inbox note,
+  Genesis now evaluates them in small groups (≈5 at a time, configurable via
+  `items_per_eval`), each producing its own `…-N.genesis.md` response file, instead of one
+  sprawling evaluation of everything at once. Crucially, once a link has been evaluated it is
+  not re-evaluated when you add new links to the same note — only the genuinely new links are
+  processed (previously an approved evaluation could re-chew the entire file). When the CLI
+  approval gate is on, you approve a drop once and all its groups run under that single
+  approval. Duplicate follow-up items from the same recommendation are now also prevented.
 
 - **Campaign results no longer sit uncaptured until the next scheduled tick.** Previously a
   campaign that ran every couple of days would finish its background session but not record
