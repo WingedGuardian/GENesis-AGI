@@ -51,10 +51,9 @@ async def user_job_create(
     if _scheduler is None:
         return {"error": "User job scheduler not initialized"}
 
-    # Validate inputs before persisting. Use the live profile registry (incl.
-    # campaign/steward/mail/discord-monitor + any install-local overlay
-    # profiles) rather than a stale hardcoded subset — matches
-    # direct_session_tools.py.
+    # Validate inputs before persisting. Use the live profile registry
+    # (VALID_PROFILES, incl. any install-local overlay profiles) rather than a
+    # stale hardcoded subset — matches direct_session_tools.py.
     from genesis.cc.direct_session import VALID_PROFILES
 
     _VALID_MODELS = {"sonnet", "opus", "haiku"}
