@@ -1418,6 +1418,11 @@ class EgoSession:
             # autonomy level. Gate fires BEFORE the atomic claim so blocked
             # proposals stay 'approved' (ego-invisible).
             if self._proposal_gate is not None:
+                # Bind before the try so the except handler can't hit an
+                # UnboundLocalError (or read a stale prior-iteration value) if
+                # get_proposal() itself raises. None => unresolved => the except
+                # treats it as high-risk (fail-closed).
+                prop_row = None
                 try:
                     prop_row = await ego_crud.get_proposal(self._db, proposal_id)
                     if prop_row is None:
@@ -1453,7 +1458,7 @@ class EgoSession:
                     # ones so a transient error can't wedge the ego cycle.
                     from genesis.autonomy.proposal_gate import gate_failure_is_blocking
 
-                    if gate_failure_is_blocking(prop_row):
+                    if prop_row is None or gate_failure_is_blocking(prop_row):
                         logger.error(
                             "Proposal gate failed for execution brief %s — "
                             "BLOCKING dispatch (fail-closed, high-risk domain)",

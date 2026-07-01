@@ -89,6 +89,13 @@ def test_gate_failure_null_execution_plan_does_not_raise():
     assert gate_failure_is_blocking(prop) is True
 
 
+def test_gate_failure_blocks_on_undeterminable_proposal():
+    # A None / malformed proposal (e.g. get_proposal raised, leaving the row
+    # unresolved) is undeterminable -> classify raises -> fail CLOSED. Backs the
+    # `prop_row is None or ...` guard in _process_execution_briefs.
+    assert gate_failure_is_blocking(None) is True
+
+
 async def test_sentinel_blocks_high_risk_and_reports_domain():
     decision = await DenyHighRiskSentinel().evaluate({"action_type": "publish"})
     assert isinstance(decision, DispatchDecision)
