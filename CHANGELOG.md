@@ -63,6 +63,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **`update.sh` no longer hangs if the health watchdog restarts the server mid-update.**
+  During an update Genesis stops its server to swap in new code and migrate the database. The
+  background health watchdog could see it "down" and restart it right then — and the revived
+  server's database lock deadlocked the update's procedure-seeding step, leaving the whole update
+  stuck for as long as ~30 minutes with no error. The watchdog now defers restarts while an update
+  is in progress, and the seeding step is time-bounded so a contended database fails fast instead of
+  hanging silently.
 - **Genesis now keeps your Claude Code CLI at the version it's tested against — automatically.**
   Previously the installer only put Claude Code in place when it was *missing*, so if you already
   had an older Claude Code, bumping the pinned version never actually upgraded you — you'd silently

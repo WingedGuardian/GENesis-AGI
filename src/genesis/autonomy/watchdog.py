@@ -30,6 +30,7 @@ import yaml
 
 from genesis.autonomy.types import WatchdogAction
 from genesis.env import secrets_path as default_secrets_path
+from genesis.env import update_in_progress
 from genesis.util.systemd import systemctl_env
 
 if TYPE_CHECKING:
@@ -200,6 +201,19 @@ class WatchdogChecker:
 
     def _restart_if_allowed(self, state: dict, *, reason: str) -> WatchdogAction:
         """Shared restart logic: backoff → validation → restart or skip."""
+        # Defer restarts while a deploy is running. update.sh intentionally stops
+        # genesis-server for its merge/bootstrap/migrate window; a watchdog revival
+        # there takes the DB write lock and deadlocks bootstrap's seed (incident
+        # IR-2). Return SKIP (not NOTIFY/BACKOFF) BEFORE _record_failure so the
+        # deploy window never trips backoff or the max-restart counter. Note: this
+        # trusts every deploy phase to either self-bound or not deadlock (the seed,
+        # the one proven hang, is separately timeout-bounded in bootstrap.sh).
+        if update_in_progress():
+            logger.info(
+                "Deploy in progress — deferring %s restart until it completes", reason,
+            )
+            return WatchdogAction.SKIP
+
         if state["consecutive_failures"] >= self._max_restarts:
             logger.error(
                 "Max restart attempts (%d) reached — refusing to restart. Manual intervention needed.",

@@ -417,7 +417,11 @@ echo "--- Seeding baseline procedures ---"
 # Non-fatal, but surface a failure instead of swallowing it (a silent miss would
 # leave advisory surfacing untracked with no signal). Capture, then check for the
 # success line rather than relying on the exit code through the pipe.
-SEED_OUT="$("$VENV_DIR/bin/python" "$GENESIS_ROOT/scripts/seed_procedures.py" 2>&1)" || true
+# Defense-in-depth (incident IR-2): bound the seed with `timeout 300`. Seeding
+# normally finishes in seconds; if the DB write lock is ever contended (a mid-
+# deploy server revival deadlocked it, hanging bootstrap ~30 min silently), fail
+# FAST at 5 min — the `|| true` keeps it non-fatal and the WARNING below fires.
+SEED_OUT="$(timeout 300 "$VENV_DIR/bin/python" "$GENESIS_ROOT/scripts/seed_procedures.py" 2>&1)" || true
 echo "$SEED_OUT" | tail -2
 if ! echo "$SEED_OUT" | grep -q "Seeded .* procedures"; then
     echo "  WARNING: baseline procedure seeding did not complete — advisor surfacing tracking may be degraded."
