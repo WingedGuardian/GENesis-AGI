@@ -155,3 +155,21 @@ async def test_sample_empty_window_skips_router_call():
 async def test_sample_malformed_content_returns_none():
     assert await AttentionSampler(_FakeRouter(content="not json at all")).sample(
         [_u("hi", is_user=1)], CFG) is None
+
+
+def test_attention_salience_call_site_is_configured():
+    """The sampler's call-site must exist in the real routing config: free-only (so
+    never_pays keeps a valid chain) and non-Groq (the L1.5 chain deliberately avoids
+    Groq's EOL 8B / JSON-breaking gpt-oss-20b). Picked by the 2026-07-01 bake-off."""
+    from genesis.attention.sampler import CALL_SITE
+    from genesis.env import repo_root
+    from genesis.routing.config import load_config
+
+    cfg = load_config(repo_root() / "config" / "model_routing.yaml", check_api_keys=False)
+    assert CALL_SITE in cfg.call_sites
+    site = cfg.call_sites[CALL_SITE]
+    assert site.never_pays is True
+    assert site.chain
+    for provider in site.chain:
+        assert cfg.providers[provider].is_free            # never_pays needs a free chain
+        assert cfg.providers[provider].provider_type != "groq"  # non-Groq by design
