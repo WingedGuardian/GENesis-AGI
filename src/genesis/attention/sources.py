@@ -9,11 +9,14 @@ import json
 import logging
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+import aiosqlite
+
 from genesis.attention.clarity import frac_below
+from genesis.attention.snapshot import _DEFAULT_DEST as _SNAPSHOTS_DIR
 from genesis.attention.types import AmbientUtterance
 
 logger = logging.getLogger(__name__)
@@ -74,6 +77,57 @@ def row_to_utterance(row: dict) -> AmbientUtterance | None:
         mode_state="unknown",  # ambient_transcripts carries no interaction-plane state
         source=row.get("source") or "",
     )
+
+
+async def resolve_window_text(
+    snapshot_id: str,
+    utt_ids: Sequence[int],
+    *,
+    snapshots_dir: str | Path | None = None,
+) -> list[dict] | None:
+    """Resolve a window's transcript text from the TRANSIENT snapshot, for the reveal UI.
+
+    Reads a transient read-only analysis snapshot — NOT genesis.db — so this raw SQL is
+    intentionally outside the "crud-layer only" rule (that rule guards genesis.db). The
+    firewall keeps transcript text off genesis.db; this returns it live to an authenticated
+    caller and persists nothing.
+
+    Returns the window's utterances (ts-ordered; ``is_trigger`` marks the last ``utt_id``,
+    the utterance the event fired on), or ``None`` if the snapshot file is gone (purged) —
+    the route turns ``None`` into a 410. A purged snapshot is permanent: that labeled event
+    becomes review-read-only. Do NOT add snapshot auto-purge without addressing this."""
+    base = Path(snapshots_dir).expanduser() if snapshots_dir else Path(_SNAPSHOTS_DIR).expanduser()
+    # pull_snapshot() writes ``ambient_{id}.db`` + stores the bare id; tolerate either form.
+    path = next(
+        (p for p in (base / f"ambient_{snapshot_id}.db", base / f"{snapshot_id}.db") if p.exists()),
+        None,
+    )
+    if path is None:
+        return None
+    ids = [int(i) for i in utt_ids]  # reject non-int; keep the IN() list parametrized
+    if not ids:
+        return []
+    trigger_id = ids[-1]
+    placeholders = ",".join("?" for _ in ids)
+    conn = await aiosqlite.connect(f"file:{path}?mode=ro", uri=True)
+    conn.row_factory = aiosqlite.Row
+    try:
+        cur = await conn.execute(
+            f"SELECT id, ts, text, speaker_label, is_user FROM ambient_transcripts "  # noqa: S608
+            f"WHERE id IN ({placeholders}) ORDER BY ts, id",
+            ids,
+        )
+        rows = await cur.fetchall()
+    finally:
+        await conn.close()
+    return [
+        {
+            "id": r["id"], "ts": r["ts"], "text": r["text"],
+            "speaker_label": r["speaker_label"], "is_user": r["is_user"],
+            "is_trigger": r["id"] == trigger_id,
+        }
+        for r in rows
+    ]
 
 
 class SnapshotSource:
