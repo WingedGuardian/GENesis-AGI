@@ -141,6 +141,7 @@ async def update_acceptance_signal(
 # ── aggregates for the cockpit stats panel (all counts — never text) ──────────────
 
 async def activation_stats(db: aiosqlite.Connection) -> dict:
+    """Per-activation event counts (hard / soft / suppressed) — the fire-rate breakdown."""
     cursor = await db.execute(
         "SELECT activation, COUNT(*) AS n FROM attention_events GROUP BY activation"
     )

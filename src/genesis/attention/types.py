@@ -43,7 +43,7 @@ class AmbientUtterance:
     n_tokens: int
     frac_lt_1: float            # fraction of ys_log_probs < -1.0 (ASR-confidence stat)
     rms: float
-    mode_state: str = "unknown"  # "unknown" offline; live interaction-plane booleans at the edge
+    mode_state: str = "unknown"  # edge: space-separated active modes ("listen_active s2s_active global_mute"); "unknown" offline. Suppressors test `<mode> in mode_state.split()`.
     source: str = ""            # connection/device id
 
 
@@ -89,13 +89,19 @@ class AttentionEvent:
 @dataclass
 class EngineState:
     """Rolling engine state, passed explicitly through the fold (NO module-level
-    state — cf. the awareness scorer anti-pattern). Mutated in place and returned;
-    serializable via ``dataclasses.asdict`` for the future edge runner.
+    state — cf. the awareness scorer anti-pattern). Mutated in place and returned.
 
     ``window`` holds recent utterances within the context window (transient, text
-    included — in memory only). ``last_perk_ts`` drives the cooldown; it intentionally
-    persists across sessions (anti-twitch). (PR3 adds ``pending_questions`` for the
-    unanswered-question bounded-lookahead signal — out of the PR1 trigger subset.)
+    included — in memory only, NEVER persisted). ``last_perk_ts`` drives the cooldown;
+    it intentionally persists across sessions (anti-twitch). ``pending_questions`` +
+    ``last_relevance_ts`` (PR3a) carry the unanswered-question look-ahead and the decay
+    clock; both reset per session (unlike ``last_perk_ts``).
+
+    Serialization (for a future edge checkpoint): primitive fields round-trip via
+    ``dataclasses.asdict``, but ``window`` is in-memory only (a ``deque`` is returned
+    as-is, not recursed) and ``pending_questions`` tuples become lists on reload — so an
+    edge checkpoint needs a custom ``serialize()``/``deserialize()`` pair (deferred to the
+    edge runner PR), NOT a bare ``asdict``.
     """
 
     session_id: str | None = None
@@ -103,3 +109,6 @@ class EngineState:
     last_utt_ts: float | None = None
     last_perk_ts: float | None = None
     window: deque = field(default_factory=deque)
+    # ── PR3a: forward-only look-ahead + decay clock (both reset per session) ──
+    pending_questions: list[tuple[int, float]] = field(default_factory=list)  # (utt_id, ts) of un-replied "?"
+    last_relevance_ts: float | None = None   # ts of the last utt carrying ANY soft relevance (the decay clock)

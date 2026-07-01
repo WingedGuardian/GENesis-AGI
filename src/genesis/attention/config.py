@@ -28,6 +28,11 @@ class StateModifiers:
     cooldown_s: float = 30.0               # refractory window after a perk
     cooldown_raise: float = 0.2            # threshold ADD while in cooldown (anti-twitch)
     unanswered_question_s: float = 5.0     # a "?" with no reply within this -> a soft signal
+    # ── PR3a: decay + suppressor dials ──
+    decay_window_s: float = 30.0           # in-session stickiness fully decays to the floor by this off-topic gap (§9: 5-30s)
+    decay_floor_mult: float = 1.0          # stickiness decays TOWARD this — removes the bonus, never a below-baseline penalty
+    low_asr_frac_lt_1: float = 0.35        # frac_lt_1 >= this -> low_asr_confidence suppressor (OFF by default; capture_clarity already dampens by 1-frac_lt_1)
+    lexical_repetition_min_tokens: int = 3  # a "repeat" needs >= this many shared CONTENT tokens (guards stopword noise)
 
 
 @dataclass(frozen=True)
@@ -89,11 +94,11 @@ DEFAULT_CONFIG_PATH = "~/.genesis/config/attention_config.json"
 def default_config_dict() -> dict:
     """A complete generic STARTER config for the first shadow pass. ``domain_keywords``
     is a coarse tech-talk starter; ``known_entities`` is empty (a generator fills it
-    from ``user_contacts`` later). ``emotional_patterns`` and the extra lexical banks
-    are present but only CONSUMED from PR3 onward — the PR1 trigger subset uses
-    question/help_seeking/multi_speaker/is_user/domain_keyword/known_entity +
-    ambient_name/explicit_invite + explicit_dismissal. All weights/thresholds are the
-    calibration surface the shadow review tunes."""
+    from ``user_contacts`` later). PR3a wires the full §4 soft taxonomy (all lexical +
+    emotional banks) + conversational-dynamics; ``sensitive_topics`` ships empty (inert
+    until a config author fills it) and the ``low_asr_confidence`` / ``mode_*`` suppressors
+    are REGISTERED but OFF by default (not in ``suppressors_enabled``). All weights/
+    thresholds are the calibration surface the shadow review tunes."""
     return {
         "version": "0.1.0-default",
         "aliases": ["genesis"],
@@ -137,8 +142,16 @@ def default_config_dict() -> dict:
         "weights": {
             "question": 0.30, "help_seeking": 0.35, "multi_speaker": 0.40,
             "is_user": 0.10, "domain_keyword": 0.30, "known_entity": 0.25,
+            # PR3a — §4 taxonomy completion (SEED weights; PR3c re-tunes against labels).
+            # multi_speaker stays 0.40 — DILUTED by these new signals, NOT down-weighted here.
+            "decision": 0.30, "task_reminder": 0.35, "temporal_deadline": 0.25,
+            "quantity_money": 0.25, "recall_cue": 0.35, "dispute": 0.30,
+            "emotional": 0.20, "topic_continuation": 0.15, "lexical_repetition": 0.20,
+            "unanswered_question": 0.30,
         },
         "state_modifiers": {},   # all StateModifiers defaults
         "thresholds": {},        # all Thresholds defaults (soft_perk 0.6, l15_graduation 0.4)
-        "suppressors_enabled": ["explicit_dismissal"],
+        # low_asr_confidence + mode_* are registered but deliberately NOT enabled by default
+        # (double-count with capture_clarity / inert offline). sensitive_topic is on but empty.
+        "suppressors_enabled": ["explicit_dismissal", "sensitive_topic"],
     }
