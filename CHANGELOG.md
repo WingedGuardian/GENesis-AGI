@@ -55,6 +55,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Genesis no longer mistakes your status updates for its own failures.** When you tell Genesis
+  how your own projects, plans, or deadlines are going ("the offer fell through", "I didn't attend
+  the conference", "let's keep going on the paper — it's never too late"), it sometimes scored the
+  whole interaction as its own "approach failure" — which could trigger a spurious learned rule in
+  STEERING.md and dock the autonomy it had earned. Genesis now judges an interaction only by the
+  concrete tasks it actually attempted that turn, so sharing context, expressing a future intent, or
+  getting a clarifying question back before it acts is correctly treated as success. Genuine
+  shortfalls on tasks it did attempt — including when they're mixed into the same message as a status
+  update — are still caught.
+
 - **Inbox notes that change without adding anything new no longer get re-scanned over and over.**
   Editing an inbox note in a way that changes its bytes but not its actual content — re-pasting a
   link with different tracking/share parameters, reordering lines, tweaking whitespace — used to

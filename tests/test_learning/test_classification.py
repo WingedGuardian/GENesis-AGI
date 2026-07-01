@@ -184,6 +184,36 @@ class TestOutcomeClassifier:
         assert "Goal Validation" in prompt
         assert "goals_failed" in prompt
 
+    @pytest.mark.asyncio
+    async def test_prompt_scopes_goals_to_attempted_tasks(self):
+        """IR-1b: a goal counts only if Genesis ATTEMPTED it this turn.
+
+        The 2026-06-30 incident: a Telegram status-update ("Autonomize is dead…
+        but we should continue… its never too late") was mislabeled
+        approach_failure because the classifier scored the user's external
+        statuses and forward-looking intent as failed goals, which fired the
+        STEERING auto-write and a false autonomy correction. The prompt must
+        scope "goal" to concrete tasks Genesis attempted, and treat status /
+        forward-intent / clarifying-question turns as success. Behavioral proof
+        is the live router spike; this guards the prompt text from regressing.
+        """
+        router = _mock_router(json.dumps({"outcome": "success"}))
+        c = OutcomeClassifier(router)
+        await c.classify(_make_summary())
+        prompt = router.route_call.call_args[0][1][0]["content"].lower()
+        # Case-insensitive, short stable tokens so minor rewordings don't silently
+        # gut the guard (review #2): concept must survive, exact phrasing may drift.
+        # A goal is only failed if it was attempted this turn.
+        assert "attempted" in prompt
+        # External statuses and forward intents are excluded from goals.
+        assert "external project" in prompt
+        assert "forward" in prompt and "intent" in prompt
+        # Asking before acting is success, not failure.
+        assert "clarifying question" in prompt
+        # Contrastive worked examples anchor the boundary (status vs real partial).
+        assert "ex-a" in prompt
+        assert "ex-b" in prompt
+
 
 # ─── DeltaAssessor ───────────────────────────────────────────────────────────
 
