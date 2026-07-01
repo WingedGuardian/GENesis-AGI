@@ -61,6 +61,21 @@ def test_parse_non_numeric_returns_none():
     assert _parse_verdict('{"real": "high", "perk": 0.3}') is None
 
 
+def test_parse_boolean_values_return_none():
+    # bool subclasses int -> float(True)==1.0 would sneak a false verdict past the parser.
+    assert _parse_verdict('{"real": true, "perk": false}') is None
+
+
+def test_parse_object_then_prose_with_brace():
+    # brace-depth scan must stop at the object's close, not extend to a later stray "}".
+    assert _parse_verdict('{"real": 0.8, "perk": 0.3} (all set})') == {"real": 0.8, "perk": 0.3}
+
+
+def test_parse_object_with_nested_extra_field():
+    # a nested extra field must not break extraction; real/perk still read, extra ignored.
+    assert _parse_verdict('{"real": 0.8, "perk": 0.3, "meta": {"k": 1}}') == {"real": 0.8, "perk": 0.3}
+
+
 def test_parse_non_dict_json_returns_none():
     assert _parse_verdict('[0.8, 0.3]') is None
 

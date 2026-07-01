@@ -99,23 +99,43 @@ def _build_prompt(window: list[AmbientUtterance]) -> str:
     )
 
 
+def _first_json_object(text: str) -> str | None:
+    """The first brace-balanced ``{...}`` span. A bare ``find``/``rfind`` mis-slices two
+    plausible model outputs — an object followed by prose that contains a ``}``, and an
+    object with a nested value — so we scan brace depth instead. (Braces inside string
+    values aren't tracked; irrelevant for a numeric ``{real, perk}`` object, and a miscount
+    just fails to parse — fail-closed.)"""
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
 def _parse_verdict(content: str | None) -> dict | None:
     """Fail-closed parse of a ``{real, perk}`` object from model output.
 
-    Strip a code fence -> take the first ``{...}`` span -> ``json.loads`` -> require BOTH
-    keys, coerce to float, reject non-finite (NaN/inf), clamp to ``[0, 1]``. Any miss ->
-    ``None`` (never raises)."""
+    Strip a code fence -> take the first brace-balanced ``{...}`` -> ``json.loads`` ->
+    require BOTH keys, reject booleans (``bool`` subclasses ``int``), coerce to float,
+    reject non-finite (NaN/inf), clamp to ``[0, 1]``. Any miss -> ``None`` (never raises)."""
     if not content:
         return None
     text = content.strip()
     fenced = _FENCE_RE.search(text)
     if fenced:
         text = fenced.group(1).strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1 or end < start:
+    span = _first_json_object(text)
+    if span is None:
         return None
     try:
-        obj = json.loads(text[start : end + 1])
+        obj = json.loads(span)
     except (json.JSONDecodeError, ValueError):
         return None
     if not isinstance(obj, dict):
@@ -124,8 +144,11 @@ def _parse_verdict(content: str | None) -> dict | None:
     for key in ("real", "perk"):
         if key not in obj:
             return None
+        raw = obj[key]
+        if isinstance(raw, bool):  # bool subclasses int; float(True)==1.0 would slip past
+            return None
         try:
-            value = float(obj[key])
+            value = float(raw)
         except (TypeError, ValueError):
             return None
         if not math.isfinite(value):  # rejects NaN / inf that json.loads happily parses
