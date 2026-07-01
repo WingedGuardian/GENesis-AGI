@@ -39,6 +39,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Inbox notes that change without adding anything new no longer get re-scanned over and over.**
+  Editing an inbox note in a way that changes its bytes but not its actual content — re-pasting a
+  link with different tracking/share parameters, reordering lines, tweaking whitespace — used to
+  leave the note looking "modified" on every scan, which (while a link approval was pending) could
+  repeatedly cancel and recreate that approval. Genesis now recognizes there's no new content and
+  marks the note current in a single scan, so it settles instead of churning.
+
 - **Inbox evaluations no longer cram a whole batch of links into one giant pass — and stop
   re-evaluating links they've already covered.** When you drop many URLs into an inbox note,
   Genesis now evaluates them in small groups (≈5 at a time, configurable via

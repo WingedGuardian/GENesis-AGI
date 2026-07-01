@@ -152,9 +152,17 @@ async def get_all_known(
     """
     from pathlib import Path
 
+    # ORDER BY created_at ASC, rowid ASC so the per-file dict-overwrite loop
+    # below deterministically keeps the NEWEST row's hash. A file has many rows
+    # (one per batch, plus reused rows), and `reuse_as_pending` resets created_at
+    # to now while KEEPING the old (low) rowid — so insertion/rowid order is NOT
+    # recency. Without this ORDER BY an arbitrary (stale) row's hash could win,
+    # so the file's current hash never matches "known" → phantom "modified"
+    # every scan (the detection storm).
     cursor = await db.execute(
         "SELECT file_path, content_hash, status, response_path, retry_count "
-        "FROM inbox_items WHERE status != 'failed'",
+        "FROM inbox_items WHERE status != 'failed' "
+        "ORDER BY created_at ASC, rowid ASC",
     )
     rows = await cursor.fetchall()
     result: dict[str, str] = {}
@@ -170,7 +178,8 @@ async def get_all_known(
     # Permanently failed items (exhausted retries) should also block reprocessing
     cursor2 = await db.execute(
         "SELECT file_path, content_hash FROM inbox_items "
-        "WHERE status = 'failed' AND retry_count >= ?",
+        "WHERE status = 'failed' AND retry_count >= ? "
+        "ORDER BY created_at ASC, rowid ASC",
         (max_retries,),
     )
     for row in await cursor2.fetchall():

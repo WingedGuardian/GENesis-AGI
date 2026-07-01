@@ -777,28 +777,49 @@ class InboxMonitor:
                     created_at=now_iso,
                 )
                 continue
-            last_at = await inbox_items.get_last_completed_at(
+            # Compute the delta BEFORE the cooldown check. Cooldown must gate
+            # only GENUINELY-new content; an empty delta (file bytes changed but
+            # no new content vs the baseline — e.g. a re-pasted URL with
+            # different tracking params, or a whitespace/reorder edit) must
+            # ALWAYS advance the known hash, even inside the cooldown window, so
+            # the file is not re-detected as "modified" on every scan (the
+            # detection storm — a stale known hash never caught up because the
+            # cooldown branch used to `continue` before writing any row).
+            prev_content = await inbox_items.get_evaluated_content(
                 self._db, str(f),
             )
-            if last_at:
-                last_dt = parse_utc_iso(last_at)
-                if last_dt is None:
-                    logger.warning(
-                        "Cooldown check: unparseable last-eval timestamp "
-                        "%r for %s; proceeding with evaluation", last_at, f,
-                    )
-                elif now - last_dt < cooldown:
-                    # Defer WITHOUT consuming. Do NOT write a 'completed' row
-                    # here: that would advance the known content hash and the
-                    # modification would never be re-detected, stranding the
-                    # new content until the next edit. Skipping leaves the file
-                    # detectable, so the next check past the cooldown window
-                    # re-detects and evaluates it.
-                    logger.debug(
-                        "Cooldown: deferring %s (last eval %s ago)",
-                        f, now - last_dt,
-                    )
-                    continue
+            if prev_content:
+                delta = _compute_new_content(prev_content, content)
+                is_empty_delta = not delta.strip()
+                eval_content = delta
+            else:
+                is_empty_delta = False
+                eval_content = content
+            # Cooldown gates ONLY genuinely-new content (non-empty delta).
+            if not is_empty_delta:
+                last_at = await inbox_items.get_last_completed_at(
+                    self._db, str(f),
+                )
+                if last_at:
+                    last_dt = parse_utc_iso(last_at)
+                    if last_dt is None:
+                        logger.warning(
+                            "Cooldown check: unparseable last-eval timestamp "
+                            "%r for %s; proceeding with evaluation", last_at, f,
+                        )
+                    elif now - last_dt < cooldown:
+                        # Defer WITHOUT writing a row: the new content must stay
+                        # detectable so the next scan past the cooldown window
+                        # re-detects and evaluates it (do not strand it).
+                        logger.debug(
+                            "Cooldown: deferring %s (last eval %s ago)",
+                            f, now - last_dt,
+                        )
+                        continue
+            # Past the gate (or empty delta): supersede a stale pending drop so
+            # a fresh modification replaces an undispatched one — and an orphaned
+            # pending row from an interrupted scan is cleaned up (shared across
+            # both the empty-delta and new-content paths).
             existing = await inbox_items.get_by_file_path(self._db, str(f))
             if existing and existing["status"] == "pending":
                 await inbox_items.update_status(
@@ -806,28 +827,21 @@ class InboxMonitor:
                     status="failed",
                     error_message="superseded_by_modification",
                 )
-            prev_content = await inbox_items.get_evaluated_content(
-                self._db, str(f),
-            )
-            if prev_content:
-                delta = _compute_new_content(prev_content, content)
-                if not delta.strip():
-                    logger.debug(
-                        "No new content in modified file: %s", f,
-                    )
-                    await inbox_items.create(
-                        self._db,
-                        id=item_id,
-                        file_path=str(f),
-                        content_hash=h,
-                        status="completed",
-                        created_at=now_iso,
-                    )
-                    continue
-                eval_content = delta
-            else:
-                eval_content = content
-            # Segment the delta into per-batch rows under one drop.
+            if is_empty_delta:
+                # No new content vs the baseline: write a completing row to
+                # ADVANCE the known hash (no evaluation). This runs regardless
+                # of cooldown — it is the storm fix.
+                logger.debug("No new content in modified file: %s", f)
+                await inbox_items.create(
+                    self._db,
+                    id=item_id,
+                    file_path=str(f),
+                    content_hash=h,
+                    status="completed",
+                    created_at=now_iso,
+                )
+                continue
+            # Genuinely new content -> segment the delta into per-batch rows.
             await self._queue_drop(
                 str(f), eval_content, h, now_iso, pending_items,
             )
