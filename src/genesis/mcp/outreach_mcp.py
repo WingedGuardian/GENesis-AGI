@@ -226,15 +226,6 @@ async def outreach_poll(
     question = gated[0].text
     answers = [g.text for g in gated[1:]]
 
-    # WS5 Discord capability SHADOW-gate: observe (never hold) this autonomous poll —
-    # record what a capability gate WOULD decide. Read-only + best-effort (guards a None
-    # _db in standalone mode); never blocks the post.
-    from genesis.autonomy.shadow_gate import observe_discord_send
-
-    await observe_discord_send(
-        _db, path="poll", verb="poll", risk_class="bulk", target=channel, content=question,
-    )
-
     url = f"{webhook_url}?wait=true"
     payload = {
         "poll": {
@@ -254,6 +245,16 @@ async def outreach_poll(
             data = resp.json()
             msg_id = data.get("id", "")
         logger.info("Discord poll created via %s (msg_id=%s)", channel, msg_id)
+
+        # WS5 Discord capability SHADOW-gate: observe (never hold) this poll AFTER it's
+        # posted, so the post is never delayed by the shadow write. Best-effort, read-
+        # only (guards a None _db in standalone mode).
+        from genesis.autonomy.shadow_gate import observe_discord_send
+
+        await observe_discord_send(
+            _db, path="poll", verb="poll", risk_class="bulk",
+            target=channel, content=question,
+        )
 
         # ── Record to outreach_history for dedup + campaign visibility ──
         if _db is not None:

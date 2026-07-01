@@ -9,16 +9,22 @@ that references a Discord/webhook/public-social endpoint must be on the ALLOWLIS
 added anywhere else fails the check — forcing it through the capability gate (or an
 explicit, reasoned allowlist entry) instead of silently shipping a bypass.
 
-SCOPE (deliberately precise, not a generic ``.post(`` scan — there are ~dozens of
-legitimate compute/read POSTs: embeddings, search, TTS, crawl, IPC):
-  * HTTP egress to Discord (REST API + webhooks) and public-social APIs (Twitter/X,
-    Slack). You cannot POST to these without referencing their endpoint/webhook-env
-    string somewhere — that reference is what this guard flags.
-OUT OF SCOPE (documented, handled elsewhere):
-  * Browser-based publishing (e.g. Medium via Playwright) — a different egress
-    modality; a browser-egress guard lands with that channel's gating stage.
-  * Owner-private notification channels (email-to-owner, Telegram-to-owner) — the
-    owner IS the recipient; these are not external-world posting.
+WHAT IT FLAGS (deliberately precise — NOT a generic ``.post(`` scan; there are ~dozens
+of legitimate compute/read POSTs: embeddings, search, TTS, crawl, IPC):
+  * Any source file that REFERENCES a Discord REST/webhook or public-social (Twitter/X,
+    Slack) endpoint or webhook env var (see PATTERNS). A new external door cannot reach
+    these services without such a reference at its endpoint lookup, so it trips here.
+WHAT IT DOES NOT SEE (by design — this is a reference tripwire, not a taint analysis):
+  * A ``.post(pre_built_url)`` whose URL arrives as a variable with no literal endpoint
+    token on the call line — e.g. ``channels/discord_adapter.py`` posts to a webhook URL
+    it RECEIVES from ``runtime/init/outreach.py``. The guard covers that URL's ORIGIN
+    (the DISCORD_WEBHOOK reference in outreach.py, allow-listed) — which is exactly what
+    a new door must add — rather than the generic POST site itself.
+OUT OF SCOPE (handled elsewhere):
+  * Browser-based publishing (e.g. Medium via Playwright) — a different egress modality;
+    a browser-egress guard lands with that channel's gating stage.
+  * Owner-private notification channels (email-to-owner, Telegram-to-owner) — the owner
+    IS the recipient; these are not external-world posting.
 
 Usage:  python scripts/check_external_io.py   (exit 0 = clean, 1 = violation)
 """

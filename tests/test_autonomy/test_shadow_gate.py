@@ -93,17 +93,19 @@ async def test_readonly_never_creates_or_mutates_cell(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_content_preview_truncated_hash_over_full(tmp_path):
-    from genesis.outreach.governance import content_hash
+async def test_content_preview_bounded_hash_over_full_content(tmp_path):
+    import hashlib
 
     db = await _db(tmp_path / "g.db")
-    long = "z" * 500
+    long = "z" * 300 + "TAIL"  # content that differs BEYOND the 200-char preview span
     await shadow_gate.observe_discord_send(
         db, path="deliver", verb="send", risk_class="bulk", target="t", content=long,
     )
     r = (await capability_shadow.list_recent(db))[0]
-    assert len(r["content_preview"]) == 200          # excerpt bounded
-    assert r["content_hash"] == content_hash(long)   # hash over FULL content, not the excerpt
+    assert len(r["content_preview"]) == 200                                  # excerpt bounded
+    assert r["content_hash"] == hashlib.sha256(long.encode()).hexdigest()    # FULL content
+    # Genuinely full — NOT the first-200-chars span (which would collide with the preview).
+    assert r["content_hash"] != hashlib.sha256(long[:200].encode()).hexdigest()
     await db.close()
 
 

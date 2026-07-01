@@ -225,19 +225,6 @@ async def send_reply(
     except RuntimeError as exc:
         return json.dumps({"error": str(exc)})
 
-    # WS5 Discord capability SHADOW-gate: observe (never hold) this reply — record what
-    # a capability gate WOULD decide. Read-only + best-effort; _db is None if the shadow
-    # DB is unavailable. Wrapped so a shadow/import problem can NEVER break the reply.
-    try:
-        from genesis.autonomy.shadow_gate import observe_discord_send
-
-        await observe_discord_send(
-            _db, path="reply", verb="reply", risk_class="standard",
-            target=channel_id, content=content,
-        )
-    except Exception:  # noqa: BLE001 — the reply path must never fail on shadow
-        logger.debug("send_reply capability shadow observe failed", exc_info=True)
-
     chunks = _chunk_text(content)
     sent_ids: list[str] = []
 
@@ -275,6 +262,20 @@ async def send_reply(
 
             msg_data = resp.json()
             sent_ids.append(msg_data.get("id", ""))
+
+    # WS5 Discord capability SHADOW-gate: observe (never hold) this reply AFTER it is
+    # fully sent, so the reply is NEVER delayed by the shadow write. Best-effort; _db is
+    # None if the shadow DB is unavailable. Wrapped so a shadow/import problem can never
+    # break the reply.
+    try:
+        from genesis.autonomy.shadow_gate import observe_discord_send
+
+        await observe_discord_send(
+            _db, path="reply", verb="reply", risk_class="standard",
+            target=channel_id, content=content,
+        )
+    except Exception:  # noqa: BLE001 — the reply path must never fail on shadow
+        logger.debug("send_reply capability shadow observe failed", exc_info=True)
 
     result_text = (
         f"sent (id: {sent_ids[0]})"

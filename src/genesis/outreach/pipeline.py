@@ -536,18 +536,6 @@ class OutreachPipeline:
             if egress.fixes_applied:
                 formatted = replace(formatted, text=egress.text)
 
-        # WS5 Discord capability SHADOW-gate: observe (never hold) autonomous Discord
-        # sends — record what a capability gate WOULD decide. Read-only + best-effort;
-        # never blocks the send. The gate_cleared resume path is below-the-gate, so it
-        # is not observed (mirrors the email gate's gate_cleared skip above).
-        if channel == "discord" and not gate_cleared:
-            from genesis.autonomy.shadow_gate import observe_discord_send
-
-            await observe_discord_send(
-                self._db, path="deliver", verb="send", risk_class="bulk",
-                target=str(delivery_recipient), content=formatted.text,
-            )
-
         try:
             delivery_id = await adapter.send_message(
                 delivery_recipient, formatted.text,
@@ -597,6 +585,19 @@ class OutreachPipeline:
                 content_hash=content_hash(request.context),
             )
             await outreach_crud.record_delivery(self._db, outreach_id, delivered_at=now)
+
+            # WS5 Discord capability SHADOW-gate: observe (never hold) autonomous Discord
+            # sends AFTER the post is already out, so the community-facing send is NEVER
+            # delayed by the shadow write (any WAL contention only defers the internal
+            # record). Records what a capability gate WOULD decide. Best-effort + read-
+            # only; the gate_cleared resume path is below-the-gate → not observed.
+            if channel == "discord" and not gate_cleared:
+                from genesis.autonomy.shadow_gate import observe_discord_send
+
+                await observe_discord_send(
+                    self._db, path="deliver", verb="send", risk_class="bulk",
+                    target=str(delivery_recipient), content=formatted.text,
+                )
 
             # WS-8 PR-D: log autonomous (GRANTED-cell) email sends for owner
             # visibility (Activity tab), the flag-as-bad correction, and the

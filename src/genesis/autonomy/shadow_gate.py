@@ -16,6 +16,7 @@ Coverage (the three live Discord doors — enumerated, exhaustive):
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -46,8 +47,6 @@ async def observe_discord_send(
     if db is None:
         return False
     try:
-        from genesis.outreach.governance import content_hash
-
         cell = await cg.get_cell(db, _DOMAIN, verb, risk_class)
         # None => the cell has never been created => not_determined => would hold.
         state = cell["state"] if cell else None
@@ -66,7 +65,10 @@ async def observe_discord_send(
             would_hold=would_hold,
             target=target,
             content_preview=text[:_PREVIEW_MAX],
-            content_hash=content_hash(text),
+            # Hash the FULL content — a genuine fingerprint for dedup/analysis, distinct
+            # from the bounded content_preview (first N chars). NOT governance.content_hash,
+            # which truncates to 200 chars (would collide with the preview span).
+            content_hash=hashlib.sha256(text.encode()).hexdigest(),
         )
     except Exception:  # noqa: BLE001 — shadow is best-effort; NEVER break the real send
         logger.debug("capability shadow observe failed (best-effort)", exc_info=True)
