@@ -19,7 +19,7 @@ from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.autonomy.dispatch_gate import check_dispatch_preconditions
 from genesis.autonomy.types import ActionClass, ApprovalDecision, AutonomyCategory
 from genesis.awareness.types import Depth
-from genesis.cc.contingency import RATE_LIMIT_DEFERRAL_TTL_S
+from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.cc.reflection_bridge._output import (
     route_deep_output,
     send_to_topic,
