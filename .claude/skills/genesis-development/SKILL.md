@@ -195,6 +195,14 @@ Verify before any commit:
 - `git status --short` — check untracked files (should be staged or ignored)
 - Review level applied matches the adaptive protocol above
 - Staged files do not include secrets (`secrets.env`, `.env`, credentials)
+- **Private-data scan before every push (public repo).** Grep the ENTIRE diff
+  (`git diff origin/main...HEAD`) for private/identifying data — real names,
+  company/product names, emails, IPs, private career/project specifics, verbatim
+  user messages. Check ALL surfaces, not just prose: **source comments,
+  docstrings, and test fixtures/data** are the easy misses. Use a synthetic
+  stand-in in tests, never the real private artifact. (2026-07-01: a verbatim
+  private DM leaked via a test docstring + a code comment after the commit
+  message and PR body were already clean.)
 - GROUNDWORK-tagged code not accidentally deleted
 - New capabilities registered in `_capabilities.py` + bootstrap manifest
 - **Conventional commit prefixes**: `feat:`, `fix:`, `refactor:`, `docs:`,
@@ -221,6 +229,13 @@ Verify before any commit:
 5. **Override**: Append `# review-override` to the merge command to
    bypass the gate (e.g., `gh pr merge 123 --squash --admin  # review-override`).
    The override is logged. Use only when findings are intentionally accepted.
+6. **Read the PR's warning comments before merging — not just the hard gate.**
+   Beyond Codex, a structural-review bot posts under the repo-owner account
+   (`WingedGuardian`, review state COMMENTED) and emits **SOFT WARNINGs** (PII /
+   private-text / wording) that the hook does NOT block on and that a naive
+   `.comments` scan misses. Check BOTH `gh pr view N --json reviews,comments`
+   and `gh api repos/<owner>/<repo>/pulls/N/comments`, and address each soft
+   warning or consciously accept it. Never merge past an unread warning.
 
 ## Reference Router
 
