@@ -98,6 +98,10 @@ class CCFallbackProbeWorker:
             effort=EffortLevel.LOW,
             bare=True,
             roster_eligible=False,
+            # Fail fast: a liveness probe must NOT inherit the 2h default and
+            # block the fallback scheduler. 300s (not 60s) leaves headroom for
+            # cross-machine latency while still bounding a hung probe.
+            timeout_s=300,
             **overrides,
         )
         try:

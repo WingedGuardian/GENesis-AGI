@@ -371,6 +371,30 @@ class TestSteeringRuleExtraction:
         await pipeline(FakeCCOutput(), "don't ever do that", "telegram")
         loader.add_steering_rule.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_incident_message_does_not_write_steering(self, db):
+        """2026-06-30 incident regression: a mislabeled chatty status update must
+        NOT become a steering rule even on APPROACH_FAILURE via telegram."""
+        loader = MagicMock()
+        ow = MagicMock()
+        ow.write = AsyncMock(return_value="obs-1")
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(OutcomeClass.APPROACH_FAILURE),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=ow,
+            identity_loader=loader,
+        )
+        incident = (
+            "Yeah sorry for the delays on all that. Autonomize is dead, forget "
+            "about it. The agent challenge went well, no need to do anything "
+            "there. I didn't attend the conference. And no arxiv didn't go in, "
+            "but we should continue on the paper--its never too late"
+        )
+        await pipeline(FakeCCOutput(), incident, "telegram")
+        loader.add_steering_rule.assert_not_called()
+
 
 class TestSuccessExtractionChannelGate:
     """SUCCESS-path procedure extraction must only fire on autonomous channels.

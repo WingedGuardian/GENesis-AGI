@@ -39,6 +39,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A casual message can no longer be mistaken for a permanent "hard rule" — and your
+  steering-rules file keeps its structure.** Genesis auto-adds a steering rule only when you
+  actually give it a terse directive ("stop doing X", "never do Y"); an ordinary status update
+  or chatty reply is no longer captured verbatim as a hard constraint, even if Genesis misread
+  the moment. And when a rule is added, the section headings and layout of your `STEERING.md`
+  are preserved instead of being flattened into one run-on list.
+
+- **Conversations can take as long as the work genuinely needs, and no longer time out twice in
+  a row.** The time budget for a Claude Code turn was a too-short 10 minutes, so substantial work
+  started in chat could be cut off mid-task; it is now 2 hours, and a turn that does hit the limit
+  no longer silently retries from scratch (which previously doubled the wait before giving up).
+  Genesis is also guided to break large jobs into steps and hand genuinely long work to a
+  background session it reports back on, rather than leaving you waiting in silence.
+
 - **Inbox evaluations no longer cram a whole batch of links into one giant pass — and stop
   re-evaluating links they've already covered.** When you drop many URLs into an inbox note,
   Genesis now evaluates them in small groups (≈5 at a time, configurable via

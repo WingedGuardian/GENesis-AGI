@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -27,6 +28,50 @@ logger = logging.getLogger(__name__)
 # (e.g., aggressive SUCCESS-path procedure extraction) and to gate behaviors
 # that should fire only on foreground activity (e.g., STEERING.md auto-update).
 _AUTONOMOUS_CHANNELS = {"inbox", "mail", "reflection", "surplus"}
+
+
+# A STEERING.md rule must READ as a terse imperative directive addressed to
+# Genesis — not a chatty, multi-sentence status update. This guard is why the
+# 2026-06-30 incident ("Yeah sorry for the delays… Autonomize is dead… its
+# never too late") could NOT be written as a "hard constraint" even though the
+# outcome classifier mislabeled it approach_failure. It is DEFENSE-IN-DEPTH: the
+# root fix is the outcome classifier, but this makes a mis-classification unable
+# to corrupt an identity file on its own. Fail-CLOSED by design — missing a real
+# correction is cheap (BIS still captures it; the user can restate directively),
+# writing a non-directive as a hard constraint is the failure we prevent.
+_DIRECTIVE_START = re.compile(
+    r"^(never|don'?t|do not|stop|always|must not|"
+    r"please\s+(?:don'?t|do not|never|stop|always)|"
+    r"you\s+(?:must|should|shouldn'?t|need to|can'?t|cannot|never|always))\b",
+    re.IGNORECASE,
+)
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_MAX_DIRECTIVE_WORDS = 30
+
+
+def _looks_like_directive(user_text: str) -> bool:
+    """True if *user_text* reads as a terse imperative directive to Genesis.
+
+    Three layers, all must pass: (1) at most two sentences, (2) at most
+    ``_MAX_DIRECTIVE_WORDS`` words, (3) opens with an imperative verb or an
+    explicit "you must/should…" addressed to Genesis. Fail-CLOSED: anything
+    that is not clearly a directive is rejected.
+
+    Note: the sentence split treats an abbreviation's period (``e.g.``, ``U.S.``)
+    as a sentence terminator, so a terse directive containing one is rejected.
+    This is intentional — fail-closed prefers dropping a legit directive (the
+    user can restate it, and BIS still captures the raw correction) over risking
+    a chatty message becoming a hard constraint.
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return False
+    sentences = [s for s in _SENTENCE_SPLIT.split(text) if s.strip()]
+    if len(sentences) > 2:
+        return False
+    if len(text.split()) > _MAX_DIRECTIVE_WORDS:
+        return False
+    return bool(_DIRECTIVE_START.match(text))
 
 
 def build_triage_pipeline(
@@ -227,31 +272,24 @@ def build_triage_pipeline(
     def _extract_steering_rule(
         summary: Any, loader: Any,
     ) -> None:
-        """Extract a steering rule from user correction and add to STEERING.md.
+        """Extract a steering rule from a user correction and add to STEERING.md.
 
-        Only fires on approach_failure — user explicitly corrected Genesis.
-        Looks for strong negative signals ("never", "don't", "stop", "wrong").
+        Fires only on approach_failure (gated upstream). A rule is written ONLY
+        if the user's text reads as a terse imperative directive addressed to
+        Genesis — see :func:`_looks_like_directive`. This defends against a
+        mis-classified chatty status update becoming a "hard constraint" (the
+        2026-06-30 incident, where a benign Telegram DM containing "its never
+        too late" was captured verbatim as a rule).
 
         Note: add_steering_rule() does synchronous file I/O (read + write
-        STEERING.md).  Acceptable because the file is tiny (<2KB) and local,
-        and this runs in a fire-and-forget background task.
+        STEERING.md). Acceptable because the file is tiny (<2KB) and local, and
+        this runs in a fire-and-forget background task.
         """
-        import re
-
-        user_text = summary.user_text or ""
-        # Only auto-add rules from strong negative feedback patterns
-        strong_negative = re.search(
-            r"\b(never|don'?t|stop|wrong|shouldn'?t|must not|do not)\b",
-            user_text,
-            re.IGNORECASE,
-        )
-        if not strong_negative:
+        user_text = (summary.user_text or "").strip()
+        if not _looks_like_directive(user_text):
             return
 
-        # Extract the rule — use the user's own words (truncated)
-        rule = user_text.strip()
-        if len(rule) > 200:
-            rule = rule[:200] + "..."
+        rule = user_text if len(user_text) <= 200 else user_text[:200] + "..."
         loader.add_steering_rule(rule)
         logger.info("Auto-added steering rule from user correction: %.80s...", rule)
 
