@@ -324,7 +324,14 @@ class CCInvoker:
         # /claude-<uid>/<cwd>/<session-id>/ for each Bash invocation.
         # Without this, the sandbox lives on /tmp where intermittent ENOENT
         # failures break the Bash tool for entire sessions.
-        env["CLAUDE_CODE_TMPDIR"] = str(self._CC_SANDBOX_TMPDIR)
+        # A per-invocation override isolates blast radius: e.g. the model-roster
+        # gauntlet points its throwaway CC sessions at a separate sandbox so a
+        # fixture that fills it can't trip genesis-tmp-watchgod into SIGKILLing a
+        # LIVE foreground/background session sharing the default cc-tmp.
+        env["CLAUDE_CODE_TMPDIR"] = str(
+            (inv.claude_code_tmpdir if inv and inv.claude_code_tmpdir else None)
+            or self._CC_SANDBOX_TMPDIR
+        )
         # Prevent CC's alt-screen renderer from corrupting terminal scrollback
         # in Linux/tmux.  No-op on CC <2.1.132; required post-migration.
         env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] = "1"

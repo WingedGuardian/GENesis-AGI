@@ -13,6 +13,13 @@
 # active model rate-limits/exhausts (0 = primary; skipped as a failover peer is
 # not done — claude IS a valid peer when something else is active).
 default: claude
+# Agentic gauntlet (genesis.eval.gauntlet) — validates that a roster member can
+# still drive Claude Code through a coding fix-loop. `genesis eval gauntlet run
+# <model>` runs on demand anytime. The WEEKLY auto-run is OFF by default because
+# it spends inference on paid peers (e.g. GLM); flip `scheduled: true` (here or
+# via the cc_roster settings domain) to enable it for all runnable roster models.
+gauntlet:
+  scheduled: false
 models:
   claude:
     native_subscription: true

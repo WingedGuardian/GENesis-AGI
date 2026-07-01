@@ -1,0 +1,6 @@
+{
+  "name": "statslib_bugs",
+  "difficulty": "easy",
+  "task": "The Python test suite in this directory is failing. Run 'python -m pytest -q' to see the failures, find the root-cause bug(s) in the statslib/ source code, and fix them so all tests pass. Do NOT modify anything under the tests/ directory. When all tests pass you are done.",
+  "timeout_s": 900
+}

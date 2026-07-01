@@ -388,6 +388,16 @@ async def ego_proposal_resolve(proposal_id: str):
             _logging.getLogger(__name__).warning(
                 "j9 regression hook failed for %s", proposal_id,
             )
+        try:
+            from genesis.ego.gauntlet_regression_actions import (
+                handle_gauntlet_regression_resolution,
+            )
+
+            await handle_gauntlet_regression_resolution(rt._db, prop, status)
+        except Exception:
+            _logging.getLogger(__name__).warning(
+                "gauntlet regression hook failed for %s", proposal_id,
+            )
 
     return jsonify({"ok": True, "id": proposal_id, "status": status})
 
