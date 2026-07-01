@@ -183,6 +183,11 @@ def _is_question(utt, config) -> bool:
     return bool((pats and _bank_match(utt.text, pats)) or "?" in utt.text)
 
 
+# Fail-safe against a pathological question-burst (stale entries drain within
+# ``unanswered_question_s``; a session reset also clears the queue) — bounds the state.
+_MAX_PENDING_QUESTIONS = 64
+
+
 def unanswered_question_update(state: EngineState, utt, config):
     """Forward-only unanswered-question look-ahead (§4 conversational dynamics). Engine-
     called (it needs state — NOT a registry trigger). ONE pass, no mutate-during-iterate:
@@ -202,7 +207,7 @@ def unanswered_question_update(state: EngineState, utt, config):
         (qid, qts) for (qid, qts) in state.pending_questions
         if qid not in emitted and qid not in answered
     ]
-    if _is_question(utt, config):
+    if _is_question(utt, config) and len(state.pending_questions) < _MAX_PENDING_QUESTIONS:
         state.pending_questions.append((utt.id, utt.ts))
     if emitted:
         return TriggerHit("unanswered_question", TriggerKind.SOFT, _w(config, "unanswered_question", 0.30))

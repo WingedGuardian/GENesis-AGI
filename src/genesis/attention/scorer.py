@@ -33,7 +33,9 @@ def stickiness_multiplier(
     if off_topic_s is None or decay_window_s <= 0.0:
         return floor
     frac = min(max(off_topic_s, 0.0) / decay_window_s, 1.0)
-    return base - (base - floor) * frac
+    # clamp to floor: decay removes the bonus, never dips below floor — and guards a
+    # misconfig where base < floor (plus any float undershoot at frac == 1.0).
+    return max(floor, base - (base - floor) * frac)
 
 
 def resolve_activation(

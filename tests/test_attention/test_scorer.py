@@ -59,3 +59,9 @@ def test_stickiness_none_off_topic_is_floor():
 
 def test_stickiness_zero_window_safe():
     assert stickiness_multiplier(1.3, 5.0, 0.0) == 1.0   # no div-by-zero
+
+
+def test_stickiness_never_below_floor_when_misconfigured():
+    # base < floor (decay_floor_mult > session_stickiness_mult) must NOT dip below floor
+    assert stickiness_multiplier(0.8, 0.0, 30.0, floor=1.0) == 1.0
+    assert stickiness_multiplier(0.8, 15.0, 30.0, floor=1.0) == 1.0

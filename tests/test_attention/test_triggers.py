@@ -172,3 +172,10 @@ def test_unanswered_question_dropped_when_answered_in_window():
 
 def test_unknown_speaker_not_registered():
     assert "unknown_speaker" not in SOFT_TRIGGERS              # deferred: no resolved identity field
+
+
+def test_pending_questions_is_bounded():
+    st = EngineState()
+    for i in range(80):                                        # a pathological question-burst
+        unanswered_question_update(st, _u("q?", id=i, ts=100.0 + i * 0.01), CFG)
+    assert len(st.pending_questions) <= 64                     # capped, does not grow unbounded
