@@ -12,9 +12,12 @@ rt._router is already set, create_standalone_router() is a no-op.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from genesis.routing.types import BudgetStatus
+
+if TYPE_CHECKING:
+    from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
 
@@ -43,19 +46,19 @@ class NullCostTracker:
         pass
 
 
-def create_standalone_router() -> None:
-    """Bootstrap a lightweight router on the GenesisRuntime singleton.
+def _build_standalone_router() -> Router | None:
+    """Construct a lightweight, DB-free ``Router`` with real provider access.
 
-    Safe to call multiple times -- skips if a router is already set.
-    Loads secrets and routing config from disk, constructs a Router
-    with real provider access but no DB-dependent components.
+    Loads secrets + routing config from disk and wires a Router with no
+    DB-dependent components (read-only breakers, null cost tracker, no event
+    bus / dead-letter). Returns the ``Router``, or ``None`` if construction
+    fails (missing config/secrets) — never raises.
+
+    Touches NO global state. Callers wanting the process-wide singleton use
+    ``create_standalone_router()``; callers that just need a router instance
+    (e.g. the offline attention runner's ``--l15`` path) call this directly and
+    own the returned object.
     """
-    from genesis.runtime._core import GenesisRuntime
-
-    rt = GenesisRuntime.instance()
-    if rt._router is not None:
-        return
-
     try:
         from dotenv import load_dotenv
 
@@ -83,7 +86,7 @@ def create_standalone_router() -> None:
         degradation = DegradationTracker(resilience_state=None)
         cost_tracker = NullCostTracker()
 
-        router = Router(
+        return Router(
             config=config,
             breakers=breakers,
             cost_tracker=cost_tracker,
@@ -92,12 +95,29 @@ def create_standalone_router() -> None:
             event_bus=None,
             dead_letter=None,
         )
-        rt._router = router
-        logger.info("Standalone router bootstrapped for MCP server")
-
     except Exception:
         logger.warning(
-            "Failed to bootstrap standalone router -- "
-            "LLM-dependent MCP tools will be unavailable",
+            "Failed to build standalone router -- "
+            "LLM-dependent tools will be unavailable",
             exc_info=True,
         )
+        return None
+
+
+def create_standalone_router() -> None:
+    """Bootstrap a lightweight router on the GenesisRuntime singleton.
+
+    Safe to call multiple times -- skips if a router is already set. Delegates
+    construction to ``_build_standalone_router()`` and assigns the result to the
+    singleton; on build failure the singleton's ``_router`` stays ``None``.
+    """
+    from genesis.runtime._core import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if rt._router is not None:
+        return
+
+    router = _build_standalone_router()
+    if router is not None:
+        rt._router = router
+        logger.info("Standalone router bootstrapped for MCP server")
