@@ -9,16 +9,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from genesis.learning.procedural.extractor import extract_procedure
-from genesis.learning.procedural.judge import (
-    judge_extraction_candidate,
-    judge_struggle_procedure,
-)
+from genesis.learning.procedural.judge import judge_multi_procedure
 from genesis.learning.procedural.scoping import (
     PROCEDURE_TYPE_DIRECTIVE,
     PROCEDURE_TYPE_TASK,
@@ -188,45 +184,25 @@ async def test_extract_procedure_keeps_real_procedure(db):
 
 
 @pytest.mark.asyncio
-async def test_judge_struggle_suppresses_directive(db):
-    """Judge path (struggle stream): a directive verdict blocks storage."""
-    judge_json = (
-        '```json\n{"worth_storing": true, "task_type": "confidence-gate", '
+async def test_builder_suppresses_directive(db):
+    """The multi-procedure builder: a directive verdict blocks that procedure.
+
+    The scoping gate fires inside _store_judged_procedure (shared by every built
+    procedure) BEFORE the novelty/embedder path, so this is deterministic without
+    an embedder. Covers the C2b single judge entry point.
+    """
+    builder_json = (
+        '```json\n{"procedures": [{"task_type": "confidence-gate", '
         '"principle": "always state confidence", "steps": ["1"], '
-        '"tools_used": ["Bash"], "context_tags": ["meta"]}\n```'
+        '"tools_used": ["Bash"], "context_tags": ["meta"]}]}\n```'
     )
     router = _router_seq(
-        _Result(content=judge_json),                                    # judge
+        _Result(content=builder_json),                                  # builder
         _Result(content='{"procedure_type": "behavioral_directive"}'),  # scoping
     )
     spine = [{
         "turn": 1, "type": "tool", "tool": "Bash",
         "args_summary": "x", "outcome": "ok", "error_text": "",
     }]
-    result = await judge_struggle_procedure(db, spine, 0.5, Path("/tmp/x.jsonl"), router)
-    assert result is None  # suppressed as a behavioral directive
-
-
-@pytest.mark.asyncio
-async def test_judge_extraction_candidate_suppresses_directive(db):
-    """Judge path (extraction-candidate stream): a directive verdict blocks storage.
-
-    Covers the second judge entry point so the router threading through
-    _store_judged_procedure is caught by a dedicated test, not only structurally.
-    """
-    judge_json = (
-        '```json\n{"worth_storing": true, "task_type": "pre-plan-confidence", '
-        '"principle": "investigate before planning", "steps": ["1"], '
-        '"tools_used": ["Bash"], "context_tags": ["meta"]}\n```'
-    )
-    router = _router_seq(
-        _Result(content=judge_json),                                    # judge
-        _Result(content='{"procedure_type": "behavioral_directive"}'),  # scoping
-    )
-    candidate = {
-        "principle": "investigate before planning",
-        "scenario": "before planning",
-        "tools_used": ["Bash"],
-    }
-    result = await judge_extraction_candidate(db, candidate, "chunk context", router)
-    assert result is None  # suppressed as a behavioral directive
+    stored = await judge_multi_procedure(db, spine, "", 0.5, router)
+    assert stored == []  # suppressed as a behavioral directive

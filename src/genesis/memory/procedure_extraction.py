@@ -1,36 +1,25 @@
-"""Stream 2: Procedure candidate post-processor.
+"""Stream 2: Procedure candidate classifier (flag-only).
 
 Runs over each chunk's extraction output (alongside reference_extraction.py).
-Classifies procedure_candidate extractions and routes them to the Judge LLM
-for validation and storage.
+Classifies ``procedure_candidate`` extractions into lightweight candidate dicts.
 
-Pattern: mirrors reference_extraction.py — zero extra LLM calls for
-classification, paid LLM call only when the Judge is invoked.
+C2b: this path no longer calls the Judge per candidate. The classified candidates
+are returned as a SESSION-LEVEL SIGNAL — their presence tells the whole-session
+struggle builder (``learning/procedural/judge.judge_multi_procedure``) to run even
+when the struggle score is below threshold. Procedure CONTENT is reconstructed by
+that builder from the action spine, not stored here. Pure, zero-LLM classification.
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
-from typing import TYPE_CHECKING
-
 from genesis.memory.extraction import Extraction
-
-if TYPE_CHECKING:
-    import aiosqlite
-
-logger = logging.getLogger(__name__)
-
-# Timeout for Judge LLM calls. Must match judge.JUDGE_TIMEOUT_SECS.
-# Kept as local constant to avoid top-level memory → learning import.
-_JUDGE_TIMEOUT_SECS = 60.0
 
 
 def classify_as_procedure(extraction: Extraction) -> dict | None:
     """Classify an extraction as a procedure candidate.
 
     Returns a dict with scenario/principle/tools or None if not a candidate.
-    Pure classifier — no LLM calls. The heavy lifting is done by the Judge.
+    Pure classifier — no LLM calls. The heavy lifting is done by the builder.
     """
     if extraction.extraction_type != "procedure_candidate":
         return None
@@ -46,52 +35,16 @@ def classify_as_procedure(extraction: Extraction) -> dict | None:
     }
 
 
-async def extract_procedures_from_chunk(
-    extractions: list[Extraction],
-    *,
-    db: aiosqlite.Connection,
-    router,
-    source_session_id: str | None = None,
-    chunk_context: str = "",
-    max_new: int | None = None,
-) -> int:
-    """Run classifier over chunk extractions, route candidates to Judge.
+def extract_procedures_from_chunk(extractions: list[Extraction]) -> list[dict]:
+    """Classify chunk extractions into procedure candidates (flag-only signal).
 
-    Returns count of procedures stored. Each Judge call is individually
-    timeout-guarded to prevent a single hung LLM from blocking the
-    entire extraction loop. ``max_new`` caps how many procedures this call may
-    store (the caller's remaining per-session budget); once reached, no further
-    candidates are judged.
+    Returns the list of candidate dicts (possibly empty). Stores nothing and
+    makes no LLM calls — the caller accumulates candidates across chunks and uses
+    their existence to trigger the whole-session builder.
     """
-    # Deferred import — memory → learning direction
-    from genesis.learning.procedural.judge import judge_extraction_candidate
-
-    count = 0
+    candidates: list[dict] = []
     for ext in extractions:
-        if max_new is not None and count >= max_new:
-            break
         candidate = classify_as_procedure(ext)
-        if candidate is None:
-            continue
-
-        try:
-            result = await asyncio.wait_for(
-                judge_extraction_candidate(
-                    db, candidate, chunk_context, router,
-                    source_session_id=source_session_id,
-                ),
-                timeout=_JUDGE_TIMEOUT_SECS,
-            )
-            if result is not None:
-                count += 1
-        except TimeoutError:
-            logger.warning(
-                "Judge timed out on procedure candidate (session %s)",
-                source_session_id,
-            )
-        except Exception:
-            logger.warning(
-                "Judge failed on procedure candidate", exc_info=True,
-            )
-
-    return count
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates

@@ -30,6 +30,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   engineering patterns, one-off events, broad workflows; those belong in skills/CLAUDE.md). The
   result is a smaller, higher-signal procedure store.
 
+- **Genesis now learns several distinct playbooks from one session, and stops storing duplicates.**
+  A session that accomplished several different things now yields a separate playbook for each
+  (instead of one muddled procedure), and a genuinely reusable sub-step can be captured on its own.
+  At the same time, before saving a new procedure Genesis checks whether it already knows
+  essentially the same one — even if it would be filed under a different name — and skips the
+  duplicate. Together these keep the procedure store both more complete and less cluttered.
+
 ### Fixed
 
 - **Inbox evaluations no longer cram a whole batch of links into one giant pass — and stop

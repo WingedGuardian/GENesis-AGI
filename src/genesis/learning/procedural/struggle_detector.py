@@ -73,8 +73,16 @@ def _summarize_args(tool_name: str, tool_input: object) -> str:
     return args_text[:cap]
 
 
-def build_action_spine(transcript_path: Path) -> list[dict]:
-    """Parse JSONL into a compact action spine.
+def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
+    """Parse JSONL into a compact action spine AND a grounding haystack.
+
+    The haystack is the newline-joined, UNCAPPED ``json.dumps`` of every
+    tool_use's input — the record of what Genesis actually RAN. The grounding
+    gate matches a built procedure's step command-tokens against it (a command
+    that was truly executed appears here; a fabricated or merely-discussed one
+    does not). Distinct from the spine's per-tool-capped ``args_summary``.
+
+    Parse JSONL into a compact action spine.
 
     Each entry: {
         "turn": int,            # sequential turn number
@@ -89,6 +97,7 @@ def build_action_spine(transcript_path: Path) -> list[dict]:
     that read_transcript_messages() intentionally strips.
     """
     spine: list[dict] = []
+    haystack_parts: list[str] = []  # uncapped tool inputs → grounding record
     pending_tools: dict[str, dict] = {}  # tool_use_id → spine entry (awaiting result)
     turn = 0
 
@@ -133,6 +142,14 @@ def build_action_spine(transcript_path: Path) -> list[dict]:
                         turn += 1
                         tool_name = block.get("name", "unknown")
                         tool_input = block.get("input", {})
+
+                        # Grounding record: the FULL command/args Genesis ran,
+                        # uncapped (the spine's args_summary is per-tool capped).
+                        # ExitPlanMode is plan prose, not an action — exclude it.
+                        if tool_name != "ExitPlanMode":
+                            haystack_parts.append(
+                                json.dumps(tool_input, ensure_ascii=False, default=str)
+                            )
 
                         args_summary = _summarize_args(tool_name, tool_input)
 
@@ -190,7 +207,15 @@ def build_action_spine(transcript_path: Path) -> list[dict]:
         entry["outcome"] = "error"
         entry["error_text"] = "no result received (session may have crashed)"
 
-    return spine
+    return spine, "\n".join(haystack_parts)
+
+
+def build_action_spine(transcript_path: Path) -> list[dict]:
+    """Back-compat thin wrapper: returns the action spine only (drops the
+    haystack). Retained so existing callers (score_struggle and its tests) keep
+    their ``list[dict]`` contract; the builder path uses build_spine_and_haystack.
+    """
+    return build_spine_and_haystack(transcript_path)[0]
 
 
 def score_struggle(spine: list[dict]) -> float:
@@ -279,24 +304,28 @@ def score_struggle(spine: list[dict]) -> float:
 
 
 def format_spine_for_judge(spine: list[dict]) -> str:
-    """Format action spine as compact text for the Judge LLM.
+    """Format the action spine as compact text for the Judge LLM — TOOL ACTIONS
+    ONLY (user turns are dropped).
+
+    A procedure is about what GENESIS DID, never what the user said. Dropping
+    user turns was the single biggest noise cut in the C2b builder spike: it
+    stops the builder reconstructing "procedures" from the user's requests or
+    corrections. (score_struggle still sees user corrections — it reads the full
+    spine from build_action_spine, not this formatted view.)
 
     Output:
     [T=1] TOOL: Bash {"command": "ssh root@..."} -> OK
     [T=2] TOOL: Read {"file_path": "/home..."} -> ERR: not found
-    [T=5] USER: "that didn't work, try again"
     """
     lines: list[str] = []
     for entry in spine:
+        if entry["type"] != "tool":
+            continue
         turn = entry["turn"]
-        if entry["type"] == "tool":
-            outcome = "OK" if entry["outcome"] == "ok" else f"ERR: {entry['error_text'][:300]}"
-            lines.append(
-                f"[T={turn}] TOOL: {entry['tool']} {entry['args_summary']} -> {outcome}"
-            )
-        elif entry["type"] == "user":
-            text = entry["args_summary"][:160]
-            lines.append(f'[T={turn}] USER: "{text}"')
+        outcome = "OK" if entry["outcome"] == "ok" else f"ERR: {entry['error_text'][:300]}"
+        lines.append(
+            f"[T={turn}] TOOL: {entry['tool']} {entry['args_summary']} -> {outcome}"
+        )
     text = "\n".join(lines)
     if len(text) > _MAX_SPINE_CHARS:
         text = "...[earlier turns truncated]...\n" + text[-_MAX_SPINE_CHARS:]

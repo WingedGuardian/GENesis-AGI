@@ -157,6 +157,59 @@ class TestBuildActionSpine:
         spine = build_action_spine(Path("/nonexistent/path.jsonl"))
         assert spine == []
 
+    def test_build_spine_and_haystack_returns_both(self):
+        """C2b: spine keeps user turns (for score_struggle); the grounding
+        haystack carries the uncapped tool inputs and excludes user text."""
+        from genesis.learning.procedural.struggle_detector import build_spine_and_haystack
+
+        path = self._write_jsonl([
+            self._tool_use_entry("Bash", {"command": "gh api repos/WingedGuardian/Genesis"}, "t1"),
+            self._tool_result_entry("t1", "ok"),
+            self._user_text_entry("try again"),
+        ])
+        spine, haystack = build_spine_and_haystack(path)
+        assert any(e["type"] == "user" for e in spine)
+        assert any(e["type"] == "tool" for e in spine)
+        assert "gh api repos/WingedGuardian/Genesis" in haystack
+        assert "try again" not in haystack  # user text never grounds a procedure
+
+    def test_haystack_excludes_exitplanmode(self):
+        from genesis.learning.procedural.struggle_detector import build_spine_and_haystack
+
+        path = self._write_jsonl([
+            self._tool_use_entry("ExitPlanMode", {"plan": "SECRET_PLAN_TEXT"}, "t1"),
+            self._tool_use_entry("Bash", {"command": "echo hi"}, "t2"),
+            self._tool_result_entry("t2", "hi"),
+        ])
+        _spine, haystack = build_spine_and_haystack(path)
+        assert "SECRET_PLAN_TEXT" not in haystack  # plan prose, not an action
+        assert "echo hi" in haystack
+
+    def test_haystack_is_uncapped_vs_capped_spine(self):
+        """The grounding haystack keeps the FULL command even when the spine's
+        args_summary is per-tool capped (Bash → 800)."""
+        from genesis.learning.procedural.struggle_detector import build_spine_and_haystack
+
+        long_cmd = "echo " + "A" * 1500 + "_TAIL_MARKER"
+        path = self._write_jsonl([
+            self._tool_use_entry("Bash", {"command": long_cmd}, "t1"),
+            self._tool_result_entry("t1", "ok"),
+        ])
+        spine, haystack = build_spine_and_haystack(path)
+        assert "_TAIL_MARKER" not in spine[0]["args_summary"]  # spine capped
+        assert "_TAIL_MARKER" in haystack  # haystack uncapped
+
+    def test_build_action_spine_wrapper_matches_first_half(self):
+        from genesis.learning.procedural.struggle_detector import (
+            build_action_spine,
+            build_spine_and_haystack,
+        )
+        path = self._write_jsonl([
+            self._tool_use_entry("Bash", {"command": "ls"}, "t1"),
+            self._tool_result_entry("t1", "ok"),
+        ])
+        assert build_action_spine(path) == build_spine_and_haystack(path)[0]
+
 
 class TestScoreStruggle:
     """Tests for struggle scoring heuristics."""
@@ -246,7 +299,9 @@ class TestFormatSpineForJudge:
         text = format_spine_for_judge(spine)
         assert "-> ERR: File not found" in text
 
-    def test_formats_user_entry(self):
+    def test_drops_user_entry(self):
+        """C2b user-blind view: user turns are dropped (a procedure is about what
+        Genesis DID, never what the user said)."""
         from genesis.learning.procedural.struggle_detector import format_spine_for_judge
 
         spine = [{
@@ -254,7 +309,22 @@ class TestFormatSpineForJudge:
             "args_summary": "try again", "outcome": "ok", "error_text": "",
         }]
         text = format_spine_for_judge(spine)
-        assert '[T=3] USER: "try again"' in text
+        assert text == ""  # only user turns → empty
+        assert "USER" not in text
+
+    def test_keeps_tool_drops_interleaved_user(self):
+        """Tool entries are kept; an interleaved user turn is omitted."""
+        from genesis.learning.procedural.struggle_detector import format_spine_for_judge
+
+        spine = [
+            {"turn": 1, "type": "tool", "tool": "Bash",
+             "args_summary": '{"command": "ls"}', "outcome": "ok", "error_text": ""},
+            {"turn": 2, "type": "user", "tool": None,
+             "args_summary": "try again", "outcome": "ok", "error_text": ""},
+        ]
+        text = format_spine_for_judge(spine)
+        assert "[T=1] TOOL: Bash" in text
+        assert "USER" not in text and "try again" not in text
 
 
 # ── Judge response parsing ──────────────────────────────────────────────────
@@ -554,38 +624,29 @@ def _proc_candidate_extraction() -> Extraction:
     )
 
 
-async def test_extract_procedures_respects_max_new(db, monkeypatch):
-    """max_new caps how many candidates are stored (and judged) per call."""
+def test_extract_procedures_from_chunk_returns_candidates():
+    """Flag-only (C2b): the chunk path CLASSIFIES candidates and returns them as
+    a list — no Judge call, no storage. Their existence is a session-level signal
+    that triggers the whole-session builder."""
     from genesis.memory import procedure_extraction as pe
 
-    calls = []
-
-    async def _fake_judge(db, candidate, ctx, router, *, source_session_id=None):
-        calls.append(candidate)
-        return f"stored-{len(calls)}"
-
-    monkeypatch.setattr(
-        "genesis.learning.procedural.judge.judge_extraction_candidate", _fake_judge,
-    )
     exts = [_proc_candidate_extraction() for _ in range(5)]
-    count = await pe.extract_procedures_from_chunk(exts, db=db, router=None, max_new=3)
-    assert count == 3
-    assert len(calls) == 3  # Judge not called once the cap is hit
+    candidates = pe.extract_procedures_from_chunk(exts)
+    assert isinstance(candidates, list)
+    assert len(candidates) == 5
+    assert all("scenario" in c and "principle" in c for c in candidates)
 
 
-async def test_extract_procedures_no_cap_when_max_new_none(db, monkeypatch):
-    """Without a cap, behavior is unchanged (all valid candidates judged)."""
+def test_extract_procedures_from_chunk_filters_non_candidates():
+    """Non-procedure extractions are filtered out of the candidate list."""
     from genesis.memory import procedure_extraction as pe
 
-    async def _fake_judge(db, candidate, ctx, router, *, source_session_id=None):
-        return "stored"
-
-    monkeypatch.setattr(
-        "genesis.learning.procedural.judge.judge_extraction_candidate", _fake_judge,
-    )
-    exts = [_proc_candidate_extraction() for _ in range(5)]
-    count = await pe.extract_procedures_from_chunk(exts, db=db, router=None)
-    assert count == 5
+    exts = [
+        _proc_candidate_extraction(),
+        Extraction(content="x" * 60, extraction_type="entity", confidence=0.9, scenario="s"),
+    ]
+    candidates = pe.extract_procedures_from_chunk(exts)
+    assert len(candidates) == 1
 
 
 class TestSummarizeArgs:

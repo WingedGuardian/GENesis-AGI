@@ -182,7 +182,14 @@ async def list_by_task_type(
     person_id: str | None = None,
     limit: int = 50,
 ) -> list[dict]:
-    sql = "SELECT * FROM procedural_memory WHERE task_type = ?"
+    # Exclude deprecated/quarantined rows: the dominant caller is the procedure
+    # novelty/dedup gate, which must NOT let a deprecated procedure suppress a new
+    # one. (matcher.find_best_match already skips them in Python, so this is a
+    # consistent no-op there.)
+    sql = (
+        "SELECT * FROM procedural_memory "
+        "WHERE task_type = ? AND deprecated = 0 AND quarantined = 0"
+    )
     params: list = [task_type]
     if person_id is not None:
         sql += " AND person_id = ?"
