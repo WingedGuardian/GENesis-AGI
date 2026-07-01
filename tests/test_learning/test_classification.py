@@ -188,10 +188,10 @@ class TestOutcomeClassifier:
     async def test_prompt_scopes_goals_to_attempted_tasks(self):
         """IR-1b: a goal counts only if Genesis ATTEMPTED it this turn.
 
-        The 2026-06-30 incident: a Telegram status-update ("Autonomize is dead…
-        but we should continue… its never too late") was mislabeled
-        approach_failure because the classifier scored the user's external
-        statuses and forward-looking intent as failed goals, which fired the
+        The 2026-06-30 incident: a benign Telegram status-update (the user
+        reporting the state of their own external projects plus a forward-looking
+        intent) was mislabeled approach_failure because the classifier scored the
+        user's external statuses and forward-looking intent as failed goals, which fired the
         STEERING auto-write and a false autonomy correction. The prompt must
         scope "goal" to concrete tasks Genesis attempted, and treat status /
         forward-intent / clarifying-question turns as success. Behavioral proof
