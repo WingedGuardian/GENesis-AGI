@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
+from genesis.autonomy.proposal_gate import gate_failure_is_blocking
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
@@ -1456,8 +1457,6 @@ class EgoSession:
                     # Gate eval raised. Fail CLOSED for high-risk domains
                     # (external / self-modify), stay resilient (allow) for benign
                     # ones so a transient error can't wedge the ego cycle.
-                    from genesis.autonomy.proposal_gate import gate_failure_is_blocking
-
                     if prop_row is None or gate_failure_is_blocking(prop_row):
                         logger.error(
                             "Proposal gate failed for execution brief %s — "
@@ -1890,8 +1889,6 @@ class EgoSession:
                     # Gate eval raised. Fail CLOSED for high-risk domains,
                     # stay resilient (allow) for benign ones — same risk-tiered
                     # policy as the execution-brief path above.
-                    from genesis.autonomy.proposal_gate import gate_failure_is_blocking
-
                     if gate_failure_is_blocking(prop):
                         logger.error(
                             "Proposal gate evaluation failed for %s — BLOCKING "

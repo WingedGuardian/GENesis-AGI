@@ -188,7 +188,7 @@ def is_high_risk_domain(domain: ActionDomain) -> bool:
     return domain in HIGH_RISK_DOMAINS
 
 
-def gate_failure_is_blocking(proposal: dict) -> bool:
+def gate_failure_is_blocking(proposal: dict | None) -> bool:
     """Decide fail-closed (True) vs resilient-allow (False) when the dispatch
     gate is unavailable or raised while evaluating *proposal*.
 
