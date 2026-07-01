@@ -931,6 +931,7 @@ class InboxMonitor:
         Returns the number of batches successfully dispatched.
         """
         from genesis.cc.types import CCModel, EffortLevel
+        from genesis.db.crud import inbox_items
 
         try:
             model = CCModel(self._config.model)
@@ -945,16 +946,32 @@ class InboxMonitor:
 
         batches_dispatched = 0
 
-        # --- Resume drops: approval already resolved -> consume then dispatch. ---
+        # --- Resume drops: claim (at-most-once) -> consume -> dispatch. ---
         for _drop_id, items in self._group_by_drop(resume_items):
-            # Consume the drop's approval BEFORE dispatching so a restart
-            # mid-drop cannot leave an unconsumed approval that a later drop
-            # rides via the content-agnostic stable key. mark_consumed is
-            # idempotent; the parked rows still drive re-dispatch on restart.
-            reqid = items[0].approval_reqid if items else ""
+            # CLAIM each batch row out of the awaiting-approval parked state
+            # BEFORE the CC call. The claim (awaiting_approval: -> dispatching:)
+            # is the at-most-once authority: a row already claimed (a prior scan
+            # still dispatching, or a concurrent scan) or no longer parked loses
+            # the claim and is skipped. A crash between the claim and completion
+            # therefore cannot duplicate the dispatch — the claimed row is
+            # 'dispatching:' (invisible to get_awaiting_approval), and a stranded
+            # one is reaped by expire_stuck_processing back into the retry path.
+            claimed = [
+                item for item in items
+                if await inbox_items.claim_for_dispatch(
+                    self._db, item.id, reqid=item.approval_reqid,
+                )
+            ]
+            if not claimed:
+                continue
+            # Consume the drop's approval (best-effort). The row-state claim above
+            # is the real gate, so a consume failure neither strands the drop nor
+            # bypasses at-most-once; it only leaves the content-agnostic approval
+            # rideable until the gate's 24h staleness window (WARNING-logged).
+            reqid = claimed[0].approval_reqid
             if reqid:
                 await self._consume_approval(reqid)
-            for item in items:
+            for item in claimed:
                 if await self._dispatch_one_batch(
                     item, model=model, effort=effort,
                     system_prompt=system_prompt, now_iso=now_iso, errors=errors,

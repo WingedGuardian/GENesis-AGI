@@ -205,6 +205,56 @@ async def test_one_approval_per_drop_then_resume_dispatches_all(
 
 
 @pytest.mark.asyncio
+async def test_resume_claim_prevents_double_dispatch_on_crash(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, monkeypatch,
+):
+    """A crash between dispatch and completion must NOT duplicate the eval.
+
+    The resume pass claims each row (awaiting_approval: -> dispatching:) BEFORE
+    the CC call, so a re-run (restart) finds the rows already 'dispatching:'
+    (excluded from get_awaiting_approval) and does not re-dispatch them. Without
+    the claim, the rows stay 'awaiting_approval:' and the next scan re-resumes
+    and re-dispatches -> duplicate eval + duplicate Genesis-N file.
+    """
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=3)
+    approvals: dict[str, dict] = {}
+    disp = _wired(
+        decision=AutonomousDispatchDecision(
+            mode="blocked", reason="approval requested",
+            approval_request_id="req-1",
+        ),
+        approval_by_id=approvals,
+    )
+    mon._autonomous_dispatcher = disp
+    (inbox_dir / "Genesis.md").write_text(_urls(6))  # 6 URLs -> 1 drop, 2 batches
+
+    await mon.check_once()  # scan 1: parked awaiting approval
+    assert len(await inbox_items.get_awaiting_approval(db)) == 2
+
+    # Simulate a crash AFTER dispatch but BEFORE completion: the resume loop
+    # claims the row first, then calls _dispatch_one_batch — stub it so the row
+    # is never marked completed (as if the process died mid-eval).
+    dispatch_calls: list[str] = []
+
+    async def _crash_dispatch(item, **kw):
+        dispatch_calls.append(item.id)
+        return True  # "dispatched" but leaves the row in its claimed state
+
+    monkeypatch.setattr(mon, "_dispatch_one_batch", _crash_dispatch)
+
+    approvals["req-1"] = {"status": "approved"}
+    await mon.check_once()  # scan 2: claim + (crashed) dispatch
+    assert len(dispatch_calls) == 2, "both batches dispatched once on resume"
+    # Claimed rows are 'dispatching:' now -> no longer awaiting.
+    assert await inbox_items.get_awaiting_approval(db) == []
+
+    await mon.check_once()  # scan 3: restart — must NOT re-dispatch the claimed rows
+    assert len(dispatch_calls) == 2, (
+        "claimed rows were re-dispatched after a crash (double dispatch)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_gate_error_fails_drop_not_stuck_processing(
     db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
 ):

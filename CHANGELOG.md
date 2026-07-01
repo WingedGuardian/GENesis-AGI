@@ -64,6 +64,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   approval gate is on, you approve a drop once and all its groups run under that single
   approval. Duplicate follow-up items from the same recommendation are now also prevented.
 
+- **An approved inbox evaluation that gets interrupted mid-run can no longer be evaluated
+  twice.** If the server restarted (or crashed) in the narrow window right after you approved a
+  link evaluation but before it finished, the next scan could re-run the same evaluation and
+  write a duplicate `…-N.genesis.md` file. Genesis now claims each evaluation the moment it
+  starts, so an interrupted one is recovered and retried rather than run a second time.
+
 - **Campaign results no longer sit uncaptured until the next scheduled tick.** Previously a
   campaign that ran every couple of days would finish its background session but not record
   the outcome (or cost, or notify you) until the *following* tick — so a finished run could
