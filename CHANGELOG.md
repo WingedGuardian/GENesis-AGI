@@ -11,6 +11,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **You can now start an interactive Claude Code session on a different model with one command.**
+  `gmodel <name>` launches `claude` on the model you pick: a Claude tier (`gmodel opus`) runs on
+  your normal Max subscription, while a roster peer (`gmodel glm-5.2`) runs on that provider's
+  native endpoint and its own API key. Plain `claude` is untouched. `gmodel` on its own lists the
+  models and which have keys configured; `gmodel --print-env <name>` shows what it would do without
+  launching. Your Anthropic subscription is protected — the launcher never lets a stray API key
+  quietly switch you to per-token billing, and never sends your Anthropic key to a third-party
+  endpoint. (Switch models by relaunching; each session is pinned to one model.)
 - **You can now put a model through a "gauntlet" to prove it can actually drive Claude Code
   before you rely on it.** `genesis eval gauntlet --model <name>` has the model (native Claude,
   or a routed roster peer like GLM) fix real broken Python projects inside a live Claude Code
