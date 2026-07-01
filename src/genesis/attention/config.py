@@ -80,3 +80,65 @@ class AttentionConfig:
 def load_config(path: str | Path) -> AttentionConfig:
     """Load + compile a versioned ``attention_config.json``."""
     return AttentionConfig.from_dict(json.loads(Path(path).expanduser().read_text()))
+
+
+# ── default starter config (the ~/.genesis overlay overrides; used by the runner) ──
+DEFAULT_CONFIG_PATH = "~/.genesis/config/attention_config.json"
+
+
+def default_config_dict() -> dict:
+    """A complete generic STARTER config for the first shadow pass. ``domain_keywords``
+    is a coarse tech-talk starter; ``known_entities`` is empty (a generator fills it
+    from ``user_contacts`` later). ``emotional_patterns`` and the extra lexical banks
+    are present but only CONSUMED from PR3 onward — the PR1 trigger subset uses
+    question/help_seeking/multi_speaker/is_user/domain_keyword/known_entity +
+    ambient_name/explicit_invite + explicit_dismissal. All weights/thresholds are the
+    calibration surface the shadow review tunes."""
+    return {
+        "version": "0.1.0-default",
+        "aliases": ["genesis"],
+        "domain_keywords": [
+            "genesis", "routing", "memory", "embedding", "retrieval", "attention",
+            "ambient", "voice", "ego", "autonomy", "reflection", "dashboard",
+            "telegram", "qdrant", "sqlite", "migration", "outreach", "procedure",
+            "deliberate", "omnipresence", "pipeline", "deploy", "model", "prompt",
+            "agent", "worktree", "backup",
+        ],
+        "known_entities": [],
+        "lexical_patterns": {
+            "question": [
+                r"\b(how|what|why|when|where|who|which)\b.{0,40}\?",
+                r"\b(should|could|can|do|does|did|is|are|will|would)\s+(i|we|you|it|they)\b",
+            ],
+            "help_seeking": [
+                r"\bhow do i\b", r"\bi'?m stuck\b", r"\bcan'?t figure\b",
+                r"\bnot sure how\b", r"\bhelp me\b",
+            ],
+            "decision": [r"\bwe should\b", r"\blet'?s\b", r"\bi'?ll\b", r"\bwe need to\b"],
+            "task_reminder": [r"\bremind me\b", r"\blook up\b", r"\bfind out\b", r"\bdon'?t forget\b"],
+            "temporal_deadline": [r"\btomorrow\b", r"\bdeadline\b", r"\btonight\b", r"\bnext week\b"],
+            "quantity_money": [r"\$\s?\d", r"\bdollars?\b", r"\bbudget\b"],
+            "recall_cue": [r"\bwhat did we say\b", r"\bdidn'?t we\b", r"\bremember when\b"],
+            "dispute": [r"\bis it true\b", r"\bactually,? no\b", r"\bare you sure\b"],
+        },
+        "emotional_patterns": {
+            "frustration": [r"\bugh\b", r"\bso annoying\b", r"\bfrustrat", r"\bcan'?t stand\b"],
+            "excitement": [r"\bthis is huge\b", r"\bamazing\b", r"\bcan'?t wait\b", r"\bso cool\b"],
+            "confusion": [r"\bconfused\b", r"\bi don'?t (get|understand)\b", r"\bmakes no sense\b"],
+            "urgency": [r"\bhurry\b", r"\basap\b", r"\bright now\b", r"\burgent\b"],
+        },
+        "suppressor_patterns": {
+            "explicit_dismissal": [
+                r"\bnever mind\b", r"\bnot you\b", r"\bforget it\b",
+                r"\bjust between us\b", r"\bnone of your\b",
+            ],
+            "sensitive_topics": [],
+        },
+        "weights": {
+            "question": 0.30, "help_seeking": 0.35, "multi_speaker": 0.40,
+            "is_user": 0.10, "domain_keyword": 0.30, "known_entity": 0.25,
+        },
+        "state_modifiers": {},   # all StateModifiers defaults
+        "thresholds": {},        # all Thresholds defaults (soft_perk 0.6, l15_graduation 0.4)
+        "suppressors_enabled": ["explicit_dismissal"],
+    }

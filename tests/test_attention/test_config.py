@@ -54,3 +54,14 @@ def test_load_config_reads_file(tmp_path):
     c = load_config(p)
     assert c.version == "1.0.0"
     assert c.suppressors_enabled == ("explicit_dismissal",)
+
+
+def test_default_config_dict_compiles():
+    from genesis.attention.config import default_config_dict
+
+    c = AttentionConfig.from_dict(default_config_dict())
+    assert c.aliases == ("genesis",)
+    assert "routing" in c.domain_keywords
+    assert c.thresholds.soft_perk == 0.6            # Thresholds default (empty dict -> defaults)
+    assert "explicit_dismissal" in c.suppressors_enabled
+    assert c.lexical_patterns["question"]           # compiled non-empty
