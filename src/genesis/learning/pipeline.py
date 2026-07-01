@@ -32,9 +32,10 @@ _AUTONOMOUS_CHANNELS = {"inbox", "mail", "reflection", "surplus"}
 
 # A STEERING.md rule must READ as a terse imperative directive addressed to
 # Genesis — not a chatty, multi-sentence status update. This guard is why the
-# 2026-06-30 incident ("Yeah sorry for the delays… Autonomize is dead… its
-# never too late") could NOT be written as a "hard constraint" even though the
-# outcome classifier mislabeled it approach_failure. It is DEFENSE-IN-DEPTH: the
+# 2026-06-30 incident (a benign, multi-sentence user status update that merely
+# contained the word "never" mid-sentence) could NOT be written as a "hard
+# constraint" even though the outcome classifier mislabeled it approach_failure.
+# It is DEFENSE-IN-DEPTH: the
 # root fix is the outcome classifier, but this makes a mis-classification unable
 # to corrupt an identity file on its own. Fail-CLOSED by design — missing a real
 # correction is cheap (BIS still captures it; the user can restate directively),

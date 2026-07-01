@@ -11,15 +11,15 @@ import pytest
 
 from genesis.learning.pipeline import _looks_like_directive
 
-# The actual message that triggered the incident (383 chars, multi-sentence,
-# opens with "Yeah", contains "never" only inside "its never too late").
+# A SYNTHETIC stand-in with the incident's structural shape (multi-sentence,
+# chatty, opens with "Yeah", contains "never" only inside "its never too late").
+# The real triggering DM is private user data and is NOT committed to this
+# public repo — the guard only cares about structure, not content.
 _INCIDENT_MESSAGE = (
-    "Yeah sorry for the delays on all that. Autonomize is dead, forget about "
-    "it. The agent challenge went well, no need to do anything there except "
-    "continue to iterate on our process for the next time we need to build "
-    "professional artifacts. I didn't attend the conference. And no arxiv "
-    "didn't go in, but we should continue doing anything else remaining on the "
-    "paper--its never too late"
+    "Yeah sorry for the delays on all that. The first thing fell through, "
+    "forget about it. The second went well, no action needed there. I skipped "
+    "the third entirely. And the write-up didn't ship, but we should keep "
+    "going on whatever's left--its never too late"
 )
 
 
@@ -45,7 +45,7 @@ def test_genuine_directives_pass(text: str) -> None:
         _INCIDENT_MESSAGE,  # the exact incident message
         "I was wrong about that approach",  # no imperative opener; 'wrong' dropped
         "yeah that went well, thanks",  # chatty acknowledgement
-        "the arxiv paper didn't go in",  # status update, not a directive
+        "the write-up didn't ship out",  # status update, not a directive
         "",  # empty
         "   ",  # whitespace only
         # opens with a directive word but rambles past 2 sentences → rejected

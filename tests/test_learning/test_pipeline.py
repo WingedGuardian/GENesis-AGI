@@ -386,11 +386,14 @@ class TestSteeringRuleExtraction:
             observation_writer=ow,
             identity_loader=loader,
         )
+        # Synthetic stand-in with the incident's structural shape (multi-sentence,
+        # chatty, "never" only inside "its never too late"). The real private DM
+        # is deliberately NOT committed to this public repo.
         incident = (
-            "Yeah sorry for the delays on all that. Autonomize is dead, forget "
-            "about it. The agent challenge went well, no need to do anything "
-            "there. I didn't attend the conference. And no arxiv didn't go in, "
-            "but we should continue on the paper--its never too late"
+            "Yeah sorry for the delays on all that. The first thing fell "
+            "through, forget about it. The second went well, no action needed "
+            "there. I skipped the third entirely. And the write-up didn't "
+            "ship, but we should keep going on whatever's left--its never too late"
         )
         await pipeline(FakeCCOutput(), incident, "telegram")
         loader.add_steering_rule.assert_not_called()
