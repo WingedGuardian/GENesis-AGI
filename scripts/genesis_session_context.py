@@ -54,6 +54,27 @@ def _emit(text: str) -> None:
     sys.stdout.flush()
 
 
+def _routed_session_notice(model: str | None) -> str | None:
+    """Markdown NOTICE when this interactive session is routed to a roster peer.
+
+    ``model`` is ``GENESIS_ROSTER_MODEL`` (set only by ``scripts/gmodel`` for a
+    peer). CC's baked-in "You are powered by …" identity text still says Claude
+    when the endpoint is a peer, so the self-reported ``[model]`` header would be
+    wrong — this block surfaces the true model and steers the header. Returns
+    ``None`` (no block) for a native/plain session.
+    """
+    if not model:
+        return None
+    return (
+        f"## ⚠ Routed session — running on {model}\n\n"
+        f"This CLI session is routed to **{model}** (a non-Anthropic roster peer), "
+        "NOT native Claude. Claude Code's built-in identity text still says Claude "
+        f"— ignore it; the model answering you is **{model}**. Begin your status "
+        f"header with `[{model} / <effort>]` accordingly. Note: Genesis MCP tools "
+        "may be unavailable or limited on non-Anthropic endpoints."
+    )
+
+
 def _sync_genesis_hooks() -> None:
     """Self-heal Genesis git hooks at session start.
 
@@ -265,6 +286,15 @@ def main() -> None:
                     first = False
             except (OSError, ValueError):
                 pass  # Advisory only — never block session start
+
+        # Routed-session NOTICE (advisory): surfaces when `gmodel <peer>` launched
+        # this window on a non-Anthropic roster model (see _routed_session_notice).
+        _routed_notice = _routed_session_notice(os.environ.get("GENESIS_ROSTER_MODEL"))
+        if _routed_notice:
+            if not first:
+                _emit("\n\n---\n\n")
+            _emit(_routed_notice)
+            first = False
 
     # 2.5. Active procedures (advisory, silent failure is correct)
     try:
