@@ -1099,6 +1099,11 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-watchdog.timer" ]; then
         echo "    + genesis-watchdog.timer enabled + started" || true
 fi
 
+if [ -f "$SYSTEMD_USER_DIR/genesis-disk-hygiene.timer" ]; then
+    systemctl --user enable --now genesis-disk-hygiene.timer 2>/dev/null && \
+        echo "    + genesis-disk-hygiene.timer enabled + started" || true
+fi
+
 # Enable AND start tmp watchgod (OS-level temp protection)
 WATCHGOD_SRC="$REPO_DIR/config/genesis-tmp-watchgod.service"
 if [ -f "$WATCHGOD_SRC" ]; then

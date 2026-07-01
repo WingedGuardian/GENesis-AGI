@@ -1,0 +1,22 @@
+[Unit]
+Description=Genesis Disk Hygiene — reap merged worktrees + reclaim regenerable caches
+After=genesis-server.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=/bin/bash __REPO_DIR__/scripts/disk_hygiene.sh
+# Reaping ~dozens of worktrees (gh/git calls each) + a multi-GB rmtree can run
+# well past the 90s default TimeoutStartSec, which would SIGTERM mid-trash-move.
+TimeoutStartSec=1200
+# `gh` (squash-merge detection) + `git` may live in /usr/bin, CC_BIN_DIR, or
+# npm-global — list all so the reaper doesn't silently fall back to git-only.
+Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+# Home-scoped: reaper trashes under ~/.genesis, reclaim clears ~/.cache & ~/.npm.
+# No sudo needed here (disk_reclaim's --system /var path is intentionally not
+# invoked by the daily wrapper — that is the reactive path's job).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h

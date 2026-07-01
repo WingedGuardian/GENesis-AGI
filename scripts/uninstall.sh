@@ -405,6 +405,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
 
         # Stop all Genesis services (timer first, then service, to prevent restart)
         for unit in genesis-watchdog.timer genesis-watchdog.service \
+                    genesis-disk-hygiene.timer genesis-disk-hygiene.service \
                     genesis-server.service genesis-bridge.service \
                     qdrant.service; do
             safe_disable_service "$unit"
