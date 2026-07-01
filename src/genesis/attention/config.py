@@ -144,10 +144,10 @@ def default_config_dict() -> dict:
             "is_user": 0.10, "domain_keyword": 0.30, "known_entity": 0.25,
             # PR3a — §4 taxonomy completion (SEED weights; PR3c re-tunes against labels).
             # multi_speaker stays 0.40 — DILUTED by these new signals, NOT down-weighted here.
-            # topic_continuation=0.0: the dry-run over the live snapshot showed it fires on ~78% of
-            # windows (non-discriminative) and stacked with multi_speaker + stickiness to DOUBLE the
-            # fire-rate on garble (11.8% vs 6.2%). NEUTRALIZED (still recorded in triggers_fired for
-            # the shadow log) pending a labelled PR3c re-tune. See quiet-frolicking-hearth.md.
+            # topic_continuation=0.0: a shadow dry-run over the live snapshot showed it fires on ~78%
+            # of windows (non-discriminative) and stacked with multi_speaker + stickiness to DOUBLE the
+            # fire-rate on garble (11.8% vs 6.2%). NEUTRALIZED (still recorded in triggers_fired for the
+            # shadow log) pending a labelled re-tune against acceptance signals.
             "decision": 0.30, "task_reminder": 0.35, "temporal_deadline": 0.25,
             "quantity_money": 0.25, "recall_cue": 0.35, "dispute": 0.30,
             "emotional": 0.20, "topic_continuation": 0.0, "lexical_repetition": 0.20,
