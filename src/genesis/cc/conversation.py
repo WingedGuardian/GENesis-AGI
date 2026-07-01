@@ -650,9 +650,11 @@ class ConversationLoop:
         try:
             output = await self._invoker.run(invocation)
             return output, session
-        except (CCRateLimitError, CCQuotaExhaustedError):
-            # Rate limits are account-wide — retrying fresh won't help.
-            # Let the caller's contingency handler deal with it.
+        except (CCRateLimitError, CCQuotaExhaustedError, CCTimeoutError):
+            # Rate limits are account-wide, and a timeout is NOT a stale-resume
+            # failure — retrying fresh won't help. A timeout retry just burns a
+            # second full window (the 2026-06-30 DM double-timeout). Let the
+            # caller's terminal handler deal with it.
             raise
         except CCError:
             if not was_resume:
@@ -688,8 +690,10 @@ class ConversationLoop:
         try:
             output = await self._invoker.run_streaming(invocation, on_event=on_event)
             return output, session
-        except (CCRateLimitError, CCQuotaExhaustedError):
-            raise  # Account-wide — retrying fresh won't help
+        except (CCRateLimitError, CCQuotaExhaustedError, CCTimeoutError):
+            # Account-wide (rate/quota) or a timeout — retrying fresh won't help;
+            # a timeout retry just burns a second full window (2026-06-30 DM).
+            raise
         except CCError:
             if not was_resume:
                 raise
