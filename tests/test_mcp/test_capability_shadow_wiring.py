@@ -96,6 +96,20 @@ async def test_send_reply_records_shadow_and_still_sends(db):
         bot_mod._bot_token, bot_mod._db = old_token, old_db
 
 
+def test_init_discord_bot_wires_shadow_db():
+    # The bootstrap injects the shadow DB via init_discord_bot(db=...); confirm it lands.
+    from genesis.mcp.discord_bot_mcp import init_discord_bot
+
+    old_token, old_db = bot_mod._bot_token, bot_mod._db
+    sentinel = object()
+    try:
+        init_discord_bot(bot_token="tok", db=sentinel)
+        assert bot_mod._bot_token == "tok"
+        assert bot_mod._db is sentinel
+    finally:
+        bot_mod._bot_token, bot_mod._db = old_token, old_db
+
+
 @pytest.mark.asyncio
 async def test_send_reply_without_shadow_db_still_sends():
     # _db=None (shadow DB unavailable) => shadow is a no-op; the reply MUST still work.
