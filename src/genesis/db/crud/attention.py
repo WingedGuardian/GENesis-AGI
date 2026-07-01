@@ -130,7 +130,7 @@ async def update_acceptance_signal(
     row = await cursor.fetchone()
     if row is None:
         return (False, None)
-    prior = row[0]
+    prior = row["acceptance_signal"]
     await db.execute(
         "UPDATE attention_events SET acceptance_signal = ? WHERE id = ?", (signal, event_id)
     )

@@ -1641,7 +1641,9 @@
             if (resp && resp.ok) {
               this.attentionRevealed = { ...this.attentionRevealed, [id]: (await resp.json()).window || [] };
             } else if (resp && resp.status === 410) {
-              this.attentionRevealed = { ...this.attentionRevealed, [id]: "unavailable" };
+              this.attentionRevealed = { ...this.attentionRevealed, [id]: "snapshot no longer available — this event is review-read-only." };
+            } else {
+              this.attentionRevealed = { ...this.attentionRevealed, [id]: `reveal failed (${resp ? resp.status : "network error"})` };
             }
           } catch (e) { console.warn("Attention reveal failed:", e); }
         },
@@ -10710,8 +10712,8 @@
             <!-- Revealed window (from the transient snapshot) -->
             <template x-if="$store.genesisDashboard.attentionRevealed[ev.id] !== undefined">
               <div style="margin-top:.5rem; background:var(--color-panel); border-radius:4px; padding:.5rem .6rem;">
-                <template x-if="$store.genesisDashboard.attentionRevealed[ev.id] === 'unavailable'">
-                  <div style="font-size:.8em; color:var(--color-warning-text);">snapshot no longer available — this event is review-read-only.</div>
+                <template x-if="typeof $store.genesisDashboard.attentionRevealed[ev.id] === 'string'">
+                  <div style="font-size:.8em; color:var(--color-warning-text);" x-text="$store.genesisDashboard.attentionRevealed[ev.id]"></div>
                 </template>
                 <template x-if="Array.isArray($store.genesisDashboard.attentionRevealed[ev.id])">
                   <div style="display:flex; flex-direction:column; gap:.25rem;">
