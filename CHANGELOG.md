@@ -63,6 +63,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Genesis now keeps your Claude Code CLI at the version it's tested against — automatically.**
+  Previously the installer only put Claude Code in place when it was *missing*, so if you already
+  had an older Claude Code, bumping the pinned version never actually upgraded you — you'd silently
+  keep running the old one. Now `install.sh`, `bootstrap.sh`, and `update.sh` all install *or* align
+  Claude Code to the pinned version on every run (matching it exactly, so an intentional rollback
+  also applies), with no manual step. It's non-fatal: if the update can't run (e.g. no permissions),
+  your update still completes and Claude Code is left as-is.
 - **A casual message can no longer be mistaken for a permanent "hard rule" — and your
   steering-rules file keeps its structure.** Genesis auto-adds a steering rule only when you
   actually give it a terse directive ("stop doing X", "never do Y"); an ordinary status update

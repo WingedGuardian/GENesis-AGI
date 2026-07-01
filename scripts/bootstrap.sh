@@ -271,6 +271,18 @@ else
     echo "  Node: $(node --version 2>/dev/null || echo 'not available') (needs >= 20)"
 fi
 
+# --- Claude Code version pin (install or align to the pinned version) ---
+# Node/npm are set up above. Align the local Claude Code to the repo pin so a
+# bump reaches the container via `bootstrap.sh` too (not just install.sh).
+# Non-fatal (`|| true`): `set -e` is active — a CC hiccup must not abort bootstrap.
+_cc_env="$SCRIPT_DIR/lib/cc_version.sh"
+if [ -f "$_cc_env" ]; then
+    echo "--- Aligning Claude Code to pinned version ---"
+    # shellcheck source=/dev/null
+    source "$_cc_env"
+    cc_ensure_local || true
+fi
+
 # bubblewrap (sandbox for codex exec — optional)
 if ! command -v bwrap &>/dev/null; then
     echo "  bubblewrap not found — installing..."

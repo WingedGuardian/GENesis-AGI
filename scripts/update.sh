@@ -911,6 +911,25 @@ print(cfg.get('host_user', 'ubuntu'))
     fi
 fi
 
+# ── Sync CONTAINER Claude Code to the pinned version ──────
+# The guardian block above syncs the HOST's CC. This aligns the CONTAINER's own
+# Claude Code (update.sh runs inside the container) so a pin bump reaches the
+# container with zero user action. UNCONDITIONAL — not gated on guardian config,
+# so guardian-less installs are covered too. Non-fatal (`|| true`): `set -e` is
+# active here (ERR trap already disarmed), and a CC install hiccup must never
+# abort an update after git-pull/migrations have run.
+_cc_env="$SCRIPT_DIR/lib/cc_version.sh"
+if [ -f "$_cc_env" ]; then
+    echo "--- Syncing container Claude Code to pin ---"
+    unset CC_VERSION            # repo pin must win over any inherited override
+    # shellcheck source=/dev/null
+    source "$_cc_env"
+    cc_ensure_local || true
+else
+    echo "  WARNING: $_cc_env missing — skipping container CC sync"
+fi
+echo ""
+
 # ── Clear update failure file on success ──────────────────
 if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
     rm -f "$HOME/.genesis/last_update_failure.json"
