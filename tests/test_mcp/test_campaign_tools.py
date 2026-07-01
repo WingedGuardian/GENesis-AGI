@@ -205,6 +205,65 @@ class TestRunnerAbsent:
             ct_mod._runner = old_runner
 
 
+class TestCampaignCreateValidation:
+    """campaign_create must validate `profile` against VALID_PROFILES before persisting
+    (mirrors user_job_tools / direct_session_tools). Guards against a bogus profile that
+    would silently fail every tick at DirectSession init."""
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_invalid_profile(self, _test_db):
+        """An unknown profile is rejected and NOTHING is persisted."""
+        old_db, old_runner = ct_mod._db, ct_mod._runner
+        try:
+            ct_mod._db = _test_db
+            ct_mod._runner = None
+            result = await ct_mod._impl_campaign_create(
+                name="bogus-profile-campaign",
+                strategy_doc_path="/tmp/s.md",
+                cron_cadence="0 */8 * * *",
+                profile="not-a-real-profile",
+            )
+            assert "error" in result
+            assert "Invalid profile" in result["error"]
+            cursor = await _test_db.execute(
+                "SELECT COUNT(*) AS n FROM campaigns WHERE name = ?",
+                ("bogus-profile-campaign",),
+            )
+            row = await cursor.fetchone()
+            assert row["n"] == 0
+        finally:
+            ct_mod._db = old_db
+            ct_mod._runner = old_runner
+
+    @pytest.mark.asyncio
+    async def test_create_accepts_valid_profile(self, _test_db):
+        """A valid profile passes validation and flows through to creation."""
+        from unittest.mock import AsyncMock
+
+        old_db, old_runner = ct_mod._db, ct_mod._runner
+        try:
+            ct_mod._db = _test_db
+            ct_mod._runner = None
+            with patch(
+                "genesis.db.crud.campaigns.get_campaign_by_name",
+                new=AsyncMock(return_value=None),
+            ), patch(
+                "genesis.db.crud.campaigns.create_campaign", new=AsyncMock(),
+            ) as mock_create:
+                result = await ct_mod._impl_campaign_create(
+                    name="valid-profile-campaign",
+                    strategy_doc_path="/tmp/s.md",
+                    cron_cadence="0 */8 * * *",
+                    profile="community-responder",
+                )
+            assert "error" not in result
+            mock_create.assert_awaited_once()
+            assert mock_create.call_args.kwargs["session_profile"] == "community-responder"
+        finally:
+            ct_mod._db = old_db
+            ct_mod._runner = old_runner
+
+
 class TestWiredDbPath:
     """When _db is wired (e.g., via init_campaign_tools), _get_db is not called."""
 

@@ -1,8 +1,8 @@
 """Standalone Discord bot MCP server — read-only message access + reply.
 
 Provides fetch_messages, fetch_forum_threads, and send_reply tools via
-the Discord bot token. Scoped to discord-monitor campaign sessions only
-(not loaded by foreground, ego, reflection, or other session types).
+the Discord bot token. Loaded only by sessions that use the discord-bot MCP
+server (not by foreground, ego, reflection, or other session types).
 
 Stateless — no DB connection needed. Token injected at bootstrap via
 init_discord_bot().

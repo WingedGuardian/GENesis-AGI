@@ -241,19 +241,22 @@ async def test_send_reply_auto_chunks():
 # ── Profile tests ───────────────────────────────────────────────────────
 
 
-def test_discord_monitor_profile_exists():
-    """discord-monitor should be a valid session profile."""
+def test_community_responder_profile_exists():
+    """community-responder should be a valid session profile (renamed from discord-monitor)."""
     from genesis.cc.direct_session import VALID_PROFILES
 
-    assert "discord-monitor" in VALID_PROFILES
+    assert "community-responder" in VALID_PROFILES
+    # The old campaign-coupled name must be fully gone from tracked source.
+    assert "discord-monitor" not in VALID_PROFILES
 
 
-def test_discord_monitor_mcp_profile_exists():
-    """discord-monitor should have an MCP profile with discord-bot server."""
+def test_community_responder_mcp_profile_exists():
+    """community-responder should have an MCP profile with the discord-bot server."""
     from genesis.cc.session_config import _MCP_PROFILES
 
-    assert "discord-monitor" in _MCP_PROFILES
-    servers = _MCP_PROFILES["discord-monitor"]
+    assert "community-responder" in _MCP_PROFILES
+    assert "discord-monitor" not in _MCP_PROFILES
+    servers = _MCP_PROFILES["community-responder"]
     assert "discord-bot" in servers
     assert "genesis-health" in servers
     assert "genesis-outreach" in servers

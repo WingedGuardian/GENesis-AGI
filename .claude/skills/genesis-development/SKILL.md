@@ -275,3 +275,10 @@ Standard open-source workflow: PRs go directly to the public repo.
 - **No sensitive data in commits** — voice data, research profiles, IPs,
   and secrets must never enter the repo. User data lives in overlays
   outside the repo (e.g., `~/.claude/skills/*/`, `~/.genesis/`).
+- **Individual campaigns are user data, not infrastructure** — a campaign's
+  name/prompt/targets/cadence live only in the `campaigns` DB table and the
+  private backups repo; never hardcode them into tracked source. Unlike modules
+  (which ship defaults under `config/modules/*.yaml`), campaigns ship ZERO
+  defaults (no `config/campaigns/`). Only campaign infrastructure ships. Express
+  reusable session types as generic roles (e.g. the `community-responder`
+  profile), not names coupled to a live campaign. See `src/genesis/campaigns/__init__.py`.
