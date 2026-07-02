@@ -89,6 +89,66 @@ def test_parse_empty_or_none_returns_none():
     assert _parse_verdict(None) is None
 
 
+# ── verdict v2: category + reason are additive + best-effort (real/perk stay required) ──
+
+def test_parse_v2_full_verdict():
+    out = _parse_verdict(
+        '{"real": 0.8, "perk": 0.9, "category": "question", "reason": "they asked whether to ship"}'
+    )
+    assert out == {"real": 0.8, "perk": 0.9, "category": "question",
+                   "reason": "they asked whether to ship"}
+
+
+def test_parse_old_format_invents_no_v2_keys():
+    # a bare {real, perk} (model ignored the v2 fields) parses cleanly with NO invented
+    # category/reason — backward compatible, and the parser never fabricates a category.
+    assert _parse_verdict('{"real": 0.8, "perk": 0.3}') == {"real": 0.8, "perk": 0.3}
+
+
+def test_parse_unknown_category_coerces_to_other():
+    out = _parse_verdict('{"real": 0.5, "perk": 0.5, "category": "banana"}')
+    assert out["category"] == "other"
+
+
+def test_parse_category_normalized_to_lowercase():
+    out = _parse_verdict('{"real": 0.5, "perk": 0.5, "category": "Question"}')
+    assert out["category"] == "question"
+
+
+def test_parse_non_string_category_coerces_to_other():
+    out = _parse_verdict('{"real": 0.5, "perk": 0.5, "category": 7}')
+    assert out["category"] == "other"
+
+
+def test_parse_reason_stripped_and_hard_capped():
+    out = _parse_verdict('{"real": 0.5, "perk": 0.5, "reason": "  ' + "x" * 400 + '  "}')
+    assert out["reason"] == "x" * 200          # whitespace-stripped, hard-capped to 200 chars
+
+
+def test_parse_blank_reason_omitted():
+    out = _parse_verdict('{"real": 0.5, "perk": 0.5, "reason": "   "}')
+    assert "reason" not in out and out["real"] == 0.5
+
+
+def test_parse_non_string_reason_omitted():
+    out = _parse_verdict('{"real": 0.5, "perk": 0.5, "reason": {"x": 1}}')
+    assert "reason" not in out
+
+
+def test_parse_missing_real_still_none_with_v2_fields_present():
+    # real/perk remain HARD-required even when category/reason are supplied.
+    assert _parse_verdict('{"perk": 0.5, "category": "task", "reason": "do X"}') is None
+
+
+def test_parse_reason_containing_brace_is_not_truncated():
+    # v2 reason is FREE TEXT; a stray "}" (or "{") inside it must NOT prematurely close the
+    # brace-balanced scan (the pre-v2 scanner ignored string context — fine when all fields
+    # were numeric, a silent verdict-loss regression now that reason is prose).
+    out = _parse_verdict('{"real": 0.8, "perk": 0.3, "category": "task", "reason": "fix the }close} bug"}')
+    assert out["real"] == 0.8 and out["category"] == "task"
+    assert out["reason"] == "fix the }close} bug"
+
+
 # ── _build_prompt: window text + speaker labels reach the model ──
 
 def test_prompt_carries_window_text_and_speaker_labels():
@@ -103,33 +163,50 @@ def test_prompt_unknown_speaker_label():
     assert "[?]" in p
 
 
+def test_prompt_lists_category_enum_and_reason_field():
+    p = _build_prompt([_u("can you book it?", is_user=1)])
+    for cat in ("question", "task", "decision", "problem", "chatter", "garble"):
+        assert cat in p
+    assert "category" in p and "reason" in p
+
+
+def test_prompt_reason_instructs_no_verbatim_quote():
+    # firewall-soften safety: the reason is a CHARACTERIZATION, not a transcript quote —
+    # the prompt must tell the model not to quote the window text back.
+    p = _build_prompt([_u("hi", is_user=1)]).lower()
+    assert "quote" in p or "verbatim" in p
+
+
 # ── AttentionSampler.sample: injected fake router ──
 
 @dataclass
 class _Result:
     success: bool
     content: str | None
+    model_id: str | None = None       # RoutingResult carries the serving model (may fall back)
 
 
 class _FakeRouter:
-    def __init__(self, *, content=None, success=True, raises=False):
+    def __init__(self, *, content=None, success=True, raises=False, model_id=None):
         self._content = content
         self._success = success
         self._raises = raises
+        self._model_id = model_id
         self.calls: list = []
 
     async def route_call(self, call_site_id, messages, **kwargs):
         self.calls.append((call_site_id, messages))
         if self._raises:
             raise RuntimeError("boom")
-        return _Result(self._success, self._content)
+        return _Result(self._success, self._content, self._model_id)
 
 
 @pytest.mark.asyncio
 async def test_sample_happy_hits_attention_salience_call_site():
     r = _FakeRouter(content='{"real": 0.7, "perk": 0.6}')
     out = await AttentionSampler(r).sample([_u("what's the plan?", is_user=1)], CFG)
-    assert out == {"real": 0.7, "perk": 0.6}
+    assert out["real"] == 0.7 and out["perk"] == 0.6
+    assert out["prompt_version"] == "v2"        # sample() stamps the prompt version
     assert r.calls and r.calls[0][0] == "attention_salience"
 
 
@@ -155,6 +232,29 @@ async def test_sample_empty_window_skips_router_call():
 async def test_sample_malformed_content_returns_none():
     assert await AttentionSampler(_FakeRouter(content="not json at all")).sample(
         [_u("hi", is_user=1)], CFG) is None
+
+
+@pytest.mark.asyncio
+async def test_sample_stamps_prompt_version_and_preserves_v2_fields():
+    r = _FakeRouter(content='{"real": 0.7, "perk": 0.6, "category": "question", "reason": "asked a q"}')
+    out = await AttentionSampler(r).sample([_u("what's the plan?", is_user=1)], CFG)
+    assert out["prompt_version"] == "v2"
+    assert out["category"] == "question" and out["reason"] == "asked a q"
+    assert out["real"] == 0.7 and out["perk"] == 0.6
+
+
+@pytest.mark.asyncio
+async def test_sample_stamps_model_when_router_reports_it():
+    r = _FakeRouter(content='{"real": 1, "perk": 1}', model_id="mistral-small-latest")
+    out = await AttentionSampler(r).sample([_u("hi", is_user=1)], CFG)
+    assert out["model"] == "mistral-small-latest"
+
+
+@pytest.mark.asyncio
+async def test_sample_omits_model_when_router_reports_none():
+    r = _FakeRouter(content='{"real": 1, "perk": 1}')     # RoutingResult.model_id is None
+    out = await AttentionSampler(r).sample([_u("hi", is_user=1)], CFG)
+    assert "model" not in out
 
 
 def test_attention_salience_call_site_is_configured():

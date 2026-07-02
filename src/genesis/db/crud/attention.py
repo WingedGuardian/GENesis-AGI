@@ -272,10 +272,35 @@ async def update_l15_verdict(
     UNCONDITIONAL (no ``acceptance_signal IS NULL`` guard) — unlike ``bulk_upsert_events``,
     which guards the human label. ``l15_verdict`` carries no human input, so a later
     ``--l15`` run may safely refresh it even on an already-LABELED row (the label/verdict
-    correlation workflow PR3c-2 needs). Stored floats-only (mirrors ``consumers._to_row``)."""
+    correlation workflow PR3c-2 needs). Stored as the judge's own JSON verdict (mirrors
+    ``consumers._to_row``) — never raw transcript text (firewall)."""
     payload = json.dumps(verdict) if verdict is not None else None
     cursor = await db.execute(
         "UPDATE attention_events SET l15_verdict = ? WHERE id = ?", (payload, event_id)
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def bulk_update_l15_verdicts(
+    db: aiosqlite.Connection, rows: list[tuple[str, str]]
+) -> int:
+    """Unconditionally set ``l15_verdict`` for each ``(event_id, verdict_json)`` pair; returns
+    the count submitted.
+
+    The bulk sibling of ``update_l15_verdict`` for the shadow runner's backfill: ``l15_verdict``
+    is a MACHINE field, so — unlike ``bulk_upsert_events``, whose ``WHERE acceptance_signal IS
+    NULL`` guard FREEZES a labeled row's derived columns — this writes even on LABELED rows.
+    That is exactly what a later ``--l15`` run needs: the verdict must attach to the same rows
+    the human already labeled, or the human∩judge agreement view reads the judge as "missing"
+    on precisely the rows under review. Callers pass already-serialized JSON (mirrors
+    ``ShadowStoreConsumer``, which ``json.dumps`` once) and filter out None verdicts themselves
+    (a no-verdict re-run must not null a stored one). One ``executemany`` in the caller's txn."""
+    if not rows:
+        return 0
+    await db.executemany(
+        "UPDATE attention_events SET l15_verdict = ? WHERE id = ?",
+        [(verdict_json, event_id) for event_id, verdict_json in rows],
+    )
+    await db.commit()
+    return len(rows)

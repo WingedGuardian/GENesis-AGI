@@ -129,6 +129,73 @@ async def test_reflush_preserves_human_label(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_flush_backfills_l15_verdict_onto_labeled_row(tmp_path):
+    # PR3d: a re-run WITH --l15 must attach the judge verdict even to a row the human already
+    # labeled. bulk_upsert's label guard FREEZES derived cols on a labeled row, so the verdict
+    # (a machine field) has to land via a second, unconditional pass — else the human∩judge
+    # agreement view would read the judge as "missing" on exactly the rows we care about.
+    from dataclasses import replace
+    db = tmp_path / "g.db"
+    _make_db(db)
+    cfg = AttentionConfig.from_dict(default_config_dict())
+    evs = _run_events([_utt(1, 100.0, "what do you think?")], cfg)
+    assert evs
+
+    c = ShadowStoreConsumer(db, snapshot_id="s", config_version=cfg.version)
+    for ev in evs:
+        c.add(ev)                                    # first persist: no verdict yet
+    await c.flush()
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE attention_events SET acceptance_signal = 'should'")   # human labels it
+    conn.commit()
+    conn.close()
+
+    c2 = ShadowStoreConsumer(db, snapshot_id="s", config_version=cfg.version)
+    for ev in evs:
+        c2.add(replace(ev, l15_verdict={"real": 0.9, "perk": 0.8, "category": "question"}))
+    await c2.flush()                                 # re-run WITH a verdict
+
+    conn = sqlite3.connect(db)
+    rows = conn.execute("SELECT acceptance_signal, l15_verdict FROM attention_events").fetchall()
+    conn.close()
+    assert rows
+    for label, verdict in rows:
+        assert label == "should"                     # human label preserved
+        assert verdict is not None and json.loads(verdict)["category"] == "question"  # verdict landed
+
+
+@pytest.mark.asyncio
+async def test_flush_without_verdict_does_not_null_a_labeled_rows_verdict(tmp_path):
+    # A plain re-run (no --l15) carries l15_verdict=None; it must NOT wipe a verdict a prior
+    # --l15 run wrote. The backfill pass only writes NON-None verdicts, and the label freezes
+    # the upsert — so the earlier verdict survives.
+    from dataclasses import replace
+    db = tmp_path / "g.db"
+    _make_db(db)
+    cfg = AttentionConfig.from_dict(default_config_dict())
+    evs = _run_events([_utt(1, 100.0, "what do you think?")], cfg)
+
+    c = ShadowStoreConsumer(db, snapshot_id="s", config_version=cfg.version)
+    for ev in evs:
+        c.add(replace(ev, l15_verdict={"real": 0.5, "perk": 0.5}))
+    await c.flush()
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE attention_events SET acceptance_signal = 'should'")
+    conn.commit()
+    conn.close()
+
+    c2 = ShadowStoreConsumer(db, snapshot_id="s", config_version=cfg.version)
+    for ev in evs:
+        c2.add(ev)                                   # l15_verdict is None on this re-run
+    await c2.flush()
+
+    conn = sqlite3.connect(db)
+    verdicts = [r[0] for r in conn.execute("SELECT l15_verdict FROM attention_events")]
+    conn.close()
+    assert verdicts and all(v is not None for v in verdicts)   # prior verdict survived
+
+
+@pytest.mark.asyncio
 async def test_new_config_version_writes_new_rows(tmp_path):
     db = tmp_path / "g.db"
     _make_db(db)
