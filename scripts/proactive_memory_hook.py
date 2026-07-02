@@ -398,6 +398,7 @@ def _search_fts5(
     db_path: Path,
     keywords: list[str],
     collection: str | None = None,
+    now_iso: str | None = None,
 ) -> list[dict]:
     """Search memory_fts using FTS5 with OR-joined keywords.
 
@@ -405,11 +406,19 @@ def _search_fts5(
     LEFT JOIN with memory_metadata. NULL source_subsystem (user-sourced
     + legacy pre-1.5b rows) is preserved.
 
+    Also drops bitemporally-invalid rows (``invalid_at`` in the past), for
+    parity with the main retrieval path (``memory.crud.search_ranked``).
+    NULL ``invalid_at`` = "valid forever" and is always preserved, so the
+    filter can never over-drop live context.
+
     ``collection``: if provided, restrict to this collection
     (e.g. ``"episodic_memory"``). Default ``None`` searches all.
+    ``now_iso``: as-of instant for the invalid_at check; defaults to now.
     """
     if not keywords:
         return []
+    if now_iso is None:
+        now_iso = datetime.now(UTC).isoformat()
 
     fts_query = " OR ".join('"' + _escape_fts5(k) + '"' for k in keywords)
     placeholders = ",".join("?" * len(_PROACTIVE_EXCLUDED_SUBSYSTEMS))
@@ -437,11 +446,14 @@ def _search_fts5(
                   AND (memory_metadata.source_subsystem IS NULL
                        OR memory_metadata.source_subsystem
                            NOT IN ({placeholders}))
+                  AND (memory_metadata.invalid_at IS NULL
+                       OR memory_metadata.invalid_at > ?)
                 ORDER BY rank
                 LIMIT ?
                 """,  # noqa: S608 -- placeholders bound separately
                 (fts_query, *collection_params,
                  *_PROACTIVE_EXCLUDED_SUBSYSTEMS,
+                 now_iso,
                  _MAX_RESULTS * 2),
             )
             rows = [dict(row) for row in cursor.fetchall()]
@@ -457,6 +469,45 @@ def _search_fts5(
     except Exception as exc:
         print(f"FTS5 search error: {exc}", file=sys.stderr)
         return []
+
+
+def _expired_memory_ids(
+    db_path: Path,
+    ids: set[str],
+    now_iso: str | None = None,
+) -> set[str]:
+    """Return the subset of ``ids`` whose ``invalid_at`` is in the past.
+
+    Post-query bitemporal filter for the Qdrant union: vector + wing hits
+    enter the fused set without seeing ``memory_metadata.invalid_at`` (the
+    Qdrant payload doesn't carry it). Mirrors
+    ``memory.retrieval._expired_candidate_ids``.
+
+    NULL ``invalid_at`` = "valid forever" and is never returned. Ids with no
+    ``memory_metadata`` row (e.g. knowledge_base points) simply don't match,
+    so they're safely ignored. On any DB error this returns an empty set —
+    the safe direction: never drop context we can't positively prove expired.
+    """
+    if not ids:
+        return set()
+    if now_iso is None:
+        now_iso = datetime.now(UTC).isoformat()
+    placeholders = ",".join("?" * len(ids))
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        try:
+            cursor = conn.execute(
+                f"SELECT memory_id FROM memory_metadata "  # noqa: S608 -- bound below
+                f"WHERE memory_id IN ({placeholders}) "
+                f"AND invalid_at IS NOT NULL AND invalid_at <= ?",
+                (*ids, now_iso),
+            )
+            return {row[0] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"invalid_at filter error: {exc}", file=sys.stderr)
+        return set()
 
 
 _PROCEDURE_SURFACE_THRESHOLD = 0.7  # Cosine cutoff for PROVEN tiers (CORE/ADVISORY/LIBRARY).
@@ -1225,8 +1276,14 @@ async def _run(prompt: str, session_id: str = "") -> None:
     except Exception:
         pass  # Taxonomy module failure must not block hook
 
+    # As-of instant for bitemporal invalid_at filtering across FTS + Qdrant
+    # (parity with retrieval.py). Computed once so every path agrees.
+    now_iso = datetime.now(UTC).isoformat()
+
     # FTS5 search (synchronous, fast) — episodic only; KB comes via Qdrant
-    fts_results = _search_fts5(_DB_PATH, keywords, collection="episodic_memory")
+    fts_results = _search_fts5(
+        _DB_PATH, keywords, collection="episodic_memory", now_iso=now_iso,
+    )
 
     # Code index search (synchronous, fast) — structural code matches
     code_results = _search_code_index(_DB_PATH, keywords)
@@ -1264,6 +1321,16 @@ async def _run(prompt: str, session_id: str = "") -> None:
                 _search_qdrant(vector, collection="knowledge_base",
                                extra_filter=_knowledge_filter),
             )
+
+    # Bitemporal parity: drop memories past their invalid_at from the Qdrant
+    # union (episodic vector + wing). knowledge_base ids aren't episodic
+    # memory_metadata rows, so knowledge_results is intentionally not filtered.
+    _episodic_ids = {r["memory_id"] for r in vector_results}
+    _episodic_ids |= {r["memory_id"] for r in wing_results}
+    _expired = _expired_memory_ids(_DB_PATH, _episodic_ids, now_iso)
+    if _expired:
+        vector_results = [r for r in vector_results if r["memory_id"] not in _expired]
+        wing_results = [r for r in wing_results if r["memory_id"] not in _expired]
 
     fts_only_fallback = len(vector_results) == 0 and len(fts_results) > 0
 
