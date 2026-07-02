@@ -132,6 +132,44 @@ class ManifestManager:
             manifest[h]["unit_ids"] = existing + unit_ids
             self._save()
 
+    def remove_unit(self, unit_id: str) -> bool:
+        """Drop a knowledge ``unit_id`` from whichever source entry owns it.
+
+        Knowledge units are deleted one at a time (the dashboard DELETE route is
+        per-unit), but the manifest tracks whole sources. We pop ``unit_id`` from
+        its owning entry's ``unit_ids``; when that removes the source's LAST live
+        unit, we delete the entire entry — a *tombstone* — so a future re-ingest
+        is no longer blocked by the source-identity gate (``has_source``), which
+        would otherwise serve now-dead cached unit IDs forever.
+
+        INVARIANT: only a transition-to-empty *via this method* tombstones an
+        entry. A ``no_units_extracted`` source (``add_source`` with
+        ``unit_ids=[]``) already has an empty list, contains no ``unit_id`` to
+        match, and is therefore left untouched.
+
+        The entry is removed even if it carries a ``pageindex_doc_id`` — keeping
+        it would keep ``has_source`` True and re-block ingest, and the tree index
+        is rebuilt (and its on-disk cache overwritten, keyed by ``source_hash``)
+        on re-ingest. Physical artifacts (extracted text, originals) are left in
+        place; re-ingest overwrites them and unlinking only adds failure modes.
+
+        Returns True if a matching entry was found and mutated, else False
+        (idempotent: a repeat delete of the same ``unit_id`` is a no-op).
+        """
+        manifest = self._load()
+        for h, entry in list(manifest.items()):  # snapshot: we may del during loop
+            unit_ids = entry.get("unit_ids", [])
+            if unit_id not in unit_ids:
+                continue
+            remaining = [u for u in unit_ids if u != unit_id]
+            if remaining:
+                entry["unit_ids"] = remaining
+            else:
+                del manifest[h]  # last live unit gone → tombstone the source
+            self._save()
+            return True
+        return False
+
     def get_units_for_source(self, source: str) -> list[str]:
         """Get all knowledge unit IDs produced from a source."""
         manifest = self._load()
