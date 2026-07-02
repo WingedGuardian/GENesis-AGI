@@ -63,4 +63,12 @@ def system_resources():
     except OSError:
         result["disk"] = {"status": "unavailable"}
 
+    # Per-CC-slot RSS — leak/anomaly visibility (one row per Claude Code session)
+    try:
+        from genesis.observability.cc_slots import enumerate_cc_slots
+
+        result["cc_slots"] = enumerate_cc_slots()
+    except Exception:
+        result["cc_slots"] = []
+
     return jsonify(result)

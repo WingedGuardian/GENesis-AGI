@@ -298,6 +298,13 @@ async def infrastructure(
         infra["cc_tmp"] = {"status": "error", "error": str(exc)}
 
     try:
+        from genesis.observability.cc_slots import enumerate_cc_slots
+
+        infra["cc_slots"] = enumerate_cc_slots()
+    except Exception:
+        infra["cc_slots"] = []
+
+    try:
         from genesis.observability.service_status import probe_qdrant_collections
 
         infra["qdrant_collections"] = await probe_qdrant_collections()

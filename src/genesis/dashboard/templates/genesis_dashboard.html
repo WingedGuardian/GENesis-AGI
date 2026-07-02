@@ -5196,6 +5196,19 @@
                         x-text="($store.genesisDashboard.health.infrastructure.disk.total_gb - $store.genesisDashboard.health.infrastructure.disk.free_gb).toFixed(0) + '/' + $store.genesisDashboard.health.infrastructure.disk.total_gb.toFixed(0) + ' GB'"></span>
                 </div>
               </template>
+              <!-- CC slots row (per-session RSS — leak detection) -->
+              <template x-if="($store.genesisDashboard.health.infrastructure?.cc_slots || []).length">
+                <div style="display:flex; align-items:flex-start; gap:0.5rem; font-size:0.8rem;">
+                  <span style="width:3.2rem; color:var(--color-text-secondary);">CC</span>
+                  <div style="flex:1; display:flex; flex-wrap:wrap; gap:0.35rem;">
+                    <template x-for="slot in $store.genesisDashboard.health.infrastructure.cc_slots" :key="slot.slot">
+                      <span style="font-size:0.7rem; padding:0.05rem 0.3rem; border-radius:3px; background:var(--color-background); white-space:nowrap;"
+                            :style="`color: ${slot.status === 'error' ? '#d9534f' : slot.status === 'degraded' ? '#f0ad4e' : 'var(--color-text-secondary)'}`"
+                            x-text="'cc-' + slot.slot + ' ' + (slot.rss_mb / 1024).toFixed(1) + 'G'"></span>
+                    </template>
+                  </div>
+                </div>
+              </template>
               <!-- Fallback when no data -->
               <template x-if="!$store.genesisDashboard.health.infrastructure?.container_memory?.used_pct && !$store.genesisDashboard.health.infrastructure?.cpu && !$store.genesisDashboard.health.infrastructure?.disk">
                 <span style="color: #666; font-size: 0.82rem;">no data</span>
