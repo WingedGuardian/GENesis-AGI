@@ -84,13 +84,14 @@ _PORTABILITY_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"/home/ubuntu/agent-zero", "absolute path /home/ubuntu/agent-zero"),
     (r"/home/ubuntu/\.[A-Za-z]", "absolute path to user dotfile"),
     (r"-home-ubuntu-genesis", "CC project dir slug"),
-    (r"10\.176\.34\.199", "Ollama host IP"),
-    (r"10\.176\.34\.206", "container IP"),
+    (r"10\.176\.\d{1,3}\.\d{1,3}", "private 10.176 subnet IP"),
+    (r"100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}", "Tailscale CGNAT IP"),
     (r"192\.168\.50\.\d+", "private subnet IP"),
     (r"\bWingedGuardian/(Genesis|genesis-backups)\b", "private repo reference"),
     (r"\bAmerica/New_York\b", "hardcoded user timezone"),
     (r"\bfd42:e3ba\b", "container IPv6 prefix"),
     (r"\bfd4d:77b8\b", "host IPv6 prefix"),
+    (r"\bfd7a:", "Tailscale IPv6 prefix"),
     (r"\b5070ti\b", "hardware reference"),
 )
 

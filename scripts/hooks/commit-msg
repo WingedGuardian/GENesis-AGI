@@ -5,7 +5,7 @@
 # and private hostnames. Covers the gap that gitleaks (file-content only)
 # does not scan commit messages.
 
-PATTERNS='10\.176\.[0-9]|192\.168\.50\.[0-9]|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|046056[0-9]{6}|moonandstar|zorror|assistant1'
+PATTERNS='10\.176\.[0-9]|192\.168\.50\.[0-9]|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|fd7a:|046056[0-9]{6}|moonandstar|zorror|assistant1'
 
 if grep -qE "$PATTERNS" "$1"; then
     echo ""

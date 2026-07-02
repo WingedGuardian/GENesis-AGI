@@ -500,3 +500,60 @@ def test_detect_secrets_positive_blocks(clean_diff, monkeypatch):
         r = sanitize.scan_diff(clean_diff)
     assert r.ok is False
     assert any(f.scanner == "detect-secrets" for f in r.blocking())
+
+
+def test_portability_cgnat_blocks():
+    """Tailscale CGNAT addresses (100.64-127.x.x) must be blocked pre-push."""
+    diff = (
+        "diff --git a/config.py b/config.py\n"
+        "--- a/config.py\n+++ b/config.py\n@@ -1 +1 @@\n"
+        "+NODE_URL = 'http://100.64.0.5:8080'\n"
+    )
+    r = sanitize.scan_diff(diff)
+    assert r.ok is False
+    assert any(f.kind == FindingKind.PORTABILITY for f in r.blocking())
+
+
+def test_portability_non_cgnat_100_allowed():
+    """A 100.x address OUTSIDE the CGNAT range (64-127) is a normal public IP
+    and must NOT be flagged (guards against an over-broad regex)."""
+    diff = (
+        "diff --git a/x.py b/x.py\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+PUBLIC = '100.200.5.5'\n"
+    )
+    r = sanitize.scan_diff(diff)
+    assert r.ok is True
+
+
+def test_portability_tailscale_ipv6_blocks():
+    """Tailscale IPv6 (fd7a: ULA prefix) must be blocked pre-push."""
+    diff = (
+        "diff --git a/x.py b/x.py\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST6 = 'fd7a:115c:a1e0::1'\n"
+    )
+    r = sanitize.scan_diff(diff)
+    assert r.ok is False
+    assert any(f.kind == FindingKind.PORTABILITY for f in r.blocking())
+
+
+def test_portability_10_176_range_blocks():
+    """Any 10.176.x.x address (not just the two legacy literals) must block."""
+    diff = (
+        "diff --git a/x.py b/x.py\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST = '10.176.99.42'\n"
+    )
+    r = sanitize.scan_diff(diff)
+    assert r.ok is False
+    assert any(f.kind == FindingKind.PORTABILITY for f in r.blocking())
+
+
+def test_portability_fd7a_requires_colon_no_false_positive():
+    r"""`\bfd7a:` should match Tailscale IPv6 (fd7a:...) but NOT an unrelated
+    hex token that merely contains 'fd7a' without the trailing colon (e.g. a
+    commit hash), so the floor doesn't over-block legitimate content."""
+    diff = (
+        "diff --git a/x.py b/x.py\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HASH = 'fd7abeefcafe0123'\n"
+    )
+    r = sanitize.scan_diff(diff)
+    assert r.ok is True
