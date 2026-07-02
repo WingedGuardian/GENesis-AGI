@@ -29,6 +29,7 @@ def system_resources():
     # Container memory — anon+kernel (non-reclaimable) for status decisions
     try:
         from genesis.autonomy.watchdog import get_container_anon_memory, get_container_memory
+        from genesis.observability.snapshots.infrastructure import _PSI_MEMORY_PATH, _read_psi
 
         anon_mem = get_container_anon_memory()
         total_mem = get_container_memory()
@@ -37,11 +38,12 @@ def system_resources():
             anon_pct = round(anon_kernel / limit * 100, 1)
             total_pct = round(total_mem[0] / limit * 100, 1) if total_mem and total_mem[1] > 0 else anon_pct
             result["memory"] = {
-                "status": "healthy" if anon_pct < 85 else ("degraded" if anon_pct < 95 else "critical"),
+                "status": "healthy" if anon_pct < 85 else ("degraded" if anon_pct < 95 else "down"),
                 "used_gb": round((total_mem[0] if total_mem else anon_kernel) / (1024**3), 1),
                 "total_gb": round(limit / (1024**3), 1),
                 "used_pct": total_pct,
                 "anon_pct": anon_pct,
+                "pressure": _read_psi(_PSI_MEMORY_PATH),
             }
         else:
             result["memory"] = {"status": "unavailable"}

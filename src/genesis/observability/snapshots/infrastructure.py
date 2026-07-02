@@ -77,17 +77,107 @@ def _read_mem_available() -> int | None:
     return None
 
 
+_PSI_CPU_PATH = "/sys/fs/cgroup/cpu.pressure"
+_PSI_MEMORY_PATH = "/sys/fs/cgroup/memory.pressure"
+
+
+def _read_psi(path: str) -> dict:
+    """Parse a cgroup PSI (pressure stall information) file into some/full avgs.
+
+    PSI is the honest "is contention actually HURTING" metric: `full.avgN` is
+    the % of wall-clock over the last N s during which *all* non-idle tasks were
+    stalled waiting on this resource. It distinguishes real pressure from benign
+    reclaim — e.g. a climbing memory.events 'high' count with memory.pressure
+    full.avg=0 is harmless page-cache reclaim, not a problem.
+
+    Returns {} if unavailable (kernel without CONFIG_PSI, missing file). Mirrors
+    genesis.guardian.health_signals.parse_psi_content; kept local to avoid
+    importing the host-side guardian module into the in-server snapshot path.
+    """
+    try:
+        out: dict[str, float] = {}
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                if not parts or parts[0] not in ("some", "full"):
+                    continue
+                prefix = parts[0]
+                for part in parts[1:]:
+                    key, sep, val = part.partition("=")
+                    if sep and key in ("avg10", "avg60", "avg300"):
+                        try:
+                            out[f"{prefix}_{key}"] = float(val)
+                        except ValueError:
+                            continue
+        return out
+    except (OSError, ValueError):
+        return {}
+
+
+# Health-status ranking (higher = worse) for composing multiple signals.
+_STATUS_RANK = {"healthy": 0, "unknown": 1, "unavailable": 1, "degraded": 2, "down": 3, "error": 3}
+
+
+def _worse_status(a: str, b: str) -> str:
+    """Return the worse (higher-ranked) of two health statuses."""
+    return a if _STATUS_RANK.get(a, 0) >= _STATUS_RANK.get(b, 0) else b
+
+
+# Container memory PSI thresholds (full.avg60 %). Sustained memory stall is REAL
+# pressure even when anon% is moderate; benign cache reclaim reads ~0.
+_MEM_PSI_DEGRADED_PCT = 10.0
+_MEM_PSI_ERROR_PCT = 30.0
+
+
+def memory_status(anon_frac: float, pressure: dict) -> str:
+    """Container-memory health = worse of anon% (OOM guard, non-reclaimable) and
+    sustained memory PSI (catches reclaim that is actually stalling work).
+
+    anon_frac is a 0..1 fraction of the cgroup limit.
+    """
+    anon_status = "healthy" if anon_frac < 0.85 else ("degraded" if anon_frac < 0.95 else "down")
+    full60 = pressure.get("full_avg60", 0.0)
+    psi_status = (
+        "down" if full60 >= _MEM_PSI_ERROR_PCT
+        else ("degraded" if full60 >= _MEM_PSI_DEGRADED_PCT else "healthy")
+    )
+    return _worse_status(anon_status, psi_status)
+
+
+# CPU utilization % thresholds — plain used_pct (NOT loadavg; loadavg counts I/O
+# wait and misrepresents CPU). Only SUSTAINED high utilization degrades; the
+# normal box hum (~45%) stays healthy.
+_CPU_DEGRADED_PCT = 80.0
+_CPU_ERROR_PCT = 95.0
+
+
+def _cpu_status(used_pct: float | None) -> str:
+    """Map CPU utilization % → health status. None (baseline/no data) → healthy."""
+    if used_pct is None:
+        return "healthy"
+    if used_pct >= _CPU_ERROR_PCT:
+        return "error"
+    if used_pct >= _CPU_DEGRADED_PCT:
+        return "degraded"
+    return "healthy"
+
+
 # Module-level state for delta-based CPU reading (no blocking sleep)
 _last_cpu_reading: tuple[int, int, float] | None = None  # (idle, total, monotonic_time)
 
 
 def _collect_cpu_usage() -> dict:
-    """Read CPU usage from /proc/stat delta. No blocking sleep.
+    """Read CPU usage from /proc/stat delta + CPU pressure (PSI). No blocking sleep.
 
-    First call stores a baseline and returns None for used_pct.
-    Subsequent calls compute delta from the stored baseline.
+    First call stores a baseline and returns None for used_pct. Subsequent calls
+    compute the delta from the stored baseline. Status derives from used_pct
+    (plain CPU utilization %), NOT loadavg — loadavg counts I/O wait and
+    misrepresents CPU. cpu.pressure (PSI) is surfaced as the honest "is CPU
+    contention actually stalling work" signal.
     """
     global _last_cpu_reading  # noqa: PLW0603
+    pressure = _read_psi(_PSI_CPU_PATH)
+    count = os.cpu_count()
     try:
         with open("/proc/stat") as f:
             parts = f.readline().split()
@@ -98,7 +188,7 @@ def _collect_cpu_usage() -> dict:
 
         if _last_cpu_reading is None:
             _last_cpu_reading = (idle, total, now)
-            return {"status": "healthy", "used_pct": None, "count": os.cpu_count()}
+            return {"status": "healthy", "used_pct": None, "count": count, "pressure": pressure}
 
         prev_idle, prev_total, _prev_time = _last_cpu_reading
         _last_cpu_reading = (idle, total, now)
@@ -106,12 +196,12 @@ def _collect_cpu_usage() -> dict:
         delta_idle = idle - prev_idle
         delta_total = total - prev_total
         if delta_total == 0:
-            return {"status": "healthy", "used_pct": 0.0, "count": os.cpu_count()}
+            return {"status": "healthy", "used_pct": 0.0, "count": count, "pressure": pressure}
 
         used_pct = round((1.0 - delta_idle / delta_total) * 100, 1)
-        return {"status": "healthy", "used_pct": used_pct, "count": os.cpu_count()}
+        return {"status": _cpu_status(used_pct), "used_pct": used_pct, "count": count, "pressure": pressure}
     except (OSError, ValueError, IndexError):
-        return {"status": "unavailable", "used_pct": None, "count": os.cpu_count()}
+        return {"status": "unavailable", "used_pct": None, "count": count, "pressure": pressure}
 
 
 async def infrastructure(
@@ -222,16 +312,18 @@ async def infrastructure(
         if anon_mem and anon_mem[1] > 0:
             anon_kernel, limit = anon_mem
             anon_pct = anon_kernel / limit
-            # Status thresholds use anon+kernel (non-reclaimable).
-            # Total cgroup usage (memory.current) is shown for reference
-            # but not used for health decisions — it includes reclaimable
-            # page cache that inflates the metric.
+            mem_pressure = _read_psi(_PSI_MEMORY_PATH)
+            # Status = worse of anon% (OOM guard, non-reclaimable) and sustained
+            # memory PSI. Total cgroup usage (memory.current) is shown for
+            # reference but NOT used for health — it includes reclaimable page
+            # cache that inflates the metric, and whose reclaim is benign.
             mem_info: dict = {
-                "status": "healthy" if anon_pct < 0.85 else ("degraded" if anon_pct < 0.95 else "down"),
+                "status": memory_status(anon_pct, mem_pressure),
                 "current_gb": round((total_mem[0] if total_mem else anon_kernel) / (1024**3), 1),
                 "limit_gb": round(limit / (1024**3), 1),
                 "used_pct": round((total_mem[0] / limit * 100) if total_mem and total_mem[1] > 0 else anon_pct * 100, 1),
                 "anon_pct": round(anon_pct * 100, 1),
+                "pressure": mem_pressure,
             }
             # MemAvailable from /proc/meminfo — the kernel's estimate of
             # memory available for new allocations without swapping. This is

@@ -19,6 +19,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The dashboard's container-health badge now tells the truth about CPU and memory pressure.**
+  Previously the badge ignored CPU entirely (it was hardwired to "healthy") and judged memory only by a
+  raw usage figure that's inflated by reclaimable cache — so a busy or memory-throttling box could still
+  read all-green. It now factors in actual CPU utilization and PSI (pressure-stall) readings: it stays
+  green when the box is merely holding reclaimable cache, and only turns amber/red when CPU or memory is
+  genuinely stalling work, with a reason that says which.
+
 - **Genesis now catches scheduled jobs that silently stop working — running on schedule but never
   succeeding.** Some background jobs (like the weekly self-assessment and quality calibration) could
   fail week after week without ever showing up as "failed," because the failure counter is reset
