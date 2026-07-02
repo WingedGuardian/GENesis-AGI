@@ -239,7 +239,7 @@
         // ── Attention review tab state ──
         attentionEvents: [],
         attentionStats: null,
-        attentionFilters: { activation: "", trigger: "", is_user: false, unlabeled: true },
+        attentionFilters: { activation: "", trigger: "", is_user: false, unlabeled: true, config_version: "" },
         attentionRevealed: {},   // {event_id: [window rows] | "unavailable"}
         attentionLabeling: {},   // {event_id: true} while a label POST is in flight
 
@@ -1621,6 +1621,7 @@
           if (f.trigger) p.set("trigger", f.trigger);
           if (f.is_user) p.set("is_user", "true");
           if (f.unlabeled) p.set("unlabeled", "true");
+          if (f.config_version) p.set("config_version", f.config_version);
           return p.toString();
         },
         async fetchAttentionEvents() {
@@ -1631,7 +1632,9 @@
         },
         async fetchAttentionStats() {
           try {
-            const resp = await fetchApi("/api/genesis/attention/stats");
+            const cv = this.attentionFilters.config_version;
+            const qs = cv ? `?config_version=${encodeURIComponent(cv)}` : "";
+            const resp = await fetchApi(`/api/genesis/attention/stats${qs}`);
             if (resp && resp.ok) { this.attentionStats = await resp.json(); }
           } catch (e) { console.warn("Attention stats failed:", e); }
         },
@@ -10665,6 +10668,14 @@
           <option value="">All triggers</option>
           <template x-for="name in Object.keys($store.genesisDashboard.attentionStats?.by_trigger || {})" :key="name">
             <option :value="name" x-text="name"></option>
+          </template>
+        </select>
+        <!-- config_version: rescopes BOTH the list AND the stats panel (else the dominance bar mixes versions) -->
+        <select x-model="$store.genesisDashboard.attentionFilters.config_version" @change="$store.genesisDashboard.fetchAttentionEvents(); $store.genesisDashboard.fetchAttentionStats()"
+                style="padding: .4rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
+          <option value="">All versions</option>
+          <template x-for="v in ($store.genesisDashboard.attentionStats?.config_versions || [])" :key="v">
+            <option :value="v" x-text="v"></option>
           </template>
         </select>
         <label style="font-size:.8rem; display:flex; align-items:center; gap:.3rem;">

@@ -31,6 +31,7 @@ def _row(
     session_id="s1",
     snapshot_id="20260701T013412Z",
     utt_ids=(1, 2, 3),
+    config_version="0.1.0-default",
 ):
     """A full attention_events tuple in COLUMNS order."""
     triggers_json = json.dumps([{"name": nm, "kind": k, "contribution": c} for nm, k, c in triggers])
@@ -41,7 +42,7 @@ def _row(
     return (
         f"id-{n}", ts, session_id, activation, score, triggers_json,
         json.dumps(list(suppressors)), window_ref, "unknown", 0.9, None,
-        acceptance, snapshot_id, "0.1.0-default", "2026-07-01T00:00:00+00:00",
+        acceptance, snapshot_id, config_version, "2026-07-01T00:00:00+00:00",
     )
 
 
@@ -153,4 +154,81 @@ async def test_update_acceptance_signal_validation_and_missing(tmp_path):
 async def test_get_event_missing_returns_none(tmp_path):
     db = await _db(tmp_path / "g.db")
     assert await crud.get_event(db, "nope") is None
+    await db.close()
+
+
+# ── PR3c-1: config_version filter (list + all 4 aggregates), config_versions, backfill, differ read ──
+
+@pytest.mark.asyncio
+async def test_list_and_stats_scope_to_config_version(tmp_path):
+    """R4: the version filter must reach list AND every aggregate — else a 2nd version
+    persisting makes the stats panel show mixed counts while the list filters correctly."""
+    db = await _db(tmp_path / "g.db")
+    await crud.bulk_upsert_events(db, [
+        _row(1, activation="soft", triggers=(("multi_speaker", "soft", 0.4),),
+             suppressors=("explicit_dismissal",), config_version="0.1.0-default"),
+        _row(2, activation="hard", triggers=(("ambient_name", "hard", 0.0),),
+             acceptance="should", config_version="0.1.0-default"),
+        _row(3, activation="soft", triggers=(("decision", "soft", 0.3),),
+             config_version="0.2.0-taxonomy"),
+    ])
+    # list
+    assert {e["id"] for e in await crud.list_events(db, config_version="0.1.0-default")} == {"id-1", "id-2"}
+    assert {e["id"] for e in await crud.list_events(db, config_version="0.2.0-taxonomy")} == {"id-3"}
+    # aggregates, scoped
+    assert await crud.activation_stats(db, "0.1.0-default") == {"soft": 1, "hard": 1}
+    assert await crud.activation_stats(db, "0.2.0-taxonomy") == {"soft": 1}
+    assert await crud.trigger_stats(db, "0.1.0-default") == {"multi_speaker": 1, "ambient_name": 1}
+    assert await crud.trigger_stats(db, "0.2.0-taxonomy") == {"decision": 1}
+    assert await crud.suppressor_stats(db, "0.1.0-default") == {"explicit_dismissal": 1}
+    assert await crud.suppressor_stats(db, "0.2.0-taxonomy") == {}
+    assert (await crud.label_counts(db, "0.1.0-default"))["labeled"] == 1
+    assert (await crud.label_counts(db, "0.2.0-taxonomy")) == {
+        "total": 1, "labeled": 0, "unlabeled": 1, "by_signal": {},
+    }
+    # unfiltered still aggregates across both versions (back-compat)
+    assert await crud.activation_stats(db) == {"soft": 2, "hard": 1}
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_config_versions_is_distinct_sorted_unfiltered(tmp_path):
+    db = await _db(tmp_path / "g.db")
+    await crud.bulk_upsert_events(db, [
+        _row(1, config_version="0.2.0-taxonomy"),
+        _row(2, config_version="0.1.0-default"),
+        _row(3, config_version="0.2.0-taxonomy"),
+    ])
+    assert await crud.config_versions(db) == ["0.1.0-default", "0.2.0-taxonomy"]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_load_fire_records_returns_all_rows_for_version(tmp_path):
+    db = await _db(tmp_path / "g.db")
+    await crud.bulk_upsert_events(db, [
+        _row(1, utt_ids=(11,), config_version="0.1.0-default"),
+        _row(2, utt_ids=(22,), config_version="0.1.0-default"),
+        _row(3, utt_ids=(33,), config_version="0.2.0-taxonomy"),
+    ])
+    rows = await crud.load_fire_records(db, "0.1.0-default")
+    assert {r["id"] for r in rows} == {"id-1", "id-2"}          # version-scoped
+    assert all("triggers_fired" in r and "window_ref" in r for r in rows)  # JSON cols present (still strings)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_update_l15_verdict_backfills_even_on_labeled_row(tmp_path):
+    """B3: l15_verdict is a MACHINE field — unconditional, unlike the label-guarded upsert."""
+    db = await _db(tmp_path / "g.db")
+    await crud.bulk_upsert_events(db, [_row(1)])
+    await crud.update_acceptance_signal(db, "id-1", "should")  # LABEL the row
+    assert await crud.update_l15_verdict(db, "id-1", {"real": 0.8, "perk": 0.6}) is True
+    ev = await crud.get_event(db, "id-1")
+    assert json.loads(ev["l15_verdict"]) == {"real": 0.8, "perk": 0.6}
+    assert ev["acceptance_signal"] == "should"                 # label untouched
+    # None clears it; missing id returns False
+    assert await crud.update_l15_verdict(db, "id-1", None) is True
+    assert (await crud.get_event(db, "id-1"))["l15_verdict"] is None
+    assert await crud.update_l15_verdict(db, "missing", {"real": 1.0, "perk": 1.0}) is False
     await db.close()

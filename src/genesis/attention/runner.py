@@ -28,7 +28,7 @@ from genesis.attention.config import (
     default_config_dict,
     load_config,
 )
-from genesis.attention.consumers import ShadowStoreConsumer
+from genesis.attention.consumers import ShadowConsumer, ShadowStoreConsumer
 from genesis.attention.engine import evaluate
 from genesis.attention.snapshot import pull_snapshot
 from genesis.attention.sources import SnapshotSource
@@ -85,7 +85,7 @@ async def run_shadow(
     *,
     snapshot_id: str = "adhoc",
     sample_n: int = 25,
-    consumer: ShadowStoreConsumer | None = None,
+    consumer: ShadowConsumer | None = None,
     sampler: AttentionSampler | None = None,
 ) -> ShadowReport:
     src = SnapshotSource(snapshot_path)

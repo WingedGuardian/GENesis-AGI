@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
+from typing import Protocol, runtime_checkable
 
 import aiosqlite
 
@@ -17,6 +18,20 @@ from genesis.attention.types import AttentionEvent
 from genesis.db.crud import attention as attention_crud
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class ShadowConsumer(Protocol):
+    """Structural sink for the ``AttentionEvent``s ``run_shadow`` emits.
+
+    Buffer on ``add`` (sync), commit on ``flush`` (async, returns the count written).
+    ``ShadowStoreConsumer`` persists to genesis.db; an in-memory collector (the PR3c-1
+    differ) captures the full fire-set; a ``JSONLConsumer`` edge sink slots in later — all
+    satisfy this contract, so ``run_shadow`` need not know which concrete sink it holds."""
+
+    def add(self, ev: AttentionEvent) -> None: ...
+
+    async def flush(self) -> int: ...
 
 
 def _iso(epoch: float) -> str:
