@@ -829,6 +829,11 @@ fi
 # ── Success: disarm trap ──────────────────────────────────
 trap - ERR
 
+# Accumulates any host-side alignment failure so it is recorded as a degraded
+# subsystem in update_history (surfaced by the dashboard) rather than silently
+# skipped. Empty = host fully aligned (or no guardian configured).
+HOST_CC_DEGRADED=""
+
 # ── Update Guardian on host VM (if configured) ──────────
 GUARDIAN_CONFIG="$HOME/.genesis/guardian_remote.yaml"
 if [ -f "$GUARDIAN_CONFIG" ]; then
@@ -882,37 +887,87 @@ print(cfg.get('host_user', 'ubuntu'))
             echo "--- No Guardian-relevant changes — skipping host redeploy ---"
         fi
 
-        # ── Sync host Claude Code to the pinned version (WS-16) ──
-        # Independent of code redeploys: keeps host CC == container pin so one is
-        # never forgotten. Idempotent (acts only on drift), non-fatal, and
-        # graceful with an old gateway that lacks `update-cc`.
+        # ── Sync host Node.js + Claude Code to the pinned versions (WS-16) ──
+        # The host runs `claude -p` for Guardian's intelligent diagnosis/recovery
+        # (guardian/diagnosis.py) — the highest-stakes CC call in the system: when
+        # it fires, Genesis is down and, without CC's judgment, no programmatic
+        # recovery is safe. So the host must carry a WORKING Claude Code at the
+        # container pin, which in turn needs a compatible Node.js major (CC 2.1.198
+        # needs node >=22). This block keeps BOTH aligned. Non-fatal, but NOT
+        # silent: any alignment failure is recorded as a degraded subsystem
+        # (guardian_host_*) in update_history so the dashboard/health surface it,
+        # instead of the old misleading "gateway unreachable" skip.
         _cc_env="$SCRIPT_DIR/lib/cc_version.sh"
         if [ -f "$_cc_env" ]; then
-            # update.sh must sync the host to the REPO pin, never an inherited
-            # CC_VERSION override — unset it so cc_version.sh's default wins.
-            unset CC_VERSION
+            # Sync the host to the REPO pins, never an inherited override.
+            unset CC_VERSION NODE_MAJOR
             # shellcheck source=/dev/null
             source "$_cc_env"
         else
-            echo "  WARNING: $_cc_env missing — skipping host CC sync"
+            echo "  WARNING: $_cc_env missing — skipping host Node/CC sync"
         fi
-        if printf '%s' "${CC_VERSION:-}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            HOST_CC_RAW="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
-                "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
-            HOST_CC="$(printf '%s' "$HOST_CC_RAW" \
+
+        # One `version` call yields both node_version and cc_version.
+        HOST_VER_RAW="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+            "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
+
+        if [ -z "$HOST_VER_RAW" ]; then
+            # Genuinely could not reach/parse the gateway — DISTINCT from "CC
+            # absent" (the conflation the old message got wrong).
+            echo "  Host gateway unreachable (no version response) — skipping Node/CC sync (non-fatal)"
+            HOST_CC_DEGRADED="guardian_host_unreachable"
+        else
+            HOST_NODE_MAJOR="$(printf '%s' "$HOST_VER_RAW" \
+                | grep -oE '"node_version": "v[0-9]+' | grep -oE '[0-9]+' || true)"
+            HOST_CC="$(printf '%s' "$HOST_VER_RAW" \
                 | grep -oE '"cc_version": "[0-9]+\.[0-9]+\.[0-9]+' \
                 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
-            if [ -z "$HOST_CC" ]; then
-                echo "  Host CC version unknown (gateway unreachable or pre-update-cc) — skipping CC sync (non-fatal)"
-            elif [ "$HOST_CC" = "$CC_VERSION" ]; then
-                echo "  Host Claude Code already at pin ($CC_VERSION) — no CC sync needed"
-            else
-                echo "--- Host Claude Code drift: $HOST_CC → syncing to $CC_VERSION ---"
-                if timeout 300 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=30 \
-                    "${HOST_USER}@${HOST_IP}" "update-cc $CC_VERSION" 2>&1; then
-                    echo "  Host Claude Code updated to $CC_VERSION"
+
+            # ── Node.js major sync (prerequisite for CC) ──
+            if printf '%s' "${NODE_MAJOR:-}" | grep -qE '^[0-9]{1,2}$'; then
+                if [ "$HOST_NODE_MAJOR" = "$NODE_MAJOR" ]; then
+                    echo "  Host Node.js already at major $NODE_MAJOR — no Node sync needed"
                 else
-                    echo "  Host Claude Code sync failed (non-fatal) — host remains on $HOST_CC"
+                    echo "--- Host Node.js: ${HOST_NODE_MAJOR:-unknown} → syncing to major $NODE_MAJOR ---"
+                    # 600s: NodeSource repo-add + apt install is heavier than an
+                    # npm install (update-cc uses 300s); bounds a hung dpkg lock.
+                    if timeout 600 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=30 \
+                        "${HOST_USER}@${HOST_IP}" "update-node $NODE_MAJOR" 2>&1; then
+                        echo "  Host Node.js updated to major $NODE_MAJOR"
+                        HOST_NODE_MAJOR="$NODE_MAJOR"
+                    else
+                        echo "  WARNING: Host Node.js sync failed — CC install will likely fail (host stays on ${HOST_NODE_MAJOR:-unknown})"
+                        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}guardian_host_node"
+                    fi
+                fi
+            fi
+
+            # ── Claude Code sync: absence => INSTALL, drift => update ──
+            if printf '%s' "${CC_VERSION:-}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                if [ -z "$HOST_CC" ]; then
+                    # cc_version was "unavailable"/unparseable → CC is NOT installed
+                    # on the host. INSTALL it (do not skip) — this is the exact case
+                    # the old code silently ignored, leaving Guardian's recovery
+                    # brain offline.
+                    echo "--- Host Claude Code not installed — installing $CC_VERSION ---"
+                    if timeout 300 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=30 \
+                        "${HOST_USER}@${HOST_IP}" "update-cc $CC_VERSION" 2>&1; then
+                        echo "  Host Claude Code installed ($CC_VERSION)"
+                    else
+                        echo "  WARNING: Host Claude Code install FAILED — Guardian intelligent recovery is OFFLINE"
+                        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}guardian_host_cc"
+                    fi
+                elif [ "$HOST_CC" = "$CC_VERSION" ]; then
+                    echo "  Host Claude Code already at pin ($CC_VERSION) — no CC sync needed"
+                else
+                    echo "--- Host Claude Code drift: $HOST_CC → syncing to $CC_VERSION ---"
+                    if timeout 300 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=30 \
+                        "${HOST_USER}@${HOST_IP}" "update-cc $CC_VERSION" 2>&1; then
+                        echo "  Host Claude Code updated to $CC_VERSION"
+                    else
+                        echo "  WARNING: Host Claude Code sync failed — host remains on $HOST_CC"
+                        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}guardian_host_cc"
+                    fi
                 fi
             fi
         fi
@@ -946,7 +1001,12 @@ if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
 fi
 
 # ── Record success in update_history ─────────────────────
-_record_update_history "success" "" ""
+# Container update succeeded; $HOST_CC_DEGRADED (if set) flags a host-side
+# Node/CC alignment gap as a degraded subsystem so it is surfaced, not silent.
+if [ -n "$HOST_CC_DEGRADED" ]; then
+    echo "  NOTE: recording degraded subsystem: $HOST_CC_DEGRADED"
+fi
+_record_update_history "success" "" "$HOST_CC_DEGRADED"
 
 _write_state "done"
 

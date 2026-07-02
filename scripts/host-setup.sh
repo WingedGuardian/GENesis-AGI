@@ -1103,53 +1103,79 @@ fi
 # ── Node.js + Claude Code on host ─────────────────────────────
 # Claude Code is installed inside the container by install.sh, but users also
 # need it on the host VM for Guardian CC sessions and direct interaction.
-# Node.js >= 20 is required by Claude Code.
+# Claude Code requires Node.js >= $NODE_MAJOR (see scripts/lib/cc_version.sh).
 echo ""
 echo "  Setting up Claude Code on the host..."
 
-_host_node_ok=0
-if command -v node &>/dev/null; then
-    _node_ver=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1)
-    [ "${_node_ver:-0}" -ge 20 ] 2>/dev/null && _host_node_ok=1
-fi
-
-if [ "$_host_node_ok" = "0" ]; then
-    echo "  Installing Node.js 20.x on host..."
-    if command -v apt-get &>/dev/null; then
-        if curl -fsSL https://deb.nodesource.com/setup_20.x 2>/dev/null | sudo -E bash - 2>/dev/null; then
-            sudo apt-get install -y -qq nodejs 2>/dev/null
-        fi
-    elif command -v dnf &>/dev/null; then
-        if curl -fsSL https://rpm.nodesource.com/setup_20.x 2>/dev/null | sudo bash - 2>/dev/null; then
-            sudo dnf install -y nodejs 2>/dev/null
-        fi
-    fi
-    if command -v node &>/dev/null; then
-        echo "  + Node.js $(node --version) installed on host"
-    else
-        echo "  WARNING: Could not install Node.js on host."
-        echo "  Claude Code won't be available on the host (still works inside the container)."
-    fi
-fi
-
-# CC version pin — single source of truth: scripts/lib/cc_version.sh
-# (2.1.198 = current pin; retains the 2.1.173 fullscreen-renderer scrollback fix — see docs/reference/cc-compatibility.md)
+# Node + CC pins — single source of truth: scripts/lib/cc_version.sh. Sourced
+# BEFORE the Node check so the REQUIRED major (NODE_MAJOR) drives both the check
+# and the install. A stale hardcoded major (was: 20) is what left an earlier
+# host on Node 18, unable to run the pinned CC, with Guardian's recovery brain
+# silently offline — so failures below are surfaced, never `2>/dev/null`'d away.
 _cc_env="$_SCRIPT_DIR/lib/cc_version.sh"
 if [ ! -f "$_cc_env" ]; then
-    echo "ERROR: missing CC version pin: $_cc_env" >&2
+    echo "ERROR: missing version pin: $_cc_env" >&2
     exit 1
 fi
 # shellcheck source=/dev/null
 source "$_cc_env"
+
+_host_node_ok=0
+if command -v node &>/dev/null; then
+    _node_ver=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1)
+    [ "${_node_ver:-0}" -ge "${NODE_MAJOR}" ] 2>/dev/null && _host_node_ok=1
+fi
+
+if [ "$_host_node_ok" = "0" ]; then
+    echo "  Installing Node.js ${NODE_MAJOR}.x on host (required by Claude Code)..."
+    if command -v apt-get &>/dev/null; then
+        if curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | sudo -E bash -; then
+            # A distro `nodejs` (not from NodeSource) causes a dpkg conflict; if
+            # the straight install fails, purge the distro package and retry once.
+            if ! sudo apt-get install -y -qq nodejs; then
+                echo "  Note: nodejs install conflicted — purging distro nodejs and retrying..."
+                sudo apt-get remove -y nodejs libnode-dev 2>/dev/null || true
+                sudo apt-get autoremove -y 2>/dev/null || true
+                sudo apt-get install -y -qq nodejs || echo "  WARNING: nodejs install failed after retry."
+            fi
+        else
+            echo "  WARNING: NodeSource repo setup failed."
+        fi
+    elif command -v dnf &>/dev/null; then
+        if curl -fsSL "https://rpm.nodesource.com/setup_${NODE_MAJOR}.x" | sudo bash -; then
+            sudo dnf install -y nodejs || echo "  WARNING: nodejs install failed."
+        else
+            echo "  WARNING: NodeSource repo setup failed."
+        fi
+    fi
+    # Loud post-check: a fresh install must never silently ship a host that
+    # cannot run the pinned Claude Code. `|| true`: when the install failed and
+    # `node` is absent, the pipeline is non-zero and would abort under set -e
+    # BEFORE the warning below (the very case this check exists to report).
+    _post_major=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1 || true)
+    if [ "${_post_major:-0}" -ge "${NODE_MAJOR}" ] 2>/dev/null; then
+        echo "  + Node.js $(node --version) installed on host"
+    else
+        echo "  WARNING: host Node.js is ${_post_major:-none}, but Claude Code needs >= ${NODE_MAJOR}."
+        echo "  WARNING: Claude Code (and Guardian's intelligent recovery) will NOT run on this host."
+    fi
+fi
+
 if ! command -v claude &>/dev/null; then
     echo "  Installing Claude Code v${CC_VERSION} on host..."
     if command -v npm &>/dev/null; then
-        # Pass PATH through sudo — npm is often installed via nvm and not in
-        # sudo's secure_path. Without this, sudo reports "npm: command not found"
-        # even though npm works fine for the user.
-        sudo env "PATH=$PATH" npm install -g "@anthropic-ai/claude-code@${CC_VERSION}" 2>/dev/null && \
-            echo "  + Claude Code $(claude --version 2>/dev/null || echo "$CC_VERSION") installed on host" || \
-            echo "  WARNING: npm install of Claude Code failed."
+        # Pass PATH through sudo — npm is often nvm-managed and absent from
+        # sudo's secure_path. Failures are surfaced (not silenced) + verified.
+        if sudo env "PATH=$PATH" npm install -g "@anthropic-ai/claude-code@${CC_VERSION}"; then
+            hash -r 2>/dev/null || true
+            if command -v claude &>/dev/null; then
+                echo "  + Claude Code $(claude --version 2>/dev/null) installed on host"
+            else
+                echo "  WARNING: npm install reported success but 'claude' is not on PATH (npm-prefix/PATH mismatch)."
+            fi
+        else
+            echo "  WARNING: npm install of Claude Code FAILED — Guardian intelligent recovery will be OFFLINE on this host."
+        fi
     else
         echo "  WARNING: npm not found — cannot install Claude Code on host."
     fi

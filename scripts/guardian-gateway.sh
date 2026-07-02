@@ -12,6 +12,7 @@
 #   sync-gateway    — redeploy gateway script from install dir (no pull; recovery)
 #   redeploy <hash> — receive tar archive on stdin, deploy to install dir
 #   update-cc <ver> — install a pinned Claude Code version (validated semver)
+#   update-node <N> — install a pinned Node.js major via NodeSource (validated)
 #   test-approval   — E2E test the keyword-reply approval gate (no recovery)
 #   ping            — liveness check
 #
@@ -316,7 +317,10 @@ PYEOF
         # Strict allowlist on the arg: it is interpolated into a privileged
         # `npm install` under sudo, so accept ONLY a bare semver X.Y.Z
         # (anchored — mirrors the `redeploy` hash check above).
-        if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        # Whole-string anchor via bash regex — NOT `grep` (line-oriented: a
+        # `1.2.3\n<payload>` would pass its `^…$`). SSH_ORIGINAL_COMMAND is
+        # untrusted, so validate the entire value.
+        if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo '{"ok": false, "action": "update-cc", "error": "invalid version (expected X.Y.Z)"}' >&2
             exit 1
         fi
@@ -348,6 +352,83 @@ PYEOF
             printf '{"ok": true, "action": "update-cc", "version": "%s", "installed": "%s"}\n' "$VERSION" "$INSTALLED"
         else
             printf '{"ok": false, "action": "update-cc", "error": "version mismatch after install", "requested": "%s", "installed": "%s"}\n' "$VERSION" "$INSTALLED" >&2
+            exit 1
+        fi
+        ;;
+    update-node\ *)
+        # Controlled Node.js major upgrade on the host (WS-16).
+        # The host runs `claude -p` for Guardian's intelligent diagnosis/recovery,
+        # and Claude Code only runs on the Node major its pin requires (e.g. CC
+        # 2.1.198 needs node >=22). This installs a pinned major via NodeSource —
+        # the SAME mechanism host-setup.sh uses — so the host stays runnable.
+        # Mirrors `update-cc`: strict arg allowlist, passwordless-sudo guard, and
+        # a post-install verify by `node --version` (never trust the apt exit
+        # code — dpkg can "succeed" while leaving the old binary first on PATH).
+        MAJOR="${SSH_ORIGINAL_COMMAND#update-node }"
+        # Strict allowlist: interpolated into a privileged NodeSource URL + a
+        # package-manager install under sudo, so accept ONLY a bare 1-2 digit
+        # major. Whole-string bash regex, NOT `grep` (line-oriented: a
+        # `22\n<payload>` would pass its `^…$`); SSH_ORIGINAL_COMMAND is untrusted.
+        if [[ ! "$MAJOR" =~ ^[0-9]{1,2}$ ]]; then
+            echo '{"ok": false, "action": "update-node", "error": "invalid major (expected NN)"}' >&2
+            exit 1
+        fi
+        if ! sudo -n true 2>/dev/null; then
+            echo '{"ok": false, "action": "update-node", "error": "passwordless sudo unavailable"}' >&2
+            exit 1
+        fi
+        # Idempotent: already on the requested major → no-op.
+        CUR_MAJOR="$(node --version 2>/dev/null | grep -oE '^v[0-9]+' | tr -d 'v' || true)"
+        if [ "$CUR_MAJOR" = "$MAJOR" ]; then
+            printf '{"ok": true, "action": "update-node", "major": "%s", "installed": "%s", "note": "already-current"}\n' \
+                "$MAJOR" "$(node --version 2>/dev/null)"
+            exit 0
+        fi
+        # Add the NodeSource repo for the requested major, then install. The URL
+        # is built ONLY from the validated major — no injection surface.
+        if command -v apt-get >/dev/null 2>&1; then
+            if ! curl -fsSL "https://deb.nodesource.com/setup_${MAJOR}.x" | sudo -n -E bash - >/dev/null 2>&1; then
+                echo '{"ok": false, "action": "update-node", "error": "nodesource repo setup failed"}' >&2
+                exit 1
+            fi
+            # A distro `nodejs` (not from NodeSource — the state that stranded an
+            # earlier host on Node 18) causes a dpkg conflict on install. If the
+            # straight install fails, purge the distro package and retry once.
+            # TRADEOFF: the purge is destructive — if the retry then fails (e.g.
+            # transient NodeSource unavailability) the host is left with no node.
+            # Bounded acceptable: host node is CC-only, and the failure is
+            # reported (mismatch JSON) → update.sh records it as a degraded
+            # subsystem rather than swallowing it.
+            if ! sudo -n apt-get install -y nodejs >/dev/null 2>&1; then
+                sudo -n apt-get remove -y nodejs libnode-dev >/dev/null 2>&1 || true
+                sudo -n apt-get autoremove -y >/dev/null 2>&1 || true
+                if ! sudo -n apt-get install -y nodejs >/dev/null 2>&1; then
+                    echo '{"ok": false, "action": "update-node", "error": "apt install nodejs failed (dpkg conflict?)"}' >&2
+                    exit 1
+                fi
+            fi
+        elif command -v dnf >/dev/null 2>&1; then
+            if ! curl -fsSL "https://rpm.nodesource.com/setup_${MAJOR}.x" | sudo -n bash - >/dev/null 2>&1; then
+                echo '{"ok": false, "action": "update-node", "error": "nodesource repo setup failed"}' >&2
+                exit 1
+            fi
+            if ! sudo -n dnf install -y nodejs >/dev/null 2>&1; then
+                echo '{"ok": false, "action": "update-node", "error": "dnf install nodejs failed"}' >&2
+                exit 1
+            fi
+        else
+            echo '{"ok": false, "action": "update-node", "error": "no supported package manager (apt/dnf)"}' >&2
+            exit 1
+        fi
+        # Verify by node major — NOT apt's exit code.
+        hash -r 2>/dev/null || true
+        NEW_MAJOR="$(node --version 2>/dev/null | grep -oE '^v[0-9]+' | tr -d 'v' || true)"
+        if [ "$NEW_MAJOR" = "$MAJOR" ]; then
+            printf '{"ok": true, "action": "update-node", "major": "%s", "installed": "%s"}\n' \
+                "$MAJOR" "$(node --version 2>/dev/null)"
+        else
+            printf '{"ok": false, "action": "update-node", "error": "version mismatch after install", "requested": "%s", "installed": "%s"}\n' \
+                "$MAJOR" "$(node --version 2>/dev/null || echo unknown)" >&2
             exit 1
         fi
         ;;
