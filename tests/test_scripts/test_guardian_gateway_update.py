@@ -373,3 +373,78 @@ def test_redeploy_regenerates_guardian_identity(stub_bin, tmp_path):
     install = home / ".local" / "share" / "genesis-guardian"
     got = (install / "CLAUDE.md").read_text()
     assert got == _GUARDIAN_MD, f"redeploy left wrong CLAUDE.md:\n{got!r}"
+
+
+# ── update-node verb ─────────────────────────────────────────────────────────
+# CC only runs on the Node major its pin requires (2.1.198 → node >=22); the host
+# runs `claude -p` for Guardian's recovery, so the host Node must be alignable
+# in-band. These exercise the verb hermetically — sudo/curl/node are stubbed so
+# nothing real is installed and no network is hit.
+
+def _make_node_bin(tmp_path, *, node_version="v22.22.2", sudo_ok=True):
+    """PATH dir for the `update-node` verb. Stubs systemctl (no-op), sudo
+    (passwordless ok/blocked; install commands are no-op 0 so nothing runs),
+    curl (no network), and node (fixed version → asserts verify-by-`node
+    --version`, never the apt exit code)."""
+    bind = tmp_path / "nodebin"
+    bind.mkdir()
+    _make_stub(bind / "systemctl", "#!/usr/bin/env bash\nexit 0\n")
+    if sudo_ok:
+        # `sudo -n true` passes AND every `sudo -n <cmd>` is a no-op 0, so the
+        # "install" trivially succeeds without touching the system.
+        _make_stub(bind / "sudo", "#!/usr/bin/env bash\nexit 0\n")
+    else:
+        _make_stub(bind / "sudo", '#!/usr/bin/env bash\nexit 1\n')
+    _make_stub(bind / "curl", "#!/usr/bin/env bash\nexit 0\n")
+    _make_stub(bind / "node", f'#!/usr/bin/env bash\necho "{node_version}"\n')
+    return bind
+
+
+@pytest.mark.parametrize("bad", ["2.2", "abc", "22x", "123", ""],
+                         ids=["semver", "word", "suffix", "three-digit", "empty"])
+def test_update_node_rejects_non_major(bad, tmp_path):
+    """The major is interpolated into a privileged NodeSource URL + install, so
+    only a bare 1-2 digit major is accepted (mirrors update-cc's semver guard).
+    (The empty arg still enters the verb — the f-string keeps a trailing space —
+    and is caught by the same invalid-major guard.)"""
+    home = tmp_path / "home"
+    home.mkdir()
+    bind = _make_node_bin(tmp_path)
+    proc = _run_verb(home, bind, f"update-node {bad}")
+    assert proc.returncode == 1, proc.stdout
+    blob = proc.stdout + proc.stderr
+    assert b'"ok": false' in blob and b"invalid major" in blob, blob
+
+
+def test_update_node_requires_passwordless_sudo(tmp_path):
+    """A valid major with no passwordless sudo fails cleanly (no partial install)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    bind = _make_node_bin(tmp_path, node_version="v18.19.1", sudo_ok=False)
+    proc = _run_verb(home, bind, "update-node 22")
+    assert proc.returncode == 1
+    assert b"passwordless sudo unavailable" in (proc.stdout + proc.stderr)
+
+
+def test_update_node_idempotent_when_current(tmp_path):
+    """Already on the requested major → no-op success, install never attempted."""
+    home = tmp_path / "home"
+    home.mkdir()
+    bind = _make_node_bin(tmp_path, node_version="v22.22.2", sudo_ok=True)
+    proc = _run_verb(home, bind, "update-node 22")
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["ok"] is True and data["note"] == "already-current", data
+
+
+def test_update_node_verifies_by_node_version_not_apt(tmp_path):
+    """The core safety property: success is decided by `node --version`, NOT the
+    apt exit code. Here every install command 'succeeds' (stubbed sudo) but node
+    stays on 18 → the verb must report a version mismatch, not a false success."""
+    home = tmp_path / "home"
+    home.mkdir()
+    bind = _make_node_bin(tmp_path, node_version="v18.19.1", sudo_ok=True)
+    proc = _run_verb(home, bind, "update-node 22")
+    assert proc.returncode == 1, proc.stdout
+    blob = proc.stdout + proc.stderr
+    assert b"version mismatch after install" in blob, blob
