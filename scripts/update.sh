@@ -937,7 +937,7 @@ print(cfg.get('host_user', 'ubuntu'))
                         HOST_NODE_MAJOR="$NODE_MAJOR"
                     else
                         echo "  WARNING: Host Node.js sync failed — CC install will likely fail (host stays on ${HOST_NODE_MAJOR:-unknown})"
-                        HOST_CC_DEGRADED="guardian_host_node"
+                        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}guardian_host_node"
                     fi
                 fi
             fi
@@ -955,7 +955,7 @@ print(cfg.get('host_user', 'ubuntu'))
                         echo "  Host Claude Code installed ($CC_VERSION)"
                     else
                         echo "  WARNING: Host Claude Code install FAILED — Guardian intelligent recovery is OFFLINE"
-                        HOST_CC_DEGRADED="guardian_host_cc"
+                        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}guardian_host_cc"
                     fi
                 elif [ "$HOST_CC" = "$CC_VERSION" ]; then
                     echo "  Host Claude Code already at pin ($CC_VERSION) — no CC sync needed"
@@ -966,7 +966,7 @@ print(cfg.get('host_user', 'ubuntu'))
                         echo "  Host Claude Code updated to $CC_VERSION"
                     else
                         echo "  WARNING: Host Claude Code sync failed — host remains on $HOST_CC"
-                        HOST_CC_DEGRADED="guardian_host_cc"
+                        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}guardian_host_cc"
                     fi
                 fi
             fi

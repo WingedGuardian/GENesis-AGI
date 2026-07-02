@@ -416,6 +416,18 @@ def test_update_node_rejects_non_major(bad, tmp_path):
     assert b'"ok": false' in blob and b"invalid major" in blob, blob
 
 
+def test_update_node_rejects_newline_injection(tmp_path):
+    """Whole-string bash-regex validation: a major with an embedded newline —
+    which the old line-oriented `grep '^…$'` would accept on its first line — is
+    rejected before any privileged install runs."""
+    home = tmp_path / "home"
+    home.mkdir()
+    bind = _make_node_bin(tmp_path)
+    proc = _run_verb(home, bind, "update-node 22\nID=$(id)")
+    assert proc.returncode == 1, proc.stdout
+    assert b"invalid major" in (proc.stdout + proc.stderr)
+
+
 def test_update_node_requires_passwordless_sudo(tmp_path):
     """A valid major with no passwordless sudo fails cleanly (no partial install)."""
     home = tmp_path / "home"

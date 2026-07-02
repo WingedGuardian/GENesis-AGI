@@ -317,7 +317,10 @@ PYEOF
         # Strict allowlist on the arg: it is interpolated into a privileged
         # `npm install` under sudo, so accept ONLY a bare semver X.Y.Z
         # (anchored — mirrors the `redeploy` hash check above).
-        if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        # Whole-string anchor via bash regex — NOT `grep` (line-oriented: a
+        # `1.2.3\n<payload>` would pass its `^…$`). SSH_ORIGINAL_COMMAND is
+        # untrusted, so validate the entire value.
+        if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo '{"ok": false, "action": "update-cc", "error": "invalid version (expected X.Y.Z)"}' >&2
             exit 1
         fi
@@ -364,8 +367,9 @@ PYEOF
         MAJOR="${SSH_ORIGINAL_COMMAND#update-node }"
         # Strict allowlist: interpolated into a privileged NodeSource URL + a
         # package-manager install under sudo, so accept ONLY a bare 1-2 digit
-        # major (anchored — mirrors update-cc's semver check).
-        if ! printf '%s' "$MAJOR" | grep -qE '^[0-9]{1,2}$'; then
+        # major. Whole-string bash regex, NOT `grep` (line-oriented: a
+        # `22\n<payload>` would pass its `^…$`); SSH_ORIGINAL_COMMAND is untrusted.
+        if [[ ! "$MAJOR" =~ ^[0-9]{1,2}$ ]]; then
             echo '{"ok": false, "action": "update-node", "error": "invalid major (expected NN)"}' >&2
             exit 1
         fi
@@ -390,6 +394,11 @@ PYEOF
             # A distro `nodejs` (not from NodeSource — the state that stranded an
             # earlier host on Node 18) causes a dpkg conflict on install. If the
             # straight install fails, purge the distro package and retry once.
+            # TRADEOFF: the purge is destructive — if the retry then fails (e.g.
+            # transient NodeSource unavailability) the host is left with no node.
+            # Bounded acceptable: host node is CC-only, and the failure is
+            # reported (mismatch JSON) → update.sh records it as a degraded
+            # subsystem rather than swallowing it.
             if ! sudo -n apt-get install -y nodejs >/dev/null 2>&1; then
                 sudo -n apt-get remove -y nodejs libnode-dev >/dev/null 2>&1 || true
                 sudo -n apt-get autoremove -y >/dev/null 2>&1 || true

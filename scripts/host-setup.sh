@@ -1149,8 +1149,10 @@ if [ "$_host_node_ok" = "0" ]; then
         fi
     fi
     # Loud post-check: a fresh install must never silently ship a host that
-    # cannot run the pinned Claude Code.
-    _post_major=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1)
+    # cannot run the pinned Claude Code. `|| true`: when the install failed and
+    # `node` is absent, the pipeline is non-zero and would abort under set -e
+    # BEFORE the warning below (the very case this check exists to report).
+    _post_major=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1 || true)
     if [ "${_post_major:-0}" -ge "${NODE_MAJOR}" ] 2>/dev/null; then
         echo "  + Node.js $(node --version) installed on host"
     else
