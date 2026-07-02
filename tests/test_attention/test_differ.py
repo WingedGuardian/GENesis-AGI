@@ -71,7 +71,16 @@ def test_by_trigger_delta_counts_per_record():
 def test_empty_sides():
     d = diff_fire_sets([], [])
     assert d.added == [] and d.removed == [] and d.by_trigger_delta == {}
+    assert d.by_suppressor_delta == {}
     assert d.baseline_n == 0 and d.candidate_n == 0
+
+
+def test_by_suppressor_delta():
+    base = [_fr(1, activation="soft", suppressors=())]
+    cand = [_fr(1, activation="suppressed", suppressors=("explicit_dismissal",))]
+    d = diff_fire_sets(base, cand)
+    assert d.by_suppressor_delta == {"explicit_dismissal": (0, 1, 1)}
+    assert d.activation_changed == [(1, "soft", "suppressed")]  # the suppression also shows as an activation change
 
 
 def test_added_and_removed_sorted_by_key():

@@ -65,9 +65,10 @@ class DiffResult:
     baseline_n: int
     candidate_n: int
     added: list[FireRecord]                            # fired in candidate, not baseline
-    removed: list[FireRecord]                          # fired in baseline, not candidate
-    activation_changed: list[tuple[int, str, str]]     # (key, baseline_act, candidate_act)
-    by_trigger_delta: dict[str, tuple[int, int, int]]  # name -> (baseline_n, candidate_n, delta)
+    removed: list[FireRecord]                           # fired in baseline, not candidate
+    activation_changed: list[tuple[int, str, str]]      # (key, baseline_act, candidate_act)
+    by_trigger_delta: dict[str, tuple[int, int, int]]   # name -> (baseline_n, candidate_n, delta)
+    by_suppressor_delta: dict[str, tuple[int, int, int]]  # name -> (baseline_n, candidate_n, delta)
     unresolvable: dict[str, int] = field(default_factory=dict)  # per side: rows skipped (empty utt_ids)
 
 
@@ -96,17 +97,21 @@ def diff_fire_sets(
         if b_by_key[k].activation != c_by_key[k].activation
     ]
 
-    b_trig = Counter(t for r in baseline for t in r.triggers)
-    c_trig = Counter(t for r in candidate for t in r.triggers)
-    by_trigger_delta = {
-        name: (b_trig[name], c_trig[name], c_trig[name] - b_trig[name])
-        for name in sorted(set(b_trig) | set(c_trig))
-    }
+    by_trigger_delta = _count_delta(baseline, candidate, lambda r: r.triggers)
+    by_suppressor_delta = _count_delta(baseline, candidate, lambda r: r.suppressors)
 
     return DiffResult(
         baseline_label, candidate_label, len(baseline), len(candidate),
-        added, removed, activation_changed, by_trigger_delta, unresolvable or {},
+        added, removed, activation_changed, by_trigger_delta, by_suppressor_delta,
+        unresolvable or {},
     )
+
+
+def _count_delta(baseline, candidate, extract) -> dict[str, tuple[int, int, int]]:
+    """Per-name (baseline_n, candidate_n, delta), each name counted once per record it's in."""
+    b = Counter(name for r in baseline for name in extract(r))
+    c = Counter(name for r in candidate for name in extract(r))
+    return {name: (b[name], c[name], c[name] - b[name]) for name in sorted(set(b) | set(c))}
 
 
 # ── mappers (persisted row / live event → FireRecord) ─────────────────────────────
@@ -214,6 +219,11 @@ def format_diff(d: DiffResult, *, sample: int = 12) -> str:
     for name, (b, c, delta) in sorted(d.by_trigger_delta.items(), key=lambda x: (-abs(x[1][2]), x[0])):
         sign = "+" if delta > 0 else ""
         lines.append(f"  {name:<22} {b:>5} -> {c:<5} ({sign}{delta})")
+    if d.by_suppressor_delta:
+        lines.append("\n--- by_suppressor delta (baseline -> candidate) ---")
+        for name, (b, c, delta) in sorted(d.by_suppressor_delta.items(), key=lambda x: (-abs(x[1][2]), x[0])):
+            sign = "+" if delta > 0 else ""
+            lines.append(f"  {name:<22} {b:>5} -> {c:<5} ({sign}{delta})")
     if d.activation_changed:
         lines.append(f"\n--- sample activation changes ({min(len(d.activation_changed), sample)} of {len(d.activation_changed)}) ---")
         for k, fr, to in d.activation_changed[:sample]:
