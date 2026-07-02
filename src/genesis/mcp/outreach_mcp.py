@@ -31,13 +31,17 @@ def init_outreach_mcp(*, pipeline, engagement, config, db, activity_tracker=None
 
     # Ensure pending_outreach table exists for standalone fallback
     if db is not None and pipeline is None:
-        import asyncio
         import contextlib
 
         from genesis.db.crud.pending_outreach import ensure_table
+        from genesis.util.tasks import tracked_task
 
+        # Requires a running loop; suppress if we're called outside one
+        # (standalone fallback). tracked_task surfaces a failed ensure_table()
+        # via its error callback instead of letting it vanish, and avoids the
+        # old get_event_loop() spawning an orphan-loop task that never runs.
         with contextlib.suppress(RuntimeError):
-            asyncio.get_event_loop().create_task(ensure_table(db))
+            tracked_task(ensure_table(db), name="outreach-ensure-pending-table", logger=logger)
 
     if activity_tracker is not None:
         from genesis.observability.mcp_middleware import InstrumentationMiddleware

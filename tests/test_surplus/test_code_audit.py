@@ -35,6 +35,28 @@ def _make_task(task_type: TaskType = TaskType.CODE_AUDIT) -> SurplusTask:
 
 
 @pytest.mark.asyncio
+async def test_run_cmd_kills_process_on_timeout():
+    """On subprocess timeout, the child is killed and reaped (not left running)."""
+    db = AsyncMock()
+    gatherer = CodebaseContextGatherer(db, repo_root="/tmp/fake")
+
+    proc = MagicMock()
+    proc.communicate = AsyncMock(side_effect=TimeoutError)
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+
+    with patch(
+        "genesis.surplus.code_audit.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=proc),
+    ):
+        result = await gatherer._run_cmd("git", "log")
+
+    assert result == ""
+    proc.kill.assert_called_once()
+    proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_gatherer_assembles_context():
     """Gatherer runs subprocess commands and assembles sections."""
     db = AsyncMock()

@@ -78,6 +78,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Completed background-task history no longer grows without bound.** Genesis's idle-time "surplus"
+  task queue kept every finished task row forever — only never-started tasks were ever cleaned up — so
+  the table crept upward over months of background work. Finished tasks (completed, failed, or
+  cancelled) are now aged out after 30 days, while any task still referenced by an open follow-up is
+  kept until that follow-up resolves.
+
 - **Deleting a knowledge item from the dashboard now works end to end.** Previously the delete
   button returned a server error, and behind the scenes the item was only half-removed — dropped
   from search but with its stored embedding left behind and its source still marked as already

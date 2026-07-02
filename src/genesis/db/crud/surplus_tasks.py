@@ -188,6 +188,35 @@ async def drain_expired(db: aiosqlite.Connection, *, before: str) -> int:
     return cursor.rowcount
 
 
+async def delete_terminal_before(db: aiosqlite.Connection, *, before: str) -> int:
+    """Delete terminal (completed/failed/cancelled) tasks older than *before*.
+
+    ``drain_expired`` only removes ``pending`` rows, so terminal rows accumulate
+    forever. This age-caps them. Age is taken from ``completed_at`` when present,
+    else ``started_at``, else ``created_at`` — a ``failed`` row never gets a
+    ``completed_at``, so the COALESCE fallback ages it by when it last ran.
+
+    Rows still referenced by a NON-terminal follow-up (``linked_task_id``) are
+    preserved so ``follow_ups.dispatcher`` can still resolve them; a terminal
+    follow-up (completed/failed) no longer protects its linked task. The
+    ``linked_task_id IS NOT NULL`` filter keeps NULLs out of the ``NOT IN`` set
+    (a NULL there would make the whole predicate false and delete nothing).
+    """
+    cursor = await db.execute(
+        "DELETE FROM surplus_tasks "
+        "WHERE status IN ('completed', 'failed', 'cancelled') "
+        "AND COALESCE(completed_at, started_at, created_at) < ? "
+        "AND id NOT IN ("
+        "    SELECT linked_task_id FROM follow_ups "
+        "    WHERE linked_task_id IS NOT NULL "
+        "    AND status NOT IN ('completed', 'failed')"
+        ")",
+        (before,),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def count_pending(db: aiosqlite.Connection) -> int:
     cursor = await db.execute(
         "SELECT COUNT(*) FROM surplus_tasks WHERE status = 'pending'",

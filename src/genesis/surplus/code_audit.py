@@ -76,6 +76,10 @@ class CodebaseContextGatherer:
             return stdout.decode("utf-8", errors="replace").strip()
         except TimeoutError:
             logger.warning("Subprocess timed out: %s", " ".join(args))
+            # Reap the timed-out child so it isn't left running past our timeout.
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+                await proc.wait()
             return ""
         except OSError:
             logger.warning("Subprocess failed: %s", " ".join(args), exc_info=True)

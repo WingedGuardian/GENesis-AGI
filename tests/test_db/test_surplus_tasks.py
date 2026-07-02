@@ -187,6 +187,109 @@ async def test_delete(db):
     assert await surplus_tasks.delete(db, "st-1") is False
 
 
+# ---------------------------------------------------------------------------
+# delete_terminal_before — terminal-row age-cap reaper (WS-F / F7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reap_terminal_deletes_old_completed_keeps_recent(db):
+    """Old completed rows are reaped; completed rows newer than the cutoff stay."""
+    await surplus_tasks.create(
+        db, id="old", task_type="brainstorm", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-01-01T00:00:00+00:00",
+    )
+    await surplus_tasks.mark_completed(db, "old", completed_at="2026-01-01T01:00:00+00:00")
+    await surplus_tasks.create(
+        db, id="recent", task_type="brainstorm", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-06-01T00:00:00+00:00",
+    )
+    await surplus_tasks.mark_completed(db, "recent", completed_at="2026-06-01T01:00:00+00:00")
+
+    reaped = await surplus_tasks.delete_terminal_before(db, before="2026-03-01T00:00:00+00:00")
+
+    assert reaped == 1
+    assert await surplus_tasks.get_by_id(db, "old") is None
+    assert await surplus_tasks.get_by_id(db, "recent") is not None
+
+
+@pytest.mark.asyncio
+async def test_reap_terminal_keeps_pending_and_running(db):
+    """Non-terminal rows are never reaped, regardless of age."""
+    await surplus_tasks.create(
+        db, id="old-pending", task_type="brainstorm", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-01-01T00:00:00+00:00",
+    )
+    await surplus_tasks.create(
+        db, id="old-running", task_type="brainstorm", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-01-01T00:00:00+00:00",
+    )
+    await surplus_tasks.mark_running(db, "old-running", started_at="2026-01-01T00:30:00+00:00")
+
+    reaped = await surplus_tasks.delete_terminal_before(db, before="2026-03-01T00:00:00+00:00")
+
+    assert reaped == 0
+    assert await surplus_tasks.get_by_id(db, "old-pending") is not None
+    assert await surplus_tasks.get_by_id(db, "old-running") is not None
+
+
+@pytest.mark.asyncio
+async def test_reap_terminal_ages_failed_and_cancelled_by_fallback(db):
+    """Failed rows (no completed_at) age by started_at/created_at; cancelled reaped too."""
+    await surplus_tasks.create(
+        db, id="old-failed", task_type="brainstorm", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-01-01T00:00:00+00:00",
+    )
+    await surplus_tasks.mark_running(db, "old-failed", started_at="2026-01-01T00:30:00+00:00")
+    await surplus_tasks.mark_failed(db, "old-failed", failure_reason="boom")
+    await surplus_tasks.create(
+        db, id="old-cancelled", task_type="brainstorm", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-01-01T00:00:00+00:00",
+    )
+    await db.execute(
+        "UPDATE surplus_tasks SET status = 'cancelled' WHERE id = ?", ("old-cancelled",),
+    )
+    await db.commit()
+
+    reaped = await surplus_tasks.delete_terminal_before(db, before="2026-03-01T00:00:00+00:00")
+
+    assert reaped == 2
+    assert await surplus_tasks.get_by_id(db, "old-failed") is None
+    assert await surplus_tasks.get_by_id(db, "old-cancelled") is None
+
+
+@pytest.mark.asyncio
+async def test_reap_terminal_skips_rows_linked_to_open_followup(db):
+    """A terminal row referenced by a NON-terminal follow-up is kept; a terminal
+    follow-up does not protect it."""
+    from genesis.db.crud import follow_ups
+
+    # completed task referenced by an OPEN (scheduled) follow-up -> keep
+    await surplus_tasks.create(
+        db, id="linked-open", task_type="brainstorm", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-01-01T00:00:00+00:00",
+    )
+    await surplus_tasks.mark_completed(db, "linked-open", completed_at="2026-01-01T01:00:00+00:00")
+    fu_open = await follow_ups.create(db, content="c", source="test", strategy="surplus_task")
+    await follow_ups.link_task(db, fu_open, "linked-open")  # -> status 'scheduled'
+
+    # completed task referenced only by a COMPLETED follow-up -> reap
+    await surplus_tasks.create(
+        db, id="linked-closed", task_type="brainstorm", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-01-01T00:00:00+00:00",
+    )
+    await surplus_tasks.mark_completed(db, "linked-closed", completed_at="2026-01-01T01:00:00+00:00")
+    fu_closed = await follow_ups.create(db, content="c", source="test", strategy="surplus_task")
+    await follow_ups.link_task(db, fu_closed, "linked-closed")
+    await follow_ups.update_status(db, fu_closed, "completed")
+
+    reaped = await surplus_tasks.delete_terminal_before(db, before="2026-03-01T00:00:00+00:00")
+
+    assert reaped == 1
+    assert await surplus_tasks.get_by_id(db, "linked-open") is not None
+    assert await surplus_tasks.get_by_id(db, "linked-closed") is None
+
+
 @pytest.mark.asyncio
 async def test_consecutive_failures(db):
     """Counts consecutive failed tasks, stopping at first non-failed."""
