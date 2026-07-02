@@ -406,10 +406,12 @@ def _search_fts5(
     LEFT JOIN with memory_metadata. NULL source_subsystem (user-sourced
     + legacy pre-1.5b rows) is preserved.
 
-    Also drops bitemporally-invalid rows (``invalid_at`` in the past), for
-    parity with the main retrieval path (``memory.crud.search_ranked``).
-    NULL ``invalid_at`` = "valid forever" and is always preserved, so the
-    filter can never over-drop live context.
+    Also drops bitemporally-invalid rows (``invalid_at`` in the past) and
+    superseded/deprecated rows (``deprecated = 1``), for parity with the main
+    retrieval path (``memory.crud.search_ranked``) and the hook's own Qdrant
+    path. NULL ``invalid_at`` = "valid forever" and NULL/0 ``deprecated`` =
+    "not deprecated" are always preserved, so the filter can never over-drop
+    live context.
 
     ``collection``: if provided, restrict to this collection
     (e.g. ``"episodic_memory"``). Default ``None`` searches all.
@@ -448,6 +450,8 @@ def _search_fts5(
                            NOT IN ({placeholders}))
                   AND (memory_metadata.invalid_at IS NULL
                        OR memory_metadata.invalid_at > ?)
+                  AND (memory_metadata.deprecated IS NULL
+                       OR memory_metadata.deprecated = 0)
                 ORDER BY rank
                 LIMIT ?
                 """,  # noqa: S608 -- placeholders bound separately

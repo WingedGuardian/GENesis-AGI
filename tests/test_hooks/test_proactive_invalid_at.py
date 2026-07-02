@@ -1,11 +1,12 @@
-"""The proactive memory hook must filter bitemporally-invalid memories.
+"""The proactive memory hook must filter invalid + deprecated memories.
 
-Parity with the main retrieval path (``memory/retrieval.py``): a memory whose
-``invalid_at`` is in the past has been superseded and must NOT be injected into
-the CC prompt context. The main path filters this two ways — in-SQL for the FTS
-query (``search_ranked``) and a post-query id filter for the Qdrant/calendar
-union (``_expired_candidate_ids``). The hook is a standalone reimplementation
-that historically filtered neither; these tests lock in both halves.
+Parity with the main retrieval path (``memory/retrieval.py`` / ``search_ranked``)
+and the hook's own Qdrant path: a memory whose ``invalid_at`` is in the past, or
+which has been superseded (``deprecated = 1``), must NOT be injected into the CC
+prompt context. The main path filters both; the hook's FTS path historically
+filtered neither. These tests lock in the in-SQL FTS filters plus the post-query
+``_expired_memory_ids`` id filter for the Qdrant union (which mirrors
+``_expired_candidate_ids``; the Qdrant search itself already drops deprecated).
 
 NULL ``invalid_at`` = "valid forever" — never dropped. This is the safety
 property: a memory can only be excluded if it carries a concrete past
@@ -144,6 +145,59 @@ def test_search_fts5_invalid_at_combines_with_subsystem(tmp_path) -> None:
     # alive: NULL/NULL → kept; future: reflection → excluded;
     # expired: past invalid_at → excluded.
     assert ids == {"alive"}
+
+
+# ── _search_fts5: deprecated (superseded) filter, parity with search_ranked ──
+
+
+def _insert_extra(db: str, memory_id: str, content: str, *, deprecated: int) -> None:
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated) "
+            "VALUES (?, ?, ?)",
+            (memory_id, _PAST, deprecated),
+        )
+        conn.execute(
+            "INSERT INTO memory_fts "
+            "(memory_id, content, source_type, tags, collection) "
+            "VALUES (?, ?, 'memory', '', 'episodic_memory')",
+            (memory_id, content),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_search_fts5_drops_deprecated(tmp_path) -> None:
+    """A deprecated=1 (superseded) row must not surface; valid rows stay."""
+    db = tmp_path / "t.db"
+    _build_db(str(db))
+    _insert_extra(str(db), "dep", "this row is a superseded duplicate", deprecated=1)
+    rows = hook._search_fts5(db, ["row"], collection="episodic_memory")
+    ids = {r["memory_id"] for r in rows}
+    assert "dep" not in ids
+    assert {"alive", "future"} <= ids  # non-deprecated valid rows untouched
+
+
+def test_search_fts5_keeps_deprecated_zero(tmp_path) -> None:
+    """deprecated=0 (the common case) is explicitly preserved."""
+    db = tmp_path / "t.db"
+    _build_db(str(db))
+    _insert_extra(str(db), "live", "this row is a live current fact", deprecated=0)
+    rows = hook._search_fts5(db, ["row"], collection="episodic_memory")
+    assert "live" in {r["memory_id"] for r in rows}
+
+
+def test_search_fts5_deprecated_and_invalid_at_both_apply(tmp_path) -> None:
+    """The deprecated and invalid_at filters compose on the same JOIN."""
+    db = tmp_path / "t.db"
+    _build_db(str(db))
+    _insert_extra(str(db), "dep", "this row is deprecated but unexpired", deprecated=1)
+    rows = hook._search_fts5(db, ["row"], collection="episodic_memory")
+    ids = {r["memory_id"] for r in rows}
+    # dep: deprecated → out; expired: past invalid_at → out; alive/future stay.
+    assert ids == {"alive", "future"}
 
 
 # ── _expired_memory_ids: post-query filter for the Qdrant union ──────────────
