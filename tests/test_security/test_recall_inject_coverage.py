@@ -66,7 +66,8 @@ KNOWN_RECALL_SITES: dict[str, tuple[str, str]] = {
     "mcp/memory/knowledge.py::reference_lookup": (
         "first-party", "source=episodic; takes unit_id/score only, not content"),
     "channels/voice/handler.py::handle": (
-        "user-facing", "spoken output; already is_external label-handled, XML wrap wrong"),
+        "wrapped", "full LLM path wraps external content into the system prompt; "
+        "the spoken (raw_snippets) rendering keeps a soft label (can't speak XML)"),
     "dashboard/routes/memory.py::memory_search": (
         "display", "human HTTP display, not an LLM prompt (stored-XSS threat class)"),
     "memory/corrective.py::_augment": (
