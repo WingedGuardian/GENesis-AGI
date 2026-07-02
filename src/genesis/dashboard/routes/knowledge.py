@@ -145,10 +145,23 @@ async def knowledge_delete(unit_id: str):
             except Exception:
                 logger.warning("Failed to delete Qdrant point %s", qdrant_id)
 
+        # Drop the unit from the ingestion manifest so a fully-deleted source is
+        # not permanently blocked from re-ingest by the source-identity gate.
+        # Best-effort: the unit is already physically gone; manifest bookkeeping
+        # must never fail the delete.
+        manifest_removed = False
+        try:
+            from genesis.knowledge.manifest import ManifestManager
+
+            manifest_removed = ManifestManager().remove_unit(unit_id)
+        except Exception:
+            logger.warning("Failed to update manifest after deleting unit %s", unit_id)
+
         return jsonify({
             "status": "ok",
             "sqlite_deleted": True,
             "qdrant_deleted": qdrant_deleted,
+            "manifest_removed": manifest_removed,
         })
     except Exception:
         logger.exception("Knowledge delete failed")
