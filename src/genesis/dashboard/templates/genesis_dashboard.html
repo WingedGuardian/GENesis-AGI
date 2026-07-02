@@ -240,6 +240,8 @@
         attentionEvents: [],
         attentionStats: null,
         attentionFilters: { activation: "", trigger: "", is_user: false, unlabeled: true, config_version: "" },
+        _attentionVersionDefaulted: false,   // one-time guard: default the filter to newest version once
+        _attentionEventsGen: 0,   // request generation — discard a stale events response superseded by a newer fetch
         attentionRevealed: {},   // {event_id: [window rows] | "unavailable"}
         attentionLabeling: {},   // {event_id: true} while a label POST is in flight
 
@@ -1625,9 +1627,17 @@
           return p.toString();
         },
         async fetchAttentionEvents() {
+          // Stamp each request; only apply the response if it's still the latest. On tab-init the
+          // one-time version default fires a second (scoped) fetch while the first (unscoped, all-versions)
+          // fetch may still be in flight — without this guard a late unscoped response could clobber the
+          // scoped list and re-introduce the version duplicates.
+          const gen = ++this._attentionEventsGen;
           try {
             const resp = await fetchApi(`/api/genesis/attention/list?${this._attentionQuery()}`);
-            if (resp && resp.ok) { this.attentionEvents = (await resp.json()).events || []; }
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              if (gen === this._attentionEventsGen) this.attentionEvents = data.events || [];
+            }
           } catch (e) { console.warn("Attention list failed:", e); }
         },
         async fetchAttentionStats() {
@@ -1635,7 +1645,21 @@
             const cv = this.attentionFilters.config_version;
             const qs = cv ? `?config_version=${encodeURIComponent(cv)}` : "";
             const resp = await fetchApi(`/api/genesis/attention/stats${qs}`);
-            if (resp && resp.ok) { this.attentionStats = await resp.json(); }
+            if (resp && resp.ok) {
+              this.attentionStats = await resp.json();
+              // ONE-TIME default to the NEWEST config version so windows that fired under multiple
+              // versions don't render as duplicates — labeling should target one clean version.
+              // config_versions is ascending, so the last entry is newest (future-proof for 0.2.1+).
+              // Guarded by _attentionVersionDefaulted so a later manual "All versions" selection sticks
+              // (else this would snap the filter back to newest on every empty-version stats fetch).
+              const versions = this.attentionStats?.config_versions || [];
+              if (!cv && !this._attentionVersionDefaulted && versions.length) {
+                this._attentionVersionDefaulted = true;
+                this.attentionFilters.config_version = versions[versions.length - 1];
+                this.fetchAttentionEvents();
+                this.fetchAttentionStats();
+              }
+            }
           } catch (e) { console.warn("Attention stats failed:", e); }
         },
         async revealAttentionText(id) {
@@ -10615,9 +10639,13 @@
       <div style="padding: 1rem;">
 
       <div style="margin-bottom: 1rem; color: var(--color-text-secondary); font-size: .85em;">
-        Shadow decisions from the passive-listening attention gate — what it <em>would</em> have perked up on.
-        Nothing here speaks or acts. Reveal a window's transcript, then label it should / shouldn't / skip to
-        tune the gate. Transcript text is read live from the local snapshot; it is never stored here.
+        Moments the passive-listening attention gate <em>would</em> have noticed. Nothing here speaks or acts.
+        <strong style="color:var(--color-text);">For each one, ask: should Genesis have PAID ATTENTION here —
+        was it worth being aware of / remembering?</strong> This is about <em>attention</em>, not about
+        interrupting you (whether to actually speak is a separate, later decision). Reveal the transcript, then
+        label — <strong>Worth noticing</strong> = yes, attend · <strong>Not worth it</strong> = noise, not
+        worth a glance · <strong>Skip</strong> = can't tell (garbled). Transcript text is read live from the
+        local snapshot; it is never stored here.
       </div>
 
       <!-- Stats -->
@@ -10704,7 +10732,7 @@
                 <template x-for="t in (ev.triggers_fired||[])" :key="t.name">
                   <span style="font-size:.6rem; padding:1px 5px; border-radius:3px; background:var(--color-panel);" x-text="t.name"></span>
                 </template>
-                <span x-show="ev.acceptance_signal" style="font-size:.6rem; padding:1px 6px; border-radius:3px; color:var(--color-primary); background:var(--color-primary)22;" x-text="ev.acceptance_signal"></span>
+                <span x-show="ev.acceptance_signal" style="font-size:.6rem; padding:1px 6px; border-radius:3px; color:var(--color-primary); background:var(--color-primary)22;" x-text="({should:'noticed',shouldnt:'ignored',skip:'skipped'})[ev.acceptance_signal] || ev.acceptance_signal"></span>
               </div>
               <div style="display:flex; gap:.3rem; align-items:center; flex-shrink:0;">
                 <button class="btn-sm" style="padding:.15rem .4rem;"
@@ -10712,12 +10740,12 @@
                   <span class="material-symbols-outlined" style="font-size:1rem; vertical-align:middle;"
                         x-text="$store.genesisDashboard.attentionRevealed[ev.id] !== undefined ? 'visibility_off' : 'visibility'"></span>
                 </button>
-                <button class="btn-sm" style="padding:.15rem .5rem;" :disabled="$store.genesisDashboard.attentionLabeling[ev.id] === true"
-                        @click="$store.genesisDashboard.labelAttentionEvent(ev.id, 'should')">should</button>
-                <button class="btn-sm" style="padding:.15rem .5rem;" :disabled="$store.genesisDashboard.attentionLabeling[ev.id] === true"
-                        @click="$store.genesisDashboard.labelAttentionEvent(ev.id, 'shouldnt')">shouldn't</button>
-                <button class="btn-sm" style="padding:.15rem .5rem; opacity:.7;" :disabled="$store.genesisDashboard.attentionLabeling[ev.id] === true"
-                        @click="$store.genesisDashboard.labelAttentionEvent(ev.id, 'skip')">skip</button>
+                <button class="btn-sm" style="padding:.15rem .5rem;" title="Genesis should have paid attention here (worth being aware of / remembering)" :disabled="$store.genesisDashboard.attentionLabeling[ev.id] === true"
+                        @click="$store.genesisDashboard.labelAttentionEvent(ev.id, 'should')">Worth noticing</button>
+                <button class="btn-sm" style="padding:.15rem .5rem;" title="Noise — not worth a glance" :disabled="$store.genesisDashboard.attentionLabeling[ev.id] === true"
+                        @click="$store.genesisDashboard.labelAttentionEvent(ev.id, 'shouldnt')">Not worth it</button>
+                <button class="btn-sm" style="padding:.15rem .5rem; opacity:.7;" title="Can't tell — too garbled to judge" :disabled="$store.genesisDashboard.attentionLabeling[ev.id] === true"
+                        @click="$store.genesisDashboard.labelAttentionEvent(ev.id, 'skip')">Skip</button>
               </div>
             </div>
             <!-- Revealed window (from the transient snapshot) -->
