@@ -1,11 +1,13 @@
 """Standalone Discord bot MCP server — read-only message access + reply.
 
 Provides fetch_messages, fetch_forum_threads, and send_reply tools via
-the Discord bot token. Scoped to discord-monitor campaign sessions only
-(not loaded by foreground, ego, reflection, or other session types).
+the Discord bot token. Loaded only by sessions that use the discord-bot MCP
+server (not by foreground, ego, reflection, or other session types).
 
-Stateless — no DB connection needed. Token injected at bootstrap via
-init_discord_bot().
+Token + an OPTIONAL best-effort genesis.db connection are injected at bootstrap
+via init_discord_bot(). The DB is used ONLY for WS5 capability-shadow recording
+(send_reply observes what a gate would decide, never holds); the server is fully
+functional without it (db=None => shadow is a no-op).
 """
 
 from __future__ import annotations
@@ -22,6 +24,10 @@ mcp = FastMCP("discord-bot")
 
 _bot_token: str | None = None
 
+# WS5: optional best-effort genesis.db connection for capability-shadow recording.
+# None => shadow is a no-op (the reply path is never gated on it).
+_db = None
+
 # GENesis Discord guild ID (public — visible in access.json)
 _GUILD_ID = "1486075405579583538"
 
@@ -32,11 +38,16 @@ _API = "https://discord.com/api/v10"
 _MAX_MESSAGE_LENGTH = 2000
 
 
-def init_discord_bot(*, bot_token: str) -> None:
-    """Wire the bot token for API calls."""
-    global _bot_token
+def init_discord_bot(*, bot_token: str, db=None) -> None:
+    """Wire the bot token for API calls, plus an OPTIONAL best-effort genesis.db
+    connection used only for WS5 capability-shadow recording (send_reply observes,
+    never holds). ``db=None`` keeps the server fully functional with shadow disabled."""
+    global _bot_token, _db
     _bot_token = bot_token
-    logger.info("Discord bot MCP wired (token=%s)", bool(bot_token))
+    _db = db
+    logger.info(
+        "Discord bot MCP wired (token=%s, shadow_db=%s)", bool(bot_token), bool(db),
+    )
 
 
 def _headers() -> dict[str, str]:
@@ -251,6 +262,20 @@ async def send_reply(
 
             msg_data = resp.json()
             sent_ids.append(msg_data.get("id", ""))
+
+    # WS5 Discord capability SHADOW-gate: observe (never hold) this reply AFTER it is
+    # fully sent, so the reply is NEVER delayed by the shadow write. Best-effort; _db is
+    # None if the shadow DB is unavailable. Wrapped so a shadow/import problem can never
+    # break the reply.
+    try:
+        from genesis.autonomy.shadow_gate import observe_discord_send
+
+        await observe_discord_send(
+            _db, path="reply", verb="reply", risk_class="standard",
+            target=channel_id, content=content,
+        )
+    except Exception:  # noqa: BLE001 — the reply path must never fail on shadow
+        logger.debug("send_reply capability shadow observe failed", exc_info=True)
 
     result_text = (
         f"sent (id: {sent_ids[0]})"

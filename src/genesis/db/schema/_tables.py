@@ -61,6 +61,24 @@ TABLES = {
             -- Not read by any cognition job (dream/ego/memory-synthesis).
         )
     """,
+    "capability_shadow_events": """
+        CREATE TABLE IF NOT EXISTS capability_shadow_events (
+            id               TEXT PRIMARY KEY,
+            observed_at      TEXT NOT NULL,      -- ISO8601 UTC — when the send was observed
+            path             TEXT NOT NULL,      -- egress door: deliver | poll | reply
+            channel          TEXT NOT NULL,      -- 'discord'
+            cell_domain      TEXT NOT NULL,      -- capability cell domain ('discord')
+            cell_verb        TEXT NOT NULL,      -- send | poll | reply
+            cell_risk_class  TEXT NOT NULL,      -- bulk | standard | identity
+            cell_state       TEXT,               -- capability_grants.state at observation; NULL => not_determined
+            would_hold       INTEGER NOT NULL,   -- 1 = a live gate WOULD hold this send; 0 = would allow (GRANTED)
+            target           TEXT,               -- routing target (webhook/channel_id/recipient) — NOT content
+            content_preview  TEXT,               -- truncated excerpt (<=200 chars); NOT paired with content_hash
+            content_hash     TEXT                -- hash over the FULL content; != content_preview
+            -- WS5 Discord capability-gate SHADOW store: gate DECISIONS + refs only.
+            -- Observe-only — no hold/approval is created here; the send always proceeds.
+        )
+    """,
     "observations": """
         CREATE TABLE IF NOT EXISTS observations (
             id               TEXT PRIMARY KEY,
@@ -1545,6 +1563,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_attention_events_session ON attention_events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_attention_events_ts ON attention_events(ts)",
     "CREATE INDEX IF NOT EXISTS idx_attention_events_unlabeled ON attention_events(acceptance_signal) WHERE acceptance_signal IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_capability_shadow_events_observed_at ON capability_shadow_events(observed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_capability_shadow_events_cell ON capability_shadow_events(cell_domain, cell_verb, cell_risk_class)",
     "CREATE INDEX IF NOT EXISTS idx_procedural_task_type ON procedural_memory(task_type)",
     "CREATE INDEX IF NOT EXISTS idx_procedural_draft ON procedural_memory(draft)",
     "CREATE INDEX IF NOT EXISTS idx_procedural_activation_tier ON procedural_memory(activation_tier)",

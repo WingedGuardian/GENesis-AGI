@@ -155,7 +155,7 @@ jobs:
         run: |
           set -euo pipefail
           body=$(gh pr view ${{ github.event.pull_request.number }} --json body -q .body 2>/dev/null || echo "")
-          PATTERNS='10\.176\.[0-9]|192\.168\.50\.[0-9]|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|046056[0-9]{6}|moonandstar|zorror|assistant1'
+          PATTERNS='10\.176\.[0-9]|192\.168\.50\.[0-9]|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|fd7a:|046056[0-9]{6}|moonandstar|zorror|assistant1'
           if echo "$body" | grep -qE "$PATTERNS"; then
             echo "::error::PR description contains private infrastructure details"
             echo "$body" | grep -nE "$PATTERNS" || true
@@ -185,6 +185,19 @@ jobs:
             exit 1
           fi
           echo "Migration prefix check: CLEAN"
+
+  external-io-check:
+    # WS5 regression guard: no NEW ungated autonomous external-world egress
+    # (Discord REST/webhook, public social APIs) outside the reasoned allowlist.
+    # See scripts/check_external_io.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: External-I/O egress guard
+        run: python scripts/check_external_io.py
 
   test:
     runs-on: ubuntu-latest

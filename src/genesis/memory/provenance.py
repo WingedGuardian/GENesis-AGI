@@ -15,6 +15,16 @@ retrieved from — always known at retrieval time, unlike the per-item store-tim
 
 from __future__ import annotations
 
+import logging
+
+from genesis.security.sanitizer import (
+    ContentSanitizer,
+    ContentSource,
+    strip_boundary_markers,
+)
+
+logger = logging.getLogger(__name__)
+
 #: The external-world knowledge collection. Everything else is first-party.
 KNOWLEDGE_COLLECTION = "knowledge_base"
 
@@ -123,3 +133,65 @@ def label_result_dicts(
             source_doc=d.get("source_doc") or d.get("source") or payload.get("source"),
         )
     return dicts
+
+
+# ---------------------------------------------------------------------------
+# Recall-side injection defense (PR2, sibling to the #809 ingestion scan).
+#
+# External-world content recalled from the KB is wrapped in <external-content>
+# boundary markers at INJECT time, so the model structurally treats it as data
+# rather than as Genesis's own trustworthy instructions. The soft `KB·source`
+# provenance label is not enough on its own — an injection payload inside an
+# ingested doc otherwise reaches the prompt looking first-party. First-party
+# memory is NEVER wrapped (it's Genesis's own observations, not the threat
+# vector). Detect-and-delimit, fail-open: a wrap failure returns the content
+# unchanged so recall/inject never breaks.
+# ---------------------------------------------------------------------------
+
+#: Lazily-constructed wrapper sanitizer. wrap_content() needs no injection
+#: patterns, but ContentSanitizer loads them on init; defer that one-time FS
+#: read to the first external recall rather than paying it at import time
+#: (provenance is imported widely, including the proactive hook).
+_WRAP_SANITIZER: ContentSanitizer | None = None
+
+
+def _wrap_sanitizer() -> ContentSanitizer:
+    global _WRAP_SANITIZER
+    if _WRAP_SANITIZER is None:
+        _WRAP_SANITIZER = ContentSanitizer()
+    return _WRAP_SANITIZER
+
+
+def _source_for(source_pipeline: str | None) -> ContentSource:
+    """Map a stored ``source_pipeline`` to the sanitizer risk tier for the tag.
+
+    Live web-fallback (CRAG) content is a fresh off-the-web fetch, not settled
+    KB, so it keeps WEB_FETCH's higher risk; recon findings keep RECON; every
+    other KB recall is already-ingested content → MEMORY. The ``risk`` attribute
+    is informational (no blocking) but should not understate a fresh fetch.
+    """
+    if source_pipeline:
+        if "crag_web" in source_pipeline:
+            return ContentSource.WEB_FETCH
+        if "recon" in source_pipeline:
+            return ContentSource.RECON
+    return ContentSource.MEMORY
+
+
+def wrap_external_recall(content: str, *, source_pipeline: str | None = None) -> str:
+    """Wrap external-world recalled content in ``<external-content>`` markers.
+
+    Call at INJECT points for content whose provenance is external-world (the
+    caller has already decided this via ``is_external(collection)`` or a
+    knowledge_base-only recall). Strips any pre-existing markers first, so
+    content that leaked an upstream wrapper is never double-wrapped (idempotent).
+    Fail-open: any error returns the original content so recall never breaks.
+    """
+    try:
+        if not isinstance(content, str) or not content:
+            return content
+        stripped = strip_boundary_markers(content)
+        return _wrap_sanitizer().wrap_content(stripped, _source_for(source_pipeline))
+    except Exception:
+        logger.warning("wrap_external_recall failed; returning unwrapped", exc_info=True)
+        return content

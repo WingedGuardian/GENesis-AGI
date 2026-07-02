@@ -78,6 +78,7 @@ class SurplusScheduler:
         dispatch_interval_minutes: int = 5,
         brainstorm_check_hours: int = 12,
         task_expiry_hours: int = 72,
+        terminal_retention_days: int = 30,
         code_audit_hours: int = 12,
         code_index_hours: int = 4,
         recon_gather_hours: int = 84,
@@ -104,6 +105,7 @@ class SurplusScheduler:
         self._dispatch_interval = dispatch_interval_minutes
         self._brainstorm_interval = brainstorm_check_hours
         self._task_expiry_hours = task_expiry_hours
+        self._terminal_retention_days = terminal_retention_days
         self._code_audit_hours = code_audit_hours
         self._code_index_hours = code_index_hours
         self._recon_gather_hours = recon_gather_hours
@@ -1590,8 +1592,12 @@ class SurplusScheduler:
         # 0. Recover tasks stuck in 'running' state (crashed mid-execution)
         await self._queue.recover_stuck()
 
-        # 1. Drain expired tasks
+        # 1. Drain expired pending tasks
         await self._queue.drain_expired(max_age_hours=self._task_expiry_hours)
+
+        # 1b. Age-cap terminal rows (completed/failed/cancelled) so they don't
+        # accumulate forever — drain_expired only touches pending.
+        await self._queue.reap_terminal(older_than_days=self._terminal_retention_days)
 
         # 2. Check idle
         if not self._idle_detector.is_idle():

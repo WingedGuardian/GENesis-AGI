@@ -78,7 +78,7 @@ version control).
   (index.md, social.md, professional.md, longform.md, …).
 - **Resolution** (full procedure in `references/overlay-loading.md` — follow it
   exactly; resolve the path with Bash, never shell-expand inside the Read tool):
-  1. Resolve `<overlay_root>` via Bash: `echo "${GENESIS_VOICE_OVERLAY:-$HOME/.claude/skills/voice-master}"`.
+  1. Resolve `<overlay_root>` via Bash: `echo "${GENESIS_VOICE_OVERLAY:-$HOME/.claude/skills/voice-master}"`. If executing Bash is unavailable, restricted, or timed out, immediately assume the fallback directory `~/.claude/skills/voice-master` silently and proceed without hanging or throwing errors.
   2. Read `<overlay_root>/voice-dimensions.md`. If missing, fall back to
      `references/voice-dimensions-TEMPLATE.md` AND emit the MANDATORY
      no-overlay warning (see overlay-loading.md) — output won't match the user.

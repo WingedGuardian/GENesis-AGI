@@ -271,6 +271,18 @@ else
     echo "  Node: $(node --version 2>/dev/null || echo 'not available') (needs >= 20)"
 fi
 
+# --- Claude Code version pin (install or align to the pinned version) ---
+# Node/npm are set up above. Align the local Claude Code to the repo pin so a
+# bump reaches the container via `bootstrap.sh` too (not just install.sh).
+# Non-fatal (`|| true`): `set -e` is active — a CC hiccup must not abort bootstrap.
+_cc_env="$SCRIPT_DIR/lib/cc_version.sh"
+if [ -f "$_cc_env" ]; then
+    echo "--- Aligning Claude Code to pinned version ---"
+    # shellcheck source=/dev/null
+    source "$_cc_env"
+    cc_ensure_local || true
+fi
+
 # bubblewrap (sandbox for codex exec — optional)
 if ! command -v bwrap &>/dev/null; then
     echo "  bubblewrap not found — installing..."
@@ -405,7 +417,11 @@ echo "--- Seeding baseline procedures ---"
 # Non-fatal, but surface a failure instead of swallowing it (a silent miss would
 # leave advisory surfacing untracked with no signal). Capture, then check for the
 # success line rather than relying on the exit code through the pipe.
-SEED_OUT="$("$VENV_DIR/bin/python" "$GENESIS_ROOT/scripts/seed_procedures.py" 2>&1)" || true
+# Defense-in-depth (incident IR-2): bound the seed with `timeout 300`. Seeding
+# normally finishes in seconds; if the DB write lock is ever contended (a mid-
+# deploy server revival deadlocked it, hanging bootstrap ~30 min silently), fail
+# FAST at 5 min — the `|| true` keeps it non-fatal and the WARNING below fires.
+SEED_OUT="$(timeout 300 "$VENV_DIR/bin/python" "$GENESIS_ROOT/scripts/seed_procedures.py" 2>&1)" || true
 echo "$SEED_OUT" | tail -2
 if ! echo "$SEED_OUT" | grep -q "Seeded .* procedures"; then
     echo "  WARNING: baseline procedure seeding did not complete — advisor surfacing tracking may be degraded."

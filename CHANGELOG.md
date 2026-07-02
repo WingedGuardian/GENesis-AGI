@@ -9,8 +9,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Security
+
+- **The contribution sanitizer now blocks Tailscale addresses before they can reach the public
+  repo.** When you prepare a community contribution, the pre-push privacy scan now catches Tailscale
+  CGNAT and Tailscale IPv6 addresses, and flags the full private `10.176` subnet range (not just two
+  hard-coded addresses) — closing a gap where these install-specific addresses could otherwise slip
+  into a public PR. The commit-message guard gained the same IPv6 coverage.
+
 ### Added
 
+- **Genesis now catches scheduled jobs that silently stop working — running on schedule but never
+  succeeding.** Some background jobs (like the weekly self-assessment and quality calibration) could
+  fail week after week without ever showing up as "failed," because the failure counter is reset
+  every time the server restarts. Genesis now watches the gap between a job's last run and its last
+  success: if a job has been running-but-not-succeeding for more than about a week, it raises a health
+  alert that reaches your daily report and the dashboard, and the job-health view now shows a
+  `days_since_success` figure and a `stale` flag for every job.
 - **You can now start an interactive Claude Code session on a different model with one command.**
   `gmodel <name>` launches `claude` on the model you pick: a Claude tier (`gmodel opus`) runs on
   your normal Max subscription, while a roster peer (`gmodel glm-5.2`) runs on that provider's
@@ -62,6 +77,55 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   duplicate. Together these keep the procedure store both more complete and less cluttered.
 
 ### Fixed
+
+- **Completed background-task history no longer grows without bound.** Genesis's idle-time "surplus"
+  task queue kept every finished task row forever — only never-started tasks were ever cleaned up — so
+  the table crept upward over months of background work. Finished tasks (completed, failed, or
+  cancelled) are now aged out after 30 days, while any task still referenced by an open follow-up is
+  kept until that follow-up resolves.
+
+- **Deleting a knowledge item from the dashboard now works end to end.** Previously the delete
+  button returned a server error, and behind the scenes the item was only half-removed — dropped
+  from search but with its stored embedding left behind and its source still marked as already
+  ingested, so re-adding that same file or URL was silently skipped and nothing came back. Deletes
+  now complete cleanly (search entry and embedding both removed), and once a source's last item is
+  deleted, re-ingesting that file or URL works again.
+
+- **The weekly self-assessment and quality-calibration jobs now recover on their own instead of
+  going dark for weeks.** Previously each ran only once a week, so if that one run failed — for
+  example when the shared Claude Code subscription was capped and returned empty output — the next
+  attempt wasn't until the following week, and a multi-day outage could leave them stale for 2–3
+  weeks. They now run daily but still complete at most once per week (an idempotency check skips the
+  rest of the week once one run succeeds), so a failed day is simply retried the next day until it
+  succeeds. Side effect: the successful run now normally lands early in the week rather than on Sunday.
+
+- **`update.sh` no longer hangs if the health watchdog restarts the server mid-update.**
+  During an update Genesis stops its server to swap in new code and migrate the database. The
+  background health watchdog could see it "down" and restart it right then — and the revived
+  server's database lock deadlocked the update's procedure-seeding step, leaving the whole update
+  stuck for as long as ~30 minutes with no error. The watchdog now defers restarts while an update
+  is in progress, and the seeding step is time-bounded so a contended database fails fast instead of
+  hanging silently.
+- **Genesis now keeps your Claude Code CLI at the version it's tested against — automatically.**
+  Previously the installer only put Claude Code in place when it was *missing*, so if you already
+  had an older Claude Code, bumping the pinned version never actually upgraded you — you'd silently
+  keep running the old one. Now `install.sh`, `bootstrap.sh`, and `update.sh` all install *or* align
+  Claude Code to the pinned version on every run (matching it exactly, so an intentional rollback
+  also applies), with no manual step. It's non-fatal: if the update can't run (e.g. no permissions),
+  your update still completes and Claude Code is left as-is.
+- **A casual message can no longer be mistaken for a permanent "hard rule" — and your
+  steering-rules file keeps its structure.** Genesis auto-adds a steering rule only when you
+  actually give it a terse directive ("stop doing X", "never do Y"); an ordinary status update
+  or chatty reply is no longer captured verbatim as a hard constraint, even if Genesis misread
+  the moment. And when a rule is added, the section headings and layout of your `STEERING.md`
+  are preserved instead of being flattened into one run-on list.
+
+- **Conversations can take as long as the work genuinely needs, and no longer time out twice in
+  a row.** The time budget for a Claude Code turn was a too-short 10 minutes, so substantial work
+  started in chat could be cut off mid-task; it is now 2 hours, and a turn that does hit the limit
+  no longer silently retries from scratch (which previously doubled the wait before giving up).
+  Genesis is also guided to break large jobs into steps and hand genuinely long work to a
+  background session it reports back on, rather than leaving you waiting in silence.
 
 - **Genesis no longer mistakes your status updates for its own failures.** When you tell Genesis
   how your own projects, plans, or deadlines are going ("the offer fell through", "I didn't attend

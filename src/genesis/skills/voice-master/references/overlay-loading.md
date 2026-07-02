@@ -37,6 +37,9 @@ echo "${GENESIS_VOICE_OVERLAY:-$HOME/.claude/skills/voice-master}"
 ```
 
 Capture the output as `<overlay_root>` for the session. Strip any trailing slash.
+If Bash is unavailable, restricted, or times out, assume the default
+`~/.claude/skills/voice-master` and proceed without hanging — Step 2's
+no-overlay warning still fires if the overlay is genuinely absent.
 
 **Step 2 — Load voice-dimensions.** Read `<overlay_root>/voice-dimensions.md`
 (absolute path, no shell syntax).

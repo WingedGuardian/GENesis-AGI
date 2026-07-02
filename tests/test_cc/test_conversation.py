@@ -305,6 +305,52 @@ async def test_resume_failure_streaming_retries_fresh(loop, mock_invoker, db):
 
 
 @pytest.mark.asyncio
+async def test_resume_timeout_not_retried(loop, mock_invoker, db):
+    """A timeout on a resume must NOT retry fresh (2026-06-30 double-timeout).
+
+    Regression: CCTimeoutError is a CCError, so the stale-resume recovery used
+    to fire on timeout and burn a second full window. It must now propagate to
+    the terminal handler after a single attempt.
+    """
+    await _setup_session_with_cc_sid(db)
+
+    call_count = 0
+
+    async def _run_side_effect(inv):
+        nonlocal call_count
+        call_count += 1
+        raise CCTimeoutError("Timeout after 7200s")
+
+    mock_invoker.run = AsyncMock(side_effect=_run_side_effect)
+
+    result = await loop.handle_message("hello", user_id="u1", channel=ChannelType.TERMINAL)
+    assert "timed out" in result.lower()
+    # Exactly ONE attempt — no fresh retry on timeout.
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_timeout_streaming_not_retried(loop, mock_invoker, db):
+    """Streaming path (the actual incident path) also must not retry on timeout."""
+    await _setup_session_with_cc_sid(db)
+
+    call_count = 0
+
+    async def _stream_side_effect(inv, on_event=None):
+        nonlocal call_count
+        call_count += 1
+        raise CCTimeoutError("Timeout after 7200s")
+
+    mock_invoker.run_streaming = AsyncMock(side_effect=_stream_side_effect)
+
+    result = await loop.handle_message_streaming(
+        "hello", user_id="u1", channel=ChannelType.TERMINAL,
+    )
+    assert "timed out" in result.lower()
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_fresh_session_failure_not_retried(loop, mock_invoker):
     """Error on first message (no resume) returns error without retry."""
     mock_invoker.run.side_effect = CCProcessError("process crashed")

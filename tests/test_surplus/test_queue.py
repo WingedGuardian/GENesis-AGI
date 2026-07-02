@@ -85,6 +85,29 @@ async def test_drain_expired_removes_old_tasks(db, queue):
     assert removed == 1
 
 
+async def test_reap_terminal_removes_old_terminal_keeps_recent(db, queue):
+    """reap_terminal deletes completed rows older than retention; recent ones stay."""
+    base = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)  # queue's fixed clock
+    old = (base - timedelta(days=40)).isoformat()
+    await surplus_tasks.create(
+        db, id="old-done", task_type="brainstorm_self", compute_tier="free_api",
+        priority=0.5, drive_alignment="curiosity", created_at=old,
+    )
+    await surplus_tasks.mark_completed(db, "old-done", completed_at=old)
+    recent = (base - timedelta(hours=1)).isoformat()
+    await surplus_tasks.create(
+        db, id="recent-done", task_type="brainstorm_self", compute_tier="free_api",
+        priority=0.5, drive_alignment="curiosity", created_at=recent,
+    )
+    await surplus_tasks.mark_completed(db, "recent-done", completed_at=recent)
+
+    reaped = await queue.reap_terminal(older_than_days=30)
+
+    assert reaped == 1
+    assert await surplus_tasks.get_by_id(db, "old-done") is None
+    assert await surplus_tasks.get_by_id(db, "recent-done") is not None
+
+
 async def test_pending_count(queue):
     await queue.enqueue(TaskType.BRAINSTORM_SELF, ComputeTier.FREE_API, 0.5, "curiosity")
     await queue.enqueue(TaskType.BRAINSTORM_USER, ComputeTier.FREE_API, 0.3, "curiosity")

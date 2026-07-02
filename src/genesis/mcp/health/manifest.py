@@ -10,12 +10,56 @@ import aiosqlite
 
 from genesis.db.connection import BUSY_TIMEOUT_MS
 from genesis.mcp.health import mcp  # noqa: E402
+from genesis.mcp.health.constants import JOB_STALE_GAP_DAYS
 
 logger = logging.getLogger(__name__)
 
 # Module-level DB path so tests can monkeypatch it without touching
 # ``Path.home()``. Matches the pattern used in ``update_history.py``.
 _DB_PATH = Path.home() / "genesis" / "data" / "genesis.db"
+
+def _parse_ts_utc(raw: str) -> datetime:
+    """Parse an ISO timestamp, coercing to timezone-aware UTC.
+
+    job_health timestamps are written as ``datetime.now(UTC).isoformat()``
+    (offset-aware), but coerce naive strings to UTC too so a mixed naive/aware
+    pair can still be subtracted without raising ``TypeError``.
+    """
+    dt = datetime.fromisoformat(raw)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+def _annotate_staleness(jobs: dict) -> dict:
+    """Return a copy of ``jobs`` with derived ``days_since_success`` + ``stale``.
+
+    ``days_since_success`` = the ``last_run − last_success`` gap in days — how
+    long a job has been firing without completing. ``stale`` = that gap exceeds
+    the alert threshold. Keying on this gap (rather than ``consecutive_failures``)
+    surfaces silent failures that ``clear_stale_job_failures`` would otherwise
+    hide by resetting the failure counter on every restart.
+
+    Non-mutating: the runtime return path hands back ``rt.job_health`` by
+    reference, so each entry is shallow-copied before the derived keys are added.
+    """
+    annotated: dict[str, dict] = {}
+    for name, info in jobs.items():
+        entry = dict(info)
+        gap: float | None = None
+        last_run = info.get("last_run")
+        last_ok = info.get("last_success")
+        if last_run and last_ok:
+            try:
+                gap = round(
+                    (_parse_ts_utc(last_run) - _parse_ts_utc(last_ok)).total_seconds()
+                    / 86400,
+                    1,
+                )
+            except (ValueError, TypeError):
+                gap = None
+        entry["days_since_success"] = gap
+        entry["stale"] = gap is not None and gap > JOB_STALE_GAP_DAYS
+        annotated[name] = entry
+    return annotated
 
 
 async def _impl_bootstrap_manifest() -> dict:
@@ -145,7 +189,7 @@ async def _impl_job_health() -> dict:
         rt = GenesisRuntime.instance()
         if rt.job_health:
             return {
-                "jobs": rt.job_health,
+                "jobs": _annotate_staleness(rt.job_health),
                 "note": None,
                 "source": "runtime",
             }
@@ -182,7 +226,7 @@ async def _impl_job_health() -> dict:
                     "last_error": row[4],
                     "consecutive_failures": row[5],
                 }
-            return {"jobs": jobs, "note": None, "source": "sqlite"}
+            return {"jobs": _annotate_staleness(jobs), "note": None, "source": "sqlite"}
     except (aiosqlite.Error, OSError):
         # aiosqlite.Error covers DB-level failures (corrupt file, busy
         # timeout, schema mismatch). OSError covers filesystem issues

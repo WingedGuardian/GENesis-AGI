@@ -12,6 +12,8 @@ the ``kind`` values and JSON keys).
 """
 from __future__ import annotations
 
+import json
+
 import aiosqlite
 
 # Column order — the offline runner's row tuples (ShadowStoreConsumer._to_row) MUST match.
@@ -72,6 +74,7 @@ async def list_events(
     is_user: bool = False,
     unlabeled: bool = False,
     session_id: str | None = None,
+    config_version: str | None = None,
     limit: int = 200,
     offset: int = 0,
 ) -> list[dict]:
@@ -80,12 +83,16 @@ async def list_events(
     ``trigger`` filters to events whose ``triggers_fired`` contains a hit with that exact
     ``name`` (via ``json_each``, not ``LIKE``). ``is_user=True`` additionally requires the
     ``is_user`` trigger — i.e. the *trigger utterance* (window end) had ``is_user=1``.
-    ``unlabeled=True`` restricts to ``acceptance_signal IS NULL`` (the review queue)."""
+    ``unlabeled=True`` restricts to ``acceptance_signal IS NULL`` (the review queue).
+    ``config_version`` scopes to one shadow-run config (the calibration A/B filter — PR3c-1)."""
     where: list[str] = []
     params: list = []
     if activation is not None:
         where.append("activation = ?")
         params.append(activation)
+    if config_version is not None:
+        where.append("config_version = ?")
+        params.append(config_version)
     if session_id is not None:
         where.append("session_id = ?")
         params.append(session_id)
@@ -139,38 +146,63 @@ async def update_acceptance_signal(
 
 
 # ── aggregates for the cockpit stats panel (all counts — never text) ──────────────
+#
+# Each aggregate accepts an optional ``config_version`` so the stats panel can scope to
+# ONE shadow-run config (PR3c-1's A/B filter) — otherwise, the moment a 2nd config_version
+# is persisted, the dominance bar would mix versions while the list filters correctly.
+# ``config_versions()`` itself stays UNFILTERED (the dropdown must list every version).
 
-async def activation_stats(db: aiosqlite.Connection) -> dict:
+def _cv_clause(config_version: str | None, *, alias: str = "") -> tuple[str, tuple]:
+    """WHERE fragment (leading space) + params for an optional config_version filter.
+
+    ``alias`` prefixes the column for the json_each aggregates (``ae.config_version``)."""
+    if config_version is None:
+        return "", ()
+    col = f"{alias}.config_version" if alias else "config_version"
+    return f" WHERE {col} = ?", (config_version,)
+
+
+async def activation_stats(db: aiosqlite.Connection, config_version: str | None = None) -> dict:
+    """Per-activation event counts (hard / soft / suppressed) — the fire-rate breakdown."""
+    where, params = _cv_clause(config_version)
     cursor = await db.execute(
-        "SELECT activation, COUNT(*) AS n FROM attention_events GROUP BY activation"
+        f"SELECT activation, COUNT(*) AS n FROM attention_events{where} GROUP BY activation",  # noqa: S608
+        params,
     )
     return {r["activation"]: r["n"] for r in await cursor.fetchall()}
 
 
-async def trigger_stats(db: aiosqlite.Connection) -> dict:
+async def trigger_stats(db: aiosqlite.Connection, config_version: str | None = None) -> dict:
     """Per-trigger fire counts (the dominance bar) — exact name via json_each."""
+    where, params = _cv_clause(config_version, alias="ae")
     cursor = await db.execute(
         "SELECT json_extract(je.value, '$.name') AS name, COUNT(*) AS n "
-        "FROM attention_events ae, json_each(ae.triggers_fired) je "
-        "GROUP BY name ORDER BY n DESC"
+        f"FROM attention_events ae, json_each(ae.triggers_fired) je{where} "  # noqa: S608
+        "GROUP BY name ORDER BY n DESC",
+        params,
     )
     return {r["name"]: r["n"] for r in await cursor.fetchall()}
 
 
-async def suppressor_stats(db: aiosqlite.Connection) -> dict:
+async def suppressor_stats(db: aiosqlite.Connection, config_version: str | None = None) -> dict:
     """Per-suppressor hit counts (``suppressors`` is a JSON array of names)."""
+    where, params = _cv_clause(config_version, alias="ae")
     cursor = await db.execute(
         "SELECT je.value AS name, COUNT(*) AS n "
-        "FROM attention_events ae, json_each(ae.suppressors) je "
-        "GROUP BY name ORDER BY n DESC"
+        f"FROM attention_events ae, json_each(ae.suppressors) je{where} "  # noqa: S608
+        "GROUP BY name ORDER BY n DESC",
+        params,
     )
     return {r["name"]: r["n"] for r in await cursor.fetchall()}
 
 
-async def label_counts(db: aiosqlite.Connection) -> dict:
+async def label_counts(db: aiosqlite.Connection, config_version: str | None = None) -> dict:
     """total / labeled / unlabeled + a by-signal breakdown."""
+    where, params = _cv_clause(config_version)
     cursor = await db.execute(
-        "SELECT acceptance_signal, COUNT(*) AS n FROM attention_events GROUP BY acceptance_signal"
+        f"SELECT acceptance_signal, COUNT(*) AS n FROM attention_events{where} "  # noqa: S608
+        "GROUP BY acceptance_signal",
+        params,
     )
     by_signal: dict[str, int] = {}
     unlabeled = 0
@@ -188,3 +220,62 @@ async def label_counts(db: aiosqlite.Connection) -> dict:
         "unlabeled": unlabeled,
         "by_signal": by_signal,
     }
+
+
+async def config_versions(db: aiosqlite.Connection) -> list[str]:
+    """Every distinct ``config_version`` present (UNFILTERED — populates the A/B dropdown)."""
+    cursor = await db.execute(
+        "SELECT DISTINCT config_version FROM attention_events "
+        "WHERE config_version IS NOT NULL ORDER BY config_version"
+    )
+    return [r["config_version"] for r in await cursor.fetchall()]
+
+
+# ── calibration tooling (PR3c-1) ──────────────────────────────────────────────────
+
+async def load_fire_records(db: aiosqlite.Connection, config_version: str) -> list[dict]:
+    """Value-free rows for the A/B fire-set differ: every event of ONE config_version.
+
+    Returns raw dicts (``id``/``activation``/``triggers_fired``/``suppressors``/``window_ref``
+    with the JSON columns still strings) — the differ parses + maps them to fire-records.
+    ALL rows, UNPAGED (the differ needs the full set, not the 500-capped review page).
+    Assumes ``db.row_factory = aiosqlite.Row`` (the caller sets it — see differ.load_from_db)."""
+    cursor = await db.execute(
+        "SELECT id, activation, triggers_fired, suppressors, window_ref "
+        "FROM attention_events WHERE config_version = ? ORDER BY ts",
+        (config_version,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def load_labeled_fires(db: aiosqlite.Connection, config_version: str) -> list[dict]:
+    """Value-free rows for the LABEL-SCORED calibration report (PR3c-2a): every should/shouldnt
+    -labeled event of ONE config_version. Extends ``load_fire_records``'s columns with ``score``
+    + ``clarity`` + ``acceptance_signal`` (the label). ``skip`` and unlabeled rows are excluded
+    in SQL — they are not a usable judgment and must never reach the metrics. UNPAGED.
+    Assumes ``db.row_factory = aiosqlite.Row`` (the caller sets it — see calibrate.load_labeled)."""
+    cursor = await db.execute(
+        "SELECT id, activation, score, clarity, triggers_fired, suppressors, window_ref, "
+        "acceptance_signal FROM attention_events "
+        "WHERE config_version = ? AND acceptance_signal IS NOT NULL AND acceptance_signal != 'skip' "
+        "ORDER BY ts",
+        (config_version,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def update_l15_verdict(
+    db: aiosqlite.Connection, event_id: str, verdict: dict | None,
+) -> bool:
+    """Backfill/refresh an event's L1.5 ``l15_verdict`` (a MACHINE field). Returns found.
+
+    UNCONDITIONAL (no ``acceptance_signal IS NULL`` guard) — unlike ``bulk_upsert_events``,
+    which guards the human label. ``l15_verdict`` carries no human input, so a later
+    ``--l15`` run may safely refresh it even on an already-LABELED row (the label/verdict
+    correlation workflow PR3c-2 needs). Stored floats-only (mirrors ``consumers._to_row``)."""
+    payload = json.dumps(verdict) if verdict is not None else None
+    cursor = await db.execute(
+        "UPDATE attention_events SET l15_verdict = ? WHERE id = ?", (payload, event_id)
+    )
+    await db.commit()
+    return cursor.rowcount > 0

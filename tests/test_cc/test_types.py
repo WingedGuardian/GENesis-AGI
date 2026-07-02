@@ -53,7 +53,7 @@ def test_cc_invocation_defaults():
     assert inv.model == CCModel.SONNET
     assert inv.effort == EffortLevel.MEDIUM
     assert inv.output_format == "json"
-    assert inv.timeout_s == 600
+    assert inv.timeout_s == 7200  # 2h project floor (raised from 600 — see CCInvocation)
     assert inv.working_dir is None
 
 

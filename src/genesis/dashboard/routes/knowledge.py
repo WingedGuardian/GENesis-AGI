@@ -131,13 +131,16 @@ async def knowledge_delete(unit_id: str):
         if not deleted:
             return jsonify({"error": "Unit not found"}), 404
 
-        # Also delete from Qdrant if we have a reference
+        # Also delete from Qdrant. The client lives on the memory store, not on
+        # the runtime directly — rt.qdrant_client never existed (bug since #83,
+        # sibling of the dream_cycle rt.qdrant→store.qdrant_client fix in #385).
         qdrant_deleted = False
-        if qdrant_id and rt.qdrant_client:
+        store = getattr(rt, "memory_store", None)
+        if qdrant_id and store is not None:
             try:
                 from qdrant_client.models import PointIdsList
 
-                rt.qdrant_client.delete(
+                store.qdrant_client.delete(
                     collection_name="knowledge_base",
                     points_selector=PointIdsList(points=[qdrant_id]),
                 )
@@ -145,10 +148,23 @@ async def knowledge_delete(unit_id: str):
             except Exception:
                 logger.warning("Failed to delete Qdrant point %s", qdrant_id)
 
+        # Drop the unit from the ingestion manifest so a fully-deleted source is
+        # not permanently blocked from re-ingest by the source-identity gate.
+        # Best-effort: the unit is already physically gone; manifest bookkeeping
+        # must never fail the delete.
+        manifest_removed = False
+        try:
+            from genesis.knowledge.manifest import ManifestManager
+
+            manifest_removed = ManifestManager().remove_unit(unit_id)
+        except Exception:
+            logger.warning("Failed to update manifest after deleting unit %s", unit_id)
+
         return jsonify({
             "status": "ok",
             "sqlite_deleted": True,
             "qdrant_deleted": qdrant_deleted,
+            "manifest_removed": manifest_removed,
         })
     except Exception:
         logger.exception("Knowledge delete failed")

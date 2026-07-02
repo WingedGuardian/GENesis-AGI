@@ -21,6 +21,7 @@ from typing import Any
 
 from genesis.autonomy.executor.types import ResearchResult
 from genesis.cc.types import CCInvocation, CCModel, CCOutput, EffortLevel, background_session_dir
+from genesis.memory.provenance import is_external, wrap_external_recall
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +222,12 @@ class DeepResearcherImpl:
             lines = []
             for r in results[:5]:
                 content = r.content[:200] if hasattr(r, "content") else str(r)[:200]
+                # Injection defense (PR2): recall defaults to source="both", so a
+                # KB hit can reach the triage prompt — wrap external-world content.
+                if is_external(getattr(r, "collection", "")):
+                    content = wrap_external_recall(
+                        content, source_pipeline=getattr(r, "source_pipeline", None),
+                    )
                 lines.append(f"- {content}")
             return "\n".join(lines)
         except Exception as exc:

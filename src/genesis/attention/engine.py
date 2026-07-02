@@ -9,8 +9,13 @@ from __future__ import annotations
 
 from genesis.attention.clarity import capture_clarity, is_blip
 from genesis.attention.config import AttentionConfig
-from genesis.attention.scorer import resolve_activation, soft_relevance
-from genesis.attention.triggers import HARD_TRIGGERS, SOFT_TRIGGERS, SUPPRESSORS
+from genesis.attention.scorer import resolve_activation, soft_relevance, stickiness_multiplier
+from genesis.attention.triggers import (
+    HARD_TRIGGERS,
+    SOFT_TRIGGERS,
+    SUPPRESSORS,
+    unanswered_question_update,
+)
 from genesis.attention.types import (
     Activation,
     AmbientUtterance,
@@ -48,6 +53,8 @@ def evaluate(
         state.session_id = f"s{utt.id}"
         state.session_started_ts = utt.ts
         state.window.clear()
+        state.pending_questions = []      # cross-session questions are stale
+        state.last_relevance_ts = None    # reset the decay clock (cooldown below persists)
         # cooldown (last_perk_ts) intentionally persists across sessions (anti-twitch).
 
     # ── context window (evict utterances older than the cap) ──
@@ -59,16 +66,27 @@ def evaluate(
     # ── triggers ──
     hard = _run(HARD_TRIGGERS, utt, window, config)
     soft = _run(SOFT_TRIGGERS, utt, window, config)
+    # unanswered-question look-ahead is engine-emitted (it needs state) and also advances
+    # the pending-question queue for future utterances.
+    uq_hit = unanswered_question_update(state, utt, config)
+    if uq_hit is not None:
+        soft.append(uq_hit)
     # suppressors_enabled is an ALLOWLIST: empty tuple -> no suppressors run (NOT "all").
     # Pass it straight through (no `or None`, which would misread [] as "run everything").
     supp = _run(SUPPRESSORS, utt, window, config, enabled=config.suppressors_enabled)
 
     # ── score ──
     relevance = soft_relevance(soft)
-    is_continuation = state.session_started_ts is not None and utt.ts != state.session_started_ts
     effective = relevance * clarity
-    if is_continuation:
-        effective *= sm.session_stickiness_mult
+    # in-session stickiness that DECAYS as the conversation drifts off-topic (§4). off_topic_s
+    # = seconds since the last utt that carried ANY relevance; None on the first relevant utt of
+    # a session -> floor (no bonus), matching the pre-PR3a first-utt behaviour without a crash.
+    off_topic_s = (utt.ts - state.last_relevance_ts) if state.last_relevance_ts is not None else None
+    effective *= stickiness_multiplier(
+        sm.session_stickiness_mult, off_topic_s, sm.decay_window_s, sm.decay_floor_mult,
+    )
+    if relevance > 0.0:
+        state.last_relevance_ts = utt.ts   # advance the decay clock on an on-topic utt
 
     in_cooldown = state.last_perk_ts is not None and (utt.ts - state.last_perk_ts) < sm.cooldown_s
     threshold = config.thresholds.soft_perk + (sm.cooldown_raise if in_cooldown else 0.0)

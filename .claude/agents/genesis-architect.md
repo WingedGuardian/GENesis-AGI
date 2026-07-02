@@ -38,6 +38,31 @@ V3 = conservative. Flag anything that looks like:
 - Bare `except Exception` without specific catches first
 - Missing `exc_info=True` on error-path logging
 
+## Auditing Existing Capabilities (enumerate, don't spot-check)
+
+Before you affirm an implementer's claim that Genesis "lacks X", "needs to add X",
+or is "weaker than <external system> at X" — verify by ENUMERATION, not a
+spot-check. Auditing a symbol is not auditing the stack.
+
+1. **Enumerate** the subsystem's full module inventory before concluding anything
+   is absent.
+2. **Trace the call graph BOTH directions** — mechanisms often live in the
+   wrapper/caller layer, not the symbol first landed on (CRAG lives in the MCP
+   recall wrapper, not `retrieval.py`; the reranker is applied by the caller).
+3. **Grep by CONCEPT** with several synonyms, not one symbol.
+4. **Verify built/enabled/disabled against RUNTIME state** (env gates, server
+   logs) — code presence ≠ enabled; code absence in one file ≠ absent from the
+   system.
+5. For **multi-path** systems build a coverage matrix (N entry points × M
+   mechanisms) — hot auto-fired paths often carry a thinner stack than the deep
+   path: a gradient, not an absence.
+6. **Confidence is capped by enumeration completeness.** A negative from a
+   positive search is not evidence of absence.
+
+This exists because a 2026-06-30 competitive audit wrongly claimed Genesis lacked
+CRAG, scope-before-rank, and a live reranker — all three had already shipped.
+Full protocol: procedure `codebase_audit` / CC memory `audit-enumerate-not-spotcheck`.
+
 ## Review Output Format
 
 For each concern:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -16,14 +16,22 @@ logger = logging.getLogger(__name__)
 
 
 class ReflectionScheduler:
-    """Owns APScheduler for weekly reflection jobs.
+    """Owns APScheduler for the weekly reflection jobs.
 
-    - Weekly self-assessment: Sunday 10:00 (user-configured timezone)
-    - Weekly quality calibration: Sunday 12:00 (user-configured timezone)
-    - Learning regression check runs after quality calibration completes
+    Both jobs FIRE DAILY (at the configured hours) but the
+    ``_already_ran_this_week`` idempotency gate holds each to ≤1 SUCCESSFUL run
+    per Monday-anchored week — so a day that fails (e.g. the shared Claude Code
+    subscription is capped and returns empty output) is retried the next day
+    instead of leaving a ≥7-day gap. Effective cadence: one success per week,
+    normally landing on the week's first fire (Monday).
 
-    Timezone is resolved via ``genesis.env.user_timezone()`` which checks
-    USER_TIMEZONE env → genesis.yaml timezone → UTC fallback.
+    - Self-assessment: daily @ ``assessment_hour`` (default 10)
+    - Quality calibration: daily @ ``calibration_hour`` (default 12)
+    - Learning regression check runs after a SUCCESSFUL quality calibration
+
+    ``assessment_day`` is retained for back-compat but no longer pins the fire
+    day. Timezone is resolved via ``genesis.env.user_timezone()`` (USER_TIMEZONE
+    env → genesis.yaml timezone → UTC fallback).
     """
 
     def __init__(
@@ -69,13 +77,19 @@ class ReflectionScheduler:
 
         self._scheduler = AsyncIOScheduler()
 
+        # Fire DAILY (at the configured hour) rather than only on one weekday,
+        # and let the _already_ran_this_week() idempotency gate hold it to ≤1
+        # SUCCESSFUL run per week. This self-heals: if the run fails on its
+        # normal day (e.g. the shared Claude Code subscription is capped and
+        # returns empty output), it retries the next day — and the next —
+        # until one success lands that week, instead of leaving a ≥7-day gap.
+        # Effective cadence: one success per Monday-anchored week (normally the
+        # week's first fire); later days that week no-op via the gate.
+        # (`_assessment_day` is retained for config/back-compat but no longer
+        # pins the fire day — the idempotency week anchor governs cadence.)
         self._scheduler.add_job(
             self._run_assessment,
-            CronTrigger(
-                day_of_week=self._assessment_day,
-                hour=self._assessment_hour,
-                timezone=tz,
-            ),
+            CronTrigger(hour=self._assessment_hour, timezone=tz),
             id="weekly_self_assessment",
             max_instances=1,
             misfire_grace_time=None,
@@ -83,11 +97,7 @@ class ReflectionScheduler:
 
         self._scheduler.add_job(
             self._run_calibration,
-            CronTrigger(
-                day_of_week=self._assessment_day,
-                hour=self._calibration_hour,
-                timezone=tz,
-            ),
+            CronTrigger(hour=self._calibration_hour, timezone=tz),
             id="weekly_quality_calibration",
             max_instances=1,
             misfire_grace_time=None,
@@ -95,9 +105,9 @@ class ReflectionScheduler:
 
         self._scheduler.start()
         logger.info(
-            "Reflection scheduler started (assessment=%s@%02d, calibration=%s@%02d, tz=%s)",
-            self._assessment_day, self._assessment_hour,
-            self._assessment_day, self._calibration_hour, tz_name,
+            "Reflection scheduler started (daily fire, ≤1 success/week via idempotency; "
+            "assessment@%02d, calibration@%02d, tz=%s)",
+            self._assessment_hour, self._calibration_hour, tz_name,
         )
 
     async def stop(self) -> None:
@@ -173,23 +183,22 @@ class ReflectionScheduler:
             result = await self._bridge.run_quality_calibration(self._db)
             if result.success:
                 logger.info("Quality calibration completed")
-            else:
-                logger.warning("Quality calibration failed: %s", result.reason)
-
-            # Run regression check after calibration
-            if self._stability:
-                regression = await self._stability.check_regression(self._db)
-                if regression:
-                    await self._stability.emit_regression_signal(self._db)
-                    logger.warning("Learning regression detected after calibration")
-                else:
-                    # Resolve-on-recovery: clear any standing regression alarm
-                    # once effectiveness recovers, so it doesn't persist stale.
-                    await self._stability.resolve_regression_if_standing(self._db)
-
-            if result.success:
+                # Regression check only after a SUCCESSFUL calibration — a failed
+                # run produces no new effectiveness data to regress against, and
+                # with daily firing an outage week would otherwise re-run this
+                # check (and possibly re-emit the signal) every day.
+                if self._stability:
+                    regression = await self._stability.check_regression(self._db)
+                    if regression:
+                        await self._stability.emit_regression_signal(self._db)
+                        logger.warning("Learning regression detected after calibration")
+                    else:
+                        # Resolve-on-recovery: clear any standing regression alarm
+                        # once effectiveness recovers, so it doesn't persist stale.
+                        await self._stability.resolve_regression_if_standing(self._db)
                 await self._record_job_result("weekly_calibration")
             else:
+                logger.warning("Quality calibration failed: %s", result.reason)
                 await self._record_job_result("weekly_calibration", error=result.reason or "unknown")
         except Exception as exc:
             logger.exception("Quality calibration error")
@@ -206,13 +215,18 @@ class ReflectionScheduler:
         The observation is written only on a *successful* run (a failure writes
         nothing), so its presence is a last-success signal and a failed run
         stays retriable.
+
+        The reflection jobs fire DAILY (see ``start``); this gate is what holds
+        that to ≤1 successful run per Monday-anchored week. Once a week's run
+        succeeds, later days no-op here; if the run fails, the window stays
+        empty so the next day's fire retries — that is the self-heal.
         """
         from genesis.db.crud import observations
 
         # Get start of current week (Monday 00:00)
         now = datetime.now(UTC)
         monday = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        monday -= __import__("datetime").timedelta(days=now.weekday())
+        monday -= timedelta(days=now.weekday())
         monday_iso = monday.isoformat()
 
         for obs_type in obs_types:

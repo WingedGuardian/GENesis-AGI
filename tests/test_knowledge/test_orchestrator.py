@@ -76,6 +76,30 @@ async def test_ingest_duplicate_detection(tmp_path: Path):
         assert "duplicate_source" in r2.quality_flags
 
 
+async def test_reingest_after_full_unit_delete(tmp_path: Path):
+    """After all of a source's units are removed from the manifest (the
+    tombstone path), a re-ingest runs the full pipeline again rather than
+    returning the now-dead cached result."""
+    units = [KnowledgeUnit(concept="Test", body="Test body", domain="test")]
+    orch = _make_orchestrator(tmp_path, mock_distill_result=units)
+
+    with patch("genesis.knowledge.orchestrator.KnowledgeOrchestrator._store_units",
+               new_callable=AsyncMock, return_value=["unit-1"]):
+        file = tmp_path / "doc.txt"
+        file.write_text("Some meaningful content here.")
+
+        r1 = await orch.ingest_source(str(file), project_type="test")
+        assert r1.units_created == 1
+
+        # Simulate the dashboard deleting the source's only unit.
+        assert orch._manifest.remove_unit("unit-1") is True
+
+        # Re-ingest must NOT short-circuit as a duplicate now.
+        r2 = await orch.ingest_source(str(file), project_type="test")
+        assert r2.units_created == 1
+        assert "duplicate_source" not in r2.quality_flags
+
+
 async def test_ingest_no_units_extracted(tmp_path: Path):
     """Distillation producing zero units flags appropriately."""
     orch = _make_orchestrator(tmp_path, mock_distill_result=[])

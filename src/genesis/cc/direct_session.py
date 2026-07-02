@@ -172,12 +172,12 @@ PROFILES: dict[str, list[str]] = {
         [t for t in _UNIVERSAL_DISALLOW if t != "Bash"]
         + _NO_BROWSER_INTERACTION + _NO_FILE_WRITE
     ),
-    # ── Discord monitor profile ─────────────────────────────────
-    # Reads Discord channels and responds via bot token API.
-    # MCP config loads discord-bot + health + outreach (no memory server).
-    # Belt-and-suspenders: block memory writes at tool level too, in case
-    # MCP config generation fails and falls back to full config.
-    "discord-monitor": (
+    # ── Community responder profile ─────────────────────────────
+    # Reactive community responder: reads a community's channels and replies
+    # via the discord-bot MCP server. MCP config loads discord-bot + health +
+    # outreach (no memory server). Belt-and-suspenders: block memory writes at
+    # tool level too, in case MCP config generation fails and falls back to full.
+    "community-responder": (
         _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION
         + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS
     ),
@@ -261,17 +261,17 @@ action you take on an external PR.
 
 {_MISSION_INJECTION}
 """,
-    "discord-monitor": f"""
+    "community-responder": f"""
 
-## Session Profile: discord-monitor
+## Session Profile: community-responder
 
 You have: discord-bot MCP tools (fetch_messages, fetch_forum_threads, send_reply), outreach_send, web tools.
 You do NOT have: Edit, Bash, NotebookEdit, browser tools, memory tools.
 Your final message IS your deliverable.
 
-You are a reactive community responder. Read Discord channels and respond
-to unanswered messages using send_reply. Do NOT post proactive content —
-that is the discord-engagement campaign's job.
+You are a reactive community responder. Read the community's channels and respond
+to unanswered messages using send_reply. Do NOT post proactive content — proactive
+posting is a separate campaign's job, not this profile's.
 
 {_MISSION_INJECTION}
 """,
@@ -297,7 +297,7 @@ _PROFILE_SKILLS: dict[str, list[str]] = {
     "observe": [],
     "campaign": ["voice-master"],
     "steward": ["voice-master"],
-    "discord-monitor": ["genesis-voice"],
+    "community-responder": ["genesis-voice"],
     "mail": ["genesis-voice"],
 }
 
@@ -318,7 +318,7 @@ _PROFILE_TO_MCP: dict[str, str] = {
     "interact": "sentinel",
     "campaign": "campaign",
     "steward": "campaign",  # health + memory + outreach (for notify)
-    "discord-monitor": "discord-monitor",
+    "community-responder": "community-responder",
     "mail": "mail",
 }
 

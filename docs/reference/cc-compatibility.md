@@ -9,15 +9,23 @@
 > through 8 evaluation lenses (see analyzer prompt for details). This document
 > is updated manually after each evaluation.
 >
-> Created: 2026-03-09 | Last updated: 2026-06-11
+> Created: 2026-03-09 | Last updated: 2026-07-01
 
 ---
 
 ## Current CC Version
 
-**Installed:** Claude Code 2.1.173 on the **container** (upgraded 2026-06-11 from 2.1.170 — Fable 5 `[1m]` model-ID normalization fix + 2.1.172 long-conversation render perf). The **host VM** runs **2.1.87** — deliberately held there after the 2.1.90 Linux scrollback regression (see the 2.1.90 row below). 2.1.173 (the fullscreen-renderer scrollback fix) is the version the host is now being moved to via the unified updater. **Both** container and host install Claude Code **via npm-global** (`npm install -g @anthropic-ai/claude-code@<version>` — the container auto-detects its npm prefix, the host uses `sudo npm install -g`). There is no native-installer path.
-**Pin (single source of truth):** `CC_VERSION` in `scripts/lib/cc_version.sh`, sourced by `scripts/install.sh`, `scripts/host-setup.sh`, and `scripts/update.sh`. Bump it in one place; the next `update.sh` run syncs the host (see "Updating Claude Code" below).
-**Minimum required by Genesis:** intentionally **not enforced** at runtime (all current code works with 2.0+). A managed-settings `requiredMinimumVersion` floor (`/etc/claude-code/managed-settings.json`, Linux-only — never read from user/project `settings.json`) was evaluated and **deliberately rejected**: a hard floor removes the incident-recovery downgrade path the project has actually used (the 2.1.90→2.1.87 scrollback rollback) and can brick CC if the floor is written above the installed version. Drift is prevented instead by the npm pin + the unified `update-cc` updater + `DISABLE_AUTOUPDATER`/`DISABLE_UPDATES` (so CC never self-bumps).
+**Installed:** Claude Code **2.1.198** on **both** container and host VM — deployed + verified 2026-07-01 (#841; a 25-release delta from 2.1.173 that is overwhelmingly fixes + perf; Sonnet 5 becomes CC's default model at 2.1.197, and Claude-in-Chrome goes GA at 2.1.198). The **container** (previously 2.1.173, upgraded 2026-06-11 from 2.1.170) was aligned via `cc_ensure_local` — verified with `claude --version` plus a headless `-p` smoke test. The **host VM** — held at 2.1.87 after the 2.1.90 Linux scrollback regression, then moved to 2.1.173 on 2026-06-11 — was synced 2.1.173→2.1.198 via the guardian `update-cc` op (a targeted CC-only sync, gateway-verified; deliberately not a full `scripts/update.sh` app redeploy, to avoid deploying unrelated in-flight code). The 2.1.198 range **retains and extends** the fullscreen-renderer scrollback fix that motivated the 2.1.173 pin (no scrollback regression in 2.1.174–2.1.198). **Both** container and host install Claude Code **via npm-global** (`npm install -g @anthropic-ai/claude-code@<version>` — the container auto-detects its npm prefix, the host uses `sudo npm install -g`). There is no native-installer path.
+**Pin (single source of truth):** `CC_VERSION` in `scripts/lib/cc_version.sh`, which
+also exports the shared **`cc_ensure_local`** aligner. Sourced by `scripts/install.sh`,
+`scripts/host-setup.sh`, `scripts/bootstrap.sh`, and `scripts/update.sh`. Bump it in one
+place; the next `install.sh`/`bootstrap.sh`/`update.sh` run aligns the **container's**
+own Claude Code to the pin via `cc_ensure_local` (installs when absent AND upgrades/
+downgrades a drifted-but-present CC — the earlier scripts only installed when CC was
+*missing*, so a bumped pin never reached an already-installed container). `update.sh`
+additionally syncs the **host VM** via the guardian `update-cc` op (see "Updating Claude
+Code" below).
+**Minimum required by Genesis:** intentionally **not enforced** at runtime (all current code works with 2.0+). A managed-settings `requiredMinimumVersion` floor (`/etc/claude-code/managed-settings.json`, Linux-only — never read from user/project `settings.json`) was evaluated and **deliberately rejected**: a hard floor removes the incident-recovery downgrade path the project has actually used (the 2.1.90→2.1.87 scrollback rollback) and can brick CC if the floor is written above the installed version. Drift is prevented instead by the npm pin + `cc_ensure_local` (aligns the local CC to the pin on every install/bootstrap/update — exact-match, so a downgrade pin also applies) + the unified `update-cc` updater for the host + `DISABLE_AUTOUPDATER`/`DISABLE_UPDATES` (so CC never self-bumps).
 
 ---
 
@@ -40,7 +48,7 @@ installs `@anthropic-ai/claude-code@<version>` using the npm that owns the in-us
 baked `command -v claude` path), and verifies `claude --version` afterward.
 
 To move the host by hand:
-`ssh -i ~/.ssh/genesis_guardian_ed25519 <host_user>@<host_ip> "update-cc 2.1.173"`
+`ssh -i ~/.ssh/genesis_guardian_ed25519 <host_user>@<host_ip> "update-cc 2.1.198"`
 
 **Incident downgrade:** because there is no `requiredMinimumVersion` floor, the
 host (or container) can be rolled back to an older known-good version the same way
@@ -191,6 +199,9 @@ When a new CC version is released, run through this:
 | 2.1.170 | 2026-06-10 | **Claude Fable 5 (Mythos-class)** model access; fixed sessions not saving transcripts (and missing from `--resume`) when launched from a shell that inherited CC env vars | **Upgraded to this version.** Fable 5 → separate eval follow-up (background sessions pin `--model`, so no leak). Transcript fix benefits Genesis background sessions (inherited-env spawn path). |
 | 2.1.172 | 2026-06-11 | Nested sub-agents (5 levels); long-conversation render perf + idle CPU reduction; background-agent fixes (project settings cross-read, stale-version attach EAUTH); `[1M][1m]` doubled-suffix fix; mouse tracking disabled on limited Windows consoles | Additive/fixes — recon classified informational. Background-agent fixes benefit Genesis dispatch paths. |
 | 2.1.173 | 2026-06-11 | Fable 5 model IDs with `[1m]` suffix now normalized (1M context is default); Windows sandbox warning fix | **Upgraded to this version (container).** Settings had `"model": "claude-fable-5[1m]"` — normalization removes suffix-handling edge cases. |
+| 2.1.174–2.1.196 | 2026-07-01 | Range reviewed via changelog. Overwhelmingly fixes + perf: **hook** matcher fixes (comma-separated matchers never firing @191, hyphenated matchers substring-matching @195, symlinked `.claude/settings.json` @176, `.claude/rules/` via symlinks @198); **skills** fixes (nested `.claude/skills` load + closest-cwd-wins @178, frontmatter accepts kebab/snake/camelCase @186, hot-reload no longer re-sends full listing @176, duplicate autocomplete @181/@183); **MCP** fixes (untrusted-workspace `.mcp.json` no longer auto-spawned @196 [security], `headersHelper` re-auth on 401/403 @193, discovery/OAuth retries @191, false "server disconnected" for retired tools @186); **headless/`-p`** fixes (auth-stub tools no longer exposed in headless/SDK mode @183, `--resume "No conversation found"` @187, structured-output infinite re-calling @186/@187); **auto-mode** safety (destructive git + terraform/pulumi/cdk destroy blocked @183, `Agent(type)` deny rules enforced for named spawns @186, denial reasons in transcript @193); **perf/memory** (~37% less streaming CPU + reduced long-session terminal-cache growth @191, idle-session history loss fixed @181). Removed the `TeamCreate`/`TeamDelete` tools @178 and the `/agents` wizard @198 — grep-verified **not referenced** anywhere in Genesis (`src/`, `.claude/`, `scripts/`). | No Genesis-breaking changes. Perf + session-stability fixes directly benefit long CC sessions (the marathon-session heap/history-loss class). No code change required. |
+| 2.1.197 | 2026-07-01 | **Claude Sonnet 5** becomes CC's default model (native 1M-token context, promotional pricing) | Genesis pins explicit models everywhere it calls CC (`--model`, cc-sonnet/cc-haiku/opus), so the changed *default* does not auto-apply to any Genesis path. Sonnet 5 adoption → separate eval. |
+| 2.1.198 | 2026-07-01 | Claude in Chrome GA; background agents auto-commit/push/draft-PR on finishing code work; built-in Explore agent inherits the session model (capped at opus); subagents + context compaction inherit extended-thinking config; `/dataviz` skill; `Notification` hook fires for background-agent completion; broad fullscreen/background/hook fixes | **Deployed + verified on both machines 2026-07-01 (#841):** container via `cc_ensure_local` (`claude --version` + headless smoke); host 2.1.173→2.1.198 via the guardian `update-cc` op (gateway-verified, targeted CC-only sync). Fullscreen renderer (the reason for the 2.1.173 pin) preserved and improved — no scrollback regression across the range. |
 
 ---
 

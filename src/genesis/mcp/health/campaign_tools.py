@@ -76,6 +76,18 @@ async def _impl_campaign_create(
     initial_state: dict | None = None,
 ) -> dict:
     """Create and activate a new campaign."""
+    # Validate the session profile against the live registry BEFORE persisting.
+    # An unknown profile would pass here but raise ValueError at DirectSession
+    # init on every tick — a silent campaign outage. Mirrors user_job_tools.py /
+    # direct_session_tools.py.
+    from genesis.cc.direct_session import VALID_PROFILES
+
+    if profile not in VALID_PROFILES:
+        return {
+            "error": f"Invalid profile '{profile}'. "
+            f"Must be one of: {', '.join(sorted(VALID_PROFILES))}"
+        }
+
     db = _db
     own_db = False
     if db is None:
@@ -324,7 +336,7 @@ async def campaign_create(
     """Create and activate a new campaign.
 
     Args:
-        name: Unique slug (e.g., 'discord-engagement').
+        name: Unique slug (e.g., 'weekly-digest').
         strategy_doc_path: Path to the strategy markdown file.
         cron_cadence: Cron expression for tick schedule.
         model: LLM model for session ticks (sonnet/opus/haiku).

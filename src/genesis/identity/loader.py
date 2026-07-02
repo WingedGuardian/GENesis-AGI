@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -140,20 +141,30 @@ class IdentityLoader:
         return self._load("STEERING.md")
 
     def steering_rules(self) -> list[str]:
-        """Return individual steering rules parsed from STEERING.md."""
+        """Return individual steering rules parsed from STEERING.md.
+
+        Rules are stored as ``---``-delimited BLOCKS after the preamble. Each
+        block may carry a ``## header`` and a multi-line body, all preserved
+        verbatim; the first block (before any ``---``) is the preamble and is
+        never returned as a rule. Parsing by block — not by physical line — is
+        what preserves section structure across ``add_steering_rule`` rewrites.
+        (The 2026-06-30 incident flattened the file because the old parser
+        split per line and dropped every ``#`` header and ``---`` separator.)
+        """
         text = self.steering()
         if not text:
             return []
-        rules: list[str] = []
-        in_rules = False
+        blocks: list[str] = []
+        current: list[str] = []
         for line in text.splitlines():
-            stripped = line.strip()
-            if stripped == _STEERING_SEPARATOR:
-                in_rules = True
-                continue
-            if in_rules and stripped and not stripped.startswith("#"):
-                rules.append(stripped)
-        return rules
+            if line.strip() == _STEERING_SEPARATOR:
+                blocks.append("\n".join(current))
+                current = []
+            else:
+                current.append(line)
+        blocks.append("\n".join(current))
+        # blocks[0] is the preamble; blocks[1:] are the individual rules.
+        return [b.strip() for b in blocks[1:] if b.strip()]
 
     def identity_block(self) -> str:
         """Full identity context: SOUL + USER + STEERING."""
@@ -407,10 +418,14 @@ class IdentityLoader:
 
         If the rule count exceeds the cap, the oldest rule is dropped.
         Clears the STEERING.md cache so the next read picks up the change.
+        Any line inside the rule that is exactly the block separator (``---``)
+        is neutralized to an em-dash, so a rule body can never be silently split
+        into two blocks on the next read→write round-trip.
         """
         path = self._dir / "STEERING.md"
         rules = self.steering_rules()
-        rules.append(rule.strip())
+        safe_rule = re.sub(r"(?m)^\s*---\s*$", "—", rule.strip())
+        rules.append(safe_rule)
         # FIFO eviction — drop oldest if over cap
         while len(rules) > self._steering_max_rules:
             rules.pop(0)
@@ -434,8 +449,15 @@ class IdentityLoader:
 
     @staticmethod
     def _write_steering(path: Path, rules: list[str]) -> None:
-        """Write STEERING.md with header + rules."""
-        lines = [
+        """Write STEERING.md as preamble + ``---``-delimited rule blocks.
+
+        Each rule is emitted as its own block preceded by a ``---`` separator,
+        so a rule's ``## header`` and multi-line body survive read→append→write
+        round-trips. Counterpart to :meth:`steering_rules` (which splits on the
+        same separator). FIFO eviction in :meth:`add_steering_rule` now drops
+        whole oldest blocks, not partial lines.
+        """
+        preamble = "\n".join([
             "# Steering Rules",
             "",
             "Rules below are hard constraints on Genesis behavior, set by the user.",
@@ -443,10 +465,9 @@ class IdentityLoader:
             "",
             "When the user gives strong negative feedback (\"never do X\", \"stop doing Y\"),",
             "a new rule is appended here. Oldest rules are evicted when the cap is reached.",
-            "",
-            _STEERING_SEPARATOR,
-        ]
+        ])
+        parts = [preamble]
         for rule in rules:
-            lines.append(rule)
-        lines.append("")  # trailing newline
-        path.write_text("\n".join(lines), encoding="utf-8")
+            parts.append(_STEERING_SEPARATOR)
+            parts.append(rule.strip())
+        path.write_text("\n\n".join(parts) + "\n", encoding="utf-8")

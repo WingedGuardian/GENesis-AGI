@@ -18,8 +18,33 @@ _STEERING_CONTENT = """\
 Hard constraints.
 
 ---
+
 Never send emails without approval
+
+---
+
 Always cite sources
+"""
+
+# A structured file with ## section headers + multi-line bodies — the shape the
+# 2026-06-30 incident flattened. Used to prove headers survive add_steering_rule.
+_STRUCTURED_STEERING = """\
+# Steering Rules
+
+Hard constraints.
+
+---
+
+## Capability Honesty
+
+Never claim a capability you haven't verified.
+A wrong explanation is worse than no explanation.
+
+---
+
+## Ambiguous Signals
+
+When a signal is ambiguous, look it up first.
 """
 
 _SOUL_CONTENT = "You are Genesis."
@@ -107,6 +132,74 @@ class TestAddSteeringRule:
         updated = loader.steering()
         assert "Brand new rule" in updated
         assert updated != original
+
+    def test_rule_with_separator_line_not_split(self, loader: IdentityLoader) -> None:
+        # A rule body containing a bare '---' line must not be silently split
+        # into two blocks on the next round-trip (review P2-A). The separator
+        # line is neutralized to an em-dash on add.
+        loader.add_steering_rule("Never paste this:\n---\nas a raw block")
+        rules = loader.steering_rules()
+        # Stored as ONE rule (2 fixture rules + 1 new), not split into two.
+        assert len(rules) == 3
+        assert any(
+            "Never paste this" in r and "as a raw block" in r for r in rules
+        )
+        # The embedded separator line is gone (no longer a bare '---').
+        assert not any(
+            line.strip() == "---"
+            for r in rules
+            for line in r.splitlines()
+        )
+
+
+# ===========================================================================
+# TestStructurePreservation — regression for the 2026-06-30 STEERING flattening
+# ===========================================================================
+
+
+class TestStructurePreservation:
+    """A structured STEERING.md (## headers + multi-line bodies) must survive
+    the read→append→write round-trip that add_steering_rule performs. The
+    incident: the old per-line parser dropped every ## header and merged bodies.
+    """
+
+    @pytest.fixture()
+    def structured_loader(self, tmp_path: Path) -> IdentityLoader:
+        (tmp_path / "STEERING.md").write_text(_STRUCTURED_STEERING, encoding="utf-8")
+        return IdentityLoader(identity_dir=tmp_path)
+
+    def test_blocks_parsed_whole_with_headers(self, structured_loader: IdentityLoader) -> None:
+        rules = structured_loader.steering_rules()
+        # Two ## sections → two rule blocks, each carrying its header + body.
+        assert len(rules) == 2
+        assert rules[0].startswith("## Capability Honesty")
+        assert "A wrong explanation is worse than no explanation." in rules[0]
+        assert rules[1].startswith("## Ambiguous Signals")
+
+    def test_headers_survive_add(self, structured_loader: IdentityLoader) -> None:
+        structured_loader.add_steering_rule("Never merge to main without a PR.")
+        text = structured_loader.steering()
+        # Both original section headers must still be present after the rewrite.
+        assert "## Capability Honesty" in text
+        assert "## Ambiguous Signals" in text
+        # Multi-line body preserved, not flattened into separate rules.
+        assert "A wrong explanation is worse than no explanation." in text
+        # New rule appended as its own block.
+        rules = structured_loader.steering_rules()
+        assert len(rules) == 3
+        assert "Never merge to main without a PR." in rules[-1]
+
+    def test_eviction_drops_whole_block(self, structured_loader: IdentityLoader) -> None:
+        loader = IdentityLoader(
+            identity_dir=structured_loader._dir, steering_max_rules=2,
+        )
+        loader.add_steering_rule("A brand new terse rule.")
+        rules = loader.steering_rules()
+        # Cap=2: oldest whole block (Capability Honesty) evicted, not a stray line.
+        assert len(rules) == 2
+        assert not any("Capability Honesty" in r for r in rules)
+        assert any("Ambiguous Signals" in r for r in rules)
+        assert any("A brand new terse rule." in r for r in rules)
 
 
 # ===========================================================================

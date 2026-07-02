@@ -76,3 +76,31 @@ class TestCreateStandaloneRouterFailure:
 
         assert rt._router is None  # failed gracefully
         GenesisRuntime.reset()
+
+
+class TestBuildStandaloneRouter:
+    async def test_returns_router_without_touching_singleton(self):
+        """The helper returns a Router and must NOT mutate the GenesisRuntime singleton
+        (the offline runner's --l15 path uses it directly, not via the singleton)."""
+        from genesis.routing.router import Router
+        from genesis.routing.standalone import _build_standalone_router
+        from genesis.runtime._core import GenesisRuntime
+
+        GenesisRuntime.reset()
+        rt = GenesisRuntime.instance()
+        assert rt._router is None
+
+        router = _build_standalone_router()
+
+        assert isinstance(router, Router)
+        assert rt._router is None  # helper left the singleton untouched
+        GenesisRuntime.reset()
+
+    async def test_returns_none_on_build_failure(self):
+        """Missing config -> None (never raises), same graceful failure as the public fn."""
+        from unittest.mock import patch
+
+        from genesis.routing.standalone import _build_standalone_router
+
+        with patch("genesis.env.repo_root", return_value="/nonexistent"):
+            assert _build_standalone_router() is None

@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from genesis.db.crud import surplus_tasks
 from genesis.surplus.compute_availability import ComputeAvailability
 from genesis.surplus.executor import StubExecutor
 from genesis.surplus.idle_detector import IdleDetector
@@ -64,6 +65,20 @@ async def test_dispatch_skips_when_queue_empty(db):
     with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):
         result = await sched.dispatch_once()
     assert result is False
+
+
+async def test_dispatch_reaps_old_terminal_rows(db):
+    """dispatch_once age-caps terminal rows (runs before the idle short-circuit)."""
+    sched, compute = _make_scheduler(db, idle=False)  # not idle → returns early after reap
+    old = (datetime.now(UTC) - timedelta(days=40)).isoformat()
+    await surplus_tasks.create(
+        db, id="ancient", task_type="brainstorm_self", compute_tier="free_api",
+        priority=0.5, drive_alignment="curiosity", created_at=old,
+    )
+    await surplus_tasks.mark_completed(db, "ancient", completed_at=old)
+    with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):
+        await sched.dispatch_once()
+    assert await surplus_tasks.get_by_id(db, "ancient") is None
 
 
 async def test_dispatch_processes_task(db):

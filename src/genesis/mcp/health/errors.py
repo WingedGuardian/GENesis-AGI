@@ -7,6 +7,7 @@ import logging
 from datetime import UTC, datetime
 
 from genesis.mcp.health import mcp  # noqa: E402
+from genesis.mcp.health.constants import JOB_STALE_GAP_DAYS
 
 logger = logging.getLogger(__name__)
 
@@ -536,6 +537,42 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                     "message": f"Job {job_name} is quarantined (max retries exhausted, auto-unquarantine in ≤24h)",
                 })
                 current_ids.add(alert_id)
+
+    # ── Silently-stale jobs ──────────────────────────────────────────
+    # A job whose last_run is well ahead of last_success is firing on
+    # schedule but never completing. consecutive_failures MISSES this:
+    # clear_stale_job_failures resets it to 0 on every server restart, and
+    # an infrequent (weekly/monthly) job can't reach the failure threshold
+    # between restarts anyway. The last_run − last_success gap survives
+    # restarts (clear_stale never touches those two fields), so it is the
+    # honest "running but not succeeding" signal. The gap only grows when a
+    # job runs without succeeding, so a healthy job reads 0 regardless of
+    # cadence — no per-job schedule lookup needed.
+    if _service and _service._db:
+        try:
+            from genesis.db.crud import job_health as job_health_crud
+
+            for row in await job_health_crud.get_stale_jobs(
+                _service._db, threshold_days=JOB_STALE_GAP_DAYS
+            ):
+                alert_id = f"job_stale:{row['job_name']}"
+                alerts.append({
+                    "id": alert_id,
+                    "severity": "WARNING",
+                    "message": (
+                        f"Scheduled job '{row['job_name']}' has run since but not "
+                        f"succeeded in {row['gap_days']:.0f} days (last success "
+                        f"{str(row['last_success'])[:10]}) — silently failing "
+                        f"(its failure counter resets on restart)"
+                    ),
+                })
+                current_ids.add(alert_id)
+        except Exception:
+            # job_health is a core table that always exists — a failure here is
+            # a real operational fault, not an expected-absent-table case, so
+            # ERROR (unlike the credit-exhaustion block, which queries the
+            # optionally-absent activity_log).
+            logger.error("Silently-stale job alert check failed", exc_info=True)
 
     # ── Genesis update available ─────────────────────────────────────
     if _service and _service._db:

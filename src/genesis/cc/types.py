@@ -123,7 +123,13 @@ class CCInvocation:
     resume_session_id: str | None = None
     output_format: str = "json"
     mcp_config: str | None = None
-    timeout_s: int = 600
+    # 2h (7200s) project floor. A short default silently guillotines legitimate
+    # long CC work — the conversational path timed out at 600s on 2026-06-30
+    # mid-task. Per the genesis-dev timeout policy, caps on cognitive/CC paths
+    # fight Genesis; the subprocess kill still bounds a truly-hung process. Call
+    # sites that MUST fail fast set an explicit shorter value (e.g. the CC
+    # fallback liveness probe uses 300s).
+    timeout_s: int = 7200
     allowed_tools: list[str] | None = None
     disallowed_tools: list[str] | None = None
     skip_permissions: bool = False

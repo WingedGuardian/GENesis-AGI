@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from genesis.channels.tts_config import sanitize_for_speech
 from genesis.channels.voice.sessions import VoiceSessionManager
-from genesis.memory.provenance import is_external
+from genesis.memory.provenance import is_external, wrap_external_recall
 
 if TYPE_CHECKING:
     from genesis.memory.retrieval import HybridRetriever
@@ -88,25 +88,39 @@ class VoiceConversationHandler:
         if not transcript.strip():
             return "I didn't catch that. Could you say that again?"
 
-        # Memory recall (best-effort — don't fail the whole request)
+        # Memory recall (best-effort — don't fail the whole request).
+        # Two renderings of the SAME recalled set:
+        #   memories_text     — SPOKEN path: soft `[external-world knowledge]`
+        #                       label (can't speak XML boundary markers) (D12).
+        #   llm_memories_text — FULL LLM path: external-world content wrapped in
+        #                       <external-content> so a payload in recalled KB is
+        #                       treated as data in the system prompt, not an
+        #                       instruction (PR2 injection defense).
         memories_text = ""
+        llm_memories_text = ""
         try:
             results = await self._retriever.recall(transcript, limit=5, rerank=False)
             if results:
-                snippets = []
+                spoken_snippets = []
+                llm_snippets = []
                 for r in results[:5]:
                     content = getattr(r, "content", str(r))
                     if isinstance(content, str) and content.strip():
-                        # Mark external-world KB so it isn't spoken as first-party
-                        # memory (audit D12).
-                        prefix = (
-                            "[external-world knowledge] "
-                            if is_external(getattr(r, "collection", ""))
-                            else ""
-                        )
-                        snippets.append(f"- {prefix}{content[:300]}")
-                if snippets:
-                    memories_text = "Recalled memories:\n" + "\n".join(snippets)
+                        external = is_external(getattr(r, "collection", ""))
+                        source_pipeline = getattr(r, "source_pipeline", None)
+                        prefix = "[external-world knowledge] " if external else ""
+                        spoken_snippets.append(f"- {prefix}{content[:300]}")
+                        if external:
+                            llm_snippets.append(
+                                "- " + wrap_external_recall(
+                                    content[:300], source_pipeline=source_pipeline,
+                                )
+                            )
+                        else:
+                            llm_snippets.append(f"- {content[:300]}")
+                if spoken_snippets:
+                    memories_text = "Recalled memories:\n" + "\n".join(spoken_snippets)
+                    llm_memories_text = "Recalled memories:\n" + "\n".join(llm_snippets)
         except Exception:
             logger.warning(
                 "Memory recall failed for voice session %s",
@@ -135,8 +149,9 @@ class VoiceConversationHandler:
         context_parts = []
         if essential:
             context_parts.append(f"Essential knowledge:\n{essential}")
-        if memories_text:
-            context_parts.append(memories_text)
+        if llm_memories_text:
+            # Full LLM path uses the wrapped rendering (injection defense).
+            context_parts.append(llm_memories_text)
 
         context_block = "\n\n".join(context_parts) if context_parts else ""
         system_prompt = _VOICE_SYSTEM_PROMPT.format(context=context_block)

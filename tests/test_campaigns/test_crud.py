@@ -25,12 +25,12 @@ async def test_get_campaign_by_name(db):
     await crud.create_campaign(
         db,
         id="c2",
-        name="discord-engagement",
+        name="weekly-digest",
         strategy_doc_path="/tmp/strat.md",
         cron_cadence="0 */8 * * *",
         created_at="2026-06-07T00:00:00Z",
     )
-    row = await crud.get_campaign_by_name(db, "discord-engagement")
+    row = await crud.get_campaign_by_name(db, "weekly-digest")
     assert row is not None
     assert row["id"] == "c2"
     assert row["status"] == "active"

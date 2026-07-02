@@ -586,6 +586,24 @@ class OutreachPipeline:
             )
             await outreach_crud.record_delivery(self._db, outreach_id, delivered_at=now)
 
+            # WS5 Discord capability SHADOW-gate: observe (never hold) autonomous Discord
+            # sends AFTER the post is already out, so the community-facing send is NEVER
+            # delayed by the shadow write (any WAL contention only defers the internal
+            # record). Records what a capability gate WOULD decide. Best-effort + read-
+            # only; the gate_cleared resume path is below-the-gate → not observed.
+            if channel == "discord" and not gate_cleared:
+                # Import + call are wrapped so a shadow/import failure can never break the
+                # already-completed send (uniform with the poll/reply doors).
+                try:
+                    from genesis.autonomy.shadow_gate import observe_discord_send
+
+                    await observe_discord_send(
+                        self._db, path="deliver", verb="send", risk_class="bulk",
+                        target=str(delivery_recipient), content=formatted.text,
+                    )
+                except Exception:  # noqa: BLE001 — shadow is best-effort; never break the send
+                    logger.debug("deliver capability shadow observe failed", exc_info=True)
+
             # WS-8 PR-D: log autonomous (GRANTED-cell) email sends for owner
             # visibility (Activity tab), the flag-as-bad correction, and the
             # per-cell rate-limit guard.  Owner-APPROVED holds resume via

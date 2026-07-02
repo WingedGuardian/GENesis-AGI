@@ -14,6 +14,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from genesis.awareness.types import Depth
+from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 
 if TYPE_CHECKING:
     from genesis.resilience.deferred_work import DeferredWorkQueue
@@ -21,10 +22,6 @@ if TYPE_CHECKING:
     from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
-
-# How long deferred items persist before expiry. Matches typical CC Max rate
-# limit reset window. Referenced from awareness/loop.py and reflection_bridge.py.
-RATE_LIMIT_DEFERRAL_TTL_S = 14400  # 4 hours
 
 # Depths that should be deferred (not routed to API) when CC is down.
 # Deep and Light reflections require Claude-quality reasoning — falling back

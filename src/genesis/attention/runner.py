@@ -16,21 +16,26 @@ import argparse
 import asyncio
 import logging
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from genesis.attention.clarity import is_blip
 from genesis.attention.config import (
     DEFAULT_CONFIG_PATH,
     AttentionConfig,
+    Thresholds,
     default_config_dict,
     load_config,
 )
-from genesis.attention.consumers import ShadowStoreConsumer
+from genesis.attention.consumers import ShadowConsumer, ShadowStoreConsumer
 from genesis.attention.engine import evaluate
 from genesis.attention.snapshot import pull_snapshot
 from genesis.attention.sources import SnapshotSource
-from genesis.attention.types import AttentionEvent, EngineState
+from genesis.attention.types import Activation, AttentionEvent, EngineState
+
+if TYPE_CHECKING:
+    from genesis.attention.sampler import AttentionSampler
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +67,26 @@ def load_runner_config(path: str | None) -> AttentionConfig:
     return AttentionConfig.from_dict(default_config_dict())
 
 
+def _graduates_to_l15(ev: AttentionEvent, thresholds: Thresholds) -> bool:
+    """Whether an event should be scored by L1.5. Gate on ACTIVATION, not raw ``ev.score``:
+    a bare-HARD fire has ``score == 0.0`` (no soft co-trigger) yet is the MOST certain
+    perk-up, and SUPPRESSED events are vetoes not worth an LLM call. So HARD always
+    graduates; SOFT graduates above the ``l15_graduation`` cost-floor; SUPPRESSED never."""
+    if ev.activation == Activation.HARD:
+        return True
+    if ev.activation == Activation.SOFT:
+        return ev.score >= thresholds.l15_graduation
+    return False
+
+
 async def run_shadow(
     snapshot_path: str | Path,
     config: AttentionConfig,
     *,
     snapshot_id: str = "adhoc",
     sample_n: int = 25,
-    consumer: ShadowStoreConsumer | None = None,
+    consumer: ShadowConsumer | None = None,
+    sampler: AttentionSampler | None = None,
 ) -> ShadowReport:
     src = SnapshotSource(snapshot_path)
     state = EngineState()
@@ -86,6 +104,13 @@ async def run_shadow(
         state, ev = evaluate(utt, state, config)
         if ev is None:
             continue
+        # L1.5 (opt-in): score the fire's window via a cheap LLM and attach the
+        # {real, perk} verdict BEFORE the event is buffered/persisted. state.window is a
+        # fire-time snapshot (immutable utterances; last element is this trigger utt);
+        # its text goes to the LLM in memory only — never to genesis.db (firewall).
+        if sampler is not None and _graduates_to_l15(ev, config.thresholds):
+            verdict = await sampler.sample(list(state.window), config)
+            ev = replace(ev, l15_verdict=verdict)
         events.append(ev)
         if consumer is not None:
             consumer.add(ev)
@@ -108,6 +133,7 @@ async def run_shadow(
             "triggers": [h.name for h in ev.triggers_fired],
             "suppressors": list(ev.suppressors),
             "is_user": getattr(trg, "is_user", None),
+            "l15": ev.l15_verdict,   # {real, perk} when --l15 ran, else None
             "text": getattr(trg, "text", ""),
         })
     return ShadowReport(
@@ -126,8 +152,9 @@ def print_report(r: ShadowReport) -> None:
     print(f"by_suppressor: {r.by_suppressor}")
     print(f"\n--- {len(r.samples)} sample events (text shown for OFFLINE eyeballing only) ---")
     for s in r.samples:
+        l15 = f" l15={s['l15']}" if s.get("l15") is not None else ""
         print(f"[{s['activation']:>10}] score={s['score']:.3f} clarity={s['clarity']:.2f} "
-              f"u={s['is_user']} trig={s['triggers']} sup={s['suppressors']}")
+              f"u={s['is_user']} trig={s['triggers']} sup={s['suppressors']}{l15}")
         print(f"             text: {s['text'][:150]!r}")
 
 
@@ -148,6 +175,12 @@ def main() -> None:
     ap.add_argument("--config", help="attention_config.json (default: ~/.genesis overlay or built-in)")
     ap.add_argument("--samples", type=int, default=25)
     ap.add_argument("--persist", action="store_true", help="write events to attention_events")
+    ap.add_argument(
+        "--l15", action="store_true",
+        help="score graduated (HARD + above-floor SOFT) windows via the L1.5 "
+             "'attention_salience' LLM call-site. PRIVACY: this SENDS the window's ambient "
+             "transcript text to an external free LLM provider. Off by default.",
+    )
     ap.add_argument("--db", help="genesis.db path for --persist (default: genesis_db_path())")
     args = ap.parse_args()
 
@@ -169,7 +202,22 @@ async def _run_cli(args) -> None:
         db_path = args.db or str(genesis_db_path())
         consumer = ShadowStoreConsumer(db_path, snapshot_id=sid, config_version=cfg.version)
         logger.info("persisting to %s", db_path)
-    report = await run_shadow(path, cfg, snapshot_id=sid, sample_n=args.samples, consumer=consumer)
+
+    sampler = None
+    if args.l15:
+        from genesis.attention.sampler import CALL_SITE, AttentionSampler
+        from genesis.routing.standalone import _build_standalone_router
+        router = _build_standalone_router()
+        if router is None:
+            logger.error("--l15: could not build a router (missing config/secrets); running WITHOUT L1.5")
+        else:
+            sampler = AttentionSampler(router)
+            logger.info("L1.5 ENABLED: scoring graduated windows via '%s' — sends window "
+                        "transcript text to an external LLM (egress).", CALL_SITE)
+
+    report = await run_shadow(
+        path, cfg, snapshot_id=sid, sample_n=args.samples, consumer=consumer, sampler=sampler,
+    )
     print_report(report)
 
 

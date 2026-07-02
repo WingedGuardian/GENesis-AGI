@@ -165,6 +165,31 @@ Use the right tool for how you're exploring:
 
 Full decision matrix: `.claude/docs/code-intelligence.md`
 
+### Auditing Existing Capabilities — enumerate, don't spot-check
+
+Before claiming Genesis "lacks X", "needs to add X", or is "weaker than
+<external system> at X" — or before any competitive/architecture comparison —
+verify by ENUMERATION, not a spot-check. **Auditing a symbol is not auditing the
+stack**, and a negative from a positive search is not evidence of absence:
+
+1. Enumerate the subsystem's full module inventory before concluding anything is absent.
+2. Trace the call graph BOTH directions — mechanisms often live in the
+   wrapper/caller layer, not the first symbol (CRAG lives in the MCP recall
+   wrapper, not `retrieval.py`; the reranker is applied by the caller).
+3. Grep by CONCEPT with several synonyms, not one symbol.
+4. Verify built/enabled/disabled against RUNTIME state (env gates, server logs),
+   not code presence.
+5. Multi-path systems → coverage matrix (N entry points × M mechanisms); hot
+   auto-fired paths often carry a thinner stack than the deep path — a gradient,
+   not an absence.
+6. Confidence is capped by enumeration completeness.
+
+A 2026-06-30 competitive audit wrongly claimed Genesis lacked CRAG,
+scope-before-rank, and a live reranker — all three had already shipped. Full
+protocol: procedure `codebase_audit` / CC memory `audit-enumerate-not-spotcheck`.
+For "does Genesis already have X", consult the capability map
+(`references/codebase-map.md`) FIRST.
+
 ## Adaptive Review Protocol
 
 Choose the review level proportional to the change:
@@ -195,6 +220,14 @@ Verify before any commit:
 - `git status --short` — check untracked files (should be staged or ignored)
 - Review level applied matches the adaptive protocol above
 - Staged files do not include secrets (`secrets.env`, `.env`, credentials)
+- **Private-data scan before every push (public repo).** Grep the ENTIRE diff
+  (`git diff origin/main...HEAD`) for private/identifying data — real names,
+  company/product names, emails, IPs, private career/project specifics, verbatim
+  user messages. Check ALL surfaces, not just prose: **source comments,
+  docstrings, and test fixtures/data** are the easy misses. Use a synthetic
+  stand-in in tests, never the real private artifact. (2026-07-01: a verbatim
+  private DM leaked via a test docstring + a code comment after the commit
+  message and PR body were already clean.)
 - GROUNDWORK-tagged code not accidentally deleted
 - New capabilities registered in `_capabilities.py` + bootstrap manifest
 - **Conventional commit prefixes**: `feat:`, `fix:`, `refactor:`, `docs:`,
@@ -221,6 +254,13 @@ Verify before any commit:
 5. **Override**: Append `# review-override` to the merge command to
    bypass the gate (e.g., `gh pr merge 123 --squash --admin  # review-override`).
    The override is logged. Use only when findings are intentionally accepted.
+6. **Read the PR's warning comments before merging — not just the hard gate.**
+   Beyond Codex, a structural-review bot posts under the repo-owner account
+   (`WingedGuardian`, review state COMMENTED) and emits **SOFT WARNINGs** (PII /
+   private-text / wording) that the hook does NOT block on and that a naive
+   `.comments` scan misses. Check BOTH `gh pr view N --json reviews,comments`
+   and `gh api repos/<owner>/<repo>/pulls/N/comments`, and address each soft
+   warning or consciously accept it. Never merge past an unread warning.
 
 ## Reference Router
 
@@ -260,3 +300,10 @@ Standard open-source workflow: PRs go directly to the public repo.
 - **No sensitive data in commits** — voice data, research profiles, IPs,
   and secrets must never enter the repo. User data lives in overlays
   outside the repo (e.g., `~/.claude/skills/*/`, `~/.genesis/`).
+- **Individual campaigns are user data, not infrastructure** — a campaign's
+  name/prompt/targets/cadence live only in the `campaigns` DB table and the
+  private backups repo; never hardcode them into tracked source. Unlike modules
+  (which ship defaults under `config/modules/*.yaml`), campaigns ship ZERO
+  defaults (no `config/campaigns/`). Only campaign infrastructure ships. Express
+  reusable session types as generic roles (e.g. the `community-responder`
+  profile), not names coupled to a live campaign. See `src/genesis/campaigns/__init__.py`.

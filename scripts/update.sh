@@ -509,6 +509,12 @@ with open(sys.argv[11], 'w') as f:
   "$(date -Iseconds)" \
   "$HOME/.genesis/last_update_failure.json"
 
+    # Clear the in-progress signal files (mirrors the success-path cleanup) so a
+    # leftover entry can't suppress the watchdog's deploy-restart guard after a
+    # rollback. The server is back up (above); once this invocation exits its PID
+    # dies anyway, but removing the files closes the PID-reuse window proactively.
+    rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
+
     echo ""
     echo "  ──────────────────────────────────────"
     echo "  Rolled back: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"
@@ -626,6 +632,9 @@ if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
             systemctl --user start "$svc.service" 2>/dev/null || true
         fi
     done
+    # Nothing changed and no --post-merge continuation follows, so clear the
+    # in-progress signals (like the success path) — a leftover must never linger.
+    rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
     echo ""
     echo "  Nothing to do."
     exit 0
@@ -910,6 +919,25 @@ print(cfg.get('host_user', 'ubuntu'))
         echo ""
     fi
 fi
+
+# ── Sync CONTAINER Claude Code to the pinned version ──────
+# The guardian block above syncs the HOST's CC. This aligns the CONTAINER's own
+# Claude Code (update.sh runs inside the container) so a pin bump reaches the
+# container with zero user action. UNCONDITIONAL — not gated on guardian config,
+# so guardian-less installs are covered too. Non-fatal (`|| true`): `set -e` is
+# active here (ERR trap already disarmed), and a CC install hiccup must never
+# abort an update after git-pull/migrations have run.
+_cc_env="$SCRIPT_DIR/lib/cc_version.sh"
+if [ -f "$_cc_env" ]; then
+    echo "--- Syncing container Claude Code to pin ---"
+    unset CC_VERSION            # repo pin must win over any inherited override
+    # shellcheck source=/dev/null
+    source "$_cc_env"
+    cc_ensure_local || true
+else
+    echo "  WARNING: $_cc_env missing — skipping container CC sync"
+fi
+echo ""
 
 # ── Clear update failure file on success ──────────────────
 if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
