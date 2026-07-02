@@ -120,6 +120,15 @@ def test_row_null_json_columns_safe():
     assert lf.causal_soft == frozenset() and lf.suppressors == frozenset()
 
 
+def test_row_missing_required_field_is_none_not_keyerror():
+    # a malformed row missing a REQUIRED field -> None (unresolvable), never a KeyError.
+    base = {"activation": "soft", "score": 0.6, "acceptance_signal": "should",
+            "window_ref": json.dumps({"utt_ids": [5]})}
+    assert labeled_from_row(base) is not None
+    for drop in ("activation", "score", "acceptance_signal"):
+        assert labeled_from_row({k: v for k, v in base.items() if k != drop}) is None
+
+
 # ── precision metrics ────────────────────────────────────────────────────────────────
 
 def test_overall_precision_excludes_suppressed():

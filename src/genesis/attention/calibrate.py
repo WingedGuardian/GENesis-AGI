@@ -148,10 +148,16 @@ def labeled_from_row(row: dict) -> LabeledFire | None:
     """Map a persisted (labeled) ``attention_events`` row → LabeledFire. None if no utt_ids.
 
     Splits ``triggers_fired`` by (kind, contribution): hard → ``hard_triggers``; soft with
-    contribution > 0 → ``causal_soft``; soft with contribution == 0 → ``inert_soft``."""
+    contribution > 0 → ``causal_soft``; soft with contribution == 0 → ``inert_soft``.
+
+    Total by contract: returns None (an "unresolvable" row, counted not raised) for a row missing
+    utt_ids OR any REQUIRED field (activation/score/acceptance_signal) — never a KeyError."""
+    activation = row.get("activation")
+    score = row.get("score")
+    signal = row.get("acceptance_signal")
     wr = json.loads(row["window_ref"]) if row.get("window_ref") else {}
     utt_ids = wr.get("utt_ids") or []
-    if not utt_ids:
+    if not utt_ids or activation is None or score is None or signal is None:
         return None
     causal_soft: set[str] = set()
     hard: set[str] = set()
@@ -170,10 +176,10 @@ def labeled_from_row(row: dict) -> LabeledFire | None:
     clarity = row.get("clarity")
     return LabeledFire(
         key=int(utt_ids[-1]),
-        activation=row["activation"],
-        score=float(row["score"]),
         clarity=(None if clarity is None else float(clarity)),
-        signal=row["acceptance_signal"],
+        activation=activation,
+        score=float(score),
+        signal=signal,
         causal_soft=frozenset(causal_soft),
         hard_triggers=frozenset(hard),
         inert_soft=frozenset(inert),
@@ -247,8 +253,9 @@ def precision_by_clarity_band(
     fires: list[LabeledFire], bands: tuple[tuple[float, float, str], ...] = DEFAULT_CLARITY_BANDS
 ) -> dict[str, PrecisionStat]:
     """Precision of perk fires bucketed by capture clarity — exposes garble-driven low precision.
-    NULL clarity → its own ``clarity=NULL`` bucket (never silently folded into the low band).
-    Bands are returned even when empty (n == 0, precision None) so coverage is explicit."""
+    The fixed ``bands`` are ALWAYS returned (even at n == 0, precision None) so coverage is explicit.
+    NULL clarity is never folded into the low band: it gets its own ``clarity=NULL`` bucket, which is
+    emitted ONLY when such rows exist — its presence is itself the signal that some rows lack clarity."""
     perks = _perks(fires)
     out: dict[str, PrecisionStat] = {}
     null_fires = [f for f in perks if f.clarity is None]
