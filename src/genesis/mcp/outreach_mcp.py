@@ -246,6 +246,21 @@ async def outreach_poll(
             msg_id = data.get("id", "")
         logger.info("Discord poll created via %s (msg_id=%s)", channel, msg_id)
 
+        # WS5 Discord capability SHADOW-gate: observe (never hold) this poll AFTER it's
+        # posted, so the post is never delayed by the shadow write. Best-effort, read-
+        # only (guards a None _db in standalone mode). The import + call are wrapped so a
+        # shadow/import failure can never flip an already-posted poll into an error return
+        # (which the caller could otherwise retry → double-post).
+        try:
+            from genesis.autonomy.shadow_gate import observe_discord_send
+
+            await observe_discord_send(
+                _db, path="poll", verb="poll", risk_class="bulk",
+                target=channel, content=question,
+            )
+        except Exception:  # noqa: BLE001 — shadow is best-effort; never break the poll
+            logger.debug("outreach_poll capability shadow observe failed", exc_info=True)
+
         # ── Record to outreach_history for dedup + campaign visibility ──
         if _db is not None:
             from genesis.outreach.governance import content_hash as _ch

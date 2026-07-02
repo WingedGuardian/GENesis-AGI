@@ -186,6 +186,19 @@ jobs:
           fi
           echo "Migration prefix check: CLEAN"
 
+  external-io-check:
+    # WS5 regression guard: no NEW ungated autonomous external-world egress
+    # (Discord REST/webhook, public social APIs) outside the reasoned allowlist.
+    # See scripts/check_external_io.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: External-I/O egress guard
+        run: python scripts/check_external_io.py
+
   test:
     runs-on: ubuntu-latest
     # CI is blocking — local full-suite runs are banned. See procedure
