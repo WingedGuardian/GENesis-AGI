@@ -107,6 +107,7 @@ def test_stats_aggregates(client):
         patch("genesis.db.crud.attention.activation_stats", new=AsyncMock(return_value={"soft": 2, "hard": 1})),
         patch("genesis.db.crud.attention.trigger_stats", new=AsyncMock(return_value={"multi_speaker": 2})),
         patch("genesis.db.crud.attention.suppressor_stats", new=AsyncMock(return_value={})),
+        patch("genesis.db.crud.attention.config_versions", new=AsyncMock(return_value=["0.1.0-default"])),
     ):
         MockRT.instance.return_value = _mock_rt()
         resp = client.get("/api/genesis/attention/stats")
@@ -114,6 +115,44 @@ def test_stats_aggregates(client):
     data = resp.get_json()
     assert data["labels"]["unlabeled"] == 2
     assert data["by_trigger"]["multi_speaker"] == 2
+    assert data["config_versions"] == ["0.1.0-default"]
+
+
+# ── config_version filter (PR3c-1) ─────────────────────────────────────────
+
+def test_list_threads_config_version(client):
+    le = AsyncMock(return_value=[])
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.db.crud.attention.list_events", new=le),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        resp = client.get("/api/genesis/attention/list?config_version=0.2.0-taxonomy")
+    assert resp.status_code == 200
+    _, kwargs = le.call_args
+    assert kwargs["config_version"] == "0.2.0-taxonomy"
+
+
+def test_stats_scopes_aggregates_but_lists_all_versions(client):
+    """R4: the 4 count aggregates get the selected version; config_versions stays FULL (dropdown)."""
+    act = AsyncMock(return_value={"soft": 1})
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.db.crud.attention.label_counts",
+              new=AsyncMock(return_value={"total": 1, "labeled": 0, "unlabeled": 1, "by_signal": {}})),
+        patch("genesis.db.crud.attention.activation_stats", new=act),
+        patch("genesis.db.crud.attention.trigger_stats", new=AsyncMock(return_value={})),
+        patch("genesis.db.crud.attention.suppressor_stats", new=AsyncMock(return_value={})),
+        patch("genesis.db.crud.attention.config_versions",
+              new=AsyncMock(return_value=["0.1.0-default", "0.2.0-taxonomy"])),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        resp = client.get("/api/genesis/attention/stats?config_version=0.1.0-default")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["config_versions"] == ["0.1.0-default", "0.2.0-taxonomy"]  # UNFILTERED
+    args, _ = act.call_args
+    assert args[1] == "0.1.0-default"                                      # aggregate scoped
 
 
 # ── reveal-text ───────────────────────────────────────────────────────────

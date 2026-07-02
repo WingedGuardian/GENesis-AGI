@@ -85,13 +85,14 @@ async def attention_list():
     trigger = request.args.get("trigger") or None
     is_user = request.args.get("is_user", "").lower() == "true"
     unlabeled = request.args.get("unlabeled", "").lower() == "true"
+    config_version = request.args.get("config_version") or None
     limit = max(1, min(request.args.get("limit", 200, type=int), 500))
     offset = max(0, request.args.get("offset", 0, type=int))
 
     try:
         rows = await attention_crud.list_events(
             rt.db, activation=activation, trigger=trigger, is_user=is_user,
-            unlabeled=unlabeled, limit=limit, offset=offset,
+            unlabeled=unlabeled, config_version=config_version, limit=limit, offset=offset,
         )
         events = [_event_summary(r) for r in rows]
         return jsonify({"events": events, "count": len(events)})
@@ -103,7 +104,11 @@ async def attention_list():
 @blueprint.route("/api/genesis/attention/stats")
 @_async_route
 async def attention_stats():
-    """Aggregate counts for the cockpit panel: labels, activation, per-trigger, suppressors."""
+    """Aggregate counts for the cockpit panel: labels, activation, per-trigger, suppressors.
+
+    ``config_version`` scopes the four count aggregates to one shadow-run config (so the
+    dominance bar doesn't mix versions once a 2nd config persists); ``config_versions`` is
+    always the FULL set (it populates the filter dropdown)."""
     if (resp := _auth_or_403()) is not None:
         return resp
     from genesis.db.crud import attention as attention_crud
@@ -113,12 +118,14 @@ async def attention_stats():
     if not rt.is_bootstrapped or rt.db is None:
         return jsonify({"error": "Not bootstrapped"}), 503
 
+    config_version = request.args.get("config_version") or None
     try:
         return jsonify({
-            "labels": await attention_crud.label_counts(rt.db),
-            "by_activation": await attention_crud.activation_stats(rt.db),
-            "by_trigger": await attention_crud.trigger_stats(rt.db),
-            "by_suppressor": await attention_crud.suppressor_stats(rt.db),
+            "labels": await attention_crud.label_counts(rt.db, config_version),
+            "by_activation": await attention_crud.activation_stats(rt.db, config_version),
+            "by_trigger": await attention_crud.trigger_stats(rt.db, config_version),
+            "by_suppressor": await attention_crud.suppressor_stats(rt.db, config_version),
+            "config_versions": await attention_crud.config_versions(rt.db),
         })
     except Exception:
         logger.exception("Attention stats failed")
