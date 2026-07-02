@@ -11,11 +11,16 @@ from aioresponses import aioresponses
 def _patch_client_response_init():
     """Patch ClientResponse.__init__ to accept stream_writer / writer kwargs.
 
-    Older aioresponses (<0.7.7) constructs ClientResponse without the
-    ``stream_writer`` (aiohttp >=3.10) or ``writer`` (aiohttp >=3.12) kwarg
-    that newer aiohttp versions require.  This shim silently absorbs
-    whichever variant the library passes and supplies a MagicMock default
-    when it is missing so the mock response can be created.
+    aioresponses (through its latest release, 0.7.9) constructs ClientResponse
+    without the ``stream_writer`` (aiohttp >=3.10) / ``writer`` (aiohttp >=3.12)
+    keyword-only arg that current aiohttp requires — so a bare ``aioresponses``
+    mock raises ``TypeError: ClientResponse.__init__() missing ... 'stream_writer'``
+    under aiohttp >=3.14.  This shim silently absorbs whichever variant the
+    library passes and supplies a MagicMock default when it is missing, so the
+    mock response can be created.  It is what lets the runtime dep stay on
+    aiohttp >=3.14.1 (which fixes 11 advisories) while still mocking with
+    aioresponses in tests — do not remove it until aioresponses ships native
+    aiohttp 3.14 support.
     """
     original_init = aiohttp.ClientResponse.__init__
 

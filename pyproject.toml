@@ -4,7 +4,9 @@ version = "3.0.0b16"
 requires-python = ">=3.12"
 dependencies = [
     "aiosqlite",
-    "aiohttp<3.14",  # 3.14 adds required stream_writer kwarg to ClientResponse; aioresponses 0.7.8 doesn't pass it
+    "aiohttp>=3.14.1",  # security floor — 3.14.1 fixes 11 advisories (cookie leak on redirect, several DoS,
+                       # multipart header injection). Genesis is client-only; the aioresponses/ClientResponse
+                       # stream_writer-kwarg mismatch is absorbed by the tests/test_observability/conftest.py shim.
     "apscheduler>=3.11,<4",
     "tzlocal>=5",  # transitive dep of apscheduler (ego/cadence uses the local-timezone path); declare so a clean/cached install can't drop it
     "python-telegram-bot>=21.0",
