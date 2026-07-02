@@ -81,10 +81,18 @@ _JUDGE_EXPECTED: dict[TaskType, str] = {
         "and references actual procedures or patterns."
     ),
     TaskType.GAP_CLUSTERING: (
-        "A clustered analysis of knowledge or capability gaps — coherent themes "
-        "grouped from underlying signals, each described specifically. Good output "
-        "is a structured set of real, distinguishable gap clusters, not a flat "
-        "generic list."
+        # Matches the executor's actual task (executor.py GAP_CLUSTERING prompt:
+        # "cluster recent unresolved observations into themes ... recurring
+        # patterns that suggest systemic issues"). An earlier draft graded against
+        # "knowledge/capability gaps", which false-hollowed correct systemic-issue
+        # theme clusterings — corrected 2026-07-01 from the calibration probe.
+        "A clustered analysis that groups recent unresolved observations into "
+        "recurring themes — patterns that suggest systemic issues rather than "
+        "one-off events. Good output is a structured set of real, distinguishable "
+        "named themes, each grouping several related observations and supported "
+        "with specific evidence (regardless of prose or JSON format). A flat list "
+        "of individual signals, or a single one-off diagnostic that does not "
+        "cluster, is not good output."
     ),
     TaskType.SELF_UNBLOCK: (
         "Concrete steps or a diagnosis to unblock a stuck goal or task. Good output "
@@ -107,9 +115,20 @@ _JUDGE_EXPECTED: dict[TaskType, str] = {
         "found'). Good output is concrete and technically grounded, not vague."
     ),
     TaskType.WING_AUDIT: (
-        "A memory-taxonomy hygiene finding about wings/rooms — miscategorization, "
-        "sparse or overloaded domains, or structural improvements. Good output "
-        "names specific wings/rooms and concrete issues."
+        # Matches the executor's actual task (executor.py WING_AUDIT prompt:
+        # "identify clusters of related [currently-uncategorized] memories that
+        # should be reclassified into a more specific wing/room"). An earlier
+        # draft graded against auditing the EXISTING taxonomy for "miscategorization
+        # / sparse-or-overloaded domains", which would false-hollow correct
+        # reclassification proposals — corrected 2026-07-01 (same class of mismatch
+        # as GAP_CLUSTERING; caught by the broader-class scan, not empirically —
+        # WING_AUDIT has no completed tasks to grade).
+        "A finding that groups currently-uncategorized memories into clusters and "
+        "proposes a specific wing/room for each, naming the member memories and a "
+        "rationale for why the grouping improves retrieval. Good output is a "
+        "conservative, well-supported reclassification proposal (memories that "
+        "clearly belong together); a reasoned 'nothing clearly clusters' conclusion "
+        "is also valid. A vague comment that proposes no concrete grouping is not."
     ),
 }
 
