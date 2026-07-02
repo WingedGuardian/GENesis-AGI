@@ -60,6 +60,24 @@ class TestSchedulerLifecycle:
         assert not scheduler.is_running
 
     @pytest.mark.asyncio
+    async def test_jobs_fire_daily_for_self_heal(self, scheduler):
+        # Both reflection jobs must fire EVERY day (day_of_week unrestricted) so
+        # the _already_ran_this_week idempotency gate — not the cron day —
+        # governs cadence. This is the self-heal: a day that fails on empty CC
+        # output retries the next day instead of leaving a ≥7-day gap.
+        await scheduler.start()
+        try:
+            for job_id in ("weekly_self_assessment", "weekly_quality_calibration"):
+                job = scheduler._scheduler.get_job(job_id)
+                assert job is not None, f"{job_id} not registered"
+                dow = next(
+                    f for f in job.trigger.fields if f.name == "day_of_week"
+                )
+                assert str(dow) == "*", f"{job_id} still pinned to one weekday: {dow}"
+        finally:
+            await scheduler.stop()
+
+    @pytest.mark.asyncio
     async def test_not_running_before_start(self, scheduler):
         assert not scheduler.is_running
 
@@ -140,6 +158,20 @@ class TestCalibrationJob:
     async def test_no_regression_no_signal(self, scheduler, mock_stability, db):
         mock_stability.check_regression.return_value = False
         await scheduler._run_calibration()
+        mock_stability.emit_regression_signal.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_regression_check_on_failed_calibration(
+        self, scheduler, mock_bridge, mock_stability, db,
+    ):
+        # A failed calibration produces no new baseline — the regression check
+        # (and any signal) must be skipped, so daily retries during a CC outage
+        # don't re-run/re-emit it every day.
+        mock_bridge.run_quality_calibration.return_value = ReflectionResult(
+            success=False, reason="empty output",
+        )
+        await scheduler._run_calibration()
+        mock_stability.check_regression.assert_not_called()
         mock_stability.emit_regression_signal.assert_not_called()
 
     @pytest.mark.asyncio
