@@ -954,7 +954,10 @@ class EgoCadenceManager:
         try:
             from genesis.runtime import GenesisRuntime
 
-            GenesisRuntime.instance().record_job_success("ego_cycle")
+            # Per-ego job_health key (user_ego_cycle / genesis_ego_cycle) — the
+            # two egos write to the ONE global job_health table, so a shared
+            # "ego_cycle" key made them clobber each other's health row.
+            GenesisRuntime.instance().record_job_success(self._session._source_tag)
         except ImportError:
             pass
         except Exception:
@@ -977,7 +980,10 @@ class EgoCadenceManager:
         try:
             from genesis.runtime import GenesisRuntime
 
-            GenesisRuntime.instance().record_job_failure("ego_cycle", error)
+            # Per-ego job_health key — see _record_success.
+            GenesisRuntime.instance().record_job_failure(
+                self._session._source_tag, error,
+            )
         except ImportError:
             pass
         except Exception:

@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
     from genesis.runtime._core import GenesisRuntime
 
 logger = logging.getLogger("genesis.runtime")
@@ -38,6 +43,37 @@ async def _degraded(rt: GenesisRuntime, component: str, error: str = "failed to 
     from genesis.runtime._degradation import record_init_degradation
 
     await record_init_degradation(rt._db, rt._event_bus, "surplus", component, error)
+
+
+def _wire_memory_extraction_job(
+    scheduler: AsyncIOScheduler,
+    *,
+    coro: Callable[[], object],
+    extraction_hours: int,
+    now: datetime | None = None,
+) -> None:
+    """Register the memory-extraction job on a restart-safe schedule.
+
+    Uses ``CronTrigger`` (fires every N hours on the wall clock), not
+    ``IntervalTrigger``: per the CLAUDE.md convention, a >1h IntervalTrigger
+    measures from the last start and RESETS on every restart, so a server that
+    restarts more often than the interval starves the job entirely. CronTrigger
+    computes each fire from the wall clock and never resets. The explicit
+    ``next_run_time`` ~60s out additionally guarantees a run shortly after every
+    boot (the same boot-run pin the ``schedule_code_audit`` job uses).
+    """
+    from apscheduler.triggers.cron import CronTrigger
+
+    if now is None:
+        now = datetime.now(UTC)
+    scheduler.add_job(
+        coro,
+        CronTrigger(hour=f"*/{extraction_hours}"),
+        id="memory_extraction",
+        max_instances=1,
+        misfire_grace_time=300,
+        next_run_time=now + timedelta(seconds=60),
+    )
 
 
 async def init(rt: GenesisRuntime) -> None:
@@ -325,18 +361,16 @@ async def init(rt: GenesisRuntime) -> None:
                 rt._surplus_scheduler.set_extraction_deps(
                     store=rt._memory_store, router=rt._router,
                 )
-                from apscheduler.triggers.interval import (
-                    IntervalTrigger as _ExtIvlTrig,
-                )
                 extraction_hours = rt._surplus_scheduler._memory_extraction_hours
-                rt._surplus_scheduler._scheduler.add_job(
-                    rt._surplus_scheduler.run_memory_extraction,
-                    _ExtIvlTrig(hours=extraction_hours),
-                    id="memory_extraction",
-                    max_instances=1,
-                    misfire_grace_time=300,
+                _wire_memory_extraction_job(
+                    rt._surplus_scheduler._scheduler,
+                    coro=rt._surplus_scheduler.run_memory_extraction,
+                    extraction_hours=extraction_hours,
                 )
-                logger.info("Memory extraction job wired (%dh interval)", extraction_hours)
+                logger.info(
+                    "Memory extraction job wired (%dh interval, boot-run)",
+                    extraction_hours,
+                )
         except (ImportError, AttributeError):
             logger.error("Failed to wire memory extraction", exc_info=True)
             await _degraded(rt, "memory_extraction")
