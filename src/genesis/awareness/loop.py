@@ -134,6 +134,69 @@ async def _check_wal_health(db) -> None:
         logger.debug("Failed to create WAL health alert observation", exc_info=True)
 
 
+# Per-CC-slot RSS alerting. Same monotonic-since-boot caveat as WAL above: use a
+# key-existence check (a missing key means "never alerted"), NEVER a default of
+# 0.0 — on a host booted <cooldown ago, `now - 0.0` is small and would wrongly
+# suppress the first alert for a slot.
+_last_slot_alert_at: dict[str, float] = {}
+_SLOT_ALERT_COOLDOWN_S = 3600  # one alert per slot per hour
+
+
+async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
+    """Alert when a single CC slot's RSS is abnormally high (a session leak).
+
+    Reads /proc (no DB dependency — runs even during a DB hiccup); only the
+    observation write needs `db`. WARN → priority 'high' (morning report); CRIT
+    → 'critical' (rides the critical-observations job to Telegram). Best-effort;
+    never raises into the tick. `slots` may be passed pre-collected (tests /
+    future sharing); otherwise it enumerates."""
+    try:
+        from genesis.observability.cc_slots import (
+            SLOT_RSS_CRIT_MB,
+            SLOT_RSS_WARN_MB,
+            enumerate_cc_slots,
+        )
+        if slots is None:
+            slots = enumerate_cc_slots()
+    except Exception:
+        logger.debug("cc_slot memory check: enumeration failed", exc_info=True)
+        return
+
+    now = time.monotonic()
+    for slot in slots:
+        rss = slot.get("rss_mb", 0.0)
+        if rss < SLOT_RSS_WARN_MB:
+            continue
+        key = str(slot.get("slot", "?"))
+        last = _last_slot_alert_at.get(key)
+        if last is not None and (now - last) < _SLOT_ALERT_COOLDOWN_S:
+            continue
+        if db is None:
+            continue  # can't write the observation now; retry next tick
+        priority = "critical" if rss >= SLOT_RSS_CRIT_MB else "high"
+        # Consumed only once we can actually write (after the db-None guard), and
+        # set before the await so a failed create still suppresses per-tick retries.
+        _last_slot_alert_at[key] = now
+        try:
+            await observations.create(
+                db,
+                id=str(uuid.uuid4()),
+                source="cc_slot_monitor",
+                type="infrastructure_alert",
+                content=(
+                    f"CC slot cc-{key} (pid {slot.get('pid')}) is using "
+                    f"{rss / 1024:.1f} GB RAM (warn {SLOT_RSS_WARN_MB // 1024} GB, "
+                    f"crit {SLOT_RSS_CRIT_MB // 1024} GB). A single Claude Code "
+                    f"session may be leaking — consider restarting slot cc-{key}."
+                ),
+                priority=priority,
+                created_at=datetime.now(UTC).isoformat(),
+            )
+            logger.warning("CC slot memory alert: cc-%s %.1f GB (%s)", key, rss / 1024, priority)
+        except Exception:
+            logger.debug("Failed to create cc_slot alert observation", exc_info=True)
+
+
 # Micro ticks are silent by default (counted for cascade, no LLM call).
 # LLM fires only when these critical operational signals are active.
 _MICRO_CRITICAL_SIGNALS = frozenset({"software_error_spike", "critical_failure"})
@@ -761,6 +824,11 @@ class AwarenessLoop:
                         self._resilience_state_machine.update_tmp_pressure(tmp_status)
                 except Exception:
                     logger.debug("tmp_pressure axis update failed", exc_info=True)
+
+            # Per-CC-slot RSS leak check — reads /proc (no DB dependency, so it
+            # still runs during a DB hiccup); the observation write is guarded on
+            # db inside the function. Surfaces a single ballooning CC session.
+            await _check_cc_slot_memory(self._db)
 
             # SQLite WAL checkpoint — prevent unbounded WAL growth from
             # external scripts or concurrent writers. PASSIVE is non-blocking.

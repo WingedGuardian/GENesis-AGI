@@ -3256,16 +3256,27 @@
         containerSemantic() {
           const mem = this.health.infrastructure?.container_memory;
           const disk = this.health.infrastructure?.disk;
-          const stateRank = { error: 3, degraded: 2, unknown: 1, healthy: 0 };
+          const cpu = this.health.infrastructure?.cpu;
+          // "down" is the memory block's worst status; rank it with "error".
+          const stateRank = { error: 3, down: 3, degraded: 2, unknown: 1, unavailable: 1, healthy: 0 };
 
-          // Memory assessment (primary — OOM kills)
+          // Memory assessment (primary — OOM kills). Status already folds in
+          // sustained memory PSI server-side; report PSI when it's the driver.
           let memState = "healthy", memReason = "container resources within safe limits";
+          const memPct = (mem?.anon_pct ?? mem?.used_pct);
+          const memFull60 = mem?.pressure?.full_avg60;
           if (!mem || ["unknown", "unavailable"].includes(mem.status)) {
             memState = "unknown"; memReason = "container memory data unavailable";
-          } else if ((mem.anon_pct ?? mem.used_pct) > 85 || mem.status === "down") {
-            memState = "error"; memReason = "memory in danger zone (" + (mem.anon_pct ?? mem.used_pct).toFixed(0) + "%)";
-          } else if ((mem.anon_pct ?? mem.used_pct) > 75 || mem.status === "degraded") {
-            memState = "degraded"; memReason = "memory usage elevated (" + (mem.anon_pct ?? mem.used_pct).toFixed(0) + "%)";
+          } else if (mem.status === "down" || memPct > 85) {
+            memState = "error";
+            memReason = (memFull60 >= 30)
+              ? "memory stalling work (PSI " + memFull60.toFixed(0) + "%)"
+              : "memory in danger zone (" + memPct.toFixed(0) + "%)";
+          } else if (mem.status === "degraded" || memPct > 75) {
+            memState = "degraded";
+            memReason = (memFull60 >= 10)
+              ? "memory pressure elevated (PSI " + memFull60.toFixed(0) + "%)"
+              : "memory usage elevated (" + memPct.toFixed(0) + "%)";
           }
 
           // Disk assessment (secondary — write failures)
@@ -3279,11 +3290,21 @@
             }
           }
 
-          // Worst-of-two — disk or memory, whichever is worse
-          if ((stateRank[diskState] || 0) > (stateRank[memState] || 0)) {
-            return { state: diskState, reason: diskReason };
+          // CPU assessment (utilization % from used_pct — NOT loadavg).
+          let cpuState = "healthy", cpuReason = "";
+          if (cpu && (cpu.status === "degraded" || cpu.status === "error")) {
+            cpuState = cpu.status;
+            const cpuFull60 = cpu.pressure?.full_avg60;
+            cpuReason = "CPU " + cpu.status + " (" + (cpu.used_pct ?? 0).toFixed(0) + "% used"
+              + ((cpuFull60 >= 1) ? ", stall " + cpuFull60.toFixed(0) + "%" : "") + ")";
           }
-          return { state: memState, reason: memReason };
+
+          // Worst-of — memory, disk, or CPU, whichever is worst.
+          let worst = { state: memState, reason: memReason };
+          for (const c of [{ state: diskState, reason: diskReason }, { state: cpuState, reason: cpuReason }]) {
+            if ((stateRank[c.state] || 0) > (stateRank[worst.state] || 0)) worst = c;
+          }
+          return worst;
         },
 
         awarenessSemantic() {
@@ -5173,6 +5194,19 @@
                   </div>
                   <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
                         x-text="($store.genesisDashboard.health.infrastructure.disk.total_gb - $store.genesisDashboard.health.infrastructure.disk.free_gb).toFixed(0) + '/' + $store.genesisDashboard.health.infrastructure.disk.total_gb.toFixed(0) + ' GB'"></span>
+                </div>
+              </template>
+              <!-- CC slots row (per-session RSS — leak detection) -->
+              <template x-if="($store.genesisDashboard.health.infrastructure?.cc_slots || []).length">
+                <div style="display:flex; align-items:flex-start; gap:0.5rem; font-size:0.8rem;">
+                  <span style="width:3.2rem; color:var(--color-text-secondary);">CC</span>
+                  <div style="flex:1; display:flex; flex-wrap:wrap; gap:0.35rem;">
+                    <template x-for="slot in $store.genesisDashboard.health.infrastructure.cc_slots" :key="slot.slot">
+                      <span style="font-size:0.7rem; padding:0.05rem 0.3rem; border-radius:3px; background:var(--color-background); white-space:nowrap;"
+                            :style="`color: ${slot.status === 'error' ? '#d9534f' : slot.status === 'degraded' ? '#f0ad4e' : 'var(--color-text-secondary)'}`"
+                            x-text="'cc-' + slot.slot + ' ' + (slot.rss_mb / 1024).toFixed(1) + 'G'"></span>
+                    </template>
+                  </div>
                 </div>
               </template>
               <!-- Fallback when no data -->
