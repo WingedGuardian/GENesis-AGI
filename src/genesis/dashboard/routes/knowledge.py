@@ -131,13 +131,16 @@ async def knowledge_delete(unit_id: str):
         if not deleted:
             return jsonify({"error": "Unit not found"}), 404
 
-        # Also delete from Qdrant if we have a reference
+        # Also delete from Qdrant. The client lives on the memory store, not on
+        # the runtime directly — rt.qdrant_client never existed (bug since #83,
+        # sibling of the dream_cycle rt.qdrant→store.qdrant_client fix in #385).
         qdrant_deleted = False
-        if qdrant_id and rt.qdrant_client:
+        store = getattr(rt, "memory_store", None)
+        if qdrant_id and store is not None:
             try:
                 from qdrant_client.models import PointIdsList
 
-                rt.qdrant_client.delete(
+                store.qdrant_client.delete(
                     collection_name="knowledge_base",
                     points_selector=PointIdsList(points=[qdrant_id]),
                 )
