@@ -6,7 +6,7 @@ import json
 import logging
 from datetime import UTC, datetime
 
-from genesis.memory.provenance import label_result_dicts
+from genesis.memory.provenance import label_result_dicts, wrap_external_recall
 from genesis.memory.reference_ops import (
     REFERENCE_KINDS as _REFERENCE_KINDS,
 )
@@ -193,6 +193,14 @@ async def knowledge_recall(
     # — label original + any CRAG-augmented / web-fallback items. Runs regardless
     # of `corrective` so the contract is uniform.
     label_result_dicts(final, default_collection="knowledge_base")
+    # Injection defense (PR2): every knowledge_recall hit is external-world —
+    # wrap the content (vector `r.content` and FTS `body` both land under the
+    # `content` key here) so the model treats it as data, not instructions.
+    for d in final:
+        if isinstance(d, dict) and "content" in d:
+            d["content"] = wrap_external_recall(
+                d["content"], source_pipeline=d.get("source_pipeline"),
+            )
     return final
 
 

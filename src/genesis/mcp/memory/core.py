@@ -12,6 +12,7 @@ from genesis.memory.provenance import (
     is_external,
     label_result_dicts,
     provenance_descriptor,
+    wrap_external_recall,
 )
 
 from ..memory import mcp
@@ -390,6 +391,14 @@ async def memory_recall(
     # first-party vs external-world. Runs regardless of `corrective` so the
     # output contract is uniform.
     label_result_dicts(enriched, default_collection="episodic_memory")
+    # Injection defense (PR2): structurally delimit external-world content so
+    # the model treats it as data, not first-party instructions. Gate on the
+    # post-label collection so CRAG web-fallback items are covered too.
+    for d in enriched:
+        if isinstance(d, dict) and is_external(d.get("collection")):
+            d["content"] = wrap_external_recall(
+                d.get("content", ""), source_pipeline=d.get("source_pipeline"),
+            )
     return enriched
 
 
@@ -471,6 +480,13 @@ async def memory_expand(
                 source_doc=payload.get("source"),
             ),
         }
+
+        # Injection defense (PR2): wrap full external-world content pulled into
+        # context after a compact recall (the real full-payload surface).
+        if is_external(_collection):
+            d["content"] = wrap_external_recall(
+                d["content"], source_pipeline=payload.get("source_pipeline"),
+            )
 
         # Graph enrichment
         try:
@@ -573,7 +589,18 @@ async def memory_proactive(
         r for r in results
         if "memory_operation" not in (r.payload.get("tags") or [])
     ][:limit]
-    return [asdict(r) for r in filtered]
+    # Injection defense (PR2): recall defaults to source="both", so KB content
+    # can appear here and flow straight into prompt context — wrap external-world
+    # items so the model treats them as data, not first-party instructions.
+    out: list[dict] = []
+    for r in filtered:
+        d = asdict(r)
+        if is_external(r.collection):
+            d["content"] = wrap_external_recall(
+                d.get("content", ""), source_pipeline=r.source_pipeline,
+            )
+        out.append(d)
+    return out
 
 
 @mcp.tool()

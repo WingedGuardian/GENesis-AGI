@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from genesis.memory.provenance import is_external, wrap_external_recall
+
 if TYPE_CHECKING:
     from genesis.memory.retrieval import HybridRetriever
 
@@ -54,9 +56,16 @@ class ContextInjector:
 
         lines = ["## Relevant Prior Experience\n"]
         for r in results:
+            content = r.content[:200]
+            # Injection defense (PR2): this path recalls source="episodic"
+            # (first-party) today, so the guard never fires — but wrap defensively
+            # so a future `source` widening can't silently inject unwrapped KB.
+            if is_external(getattr(r, "collection", "")):
+                content = wrap_external_recall(
+                    content, source_pipeline=getattr(r, "source_pipeline", None),
+                )
             lines.append(
-                f"- **[{r.memory_type}]** (score: {r.score:.2f}) "
-                f"{r.content[:200]}"
+                f"- **[{r.memory_type}]** (score: {r.score:.2f}) {content}"
             )
 
         return "\n".join(lines)
