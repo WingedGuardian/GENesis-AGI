@@ -90,6 +90,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Superseded and expired memories no longer resurface in Genesis's automatic recall.** Before every
+  prompt, Genesis injects the most relevant memories into its working context. That fast-path recall
+  wasn't checking whether a memory had expired or been superseded (replaced by a newer, consolidated
+  version) — so an outdated network note, stale career details, an old build-progress snapshot, or a
+  duplicate the memory system had already merged away could still surface, even though the main memory
+  system filtered all of those out. The fast path now applies the same validity checks across all of
+  its sources, matching the main retriever. Memories that are current (no expiry, not superseded) are
+  never affected, so nothing live is ever dropped.
+
 - **Completed background-task history no longer grows without bound.** Genesis's idle-time "surplus"
   task queue kept every finished task row forever — only never-started tasks were ever cleaned up — so
   the table crept upward over months of background work. Finished tasks (completed, failed, or
