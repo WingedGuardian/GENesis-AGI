@@ -20,6 +20,16 @@
         // ── sub-tab state ──
         voiceTab: "calibration",
 
+        // ── Calibration (attention review) state — must be declared so the ported methods/panel
+        //    have reactive keys to read on first load (before any fetch returns) ──
+        attentionEvents: [],
+        attentionStats: null,
+        attentionFilters: { activation: "", trigger: "", is_user: false, unlabeled: true, config_version: "" },
+        _attentionVersionDefaulted: false,   // one-time guard: default the filter to newest version once
+        _attentionEventsGen: 0,   // request generation — discard a stale events response superseded by a newer fetch
+        attentionRevealed: {},   // {event_id: [window rows] | "unavailable"}
+        attentionLabeling: {},   // {event_id: true} while a label POST is in flight
+
         // ── Bridge (ambient edge) — reuses /api/genesis/health infrastructure.ambient ──
         bridge: null,
         bridgeError: null,
