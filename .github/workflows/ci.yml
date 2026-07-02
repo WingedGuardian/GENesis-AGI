@@ -155,7 +155,7 @@ jobs:
         run: |
           set -euo pipefail
           body=$(gh pr view ${{ github.event.pull_request.number }} --json body -q .body 2>/dev/null || echo "")
-          PATTERNS='10\.176\.[0-9]|192\.168\.50\.[0-9]|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|046056[0-9]{6}|moonandstar|zorror|assistant1'
+          PATTERNS='10\.176\.[0-9]|192\.168\.50\.[0-9]|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|fd7a:|046056[0-9]{6}|moonandstar|zorror|assistant1'
           if echo "$body" | grep -qE "$PATTERNS"; then
             echo "::error::PR description contains private infrastructure details"
             echo "$body" | grep -nE "$PATTERNS" || true

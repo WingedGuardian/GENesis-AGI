@@ -9,6 +9,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Security
+
+- **The contribution sanitizer now blocks Tailscale addresses before they can reach the public
+  repo.** When you prepare a community contribution, the pre-push privacy scan now catches Tailscale
+  CGNAT and Tailscale IPv6 addresses, and flags the full private `10.176` subnet range (not just two
+  hard-coded addresses) — closing a gap where these install-specific addresses could otherwise slip
+  into a public PR. The commit-message guard gained the same IPv6 coverage.
+
 ### Added
 
 - **You can now start an interactive Claude Code session on a different model with one command.**
