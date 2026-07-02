@@ -287,3 +287,29 @@ async def test_send_standalone_email_without_thread_enqueues_no_recipient():
     finally:
         mcp_mod._pipeline = old_pipeline
         mcp_mod._db = old_db
+
+
+@pytest.mark.asyncio
+async def test_init_schedules_ensure_table_via_tracked_task():
+    """Standalone fallback (pipeline=None, db set) schedules ensure_table via
+    tracked_task — not a bare get_event_loop().create_task that swallows errors
+    and can spawn an orphan-loop task."""
+    old_pipeline, old_db = mcp_mod._pipeline, mcp_mod._db
+    scheduled: list[dict] = []
+
+    def _capture(coro, **kwargs):
+        scheduled.append(kwargs)
+        coro.close()  # avoid 'coroutine was never awaited' warning
+        return MagicMock()
+
+    try:
+        with patch("genesis.util.tasks.tracked_task", side_effect=_capture), \
+             patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock):
+            mcp_mod.init_outreach_mcp(
+                pipeline=None, engagement=None, config=None, db=AsyncMock(),
+            )
+        assert scheduled, "ensure_table was not scheduled via tracked_task"
+        assert scheduled[0].get("name") == "outreach-ensure-pending-table"
+    finally:
+        mcp_mod._pipeline = old_pipeline
+        mcp_mod._db = old_db

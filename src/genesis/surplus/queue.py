@@ -98,6 +98,20 @@ class SurplusQueue:
         cutoff = self._clock() - timedelta(hours=max_age_hours)
         return await surplus_tasks.drain_expired(self._db, before=cutoff.isoformat())
 
+    async def reap_terminal(self, *, older_than_days: int = 30) -> int:
+        """Delete terminal (completed/failed/cancelled) tasks older than *older_than_days*.
+
+        ``drain_expired`` only removes ``pending`` rows, so terminal rows would
+        otherwise accumulate forever. Retention defaults to 30 days — far above
+        the largest scheduler cooldown (``analytical_hours``=24h) and the
+        pending-drain window (``task_expiry_hours``=72h), so neither
+        ``last_completed_at`` cooldown checks nor open follow-up links are ever
+        disturbed. Rows referenced by a non-terminal follow-up are preserved by
+        the CRUD layer.
+        """
+        cutoff = self._clock() - timedelta(days=older_than_days)
+        return await surplus_tasks.delete_terminal_before(self._db, before=cutoff.isoformat())
+
     async def recover_stuck(self, *, older_than_hours: int = 2, max_retries: int = 3) -> tuple[int, int]:
         """Recover tasks stuck in 'running' state."""
         return await surplus_tasks.recover_stuck_with_retries(
