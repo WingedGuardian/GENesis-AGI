@@ -129,6 +129,37 @@ async def test_multiple_stale_jobs_sorted_worst_first():
     assert ids == ["job_stale:weekly_assessment", "job_stale:weekly_calibration"]
 
 
+# ── get_stale_jobs crud (the raw query behind the alert) ─────────────────────
+
+@pytest.mark.asyncio
+async def test_get_stale_jobs_crud():
+    """The crud read returns only jobs past the threshold, widest gap first."""
+    from genesis.db.crud import job_health
+
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.execute(
+        "CREATE TABLE job_health (job_name TEXT PRIMARY KEY, last_run TEXT, last_success TEXT)"
+    )
+    await db.executemany(
+        "INSERT INTO job_health (job_name, last_run, last_success) VALUES (?, ?, ?)",
+        [
+            ("stale_a", _RUN, _OK_STALE),        # gap 14
+            ("stale_b", _RUN, "2026-06-20T00:00:00+00:00"),  # gap 8
+            ("healthy", _RUN, _OK_HEALTHY),      # gap 0
+            ("recent", _RUN, _OK_RECENT),        # gap 3 (< 6.0)
+        ],
+    )
+    await db.commit()
+    try:
+        rows = await job_health.get_stale_jobs(db, threshold_days=6.0)
+    finally:
+        await db.close()
+
+    assert [r["job_name"] for r in rows] == ["stale_a", "stale_b"]  # widest gap first
+    assert rows[0]["gap_days"] == 14.0
+
+
 # ── _annotate_staleness (job_health MCP output field) ────────────────────────
 
 def test_annotate_staleness_computes_gap_and_flag():

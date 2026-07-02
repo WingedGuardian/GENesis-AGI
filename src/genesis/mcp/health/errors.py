@@ -550,27 +550,20 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
     # cadence — no per-job schedule lookup needed.
     if _service and _service._db:
         try:
-            cursor = await _service._db.execute(
-                "SELECT job_name, last_success, "
-                "julianday(last_run) - julianday(last_success) AS gap_days "
-                "FROM job_health "
-                "WHERE last_run IS NOT NULL AND last_success IS NOT NULL "
-                "AND julianday(last_run) - julianday(last_success) > ? "
-                "ORDER BY gap_days DESC",
-                (JOB_STALE_GAP_DAYS,),
-            )
-            for row in await cursor.fetchall():
-                job_name = row[0] if isinstance(row, tuple) else row["job_name"]
-                last_success = row[1] if isinstance(row, tuple) else row["last_success"]
-                gap_days = row[2] if isinstance(row, tuple) else row["gap_days"]
-                alert_id = f"job_stale:{job_name}"
+            from genesis.db.crud import job_health as job_health_crud
+
+            for row in await job_health_crud.get_stale_jobs(
+                _service._db, threshold_days=JOB_STALE_GAP_DAYS
+            ):
+                alert_id = f"job_stale:{row['job_name']}"
                 alerts.append({
                     "id": alert_id,
                     "severity": "WARNING",
                     "message": (
-                        f"Scheduled job '{job_name}' has run since but not succeeded "
-                        f"in {gap_days:.0f} days (last success {str(last_success)[:10]}) — "
-                        f"silently failing (its failure counter resets on restart)"
+                        f"Scheduled job '{row['job_name']}' has run since but not "
+                        f"succeeded in {row['gap_days']:.0f} days (last success "
+                        f"{str(row['last_success'])[:10]}) — silently failing "
+                        f"(its failure counter resets on restart)"
                     ),
                 })
                 current_ids.add(alert_id)
