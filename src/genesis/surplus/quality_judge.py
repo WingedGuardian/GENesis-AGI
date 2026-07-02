@@ -89,9 +89,10 @@ _JUDGE_EXPECTED: dict[TaskType, str] = {
         "A clustered analysis that groups recent unresolved observations into "
         "recurring themes — patterns that suggest systemic issues rather than "
         "one-off events. Good output is a structured set of real, distinguishable "
-        "themes (e.g. 'Theme 1: ...'), each named and supported with specific "
-        "evidence from the observations. A flat list of individual signals, or a "
-        "single one-off diagnostic that does not cluster, is not good output."
+        "named themes, each grouping several related observations and supported "
+        "with specific evidence (regardless of prose or JSON format). A flat list "
+        "of individual signals, or a single one-off diagnostic that does not "
+        "cluster, is not good output."
     ),
     TaskType.SELF_UNBLOCK: (
         "Concrete steps or a diagnosis to unblock a stuck goal or task. Good output "
