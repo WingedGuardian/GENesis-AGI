@@ -592,12 +592,17 @@ class OutreachPipeline:
             # record). Records what a capability gate WOULD decide. Best-effort + read-
             # only; the gate_cleared resume path is below-the-gate → not observed.
             if channel == "discord" and not gate_cleared:
-                from genesis.autonomy.shadow_gate import observe_discord_send
+                # Import + call are wrapped so a shadow/import failure can never break the
+                # already-completed send (uniform with the poll/reply doors).
+                try:
+                    from genesis.autonomy.shadow_gate import observe_discord_send
 
-                await observe_discord_send(
-                    self._db, path="deliver", verb="send", risk_class="bulk",
-                    target=str(delivery_recipient), content=formatted.text,
-                )
+                    await observe_discord_send(
+                        self._db, path="deliver", verb="send", risk_class="bulk",
+                        target=str(delivery_recipient), content=formatted.text,
+                    )
+                except Exception:  # noqa: BLE001 — shadow is best-effort; never break the send
+                    logger.debug("deliver capability shadow observe failed", exc_info=True)
 
             # WS-8 PR-D: log autonomous (GRANTED-cell) email sends for owner
             # visibility (Activity tab), the flag-as-bad correction, and the
