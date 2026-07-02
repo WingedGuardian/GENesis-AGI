@@ -78,11 +78,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
-- **Deleting a knowledge item no longer blocks you from re-adding its source.** When you deleted
-  a knowledge unit from the dashboard, Genesis removed it from the search index but still remembered
-  having ingested its source — so re-adding that same file or URL was silently skipped and nothing
-  came back. Now deleting a source's last remaining unit clears that record, and re-ingesting the
-  source works normally again.
+- **Deleting a knowledge item from the dashboard now works end to end.** Previously the delete
+  button returned a server error, and behind the scenes the item was only half-removed — dropped
+  from search but with its stored embedding left behind and its source still marked as already
+  ingested, so re-adding that same file or URL was silently skipped and nothing came back. Deletes
+  now complete cleanly (search entry and embedding both removed), and once a source's last item is
+  deleted, re-ingesting that file or URL works again.
 
 - **The weekly self-assessment and quality-calibration jobs now recover on their own instead of
   going dark for weeks.** Previously each ran only once a week, so if that one run failed — for
