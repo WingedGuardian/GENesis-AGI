@@ -75,6 +75,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   having ingested its source — so re-adding that same file or URL was silently skipped and nothing
   came back. Now deleting a source's last remaining unit clears that record, and re-ingesting the
   source works normally again.
+
+- **The weekly self-assessment and quality-calibration jobs now recover on their own instead of
+  going dark for weeks.** Previously each ran only once a week, so if that one run failed — for
+  example when the shared Claude Code subscription was capped and returned empty output — the next
+  attempt wasn't until the following week, and a multi-day outage could leave them stale for 2–3
+  weeks. They now run daily but still complete at most once per week (an idempotency check skips the
+  rest of the week once one run succeeds), so a failed day is simply retried the next day until it
+  succeeds. Side effect: the successful run now normally lands early in the week rather than on Sunday.
+
 - **`update.sh` no longer hangs if the health watchdog restarts the server mid-update.**
   During an update Genesis stops its server to swap in new code and migrate the database. The
   background health watchdog could see it "down" and restart it right then — and the revived
