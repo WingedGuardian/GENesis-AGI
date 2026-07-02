@@ -62,6 +62,7 @@ def _event_summary(row: dict) -> dict:
         "window_ref": _loads(row.get("window_ref"), {}),
         "l15_verdict": _loads(row.get("l15_verdict"), None),
         "acceptance_signal": row.get("acceptance_signal"),
+        "acceptance_note": row.get("acceptance_note"),
         "snapshot_id": row.get("snapshot_id"),
         "config_version": row.get("config_version"),
         "created_at": row.get("created_at"),
@@ -169,7 +170,12 @@ async def attention_reveal_text(event_id: str):
 @blueprint.route("/api/genesis/attention/<event_id>/label", methods=["POST"])
 @_async_route
 async def attention_label(event_id: str):
-    """Write a should/shouldn't/skip review label. Returns the prior value (for X->Y)."""
+    """Write a should/shouldn't/skip review label, plus the reviewer's optional WHY note.
+
+    The perk decision is an LLM judgment, so the review captures the human's REASONING, not
+    just a binary — an ``acceptance_note`` (when present in the body) is stored beside the
+    label. Omit it to leave any existing note untouched (crud sentinel); send ``""``/null to
+    clear. Returns the prior signal (for X->Y)."""
     if (resp := _auth_or_403()) is not None:
         return resp
     from genesis.db.crud import attention as attention_crud
@@ -181,8 +187,19 @@ async def attention_label(event_id: str):
 
     data = request.get_json(silent=True) or {}
     signal = data.get("acceptance_signal")
+    note_kwargs = {}
+    stored_note = None
+    if "acceptance_note" in data:  # present (incl. null/"") => set it; absent => preserve
+        raw = data.get("acceptance_note")
+        if raw is not None and not isinstance(raw, str):
+            # reject junk types (a number/array) rather than silently CLEARING the note
+            return jsonify({"error": "acceptance_note must be a string or null"}), 400
+        stored_note = raw.strip()[:500] or None if isinstance(raw, str) else None
+        note_kwargs["note"] = stored_note
     try:
-        found, prior = await attention_crud.update_acceptance_signal(rt.db, event_id, signal)
+        found, prior = await attention_crud.update_acceptance_signal(
+            rt.db, event_id, signal, **note_kwargs
+        )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception:
@@ -191,4 +208,7 @@ async def attention_label(event_id: str):
 
     if not found:
         return jsonify({"error": "Event not found"}), 404
-    return jsonify({"status": "ok", "id": event_id, "acceptance_signal": signal, "prior": prior})
+    body = {"status": "ok", "id": event_id, "acceptance_signal": signal, "prior": prior}
+    if "acceptance_note" in data:  # echo only what we actually wrote (else UI keeps its note)
+        body["acceptance_note"] = stored_note
+    return jsonify(body)

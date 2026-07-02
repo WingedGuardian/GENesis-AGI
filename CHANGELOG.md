@@ -19,6 +19,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The Genesis Voice add-on's attention surface now shows the judge's reasoning — and lets you review it.**
+  For the optional passive-listening add-on, the buried "Attention" tab is now a top-level **Genesis Voice →
+  Judgment** review. Each moment the attention gate noticed is scored by a lightweight LLM judge that says
+  whether it was real speech, whether it was worth attention, and — new — a one-word category and a short
+  reason. You review the judge (worth noticing / not worth it / skip) and can jot your own *why*; your notes
+  inform the judge's prompt, not any hidden weights. It stays offline observability — nothing here speaks or
+  acts, and it's hidden entirely when the voice add-on isn't installed.
+
 - **The dashboard's container-health badge now tells the truth about CPU and memory pressure.**
   Previously the badge ignored CPU entirely (it was hardwired to "healthy") and judged memory only by a
   raw usage figure that's inflated by reclaimable cache — so a busy or memory-throttling box could still
