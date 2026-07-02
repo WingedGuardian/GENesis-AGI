@@ -31,6 +31,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   if a single session climbs past a high ceiling — a sign it may be leaking — Genesis raises a health alert
   (reaching Telegram at the critical level) so you can restart just that session instead of finding out the hard way.
 
+- **Genesis can now shelve "someday/maybe" ideas separately from its actionable to-do list.**
+  Until now, every deferred item a session or the ego created landed in the actionable follow-up
+  queue — even low-value "might be worth doing someday" ideas — so the queue filled with things
+  nobody intended to act on. Genesis can now file those into a separate "tabled" lane instead
+  (the dashboard Follow-ups tab already supported this; now Genesis's own sessions and ego can too,
+  and can move an existing item between the two lanes). Tabled items are tracked but never surfaced
+  as work or auto-actioned, keeping the actionable list focused on real commitments.
+
 - **Genesis now catches scheduled jobs that silently stop working — running on schedule but never
   succeeding.** Some background jobs (like the weekly self-assessment and quality calibration) could
   fail week after week without ever showing up as "failed," because the failure counter is reset

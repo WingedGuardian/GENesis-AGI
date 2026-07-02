@@ -37,6 +37,7 @@ async def _impl_follow_up_create(
     priority: str = "medium",
     pinned: bool = False,
     domain: str | None = None,
+    kind: str = "follow_up",
     source_session: str | None = None,
 ) -> dict:
     """Create a follow-up item in the accountability ledger."""
@@ -55,6 +56,10 @@ async def _impl_follow_up_create(
     valid_domains = {"internal", "user_world"}
     if domain is not None and domain not in valid_domains:
         return {"error": f"Invalid domain '{domain}'. Must be one of: {', '.join(sorted(valid_domains))}"}
+
+    valid_kinds = {"follow_up", "tabled"}
+    if kind not in valid_kinds:
+        return {"error": f"Invalid kind '{kind}'. Must be one of: {', '.join(sorted(valid_kinds))}"}
 
     if strategy == "scheduled_task" and not scheduled_at:
         return {"error": "scheduled_at is required when strategy is 'scheduled_task'"}
@@ -88,14 +93,21 @@ async def _impl_follow_up_create(
             priority=priority,
             pinned=pinned,
             domain=domain,
+            kind=kind,
+        )
+        lane_msg = (
+            "Tabled (someday/maybe — tracked, not surfaced as actionable work)."
+            if kind == "tabled"
+            else f"Follow-up created. Strategy: {strategy}."
         )
         return {
             "id": fid,
             "status": "pending",
+            "kind": kind,
             "strategy": strategy,
             "domain": domain,
             "pinned": pinned,
-            "message": f"Follow-up created. Strategy: {strategy}."
+            "message": lane_msg
             + (f" Domain: {domain}." if domain else "")
             + (" (pinned — ego cannot auto-resolve)" if pinned else ""),
         }
@@ -141,6 +153,7 @@ async def _impl_follow_up_update(
     blocked_reason: str | None = None,
     priority: str | None = None,
     pinned: bool | None = None,
+    kind: str | None = None,
 ) -> dict:
     """Update an existing follow-up item."""
     db = _get_db()
@@ -154,6 +167,10 @@ async def _impl_follow_up_update(
     valid_priorities = {"low", "medium", "high", "critical"}
     if priority and priority not in valid_priorities:
         return {"error": f"Invalid priority '{priority}'. Must be one of: {', '.join(sorted(valid_priorities))}"}
+
+    valid_kinds = {"follow_up", "tabled"}
+    if kind and kind not in valid_kinds:
+        return {"error": f"Invalid kind '{kind}'. Must be one of: {', '.join(sorted(valid_kinds))}"}
 
     try:
         from genesis.db.crud import follow_ups
@@ -171,6 +188,9 @@ async def _impl_follow_up_update(
 
         if pinned is not None:
             await follow_ups.set_pinned(db, follow_up_id, pinned)
+
+        if kind:
+            await follow_ups.set_kind(db, follow_up_id, kind)
 
         if status:
             updated = await follow_ups.update_status(
@@ -195,6 +215,7 @@ async def _impl_follow_up_update(
         return {
             "id": follow_up_id,
             "status": refreshed["status"],
+            "kind": refreshed.get("kind"),
             "priority": refreshed["priority"],
             "pinned": bool(refreshed.get("pinned", 0)),
             "message": "Follow-up updated.",
@@ -218,14 +239,26 @@ async def follow_up_create(
     priority: str = "medium",
     pinned: bool = False,
     domain: str = "",
+    kind: str = "follow_up",
 ) -> dict:
-    """Create a follow-up item for Genesis to track and execute.
+    """Create a follow-up (or a tabled someday/maybe) in the accountability ledger.
 
-    Use this when a session identifies deferred work that Genesis should own.
+    Two lanes, chosen by `kind` — pick deliberately:
+    - kind="follow_up" (default): ACTIONABLE deferred work Genesis should own and
+      eventually DO. Enters the ledger, surfaces in the morning report, and the
+      ego/sessions act on it. Use ONLY when there is a real, intended next step.
+    - kind="tabled": a SOMEDAY/MAYBE — worth remembering but NOT committing to.
+      Tracked, but never surfaced as work or auto-actioned. Use for ideas,
+      interests, or possibilities to revisit later so they don't clog the
+      actionable queue. When torn between a low-priority follow_up and a maybe
+      with no concrete next step, prefer tabled.
 
     Args:
         content: What needs to happen (actionable description)
         reason: Why this follow-up exists (context for future sessions/ego)
+        kind: "follow_up" (actionable, default) or "tabled" (someday/maybe, never
+            auto-actioned). See the two-lane note above — don't file a real
+            commitment as tabled, and don't clog the actionable queue with maybes.
         strategy: How to handle it — choose based on what kind of work this requires:
             - user_input_needed: Park this for a future interactive session. No
               automation touches it. Use for anything requiring real CC sessions:
@@ -257,6 +290,7 @@ async def follow_up_create(
         priority=priority,
         pinned=pinned,
         domain=domain or None,
+        kind=kind,
     )
 
 
@@ -268,11 +302,12 @@ async def follow_up_update(
     blocked_reason: str = "",
     priority: str = "",
     pinned: str = "",
+    kind: str = "",
 ) -> dict:
     """Update an existing follow-up item.
 
     Use this to change status, add resolution notes, mark as blocked,
-    adjust priority, or pin/unpin on an existing follow-up.
+    adjust priority, pin/unpin, or move it between the follow_up/tabled lanes.
 
     Args:
         follow_up_id: The ID of the follow-up to update
@@ -281,6 +316,9 @@ async def follow_up_update(
         blocked_reason: Why this follow-up is blocked (sets status to blocked if status not provided).
         priority: New priority (low, medium, high, critical). Empty to keep current.
         pinned: Set to "true" to pin (ego cannot auto-resolve) or "false" to unpin. Empty to keep current.
+        kind: Move between lanes — "follow_up" (actionable) or "tabled" (someday/maybe).
+            Empty to keep current. Use to demote a follow-up you're no longer
+            committing to into tabled, or promote a tabled idea back to actionable work.
     """
     pinned_bool: bool | None = None
     if pinned.lower() in ("true", "1", "yes"):
@@ -295,6 +333,7 @@ async def follow_up_update(
         blocked_reason=blocked_reason or None,
         priority=priority or None,
         pinned=pinned_bool,
+        kind=kind or None,
     )
 
 
