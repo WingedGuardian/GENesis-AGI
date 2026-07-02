@@ -272,8 +272,11 @@ def _update_and_format_trail(
 
 def _is_garbage(content: str) -> bool:
     """Filter out content that should never surface as proactive memory."""
-    if "<external-content" in content:
-        return True
+    # NOTE (PR2): we deliberately no longer drop content merely for containing
+    # `<external-content>` markers. That was a blunt defense against leaked
+    # boundary markers, but it also silently lost legitimate hits. `_format_results`
+    # now strips any leaked markers and re-labels external-world hits (`KB·…`),
+    # so surfacing-clean is safe. Do not re-add this drop as "protective".
     stripped = content.lstrip()
     if stripped.startswith("{") and any(
         k in stripped[:100] for k in ('"drift_detected"', '"tags"', '"type":', '"operation"')
@@ -845,6 +848,13 @@ def _format_results(results: list[dict]) -> str:
         is_rule = r.get("memory_class") == "rule"
         max_len = 300 if (rank == 0 or is_rule) else 200
         content = r.get("content", "")
+        # Injection defense (PR2): strip any leaked <external-content> boundary
+        # markers from BOTH first-party and KB hits, so raw markers never reach
+        # the model. External-world hits keep their soft `KB·source` label below
+        # (this line-oriented one-per-hint format can't carry a multi-line
+        # structural wrapper — the full-content MCP/expand paths do that).
+        from genesis.security.sanitizer import strip_boundary_markers
+        content = strip_boundary_markers(content)
         # Strip extraction-pipeline prefixes like [discovery], [feature], etc.
         # These are baked into stored content but waste display chars.
         if content.startswith("[") and "] " in content[:30]:

@@ -14,6 +14,8 @@ import json
 import logging
 from dataclasses import dataclass, field
 
+from genesis.memory.provenance import wrap_external_recall
+
 logger = logging.getLogger(__name__)
 
 # 41_resume_review_pass1 — structural analysis pass (no knowledge augmentation).
@@ -207,17 +209,26 @@ class ResumeReviewer:
             seen: set[str] = set()
             context_parts: list[str] = []
 
+            # Injection defense (PR2): this is a source="knowledge" recall +
+            # KB FTS — every hit is external-world. Wrap both the vector
+            # (`r.content`) and FTS (`body`) branches before they enter the
+            # review LLM prompt so payloads are treated as data, not instructions.
             for r in results:
                 if r.memory_id not in seen:
                     seen.add(r.memory_id)
-                    context_parts.append(f"[Knowledge: {r.source}]\n{r.content}")
+                    wrapped = wrap_external_recall(
+                        r.content, source_pipeline=getattr(r, "source_pipeline", None),
+                    )
+                    context_parts.append(f"[Knowledge: {r.source}]\n{wrapped}")
 
             for fts in fts_results:
                 uid = fts["unit_id"]
                 if uid not in seen:
                     seen.add(uid)
                     concept = fts.get("concept", "")
-                    body = fts.get("body", "")
+                    body = wrap_external_recall(
+                        fts.get("body", ""), source_pipeline=fts.get("source_pipeline"),
+                    )
                     context_parts.append(f"[Knowledge: {concept}]\n{body}")
 
             return "\n\n---\n\n".join(context_parts[:20])
