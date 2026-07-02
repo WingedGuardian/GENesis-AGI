@@ -374,6 +374,7 @@ body {
     .monitor-grid { grid-template-columns: 1fr; }
 }
 </style>
+  <script src="/js/voice-nav.js"></script>
 </head>
 <body>
 
@@ -382,6 +383,7 @@ body {
     <a href="/genesis/logs">Event Log</a>
     <a href="/genesis/errors">Error Log</a>
     <a href="/genesis/monitor" class="active">Neural Monitor</a>
+    <a href="/genesis/voice" data-voice-nav style="display:none">Genesis Voice</a>
 </nav>
 
 <div class="header">
@@ -652,6 +654,17 @@ function updateSidePanel(data) {
             const ccColor = ccTier === 'green' ? 'color:#4ade80' : ccTier === 'orange' ? 'color:#ffe600' : ccTier === 'red' ? 'color:#ef4444' : 'color:#888';
             svcEl.appendChild(sectionRow('CC Tmp', ccTmp.cc_used_mb + 'MB / ' + ccTmp.cc_budget_mb + 'MB', ccColor));
         }
+
+        // Voice Bridge — the OPTIONAL ambient add-on. Present in the health snapshot only when
+        // configured (an absent ambient edge is omitted, not a fault), so this row self-hides otherwise.
+        const ambient = (data.infrastructure || {}).ambient;
+        if (ambient && ambient.status !== undefined) {
+            const aStatus = String(ambient.status);
+            const aColor = /healthy|ok/i.test(aStatus) ? 'color:#4ade80'
+                : /degraded/i.test(aStatus) ? 'color:#ffe600' : 'color:#ef4444';
+            const aDetail = aStatus + (ambient.latency_ms != null ? ' (' + Math.round(ambient.latency_ms) + 'ms)' : '');
+            svcEl.appendChild(sectionRow('Voice Bridge', aDetail, aColor + ';font-weight:600'));
+        }
     }
 
     // Infrastructure
@@ -661,6 +674,7 @@ function updateSidePanel(data) {
         infraEl.replaceChildren();
         for (const [name, info] of Object.entries(infra)) {
             if (name === 'cc_tmp') continue;
+            if (name === 'ambient') continue;  // shown as "Voice Bridge" in Services (above)
             const row = el('div', 'section-row');
             const labelSpan = el('span', 'label');
             const dot = el('span', 'status-dot ' + infraStatusClass(info));
