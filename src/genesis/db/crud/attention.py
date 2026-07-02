@@ -123,10 +123,18 @@ async def list_events(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+_NOTE_UNSET = object()  # sentinel: distinguishes "note not provided" from "note set to None (clear)"
+
+
 async def update_acceptance_signal(
-    db: aiosqlite.Connection, event_id: str, signal: str,
+    db: aiosqlite.Connection, event_id: str, signal: str, note=_NOTE_UNSET,
 ) -> tuple[bool, str | None]:
-    """Write a review label. Returns ``(found, prior_signal)`` so the UI can show X->Y.
+    """Write a review label (+ an optional reviewer note). Returns ``(found, prior_signal)``
+    so the UI can show X->Y.
+
+    ``note`` is the reviewer's own one-line WHY — the reasoning that the perk decision is an
+    LLM judgment makes the point of the review (PR3d). It is SENTINEL-defaulted: omitted →
+    the existing note is preserved; passed (a string, or ``None`` to clear) → it is written.
 
     Raises ``ValueError`` for a signal outside ``LABELS`` (route maps it to 400)."""
     if signal not in LABELS:
@@ -138,9 +146,15 @@ async def update_acceptance_signal(
     if row is None:
         return (False, None)
     prior = row["acceptance_signal"]
-    await db.execute(
-        "UPDATE attention_events SET acceptance_signal = ? WHERE id = ?", (signal, event_id)
-    )
+    if note is _NOTE_UNSET:
+        await db.execute(
+            "UPDATE attention_events SET acceptance_signal = ? WHERE id = ?", (signal, event_id)
+        )
+    else:
+        await db.execute(
+            "UPDATE attention_events SET acceptance_signal = ?, acceptance_note = ? WHERE id = ?",
+            (signal, note, event_id),
+        )
     await db.commit()
     return (True, prior)
 
