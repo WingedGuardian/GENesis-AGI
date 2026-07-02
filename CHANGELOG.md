@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now catches scheduled jobs that silently stop working — running on schedule but never
+  succeeding.** Some background jobs (like the weekly self-assessment and quality calibration) could
+  fail week after week without ever showing up as "failed," because the failure counter is reset
+  every time the server restarts. Genesis now watches the gap between a job's last run and its last
+  success: if a job has been running-but-not-succeeding for more than about a week, it raises a health
+  alert that reaches your daily report and the dashboard, and the job-health view now shows a
+  `days_since_success` figure and a `stale` flag for every job.
 - **You can now start an interactive Claude Code session on a different model with one command.**
   `gmodel <name>` launches `claude` on the model you pick: a Claude tier (`gmodel opus`) runs on
   your normal Max subscription, while a roster peer (`gmodel glm-5.2`) runs on that provider's
