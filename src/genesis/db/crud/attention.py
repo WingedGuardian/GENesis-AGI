@@ -248,6 +248,22 @@ async def load_fire_records(db: aiosqlite.Connection, config_version: str) -> li
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def load_labeled_fires(db: aiosqlite.Connection, config_version: str) -> list[dict]:
+    """Value-free rows for the LABEL-SCORED calibration report (PR3c-2a): every should/shouldnt
+    -labeled event of ONE config_version. Extends ``load_fire_records``'s columns with ``score``
+    + ``clarity`` + ``acceptance_signal`` (the label). ``skip`` and unlabeled rows are excluded
+    in SQL — they are not a usable judgment and must never reach the metrics. UNPAGED.
+    Assumes ``db.row_factory = aiosqlite.Row`` (the caller sets it — see calibrate.load_labeled)."""
+    cursor = await db.execute(
+        "SELECT id, activation, score, clarity, triggers_fired, suppressors, window_ref, "
+        "acceptance_signal FROM attention_events "
+        "WHERE config_version = ? AND acceptance_signal IS NOT NULL AND acceptance_signal != 'skip' "
+        "ORDER BY ts",
+        (config_version,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def update_l15_verdict(
     db: aiosqlite.Connection, event_id: str, verdict: dict | None,
 ) -> bool:

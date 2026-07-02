@@ -218,6 +218,24 @@ async def test_load_fire_records_returns_all_rows_for_version(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_load_labeled_fires_scopes_labeled_nonskip_with_score_and_signal(tmp_path):
+    """PR3c-2a: only should/shouldnt rows of ONE version, carrying score+clarity+acceptance_signal."""
+    db = await _db(tmp_path / "g.db")
+    await crud.bulk_upsert_events(db, [
+        _row(1, utt_ids=(11,), acceptance="should", score=0.71, config_version="0.2.0-taxonomy"),
+        _row(2, utt_ids=(22,), acceptance="shouldnt", config_version="0.2.0-taxonomy"),
+        _row(3, utt_ids=(33,), acceptance="skip", config_version="0.2.0-taxonomy"),      # excluded
+        _row(4, utt_ids=(44,), acceptance=None, config_version="0.2.0-taxonomy"),        # excluded
+        _row(5, utt_ids=(55,), acceptance="should", config_version="0.1.0-default"),     # other version
+    ])
+    rows = await crud.load_labeled_fires(db, "0.2.0-taxonomy")
+    assert {r["id"] for r in rows} == {"id-1", "id-2"}                       # labeled non-skip, this version
+    r1 = next(r for r in rows if r["id"] == "id-1")
+    assert r1["acceptance_signal"] == "should" and r1["score"] == 0.71 and r1["clarity"] == 0.9
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_update_l15_verdict_backfills_even_on_labeled_row(tmp_path):
     """B3: l15_verdict is a MACHINE field — unconditional, unlike the label-guarded upsert."""
     db = await _db(tmp_path / "g.db")
