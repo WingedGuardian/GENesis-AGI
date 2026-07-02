@@ -82,16 +82,45 @@ class ShadowStoreConsumer:
         )
 
     async def flush(self) -> int:
-        """Write all buffered rows via the crud layer in one transaction; returns count."""
+        """Write all buffered rows via the crud layer; returns the upserted count.
+
+        Two passes on one connection: (1) the label-preserving upsert; (2) an unconditional
+        backfill of ``l15_verdict`` for buffered rows that carry one. Pass 2 exists because
+        pass 1's ``WHERE acceptance_signal IS NULL`` guard FREEZES a labeled row's derived
+        columns — so on a re-run WITH ``--l15``, a verdict would never reach an already-labeled
+        row without it (and those are exactly the human∩judge rows the review needs). Only
+        NON-None verdicts are backfilled, so a plain (no ``--l15``) re-run never nulls a stored
+        verdict.
+
+        The two passes COMMIT SEPARATELY (each crud call commits), so this is not one atomic
+        transaction. That is acceptable here: this is an offline, single-writer, manually-run
+        tool, and BOTH passes are idempotent — if pass 2 fails after pass 1 commits, the rows
+        are simply back in their pre-``--l15`` state (present, no verdict) and the next ``--l15``
+        run re-attaches verdicts. A failure re-raises (surfacing in the runner) after a scoped
+        log; ``self._rows`` is only cleared on success, so a caller may safely retry ``flush``."""
         if not self._rows:
             return 0
+        id_idx = attention_crud.COLUMNS.index("id")
+        verdict_idx = attention_crud.COLUMNS.index("l15_verdict")
+        verdict_rows = [
+            (r[id_idx], r[verdict_idx]) for r in self._rows if r[verdict_idx] is not None
+        ]
+        n = 0
         conn = await aiosqlite.connect(self.db_path, timeout=self.timeout_s)
         try:
             await conn.execute("PRAGMA busy_timeout=30000")
             n = await attention_crud.bulk_upsert_events(conn, self._rows)
+            if verdict_rows:
+                await attention_crud.bulk_update_l15_verdicts(conn, verdict_rows)
+        except Exception:
+            logger.exception(
+                "attention flush failed (snapshot=%s config=%s, upserted≈%d, verdicts=%d)",
+                self.snapshot_id, self.config_version, n, len(verdict_rows),
+            )
+            raise
         finally:
             await conn.close()
-        logger.info("persisted %d attention_events (snapshot=%s config=%s)",
-                    n, self.snapshot_id, self.config_version)
+        logger.info("persisted %d attention_events (snapshot=%s config=%s, verdicts=%d)",
+                    n, self.snapshot_id, self.config_version, len(verdict_rows))
         self._rows = []
         return n
