@@ -104,3 +104,26 @@ async def test_list_include_tabled_shows_them(db):
 
     kinds = sorted(f["kind"] for f in res["follow_ups"])
     assert kinds == ["follow_up", "tabled"]
+
+
+async def test_list_status_filter_excludes_tabled(db):
+    """The status_filter path (get_by_status) also excludes tabled by default."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        await follow_up_tools._impl_follow_up_create(
+            content="actionable pending", reason="r", strategy="ego_judgment",
+        )
+        # tabled items keep their status ('pending' by default), so a naive
+        # status filter would surface them without the kind exclusion.
+        await follow_up_tools._impl_follow_up_create(
+            content="tabled pending", reason="r", strategy="ego_judgment", kind="tabled",
+        )
+        res = await follow_up_tools._impl_follow_up_list(status_filter="pending")
+    kinds = [f["kind"] for f in res["follow_ups"]]
+    assert kinds == ["follow_up"]
+
+    # ...unless the caller opts in.
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        res_incl = await follow_up_tools._impl_follow_up_list(
+            status_filter="pending", include_tabled=True,
+        )
+    assert sorted(f["kind"] for f in res_incl["follow_ups"]) == ["follow_up", "tabled"]
