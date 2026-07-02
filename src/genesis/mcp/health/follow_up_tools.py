@@ -119,8 +119,14 @@ async def _impl_follow_up_create(
 async def _impl_follow_up_list(
     status_filter: str | None = None,
     limit: int = 20,
+    include_tabled: bool = False,
 ) -> dict:
-    """List follow-up items, optionally filtered by status."""
+    """List follow-up items, optionally filtered by status.
+
+    By default the tabled (someday/maybe) lane is excluded so the list and
+    counts reflect actionable work; ``tabled_count`` reports how many are
+    shelved. Pass include_tabled=True to include tabled items in the list.
+    """
     db = _get_db()
     if db is None:
         return {"error": "Database not available"}
@@ -129,17 +135,25 @@ async def _impl_follow_up_list(
         from genesis.db.crud import follow_ups
 
         if status_filter:
-            items = await follow_ups.get_by_status(db, status_filter)
+            items = await follow_ups.get_by_status(
+                db, status_filter, include_tabled=include_tabled,
+            )
         else:
-            items = await follow_ups.get_recent(db, limit=limit)
+            items = await follow_ups.get_recent(
+                db, limit=limit, include_tabled=include_tabled,
+            )
 
-        counts = await follow_ups.get_summary_counts(db)
+        counts = await follow_ups.get_summary_counts(db, include_tabled=include_tabled)
 
-        return {
+        result = {
             "follow_ups": items[:limit],
             "counts": counts,
             "total": sum(counts.values()),
         }
+        if not include_tabled:
+            all_counts = await follow_ups.get_summary_counts(db, include_tabled=True)
+            result["tabled_count"] = sum(all_counts.values()) - sum(counts.values())
+        return result
     except Exception as exc:
         logger.error("follow_up_list failed", exc_info=True)
         return {"error": f"Failed to list follow-ups: {exc}"}
@@ -341,14 +355,21 @@ async def follow_up_update(
 async def follow_up_list(
     status_filter: str = "",
     limit: int = 20,
+    include_tabled: bool = False,
 ) -> dict:
     """List follow-up items with status counts.
+
+    By default only the actionable follow_up lane is listed; the response's
+    ``tabled_count`` says how many someday/maybe items are shelved. Set
+    include_tabled=True to include tabled items in the list itself.
 
     Args:
         status_filter: Filter by status (pending, scheduled, in_progress, completed, failed, blocked). Empty for all.
         limit: Max items to return (default 20)
+        include_tabled: Include tabled (someday/maybe) items in the list. Default False.
     """
     return await _impl_follow_up_list(
         status_filter=status_filter or None,
         limit=limit,
+        include_tabled=include_tabled,
     )

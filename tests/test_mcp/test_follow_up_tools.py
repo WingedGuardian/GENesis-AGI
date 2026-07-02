@@ -71,3 +71,36 @@ async def test_update_invalid_kind_errors(db):
         res = await follow_up_tools._impl_follow_up_update(created["id"], kind="nope")
     assert "error" in res
     assert "kind" in res["error"].lower()
+
+
+async def test_list_excludes_tabled_by_default(db):
+    """follow_up_list hides tabled items from the agent view and reports them separately."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        await follow_up_tools._impl_follow_up_create(
+            content="actionable thing", reason="r", strategy="ego_judgment",
+        )
+        await follow_up_tools._impl_follow_up_create(
+            content="someday idea", reason="r", strategy="ego_judgment", kind="tabled",
+        )
+        res = await follow_up_tools._impl_follow_up_list()
+
+    kinds = [f["kind"] for f in res["follow_ups"]]
+    assert "tabled" not in kinds
+    assert res.get("tabled_count") == 1
+    # status counts + total reflect actionable items only (the tabled item is pending)
+    assert res["total"] == 1
+
+
+async def test_list_include_tabled_shows_them(db):
+    """Opting in surfaces tabled items alongside actionable ones."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        await follow_up_tools._impl_follow_up_create(
+            content="actionable thing", reason="r", strategy="ego_judgment",
+        )
+        await follow_up_tools._impl_follow_up_create(
+            content="someday idea", reason="r", strategy="ego_judgment", kind="tabled",
+        )
+        res = await follow_up_tools._impl_follow_up_list(include_tabled=True)
+
+    kinds = sorted(f["kind"] for f in res["follow_ups"])
+    assert kinds == ["follow_up", "tabled"]
