@@ -81,10 +81,17 @@ _JUDGE_EXPECTED: dict[TaskType, str] = {
         "and references actual procedures or patterns."
     ),
     TaskType.GAP_CLUSTERING: (
-        "A clustered analysis of knowledge or capability gaps — coherent themes "
-        "grouped from underlying signals, each described specifically. Good output "
-        "is a structured set of real, distinguishable gap clusters, not a flat "
-        "generic list."
+        # Matches the executor's actual task (executor.py GAP_CLUSTERING prompt:
+        # "cluster recent unresolved observations into themes ... recurring
+        # patterns that suggest systemic issues"). An earlier draft graded against
+        # "knowledge/capability gaps", which false-hollowed correct systemic-issue
+        # theme clusterings — corrected 2026-07-01 from the calibration probe.
+        "A clustered analysis that groups recent unresolved observations into "
+        "recurring themes — patterns that suggest systemic issues rather than "
+        "one-off events. Good output is a structured set of real, distinguishable "
+        "themes (e.g. 'Theme 1: ...'), each named and supported with specific "
+        "evidence from the observations. A flat list of individual signals, or a "
+        "single one-off diagnostic that does not cluster, is not good output."
     ),
     TaskType.SELF_UNBLOCK: (
         "Concrete steps or a diagnosis to unblock a stuck goal or task. Good output "
