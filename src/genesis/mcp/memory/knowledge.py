@@ -838,13 +838,18 @@ async def resume_review(
     source_path = Path(resume_source)
     if source_path.exists():
         if source_path.suffix.lower() == ".pdf":
-            import pymupdf
-
-            doc = pymupdf.open(str(source_path))
-            resume_text = "\n\n".join(
-                page.get_text().strip() for page in doc if page.get_text().strip()
+            # Extract via the crash/hang-isolated pool (PyMuPDF is not
+            # thread-safe and can crash on adversarial PDFs). Return a
+            # structured error rather than throwing through the MCP boundary.
+            from genesis.knowledge.pdf_extract import (
+                PDFExtractionError,
+                extract_pdf_text,
             )
-            doc.close()
+
+            try:
+                resume_text, _sections, _pages = await extract_pdf_text(str(source_path))
+            except PDFExtractionError as exc:
+                return {"error": f"Resume PDF could not be parsed: {exc}"}
         else:
             resume_text = source_path.read_text(encoding="utf-8", errors="replace")
 

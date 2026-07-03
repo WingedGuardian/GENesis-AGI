@@ -113,6 +113,36 @@ async def test_run_ingest_missing_upload(db):
         await run_ingest("nonexistent", project_type="pro")
 
 
+async def test_run_ingest_marks_failed_on_lookup_error(db, upload_id):
+    """A transient DB error reading the upload row must mark it failed, not strand it.
+
+    F3 regression: the early ``knowledge_uploads.get()`` sat ABOVE the try/except,
+    so a locked-DB ``OperationalError`` propagated out of ``run_ingest`` and left
+    the row stuck in 'processing' until the next server restart (recovery only runs
+    at startup). The fix wraps the lookup and marks the row 'failed' instead.
+    """
+    import sqlite3
+
+    from genesis.knowledge.ingest_upload import run_ingest
+
+    mock_rt = MagicMock()
+    mock_rt.db = db
+
+    async def raising_get(conn, uid):
+        raise sqlite3.OperationalError("database is locked")
+
+    with (
+        patch("genesis.runtime.GenesisRuntime.instance", return_value=mock_rt),
+        patch("genesis.db.crud.knowledge_uploads.get", new=raising_get),
+    ):
+        # Must NOT raise — the failure must be handled and recorded on the row.
+        await run_ingest(upload_id, project_type="pro", domain="test")
+
+    row = await knowledge_uploads.get(db, upload_id)
+    assert row["status"] == "failed"
+    assert "lookup" in (row["error_message"] or "").lower()
+
+
 # ─── injection-defense: store-as-is (no-LLM) path ──────────────────────────
 
 
