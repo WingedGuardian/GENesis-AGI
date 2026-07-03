@@ -133,6 +133,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The dashboard's per-session memory row is clearer: "Claude Code Sessions", green when healthy.** The
+  cryptic "CC" row that listed sessions as gray "cc-1 …" chips is now labeled **Claude Code Sessions**,
+  renders each healthy session in green (amber ≥ 4 GB, red ≥ 6 GB), and shows a hover tooltip explaining
+  it's per-session memory for leak detection — so "gray" no longer reads as inactive/unknown.
+
 - **The dashboard's system-health view stays responsive under load and no longer errors out when a single
   check hiccups.** Building the health snapshot used to run its systemd service checks (several `systemctl`
   calls) and a couple of file scans directly on the main event loop, so gathering health could briefly stall
