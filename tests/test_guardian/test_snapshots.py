@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -140,14 +141,20 @@ class TestSnapshotList:
         assert names == []
 
 
+def _meta(names_ages: list[tuple[str, float]]) -> list[tuple[str, datetime]]:
+    """Build (name, created_at) tuples from (name, age_in_days), newest first."""
+    now = datetime.now(UTC)
+    return [(name, now - timedelta(days=age)) for name, age in names_ages]
+
+
 class TestSnapshotPrune:
 
     @pytest.mark.asyncio
     async def test_prune_within_retention(self, manager: SnapshotManager) -> None:
-        """Should not prune when within retention limit."""
+        """A single fresh snapshot (== retention=1) is kept, nothing pruned."""
         with patch.object(
-            manager, "list_snapshots",
-            return_value=["guardian-1", "guardian-2"],
+            manager, "_list_snapshots_with_meta",
+            return_value=_meta([("guardian-1", 0.0)]),
         ):
             deleted = await manager.prune()
         assert deleted == 0
@@ -155,9 +162,9 @@ class TestSnapshotPrune:
     @pytest.mark.asyncio
     async def test_prune_over_retention(self, manager: SnapshotManager) -> None:
         """Should prune oldest snapshots past retention (1)."""
-        snapshots = [f"guardian-{i}" for i in range(3, 0, -1)]
+        snapshots = _meta([(f"guardian-{i}", float(3 - i)) for i in range(3, 0, -1)])
         with (
-            patch.object(manager, "list_snapshots", return_value=snapshots),
+            patch.object(manager, "_list_snapshots_with_meta", return_value=snapshots),
             patch(
                 "genesis.guardian.snapshots._run_subprocess",
                 _mock_subprocess(0, ""),
@@ -169,19 +176,97 @@ class TestSnapshotPrune:
     @pytest.mark.asyncio
     async def test_prune_preserves_healthy(self, manager: SnapshotManager) -> None:
         """The most recent healthy snapshot should be preserved even if old."""
-        snapshots = [
-            "guardian-6", "guardian-5", "guardian-4", "guardian-3",
-            "guardian-2", "guardian-1-healthy",  # oldest but healthy
-        ]
+        snapshots = _meta([
+            ("guardian-6", 1.0), ("guardian-5", 2.0), ("guardian-4", 3.0),
+            ("guardian-3", 4.0), ("guardian-2", 5.0),
+            ("guardian-1-healthy", 6.0),  # oldest but healthy
+        ])
+        deleted_names: list[str] = []
+
+        async def track_delete(*args, **kwargs):
+            if len(args) >= 4 and args[1] == "snapshot" and args[2] == "delete":
+                deleted_names.append(args[4])
+            return (0, "", "")
+
         with (
-            patch.object(manager, "list_snapshots", return_value=snapshots),
-            patch(
-                "genesis.guardian.snapshots._run_subprocess",
-                _mock_subprocess(0, ""),
-            ),
+            patch.object(manager, "_list_snapshots_with_meta", return_value=snapshots),
+            patch("genesis.guardian.snapshots._run_subprocess", track_delete),
         ):
             await manager.prune()
-        # guardian-1-healthy should NOT be deleted even though it's outside retention
+        assert "guardian-1-healthy" not in deleted_names
+
+    @pytest.mark.asyncio
+    async def test_prune_deletes_stale_newest_pre_recovery(
+        self, manager: SnapshotManager,
+    ) -> None:
+        """The exact incident: a guardian-pre-recovery snapshot sorts as 'newest'
+        (name suffix), so retention alone protects it forever. Age-prune must
+        delete it because it is stale AND not the latest-healthy lifeline —
+        while keeping the older healthy snapshot as the rollback lifeline."""
+        snapshots = _meta([
+            ("guardian-20260503-120000-pre-recovery", 61.0),  # stale, sorts newest
+            ("guardian-20260401-120000-healthy", 90.0),       # older, the lifeline
+        ])
+        # Sanity: sorted newest-first by name, pre-recovery is index 0.
+        assert snapshots[0][0].endswith("-pre-recovery")
+        deleted_names: list[str] = []
+
+        async def track_delete(*args, **kwargs):
+            if len(args) >= 4 and args[1] == "snapshot" and args[2] == "delete":
+                deleted_names.append(args[4])
+            return (0, "", "")
+
+        with (
+            patch.object(manager, "_list_snapshots_with_meta", return_value=snapshots),
+            patch("genesis.guardian.snapshots._run_subprocess", track_delete),
+        ):
+            await manager.prune()
+        assert "guardian-20260503-120000-pre-recovery" in deleted_names
+        assert "guardian-20260401-120000-healthy" not in deleted_names
+
+    @pytest.mark.asyncio
+    async def test_prune_keeps_aged_healthy_lifeline(self, manager: SnapshotManager) -> None:
+        """Even if the ONLY healthy snapshot is older than max_age_days, it must
+        survive — it is the offline snapshot-rollback lifeline."""
+        snapshots = _meta([
+            ("guardian-20260401-healthy", 90.0),  # 90d old but the only healthy
+        ])
+        deleted_names: list[str] = []
+
+        async def track_delete(*args, **kwargs):
+            if len(args) >= 4 and args[1] == "snapshot" and args[2] == "delete":
+                deleted_names.append(args[4])
+            return (0, "", "")
+
+        with (
+            patch.object(manager, "_list_snapshots_with_meta", return_value=snapshots),
+            patch("genesis.guardian.snapshots._run_subprocess", track_delete),
+        ):
+            await manager.prune()
+        assert deleted_names == []
+
+
+class TestSnapshotExpiryPolicy:
+
+    @pytest.mark.asyncio
+    async def test_enforce_expiry_sets_incus_config(self, manager: SnapshotManager) -> None:
+        """enforce_expiry_policy sets snapshots.expiry (scheduled-only) on the container."""
+        calls: list[tuple] = []
+
+        async def record(*args, **kwargs):
+            calls.append(args)
+            return (0, "", "")
+
+        with patch("genesis.guardian.snapshots._run_subprocess", record):
+            ok = await manager.enforce_expiry_policy()
+        assert ok is True
+        assert any(
+            a[:4] == ("incus", "config", "set", manager._container)
+            and "snapshots.expiry" in a
+            for a in calls
+        )
+        # Must NOT set snapshots.expiry.manual (would expire user snapshots).
+        assert not any("snapshots.expiry.manual" in a for a in calls)
 
 
 class TestMarkHealthy:

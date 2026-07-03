@@ -200,6 +200,11 @@ async def run_check(config: GuardianConfig | None = None) -> None:
 
     try:
         await _check_cycle(config, sm, dispatcher, snapshots, diagnosis_engine, recovery_engine)
+        # Snapshot lifecycle maintenance runs regardless of resulting state —
+        # a guardian stuck in confirmed_dead/recovering for weeks must still
+        # enforce expiry + prune stale snapshots (the incident: prune only ran
+        # in HEALTHY, so it never fired while the pool silently filled).
+        await _maintain_snapshots(config, snapshots)
         # Heartbeat means "Guardian process is alive and watching" —
         # NOT "Genesis container is healthy". Any successful check cycle
         # (regardless of resulting state) should refresh liveness. A
@@ -307,8 +312,27 @@ async def _handle_healthy(
     """Actions when all probes are healthy."""
     # Heartbeat is written by run_check after each successful check cycle,
     # regardless of state outcome, so HEALTHY no longer needs a direct call.
+    # Snapshot lifecycle maintenance moved to _maintain_snapshots (called from
+    # run_check for ALL states, not only HEALTHY).
 
-    # Periodic snapshot pruning (don't prune every check — too expensive)
+
+async def _maintain_snapshots(
+    config: GuardianConfig,
+    snapshots: SnapshotManager,
+) -> None:
+    """Enforce snapshot expiry policy and prune, on a daily cadence.
+
+    Runs after every check cycle regardless of guardian state. Expiry
+    enforcement is cheap+idempotent; prune (list+delete) is throttled to once
+    per 24h via a marker to avoid per-tick cost.
+    """
+    # Idempotent, cheap — keep incus daemon-side expiry in force every cycle so
+    # the guardian-independent safety net survives even a wedged guardian.
+    try:
+        await snapshots.enforce_expiry_policy()
+    except Exception:
+        logger.warning("enforce_expiry_policy failed", exc_info=True)
+
     prune_marker = config.state_path / ".last_prune"
     should_prune = True
     if prune_marker.exists():
@@ -320,9 +344,12 @@ async def _handle_healthy(
             should_prune = True
 
     if should_prune:
-        pruned = await snapshots.prune()
-        if pruned > 0:
-            logger.info("Pruned %d old snapshots", pruned)
+        try:
+            pruned = await snapshots.prune()
+            if pruned > 0:
+                logger.info("Pruned %d old snapshots", pruned)
+        except Exception:
+            logger.warning("Snapshot prune failed", exc_info=True)
         prune_marker.parent.mkdir(parents=True, exist_ok=True)
         prune_marker.write_text(datetime.now(UTC).isoformat())
 

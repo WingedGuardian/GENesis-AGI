@@ -13,6 +13,7 @@ from genesis.guardian.check import (
     _handle_cc_resolved,
     _handle_confirmed_dead,
     _handle_healthy,
+    _maintain_snapshots,
     _write_guardian_heartbeat,
     run_check,
 )
@@ -94,13 +95,47 @@ class TestHandleHealthy:
         mock_hb.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_handle_healthy_no_longer_prunes(self, config: GuardianConfig) -> None:
+        """Prune moved to _maintain_snapshots (runs for ALL states)."""
+        snapshots = MagicMock()
+        snapshots.prune = AsyncMock(return_value=0)
+        snapshots.enforce_expiry_policy = AsyncMock(return_value=True)
+
+        await _handle_healthy(config, snapshots)
+        snapshots.prune.assert_not_called()
+
+
+class TestMaintainSnapshots:
+
+    @pytest.mark.asyncio
     async def test_prunes_when_due(self, config: GuardianConfig) -> None:
         snapshots = MagicMock()
         snapshots.prune = AsyncMock(return_value=2)
+        snapshots.enforce_expiry_policy = AsyncMock(return_value=True)
 
-        await _handle_healthy(config, snapshots)
-        # Should attempt prune (no marker file exists = overdue)
+        await _maintain_snapshots(config, snapshots)
+        # No marker file exists = overdue → prune runs; expiry always enforced.
         snapshots.prune.assert_called_once()
+        snapshots.enforce_expiry_policy.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_enforces_expiry_even_when_prune_not_due(
+        self, config: GuardianConfig,
+    ) -> None:
+        """Expiry enforcement is cheap+idempotent → every cycle, even if the
+        24h prune throttle says skip."""
+        from datetime import UTC, datetime
+        marker = config.state_path / ".last_prune"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(datetime.now(UTC).isoformat())  # fresh → prune not due
+
+        snapshots = MagicMock()
+        snapshots.prune = AsyncMock(return_value=0)
+        snapshots.enforce_expiry_policy = AsyncMock(return_value=True)
+
+        await _maintain_snapshots(config, snapshots)
+        snapshots.enforce_expiry_policy.assert_called_once()
+        snapshots.prune.assert_not_called()
 
 
 class TestRunCheck:

@@ -54,6 +54,14 @@ snapshots:
   prefix: "guardian-"
   take_pre_recovery: false
   max_pool_usage_pct: 80
+  # Age-prune backstop: delete guardian-* snapshots older than this many days,
+  # except the newest and the latest healthy (the rollback lifeline). Catches
+  # stale guardian-pre-recovery snapshots that retention alone can protect
+  # indefinitely as the "newest".
+  max_age_days: 14
+  # incus daemon-side auto-expiry of scheduled snapshots (guardian-independent
+  # safety net). Empty string disables. NOT applied to manual snapshots.
+  expiry: "2w"
 
 recovery:
   verification_delay_s: 30

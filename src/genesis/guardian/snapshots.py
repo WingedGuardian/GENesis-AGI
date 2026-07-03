@@ -9,12 +9,34 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+import re
+from datetime import UTC, datetime, timedelta
 
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.config import GuardianConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_created_at(raw: object) -> datetime | None:
+    """Parse an incus snapshot `created_at` into an aware UTC datetime.
+
+    incus emits RFC3339 (often with a `Z` suffix and up to nanosecond
+    fractional seconds, which Python's fromisoformat can't take). Returns None
+    on absent/unparseable values → the snapshot is treated as unknown-age and
+    is never age-pruned (retention still applies).
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    s = raw.strip()
+    # Truncate fractional seconds to 6 digits (drop nanosecond precision).
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s)
+    s = s.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
 class SnapshotManager:
@@ -225,8 +247,12 @@ class SnapshotManager:
         logger.info("Restored snapshot: %s", name)
         return True
 
-    async def list_snapshots(self) -> list[str]:
-        """List all guardian snapshots, newest first."""
+    async def _list_snapshots_with_meta(self) -> list[tuple[str, datetime | None]]:
+        """List guardian snapshots as (name, created_at), newest-first by name.
+
+        created_at is None when incus omits it or it can't be parsed (such
+        snapshots are never age-pruned — only retention applies).
+        """
         rc, stdout, stderr = await _run_subprocess(
             "incus", "snapshot", "list", self._container, "--format", "json",
             timeout=30.0,
@@ -237,34 +263,64 @@ class SnapshotManager:
 
         try:
             snapshots = json.loads(stdout)
-            names = [
-                s.get("name", "")
-                for s in snapshots
-                if isinstance(s, dict)
-                and s.get("name", "").startswith(self._prefix)
-            ]
-            # Sort by name (contains timestamp) — newest first
-            names.sort(reverse=True)
-            return names
         except (json.JSONDecodeError, TypeError) as exc:
             logger.warning("Failed to parse snapshot list: %s", exc)
             return []
 
+        result: list[tuple[str, datetime | None]] = [
+            (s.get("name", ""), _parse_created_at(s.get("created_at")))
+            for s in snapshots
+            if isinstance(s, dict) and s.get("name", "").startswith(self._prefix)
+        ]
+        # Sort by name (contains timestamp) — newest first
+        result.sort(key=lambda t: t[0], reverse=True)
+        return result
+
+    async def list_snapshots(self) -> list[str]:
+        """List all guardian snapshots, newest first."""
+        return [name for name, _ in await self._list_snapshots_with_meta()]
+
     async def prune(self) -> int:
-        """Delete oldest snapshots past retention limit. Returns count deleted."""
-        snapshots = await self.list_snapshots()
-        if len(snapshots) <= self._retention:
+        """Prune guardian snapshots. Returns count deleted.
+
+        Two independent rules, unioned:
+        - **Retention**: keep the newest ``retention`` + the most-recent healthy;
+          delete the rest.
+        - **Age**: delete anything older than ``max_age_days`` that is NOT the
+          most-recent healthy snapshot — *even if it currently sorts as the
+          "newest"*. This is the incident backstop: a stale
+          ``guardian-pre-recovery`` snapshot sorts newest by name suffix and
+          would otherwise be protected by retention forever, accumulating CoW
+          divergence. The most-recent healthy snapshot is always exempt — it is
+          the offline snapshot-rollback lifeline.
+        """
+        meta = await self._list_snapshots_with_meta()
+        if not meta:
             return 0
 
-        # Always keep the most recent "healthy" snapshot
-        healthy = [s for s in snapshots if s.endswith("-healthy")]
-        to_keep = set(snapshots[:self._retention])
-        if healthy:
-            to_keep.add(healthy[0])  # most recent healthy
+        names = [name for name, _ in meta]
+        healthy = [n for n in names if n.endswith("-healthy")]
+        latest_healthy = healthy[0] if healthy else None
 
-        to_delete = [s for s in snapshots if s not in to_keep]
+        # Retention rule: keep newest N + latest healthy.
+        to_keep = set(names[:self._retention])
+        if latest_healthy:
+            to_keep.add(latest_healthy)
+        to_delete = {n for n in names if n not in to_keep}
+
+        # Age rule: delete stale snapshots (except the healthy lifeline),
+        # including a stale "newest" non-healthy snapshot that retention keeps.
+        max_age_days = self._config.snapshots.max_age_days
+        if max_age_days > 0:
+            cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+            for name, created in meta:
+                if name == latest_healthy:
+                    continue  # never delete the rollback lifeline
+                if created is not None and created < cutoff:
+                    to_delete.add(name)
+
         deleted = 0
-        for name in to_delete:
+        for name in sorted(to_delete):
             rc, _, stderr = await _run_subprocess(
                 "incus", "snapshot", "delete", self._container, name,
                 timeout=120.0,
@@ -276,6 +332,30 @@ class SnapshotManager:
                 logger.warning("Failed to prune snapshot %s: %s", name, stderr)
 
         return deleted
+
+    async def enforce_expiry_policy(self) -> bool:
+        """Idempotently set incus ``snapshots.expiry`` on the container.
+
+        This makes the incus daemon auto-delete aged SCHEDULED snapshots even if
+        the guardian process is dead — a guardian-independent safety net layered
+        under :meth:`prune`. Deliberately does NOT set ``snapshots.expiry.manual``
+        (that is instance-wide and would silently expire snapshots the user
+        creates by hand; guardian-prefixed snapshots are handled by age-prune).
+        Returns True when the policy was applied (or intentionally skipped).
+        """
+        expiry = self._config.snapshots.expiry
+        if not expiry:
+            return False
+        rc, _, stderr = await _run_subprocess(
+            "incus", "config", "set", self._container,
+            "snapshots.expiry", expiry,
+            timeout=10.0,
+        )
+        if rc != 0:
+            logger.warning("Failed to set snapshots.expiry=%s: %s", expiry, stderr)
+            return False
+        logger.debug("Enforced snapshots.expiry=%s on %s", expiry, self._container)
+        return True
 
     async def mark_healthy(
         self, snapshot_size_history: list[int] | None = None,

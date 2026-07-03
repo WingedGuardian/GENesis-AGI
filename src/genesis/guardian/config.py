@@ -109,6 +109,17 @@ class SnapshotConfig:
     take_pre_recovery: bool = True  # Take snapshot before recovery action
     max_pool_usage_pct: float = 80.0  # Fallback threshold if headroom check unavailable
     min_headroom_gb: float = 5.0  # Minimum free space floor for headroom check
+    # Age-based prune: delete guardian-* snapshots older than this many days,
+    # regardless of retention count — EXCEPT the newest and the latest healthy
+    # (the offline snapshot-rollback lifeline). Backstops the incident where
+    # stale guardian-pre-recovery snapshots accumulated CoW divergence for months.
+    max_age_days: int = 14
+    # incus `snapshots.expiry` — daemon-side auto-deletion of SCHEDULED snapshots
+    # after this interval (units: s/m/h/d/w/M/y). A guardian-independent kill
+    # switch that fires even if the guardian process is dead. Deliberately does
+    # NOT set `snapshots.expiry.manual` (instance-wide; would expire snapshots
+    # the user creates by hand). Empty string disables enforcement.
+    expiry: str = "2w"
 
 
 @dataclass
