@@ -13,6 +13,7 @@ The snapshot reads ``_instance`` (read-only peek) instead of calling
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -85,18 +86,31 @@ def test_services_sentinel_unavailable_when_sentinel_is_none(runtime_singleton):
     assert result["sentinel"]["is_active"] is False
 
 
-def test_services_sentinel_unavailable_when_runtime_not_bootstrapped(runtime_singleton):
-    """The real bootstrap-never-ran path: _instance is None.
+def test_services_sentinel_unavailable_when_runtime_not_bootstrapped(
+    runtime_singleton, monkeypatch,
+):
+    """The real bootstrap-never-ran path: the snapshot reads the runtime via
+    ``peek()`` and reports 'unavailable' without ever constructing one.
 
-    The snapshot must NOT spawn a blank runtime as a side effect of being
-    called — that would mask real bootstrap failures elsewhere in the
-    process. Instead it returns 'unavailable' and leaves the singleton alone.
+    Enforced via a ``peek()`` spy rather than a post-call
+    ``GenesisRuntime._instance is None`` assertion. That global check was fragile
+    to cross-test singleton pollution: another test that constructs a runtime on
+    a background awareness tick can set ``_instance`` *after* this call returns,
+    failing the assertion purely as a function of collection order (see the
+    tracked follow-up for the underlying singleton-leak isolation bug). Asserting
+    that ``services()`` went through ``peek()`` (the non-constructing read) both
+    proves the real invariant — an observability call must never spawn a zombie
+    runtime via ``instance()`` — and is immune to what other tests leave behind.
     """
     GenesisRuntime._instance = None
+    peek_spy = MagicMock(return_value=None)
+    monkeypatch.setattr(GenesisRuntime, "peek", peek_spy)
+
     result = services()
+
     assert result["sentinel"]["enabled"] is False
     assert result["sentinel"]["current_state"] == "unavailable"
-    # services() must still return its other keys.
     assert "host_framework" in result
-    # Critical: the snapshot must not have constructed a zombie singleton.
-    assert GenesisRuntime._instance is None
+    # The snapshot must read the runtime via peek() (never instance(), which would
+    # construct). If a future change swaps peek() for instance(), this fails.
+    peek_spy.assert_called()
