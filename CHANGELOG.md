@@ -407,6 +407,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   (dry-run by default) re-parses the previously mangled entries into proper knowledge units and removes
   the junk ones.
 
+- **Fresh installs and repairs now get scheduled housekeeping running without a manual step.** The
+  bootstrap script rendered Genesis's systemd timer units (watchdog health check, daily disk hygiene)
+  but never enabled them, so on a new machine — or after a repair re-render — the timers sat installed
+  yet dead until something else switched them on. Bootstrap now enables and starts the housekeeping
+  timers idempotently, right after the render pass; environments without systemd are unaffected. The
+  backup timer is deliberately left for you to enable after configuring backups (passphrase + verify
+  run), so it is not auto-started here.
+
 - **The dashboard's per-session memory row is clearer: "Claude Code Sessions", green when healthy.** The
   cryptic "CC" row that listed sessions as gray "cc-1 …" chips is now labeled **Claude Code Sessions**,
   renders each healthy session in green (amber ≥ 4 GB, red ≥ 6 GB), and shows a hover tooltip explaining
