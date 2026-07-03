@@ -27,25 +27,21 @@ def _mocks(monkeypatch):
     return create, resolve
 
 
-class _FakeCursor:
-    def __init__(self, count: int):
-        self._count = count
-
-    async def fetchone(self):
-        return (self._count,)
-
-
 class _FakeDB:
-    """Minimal async db whose COUNT(*) query returns a controllable value."""
+    """Minimal async db whose COUNT(*) fetch returns a controllable value.
+
+    The detector counts via observations.count_recent_unresolved_by_type_and_source,
+    which uses execute_fetchall — so that's what the fake implements.
+    """
 
     def __init__(self, count: int, *, raise_on_execute: bool = False):
         self._count = count
         self._raise = raise_on_execute
 
-    async def execute(self, *args, **kwargs):
+    async def execute_fetchall(self, *args, **kwargs):
         if self._raise:
             raise RuntimeError("db error")
-        return _FakeCursor(self._count)
+        return [(self._count,)]
 
     async def commit(self):
         pass

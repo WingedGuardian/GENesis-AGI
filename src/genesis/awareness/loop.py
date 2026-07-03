@@ -231,14 +231,9 @@ async def _check_cc_cap_detection(db) -> None:
     # recovery.
     try:
         cutoff = (datetime.now(UTC) - timedelta(minutes=_CAP_EMPTY_WINDOW_MIN)).isoformat()
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM observations "
-            "WHERE type = 'cc_cap_empty_event' AND source = 'cc_cap_monitor' "
-            "AND created_at > ? AND resolved = 0",
-            (cutoff,),
+        count = await observations.count_recent_unresolved_by_type_and_source(
+            db, type="cc_cap_empty_event", source="cc_cap_monitor", since=cutoff,
         )
-        row = await cur.fetchone()
-        count = row[0] if row else 0
 
         if count < _CAP_EMPTY_THRESHOLD:
             # Recovery: clear any outstanding cap alert so it doesn't linger for its

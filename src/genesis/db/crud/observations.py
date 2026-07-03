@@ -728,3 +728,24 @@ async def count_unresolved_by_types(
     )
     row = rows[0] if rows else None
     return row[0] if row else 0
+
+
+async def count_recent_unresolved_by_type_and_source(
+    db: aiosqlite.Connection,
+    *,
+    type: str,
+    source: str,
+    since: str,
+) -> int:
+    """Count unresolved observations of a type+source created after ``since`` (ISO).
+
+    Used by the awareness silent-cap detector to count recent
+    ``cc_cap_empty_event`` telemetry rows without embedding raw SQL in the loop.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM observations "
+        "WHERE type = ? AND source = ? AND created_at > ? AND resolved = 0",
+        (type, source, since),
+    )
+    row = rows[0] if rows else None
+    return row[0] if row else 0
