@@ -120,6 +120,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Re-ingesting a knowledge source with changed content now refreshes it instead of serving the stale
+  version.** Previously, once a file or URL was ingested, re-ingesting the same source was skipped on source
+  identity alone — so if the underlying content changed, the knowledge base kept serving the old distilled
+  version indefinitely. Re-ingestion now compares a content fingerprint and re-distills when the content has
+  actually changed (unchanged content is still skipped, and a now-unreachable source falls back to its
+  previously cached version).
+
 - **The dead-letter-queue alert no longer cries wolf on self-healing bursts.** A short burst of low-value
   retry items (e.g. memory-relevance grades, which are discarded within an hour by design) could push the queue
   past its alert threshold and fire a *critical* notification for something that clears itself minutes later.
