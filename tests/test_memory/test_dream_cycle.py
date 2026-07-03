@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -11,15 +12,20 @@ from genesis.memory.dream_cycle import (
     _CAPACITY_ABORT_THRESHOLD,
     MAX_BUCKET_SIZE,
     MAX_CLUSTER_SIZE,
+    WORKLIST_WORK_TYPE,
     _build_synthesis_prompt,
     _CapacityBreaker,
     _parse_synthesis_response,
+    _persist_worklist,
+    _rank_and_cap_clusters,
     _read_mem_available_mb,
     _size_distribution,
     _synthesize_clusters,
     _UnionFind,
     run,
+    run_synthesis_drain,
 )
+from genesis.resilience.deferred_work import DeferredWorkQueue
 
 
 def _fake_cluster(n: int = 2, wing: str = "memory", room: str = "store"):
@@ -249,7 +255,7 @@ class TestSizeDistribution:
 class TestDryRun:
     @pytest.mark.asyncio
     async def test_dry_run_returns_report_without_changes(self):
-        """Dry run computes clusters but doesn't write anything."""
+        """Dry run clusters + persists the worklist but stores no memories."""
         mock_qdrant = MagicMock()
         mock_db = AsyncMock()
         mock_router = AsyncMock()
@@ -257,7 +263,12 @@ class TestDryRun:
 
         with patch(_SCROLL) as mock_scroll, \
              patch(_SEARCH) as mock_search, \
-             patch(_BATCH_VEC) as mock_vec:
+             patch(_BATCH_VEC) as mock_vec, \
+             patch(
+                 "genesis.memory.dream_cycle._persist_worklist",
+                 new_callable=AsyncMock,
+                 return_value={"enqueued": 1, "oversize_flagged": 0, "superseded": 0},
+             ) as mock_persist:
             mock_scroll.return_value = (
                 [
                     {"id": "p1", "payload": {"wing": "memory", "room": "store", "content": "fact A", "confidence": 0.9}},
@@ -280,7 +291,13 @@ class TestDryRun:
 
         assert report["dry_run"] is True
         assert report["clusters_found"] >= 1
-        assert report["clusters_merged"] == 0
+        # Worklist maintenance runs in ALL modes — clustering + enqueue IS the
+        # weekly job; the merge decision is gated on the drain side.
+        mock_persist.assert_awaited_once()
+        assert report["worklist_enqueued"] == 1
+        # Synthesis-outcome keys moved to the drain report — a permanent
+        # "0 merged" here must not masquerade as a synthesis result.
+        assert "clusters_merged" not in report
         # Consolidation must not write any new memories in dry_run
         mock_store.store.assert_not_called()
         # Note: Sprint 2 phases (link repair, entity resolution, etc.) may
@@ -288,105 +305,277 @@ class TestDryRun:
         # The key assertion is that no synthesized memories were stored.
 
 
-class TestLiveRun:
+class TestSynthesizeClustersSkipsLarge:
     @pytest.mark.asyncio
-    async def test_live_run_synthesizes_and_deprecates(self):
-        """Live run calls LLM, stores synthesis, deprecates originals."""
-        mock_qdrant = MagicMock()
-        mock_db = AsyncMock()
-        mock_db.execute = AsyncMock()
-        mock_db.commit = AsyncMock()
-        mock_router = AsyncMock()
-        mock_store = AsyncMock()
-        mock_store.store = AsyncMock(return_value="new-synth-id")
-        mock_store.linker = None
+    async def test_oversize_cluster_skipped_no_llm(self):
+        """Defense-in-depth: even if an oversize cluster reaches synthesis
+        (worklist excludes them at enqueue), it is skipped without LLM calls."""
+        router = AsyncMock()
+        report = _fresh_report()
+        await _synthesize_clusters(
+            [_fake_cluster(MAX_CLUSTER_SIZE + 2)],
+            run_id="t", qdrant=MagicMock(), db=AsyncMock(),
+            router=router, store=AsyncMock(),
+            max_merges=100, max_cluster_size=MAX_CLUSTER_SIZE, report=report,
+        )
+        assert report["clusters_skipped_large"] == 1
+        assert report["clusters_merged"] == 0
+        router.route_call.assert_not_called()
 
-        synthesis_json = json.dumps({
-            "content": "Merged fact A+B",
-            "tags": ["test"],
-            "confidence": 0.9,
-            "memory_class": "fact",
-            "wing": "memory",
-            "room": "store",
-            "synthesis_notes": "combined",
-        })
-        adversarial_json = json.dumps({"verdict": "PASS"})
-        mock_router.route_call = AsyncMock(
-            side_effect=[
-                MagicMock(success=True, content=synthesis_json),
-                MagicMock(success=True, content=adversarial_json),
-            ],
+
+# ── Worklist persistence (weekly → queue) ───────────────────────────────
+
+
+def _clusters_of_sizes(*sizes: int):
+    return [_fake_cluster(n, room=f"r{i}") for i, n in enumerate(sizes)]
+
+
+class TestWorklist:
+    @pytest.mark.asyncio
+    async def test_enqueues_value_ordered_and_supersedes(self, db):
+        """Slices drain biggest-first; a fresh weekly run replaces the old list."""
+        queue = DeferredWorkQueue(db)
+        result = await _persist_worklist(
+            db, _clusters_of_sizes(2, 5, 3), weekly_run_id="week-1",
+        )
+        assert result == {"enqueued": 3, "oversize_flagged": 0, "superseded": 0}
+        assert await queue.count_pending(work_type=WORKLIST_WORK_TYPE) == 3
+
+        # FIFO-within-priority == enqueue order == size desc
+        first = await queue.next_pending(work_type=WORKLIST_WORK_TYPE)
+        payload = json.loads(first["payload_json"])
+        assert len(payload["member_ids"]) == 5
+        assert payload["weekly_run_id"] == "week-1"
+        assert payload["value_score"] == 5
+
+        # A fresh weekly re-cluster is authoritative: old rows deleted
+        result2 = await _persist_worklist(
+            db, _clusters_of_sizes(4), weekly_run_id="week-2",
+        )
+        assert result2["superseded"] == 3
+        assert await queue.count_pending(work_type=WORKLIST_WORK_TYPE) == 1
+        only = await queue.next_pending(work_type=WORKLIST_WORK_TYPE)
+        assert json.loads(only["payload_json"])["weekly_run_id"] == "week-2"
+
+    @pytest.mark.asyncio
+    async def test_top_k_cap(self, db):
+        """Only the top-K by value are persisted; the tail is dropped."""
+        queue = DeferredWorkQueue(db)
+        result = await _persist_worklist(
+            db, _clusters_of_sizes(2, 6, 3, 5, 4), weekly_run_id="w", cap=3,
+        )
+        assert result["enqueued"] == 3
+        sizes = []
+        for _ in range(3):
+            item = await queue.next_pending(work_type=WORKLIST_WORK_TYPE)
+            sizes.append(json.loads(item["payload_json"])["value_score"])
+            await queue.mark_completed(item["id"])
+        assert sizes == [6, 5, 4]
+
+    @pytest.mark.asyncio
+    async def test_oversize_excluded_and_flagged(self, db):
+        """Clusters > MAX_CLUSTER_SIZE never enter the worklist (FM-1) — they
+        would rank FIRST (size desc) yet be unmergeable, wasting drain budget
+        weekly and making shadow reports unfaithful to live behavior."""
+        queue = DeferredWorkQueue(db)
+        clusters = [_fake_cluster(MAX_CLUSTER_SIZE + 3), _fake_cluster(3)]
+        result = await _persist_worklist(db, clusters, weekly_run_id="w")
+        assert result["enqueued"] == 1
+        assert result["oversize_flagged"] == 1
+        item = await queue.next_pending(work_type=WORKLIST_WORK_TYPE)
+        assert len(json.loads(item["payload_json"])["member_ids"]) == 3
+
+    def test_rank_and_cap_excludes_oversize(self):
+        ranked = _rank_and_cap_clusters(
+            _clusters_of_sizes(12, 4, 2), cap=10, max_cluster_size=10,
+        )
+        assert [len(c) for c in ranked] == [4, 2]
+
+
+# ── Daily synthesis drain ────────────────────────────────────────────────
+
+
+def _drain_qdrant(points_by_id: dict[str, dict]):
+    """Qdrant mock for the drain: healthy preflight + batch retrieve that
+    returns only the ids present in ``points_by_id`` (Qdrant semantics)."""
+    q = MagicMock()
+
+    def _retrieve(*, collection_name, ids, with_payload, with_vectors):
+        return [
+            SimpleNamespace(id=i, payload=points_by_id[i])
+            for i in ids if i in points_by_id
+        ]
+
+    q.retrieve = MagicMock(side_effect=_retrieve)
+    return q
+
+
+def _live_points(cluster) -> dict[str, dict]:
+    return {item["id"]: dict(item["payload"]) for item in cluster}
+
+
+class TestSynthesisDrain:
+    @pytest.mark.asyncio
+    async def test_shadow_reports_would_merge_without_mutation(self, db):
+        """SHADOW exercises the full queue lifecycle: no LLM, no writes."""
+        clusters = _clusters_of_sizes(3, 2)
+        await _persist_worklist(db, clusters, weekly_run_id="w")
+        points = {**_live_points(clusters[0]), **_live_points(clusters[1])}
+        router = AsyncMock()
+        store = AsyncMock()
+
+        report = await run_synthesis_drain(
+            qdrant=_drain_qdrant(points), db=db, router=router, store=store,
+            budget=10, dry_run=True,
         )
 
-        with patch(_SCROLL) as mock_scroll, \
-             patch(_SEARCH) as mock_search, \
-             patch(_BATCH_VEC) as mock_vec, \
-             patch(_UPDATE) as mock_update:
-            mock_scroll.return_value = (
-                [
-                    {"id": "p1", "payload": {"wing": "memory", "room": "store", "content": "fact A", "confidence": 0.9}},
-                    {"id": "p2", "payload": {"wing": "memory", "room": "store", "content": "fact A v2", "confidence": 0.8}},
-                ],
-                None,
-            )
-            mock_search.return_value = [
-                {"id": "p2", "score": 0.92, "payload": {}},
-            ]
-            mock_vec.return_value = {"p1": [0.1] * 768, "p2": [0.1] * 768}
+        assert report["dry_run"] is True
+        assert report["drained"] == 2
+        assert report["would_merge"] == 2
+        assert report["clusters_merged"] == 0
+        router.route_call.assert_not_called()
+        store.store.assert_not_called()
+        queue = DeferredWorkQueue(db)
+        assert await queue.count_pending(work_type=WORKLIST_WORK_TYPE) == 0
 
-            report = await run(
-                qdrant=mock_qdrant,
-                db=mock_db,
-                router=mock_router,
-                store=mock_store,
-                dry_run=False,
+    @pytest.mark.asyncio
+    async def test_drain_honors_budget(self, db):
+        """At most ``budget`` slices are consumed per drain."""
+        clusters = _clusters_of_sizes(2, 2, 2, 2, 2)
+        await _persist_worklist(db, clusters, weekly_run_id="w")
+        points: dict[str, dict] = {}
+        for c in clusters:
+            points.update(_live_points(c))
+
+        report = await run_synthesis_drain(
+            qdrant=_drain_qdrant(points), db=db,
+            router=AsyncMock(), store=AsyncMock(), budget=2, dry_run=True,
+        )
+
+        assert report["drained"] == 2
+        queue = DeferredWorkQueue(db)
+        assert await queue.count_pending(work_type=WORKLIST_WORK_TYPE) == 3
+
+    @pytest.mark.asyncio
+    async def test_stale_slice_completed_not_discarded(self, db):
+        """<2 live members = normal lifecycle no-op: completed, NOT discarded —
+        discarded rows surface as failures on the dashboard errors view (FM-5)."""
+        cluster = _fake_cluster(2)
+        await _persist_worklist(db, [cluster], weekly_run_id="w")
+        points = _live_points(cluster)
+        points[cluster[0]["id"]]["deprecated"] = True  # one member deprecated
+
+        report = await run_synthesis_drain(
+            qdrant=_drain_qdrant(points), db=db,
+            router=AsyncMock(), store=AsyncMock(), budget=10, dry_run=True,
+        )
+
+        assert report["stale_skipped"] == 1
+        assert report["would_merge"] == 0
+        cursor = await db.execute(
+            "SELECT status FROM deferred_work_queue WHERE work_type = ?",
+            (WORKLIST_WORK_TYPE,),
+        )
+        rows = await cursor.fetchall()
+        assert [r["status"] for r in rows] == ["completed"]
+
+    @pytest.mark.asyncio
+    async def test_qdrant_preflight_abort_consumes_nothing(self, db):
+        """Qdrant down at drain start: abort without touching the worklist —
+        an outage must not mass-discard the week's top-value slices (FM-2)."""
+        await _persist_worklist(db, _clusters_of_sizes(2), weekly_run_id="w")
+        qdrant = MagicMock()
+        qdrant.get_collection = MagicMock(side_effect=ConnectionError("down"))
+
+        report = await run_synthesis_drain(
+            qdrant=qdrant, db=db,
+            router=AsyncMock(), store=AsyncMock(), budget=10, dry_run=True,
+        )
+
+        assert report["aborted_infra"] is True
+        assert report["drained"] == 0
+        queue = DeferredWorkQueue(db)
+        assert await queue.count_pending(work_type=WORKLIST_WORK_TYPE) == 1
+
+    @pytest.mark.asyncio
+    async def test_mid_drain_infra_error_resets_item(self, db):
+        """Qdrant dies after preflight: in-flight item goes back to pending
+        and the drain aborts — never discard on infrastructure failure (FM-2)."""
+        await _persist_worklist(db, _clusters_of_sizes(2), weekly_run_id="w")
+        qdrant = MagicMock()
+        qdrant.retrieve = MagicMock(side_effect=ConnectionError("died mid-drain"))
+
+        report = await run_synthesis_drain(
+            qdrant=qdrant, db=db,
+            router=AsyncMock(), store=AsyncMock(), budget=10, dry_run=True,
+        )
+
+        assert report["aborted_infra"] is True
+        assert report["drained"] == 0
+        queue = DeferredWorkQueue(db)
+        assert await queue.count_pending(work_type=WORKLIST_WORK_TYPE) == 1
+
+    @pytest.mark.asyncio
+    async def test_superseded_item_skipped(self, db):
+        """mark_processing returning False (row deleted by a racing weekly
+        supersede) skips the item instead of processing a ghost (FM-10)."""
+        cluster = _fake_cluster(2)
+        await _persist_worklist(db, [cluster], weekly_run_id="w")
+
+        with patch.object(
+            DeferredWorkQueue, "mark_processing",
+            new_callable=AsyncMock, return_value=False,
+        ):
+            report = await run_synthesis_drain(
+                qdrant=_drain_qdrant(_live_points(cluster)), db=db,
+                router=AsyncMock(), store=AsyncMock(), budget=3, dry_run=True,
+            )
+
+        assert report["drained"] == 0
+        assert report["would_merge"] == 0
+
+    @pytest.mark.asyncio
+    async def test_live_drain_synthesizes_and_deprecates(self, db):
+        """LIVE drain: rehydrates, calls LLM, stores synthesis, deprecates
+        originals, and completes the queue item (the old weekly live path,
+        now driven from the drain)."""
+        cluster = _fake_cluster(2)
+        await _persist_worklist(db, [cluster], weekly_run_id="w")
+
+        store = AsyncMock()
+        store.store = AsyncMock(return_value="new-synth-id")
+        store.linker = None
+        synthesis_json = json.dumps({
+            "content": "Merged fact 0 and fact 1 into one canonical record",
+            "tags": ["test"], "confidence": 0.9, "memory_class": "fact",
+            "wing": "memory", "room": "store", "synthesis_notes": "combined",
+        })
+        adversarial_json = json.dumps({"verdict": "PASS"})
+        router = AsyncMock()
+        router.route_call = AsyncMock(side_effect=[
+            MagicMock(success=True, content=synthesis_json),
+            MagicMock(success=True, content=adversarial_json),
+        ])
+
+        with patch(_UPDATE) as mock_update:
+            report = await run_synthesis_drain(
+                qdrant=_drain_qdrant(_live_points(cluster)), db=db,
+                router=router, store=store, budget=10, dry_run=False,
             )
 
         assert report["dry_run"] is False
-        assert report["clusters_merged"] >= 1
-        assert report["memories_deprecated"] >= 2
-        mock_store.store.assert_called_once()
-        assert mock_store.store.call_args[1]["source_pipeline"] == "dream_cycle"
-        # 1 for synthesized_from + 2 for deprecated originals
+        assert report["clusters_merged"] == 1
+        assert report["memories_deprecated"] == 2
+        store.store.assert_called_once()
+        assert store.store.call_args[1]["source_pipeline"] == "dream_cycle"
+        # 1 synthesized_from + 2 deprecated originals
         assert mock_update.call_count >= 3
-
-    @pytest.mark.asyncio
-    async def test_skips_large_clusters(self):
-        """Clusters > MAX_CLUSTER_SIZE are skipped."""
-        mock_qdrant = MagicMock()
-        mock_db = AsyncMock()
-        mock_router = AsyncMock()
-        mock_store = AsyncMock()
-        mock_store.linker = None
-
-        large_cluster_points = [
-            {"id": f"p{i}", "payload": {"wing": "memory", "room": "store", "content": f"fact {i}", "confidence": 0.5}}
-            for i in range(MAX_CLUSTER_SIZE + 5)
-        ]
-
-        with patch(_SCROLL) as mock_scroll, \
-             patch(_SEARCH) as mock_search, \
-             patch(_BATCH_VEC) as mock_vec:
-            mock_scroll.return_value = (large_cluster_points, None)
-            mock_search.side_effect = lambda *a, **kw: [
-                {"id": p["id"], "score": 0.95, "payload": {}}
-                for p in large_cluster_points
-            ]
-            mock_vec.return_value = {
-                p["id"]: [0.1] * 768 for p in large_cluster_points
-            }
-
-            report = await run(
-                qdrant=mock_qdrant,
-                db=mock_db,
-                router=mock_router,
-                store=mock_store,
-                dry_run=False,
-            )
-
-        assert report["clusters_skipped_large"] >= 1
-        assert report["clusters_merged"] == 0
-        mock_store.store.assert_not_called()
+        cursor = await db.execute(
+            "SELECT status FROM deferred_work_queue WHERE work_type = ?",
+            (WORKLIST_WORK_TYPE,),
+        )
+        rows = await cursor.fetchall()
+        assert [r["status"] for r in rows] == ["completed"]
 
 
 # ── Rollback ─────────────────────────────────────────────────────────────
