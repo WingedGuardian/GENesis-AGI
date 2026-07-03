@@ -31,3 +31,20 @@ async def get_stale_jobs(
         (threshold_days,),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_job_last_success(
+    db: aiosqlite.Connection, job_name: str
+) -> str | None:
+    """Return the ISO ``last_success`` timestamp for ``job_name`` (or None).
+
+    Used by the ego cadence to anchor its restart-safe boot first-fire to the
+    last time this ego actually cycled (see
+    ``EgoCadenceManager._compute_boot_first_fire``).
+    """
+    cursor = await db.execute(
+        "SELECT last_success FROM job_health WHERE job_name = ?",
+        (job_name,),
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else None

@@ -133,6 +133,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Genesis's background egos now keep their thinking rhythm across a restart instead of going quiet.**
+  The two egos run proactive cycles on an adaptive schedule that stretches out when things are idle. That
+  schedule was re-armed from scratch on every restart, so an install that restarts often (deploys, recovery)
+  could keep pushing the next cycle further out — in the worst case starving an ego for up to its full
+  backed-off interval. Each ego now anchors its first post-restart cycle to when it last actually ran: an
+  overdue ego runs shortly after startup, while an up-to-date one simply keeps its cadence.
+
 - **Uploading a large or malformed PDF to the Knowledge tab no longer freezes — or crashes — Genesis.**
   PDF text extraction used to run directly on the main event loop, so a big document could stall the whole
   server for seconds (health checks, background thinking, other requests all waited), and a corrupt or
