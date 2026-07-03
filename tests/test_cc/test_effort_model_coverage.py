@@ -19,6 +19,7 @@ hand-maintained site list.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -196,6 +197,15 @@ def _string_literal_elements(node: ast.AST) -> set[str] | None:
     return values
 
 
+def _flags_tier_literal(node: ast.AST) -> bool:
+    """True if node is a string-literal set/dict/frozenset whose elements are —
+    CASE-FOLDED — a superset of the model tokens (the hardcoded-selection
+    antipattern). Case folding matters: the routing registry used a Capitalized
+    ``{"Haiku","Sonnet","Opus"}`` set that a case-sensitive scan missed."""
+    values = _string_literal_elements(node)
+    return values is not None and {v.lower() for v in values} >= _MODEL_TOKENS
+
+
 def test_no_hardcoded_model_tier_literals_outside_allowlist():
     pkg_root = Path(genesis.__file__).resolve().parent
     offenders: list[str] = []
@@ -207,10 +217,11 @@ def test_no_hardcoded_model_tier_literals_outside_allowlist():
             tree = ast.parse(py.read_text(encoding="utf-8"))
         except (SyntaxError, UnicodeDecodeError):
             continue
-        for node in ast.walk(tree):
-            values = _string_literal_elements(node)
-            if values is not None and values >= _MODEL_TOKENS:
-                offenders.append(f"{rel}:{getattr(node, 'lineno', '?')}")
+        offenders += [
+            f"{rel}:{getattr(node, 'lineno', '?')}"
+            for node in ast.walk(tree)
+            if _flags_tier_literal(node)
+        ]
     assert not offenders, (
         "Hardcoded model-tier set/dict literal(s) found — derive from "
         "genesis.cc.types.VALID_MODEL_NAMES / the CCModel enum instead:\n  "
@@ -218,17 +229,40 @@ def test_no_hardcoded_model_tier_literals_outside_allowlist():
     )
 
 
-def test_ast_scan_self_check_flags_a_planted_dict():
-    """The scan must actually catch a dict-keyed model map (regression for the
-    telegram/cmd_effort blind spot that shipped in the first pass)."""
-    planted = ast.parse('M = {"opus": 1, "sonnet": 2, "haiku": 3}')
-    hits = [
-        _string_literal_elements(n)
-        for n in ast.walk(planted)
-        if _string_literal_elements(n) is not None
-        and _string_literal_elements(n) >= _MODEL_TOKENS
-    ]
-    assert hits, "AST scan failed to flag a hardcoded model-tier dict"
+def test_ast_scan_self_check_flags_planted_literals():
+    """The scan must catch dict-keyed AND Capitalized model maps — regressions
+    for the two blind spots that shipped earlier (the telegram/cmd_effort dict,
+    and the Capitalized routing ``_VALID_CC_MODELS`` set)."""
+    for src in (
+        'M = {"opus": 1, "sonnet": 2, "haiku": 3}',  # dict keys
+        'M = {"Opus", "Sonnet", "Haiku"}',           # capitalized set
+    ):
+        tree = ast.parse(src)
+        assert any(_flags_tier_literal(n) for n in ast.walk(tree)), (
+            f"AST scan failed to flag: {src}"
+        )
+
+
+# JS/HTML dashboard templates are out of AST reach; scan them textually so a
+# model-tier dropdown that omits a tier fails here too (regression for the
+# neural_monitor.html routing selector missed in the first passes).
+_JS_ARRAY_RE = re.compile(r"\[([^\[\]]*)\]")
+_JS_QUOTED_RE = re.compile(r"""['"]([A-Za-z]+)['"]""")
+
+
+def test_dashboard_templates_offer_every_model_tier():
+    tpl_dir = Path(genesis.__file__).resolve().parent / "dashboard" / "templates"
+    offenders: list[str] = []
+    for html in tpl_dir.glob("*.html"):
+        text = html.read_text(encoding="utf-8")
+        for arr in _JS_ARRAY_RE.finditer(text):
+            toks = {q.group(1).lower() for q in _JS_QUOTED_RE.finditer(arr.group(1))}
+            if toks >= _MODEL_TOKENS and "fable" not in toks:
+                offenders.append(f"{html.name}: [{arr.group(1).strip()[:60]}]")
+    assert not offenders, (
+        "Dashboard model-tier dropdown(s) missing 'fable' (JS array):\n  "
+        + "\n  ".join(offenders)
+    )
 
 
 def test_intent_parser_recognizes_every_tier_and_effort():
