@@ -397,6 +397,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   report (the dedicated morning-report pipeline is the sole source — its daily-briefing cycle now
   focuses on what you need today), and the pending-proposal guidance matches the real threshold.
 
+- **Background research findings reach your knowledge base again — instead of piling up as unreadable
+  JSON blobs.** Genesis's idle-time research (brainstorms, gap clustering, code and wing audits) sends its
+  findings through an intake step that splits them into individual knowledge entries. That step couldn't
+  read the output format models actually produce (code-fenced JSON, and the bare-array shape code audits
+  emit), so months of findings were stored as single raw JSON dumps — useless to search and recall. Intake
+  now parses these formats, skips empty result envelopes outright, and wing-audit results are split into
+  individual findings like the other research types. A new `scripts/cleanup_fenced_knowledge_units.py`
+  (dry-run by default) re-parses the previously mangled entries into proper knowledge units and removes
+  the junk ones.
+
 - **The dashboard's per-session memory row is clearer: "Claude Code Sessions", green when healthy.** The
   cryptic "CC" row that listed sessions as gray "cc-1 …" chips is now labeled **Claude Code Sessions**,
   renders each healthy session in green (amber ≥ 4 GB, red ≥ 6 GB), and shows a hover tooltip explaining

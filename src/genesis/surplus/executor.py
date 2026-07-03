@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import observations
+from genesis.surplus.intake import _FENCE_RE
 from genesis.surplus.types import ExecutorResult, SurplusTask, TaskType
 
 if TYPE_CHECKING:
@@ -49,11 +50,8 @@ def _parse_search_queries(llm_output: str, max_queries: int = 5) -> list[str]:
     return queries
 
 
-# Matches ONLY a whole-message ```json fence (case-insensitive tag). `$` without
-# re.MULTILINE anchors to end-of-string, so combined with re.DOTALL the match
-# spans the entire message — inline fences (mid-text) and other-language blocks
-# (```python, bare ```) are deliberately NOT matched and pass through untouched.
-_FENCE_RE = re.compile(r"^\s*```(?i:json)\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL)
+# _FENCE_RE (whole-message ```json fence matcher) is single-sourced in
+# intake.py — see the comment there for exact matching semantics.
 
 
 def _humanize_surplus_content(content: str) -> str:
