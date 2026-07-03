@@ -9,6 +9,7 @@ import pytest
 
 from genesis.guardian.check import (
     _build_dispatcher,
+    _check_storage_pool_and_alert,
     _execute_recovery_with_approval,
     _handle_cc_resolved,
     _handle_confirmed_dead,
@@ -20,6 +21,7 @@ from genesis.guardian.check import (
 from genesis.guardian.config import GuardianConfig
 from genesis.guardian.diagnosis import DiagnosisEngine, DiagnosisResult, RecoveryAction
 from genesis.guardian.health_signals import HealthSnapshot, PauseState, SignalResult
+from genesis.guardian.pool import StoragePoolStatus
 from genesis.guardian.state_machine import ConfirmationStateMachine, GuardianState
 
 
@@ -149,6 +151,58 @@ class TestMaintainSnapshots:
 
         await _maintain_snapshots(config, snapshots)
         assert (config.state_path / ".last_prune").exists()
+
+
+class TestStoragePoolAlert:
+
+    @pytest.mark.asyncio
+    async def test_crit_alerts_and_persists_state(self, config: GuardianConfig) -> None:
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock(return_value=True)
+        status = StoragePoolStatus(detected=True, data_pct=95.0, metadata_pct=30.0)
+
+        with patch("genesis.guardian.check.measure_storage_pool",
+                   AsyncMock(return_value=status)):
+            await _check_storage_pool_and_alert(config, dispatcher)
+
+        dispatcher.send.assert_called_once()
+        alert = dispatcher.send.call_args.args[0]
+        assert alert.severity.value == "critical"
+        assert (config.state_path / "pool_alert_state.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_sustained_tier_does_not_double_alert(self, config: GuardianConfig) -> None:
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock(return_value=True)
+        status = StoragePoolStatus(detected=True, data_pct=95.0)
+
+        with patch("genesis.guardian.check.measure_storage_pool",
+                   AsyncMock(return_value=status)):
+            await _check_storage_pool_and_alert(config, dispatcher)  # first: alerts
+            await _check_storage_pool_and_alert(config, dispatcher)  # same tier, within interval
+        # Only the first tick alerts; the second is suppressed by hysteresis.
+        assert dispatcher.send.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_undetected_pool_never_alerts(self, config: GuardianConfig) -> None:
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock(return_value=True)
+        status = StoragePoolStatus(detected=False, detail="not lvm")
+
+        with patch("genesis.guardian.check.measure_storage_pool",
+                   AsyncMock(return_value=status)):
+            await _check_storage_pool_and_alert(config, dispatcher)
+        dispatcher.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disabled_short_circuits(self, config: GuardianConfig) -> None:
+        config.storage_pool.enabled = False
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock(return_value=True)
+        called = MagicMock()
+        with patch("genesis.guardian.check.measure_storage_pool", called):
+            await _check_storage_pool_and_alert(config, dispatcher)
+        called.assert_not_called()
 
 
 class TestRunCheck:

@@ -63,6 +63,20 @@ snapshots:
   # safety net). Empty string disables. NOT applied to manual snapshots.
   expiry: "2w"
 
+# Host storage-pool monitoring (LVM-thin data% + metadata% + VG headroom).
+# Tiered guardian alerts with hysteresis; metadata alerts earlier than data
+# (metadata-full forces an offline thin_check/repair). This is the warning that
+# was missing when the thin pool silently filled to 100%.
+storage_pool:
+  enabled: true
+  data_warn_pct: 75
+  data_high_pct: 85
+  data_crit_pct: 92
+  metadata_warn_pct: 60
+  metadata_high_pct: 70
+  metadata_crit_pct: 80
+  realert_hours: 6
+
 recovery:
   verification_delay_s: 30
   max_escalations: 3
