@@ -18,6 +18,12 @@ def _make_gate(current_level: int = 2) -> ProposalDispatchGate:
     mock_state = MagicMock()
     mock_state.current_level = current_level
     mgr.get_state = AsyncMock(return_value=mock_state)
+    # The gate gates on the ceiling-clamped *effective* level, not the raw
+    # earned level. Mock effective_level to mirror current_level so these unit
+    # tests exercise the gate's threshold comparison; the ceiling-clamp itself
+    # is covered by test_financial_uses_effective_not_raw_level below and by
+    # the AutonomyManager.effective_level tests.
+    mgr.effective_level = AsyncMock(return_value=current_level)
 
     engine = RuleEngine()
 
@@ -84,10 +90,34 @@ class TestProposalDispatchGate:
         assert "L4" in result.reason
 
     @pytest.mark.asyncio
-    async def test_financial_allowed_at_l4(self) -> None:
+    async def test_financial_allowed_when_effective_meets_min(self) -> None:
+        # Pure gate-threshold check: given an effective level of 4, FINANCIAL
+        # (min L4) passes. In production background_cognitive is ceiling-capped
+        # at L3 so this state is unreachable there — the clamp is exercised by
+        # test_financial_uses_effective_not_raw_level.
         gate = _make_gate(current_level=4)
         result = await gate.evaluate({"action_type": "purchase"})
         assert result.allowed
+
+    @pytest.mark.asyncio
+    async def test_financial_uses_effective_not_raw_level(self) -> None:
+        """The gate must read the ceiling-clamped effective level, not the raw
+        earned level. background_cognitive can earn L4 while its context ceiling
+        is L3, so a FINANCIAL proposal (min L4) must be BLOCKED at effective L3
+        — even though the raw current_level is 4."""
+        mgr = MagicMock(spec=AutonomyManager)
+        raw_state = MagicMock()
+        raw_state.current_level = 4  # earned above the L3 ceiling
+        mgr.get_state = AsyncMock(return_value=raw_state)
+        mgr.effective_level = AsyncMock(return_value=3)  # ceiling-clamped
+        gate = ProposalDispatchGate(autonomy_manager=mgr, rule_engine=RuleEngine())
+
+        result = await gate.evaluate({"action_type": "purchase"})
+
+        assert not result.allowed
+        assert "L4" in result.reason
+        # Prove the gate consulted the clamped level, not the raw one.
+        mgr.effective_level.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_unknown_action_type_defaults_to_external_read(self) -> None:
@@ -126,9 +156,12 @@ class TestProposalDispatchGate:
 
     @pytest.mark.asyncio
     async def test_no_state_defaults_to_l1(self) -> None:
-        """If AutonomyManager returns no state, default to L1."""
+        """With no autonomy state, effective_level() returns 0; the gate treats
+        that as baseline L1 so benign L1 domains still pass (fresh-install
+        behavior preserved)."""
         mgr = MagicMock(spec=AutonomyManager)
         mgr.get_state = AsyncMock(return_value=None)
+        mgr.effective_level = AsyncMock(return_value=0)  # no state row
         gate = ProposalDispatchGate(
             autonomy_manager=mgr,
             rule_engine=RuleEngine(),

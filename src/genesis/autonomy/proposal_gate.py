@@ -82,11 +82,17 @@ class ProposalDispatchGate:
                 action_domain=domain,
             )
 
-        # 3. Get current autonomy level for background cognitive
-        state = await self._autonomy_manager.get_state(
+        # 3. Get the ceiling-clamped effective autonomy level for background
+        # cognitive. Use effective_level (not the raw earned current_level): an
+        # earned level above the context ceiling (e.g. background_cognitive can
+        # sit at L4 while its context ceiling is L3) must NOT satisfy a domain
+        # min-level check — otherwise a FINANCIAL proposal (min L4) would pass on
+        # a raw L4 read. effective_level() returns 0 when no state row exists;
+        # treat that as baseline L1 (preserves the prior fresh-install default).
+        effective = await self._autonomy_manager.effective_level(
             AutonomyCategory.BACKGROUND_COGNITIVE.value
         )
-        current_level = state.current_level if state else 1
+        current_level = effective if effective > 0 else 1
 
         # 4. Check minimum level for domain
         if current_level < min_level:
