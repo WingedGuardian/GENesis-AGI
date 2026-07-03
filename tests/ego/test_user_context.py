@@ -499,7 +499,9 @@ class TestUserEgoContextBuilder:
         assert "proposals" in result
         assert "focus_summary" in result
         assert "JSON" in result
-        assert "morning_report" in result
+        # The morning report is produced by its own pipeline (D1) — the
+        # contract must not instruct a morning_report field.
+        assert "morning_report" not in result
 
     # ── Integration ─────────────────────────────────────────────────────
 

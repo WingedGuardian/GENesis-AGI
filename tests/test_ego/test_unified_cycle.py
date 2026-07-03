@@ -120,7 +120,7 @@ def test_build_focused_prompt_proactive():
 
 
 def test_build_focused_prompt_daily_briefing():
-    """Daily briefing focus should include morning report instructions."""
+    """Daily briefing focus prioritizes the user's day — no morning_report field."""
     from genesis.ego.focus import FocusResult
     from genesis.ego.session import EgoSession
 
@@ -134,7 +134,10 @@ def test_build_focused_prompt_daily_briefing():
         focus=focus,
     )
     assert "DAILY BRIEFING" in prompt
-    assert "morning_report" in prompt
+    assert "needs today" in prompt
+    # The real morning report pipeline is the sole source — the ego must
+    # not be instructed to produce a morning_report field.
+    assert "morning_report" not in prompt
 
 
 def test_build_focused_prompt_goal_review():

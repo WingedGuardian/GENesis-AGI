@@ -354,6 +354,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   the folder. And a stale catalog can no longer cut the nudge off entirely: regeneration now runs in
   the background while the current prompt uses the existing catalog.
 
+- **Reactive ego events no longer force the expensive Opus model, critical escalations always think at
+  full effort, and a missing ego prompt file fails loudly instead of silently running a placeholder.**
+  Reactive events (deadline alerts, breaker trips) used to override every ego onto Opus at high effort
+  regardless of your configured model — now each ego handles them on its own base configuration.
+  Critical escalations previously ran at *medium* effort (less thinking than a routine tick); they now
+  always run at high effort. And if a per-ego identity prompt file is missing, the ego refuses to start
+  with a clear error naming the file, instead of quietly substituting a generic placeholder identity
+  (the obsolete legacy `EGO_SESSION.md` prompt is removed). The ego prompts themselves also got
+  corrections: the user ego no longer lists a health tool it doesn't have, no longer writes the morning
+  report (the dedicated morning-report pipeline is the sole source — its daily-briefing cycle now
+  focuses on what you need today), and the pending-proposal guidance matches the real threshold.
+
 - **The dashboard's per-session memory row is clearer: "Claude Code Sessions", green when healthy.** The
   cryptic "CC" row that listed sessions as gray "cc-1 …" chips is now labeled **Claude Code Sessions**,
   renders each healthy session in green (amber ≥ 4 GB, red ≥ 6 GB), and shows a hover tooltip explaining
