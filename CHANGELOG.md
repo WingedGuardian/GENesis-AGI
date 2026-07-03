@@ -23,6 +23,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   and several denial-of-service vectors). Genesis uses it only as a client for outbound calls, so
   real-world exposure was limited, but the newer version removes the advisories outright.
 
+- **The autonomy gate now honors each action category's context ceiling before auto-dispatching a
+  background action.** When deciding whether a background action may run, the gate compared the
+  required level against the raw *earned* level — so a category that had earned a high level could
+  clear a bar it shouldn't in a more restricted context, most notably letting a financial action pass
+  its level check. It now uses the ceiling-clamped effective level, so background auto-dispatch of
+  higher-risk categories (e.g. financial) is refused regardless of earned level. Your explicit
+  approval was, and still is, required for these actions — this closes a defense-in-depth gap behind
+  that approval.
+
+- **The Genesis→host control SSH key is now bound to the container's source address and denied an
+  interactive terminal.** The key that lets the container drive recovery on the host is installed with
+  a `from=` source-IP restriction and `no-pty`, so a copied key can't be used from another machine on
+  your LAN and can't request a shell. Re-running the Guardian installer upgrades an existing key in
+  place; if the source address can't be confirmed it keeps the terminal restriction and safely skips
+  the address lock (verified by the installer's own connectivity test) rather than risk locking
+  Guardian out.
+
 ### Added
 
 - **Off-site backups now self-prune on a grandfather-father-son schedule instead of growing forever.**
