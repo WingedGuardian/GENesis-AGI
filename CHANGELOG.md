@@ -156,6 +156,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Skill suggestions now actually fire — and nested skill packs show up in the catalog.** The
+  prompt-time skill nudge scored matches against the length of your prompt, so on any wordy prompt a
+  genuine match was diluted below the firing threshold and suggestions near-never appeared; a single
+  clear name-or-keyword match is now enough. Suggestions also no longer get crowded out by the process
+  (TDD/brainstorming) nudges — each kind keeps its own slots — and library-skill suggestions now tell
+  you exactly what to do (`Read <path>/SKILL.md`) instead of pointing at a command that can't load
+  them. The catalog builder now looks inside container directories (skill packs like `gitnexus/` or
+  plugin repos in the skill library), indexing the real skills inside instead of one useless entry for
+  the folder. And a stale catalog can no longer cut the nudge off entirely: regeneration now runs in
+  the background while the current prompt uses the existing catalog.
+
 - **The dashboard's per-session memory row is clearer: "Claude Code Sessions", green when healthy.** The
   cryptic "CC" row that listed sessions as gray "cc-1 …" chips is now labeled **Claude Code Sessions**,
   renders each healthy session in green (amber ≥ 4 GB, red ≥ 6 GB), and shows a hover tooltip explaining
