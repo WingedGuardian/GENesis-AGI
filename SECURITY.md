@@ -156,12 +156,20 @@ The guard:
 
 ### Dependency Security
 
-```bash
-# Check Python dependencies for known vulnerabilities
-pip-audit
+Python dependencies are declared in `pyproject.toml` (the sole dependency
+source — there is no `requirements.txt`). Known-CVE scanning runs automatically:
 
-# Review and update regularly
-pip install --upgrade -r requirements.txt
+- **CI** — the `dependency-audit` job in `.github/workflows/ci.yml` runs
+  `pip-audit` against the resolved runtime tree on every PR/push and weekly,
+  failing on any new (untriaged) advisory. Already-triaged, not-reachable
+  advisories are listed with rationale in that job.
+- **Dependabot** — GitHub's dependency-graph security alerts are enabled for
+  the repo, and `.github/dependabot.yml` keeps the GitHub Actions current.
+
+To scan locally:
+
+```bash
+pip install pip-audit && pip-audit
 ```
 
 ### Incident Response
