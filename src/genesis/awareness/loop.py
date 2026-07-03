@@ -225,9 +225,7 @@ async def _check_cc_cap_detection(db) -> None:
     global _last_cap_alert_at
     if db is None:
         return
-    now = time.monotonic()
-    if _last_cap_alert_at is not None and now - _last_cap_alert_at < _CAP_ALERT_COOLDOWN_S:
-        return
+    # Query first (always) so we can BOTH alert on a run AND resolve on recovery.
     try:
         cutoff = (datetime.now(UTC) - timedelta(minutes=_CAP_EMPTY_WINDOW_MIN)).isoformat()
         cur = await db.execute(
@@ -241,12 +239,40 @@ async def _check_cc_cap_detection(db) -> None:
     except Exception:
         logger.debug("cc_cap detection: query failed", exc_info=True)
         return
+
     if count < _CAP_EMPTY_THRESHOLD:
+        # Recovery: clear any outstanding cap alert so it doesn't linger for its
+        # 3-day TTL after the cap lifts, and reset the cooldown on a genuine
+        # resolve so a fresh cap re-alerts immediately (mirrors the DLQ path).
+        try:
+            resolved = await observations.resolve_by_source_and_type(
+                db,
+                source="cc_cap_monitor",
+                type="infrastructure_alert",
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes=(
+                    f"auto-resolved: {count} empty cognitive completions in the last "
+                    f"{_CAP_EMPTY_WINDOW_MIN} min (< {_CAP_EMPTY_THRESHOLD})"
+                ),
+            )
+            if resolved:
+                _last_cap_alert_at = None
+        except Exception:
+            logger.debug("cc_cap detection: resolve failed", exc_info=True)
+        return
+
+    now = time.monotonic()
+    if _last_cap_alert_at is not None and now - _last_cap_alert_at < _CAP_ALERT_COOLDOWN_S:
         return
     # Set the cooldown BEFORE the write so a failed create still suppresses retries.
     _last_cap_alert_at = now
     try:
-        await observations.create(
+        # DB-backed dedup: a stable content_hash + skip_if_duplicate means a cap
+        # persisting for hours produces ONE unresolved alert, not one per hour
+        # (the same discipline as the DLQ accumulation alert). It clears via the
+        # resolve path above and re-alerts on a fresh cap.
+        content_hash = hashlib.sha256(b"cc_cap_alert").hexdigest()
+        created = await observations.create(
             db,
             id=str(uuid.uuid4()),
             source="cc_cap_monitor",
@@ -260,7 +286,11 @@ async def _check_cc_cap_detection(db) -> None:
             ),
             priority="critical",
             created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
         )
+        if created is None:
+            return  # an unresolved cap alert already exists — don't duplicate
         logger.warning(
             "CC cap detection alert: %d empty cognitive completions in %d min",
             count, _CAP_EMPTY_WINDOW_MIN,
