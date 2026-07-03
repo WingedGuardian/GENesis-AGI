@@ -25,6 +25,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Daily disk hygiene now prunes stale scratch and old attention snapshots.** Housekeeping now
+  age-prunes leftover files in `~/tmp` (older than 7 days) and garbage-collects attention-engine
+  snapshots older than 60 days — but never one behind a moment you've labeled for review, so your
+  labeled history stays revealable. Keeps disk usage from creeping up between the reactive cleanups
+  that previously only fired when the disk was nearly full.
+
 - **Genesis now notices when its Claude Code subscription hits its usage cap — instead of quietly going dark.**
   A capped Anthropic subscription makes `claude -p` return *empty* output with no error, which Genesis used to
   record as a successful (but blank) run — so its background thinking (ego cycles, reflections, weekly reviews)
@@ -127,6 +133,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   time limit: a large PDF no longer blocks anything else, and a PDF that crashes or hangs the parser fails
   just that one ingest — the rest of Genesis keeps running. Uploads that hit a transient database hiccup are
   now marked "failed" (and can be retried) instead of getting stuck showing "processing" forever.
+
+- **Re-ingesting a knowledge source with changed content now refreshes it instead of serving the stale
+  version.** Previously, once a file or URL was ingested, re-ingesting the same source was skipped on source
+  identity alone — so if the underlying content changed, the knowledge base kept serving the old distilled
+  version indefinitely. Re-ingestion now compares a content fingerprint and re-distills when the content has
+  actually changed (unchanged content is still skipped, and a now-unreachable source falls back to its
+  previously cached version).
 
 - **The dead-letter-queue alert no longer cries wolf on self-healing bursts.** A short burst of low-value
   retry items (e.g. memory-relevance grades, which are discarded within an hour by design) could push the queue

@@ -101,3 +101,37 @@ def test_remove_unit_partial_removal_persists_across_reload(tmp_path: Path):
     assert mgr.remove_unit("u1") is True
     fresh = _mgr(tmp_path)
     assert fresh.get_units_for_source("doc.txt") == ["u2"]
+
+
+# ─── content-hash idempotency (gate move: re-ingest changed content) ──────────
+
+
+def test_add_source_persists_content_hash(tmp_path: Path):
+    """add_source stores an optional content_hash that survives a reload and
+    drives has_unchanged_source."""
+    mgr = _mgr(tmp_path)
+    mgr.add_source(
+        "doc.txt",
+        source_type="text",
+        extracted_path=mgr.sources_dir / f"{ManifestManager.source_hash('doc.txt')}.md",
+        unit_ids=["u1"],
+        content_hash="abc123",
+    )
+    fresh = _mgr(tmp_path)  # reload from disk
+    assert fresh.has_unchanged_source("doc.txt", "abc123") is True
+    assert fresh.has_unchanged_source("doc.txt", "different") is False
+
+
+def test_has_unchanged_source_unknown_source_is_false(tmp_path: Path):
+    """A never-ingested source is trivially 'changed' (needs ingest)."""
+    mgr = _mgr(tmp_path)
+    assert mgr.has_unchanged_source("never.txt", "abc") is False
+
+
+def test_has_unchanged_source_false_without_stored_hash(tmp_path: Path):
+    """A pre-existing entry with NO content_hash (legacy add_source) reads as
+    changed, so it re-distills exactly once and then stabilizes."""
+    mgr = _mgr(tmp_path)
+    _add(mgr, "doc.txt", ["u1"])  # legacy add: no content_hash persisted
+    assert mgr.has_source("doc.txt") is True
+    assert mgr.has_unchanged_source("doc.txt", "anyhash") is False

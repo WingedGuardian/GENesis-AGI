@@ -18,9 +18,10 @@ low ingest volume; each failed caller simply retries on a fresh pool.
 
 Temp/IPC note: a ``spawn`` ProcessPoolExecutor on Linux/CPython 3.12 keeps its
 IPC in ``/dev/shm`` (POSIX ``sem.mp-*``) plus anonymous fd pipes — it writes
-NOTHING under ``$TMPDIR`` (verified empirically). So despite genesis-server's
-``TMPDIR=~/.genesis/cc-tmp`` (which the tmp-watchgod sweeps), the pool has no
-artifacts there to be reaped. Revisit if a future CPython changes this.
+NOTHING under ``$TMPDIR`` (verified empirically). So even though genesis-server
+runs with ``$TMPDIR`` pointed at the Claude Code working-temp dir (which the
+tmp-watchgod prunes under pressure), the pool has no artifacts there to be
+reaped. Revisit if a future CPython changes this.
 """
 
 from __future__ import annotations
