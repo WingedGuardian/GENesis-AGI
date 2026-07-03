@@ -112,6 +112,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The dashboard now reports each ego's cycle health separately.** Genesis runs two egos (a user-facing
+  one and its own), and both recorded their proactive-cycle health under a single shared key — so on the
+  health surface one ego's last run kept overwriting the other's, making it impossible to tell whether
+  either was actually cycling. Each ego now tracks its own health row, so a stalled or failing ego is
+  visible instead of masked.
+
+- **Memory extraction now runs reliably after a restart.** The job that turns recent conversations into
+  long-term memories was scheduled on a fixed 2-hour interval measured from server start — and that timer
+  reset on every restart, so a box that restarted more often than every two hours could keep deferring
+  extraction indefinitely. It now also runs shortly after each start, so extraction can't be starved by
+  frequent restarts.
+
 - **Superseded and expired memories no longer resurface in Genesis's automatic recall.** Before every
   prompt, Genesis injects the most relevant memories into its working context. That fast-path recall
   wasn't checking whether a memory had expired or been superseded (replaced by a newer, consolidated

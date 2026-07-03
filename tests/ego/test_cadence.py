@@ -1154,3 +1154,63 @@ class TestGoalStaleness:
         assert sig.priority == "medium"
         assert sig.metadata["mode"] == "stale"
         assert sig.metadata["executed_proposals"] == 1
+
+
+class TestJobHealthKeyPerEgo:
+    """Each ego records job health under its OWN key, never a shared 'ego_cycle'.
+
+    Both EgoCadenceManagers write to the single global job_health table via
+    GenesisRuntime.record_job_success/failure. Sharing the literal key
+    'ego_cycle' made the two egos clobber each other's health row — one ego's
+    cycle success/failure overwrote the other's. The key must be the ego's own
+    source_tag ('user_ego_cycle' / 'genesis_ego_cycle'), matching the existing
+    ego_source convention used everywhere else.
+    """
+
+    @pytest.mark.parametrize("source_tag", ["user_ego_cycle", "genesis_ego_cycle"])
+    async def test_record_success_uses_per_ego_key(
+        self, cadence, source_tag, monkeypatch,
+    ):
+        cadence._session._source_tag = source_tag
+        mock_rt = MagicMock()
+        monkeypatch.setattr(
+            "genesis.runtime.GenesisRuntime.instance",
+            classmethod(lambda cls: mock_rt),
+        )
+        cadence._record_success()
+        mock_rt.record_job_success.assert_called_once_with(source_tag)
+
+    @pytest.mark.parametrize("source_tag", ["user_ego_cycle", "genesis_ego_cycle"])
+    async def test_record_failure_uses_per_ego_key(
+        self, cadence, source_tag, monkeypatch,
+    ):
+        cadence._session._source_tag = source_tag
+        mock_rt = MagicMock()
+        monkeypatch.setattr(
+            "genesis.runtime.GenesisRuntime.instance",
+            classmethod(lambda cls: mock_rt),
+        )
+        cadence._record_failure("boom")
+        mock_rt.record_job_failure.assert_called_once_with(source_tag, "boom")
+
+    async def test_two_egos_write_distinct_keys(
+        self, config, mock_idle_detector, db, monkeypatch,
+    ):
+        """The core guarantee: user and genesis egos never collide on one key."""
+        recorded: list[str] = []
+        mock_rt = MagicMock()
+        mock_rt.record_job_success.side_effect = recorded.append
+        monkeypatch.setattr(
+            "genesis.runtime.GenesisRuntime.instance",
+            classmethod(lambda cls: mock_rt),
+        )
+        for tag in ("user_ego_cycle", "genesis_ego_cycle"):
+            session = AsyncMock()
+            session._source_tag = tag
+            mgr = EgoCadenceManager(
+                session=session, config=config,
+                idle_detector=mock_idle_detector, db=db,
+            )
+            mgr._record_success()
+        assert recorded == ["user_ego_cycle", "genesis_ego_cycle"]
+        assert len(set(recorded)) == 2  # no collision
