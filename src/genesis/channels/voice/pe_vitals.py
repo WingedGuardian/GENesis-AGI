@@ -91,26 +91,37 @@ async def fetch_voice_pe_vitals() -> dict:
                 return_exceptions=True,
             )
     except Exception as exc:  # client setup / unexpected — stay graceful
-        logger.warning(
-            "Voice PE vitals fetch failed: %s: %s", type(exc).__name__, exc, exc_info=True,
-        )
+        # NOTE: no exc_info — an httpx error can carry the Request (Authorization
+        # header with the HA token) in its traceback chain; keep the token out of logs.
+        logger.warning("Voice PE vitals fetch failed: %s: %s", type(exc).__name__, exc)
         return {"reachable": False, "reason": type(exc).__name__}
 
     vitals: dict = {"reachable": True}
-    any_ok = False
+    ha_responded = False  # did HA reply at all (200 or an HTTP error), vs unreachable?
+    any_ok = False        # did any entity yield a usable reading?
     for (_suf, _dom, key, has_unit), res in zip(_VITALS, results, strict=True):
         if isinstance(res, BaseException):
+            # An HTTP status error means HA replied (entity-level failure); a
+            # transport/timeout/JSON error means we couldn't get a reading for it.
+            if isinstance(res, httpx.HTTPStatusError):
+                ha_responded = True
             vitals[key] = None
             continue
+        ha_responded = True
         state, unit = res
+        # HA reports "unavailable"/"unknown" for a known sensor with no current
+        # reading — normalize to None so the panel hides the card, not the word.
+        if state in ("unavailable", "unknown"):
+            state = None
         vitals[key] = state
-        if has_unit and unit:
+        if has_unit and unit and state is not None:
             vitals[f"{key}_unit"] = unit
         if state is not None:
             any_ok = True
 
+    if not ha_responded:
+        return {"reachable": False, "reason": "could not reach Home Assistant"}
     if not any_ok:
-        # HA answered but every Voice PE entity errored/was absent → report a clean
-        # "not reporting" rather than a wall of nulls.
-        return {"reachable": False, "reason": "no Voice PE entities returned from Home Assistant"}
+        # HA replied but every Voice PE entity errored / was absent / unavailable.
+        return {"reachable": False, "reason": "Home Assistant reachable but no Voice PE entities reported"}
     return vitals

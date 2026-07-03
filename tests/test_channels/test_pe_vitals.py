@@ -7,6 +7,7 @@ It must NEVER raise: not-configured or HA-unreachable returns
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -94,7 +95,7 @@ def test_ha_unreachable_is_graceful(monkeypatch):
         out = asyncio.run(pe_vitals.fetch_voice_pe_vitals())
 
     assert out["reachable"] is False
-    assert "reason" in out
+    assert "reach" in out["reason"].lower()  # transport error → "could not reach Home Assistant"
 
 
 def test_missing_entity_is_none_not_fatal(monkeypatch):
@@ -111,3 +112,77 @@ def test_missing_entity_is_none_not_fatal(monkeypatch):
     assert out["reachable"] is True
     assert out["loop_time"] is None
     assert out["temperature"] == "42"
+
+
+def _resp_http_error(code: int) -> MagicMock:
+    """A response whose ``raise_for_status()`` raises — HA replied with an error."""
+    req = httpx.Request("GET", "http://ha.test/api/states/x")
+    resp = httpx.Response(code, request=req)
+    r = MagicMock()
+    r.status_code = code
+    r.json = MagicMock(return_value={})
+    r.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("err", request=req, response=resp),
+    )
+    return r
+
+
+def test_all_http_errors_reads_as_reachable_but_erroring(monkeypatch):
+    """HA up but every entity 500s → reachable False, reason says HA WAS reachable."""
+    _configure(monkeypatch)
+
+    def fake_get(url, headers=None):
+        return _resp_http_error(500)
+
+    with patch(_CLIENT, _client_returning(fake_get)):
+        out = asyncio.run(pe_vitals.fetch_voice_pe_vitals())
+
+    assert out["reachable"] is False
+    assert "reachable" in out["reason"].lower()  # distinct from "could not reach"
+
+
+def test_malformed_json_is_field_level_not_fatal(monkeypatch):
+    _configure(monkeypatch)
+
+    def fake_get(url, headers=None):
+        if url.endswith("wifi_signal"):
+            r = _resp(200, {})
+            r.json = MagicMock(side_effect=json.JSONDecodeError("bad", "doc", 0))
+            return r
+        return _resp(200, _state("7"))
+
+    with patch(_CLIENT, _client_returning(fake_get)):
+        out = asyncio.run(pe_vitals.fetch_voice_pe_vitals())
+
+    assert out["reachable"] is True
+    assert out["wifi_signal"] is None
+    assert out["temperature"] == "7"
+
+
+def test_all_entities_absent_is_graceful(monkeypatch):
+    _configure(monkeypatch)
+
+    def fake_get(url, headers=None):
+        return _resp(404, {})
+
+    with patch(_CLIENT, _client_returning(fake_get)):
+        out = asyncio.run(pe_vitals.fetch_voice_pe_vitals())
+
+    assert out["reachable"] is False
+    assert "no Voice PE entities" in out["reason"]
+
+
+def test_unavailable_state_normalized_to_none(monkeypatch):
+    _configure(monkeypatch)
+
+    def fake_get(url, headers=None):
+        if url.endswith("internal_temperature"):
+            return _resp(200, _state("unavailable", "°F"))
+        return _resp(200, _state("5"))
+
+    with patch(_CLIENT, _client_returning(fake_get)):
+        out = asyncio.run(pe_vitals.fetch_voice_pe_vitals())
+
+    assert out["reachable"] is True
+    assert out["temperature"] is None
+    assert "temperature_unit" not in out  # no unit attached to a normalized-None field
