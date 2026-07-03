@@ -14,6 +14,8 @@ import asyncio
 import threading
 from unittest.mock import AsyncMock
 
+import pytest
+
 from genesis.observability.health_data import HealthDataService
 
 
@@ -127,8 +129,8 @@ def test_concurrent_snapshots_coalesce_to_single_compute():
     assert r1 is r2, "coalesced callers should receive the same shared result object"
 
 
-def test_inflight_cleared_after_completion():
-    """After a snapshot completes, the in-flight handle is cleared for the next call."""
+def test_completed_snapshot_is_not_reused():
+    """A completed in-flight handle must not coalesce — sequential calls recompute."""
     svc = HealthDataService(db=_mock_db())
 
     calls = 0
@@ -145,4 +147,43 @@ def test_inflight_cleared_after_completion():
 
     # Sequential (non-overlapping) calls must each recompute — no stale coalescing.
     assert calls == 2
-    assert svc._inflight is None
+    # The handle is never left pointing at a live task (cleared by done-callback;
+    # the .done() guard makes a lingering completed handle harmless regardless).
+    assert svc._inflight is None or svc._inflight.done()
+
+
+def test_caller_cancellation_does_not_abort_coalesced_siblings():
+    """One caller's cancellation must NOT cancel the shared compute for siblings.
+
+    Regression for the unshielded-task bug: the dashboard route's 15s timeout
+    cancels its snapshot() future; without asyncio.shield that would cancel the
+    in-flight computation for the sentinel/ego callers coalescing on it.
+    """
+    svc = HealthDataService(db=_mock_db())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed = False
+
+    async def slow_compute():
+        nonlocal completed
+        started.set()
+        await release.wait()  # held in-flight until we allow completion
+        completed = True
+        return {"ok": True}
+
+    svc._compute_snapshot = slow_compute
+
+    async def _run():
+        a = asyncio.create_task(svc.snapshot())   # owner
+        await started.wait()                       # compute is now in-flight
+        b = asyncio.create_task(svc.snapshot())    # coalesces onto the same task
+        await asyncio.sleep(0)                      # let b reach its await
+        a.cancel()                                 # simulate the dashboard 15s timeout
+        with pytest.raises(asyncio.CancelledError):
+            await a
+        release.set()                              # allow the shared compute to finish
+        return await b                             # sibling must still get the result
+
+    result_b = asyncio.run(_run())
+    assert completed is True, "shared compute was cancelled by the other caller"
+    assert result_b == {"ok": True}, "coalesced sibling did not receive the result"

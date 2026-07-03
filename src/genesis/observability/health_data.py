@@ -102,21 +102,39 @@ class HealthDataService:
         instead of each triggering a full recompute. The returned dict is
         READ-ONLY by contract (every caller reads via ``.get()``), so it is shared
         among coalesced callers without a defensive copy.
+
+        The shared task is awaited through ``asyncio.shield`` so one caller's
+        cancellation — e.g. the dashboard route's 15s ``_async_route`` timeout —
+        cannot cancel the in-flight snapshot out from under the other coalesced
+        callers (who catch ``Exception``, not ``CancelledError``). ``_inflight``
+        is released by the task's own done-callback, not a caller's ``finally``,
+        so it survives the cancelling caller unwinding first; the ``.done()`` guard
+        makes correctness independent of when that callback runs.
         """
         inflight = self._inflight
         if inflight is not None and not inflight.done():
-            return await inflight
+            return await asyncio.shield(inflight)
         # No await between the done() check and the assignment below → race-free
         # on the single-threaded loop.
         task = asyncio.create_task(self._compute_snapshot())
         self._inflight = task
-        try:
-            return await task
-        finally:
-            # Clear only if still ours: a later caller may have installed a fresh
-            # task after ours finished, and we must not clobber it.
-            if self._inflight is task:
-                self._inflight = None
+        task.add_done_callback(self._release_inflight)
+        return await asyncio.shield(task)
+
+    def _release_inflight(self, task: asyncio.Task) -> None:
+        """Done-callback: drop the in-flight handle when the compute finishes.
+
+        Runs on the loop (scheduled via ``call_soon``). Clears only if the handle
+        is still ours, and retrieves any exception so a fully-orphaned failed
+        compute (every awaiter cancelled before completion) does not emit a
+        "Task exception was never retrieved" warning.
+        """
+        if self._inflight is task:
+            self._inflight = None
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.debug("Orphaned health snapshot compute failed", exc_info=exc)
 
     async def _compute_snapshot(self) -> dict:
         """Build the full system health state as a dict (uncoalesced)."""
