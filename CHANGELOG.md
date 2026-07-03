@@ -25,6 +25,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Daily disk hygiene now prunes stale scratch and old attention snapshots.** Housekeeping now
+  age-prunes leftover files in `~/tmp` (older than 7 days) and garbage-collects attention-engine
+  snapshots older than 60 days — but never one behind a moment you've labeled for review, so your
+  labeled history stays revealable. Keeps disk usage from creeping up between the reactive cleanups
+  that previously only fired when the disk was nearly full.
+
 - **Genesis now notices when its Claude Code subscription hits its usage cap — instead of quietly going dark.**
   A capped Anthropic subscription makes `claude -p` return *empty* output with no error, which Genesis used to
   record as a successful (but blank) run — so its background thinking (ego cycles, reflections, weekly reviews)
