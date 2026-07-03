@@ -71,7 +71,7 @@ class TestCCUnavailableEscalation:
         snap = _snap(
             container_status="Running",
             services=[
-                ServiceInfo(name="genesis-bridge", active=False, sub_state="dead"),
+                ServiceInfo(name="genesis-server", active=False, sub_state="dead"),
                 ServiceInfo(name="qdrant", active=False, sub_state="dead"),
             ],
         )
@@ -83,11 +83,11 @@ class TestCCUnavailableEscalation:
         snap = _snap(
             container_status="Running",
             disks=[DiskInfo(mount="/", total_mb=140000, used_mb=70000, avail_mb=70000, usage_pct=50.0)],
-            services=[ServiceInfo(name="genesis-bridge", active=True, sub_state="running")],
+            services=[ServiceInfo(name="genesis-server", active=True, sub_state="running")],
         )
         result = engine._escalate_without_cc(snap)
         assert any("Container: Running" in e for e in result.evidence)
-        assert any("genesis-bridge" in e for e in result.evidence)
+        assert any("genesis-server" in e for e in result.evidence)
         assert any("Disk /:" in e for e in result.evidence)
 
 
@@ -107,12 +107,12 @@ class TestBriefingIntegration:
     def test_prompt_with_briefing(self) -> None:
         from genesis.guardian.diagnosis import _build_diagnosis_prompt
         snap = _snap(container_status="Stopped")
-        briefing = "### Service Baseline\n- genesis-bridge: main service"
+        briefing = "### Service Baseline\n- genesis-server: main service"
         prompt = _build_diagnosis_prompt(
             snap, "signal data", "genesis", briefing_context=briefing,
         )
         assert "Genesis Context Briefing" in prompt
-        assert "genesis-bridge: main service" in prompt
+        assert "genesis-server: main service" in prompt
 
     def test_briefing_none_same_as_no_briefing(self) -> None:
         from genesis.guardian.diagnosis import _build_diagnosis_prompt

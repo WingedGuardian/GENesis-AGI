@@ -56,7 +56,7 @@ class TestWriteGuardianBriefing:
     def test_default_content_has_baselines(self, tmp_path: Path) -> None:
         path = write_guardian_briefing(briefing_dir=tmp_path)
         text = path.read_text()
-        assert "genesis-bridge" in text
+        assert "genesis-server" in text
         assert "qdrant" in text
         assert "awareness_tick_interval" in text
 

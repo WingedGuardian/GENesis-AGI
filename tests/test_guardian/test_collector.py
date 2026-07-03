@@ -65,7 +65,7 @@ class TestDiagnosticSnapshot:
             cpu=CPUInfo(usage_usec=1000000),
             io=IOInfo(pressure_full_10s=0.5),
             disks=[DiskInfo(mount="/", total_mb=100000, used_mb=60000, avail_mb=40000, usage_pct=60.0)],
-            services=[ServiceInfo(name="genesis-bridge", active=True, sub_state="running", n_restarts=0)],
+            services=[ServiceInfo(name="genesis-server", active=True, sub_state="running", n_restarts=0)],
             top_processes="PID USER ... python3",
             journal_recent="some log lines",
             error_count_1h=5,
@@ -79,7 +79,7 @@ class TestDiagnosticSnapshot:
         text = snap.to_prompt_text()
         assert "DIAGNOSTIC SNAPSHOT" in text
         assert "50.0%" in text  # memory
-        assert "genesis-bridge" in text
+        assert "genesis-server" in text
         assert "ACTIVE" in text
         assert "abc123" in text
         assert "MEMORY" in text

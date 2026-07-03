@@ -310,14 +310,14 @@ async def probe_heartbeat_canary(config: GuardianConfig) -> SignalResult:
 
 
 async def probe_log_freshness(config: GuardianConfig) -> SignalResult:
-    """Check journal log freshness — recent output from genesis-bridge."""
+    """Check journal log freshness — recent output from genesis-server."""
     name = "log_freshness"
     t0 = datetime.now(UTC)
     try:
         rc, stdout, stderr = await _run_subprocess(
             "incus", "exec", config.container_name, "--",
             "su", "-", "ubuntu", "-c",
-            f"journalctl --user -u genesis-bridge -n{config.probes.journal_lines} "
+            f"journalctl --user -u genesis-server -n{config.probes.journal_lines} "
             "--no-pager -o short-iso",
             timeout=config.probes.probe_timeout_s,
         )
@@ -553,14 +553,14 @@ async def check_tmp_usage(config: GuardianConfig) -> SuspiciousResult:
 
 
 async def check_restart_count(config: GuardianConfig) -> SuspiciousResult:
-    """Check genesis-bridge systemd restart count (crash loop detection)."""
+    """Check genesis-server systemd restart count (crash loop detection)."""
     name = "restart_count"
     t0 = datetime.now(UTC)
     try:
         rc, stdout, stderr = await _run_subprocess(
             "incus", "exec", config.container_name, "--",
             "su", "-", "ubuntu", "-c",
-            "systemctl --user show genesis-bridge -p NRestarts --value",
+            "systemctl --user show genesis-server -p NRestarts --value",
             timeout=config.probes.probe_timeout_s,
         )
         if rc != 0:
