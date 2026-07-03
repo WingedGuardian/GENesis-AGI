@@ -153,6 +153,50 @@ async def test_large_pdf_does_not_block_event_loop(tmp_path):
     assert ticks > 5, f"event loop appears to have stalled (only {ticks} heartbeats)"
 
 
+async def test_pool_creation_failure_raises_pdf_error(monkeypatch):
+    """A failed pool creation must surface as PDFExtractionError, not a bare error.
+
+    resume_review only catches PDFExtractionError; a raw TimeoutError from a
+    stalled worker spawn would otherwise escape through the MCP boundary.
+    """
+    import genesis.knowledge.pdf_extract as pe
+
+    def _boom() -> object:
+        raise TimeoutError("worker spawn stalled")
+
+    monkeypatch.setattr(pe, "_make_pool", _boom)
+
+    with pytest.raises(pe.PDFExtractionError):
+        await pe.extract_pdf_text("/nonexistent/file.pdf")
+    assert pe._pool is None  # nothing left half-created
+
+
+def test_make_pool_shuts_down_on_warmup_failure(monkeypatch):
+    """If the warmup probe fails, _make_pool must not leak the executor."""
+    import genesis.knowledge.pdf_extract as pe
+
+    shutdown_called = {"v": False}
+
+    class _FakeFuture:
+        def result(self, timeout=None):
+            raise TimeoutError("warmup stalled")
+
+    class _FakePool:
+        _processes: dict = {}
+
+        def submit(self, *a, **k):
+            return _FakeFuture()
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            shutdown_called["v"] = True
+
+    monkeypatch.setattr(pe, "ProcessPoolExecutor", lambda *a, **k: _FakePool())
+
+    with pytest.raises(TimeoutError):
+        pe._make_pool()
+    assert shutdown_called["v"], "a failed pool creation must shut the executor down"
+
+
 async def test_shutdown_then_reextract(tmp_path):
     """shutdown_pdf_pool tears the pool down; a later call lazily recreates it."""
     import genesis.knowledge.pdf_extract as pe

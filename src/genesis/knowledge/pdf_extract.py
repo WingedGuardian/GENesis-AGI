@@ -26,6 +26,7 @@ artifacts there to be reaped. Revisit if a future CPython changes this.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
@@ -65,7 +66,15 @@ def _make_pool() -> ProcessPoolExecutor:
     """
     ctx = multiprocessing.get_context("spawn")
     pool = ProcessPoolExecutor(max_workers=1, mp_context=ctx)
-    pool.submit(_warmup).result(timeout=_START_TIMEOUT_S)
+    try:
+        pool.submit(_warmup).result(timeout=_START_TIMEOUT_S)
+    except Exception:
+        # A failed warmup (spawn stall, resource exhaustion) must not leak the
+        # executor or any worker the OS did manage to start.
+        _kill_workers(pool)
+        with contextlib.suppress(Exception):
+            pool.shutdown(wait=False, cancel_futures=True)
+        raise
     return pool
 
 
@@ -87,8 +96,15 @@ async def extract_pdf_text(path: str) -> tuple[str, list[str], int]:
     recreated on the next call). Callers treat this as a failed ingest; the
     server is unaffected.
     """
-    pool = await _get_pool()
     loop = asyncio.get_running_loop()
+    try:
+        pool = await _get_pool()
+    except Exception as exc:
+        # Pool creation failed (worker spawn stall, resource exhaustion).
+        # _make_pool has already cleaned up its own partial pool; surface a
+        # clean domain error so callers (e.g. resume_review) degrade gracefully.
+        logger.error("PDF extraction pool unavailable: %s", exc)
+        raise PDFExtractionError("PDF extraction pool unavailable") from exc
     try:
         return await asyncio.wait_for(
             loop.run_in_executor(pool, extract_pdf_text_sync, path),
