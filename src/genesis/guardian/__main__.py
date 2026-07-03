@@ -5,6 +5,7 @@ Usage:
     python -m genesis.guardian --test        # test alert channels
     python -m genesis.guardian --check-only  # one-shot health check (no recovery)
     python -m genesis.guardian --test-approval  # E2E test the keyword-reply gate
+    python -m genesis.guardian --disk-status  # print storage-pool JSON (read-only)
 """
 
 from __future__ import annotations
@@ -29,6 +30,10 @@ def main() -> None:
 
     if "--test-approval" in sys.argv:
         asyncio.run(_test_approval())
+        return
+
+    if "--disk-status" in sys.argv:
+        asyncio.run(_disk_status())
         return
 
     asyncio.run(run_check())
@@ -105,6 +110,38 @@ async def _test_approval() -> None:
             print(f"  Read keyword: {kw}")
             return
     print("  Timeout — no APPROVE/DENY reply read within ~120s")
+
+
+async def _disk_status() -> None:
+    """Print storage-pool + snapshot status as JSON (read-only).
+
+    Genesis's programmatic window into host capacity — consumed by the
+    `disk-status` gateway verb. Reuses the same measurement the guardian alerts
+    on, so the container sees exactly what the guardian sees.
+    """
+    import dataclasses
+    import json
+
+    from genesis.guardian.config import load_config
+    from genesis.guardian.pool import measure_storage_pool, worst_tier
+    from genesis.guardian.snapshots import SnapshotManager
+
+    config = load_config()
+    status = await measure_storage_pool(config)
+    tier = worst_tier(status, config.storage_pool) if status.detected else "unknown"
+
+    snap_mgr = SnapshotManager(config)
+    snapshots = [
+        {"name": name, "created_at": created.isoformat() if created else None}
+        for name, created in await snap_mgr._list_snapshots_with_meta()
+    ]
+
+    print(json.dumps({
+        "ok": True,
+        "pool": dataclasses.asdict(status),
+        "tier": tier,
+        "snapshots": snapshots,
+    }))
 
 
 async def _check_only() -> None:

@@ -35,6 +35,13 @@ from genesis.guardian.diagnosis import DiagnosisEngine
 from genesis.guardian.diagnosis_writer import write_diagnosis_result
 from genesis.guardian.dialogue import DialogueStatus, build_request, send_dialogue
 from genesis.guardian.health_signals import collect_all_signals
+from genesis.guardian.pool import (
+    TIER_CRIT,
+    TIER_OK,
+    decide_alert,
+    measure_storage_pool,
+    worst_tier,
+)
 from genesis.guardian.recovery import RecoveryEngine
 from genesis.guardian.snapshots import SnapshotManager
 from genesis.guardian.state_machine import (
@@ -205,6 +212,9 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # enforce expiry + prune stale snapshots (the incident: prune only ran
         # in HEALTHY, so it never fired while the pool silently filled).
         await _maintain_snapshots(config, snapshots)
+        # Storage-pool monitoring runs every cycle regardless of state — a
+        # filling thin pool is the exact silent failure that caused the outage.
+        await _check_storage_pool_and_alert(config, dispatcher)
         # Heartbeat means "Guardian process is alive and watching" —
         # NOT "Genesis container is healthy". Any successful check cycle
         # (regardless of resulting state) should refresh liveness. A
@@ -357,6 +367,95 @@ async def _maintain_snapshots(
 
     prune_marker.parent.mkdir(parents=True, exist_ok=True)
     prune_marker.write_text(datetime.now(UTC).isoformat())
+
+
+_POOL_TIER_SEVERITY = {
+    "warn": AlertSeverity.WARNING,
+    "high": AlertSeverity.WARNING,
+    "crit": AlertSeverity.CRITICAL,
+}
+
+
+async def _check_storage_pool_and_alert(
+    config: GuardianConfig,
+    dispatcher: AlertDispatcher,
+) -> None:
+    """Measure the host storage pool and emit tiered alerts with hysteresis.
+
+    State (last-alerted tier + timestamp) persists in the guardian state dir so
+    the hysteresis survives across the guardian's stateless per-tick invocations.
+    Alerts go through the guardian's own dispatcher (host Telegram channel),
+    which survives a read-only/dead container — exactly when this matters most.
+    """
+    cfg = config.storage_pool
+    if not cfg.enabled:
+        return
+
+    try:
+        status = await measure_storage_pool(config)
+    except Exception:
+        logger.warning("storage-pool measurement failed", exc_info=True)
+        return
+    if not status.detected:
+        logger.debug("storage-pool not measurable: %s", status.detail)
+        return
+
+    tier = worst_tier(status, cfg)
+
+    state_file = config.state_path / "pool_alert_state.json"
+    last_tier = TIER_OK
+    last_alert_at: datetime | None = None
+    if state_file.exists():
+        try:
+            data = json.loads(state_file.read_text())
+            last_tier = data.get("tier", TIER_OK)
+            raw_at = data.get("last_alert_at")
+            last_alert_at = datetime.fromisoformat(raw_at) if raw_at else None
+        except (ValueError, OSError):
+            pass
+
+    now = datetime.now(UTC)
+    decision = decide_alert(tier, last_tier, last_alert_at, now, cfg.realert_hours)
+
+    if decision.should_alert:
+        if decision.is_resolution:
+            severity = AlertSeverity.INFO
+            title = "Storage pool recovered"
+        else:
+            severity = _POOL_TIER_SEVERITY.get(tier, AlertSeverity.WARNING)
+            title = f"Storage pool {tier.upper()}"
+        parts = []
+        if status.data_pct is not None:
+            parts.append(f"data {status.data_pct:.0f}%")
+        if status.metadata_pct is not None:
+            parts.append(f"metadata {status.metadata_pct:.0f}%")
+        if status.vg_free_bytes is not None:
+            parts.append(f"VG free {status.vg_free_bytes / 1024**3:.1f}G")
+        if status.pool_used_pct is not None:
+            parts.append(f"pool used {status.pool_used_pct:.0f}%")
+        body = f"{decision.reason}. " + ", ".join(parts)
+        if tier == TIER_CRIT:
+            body += (
+                "\nThin pool near exhaustion — add VG space or free allocation "
+                "before it forces the container read-only."
+            )
+        try:
+            await dispatcher.send(Alert(severity=severity, title=title, body=body))
+        except Exception:
+            logger.warning("failed to send storage-pool alert", exc_info=True)
+
+    # Persist tier every cycle (even without an alert) so a later rise from a
+    # silently-decreased tier re-alerts correctly. Only advance the alert
+    # timestamp when we actually alerted.
+    new_alert_at = now if decision.should_alert else last_alert_at
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps({
+            "tier": tier,
+            "last_alert_at": new_alert_at.isoformat() if new_alert_at else None,
+        }))
+    except OSError:
+        logger.warning("failed to persist pool alert state", exc_info=True)
 
 
 async def _handle_confirming(

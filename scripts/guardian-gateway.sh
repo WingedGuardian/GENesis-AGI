@@ -14,6 +14,8 @@
 #   update-cc <ver> — install a pinned Claude Code version (validated semver)
 #   update-node <N> — install a pinned Node.js major via NodeSource (validated)
 #   test-approval   — E2E test the keyword-reply approval gate (no recovery)
+#   disk-status     — read-only storage-pool + snapshot JSON (Genesis's window
+#                     into host capacity: lvs data%/metadata%, VG free, snapshots)
 #   ping            — liveness check
 #
 # SSH authorized_keys entry (replace CONTAINER_IP with the container's
@@ -448,6 +450,20 @@ PYEOF
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
         GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
             timeout 130 "$VENV_PY" -m genesis.guardian --test-approval
+        ;;
+    disk-status)
+        # Read-only: print storage-pool + snapshot JSON. Genesis's programmatic
+        # window into host capacity (thin-pool data%/metadata%, VG free extents,
+        # guardian snapshot list). No mutation, no secrets needed.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "disk-status", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+            timeout 30 "$VENV_PY" -m genesis.guardian --disk-status
         ;;
     sync-gateway)
         # Recovery: redeploy the gateway script from the (already-pulled) install

@@ -132,6 +132,29 @@ class RecoveryConfig:
 
 
 @dataclass
+class StoragePoolConfig:
+    """Host storage-pool monitoring thresholds (LVM-thin data + metadata).
+
+    The incident that motivated this: the LVM thin pool filled to 100% with no
+    warning. Metadata exhaustion is worse than data exhaustion (it forces an
+    offline thin_check/repair), so metadata alerts at LOWER percentages.
+    """
+
+    enabled: bool = True
+    # Data-allocation tiers (percent of thin-pool data space used).
+    data_warn_pct: float = 75.0
+    data_high_pct: float = 85.0
+    data_crit_pct: float = 92.0
+    # Metadata tiers — alert earlier; metadata-full is nastier to recover.
+    metadata_warn_pct: float = 60.0
+    metadata_high_pct: float = 70.0
+    metadata_crit_pct: float = 80.0
+    # Re-alert cadence while a tier is sustained (avoids per-tick spam but keeps
+    # a live problem visible). Tier *increases* always alert immediately.
+    realert_hours: float = 6.0
+
+
+@dataclass
 class GuardianConfig:
     """Top-level Guardian configuration."""
 
@@ -155,6 +178,7 @@ class GuardianConfig:
     briefing: BriefingConfig = field(default_factory=BriefingConfig)
     snapshots: SnapshotConfig = field(default_factory=SnapshotConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
+    storage_pool: StoragePoolConfig = field(default_factory=StoragePoolConfig)
 
     @property
     def health_url(self) -> str:
@@ -320,6 +344,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         briefing=_build_sub(BriefingConfig, raw, "briefing"),
         snapshots=_build_sub(SnapshotConfig, raw, "snapshots"),
         recovery=_build_sub(RecoveryConfig, raw, "recovery"),
+        storage_pool=_build_sub(StoragePoolConfig, raw, "storage_pool"),
     )
 
     return _env_override(config)
