@@ -491,9 +491,9 @@ _CALL_SITE_META: dict[str, dict] = {
         "status_reason": "V4_PLACEHOLDER",
     },
     "dream_cycle_synthesis": {
-        "description": "Dream cycle cluster-merge synthesis. Consolidates near-duplicate episodic memories into canonical records. Weekly Sunday 4am via CronTrigger.",
+        "description": "Dream cycle cluster-merge synthesis. Consolidates near-duplicate episodic memories into canonical records. Fires from the DAILY synthesis drain (dream_synthesis_drain, 8am) in live mode — the weekly Sunday 4am job only clusters and persists the worklist. Drain is SHADOW (no LLM calls) until the T2-D PR2 live flip.",
         "category": "consolidation",
-        "frequency": "Weekly batch (Sunday 4am, max 100 clusters/run)",
+        "frequency": "Daily drain slices (8am, max 100 clusters/day; live-gated)",
         "model_tier": "slm",
         "wired": True,
     },
@@ -508,7 +508,7 @@ _CALL_SITE_META: dict[str, dict] = {
     "dream_cycle_synthesis_challenge": {
         "description": "Adversarial challenge of dream cycle synthesis output. Different provider from synthesis (Kimi challenges DeepSeek) to ensure model independence. Blocks deprecation when information loss detected.",
         "category": "consolidation",
-        "frequency": "Weekly batch (Sunday 4am, one per cluster synthesized)",
+        "frequency": "Daily drain slices (8am, one per cluster synthesized; live-gated)",
         "model_tier": "slm",
         "wired": True,
         "see_also": ["dream_cycle_synthesis"],

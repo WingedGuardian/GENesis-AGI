@@ -183,19 +183,17 @@ async def run(
     report dict with cluster counts, worklist-enqueue count, and any errors.
     """
     run_id = str(uuid.uuid4())
+    # Synthesis-outcome keys (clusters_merged, memories_deprecated, breaker
+    # state, …) live in run_synthesis_drain's report now — the weekly report
+    # carries only clustering + worklist facts, so a permanent "0 merged" here
+    # can't masquerade as a synthesis result.
     report: dict[str, Any] = {
         "run_id": run_id,
         "dry_run": dry_run,
         "threshold": similarity_threshold,
         "clusters_found": 0,
-        "clusters_merged": 0,
-        "clusters_skipped_large": 0,
-        "memories_deprecated": 0,
-        "adversarial_blocked": 0,
-        "shrink_gate_blocked": 0,
-        "rollback_flagged": False,
-        "aborted_capacity": False,
         "worklist_enqueued": 0,
+        "oversize_flagged": 0,
         "errors": [],
     }
 
@@ -283,9 +281,11 @@ async def run(
     # gated on the drain side. Supersedes last week's worklist (a fresh full
     # re-cluster is authoritative).
     try:
-        report["worklist_enqueued"] = await _persist_worklist(
+        worklist = await _persist_worklist(
             db, all_clusters, weekly_run_id=run_id, cap=WORKLIST_CAP,
         )
+        report["worklist_enqueued"] = worklist["enqueued"]
+        report["oversize_flagged"] = worklist["oversize_flagged"]
     except Exception as exc:
         report["errors"].append({"phase": "worklist_persist", "error": str(exc)})
         logger.warning(
@@ -310,24 +310,20 @@ async def run(
         logger.warning("Dream phase link_repair failed: %s", exc, exc_info=True)
 
     # Phase 6 — Entity resolution (dedup + contradiction detection).
-    # Skip when synthesis aborted on capacity: entity resolution is LLM-heavy
-    # and would just hammer the same saturated providers (Phases 5/7/8 are
-    # non-LLM SQL/graph work and run regardless).
-    if report["aborted_capacity"]:
-        logger.info(
-            "Dream cycle %s: skipping entity resolution — synthesis aborted on capacity",
-            run_id[:8],
-        )
-    else:
-        try:
-            from genesis.memory.dream_entity_scan import run_entity_resolution
+    # The old "skip when synthesis aborted on capacity" guard is gone: synthesis
+    # moved to run_synthesis_drain, so run() has no capacity signal to read.
+    # Equivalent protection (provider probe or an internal breaker) lands with
+    # the live flip (T2-D PR2 / FM-8); until then entity resolution is bounded
+    # by its own MAX_ENTITY_CHECKS_PER_RUN cap and gated by dry_run.
+    try:
+        from genesis.memory.dream_entity_scan import run_entity_resolution
 
-            report["entity_resolution"] = await run_entity_resolution(
-                **phase_kwargs, buckets=buckets,
-            )
-        except Exception as exc:
-            report["errors"].append({"phase": "entity_resolution", "error": str(exc)})
-            logger.warning("Dream phase entity_resolution failed: %s", exc, exc_info=True)
+        report["entity_resolution"] = await run_entity_resolution(
+            **phase_kwargs, buckets=buckets,
+        )
+    except Exception as exc:
+        report["errors"].append({"phase": "entity_resolution", "error": str(exc)})
+        logger.warning("Dream phase entity_resolution failed: %s", exc, exc_info=True)
 
     # Phase 7 — Orphan detection
     try:
@@ -355,8 +351,14 @@ async def run(
 
 def _rank_and_cap_clusters(
     clusters: list[list[dict]], *, cap: int,
+    max_cluster_size: int = MAX_CLUSTER_SIZE,
 ) -> list[list[dict]]:
-    """Rank clusters by VALUE (size desc = dedup payoff) and keep the top ``cap``.
+    """Rank MERGEABLE clusters by VALUE (size desc = dedup payoff), top ``cap``.
+
+    Clusters over ``max_cluster_size`` are excluded up front — synthesis skips
+    them (manual-review territory), so enqueueing them would put unmergeable
+    items at the TOP of a size-ranked worklist, wasting drain budget every week
+    and making shadow "would merge" reports unfaithful to live behavior (FM-1).
 
     Size is the v1 value signal (matches the existing synthesis sort). The daily
     drain works this list top-down within its budget, so the highest-value merges
@@ -364,7 +366,8 @@ def _rank_and_cap_clusters(
     (A similarity tiebreak is a deferred enhancement — the union edge-scores are
     computed during clustering but not currently retained past ``_cluster_bucket``.)
     """
-    return sorted(clusters, key=len, reverse=True)[:cap]
+    mergeable = [c for c in clusters if len(c) <= max_cluster_size]
+    return sorted(mergeable, key=len, reverse=True)[:cap]
 
 
 async def _persist_worklist(
@@ -373,8 +376,10 @@ async def _persist_worklist(
     *,
     weekly_run_id: str,
     cap: int = WORKLIST_CAP,
-) -> int:
-    """Persist the top-value clusters as the daily-drain worklist. Returns count.
+) -> dict[str, int]:
+    """Persist the top-value clusters as the daily-drain worklist.
+
+    Returns ``{"enqueued": n, "oversize_flagged": n, "superseded": n}``.
 
     Supersedes any prior ``dream_synthesis_slice`` rows (a fresh full re-cluster
     is authoritative) via an explicit synchronous supersede — NOT a staleness
@@ -382,11 +387,21 @@ async def _persist_worklist(
     under a single priority so the FIFO-within-priority drain order == value order.
     Stores only member ids + (wing, room) + weekly_run_id; the drain re-fetches
     live payloads (rehydrate), so a stale snapshot can't merge deprecated members.
+    Oversize clusters (> MAX_CLUSTER_SIZE) are never enqueued — flagged for
+    manual review here instead (FM-1).
     """
     from genesis.resilience.deferred_work import DRAIN, MEMORY_OPS, DeferredWorkQueue
 
     queue = DeferredWorkQueue(db)
     superseded = await queue.supersede(WORKLIST_WORK_TYPE)
+    oversize = [c for c in clusters if len(c) > MAX_CLUSTER_SIZE]
+    for cluster in oversize:
+        logger.info(
+            "Dream cycle %s: cluster of %d in %s/%s exceeds MAX_CLUSTER_SIZE — "
+            "flagged for manual review, not enqueued",
+            weekly_run_id[:8], len(cluster),
+            cluster[0].get("wing", "?"), cluster[0].get("room", "?"),
+        )
     ranked = _rank_and_cap_clusters(clusters, cap=cap)
 
     enqueued = 0
@@ -407,16 +422,21 @@ async def _persist_worklist(
             enqueued += 1
 
     logger.info(
-        "Dream cycle %s: worklist superseded %d prior, enqueued %d/%d clusters",
-        weekly_run_id[:8], superseded, enqueued, len(ranked),
+        "Dream cycle %s: worklist superseded %d prior, enqueued %d/%d clusters, "
+        "%d oversize flagged",
+        weekly_run_id[:8], superseded, enqueued, len(ranked), len(oversize),
     )
-    return enqueued
+    return {
+        "enqueued": enqueued,
+        "oversize_flagged": len(oversize),
+        "superseded": superseded,
+    }
 
 
 def _rehydrate_cluster(
     qdrant: QdrantClient, member_ids: list[str], wing: str, room: str,
 ) -> list[dict]:
-    """Re-fetch a persisted cluster's live members from Qdrant.
+    """Re-fetch a persisted cluster's live members from Qdrant (one batch call).
 
     A worklist slice stores only ids; by drain time members may have been
     deprecated (by an earlier slice or entity resolution). Fetch current payloads,
@@ -424,18 +444,25 @@ def _rehydrate_cluster(
     ``_synthesize_and_deprecate`` consumes. The caller skips a cluster with < 2
     live members (nothing left to consolidate). Union-find components are disjoint,
     so a member belongs to exactly one cluster — no cross-cluster double-merge.
-    """
-    from genesis.qdrant.collections import get_point
 
+    Synchronous (call via ``asyncio.to_thread``). Deliberately does NOT swallow
+    Qdrant errors: a genuinely-deleted point is simply absent from the batch
+    result, while an unreachable Qdrant RAISES — the drain must not mistake an
+    infrastructure outage for "members gone" and mass-discard the worklist (FM-2).
+    """
+    points = qdrant.retrieve(
+        collection_name=COLLECTION,
+        ids=member_ids,
+        with_payload=True,
+        with_vectors=False,
+    )
     live: list[dict] = []
-    for mid in member_ids:
-        point = get_point(qdrant, collection=COLLECTION, point_id=mid)
-        if point is None:
-            continue
-        if point["payload"].get("deprecated") is True:
+    for point in points:
+        payload = point.payload or {}
+        if payload.get("deprecated") is True:
             continue
         live.append({
-            "id": point["id"], "payload": point["payload"],
+            "id": str(point.id), "payload": payload,
             "wing": wing, "room": room,
         })
     return live
@@ -461,7 +488,12 @@ async def run_synthesis_drain(
 
     Items attempted this slice are marked completed regardless of per-cluster
     outcome — unmerged/blocked/aborted clusters simply re-surface in next week's
-    re-cluster (the design is value-ranked, not exhaustive).
+    re-cluster (the design is value-ranked, not exhaustive). Exception: on an
+    infrastructure failure (Qdrant unreachable) the drain aborts WITHOUT
+    consuming items — a preflight ping guards the start, and a mid-drain
+    rehydrate error resets the in-flight item to pending (FM-2). A stale slice
+    (<2 live members) is completed as a no-op, not discarded — discard implies
+    failure on the dashboard errors view (FM-5).
     """
     from genesis.resilience.deferred_work import DeferredWorkQueue
 
@@ -472,8 +504,22 @@ async def run_synthesis_drain(
         "clusters_merged": 0, "clusters_skipped_large": 0,
         "memories_deprecated": 0, "adversarial_blocked": 0,
         "shrink_gate_blocked": 0, "rollback_flagged": False,
-        "aborted_capacity": False, "errors": [],
+        "aborted_capacity": False, "aborted_infra": False, "errors": [],
     }
+
+    # Preflight: don't consume the worklist when Qdrant is unreachable — a dead
+    # Qdrant makes every member look "gone" and would mass-discard the week's
+    # top-value slices as stale (FM-2).
+    try:
+        await asyncio.to_thread(qdrant.get_collection, COLLECTION)
+    except Exception as exc:
+        report["aborted_infra"] = True
+        report["errors"].append({"phase": "preflight", "error": str(exc)})
+        logger.warning(
+            "Dream drain %s: Qdrant preflight failed — aborting without "
+            "consuming worklist: %s", run_id[:8], exc,
+        )
+        return report
 
     queue = DeferredWorkQueue(db)
     pending: list[tuple[dict, list[dict]]] = []
@@ -481,23 +527,46 @@ async def run_synthesis_drain(
         item = await queue.next_pending(work_type=WORKLIST_WORK_TYPE)
         if item is None:
             break
-        await queue.mark_processing(item["id"])
+        if not await queue.mark_processing(item["id"]):
+            # Row deleted between fetch and claim (weekly supersede racing this
+            # drain — near-impossible by schedule, cheap to guard: FM-10).
+            continue
         try:
             payload = json.loads(item["payload_json"])
-            cluster = _rehydrate_cluster(
+        except Exception as exc:
+            await queue.mark_discarded(item["id"], f"corrupt payload: {exc}")
+            report["errors"].append({"phase": "payload", "error": str(exc)})
+            continue
+        try:
+            cluster = await asyncio.to_thread(
+                _rehydrate_cluster,
                 qdrant,
                 payload.get("member_ids", []),
                 payload.get("wing", "general"),
                 payload.get("room", "uncategorized"),
             )
         except Exception as exc:
-            await queue.mark_discarded(item["id"], f"rehydrate error: {exc}")
+            # Infrastructure error mid-drain (Qdrant died after preflight):
+            # put the item back and stop — never discard on infra failure.
+            await queue.reset_to_pending(item["id"])
+            report["aborted_infra"] = True
             report["errors"].append({"phase": "rehydrate", "error": str(exc)})
-            continue
+            logger.warning(
+                "Dream drain %s: rehydrate infra error — item reset to "
+                "pending, aborting drain: %s", run_id[:8], exc,
+            )
+            break
         report["drained"] += 1
         if len(cluster) < 2:
-            await queue.mark_discarded(item["id"], "stale: <2 live members")
+            # Normal lifecycle outcome (members deprecated since Sunday), not a
+            # failure — completed, so it doesn't surface on the dashboard
+            # errors view via query_failed (FM-5).
+            await queue.mark_completed(item["id"])
             report["stale_skipped"] += 1
+            logger.info(
+                "Dream drain %s: slice stale (<2 live members) — completed as "
+                "no-op", run_id[:8],
+            )
             continue
         pending.append((item, cluster))
 

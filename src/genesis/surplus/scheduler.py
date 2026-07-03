@@ -393,12 +393,24 @@ class SurplusScheduler:
                 max_instances=1,
                 misfire_grace_time=3600,
             )
-        # Dream cycle: weekly Sunday 4am — episodic memory consolidation
+        # Dream cycle: weekly Sunday 4am — clustering + worklist persist
         from apscheduler.triggers.cron import CronTrigger
         self._scheduler.add_job(
             self.run_dream_cycle,
             CronTrigger(day_of_week="sun", hour=4, timezone=user_timezone()),
             id="dream_cycle",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+        # Dream synthesis drain: daily 8am — merges a bounded, value-ranked
+        # slice of the weekly worklist (SHADOW until the user-gated live flip),
+        # spreading synthesis load across the week instead of a Sunday spike.
+        # 8am leaves ~4h after the weekly scan starts; if the weekly is still
+        # running, the drain skips via the heavy_workload guard.
+        self._scheduler.add_job(
+            self.run_dream_synthesis_drain,
+            CronTrigger(hour=8, timezone=user_timezone()),
+            id="dream_synthesis_drain",
             max_instances=1,
             misfire_grace_time=3600,
         )
@@ -1356,10 +1368,14 @@ class SurplusScheduler:
                 pass
 
     async def run_dream_cycle(self) -> None:
-        """Run weekly episodic memory consolidation (dream cycle).
+        """Run the WEEKLY dream-cycle clustering pass (Sunday 4am).
 
-        Dry-run by default — set ``dream_cycle_live`` in Genesis config
-        to enable live merges after reviewing a dry-run report.
+        Scans + clusters episodic memory, runs the additive link/centrality
+        layer, and persists the value-ranked synthesis worklist that
+        ``run_dream_synthesis_drain`` consumes daily. Destructive phases
+        (entity resolution, link repair) are dry-run by default — set the
+        ``GENESIS_DREAM_CYCLE_LIVE=1`` environment variable (there is NO
+        config-file key for this) after reviewing dry-run reports.
         """
         try:
             from genesis.runtime import GenesisRuntime
@@ -1423,10 +1439,12 @@ class SurplusScheduler:
                     source="dream_cycle",
                     type="dream_cycle_report",
                     content=(
-                        f"Dream cycle {'DRY RUN' if dry_run else 'LIVE'}: "
+                        f"Dream cycle {'DRY RUN' if dry_run else 'LIVE'} "
+                        f"(weekly clustering): "
                         f"{report.get('clusters_found', 0)} clusters found, "
-                        f"{report.get('clusters_merged', 0)} merged, "
-                        f"{report.get('memories_deprecated', 0)} deprecated, "
+                        f"{report.get('worklist_enqueued', 0)} enqueued for "
+                        f"daily drain, "
+                        f"{report.get('oversize_flagged', 0)} oversize flagged, "
                         f"{len(report.get('errors', []))} errors"
                     ),
                     priority="low",
@@ -1452,14 +1470,124 @@ class SurplusScheduler:
                     rec_err, exc,
                 )
         finally:
-            # Always clear heavy workload flag, even on failure.
+            # Always clear heavy workload flag, even on failure — but ONLY if
+            # this job set it: an early return above fires before the flag is
+            # set, and an unconditional clear would clobber a flag held by the
+            # daily synthesis drain (the two dream jobs share the flag).
             # Use the captured `rt` reference from the try block above —
             # re-looking up GenesisRuntime.instance() here introduces a
             # second failure mode during shutdown races.  If `rt` is
             # unbound (import/lookup failed), NameError is caught below.
             try:
-                rt._heavy_workload = None
-                rt._heavy_workload_since = None
+                if rt._heavy_workload == "dream_cycle":
+                    rt._heavy_workload = None
+                    rt._heavy_workload_since = None
+            except Exception:
+                pass
+
+    async def run_dream_synthesis_drain(self) -> None:
+        """Drain a bounded, value-ranked slice of the dream-cycle synthesis
+        worklist (DAILY 8am — the weekly clustering job persists the worklist).
+
+        SHADOW mode: exercises the full queue + rehydration lifecycle but makes
+        no LLM calls and no memory mutations, reporting what it WOULD merge.
+        The live flip (honoring ``GENESIS_DREAM_CYCLE_LIVE``) is a separate,
+        user-gated change (T2-D PR2).
+        """
+        try:
+            from genesis.runtime import GenesisRuntime
+            rt = GenesisRuntime.instance()
+            if rt.paused:
+                logger.debug("Dream synthesis drain skipped (Genesis paused)")
+                return
+            if rt.heavy_workload:
+                # Weekly clustering (or another batch job) still running —
+                # don't overlap; today's slice re-surfaces tomorrow.
+                logger.info(
+                    "Dream synthesis drain skipped — heavy workload active (%s)",
+                    rt.heavy_workload,
+                )
+                return
+        except Exception:
+            logger.warning(
+                "Pause check failed — skipping dream synthesis drain",
+                exc_info=True,
+            )
+            return
+
+        with contextlib.suppress(Exception):
+            GenesisRuntime.instance().record_job_start("dream_synthesis_drain")
+
+        try:
+            from genesis.memory import dream_cycle
+
+            store = rt.memory_store
+            if rt.db is None or store is None or rt.router is None:
+                logger.warning(
+                    "Dream synthesis drain skipped — missing runtime dependencies"
+                )
+                return
+            qdrant = store.qdrant_client
+            if qdrant is None:
+                logger.warning(
+                    "Dream synthesis drain skipped — MemoryStore has no Qdrant client"
+                )
+                return
+
+            rt._heavy_workload = "dream_synthesis_drain"
+            rt._heavy_workload_since = datetime.now(UTC)
+
+            # SHADOW hardwired: the live flip is a separate user-gated change.
+            report = await dream_cycle.run_synthesis_drain(
+                qdrant=qdrant, db=rt.db, router=rt.router, store=store,
+                dry_run=True,
+            )
+
+            try:
+                import uuid as _uuid  # noqa: PLC0415
+
+                from genesis.db.crud import observations as obs_crud
+                await obs_crud.create(
+                    rt.db,
+                    id=str(_uuid.uuid4()),
+                    source="dream_cycle",
+                    type="dream_synthesis_drain_report",
+                    content=(
+                        f"Dream synthesis drain "
+                        f"{'SHADOW' if report.get('dry_run') else 'LIVE'}: "
+                        f"{report.get('drained', 0)} drained, "
+                        f"{report.get('would_merge', 0)} would merge, "
+                        f"{report.get('stale_skipped', 0)} stale, "
+                        f"{len(report.get('errors', []))} errors"
+                    ),
+                    priority="low",
+                    created_at=datetime.now(UTC).isoformat(),
+                )
+            except Exception:
+                pass
+
+            logger.info("Dream synthesis drain complete: %s", report)
+            with contextlib.suppress(Exception):
+                GenesisRuntime.instance().record_job_success("dream_synthesis_drain")
+        except Exception as exc:
+            logger.exception("Dream synthesis drain failed: %s", exc)
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure(
+                    "dream_synthesis_drain", str(exc)[:500],
+                )
+            except Exception as rec_err:
+                logger.error(
+                    "Failed to record dream_synthesis_drain failure: %s "
+                    "(original error: %s)",
+                    rec_err, exc,
+                )
+        finally:
+            # Clear only if this job set the flag (see run_dream_cycle note).
+            try:
+                if rt._heavy_workload == "dream_synthesis_drain":
+                    rt._heavy_workload = None
+                    rt._heavy_workload_since = None
             except Exception:
                 pass
 
