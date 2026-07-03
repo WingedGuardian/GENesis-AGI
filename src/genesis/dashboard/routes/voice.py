@@ -6,9 +6,11 @@ visibility. Voice is an OPTIONAL add-on: on a stock clone with no
 ``~/.genesis/ambient_remote.yaml`` the page 404s and the nav link stays hidden, so
 non-voice installs never see voice surfaces.
 
-The page's sub-tabs (Calibration / Bridge / STT / S2S) are all in the served template;
-the Bridge tab reuses the existing ``/api/genesis/health`` ``infrastructure.ambient``
-block, so no heavy voice-specific endpoint is added here.
+The page's sub-tabs (Judgment / Bridge / STT / S2S / Device) are all in the served
+template. The Bridge tab reuses the existing ``/api/genesis/health``
+``infrastructure.ambient`` block; the Device tab reads live Voice PE hardware vitals
+from Home Assistant via ``GET /api/genesis/voice/device`` (below) — the one
+voice-specific endpoint here, on-demand so it never burdens the health snapshot.
 """
 from __future__ import annotations
 
@@ -16,7 +18,7 @@ from pathlib import Path
 
 from flask import abort, jsonify, send_from_directory
 
-from genesis.dashboard._blueprint import blueprint
+from genesis.dashboard._blueprint import _async_route, blueprint
 
 TEMPLATE_DIR = Path(__file__).parent.parent / "templates"
 
@@ -53,3 +55,18 @@ def voice_enabled():
     """Whether the optional voice add-on is configured — drives nav-link visibility.
     Non-sensitive boolean; open like the rest of the ``/api`` surface."""
     return jsonify({"enabled": _voice_configured()})
+
+
+@blueprint.route("/api/genesis/voice/device")
+@_async_route(timeout=10.0)
+async def voice_device():
+    """Live Voice PE hardware vitals (temperature / wifi / uptime / reset reason /
+    heap / loop time + connected status), polled from Home Assistant on demand.
+
+    Always returns HTTP 200 with a ``reachable`` flag so the Device tab degrades
+    gracefully when HA is unreachable or ``HA_VOICE_PE_PREFIX`` isn't set — never a
+    5xx the frontend would treat as a server fault. Gates on HA env (NOT
+    ``_voice_configured``, which checks the unrelated ambient SSH config)."""
+    from genesis.channels.voice.pe_vitals import fetch_voice_pe_vitals
+
+    return jsonify(await fetch_voice_pe_vitals())
