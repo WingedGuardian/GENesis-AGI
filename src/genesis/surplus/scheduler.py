@@ -308,27 +308,29 @@ class SurplusScheduler:
             misfire_grace_time=60,
         )
         if self._enable_code_audits:
+            # CronTrigger not IntervalTrigger — same >1h restart-reset trap as
+            # maintenance/code_index (code_audit_hours=12 by default). _code_audit_hours
+            # stays the _recently_completed cooldown; the boot run is covered by the
+            # immediate await in start() below.
             self._scheduler.add_job(
                 self.schedule_code_audit,
-                IntervalTrigger(hours=self._code_audit_hours),
+                _restart_safe_hourly(self._code_audit_hours, minute=5),
                 id="schedule_code_audit",
                 max_instances=1,
                 misfire_grace_time=300,
-                next_run_time=datetime.now(UTC) + timedelta(seconds=60),
             )
         else:
             logger.info("Code audits disabled — skipping job registration")
         # CronTrigger not IntervalTrigger — a >1h IntervalTrigger resets on every
         # restart (CLAUDE.md trap), so code indexing starves if the server restarts
         # more often than code_index_hours. _code_index_hours stays the
-        # _recently_completed cooldown; the boot-pin re-indexes shortly after each start.
+        # _recently_completed cooldown; the boot run is covered by start()'s await below.
         self._scheduler.add_job(
             self.schedule_code_index,
             _restart_safe_hourly(self._code_index_hours, minute=10),
             id="schedule_code_index",
             max_instances=1,
             misfire_grace_time=300,
-            next_run_time=datetime.now(UTC) + timedelta(seconds=60),
         )
         # Recon gather: Tue & Fri 1:45am local (~3.5 day cadence).
         # CronTrigger instead of IntervalTrigger — IntervalTrigger(hours=84)
@@ -443,14 +445,13 @@ class SurplusScheduler:
         # restart (CLAUDE.md trap), starving maintenance (surplus TTL, pending_embeddings,
         # heartbeats, weak links, transcript archival) under frequent restarts.
         # _maintenance_hours stays the _recently_completed cooldown (the real cadence
-        # gate); the boot-pin also runs it shortly after each start.
+        # gate); the boot run is covered by the immediate await in start() below.
         self._scheduler.add_job(
             self.schedule_maintenance,
             _restart_safe_hourly(self._maintenance_hours, minute=20),
             id="schedule_maintenance",
             max_instances=1,
             misfire_grace_time=300,
-            next_run_time=datetime.now(UTC) + timedelta(seconds=60),
         )
         # Analytical tasks: daily 7am local — LLM-based gap clustering,
         # prompt effectiveness, anticipatory research.
@@ -547,7 +548,7 @@ class SurplusScheduler:
         # Run brainstorm check immediately on startup
         await self.brainstorm_check()
         # Run remaining jobs immediately on startup —
-        # otherwise they only fire after their IntervalTrigger elapses.
+        # otherwise they only fire at their next scheduled time.
         if self._enable_code_audits:
             await self.schedule_code_audit()
         await self.schedule_code_index()

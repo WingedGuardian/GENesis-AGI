@@ -7,7 +7,7 @@ unexpected file changes ("what session touched this file?").
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -73,11 +73,7 @@ async def prune_older_than(
     db: aiosqlite.Connection,
     days: int = 90,
 ) -> int:
-    """Delete records older than N days. Returns count deleted."""
-    cutoff = datetime.now(UTC).isoformat()
-    # Compute cutoff by subtracting days (ISO format comparison works)
-    from datetime import timedelta
-
+    """Delete records older than N days (by timestamp). Returns count deleted."""
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
     cursor = await db.execute(
         "DELETE FROM file_modifications WHERE timestamp < ?",

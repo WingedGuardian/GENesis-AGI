@@ -53,13 +53,14 @@ async def test_restart_safe_hourly_subdaily_is_stepped_and_daily_differs():
     assert "*/24" not in daily  # collapses to a fixed daily hour, not an every-24h step
 
 
-async def test_maintenance_and_code_index_triggers_are_restart_safe(db):
-    """schedule_maintenance + schedule_code_index must use CronTrigger, not IntervalTrigger —
-    a >1h IntervalTrigger resets on every restart and starves the job (the CLAUDE.md trap)."""
-    sched, _ = _make_scheduler(db)
+async def test_long_interval_jobs_use_restart_safe_crontriggers(db):
+    """The >1h jobs — schedule_maintenance, schedule_code_index, schedule_code_audit — must
+    use CronTrigger, not IntervalTrigger: a >1h IntervalTrigger resets on every restart and
+    starves the job (the CLAUDE.md trap). Enumerated as a class, not just the flagged job."""
+    sched, _ = _make_scheduler(db, enable_code_audits=True)
     await sched.start()
     try:
-        for job_id in ("schedule_maintenance", "schedule_code_index"):
+        for job_id in ("schedule_maintenance", "schedule_code_index", "schedule_code_audit"):
             job = sched._scheduler.get_job(job_id)
             assert job is not None, f"{job_id} not registered"
             assert isinstance(job.trigger, CronTrigger), f"{job_id} must be CronTrigger"
