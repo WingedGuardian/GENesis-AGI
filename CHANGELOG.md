@@ -25,6 +25,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **You can now run Genesis on Claude Fable 5, and pick the full thinking-effort range on Sonnet and Fable.**
+  Fable 5 (Anthropic's new top-tier model) is now a selectable model everywhere you choose one — the ego,
+  campaigns, the inbox monitor, the Telegram default, the `/model` command (terminal and Telegram), and the
+  dashboard dropdowns. Sonnet (now Sonnet 5) and Fable also accept the full `low`–`max` effort range,
+  including `xhigh` and `max`; previously Sonnet was capped at `high`. Nothing switches automatically — your
+  existing defaults are unchanged; this only makes the new options available when you want them.
+
 - **Daily disk hygiene now prunes stale scratch and old attention snapshots.** Housekeeping now
   age-prunes leftover files in `~/tmp` (older than 7 days) and garbage-collects attention-engine
   snapshots older than 60 days — but never one behind a moment you've labeled for review, so your
@@ -133,6 +140,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   checks now run off the main loop, and a failure in one section degrades just that section to an error state
   while the rest of the health view loads normally. Overlapping health requests now also share a single
   computation instead of each recomputing from scratch.
+
+- **Genesis's background egos now keep their thinking rhythm across a restart instead of going quiet.**
+  The two egos run proactive cycles on an adaptive schedule that stretches out when things are idle. That
+  schedule was re-armed from scratch on every restart, so an install that restarts often (deploys, recovery)
+  could keep pushing the next cycle further out — in the worst case starving an ego for up to its full
+  backed-off interval. Each ego now anchors its first post-restart cycle to when it last actually ran: an
+  overdue ego runs shortly after startup, while an up-to-date one simply keeps its cadence.
 
 - **Uploading a large or malformed PDF to the Knowledge tab no longer freezes — or crashes — Genesis.**
   PDF text extraction used to run directly on the main event loop, so a big document could stall the whole

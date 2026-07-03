@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -115,3 +116,17 @@ async def delete(db: aiosqlite.Connection, id: str) -> bool:
     cursor = await db.execute("DELETE FROM execution_traces WHERE id = ?", (id,))
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def prune_older_than(db: aiosqlite.Connection, days: int = 90) -> int:
+    """Delete traces older than N days (by ``created_at``). Returns the count deleted.
+
+    A single indexed DELETE (``idx_traces_created``); runs in a daily maintenance job,
+    never the hot path. The caller logs the returned count for observability.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    cursor = await db.execute(
+        "DELETE FROM execution_traces WHERE created_at < ?", (cutoff,),
+    )
+    await db.commit()
+    return cursor.rowcount  # type: ignore[return-value]

@@ -270,6 +270,17 @@ def test_interact_profile_keeps_opus_when_already_opus():
     assert inv.model == CCModel.OPUS
 
 
+def test_interact_profile_pins_fable_down_to_opus():
+    """Interact intentionally pins Fable DOWN to Opus (Fable not yet cleared for
+    the browser/ATS path — see cc-compatibility.md). Documents the deliberate
+    pin so it isn't mistaken for a downgrade bug; flip to a tier floor if Fable
+    is later cleared for interact work."""
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="test", profile="interact", model=CCModel.FABLE)
+    inv = runner._build_invocation(req, "test-session")
+    assert inv.model == CCModel.OPUS
+
+
 def test_research_profile_does_not_upgrade_model():
     """Non-interact profiles must NOT override the requested model."""
     runner = _make_runner()

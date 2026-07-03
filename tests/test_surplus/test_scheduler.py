@@ -6,13 +6,15 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.db.crud import surplus_tasks
 from genesis.surplus.compute_availability import ComputeAvailability
 from genesis.surplus.executor import StubExecutor
 from genesis.surplus.idle_detector import IdleDetector
 from genesis.surplus.queue import SurplusQueue
-from genesis.surplus.scheduler import SurplusScheduler
+from genesis.surplus.scheduler import SurplusScheduler, _restart_safe_hourly
 from genesis.surplus.types import ComputeTier, TaskType
 
 pytestmark = pytest.mark.asyncio
@@ -30,6 +32,45 @@ def _make_scheduler(db, *, idle=True, lmstudio_up=False, enable_code_audits=Fals
         compute_availability=compute, executor=StubExecutor(),
         enable_code_audits=enable_code_audits,
     ), compute
+
+
+async def test_restart_safe_hourly_returns_crontrigger_not_interval():
+    """Every sub-daily / daily cadence must come back as a CronTrigger (never Interval)."""
+    for hours in (4, 6, 12, 24):
+        trig = _restart_safe_hourly(hours)
+        assert isinstance(trig, CronTrigger)
+        assert not isinstance(trig, IntervalTrigger)
+
+
+async def test_restart_safe_hourly_subdaily_is_stepped_and_daily_differs():
+    """4h -> every-4-hours step; >=24h -> a single daily fire (the _recently_completed
+    cooldown is the real cadence gate). Assert on trigger fields, not the __str__ repr."""
+    def _field(trig, name):
+        return next(str(f) for f in trig.fields if f.name == name)
+
+    sub = _restart_safe_hourly(4, minute=10)
+    daily = _restart_safe_hourly(24, minute=20)
+    assert _field(sub, "hour") == "*/4"
+    assert _field(sub, "minute") == "10"
+    # >=24h collapses to a single fixed daily hour, not an every-24h step
+    assert _field(daily, "hour") == "4"
+    assert _field(daily, "minute") == "20"
+
+
+async def test_long_interval_jobs_use_restart_safe_crontriggers(db):
+    """The >1h jobs — schedule_maintenance, schedule_code_index, schedule_code_audit — must
+    use CronTrigger, not IntervalTrigger: a >1h IntervalTrigger resets on every restart and
+    starves the job (the CLAUDE.md trap). Enumerated as a class, not just the flagged job."""
+    sched, _ = _make_scheduler(db, enable_code_audits=True)
+    await sched.start()
+    try:
+        for job_id in ("schedule_maintenance", "schedule_code_index", "schedule_code_audit"):
+            job = sched._scheduler.get_job(job_id)
+            assert job is not None, f"{job_id} not registered"
+            assert isinstance(job.trigger, CronTrigger), f"{job_id} must be CronTrigger"
+            assert not isinstance(job.trigger, IntervalTrigger)
+    finally:
+        sched._scheduler.shutdown(wait=False)
 
 
 async def test_run_gitnexus_strip_cleans_claude_md(db, tmp_path, monkeypatch):

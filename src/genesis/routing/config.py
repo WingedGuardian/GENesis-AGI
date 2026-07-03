@@ -12,6 +12,7 @@ from pathlib import Path
 
 import yaml
 
+from genesis.cc.types import CCModel
 from genesis.routing.types import (
     CallSiteConfig,
     ProviderConfig,
@@ -375,8 +376,10 @@ def update_call_site_in_yaml(
         local_cs["never_pays"] = never_pays
         effective_cs["never_pays"] = never_pays
 
-    # CC dispatch metadata (stored in YAML, read by dashboard)
-    _VALID_CC_MODELS = {"Haiku", "Sonnet", "Opus"}
+    # CC dispatch metadata (stored in YAML, read by dashboard). Capitalized to
+    # match the routing-registry convention; derived from CCModel so a new tier
+    # (e.g. Fable) is accepted here automatically.
+    _VALID_CC_MODELS = {m.value.capitalize() for m in CCModel}
     if cc_model is not None and cc_model not in _VALID_CC_MODELS:
         msg = f"Invalid CC model: {cc_model!r}. Must be one of {_VALID_CC_MODELS}"
         raise ValueError(msg)

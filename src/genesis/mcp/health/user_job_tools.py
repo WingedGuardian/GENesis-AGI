@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from genesis.cc.types import VALID_EFFORT_NAMES, VALID_MODEL_NAMES
 from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
@@ -56,8 +57,8 @@ async def user_job_create(
     # stale hardcoded subset — matches direct_session_tools.py.
     from genesis.cc.direct_session import VALID_PROFILES
 
-    _VALID_MODELS = {"sonnet", "opus", "haiku"}
-    _VALID_EFFORTS = {"low", "medium", "high"}
+    _VALID_MODELS = VALID_MODEL_NAMES
+    _VALID_EFFORTS = VALID_EFFORT_NAMES
 
     if profile not in VALID_PROFILES:
         return {"error": f"Invalid profile '{profile}'. Must be one of: {', '.join(sorted(VALID_PROFILES))}"}
