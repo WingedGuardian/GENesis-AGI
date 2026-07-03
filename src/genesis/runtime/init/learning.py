@@ -825,6 +825,73 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        # ── genesis.db drip-table retention (restart-safe CronTrigger) ──────────
+        # These tables accrue a steady drip with no prior scheduled GC. 90d windows;
+        # cost_events 90d stays well clear of the monthly budget window. Each is a
+        # single indexed DELETE in an off-peak daily job (staggered after otel prune).
+        async def _prune_execution_traces() -> None:
+            if rt._db is None:
+                return
+            try:
+                from genesis.db.crud import execution_traces as _et
+                removed = await _et.prune_older_than(rt._db, days=90)
+                rt.record_job_success("execution_traces_prune")
+                if removed:
+                    logger.info("execution_traces prune: removed %d rows (>90d)", removed)
+            except Exception as exc:
+                rt.record_job_failure("execution_traces_prune", str(exc))
+                logger.exception("execution_traces prune failed")
+
+        rt._learning_scheduler.add_job(
+            _prune_execution_traces,
+            CronTrigger(hour=4, minute=40, timezone=user_timezone()),
+            id="execution_traces_prune",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
+        async def _prune_cost_events() -> None:
+            if rt._db is None:
+                return
+            try:
+                from genesis.db.crud import cost_events as _ce
+                removed = await _ce.prune_older_than(rt._db, days=90)
+                rt.record_job_success("cost_events_prune")
+                if removed:
+                    logger.info("cost_events prune: removed %d rows (>90d)", removed)
+            except Exception as exc:
+                rt.record_job_failure("cost_events_prune", str(exc))
+                logger.exception("cost_events prune failed")
+
+        rt._learning_scheduler.add_job(
+            _prune_cost_events,
+            CronTrigger(hour=4, minute=50, timezone=user_timezone()),
+            id="cost_events_prune",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
+        async def _prune_file_modifications() -> None:
+            if rt._db is None:
+                return
+            try:
+                from genesis.db.crud import file_modifications as _fm
+                removed = await _fm.prune_older_than(rt._db, days=90)
+                rt.record_job_success("file_modifications_prune")
+                if removed:
+                    logger.info("file_modifications prune: removed %d rows (>90d)", removed)
+            except Exception as exc:
+                rt.record_job_failure("file_modifications_prune", str(exc))
+                logger.exception("file_modifications prune failed")
+
+        rt._learning_scheduler.add_job(
+            _prune_file_modifications,
+            CronTrigger(hour=5, minute=0, timezone=user_timezone()),
+            id="file_modifications_prune",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         async def _reap_stale_processes() -> None:
             """Kill leaked processes older than their configured threshold.
 

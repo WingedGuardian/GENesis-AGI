@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -161,3 +162,19 @@ async def delete(db: aiosqlite.Connection, id: str) -> bool:
     cursor = await db.execute("DELETE FROM cost_events WHERE id = ?", (id,))
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def prune_older_than(db: aiosqlite.Connection, days: int = 90) -> int:
+    """Delete cost_events older than N days (by ``created_at``). Returns count deleted.
+
+    Single indexed DELETE (``idx_cost_events_created``); runs in a daily maintenance job.
+    The 90d default stays well clear of the monthly budget window
+    (``cost_tracker._period_start('this_month')`` looks back at most ~31d), so retention
+    can never delete a row the budget accounting still needs.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    cursor = await db.execute(
+        "DELETE FROM cost_events WHERE created_at < ?", (cutoff,),
+    )
+    await db.commit()
+    return cursor.rowcount  # type: ignore[return-value]
