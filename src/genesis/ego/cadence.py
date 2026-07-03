@@ -134,12 +134,24 @@ class EgoCadenceManager:
 
     async def start(self) -> None:
         """Register APScheduler jobs and start."""
+        # Restart-safe boot first-fire: anchor to this ego's own persisted
+        # job_health.last_success so a restart cannot starve the proactive
+        # cycle by a full (backed-off, up to 72h) interval — the documented
+        # IntervalTrigger-resets-on-restart trap. None => fresh install =>
+        # OMIT next_run_time (never pass None — APScheduler treats an explicit
+        # next_run_time=None as a PAUSED job).
+        boot_first_fire = await self._compute_boot_first_fire()
+        ego_cycle_kwargs: dict[str, object] = {
+            "id": "ego_cycle",
+            "max_instances": 1,
+            "misfire_grace_time": 300,
+        }
+        if boot_first_fire is not None:
+            ego_cycle_kwargs["next_run_time"] = boot_first_fire
         self._scheduler.add_job(
             self._on_tick,
             IntervalTrigger(minutes=self._current_interval),
-            id="ego_cycle",
-            max_instances=1,
-            misfire_grace_time=300,
+            **ego_cycle_kwargs,
         )
         if self._config.morning_report_enabled:
             tz = user_timezone()
@@ -1026,6 +1038,56 @@ class EgoCadenceManager:
                 return max_mins
 
         return self._config.max_interval_minutes
+
+    async def _compute_boot_first_fire(self) -> datetime | None:
+        """Restart-safe first-fire time for the ``ego_cycle`` job.
+
+        The proactive cadence uses an ``IntervalTrigger`` whose interval adapts
+        (base → up to 72h) and RESETS to base on every restart, and APScheduler
+        counts the interval from scheduler start with no ``next_run_time``. On a
+        restart-heavy install this defers — and keeps re-deferring — the first
+        proactive fire by a full backed-off interval (the documented
+        IntervalTrigger-resets-on-restart trap).
+
+        Anchor the boot first-fire to this ego's OWN ``job_health.last_success``
+        (per-ego since #863; persisted and reloaded across restarts). Mirrors the
+        ``memory_extraction`` boot-pin from #863: fire ~soon after boot when the
+        ego is overdue, otherwise wait out only the remaining base interval so a
+        restart does not re-run the expensive cycle prematurely.
+
+        Returns the datetime for ``add_job(next_run_time=...)``, or ``None`` when
+        there is no prior successful cycle (fresh install / no row / read error)
+        so ``start()`` OMITS the kwarg and keeps APScheduler's default
+        trigger-computed first fire. ``None`` must never be passed to
+        ``add_job`` — an explicit ``next_run_time=None`` marks the job PAUSED.
+        """
+        try:
+            cursor = await self._db.execute(
+                "SELECT last_success FROM job_health WHERE job_name = ?",
+                (self._session._source_tag,),
+            )
+            row = await cursor.fetchone()
+        except Exception:
+            logger.debug(
+                "Boot first-fire: job_health read failed; using default timing",
+                exc_info=True,
+            )
+            return None
+
+        if not row or not row[0]:
+            return None
+        try:
+            last_success = datetime.fromisoformat(row[0])
+        except (ValueError, TypeError):
+            return None
+        if last_success.tzinfo is None:
+            last_success = last_success.replace(tzinfo=UTC)
+
+        now = datetime.now(UTC)
+        base = timedelta(minutes=self._config.cadence_minutes)
+        # ~60s boot-pin mirrors #863's memory_extraction restart-safe schedule.
+        boot_pin = now + timedelta(seconds=60)
+        return max(boot_pin, last_success + base)
 
     async def _update_interval(self, *, had_proposals: bool) -> None:
         """Adjust cycle interval based on productivity and user recency.

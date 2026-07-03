@@ -130,6 +130,112 @@ class TestCadenceLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# Restart-safe boot first-fire (B1): anchor ego_cycle to job_health.last_success
+# ---------------------------------------------------------------------------
+
+_JOB_HEALTH_DDL = """
+    CREATE TABLE IF NOT EXISTS job_health (
+        job_name         TEXT PRIMARY KEY,
+        last_run         TEXT,
+        last_success     TEXT,
+        last_failure     TEXT,
+        last_error       TEXT,
+        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        total_runs       INTEGER NOT NULL DEFAULT 0,
+        total_successes  INTEGER NOT NULL DEFAULT 0,
+        total_failures   INTEGER NOT NULL DEFAULT 0,
+        updated_at       TEXT NOT NULL
+    )
+"""
+
+
+async def _seed_last_success(conn, job_name: str, last_success: datetime) -> None:
+    """Create job_health (not in TABLES) and seed one ego's last_success row."""
+    await conn.execute(_JOB_HEALTH_DDL)
+    iso = last_success.isoformat()
+    await conn.execute(
+        "INSERT INTO job_health "
+        "(job_name, last_run, last_success, consecutive_failures, "
+        " total_runs, total_successes, total_failures, updated_at) "
+        "VALUES (?, ?, ?, 0, 1, 1, 0, ?)",
+        (job_name, iso, iso, iso),
+    )
+    await conn.commit()
+
+
+class TestBootFirstFire:
+    """The ego_cycle boot first-fire is anchored to this ego's OWN persisted
+    job_health.last_success so a restart cannot starve the proactive cycle
+    (the IntervalTrigger-resets-on-restart trap)."""
+
+    async def test_overdue_fires_soon(self, cadence, mock_session, db):
+        mock_session._source_tag = "user_ego_cycle"
+        await _seed_last_success(
+            db, "user_ego_cycle", datetime.now(UTC) - timedelta(days=5),
+        )
+        first_fire = await cadence._compute_boot_first_fire()
+        assert first_fire is not None
+        delta = (first_fire - datetime.now(UTC)).total_seconds()
+        # overdue by >> base → ~60s boot-pin, not a full base interval away
+        assert 0 < delta <= 120
+
+    async def test_recent_waits_remaining_base(self, cadence, mock_session, db):
+        mock_session._source_tag = "user_ego_cycle"
+        last = datetime.now(UTC) - timedelta(minutes=10)  # base=60 → +50m ahead
+        await _seed_last_success(db, "user_ego_cycle", last)
+        first_fire = await cadence._compute_boot_first_fire()
+        expected = last + timedelta(minutes=60)  # config.cadence_minutes == 60
+        assert abs((first_fire - expected).total_seconds()) < 2
+
+    async def test_no_row_returns_none(self, cadence, mock_session, db):
+        mock_session._source_tag = "genesis_ego_cycle"
+        await db.execute(_JOB_HEALTH_DDL)  # table exists, no row for this ego
+        await db.commit()
+        assert await cadence._compute_boot_first_fire() is None
+
+    async def test_missing_table_returns_none(self, cadence, mock_session):
+        # job_health never created → read raises → swallowed → None (fresh path)
+        mock_session._source_tag = "genesis_ego_cycle"
+        assert await cadence._compute_boot_first_fire() is None
+
+    async def test_per_ego_isolation(self, cadence, mock_session, db):
+        # only the genesis row exists; the user ego must NOT read it
+        await _seed_last_success(
+            db, "genesis_ego_cycle", datetime.now(UTC) - timedelta(days=5),
+        )
+        mock_session._source_tag = "user_ego_cycle"
+        assert await cadence._compute_boot_first_fire() is None
+
+    async def test_start_pins_next_run_time_when_overdue(
+        self, cadence, mock_session, db,
+    ):
+        mock_session._source_tag = "user_ego_cycle"
+        await _seed_last_success(
+            db, "user_ego_cycle", datetime.now(UTC) - timedelta(days=5),
+        )
+        await cadence.start()
+        try:
+            job = cadence._scheduler.get_job("ego_cycle")
+            assert job is not None and job.next_run_time is not None
+            delta = (job.next_run_time - datetime.now(UTC)).total_seconds()
+            assert 0 < delta <= 120
+        finally:
+            await cadence.stop()
+
+    async def test_start_fresh_install_not_paused(self, cadence, mock_session):
+        # No job_health row → next_run_time OMITTED → trigger computes it
+        # (now + base). Must NOT be paused: an explicit None would pause it.
+        mock_session._source_tag = "genesis_ego_cycle"
+        await cadence.start()
+        try:
+            job = cadence._scheduler.get_job("ego_cycle")
+            assert job is not None
+            assert job.next_run_time is not None  # not paused
+        finally:
+            await cadence.stop()
+
+
+# ---------------------------------------------------------------------------
 # Heartbeat — dedicated fixed-interval liveness pulse (decoupled from _on_tick)
 # ---------------------------------------------------------------------------
 
