@@ -37,7 +37,7 @@ Container inspection (via incus exec):
 - `incus exec genesis -- su - ubuntu -c "cd ~/genesis && git log --oneline -5"` — Recent commits
 - `incus info genesis` — Container status
 - `incus restart genesis` — Restart container (last resort)
-- `incus snapshot create genesis guardian-pre-recovery` — Snapshot BEFORE recovery
+- `incus snapshot create genesis guardian-$(date +%Y%m%d-%H%M%S)-pre-recovery` — Snapshot BEFORE recovery (timestamped name so it sorts and prunes correctly; the guardian auto-prunes guardian-* snapshots older than ~14 days, but DELETE this one yourself once recovery is verified: `incus snapshot delete genesis <name>`)
 
 Direct host reads (work when container is frozen/D-state and incus exec is unresponsive):
 - `cat /sys/fs/cgroup/lxc.payload.genesis/io.pressure` — I/O pressure (PSI)
