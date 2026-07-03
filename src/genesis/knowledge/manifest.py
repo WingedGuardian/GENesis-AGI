@@ -75,6 +75,19 @@ class ManifestManager:
         """Check if a source has already been ingested."""
         return self.source_hash(source) in self._load()
 
+    def has_unchanged_source(self, source: str, content_hash: str) -> bool:
+        """True iff the source is already ingested AND its stored ``content_hash``
+        matches (i.e. the content has NOT changed since the last ingest).
+
+        A source that is unknown, or a pre-existing entry with no stored
+        ``content_hash``, reads as *changed* (returns False) so it re-distills
+        exactly once and then stabilizes."""
+        entry = self._load().get(self.source_hash(source))
+        if entry is None:
+            return False
+        stored = entry.get("content_hash")
+        return stored is not None and stored == content_hash
+
     def save_extracted_text(self, source: str, text: str, source_type: str) -> Path:
         """Save extracted text to sources/ directory. Returns the file path."""
         self.ensure_dirs()
@@ -109,8 +122,16 @@ class ManifestManager:
         extracted_path: Path,
         original_path: Path | None = None,
         unit_ids: list[str] | None = None,
+        content_hash: str | None = None,
     ) -> None:
-        """Register a source in the manifest."""
+        """Register a source in the manifest.
+
+        ``content_hash`` (optional) fingerprints the extracted text so a later
+        re-ingest can tell whether the content CHANGED (re-distill) or is
+        unchanged (serve cache) via ``has_unchanged_source``. Additive JSON key —
+        entries written before this existed carry no ``content_hash`` and read as
+        *changed* the first time (re-distill once, then stabilize).
+        """
         manifest = self._load()
         h = self.source_hash(source)
         manifest[h] = {
@@ -119,6 +140,7 @@ class ManifestManager:
             "extracted_path": str(extracted_path),
             "original_path": str(original_path) if original_path else None,
             "unit_ids": unit_ids or [],
+            "content_hash": content_hash,
             "ingested_at": datetime.now(UTC).isoformat(),
         }
         self._save()
@@ -139,8 +161,9 @@ class ManifestManager:
         per-unit), but the manifest tracks whole sources. We pop ``unit_id`` from
         its owning entry's ``unit_ids``; when that removes the source's LAST live
         unit, we delete the entire entry — a *tombstone* — so a future re-ingest
-        is no longer blocked by the source-identity gate (``has_source``), which
-        would otherwise serve now-dead cached unit IDs forever.
+        is no longer short-circuited by the dedup gate (``has_unchanged_source``,
+        which keys on the manifest entry), which would otherwise serve now-dead
+        cached unit IDs forever.
 
         INVARIANT: only a transition-to-empty *via this method* tombstones an
         entry. A ``no_units_extracted`` source (``add_source`` with

@@ -248,3 +248,71 @@ async def test_ingest_scan_failure_is_fail_open(tmp_path: Path):
 
     assert result.units_created == 1
     assert not any("injection_patterns_detected" in f for f in result.quality_flags)
+
+
+# ─── content-hash idempotency: re-ingest changed vs unchanged content ─────────
+
+
+async def test_reingest_changed_content_redistills(tmp_path: Path):
+    """Re-ingesting the SAME source with CHANGED content re-runs distillation
+    instead of serving the stale cached units (the content-hash gate move)."""
+    units = [KnowledgeUnit(concept="Test", body="Test body", domain="test")]
+    orch = _make_orchestrator(tmp_path, mock_distill_result=units)
+    with patch("genesis.knowledge.orchestrator.KnowledgeOrchestrator._store_units",
+               new_callable=AsyncMock, return_value=["unit-1"]):
+        file = tmp_path / "doc.txt"
+        file.write_text("Original content worth distilling.")
+        r1 = await orch.ingest_source(str(file), project_type="test")
+        assert r1.units_created == 1
+
+        # Change the content — must NOT short-circuit as a duplicate now.
+        file.write_text("Completely different content, re-distill me please.")
+        r2 = await orch.ingest_source(str(file), project_type="test")
+        assert r2.units_created == 1
+        assert "duplicate_source" not in r2.quality_flags
+
+
+async def test_reingest_unchanged_content_serves_cache(tmp_path: Path):
+    """Re-ingesting identical content still short-circuits to the cached result
+    (dedup preserved through the gate move)."""
+    units = [KnowledgeUnit(concept="Test", body="Test body", domain="test")]
+    orch = _make_orchestrator(tmp_path, mock_distill_result=units)
+    with patch("genesis.knowledge.orchestrator.KnowledgeOrchestrator._store_units",
+               new_callable=AsyncMock, return_value=["unit-1"]):
+        file = tmp_path / "doc.txt"
+        file.write_text("Stable content.")
+        await orch.ingest_source(str(file), project_type="test")
+        r2 = await orch.ingest_source(str(file), project_type="test")
+        assert r2.units_created == 0
+        assert "duplicate_source" in r2.quality_flags
+
+
+async def test_reingest_unreachable_source_serves_cache(tmp_path: Path):
+    """With the source-string gate removed, a re-ingest runs the processor first;
+    if a previously-cached source is now unreachable, serve cached (not error)."""
+    units = [KnowledgeUnit(concept="Test", body="Test body", domain="test")]
+    orch = _make_orchestrator(tmp_path, mock_distill_result=units)
+    with patch("genesis.knowledge.orchestrator.KnowledgeOrchestrator._store_units",
+               new_callable=AsyncMock, return_value=["unit-1"]):
+        file = tmp_path / "doc.txt"
+        file.write_text("Cache me.")
+        r1 = await orch.ingest_source(str(file), project_type="test")
+        assert r1.units_created == 1
+
+        file.unlink()  # source now unreachable
+        r2 = await orch.ingest_source(str(file), project_type="test")
+        assert r2.error is None
+        assert r2.units_created == 0
+        assert r2.unit_ids == ["unit-1"]
+
+
+async def test_reingest_no_units_source_detects_unchanged(tmp_path: Path):
+    """The no-units path also persists content_hash, so an identical re-ingest of
+    a source that distilled to zero units is still detected as unchanged."""
+    orch = _make_orchestrator(tmp_path, mock_distill_result=[])
+    file = tmp_path / "notes.txt"
+    file.write_text("Content that yields no units.")
+    r1 = await orch.ingest_source(str(file), project_type="test")
+    assert "no_units_extracted" in r1.quality_flags
+    r2 = await orch.ingest_source(str(file), project_type="test")
+    assert "duplicate_source" in r2.quality_flags
