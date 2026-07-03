@@ -265,3 +265,43 @@ class DeadLetterQueue:
     async def get_pending_count(self, *, target_provider: str | None = None) -> int:
         """Count pending items, optionally filtered by provider."""
         return await dl_crud.count_pending(self.db, target_provider=target_provider)
+
+    def _short_ttl_hours_for(self, operation_type: str) -> int | None:
+        """The short self-heal TTL (hours) for an op_type, or None if it has none.
+
+        Longest-prefix match against :attr:`_OPERATION_TTL_HOURS` — the SAME map
+        ``expire_old`` uses. ``None`` means the type carries no short TTL, so for
+        stuck-counting it is countable immediately (the 72h ``expire_old`` default
+        is deliberately NOT treated as a short window here).
+        """
+        for pattern, hours in self._OPERATION_TTL_HOURS.items():
+            if operation_type.startswith(pattern):
+                return hours
+        return None
+
+    async def get_stuck_count(self) -> int:
+        """Count pending items that are GENUINELY STUCK (for alerting).
+
+        A pending item counts iff it is NOT a short-TTL self-healing type still
+        inside its window: an item whose operation_type has a short TTL in
+        ``_OPERATION_TTL_HOURS`` counts only once it is OLDER than that TTL (past
+        its designed self-heal window ⇒ the drainer is failing to clear it); an
+        item with no short-TTL entry counts immediately (unchanged from the raw
+        pending count — the 72h default is NOT applied as a gate, so long-lived
+        types never regress). This stops a fresh burst of short-TTL, self-healing
+        items (e.g. a ``chain_exhausted:judge`` batch, 1h TTL) from crying wolf on
+        the critical DLQ-accumulation alert, while a genuine accumulation — or an
+        aged, un-drained backlog — still trips it.
+        """
+        rows = await dl_crud.list_pending_type_age(self.db)
+        now = self._clock()
+        stuck = 0
+        for op_type, created_at in rows:
+            ttl_hours = self._short_ttl_hours_for(op_type or "")
+            if ttl_hours is None:
+                stuck += 1  # no short TTL → genuinely stuck from the moment pending
+                continue
+            cutoff = (now - timedelta(hours=ttl_hours)).isoformat()
+            if (created_at or "") < cutoff:
+                stuck += 1  # short-TTL type past its self-heal window → stuck
+        return stuck
