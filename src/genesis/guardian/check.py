@@ -322,36 +322,41 @@ async def _maintain_snapshots(
 ) -> None:
     """Enforce snapshot expiry policy and prune, on a daily cadence.
 
-    Runs after every check cycle regardless of guardian state. Expiry
-    enforcement is cheap+idempotent; prune (list+delete) is throttled to once
-    per 24h via a marker to avoid per-tick cost.
+    Runs after every check cycle regardless of guardian state, but the actual
+    work (an ``incus config set`` + a list/delete pass) is throttled to once
+    per 24h via a marker — the first tick has no marker so both fire
+    immediately on deploy, then daily. `snapshots.expiry` is a persistent incus
+    setting, so re-asserting it daily is ample and avoids a per-tick subprocess.
     """
-    # Idempotent, cheap — keep incus daemon-side expiry in force every cycle so
-    # the guardian-independent safety net survives even a wedged guardian.
+    prune_marker = config.state_path / ".last_prune"
+    should_run = True
+    if prune_marker.exists():
+        try:
+            last_prune = datetime.fromisoformat(prune_marker.read_text().strip())
+            hours_since = (datetime.now(UTC) - last_prune).total_seconds() / 3600
+            should_run = hours_since >= 24
+        except (ValueError, OSError):
+            should_run = True
+
+    if not should_run:
+        return
+
+    # Idempotent — keep incus daemon-side expiry in force (guardian-independent
+    # safety net that fires even if the guardian process later dies).
     try:
         await snapshots.enforce_expiry_policy()
     except Exception:
         logger.warning("enforce_expiry_policy failed", exc_info=True)
 
-    prune_marker = config.state_path / ".last_prune"
-    should_prune = True
-    if prune_marker.exists():
-        try:
-            last_prune = datetime.fromisoformat(prune_marker.read_text().strip())
-            hours_since = (datetime.now(UTC) - last_prune).total_seconds() / 3600
-            should_prune = hours_since >= 24
-        except (ValueError, OSError):
-            should_prune = True
+    try:
+        pruned = await snapshots.prune()
+        if pruned > 0:
+            logger.info("Pruned %d old snapshots", pruned)
+    except Exception:
+        logger.warning("Snapshot prune failed", exc_info=True)
 
-    if should_prune:
-        try:
-            pruned = await snapshots.prune()
-            if pruned > 0:
-                logger.info("Pruned %d old snapshots", pruned)
-        except Exception:
-            logger.warning("Snapshot prune failed", exc_info=True)
-        prune_marker.parent.mkdir(parents=True, exist_ok=True)
-        prune_marker.write_text(datetime.now(UTC).isoformat())
+    prune_marker.parent.mkdir(parents=True, exist_ok=True)
+    prune_marker.write_text(datetime.now(UTC).isoformat())
 
 
 async def _handle_confirming(

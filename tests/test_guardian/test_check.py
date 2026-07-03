@@ -119,23 +119,36 @@ class TestMaintainSnapshots:
         snapshots.enforce_expiry_policy.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_enforces_expiry_even_when_prune_not_due(
+    async def test_skips_all_work_when_not_due(
         self, config: GuardianConfig,
     ) -> None:
-        """Expiry enforcement is cheap+idempotent → every cycle, even if the
-        24h prune throttle says skip."""
+        """Within the 24h throttle window, neither expiry nor prune runs — the
+        marker gate avoids a per-tick incus subprocess."""
         from datetime import UTC, datetime
         marker = config.state_path / ".last_prune"
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(datetime.now(UTC).isoformat())  # fresh → prune not due
+        marker.write_text(datetime.now(UTC).isoformat())  # fresh → not due
 
         snapshots = MagicMock()
         snapshots.prune = AsyncMock(return_value=0)
         snapshots.enforce_expiry_policy = AsyncMock(return_value=True)
 
         await _maintain_snapshots(config, snapshots)
-        snapshots.enforce_expiry_policy.assert_called_once()
+        snapshots.enforce_expiry_policy.assert_not_called()
         snapshots.prune.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_prune_failure_does_not_stop_marker_write(
+        self, config: GuardianConfig,
+    ) -> None:
+        """A prune exception is swallowed and the marker still advances (no
+        tight-loop retry storm on a persistently failing incus)."""
+        snapshots = MagicMock()
+        snapshots.enforce_expiry_policy = AsyncMock(return_value=True)
+        snapshots.prune = AsyncMock(side_effect=RuntimeError("incus down"))
+
+        await _maintain_snapshots(config, snapshots)
+        assert (config.state_path / ".last_prune").exists()
 
 
 class TestRunCheck:
