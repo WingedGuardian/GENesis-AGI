@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import mimetypes
 import re
@@ -137,18 +136,26 @@ async def knowledge_ingest_upload():
             return jsonify({"error": "Upload not found"}), 404
         return jsonify({"error": f"Upload in '{upload['status']}' state, expected 'uploaded'"}), 409
 
-    # Fire-and-forget: _async_route already runs us on the main event loop,
-    # so create_task schedules directly without an extra cross-thread hop.
+    # Fire-and-forget: _async_route already runs us on the main event loop, so
+    # create_task schedules directly without an extra cross-thread hop. Use
+    # tracked_task so any failure that escapes run_ingest's own handling (e.g.
+    # an unexpected error before its inner try) is logged with context instead
+    # of being silently swallowed by a bare create_task.
     from genesis.knowledge.ingest_upload import run_ingest
+    from genesis.util.tasks import tracked_task
 
-    asyncio.create_task(run_ingest(
-        upload_id,
-        project_type=project_type,
-        domain=domain,
-        purpose=purpose_list,
-        context=context,
-        mode=mode,
-    ))
+    tracked_task(
+        run_ingest(
+            upload_id,
+            project_type=project_type,
+            domain=domain,
+            purpose=purpose_list,
+            context=context,
+            mode=mode,
+        ),
+        name=f"ingest-{upload_id}",
+        logger=logger,
+    )
 
     return jsonify({
         "upload_id": upload_id,

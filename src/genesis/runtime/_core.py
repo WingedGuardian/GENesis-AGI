@@ -540,6 +540,14 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
                 except Exception:
                     logger.debug("Reranker close failed", exc_info=True)
 
+        try:
+            from genesis.knowledge.pdf_extract import shutdown_pdf_pool
+
+            await shutdown_pdf_pool()
+            logger.info("PDF extraction pool shut down")
+        except Exception:
+            logger.exception("Failed to shut down PDF extraction pool")
+
         if self._event_bus is not None:
             try:
                 await self._event_bus.stop()

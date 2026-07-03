@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -20,7 +21,10 @@ class TextProcessor:
         if not path.exists():
             raise FileNotFoundError(f"Text file not found: {source}")
 
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # Offload the blocking read off the event loop (large files stall it).
+        text = await asyncio.to_thread(
+            path.read_text, encoding="utf-8", errors="replace"
+        )
         return ProcessedContent(
             text=text.strip(),
             metadata={

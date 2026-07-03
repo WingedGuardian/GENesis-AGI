@@ -175,24 +175,37 @@ class KnowledgeOrchestrator:
                 name=f"tree-index-{Path(source).name}",
             )
 
-        # 4. Save extracted text to disk
-        extracted_path = self._manifest.save_extracted_text(
-            source, content.text, content.source_type
-        )
+        # 4-6. Save extracted text + optional original, then distill. If any of
+        # these fail, cancel the in-flight tree-index task first so a failed
+        # ingest can't leak an orphaned PageIndex upload (which polls for up to
+        # 300s), then re-raise. (The storage step below has its own cancel.)
+        try:
+            # 4. Save extracted text to disk
+            extracted_path = self._manifest.save_extracted_text(
+                source, content.text, content.source_type
+            )
 
-        # 5. Optionally save original
-        original_path = None
-        source_path = Path(source)
-        if source_path.exists():
-            original_path = self._manifest.save_original(source, source_path)
+            # 5. Optionally save original
+            original_path = None
+            source_path = Path(source)
+            if source_path.exists():
+                original_path = self._manifest.save_original(source, source_path)
 
-        # 6. Distill
-        units = await self._distillation.distill(
-            content, project_type=project_type, domain=domain,
-            user_context=user_context,
-            on_chunk_done=on_chunk_done,
-            content_source=content_source,
-        )
+            # 6. Distill
+            units = await self._distillation.distill(
+                content, project_type=project_type, domain=domain,
+                user_context=user_context,
+                on_chunk_done=on_chunk_done,
+                content_source=content_source,
+            )
+        except Exception:
+            if tree_task is not None:
+                tree_task.cancel()
+                # CancelledError is a BaseException, so suppress(Exception)
+                # alone would let it escape and mask the real error.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await tree_task
+            raise
 
         if not units:
             self._manifest.add_source(
@@ -227,7 +240,9 @@ class KnowledgeOrchestrator:
             # Cancel tree task to avoid orphaned upload
             if tree_task is not None:
                 tree_task.cancel()
-                with contextlib.suppress(Exception):
+                # CancelledError is a BaseException, so suppress(Exception)
+                # alone would let it escape and mask the real error.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await tree_task
             return IngestResult(
                 source=source,
