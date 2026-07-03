@@ -126,6 +126,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The dashboard's system-health view stays responsive under load and no longer errors out when a single
+  check hiccups.** Building the health snapshot used to run its systemd service checks (several `systemctl`
+  calls) and a couple of file scans directly on the main event loop, so gathering health could briefly stall
+  other work; and if any one sub-check raised an unexpected error, the entire health request failed. Those
+  checks now run off the main loop, and a failure in one section degrades just that section to an error state
+  while the rest of the health view loads normally. Overlapping health requests now also share a single
+  computation instead of each recomputing from scratch.
+
 - **Uploading a large or malformed PDF to the Knowledge tab no longer freezes — or crashes — Genesis.**
   PDF text extraction used to run directly on the main event loop, so a big document could stall the whole
   server for seconds (health checks, background thinking, other requests all waited), and a corrupt or
