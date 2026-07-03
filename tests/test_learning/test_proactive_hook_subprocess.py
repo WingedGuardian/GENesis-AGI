@@ -118,6 +118,11 @@ def test_procedure_surfacing_subprocess(seeded_db, tmp_path: Path):
     env = os.environ.copy()
     env["GENESIS_DB_PATH"] = str(db_path)
     env.pop("GENESIS_CC_SESSION", None)
+    # Isolate HOME so the hook's per-session state (intent trail, working
+    # set, injection log) and proactive_metrics.json land in tmp_path —
+    # NOT the real ~/.genesis. The injection log feeds the live 7-day
+    # overlap measurement; test runs must never pollute it.
+    env["HOME"] = str(tmp_path)
     # Qdrant URL — use the real one (needed for memory recall, but
     # we're testing procedure surfacing which uses SQLite only)
     env.setdefault("QDRANT_URL", "http://localhost:6333")
@@ -158,6 +163,14 @@ def test_procedure_surfacing_subprocess(seeded_db, tmp_path: Path):
             f"Expected task_type={_TASK_TYPE} or id prefix={proc_id[:8]}\n"
             f"Got: {stdout[:500]}"
         )
+
+    # H-1 PR1 wiring: the surfaced procedure must be recorded in the
+    # session working set + injection log — under the ISOLATED home.
+    session_dir = tmp_path / ".genesis" / "sessions" / "test-session-001"
+    ws = json.loads((session_dir / "surfaced_memories.json").read_text())
+    assert proc_id in ws["procedures"]
+    log_lines = (session_dir / "injection_log.jsonl").read_text().strip().split("\n")
+    assert json.loads(log_lines[0])["proc"] is True
 
 
 def test_genesis_cc_session_exits_immediately():
