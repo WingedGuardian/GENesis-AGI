@@ -120,6 +120,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Uploading a large or malformed PDF to the Knowledge tab no longer freezes — or crashes — Genesis.**
+  PDF text extraction used to run directly on the main event loop, so a big document could stall the whole
+  server for seconds (health checks, background thinking, other requests all waited), and a corrupt or
+  hostile PDF could take the process down entirely. Extraction now runs in an isolated worker process with a
+  time limit: a large PDF no longer blocks anything else, and a PDF that crashes or hangs the parser fails
+  just that one ingest — the rest of Genesis keeps running. Uploads that hit a transient database hiccup are
+  now marked "failed" (and can be retried) instead of getting stuck showing "processing" forever.
+
 - **The dead-letter-queue alert no longer cries wolf on self-healing bursts.** A short burst of low-value
   retry items (e.g. memory-relevance grades, which are discarded within an hour by design) could push the queue
   past its alert threshold and fire a *critical* notification for something that clears itself minutes later.

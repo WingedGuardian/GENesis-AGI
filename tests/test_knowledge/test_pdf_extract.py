@@ -118,6 +118,41 @@ async def test_hang_is_killed_and_pool_dropped(tmp_path, monkeypatch):
     assert pe._pool is None, "wedged pool must be dropped for recreation"
 
 
+async def test_large_pdf_does_not_block_event_loop(tmp_path):
+    """The whole point of F1: a big PDF must extract WITHOUT stalling the loop."""
+    import asyncio
+
+    import pymupdf
+
+    from genesis.knowledge.processors.pdf import PDFProcessor
+
+    big = tmp_path / "big.pdf"
+    doc = pymupdf.open()
+    for i in range(200):
+        page = doc.new_page()
+        page.insert_text((72, 72), f"Page {i} " + ("lorem ipsum dolor sit amet " * 40))
+    doc.save(str(big))
+    doc.close()
+
+    ticks = 0
+    stop = False
+
+    async def heartbeat():
+        nonlocal ticks
+        while not stop:
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    hb = asyncio.create_task(heartbeat())
+    result = await PDFProcessor().process(str(big))
+    stop = True
+    await hb
+
+    assert result.metadata["page_count"] == 200
+    # With on-loop parsing this would be ~0; the offload keeps the loop live.
+    assert ticks > 5, f"event loop appears to have stalled (only {ticks} heartbeats)"
+
+
 async def test_shutdown_then_reextract(tmp_path):
     """shutdown_pdf_pool tears the pool down; a later call lazily recreates it."""
     import genesis.knowledge.pdf_extract as pe
