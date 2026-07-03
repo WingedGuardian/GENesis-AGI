@@ -11,12 +11,13 @@ import sys
 
 from genesis.cc.conversation import ConversationLoop
 from genesis.cc.system_prompt import SystemPromptAssembler
-from genesis.cc.types import ChannelType, StreamEvent
+from genesis.cc.types import CCModel, ChannelType, EffortLevel, StreamEvent
 from genesis.runtime import GenesisRuntime
 
-_BANNER = """\
+_BANNER = f"""\
 Genesis Terminal — type your message, press Enter.
-Commands: /model <sonnet|opus|haiku>, /effort <low|medium|high|xhigh|max>
+Commands: /model <{"|".join(m.value for m in CCModel)}>, \
+/effort <{"|".join(e.value for e in EffortLevel)}>
 Type 'exit' or 'quit' to leave. Ctrl+D or Ctrl+C also works.
 """
 

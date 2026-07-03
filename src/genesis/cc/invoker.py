@@ -24,7 +24,15 @@ from genesis.cc.exceptions import (
     CCSessionError,
     CCTimeoutError,
 )
-from genesis.cc.types import CCInvocation, CCModel, CCOutput, StreamEvent, clamp_effort
+from genesis.cc.types import (
+    CCInvocation,
+    CCModel,
+    CCOutput,
+    EffortLevel,
+    StreamEvent,
+    clamp_effort,
+    model_supports_effort,
+)
 from genesis.observability.spans import SpanKind, start_span
 
 logger = logging.getLogger(__name__)
@@ -151,7 +159,7 @@ def cc_span_settings_path() -> str | None:
 class CCInvoker:
     """Invokes claude CLI as async subprocess."""
 
-    _TIER_RANK = {CCModel.HAIKU: 0, CCModel.SONNET: 1, CCModel.OPUS: 2}
+    _TIER_RANK = {CCModel.HAIKU: 0, CCModel.SONNET: 1, CCModel.OPUS: 2, CCModel.FABLE: 3}
 
     def __init__(
         self,
@@ -246,13 +254,23 @@ class CCInvoker:
         if inv.model_id_override is None:
             args += ["--model", str(inv.model)]
         args += ["--output-format", inv.output_format]
-        effort = clamp_effort(inv.model, inv.effort)
-        if effort != inv.effort:
-            logger.warning(
-                "Effort %r exceeds max for model %r — clamping to %r",
-                str(inv.effort), str(inv.model), str(effort),
+        # Haiku does not use an effort setting — omit --effort entirely rather
+        # than pass a no-op. All other tiers accept the full low..max range.
+        if model_supports_effort(inv.model):
+            effort = clamp_effort(inv.model, inv.effort)
+            if effort != inv.effort:
+                logger.warning(
+                    "Effort %r exceeds max for model %r — clamping to %r",
+                    str(inv.effort), str(inv.model), str(effort),
+                )
+            args += ["--effort", str(effort)]
+        elif inv.effort != EffortLevel.MEDIUM:
+            # Only note when the caller explicitly asked for a non-default effort
+            # that we're dropping, so intent stays visible without log spam.
+            logger.debug(
+                "Model %r does not use an effort setting — dropping requested effort %r",
+                str(inv.model), str(inv.effort),
             )
-        args += ["--effort", str(effort)]
         system_prompt = inv.system_prompt
         if system_prompt and inv.skip_permissions and self._protected_paths:
             protection_context = self._protected_paths.format_for_prompt()
@@ -520,9 +538,11 @@ class CCInvoker:
         start = time.monotonic()
 
         # Extract dispatched effort from args — may differ from invocation.effort
-        # if clamp_effort() clamped it for a non-Opus model.
-        effort_idx = args.index("--effort") + 1
-        dispatched_effort = args[effort_idx]
+        # if clamp_effort() clamped it, and is absent entirely for models that
+        # don't use an effort setting (Haiku).
+        dispatched_effort = (
+            args[args.index("--effort") + 1] if "--effort" in args else "n/a"
+        )
 
         prompt_preview = invocation.prompt[:80].replace("\n", " ")
         logger.info(
@@ -691,9 +711,11 @@ class CCInvoker:
         start = time.monotonic()
 
         # Extract dispatched effort from args — may differ from invocation.effort
-        # if clamp_effort() clamped it for a non-Opus model.
-        effort_idx = args.index("--effort") + 1
-        dispatched_effort = args[effort_idx]
+        # if clamp_effort() clamped it, and is absent entirely for models that
+        # don't use an effort setting (Haiku).
+        dispatched_effort = (
+            args[args.index("--effort") + 1] if "--effort" in args else "n/a"
+        )
 
         prompt_preview = invocation.prompt[:80].replace("\n", " ")
         logger.info(

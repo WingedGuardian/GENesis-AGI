@@ -496,13 +496,23 @@ def _apply_supervised(pid_file: Path) -> tuple:
     })
 
 
-def _spawn_detached_cc(prompt: str, model: str) -> subprocess.Popen:
-    """Spawn a detached CC session. Returns the Popen object (caller waits)."""
+def _spawn_detached_cc(
+    prompt: str, model: str, effort: str | None = None,
+) -> subprocess.Popen:
+    """Spawn a detached CC session. Returns the Popen object (caller waits).
+
+    ``effort`` is emitted as ``--effort`` when set; pass None for models that
+    don't use an effort setting (Haiku).
+    """
     log_path = _HOME / ".genesis" / f"cc_session_{model.replace('/', '_')}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "w")  # noqa: SIM115
+    cmd = ["claude", "-p", prompt, "--model", model]
+    if effort:
+        cmd += ["--effort", effort]
+    cmd.append("--dangerously-skip-permissions")
     proc = subprocess.Popen(
-        ["claude", "-p", prompt, "--model", model, "--dangerously-skip-permissions"],
+        cmd,
         stdout=log_fh,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -544,11 +554,15 @@ def cleanup():
         except Exception:
             pass
 
-def spawn_cc(prompt, model):
+def spawn_cc(prompt, model, effort=None):
     try:
+        cmd = ["claude", "-p", prompt, "--model", model]
+        # Haiku doesn't use an effort setting — callers pass effort=None for it.
+        if effort:
+            cmd += ["--effort", effort]
+        cmd.append("--dangerously-skip-permissions")
         proc = subprocess.Popen(
-            ["claude", "-p", prompt, "--model", model, "--dangerously-skip-permissions"],
-            start_new_session=True, cwd=str(GENESIS_ROOT),
+            cmd, start_new_session=True, cwd=str(GENESIS_ROOT),
         )
         PID_FILE.write_text(str(proc.pid))
         log.info("CC %s started (pid %d)", model, proc.pid)
@@ -565,7 +579,7 @@ def spawn_cc(prompt, model):
 
 # ── Tier 1: Haiku ──
 log.info("Starting Tier 1 (Haiku)")
-rc1 = spawn_cc({tier1_prompt!r}, "haiku")
+rc1 = spawn_cc({tier1_prompt!r}, "haiku", None)
 
 # ── CC failure detection ──
 # If CC exited non-zero but wrote no escalation file, the CC session itself
@@ -584,7 +598,7 @@ if rc1 != 0 and not ESCALATION.is_file():
 if ESCALATION.is_file() and "tier2_needed" in ESCALATION.read_text():
     log.info("Tier 1 escalated -> Tier 2 (Sonnet)")
     ESCALATION.unlink(missing_ok=True)
-    rc2 = spawn_cc({tier2_prompt!r}, "sonnet")
+    rc2 = spawn_cc({tier2_prompt!r}, "sonnet", "high")
 
     if rc2 != 0 and not ESCALATION.is_file():
         log.error("Tier 2 CC failed (rc=%d) with no escalation", rc2)
@@ -661,7 +675,7 @@ def update_resolve():
         update_script=_UPDATE_SCRIPT,
     )
 
-    proc = _spawn_detached_cc(tier3_prompt, "opus")
+    proc = _spawn_detached_cc(tier3_prompt, "opus", "max")
     _PID_FILE.write_text(str(proc.pid))
     logger.info("Tier 3 (Opus) started (pid %d)", proc.pid)
 

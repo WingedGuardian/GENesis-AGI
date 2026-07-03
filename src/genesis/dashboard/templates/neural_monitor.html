@@ -1329,7 +1329,7 @@ function _renderChainList(listEl) {
 
             const select = document.createElement('select');
             select.style.cssText = 'font-size:11px;padding:1px 4px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:3px;';
-            ['Haiku', 'Sonnet', 'Opus'].forEach(m => {
+            ['Haiku', 'Sonnet', 'Opus', 'Fable'].forEach(m => {
                 const opt = document.createElement('option');
                 opt.value = m;
                 opt.textContent = m;
@@ -1483,7 +1483,7 @@ function _populateAddSelect(selectEl) {
     // CC dispatch options (only if no CC entry already in chain)
     const hasCC = _editorState.chain.some(_isCC);
     if (!hasCC) {
-        for (const model of ['Haiku', 'Sonnet', 'Opus']) {
+        for (const model of ['Haiku', 'Sonnet', 'Opus', 'Fable']) {
             const opt = document.createElement('option');
             opt.value = 'CC/' + model;
             opt.textContent = 'CC/' + model + ' (Claude Code)';

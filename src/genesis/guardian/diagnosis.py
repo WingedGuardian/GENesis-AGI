@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+from genesis.cc.types import model_name_supports_effort
 from genesis.guardian.briefing import read_guardian_briefing
 from genesis.guardian.collector import DiagnosticSnapshot
 from genesis.guardian.config import GuardianConfig
@@ -432,10 +433,15 @@ class DiagnosisEngine:
         # preventing unnecessary memory consumption from heavy MCP server
         # processes (codebase-memory-mcp, serena, gitnexus, etc.).
         no_mcp_config = work_dir / "config" / "no_mcp.json"
+        # Emit --effort unless the model doesn't use one (Haiku). Unknown model
+        # strings fall through to including it (best-effort; guardian defaults to
+        # opus, which supports the full range).
+        _include_effort = model_name_supports_effort(effective_model)
         cmd = [
             cc_path, "-p",
             "--model", effective_model,
             "--output-format", "json",
+            *(["--effort", self._config.cc.effort] if _include_effort else []),
             "--max-turns", str(self._config.cc.max_turns),
             "--dangerously-skip-permissions",
         ]
