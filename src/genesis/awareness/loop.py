@@ -16,7 +16,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -195,6 +195,78 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
             logger.warning("CC slot memory alert: cc-%s %.1f GB (%s)", key, rss / 1024, priority)
         except Exception:
             logger.debug("Failed to create cc_slot alert observation", exc_info=True)
+
+
+# CC silent-cap detection. A capped Anthropic subscription makes `claude -p`
+# return empty output (no text, no error, no rate-limit signal) on OUTPUT-EXPECTING
+# cognitive invocations — it reads as a successful completion, so nothing alerts
+# (this happened for ~2 days in late June). The invoker records one
+# `cc_cap_empty_event` observation per such empty (opt-in via
+# CCInvocation.expect_output; see runtime/init/cc_relay._on_cc_empty_output). This
+# check aggregates a run of them into a single critical alert. Same monotonic-
+# since-boot caveat as WAL/slot: None = "never alerted", never 0.0.
+_CAP_EMPTY_WINDOW_MIN = 60          # look back this many minutes for empties
+_CAP_EMPTY_THRESHOLD = 3           # ≥ this many empties in the window → alert
+_CAP_ALERT_COOLDOWN_S = 3600       # one alert per hour max
+_last_cap_alert_at: float | None = None
+
+
+async def _check_cc_cap_detection(db) -> None:
+    """Alert when output-expecting cognitive CC invocations return empty in a run.
+
+    Counts recent `cc_cap_empty_event` observations (written by the invoker's
+    empty-output callback) and raises ONE critical infrastructure_alert when
+    ``>=_CAP_EMPTY_THRESHOLD`` land inside ``_CAP_EMPTY_WINDOW_MIN`` — the silent-
+    cap signature. Rides the critical-observations job to Telegram. Detection only;
+    the invoker never altered control flow to produce these. Best-effort; never
+    raises into the tick. The cooldown + the window rolling forward mean a
+    persisting cap re-alerts at most hourly (correct), and a transient blip that
+    ages out of the window stops re-firing."""
+    global _last_cap_alert_at
+    if db is None:
+        return
+    now = time.monotonic()
+    if _last_cap_alert_at is not None and now - _last_cap_alert_at < _CAP_ALERT_COOLDOWN_S:
+        return
+    try:
+        cutoff = (datetime.now(UTC) - timedelta(minutes=_CAP_EMPTY_WINDOW_MIN)).isoformat()
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM observations "
+            "WHERE type = 'cc_cap_empty_event' AND source = 'cc_cap_monitor' "
+            "AND created_at > ? AND resolved = 0",
+            (cutoff,),
+        )
+        row = await cur.fetchone()
+        count = row[0] if row else 0
+    except Exception:
+        logger.debug("cc_cap detection: query failed", exc_info=True)
+        return
+    if count < _CAP_EMPTY_THRESHOLD:
+        return
+    # Set the cooldown BEFORE the write so a failed create still suppresses retries.
+    _last_cap_alert_at = now
+    try:
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="cc_cap_monitor",
+            type="infrastructure_alert",
+            content=(
+                f"CC subscription likely capped: {count} output-expecting cognitive "
+                f"sessions returned EMPTY in the last {_CAP_EMPTY_WINDOW_MIN} min "
+                f"(no text, no error, no rate-limit signal — the silent-cap signature). "
+                f"CC cognitive work (ego, reflections, weekly jobs) is degraded until "
+                f"the Anthropic usage limit resets."
+            ),
+            priority="critical",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        logger.warning(
+            "CC cap detection alert: %d empty cognitive completions in %d min",
+            count, _CAP_EMPTY_WINDOW_MIN,
+        )
+    except Exception:
+        logger.debug("Failed to create cc_cap alert observation", exc_info=True)
 
 
 # Micro ticks are silent by default (counted for cascade, no LLM call).
@@ -829,6 +901,11 @@ class AwarenessLoop:
             # still runs during a DB hiccup); the observation write is guarded on
             # db inside the function. Surfaces a single ballooning CC session.
             await _check_cc_slot_memory(self._db)
+
+            # CC silent-cap detection — counts recent empty-output cognitive
+            # completions (recorded by the invoker) and alerts on a run. Guarded
+            # on db internally; a query failure no-ops (never breaks the tick).
+            await _check_cc_cap_detection(self._db)
 
             # SQLite WAL checkpoint — prevent unbounded WAL growth from
             # external scripts or concurrent writers. PASSIVE is non-blocking.

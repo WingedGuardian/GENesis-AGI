@@ -65,6 +65,10 @@ INTERNAL_OBS_TYPES: frozenset[str] = frozenset({
     "interpretation_correction",
     "scope_clarification",
     "feedback_rule",
+    # CC silent-cap detection — per-empty telemetry rows. Internal: only the
+    # aggregate infrastructure_alert (raised by the awareness cap detector when
+    # a run of these accumulates) surfaces to the user.
+    "cc_cap_empty_event",
 })
 
 # Default TTL for types not explicitly listed. Any new type that appears without
@@ -88,6 +92,7 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "process_reaper_kill": timedelta(days=3),
     "operational_alert": timedelta(days=3),
     "infrastructure_alert": timedelta(days=3),
+    "cc_cap_empty_event": timedelta(days=3),
     "strategic_reflection": timedelta(days=3),
     # ── 1-day (transient) ──────────────────────────────────────────────
     "light_escalation_resolved": timedelta(days=1),
