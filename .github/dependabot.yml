@@ -1,0 +1,19 @@
+# Dependabot config — GitHub Actions version updates only.
+#
+# The pip ecosystem is intentionally NOT managed here: Genesis's runtime deps
+# carry deliberate security pins (litellm pinned <1.83 to dodge 1.82.x malware,
+# fastmcp <3 for API stability, transitive secure floors) that automatic
+# version-update PRs would fight. GitHub's Dependabot *security* alerts are
+# already enabled for the repo and cover the pip CVE side; the pip-audit CI job
+# gates the resolved tree per-PR. So dependabot only keeps the Actions current.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns: ["*"]

@@ -6,6 +6,8 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"  # weekly Mon 06:00 UTC — surface new CVEs even without repo activity
 
 permissions:
   contents: read
@@ -22,6 +24,42 @@ jobs:
         run: pip install ruff
       - name: Lint
         run: ruff check src/ tests/ scripts/
+
+  dependency-audit:
+    # Fail on any KNOWN-vulnerable dependency in the resolved runtime tree,
+    # except the triaged IDs below. A red run is a SIGNAL to bump the dep or
+    # add a triaged ignore — not a hard freeze (the ruleset has no required
+    # checks). Complements GitHub's already-enabled Dependabot security alerts.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install runtime deps + pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pip-audit
+      - name: Audit dependencies for known CVEs
+        run: |
+          # Triaged --ignore-vuln IDs (rationale of record: pyproject.toml pins).
+          # A NEW / untriaged advisory is NOT in this list and so fails the job.
+          #   litellm 1.78.7 — every ID is a proxy-server / JWT / OIDC / UI vuln;
+          #     Genesis uses acompletion/completion_cost only (no proxy server),
+          #     so none are reachable. Pinned <1.83 also dodges 1.82.x malware.
+          #   diskcache 5.6.3 (CVE-2025-69872) — pickle-by-default RCE, no fixed
+          #     release. Genesis's only diskcache use (memory/embeddings.py) is a
+          #     JSON-only _SafeDisk subclass, so the vulnerable pickle path is unused.
+          pip-audit \
+            --ignore-vuln PYSEC-2026-390 \
+            --ignore-vuln PYSEC-2026-388 \
+            --ignore-vuln CVE-2026-35029 \
+            --ignore-vuln GHSA-69x8-hrgq-fjj8 \
+            --ignore-vuln CVE-2026-42271 \
+            --ignore-vuln CVE-2026-47102 \
+            --ignore-vuln CVE-2026-47101 \
+            --ignore-vuln CVE-2025-69872
 
   leak-detector:
     # Verify no user-specific content (IPs, timezones, personal paths, secrets)

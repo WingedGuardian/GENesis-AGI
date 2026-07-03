@@ -10,8 +10,9 @@ dependencies = [
     "apscheduler>=3.11,<4",
     "tzlocal>=5",  # transitive dep of apscheduler (ego/cadence uses the local-timezone path); declare so a clean/cached install can't drop it
     "python-telegram-bot>=21.0",
-    "litellm==1.78.7",  # pinned — 1.82.7/1.82.8 contain malware; CVE-2026-35030/35029 not exploitable
-                       # (Genesis uses acompletion/completion_cost only, no proxy server or OIDC)
+    "litellm==1.78.7",  # pinned — 1.82.7/1.82.8 contain malware. Its open advisories are all
+                       # proxy-server / JWT / OIDC / UI vulns (see the ci.yml dependency-audit
+                       # ignore-list); not reachable — Genesis uses acompletion/completion_cost only.
     "qdrant-client",
     "pyyaml",
     "httpx",
@@ -22,8 +23,9 @@ dependencies = [
     "flask>=3.0",
     "flask-sock>=0.7",
     "wsproto>=1.2",  # transitive dep of flask-sock; pin to prevent silent uninstall
-    "fastmcp>=2.0,<3.0",  # 3.x has breaking API changes; CVE-2026-32871/27124/2025-64340 not exploitable
-                         # (Genesis uses stdio transport only, no OpenAPI/OAuth/CLI features)
+    "fastmcp>=2.0,<3.0",  # <3 for API stability (3.x breaks the API). Genesis uses fastmcp stdio
+                         # transport only (no OpenAPIProvider/OAuthProxy), so its OpenAPI/OAuth CVEs
+                         # (CVE-2026-32871/27124/2025-64340, unfixed pre-3.2.0) are not reachable.
     "detect-secrets>=1.4",  # Phase 6 contribution sanitizer — REQUIRED floor. sanitize.py fails closed if missing.
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
     "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
