@@ -200,7 +200,7 @@ class TestBackgroundFallbackRecovery:
             invoker=invoker, session_manager=sm, config_builder=AsyncMock(),
             runtime=SimpleNamespace(_db=db),
         )
-        runner._build_invocation = lambda _req: CCInvocation(prompt="x")
+        runner._build_invocation = lambda _req, _sid: CCInvocation(prompt="x")
         sess = await sm.create_background(
             session_type=SessionType.BACKGROUND_TASK,
             model=CCModel.SONNET, effort=EffortLevel.MEDIUM,
@@ -233,3 +233,56 @@ class TestBackgroundFallbackRecovery:
         # succeeds but must NOT clear the glm fallback (Claude is ~always up).
         state = await self._run(db, tmp_path, monkeypatch, home="glm-5.2", roster_model="claude")
         assert state.is_fallback is True
+
+
+@pytest.mark.asyncio
+async def test_run_session_isolates_and_cleans_sandbox(db, tmp_path, monkeypatch):
+    """E2E lifecycle: _run_session creates the per-session CC sandbox OFF the
+    watchgod-policed cc-tmp BEFORE invoking CC, and removes it in the finally
+    afterward. The stub run_streaming asserts the dir exists at invocation time,
+    proving the mkdir-before-run ordering; the post-return check proves cleanup.
+    """
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from genesis.cc.direct_session import _bg_session_root, _bg_session_sandbox
+    from genesis.cc.types import CCInvocation, CCModel, CCOutput, EffortLevel, SessionType
+
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
+    captured: dict = {}
+
+    async def _check_sandbox_live(inv, on_event=None):
+        # Called by _run_session — the sandbox must already exist here.
+        p = Path(inv.claude_code_tmpdir)
+        captured["existed_at_run"] = p.exists()
+        captured["path"] = str(p)
+        return CCOutput(
+            session_id="cc-bg", text="done", model_used="sonnet",
+            cost_usd=0.0, input_tokens=1, output_tokens=1, duration_ms=1,
+            exit_code=0, is_error=False, roster_model=None,
+        )
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    invoker = AsyncMock()
+    invoker.run_streaming = _check_sandbox_live
+    runner = DirectSessionRunner(
+        invoker=invoker, session_manager=sm, config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db),
+    )
+    # Mirror the real _build_invocation: wire the per-session sandbox tmpdir.
+    runner._build_invocation = lambda _req, sid: CCInvocation(
+        prompt="x", claude_code_tmpdir=_bg_session_sandbox(sid),
+    )
+    sess = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET, effort=EffortLevel.MEDIUM,
+    )
+    result = await runner._run_session(DirectSessionRequest(prompt="t"), sess["id"])
+
+    assert result.success is True
+    # mkdir ran before the CC invocation, in a dir OFF cc-tmp
+    assert captured["existed_at_run"] is True
+    assert ".genesis/cc-tmp" not in captured["path"]
+    assert "bg-cc-sessions" in captured["path"]
+    # finally cleanup removed the whole per-session tree
+    assert not _bg_session_root(sess["id"]).exists()
