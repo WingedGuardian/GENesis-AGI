@@ -25,6 +25,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Off-site backups now self-prune on a grandfather-father-son schedule instead of growing forever.**
+  When you back up to an off-site target (NAS/SMB or a mounted path), each run now prunes old dated
+  snapshots — keeping the last 7 daily, 4 weekly, and 6 monthly — so remote storage stays bounded. It
+  never deletes the most recent complete snapshot (the one a restore uses), never touches an
+  in-progress snapshot, and never affects your local keep-forever transcript archive.
+
 - **You can now run Genesis on Claude Fable 5, and pick the full thinking-effort range on Sonnet and Fable.**
   Fable 5 (Anthropic's new top-tier model) is now a selectable model everywhere you choose one — the ego,
   campaigns, the inbox monitor, the Telegram default, the `/model` command (terminal and Telegram), and the
@@ -137,6 +143,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   cryptic "CC" row that listed sessions as gray "cc-1 …" chips is now labeled **Claude Code Sessions**,
   renders each healthy session in green (amber ≥ 4 GB, red ≥ 6 GB), and shows a hover tooltip explaining
   it's per-session memory for leak detection — so "gray" no longer reads as inactive/unknown.
+
+- **Genesis's COO (self-maintenance ego) no longer burns cognitive cycles reacting to model-provider
+  outages it can't fix.** When a provider chain runs out of options (e.g. a temporary DeepSeek outage),
+  the "all providers exhausted" alerts no longer wake the ego into a full high-effort reasoning cycle that
+  can only conclude "nothing I can do" — these were the large majority of its zero-outcome reactive cycles.
+  The outage still reaches the ego through its normal system-health context, so nothing is hidden; it just
+  stops paying to react to it. Relatedly, the cross-type procedure-dedup check now skips its judgment call
+  outright when that chain is down, instead of firing a doomed request that would raise yet another alert.
 
 - **The dashboard's system-health view stays responsive under load and no longer errors out when a single
   check hiccups.** Building the health snapshot used to run its systemd service checks (several `systemctl`

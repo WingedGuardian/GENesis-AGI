@@ -647,3 +647,25 @@ def test_degradation_coverage_ollama_axis_independent_of_essential_map():
     for _ in range(3):
         reg.get("ol").record_failure(ErrorCategory.TRANSIENT)
     assert reg.compute_degradation_level() == DegradationLevel.LOCAL_COMPUTE_DOWN
+
+
+def test_chain_has_available_true_when_any_provider_closed():
+    reg = CircuitBreakerRegistry({"a": _provider("a"), "b": _provider("b")})
+    for _ in range(3):  # trip 'a' OPEN (default threshold trips on the 3rd)
+        reg.get("a").record_failure(ErrorCategory.TRANSIENT)
+    assert reg.get("a").state == ProviderState.OPEN
+    assert reg.chain_has_available(["a", "b"]) is True  # 'b' still CLOSED
+
+
+def test_chain_has_available_false_when_all_open():
+    reg = CircuitBreakerRegistry({"a": _provider("a"), "b": _provider("b")})
+    for name in ("a", "b"):
+        for _ in range(3):
+            reg.get(name).record_failure(ErrorCategory.TRANSIENT)
+    assert reg.chain_has_available(["a", "b"]) is False
+
+
+def test_chain_has_available_false_for_empty_or_unknown():
+    reg = CircuitBreakerRegistry({"a": _provider("a")})
+    assert reg.chain_has_available([]) is False
+    assert reg.chain_has_available(["nonexistent"]) is False

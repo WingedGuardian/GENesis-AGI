@@ -149,6 +149,25 @@ async def _cross_type_duplicate(
         nt=task_type, np=principle, ns=ns_txt, candidates="\n".join(lines),
     )
 
+    # Fail fast when the novelty-judge chain has NO available provider: a
+    # route_call now would just exhaust and emit an `all_exhausted` event that
+    # feeds the COO's reactive-cycle storm. Skip it and fail open to "novel" —
+    # the same outcome as a failed judgment (below), but without the doomed call.
+    # Precision-safe: worst case is a paraphrase duplicate stored, never a
+    # false-merge. Duck-typed (router may be a stub in tests) → any miss falls
+    # through to the normal call, which also fails open. See plan REACTIVE-WASTE (L2c).
+    _breakers = getattr(router, "breakers", None)
+    _cfg = getattr(router, "config", None)
+    if _breakers is not None and _cfg is not None:
+        _site = getattr(_cfg, "call_sites", {}).get(_NOVELTY_CALL_SITE)
+        _chain = getattr(_site, "chain", None)
+        if _chain and not _breakers.chain_has_available(_chain):
+            logger.debug(
+                "Cross-type dedup: all %s providers circuit-breaker-open — "
+                "skipping novelty judge, treating as novel", _NOVELTY_CALL_SITE,
+            )
+            return False, max_cross_sim
+
     try:
         result = await router.route_call(
             call_site_id=_NOVELTY_CALL_SITE,

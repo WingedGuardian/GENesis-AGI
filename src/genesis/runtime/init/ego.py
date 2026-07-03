@@ -29,6 +29,19 @@ logger = logging.getLogger("genesis.runtime")
 _IDENTITY_DIR = Path(__file__).resolve().parents[2] / "identity"
 
 
+def _is_non_actionable_infra_event(subsystem: str, event_type: str) -> bool:
+    """True for routing/provider chain-exhaustion events the COO ego can't act on.
+
+    A provider outage / chain exhaustion is not reconfigurable by the ego, so a
+    reactive Opus/high cycle on it always no-ops — these drove ~92% of the COO's
+    zero-proposal reactive cycles. The condition still reaches the ego via
+    ProviderEscalation -> `provider_failure` observation (routing/escalation.py),
+    read in PROACTIVE context (genesis_context.py::_observations_section) — so the
+    gate drops the WASTE, not the signal. Module-level so it is unit-testable.
+    """
+    return subsystem in ("routing", "providers") and event_type == "all_exhausted"
+
+
 async def init(rt: GenesisRuntime) -> None:
     """Initialize both egos: user ego + genesis ego."""
     # Hard dependencies — skip if unavailable
@@ -375,6 +388,12 @@ async def init(rt: GenesisRuntime) -> None:
                     return
 
                 subsystem = str(getattr(event, "subsystem", ""))
+
+                # DOMAIN GATE: drop non-COO-actionable routing/provider exhaustion
+                # from the reactive path (still surfaced via ProviderEscalation ->
+                # proactive-context observation). See _is_non_actionable_infra_event.
+                if _is_non_actionable_infra_event(subsystem, event.event_type):
+                    return
 
                 event_dict = {
                     "type": event.event_type,
