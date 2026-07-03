@@ -246,3 +246,60 @@ def test_large_temp_goes_to_dedicated_dir_not_inherited_tmpdir(backup_env, tmp_p
     # The script announces where large temp goes; it must be the dedicated dir, not cc-tmp.
     assert f"big-temp dir: {bigtmp}" in proc.stdout, (
         f"backup did not route large temp to the dedicated dir (expected {bigtmp}):\n{proc.stdout}")
+
+
+# --------------------------------------------------------------------------- #
+# GFS retention prune (D4) — off-site dated snapshots
+# --------------------------------------------------------------------------- #
+
+def _seed_offsite_snapshot(host_dir: Path, stamp: str, *, complete: bool) -> None:
+    snap = host_dir / stamp
+    (snap / "data").mkdir(parents=True)
+    (snap / "data" / "genesis.sql.gpg").write_text("x")
+    (snap / "transcripts").mkdir()
+    (snap / "transcripts" / "t.jsonl.gpg").write_text("x")
+    if complete:
+        (snap / "COMPLETE").write_text("")
+
+
+def test_gfs_prune_keeps_buckets_never_latest_or_incomplete_or_transcripts(backup_env, tmp_path):
+    """backup.sh's GFS prune keeps daily/weekly/monthly + the run's latest COMPLETE, deletes
+    the rest, NEVER touches an incomplete (in-flight) snapshot, and every retained snapshot
+    keeps its transcripts/. Real `local` backend, real fs (the SMB path shares this dispatch;
+    it is verified manually at deploy)."""
+    from datetime import UTC, datetime, timedelta
+
+    host = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
+    offsite = tmp_path / "offsite"
+    host_dir = offsite / "Genesis" / host
+    host_dir.mkdir(parents=True)
+
+    now = datetime.now(UTC)
+    # 200 daily COMPLETE snapshots (day-1 .. day-200), all older than the run's new one.
+    seeded = []
+    for d in range(1, 201):
+        s = (now - timedelta(days=d)).strftime("%Y%m%dT%H%M%SZ")
+        _seed_offsite_snapshot(host_dir, s, complete=True)
+        seeded.append(s)
+    # An INCOMPLETE (no COMPLETE) snapshot — GFS must never consider or delete it.
+    incomplete = (now - timedelta(days=149, hours=3)).strftime("%Y%m%dT%H%M%SZ")
+    _seed_offsite_snapshot(host_dir, incomplete, complete=False)
+
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    remaining = {d.name for d in host_dir.iterdir() if _STAMP_RE.fullmatch(d.name)}
+    # the run wrote a new (newest) COMPLETE snapshot — it must survive the prune.
+    new_stamps = remaining - set(seeded) - {incomplete}
+    assert len(new_stamps) == 1, f"expected exactly one new snapshot, got {new_stamps}"
+    assert (host_dir / next(iter(new_stamps)) / "COMPLETE").is_file()
+    # GFS keeps at most daily7 + weekly4 + monthly6 of the COMPLETE snapshots (overlaps -> fewer).
+    complete_remaining = {s for s in remaining if (host_dir / s / "COMPLETE").is_file()}
+    assert len(complete_remaining) <= 7 + 4 + 6
+    # a very old, non-boundary snapshot is pruned.
+    assert (now - timedelta(days=199)).strftime("%Y%m%dT%H%M%SZ") not in remaining
+    # the incomplete snapshot is NEVER pruned (no COMPLETE -> not eligible).
+    assert incomplete in remaining, "GFS must not delete an incomplete/in-flight snapshot"
+    # every retained snapshot keeps its transcripts/.
+    for s in complete_remaining:
+        assert (host_dir / s / "transcripts").is_dir(), f"{s} lost its transcripts/"
