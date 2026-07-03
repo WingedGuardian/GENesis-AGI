@@ -59,7 +59,33 @@
           return Object.entries(b).filter(([k]) => !["status","latency_ms","message"].includes(k));
         },
 
-        setTab(t) { this.voiceTab = t; if (t === "bridge") this.fetchBridge(); },
+        // ── Device (Voice PE hardware vitals via Home Assistant) ──
+        device: null,
+        deviceError: null,
+        deviceLoading: true,
+        async fetchDevice() {
+          this.deviceLoading = true;
+          try {
+            const resp = await fetchApi("/api/genesis/voice/device");
+            if (resp && resp.ok) {
+              const d = await resp.json();
+              if (d && d.reachable) { this.device = d; this.deviceError = null; }
+              else { this.device = null; this.deviceError = (d && d.reason) || "device not reporting"; }
+            } else { this.device = null; this.deviceError = `device fetch failed (${resp ? resp.status : "network error"})`; }
+          } catch (e) { this.device = null; this.deviceError = String(e); }
+          finally { this.deviceLoading = false; }
+        },
+        _fmtUptime(s) {
+          const n = parseFloat(s); if (!isFinite(n)) return s;
+          const d = Math.floor(n/86400), h = Math.floor((n%86400)/3600), m = Math.floor((n%3600)/60);
+          return d>0 ? `${d}d ${h}h` : h>0 ? `${h}h ${m}m` : `${m}m`;
+        },
+        _tempColor(f) {
+          const n = parseFloat(f); if (!isFinite(n)) return "var(--color-text)";
+          if (n >= 130) return "#ef4444"; if (n >= 115) return "var(--color-warning-text)"; return "var(--color-primary)";
+        },
+
+        setTab(t) { this.voiceTab = t; if (t === "bridge") this.fetchBridge(); if (t === "device") this.fetchDevice(); },
         onOpen() { this.fetchAttentionEvents(); this.fetchAttentionStats(); this.fetchBridge(); },
 
         // ── Attention review tab ─────────────────────────────────
@@ -224,6 +250,7 @@
       <button :class="{ active: $store.genesisVoice.voiceTab === 'bridge' }" @click="$store.genesisVoice.setTab('bridge')">Bridge</button>
       <button :class="{ active: $store.genesisVoice.voiceTab === 'stt' }" @click="$store.genesisVoice.setTab('stt')">STT quality</button>
       <button :class="{ active: $store.genesisVoice.voiceTab === 's2s' }" @click="$store.genesisVoice.setTab('s2s')">S2S sessions</button>
+      <button :class="{ active: $store.genesisVoice.voiceTab === 'device' }" @click="$store.genesisVoice.setTab('device')">Device</button>
     </nav>
 
     <!-- ═══ Judgment (L1.5 review) ═══ -->
@@ -489,6 +516,51 @@
       <div class="panel-header"><span class="material-symbols-outlined">forum</span> S2S sessions</div>
       <div style="padding:1rem; color:var(--color-text-secondary);">
         <p><strong style="color:var(--color-text);">Coming soon.</strong> Will surface live speech-to-speech session status per satellite — active sessions, connection age, last-turn timestamps — for the realtime voice pipeline (the "mouth").</p>
+      </div>
+    </div>
+
+    <!-- ═══ Device (Voice PE hardware vitals) ═══ -->
+    <div class="panel" x-show="$store.genesisVoice.voiceTab === 'device'">
+      <div class="panel-header"><span class="material-symbols-outlined">memory</span> Voice PE device</div>
+      <div style="padding:1rem;">
+        <div style="color:var(--color-text-secondary); font-size:.85em; margin-bottom:1rem;">
+          Live hardware vitals of the Voice PE (ESP32-S3), read from Home Assistant. Read-only — nothing here acts on the device.
+        </div>
+        <template x-if="$store.genesisVoice.deviceLoading && !$store.genesisVoice.device">
+          <p style="color:var(--color-text-secondary);">Loading device vitals…</p>
+        </template>
+        <template x-if="$store.genesisVoice.device">
+          <div>
+            <div style="display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1rem;">
+              <div class="voice-stat" x-show="$store.genesisVoice.device.temperature != null">
+                <div style="font-size:1.3rem; font-weight:700;" :style="`color:${$store.genesisVoice._tempColor($store.genesisVoice.device.temperature)}`"><span x-text="$store.genesisVoice.device.temperature"></span><span style="font-size:.8rem;" x-text="' ' + ($store.genesisVoice.device.temperature_unit || '')"></span></div>
+                <div style="font-size:.75rem; color:var(--color-text-secondary);">Temperature</div>
+              </div>
+              <div class="voice-stat" x-show="$store.genesisVoice.device.wifi_signal != null">
+                <div style="font-size:1.3rem; font-weight:700;"><span x-text="$store.genesisVoice.device.wifi_signal"></span><span style="font-size:.8rem;" x-text="' ' + ($store.genesisVoice.device.wifi_signal_unit || 'dBm')"></span></div>
+                <div style="font-size:.75rem; color:var(--color-text-secondary);">WiFi signal</div>
+              </div>
+              <div class="voice-stat" x-show="$store.genesisVoice.device.uptime != null">
+                <div style="font-size:1.3rem; font-weight:700;" x-text="$store.genesisVoice._fmtUptime($store.genesisVoice.device.uptime)"></div>
+                <div style="font-size:.75rem; color:var(--color-text-secondary);">Uptime</div>
+              </div>
+              <div class="voice-stat">
+                <div style="font-size:1.3rem; font-weight:700; text-transform:uppercase;" :style="`color:${$store.genesisVoice.device.connected==='on' ? 'var(--color-primary)' : 'var(--color-text-secondary)'}`" x-text="$store.genesisVoice.device.connected==='on' ? 'connected' : 'idle'"></div>
+                <div style="font-size:.75rem; color:var(--color-text-secondary);">Voice pipeline</div>
+              </div>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:.25rem; font-size:.8rem;">
+              <div style="display:flex; gap:.5rem;" x-show="$store.genesisVoice.device.status != null"><span style="min-width:160px; color:var(--color-text-secondary);">Assistant status</span><span x-text="$store.genesisVoice.device.status"></span></div>
+              <div style="display:flex; gap:.5rem;" x-show="$store.genesisVoice.device.reset_reason != null"><span style="min-width:160px; color:var(--color-text-secondary);">Last reset reason</span><span x-text="$store.genesisVoice.device.reset_reason"></span></div>
+              <div style="display:flex; gap:.5rem;" x-show="$store.genesisVoice.device.heap_free != null"><span style="min-width:160px; color:var(--color-text-secondary);">Free heap</span><span><span x-text="$store.genesisVoice.device.heap_free"></span> <span x-text="$store.genesisVoice.device.heap_free_unit || 'B'"></span></span></div>
+              <div style="display:flex; gap:.5rem;" x-show="$store.genesisVoice.device.loop_time != null"><span style="min-width:160px; color:var(--color-text-secondary);">Loop time</span><span><span x-text="$store.genesisVoice.device.loop_time"></span> <span x-text="$store.genesisVoice.device.loop_time_unit || 'ms'"></span></span></div>
+            </div>
+          </div>
+        </template>
+        <template x-if="$store.genesisVoice.deviceError && !$store.genesisVoice.device">
+          <p style="color:var(--color-warning-text);" x-text="$store.genesisVoice.deviceError"></p>
+        </template>
+        <button class="btn-sm" style="margin-top:1rem;" @click="$store.genesisVoice.fetchDevice()">Refresh</button>
       </div>
     </div>
   </div>
