@@ -134,9 +134,15 @@ class EgoCadenceManager:
 
     async def start(self) -> None:
         """Register APScheduler jobs and start."""
-        # Restart-safe boot first-fire: anchor to this ego's own persisted
+        # NOTE: this job intentionally keeps IntervalTrigger despite the
+        # ">1h intervals should use CronTrigger" convention (CLAUDE.md Traps) —
+        # the ego's interval is variable/adaptive (base → up to 72h) and a
+        # wall-clock CronTrigger can't express a changing interval. The
+        # restart-safe boot first-fire below is the mitigation for the reset trap.
+        #
+        # Boot first-fire: anchor to this ego's own persisted
         # job_health.last_success so a restart cannot starve the proactive
-        # cycle by a full (backed-off, up to 72h) interval — the documented
+        # cycle by a full (backed-off) interval — the documented
         # IntervalTrigger-resets-on-restart trap. None => fresh install =>
         # OMIT next_run_time (never pass None — APScheduler treats an explicit
         # next_run_time=None as a PAUSED job).
@@ -1062,11 +1068,11 @@ class EgoCadenceManager:
         ``add_job`` — an explicit ``next_run_time=None`` marks the job PAUSED.
         """
         try:
-            cursor = await self._db.execute(
-                "SELECT last_success FROM job_health WHERE job_name = ?",
-                (self._session._source_tag,),
+            from genesis.db.crud import job_health as job_health_crud
+
+            last_success_iso = await job_health_crud.get_job_last_success(
+                self._db, self._session._source_tag,
             )
-            row = await cursor.fetchone()
         except Exception:
             logger.debug(
                 "Boot first-fire: job_health read failed; using default timing",
@@ -1074,10 +1080,10 @@ class EgoCadenceManager:
             )
             return None
 
-        if not row or not row[0]:
+        if not last_success_iso:
             return None
         try:
-            last_success = datetime.fromisoformat(row[0])
+            last_success = datetime.fromisoformat(last_success_iso)
         except (ValueError, TypeError):
             return None
         if last_success.tzinfo is None:
