@@ -1,0 +1,1022 @@
+
+
+    <!-- Approval Queue moved to Chat tab → Approvals sub-tab -->
+
+    <!-- Panel: Awareness Signals (Collapsible) [Tab: internals] -->
+    <div class="panel" x-data="{ sigOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header" style="cursor: pointer;" @click="sigOpen = !sigOpen">
+        <span class="material-symbols-outlined" :style="sigOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">sensors</span>
+        Awareness Signals
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.awarenessSignals?.latest">
+            <span style="font-size: 0.68rem; opacity: 0.7;"
+                  x-text="(() => { const t = $store.genesisDashboard.awarenessSignals.latest; const d = t.classified_depth; const ago = Math.round((Date.now() - new Date(t.created_at).getTime()) / 60000); return (d ? d : 'idle') + ' · ' + ago + 'm ago'; })()"></span>
+          </template>
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('awarenessSignals')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('awarenessSignals')"></span>
+        </span>
+      </div>
+      <div class="panel-body" x-show="sigOpen" x-transition>
+        <template x-if="$store.genesisDashboard.panelStatusDetail('awarenessSignals')">
+          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('awarenessSignals')"></div>
+        </template>
+        <template x-if="!$store.genesisDashboard.awarenessSignals?.latest">
+          <div class="empty-state">No awareness ticks recorded.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.awarenessSignals?.latest">
+          <div>
+            <!-- Depth Scores -->
+            <div style="margin-bottom: 0.75rem; padding: 0.5rem 0.6rem; border: 1px solid var(--color-border); border-radius: 6px;">
+              <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem;">Depth Scores</div>
+              <template x-for="score in $store.genesisDashboard.awarenessSignals.latest.scores" :key="score.depth">
+                <div style="display: flex; align-items: center; gap: 0.5rem; margin: 0.2rem 0; font-size: 0.76rem;">
+                  <span style="width: 60px; font-weight: 600;" x-text="score.depth"></span>
+                  <div style="flex: 1; height: 8px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden;">
+                    <div :style="`width: ${Math.min(score.final_score * 100 / Math.max(score.threshold, 0.01), 100)}%; height: 100%; border-radius: 4px; background: ${score.triggered ? '#4caf50' : score.final_score > score.threshold * 0.7 ? '#f0ad4e' : '#888'};`"></div>
+                  </div>
+                  <span style="width: 70px; font-size: 0.68rem; text-align: right;"
+                        x-text="score.final_score.toFixed(2) + '/' + score.threshold.toFixed(2)"></span>
+                  <template x-if="score.triggered">
+                    <span style="font-size: 0.62rem; color: #4caf50; font-weight: 600;">TRIGGERED</span>
+                  </template>
+                </div>
+              </template>
+            </div>
+            <!-- Signal Values -->
+            <div style="padding: 0.5rem 0.6rem; border: 1px solid var(--color-border); border-radius: 6px; margin-bottom: 0.75rem;">
+              <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem;">Signal Values</div>
+              <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0.2rem;">
+                <template x-for="sig in $store.genesisDashboard.awarenessSignals.latest.signals" :key="sig.name">
+                  <div style="display: flex; align-items: center; gap: 0.4rem; font-size: 0.72rem;">
+                    <span style="width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" :title="sig.name" x-text="sig.name.replace(/_/g, ' ')"></span>
+                    <div style="flex: 1; height: 6px; background: rgba(255,255,255,0.08); border-radius: 3px; overflow: hidden; min-width: 40px;">
+                      <div :style="`width: ${Math.min(sig.value * 100, 100)}%; height: 100%; border-radius: 3px; background: ${sig.value > 0.7 ? '#d9534f' : sig.value > 0.3 ? '#f0ad4e' : '#4caf50'};`"></div>
+                    </div>
+                    <span style="width: 32px; text-align: right; font-family: monospace; font-size: 0.68rem;" x-text="sig.value.toFixed(2)"></span>
+                  </div>
+                </template>
+              </div>
+            </div>
+            <!-- Tick History -->
+            <div style="padding: 0.5rem 0.6rem; border: 1px solid var(--color-border); border-radius: 6px;">
+              <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.3rem;">Recent Ticks</div>
+              <div style="display: flex; gap: 0.3rem; flex-wrap: wrap;">
+                <template x-for="tick in $store.genesisDashboard.awarenessSignals.history" :key="tick.id">
+                  <div :style="`padding: 0.15rem 0.4rem; border-radius: 3px; font-size: 0.62rem; font-family: monospace; background: ${tick.classified_depth ? (tick.classified_depth === 'Deep' ? 'rgba(217,83,79,0.2)' : tick.classified_depth === 'Light' ? 'rgba(240,173,78,0.2)' : tick.classified_depth === 'Micro' ? 'rgba(76,175,80,0.2)' : 'rgba(156,39,176,0.2)') : 'rgba(255,255,255,0.05)'};`"
+                       :title="tick.created_at + (tick.trigger_reason ? ' — ' + tick.trigger_reason : '')"
+                       x-text="new Date(tick.created_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + (tick.classified_depth ? ' ' + tick.classified_depth.charAt(0) : '')"></div>
+                </template>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Routing Health (Collapsible) [Tab: internals] -->
+    <div class="panel" id="routing-health" x-data="{ routingOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header" style="cursor: pointer;" @click="routingOpen = !routingOpen">
+        <span class="material-symbols-outlined" :style="routingOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">route</span>
+        Routing Health
+        <span class="panel-status">
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('routing')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('routing')"></span>
+        </span>
+        <template x-if="$store.genesisDashboard.health.call_sites">
+          <span style="margin-left: auto; font-size: 0.75rem; font-weight: 400; opacity: 0.7"
+                x-text="(() => {
+                  const sites = $store.genesisDashboard.health.call_sites;
+                  const routing = Object.entries(sites).filter(([, s]) => s.routing !== false);
+                  const total = routing.length;
+                  const healthy = routing.filter(([, s]) => s.status === 'healthy' || s.status === 'active').length;
+                  const down = routing.filter(([, s]) => s.status === 'down').length;
+                  const warning = routing.filter(([, s]) => s.status === 'warning').length;
+                  const degraded = routing.filter(([, s]) => s.status === 'degraded').length;
+                  const parts = [];
+                  if (down > 0) parts.push(down + ' down');
+                  if (warning > 0) parts.push(warning + ' warning');
+                  if (degraded > 0) parts.push(degraded + ' degraded');
+                  if (parts.length) return parts.join(', ') + ' / ' + total + ' configured';
+                  return healthy + '/' + total + ' call sites healthy';
+                })()"></span>
+        </template>
+      </div>
+      <div class="panel-body" x-show="routingOpen" x-transition>
+        <template x-if="$store.genesisDashboard.statusReason('routing', $store.genesisDashboard.routingSemantic())">
+          <div class="inline-warning" x-text="$store.genesisDashboard.statusReason('routing', $store.genesisDashboard.routingSemantic())"></div>
+        </template>
+        <div style="display:flex; gap:0.5rem; flex-wrap:wrap; align-items:center; margin-bottom:0.75rem;">
+          <button type="button"
+                  style="font-size:0.74rem; padding:0.3rem 0.55rem; border-radius:4px; border:1px solid rgba(33,150,243,0.28); color:#2196F3; background:transparent; cursor:pointer;"
+                  :disabled="$store.genesisDashboard.routingEditor.reloading"
+                  @click="$store.genesisDashboard.reloadRoutingConfig()"
+                  x-text="$store.genesisDashboard.routingEditor.reloading ? 'Reloading...' : 'Reload routing config'"></button>
+          <template x-if="$store.genesisDashboard.routingEditor.reloadMessage">
+            <span style="font-size:0.72rem; color:#4caf50;" x-text="$store.genesisDashboard.routingEditor.reloadMessage"></span>
+          </template>
+          <template x-if="$store.genesisDashboard.routingEditor.reloadError">
+            <span style="font-size:0.72rem; color:#d9534f;" x-text="$store.genesisDashboard.routingEditor.reloadError"></span>
+          </template>
+        </div>
+        <template x-if="$store.genesisDashboard.routingConfig?.call_sites">
+          <div style="display:flex; gap:0.75rem; flex-wrap:wrap; margin-bottom:0.8rem; font-size:0.76rem;">
+            <div style="padding:0.35rem 0.6rem; border-radius:6px; background:rgba(255,255,255,0.04); border:1px solid var(--color-border);">
+              <span style="font-weight:600;" x-text="Object.keys($store.genesisDashboard.routingConfig.call_sites || {}).length"></span> configured call sites
+            </div>
+            <div style="padding:0.35rem 0.6rem; border-radius:6px; background:rgba(240,173,78,0.08); border:1px solid rgba(240,173,78,0.18); color:#f0ad4e;">
+              <span style="font-weight:600;" x-text="$store.genesisDashboard.fallbackCallSiteCount"></span> on fallback
+            </div>
+            <div style="padding:0.35rem 0.6rem; border-radius:6px; background:rgba(76,175,80,0.08); border:1px solid rgba(76,175,80,0.18); color:#4caf50;">
+              <span style="font-weight:600;" x-text="Object.values($store.genesisDashboard.routingConfig.providers || {}).filter(p => p.free).length"></span> free providers
+            </div>
+          </div>
+          <!-- Model provider toggles -->
+          <div style="display:flex; gap:0.4rem; flex-wrap:wrap; margin-bottom:0.8rem;">
+            <template x-for="(prov, provName) in ($store.genesisDashboard.routingConfig.providers || {})" :key="provName">
+              <div style="display:flex; align-items:center; gap:0.35rem; padding:0.25rem 0.5rem; border-radius:5px; background:rgba(255,255,255,0.04); border:1px solid var(--color-border); font-size:0.72rem;">
+                <span class="status-dot"
+                      :style="`background: ${($store.genesisDashboard.routingConfig.cb_states || {})[provName] === 'OPEN' ? '#d9534f' : '#4caf50'}`"></span>
+                <span style="font-weight:500; color:#e0e0e0;" x-text="provName"></span>
+                <span style="color:#666; font-size:0.65rem;" x-text="prov.model"></span>
+                <button @click.stop="$store.genesisDashboard.toggleProvider(provName)"
+                        style="font-size:0.62rem; padding:1px 6px; border-radius:3px; cursor:pointer; border:1px solid; font-weight:500; margin-left:0.25rem;"
+                        :style="($store.genesisDashboard.routingConfig.cb_states || {})[provName] !== 'OPEN'
+                          ? 'background:transparent; color:#ef9a9a; border-color:#ef9a9a;'
+                          : 'background:transparent; color:#81c784; border-color:#81c784;'"
+                        x-text="($store.genesisDashboard.routingConfig.cb_states || {})[provName] !== 'OPEN' ? 'disable' : 'enable'"></button>
+              </div>
+            </template>
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.health.call_sites">
+          <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 0.5rem;">
+            <template x-for="(site, siteId) in $store.genesisDashboard.health.call_sites" :key="siteId">
+              <div style="background: var(--color-background); border: 1px solid var(--color-border); border-radius: 6px; padding: 0.5rem 0.75rem; font-size: 0.78rem;">
+                <div style="display: flex; align-items: center; justify-content:space-between; gap: 0.4rem; margin-bottom: 0.25rem;">
+                  <div style="display:flex; align-items:center; gap:0.4rem;">
+                    <span class="status-dot" :style="`background: ${$store.genesisDashboard.probeStatusColor(site)}`"></span>
+                    <span style="font-weight: 600" x-text="siteId"></span>
+                  </div>
+                  <button type="button"
+                          style="font-size:0.68rem; padding:0.2rem 0.42rem; border-radius:4px; border:1px solid rgba(33,150,243,0.24); color:#2196F3; background:transparent; cursor:pointer;"
+                          @click="$store.genesisDashboard.openRoutingEditor(siteId)"
+                          x-text="$store.genesisDashboard.routingEditor.siteId === siteId ? 'Editing' : 'Edit'"></button>
+                </div>
+                <div style="color: var(--color-text-secondary); font-size: 0.72rem; margin-bottom: 0.2rem;"
+                     x-text="site.description || ''"></div>
+                <div style="font-size: 0.72rem;">
+                  Active: <span x-text="site.active_provider || '—'" :style="`color: ${site.active_provider === site.chain_health?.[0]?.provider ? '#4caf50' : '#f0ad4e'}`"></span>
+                </div>
+                <template x-if="site.recent_failures">
+                  <div style="font-size:0.68rem; margin-top:0.15rem; color:#f0ad4e;"
+                       :title="site.last_failure_at ? 'Last failure: ' + new Date(site.last_failure_at).toLocaleString() : ''"
+                       x-text="site.recent_failures + ' failures in last 30m'"></div>
+                </template>
+                <template x-if="site.recent_exhaustions && !site.recent_failures">
+                  <div style="font-size:0.68rem; margin-top:0.15rem; color:#f0ad4e;"
+                       x-text="site.recent_exhaustions + ' recent exhaustions'"></div>
+                </template>
+                <template x-if="$store.genesisDashboard.routingConfig?.call_sites?.[siteId]">
+                  <div style="display:flex; gap:0.25rem; flex-wrap:wrap; margin-top:0.25rem;">
+                    <template x-if="$store.genesisDashboard.routingConfig.call_sites[siteId].default_paid">
+                      <span style="font-size:0.65rem; padding:0.08rem 0.32rem; border-radius:3px; background:rgba(240,173,78,0.16); color:#f0ad4e;">default paid</span>
+                    </template>
+                    <template x-if="$store.genesisDashboard.routingConfig.call_sites[siteId].never_pays">
+                      <span style="font-size:0.65rem; padding:0.08rem 0.32rem; border-radius:3px; background:rgba(76,175,80,0.16); color:#4caf50;">never pays</span>
+                    </template>
+                    <template x-if="$store.genesisDashboard.routingConfig.call_sites[siteId].retry_profile">
+                      <span style="font-size:0.65rem; padding:0.08rem 0.32rem; border-radius:3px; background:rgba(255,255,255,0.07); color:var(--color-text-secondary);" x-text="$store.genesisDashboard.routingConfig.call_sites[siteId].retry_profile"></span>
+                    </template>
+                    <template x-if="site.parallelized">
+                      <span style="font-size:0.65rem; padding:0.08rem 0.32rem; border-radius:3px; background:rgba(156,39,176,0.16); color:#9c27ac;">parallelized</span>
+                    </template>
+                  </div>
+                </template>
+                <template x-if="site.chain_health">
+                  <div style="font-size: 0.68rem; margin-top: 0.2rem; color: var(--color-text-secondary);">
+                    Chain:
+                    <template x-for="(ch, ci) in site.chain_health" :key="ci">
+                      <span>
+                        <span :style="`color: ${ch.state === 'open' ? '#d9534f' : ch.failures > 0 ? '#f0ad4e' : '#4caf50'}`"
+                              x-text="ch.provider"></span>
+                        <span style="opacity:0.55;" x-text="' (' + ch.state + (ch.failures > 0 ? ', ' + ch.failures + ' fail' + (ch.failures === 1 ? '' : 's') : '') + ')'"></span><span x-show="ci < site.chain_health.length - 1"> → </span>
+                      </span>
+                    </template>
+                  </div>
+                </template>
+                <template x-if="$store.genesisDashboard.routingEditor.siteId === siteId">
+                  <div style="margin-top:0.5rem; padding-top:0.5rem; border-top:1px solid rgba(255,255,255,0.06);">
+                    <div style="font-size:0.68rem; color:var(--color-text-secondary); margin-bottom:0.25rem;">Edit provider chain as a comma-separated list.</div>
+                    <label style="display:block; font-size:0.68rem; color:var(--color-text-secondary); margin-bottom:0.15rem;">Chain</label>
+                    <input type="text"
+                           x-model="$store.genesisDashboard.routingEditor.chainText"
+                           style="width:100%; box-sizing:border-box; font-size:0.72rem; padding:0.36rem 0.45rem; border-radius:4px; border:1px solid var(--color-border); background:rgba(255,255,255,0.03); color:var(--color-text-primary);">
+                    <div style="font-size:0.64rem; color:var(--color-text-secondary); margin-top:0.2rem;"
+                         x-text="'Available providers: ' + $store.genesisDashboard.routingProviderList.join(', ')"></div>
+                    <label style="display:flex; gap:0.35rem; align-items:center; font-size:0.68rem; margin-top:0.4rem;">
+                      <input type="checkbox" x-model="$store.genesisDashboard.routingEditor.default_paid">
+                      <span>Default paid</span>
+                    </label>
+                    <label style="display:flex; gap:0.35rem; align-items:center; font-size:0.68rem; margin-top:0.2rem;">
+                      <input type="checkbox" x-model="$store.genesisDashboard.routingEditor.never_pays">
+                      <span>Never pays</span>
+                    </label>
+                    <div style="display:flex; gap:0.4rem; flex-wrap:wrap; margin-top:0.5rem;">
+                      <button type="button"
+                              style="font-size:0.68rem; padding:0.24rem 0.48rem; border-radius:4px; border:1px solid rgba(33,150,243,0.24); color:#2196F3; background:transparent; cursor:pointer;"
+                              :disabled="$store.genesisDashboard.routingEditor.saving"
+                              @click="$store.genesisDashboard.saveRoutingEditor()"
+                              x-text="$store.genesisDashboard.routingEditor.saving ? 'Saving...' : 'Save route'"></button>
+                      <button type="button"
+                              style="font-size:0.68rem; padding:0.24rem 0.48rem; border-radius:4px; border:1px solid var(--color-border); color:var(--color-text-secondary); background:transparent; cursor:pointer;"
+                              @click="$store.genesisDashboard.closeRoutingEditor()">Close</button>
+                    </div>
+                    <template x-if="$store.genesisDashboard.routingEditor.message">
+                      <div style="font-size:0.68rem; color:#4caf50; margin-top:0.35rem;" x-text="$store.genesisDashboard.routingEditor.message"></div>
+                    </template>
+                    <template x-if="$store.genesisDashboard.routingEditor.error">
+                      <div style="font-size:0.68rem; color:#d9534f; margin-top:0.35rem;" x-text="$store.genesisDashboard.routingEditor.error"></div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+        </template>
+        <template x-if="!$store.genesisDashboard.health.call_sites || Object.keys($store.genesisDashboard.health.call_sites).length === 0">
+          <div class="empty-state">No call site data available.</div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Scheduler Overview [Tab: internals] -->
+    <div class="panel" x-data="{ schedOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header" style="cursor: pointer;" @click="schedOpen = !schedOpen">
+        <span class="material-symbols-outlined" :style="schedOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">event_repeat</span>
+        Scheduler
+        <span class="panel-status">
+          <span style="font-size: 0.68rem; opacity: 0.7;"
+                x-text="($store.genesisDashboard.userJobs?.jobs?.length || 0) + ' user · ' + ($store.genesisDashboard.schedulerData?.total_jobs || 0) + ' system'"></span>
+        </span>
+      </div>
+      <div class="panel-body" x-show="schedOpen" x-transition>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;">
+
+          <!-- User Jobs Card -->
+          <div style="border: 1px solid var(--color-border); border-radius: 6px; padding: 0.75rem;">
+            <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.3rem;">
+              <span class="material-symbols-outlined" style="font-size: 1rem;">person</span>
+              User Jobs
+              <span style="font-weight: 400; opacity: 0.6; margin-left: auto;" x-text="($store.genesisDashboard.userJobs?.jobs?.length || 0)"></span>
+            </div>
+            <template x-if="!$store.genesisDashboard.userJobs?.jobs?.length">
+              <div style="font-size: 0.76rem; opacity: 0.5; padding: 0.5rem 0;">No user jobs. Create one via <code>user_job_create</code> MCP tool.</div>
+            </template>
+            <template x-if="$store.genesisDashboard.userJobs?.jobs?.length > 0">
+              <div>
+                <template x-for="job in $store.genesisDashboard.userJobs.jobs" :key="job.id">
+                  <div style="margin-bottom: 0.5rem; padding: 0.4rem 0.5rem; border: 1px solid rgba(255,255,255,0.06); border-radius: 4px; font-size: 0.76rem;">
+                    <div style="display: flex; align-items: center; gap: 0.3rem;">
+                      <span class="status-dot" :style="`background: ${job.status === 'active' ? (job.last_status === 'failed' ? '#d9534f' : '#4caf50') : '#888'}`"></span>
+                      <strong x-text="job.title" style="font-size: 0.78rem;"></strong>
+                      <span style="margin-left: auto; font-size: 0.65rem; opacity: 0.6; font-family: monospace;" x-text="job.cron_expression"></span>
+                    </div>
+                    <div style="font-size: 0.68rem; opacity: 0.6; margin-top: 0.15rem;">
+                      <span x-text="job.profile + ' · ' + job.model"></span>
+                      <template x-if="job.last_run_at">
+                        <span x-text="' · last: ' + new Date(job.last_run_at).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})"></span>
+                      </template>
+                      <template x-if="job.failure_count > 0">
+                        <span style="color: #d9534f;" x-text="' · ' + job.failure_count + ' fail(s)'"></span>
+                      </template>
+                    </div>
+                    <div style="margin-top: 0.3rem; display: flex; gap: 0.3rem;">
+                      <button @click="$store.genesisDashboard.userJobAction(job.id, 'run_now')"
+                              style="font-size: 0.62rem; padding: 0.15rem 0.4rem; border: 1px solid var(--color-border); border-radius: 3px; background: rgba(76,175,80,0.1); cursor: pointer; color: inherit;">
+                        Run Now
+                      </button>
+                      <template x-if="job.status === 'active'">
+                        <button @click="$store.genesisDashboard.userJobAction(job.id, 'pause')"
+                                style="font-size: 0.62rem; padding: 0.15rem 0.4rem; border: 1px solid var(--color-border); border-radius: 3px; background: rgba(240,173,78,0.1); cursor: pointer; color: inherit;">
+                          Pause
+                        </button>
+                      </template>
+                      <template x-if="job.status === 'paused'">
+                        <button @click="$store.genesisDashboard.userJobAction(job.id, 'resume')"
+                                style="font-size: 0.62rem; padding: 0.15rem 0.4rem; border: 1px solid var(--color-border); border-radius: 3px; background: rgba(76,175,80,0.1); cursor: pointer; color: inherit;">
+                          Resume
+                        </button>
+                      </template>
+                      <button @click="if(confirm('Delete this job?')) $store.genesisDashboard.userJobAction(job.id, 'delete')"
+                              style="font-size: 0.62rem; padding: 0.15rem 0.4rem; border: 1px solid var(--color-border); border-radius: 3px; background: rgba(217,83,79,0.1); cursor: pointer; color: inherit;">
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+
+          <!-- System Jobs Card -->
+          <div style="border: 1px solid var(--color-border); border-radius: 6px; padding: 0.75rem;">
+            <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.3rem;">
+              <span class="material-symbols-outlined" style="font-size: 1rem;">settings</span>
+              System Jobs
+              <span style="font-weight: 400; opacity: 0.6; margin-left: auto;" x-text="($store.genesisDashboard.schedulerData?.total_jobs || 0)"></span>
+            </div>
+            <template x-if="!$store.genesisDashboard.schedulerData?.subsystems?.length">
+              <div style="font-size: 0.76rem; opacity: 0.5; padding: 0.5rem 0;">No scheduler data available.</div>
+            </template>
+            <template x-if="$store.genesisDashboard.schedulerData?.subsystems?.length > 0">
+              <div>
+                <template x-for="sub in $store.genesisDashboard.schedulerData.subsystems" :key="sub.name">
+                  <div x-data="{ open: false }" style="margin-bottom: 0.3rem;">
+                    <div @click="open = !open" style="cursor: pointer; display: flex; align-items: center; gap: 0.3rem; padding: 0.25rem 0.3rem; border-radius: 3px; font-size: 0.76rem;"
+                         :style="open ? 'background: rgba(255,255,255,0.04)' : ''">
+                      <span class="material-symbols-outlined" style="font-size: 0.8rem; transition: transform 0.15s;" :style="open ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+                      <span class="status-dot" :style="`background: ${sub.jobs.some(j => j.consecutive_failures > 0) ? '#d9534f' : '#4caf50'}`"></span>
+                      <span x-text="sub.name" style="font-weight: 500;"></span>
+                      <span style="opacity: 0.5; font-size: 0.65rem; margin-left: auto;" x-text="'(' + sub.count + ')'"></span>
+                    </div>
+                    <div x-show="open" x-transition style="margin-left: 1.5rem; font-size: 0.7rem;">
+                      <template x-for="job in sub.jobs" :key="job.id">
+                        <div style="padding: 0.15rem 0; opacity: 0.8; display: flex; gap: 0.4rem; align-items: baseline;">
+                          <span class="status-dot" style="flex-shrink: 0;"
+                                :style="`background: ${job.consecutive_failures > 0 ? '#d9534f' : '#4caf50'}; margin-top: 0.2rem;`"></span>
+                          <span x-text="job.id" style="font-family: monospace; font-size: 0.65rem; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"></span>
+                          <span style="opacity: 0.5; font-size: 0.6rem; flex-shrink: 0;" x-text="job.trigger_type"></span>
+                          <span style="opacity: 0.5; font-size: 0.6rem; font-family: monospace; flex-shrink: 0;"
+                                x-text="job.next_run_time ? new Date(job.next_run_time).toLocaleString([], {hour:'2-digit',minute:'2-digit'}) : '—'"></span>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel: Job Health (Collapsible) [Tab: internals] -->
+    <div class="panel" x-data="{ jobsOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header" style="cursor: pointer;" @click="jobsOpen = !jobsOpen">
+        <span class="material-symbols-outlined" :style="jobsOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">schedule</span>
+        Job Health
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.jobHealth?.jobs">
+            <span style="font-size: 0.68rem; opacity: 0.7;"
+                  x-text="(() => { const j = $store.genesisDashboard.jobHealth.jobs; const f = j.filter(x => x.consecutive_failures > 0).length; return f > 0 ? f + ' failing' : j.length + ' jobs healthy'; })()"></span>
+          </template>
+          <template x-if="$store.genesisDashboard.jobHealth?.observations">
+            <span style="font-size: 0.68rem; opacity: 0.5; margin-left: 0.3rem;"
+                  x-text="'obs: ' + $store.genesisDashboard.jobHealth.observations.total"></span>
+          </template>
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('jobHealth')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('jobHealth')"></span>
+        </span>
+      </div>
+      <div class="panel-body" x-show="jobsOpen" x-transition>
+        <template x-if="$store.genesisDashboard.panelStatusDetail('jobHealth')">
+          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('jobHealth')"></div>
+        </template>
+        <template x-if="!$store.genesisDashboard.jobHealth?.jobs?.length">
+          <div class="empty-state">No scheduled jobs.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.jobHealth?.jobs?.length > 0">
+          <div>
+            <!-- Observation Stats -->
+            <template x-if="$store.genesisDashboard.jobHealth?.observations">
+              <div style="margin-bottom: 0.75rem; padding: 0.5rem 0.6rem; border: 1px solid var(--color-border); border-radius: 6px; background: rgba(76,175,80,0.04);">
+                <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.3rem;">Observation Pipeline</div>
+                <div style="display: flex; gap: 1rem; font-size: 0.76rem; flex-wrap: wrap;">
+                  <span>Total: <strong x-text="$store.genesisDashboard.jobHealth.observations.total"></strong></span>
+                  <span>24h: <strong x-text="$store.genesisDashboard.jobHealth.observations.created_24h"></strong></span>
+                  <span>Retrieved: <strong x-text="$store.genesisDashboard.jobHealth.observations.total_retrieved"
+                        :style="$store.genesisDashboard.jobHealth.observations.total_retrieved === 0 && $store.genesisDashboard.jobHealth.observations.total > 0 ? 'color: #d9534f' : 'color: #4caf50'"></strong></span>
+                  <span>Influenced: <strong x-text="$store.genesisDashboard.jobHealth.observations.total_influenced"></strong></span>
+                </div>
+              </div>
+            </template>
+            <!-- Job Table -->
+            <div style="overflow-x: auto;">
+              <table style="width: 100%; border-collapse: collapse; font-size: 0.72rem;">
+                <thead>
+                  <tr style="border-bottom: 1px solid var(--color-border); text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.65rem;">
+                    <th style="text-align: left; padding: 0.3rem 0.4rem;">Job</th>
+                    <th style="text-align: right; padding: 0.3rem 0.4rem;">Runs</th>
+                    <th style="text-align: right; padding: 0.3rem 0.4rem;">Fails</th>
+                    <th style="text-align: right; padding: 0.3rem 0.4rem;">Streak</th>
+                    <th style="text-align: right; padding: 0.3rem 0.4rem;">Last Run</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="job in $store.genesisDashboard.jobHealth.jobs" :key="job.job_name">
+                    <tr :style="job.consecutive_failures > 0 ? 'background: rgba(217,83,79,0.08)' : ''"
+                        style="border-bottom: 1px solid rgba(255,255,255,0.04);">
+                      <td style="padding: 0.25rem 0.4rem;">
+                        <span class="status-dot" :style="`background: ${job.consecutive_failures > 0 ? '#d9534f' : '#4caf50'}`"></span>
+                        <span x-text="job.job_name" style="margin-left: 0.3rem;"></span>
+                      </td>
+                      <td style="text-align: right; padding: 0.25rem 0.4rem;" x-text="job.total_runs"></td>
+                      <td style="text-align: right; padding: 0.25rem 0.4rem;"
+                          :style="job.total_failures > 0 ? 'color: #f0ad4e' : ''"
+                          x-text="job.total_failures"></td>
+                      <td style="text-align: right; padding: 0.25rem 0.4rem;"
+                          :style="job.consecutive_failures > 0 ? 'color: #d9534f; font-weight: 700' : ''"
+                          x-text="job.consecutive_failures"></td>
+                      <td style="text-align: right; padding: 0.25rem 0.4rem; font-family: monospace; font-size: 0.65rem;"
+                          x-text="job.last_run ? new Date(job.last_run).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—'"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Eval Metrics (Compounding Intelligence) [Tab: internals] -->
+    <div class="panel" x-data="{ evalOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header" style="cursor: pointer;" @click="evalOpen = !evalOpen">
+        <span class="material-symbols-outlined" :style="evalOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">insights</span>
+        Eval Metrics (J-9)
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.evalMetrics?.dimensions">
+            <span style="font-size: 0.68rem; opacity: 0.7;"
+                  x-text="(() => { const d = $store.genesisDashboard.evalMetrics.dimensions; const vals = Object.values(d).map(x => x.weeks_of_data || 0); const weeks = vals.length ? Math.max(...vals) : 0; return weeks + ' weeks of data'; })()"></span>
+          </template>
+        </span>
+      </div>
+      <div class="panel-body" x-show="evalOpen" x-transition>
+        <template x-if="!$store.genesisDashboard.evalMetrics?.dimensions">
+          <div class="empty-state">No eval data yet. Aggregation runs Sundays 05:00 UTC.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.evalMetrics?.dimensions">
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.6rem;">
+            <template x-for="[dim, data] in Object.entries($store.genesisDashboard.evalMetrics.dimensions)" :key="dim">
+              <div style="border: 1px solid var(--color-border); border-radius: 6px; padding: 0.5rem 0.6rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem;">
+                  <span style="font-size: 0.72rem; font-weight: 600; text-transform: capitalize;" x-text="dim"></span>
+                  <span style="font-size: 0.65rem; opacity: 0.6;" x-text="data.headline_metric"></span>
+                </div>
+                <div style="display: flex; align-items: baseline; gap: 0.4rem;">
+                  <span style="font-size: 1.1rem; font-weight: 700;"
+                        x-text="data.current_value !== null ? (data.headline_metric === 'delta' ? (data.current_value >= 0 ? '+' : '') : '') + (data.current_value * 100).toFixed(1) + '%' : '—'"></span>
+                  <span style="font-size: 0.7rem;"
+                        :style="data.trend === 'up' ? 'color: #4caf50' : data.trend === 'down' ? 'color: #d9534f' : 'color: #888'"
+                        x-text="data.trend === 'up' ? '\u2191' : data.trend === 'down' ? '\u2193' : data.trend === 'flat' ? '\u2192' : '\u2026'"></span>
+                </div>
+                <!-- Sparkline: CSS bar chart (min-max normalized per series) -->
+                <div style="display: flex; align-items: flex-end; gap: 1px; height: 24px; margin-top: 0.3rem;">
+                  <template x-for="(pt, i) in data.series" :key="i">
+                    <div :style="(() => {
+                      const color = data.trend === 'up' ? 'rgba(76,175,80,0.5)' : data.trend === 'down' ? 'rgba(217,83,79,0.5)' : 'rgba(136,136,136,0.4)';
+                      if (pt.value === null) return `flex:1; background:${color}; border-radius:1px; height:2px;`;
+                      const vals = data.series.filter(p => p.value !== null).map(p => p.value);
+                      const mn = Math.min(...vals), mx = Math.max(...vals);
+                      const pct = mx > mn ? ((pt.value - mn) / (mx - mn)) * 90 + 10 : 50;
+                      return `flex:1; background:${color}; border-radius:1px; height:${pct}%;`;
+                    })()"></div>
+                  </template>
+                </div>
+                <div style="font-size: 0.62rem; opacity: 0.5; margin-top: 0.2rem;" x-text="data.weeks_of_data + ' weeks'"></div>
+              </div>
+            </template>
+          </div>
+        </template>
+        <!-- Subsystem Grades -->
+        <template x-if="$store.genesisDashboard.subsystemGrades?.grades">
+          <div style="margin-top: 0.8rem;">
+            <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; opacity: 0.7;">Subsystem Quality Grades</div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.5rem;">
+              <template x-for="sub in ['memory', 'ego', 'procedural', 'awareness', 'reflection']" :key="sub">
+                <div style="border: 1px solid var(--color-border); border-radius: 6px; padding: 0.5rem 0.6rem;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.2rem;">
+                    <span style="font-size: 0.72rem; font-weight: 600; text-transform: capitalize;" x-text="sub"></span>
+                    <span style="font-size: 1.1rem; font-weight: 700; min-width: 1.5rem; text-align: center;"
+                          :style="(() => {
+                            const g = $store.genesisDashboard.subsystemGrades?.grades?.[sub];
+                            if (!g || !g.grade) return 'opacity: 0.4';
+                            const colors = { A: '#4caf50', B: '#8bc34a', C: '#ff9800', D: '#ff5722', F: '#d9534f' };
+                            return 'color:' + (colors[g.grade] || '#888');
+                          })()"
+                          x-text="$store.genesisDashboard.subsystemGrades?.grades?.[sub]?.grade || '—'"></span>
+                  </div>
+                  <div style="font-size: 0.65rem; opacity: 0.6;"
+                       x-text="(() => {
+                         const g = $store.genesisDashboard.subsystemGrades?.grades?.[sub];
+                         if (!g) return 'no data';
+                         if (!g.grade) return g.reason || 'insufficient data';
+                         return 'score: ' + g.score + ' · ' + g.sample_count + ' samples';
+                       })()"></div>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Drives & Thresholds (Collapsible) [Tab: internals] -->
+    <div class="panel" x-data="{ drivesOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header" style="cursor: pointer;" @click="drivesOpen = !drivesOpen">
+        <span class="material-symbols-outlined" :style="drivesOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">tune</span>
+        Drives & Thresholds
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.autonomyConfig?.drives?.length">
+            <span style="font-size: 0.68rem; opacity: 0.7;"
+                  x-text="$store.genesisDashboard.autonomyConfig.drives.length + ' drives · ' + ($store.genesisDashboard.autonomyConfig.thresholds?.length || 0) + ' thresholds'"></span>
+          </template>
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('autonomyConfig')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('autonomyConfig')"></span>
+        </span>
+      </div>
+      <div class="panel-body" x-show="drivesOpen" x-transition>
+        <template x-if="$store.genesisDashboard.panelStatusDetail('autonomyConfig')">
+          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('autonomyConfig')"></div>
+        </template>
+        <template x-if="!$store.genesisDashboard.autonomyConfig?.drives?.length">
+          <div class="empty-state">No drives configured.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.autonomyConfig?.drives?.length > 0">
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;">
+            <!-- Drive Weights -->
+            <div style="padding: 0.5rem 0.6rem; border: 1px solid var(--color-border); border-radius: 6px;">
+              <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem;">Drive Weights</div>
+              <template x-for="d in $store.genesisDashboard.autonomyConfig.drives" :key="d.drive_name">
+                <div style="display: flex; align-items: center; gap: 0.4rem; margin: 0.3rem 0; font-size: 0.76rem;">
+                  <span style="width: 90px; text-transform: capitalize;" x-text="d.drive_name"></span>
+                  <div style="flex: 1; height: 8px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden;">
+                    <div :style="`width: ${d.current_weight * 100}%; height: 100%; border-radius: 4px; background: ${d.drive_name === 'preservation' ? '#2196F3' : d.drive_name === 'curiosity' ? '#9c27b0' : d.drive_name === 'cooperation' ? '#4caf50' : '#ff9800'};`"></div>
+                  </div>
+                  <span style="width: 32px; text-align: right; font-family: monospace; font-size: 0.68rem;" x-text="d.current_weight.toFixed(2)"></span>
+                </div>
+              </template>
+            </div>
+            <!-- Depth Thresholds -->
+            <div style="padding: 0.5rem 0.6rem; border: 1px solid var(--color-border); border-radius: 6px;">
+              <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem;">Depth Thresholds</div>
+              <template x-for="t in $store.genesisDashboard.autonomyConfig.thresholds" :key="t.depth_name">
+                <div style="display: flex; align-items: center; gap: 0.4rem; margin: 0.3rem 0; font-size: 0.76rem;">
+                  <span style="width: 65px; font-weight: 600;" x-text="t.depth_name"></span>
+                  <span style="font-family: monospace; font-size: 0.72rem;" x-text="'≥ ' + t.threshold.toFixed(2)"></span>
+                  <span style="opacity: 0.5; font-size: 0.65rem; margin-left: auto;"
+                        x-text="(() => { const s = t.floor_seconds; return s >= 86400 ? Math.round(s/86400) + 'd' : s >= 3600 ? Math.round(s/3600) + 'h' : Math.round(s/60) + 'm'; })() + ' floor'"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+
+    <!-- Panel: CC Sessions [Tab: sessions] -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">terminal</span>
+        CC Sessions
+        <span class="panel-status">
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('sessions')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('sessions')"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <template x-if="$store.genesisDashboard.panelStatusDetail('sessions')">
+          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('sessions')"></div>
+        </template>
+        <div class="activity-filters">
+          <select x-model="$store.genesisDashboard.sessionFilters.status"
+                  @change="$store.genesisDashboard.fetchSessions()">
+            <option value="">All statuses</option>
+            <option value="active">Active</option>
+            <option value="completed">Completed</option>
+            <option value="failed">Failed</option>
+            <option value="expired">Expired</option>
+          </select>
+          <select x-model="$store.genesisDashboard.sessionFilters.sessionType"
+                  @change="$store.genesisDashboard.fetchSessions()">
+            <option value="">All types</option>
+            <option value="foreground">Foreground</option>
+            <option value="background_reflection">Reflection</option>
+            <option value="background_task">Task</option>
+          </select>
+        </div>
+        <div class="activity-feed" style="max-height: 300px;">
+          <template x-if="$store.genesisDashboard.sessions.length === 0">
+            <div class="empty-state">No sessions found.</div>
+          </template>
+          <template x-for="sess in $store.genesisDashboard.sessions" :key="sess.id">
+            <div>
+              <div class="activity-row" style="cursor:pointer;"
+                   @click="$store.genesisDashboard.toggleSession(sess.id)">
+                <span class="activity-time"
+                      x-text="$store.genesisDashboard.formatTime(sess.started_at)"></span>
+                <span class="activity-subsystem"
+                      :style="`color: ${$store.genesisDashboard.sessionStatusColor(sess.status)}`"
+                      x-text="$store.genesisDashboard.sessionTypeLabel(sess.session_type)"></span>
+                <span class="activity-type" x-text="sess.model"></span>
+                <span class="activity-msg" style="color: #aaa;"
+                      x-text="(sess.source_tag || sess.channel || '-') + ' | ' + sess.status"></span>
+                <template x-if="sess.status === 'active' && sess.session_type === 'foreground' && sess.last_activity_at && (Date.now() - Date.parse(sess.last_activity_at)) > 7200000">
+                  <span style="font-size: 0.62rem; padding: 0.08rem 0.3rem; border-radius: 3px; background: rgba(240,173,78,0.15); color: #f0ad4e; margin-left: 0.3rem;">stale</span>
+                </template>
+              </div>
+              <template x-if="$store.genesisDashboard.expandedSession === sess.id">
+                <div style="padding: 0.4rem 0.8rem; background: rgba(255,255,255,0.03); border-left: 2px solid #27875e; margin: 0.2rem 0 0.4rem 1rem; font-size: 0.75rem;">
+                  <template x-if="$store.genesisDashboard.sessionEvents.length === 0">
+                    <div style="color: #666;">No events recorded for this session.</div>
+                  </template>
+                  <template x-for="(evt, i) in $store.genesisDashboard.sessionEvents" :key="i">
+                    <div class="activity-row">
+                      <span class="activity-time"
+                            x-text="$store.genesisDashboard.formatTime(evt.timestamp)"></span>
+                      <span class="activity-type" x-text="evt.event_type"></span>
+                      <span class="activity-msg"
+                            :style="`color: ${$store.genesisDashboard.severityColor(evt.severity)}`"
+                            x-text="evt.message"></span>
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel: Activity Feed [Tab: sessions] -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">timeline</span>
+        Activity Feed
+        <span class="panel-status">
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('activity')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('activity')"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <template x-if="$store.genesisDashboard.panelStatusDetail('activity')">
+          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('activity')"></div>
+        </template>
+        <div class="activity-filters">
+          <select x-model="$store.genesisDashboard.activityTimeRange"
+                  @change="$store.genesisDashboard.fetchActivity()">
+            <option value="1h">Last 1h</option>
+            <option value="6h">Last 6h</option>
+            <option value="24h">Last 24h</option>
+            <option value="7d">Last 7d</option>
+          </select>
+          <select x-model="$store.genesisDashboard.filters.subsystem"
+                  @change="$store.genesisDashboard.fetchActivity()">
+            <option value="">All subsystems</option>
+            <template x-for="s in $store.genesisDashboard.subsystems.filter(x => x)" :key="s">
+              <option :value="s" x-text="s"></option>
+            </template>
+          </select>
+          <select x-model="$store.genesisDashboard.filters.minSeverity"
+                  @change="$store.genesisDashboard.fetchActivity()">
+            <option value="debug">Debug+</option>
+            <option value="info">Info+</option>
+            <option value="warning">Warning+</option>
+            <option value="error">Error+</option>
+          </select>
+        </div>
+        <div class="activity-feed">
+          <template x-if="$store.genesisDashboard.activity.length === 0">
+            <div class="empty-state">No events yet.</div>
+          </template>
+          <template x-for="(evt, i) in $store.genesisDashboard.activity" :key="i">
+            <div class="activity-row">
+              <span class="activity-time"
+                    x-text="evt.timestamp ? new Date(evt.timestamp).toLocaleTimeString() : ''"></span>
+              <span class="activity-subsystem" x-text="evt.subsystem"></span>
+              <span class="activity-type" x-text="evt.event_type"></span>
+              <span class="activity-msg"
+                    :style="`color: ${$store.genesisDashboard.severityColor(evt.severity)}`"
+                    x-text="evt.message"></span>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel: Operational Vitals (Collapsible) [Tab: internals] -->
+    <div class="panel" x-data="{ vitalsOpen: true, llmOpen: true, embedOpen: true, qdOpen: false, sqlOpen: false, mcpOpen: false, onpremOpen: false }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header" style="cursor: pointer;" @click="vitalsOpen = !vitalsOpen">
+        <span class="material-symbols-outlined" :style="vitalsOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">monitoring</span>
+        Operational Vitals
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.operationalVitals">
+            <span style="font-size: 0.72rem; opacity: 0.7;"
+                  x-text="(() => {
+                    const v = $store.genesisDashboard.operationalVitals;
+                    const llm = v?.llm?.totals || {};
+                    const emb = v?.embedding || {};
+                    const qd = v?.qdrant || {};
+                    return (llm.calls_24h || 0) + ' LLM calls · ' + (emb.total_embeddings_24h || 0) + ' embed ops · ' + (qd.total_points || 0) + ' vectors · $' + (llm.cost_24h || 0).toFixed(2) + '/24h';
+                  })()"></span>
+          </template>
+          <template x-if="!$store.genesisDashboard.operationalVitals">
+            <span style="font-size: 0.72rem; opacity: 0.5;">loading...</span>
+          </template>
+        </span>
+      </div>
+      <div class="panel-body" x-show="vitalsOpen" x-transition>
+        <template x-if="!$store.genesisDashboard.operationalVitals">
+          <div style="font-size: 0.78rem; color: var(--color-text-secondary); padding: 0.5rem 0;">Loading operational vitals...</div>
+        </template>
+        <template x-if="$store.genesisDashboard.operationalVitals">
+          <div x-data="{ v: $store.genesisDashboard.operationalVitals }">
+
+            <!-- ── LLM Routing ── -->
+            <div style="margin-bottom: 0.75rem; border: 1px solid var(--color-border); border-radius: 6px; overflow: hidden;">
+              <div @click="llmOpen = !llmOpen" style="cursor: pointer; padding: 0.4rem 0.6rem; background: rgba(255,152,0,0.06); display: flex; align-items: center; gap: 0.4rem; font-size: 0.76rem; font-weight: 600;">
+                <span class="material-symbols-outlined" style="font-size: 14px;" :style="llmOpen ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+                LLM Routing
+                <span style="margin-left: auto; font-weight: 400; opacity: 0.7; font-size: 0.7rem;"
+                      x-text="(v.llm?.providers?.length || 0) + ' providers · ' + (v.llm?.totals?.calls_1h || 0) + ' calls/1h · $' + (v.llm?.totals?.cost_24h || 0).toFixed(2) + '/24h'"></span>
+              </div>
+              <div x-show="llmOpen" x-transition style="padding: 0.5rem 0.6rem; font-size: 0.74rem;">
+                <template x-if="v.llm?.error">
+                  <div style="color: #d9534f;" x-text="'LLM: ' + v.llm.error"></div>
+                </template>
+                <template x-if="!v.llm?.error">
+                  <div>
+                    <!-- Totals -->
+                    <div style="display: flex; gap: 1rem; margin-bottom: 0.5rem; font-size: 0.72rem; flex-wrap: wrap;">
+                      <span>1h: <b x-text="v.llm?.totals?.calls_1h || 0"></b> calls · $<b x-text="(v.llm?.totals?.cost_1h || 0).toFixed(4)"></b></span>
+                      <span>24h: <b x-text="v.llm?.totals?.calls_24h || 0"></b> calls · $<b x-text="(v.llm?.totals?.cost_24h || 0).toFixed(4)"></b></span>
+                    </div>
+                    <!-- Per-provider full cards -->
+                    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 0.4rem;">
+                      <template x-for="p in (v.llm?.providers || [])" :key="p.name">
+                        <div style="padding: 0.4rem 0.55rem; border-radius: 5px;"
+                             :style="p.cb_state === 'open' ? 'border: 1px solid #d9534f; background: rgba(217,83,79,0.08)' : p.cb_state === 'half_open' ? 'border: 1px solid #f0ad4e; background: rgba(240,173,78,0.06)' : p.calls_24h > 0 ? 'border: 1px solid var(--color-border); background: rgba(255,255,255,0.03)' : 'border: 1px solid var(--color-border); background: rgba(255,255,255,0.01); opacity: 0.5'">
+                          <div style="display: flex; align-items: center; gap: 0.35rem; margin-bottom: 0.2rem;">
+                            <template x-if="p.cb_state === 'open'">
+                              <span style="padding: 0.05rem 0.2rem; border-radius: 3px; font-size: 0.56rem; background: rgba(217,83,79,0.25); color: #d9534f; font-weight: 700;">OPEN</span>
+                            </template>
+                            <template x-if="p.cb_state === 'half_open'">
+                              <span style="padding: 0.05rem 0.2rem; border-radius: 3px; font-size: 0.56rem; background: rgba(240,173,78,0.25); color: #f0ad4e; font-weight: 700;">HALF-OPEN</span>
+                            </template>
+                            <span style="font-weight: 600; font-size: 0.74rem;" x-text="p.display_name"></span>
+                            <span style="padding: 0.05rem 0.25rem; border-radius: 3px; font-size: 0.58rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0.03em;"
+                                  :style="({'openrouter':'background:rgba(139,92,246,0.15);color:#a78bfa','google':'background:rgba(66,133,244,0.15);color:#8ab4f8','mistral':'background:rgba(255,152,0,0.15);color:#ffb74d','anthropic':'background:rgba(217,119,87,0.15);color:#d9a98a','ollama':'background:rgba(76,175,80,0.15);color:#81c784','groq':'background:rgba(0,188,212,0.15);color:#4dd0e1','deepseek':'background:rgba(33,150,243,0.15);color:#64b5f6','xai':'background:rgba(255,255,255,0.1);color:#aaa','qwen':'background:rgba(255,193,7,0.15);color:#ffd54f','zenmux':'background:rgba(156,39,176,0.15);color:#ce93d8','minimax':'background:rgba(244,67,54,0.15);color:#ef9a9a'})[p.provider_type] || 'background:rgba(255,255,255,0.08);color:#888'"
+                                  x-text="p.provider_type"></span>
+                            <template x-if="p.intelligence_tier">
+                              <span style="padding: 0.05rem 0.25rem; border-radius: 3px; font-size: 0.58rem; font-weight: 700; letter-spacing: 0.03em;"
+                                    :style="({'S':'background:rgba(255,215,0,0.2);color:#ffd700','A':'background:rgba(139,92,246,0.15);color:#a78bfa','B':'background:rgba(33,150,243,0.12);color:#64b5f6','C':'background:rgba(255,255,255,0.08);color:#888'})[p.intelligence_tier] || 'background:rgba(255,255,255,0.08);color:#888'"
+                                    x-text="p.intelligence_tier"></span>
+                            </template>
+                            <template x-if="p.free">
+                              <span style="padding: 0.05rem 0.2rem; border-radius: 3px; font-size: 0.56rem; background: rgba(76,175,80,0.15); color: #81c784;">FREE</span>
+                            </template>
+                          </div>
+                          <div style="font-size: 0.64rem; opacity: 0.6; font-family: monospace; margin-bottom: 0.2rem;" x-text="p.model_id"></div>
+                          <template x-if="p.cb_trip_count > 0">
+                            <div style="font-size: 0.62rem; margin-bottom: 0.2rem;"
+                                 :style="p.cb_state === 'open' ? 'color: #d9534f' : 'color: #f0ad4e'"
+                                 x-text="'Breaker tripped ' + p.cb_trip_count + 'x' + (p.cb_last_failure ? ' (' + p.cb_last_failure + ')' : '')"></div>
+                          </template>
+                          <template x-if="p.calls_24h > 0">
+                            <div style="display: flex; gap: 0.6rem; font-size: 0.66rem; flex-wrap: wrap;">
+                              <span><b x-text="p.calls_24h"></b> calls</span>
+                              <span x-text="p.avg_latency_ms.toFixed(0) + 'ms'"></span>
+                              <span :style="p.error_rate > 0.1 ? 'color: #d9534f' : ''" x-text="(p.error_rate * 100).toFixed(1) + '% err'"></span>
+                              <template x-if="p.cost_24h > 0">
+                                <span x-text="'$' + p.cost_24h.toFixed(4)"></span>
+                              </template>
+                            </div>
+                          </template>
+                          <div style="font-size: 0.6rem; opacity: 0.5; margin-top: 0.15rem;"
+                               x-text="p.call_site_count > 0 ? p.call_site_count + ' call site(s): ' + p.call_sites.slice(0, 3).join(', ') + (p.call_sites.length > 3 ? '...' : '') : 'available (not assigned)'"></div>
+                        </div>
+                      </template>
+                    </div>
+                    <!-- Sessions -->
+                    <template x-if="v.llm?.sessions">
+                      <div style="margin-top: 0.5rem; font-size: 0.7rem; opacity: 0.8;">
+                        CC Sessions: <b x-text="v.llm.sessions.fg_active"></b> fg · <b x-text="v.llm.sessions.bg_active"></b> bg active · <b x-text="v.llm.sessions.created_24h"></b> created 24h · $<b x-text="(v.llm.sessions.session_cost_24h || 0).toFixed(4)"></b> cost
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- ── Embedding Pipeline ── -->
+            <div style="margin-bottom: 0.75rem; border: 1px solid var(--color-border); border-radius: 6px; overflow: hidden;">
+              <div @click="embedOpen = !embedOpen" style="cursor: pointer; padding: 0.4rem 0.6rem; background: rgba(76,175,80,0.06); display: flex; align-items: center; gap: 0.4rem; font-size: 0.76rem; font-weight: 600;">
+                <span class="material-symbols-outlined" style="font-size: 14px;" :style="embedOpen ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+                Embedding Pipeline
+                <span style="margin-left: auto; font-weight: 400; opacity: 0.7; font-size: 0.7rem;"
+                      x-text="(v.embedding?.total_embeddings_24h || 0) + ' ops/24h · ' + (v.embedding?.backends?.length || 0) + ' backends'"></span>
+              </div>
+              <div x-show="embedOpen" x-transition style="padding: 0.5rem 0.6rem; font-size: 0.74rem;">
+                <template x-if="v.embedding?.error">
+                  <div style="color: #d9534f;" x-text="'Embedding: ' + v.embedding.error"></div>
+                </template>
+                <template x-if="!v.embedding?.error">
+                  <div>
+                    <!-- Model & dual chain info -->
+                    <div style="display: flex; gap: 1rem; margin-bottom: 0.5rem; font-size: 0.7rem; flex-wrap: wrap;">
+                      <span>Model: <b x-text="v.embedding?.active_model || '—'"></b></span>
+                    </div>
+                    <div style="display: flex; gap: 0.5rem; margin-bottom: 0.5rem; font-size: 0.68rem; flex-wrap: wrap;">
+                      <span style="background: rgba(76,175,80,0.12); padding: 0.15rem 0.4rem; border-radius: 3px;">
+                        Storage: <b x-text="(v.embedding?.storage_chain || []).join(' → ') || '—'"></b>
+                      </span>
+                      <span style="background: rgba(33,150,243,0.12); padding: 0.15rem 0.4rem; border-radius: 3px;">
+                        Recall: <b x-text="(v.embedding?.recall_chain || []).join(' → ') || '—'"></b>
+                      </span>
+                    </div>
+                    <!-- Per-backend stats -->
+                    <template x-for="b in (v.embedding?.backends || [])" :key="b.name">
+                      <div style="display: flex; justify-content: space-between; padding: 0.25rem 0; border-bottom: 1px solid rgba(255,255,255,0.04);">
+                        <span style="font-weight: 600; font-size: 0.72rem;" x-text="b.name"></span>
+                        <span style="opacity: 0.7; font-size: 0.68rem;">
+                          <span x-text="b.calls_24h"></span> calls
+                          · <span :style="b.avg_latency_ms > 5000 ? 'color:#d9534f; font-weight:600' : b.avg_latency_ms > 2000 ? 'color:#f0ad4e; font-weight:600' : ''" x-text="b.avg_latency_ms.toFixed(0) + 'ms'"></span>
+                          · <span :style="b.error_rate > 0.1 ? 'color: #d9534f' : ''" x-text="(b.error_rate * 100).toFixed(1) + '% err'"></span>
+                        </span>
+                      </div>
+                    </template>
+                    <template x-if="(v.embedding?.backends || []).length === 0">
+                      <div style="font-size: 0.7rem; opacity: 0.5;">No embedding activity in last 24h</div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- ── Vector Store (Qdrant) ── -->
+            <div style="margin-bottom: 0.75rem; border: 1px solid var(--color-border); border-radius: 6px; overflow: hidden;">
+              <div @click="qdOpen = !qdOpen" style="cursor: pointer; padding: 0.4rem 0.6rem; background: rgba(156,39,176,0.06); display: flex; align-items: center; gap: 0.4rem; font-size: 0.76rem; font-weight: 600;">
+                <span class="material-symbols-outlined" style="font-size: 14px;" :style="qdOpen ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+                Vector Store — Qdrant
+                <span style="margin-left: auto; font-weight: 400; opacity: 0.7; font-size: 0.7rem;" x-text="(v.qdrant?.total_points || 0) + ' points · ' + (v.qdrant?.collections?.length || 0) + ' collections'"></span>
+              </div>
+              <div x-show="qdOpen" x-transition style="padding: 0.5rem 0.6rem; font-size: 0.74rem;">
+                <template x-if="v.qdrant?.error">
+                  <div style="color: #d9534f;" x-text="'Qdrant: ' + v.qdrant.error"></div>
+                </template>
+                <template x-if="!v.qdrant?.error">
+                  <div>
+                    <template x-for="c in (v.qdrant?.collections || [])" :key="c.name">
+                      <div style="display: flex; justify-content: space-between; padding: 0.2rem 0; border-bottom: 1px solid rgba(255,255,255,0.04);">
+                        <span style="font-weight: 600;" x-text="c.name"></span>
+                        <span style="opacity: 0.7;">
+                          <span x-text="(c.points || 0).toLocaleString()"></span> points
+                          · dim <span x-text="c.dimension || '?'"></span>
+                          · <span x-text="(c.indexed_vectors || 0) + ' indexed (threshold: ' + (c.full_scan_threshold || '?') + ')'"></span>
+                        </span>
+                      </div>
+                    </template>
+                    <div style="display: flex; gap: 1rem; margin-top: 0.4rem; opacity: 0.8; font-size: 0.7rem;">
+                      <span x-text="'Points written/24h: ' + (v.qdrant?.embedded_24h ?? '—')"></span>
+                      <span x-text="'Pending queue: ' + (v.qdrant?.pending_queue ?? '—')"></span>
+                    </div>
+                    <template x-if="(v.qdrant?.warnings || []).length > 0">
+                      <div style="margin-top: 0.4rem;">
+                        <template x-for="w in v.qdrant.warnings" :key="w">
+                          <div style="font-size: 0.7rem; color: #f0ad4e; padding: 0.2rem 0.4rem; margin-top: 0.2rem; background: rgba(240,173,78,0.08); border-radius: 3px;"
+                               x-text="w"></div>
+                        </template>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- ── Database (SQLite) ── -->
+            <div style="margin-bottom: 0.75rem; border: 1px solid var(--color-border); border-radius: 6px; overflow: hidden;">
+              <div @click="sqlOpen = !sqlOpen" style="cursor: pointer; padding: 0.4rem 0.6rem; background: rgba(33,150,243,0.06); display: flex; align-items: center; gap: 0.4rem; font-size: 0.76rem; font-weight: 600;">
+                <span class="material-symbols-outlined" style="font-size: 14px;" :style="sqlOpen ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+                Database — SQLite
+                <span style="margin-left: auto; font-weight: 400; opacity: 0.7; font-size: 0.7rem;"
+                      x-text="(v.sqlite?.tables?.length || 0) + ' tables · ' + (v.sqlite?.db_size_mb || 0) + ' MB'"></span>
+              </div>
+              <div x-show="sqlOpen" x-transition style="padding: 0.5rem 0.6rem; font-size: 0.74rem;">
+                <div style="display: flex; gap: 1rem; margin-bottom: 0.5rem; font-size: 0.72rem; flex-wrap: wrap;">
+                  <template x-if="v.sqlite?.events">
+                    <span>Events: <b x-text="v.sqlite.events.events_1h"></b>/1h · <b x-text="v.sqlite.events.events_24h"></b>/24h</span>
+                  </template>
+                  <template x-if="v.sqlite?.observations">
+                    <span>Observations: <b x-text="v.sqlite.observations.created_24h"></b> new · <b x-text="v.sqlite.observations.resolved_24h"></b> resolved · <b x-text="v.sqlite.observations.open_total"></b> open</span>
+                  </template>
+                </div>
+                <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.25rem;">
+                  <template x-for="t in (v.sqlite?.tables || []).filter(t => t.rows > 0).sort((a,b) => b.rows - a.rows)" :key="t.name">
+                    <div style="display: flex; justify-content: space-between; padding: 0.15rem 0.3rem; border-radius: 3px; background: rgba(255,255,255,0.02);">
+                      <span style="font-family: monospace; font-size: 0.68rem;" x-text="t.name"></span>
+                      <span style="opacity: 0.7; font-size: 0.68rem;">
+                        <span x-text="t.rows.toLocaleString()"></span>
+                        <template x-if="t.rows_24h !== undefined">
+                          <span style="color: #4caf50;" x-text="' (+' + t.rows_24h + ')'"></span>
+                        </template>
+                      </span>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </div>
+
+            <!-- ── MCP Servers ── -->
+            <div style="margin-bottom: 0.75rem; border: 1px solid var(--color-border); border-radius: 6px; overflow: hidden;">
+              <div @click="mcpOpen = !mcpOpen" style="cursor: pointer; padding: 0.4rem 0.6rem; background: rgba(0,188,212,0.06); display: flex; align-items: center; gap: 0.4rem; font-size: 0.76rem; font-weight: 600;">
+                <span class="material-symbols-outlined" style="font-size: 14px;" :style="mcpOpen ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+                MCP Servers
+                <span style="margin-left: auto; font-weight: 400; opacity: 0.7; font-size: 0.7rem;"
+                      x-text="(v.mcp?.servers?.length || 0) + ' servers · ' + (v.mcp?.servers || []).reduce((s, srv) => s + srv.total_calls_24h, 0) + ' calls/24h'"></span>
+              </div>
+              <div x-show="mcpOpen" x-transition style="padding: 0.5rem 0.6rem; font-size: 0.74rem;">
+                <template x-if="v.mcp?.error">
+                  <div style="color: #d9534f;" x-text="'MCP: ' + v.mcp.error"></div>
+                </template>
+                <template x-if="!v.mcp?.error">
+                  <div>
+                    <template x-for="s in (v.mcp?.servers || [])" :key="s.name">
+                      <div style="margin-bottom: 0.4rem; padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.04);">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                          <span style="font-weight: 600; font-size: 0.72rem;" x-text="s.name"></span>
+                          <span style="opacity: 0.6; font-size: 0.66rem;" x-text="s.total_calls_24h + ' calls/24h'"></span>
+                        </div>
+                        <template x-if="s.tools_invoked.length > 0">
+                          <div style="display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.2rem;">
+                            <template x-for="t in s.tools_invoked" :key="t.tool">
+                              <span style="padding: 0.1rem 0.35rem; border-radius: 3px; background: rgba(0,188,212,0.08); border: 1px solid rgba(0,188,212,0.15); font-size: 0.62rem; font-family: monospace;"
+                                    x-text="t.tool + ' (' + t.calls + (t.errors > 0 ? ', ' + t.errors + ' err' : '') + ')'"></span>
+                            </template>
+                          </div>
+                        </template>
+                        <template x-if="s.tools_invoked.length === 0">
+                          <div style="font-size: 0.64rem; opacity: 0.4; margin-top: 0.1rem;">no activity</div>
+                        </template>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- ── On-Prem Inference (conditional) ── -->
+            <template x-if="v.onprem?.ollama?.enabled || v.onprem?.lmstudio?.enabled">
+              <div style="margin-bottom: 0; border: 1px solid var(--color-border); border-radius: 6px; overflow: hidden;">
+                <div @click="onpremOpen = !onpremOpen" style="cursor: pointer; padding: 0.4rem 0.6rem; background: rgba(121,85,72,0.06); display: flex; align-items: center; gap: 0.4rem; font-size: 0.76rem; font-weight: 600;">
+                  <span class="material-symbols-outlined" style="font-size: 14px;" :style="onpremOpen ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+                  On-Prem Inference
+                  <span style="margin-left: auto; font-weight: 400; opacity: 0.7; font-size: 0.7rem;"
+                        x-text="[v.onprem?.ollama?.enabled ? 'Ollama ' + (v.onprem.ollama.status || '') : '', v.onprem?.lmstudio?.enabled ? 'LM Studio ' + (v.onprem.lmstudio.status || '') : ''].filter(Boolean).join(' · ')"></span>
+                </div>
+                <div x-show="onpremOpen" x-transition style="padding: 0.5rem 0.6rem; font-size: 0.74rem;">
+                  <!-- Ollama -->
+                  <template x-if="v.onprem?.ollama?.enabled">
+                    <div style="margin-bottom: 0.4rem;">
+                      <div style="display: flex; align-items: center; gap: 0.3rem; margin-bottom: 0.2rem;">
+                        <span style="font-weight: 600; font-size: 0.72rem;">Ollama</span>
+                        <span style="font-size: 0.64rem; opacity: 0.6;" x-text="v.onprem.ollama.url || ''"></span>
+                        <span style="padding: 0.05rem 0.2rem; border-radius: 3px; font-size: 0.56rem;"
+                              :style="v.onprem.ollama.status === 'online' ? 'background: rgba(76,175,80,0.15); color: #81c784' : 'background: rgba(217,83,79,0.15); color: #d9534f'"
+                              x-text="v.onprem.ollama.status || 'unknown'"></span>
+                      </div>
+                      <template x-for="m in (v.onprem?.ollama?.models || [])" :key="m.name">
+                        <div style="display: flex; justify-content: space-between; padding: 0.15rem 0; font-size: 0.7rem;">
+                          <span style="font-weight: 500;" x-text="m.name"></span>
+                          <span style="opacity: 0.6;" x-text="[m.parameter_size, m.quantization, m.size_gb + 'GB'].filter(Boolean).join(' · ')"></span>
+                        </div>
+                      </template>
+                    </div>
+                  </template>
+                  <!-- LM Studio -->
+                  <template x-if="v.onprem?.lmstudio?.enabled">
+                    <div>
+                      <div style="display: flex; align-items: center; gap: 0.3rem;">
+                        <span style="font-weight: 600; font-size: 0.72rem;">LM Studio</span>
+                        <span style="padding: 0.05rem 0.2rem; border-radius: 3px; font-size: 0.56rem;"
+                              :style="v.onprem.lmstudio.status === 'online' ? 'background: rgba(76,175,80,0.15); color: #81c784' : 'background: rgba(217,83,79,0.15); color: #d9534f'"
+                              x-text="v.onprem.lmstudio.status || 'unknown'"></span>
+                      </div>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </template>
+
+          </div>
+        </template>
+      </div>
+    </div>

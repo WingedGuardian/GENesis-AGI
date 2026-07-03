@@ -1,0 +1,128 @@
+
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         Panel: File Browser [Tab: files]
+         ═══════════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'files'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">folder_open</span>
+        File Browser
+      </div>
+      <div class="panel-body">
+        <!-- File upload drop zone -->
+        <div @dragover.prevent="$store.genesisDashboard.fileUpload.dragging = true"
+             @dragleave.prevent="$store.genesisDashboard.fileUpload.dragging = false"
+             @drop.prevent="$store.genesisDashboard.uploadFile($event)"
+             @click="$refs.fileUploadInput.click()"
+             :style="`border: 1px dashed ${$store.genesisDashboard.fileUpload.dragging ? 'var(--color-accent)' : 'var(--color-border)'}; border-radius: 6px; padding: 0.6rem 1rem; text-align: center; cursor: pointer; margin-bottom: 0.75rem; transition: border-color .2s; background: ${$store.genesisDashboard.fileUpload.dragging ? 'rgba(99,102,241,.06)' : 'transparent'};`">
+          <span style="font-size: .8rem; color: var(--color-text-secondary);"
+                x-text="$store.genesisDashboard.fileUpload.uploading ? ($store.genesisDashboard.fileUpload.progress || 'Uploading...') : 'Drop files or folders here to upload — no processing, just storage'"></span>
+          <input type="file" multiple x-ref="fileUploadInput" style="display:none" @change="$store.genesisDashboard.uploadFile($event)">
+        </div>
+        <template x-if="$store.genesisDashboard.fileUpload.error">
+          <div style="color: var(--color-error-text); font-size: .8rem; margin-bottom: .5rem;" x-text="$store.genesisDashboard.fileUpload.error"></div>
+        </template>
+        <template x-if="$store.genesisDashboard.fileUpload.success">
+          <div style="color:#66bb6a; font-size: .8rem; margin-bottom: .5rem; font-family:monospace; word-break:break-all;">
+            <span class="material-symbols-outlined" style="font-size:0.9rem;vertical-align:middle;">check_circle</span>
+            <span x-text="$store.genesisDashboard.fileUpload.success"></span>
+          </div>
+        </template>
+        <!-- Breadcrumb / path bar -->
+        <div style="display:flex; gap:0.3rem; align-items:center; margin-bottom:0.75rem; font-size:0.75rem; flex-wrap:wrap;">
+          <template x-if="$store.genesisDashboard.fileBrowser.parent">
+            <button @click="$store.genesisDashboard.fetchFiles($store.genesisDashboard.fileBrowser.parent)"
+                    style="cursor:pointer; background:rgba(33,150,243,0.1); color:#2196F3; border:1px solid rgba(33,150,243,0.2);
+                           padding:0.15rem 0.5rem; border-radius:3px; font-size:0.72rem;">
+              <span class="material-symbols-outlined" style="font-size:0.85rem;vertical-align:middle;">arrow_upward</span> Up
+            </button>
+          </template>
+          <span style="color:var(--color-text-secondary); font-family:monospace; word-break:break-all;"
+                x-text="$store.genesisDashboard.fileBrowser.path || 'Loading...'"></span>
+          <button @click="$store.genesisDashboard.fileBrowser.sidebarCollapsed = !$store.genesisDashboard.fileBrowser.sidebarCollapsed"
+                  style="cursor:pointer; background:rgba(255,255,255,0.05); color:var(--color-text-secondary); border:1px solid var(--color-border);
+                         padding:0.15rem 0.5rem; border-radius:3px; font-size:0.65rem; margin-left:auto;"
+                  x-text="$store.genesisDashboard.fileBrowser.sidebarCollapsed ? 'Show Files' : 'Hide Files'"></button>
+        </div>
+
+        <div style="display:flex; min-height:calc(100vh - 280px);">
+          <!-- Directory listing -->
+          <div x-show="!$store.genesisDashboard.fileBrowser.sidebarCollapsed"
+               x-ref="fileBrowserSidebar"
+               style="flex:0 0 28%; max-height:calc(100vh - 280px); overflow-y:auto; padding-right:0.5rem;">
+            <template x-if="$store.genesisDashboard.fileBrowser.loading">
+              <div style="color:var(--color-text-secondary); font-size:0.75rem; padding:1rem;">Loading...</div>
+            </template>
+            <template x-for="entry in $store.genesisDashboard.fileBrowser.entries" :key="entry.path">
+              <div @click="entry.is_dir ? $store.genesisDashboard.fetchFiles(entry.path) : $store.genesisDashboard.openFile(entry.path)"
+                   style="display:flex; align-items:center; gap:0.4rem; padding:0.25rem 0.35rem; cursor:pointer;
+                          border-radius:3px; font-size:0.73rem; transition:background 0.1s;"
+                   :style="$store.genesisDashboard.fileBrowser.selectedFile === entry.path ? 'background:rgba(33,150,243,0.15)' : ''"
+                   onmouseover="this.style.background=this.style.background||'rgba(255,255,255,0.04)'"
+                   onmouseout="if(!this.style.background.includes('33,150,243'))this.style.background=''">
+                <span class="material-symbols-outlined" style="font-size:1rem;"
+                      :style="entry.is_dir ? 'color:#ffa726' : 'color:#90caf9'"
+                      x-text="entry.is_dir ? 'folder' : 'description'"></span>
+                <span x-text="entry.name" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+                <span x-show="!entry.is_dir && entry.size != null"
+                      style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
+                      x-text="entry.size > 1024*1024 ? (entry.size/1024/1024).toFixed(1)+'MB' : entry.size > 1024 ? (entry.size/1024).toFixed(1)+'KB' : entry.size+'B'"></span>
+              </div>
+            </template>
+          </div>
+
+          <!-- Resize handle -->
+          <div x-show="!$store.genesisDashboard.fileBrowser.sidebarCollapsed"
+               style="flex:0 0 8px; cursor:col-resize; background:var(--color-bg-tertiary);
+                      display:flex; align-items:center; justify-content:center;
+                      border-left:1px solid var(--color-border); border-right:1px solid var(--color-border);
+                      transition:background .15s; position:relative; z-index:5;"
+               @mouseenter="$el.style.background='rgba(99,102,241,0.25)'"
+               @mouseleave="if(!$store.genesisDashboard.fileBrowser._resizing) $el.style.background='var(--color-bg-tertiary)'"
+               @mousedown.prevent="$store.genesisDashboard._startFileBrowserResize($event, $refs.fileBrowserSidebar)">
+            <span style="color:var(--color-text-secondary); font-size:0.55rem; pointer-events:none; opacity:0.6;">&#x22EE;</span>
+          </div>
+
+          <!-- File viewer -->
+          <div style="flex:1; min-width:0;">
+            <template x-if="$store.genesisDashboard.fileBrowser.selectedFile">
+              <div>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+                  <span style="font-size:0.72rem; font-family:monospace; color:var(--color-text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:70%;"
+                        x-text="$store.genesisDashboard.fileBrowser.selectedFile"></span>
+                  <div style="display:flex; gap:0.3rem;">
+                    <button @click="window.open('/api/genesis/files/download?path=' + encodeURIComponent($store.genesisDashboard.fileBrowser.selectedFile), '_blank')"
+                            style="font-size:0.75rem; padding:0.3rem 0.7rem; border-radius:3px; cursor:pointer;
+                                   background:rgba(33,150,243,0.15); color:#2196F3; border:1px solid rgba(33,150,243,0.3);
+                                   display:flex; align-items:center; gap:0.3rem;"
+                            title="Download file">
+                      <span class="material-symbols-outlined" style="font-size:0.9rem;">download</span>
+                      Download
+                    </button>
+                    <template x-if="$store.genesisDashboard.fileBrowser.fileWritable && $store.genesisDashboard.fileBrowser.fileDirty">
+                      <button @click="$store.genesisDashboard.saveFile()"
+                              :disabled="$store.genesisDashboard.fileBrowser.saving"
+                              style="font-size:0.7rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer;
+                                     background:rgba(102,187,106,0.15); color:#66bb6a; border:1px solid rgba(102,187,106,0.3);"
+                              x-text="$store.genesisDashboard.fileBrowser.saving ? 'Saving...' : 'Save'"></button>
+                    </template>
+                  </div>
+                </div>
+                <textarea x-model="$store.genesisDashboard.fileBrowser.fileContent"
+                          @input="$store.genesisDashboard.fileBrowser.fileDirty = true"
+                          :readonly="!$store.genesisDashboard.fileBrowser.fileWritable"
+                          style="width:100%; height:calc(100vh - 320px); min-height:300px; font-family:monospace;
+                                 font-size:0.75rem; line-height:1.5; background:rgba(0,0,0,0.3); color:var(--color-text);
+                                 border:1px solid var(--color-border); border-radius:4px; padding:0.5rem;
+                                 resize:both; tab-size:4;"></textarea>
+              </div>
+            </template>
+            <template x-if="!$store.genesisDashboard.fileBrowser.selectedFile">
+              <div style="padding:2rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+                Select a file to view its contents.
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+    </div>

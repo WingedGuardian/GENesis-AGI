@@ -1,0 +1,342 @@
+
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Knowledge Base [Tab: knowledge]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'knowledge'" style="overflow-y: auto; max-height: calc(100vh - 180px);">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">school</span>
+        Knowledge Base
+      </div>
+      <div style="padding: 1rem;">
+
+      <!-- ── Tracked GitHub Repositories (recon watchlist) ───── -->
+      <div style="margin-bottom: 1.5rem;">
+        <div style="display:flex; align-items:center; gap:0.4rem; margin-bottom:0.4rem;">
+          <span class="material-symbols-outlined" style="font-size:1.1rem;">visibility</span>
+          <strong>Tracked GitHub Repositories</strong>
+          <span style="font-size:0.72rem; color:var(--color-text-secondary);"
+                x-text="'(' + $store.genesisDashboard.watchlistEntries.length + ')'"></span>
+        </div>
+        <div style="font-size:0.74rem; color:var(--color-text-secondary); margin-bottom:0.6rem;">
+          Repos Genesis monitors for releases, commits, and issues. Base entries ship with
+          Genesis (lock icon — can be disabled); add install-specific repos below.
+        </div>
+        <div style="display:flex; flex-direction:column; gap:0.3rem; margin-bottom:0.6rem;">
+          <template x-for="e in $store.genesisDashboard.watchlistEntries" :key="e.repo">
+            <div style="display:flex; align-items:center; gap:0.5rem; padding:0.35rem 0.5rem; border-radius:4px; background:rgba(0,0,0,0.15);"
+                 :style="e.disabled ? 'opacity:0.5;' : ''">
+              <span class="material-symbols-outlined" style="font-size:0.85rem; color:var(--color-text-secondary);"
+                    x-text="e.source === 'base' ? 'lock' : 'person'"
+                    :title="e.source === 'base' ? 'Base entry (ships with Genesis)' : 'Install-added'"></span>
+              <a :href="'https://github.com/' + e.repo" target="_blank" rel="noopener"
+                 style="font-family:monospace; font-size:0.78rem; color:#64b5f6; text-decoration:none;" x-text="e.repo"></a>
+              <span style="font-size:0.62rem; padding:0.05rem 0.3rem; border-radius:3px; background:rgba(255,255,255,0.08); color:var(--color-text-secondary);" x-text="e.priority"></span>
+              <span style="font-size:0.66rem; color:var(--color-text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;" x-text="(e.track || []).join(', ')"></span>
+              <template x-if="e.source === 'base'">
+                <button style="font-size:0.62rem; padding:0.1rem 0.45rem; border-radius:3px; cursor:pointer; border:1px solid #555; background:transparent;"
+                        :style="e.disabled ? 'color:#81c784; border-color:#81c784;' : 'color:#aaa;'"
+                        @click="$store.genesisDashboard.toggleWatchlistRepo(e.repo, !e.disabled)"
+                        x-text="e.disabled ? 'Enable' : 'Disable'"></button>
+              </template>
+              <template x-if="e.source === 'overlay'">
+                <button style="font-size:0.62rem; padding:0.1rem 0.45rem; border-radius:3px; cursor:pointer; border:1px solid rgba(239,83,80,0.4); background:transparent; color:#ef9a9a;"
+                        @click="$store.genesisDashboard.removeWatchlistRepo(e.repo)">Remove</button>
+              </template>
+            </div>
+          </template>
+          <template x-if="$store.genesisDashboard.watchlistEntries.length === 0">
+            <div style="font-size:0.74rem; color:var(--color-text-secondary); padding:0.5rem;">No tracked repositories loaded.</div>
+          </template>
+        </div>
+        <details style="font-size:0.78rem;">
+          <summary style="cursor:pointer; color:var(--color-text-secondary);">+ Add a repository</summary>
+          <div style="display:flex; flex-direction:column; gap:0.4rem; margin-top:0.5rem; max-width:480px;">
+            <input type="text" x-model="$store.genesisDashboard.watchlistForm.name" placeholder="Name (e.g. Cool Project)"
+                   style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+            <input type="text" x-model="$store.genesisDashboard.watchlistForm.repo" placeholder="owner/repo (not a URL)"
+                   style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary); font-family:monospace;">
+            <input type="text" x-model="$store.genesisDashboard.watchlistForm.track" placeholder="track: releases,commits,issues,discussions,stars"
+                   style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+            <select x-model="$store.genesisDashboard.watchlistForm.priority"
+                    style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+              <option value="high">Priority: high</option>
+              <option value="medium">Priority: medium</option>
+              <option value="low">Priority: low</option>
+            </select>
+            <input type="text" x-model="$store.genesisDashboard.watchlistForm.notes" placeholder="Notes (optional) — why track this?"
+                   style="font-size:0.78rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+            <div style="display:flex; gap:0.6rem; align-items:center;">
+              <button @click="$store.genesisDashboard.addWatchlistRepo()"
+                      :disabled="$store.genesisDashboard.watchlistSaving"
+                      style="font-size:0.78rem; padding:0.3rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(33,150,243,0.15); color:#64b5f6; border:1px solid rgba(33,150,243,0.4);"
+                      x-text="$store.genesisDashboard.watchlistSaving ? 'Adding…' : 'Add repository'"></button>
+              <span x-show="$store.genesisDashboard.watchlistMsg"
+                    :style="$store.genesisDashboard.watchlistMsg?.ok ? 'color:#81c784; font-size:0.76rem;' : 'color:#ef9a9a; font-size:0.76rem;'"
+                    x-text="$store.genesisDashboard.watchlistMsg?.text"></span>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- ── Upload Zone ─────────────────────────────────────── -->
+      <div style="margin-bottom: 1.5rem;">
+        <!-- Drop Zone -->
+        <div x-show="!$store.genesisDashboard.knowledgeUpload.confirm"
+             @dragover.prevent="$store.genesisDashboard.knowledgeUpload.dragging = true"
+             @dragleave.prevent="$store.genesisDashboard.knowledgeUpload.dragging = false"
+             @drop.prevent="$store.genesisDashboard.handleKnowledgeFileDrop($event)"
+             @click="$refs.knowledgeFileInput.click()"
+             :style="`border: 2px dashed ${$store.genesisDashboard.knowledgeUpload.dragging ? 'var(--color-accent)' : 'var(--color-border)'}; border-radius: 8px; padding: 2rem; text-align: center; cursor: pointer; transition: border-color .2s; background: ${$store.genesisDashboard.knowledgeUpload.dragging ? 'rgba(99,102,241,.08)' : 'transparent'};`">
+          <span class="material-symbols-outlined" style="font-size: 2rem; color: var(--color-text-secondary);">upload_file</span>
+          <div style="margin-top: .5rem; color: var(--color-text-secondary);" x-text="$store.genesisDashboard.knowledgeUpload.uploading ? 'Uploading...' : 'Drop files here or click to browse'"></div>
+          <div style="font-size: .8em; color: var(--color-text-secondary); margin-top: .25rem;">PDF, text, audio, video — up to 500 MB</div>
+          <div style="font-size: .7em; color: var(--color-text-secondary); margin-top: .15rem; opacity: .7;">Stores to knowledge base for long-term recall. For simple file sharing, use the Files tab.</div>
+          <input type="file" x-ref="knowledgeFileInput" style="display:none"
+                 @change="$store.genesisDashboard.handleKnowledgeFileDrop($event)">
+        </div>
+
+        <!-- Confirmation Card -->
+        <template x-if="$store.genesisDashboard.knowledgeUpload.confirm">
+          <div class="card" style="border: 1px solid var(--color-accent); padding: 1.25rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+              <strong>Store to Knowledge Base</strong>
+              <span class="badge" x-text="$store.genesisDashboard.knowledgeUpload.file?.mime || 'unknown'"></span>
+            </div>
+            <div style="margin-bottom: .75rem; color: var(--color-text-secondary);">
+              <span x-text="$store.genesisDashboard.knowledgeUpload.file?.name"></span>
+              (<span x-text="$store.genesisDashboard._formatFileSize($store.genesisDashboard.knowledgeUpload.file?.size)"></span>)
+            </div>
+            <!-- Context message -->
+            <div style="margin-bottom: .75rem;">
+              <label style="font-size: .8em; color: var(--color-text-secondary);">Context</label>
+              <textarea x-model="$store.genesisDashboard.knowledgeUpload.context" rows="3"
+                        placeholder="Tell Genesis about this document — what is it, how should it be understood? (optional)"
+                        style="width: 100%; padding: .4rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px; font-size: .85rem; resize: vertical;"></textarea>
+            </div>
+            <!-- Processing mode -->
+            <div style="margin-bottom: .75rem; display: flex; gap: 1rem;">
+              <label style="font-size: .8em; cursor: pointer; display: flex; align-items: center; gap: .3rem;">
+                <input type="radio" value="extract" x-model="$store.genesisDashboard.knowledgeUpload.mode">
+                <span style="color: var(--color-text-secondary);">Extract &amp; distill</span>
+                <span style="font-size: .7em; color: var(--color-text-secondary); opacity: .7;">— AI breaks into searchable concepts</span>
+              </label>
+              <label style="font-size: .8em; cursor: pointer; display: flex; align-items: center; gap: .3rem;">
+                <input type="radio" value="store" x-model="$store.genesisDashboard.knowledgeUpload.mode">
+                <span style="color: var(--color-text-secondary);">Store as-is</span>
+                <span style="font-size: .7em; color: var(--color-text-secondary); opacity: .7;">— full document, one unit, instant</span>
+              </label>
+            </div>
+            <div style="display: flex; gap: .5rem; margin-bottom: .75rem;">
+              <div style="flex: 1;">
+                <label style="font-size: .8em; color: var(--color-text-secondary);">Project Type *</label>
+                <input type="text" list="kb-project-types" x-model="$store.genesisDashboard.knowledgeUpload.projectType"
+                       placeholder="e.g. professional" style="width: 100%; padding: .4rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
+                <datalist id="kb-project-types">
+                  <template x-for="pt in $store.genesisDashboard.knowledgeTaxonomy.project_types" :key="pt">
+                    <option :value="pt"></option>
+                  </template>
+                </datalist>
+                <div style="font-size: .65em; color: var(--color-text-secondary); margin-top: 2px; opacity: .7;">Workspace scope (e.g., 'genesis', 'career')</div>
+              </div>
+              <div style="flex: 1;">
+                <label style="font-size: .8em; color: var(--color-text-secondary);">Domain</label>
+                <input type="text" list="kb-domains" x-model="$store.genesisDashboard.knowledgeUpload.domain"
+                       placeholder="auto" style="width: 100%; padding: .4rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
+                <datalist id="kb-domains">
+                  <template x-for="d in $store.genesisDashboard.knowledgeTaxonomy.domains" :key="d">
+                    <option :value="d"></option>
+                  </template>
+                </datalist>
+                <div style="font-size: .65em; color: var(--color-text-secondary); margin-top: 2px; opacity: .7;">Topic filter. Leave 'auto' for AI detection.</div>
+              </div>
+            </div>
+            <div style="margin-bottom: .75rem;">
+              <label style="font-size: .8em; color: var(--color-text-secondary);">Purpose (optional, comma-separated)</label>
+              <input type="text" x-model="$store.genesisDashboard.knowledgeUpload.purpose"
+                     placeholder="e.g. resume-prep, cloud-eng" style="width: 100%; padding: .4rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
+              <div style="font-size: .65em; color: var(--color-text-secondary); margin-top: 2px; opacity: .7;">Usage tags (e.g., 'planning', 'reference')</div>
+            </div>
+            <template x-if="$store.genesisDashboard.knowledgeUpload.error">
+              <div style="color: var(--color-error-text); margin-bottom: .5rem; font-size: .9em;" x-text="$store.genesisDashboard.knowledgeUpload.error"></div>
+            </template>
+            <div style="display: flex; gap: .5rem; justify-content: flex-end;">
+              <button class="btn-sm" style="opacity: .7;" @click="$store.genesisDashboard.cancelKnowledgeUpload()">Cancel</button>
+              <button class="btn-sm" style="background: var(--color-accent); color: #fff;" @click="$store.genesisDashboard.confirmKnowledgeIngest()">Store</button>
+            </div>
+          </div>
+        </template>
+
+        <!-- Upload error outside confirmation -->
+        <template x-if="$store.genesisDashboard.knowledgeUpload.error && !$store.genesisDashboard.knowledgeUpload.confirm">
+          <div style="color: var(--color-error-text); margin-top: .5rem; font-size: .9em;" x-text="$store.genesisDashboard.knowledgeUpload.error"></div>
+        </template>
+      </div>
+
+      <!-- ── Recent Uploads Status ────────────────────────────── -->
+      <template x-if="$store.genesisDashboard.knowledgeUploads.length > 0">
+        <div style="margin-bottom: 1.5rem;">
+          <h4 style="margin-bottom: .5rem;">Recent Uploads</h4>
+          <template x-for="upload in $store.genesisDashboard.knowledgeUploads.slice(0, 10)" :key="upload.id">
+            <div class="card" style="margin-bottom: .4rem; padding: .6rem .8rem; display: flex; justify-content: space-between; align-items: center;">
+              <div>
+                <span x-text="upload.filename" style="font-weight: 500;"></span>
+                <span style="font-size: .8em; color: var(--color-text-secondary); margin-left: .5rem;"
+                      x-text="$store.genesisDashboard._formatFileSize(upload.file_size)"></span>
+              </div>
+              <div style="display: flex; align-items: center; gap: .5rem;">
+                <template x-if="upload.status === 'processing'">
+                  <span class="badge" style="background: var(--color-warning-text); color: #000;"
+                        x-text="upload.chunks_total ? 'processing ' + (upload.chunks_done || 0) + '/' + upload.chunks_total : 'processing'"></span>
+                </template>
+                <template x-if="upload.status === 'completed'">
+                  <span class="badge" style="background: var(--color-primary); color: #fff;" x-text="'completed (' + (JSON.parse(upload.unit_ids || '[]')).length + ' units)'"></span>
+                </template>
+                <template x-if="upload.status === 'failed'">
+                  <span class="badge" style="background: var(--color-error-text); color: #fff;" :title="upload.error_message">failed</span>
+                </template>
+                <template x-if="upload.status === 'uploaded'">
+                  <span class="badge">uploaded</span>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+      </template>
+
+      <!-- Stats Cards -->
+      <div style="display: flex; gap: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap;">
+        <div style="flex: 1; min-width: 100px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700;" x-text="$store.genesisDashboard.knowledgeStats?.total ?? '—'"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">Total Units</div>
+        </div>
+        <div style="flex: 1; min-width: 100px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700;" x-text="$store.genesisDashboard.knowledgeStats?.qdrant_vectors ?? '—'"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">Qdrant Vectors</div>
+        </div>
+        <div style="flex: 1; min-width: 100px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700;" x-text="Object.keys($store.genesisDashboard.knowledgeStats?.by_domain ?? {}).length"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">Domains</div>
+        </div>
+        <div style="flex: 1; min-width: 100px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700;" x-text="$store.genesisDashboard.knowledgeStats?.by_tier?.curated ?? 0"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">Curated</div>
+        </div>
+      </div>
+
+      <!-- Tier Breakdown -->
+      <template x-if="$store.genesisDashboard.knowledgeStats?.by_tier">
+        <div style="margin-bottom: 1rem;">
+          <strong>By Tier:</strong>
+          <template x-for="[tier, count] in Object.entries($store.genesisDashboard.knowledgeStats.by_tier)" :key="tier">
+            <span class="badge" style="margin: 0 .25rem;" x-text="tier + ': ' + count"></span>
+          </template>
+        </div>
+      </template>
+
+      <!-- Domain Breakdown -->
+      <template x-if="$store.genesisDashboard.knowledgeStats?.by_domain">
+        <div style="margin-bottom: 1.5rem;">
+          <strong>By Domain:</strong>
+          <template x-for="[domain, count] in Object.entries($store.genesisDashboard.knowledgeStats.by_domain)" :key="domain">
+            <span class="badge" style="margin: 0 .25rem;" x-text="domain + ': ' + count"></span>
+          </template>
+        </div>
+      </template>
+
+      <!-- Search -->
+      <div style="margin-bottom: 1rem; display: flex; gap: .5rem;">
+        <input type="text" x-model="$store.genesisDashboard.knowledgeQuery" placeholder="Search knowledge base..."
+               @keyup.enter="$store.genesisDashboard.searchKnowledge()"
+               style="flex: 1; padding: .5rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
+        <button @click="$store.genesisDashboard.searchKnowledge()" class="btn-sm">Search</button>
+      </div>
+
+      <!-- Search Results -->
+      <template x-if="$store.genesisDashboard.knowledgeSearchResults.length > 0">
+        <div style="margin-bottom: 1.5rem;">
+          <h4 style="margin-bottom: .5rem;">Search Results</h4>
+          <div style="display: flex; flex-direction: column; gap: .5rem;">
+            <template x-for="item in $store.genesisDashboard.knowledgeSearchResults" :key="item.unit_id">
+              <div :style="`background: var(--color-background); border: 1px solid var(--color-border); border-left: 3px solid ${$store.genesisDashboard._domainColor(item.domain)}; border-radius: 6px; padding: .75rem; cursor: pointer; transition: background .15s;`"
+                   @mouseenter="$el.style.background='rgba(255,255,255,0.06)'"
+                   @mouseleave="$el.style.background=''"
+                   @click="$store.genesisDashboard.viewKnowledgeDetail(item.unit_id)">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                  <strong x-text="item.concept || item.unit_id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%;"></strong>
+                  <div style="display:flex; gap:.35rem; align-items:center;">
+                    <span :style="`font-size:.65rem; padding:1px 6px; border-radius:3px; background:${$store.genesisDashboard._domainColor(item.domain)}22; color:${$store.genesisDashboard._domainColor(item.domain)};`"
+                          x-text="item.domain"></span>
+                    <span class="badge" x-text="item.source_pipeline || 'unknown'"></span>
+                  </div>
+                </div>
+                <div style="font-size: .85em; margin-top: .25rem; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;"
+                     x-text="(item.body || item.content || '').substring(0, 200)"></div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+
+      <!-- Recent Units -->
+      <h4 style="margin-bottom: .5rem;">Recent Knowledge Units</h4>
+      <template x-if="$store.genesisDashboard.knowledgeRecent.length === 0">
+        <p style="color: var(--color-text-secondary);">No knowledge units ingested yet.</p>
+      </template>
+      <div style="display: flex; flex-direction: column; gap: .5rem;">
+        <template x-for="unit in $store.genesisDashboard.knowledgeRecent" :key="unit.id">
+          <div :style="`background: var(--color-background); border: 1px solid var(--color-border); border-left: 3px solid ${$store.genesisDashboard._domainColor(unit.domain)}; border-radius: 6px; padding: .75rem; cursor: pointer; transition: background .15s;`"
+               @mouseenter="$el.style.background='rgba(255,255,255,0.06)'"
+               @mouseleave="$el.style.background=''"
+               @click="$store.genesisDashboard.viewKnowledgeDetail(unit.id)">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <strong x-text="unit.concept || unit.id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%;"></strong>
+              <div style="display:flex; gap:.35rem; align-items:center;">
+                <span :style="`font-size:.65rem; padding:1px 6px; border-radius:3px; background:${$store.genesisDashboard._tierColor(unit.source_pipeline)}22; color:${$store.genesisDashboard._tierColor(unit.source_pipeline)};`"
+                      x-text="unit.source_pipeline || 'unknown'"></span>
+                <span :style="`font-size:.65rem; padding:1px 6px; border-radius:3px; background:${$store.genesisDashboard._domainColor(unit.domain)}22; color:${$store.genesisDashboard._domainColor(unit.domain)};`"
+                      x-text="unit.domain"></span>
+              </div>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size: .8em; color: var(--color-text-secondary); margin-top:.25rem;">
+              <span>
+                <span x-text="unit.source_pipeline || 'unknown'" style="opacity:.7;"></span>
+                <span x-show="unit.project_type"> | <span x-text="unit.project_type"></span></span>
+              </span>
+              <span x-text="unit.ingested_at?.substring(0, 10)" style="opacity:.6;"></span>
+            </div>
+            <div style="font-size: .85em; margin-top: .35rem; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height:1.4;"
+                 x-text="(unit.body || '').substring(0, 200)"></div>
+          </div>
+        </template>
+      </div>
+
+      <!-- Detail Modal -->
+      <template x-if="$store.genesisDashboard.knowledgeDetail">
+        <div style="position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; display: flex; align-items: center; justify-content: center;"
+             @click.self="$store.genesisDashboard.knowledgeDetail = null">
+          <div style="background: var(--color-panel); border: 1px solid var(--color-border); border-radius: 8px; padding: 1.5rem; max-width: 700px; width: 90%; max-height: 80vh; overflow-y: auto;">
+            <h3 x-text="$store.genesisDashboard.knowledgeDetail.concept"></h3>
+            <div style="margin: .75rem 0; font-size: .9em; color: var(--color-text-secondary);">
+              <span x-text="'Domain: ' + $store.genesisDashboard.knowledgeDetail.domain"></span> |
+              <span x-text="'Project: ' + $store.genesisDashboard.knowledgeDetail.project_type"></span> |
+              <span x-text="'Pipeline: ' + ($store.genesisDashboard.knowledgeDetail.source_pipeline || 'unknown')"></span> |
+              <span x-text="'Confidence: ' + $store.genesisDashboard.knowledgeDetail.confidence"></span>
+            </div>
+            <template x-if="$store.genesisDashboard.knowledgeDetail.purpose">
+              <div style="margin-bottom: .5rem;"><strong>Purpose:</strong> <span x-text="$store.genesisDashboard.knowledgeDetail.purpose"></span></div>
+            </template>
+            <template x-if="$store.genesisDashboard.knowledgeDetail.ingestion_source">
+              <div style="margin-bottom: .5rem;"><strong>Source:</strong> <span x-text="$store.genesisDashboard.knowledgeDetail.ingestion_source"></span></div>
+            </template>
+            <div style="white-space: pre-wrap; font-family: monospace; font-size: .85em; background: var(--color-background); padding: 1rem; border-radius: 4px; margin: .75rem 0;"
+                 x-text="$store.genesisDashboard.knowledgeDetail.body"></div>
+            <div style="display: flex; gap: .5rem; justify-content: space-between; margin-top: 1rem;">
+              <button class="btn-sm btn-danger" @click="$store.genesisDashboard.deleteKnowledge($store.genesisDashboard.knowledgeDetail.id)">Delete</button>
+              <button class="btn-sm" @click="$store.genesisDashboard.knowledgeDetail = null">Close</button>
+            </div>
+          </div>
+        </div>
+      </template>
+      </div><!-- /panel-body padding -->
+    </div>

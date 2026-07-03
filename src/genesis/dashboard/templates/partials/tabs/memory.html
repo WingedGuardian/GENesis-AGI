@@ -1,0 +1,156 @@
+
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Memory Browser [Tab: memory]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'memory'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">psychology</span>
+        Memory Browser
+      </div>
+      <div class="panel-body">
+        <!-- Stats row -->
+        <div style="display:flex; gap:1rem; margin-bottom:1rem; flex-wrap:wrap;" x-data>
+          <template x-if="$store.genesisDashboard.memoryStats.total != null">
+            <div class="card" style="flex:1; min-width:120px; padding:0.75rem;">
+              <div style="font-size:0.7rem; color:var(--color-text-secondary);">Total Memories</div>
+              <div style="font-size:1.5rem; font-weight:600;" x-text="$store.genesisDashboard.memoryStats.total"></div>
+            </div>
+          </template>
+          <template x-if="$store.genesisDashboard.memoryStats.pending_embeddings != null">
+            <div class="card" style="flex:1; min-width:120px; padding:0.75rem;">
+              <div style="font-size:0.7rem; color:var(--color-text-secondary);">Pending Embeddings</div>
+              <div style="font-size:1.5rem; font-weight:600;" x-text="$store.genesisDashboard.memoryStats.pending_embeddings"></div>
+            </div>
+          </template>
+          <template x-if="$store.genesisDashboard.memoryStats.qdrant_episodic_memory != null">
+            <div class="card" style="flex:1; min-width:120px; padding:0.75rem;">
+              <div style="font-size:0.7rem; color:var(--color-text-secondary);">Qdrant Episodic</div>
+              <div style="font-size:1.5rem; font-weight:600;" x-text="$store.genesisDashboard.memoryStats.qdrant_episodic_memory"></div>
+            </div>
+          </template>
+        </div>
+
+        <!-- Memory Growth Sparkline -->
+        <template x-if="$store.genesisDashboard.memoryStats.daily_growth && $store.genesisDashboard.memoryStats.daily_growth.length > 1">
+          <div class="card" style="margin-bottom:1rem; padding:0.75rem;">
+            <div style="font-size:0.75rem; color:var(--color-text-secondary); margin-bottom:0.5rem;">Memory Growth (30 days)</div>
+            <svg width="100%" height="48" viewBox="0 0 600 48" preserveAspectRatio="none" style="display:block;" x-data="{
+              get points() {
+                const data = $store.genesisDashboard.memoryStats.daily_growth;
+                if (!data || data.length < 2) return '';
+                const max = Math.max(...data.map(d => d.count));
+                const min = Math.min(...data.map(d => d.count));
+                const range = max - min || 1;
+                const w = 600;
+                const h = 44;
+                return data.map((d, i) => {
+                  const x = (i / (data.length - 1)) * w;
+                  const y = h - ((d.count - min) / range) * (h - 4) - 2;
+                  return `${x},${y}`;
+                }).join(' ');
+              }
+            }">
+              <polyline :points="points" fill="none" stroke="var(--color-accent, #60a5fa)" stroke-width="2" vector-effect="non-scaling-stroke" />
+            </svg>
+            <div style="display:flex; justify-content:space-between; font-size:0.65rem; color:var(--color-text-secondary);">
+              <span x-text="$store.genesisDashboard.memoryStats.daily_growth[0]?.day || ''"></span>
+              <span x-text="'Total: +' + $store.genesisDashboard.memoryStats.daily_growth.reduce((s,d) => s + d.count, 0) + ' memories'"></span>
+              <span x-text="$store.genesisDashboard.memoryStats.daily_growth[$store.genesisDashboard.memoryStats.daily_growth.length - 1]?.day || ''"></span>
+            </div>
+          </div>
+        </template>
+
+        <!-- Wing Distribution -->
+        <template x-if="$store.genesisDashboard.memoryStats.wings && $store.genesisDashboard.memoryStats.wings.length > 0">
+          <div class="card" style="margin-bottom:1rem; padding:0.75rem;">
+            <div style="font-size:0.75rem; color:var(--color-text-secondary); margin-bottom:0.5rem;">Memory by Wing</div>
+            <div style="display:flex; flex-wrap:wrap; gap:0.4rem;">
+              <template x-for="w in $store.genesisDashboard.memoryStats.wings" :key="w.wing">
+                <span class="badge" style="font-size:0.7rem; padding:0.2rem 0.5rem;"
+                      x-text="w.wing + ': ' + w.count.toLocaleString()"></span>
+              </template>
+            </div>
+          </div>
+        </template>
+
+        <!-- Search -->
+        <div style="display:flex; gap:0.5rem; margin-bottom:1rem;">
+          <input type="text" x-model="$store.genesisDashboard.memorySearch.query"
+                 @keydown.enter="$store.genesisDashboard.searchMemory()"
+                 placeholder="Semantic search..."
+                 style="flex:1; background:var(--color-bg-primary); border:1px solid var(--color-border); color:var(--color-text-primary); padding:0.5rem; border-radius:4px; font-family:inherit;">
+          <button @click="$store.genesisDashboard.searchMemory()"
+                  style="background:var(--color-accent); color:#000; border:none; padding:0.5rem 1rem; border-radius:4px; cursor:pointer;"
+                  x-text="$store.genesisDashboard.memorySearch.loading ? 'Searching...' : 'Search'"></button>
+        </div>
+
+        <!-- Search results -->
+        <template x-if="$store.genesisDashboard.memorySearch.results.length > 0">
+          <div class="card" style="margin-bottom:1rem;">
+            <div style="padding:0.5rem; font-size:0.8rem; color:var(--color-text-secondary);">
+              Search Results (<span x-text="$store.genesisDashboard.memorySearch.results.length"></span>)
+            </div>
+            <template x-for="r in $store.genesisDashboard.memorySearch.results" :key="r.memory_id">
+              <div :style="`padding:0.5rem; border-top:1px solid var(--color-border); border-left:3px solid ${$store.genesisDashboard._memoryTypeColor(r.memory_type || r.collection)}; cursor:pointer; transition:background .15s;`"
+                   @mouseenter="$el.style.background='rgba(255,255,255,0.04)'"
+                   @mouseleave="$el.style.background=''"
+                   @click="$store.genesisDashboard.viewMemoryDetail(r.memory_id)">
+                <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.75rem;">
+                  <span :style="`padding:1px 5px; border-radius:3px; background:${$store.genesisDashboard._memoryTypeColor(r.memory_type || r.collection)}22; color:${$store.genesisDashboard._memoryTypeColor(r.memory_type || r.collection)};`"
+                        x-text="r.memory_type || r.collection"></span>
+                  <span style="color:var(--color-text-secondary);" x-text="'score: ' + (r.score || '?')"></span>
+                </div>
+                <div style="font-size:0.85rem; white-space:pre-wrap; max-height:3rem; overflow:hidden; margin-top:.25rem;" x-text="r.content"></div>
+              </div>
+            </template>
+          </div>
+        </template>
+
+        <!-- Memory detail modal -->
+        <template x-if="$store.genesisDashboard.memoryDetail">
+          <div class="card" style="margin-bottom:1rem; border:1px solid var(--color-accent);">
+            <div style="padding:0.75rem; display:flex; justify-content:space-between; align-items:center;">
+              <span style="font-size:0.8rem; color:var(--color-accent);" x-text="'ID: ' + $store.genesisDashboard.memoryDetail.memory_id"></span>
+              <div style="display:flex; gap:0.5rem; justify-content:space-between;">
+                <button @click="$store.genesisDashboard.deleteMemory($store.genesisDashboard.memoryDetail.memory_id)"
+                        style="background:rgba(239,154,154,0.2); color:#ef9a9a; border:1px solid rgba(239,154,154,0.3); padding:0.25rem 0.5rem; border-radius:4px; cursor:pointer; font-size:0.75rem;">Delete</button>
+                <button @click="$store.genesisDashboard.memoryDetail = null"
+                        style="background:var(--color-background); color:var(--color-text-secondary); border:1px solid var(--color-border); padding:0.25rem 0.5rem; border-radius:4px; cursor:pointer; font-size:0.75rem;">Close</button>
+              </div>
+            </div>
+            <div style="padding:0.75rem; border-top:1px solid var(--color-border);">
+              <div style="font-size:0.7rem; color:var(--color-text-secondary); margin-bottom:0.25rem;">
+                <span x-text="'Collection: ' + ($store.genesisDashboard.memoryDetail.collection || '?')"></span> ·
+                <span x-text="'Links: ' + ($store.genesisDashboard.memoryDetail.link_count || 0)"></span> ·
+                <span x-text="'Created: ' + ($store.genesisDashboard.memoryDetail.created_at || 'unknown')"></span>
+              </div>
+              <pre style="white-space:pre-wrap; font-size:0.85rem; max-height:400px; overflow-y:auto; margin:0;" x-text="$store.genesisDashboard.memoryDetail.content"></pre>
+            </div>
+          </div>
+        </template>
+
+        <!-- Recent memories -->
+        <div class="card">
+          <div style="padding:0.5rem; font-size:0.8rem; color:var(--color-text-secondary);">
+            Recent Memories (<span x-text="$store.genesisDashboard.memoryRecent.total"></span> total)
+          </div>
+          <template x-if="$store.genesisDashboard.memoryRecent.loading">
+            <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
+          </template>
+          <template x-for="m in $store.genesisDashboard.memoryRecent.items" :key="m.memory_id">
+            <div :style="`padding:0.5rem; border-top:1px solid var(--color-border); border-left:3px solid ${$store.genesisDashboard._memoryTypeColor(m.collection)}; cursor:pointer; transition:background .15s;`"
+                 @mouseenter="$el.style.background='rgba(255,255,255,0.04)'"
+                 @mouseleave="$el.style.background=''"
+                 @click="$store.genesisDashboard.viewMemoryDetail(m.memory_id)">
+              <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.7rem;">
+                <span :style="`padding:1px 5px; border-radius:3px; background:${$store.genesisDashboard._memoryTypeColor(m.collection)}22; color:${$store.genesisDashboard._memoryTypeColor(m.collection)};`"
+                      x-text="m.collection"></span>
+                <span style="color:var(--color-text-secondary);" x-text="m.created_at ? new Date(m.created_at).toLocaleString() : ''"></span>
+              </div>
+              <div style="font-size:0.85rem; white-space:pre-wrap; max-height:2.5rem; overflow:hidden; margin-top:.25rem; line-height:1.4;" x-text="m.content"></div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>

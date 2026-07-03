@@ -1,0 +1,1020 @@
+
+
+    <!-- Panel 1: System Health [Tab: overview] -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'overview'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">monitor_heart</span>
+        System Health
+        <span class="panel-status">
+          <span class="status-dot"
+                :style="`background:${$store.genesisDashboard.healthStale
+                  ? '#d9534f'
+                  : $store.genesisDashboard.semanticStateColor($store.genesisDashboard.overallHealthSemantic().state)}`"></span>
+          <span x-text="$store.genesisDashboard.healthStale
+            ? 'stale'
+            : $store.genesisDashboard.overallHealthSemantic().state"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <template x-if="$store.genesisDashboard.panelStatusDetail('health')">
+          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('health')"></div>
+        </template>
+        <div class="health-grid">
+
+          <!-- Infrastructure probes -->
+          <div class="health-card">
+            <div class="health-card-header">
+              <div class="health-card-title">Infrastructure</div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.infrastructureSemantic().state)}`"
+                    x-text="$store.genesisDashboard.infrastructureSemantic().state"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.health.infrastructure">
+                <template x-for="(probe, name) in $store.genesisDashboard.health.infrastructure" :key="name">
+                  <div x-show="!['container_memory', 'disk', 'cpu'].includes(name)"
+                       style="margin-bottom: 0.2rem; cursor: default;"
+                       :title="probe.error
+                         ? $store.genesisDashboard.infraLabel(name) + ': ERROR — ' + probe.error
+                         : probe.latency_ms != null
+                           ? $store.genesisDashboard.infraLabel(name) + ': ' + (probe.status || 'healthy') + ' (' + Math.round(probe.latency_ms) + 'ms)'
+                           : probe.free_pct != null
+                             ? $store.genesisDashboard.infraLabel(name) + ': ' + probe.free_gb?.toFixed(1) + ' GB free (' + probe.free_pct?.toFixed(0) + '% of ' + probe.total_gb?.toFixed(0) + ' GB)'
+                             : probe.total_points != null
+                               ? $store.genesisDashboard.infraLabel(name) + ': ' + probe.total_points + ' total points across ' + (probe.collections?.length || 0) + ' collections'
+                             : probe.cc_tier != null
+                               ? $store.genesisDashboard.infraLabel(name) + ': CC ' + probe.cc_tier + ' (' + probe.cc_used_mb + '/' + probe.cc_budget_mb + 'MB)' + (probe.sys_tier ? ', /tmp ' + probe.sys_tier + ' (' + probe.sys_used_pct + '%)' : '')
+                             : $store.genesisDashboard.infraLabel(name) + ': ' + (probe.status || 'unknown')">
+                    <span class="status-dot"
+                          :style="`background: ${$store.genesisDashboard.probeStatusColor(probe)}`"></span>
+                    <span x-text="$store.genesisDashboard.infraLabel(name)" style="font-size: 0.82rem"></span>
+                    <template x-if="probe.wal_mb != null">
+                      <span style="margin-left: 0.4rem; font-size: 0.72rem; opacity: 0.75;"
+                            :title="'SQLite WAL sidecar size — green < 100MB, yellow ≥ 100MB, red ≥ 500MB'">
+                        <span class="status-dot"
+                              :style="`background: ${$store.genesisDashboard.probeStatusColor({status: probe.wal_status})}`"></span>
+                        <span x-text="'WAL: ' + probe.wal_mb + ' MB'"></span>
+                      </span>
+                    </template>
+                    <template x-if="probe.total_points != null">
+                      <span style="opacity: 0.6; font-size: 0.72rem;" x-text="'(' + probe.total_points + ' pts)'"></span>
+                    </template>
+                    <template x-if="probe.collections?.length > 0">
+                      <div style="margin-left: 1.1rem; margin-top: 0.1rem;">
+                        <template x-for="coll in probe.collections" :key="coll.name">
+                          <div style="font-size: 0.7rem; opacity: 0.6; padding: 0.05rem 0;">
+                            <span x-text="coll.name"></span>
+                            <span style="opacity: 0.7;" x-text="'(' + (coll.points || 0).toLocaleString() + ' pts)'"></span>
+                          </div>
+                        </template>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </template>
+              <!-- Ollama missing models warning -->
+              <template x-if="$store.genesisDashboard.health.infrastructure?.ollama?.missing_models?.length > 0">
+                <div style="margin-top: 0.3rem; font-size: 0.72rem; color: #d9534f;">
+                  Missing Ollama models:
+                  <template x-for="m in $store.genesisDashboard.health.infrastructure.ollama.missing_models" :key="m.model">
+                    <span x-text="m.model + ' '" style="font-weight: 600;"></span>
+                  </template>
+                </div>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.infrastructureSemantic().reason"></div>
+          </div>
+
+          <!-- CC Sessions -->
+          <div class="health-card" title="Active Claude Code sessions. Foreground = user conversation, Background = reflections/tasks.">
+            <div class="health-card-header">
+              <div class="health-card-title">CC Sessions</div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.ccSemantic().state)}`"
+                    x-text="$store.genesisDashboard.ccSemantic().state"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.health.cc_sessions">
+                <div>
+                  <span x-text="$store.genesisDashboard.health.cc_sessions.foreground?.active ?? '—'"
+                        :style="`color: ${($store.genesisDashboard.health.cc_sessions.foreground?.active || 0) > 0 ? '#4caf50' : '#888'}`"></span> fg
+                  /
+                  <span x-text="$store.genesisDashboard.health.cc_sessions.background?.active ?? '—'"
+                        :style="`color: ${($store.genesisDashboard.health.cc_sessions.background?.active || 0) > 0 ? '#4caf50' : '#888'}`"></span> bg
+                </div>
+              </template>
+            </div>
+            <div class="health-card-detail"
+                 x-text="$store.genesisDashboard.health.cc_sessions?.background?.hourly_budget || ''"></div>
+            <template x-if="$store.genesisDashboard.health.cc_sessions?.hourly_burn_rate != null">
+              <div class="health-card-detail" style="font-size: 0.72rem;"
+                   x-text="$store.genesisDashboard.health.cc_sessions.hourly_burn_rate + ' sess/hr (max ' + ($store.genesisDashboard.health.cc_sessions.max_per_hour || 20) + ')'"></div>
+            </template>
+            <template x-if="($store.genesisDashboard.health.cc_sessions?.failed_24h || 0) > 0">
+              <div class="health-card-detail" style="color: #d9534f; font-weight: 600;"
+                   x-text="$store.genesisDashboard.health.cc_sessions.failed_24h + ' failed (24h)'"></div>
+            </template>
+            <template x-if="$store.genesisDashboard.health.cc_sessions?.fallback?.is_fallback">
+              <div class="health-card-detail" style="color: #f0ad4e; font-weight: 600;"
+                   x-text="'on ' + ($store.genesisDashboard.health.cc_sessions.fallback.fallback || 'roster peer') + ' since ' + (($store.genesisDashboard.health.cc_sessions.fallback.since || '').replace('T', ' ').slice(0, 16) || 'unknown')"></div>
+            </template>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.ccSemantic().reason"></div>
+          </div>
+
+          <!-- Cost -->
+          <div class="health-card" title="API cost + CC subscription shadow cost.">
+            <div class="health-card-header">
+              <div class="health-card-title">Cost</div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.costSemantic().state)}`"
+                    x-text="$store.genesisDashboard.costSemantic().state"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.health.cost">
+                <div>
+                  <span x-text="'API: $' + ($store.genesisDashboard.health.cost.monthly_usd?.toFixed(2) ?? '—')" style="font-size: 0.85rem"></span>
+                  <template x-if="$store.genesisDashboard.health.cost.budget_monthly_limit">
+                    <span style="opacity: 0.6; font-size: 0.72rem"
+                          x-text="' / $' + $store.genesisDashboard.health.cost.budget_monthly_limit.toFixed(2) + ' (' + ($store.genesisDashboard.health.cost.budget_pct_used?.toFixed(0) || 0) + '%)'"></span>
+                  </template>
+                  <div class="health-card-detail"
+                       x-text="'Today: $' + ($store.genesisDashboard.health.cost.daily_usd?.toFixed(3) ?? '—') + ' | Week: $' + ($store.genesisDashboard.health.cost.weekly_usd?.toFixed(3) ?? '—')"></div>
+                  <template x-if="$store.genesisDashboard.health.cost.forecast_monthly_usd">
+                    <div class="health-card-detail"
+                         :style="(() => { const f = $store.genesisDashboard.health.cost.forecast_monthly_usd; const l = $store.genesisDashboard.health.cost.budget_monthly_limit; if (!l) return ''; return f > l ? 'color: #d9534f; font-weight: 600' : f > l * 0.8 ? 'color: #f0ad4e' : 'color: #4caf50'; })()"
+                         x-text="'Pacing: ~$' + $store.genesisDashboard.health.cost.forecast_monthly_usd.toFixed(2) + '/mo'"></div>
+                  </template>
+                  <template x-if="$store.genesisDashboard.health.cc_sessions?.shadow_cost_month > 0">
+                    <div class="health-card-detail" style="margin-top: 0.2rem; border-top: 1px solid var(--color-border); padding-top: 0.2rem;"
+                         x-text="'CC shadow: $' + $store.genesisDashboard.health.cc_sessions.shadow_cost_today.toFixed(2) + ' today ($' + $store.genesisDashboard.health.cc_sessions.shadow_cost_month.toFixed(2) + '/mo)'"></div>
+                  </template>
+                  <template x-if="($store.genesisDashboard.health.cc_sessions?.rate_limited_24h || 0) > 0">
+                    <div class="health-card-detail" style="color: #d9534f; font-weight: 600;"
+                         x-text="$store.genesisDashboard.health.cc_sessions.rate_limited_24h + ' rate limits (24h)'"></div>
+                  </template>
+                </div>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.costSemantic().reason"></div>
+          </div>
+
+          <!-- Queues -->
+          <div class="health-card" id="queue-review">
+            <div class="health-card-header">
+              <div class="health-card-title">Queues</div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.queuesSemantic().state)}`"
+                    x-text="$store.genesisDashboard.queuesSemantic().state"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.health.queues">
+                <div>
+                  <div style="font-size: 0.82rem; cursor: default;"
+                       title="Failed operations that exhausted all retry providers">
+                    Dead Letters:
+                    <span x-text="$store.genesisDashboard.health.queues.dead_letters ?? 0"
+                          :style="($store.genesisDashboard.health.queues.dead_letters || 0) > 0 ? 'color: #d9534f; font-weight: 700' : 'color: #4caf50'"></span>
+                  </div>
+                  <div style="font-size: 0.82rem; cursor: default;"
+                       title="Tasks postponed due to service degradation">
+                    Deferred Pending:
+                    <span x-text="$store.genesisDashboard.health.queues.deferred_work ?? 0"
+                          :style="($store.genesisDashboard.health.queues.deferred_work || 0) > 0 ? 'color: #f0ad4e; font-weight: 700' : 'color: #4caf50'"></span>
+                    <template x-if="$store.genesisDashboard.health.queues.deferred_oldest_age_seconds > 0">
+                      <span style="font-size: 0.68rem; color: var(--color-text-secondary);"
+                            x-text="'(oldest: ' + (() => { const s = $store.genesisDashboard.health.queues.deferred_oldest_age_seconds; return s > 3600 ? Math.round(s/3600) + 'h' : Math.round(s/60) + 'm'; })() + ')'"></span>
+                    </template>
+                  </div>
+                  <template x-if="($store.genesisDashboard.health.queues.deferred_processing || 0) > 0">
+                    <div style="font-size: 0.82rem; cursor: default;"
+                         title="Items currently being processed (may be stuck if old)">
+                      Deferred Processing:
+                      <span x-text="$store.genesisDashboard.health.queues.deferred_processing"
+                            style="color: #f0ad4e; font-weight: 700"></span>
+                      <template x-if="($store.genesisDashboard.health.queues.deferred_stuck || 0) > 0">
+                        <span style="font-size: 0.72rem; color: #d9534f; font-weight: 600;"
+                              x-text="'(' + $store.genesisDashboard.health.queues.deferred_stuck + ' stuck >2h)'"></span>
+                      </template>
+                    </div>
+                  </template>
+                  <template x-if="$store.genesisDashboard.health.queues.deferred_items?.length > 0">
+                    <div style="margin-top: 0.3rem; font-size: 0.68rem;">
+                      <template x-for="item in $store.genesisDashboard.health.queues.deferred_items" :key="item.type + item.site">
+                        <div style="color: var(--color-text-secondary); margin: 0.1rem 0;"
+                             :title="item.reason">
+                          <span x-text="item.type"></span> &rarr;
+                          <span x-text="item.site"></span>
+                          (<span x-text="Math.round(item.age_s / 60) + 'm'" :style="item.age_s > 3600 ? 'color: #d9534f' : ''"></span>,
+                          <span x-text="item.attempts + ' tries'"></span>)
+                        </div>
+                      </template>
+                    </div>
+                  </template>
+                  <template x-if="($store.genesisDashboard.health.queues.discarded_items?.length || 0) > 0">
+                    <div style="margin-top: 0.3rem; font-size: 0.72rem; color: #d9534f; font-weight: 600;">
+                      <span x-text="$store.genesisDashboard.health.queues.discarded_items.length"></span> discarded — needs review
+                    </div>
+                  </template>
+                  <div style="font-size: 0.82rem; cursor: default;"
+                       title="Memory items waiting to be embedded in vector DB">
+                    Embeddings Pending:
+                    <span x-text="$store.genesisDashboard.health.queues.pending_embeddings ?? 0"
+                          :style="($store.genesisDashboard.health.queues.pending_embeddings || 0) > 0 ? 'color: #f0ad4e; font-weight: 700' : ''"></span>
+                  </div>
+                  <template x-if="($store.genesisDashboard.health.queues.failed_embeddings || 0) > 0">
+                    <div style="font-size: 0.82rem; cursor: default;"
+                         :title="$store.genesisDashboard.health.queues.embedding_last_error || 'embedding failure'">
+                      Embeddings Failed:
+                      <span x-text="$store.genesisDashboard.health.queues.failed_embeddings"
+                            style="color: #d9534f; font-weight: 700"></span>
+                    </div>
+                  </template>
+                  <div style="font-size: 0.82rem; cursor: default;"
+                       title="Items that failed inline embedding but were later successfully embedded via retry queue">
+                    Embedding Retries OK:
+                    <span x-text="$store.genesisDashboard.health.queues.embedded_total ?? 0"
+                          style="color: #4caf50"></span>
+                  </div>
+                  <template x-if="$store.genesisDashboard.queueReview.message">
+                    <div class="health-card-detail" style="margin-top:0.45rem; color:#4caf50;" x-text="$store.genesisDashboard.queueReview.message"></div>
+                  </template>
+                  <template x-if="$store.genesisDashboard.queueReview.error">
+                    <div class="health-card-detail" style="margin-top:0.45rem; color:#d9534f;" x-text="$store.genesisDashboard.queueReview.error"></div>
+                  </template>
+                  <template x-if="$store.genesisDashboard.deferredQueueGroups.length > 0">
+                    <div style="margin-top:0.55rem; border-top:1px solid rgba(255,255,255,0.06); padding-top:0.55rem;">
+                      <div style="font-size:0.7rem; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:var(--color-text-secondary); margin-bottom:0.35rem;">Deferred review</div>
+                      <template x-for="group in $store.genesisDashboard.deferredQueueGroups" :key="group.key">
+                        <div style="margin-bottom:0.45rem; padding:0.4rem 0.5rem; border-radius:6px; background:rgba(240,173,78,0.07); border:1px solid rgba(240,173,78,0.18);">
+                          <div style="display:flex; justify-content:space-between; gap:0.5rem; align-items:flex-start;">
+                            <div>
+                              <div style="font-size:0.74rem; font-weight:600;">
+                                <span x-text="group.site"></span>
+                                <span style="opacity:0.6;"> • </span>
+                                <span x-text="group.type"></span>
+                              </div>
+                              <div style="font-size:0.68rem; color:var(--color-text-secondary);" x-text="group.reason"></div>
+                            </div>
+                            <div style="font-size:0.68rem; color:var(--color-text-secondary); text-align:right;">
+                              <div x-text="group.count + ' item' + (group.count === 1 ? '' : 's')"></div>
+                              <div x-text="'oldest ' + $store.genesisDashboard.formatAgeSeconds(group.maxAgeSeconds)"></div>
+                            </div>
+                          </div>
+                          <template x-for="item in group.items" :key="item.type + ':' + item.site + ':' + item.age_s + ':' + item.attempts">
+                            <div style="margin-top:0.3rem; font-size:0.68rem; color:var(--color-text-secondary); display:flex; justify-content:space-between; gap:0.5rem;">
+                              <span x-text="$store.genesisDashboard.formatAgeSeconds(item.age_s) + ' old'"></span>
+                              <span x-text="item.attempts + ' tries'"></span>
+                            </div>
+                          </template>
+                        </div>
+                      </template>
+                    </div>
+                  </template>
+                  <div style="margin-top:0.55rem; border-top:1px solid rgba(255,255,255,0.06); padding-top:0.55rem;">
+                    <div style="display:flex; justify-content:space-between; gap:0.5rem; align-items:center; margin-bottom:0.35rem;">
+                      <div style="font-size:0.7rem; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:var(--color-text-secondary);">Discarded review</div>
+                      <button type="button"
+                              style="font-size:0.68rem; padding:0.22rem 0.45rem; border-radius:4px; border:1px solid rgba(217,83,79,0.3); color:#d9534f; background:transparent; cursor:pointer;"
+                              :disabled="$store.genesisDashboard.queueReview.clearingAll || ($store.genesisDashboard.health.queues.discarded_items?.length || 0) === 0"
+                              @click="$store.genesisDashboard.clearAllDiscardedItems()"
+                              x-text="$store.genesisDashboard.queueReview.clearingAll ? 'Clearing...' : 'Clear all reviewed'"></button>
+                    </div>
+                    <template x-if="$store.genesisDashboard.discardedQueueGroups.length === 0">
+                      <div class="health-card-detail" style="margin-top:0;">No discarded or expired items awaiting review.</div>
+                    </template>
+                    <template x-for="group in $store.genesisDashboard.discardedQueueGroups" :key="group.key">
+                      <div style="margin-bottom:0.5rem; padding:0.45rem 0.55rem; border-radius:6px; background:rgba(217,83,79,0.08); border:1px solid rgba(217,83,79,0.18);">
+                        <div style="display:flex; justify-content:space-between; gap:0.5rem; align-items:flex-start;">
+                          <div>
+                            <div style="font-size:0.74rem; font-weight:600;">
+                              <span x-text="group.site"></span>
+                              <span style="opacity:0.6;"> • </span>
+                              <span x-text="group.type"></span>
+                            </div>
+                            <div style="font-size:0.68rem; color:var(--color-text-secondary);" x-text="group.reason"></div>
+                          </div>
+                          <div style="font-size:0.68rem; color:var(--color-text-secondary); text-align:right;">
+                            <div x-text="group.count + ' item' + (group.count === 1 ? '' : 's')"></div>
+                            <div x-text="'oldest ' + $store.genesisDashboard.formatAgeSeconds(group.maxAgeSeconds)"></div>
+                          </div>
+                        </div>
+                        <template x-for="item in group.items" :key="item.id">
+                          <div style="margin-top:0.35rem; padding-top:0.35rem; border-top:1px solid rgba(255,255,255,0.05);">
+                            <div style="display:flex; justify-content:space-between; gap:0.5rem; align-items:flex-start;">
+                              <div style="font-size:0.68rem; color:var(--color-text-secondary);">
+                                <div>
+                                  <span x-text="item.status"></span>
+                                  <span style="opacity:0.6;"> • </span>
+                                  <span x-text="$store.genesisDashboard.formatAgeSeconds(item.age_s) + ' old'"></span>
+                                  <span style="opacity:0.6;"> • </span>
+                                  <span x-text="item.attempts + ' tries'"></span>
+                                </div>
+                                <template x-if="item.error">
+                                  <div style="margin-top:0.15rem; color:#f5c2c0;" x-text="item.error"></div>
+                                </template>
+                                <template x-if="item.discarded_at">
+                                  <div style="margin-top:0.15rem;" x-text="'discarded ' + $store.genesisDashboard.relativeTime(item.discarded_at)"></div>
+                                </template>
+                              </div>
+                              <button type="button"
+                                      style="font-size:0.68rem; padding:0.22rem 0.45rem; border-radius:4px; border:1px solid rgba(217,83,79,0.3); color:#d9534f; background:transparent; cursor:pointer;"
+                                      :disabled="$store.genesisDashboard.queueReview.clearingIds[item.id]"
+                                      @click="$store.genesisDashboard.clearDeferredItem(item.id)"
+                                      x-text="$store.genesisDashboard.queueReview.clearingIds[item.id] ? 'Clearing...' : 'Clear'"></button>
+                            </div>
+                          </div>
+                        </template>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.queuesSemantic().reason"></div>
+          </div>
+
+          <!-- Surplus -->
+          <div class="health-card" title="Surplus compute: opportunistic background tasks during idle time."
+               style="cursor: pointer;" @click="$store.genesisDashboard.surplusModal.open = true; $store.genesisDashboard.fetchSurplusDetail()">
+            <div class="health-card-header">
+              <div class="health-card-title">Surplus <span style="font-size: 0.6rem; opacity: 0.5;">click for details</span></div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.surplusSemantic().state)}`"
+                    x-text="$store.genesisDashboard.surplusSemantic().state"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.health.surplus">
+                <div>
+                  <span class="status-dot"
+                        :style="`background: ${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.surplusSemantic().state)}`"></span>
+                  <span style="font-size: 0.82rem"
+                        x-text="$store.genesisDashboard.health.surplus.status || 'unknown'"></span>
+                  <div class="health-card-detail"
+                       x-text="'Queue: ' + ($store.genesisDashboard.health.surplus.queue_depth ?? 0)"></div>
+                  <template x-if="$store.genesisDashboard.health.surplus.tasks_completed_24h > 0 || $store.genesisDashboard.health.surplus.tasks_failed_24h > 0">
+                    <div class="health-card-detail" style="font-size: 0.72rem;"
+                         x-text="($store.genesisDashboard.health.surplus.tasks_completed_24h || 0) + ' done / ' + ($store.genesisDashboard.health.surplus.tasks_failed_24h || 0) + ' failed (24h)'"></div>
+                  </template>
+                </div>
+              </template>
+              <template x-if="!$store.genesisDashboard.health.surplus">
+                <span style="color: #666; font-size: 0.82rem">No surplus data</span>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.surplusSemantic().reason"></div>
+          </div>
+
+          <!-- Ego — dual-ego display -->
+          <template x-if="$store.genesisDashboard.egoStatus?.enabled">
+            <div class="health-card" title="Ego: dual autonomous decision-making cycles with adaptive cadence."
+                 style="cursor: pointer;" @click="$store.genesisDashboard.egoModal.open = true; $store.genesisDashboard.fetchEgoDetail()">
+              <div class="health-card-header">
+                <div class="health-card-title">Ego <span style="font-size: 0.6rem; opacity: 0.5;">click for details</span></div>
+                <span class="status-chip"
+                      :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.egoSemantic().state)}`"
+                      x-text="$store.genesisDashboard.egoSemantic().state"></span>
+              </div>
+              <div class="health-card-value" style="width: 100%;">
+                <!-- User Ego (CEO) row -->
+                <div x-data="{ ue: $store.genesisDashboard.egoStatus?.egos?.user_ego }" style="margin-bottom: 0.4rem;">
+                  <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.15rem;">
+                    <span style="font-size: 0.72rem; font-weight: 600; color: #c084fc;">CEO <span style="font-weight: 400; opacity: 0.7;">(User Ego)</span></span>
+                    <template x-if="ue?.pending_proposals > 0">
+                      <span style="font-size: 0.62rem; background: rgba(192,132,252,0.2); color: #c084fc; padding: 0 0.3rem; border-radius: 3px;"
+                            x-text="ue.pending_proposals + ' pending'"></span>
+                    </template>
+                  </div>
+                  <!-- Cadence progress bar -->
+                  <div style="display: flex; align-items: center; gap: 0.3rem;">
+                    <div style="flex: 1; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden;"
+                         :title="'Interval: ' + (ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || '?') + 'min / ' + (ue?.max_interval_minutes || 240) + 'min max'">
+                      <div :style="(() => {
+                        const cur = ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || 90;
+                        const base = ue?.cadence_minutes || 90;
+                        const max = ue?.max_interval_minutes || 240;
+                        const pct = Math.min(100, (cur / max) * 100);
+                        const cFail = ue?.cadence?.consecutive_failures || 0;
+                        const color = cFail >= 3 ? '#d9534f' : cur <= base ? '#4caf50' : '#f0ad4e';
+                        return `width: ${pct}%; height: 100%; background: ${color}; border-radius: 2px; transition: width 0.5s;`;
+                      })()"></div>
+                    </div>
+                    <span style="font-size: 0.6rem; color: var(--color-text-secondary); min-width: 2.2rem; text-align: right;"
+                          x-text="(ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || '?') + 'm'"></span>
+                  </div>
+                </div>
+                <!-- Genesis Ego (COO) row -->
+                <div x-data="{ ge: $store.genesisDashboard.egoStatus?.egos?.genesis_ego }">
+                  <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.15rem;">
+                    <span style="font-size: 0.72rem; font-weight: 600; color: #60a5fa;">COO <span style="font-weight: 400; opacity: 0.7;">(Genesis Ego)</span></span>
+                    <template x-if="ge?.pending_proposals > 0">
+                      <span style="font-size: 0.62rem; background: rgba(96,165,250,0.2); color: #60a5fa; padding: 0 0.3rem; border-radius: 3px;"
+                            x-text="ge.pending_proposals + ' pending'"></span>
+                    </template>
+                  </div>
+                  <!-- Cadence progress bar -->
+                  <div style="display: flex; align-items: center; gap: 0.3rem;">
+                    <div style="flex: 1; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden;"
+                         :title="'Interval: ' + (ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || '?') + 'min / ' + (ge?.max_interval_minutes || 240) + 'min max'">
+                      <div :style="(() => {
+                        const cur = ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || 90;
+                        const base = ge?.cadence_minutes || 90;
+                        const max = ge?.max_interval_minutes || 240;
+                        const pct = Math.min(100, (cur / max) * 100);
+                        const cFail = ge?.cadence?.consecutive_failures || 0;
+                        const color = cFail >= 3 ? '#d9534f' : cur <= base ? '#4caf50' : '#f0ad4e';
+                        return `width: ${pct}%; height: 100%; background: ${color}; border-radius: 2px; transition: width 0.5s;`;
+                      })()"></div>
+                    </div>
+                    <span style="font-size: 0.6rem; color: var(--color-text-secondary); min-width: 2.2rem; text-align: right;"
+                          x-text="(ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || '?') + 'm'"></span>
+                  </div>
+                </div>
+                <!-- Cost footer -->
+                <div style="margin-top: 0.35rem; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 0.25rem;">
+                  <span style="font-size: 0.62rem; color: var(--color-text-secondary);"
+                        x-text="'$' + ($store.genesisDashboard.egoStatus?.daily_cost_usd || 0).toFixed(2) + ' today'"></span>
+                </div>
+              </div>
+              <div class="health-card-reason"
+                   :style="$store.genesisDashboard.egoSemantic().reason?.includes('proposals awaiting') ? 'cursor:pointer; text-decoration:underline;' : ''"
+                   @click="if ($store.genesisDashboard.egoSemantic().reason?.includes('proposals awaiting')) { location.hash = 'chat'; $store.genesisDashboard.commsTab = 'proposals'; $store.genesisDashboard.commsProposalFilter = 'pending'; $store.genesisDashboard.fetchComms(); }"
+                   x-text="$store.genesisDashboard.egoSemantic().reason"></div>
+            </div>
+          </template>
+
+          <!-- Services -->
+          <div class="health-card" title="Host framework, bridge, and watchdog service status">
+            <div class="health-card-header">
+              <div class="health-card-title">Services</div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.servicesSemantic().state)}`"
+                    x-text="$store.genesisDashboard.servicesSemantic().state"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.health.services">
+                <div>
+                  <!-- Host Framework (auto-detected) -->
+                  <template x-if="$store.genesisDashboard.health.services?.host_framework?.detected">
+                    <div style="font-size: 0.82rem; margin-bottom: 0.2rem; cursor: default;"
+                         :title="(() => {
+                           const hf = $store.genesisDashboard.health.services.host_framework;
+                           let tip = hf.name + ': ' + hf.status;
+                           if (hf.details?.restart_count != null) tip += ' (restarts: ' + hf.details.restart_count + ')';
+                           return tip;
+                         })()">
+                      <span class="status-dot"
+                            :style="`background: ${$store.genesisDashboard.health.services.host_framework.status === 'healthy' ? '#4caf50' : $store.genesisDashboard.health.services.host_framework.status === 'degraded' ? '#f0ad4e' : '#d9534f'}`"></span>
+                      <span x-text="$store.genesisDashboard.health.services.host_framework.name" style="font-weight: 600"></span>
+                      <span style="opacity: 0.6; font-size: 0.75rem"
+                            x-text="$store.genesisDashboard.health.services.host_framework.uptime_seconds != null ? Math.round($store.genesisDashboard.health.services.host_framework.uptime_seconds / 60) + 'm' : ''"></span>
+                    </div>
+                  </template>
+                  <!-- Genesis service (server or bridge) -->
+                  <div style="font-size: 0.82rem; margin-bottom: 0.2rem; cursor: default;"
+                       :title="($store.genesisDashboard.health.services?.bridge?.service_label || 'Genesis') + ': ' + ($store.genesisDashboard.health.services?.bridge?.active_state || 'unknown') + ' (PID ' + ($store.genesisDashboard.health.services?.bridge?.pid || '?') + ')'">
+                    <span class="status-dot"
+                          :style="`background: ${$store.genesisDashboard.health.services?.bridge?.active_state === 'active' ? '#4caf50' : ['failed', 'inactive'].includes($store.genesisDashboard.health.services?.bridge?.active_state) ? '#d9534f' : '#666'}`"></span>
+                    <span x-text="$store.genesisDashboard.health.services?.bridge?.service_label || 'Genesis'"></span>
+                    <span style="opacity: 0.6; font-size: 0.75rem"
+                          x-text="$store.genesisDashboard.health.services?.bridge?.uptime_seconds != null ? Math.round($store.genesisDashboard.health.services.bridge.uptime_seconds / 60) + 'm' : ''"></span>
+                  </div>
+                  <!-- Watchdog -->
+                  <div style="font-size: 0.82rem; margin-bottom: 0.2rem; cursor: default;"
+                       :title="'Watchdog timer: ' + ($store.genesisDashboard.health.services?.watchdog_timer?.active_state || 'unknown')">
+                    <span class="status-dot"
+                          :style="`background: ${$store.genesisDashboard.health.services?.watchdog_timer?.active_state === 'active' ? '#4caf50' : ['failed', 'inactive'].includes($store.genesisDashboard.health.services?.watchdog_timer?.active_state) ? '#d9534f' : '#666'}`"></span>
+                    Watchdog
+                    <span style="opacity: 0.6; font-size: 0.75rem"
+                          x-text="(() => { const n = $store.genesisDashboard.health.services?.watchdog?.consecutive_failures || 0; if (n === 0) return ''; const reason = $store.genesisDashboard.health.services?.watchdog?.last_reason; const label = reason ? reason.replace(/_/g, ' ') : 'restart'; return n <= 3 ? `(${label})` : `(${n} restarts)`; })()"></span>
+                  </div>
+                  <!-- Sentinel (container-side guardian) -->
+                  <div style="font-size: 0.82rem; margin-bottom: 0.2rem; cursor: default;"
+                       :title="(() => {
+                         const s = $store.genesisDashboard.health.services?.sentinel;
+                         if (!s || !s.enabled) return 'Sentinel: unavailable';
+                         let tip = 'Sentinel: ' + s.current_state;
+                         if (s.is_stale) tip += ` (stale ${Math.round((s.staleness_s || 0) / 60)}m)`;
+                         else if (s.is_active) tip += ' (running)';
+                         if (s.last_trigger_reason) tip += ' — last: ' + s.last_trigger_reason;
+                         return tip;
+                       })()">
+                    <span class="status-dot"
+                          :style="`background: ${(() => {
+                            const s = $store.genesisDashboard.health.services?.sentinel;
+                            if (!s || !s.enabled) return '#666';
+                            if (s.is_stale || s.current_state === 'stale') return '#ff9800';
+                            if (s.current_state === 'healthy') return '#4caf50';
+                            if (s.current_state === 'escalated') return '#d9534f';
+                            if (['investigating', 'remediating', 'awaiting_dispatch_approval', 'awaiting_action_approval'].includes(s.current_state)) return '#f0ad4e';
+                            return '#666';  // unknown/future state — gray, not yellow
+                          })()}`"></span>
+                    Sentinel
+                    <span style="opacity: 0.6; font-size: 0.75rem"
+                          x-text="(() => {
+                            const s = $store.genesisDashboard.health.services?.sentinel;
+                            if (!s || !s.enabled) return '';
+                            if (s.is_stale) return '(stale)';
+                            if (s.is_active) return '(running)';
+                            if (s.current_state.startsWith('awaiting')) return '(awaiting approval)';
+                            if (s.current_state !== 'healthy') return '(' + s.current_state + ')';
+                            return '';
+                          })()"></span>
+                  </div>
+                  <!-- /tmp is shown in Infrastructure card, not here -->
+                </div>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.servicesSemantic().reason"></div>
+          </div>
+
+          <!-- Container Resources (memory + CPU + disk) -->
+          <div class="health-card" title="Container resource usage. Memory >85% = OOM danger zone. Disk >90% = write failures.">
+            <div class="health-card-header">
+              <div class="health-card-title">Container</div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.containerSemantic().state)}`"
+                    x-text="$store.genesisDashboard.containerSemantic().state"></span>
+            </div>
+            <div class="health-card-value" style="display:flex; flex-direction:column; gap:0.35rem;">
+              <!-- Memory row -->
+              <template x-if="($store.genesisDashboard.health.infrastructure?.container_memory?.anon_pct ?? $store.genesisDashboard.health.infrastructure?.container_memory?.used_pct) != null">
+                <div style="display:flex; align-items:center; gap:0.5rem; font-size:0.8rem;">
+                  <span style="width:3.2rem; color:var(--color-text-secondary);">Memory</span>
+                  <span style="width:3rem; text-align:right; font-weight:600;"
+                        :style="(() => { const p = $store.genesisDashboard.health.infrastructure.container_memory.anon_pct ?? $store.genesisDashboard.health.infrastructure.container_memory.used_pct; return `color: ${p > 85 ? '#d9534f' : p > 75 ? '#f0ad4e' : '#4caf50'}`; })()"
+                        x-text="(($store.genesisDashboard.health.infrastructure.container_memory.anon_pct ?? $store.genesisDashboard.health.infrastructure.container_memory.used_pct) || 0).toFixed(0) + '%'"></span>
+                  <div style="flex:1; height:6px; background:var(--color-background); border-radius:3px; min-width:40px;">
+                    <div style="height:100%; border-radius:3px; transition:width 0.3s;"
+                         :style="(() => { const p = $store.genesisDashboard.health.infrastructure.container_memory.anon_pct ?? $store.genesisDashboard.health.infrastructure.container_memory.used_pct ?? 0; return 'width:' + p + '%; background:' + (p > 85 ? '#d9534f' : p > 75 ? '#f0ad4e' : '#4caf50'); })()"></div>
+                  </div>
+                  <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
+                        :title="(() => { const cm = $store.genesisDashboard.health.infrastructure.container_memory; const avail = cm.available_gb != null ? cm.available_gb.toFixed(0) + ' GB available. ' : ''; return avail + 'Shows non-reclaimable memory (anon+kernel), matching the %. cgroup memory.current is ' + (cm.current_gb ?? 0).toFixed(0) + ' GB including reclaimable page cache, which is not counted here.'; })()"
+                        x-text="(() => { const cm = $store.genesisDashboard.health.infrastructure.container_memory; const used = (cm.anon_gb != null && cm.kernel_gb != null) ? (cm.anon_gb + cm.kernel_gb) : cm.current_gb; return (used ?? 0).toFixed(0) + '/' + (cm.limit_gb ?? 0).toFixed(0) + ' GB'; })()"></span>
+                </div>
+              </template>
+              <!-- CPU row -->
+              <template x-if="$store.genesisDashboard.health.infrastructure?.cpu">
+                <div style="display:flex; align-items:center; gap:0.5rem; font-size:0.8rem;">
+                  <span style="width:3.2rem; color:var(--color-text-secondary);">CPU</span>
+                  <template x-if="$store.genesisDashboard.health.infrastructure.cpu.used_pct != null">
+                    <span style="width:3rem; text-align:right; font-weight:600;"
+                          :style="`color: ${$store.genesisDashboard.health.infrastructure.cpu.used_pct > 85 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.cpu.used_pct > 60 ? '#f0ad4e' : '#4caf50'}`"
+                          x-text="$store.genesisDashboard.health.infrastructure.cpu.used_pct.toFixed(0) + '%'"></span>
+                  </template>
+                  <template x-if="$store.genesisDashboard.health.infrastructure.cpu.used_pct == null">
+                    <span style="width:3rem; text-align:right; font-size:0.7rem; color:var(--color-text-secondary);">—</span>
+                  </template>
+                  <template x-if="$store.genesisDashboard.health.infrastructure.cpu.used_pct != null">
+                    <div style="flex:1; height:6px; background:var(--color-background); border-radius:3px; min-width:40px;">
+                      <div style="height:100%; border-radius:3px; transition:width 0.3s;"
+                           :style="'width:' + $store.genesisDashboard.health.infrastructure.cpu.used_pct + '%; background:' + ($store.genesisDashboard.health.infrastructure.cpu.used_pct > 85 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.cpu.used_pct > 60 ? '#f0ad4e' : '#4caf50')"></div>
+                    </div>
+                  </template>
+                  <template x-if="$store.genesisDashboard.health.infrastructure.cpu.used_pct == null">
+                    <div style="flex:1;"></div>
+                  </template>
+                  <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
+                        x-text="($store.genesisDashboard.health.infrastructure.cpu.count || '?') + ' vCPUs'"></span>
+                </div>
+              </template>
+              <!-- Disk row -->
+              <template x-if="$store.genesisDashboard.health.infrastructure?.disk?.free_pct != null">
+                <div style="display:flex; align-items:center; gap:0.5rem; font-size:0.8rem;">
+                  <span style="width:3.2rem; color:var(--color-text-secondary);">Disk</span>
+                  <span style="width:3rem; text-align:right; font-weight:600;"
+                        :style="`color: ${(100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) > 90 ? '#d9534f' : (100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) > 85 ? '#f0ad4e' : '#4caf50'}`"
+                        x-text="(100 - $store.genesisDashboard.health.infrastructure.disk.free_pct).toFixed(0) + '%'"></span>
+                  <div style="flex:1; height:6px; background:var(--color-background); border-radius:3px; min-width:40px;">
+                    <div style="height:100%; border-radius:3px; transition:width 0.3s;"
+                         :style="'width:' + (100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) + '%; background:' + ((100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) > 90 ? '#d9534f' : (100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) > 85 ? '#f0ad4e' : '#4caf50')"></div>
+                  </div>
+                  <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
+                        x-text="($store.genesisDashboard.health.infrastructure.disk.total_gb - $store.genesisDashboard.health.infrastructure.disk.free_gb).toFixed(0) + '/' + $store.genesisDashboard.health.infrastructure.disk.total_gb.toFixed(0) + ' GB'"></span>
+                </div>
+              </template>
+              <!-- Claude Code sessions row (per-session RSS — leak detection) -->
+              <template x-if="($store.genesisDashboard.health.infrastructure?.cc_slots || []).length">
+                <div style="display:flex; flex-direction:column; gap:0.3rem; font-size:0.8rem;">
+                  <span style="color:var(--color-text-secondary);"
+                        title="Memory (RSS) used by each concurrent Claude Code worker session — leak detection. Green = healthy, amber ≥ 4 GB, red ≥ 6 GB.">Claude Code Sessions</span>
+                  <div style="display:flex; flex-wrap:wrap; gap:0.35rem;">
+                    <template x-for="slot in $store.genesisDashboard.health.infrastructure.cc_slots" :key="slot.slot">
+                      <span style="font-size:0.7rem; padding:0.05rem 0.3rem; border-radius:3px; background:var(--color-background); white-space:nowrap;"
+                            :style="`color: ${slot.status === 'error' ? '#d9534f' : slot.status === 'degraded' ? '#f0ad4e' : '#4caf50'}`"
+                            :title="'Session ' + slot.slot + ' (pid ' + slot.pid + '): ' + (slot.rss_mb / 1024).toFixed(2) + ' GB RSS'"
+                            x-text="'#' + slot.slot + ' ' + (slot.rss_mb / 1024).toFixed(1) + 'G'"></span>
+                    </template>
+                  </div>
+                </div>
+              </template>
+              <!-- Fallback when no data -->
+              <template x-if="!$store.genesisDashboard.health.infrastructure?.container_memory?.used_pct && !$store.genesisDashboard.health.infrastructure?.cpu && !$store.genesisDashboard.health.infrastructure?.disk">
+                <span style="color: #666; font-size: 0.82rem;">no data</span>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.containerSemantic().reason"></div>
+          </div>
+
+          <!-- Awareness Loop -->
+          <div class="health-card" title="Awareness loop health: 5-min ticks, signal collection, reflection triggers.">
+            <div class="health-card-header">
+              <div class="health-card-title">Awareness Loop</div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.awarenessSemantic().state)}`"
+                    x-text="$store.genesisDashboard.awarenessSemantic().state"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.health.awareness">
+                <div>
+                  <span class="status-dot"
+                        :style="`background: ${$store.genesisDashboard.probeStatusColor($store.genesisDashboard.health.awareness)}`"></span>
+                  <span x-text="$store.genesisDashboard.health.awareness.time_since_last_tick_seconds != null
+                    ? ($store.genesisDashboard.health.awareness.time_since_last_tick_seconds < 60
+                      ? Math.round($store.genesisDashboard.health.awareness.time_since_last_tick_seconds) + 's ago'
+                      : Math.round($store.genesisDashboard.health.awareness.time_since_last_tick_seconds / 60) + 'm ago')
+                    : $store.genesisDashboard.health.awareness.status || 'unknown'"
+                        style="font-size: 0.82rem"></span>
+                  <div class="health-card-detail"
+                       x-text="$store.genesisDashboard.health.awareness.ticks_24h != null ? $store.genesisDashboard.health.awareness.ticks_24h + ' ticks/24h' : ''"></div>
+                  <template x-if="$store.genesisDashboard.health.awareness.depth_distribution_24h">
+                    <div style="font-size: 0.68rem; color: var(--color-text-secondary); margin-top: 0.15rem; cursor: help;"
+                         title="Ticks = awareness loop cycles (~2 min). Reflections (micro/light/deep/strategic) trigger when signal scores exceed thresholds. 'No reflections' = all ticks were signal-only."
+                         x-text="(() => {
+                           const d = $store.genesisDashboard.health.awareness.depth_distribution_24h;
+                           const keys = Object.keys(d);
+                           if (keys.length === 1 && keys[0] === 'none') return d.none + ' ticks (no reflections)';
+                           return Object.entries(d).map(([k,v]) => (k === 'none' ? 'micro' : k) + ':' + v).join(' ');
+                         })()"></div>
+                  </template>
+                  <template x-if="$store.genesisDashboard.health.awareness.last_reflection">
+                    <div style="font-size: 0.68rem; color: var(--color-text-secondary); margin-top: 0.1rem;"
+                         x-text="'Last reflection: ' + $store.genesisDashboard.formatTime($store.genesisDashboard.health.awareness.last_reflection.at)"></div>
+                  </template>
+                  <template x-if="($store.genesisDashboard.health.awareness.critical_bypasses_24h || 0) > 0">
+                    <div style="font-size: 0.68rem; color: #d9534f; font-weight: 600; margin-top: 0.1rem;"
+                         x-text="$store.genesisDashboard.health.awareness.critical_bypasses_24h + ' critical bypasses (24h)'"></div>
+                  </template>
+                </div>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.awarenessSemantic().reason"></div>
+          </div>
+
+          <!-- Outreach Stats -->
+          <div class="health-card" title="7-day outreach metrics. Click to view messages."
+               style="cursor: pointer;" @click="location.hash = 'chat'; $store.genesisDashboard.commsTab = 'outreach'">
+            <div class="health-card-header">
+              <div class="health-card-title">Outreach (7d) <span style="font-size: 0.6rem; opacity: 0.5;">click for details</span></div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.outreachSemantic().state)}`"
+                    x-text="$store.genesisDashboard.outreachSemantic().state"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.health.outreach_stats?.total != null">
+                <div>
+                  <span x-text="$store.genesisDashboard.health.outreach_stats.total + ' sent'" style="font-size: 0.82rem"></span>
+                  <div class="health-card-detail"
+                       x-text="$store.genesisDashboard.health.outreach_stats.engagement_rate != null ? 'Engagement: ' + ($store.genesisDashboard.health.outreach_stats.engagement_rate * 100).toFixed(0) + '%' : 'No engagement data'"></div>
+                </div>
+              </template>
+              <template x-if="$store.genesisDashboard.health.outreach_stats?.total == null">
+                <span style="color: #666; font-size: 0.82rem">No outreach data</span>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.outreachSemantic().reason"></div>
+          </div>
+
+          <!-- Conversation Activity -->
+          <div class="health-card" title="Current conversation session activity from CC CLI.">
+            <div class="health-card-header">
+              <div class="health-card-title">Conversation</div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.conversationSemantic().state)}`"
+                    x-text="$store.genesisDashboard.conversationSemantic().state"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.health.conversation?.last_user_message_age_s != null">
+                <div>
+                  <span style="font-size: 0.82rem"
+                        :style="`color: ${(() => {
+                          const s = $store.genesisDashboard.health.conversation.last_user_message_age_s;
+                          if (s < 300) return '#4caf50';
+                          if (s < 1800) return '#f0ad4e';
+                          return '#888';
+                        })()}`"
+                        x-text="(() => {
+                          const s = $store.genesisDashboard.health.conversation.last_user_message_age_s;
+                          if (s < 60) return 'Last msg: ' + Math.round(s) + 's ago';
+                          if (s < 3600) return 'Last msg: ' + Math.round(s/60) + 'm ago';
+                          return 'Last msg: ' + Math.round(s/3600) + 'h ago';
+                        })()"></span>
+                  <div class="health-card-detail"
+                       x-text="($store.genesisDashboard.health.conversation.recent_user_turns || 0) + ' user / ' + ($store.genesisDashboard.health.conversation.recent_assistant_turns || 0) + ' assistant turns'"></div>
+                </div>
+              </template>
+              <template x-if="$store.genesisDashboard.health.conversation?.last_user_message_age_s == null">
+                <span style="color: #666; font-size: 0.82rem"
+                      x-text="$store.genesisDashboard.health.conversation?.status || 'no data'"></span>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.conversationSemantic().reason"></div>
+          </div>
+
+          <!-- MCP Servers -->
+          <div class="health-card" title="Genesis MCP server status. Click for tool details."
+               style="cursor: pointer;" @click="$store.genesisDashboard.mcpModal.open = true; $store.genesisDashboard.fetchMcpTools()">
+            <div class="health-card-header">
+              <div class="health-card-title">MCP Servers</div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.mcpSemantic().state)}`"
+                    x-text="$store.genesisDashboard.mcpSemantic().state"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.health.mcp_servers">
+                <div>
+                  <template x-for="(info, name) in $store.genesisDashboard.health.mcp_servers" :key="name">
+                    <div style="font-size: 0.78rem; margin-bottom: 0.15rem;"
+                         :title="info.error ? name + ': ' + info.error : name + ': ' + info.tool_count + ' tools'">
+                      <span class="status-dot" :style="`background: ${$store.genesisDashboard.probeStatusColor(info)}`"></span>
+                      <span x-text="name"></span>
+                      <span style="opacity: 0.6; font-size: 0.7rem"
+                            x-text="info.tool_count != null ? '(' + info.tool_count + ' tools)' : info.error ? '(error)' : ''"></span>
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.mcpSemantic().reason"></div>
+          </div>
+
+          <!-- API Keys -->
+          <div class="health-card" title="API key status. Click for details."
+               style="cursor: pointer;" @click="$store.genesisDashboard.apiKeysModal.open = true">
+            <div class="health-card-header">
+              <div class="health-card-title">API Keys</div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.apiKeysSemantic().state)}`"
+                    x-text="$store.genesisDashboard.apiKeysSemantic().state"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.health.api_keys">
+                <div>
+                  <span style="font-size: 0.82rem"
+                        x-text="(() => {
+                          const keys = ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {});
+                          const vals = Object.values(keys);
+                          const local = vals.filter(k => ['local','cc_managed','disabled'].includes(k.status)).length;
+                          const red = vals.filter(k => k.key_health === 'red').length;
+                          const yellow = vals.filter(k => k.key_health === 'yellow').length;
+                          const green = vals.filter(k => k.key_health === 'green').length;
+                          const tracked = vals.length - local;
+                          if (red > 0 || yellow > 0) return green + ' ok, ' + (red + yellow) + ' issue(s) / ' + tracked;
+                          return green + '/' + tracked + ' working';
+                        })()"></span>
+                  <template x-for="(info, name) in ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {})" :key="name">
+                    <template x-if="info.key_health === 'red' || info.key_health === 'yellow'">
+                      <div style="font-size: 0.72rem; margin-top: 0.1rem;"
+                           :style="`color: ${$store.genesisDashboard.keyHealthColor(info.key_health)}`"
+                           :title="info.error || info.cb_reason || ''">
+                        <span class="status-dot" :style="`background: ${$store.genesisDashboard.keyHealthColor(info.key_health)}`"></span>
+                        <span x-text="name + ' (' + (
+                          info.status === 'missing' ? 'key missing'
+                          : info.cb_reason === 'quota_exhausted' ? 'out of credits'
+                          : info.cb_state === 'open' ? 'API down'
+                          : info.error ? info.error.substring(0, 40)
+                          : info.status
+                        ) + ')'"></span>
+                      </div>
+                    </template>
+                  </template>
+                </div>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.apiKeysSemantic().reason"></div>
+          </div>
+
+        </div>
+
+        <!-- Provider Activity moved to Operational Vitals -->
+      </div>
+    </div>
+
+    <!-- Panel: Cognitive State (Collapsible) [Tab: overview] -->
+    <div class="panel" x-data="{ cogOpen: false }" x-show="$store.genesisDashboard.activeTab === 'overview'">
+      <div class="panel-header" style="cursor: pointer;" @click="cogOpen = !cogOpen">
+        <span class="material-symbols-outlined" :style="cogOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">psychology</span>
+        Cognitive State
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.cognitiveState?.freshness_level">
+            <span style="font-size: 0.68rem;"
+                  :style="({'fresh':'color:#4caf50','aging':'color:#f0ad4e','stale':'color:#d9534f','unknown':'opacity:0.5'})[
+                    $store.genesisDashboard.cognitiveState.freshness_level] || 'opacity:0.5'"
+                  x-text="(() => {
+                    const s = $store.genesisDashboard.cognitiveState.freshness_seconds;
+                    if (!s) return '';
+                    if (s < 3600) return Math.round(s/60) + 'm ago';
+                    if (s < 86400) return Math.round(s/3600) + 'h ago';
+                    return Math.round(s/86400) + 'd ago';
+                  })()"></span>
+          </template>
+          <template x-if="$store.genesisDashboard.cognitiveState?.health_flags">
+            <span style="color: #f0ad4e; font-size: 0.68rem;" x-text="$store.genesisDashboard.cognitiveState.health_flags.split('\n').filter(l => l.trim()).length + ' flag(s)'"></span>
+          </template>
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('cognitive')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('cognitive')"></span>
+        </span>
+      </div>
+      <div class="panel-body" x-show="cogOpen" x-transition>
+        <template x-if="$store.genesisDashboard.panelStatusDetail('cognitive')">
+          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('cognitive')"></div>
+        </template>
+        <template x-if="!$store.genesisDashboard.cognitiveState">
+          <div class="empty-state">No cognitive state generated yet.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.cognitiveState">
+          <div>
+            <!-- Health flags (computed, auto-clearing) -->
+            <template x-if="$store.genesisDashboard.cognitiveState.health_flags">
+              <div style="margin-bottom: 0.75rem; padding: 0.5rem 0.6rem; border: 1px solid var(--color-border); border-radius: 6px; background: rgba(240,173,78,0.06);">
+                <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.3rem; color: #f0ad4e;">Computed Health Flags</div>
+                <template x-for="line in $store.genesisDashboard.cognitiveState.health_flags.split('\n').filter(l => l.trim())" :key="line">
+                  <div style="font-size: 0.76rem; margin: 0.15rem 0; color: var(--color-text);"
+                       :style="line.includes('[CRITICAL]') ? 'color: #d9534f; font-weight: 600' : line.includes('[WARNING]') ? 'color: #f0ad4e' : ''"
+                       x-text="line.replace(/^- /, '')"></div>
+                </template>
+              </div>
+            </template>
+            <!-- State flags / focus directive -->
+            <template x-if="$store.genesisDashboard.cognitiveState.state_flags?.content">
+              <div style="margin-bottom: 0.75rem; padding: 0.5rem 0.6rem; border: 1px solid var(--color-border); border-radius: 6px;">
+                <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.3rem;">Reflection Focus</div>
+                <div style="font-size: 0.76rem; white-space: pre-wrap; color: var(--color-text-secondary);" x-text="$store.genesisDashboard.cognitiveState.state_flags.content.replace(/^## .+\n/, '')"></div>
+              </div>
+            </template>
+            <!-- Active context -->
+            <template x-if="$store.genesisDashboard.cognitiveState.active_context?.content">
+              <div style="padding: 0.5rem 0.6rem; border: 1px solid var(--color-border); border-radius: 6px;">
+                <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.3rem;">
+                  Active Context
+                  <span :style="(() => {
+                          const hrs = (Date.now() - new Date($store.genesisDashboard.cognitiveState.active_context.created_at).getTime()) / 3600000;
+                          return hrs > 24 ? 'color:#d9534f; font-weight:600; text-transform:none'
+                               : hrs > 4  ? 'color:#f0ad4e; font-weight:600; text-transform:none'
+                               : 'font-weight:400; opacity:0.6; text-transform:none';
+                        })()"
+                        x-text="(() => {
+                          const hrs = (Date.now() - new Date($store.genesisDashboard.cognitiveState.active_context.created_at).getTime()) / 3600000;
+                          const ts = new Date($store.genesisDashboard.cognitiveState.active_context.created_at).toLocaleString();
+                          return hrs > 24 ? 'generated ' + ts + ' (stale — ' + Math.round(hrs) + 'h ago)'
+                               : hrs > 4  ? 'generated ' + ts + ' (' + Math.round(hrs) + 'h ago)'
+                               : 'generated ' + ts;
+                        })()"></span>
+                </div>
+                <div style="font-size: 0.74rem; white-space: pre-wrap; max-height: 400px; overflow-y: auto; line-height: 1.5; color: var(--color-text-secondary);"
+                     x-text="$store.genesisDashboard.cognitiveState.active_context.content"></div>
+              </div>
+            </template>
+            <!-- Session Patches (since last reflection) -->
+            <template x-if="($store.genesisDashboard.cognitiveState?.session_patches || []).length > 0">
+              <div style="margin-top: 0.75rem; padding: 0.5rem 0.6rem; border: 1px solid var(--color-border); border-radius: 6px;">
+                <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.3rem;">
+                  Recent Sessions
+                  <span style="font-weight: 400; opacity: 0.6; text-transform: none;"
+                        x-text="'(' + $store.genesisDashboard.cognitiveState.session_patches.length + ' since last reflection)'"></span>
+                </div>
+                <template x-for="p in $store.genesisDashboard.cognitiveState.session_patches.slice().reverse()" :key="p.session_id">
+                  <div style="font-size: 0.74rem; padding: 0.2rem 0; border-bottom: 1px solid rgba(255,255,255,0.04); display: flex; justify-content: space-between; gap: 0.5rem;">
+                    <span style="color: var(--color-text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" x-text="p.topic || 'no topic'"></span>
+                    <span style="opacity: 0.6; white-space: nowrap; font-size: 0.68rem;"
+                          x-text="(p.message_count || 0) + ' msgs · ' + new Date(p.ended_at).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})"></span>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Essential Knowledge (Collapsible) [Tab: overview] -->
+    <div class="panel" x-data="{ ekOpen: false }" x-show="$store.genesisDashboard.activeTab === 'overview'">
+      <div class="panel-header" style="cursor: pointer;" @click="ekOpen = !ekOpen">
+        <span class="material-symbols-outlined" :style="ekOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">auto_stories</span>
+        Essential Knowledge
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.essentialKnowledge?.updated_at">
+            <span style="font-size: 0.68rem; opacity: 0.7;"
+                  x-text="(() => {
+                    const s = Math.round((Date.now() - new Date($store.genesisDashboard.essentialKnowledge.updated_at).getTime()) / 60000);
+                    if (s < 60) return s + 'm ago';
+                    if (s < 1440) return Math.round(s/60) + 'h ago';
+                    return Math.round(s/1440) + 'd ago';
+                  })()"></span>
+          </template>
+        </span>
+      </div>
+      <div class="panel-body" x-show="ekOpen" x-transition>
+        <template x-if="!$store.genesisDashboard.essentialKnowledge?.content">
+          <div class="empty-state" x-text="$store.genesisDashboard.essentialKnowledge?.error || 'Essential knowledge not loaded yet.'"></div>
+        </template>
+        <template x-if="$store.genesisDashboard.essentialKnowledge?.content">
+          <div style="font-size: 0.76rem; white-space: pre-wrap; color: var(--color-text-secondary); max-height: 400px; overflow-y: auto;"
+               x-text="$store.genesisDashboard.essentialKnowledge.content"></div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Modules & Providers [Tab: overview] -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'overview'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">extension</span>
+        Modules & Providers
+        <span class="panel-status">
+          <span class="status-dot"
+                :style="`background:${$store.genesisDashboard.panelStateColor('modules')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('modules')"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <template x-if="$store.genesisDashboard.panelStatusDetail('modules')">
+          <div class="panel-status-detail"
+               x-text="$store.genesisDashboard.panelStatusDetail('modules')"></div>
+        </template>
+
+        <!-- Capability Modules -->
+        <h4 style="margin: 0 0 0.5rem 0; color: #ccc; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em;">Capability Modules</h4>
+        <template x-if="$store.genesisDashboard.modules.length === 0">
+          <div class="empty-state">No modules loaded.</div>
+        </template>
+        <template x-for="mod in $store.genesisDashboard.modules" :key="mod.name">
+          <div style="background: #1a1a2e; border-radius: 8px; padding: 0.75rem; margin-bottom: 0.5rem; border-left: 3px solid; cursor: pointer;"
+               :style="`border-left-color: ${mod.type === 'external' ? (mod.ipc_healthy ? '#2196F3' : '#d9534f') : (mod.enabled ? '#4caf50' : '#666')}`"
+               @click="$store.genesisDashboard.selectedModule = mod">
+            <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.4rem;">
+              <span style="font-weight: 600; color: #e0e0e0;" x-text="mod.name.replace(/_/g, ' ')"></span>
+              <template x-if="mod.type === 'external'">
+                <span style="font-size: 0.65rem; padding: 1px 5px; border-radius: 3px; font-weight: 600; background: #1a237e; color: #90caf9; letter-spacing: 0.03em;">EXTERNAL</span>
+              </template>
+              <span style="font-size: 0.7rem; padding: 2px 6px; border-radius: 4px; font-weight: 500;"
+                    :style="`background: ${mod.enabled ? '#1b5e20' : '#424242'}; color: ${mod.enabled ? '#81c784' : '#999'}`"
+                    x-text="mod.enabled ? 'active' : 'disabled'"></span>
+              <template x-if="mod.type === 'external'">
+                <span class="status-dot" :style="`background: ${mod.ipc_healthy ? '#4caf50' : '#d9534f'}`" title="IPC connection status"></span>
+              </template>
+              <button @click.stop="$store.genesisDashboard.toggleModule(mod.name)"
+                      style="margin-left: auto; font-size: 0.68rem; padding: 2px 8px; border-radius: 4px; cursor: pointer; border: 1px solid; font-weight: 500;"
+                      :style="mod.enabled
+                        ? 'background: transparent; color: #ef9a9a; border-color: #ef9a9a;'
+                        : 'background: transparent; color: #81c784; border-color: #81c784;'"
+                      x-text="mod.enabled ? 'disable' : 'enable'"></button>
+            </div>
+            <div style="font-size: 0.8rem; color: #999; margin-bottom: 0.3rem; line-height: 1.4;" x-text="mod.description"></div>
+            <div style="font-size: 0.75rem; color: #666; display: flex; gap: 1rem; flex-wrap: wrap;">
+              <span x-show="mod.research_profile">Pipeline: <em style="color: #888;" x-text="mod.research_profile"></em></span>
+              <template x-if="mod.type === 'external' && mod.ipc_url">
+                <span style="color: #7986cb;"><em x-text="mod.ipc_method.toUpperCase()"></em> <span style="opacity: 0.7;" x-text="mod.ipc_url"></span></span>
+              </template>
+              <template x-if="mod.type === 'external' && mod.ipc_error">
+                <span style="color: #ef9a9a;" x-text="mod.ipc_error"></span>
+              </template>
+              <template x-if="mod.stats && mod.stats.total_records !== undefined">
+                <span>Bets: <em style="color: #888;" x-text="mod.stats.total_records"></em></span>
+              </template>
+              <template x-if="mod.stats && mod.stats.total_launches !== undefined">
+                <span>Launches: <em style="color: #888;" x-text="mod.stats.total_launches"></em></span>
+              </template>
+              <template x-if="mod.stats && mod.stats.brier_score !== null && mod.stats.brier_score !== undefined">
+                <span>Brier: <em style="color: #888;" x-text="mod.stats.brier_score.toFixed(3)"></em></span>
+              </template>
+            </div>
+          </div>
+        </template>
+
+        <!-- Tool Providers -->
+        <h4 style="margin: 1rem 0 0.5rem 0; color: #ccc; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em;">Tool Providers</h4>
+        <template x-if="$store.genesisDashboard.providersDetail.length === 0">
+          <div class="empty-state">No providers registered.</div>
+        </template>
+        <div style="display: grid; gap: 0.3rem;">
+          <template x-for="p in $store.genesisDashboard.providersDetail" :key="p.name">
+            <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.6rem; background: #1a1a2e; border-radius: 6px; font-size: 0.8rem;">
+              <span class="status-dot" :style="`background: ${p.status === 'available' ? '#4caf50' : p.status === 'degraded' ? '#f0ad4e' : '#d9534f'}`"></span>
+              <span style="font-weight: 500; color: #e0e0e0; min-width: 140px;" x-text="p.name"></span>
+              <span style="color: #888; min-width: 80px;" x-text="p.categories.join(', ')"></span>
+              <span style="font-size: 0.7rem; padding: 1px 5px; border-radius: 3px;"
+                    :style="`background: ${p.cost_tier === 'free' ? '#1b5e20' : p.cost_tier === 'cheap' ? '#1a237e' : p.cost_tier === 'moderate' ? '#4a3800' : '#4a0000'}; color: ${p.cost_tier === 'free' ? '#81c784' : p.cost_tier === 'cheap' ? '#90caf9' : p.cost_tier === 'moderate' ? '#ffd54f' : '#ef9a9a'}`"
+                    x-text="p.cost_tier"></span>
+              <span style="color: #666;" x-text="p.invocation_count > 0 ? p.invocation_count + ' calls' : ''"></span>
+              <button @click.stop="$store.genesisDashboard.toggleProvider(p.name)"
+                      style="margin-left: auto; font-size: 0.68rem; padding: 2px 8px; border-radius: 4px; cursor: pointer; border: 1px solid; font-weight: 500;"
+                      :style="p.status !== 'disabled'
+                        ? 'background: transparent; color: #ef9a9a; border-color: #ef9a9a;'
+                        : 'background: transparent; color: #81c784; border-color: #81c784;'"
+                      x-text="p.status !== 'disabled' ? 'disable' : 'enable'"></button>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>

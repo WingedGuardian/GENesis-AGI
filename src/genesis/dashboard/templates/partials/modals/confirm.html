@@ -1,0 +1,19 @@
+
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         Confirm Modal (replaces window.confirm)
+         ═══════════════════════════════════════════════════════════════ -->
+    <template x-if="$store.genesisDashboard.confirmModal.show">
+      <div style="position:fixed; inset:0; z-index:9999; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,0.6);"
+           @click.self="$store.genesisDashboard._confirmModalResolve(false)">
+        <div style="background:var(--color-bg-secondary); border:1px solid var(--color-border); border-radius:8px; padding:1.5rem; max-width:420px; width:90%; box-shadow:0 8px 32px rgba(0,0,0,0.4);">
+          <h3 style="margin:0 0 0.75rem 0; font-size:1rem;" x-text="$store.genesisDashboard.confirmModal.title"></h3>
+          <p style="color:var(--color-text-secondary); font-size:0.85rem; white-space:pre-line; margin:0 0 1.25rem 0; line-height:1.5;"
+             x-text="$store.genesisDashboard.confirmModal.message"></p>
+          <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
+            <button class="btn-sm" style="opacity:.7;" @click="$store.genesisDashboard._confirmModalResolve(false)">Cancel</button>
+            <button class="btn-sm" style="background:var(--color-accent); color:#fff;" @click="$store.genesisDashboard._confirmModalResolve(true)">Confirm</button>
+          </div>
+        </div>
+      </div>
+    </template>

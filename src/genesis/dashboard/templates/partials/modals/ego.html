@@ -1,0 +1,398 @@
+
+
+  <!-- Ego Detail Modal -->
+  <div class="config-modal-overlay" x-show="$store.genesisDashboard.egoModal.open"
+       @click.self="$store.genesisDashboard.egoModal.open = false" x-transition>
+    <div class="config-modal" style="max-width: 900px;">
+      <div class="config-modal-header">
+        <span>Ego — Autonomous Decision Cycle</span>
+        <span class="panel-status">
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.modalStateColor($store.genesisDashboard.egoModal)}`"></span>
+          <span x-text="$store.genesisDashboard.modalStateLabel($store.genesisDashboard.egoModal)"></span>
+        </span>
+        <button @click="$store.genesisDashboard.egoModal.open = false">&times;</button>
+      </div>
+      <div class="config-modal-body">
+        <!-- Status detail -->
+        <template x-if="$store.genesisDashboard.modalStatusDetail($store.genesisDashboard.egoModal)">
+          <div class="panel-status-detail" style="margin-bottom: 0.75rem;"
+               x-text="$store.genesisDashboard.modalStatusDetail($store.genesisDashboard.egoModal)"></div>
+        </template>
+        <!-- Loading -->
+        <div x-show="$store.genesisDashboard.egoModal.fetch.state === 'loading' && !$store.genesisDashboard.egoStatus"
+             style="text-align: center; padding: 2rem; color: var(--color-text-secondary);">Loading...</div>
+        <!-- Error -->
+        <div x-show="$store.genesisDashboard.egoModal.fetch.state === 'error' && !$store.genesisDashboard.egoStatus"
+             class="empty-state">Ego detail unavailable.</div>
+
+        <template x-if="$store.genesisDashboard.egoStatus">
+          <div>
+            <!-- Tab bar -->
+            <div style="display: flex; gap: 0; border-bottom: 1px solid var(--color-border); margin-bottom: 1rem;">
+              <template x-for="t in [{id:'overview',label:'Overview'},{id:'cycles',label:'Cycles'}]" :key="t.id">
+                <button style="padding: 0.4rem 1rem; font-size: 0.78rem; border: none; background: none; cursor: pointer; border-bottom: 2px solid transparent; color: var(--color-text-secondary);"
+                        :style="$store.genesisDashboard.egoModal.tab === t.id ? 'border-bottom-color: #c084fc; color: #c084fc; font-weight: 600;' : ''"
+                        @click="$store.genesisDashboard.egoModal.tab = t.id"
+                        x-text="t.label + (t.id === 'proposals' ? ' (' + ($store.genesisDashboard.egoStatus?.pending_proposals || 0) + ')' : '')"></button>
+              </template>
+            </div>
+
+            <!-- ═══ Tab: Overview ═══ -->
+            <div x-show="$store.genesisDashboard.egoModal.tab === 'overview'">
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                <!-- Focus -->
+                <div style="background: rgba(192,132,252,0.06); border: 1px solid rgba(192,132,252,0.15); border-radius: 6px; padding: 0.8rem;">
+                  <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.3rem;">Current Focus</div>
+                  <div style="font-size: 0.82rem;" x-text="$store.genesisDashboard.egoStatus?.focus_summary || 'No focus set'"></div>
+                </div>
+                <!-- Cadence -->
+                <div style="background: rgba(255,255,255,0.03); border: 1px solid var(--color-border); border-radius: 6px; padding: 0.8rem;">
+                  <div style="font-size: 0.72rem; color: var(--color-text-secondary); font-weight: 600; margin-bottom: 0.3rem;">Cadence</div>
+                  <template x-if="$store.genesisDashboard.egoModal.cadence?.available">
+                    <div style="font-size: 0.82rem;">
+                      <span x-text="$store.genesisDashboard.egoModal.cadence.is_paused ? 'Paused' : ($store.genesisDashboard.egoModal.cadence.is_running ? 'Running' : 'Stopped')"></span>
+                      <span style="color: var(--color-text-secondary);" x-text="' — every ' + $store.genesisDashboard.egoModal.cadence.current_interval_minutes + 'min'"></span>
+                      <template x-if="$store.genesisDashboard.egoModal.cadence.is_running && !$store.genesisDashboard.egoModal.cadence.is_paused">
+                        <span class="status-dot" style="width: 6px; height: 6px; margin-left: 0.3rem; animation: pulse 2s infinite;" :style="`background: #4caf50`"></span>
+                      </template>
+                      <template x-if="$store.genesisDashboard.egoModal.cadence.consecutive_failures > 0">
+                        <div style="font-size: 0.72rem; color: #f0ad4e; margin-top: 0.2rem;"
+                             x-text="$store.genesisDashboard.egoModal.cadence.consecutive_failures + ' consecutive failures'"></div>
+                      </template>
+                    </div>
+                  </template>
+                  <template x-if="!$store.genesisDashboard.egoModal.cadence?.available">
+                    <span style="font-size: 0.82rem; color: var(--color-text-secondary);">Cadence manager not available</span>
+                  </template>
+                </div>
+                <!-- Daily Cost (observational) -->
+                <div style="background: rgba(255,255,255,0.03); border: 1px solid var(--color-border); border-radius: 6px; padding: 0.8rem;">
+                  <div style="font-size: 0.72rem; color: var(--color-text-secondary); font-weight: 600; margin-bottom: 0.3rem;">Daily Cost</div>
+                  <div style="display: flex; align-items: center; gap: 0.5rem;">
+                    <span style="font-size: 1.1rem; font-weight: 600;"
+                          x-text="'$' + ($store.genesisDashboard.egoStatus?.daily_cost_usd || 0).toFixed(2)"></span>
+                    <span style="font-size: 0.78rem; color: var(--color-text-secondary);"
+                          x-text="'avg $' + ($store.genesisDashboard.egoStatus?.rolling_daily_avg_usd || 0).toFixed(2) + '/day'"></span>
+                  </div>
+                </div>
+                <!-- Quick stats -->
+                <div style="background: rgba(255,255,255,0.03); border: 1px solid var(--color-border); border-radius: 6px; padding: 0.8rem;">
+                  <div style="font-size: 0.72rem; color: var(--color-text-secondary); font-weight: 600; margin-bottom: 0.3rem;">Quick Stats</div>
+                  <div style="font-size: 0.82rem; display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem;">
+                    <span x-text="($store.genesisDashboard.egoModal.cycles?.length || 0) + ' recent cycles'"></span>
+                    <span x-text="($store.genesisDashboard.egoStatus?.pending_proposals || 0) + ' pending'"></span>
+                    <span x-text="$store.genesisDashboard.egoStatus?.model || 'unknown'"></span>
+                    <span x-text="($store.genesisDashboard.egoStatus?.uncompacted_cycles || 0) + ' uncompacted'"></span>
+                  </div>
+                </div>
+                <!-- VCR (Verified Completion Rate) -->
+                <template x-if="$store.genesisDashboard.egoModal.vcr">
+                  <div style="background: rgba(76,175,80,0.06); border: 1px solid rgba(76,175,80,0.15); border-radius: 6px; padding: 0.8rem; grid-column: 1 / -1;">
+                    <div style="font-size: 0.72rem; color: #4caf50; font-weight: 600; margin-bottom: 0.3rem;">Verified Completion Rate (30d)</div>
+                    <div style="display: flex; align-items: baseline; gap: 1.5rem; flex-wrap: wrap;">
+                      <div>
+                        <span style="font-size: 1.3rem; font-weight: 700;"
+                              x-text="(($store.genesisDashboard.egoModal.vcr.vcr || 0) * 100).toFixed(0) + '%'"></span>
+                        <span style="font-size: 0.72rem; color: var(--color-text-secondary);"> VCR</span>
+                      </div>
+                      <div>
+                        <span style="font-size: 1.1rem; font-weight: 600;"
+                              x-text="(($store.genesisDashboard.egoModal.vcr.dispatch_rate || 0) * 100).toFixed(0) + '%'"></span>
+                        <span style="font-size: 0.72rem; color: var(--color-text-secondary);"> dispatch rate</span>
+                      </div>
+                      <div style="font-size: 0.78rem; color: var(--color-text-secondary);">
+                        <span x-text="$store.genesisDashboard.egoModal.vcr.outcomes_completed || 0"></span> completed,
+                        <span x-text="$store.genesisDashboard.egoModal.vcr.outcomes_failed || 0"></span> failed,
+                        <span x-text="$store.genesisDashboard.egoModal.vcr.outcomes_unknown || 0"></span> unknown
+                        <span> / <span x-text="$store.genesisDashboard.egoModal.vcr.total_executed || 0"></span> executed</span>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+              </div>
+              <!-- Effort selector -->
+              <div style="margin-top: 1rem; padding: 0.6rem 0.8rem; background: rgba(192,132,252,0.04); border: 1px solid rgba(192,132,252,0.12); border-radius: 6px;">
+                <div style="display: flex; align-items: center; gap: 1rem;">
+                  <div>
+                    <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.2rem;">Default Effort</div>
+                    <div style="font-size: 0.72rem; color: var(--color-text-secondary);">Takes effect on restart</div>
+                  </div>
+                  <select style="margin-left: auto; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
+                          @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({default_effort: $event.target.value}) })">
+                    <!-- MAX and XHIGH intentionally excluded per user decision (ego defaults stay at high; the full range is reachable via session_set_effort) -->
+                    <template x-for="e in ['low', 'medium', 'high']" :key="e">
+                      <option :value="e" x-text="e.charAt(0).toUpperCase() + e.slice(1)"
+                              :selected="e === ($store.genesisDashboard.egoStatus?.default_effort || 'high')"></option>
+                    </template>
+                  </select>
+                </div>
+              </div>
+              <!-- Model -->
+              <div style="margin-top: 0.6rem; padding: 0.6rem 0.8rem; background: rgba(192,132,252,0.04); border: 1px solid rgba(192,132,252,0.12); border-radius: 6px;">
+                <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.2rem;">Model</div>
+                <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
+                        @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model: $event.target.value}) })">
+                  <template x-for="m in ['fable', 'opus', 'sonnet', 'haiku']" :key="m">
+                    <option :value="m" x-text="m.charAt(0).toUpperCase() + m.slice(1)"
+                            :selected="m === ($store.genesisDashboard.egoStatus?.model || 'opus')"></option>
+                  </template>
+                </select>
+              </div>
+              <!-- User Ego (CEO) Cadence -->
+              <div x-data="{ ue: $store.genesisDashboard.egoStatus?.egos?.user_ego }"
+                   style="margin-top: 0.6rem; padding: 0.6rem 0.8rem; background: rgba(192,132,252,0.04); border: 1px solid rgba(192,132,252,0.12); border-radius: 6px;">
+                <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.4rem;">User Ego (CEO) Cadence</div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+                  <div>
+                    <div style="font-size: 0.65rem; color: var(--color-text-secondary); margin-bottom: 0.15rem;">When active</div>
+                    <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.25rem 0.4rem; font-size: 0.78rem;"
+                            @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cadence_minutes: parseInt($event.target.value)}) })">
+                      <template x-for="c in [30, 60, 90, 120, 180, 240]" :key="c">
+                        <option :value="c" x-text="c >= 60 ? (c/60) + 'h' : c + 'min'"
+                                :selected="c === ($store.genesisDashboard.egoStatus?.cadence_minutes || 90)"></option>
+                      </template>
+                    </select>
+                  </div>
+                  <div>
+                    <div style="font-size: 0.65rem; color: var(--color-text-secondary); margin-bottom: 0.15rem;">When idle</div>
+                    <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.25rem 0.4rem; font-size: 0.78rem;"
+                            @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({max_interval_minutes: parseInt($event.target.value)}) })">
+                      <template x-for="c in [120, 240, 480, 720, 1440]" :key="c">
+                        <option :value="c" x-text="c >= 60 ? (c/60) + 'h' : c + 'min'"
+                                :selected="c === (ue?.max_interval_minutes || 240)"></option>
+                      </template>
+                    </select>
+                  </div>
+                </div>
+                <div style="font-size: 0.6rem; color: var(--color-text-secondary); margin-top: 0.25rem;">
+                  Currently every <span x-text="ue?.cadence?.current_interval_minutes || '?'"></span>min.
+                  How often when you're engaged. Slows toward idle limit when you're away.
+                </div>
+              </div>
+              <!-- Genesis Ego (COO) Cadence — collapsed by default -->
+              <div x-data="{ expanded: false, ge: $store.genesisDashboard.egoStatus?.egos?.genesis_ego }"
+                   style="margin-top: 0.4rem; padding: 0.4rem 0.8rem; background: rgba(96,165,250,0.04); border: 1px solid rgba(96,165,250,0.12); border-radius: 6px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;" @click="expanded = !expanded">
+                  <span style="font-size: 0.72rem; color: #60a5fa; font-weight: 600;">Genesis Ego (COO) Cadence</span>
+                  <span style="font-size: 0.65rem; color: var(--color-text-secondary);">
+                    <template x-if="!expanded">
+                      <span x-text="'Active: ' + (ge?.cadence_minutes || '?') + 'min / Idle: ' + ((ge?.max_interval_minutes || 240)/60) + 'h  ▸'"></span>
+                    </template>
+                    <template x-if="expanded"><span>▾</span></template>
+                  </span>
+                </div>
+                <template x-if="expanded">
+                  <div style="margin-top: 0.4rem;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+                      <div>
+                        <div style="font-size: 0.65rem; color: var(--color-text-secondary); margin-bottom: 0.15rem;">When active</div>
+                        <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.25rem 0.4rem; font-size: 0.78rem;"
+                                @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({genesis_cadence_minutes: parseInt($event.target.value)}) })">
+                          <template x-for="c in [30, 60, 90, 120, 180, 240]" :key="c">
+                            <option :value="c" x-text="c >= 60 ? (c/60) + 'h' : c + 'min'"
+                                    :selected="c === (ge?.cadence_minutes || 90)"></option>
+                          </template>
+                        </select>
+                      </div>
+                      <div>
+                        <div style="font-size: 0.65rem; color: var(--color-text-secondary); margin-bottom: 0.15rem;">When idle</div>
+                        <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.25rem 0.4rem; font-size: 0.78rem;"
+                                @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({genesis_max_interval_minutes: parseInt($event.target.value)}) })">
+                          <template x-for="c in [120, 240, 480, 720, 1440]" :key="c">
+                            <option :value="c" x-text="c >= 60 ? (c/60) + 'h' : c + 'min'"
+                                    :selected="c === (ge?.max_interval_minutes || 240)"></option>
+                          </template>
+                        </select>
+                      </div>
+                    </div>
+                    <div style="font-size: 0.6rem; color: var(--color-text-secondary); margin-top: 0.25rem;">
+                      Currently every <span x-text="ge?.cadence?.current_interval_minutes || '?'"></span>min.
+                    </div>
+                  </div>
+                </template>
+              </div>
+              <div style="font-size: 0.6rem; color: var(--color-text-secondary); margin-top: 0.3rem; padding: 0 0.8rem;">
+                Adaptive cadence: runs at the "active" rate when you're engaged, backs off toward the "idle" limit when you're away, then slows further the longer you've been gone (up to every 3 days after 2 weeks).
+              </div>
+              <!-- Last cycle -->
+              <template x-if="$store.genesisDashboard.egoStatus?.last_cycle">
+                <div style="margin-top: 1rem; padding: 0.6rem 0.8rem; background: rgba(255,255,255,0.03); border: 1px solid var(--color-border); border-radius: 6px;">
+                  <div style="font-size: 0.72rem; color: var(--color-text-secondary); font-weight: 600; margin-bottom: 0.2rem;">Last Cycle</div>
+                  <div style="font-size: 0.82rem;">
+                    <span x-text="$store.genesisDashboard.egoStatus.last_cycle.focus_summary || 'No summary'"></span>
+                    <span style="color: var(--color-text-secondary); font-size: 0.72rem; margin-left: 0.5rem;"
+                          x-text="$store.genesisDashboard.formatDateTime($store.genesisDashboard.egoStatus.last_cycle.created_at)"></span>
+                    <span style="color: var(--color-text-secondary); font-size: 0.72rem; margin-left: 0.5rem;"
+                          x-text="'$' + ($store.genesisDashboard.egoStatus.last_cycle.cost_usd || 0).toFixed(4)"></span>
+                  </div>
+                </div>
+              </template>
+              <!-- Quick navigation links -->
+              <div style="margin-top:1rem; display:flex; gap:0.5rem;">
+                <button style="font-size:0.72rem; padding:0.3rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(192,132,252,0.1); color:#c084fc; border:1px solid rgba(192,132,252,0.2);"
+                        @click="$store.genesisDashboard.egoModal.open = false; location.hash = 'chat'; $store.genesisDashboard.commsTab = 'proposals'">View Proposals</button>
+                <button style="font-size:0.72rem; padding:0.3rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(156,39,176,0.1); color:#ce93d8; border:1px solid rgba(156,39,176,0.2);"
+                        @click="$store.genesisDashboard.egoModal.open = false; location.hash = 'work';">View Follow-ups</button>
+              </div>
+            </div>
+
+            <!-- ═══ Tab: Proposals (deprecated — now in Chat tab) ═══ -->
+            <div x-show="$store.genesisDashboard.egoModal.tab === 'proposals'">
+              <!-- Filter pills -->
+              <div style="display: flex; gap: 0.4rem; margin-bottom: 0.8rem; flex-wrap: wrap;">
+                <template x-for="s in [null, 'pending', 'approved', 'rejected', 'expired']" :key="s || 'all'">
+                  <button style="font-size: 0.75rem; padding: 0.25rem 0.7rem; border-radius: 12px; border: 1px solid var(--color-border); cursor: pointer; transition: all 0.15s;"
+                          :style="$store.genesisDashboard.egoModal.proposalFilter === s ? 'background: rgba(192,132,252,0.2); border-color: #c084fc; color: #c084fc;' : 'background: transparent; color: var(--color-text-secondary);'"
+                          @click="$store.genesisDashboard.egoModal.proposalFilter = s"
+                          x-text="s || 'all'"></button>
+                </template>
+              </div>
+              <!-- Proposal list -->
+              <div style="max-height: 450px; overflow-y: auto;">
+                <template x-if="$store.genesisDashboard.egoModal.proposals.filter(p => !$store.genesisDashboard.egoModal.proposalFilter || p.status === $store.genesisDashboard.egoModal.proposalFilter).length === 0">
+                  <div class="empty-state" style="font-size: 0.78rem;">No proposals match this filter.</div>
+                </template>
+                <template x-for="p in $store.genesisDashboard.egoModal.proposals.filter(p => !$store.genesisDashboard.egoModal.proposalFilter || p.status === $store.genesisDashboard.egoModal.proposalFilter)" :key="p.id">
+                  <div style="padding: 0.6rem 0.8rem; border: 1px solid var(--color-border); border-radius: 6px; margin-bottom: 0.5rem;">
+                    <!-- Header: type badge + urgency + status + confidence -->
+                    <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.3rem; flex-wrap: wrap;">
+                      <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 3px; font-weight: 600;"
+                            :style="`background: rgba(192,132,252,0.15); color: #c084fc;`"
+                            x-text="p.action_type"></span>
+                      <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 3px;"
+                            :style="`background: ${p.urgency === 'critical' ? 'rgba(217,83,79,0.15)' : p.urgency === 'high' ? 'rgba(240,173,78,0.15)' : p.urgency === 'normal' ? 'rgba(33,150,243,0.15)' : 'rgba(136,136,136,0.15)'}; color: ${p.urgency === 'critical' ? '#d9534f' : p.urgency === 'high' ? '#f0ad4e' : p.urgency === 'normal' ? '#2196F3' : '#888'}`"
+                            x-text="p.urgency"></span>
+                      <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 3px;"
+                            :style="`background: ${p.status === 'approved' ? 'rgba(76,175,80,0.15)' : p.status === 'rejected' ? 'rgba(217,83,79,0.15)' : p.status === 'expired' ? 'rgba(136,136,136,0.15)' : 'rgba(240,173,78,0.15)'}; color: ${p.status === 'approved' ? '#4caf50' : p.status === 'rejected' ? '#d9534f' : p.status === 'expired' ? '#888' : '#f0ad4e'}`"
+                            x-text="p.status"></span>
+                      <!-- Confidence bar -->
+                      <div style="display: flex; align-items: center; gap: 0.3rem; margin-left: auto;">
+                        <div style="width: 40px; height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden;">
+                          <div :style="`width: ${(p.confidence || 0) * 100}%; height: 100%; background: #c084fc; border-radius: 2px;`"></div>
+                        </div>
+                        <span style="font-size: 0.65rem; color: var(--color-text-secondary);" x-text="Math.round((p.confidence || 0) * 100) + '%'"></span>
+                      </div>
+                    </div>
+                    <!-- Content -->
+                    <div style="font-size: 0.82rem; margin-bottom: 0.3rem;" x-text="p.content"></div>
+                    <!-- Rationale (if present) -->
+                    <template x-if="p.rationale">
+                      <div style="font-size: 0.72rem; color: var(--color-text-secondary); margin-bottom: 0.3rem;">
+                        <span style="font-weight: 600;">Rationale:</span> <span x-text="p.rationale"></span>
+                      </div>
+                    </template>
+                    <!-- Timestamps -->
+                    <div style="font-size: 0.68rem; color: var(--color-text-secondary); display: flex; gap: 1rem;">
+                      <span x-text="'Created: ' + $store.genesisDashboard.formatDateTime(p.created_at)"></span>
+                      <template x-if="p.expires_at">
+                        <span x-text="'Expires: ' + $store.genesisDashboard.formatDateTime(p.expires_at)"></span>
+                      </template>
+                      <template x-if="p.resolved_at">
+                        <span x-text="'Resolved: ' + $store.genesisDashboard.formatDateTime(p.resolved_at)"></span>
+                      </template>
+                    </div>
+                    <!-- User response (if resolved) -->
+                    <template x-if="p.user_response">
+                      <div style="font-size: 0.72rem; color: var(--color-text-secondary); margin-top: 0.2rem;">
+                        <span style="font-weight: 600;">Response:</span> <span x-text="p.user_response"></span>
+                      </div>
+                    </template>
+                    <!-- Approve/Reject buttons (pending only) -->
+                    <template x-if="p.status === 'pending'">
+                      <div style="margin-top: 0.5rem; display: flex; gap: 0.4rem; align-items: center;">
+                        <button style="font-size: 0.72rem; padding: 0.25rem 0.8rem; border-radius: 4px; border: 1px solid #4caf50; background: rgba(76,175,80,0.1); color: #4caf50; cursor: pointer;"
+                                @click="$store.genesisDashboard.resolveEgoProposal(p.id, 'approved', '')">Approve</button>
+                        <template x-if="$store.genesisDashboard.egoModal.rejectingId !== p.id">
+                          <button style="font-size: 0.72rem; padding: 0.25rem 0.8rem; border-radius: 4px; border: 1px solid #d9534f; background: rgba(217,83,79,0.1); color: #d9534f; cursor: pointer;"
+                                  @click="$store.genesisDashboard.egoModal.rejectingId = p.id; $store.genesisDashboard.egoModal.rejectReason = ''">Reject</button>
+                        </template>
+                        <template x-if="$store.genesisDashboard.egoModal.rejectingId === p.id">
+                          <div style="display: flex; gap: 0.3rem; align-items: center; flex: 1;">
+                            <input type="text" placeholder="Reason (optional)"
+                                   style="font-size: 0.72rem; padding: 0.2rem 0.5rem; border: 1px solid var(--color-border); border-radius: 4px; background: var(--color-bg); color: var(--color-text); flex: 1;"
+                                   x-model="$store.genesisDashboard.egoModal.rejectReason"
+                                   @keyup.enter="$store.genesisDashboard.resolveEgoProposal(p.id, 'rejected', $store.genesisDashboard.egoModal.rejectReason)">
+                            <button style="font-size: 0.72rem; padding: 0.2rem 0.6rem; border-radius: 4px; border: 1px solid #d9534f; background: #d9534f; color: white; cursor: pointer;"
+                                    @click="$store.genesisDashboard.resolveEgoProposal(p.id, 'rejected', $store.genesisDashboard.egoModal.rejectReason)">Reject</button>
+                            <button style="font-size: 0.72rem; padding: 0.2rem 0.5rem; border: none; background: none; color: var(--color-text-secondary); cursor: pointer;"
+                                    @click="$store.genesisDashboard.egoModal.rejectingId = null">&times;</button>
+                          </div>
+                        </template>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- ═══ Tab: Cycles ═══ -->
+            <div x-show="$store.genesisDashboard.egoModal.tab === 'cycles'">
+              <template x-if="$store.genesisDashboard.egoModal.cycles.length === 0">
+                <div class="empty-state" style="font-size: 0.78rem;">No ego cycles recorded yet.</div>
+              </template>
+              <div style="max-height: 450px; overflow-y: auto;">
+                <template x-for="c in $store.genesisDashboard.egoModal.cycles" :key="c.id">
+                  <div style="padding: 0.5rem 0.8rem; border-bottom: 1px solid var(--color-border);">
+                    <div style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;"
+                         @click="$store.genesisDashboard.egoModal.expandedCycle = $store.genesisDashboard.egoModal.expandedCycle === c.id ? null : c.id">
+                      <span style="font-size: 0.72rem; color: var(--color-text-secondary); min-width: 120px;"
+                            x-text="$store.genesisDashboard.formatDateTime(c.created_at)"></span>
+                      <span style="font-size: 0.62rem; padding: 1px 5px; border-radius: 3px; font-weight: 600; min-width: 28px; text-align: center;"
+                            :style="(c.ego_source || '').includes('genesis') ? 'background: rgba(59,130,246,0.15); color: #60a5fa;' : (c.ego_source ? 'background: rgba(168,85,247,0.15); color: #c084fc;' : 'background: rgba(136,136,136,0.1); color: #888;')"
+                            x-text="(c.ego_source || '').includes('genesis') ? 'COO' : (c.ego_source ? 'CEO' : '?')"></span>
+                      <span style="font-size: 0.82rem; flex: 1;" x-text="c.focus_summary || 'No summary'"></span>
+                      <span style="font-size: 0.72rem; color: var(--color-text-secondary);"
+                            x-text="'$' + (c.cost_usd || 0).toFixed(4)"></span>
+                      <span style="font-size: 0.68rem; color: var(--color-text-secondary);"
+                            x-text="c.model_used || ''"></span>
+                      <template x-if="c.compacted_into">
+                        <span style="font-size: 0.62rem; padding: 1px 4px; border-radius: 2px; background: rgba(136,136,136,0.15); color: #888;">compacted</span>
+                      </template>
+                      <span style="font-size: 0.72rem; color: var(--color-text-secondary);" x-text="$store.genesisDashboard.egoModal.expandedCycle === c.id ? '▾' : '▸'"></span>
+                    </div>
+                    <!-- Expanded detail -->
+                    <template x-if="$store.genesisDashboard.egoModal.expandedCycle === c.id">
+                      <div style="margin-top: 0.5rem; padding: 0.5rem; background: rgba(255,255,255,0.03); border-radius: 4px; font-size: 0.75rem;">
+                        <div style="display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.4rem; color: var(--color-text-secondary);">
+                          <span x-text="'Tokens: ' + (c.input_tokens || 0) + ' in / ' + (c.output_tokens || 0) + ' out'"></span>
+                          <span x-text="'Duration: ' + ((c.duration_ms || 0) / 1000).toFixed(1) + 's'"></span>
+                          <span x-text="'ID: ' + c.id.slice(0, 8)"></span>
+                        </div>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- ═══ Tab: Follow-ups ═══ -->
+            <div x-show="$store.genesisDashboard.egoModal.tab === 'followups'">
+              <template x-if="$store.genesisDashboard.egoModal.followUps.length === 0">
+                <div class="empty-state" style="font-size: 0.78rem;">No ego-originated follow-ups pending.</div>
+              </template>
+              <div style="max-height: 450px; overflow-y: auto;">
+                <template x-for="f in $store.genesisDashboard.egoModal.followUps" :key="f.id">
+                  <div style="padding: 0.5rem 0.8rem; border-bottom: 1px solid var(--color-border); font-size: 0.82rem;">
+                    <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.2rem;">
+                      <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 3px;"
+                            :style="`background: ${f.priority === 'critical' ? 'rgba(217,83,79,0.15)' : f.priority === 'high' ? 'rgba(240,173,78,0.15)' : 'rgba(136,136,136,0.15)'}; color: ${f.priority === 'critical' ? '#d9534f' : f.priority === 'high' ? '#f0ad4e' : '#888'}`"
+                            x-text="f.priority"></span>
+                      <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 3px; background: rgba(33,150,243,0.15); color: #2196F3;"
+                            x-text="f.strategy"></span>
+                      <span style="font-size: 0.68rem; color: var(--color-text-secondary); margin-left: auto;"
+                            x-text="$store.genesisDashboard.formatDateTime(f.created_at)"></span>
+                    </div>
+                    <div x-text="f.content"></div>
+                    <template x-if="f.reason">
+                      <div style="font-size: 0.72rem; color: var(--color-text-secondary); margin-top: 0.2rem;" x-text="f.reason"></div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>

@@ -1,0 +1,135 @@
+
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Reference Store [Tab: references]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'campaigns'" style="overflow-y: auto; max-height: calc(100vh - 180px);">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">campaign</span>
+        Campaigns
+      </div>
+      <div style="padding: 1rem;">
+        <div style="margin-bottom: 1rem; color: var(--color-text-secondary); font-size: .85em;">
+          Autonomous campaigns run on a schedule, dispatching background sessions.
+          Pause/resume, run one now, or edit cadence, model, effort, daily cap and jitter.
+        </div>
+
+        <template x-if="$store.genesisDashboard.campaignsList.length === 0">
+          <div style="color: var(--color-text-secondary); padding: 1rem 0;">No campaigns.</div>
+        </template>
+
+        <template x-for="c in $store.genesisDashboard.campaignsList" :key="c.id">
+          <div style="background: var(--color-background); border: 1px solid var(--color-border); border-radius: 8px; padding: 1rem; margin-bottom: 1rem;">
+            <!-- Header row -->
+            <div style="display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;">
+              <span style="font-weight: 700; font-size: 1.05em;" x-text="c.name"></span>
+              <span x-text="c.status"
+                    :style="`font-size:.7rem; text-transform:uppercase; padding:.15rem .5rem; border-radius:10px; ${c.status==='active' ? 'background:var(--color-success-bg,#1b3b2a); color:var(--color-success-text,#6ee7b7);' : 'background:var(--color-warning-bg,#3b321b); color:var(--color-warning-text,#fbbf24);'}`"></span>
+              <span x-show="c.pending_session" title="A session is in flight; results captured on completion"
+                    style="font-size:.7rem; padding:.15rem .5rem; border-radius:10px; background:var(--color-warning-bg,#3b321b); color:var(--color-warning-text,#fbbf24);">session in flight</span>
+              <span style="flex:1;"></span>
+              <span style="font-size:.8rem; color:var(--color-text-secondary);"
+                    x-text="`${c.model} / ${c.effort}` + (c.profile ? ' · ' + c.profile : '')"></span>
+            </div>
+
+            <!-- Metrics grid -->
+            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap:.5rem; margin-top:.75rem;">
+              <div><div style="font-size:.7rem; color:var(--color-text-secondary);">Cadence</div>
+                <div style="font-family:monospace; font-size:.85rem;" x-text="c.cadence + (c.jitter_seconds ? ` ±${c.jitter_seconds}s` : '')"></div></div>
+              <div><div style="font-size:.7rem; color:var(--color-text-secondary);">Next fire</div>
+                <div style="font-size:.85rem;" x-text="c.next_fire ? new Date(c.next_fire).toLocaleString() : (c.status==='paused' ? 'paused' : '—')"></div></div>
+              <div><div style="font-size:.7rem; color:var(--color-text-secondary);">Today / cap</div>
+                <div style="font-size:.85rem;" x-text="`$${(c.today_cost_usd||0).toFixed(2)} / $${(c.max_daily_cost_usd||0).toFixed(2)}`"></div></div>
+              <div><div style="font-size:.7rem; color:var(--color-text-secondary);">Completed runs</div>
+                <div style="font-size:.85rem;" x-text="`${c.total_runs} ($${(c.total_cost_usd||0).toFixed(2)})`"></div></div>
+              <div><div style="font-size:.7rem; color:var(--color-text-secondary);">Attempts</div>
+                <div style="font-size:.85rem;" x-text="`${c.attempts}` + (c.run_counts && (c.run_counts.pending||c.run_counts.error||c.run_counts.skip) ? ` (${[c.run_counts.pending?c.run_counts.pending+' pending':'', c.run_counts.skip?c.run_counts.skip+' skip':'', c.run_counts.error?c.run_counts.error+' err':''].filter(Boolean).join(', ')})` : '')"></div></div>
+            </div>
+
+            <!-- Controls -->
+            <div style="display:flex; gap:.5rem; margin-top:.85rem; flex-wrap:wrap;">
+              <button class="btn-sm" x-show="c.status==='active'"
+                      :disabled="!!$store.genesisDashboard.campaignsMutating[c.name]"
+                      @click="$store.genesisDashboard.pauseCampaign(c.name)">Pause</button>
+              <button class="btn-sm" x-show="c.status!=='active'"
+                      :disabled="!!$store.genesisDashboard.campaignsMutating[c.name]"
+                      @click="$store.genesisDashboard.resumeCampaign(c.name)">Resume</button>
+              <button class="btn-sm" :disabled="!!$store.genesisDashboard.campaignsMutating[c.name]"
+                      @click="$store.genesisDashboard.triggerCampaign(c.name)">Trigger now</button>
+              <button class="btn-sm" @click="$store.genesisDashboard.startCampaignEdit(c)">Edit</button>
+              <button class="btn-sm" style="opacity:.8;" @click="$store.genesisDashboard.openCampaignDetail(c.name)">Details</button>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- Detail modal -->
+      <template x-if="$store.genesisDashboard.campaignDetail">
+        <div @click.self="$store.genesisDashboard.closeCampaignDetail()"
+             style="position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; z-index:1000;">
+          <div style="background:var(--color-surface,#1a1a1a); border:1px solid var(--color-border); border-radius:8px; padding:1.25rem; max-width:720px; width:90%; max-height:85vh; overflow-y:auto;">
+            <div style="display:flex; align-items:center; gap:.5rem;">
+              <span style="font-weight:700; font-size:1.1em;" x-text="$store.genesisDashboard.campaignDetail.name"></span>
+              <span style="flex:1;"></span>
+              <button class="btn-sm" @click="$store.genesisDashboard.closeCampaignDetail()">Close</button>
+            </div>
+            <div style="font-size:.8rem; color:var(--color-text-secondary); margin-top:.25rem;"
+                 x-text="$store.genesisDashboard.campaignDetail.strategy_doc_path"></div>
+            <div style="margin-top:.75rem;">
+              <div style="font-size:.75rem; color:var(--color-text-secondary); margin-bottom:.25rem;">State</div>
+              <pre style="background:var(--color-background); border-radius:6px; padding:.6rem; font-size:.75rem; overflow-x:auto; white-space:pre-wrap;"
+                   x-text="JSON.stringify($store.genesisDashboard.campaignDetail.state, null, 2)"></pre>
+            </div>
+            <div style="margin-top:.75rem;">
+              <div style="font-size:.75rem; color:var(--color-text-secondary); margin-bottom:.25rem;">Recent runs</div>
+              <template x-for="(r, i) in $store.genesisDashboard.campaignDetail.recent_runs" :key="i">
+                <div style="border-bottom:1px solid var(--color-border); padding:.4rem 0; font-size:.8rem;">
+                  <div style="display:flex; gap:.5rem; align-items:center;">
+                    <span x-text="r.outcome" style="font-weight:600;"></span>
+                    <span style="color:var(--color-text-secondary);" x-text="r.trigger_type"></span>
+                    <span style="flex:1;"></span>
+                    <span style="color:var(--color-text-secondary);" x-text="`$${(r.cost_usd||0).toFixed(2)}`"></span>
+                    <span style="color:var(--color-text-secondary);" x-text="r.started_at ? new Date(r.started_at).toLocaleString() : ''"></span>
+                  </div>
+                  <div x-show="r.summary" style="color:var(--color-text-secondary); margin-top:.2rem;" x-text="r.summary"></div>
+                  <div x-show="r.skip_reason" style="color:var(--color-warning-text,#fbbf24); margin-top:.2rem;" x-text="'skip: ' + r.skip_reason"></div>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <!-- Edit modal -->
+      <template x-if="$store.genesisDashboard.campaignEdit">
+        <div @click.self="$store.genesisDashboard.cancelCampaignEdit()"
+             style="position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; z-index:1000;">
+          <div style="background:var(--color-surface,#1a1a1a); border:1px solid var(--color-border); border-radius:8px; padding:1.25rem; max-width:460px; width:90%;">
+            <div style="font-weight:700; margin-bottom:.75rem;" x-text="'Edit: ' + $store.genesisDashboard.campaignEdit.name"></div>
+            <label style="display:block; font-size:.75rem; color:var(--color-text-secondary);">Cadence (cron)</label>
+            <input type="text" x-model="$store.genesisDashboard.campaignEdit.cron_cadence"
+                   style="width:100%; padding:.4rem; margin-bottom:.6rem; background:var(--color-background); border:1px solid var(--color-border); color:var(--color-text); border-radius:4px; font-family:monospace;">
+            <label style="display:block; font-size:.75rem; color:var(--color-text-secondary);">Model</label>
+            <select x-model="$store.genesisDashboard.campaignEdit.model"
+                    style="width:100%; padding:.4rem; margin-bottom:.6rem; background:var(--color-background); border:1px solid var(--color-border); color:var(--color-text); border-radius:4px;">
+              <option value="haiku">haiku</option><option value="sonnet">sonnet</option><option value="opus">opus</option><option value="fable">fable</option>
+            </select>
+            <label style="display:block; font-size:.75rem; color:var(--color-text-secondary);">Effort</label>
+            <select x-model="$store.genesisDashboard.campaignEdit.effort"
+                    style="width:100%; padding:.4rem; margin-bottom:.6rem; background:var(--color-background); border:1px solid var(--color-border); color:var(--color-text); border-radius:4px;">
+              <option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option>
+            </select>
+            <label style="display:block; font-size:.75rem; color:var(--color-text-secondary);">Max daily cost (USD)</label>
+            <input type="number" step="0.5" min="0" x-model.number="$store.genesisDashboard.campaignEdit.max_daily_cost_usd"
+                   style="width:100%; padding:.4rem; margin-bottom:.6rem; background:var(--color-background); border:1px solid var(--color-border); color:var(--color-text); border-radius:4px;">
+            <label style="display:block; font-size:.75rem; color:var(--color-text-secondary);">Jitter (seconds, 0 = off)</label>
+            <input type="number" step="30" min="0" x-model.number="$store.genesisDashboard.campaignEdit.jitter_seconds"
+                   style="width:100%; padding:.4rem; margin-bottom:1rem; background:var(--color-background); border:1px solid var(--color-border); color:var(--color-text); border-radius:4px;">
+            <div style="display:flex; gap:.5rem; justify-content:flex-end;">
+              <button class="btn-sm" style="opacity:.8;" @click="$store.genesisDashboard.cancelCampaignEdit()">Cancel</button>
+              <button class="btn-sm" @click="$store.genesisDashboard.saveCampaignEdit()">Save</button>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>

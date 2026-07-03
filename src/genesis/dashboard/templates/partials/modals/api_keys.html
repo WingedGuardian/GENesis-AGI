@@ -1,0 +1,66 @@
+
+
+  <!-- API Keys Modal -->
+  <div class="config-modal-overlay" x-show="$store.genesisDashboard.apiKeysModal.open"
+       @click.self="$store.genesisDashboard.apiKeysModal.open = false" x-transition>
+    <div class="config-modal" style="max-width: 700px;">
+      <div class="config-modal-header">
+        <span>API Key Status</span>
+        <button @click="$store.genesisDashboard.apiKeysModal.open = false">&times;</button>
+      </div>
+      <div class="config-modal-body">
+        <template x-if="$store.genesisDashboard.health.api_keys">
+          <div>
+            <div style="font-size: 0.72rem; color: var(--color-text-secondary); margin-bottom: 0.75rem;">
+              Keys are read from environment variables. Configure in <a href="#" @click.prevent="$store.genesisDashboard.activeTab = 'config'; $store.genesisDashboard.fetchSecrets()" style="color:var(--color-primary);">Settings &rarr; Provider Keys</a>.
+            </div>
+            <template x-for="(info, name) in ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {})" :key="name">
+              <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0; border-bottom: 1px solid var(--color-border); font-size: 0.78rem; flex-wrap: wrap;">
+                <span class="status-dot" :style="`background: ${$store.genesisDashboard.keyHealthColor(info.key_health)}`"></span>
+                <span style="font-weight: 600; min-width: 100px;" x-text="name"></span>
+                <template x-if="info.status === 'validated'">
+                  <span style="min-width: 80px; color: #4caf50;" title="API key accepted by provider. Does not verify inference works.">key ok</span>
+                </template>
+                <template x-if="info.status === 'missing'">
+                  <span :style="`min-width: 80px; color: ${$store.genesisDashboard.providerFallbackActive(name) ? '#f0ad4e' : '#d9534f'}`"
+                        x-text="$store.genesisDashboard.providerFallbackActive(name) ? 'missing (fallback active)' : 'missing (needed!)'"></span>
+                </template>
+                <template x-if="info.status !== 'validated' && info.status !== 'missing'">
+                  <span :style="`min-width: 80px; color: ${info.status === 'local' ? '#2196F3' : '#f0ad4e'}`"
+                        x-text="info.status"></span>
+                </template>
+                <span style="color: var(--color-text-secondary); font-size: 0.72rem;"
+                      x-text="info.provider_type || ''"></span>
+                <template x-if="info.status === 'missing'">
+                  <code style="font-size: 0.68rem; color: #f0ad4e; margin-left: auto;"
+                        x-text="'export API_KEY_' + name.toUpperCase() + '=...'"></code>
+                </template>
+                <template x-if="info.error">
+                  <span style="font-size: 0.68rem; color: #d9534f; margin-left: auto;" x-text="info.error.substring(0, 60)"></span>
+                </template>
+                <template x-if="$store.genesisDashboard.providerCbState(name)">
+                  <span style="font-size: 0.68rem; margin-left: 0.3rem;"
+                        :style="`color: ${$store.genesisDashboard.providerCbState(name) === 'closed' ? '#4caf50' : $store.genesisDashboard.providerCbState(name) === 'open' ? '#d9534f' : '#f0ad4e'}`"
+                        x-text="'CB: ' + $store.genesisDashboard.providerCbState(name)"></span>
+                </template>
+              </div>
+            </template>
+            <!-- Provider → Call Site Usage -->
+            <template x-if="$store.genesisDashboard.health.api_keys">
+              <div style="margin-top: 1rem;">
+                <div style="font-size: 0.78rem; font-weight: 600; margin-bottom: 0.3rem;">Provider → Call Site Usage</div>
+                <div style="font-size: 0.72rem; color: var(--color-text-secondary);">
+                  <template x-for="(info, name) in ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {})" :key="'usage-' + name">
+                    <div style="margin-bottom: 0.15rem;">
+                      <span style="font-weight: 600;" x-text="name"></span>:
+                      <span x-text="(() => { const sites = $store.genesisDashboard.providerCallSites(name); return sites.length ? sites.join(', ') : '(no call sites)'; })()"></span>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>

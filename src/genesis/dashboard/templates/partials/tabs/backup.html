@@ -1,0 +1,342 @@
+
+
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Backup & Updates [Tab: backup]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'backup'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">system_update</span>
+        Backup & Updates
+      </div>
+      <div class="panel-body">
+
+        <!-- ── Update Section ─────────────────────────────────── -->
+        <div id="update-section" style="margin-bottom:1.5rem;">
+
+          <!-- Updating overlay -->
+          <template x-if="$store.genesisDashboard._updating">
+            <div class="card" style="padding:1.5rem; text-align:center;">
+              <div style="font-size:1.5rem; margin-bottom:0.5rem;">&#8987;</div>
+              <div style="font-size:1rem; font-weight:500;"
+                   x-text="$store.genesisDashboard._updatePhaseLabel($store.genesisDashboard.updateProgress?.phase)"></div>
+              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.5rem;">A background session is managing the update. This may take a few minutes.</div>
+              <div style="font-size:0.75rem; color:var(--color-text-secondary); margin-top:0.25rem;">Progress continues in the background. You can safely close or refresh this page.</div>
+              <template x-if="$store.genesisDashboard.updateProgress?.summary">
+                <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.5rem; font-family:monospace;"
+                     x-text="$store.genesisDashboard.updateProgress.summary"></div>
+              </template>
+            </div>
+          </template>
+
+          <!-- Resolving conflicts overlay -->
+          <template x-if="$store.genesisDashboard._resolvingConflicts">
+            <div class="card" style="padding:1.5rem; text-align:center;">
+              <div style="font-size:1.5rem; margin-bottom:0.5rem;">&#128295;</div>
+              <div style="font-size:1rem; font-weight:500;">Opus is resolving merge conflicts...</div>
+              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.5rem;">This may take several minutes. The page will update when complete.</div>
+            </div>
+          </template>
+
+          <!-- Normal update UI -->
+          <template x-if="!$store.genesisDashboard._updating && !$store.genesisDashboard._resolvingConflicts">
+            <div>
+              <!-- Version + check/apply -->
+              <div class="card" style="padding:1rem; margin-bottom:1rem;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                  <h3 style="margin:0; font-size:1rem;">Genesis Version</h3>
+                  <div style="display:flex; gap:0.5rem;">
+                    <template x-if="$store.genesisDashboard.updateStatus?.update_available">
+                      <button @click="$store.genesisDashboard.applyUpdate()"
+                              style="background:#2196F3; color:#fff; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                        Install Update</button>
+                    </template>
+                    <button @click="$store.genesisDashboard.checkForUpdates()"
+                            :disabled="$store.genesisDashboard._checkingForUpdates"
+                            style="background:var(--color-surface-elevated); color:var(--color-text); border:1px solid var(--color-border); padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                      <span x-text="$store.genesisDashboard._checkingForUpdates ? 'Checking...' : $store.genesisDashboard._checkUpToDate ? 'Up to date \u2714' : 'Check for Updates'"></span>
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Current version -->
+                <div style="display:flex; gap:1.5rem; flex-wrap:wrap; margin-bottom:0.5rem;">
+                  <div>
+                    <span style="font-size:0.7rem; color:var(--color-text-secondary);">Current</span><br>
+                    <span style="font-size:0.9rem;" x-text="($store.genesisDashboard.updateStatus?.current_version || '...') + ' (' + ($store.genesisDashboard.updateStatus?.current_commit || '...') + ')'"></span>
+                  </div>
+                </div>
+
+                <!-- Update available banner -->
+                <template x-if="$store.genesisDashboard.updateStatus?.update_available">
+                  <div style="margin-top:0.75rem; padding:0.75rem; border-radius:4px; background:rgba(33,150,243,0.1); border:1px solid rgba(33,150,243,0.3);">
+                    <div style="font-size:0.85rem; font-weight:500; color:#2196F3;">
+                      Update available
+                      <span x-text="$store.genesisDashboard.updateStatus.update_available.target_tag ? '  ' + $store.genesisDashboard.updateStatus.update_available.target_tag : ''"></span>
+                    </div>
+                    <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.25rem;"
+                         x-text="($store.genesisDashboard.updateStatus.update_available.commits_behind || '?') + ' commit(s) behind'"></div>
+                    <template x-if="$store.genesisDashboard.updateStatus.update_available.summary">
+                      <pre style="font-size:0.75rem; color:var(--color-text-secondary); margin-top:0.5rem; max-height:6rem; overflow-y:auto; white-space:pre-wrap; background:transparent; border:none; padding:0;"
+                           x-text="$store.genesisDashboard.updateStatus.update_available.summary"></pre>
+                    </template>
+                  </div>
+                </template>
+
+                <!-- Up to date -->
+                <template x-if="$store.genesisDashboard.updateStatus && !$store.genesisDashboard.updateStatus.update_available">
+                  <div style="margin-top:0.5rem; font-size:0.8rem; color:#81c784;">Up to date</div>
+                </template>
+              </div>
+
+              <!-- Conflicts / failed update needing resolution -->
+              <template x-if="$store.genesisDashboard.updateProgress?.conflicts || $store.genesisDashboard.updateProgress?.failed || $store.genesisDashboard.updateProgress?.stale">
+                <div class="card" style="padding:1rem; margin-bottom:1rem; border:1px solid rgba(255,152,0,0.4);">
+                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                    <h3 style="margin:0; font-size:1rem; color:#ffb74d;"
+                        x-text="$store.genesisDashboard.updateProgress?.conflicts ? 'Merge Conflicts' : 'Update Failed'"></h3>
+                    <div style="display:flex; gap:0.5rem;">
+                      <template x-if="$store.genesisDashboard.updateProgress?.conflicts">
+                        <button @click="$store.genesisDashboard.resolveConflicts()"
+                                style="background:#ff9800; color:#fff; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                          Resolve with Opus</button>
+                      </template>
+                      <button @click="$store.genesisDashboard.applyUpdate()"
+                              style="background:var(--color-surface-elevated); color:var(--color-text); border:1px solid var(--color-border); padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                        Retry</button>
+                      <button @click="$store.genesisDashboard.dismissUpdate()"
+                              style="background:transparent; color:var(--color-text-secondary); border:1px solid var(--color-border); padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                        Dismiss</button>
+                    </div>
+                  </div>
+                  <div style="font-size:0.8rem; color:var(--color-text-secondary);"
+                       x-text="$store.genesisDashboard.updateProgress?.conflicts
+                         ? 'The update has merge conflicts that could not be resolved automatically. Opus can analyze both sides and find the best resolution.'
+                         : 'The last update attempt did not complete successfully. You can retry or dismiss this notice.'"></div>
+                  <template x-if="$store.genesisDashboard.updateProgress?.summary">
+                    <div style="margin-top:0.5rem; padding:0.5rem; border-radius:4px; background:rgba(255,152,0,0.05); font-size:0.8rem; font-family:monospace; color:var(--color-text-secondary);"
+                         x-text="$store.genesisDashboard.updateProgress.summary"></div>
+                  </template>
+                  <template x-if="$store.genesisDashboard.updateProgress?.conflicts?.conflicted_files">
+                    <div style="margin-top:0.5rem;">
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Conflicted files:</span>
+                      <pre style="font-size:0.75rem; color:#ffb74d; margin-top:0.25rem; white-space:pre-wrap; background:transparent; border:none; padding:0;"
+                           x-text="$store.genesisDashboard.updateProgress.conflicts.conflicted_files.join('\n')"></pre>
+                    </div>
+                  </template>
+                </div>
+              </template>
+
+              <!-- Last update result -->
+              <template x-if="$store.genesisDashboard.updateStatus?.last_update">
+                <div class="card" style="padding:1rem; margin-bottom:1rem;">
+                  <h3 style="margin:0 0 0.75rem 0; font-size:1rem;">Last Update</h3>
+                  <div style="display:flex; gap:1.5rem; flex-wrap:wrap;">
+                    <div>
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Status</span><br>
+                      <span style="font-size:0.9rem;"
+                            :style="$store.genesisDashboard.updateStatus.last_update.status === 'success' ? 'color:#81c784' : 'color:#ef9a9a'"
+                            x-text="$store.genesisDashboard.updateStatus.last_update.status"></span>
+                    </div>
+                    <div>
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Version</span><br>
+                      <span style="font-size:0.9rem;" x-text="($store.genesisDashboard.updateStatus.last_update.old_tag || '?') + ' → ' + ($store.genesisDashboard.updateStatus.last_update.new_tag || '?')"></span>
+                    </div>
+                    <div>
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">When</span><br>
+                      <span style="font-size:0.9rem;" x-text="$store.genesisDashboard.updateStatus.last_update.completed_at ? new Date($store.genesisDashboard.updateStatus.last_update.completed_at).toLocaleString() : 'in progress'"></span>
+                    </div>
+                  </div>
+                  <template x-if="$store.genesisDashboard.updateStatus.last_update.failure_reason">
+                    <div style="margin-top:0.75rem; padding:0.5rem; border-radius:4px; background:rgba(239,154,154,0.1); border:1px solid rgba(239,154,154,0.3); font-size:0.8rem; color:#ef9a9a;"
+                         x-text="$store.genesisDashboard.updateStatus.last_update.failure_reason"></div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+
+        <hr style="border:none; border-top:1px solid var(--color-border); margin-bottom:1.5rem;">
+
+        <!-- ── Backup Section (original) ──────────────────────── -->
+        <template x-if="!$store.genesisDashboard.backupStatus">
+          <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
+        </template>
+        <template x-if="$store.genesisDashboard.backupStatus">
+          <div>
+            <!-- Status card -->
+            <div class="card" style="padding:1rem; margin-bottom:1rem;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                <h3 style="margin:0; font-size:1rem;">Backup Status</h3>
+                <button @click="$store.genesisDashboard.triggerBackup()"
+                        style="background:var(--color-accent); color:#000; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                  Run Now</button>
+              </div>
+              <template x-if="$store.genesisDashboard.backupStatus.last_backup">
+                <div>
+                  <div style="display:flex; gap:1.5rem; flex-wrap:wrap; margin-bottom:0.5rem;">
+                    <div>
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Last Run</span><br>
+                      <span style="font-size:0.9rem;" x-text="new Date($store.genesisDashboard.backupStatus.last_backup.timestamp).toLocaleString()"></span>
+                    </div>
+                    <div>
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Status</span><br>
+                      <span style="font-size:0.9rem;"
+                            :style="$store.genesisDashboard.backupStatus.last_backup.success ? 'color:#81c784' : 'color:#ef9a9a'"
+                            x-text="$store.genesisDashboard.backupStatus.last_backup.success ? 'Success' : 'Failed'"></span>
+                    </div>
+                    <div>
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Duration</span><br>
+                      <span style="font-size:0.9rem;" x-text="$store.genesisDashboard.backupStatus.last_backup.duration_s + 's'"></span>
+                    </div>
+                  </div>
+                  <template x-if="$store.genesisDashboard.backupStatus.last_backup.success">
+                    <div style="display:flex; gap:1.5rem; flex-wrap:wrap; font-size:0.8rem; color:var(--color-text-secondary);">
+                      <span x-text="'SQLite: ' + $store.genesisDashboard.backupStatus.last_backup.sqlite_lines + ' lines'"></span>
+                      <span x-text="'Qdrant: ' + $store.genesisDashboard.backupStatus.last_backup.qdrant_collections + ' collections'"></span>
+                      <span x-text="'Transcripts: ' + $store.genesisDashboard.backupStatus.last_backup.transcript_files + ' files'"></span>
+                      <span x-text="'Memory: ' + $store.genesisDashboard.backupStatus.last_backup.memory_files + ' files'"></span>
+                      <span :style="$store.genesisDashboard.backupStatus.last_backup.secrets_encrypted ? 'color:#81c784' : 'color:#ef9a9a'"
+                            x-text="$store.genesisDashboard.backupStatus.last_backup.secrets_encrypted ? 'Secrets: encrypted' : 'Secrets: NOT encrypted'"></span>
+                    </div>
+                  </template>
+                  <template x-if="!$store.genesisDashboard.backupStatus.last_backup.success">
+                    <div>
+                      <div style="margin-top:0.5rem; padding:0.5rem; border-radius:4px; background:rgba(239,154,154,0.1); border:1px solid rgba(239,154,154,0.3); font-size:0.8rem; color:#ef9a9a;"
+                           x-text="$store.genesisDashboard.backupStatus.last_backup.failure_reason || 'Backup failed — check logs'"></div>
+                      <template x-if="!$store.genesisDashboard.backupStatus?.repo_configured">
+                        <div style="margin-top:0.4rem; padding:0.5rem; border-radius:4px; background:rgba(255,183,77,0.1); border:1px solid rgba(255,183,77,0.3); font-size:0.8rem; color:#ffb74d;">
+                          Backup repo not configured. Set GENESIS_BACKUP_REPO in secrets.env and run a backup to clone it.</div>
+                      </template>
+                    </div>
+                  </template>
+                </div>
+              </template>
+              <template x-if="!$store.genesisDashboard.backupStatus.last_backup">
+                <div style="color:var(--color-text-secondary);">No backup status file found. Run a backup to generate status.</div>
+              </template>
+            </div>
+            <!-- Config card -->
+            <div class="card" style="padding:1rem;">
+              <h3 style="margin:0 0 0.5rem 0; font-size:1rem;">Configuration</h3>
+              <div style="font-size:0.85rem;">
+                <div style="margin-bottom:0.25rem;">
+                  <span style="color:var(--color-text-secondary);">Repo:</span>
+                  <span x-text="$store.genesisDashboard.backupStatus.repo || 'Not configured'"></span>
+                </div>
+                <div style="margin-bottom:0.25rem;">
+                  <span style="color:var(--color-text-secondary);">Cron:</span>
+                  <code style="font-size:0.8rem;" x-text="$store.genesisDashboard.backupStatus.cron_schedule || 'Not scheduled'"></code>
+                </div>
+                <div>
+                  <span style="color:var(--color-text-secondary);">Script:</span>
+                  <span x-text="$store.genesisDashboard.backupStatus.configured ? 'Installed' : 'Not found'"
+                        :style="$store.genesisDashboard.backupStatus.configured ? 'color:#81c784' : 'color:#ef9a9a'"></span>
+                </div>
+              </div>
+            </div>
+            <!-- Editable backup configuration -->
+            <div class="card" style="padding:1rem; margin-top:0.75rem;">
+              <h3 style="margin:0 0 0.6rem 0; font-size:1rem;">Backup configuration</h3>
+              <div style="display:flex; flex-direction:column; gap:0.55rem; font-size:0.82rem; max-width:520px;">
+                <!-- Destination repo -->
+                <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                  <span style="color:var(--color-text-secondary);">Backups repo (git URL)</span>
+                  <input type="text" x-model="$store.genesisDashboard.backupConfigForm.repo"
+                         placeholder="https://github.com/you/genesis-backups.git"
+                         style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                </label>
+                <template x-if="$store.genesisDashboard.backupConfigForm.repo && $store.genesisDashboard.backupConfig && $store.genesisDashboard.backupConfig.repo && $store.genesisDashboard.backupConfigForm.repo !== $store.genesisDashboard.backupConfig.repo">
+                  <div style="font-size:0.72rem; color:#ffb74d;">⚠ Changing the repo URL does not migrate existing backup history — keep the old repo reachable for restores.</div>
+                </template>
+
+                <!-- Encryption passphrase (write-only) -->
+                <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                  <span style="color:var(--color-text-secondary);">Encryption passphrase
+                    <span x-show="$store.genesisDashboard.backupConfig?.passphrase_set" style="color:#81c784;">(set — blank keeps current)</span></span>
+                  <input type="password" autocomplete="new-password" x-model="$store.genesisDashboard.backupConfigForm.passphrase"
+                         placeholder="leave blank to keep current"
+                         style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                </label>
+                <template x-if="$store.genesisDashboard.backupConfigForm.passphrase">
+                  <div style="font-size:0.72rem; color:#ffb74d;">⚠ Rotating the passphrase does NOT re-encrypt existing backups. Keep the old one until a fresh backup is verified.</div>
+                </template>
+
+                <!-- Off-site backend -->
+                <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                  <span style="color:var(--color-text-secondary);">Off-site backend</span>
+                  <select x-model="$store.genesisDashboard.backupConfigForm.tier2_backend"
+                          style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    <option value="none">None</option>
+                    <option value="local">Local / mounted path</option>
+                    <option value="smb">SMB / NAS</option>
+                  </select>
+                </label>
+                <template x-if="$store.genesisDashboard.backupConfigForm.tier2_backend === 'local'">
+                  <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                    <span style="color:var(--color-text-secondary);">Local path</span>
+                    <input type="text" x-model="$store.genesisDashboard.backupConfigForm.local_path" placeholder="/mnt/backups"
+                           style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                  </label>
+                </template>
+                <template x-if="$store.genesisDashboard.backupConfigForm.tier2_backend === 'smb'">
+                  <div style="display:flex; flex-direction:column; gap:0.55rem;">
+                    <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                      <span style="color:var(--color-text-secondary);">NAS share</span>
+                      <input type="text" x-model="$store.genesisDashboard.backupConfigForm.nas" placeholder="//host/share"
+                             style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    </label>
+                    <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                      <span style="color:var(--color-text-secondary);">NAS user</span>
+                      <input type="text" x-model="$store.genesisDashboard.backupConfigForm.nas_user"
+                             style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    </label>
+                    <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                      <span style="color:var(--color-text-secondary);">NAS password
+                        <span x-show="$store.genesisDashboard.backupConfig?.nas_pass_set" style="color:#81c784;">(set — blank keeps current)</span></span>
+                      <input type="password" autocomplete="new-password" x-model="$store.genesisDashboard.backupConfigForm.nas_pass" placeholder="leave blank to keep current"
+                             style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    </label>
+                  </div>
+                </template>
+
+                <!-- Schedule -->
+                <label style="display:flex; align-items:center; gap:0.4rem; margin-top:0.2rem;">
+                  <input type="checkbox" x-model="$store.genesisDashboard.backupConfigForm.schedule_enabled"
+                         @change="$store.genesisDashboard.scheduleDirty = true">
+                  <span>Scheduled (cron) backups</span>
+                </label>
+                <template x-if="$store.genesisDashboard.backupConfigForm.schedule_enabled">
+                  <label style="display:flex; flex-direction:column; gap:0.15rem;">
+                    <span style="color:var(--color-text-secondary);">Cron schedule</span>
+                    <input type="text" x-model="$store.genesisDashboard.backupConfigForm.schedule" placeholder="0 */6 * * *"
+                           @input="$store.genesisDashboard.scheduleDirty = true"
+                           style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary); font-family:monospace;">
+                    <span style="font-size:0.7rem; color:var(--color-text-secondary);">5-field cron — e.g. <code>0 */6 * * *</code> = every 6 hours</span>
+                  </label>
+                </template>
+
+                <!-- Save -->
+                <div style="display:flex; gap:0.6rem; align-items:center; margin-top:0.3rem;">
+                  <button @click="$store.genesisDashboard.saveBackupConfig()"
+                          :disabled="$store.genesisDashboard.backupConfigSaving"
+                          style="font-size:0.8rem; padding:0.35rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(33,150,243,0.15); color:#64b5f6; border:1px solid rgba(33,150,243,0.4);"
+                          x-text="$store.genesisDashboard.backupConfigSaving ? 'Saving…' : 'Save configuration'"></button>
+                  <span x-show="$store.genesisDashboard.backupConfigMsg"
+                        :style="$store.genesisDashboard.backupConfigMsg?.ok ? 'color:#81c784; font-size:0.78rem;' : 'color:#ef9a9a; font-size:0.78rem;'"
+                        x-text="$store.genesisDashboard.backupConfigMsg?.text"></span>
+                </div>
+                <template x-if="$store.genesisDashboard.backupConfigMsg?.warnings?.length">
+                  <div style="font-size:0.72rem; color:#ffb74d; display:flex; flex-direction:column; gap:0.2rem;">
+                    <template x-for="w in $store.genesisDashboard.backupConfigMsg.warnings" :key="w">
+                      <div x-text="'⚠ ' + w"></div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
