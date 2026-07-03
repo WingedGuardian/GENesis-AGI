@@ -454,6 +454,44 @@ else
         _T2_STATUS="partial"
         log "WARNING: Tier 2 backup partially failed"
     fi
+
+    # --- Tier 2 GFS retention prune (off-site dated snapshots only) --------------
+    # Keep daily 7 / weekly 4 / monthly 6 of the COMPLETE off-site snapshots. gfs_select
+    # ALWAYS keeps the newest (restore.sh selects the latest COMPLETE); we also skip the
+    # current run's stamp explicitly. Best-effort — a prune failure never fails the backup.
+    # Transcripts are preserved elsewhere (local git keep-forever + the latest snapshot
+    # re-uploads the full set every run), so deleting an aged snapshot's transcripts/ copy
+    # loses nothing. Only the off-site dated tree is touched; the local ~/backups git repo
+    # is never pruned here. Runs only after a fully-uploaded (ok) snapshot this run.
+    if [ "${_T2_STATUS:-}" = "ok" ] && backend_available; then
+        # DR-safety: the host segment flows into a DESTRUCTIVE backend_delete (smb deltree /
+        # local rm -rf), so refuse to prune unless it is the plain filename charset — then a
+        # pathological hostname can never break out of the snapshot path. (The stamps below
+        # are already grep-restricted to the timestamp charset.)
+        if ! printf '%s' "$_T2_HOST_DIR" | grep -qE '^Genesis/[A-Za-z0-9._-]+$'; then
+            log "WARNING: GFS prune skipped — unsafe off-site host path '$_T2_HOST_DIR'"
+        else
+            _gfs_complete="$(
+                for _st in $(backend_list_dirs "$_T2_HOST_DIR" 2>/dev/null \
+                                | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -u || true); do
+                    backend_exists "$_T2_HOST_DIR/$_st/COMPLETE" && printf '%s\n' "$_st"
+                done
+                true
+            )"
+            _gfs_delete="$(printf '%s\n' "$_gfs_complete" \
+                | python3 "$_SCRIPT_DIR/gfs_select.py" --daily 7 --weekly 4 --monthly 6)" || _gfs_delete=""
+            for _st in $_gfs_delete; do
+                if [ "$_st" = "$_T2_STAMP" ]; then
+                    continue   # never the current run's snapshot
+                fi
+                if backend_delete "$_T2_HOST_DIR/$_st"; then
+                    log "GFS prune: removed off-site snapshot $_st"
+                else
+                    log "WARNING: GFS prune failed for off-site snapshot $_st"
+                fi
+            done
+        fi
+    fi
 fi
 backend_cleanup
 

@@ -25,6 +25,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Off-site backups now self-prune on a grandfather-father-son schedule instead of growing forever.**
+  When you back up to an off-site target (NAS/SMB or a mounted path), each run now prunes old dated
+  snapshots — keeping the last 7 daily, 4 weekly, and 6 monthly — so remote storage stays bounded. It
+  never deletes the most recent complete snapshot (the one a restore uses), never touches an
+  in-progress snapshot, and never affects your local keep-forever transcript archive.
+
 - **You can now run Genesis on Claude Fable 5, and pick the full thinking-effort range on Sonnet and Fable.**
   Fable 5 (Anthropic's new top-tier model) is now a selectable model everywhere you choose one — the ego,
   campaigns, the inbox monitor, the Telegram default, the `/model` command (terminal and Telegram), and the
