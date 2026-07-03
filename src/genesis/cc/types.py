@@ -165,6 +165,15 @@ class CCInvocation:
     # opt in (foreground conversation, background DirectSession) are routed; every
     # other CC call site stays Claude-native until a dedicated activation pass.
     roster_eligible: bool = False
+    # Silent-cap detection opt-in. When True, the invoker fires its
+    # on_cc_empty_output callback if this invocation returns genuinely-empty
+    # output (no text, no error, no rate_limit_event) — the signature of a
+    # silent Anthropic-subscription cap that otherwise reads as a "successful"
+    # empty completion. Default False = zero behavior change; only output-
+    # producing COGNITIVE call sites (ego, reflection, weekly jobs, sentinel,
+    # autonomy executors, mail judge) opt in. NEVER changes control flow —
+    # detection/alerting only, never a raise or failover.
+    expect_output: bool = False
     # cc-loop-01: opaque per-session key for the invoker's proc registry, so an
     # interrupt (e.g. Telegram /stop) targets THIS session's subprocess and not
     # a concurrent background one. None → keyed by pid (never cross-fired).

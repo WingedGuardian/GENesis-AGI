@@ -177,6 +177,7 @@ class StepDispatcher:
 
         invocation = CCInvocation(
             prompt=prompt,
+            expect_output=True,  # silent-cap detection (step needs a result)
             model=CCModel.SONNET,
             effort=effort,
             timeout_s=step_type.default_timeout_s,

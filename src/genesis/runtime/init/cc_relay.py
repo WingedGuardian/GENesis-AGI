@@ -77,9 +77,48 @@ async def init(rt: GenesisRuntime) -> None:
                 except Exception:
                     logger.error("Failed to create model downgrade observation", exc_info=True)
 
+        async def _on_cc_empty_output(invocation, output) -> None:
+            """Record a silent-empty CC completion (the silent-cap signature).
+
+            Fired by the invoker ONLY for output-EXPECTING cognitive invocations
+            that returned genuinely-empty output (no text, no error, no
+            rate_limit_event) — the shape a silent Anthropic-subscription cap
+            takes when it otherwise reads as a successful completion. Writes
+            durable, queryable telemetry (``cc_cap_empty_event``, low priority,
+            internal); the awareness cap detector aggregates a run of these into
+            one critical infrastructure_alert. Detection only — never alters CC
+            control flow. Never raises.
+            """
+            if rt._db is None:
+                return
+            try:
+                import json
+                import uuid
+                from datetime import UTC, datetime
+
+                from genesis.db.crud import observations
+                content = json.dumps({
+                    "model": str(invocation.model),
+                    "effort": str(invocation.effort),
+                    "output_tokens": output.output_tokens,
+                    "session_id": output.session_id,
+                })
+                await observations.create(
+                    rt._db,
+                    id=str(uuid.uuid4()),
+                    source="cc_cap_monitor",
+                    type="cc_cap_empty_event",
+                    content=content,
+                    priority="low",
+                    created_at=datetime.now(UTC).isoformat(),
+                )
+            except Exception:
+                logger.warning("Failed to record cc_cap empty event", exc_info=True)
+
         rt._cc_invoker = CCInvoker(
             on_cc_status_change=_on_cc_status_change,
             on_model_downgrade=_on_model_downgrade,
+            on_cc_empty_output=_on_cc_empty_output,
         )
 
         # CC fallback recovery safety probe — clears a stale account-wide fallback

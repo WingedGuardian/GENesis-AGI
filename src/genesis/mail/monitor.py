@@ -479,6 +479,7 @@ class MailMonitor:
             )
             invocation = CCInvocation(
                 prompt=prompt,
+                expect_output=True,  # silent-cap detection (judge silently no-ops on empty)
                 model=self._config.model,
                 effort=self._config.effort,
                 system_prompt=system_prompt,

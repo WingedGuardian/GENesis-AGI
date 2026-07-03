@@ -177,6 +177,7 @@ class TaskReviewer:
 
         invocation = CCInvocation(
             prompt=prompt,
+            expect_output=True,  # silent-cap detection (plan review needs output)
             model=CCModel.OPUS,
             effort=EffortLevel.HIGH,
             timeout_s=600,
@@ -479,6 +480,7 @@ class TaskReviewer:
 
             invocation = CCInvocation(
                 prompt=prompt,
+                expect_output=True,  # silent-cap detection (adversarial review output)
                 model=CCModel.SONNET,
                 effort=EffortLevel.HIGH,
                 skip_permissions=True,

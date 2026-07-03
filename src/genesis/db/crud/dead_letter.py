@@ -81,6 +81,21 @@ async def count_pending(
     return int(row[0])
 
 
+async def list_pending_type_age(db: aiosqlite.Connection) -> list[tuple[str, str]]:
+    """Return ``(operation_type, created_at)`` for every pending item.
+
+    Lightweight companion to :func:`count_pending` — omits the (potentially
+    large) payload so a caller can apply per-operation-type age policy (e.g. the
+    stuck-vs-self-healing split used for the DLQ-accumulation alert) without
+    pulling full rows. Pending counts are bounded (~hundreds), same as the set
+    ``expire_old`` already iterates.
+    """
+    cursor = await db.execute(
+        "SELECT operation_type, created_at FROM dead_letter WHERE status = 'pending'"
+    )
+    return [(row[0], row[1]) for row in await cursor.fetchall()]
+
+
 async def delete(db: aiosqlite.Connection, id: str) -> bool:
     cursor = await db.execute("DELETE FROM dead_letter WHERE id = ?", (id,))
     await db.commit()

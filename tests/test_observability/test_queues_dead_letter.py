@@ -118,20 +118,42 @@ async def test_resolve_then_respike_realerts(db):
     assert await _total_infra(db) == 2
 
 
+class _DLQ:
+    """Fake DeadLetterQueue: raw pending total + genuinely-stuck subset.
+
+    ``stuck`` defaults to ``n`` (all pending are stuck) so a genuine backlog still
+    alerts; pass a smaller ``stuck`` to model a self-healing burst (high raw total,
+    few/zero stuck) that must NOT cry wolf.
+    """
+
+    def __init__(self, n: int, stuck: int | None = None) -> None:
+        self._n = n
+        self._stuck = n if stuck is None else stuck
+
+    async def get_pending_count(self) -> int:
+        return self._n
+
+    async def get_stuck_count(self) -> int:
+        return self._stuck
+
+
 @pytest.mark.asyncio
 async def test_queues_end_to_end_spike_then_drain(db):
-    """queues() alerts on spike and resolves on drain — the full snapshot path."""
-
-    class _DLQ:
-        def __init__(self, n: int) -> None:
-            self._n = n
-
-        async def get_pending_count(self) -> int:
-            return self._n
-
+    """queues() alerts on a genuine (stuck) spike and resolves on drain."""
     q._last_dead_letter_alert_at = 0.0
-    await q.queues(db, None, _DLQ(200), None)  # spike >= threshold
+    await q.queues(db, None, _DLQ(200), None)  # 200 stuck >= threshold
     assert await _unresolved_infra(db) == 1
 
     await q.queues(db, None, _DLQ(0), None)  # drained < threshold
     assert await _unresolved_infra(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_queues_high_pending_low_stuck_does_not_alert(db):
+    """The cry-wolf fix: a big raw pending total that is all self-healing (0 stuck,
+    e.g. a fresh chain_exhausted:judge burst) must NOT alert — but the snapshot
+    still reports the honest raw total."""
+    q._last_dead_letter_alert_at = 0.0
+    result = await q.queues(db, None, _DLQ(200, stuck=0), None)
+    assert await _unresolved_infra(db) == 0        # no cry-wolf
+    assert result["dead_letters"] == 200           # raw total stays honest
