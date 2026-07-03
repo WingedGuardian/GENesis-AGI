@@ -117,3 +117,57 @@ async def test_deprecated_row_does_not_suppress(db):
         embedder=_embedder_returning(_vec(0)), router=router, new_steps=["s"],
     )
     assert is_novel is True  # deprecated dup excluded → stored
+
+
+def _router_38a_all_open() -> MagicMock:
+    """Router whose 38a novelty chain has NO available provider (all breakers open)."""
+    from types import SimpleNamespace
+
+    r = MagicMock()
+    r.route_call = AsyncMock(return_value=_Result(content="{}"))
+    r.breakers.chain_has_available = MagicMock(return_value=False)
+    r.config = SimpleNamespace(
+        call_sites={
+            "38a_procedure_novelty_llm": SimpleNamespace(
+                chain=["nvidia-nim-deepseek", "openrouter-deepseek-v4"],
+            ),
+        },
+    )
+    return r
+
+
+@pytest.mark.asyncio
+async def test_cross_type_fail_fast_when_chain_breaker_open(db):
+    """L2c: when the 38a chain has no available provider, skip the doomed
+    route_call (no all_exhausted storm) and fail open to 'novel'."""
+    await _seed(db, "reindex-gitnexus", _vec(0))
+    router = _router_38a_all_open()
+    is_novel, _max_sim, _vec_out, _fo = await _principle_is_novel(
+        db, task_type="reindex-code-intel", new_principle="reindex the code graph",
+        embedder=_embedder_returning(_vec(0)), router=router, new_steps=["s"],
+    )
+    assert is_novel is True  # fail-open to novel — never a false-merge
+    router.route_call.assert_not_awaited()  # the doomed 38a call was skipped
+    router.breakers.chain_has_available.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cross_type_proceeds_when_call_site_absent(db):
+    """L2c guard falls through to the normal route_call when the 38a call site
+    is absent from config (unknown/None chain must NOT skip)."""
+    from types import SimpleNamespace
+
+    await _seed(db, "reindex-gitnexus", _vec(0))
+    r = MagicMock()
+    r.route_call = AsyncMock(
+        return_value=_Result(content=json.dumps({"redundant_with": None})),
+    )
+    r.breakers.chain_has_available = MagicMock(return_value=False)  # would skip IF reached
+    r.config = SimpleNamespace(call_sites={})  # 38a not present -> _site is None
+    is_novel, _m, _v, _fo = await _principle_is_novel(
+        db, task_type="reindex-code-intel", new_principle="reindex the code graph",
+        embedder=_embedder_returning(_vec(0)), router=r, new_steps=["s"],
+    )
+    assert is_novel is True
+    r.route_call.assert_awaited_once()  # guard skipped -> normal call fired
+    r.breakers.chain_has_available.assert_not_called()  # short-circuit on _chain None

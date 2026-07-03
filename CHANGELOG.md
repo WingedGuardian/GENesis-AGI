@@ -139,6 +139,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Genesis's COO (self-maintenance ego) no longer burns cognitive cycles reacting to model-provider
+  outages it can't fix.** When a provider chain runs out of options (e.g. a temporary DeepSeek outage),
+  the "all providers exhausted" alerts no longer wake the ego into a full high-effort reasoning cycle that
+  can only conclude "nothing I can do" — these were the large majority of its zero-outcome reactive cycles.
+  The outage still reaches the ego through its normal system-health context, so nothing is hidden; it just
+  stops paying to react to it. Relatedly, the cross-type procedure-dedup check now skips its judgment call
+  outright when that chain is down, instead of firing a doomed request that would raise yet another alert.
+
 - **The dashboard's system-health view stays responsive under load and no longer errors out when a single
   check hiccups.** Building the health snapshot used to run its systemd service checks (several `systemctl`
   calls) and a couple of file scans directly on the main event loop, so gathering health could briefly stall
