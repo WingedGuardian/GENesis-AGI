@@ -57,12 +57,14 @@ class CCModel(StrEnum):
     SONNET = "sonnet"
     OPUS = "opus"
     HAIKU = "haiku"
+    FABLE = "fable"  # top tier, above Opus (claude-fable-5)
 
     @staticmethod
     def from_full_name(full_name: str) -> CCModel | None:
         """Map a full model identifier to its CCModel tier.
 
-        Examples: "claude-opus-4-6" -> OPUS, "claude-sonnet-4-6" -> SONNET.
+        Examples: "claude-opus-4-8" -> OPUS, "claude-sonnet-5" -> SONNET,
+        "claude-fable-5" -> FABLE.
         Returns None if the full name doesn't match any known tier.
         Assumes each model name contains exactly one tier keyword (Anthropic
         naming convention). First substring match wins.
@@ -91,27 +93,70 @@ _EFFORT_RANK: list[EffortLevel] = [
     EffortLevel.MAX,
 ]
 
-# Maximum effort tier supported by each CC model.
-# XHIGH and MAX are Opus-only; the API silently accepts them on
-# Sonnet/Haiku (no error, just wasted/meaningless). Guard at dispatch
-# so intent is always visible in logs.
+# Maximum effort tier supported by each CC model. Opus, Sonnet, and Fable all
+# accept the full low..max range (incl. xhigh/max) — verified live against the
+# claude CLI on 2026-07-02: `sonnet` → claude-sonnet-5, `fable` → claude-fable-5,
+# `opus` → claude-opus-4-8, each accepted `--effort xhigh` and `--effort max`.
+# Haiku (claude-haiku-4-5) is intentionally ABSENT: it does not use an effort
+# setting at all (the CLI tolerates the flag but it is a no-op), so callers must
+# OMIT --effort for Haiku rather than pass a wasted value — gate on
+# model_supports_effort() below.
 _MODEL_EFFORT_CEILING: dict[CCModel, EffortLevel] = {
     CCModel.OPUS: EffortLevel.MAX,
-    CCModel.SONNET: EffortLevel.HIGH,
-    CCModel.HAIKU: EffortLevel.HIGH,
+    CCModel.SONNET: EffortLevel.MAX,
+    CCModel.FABLE: EffortLevel.MAX,
 }
+
+
+def model_supports_effort(model: CCModel) -> bool:
+    """Whether *model* uses the ``--effort`` flag at all.
+
+    Haiku does not use an effort setting; the claude CLI tolerates the flag but
+    it is a no-op, so every ``claude -p`` call site MUST omit ``--effort`` for
+    Haiku rather than pass a wasted value. All other tiers accept the full
+    low..max range.
+    """
+    return model in _MODEL_EFFORT_CEILING
+
+
+def model_name_supports_effort(model_name: str) -> bool:
+    """Whether a model *string* (tier alias or full id) uses the ``--effort`` flag.
+
+    Resolves the string to a tier via :meth:`CCModel.from_full_name`; an
+    unrecognized name (e.g. a roster/provider id) is treated as effort-capable
+    (``True``) so a model we cannot classify isn't silently stripped of effort.
+    Wraps ``from_full_name`` + :func:`model_supports_effort` so call sites that
+    hold a model STRING (Guardian, remote dispatch) don't each re-derive it.
+    """
+    tier = CCModel.from_full_name(model_name)
+    return tier is None or model_supports_effort(tier)
 
 
 def clamp_effort(model: CCModel, effort: EffortLevel) -> EffortLevel:
     """Return *effort* clamped to the maximum supported by *model*.
 
-    XHIGH and MAX are Opus-only.  Sonnet/Haiku ceiling is HIGH.
+    Opus/Sonnet/Fable accept the full low..max range (verified live against the
+    claude CLI, 2026-07-02), so this is currently a no-op for them — it remains
+    as a hook for any future weaker tier that caps below ``max``. Models with no
+    effort support (Haiku) have no ceiling entry and are returned unchanged;
+    gate emission with :func:`model_supports_effort` instead of relying on this.
     Returns the (possibly clamped) effort; caller should warn on mismatch.
     """
-    ceiling = _MODEL_EFFORT_CEILING.get(model, EffortLevel.HIGH)
+    ceiling = _MODEL_EFFORT_CEILING.get(model)
+    if ceiling is None:
+        return effort
     if _EFFORT_RANK.index(effort) > _EFFORT_RANK.index(ceiling):
         return ceiling
     return effort
+
+
+#: Canonical sets of selectable CC model-tier / effort names, derived from the
+#: enums. EVERY ``claude -p`` model/effort validator across the codebase MUST
+#: derive its allowed set from these (never a hardcoded ``{"opus","sonnet",...}``
+#: literal) so a new tier (e.g. ``fable``) or effort level is accepted at every
+#: selection surface at once. Enforced by tests/test_cc/test_effort_model_coverage.py.
+VALID_MODEL_NAMES: frozenset[str] = frozenset(m.value for m in CCModel)
+VALID_EFFORT_NAMES: frozenset[str] = frozenset(e.value for e in EffortLevel)
 
 
 @dataclass(frozen=True)

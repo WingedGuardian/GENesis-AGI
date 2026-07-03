@@ -19,21 +19,35 @@ import contextlib
 import logging
 import os
 
+from genesis.cc.types import (
+    VALID_EFFORT_NAMES,
+    VALID_MODEL_NAMES,
+    CCModel,
+    model_supports_effort,
+)
 from genesis.experimentation.standalone_router import StandaloneRoutingResult
 
 logger = logging.getLogger(__name__)
 
-_VALID_MODELS = {"haiku", "sonnet", "opus"}
+_VALID_MODELS = VALID_MODEL_NAMES
+_VALID_EFFORTS = VALID_EFFORT_NAMES
 
 
 class CCCliRouter:
     """Invoke ``claude -p`` per call as a single-shot completion provider."""
 
-    def __init__(self, model: str = "haiku", *, timeout_s: float = 180.0):
+    def __init__(
+        self, model: str = "haiku", *, effort: str | None = None, timeout_s: float = 180.0,
+    ):
         m = model.lower().removeprefix("cc-")
         if m not in _VALID_MODELS:
             raise ValueError(f"CCCliRouter model must be one of {_VALID_MODELS}, got {model!r}")
+        if effort is not None and effort not in _VALID_EFFORTS:
+            raise ValueError(
+                f"CCCliRouter effort must be one of {_VALID_EFFORTS} or None, got {effort!r}"
+            )
         self._model = m
+        self._effort = effort
         self._timeout_s = timeout_s
 
     async def route_call(
@@ -60,6 +74,10 @@ class CCCliRouter:
             # skill-lists + preambles that contaminate a bare completion).
             "--settings", '{"hooks":{}}',
         ]
+        # Effort is opt-in here. Only emit --effort when requested AND the model
+        # uses it — Haiku (the default) does not use an effort setting.
+        if self._effort and model_supports_effort(CCModel(self._model)):
+            args += ["--effort", self._effort]
         if system:
             # Replace (not append) — the variant's system prompt IS the system.
             args += ["--system-prompt", system]

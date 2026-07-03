@@ -14,6 +14,7 @@ from pathlib import Path
 
 import yaml
 
+from genesis.cc.types import VALID_EFFORT_NAMES, VALID_MODEL_NAMES
 from genesis.ego.types import EgoConfig
 
 logger = logging.getLogger(__name__)
@@ -104,7 +105,7 @@ def validate_ego_config(changes: dict) -> list[str]:
         if not isinstance(v, (int, float)) or v < 1.0:
             errors.append("backoff_multiplier must be >= 1.0")
     if "model" in changes:
-        valid_models = {"opus", "sonnet", "haiku"}
+        valid_models = VALID_MODEL_NAMES
         if changes["model"] not in valid_models:
             errors.append(f"model must be one of {valid_models}")
     if "board_size" in changes:
@@ -123,7 +124,7 @@ def validate_ego_config(changes: dict) -> list[str]:
         v = changes["morning_report_minute"]
         if not isinstance(v, int) or not (0 <= v <= 59):
             errors.append("morning_report_minute must be 0-59")
-    _VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+    _VALID_EFFORTS = VALID_EFFORT_NAMES
     if "default_effort" in changes and changes["default_effort"] not in _VALID_EFFORTS:
         errors.append(f"default_effort must be one of {_VALID_EFFORTS}")
     if "morning_report_effort" in changes and changes["morning_report_effort"] not in _VALID_EFFORTS:
@@ -138,7 +139,7 @@ def validate_ego_config(changes: dict) -> list[str]:
             errors.append("genesis_max_interval_minutes must be >= 60")
     if "dispatch_model_overrides" in changes:
         v = changes["dispatch_model_overrides"]
-        valid_models = {"opus", "sonnet", "haiku"}
+        valid_models = VALID_MODEL_NAMES
         if not isinstance(v, dict):
             errors.append("dispatch_model_overrides must be a dict")
         else:

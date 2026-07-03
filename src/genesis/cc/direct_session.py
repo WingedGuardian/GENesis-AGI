@@ -1039,11 +1039,15 @@ class DirectSessionRunner:
         if request.planning_instruction:
             prompt = f"{request.planning_instruction}\n\n{prompt}"
 
-        # Interact profile requires Opus — browser reasoning is complex and
-        # ATS anti-bot detection demands higher capability.
+        # Interact profile pins to Opus — browser reasoning + ATS anti-bot
+        # detection demand high capability. This both UPGRADES weaker models
+        # (haiku/sonnet → opus) and intentionally PINS DOWN Fable to Opus: Fable
+        # is not yet evaluated on the browser/ATS path (see the "separate eval"
+        # note in docs/reference/cc-compatibility.md). Flip this to a tier floor
+        # if/when Fable is cleared for interact work.
         model = request.model
         if request.profile == "interact" and model != CCModel.OPUS:
-            logger.info("interact profile: upgrading model %s → opus", model)
+            logger.info("interact profile: pinning model to opus (requested %s)", model)
             model = CCModel.OPUS
 
         # Intentional per-dispatch model SELECTION. When a roster_model is named,

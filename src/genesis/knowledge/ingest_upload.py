@@ -48,8 +48,26 @@ async def run_ingest(
         logger.error("DB not available for ingest upload %s", upload_id)
         return
 
-    # Fetch upload record to get file_path
-    upload = await knowledge_uploads.get(rt.db, upload_id)
+    # Fetch upload record to get file_path. A transient DB error here (e.g. a
+    # locked DB) previously propagated above the try/except below and stranded
+    # the row in 'processing' until the next server restart (recovery only runs
+    # at startup). Mark the row 'failed' instead so the dashboard reflects it
+    # and the file can be retried.
+    try:
+        upload = await knowledge_uploads.get(rt.db, upload_id)
+    except Exception as exc:
+        logger.exception("Failed to load upload %s — marking failed", upload_id)
+        try:
+            await knowledge_uploads.update_status(
+                rt.db, upload_id,
+                status="failed",
+                error_message=f"Upload lookup failed: {exc}",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to mark upload %s failed after lookup error", upload_id
+            )
+        return
     if upload is None:
         logger.error("Upload %s not found in DB", upload_id)
         return

@@ -16,6 +16,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Derived from the enums so a new tier / effort level appears in the /model and
+# /effort commands (and their help/usage/error text) automatically.
+_MODEL_CHOICES = "|".join(m.value for m in CCModel)
+_EFFORT_CHOICES = "|".join(e.value for e in EffortLevel)
+
 
 async def cmd_start(ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not ctx.authorized(update.effective_user.id):
@@ -27,8 +32,8 @@ async def cmd_start(ctx: HandlerContext, update: Update, context: ContextTypes.D
         "/new — start a fresh session\n"
         "/stop — stop current generation\n"
         "/status — show current session info\n"
-        "/model sonnet|opus|haiku — switch model\n"
-        "/effort low|medium|high|xhigh|max — change thinking effort\n"
+        f"/model {_MODEL_CHOICES} — switch model\n"
+        f"/effort {_EFFORT_CHOICES} — change thinking effort\n"
         "/pause [on|off] — pause/resume all background activity\n"
         f"{tts_line}"
     )
@@ -79,18 +84,14 @@ async def cmd_model(ctx: HandlerContext, update: Update, context: ContextTypes.D
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /model sonnet|opus|haiku")
+        await update.message.reply_text(f"Usage: /model {_MODEL_CHOICES}")
         return
 
     model_str = context.args[0].lower().strip()
-    model_map = {
-        "sonnet": CCModel.SONNET,
-        "opus": CCModel.OPUS,
-        "haiku": CCModel.HAIKU,
-    }
+    model_map = {m.value: m for m in CCModel}
     if model_str not in model_map:
         await update.message.reply_text(
-            f"Unknown model '{model_str}'. Use: sonnet, opus, haiku"
+            f"Unknown model '{model_str}'. Use: {', '.join(model_map)}"
         )
         return
 
@@ -118,20 +119,14 @@ async def cmd_effort(ctx: HandlerContext, update: Update, context: ContextTypes.
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /effort low|medium|high|xhigh|max")
+        await update.message.reply_text(f"Usage: /effort {_EFFORT_CHOICES}")
         return
 
     effort_str = context.args[0].lower().strip()
-    effort_map = {
-        "low": EffortLevel.LOW,
-        "medium": EffortLevel.MEDIUM,
-        "high": EffortLevel.HIGH,
-        "xhigh": EffortLevel.XHIGH,
-        "max": EffortLevel.MAX,
-    }
+    effort_map = {e.value: e for e in EffortLevel}
     if effort_str not in effort_map:
         await update.message.reply_text(
-            f"Unknown effort '{effort_str}'. Use: low, medium, high, xhigh, max"
+            f"Unknown effort '{effort_str}'. Use: {', '.join(effort_map)}"
         )
         return
 

@@ -75,7 +75,10 @@ async def _impl_direct_session_run(
     try:
         CCModel(model_lower)
     except ValueError:
-        return {"error": f"Invalid model '{model}'. Must be one of: sonnet, opus, haiku"}
+        return {
+            "error": f"Invalid model '{model}'. Must be one of: "
+            f"{', '.join(m.value for m in CCModel)}"
+        }
 
     effort_lower = effort.lower()
     try:
@@ -301,7 +304,7 @@ async def direct_session_run(
     Args:
         prompt: The full instructions for the background session
         profile: Safety profile (observe, interact, research)
-        model: LLM model (sonnet, opus, haiku)
+        model: LLM model (sonnet, opus, haiku, fable)
         effort: Effort level (low, medium, high, xhigh, max)
         timeout_minutes: Max runtime in minutes (default 15, max 60)
         notify: Send Telegram notification on completion/failure

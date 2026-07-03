@@ -25,6 +25,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **You can now run Genesis on Claude Fable 5, and pick the full thinking-effort range on Sonnet and Fable.**
+  Fable 5 (Anthropic's new top-tier model) is now a selectable model everywhere you choose one — the ego,
+  campaigns, the inbox monitor, the Telegram default, the `/model` command (terminal and Telegram), and the
+  dashboard dropdowns. Sonnet (now Sonnet 5) and Fable also accept the full `low`–`max` effort range,
+  including `xhigh` and `max`; previously Sonnet was capped at `high`. Nothing switches automatically — your
+  existing defaults are unchanged; this only makes the new options available when you want them.
+
 - **Daily disk hygiene now prunes stale scratch and old attention snapshots.** Housekeeping now
   age-prunes leftover files in `~/tmp` (older than 7 days) and garbage-collects attention-engine
   snapshots older than 60 days — but never one behind a moment you've labeled for review, so your
@@ -132,6 +139,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   could keep pushing the next cycle further out — in the worst case starving an ego for up to its full
   backed-off interval. Each ego now anchors its first post-restart cycle to when it last actually ran: an
   overdue ego runs shortly after startup, while an up-to-date one simply keeps its cadence.
+
+- **Uploading a large or malformed PDF to the Knowledge tab no longer freezes — or crashes — Genesis.**
+  PDF text extraction used to run directly on the main event loop, so a big document could stall the whole
+  server for seconds (health checks, background thinking, other requests all waited), and a corrupt or
+  hostile PDF could take the process down entirely. Extraction now runs in an isolated worker process with a
+  time limit: a large PDF no longer blocks anything else, and a PDF that crashes or hangs the parser fails
+  just that one ingest — the rest of Genesis keeps running. Uploads that hit a transient database hiccup are
+  now marked "failed" (and can be retried) instead of getting stuck showing "processing" forever.
 
 - **Re-ingesting a knowledge source with changed content now refreshes it instead of serving the stale
   version.** Previously, once a file or URL was ingested, re-ingesting the same source was skipped on source

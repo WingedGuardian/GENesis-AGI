@@ -67,7 +67,7 @@ rollback needed.
 | CCCheckpoint | Session pause/resume | `src/genesis/cc/checkpoint.py` | User question handling |
 | CCFormatter | Output formatting | `src/genesis/cc/formatter.py` | Response parsing |
 | IntentClassifier | N/A (Genesis-internal) | `src/genesis/cc/intent.py` | No CC dependency |
-| Guardian Diagnosis | `-p`, `--model opus`, `--max-turns 50`, `--dangerously-skip-permissions`, `--output-format json` | `src/genesis/guardian/diagnosis.py` | Agentic diagnosis + recovery on host VM. Highest-stakes CC call in system. |
+| Guardian Diagnosis | `-p`, `--model opus`, `--effort` (configurable, default `high`; omitted for Haiku), `--max-turns 50`, `--dangerously-skip-permissions`, `--output-format json` | `src/genesis/guardian/diagnosis.py` | Agentic diagnosis + recovery on host VM. Highest-stakes CC call in system. |
 
 ### CC CLI Flags Used by Genesis
 

@@ -9,7 +9,14 @@ import pytest
 
 from genesis.cc.exceptions import CCProcessError, CCTimeoutError
 from genesis.cc.invoker import CCInvoker
-from genesis.cc.types import CCInvocation, CCModel, EffortLevel, StreamEvent, clamp_effort
+from genesis.cc.types import (
+    CCInvocation,
+    CCModel,
+    EffortLevel,
+    StreamEvent,
+    clamp_effort,
+    model_supports_effort,
+)
 
 
 @pytest.fixture
@@ -1346,7 +1353,13 @@ async def test_run_no_on_spawn_callback(invoker):
 # ---------------------------------------------------------------------------
 
 class TestEffortClamping:
-    """clamp_effort() and _build_args() model-aware effort guard."""
+    """clamp_effort() / model_supports_effort() and _build_args() effort gating.
+
+    Verified live against the claude CLI on 2026-07-02: `sonnet` → claude-sonnet-5,
+    `fable` → claude-fable-5, `opus` → claude-opus-4-8 all accept the full
+    low..max range (incl. xhigh/max); haiku (claude-haiku-4-5) uses no effort
+    setting, so --effort is omitted for it entirely.
+    """
 
     def test_clamp_effort_opus_passes_xhigh(self):
         assert clamp_effort(CCModel.OPUS, EffortLevel.XHIGH) == EffortLevel.XHIGH
@@ -1354,52 +1367,58 @@ class TestEffortClamping:
     def test_clamp_effort_opus_passes_max(self):
         assert clamp_effort(CCModel.OPUS, EffortLevel.MAX) == EffortLevel.MAX
 
-    def test_clamp_effort_sonnet_xhigh_clamped_to_high(self):
-        assert clamp_effort(CCModel.SONNET, EffortLevel.XHIGH) == EffortLevel.HIGH
+    def test_clamp_effort_sonnet_passes_xhigh(self):
+        assert clamp_effort(CCModel.SONNET, EffortLevel.XHIGH) == EffortLevel.XHIGH
 
-    def test_clamp_effort_sonnet_max_clamped_to_high(self):
-        assert clamp_effort(CCModel.SONNET, EffortLevel.MAX) == EffortLevel.HIGH
+    def test_clamp_effort_sonnet_passes_max(self):
+        assert clamp_effort(CCModel.SONNET, EffortLevel.MAX) == EffortLevel.MAX
 
-    def test_clamp_effort_haiku_xhigh_clamped_to_high(self):
-        assert clamp_effort(CCModel.HAIKU, EffortLevel.XHIGH) == EffortLevel.HIGH
-
-    def test_clamp_effort_haiku_max_clamped_to_high(self):
-        assert clamp_effort(CCModel.HAIKU, EffortLevel.MAX) == EffortLevel.HIGH
-
-    def test_clamp_effort_sonnet_high_unchanged(self):
-        assert clamp_effort(CCModel.SONNET, EffortLevel.HIGH) == EffortLevel.HIGH
+    def test_clamp_effort_fable_passes_max(self):
+        assert clamp_effort(CCModel.FABLE, EffortLevel.MAX) == EffortLevel.MAX
 
     def test_clamp_effort_sonnet_low_unchanged(self):
         assert clamp_effort(CCModel.SONNET, EffortLevel.LOW) == EffortLevel.LOW
 
-    def test_build_args_sonnet_xhigh_clamped(self, invoker):
+    def test_haiku_uses_no_effort(self):
+        assert model_supports_effort(CCModel.HAIKU) is False
+        for model in (CCModel.OPUS, CCModel.SONNET, CCModel.FABLE):
+            assert model_supports_effort(model) is True
+
+    def test_build_args_sonnet_xhigh_passthrough(self, invoker):
         inv = CCInvocation(prompt="hi", model=CCModel.SONNET, effort=EffortLevel.XHIGH)
         args = invoker._build_args(inv)
-        effort_idx = args.index("--effort")
-        assert args[effort_idx + 1] == "high"
+        assert args[args.index("--effort") + 1] == "xhigh"
 
-    def test_build_args_haiku_max_clamped(self):
+    def test_build_args_sonnet_max_passthrough(self, invoker):
+        inv = CCInvocation(prompt="hi", model=CCModel.SONNET, effort=EffortLevel.MAX)
+        args = invoker._build_args(inv)
+        assert args[args.index("--effort") + 1] == "max"
+
+    def test_build_args_haiku_omits_effort(self):
         haiku_invoker = CCInvoker(claude_path="/usr/bin/claude")
         inv = CCInvocation(prompt="hi", model=CCModel.HAIKU, effort=EffortLevel.MAX)
         args = haiku_invoker._build_args(inv)
-        effort_idx = args.index("--effort")
-        assert args[effort_idx + 1] == "high"
+        assert "--effort" not in args
 
     def test_build_args_opus_xhigh_unchanged(self, invoker):
         inv = CCInvocation(prompt="hi", model=CCModel.OPUS, effort=EffortLevel.XHIGH)
         args = invoker._build_args(inv)
-        effort_idx = args.index("--effort")
-        assert args[effort_idx + 1] == "xhigh"
+        assert args[args.index("--effort") + 1] == "xhigh"
 
     def test_build_args_opus_max_unchanged(self, invoker):
         inv = CCInvocation(prompt="hi", model=CCModel.OPUS, effort=EffortLevel.MAX)
         args = invoker._build_args(inv)
-        effort_idx = args.index("--effort")
-        assert args[effort_idx + 1] == "max"
+        assert args[args.index("--effort") + 1] == "max"
 
-    def test_build_args_clamping_emits_warning(self, invoker, caplog):
+    def test_build_args_fable_max(self, invoker):
+        inv = CCInvocation(prompt="hi", model=CCModel.FABLE, effort=EffortLevel.MAX)
+        args = invoker._build_args(inv)
+        assert args[args.index("--model") + 1] == "fable"
+        assert args[args.index("--effort") + 1] == "max"
+
+    def test_build_args_no_clamp_warning_for_sonnet_xhigh(self, invoker, caplog):
         import logging
         inv = CCInvocation(prompt="hi", model=CCModel.SONNET, effort=EffortLevel.XHIGH)
         with caplog.at_level(logging.WARNING, logger="genesis.cc.invoker"):
             invoker._build_args(inv)
-        assert any("clamping" in r.message.lower() for r in caplog.records)
+        assert not any("clamping" in r.message.lower() for r in caplog.records)
