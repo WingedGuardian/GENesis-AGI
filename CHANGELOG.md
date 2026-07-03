@@ -25,6 +25,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **You can now run Genesis on Claude Fable 5, and pick the full thinking-effort range on Sonnet and Fable.**
+  Fable 5 (Anthropic's new top-tier model) is now a selectable model everywhere you choose one — the ego,
+  campaigns, the inbox monitor, the Telegram default, the `/model` command (terminal and Telegram), and the
+  dashboard dropdowns. Sonnet (now Sonnet 5) and Fable also accept the full `low`–`max` effort range,
+  including `xhigh` and `max`; previously Sonnet was capped at `high`. Nothing switches automatically — your
+  existing defaults are unchanged; this only makes the new options available when you want them.
+
 - **Daily disk hygiene now prunes stale scratch and old attention snapshots.** Housekeeping now
   age-prunes leftover files in `~/tmp` (older than 7 days) and garbage-collects attention-engine
   snapshots older than 60 days — but never one behind a moment you've labeled for review, so your

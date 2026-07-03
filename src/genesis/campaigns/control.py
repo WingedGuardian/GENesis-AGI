@@ -20,12 +20,15 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-# Single source of truth for the model/effort a campaign session may use.
-# resolve_model / resolve_effort below build their enum maps from these exact
-# keys, and CampaignRunner imports the resolvers from here — so the validator
-# and the dispatch-time resolution can never drift apart.
-VALID_MODELS = {"haiku", "sonnet", "opus"}
-VALID_EFFORTS = {"low", "medium", "high"}
+from genesis.cc.types import VALID_EFFORT_NAMES, VALID_MODEL_NAMES
+
+# The model/effort a campaign session may use is the full CC roster — derived
+# from the CCModel / EffortLevel enums so a new tier (e.g. fable) or effort level
+# is accepted here automatically. resolve_model / resolve_effort below coerce
+# straight to the enum, so the validator and dispatch-time resolution can never
+# drift apart.
+VALID_MODELS = VALID_MODEL_NAMES
+VALID_EFFORTS = VALID_EFFORT_NAMES
 
 
 def parse_state(state_json: str | None) -> dict:
@@ -44,24 +47,20 @@ def resolve_model(model_str: str) -> Any:
     """Convert a campaign model string to a CCModel enum (default sonnet)."""
     from genesis.cc.types import CCModel
 
-    mapping = {
-        "haiku": CCModel.HAIKU,
-        "sonnet": CCModel.SONNET,
-        "opus": CCModel.OPUS,
-    }
-    return mapping.get(model_str, CCModel.SONNET)
+    try:
+        return CCModel(model_str)
+    except ValueError:
+        return CCModel.SONNET
 
 
 def resolve_effort(effort_str: str) -> Any:
     """Convert a campaign effort string to an EffortLevel enum (default medium)."""
     from genesis.cc.types import EffortLevel
 
-    mapping = {
-        "low": EffortLevel.LOW,
-        "medium": EffortLevel.MEDIUM,
-        "high": EffortLevel.HIGH,
-    }
-    return mapping.get(effort_str, EffortLevel.MEDIUM)
+    try:
+        return EffortLevel(effort_str)
+    except ValueError:
+        return EffortLevel.MEDIUM
 
 
 def _validate_cadence(cron_cadence: str) -> str | None:

@@ -1408,12 +1408,17 @@ class EgoSession:
                 # Infer from proposal action_type if available
                 brief_action = brief.get("action_type", "")
                 profile = _infer_profile(brief_action)
+            # Resolve straight from the enum so any valid tier (incl. fable) is
+            # honored; an unknown value logs and falls back to sonnet rather than
+            # silently downgrading a real tier.
             model_str = brief.get("model", "sonnet")
-            if model_str == "opus":
-                model = CCModel.OPUS
-            elif model_str == "haiku":
-                model = CCModel.HAIKU
-            else:
+            try:
+                model = CCModel(model_str)
+            except ValueError:
+                logger.warning(
+                    "Execution brief %s specified unknown model %r — using sonnet",
+                    proposal_id, model_str,
+                )
                 model = CCModel.SONNET
 
             # Autonomy dispatch gate — same check as sweep_approved_inner.

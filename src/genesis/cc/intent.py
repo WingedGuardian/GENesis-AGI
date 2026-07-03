@@ -14,8 +14,14 @@ from genesis.cc.types import CCModel, EffortLevel, IntentResult
 
 
 class IntentParser:
-    _SLASH_MODEL = re.compile(r"/model\s+(sonnet|opus|haiku)", re.IGNORECASE)
-    _SLASH_EFFORT = re.compile(r"/effort\s+(low|medium|high|xhigh|max)", re.IGNORECASE)
+    # Alternations derived from the enums so a new tier (e.g. fable) or effort
+    # level is recognized here automatically — never hardcode the roster.
+    _SLASH_MODEL = re.compile(
+        rf"/model\s+({'|'.join(m.value for m in CCModel)})", re.IGNORECASE,
+    )
+    _SLASH_EFFORT = re.compile(
+        rf"/effort\s+({'|'.join(e.value for e in EffortLevel)})", re.IGNORECASE,
+    )
     _SLASH_RESUME = re.compile(r"/resume(?:\s+(\S+))?", re.IGNORECASE)
     _SLASH_TASK = re.compile(r"/task(?:\s+(.*))?", re.IGNORECASE)
 

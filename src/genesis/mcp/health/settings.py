@@ -17,6 +17,7 @@ from typing import Any
 
 import yaml
 
+from genesis.cc.types import VALID_EFFORT_NAMES, VALID_MODEL_NAMES
 from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
@@ -395,14 +396,14 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
         except (ValueError, TypeError):
             errors.append("inbox_monitor.batch_size must be an integer")
 
-    valid_models = {"sonnet", "opus", "haiku"}
+    valid_models = VALID_MODEL_NAMES
     if "model" in section and section["model"] not in valid_models:
         errors.append(
             f"inbox_monitor.model must be one of {sorted(valid_models)}, "
             f"got '{section['model']}'"
         )
 
-    valid_efforts = {"low", "medium", "high", "xhigh", "max"}
+    valid_efforts = VALID_EFFORT_NAMES
     if "effort" in section and section["effort"] not in valid_efforts:
         errors.append(
             f"inbox_monitor.effort must be one of {sorted(valid_efforts)}, "
@@ -559,8 +560,8 @@ def _validate_channels(changes: dict) -> list[str]:
     """Validate channel defaults config changes."""
     errors: list[str] = []
     valid_top_keys = {"telegram"}
-    valid_models = {"opus", "sonnet", "haiku"}
-    valid_efforts = {"low", "medium", "high", "xhigh", "max"}
+    valid_models = VALID_MODEL_NAMES
+    valid_efforts = VALID_EFFORT_NAMES
 
     for key in changes:
         if key not in valid_top_keys:

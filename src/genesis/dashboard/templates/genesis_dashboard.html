@@ -2186,7 +2186,7 @@
           // TTS
           provider: 'Active TTS provider. Requires restart to switch.',
           voice_id: 'Voice ID string from the TTS provider (e.g., ElevenLabs voice ID)',
-          model: 'LLM model for processing (opus = highest quality, haiku = fastest)',
+          model: 'LLM model for processing (fable = most capable, opus = high quality, haiku = fastest)',
           stability: '0.0\u20131.0: higher = more consistent voice',
           similarity_boost: '0.0\u20131.0: higher = closer to original voice',
           style: '0.0\u20131.0: higher = more expressive delivery',
@@ -2213,7 +2213,7 @@
           response_dir: 'Subdirectory pattern where responses are written (excluded from scanning)',
           check_interval_seconds: 'How often (in seconds) to scan the inbox directory for new files',
           batch_size: 'Maximum files to process per scan cycle (1\u201310)',
-          effort: 'Processing depth: low (fast), medium (balanced), high (thorough), xhigh (Opus 4.7 only), or max',
+          effort: 'Processing depth: low (fast), medium (balanced), high (thorough), xhigh (deeper), or max (deepest)',
           timeout_s: 'Max seconds per inbox item processing before timeout',
           // Outreach
           start: 'Quiet hours start \u2014 no outreach before this time (e.g., 22:00)',
@@ -2261,12 +2261,12 @@
           allowed_impacts: 'Impact levels eligible for auto-apply',
           backup_before_update: 'Run backup before applying any update',
           // Channels
-          default_model: 'Model for new Telegram sessions (opus = highest quality, haiku = fastest)',
+          default_model: 'Model for new Telegram sessions (fable = most capable, opus = high quality, haiku = fastest)',
           default_effort: 'Effort level for new Telegram sessions (higher = more thorough)',
         },
         _SETTING_CHOICES: {
           provider: ['elevenlabs', 'fish_audio', 'cartesia'],
-          model: ['opus', 'sonnet', 'haiku'],
+          model: ['fable', 'opus', 'sonnet', 'haiku'],
           effort: ['low', 'medium', 'high', 'xhigh', 'max'],
           approval_channel: ['telegram', 'email', 'dashboard'],
           default: ['telegram', 'email', 'dashboard'],
@@ -2274,7 +2274,7 @@
           alert: ['telegram', 'email', 'dashboard'],
           surplus: ['telegram', 'email', 'dashboard'],
           digest: ['telegram', 'email', 'dashboard'],
-          default_model: ['opus', 'sonnet', 'haiku'],
+          default_model: ['fable', 'opus', 'sonnet', 'haiku'],
           default_effort: ['low', 'medium', 'high', 'xhigh', 'max'],
         },
         // Display order for settings domains — most important first
@@ -7553,7 +7553,7 @@
                   </div>
                   <select style="margin-left: auto; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
                           @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({default_effort: $event.target.value}) })">
-                    <!-- MAX and XHIGH intentionally excluded per user decision (defaults stay at high; xhigh is Opus 4.7 only and reachable via session_set_effort) -->
+                    <!-- MAX and XHIGH intentionally excluded per user decision (ego defaults stay at high; the full range is reachable via session_set_effort) -->
                     <template x-for="e in ['low', 'medium', 'high']" :key="e">
                       <option :value="e" x-text="e.charAt(0).toUpperCase() + e.slice(1)"
                               :selected="e === ($store.genesisDashboard.egoStatus?.default_effort || 'high')"></option>
@@ -7566,7 +7566,7 @@
                 <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.2rem;">Model</div>
                 <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
                         @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model: $event.target.value}) })">
-                  <template x-for="m in ['opus', 'sonnet', 'haiku']" :key="m">
+                  <template x-for="m in ['fable', 'opus', 'sonnet', 'haiku']" :key="m">
                     <option :value="m" x-text="m.charAt(0).toUpperCase() + m.slice(1)"
                             :selected="m === ($store.genesisDashboard.egoStatus?.model || 'opus')"></option>
                   </template>
@@ -10380,12 +10380,12 @@
             <label style="display:block; font-size:.75rem; color:var(--color-text-secondary);">Model</label>
             <select x-model="$store.genesisDashboard.campaignEdit.model"
                     style="width:100%; padding:.4rem; margin-bottom:.6rem; background:var(--color-background); border:1px solid var(--color-border); color:var(--color-text); border-radius:4px;">
-              <option value="haiku">haiku</option><option value="sonnet">sonnet</option><option value="opus">opus</option>
+              <option value="haiku">haiku</option><option value="sonnet">sonnet</option><option value="opus">opus</option><option value="fable">fable</option>
             </select>
             <label style="display:block; font-size:.75rem; color:var(--color-text-secondary);">Effort</label>
             <select x-model="$store.genesisDashboard.campaignEdit.effort"
                     style="width:100%; padding:.4rem; margin-bottom:.6rem; background:var(--color-background); border:1px solid var(--color-border); color:var(--color-text); border-radius:4px;">
-              <option value="low">low</option><option value="medium">medium</option><option value="high">high</option>
+              <option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option>
             </select>
             <label style="display:block; font-size:.75rem; color:var(--color-text-secondary);">Max daily cost (USD)</label>
             <input type="number" step="0.5" min="0" x-model.number="$store.genesisDashboard.campaignEdit.max_daily_cost_usd"

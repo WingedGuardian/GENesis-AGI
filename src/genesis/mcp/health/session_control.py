@@ -5,12 +5,11 @@ from __future__ import annotations
 import logging
 
 from genesis.cc.session_cache import persist_session_config as _persist_session_config
+from genesis.cc.types import VALID_EFFORT_NAMES as _VALID_EFFORTS
+from genesis.cc.types import VALID_MODEL_NAMES as _VALID_MODELS
 from genesis.mcp.health import mcp  # noqa: E402
 
 logger = logging.getLogger(__name__)
-
-_VALID_MODELS = {"sonnet", "opus", "haiku"}
-_VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
 
 async def _impl_session_set_model(session_id: str, model: str) -> dict:
@@ -79,7 +78,7 @@ async def session_config(
     or effort ('think harder', 'low effort', 'max effort'). Both parameters
     are optional — pass only what you want to change.
 
-    Valid models: sonnet, opus, haiku.
+    Valid models: sonnet, opus, haiku, fable.
     Valid efforts: low, medium, high, xhigh, max.
     Pass the Session ID from your system configuration.
     Changes take effect on the next response.

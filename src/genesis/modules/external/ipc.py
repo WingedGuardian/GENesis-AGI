@@ -12,7 +12,7 @@ from typing import Protocol
 
 import httpx
 
-from genesis.cc.types import CCModel, EffortLevel
+from genesis.cc.types import CCModel, EffortLevel, model_supports_effort
 from genesis.modules.external.config import IPCConfig
 
 logger = logging.getLogger(__name__)
@@ -224,6 +224,14 @@ class SshIPCAdapter:
                 "SSH CC dispatch: unrecognized effort %r (quoted and passed through)", effort
             )
 
+        # Haiku does not use an effort setting — omit --effort for it (the CLI
+        # tolerates the flag but it's a no-op). Unknown models fall through to
+        # including --effort (best-effort passthrough, warned above).
+        include_effort = (
+            model not in valid_models or model_supports_effort(CCModel(model))
+        )
+        effort_seg = f" --effort {shlex.quote(effort)}" if include_effort else ""
+
         parts: list[str] = []
         if self._remote_working_dir:
             parts.append(f"cd {shlex.quote(self._remote_working_dir)} &&")
@@ -231,7 +239,7 @@ class SshIPCAdapter:
             f"{shlex.quote(self._remote_claude_path)} -p"
             f" --model {shlex.quote(model)}"
             f" --output-format json"
-            f" --effort {shlex.quote(effort)}"
+            f"{effort_seg}"
             f" --max-turns 25"
             f" --dangerously-skip-permissions"
         )
