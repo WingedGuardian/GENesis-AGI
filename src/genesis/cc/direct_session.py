@@ -23,9 +23,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.cc import roster
@@ -48,6 +50,36 @@ if TYPE_CHECKING:
     from genesis.cc.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-session CC Bash-sandbox isolation (background dispatch sessions)
+# ---------------------------------------------------------------------------
+# By default a background session's CC Bash sandbox (CLAUDE_CODE_TMPDIR) lives in
+# the shared, watchgod-policed ~/.genesis/cc-tmp. Giving each session its OWN
+# sandbox under ~/tmp (OFF cc-tmp) means (a) its scratch can't be clipped by
+# tmp_watchgod's RED nuclear-cleanup mid-run, and (b) it stops contributing to
+# cc-tmp pressure that could trip cleanup of foreground CLI sessions. Mirrors the
+# gauntlet (eval/gauntlet.py). This overrides CLAUDE_CODE_TMPDIR — the CC-specific
+# per-invocation sandbox var — NOT the shell TMPDIR, which the `tmp_filesystem_limit`
+# procedure correctly says never to override globally. (It does NOT prevent a
+# "kill": background sessions are asyncio subprocesses, not tmux sessions, so
+# watchgod's tmux-kill can't reach them anyway — do not claim otherwise.)
+_BG_CC_TMP_ROOT = Path.home() / "tmp" / "bg-cc-sessions"
+
+
+def _bg_session_root(session_id: str) -> Path:
+    """Per-session root dir for a background CC session's isolated sandbox."""
+    return _BG_CC_TMP_ROOT / session_id
+
+
+def _bg_session_sandbox(session_id: str) -> str:
+    """Return this session's CLAUDE_CODE_TMPDIR path (off cc-tmp).
+
+    Pure — the caller (_run_session) creates the directory just before the
+    session runs, so building an invocation has no filesystem side effect.
+    """
+    return str(_bg_session_root(session_id) / "cc-sandbox")
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +698,16 @@ class DirectSessionRunner:
 
         try:
             async with self._semaphore:
-                invocation = self._build_invocation(request)
+                invocation = self._build_invocation(request, session_id)
+                # Create this session's isolated CC sandbox (off cc-tmp) just
+                # before the run; removed in the finally below. The guard is
+                # intentional: if claude_code_tmpdir is unset (tests, or any
+                # future non-isolated path), CC falls back to the shared cc-tmp
+                # (the old behaviour) rather than this crashing.
+                if invocation.claude_code_tmpdir:
+                    Path(invocation.claude_code_tmpdir).mkdir(
+                        parents=True, exist_ok=True,
+                    )
                 output: CCOutput = await self._invoker.run_streaming(
                     invocation, on_event=on_event,
                 )
@@ -789,6 +830,12 @@ class DirectSessionRunner:
                 session_id[:8], elapsed, exc,
             )
             raise
+
+        finally:
+            # Remove this session's isolated CC sandbox (created off cc-tmp just
+            # before the run above). Best-effort; the disk-hygiene reaper catches
+            # any orphans left by a hard SIGKILL that skips this finally.
+            shutil.rmtree(_bg_session_root(session_id), ignore_errors=True)
 
     async def _record_proposal_outcome(
         self,
@@ -938,7 +985,9 @@ class DirectSessionRunner:
         except Exception:
             logger.debug("Failed to send dispatch debrief", exc_info=True)
 
-    def _build_invocation(self, request: DirectSessionRequest) -> CCInvocation:
+    def _build_invocation(
+        self, request: DirectSessionRequest, session_id: str,
+    ) -> CCInvocation:
         system_prompt = request.system_prompt
         if system_prompt is None:
             # Use the surplus config's system prompt (which loads SOUL.md)
@@ -1031,6 +1080,7 @@ class DirectSessionRunner:
             skip_permissions=True,
             disallowed_tools=disallowed,
             working_dir=background_session_dir(),
+            claude_code_tmpdir=_bg_session_sandbox(session_id),
             mcp_config=mcp_config,
             bash_allowlist=_PROFILE_BASH_ALLOWLIST.get(request.profile, ()),
             roster_eligible=roster_eligible,
@@ -1070,8 +1120,6 @@ class DirectSessionRunner:
         # .replace("/", "-") leaves the dot and yields a wrong path.
         transcript_path = ""
         if result.cc_session_id:
-            from pathlib import Path
-
             project_key = cc_project_key(background_session_dir())
             transcript_path = str(
                 Path.home() / ".claude" / "projects"
