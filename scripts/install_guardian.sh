@@ -595,18 +595,24 @@ REMOTECONF
     SSH_TEST=$(_guardian_ssh_test)
     if echo "$SSH_TEST" | grep -q '"ok": true'; then
         echo "  SSH bidirectional link verified${GUARD_FROM_IP:+ (source-restricted to ${GUARD_FROM_IP})}"
-    elif [ -n "${GUARD_FROM_IP:-}" ]; then
-        # A wrong from= restriction would silently lock Guardian out of the host.
-        # Never let that persist: drop from= (keep no-pty + the other options)
-        # and re-test. Guardian keeps working; the LAN source-restriction just
-        # isn't applied until the correct source IP is determined.
-        echo "  SSH test failed with from=\"${GUARD_FROM_IP}\" — retrying without from= (keeping no-pty)..."
-        sed -i '/genesis-guardian-control/d' "$HOME/.ssh/authorized_keys"
-        echo "${GUARD_BASE_OPTS} ${PUBKEY}" >> "$HOME/.ssh/authorized_keys"
-        chmod 600 "$HOME/.ssh/authorized_keys"
+    elif grep -F "$PUBKEY_BLOB" "$HOME/.ssh/authorized_keys" 2>/dev/null | grep -q 'from='; then
+        # The guardian key carries a from= restriction and the link is down — the
+        # restriction likely doesn't match the source IP the host observes (wrong
+        # derivation, or the container's address changed since the key was
+        # written). A wrong from= silently locks Guardian out, so drop it (keeping
+        # no-pty + the other options) and re-test. Keyed on the PRESENCE of from=
+        # (not on whether we wrote it this run), so a stale from= also self-heals
+        # on a plain re-run. Remove by key material (grep -vF on the blob), not
+        # the comment, so it works regardless of the key's comment field.
+        echo "  SSH test failed while a from= restriction is set on the guardian key — dropping from= (keeping no-pty) and retrying..."
+        _ak="$HOME/.ssh/authorized_keys"; _tmp="${_ak}.tmp.$$"
+        grep -vF "$PUBKEY_BLOB" "$_ak" > "$_tmp" 2>/dev/null || true
+        echo "${GUARD_BASE_OPTS} ${PUBKEY}" >> "$_tmp"
+        mv "$_tmp" "$_ak"
+        chmod 600 "$_ak"
         SSH_TEST=$(_guardian_ssh_test)
         if echo "$SSH_TEST" | grep -q '"ok": true'; then
-            echo "  SSH link verified WITHOUT from= — the derived source IP (${GUARD_FROM_IP}) is not what the host observes."
+            echo "  SSH link verified WITHOUT from= — the source-IP restriction did not match what the host observes."
             echo "  Guardian works; the LAN key-theft restriction is NOT enforced. To enable it, add"
             echo "  from=\"<container's host-facing source IP>\" to the guardian key in ~/.ssh/authorized_keys."
         else
