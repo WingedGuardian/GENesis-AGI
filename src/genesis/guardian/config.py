@@ -76,6 +76,9 @@ class CCConfig:
 
     enabled: bool = True
     model: str = "opus"
+    # Thinking effort for diagnosis: low/medium/high/xhigh/max. Omitted at
+    # dispatch for models that don't use an effort setting (Haiku).
+    effort: str = "high"
     timeout_s: int = 3600  # 60 min — must not clip downloads or deep investigation
     max_turns: int = 50    # Runaway guard — legitimate work is ~15-30 turns
     path: str = "claude"
@@ -253,6 +256,7 @@ def _env_override(config: GuardianConfig) -> GuardianConfig:
     for env_var, attr, typ in [
         ("GUARDIAN_CC_ENABLED", "enabled", lambda v: v.lower() in ("1", "true", "yes")),
         ("GUARDIAN_CC_MODEL", "model", str),
+        ("GUARDIAN_CC_EFFORT", "effort", str),
         ("GUARDIAN_CC_TIMEOUT", "timeout_s", int),
         ("GUARDIAN_CC_MAX_TURNS", "max_turns", int),
         ("GUARDIAN_CC_PATH", "path", str),
