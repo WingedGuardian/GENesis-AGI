@@ -225,7 +225,10 @@ async def _check_cc_cap_detection(db) -> None:
     global _last_cap_alert_at
     if db is None:
         return
-    # Query first (always) so we can BOTH alert on a run AND resolve on recovery.
+    # ONE best-effort guard around the whole thing: this runs on every tick, so any
+    # failure (a DB hiccup, an unexpected row shape) must skip the check, never break
+    # the tick. Query first (always) so we can BOTH alert on a run AND resolve on
+    # recovery.
     try:
         cutoff = (datetime.now(UTC) - timedelta(minutes=_CAP_EMPTY_WINDOW_MIN)).isoformat()
         cur = await db.execute(
@@ -236,15 +239,11 @@ async def _check_cc_cap_detection(db) -> None:
         )
         row = await cur.fetchone()
         count = row[0] if row else 0
-    except Exception:
-        logger.debug("cc_cap detection: query failed", exc_info=True)
-        return
 
-    if count < _CAP_EMPTY_THRESHOLD:
-        # Recovery: clear any outstanding cap alert so it doesn't linger for its
-        # 3-day TTL after the cap lifts, and reset the cooldown on a genuine
-        # resolve so a fresh cap re-alerts immediately (mirrors the DLQ path).
-        try:
+        if count < _CAP_EMPTY_THRESHOLD:
+            # Recovery: clear any outstanding cap alert so it doesn't linger for its
+            # 3-day TTL after the cap lifts, and reset the cooldown on a genuine
+            # resolve so a fresh cap re-alerts immediately (mirrors the DLQ path).
             resolved = await observations.resolve_by_source_and_type(
                 db,
                 source="cc_cap_monitor",
@@ -257,20 +256,17 @@ async def _check_cc_cap_detection(db) -> None:
             )
             if resolved:
                 _last_cap_alert_at = None
-        except Exception:
-            logger.debug("cc_cap detection: resolve failed", exc_info=True)
-        return
+            return
 
-    now = time.monotonic()
-    if _last_cap_alert_at is not None and now - _last_cap_alert_at < _CAP_ALERT_COOLDOWN_S:
-        return
-    # Set the cooldown BEFORE the write so a failed create still suppresses retries.
-    _last_cap_alert_at = now
-    try:
+        now = time.monotonic()
+        if _last_cap_alert_at is not None and now - _last_cap_alert_at < _CAP_ALERT_COOLDOWN_S:
+            return
+        # Set the cooldown BEFORE the write so a failed create still suppresses retries.
+        _last_cap_alert_at = now
         # DB-backed dedup: a stable content_hash + skip_if_duplicate means a cap
-        # persisting for hours produces ONE unresolved alert, not one per hour
-        # (the same discipline as the DLQ accumulation alert). It clears via the
-        # resolve path above and re-alerts on a fresh cap.
+        # persisting for hours produces ONE unresolved alert, not one per hour (the
+        # same discipline as the DLQ accumulation alert). It clears via the resolve
+        # path above and re-alerts on a fresh cap.
         content_hash = hashlib.sha256(b"cc_cap_alert").hexdigest()
         created = await observations.create(
             db,
@@ -296,7 +292,7 @@ async def _check_cc_cap_detection(db) -> None:
             count, _CAP_EMPTY_WINDOW_MIN,
         )
     except Exception:
-        logger.debug("Failed to create cc_cap alert observation", exc_info=True)
+        logger.debug("cc_cap detection failed — skipping this tick", exc_info=True)
 
 
 # Micro ticks are silent by default (counted for cascade, no LLM call).
