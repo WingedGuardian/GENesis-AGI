@@ -7,7 +7,7 @@ Genesis v3 is an autonomous AI agent system.
 Channels (Telegram, Dashboard, OpenClaw) → Cognitive Core (CCInvoker, triage,
 reflection) → Services (routing, memory, outreach, autonomy, surplus) → Data
 (SQLite WAL, Qdrant, ~/.genesis/) → Observability (event bus, health).
-64 packages, 94K LOC. Use `codebase_navigate` MCP to explore.
+89 packages, ~192K LOC. Use `codebase_navigate` MCP to explore.
 
 ## Environment
 
@@ -18,7 +18,6 @@ reflection) → Services (routing, memory, outreach, autonomy, surplus) → Data
   via the `guardian-gateway.sh` command dispatcher. NOT the Ollama server.
 - **Network**: Install-specific. See `~/.genesis/config/genesis.yaml` (generated
   by `scripts/setup-local-config.sh`). Dashboard proxied host:5000 → container:5000.
-  only. Do NOT install locally. NOT the host VM.
 - **Qdrant**: `localhost:6333` (systemd service)
 - **GitHub**: configured in `~/.genesis/config/genesis.yaml` (`github.user` / `github.public_repo`)
 - **Database**: `~/genesis/data/genesis.db` (NOT `~/genesis/genesis.db`)

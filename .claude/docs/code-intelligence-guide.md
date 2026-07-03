@@ -1,23 +1,9 @@
 # Code Intelligence — Deep Reference
 
 Detailed reference for Serena, GitNexus, and codebase-memory-mcp.
-For the quick decision matrix, see: `.claude/docs/code-intelligence.md`
-
-## When to Use Which
-
-| Question | Tool | Why |
-|----------|------|-----|
-| "Find all files containing X" | **Grep** | Text pattern, universal |
-| "What's the definition of this class?" | **Serena** | Type-aware, exact |
-| "Who references this function?" | **Serena** | LSP find-references |
-| "What breaks if I change X?" | **GitNexus** `impact` | Multi-hop graph traversal |
-| "How does task dispatch work end-to-end?" | **GitNexus** processes | Execution flow tracing |
-| "Which modules are tightly coupled?" | **GitNexus** clusters | Community detection |
-| "What changed in my uncommitted code?" | **GitNexus** `detect_changes` | Diff → symbol mapping |
-| Config, YAML, SQL, shell scripts | **Grep** | Non-Python, no LSP |
-| Safe rename across codebase | **Serena** (Python) or **GitNexus** (multi-lang) | Graph-aware |
-| "What API routes exist and who handles them?" | **GitNexus** `route_map` | Route → handler mapping |
-| "What MCP tools are defined and where?" | **GitNexus** `tool_map` | Tool → handler mapping |
+For which tool to pick (the decision matrix), see:
+`.claude/docs/code-intelligence.md` — this file assumes you already
+chose and covers syntax, schema, and limitations.
 
 ## Grep / Glob
 
