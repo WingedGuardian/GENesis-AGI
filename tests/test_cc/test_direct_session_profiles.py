@@ -10,12 +10,15 @@ from unittest.mock import MagicMock
 import pytest
 
 from genesis.cc.direct_session import (
+    _BG_CC_TMP_ROOT,
     _PROFILE_ADDENDA,
     PROFILES,
     VALID_PROFILES,
     DirectSessionRequest,
     DirectSessionRunner,
     ProfileOverlayContext,
+    _bg_session_root,
+    _bg_session_sandbox,
     _build_profile_addendum,
 )
 from genesis.cc.types import CCModel
@@ -255,7 +258,7 @@ def test_interact_profile_upgrades_model_to_opus():
     """Interact sessions must always use Opus regardless of requested model."""
     runner = _make_runner()
     req = DirectSessionRequest(prompt="test", profile="interact", model=CCModel.SONNET)
-    inv = runner._build_invocation(req)
+    inv = runner._build_invocation(req, "test-session")
     assert inv.model == CCModel.OPUS
 
 
@@ -263,7 +266,7 @@ def test_interact_profile_keeps_opus_when_already_opus():
     """Opus request + interact should stay Opus (idempotent)."""
     runner = _make_runner()
     req = DirectSessionRequest(prompt="test", profile="interact", model=CCModel.OPUS)
-    inv = runner._build_invocation(req)
+    inv = runner._build_invocation(req, "test-session")
     assert inv.model == CCModel.OPUS
 
 
@@ -271,7 +274,7 @@ def test_research_profile_does_not_upgrade_model():
     """Non-interact profiles must NOT override the requested model."""
     runner = _make_runner()
     req = DirectSessionRequest(prompt="test", profile="research", model=CCModel.SONNET)
-    inv = runner._build_invocation(req)
+    inv = runner._build_invocation(req, "test-session")
     assert inv.model == CCModel.SONNET
 
 
@@ -279,7 +282,7 @@ def test_observe_profile_does_not_upgrade_model():
     """Observe profile must NOT override the requested model."""
     runner = _make_runner()
     req = DirectSessionRequest(prompt="test", profile="observe", model=CCModel.HAIKU)
-    inv = runner._build_invocation(req)
+    inv = runner._build_invocation(req, "test-session")
     assert inv.model == CCModel.HAIKU
 
 
@@ -310,7 +313,7 @@ def test_roster_model_routes_to_peer(monkeypatch):
     monkeypatch.setenv("ZHIPU_TEST_KEY", "sk-secret")
     runner = _make_runner()
     req = DirectSessionRequest(prompt="t", profile="observe", roster_model="glm-5.2")
-    inv = runner._build_invocation(req)
+    inv = runner._build_invocation(req, "test-session")
     assert inv.model_id_override == "glm-5.2"
     assert inv.anthropic_base_url == "https://open.bigmodel.cn/api/anthropic"
     assert inv.anthropic_auth_token == "sk-secret"
@@ -322,7 +325,7 @@ def test_roster_model_claude_pins_native(monkeypatch):
     _patch_roster(monkeypatch)
     runner = _make_runner()
     req = DirectSessionRequest(prompt="t", profile="observe", roster_model="claude")
-    inv = runner._build_invocation(req)
+    inv = runner._build_invocation(req, "test-session")
     assert inv.model_id_override is None
     assert inv.anthropic_base_url is None
     # native pin → NOT eligible so the chokepoint can't re-select the global default.
@@ -333,7 +336,7 @@ def test_no_roster_model_uses_chokepoint_default(monkeypatch):
     _patch_roster(monkeypatch)
     runner = _make_runner()
     req = DirectSessionRequest(prompt="t", profile="observe")  # no roster_model
-    inv = runner._build_invocation(req)
+    inv = runner._build_invocation(req, "test-session")
     assert inv.roster_eligible is True  # chokepoint selects at invoke time
     assert inv.model_id_override is None
 
@@ -343,7 +346,7 @@ def test_unknown_roster_model_fails_loud(monkeypatch):
     runner = _make_runner()
     req = DirectSessionRequest(prompt="t", profile="observe", roster_model="nope")
     with pytest.raises(roster.RosterError):
-        runner._build_invocation(req)
+        runner._build_invocation(req, "test-session")
 
 
 def test_keyless_roster_model_fails_loud(monkeypatch):
@@ -352,7 +355,7 @@ def test_keyless_roster_model_fails_loud(monkeypatch):
     runner = _make_runner()
     req = DirectSessionRequest(prompt="t", profile="observe", roster_model="glm-5.2")
     with pytest.raises(roster.RosterError):
-        runner._build_invocation(req)
+        runner._build_invocation(req, "test-session")
 
 
 # --- Mail profile: perimeter session restrictions ---
@@ -420,7 +423,7 @@ def test_mail_addendum_does_not_include_mission_injection():
 def test_mail_profile_does_not_upgrade_model():
     runner = _make_runner()
     req = DirectSessionRequest(prompt="test", profile="mail", model=CCModel.SONNET)
-    inv = runner._build_invocation(req)
+    inv = runner._build_invocation(req, "test-session")
     assert inv.model == CCModel.SONNET
 
 
@@ -465,7 +468,7 @@ def test_steward_addendum_has_mission():
 def test_steward_does_not_upgrade_model():
     runner = _make_runner()
     req = DirectSessionRequest(prompt="test", profile="steward", model=CCModel.SONNET)
-    inv = runner._build_invocation(req)
+    inv = runner._build_invocation(req, "test-session")
     assert inv.model == CCModel.SONNET
 
 
@@ -474,14 +477,14 @@ def test_steward_does_not_upgrade_model():
 def test_steward_invocation_sets_gh_bash_allowlist():
     runner = _make_runner()
     req = DirectSessionRequest(prompt="test", profile="steward", model=CCModel.SONNET)
-    inv = runner._build_invocation(req)
+    inv = runner._build_invocation(req, "test-session")
     assert inv.bash_allowlist == ("gh",)
 
 
 def test_non_steward_invocation_has_empty_bash_allowlist():
     runner = _make_runner()
     req = DirectSessionRequest(prompt="test", profile="research", model=CCModel.SONNET)
-    inv = runner._build_invocation(req)
+    inv = runner._build_invocation(req, "test-session")
     assert inv.bash_allowlist == ()
 
 
@@ -590,7 +593,7 @@ def test_overlay_profile_flows_through_build_invocation(overlay_ctx, monkeypatch
     monkeypatch.setattr(ds, "VALID_PROFILES", ds.VALID_PROFILES | {"ztest-profile"})
     runner = _make_runner()
     req = DirectSessionRequest(prompt="t", profile="ztest-profile", model=CCModel.SONNET)
-    inv = runner._build_invocation(req)
+    inv = runner._build_invocation(req, "test-session")
     assert inv.bash_allowlist == (ds._VENV_PYTHON,)
     runner._config_builder.build_mcp_config.assert_called_with(profile="campaign")
 
@@ -650,3 +653,41 @@ def test_load_profile_overlays_noop_when_absent(monkeypatch):
     before = set(ds.PROFILES)
     ds._load_profile_overlays()
     assert set(ds.PROFILES) == before
+
+
+# --- Per-session CC sandbox isolation (background dispatch) ---
+
+def test_bg_session_sandbox_is_off_cc_tmp():
+    """A session's sandbox lives under ~/tmp/bg-cc-sessions, NOT the
+    watchgod-policed ~/.genesis/cc-tmp."""
+    path = _bg_session_sandbox("sess-abc")
+    assert path.endswith("/bg-cc-sessions/sess-abc/cc-sandbox")
+    assert str(_BG_CC_TMP_ROOT) in path
+    assert ".genesis/cc-tmp" not in path
+
+
+def test_bg_session_sandbox_distinct_per_session():
+    """Two sessions get distinct sandbox dirs (no cross-session collision)."""
+    assert _bg_session_sandbox("sess-a") != _bg_session_sandbox("sess-b")
+    assert _bg_session_root("sess-a") != _bg_session_root("sess-b")
+
+
+def test_bg_session_sandbox_is_pure_no_mkdir():
+    """Deriving the path must NOT create the dir (side-effect belongs to
+    _run_session, so building an invocation is pure)."""
+    sid = "sess-pure-check-xyz"
+    root = _bg_session_root(sid)
+    assert not root.exists()
+    _bg_session_sandbox(sid)
+    assert not root.exists()
+
+
+def test_build_invocation_sets_isolated_tmpdir():
+    """_build_invocation wires the per-session sandbox into the CCInvocation,
+    off cc-tmp — the actual seam the fix depends on."""
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="t", profile="research", model=CCModel.SONNET)
+    inv = runner._build_invocation(req, "sess-xyz")
+    assert inv.claude_code_tmpdir == _bg_session_sandbox("sess-xyz")
+    assert "bg-cc-sessions/sess-xyz" in (inv.claude_code_tmpdir or "")
+    assert ".genesis/cc-tmp" not in (inv.claude_code_tmpdir or "")

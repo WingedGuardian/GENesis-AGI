@@ -250,3 +250,65 @@ async def test_update_l15_verdict_backfills_even_on_labeled_row(tmp_path):
     assert (await crud.get_event(db, "id-1"))["l15_verdict"] is None
     assert await crud.update_l15_verdict(db, "missing", {"real": 1.0, "perk": 1.0}) is False
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_l15_verdicts_writes_even_on_labeled_rows(tmp_path):
+    """The shadow runner's backfill path: attach verdicts to MANY rows in one pass, including
+    already-LABELED rows (which bulk_upsert's label guard freezes). Verdict is a machine field."""
+    db = await _db(tmp_path / "g.db")
+    await crud.bulk_upsert_events(db, [_row(1), _row(2)])
+    await crud.update_acceptance_signal(db, "id-1", "should")   # LABEL id-1 (frozen to upsert)
+    v1 = json.dumps({"real": 0.8, "perk": 0.6, "category": "question"})
+    v2 = json.dumps({"real": 0.2, "perk": 0.1, "category": "garble"})
+    n = await crud.bulk_update_l15_verdicts(db, [("id-1", v1), ("id-2", v2)])
+    assert n == 2
+    e1 = await crud.get_event(db, "id-1")
+    assert json.loads(e1["l15_verdict"])["category"] == "question"   # verdict landed on labeled row
+    assert e1["acceptance_signal"] == "should"                       # label untouched
+    e2 = await crud.get_event(db, "id-2")
+    assert json.loads(e2["l15_verdict"])["real"] == 0.2
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_l15_verdicts_empty_is_noop(tmp_path):
+    db = await _db(tmp_path / "g.db")
+    assert await crud.bulk_update_l15_verdicts(db, []) == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_label_with_note_persists_reviewer_reasoning(tmp_path):
+    """PR3d: the reviewer's WHY is the point of the review loop — a label can carry a note."""
+    db = await _db(tmp_path / "g.db")
+    await crud.bulk_upsert_events(db, [_row(1)])
+    ok, prior = await crud.update_acceptance_signal(
+        db, "id-1", "shouldnt", note="trivial + self-answerable; didn't want interrupting"
+    )
+    assert ok and prior is None
+    ev = await crud.get_event(db, "id-1")
+    assert ev["acceptance_signal"] == "shouldnt"
+    assert ev["acceptance_note"] == "trivial + self-answerable; didn't want interrupting"
+
+
+@pytest.mark.asyncio
+async def test_relabel_without_note_leaves_existing_note_untouched(tmp_path):
+    """Omitting the note (sentinel) must PRESERVE a prior note — only an explicit value changes it."""
+    db = await _db(tmp_path / "g.db")
+    await crud.bulk_upsert_events(db, [_row(1)])
+    await crud.update_acceptance_signal(db, "id-1", "should", note="original reasoning")
+    await crud.update_acceptance_signal(db, "id-1", "shouldnt")          # no note arg
+    ev = await crud.get_event(db, "id-1")
+    assert ev["acceptance_signal"] == "shouldnt"
+    assert ev["acceptance_note"] == "original reasoning"                 # preserved
+
+
+@pytest.mark.asyncio
+async def test_label_note_can_be_explicitly_cleared(tmp_path):
+    db = await _db(tmp_path / "g.db")
+    await crud.bulk_upsert_events(db, [_row(1)])
+    await crud.update_acceptance_signal(db, "id-1", "should", note="x")
+    await crud.update_acceptance_signal(db, "id-1", "should", note=None)  # explicit clear
+    assert (await crud.get_event(db, "id-1"))["acceptance_note"] is None
+    await db.close()

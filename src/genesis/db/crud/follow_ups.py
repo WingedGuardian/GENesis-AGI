@@ -140,12 +140,17 @@ async def get_by_status(
     status: str,
     *,
     domain: str | None = None,
+    include_tabled: bool = True,
 ) -> list[dict]:
     """Get follow-ups by status. domain (exact match) scopes to that domain
-    only; None = all domains (no-op, identical to the prior behaviour)."""
+    only; None = all domains (no-op, identical to the prior behaviour).
+
+    include_tabled defaults True (existing callers see every kind); pass False
+    to restrict to the actionable ``follow_up`` lane."""
     dom_clause, dom_params = _domain_eq(domain)
+    kind_and = "" if include_tabled else "AND kind = 'follow_up' "
     cursor = await db.execute(
-        f"SELECT * FROM follow_ups WHERE status = ?{dom_clause} "
+        f"SELECT * FROM follow_ups WHERE status = ?{dom_clause} {kind_and}"
         "ORDER BY created_at ASC",
         (status, *dom_params),
     )
@@ -293,10 +298,16 @@ async def set_pinned(
     return cursor.rowcount > 0
 
 
-async def get_summary_counts(db: aiosqlite.Connection) -> dict[str, int]:
-    """Get counts by status for dashboard badges."""
+async def get_summary_counts(
+    db: aiosqlite.Connection, *, include_tabled: bool = True,
+) -> dict[str, int]:
+    """Get counts by status for dashboard badges.
+
+    include_tabled defaults True (existing callers unchanged); pass False to
+    count only the actionable ``follow_up`` lane."""
+    kind_where = "" if include_tabled else "WHERE kind = 'follow_up' "
     cursor = await db.execute(
-        "SELECT status, COUNT(*) FROM follow_ups GROUP BY status"
+        f"SELECT status, COUNT(*) FROM follow_ups {kind_where}GROUP BY status"
     )
     return {row[0]: row[1] for row in await cursor.fetchall()}
 
@@ -307,6 +318,7 @@ async def get_recent(
     limit: int = 20,
     exclude_source: str | None = None,
     source_mode: str = "all",
+    include_tabled: bool = True,
 ) -> list[dict]:
     """Get recent follow-ups for dashboard display.
 
@@ -321,31 +333,36 @@ async def get_recent(
         - ``"mine"`` — only ``foreground_session`` source
         - ``"system"`` — everything except ``foreground_session``
         Takes precedence over ``exclude_source`` when not ``"all"``.
+    include_tabled:
+        Defaults True (existing callers unchanged); pass False to restrict to
+        the actionable ``follow_up`` lane.
     """
+    kind_and = "" if include_tabled else "AND kind = 'follow_up' "
     if source_mode == "mine":
         cursor = await db.execute(
             "SELECT * FROM follow_ups "
-            "WHERE source = 'foreground_session' "
+            f"WHERE source = 'foreground_session' {kind_and}"
             "ORDER BY created_at DESC LIMIT ?",
             (limit,),
         )
     elif source_mode == "system":
         cursor = await db.execute(
             "SELECT * FROM follow_ups "
-            "WHERE source != 'foreground_session' "
+            f"WHERE source != 'foreground_session' {kind_and}"
             "ORDER BY created_at DESC LIMIT ?",
             (limit,),
         )
     elif exclude_source:
         cursor = await db.execute(
             "SELECT * FROM follow_ups "
-            "WHERE source NOT LIKE ? "
+            f"WHERE source NOT LIKE ? {kind_and}"
             "ORDER BY created_at DESC LIMIT ?",
             (f"%{exclude_source}%", limit),
         )
     else:
+        where_kind = "" if include_tabled else "WHERE kind = 'follow_up' "
         cursor = await db.execute(
-            "SELECT * FROM follow_ups ORDER BY created_at DESC LIMIT ?",
+            f"SELECT * FROM follow_ups {where_kind}ORDER BY created_at DESC LIMIT ?",
             (limit,),
         )
     return [dict(row) for row in await cursor.fetchall()]

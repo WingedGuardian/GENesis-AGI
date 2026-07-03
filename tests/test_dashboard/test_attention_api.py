@@ -58,6 +58,7 @@ def _evrow(**over):
         }),
         "l15_verdict": None,
         "acceptance_signal": None,
+        "acceptance_note": None,
         "snapshot_id": "20260701T013412Z",
         "config_version": "0.1.0-default",
         "created_at": "2026-07-01T00:00:04+00:00",
@@ -205,6 +206,82 @@ def test_label_ok_returns_prior(client):
     assert resp.status_code == 200
     data = resp.get_json()
     assert data == {"status": "ok", "id": "evt-1", "acceptance_signal": "shouldnt", "prior": "should"}
+
+
+def test_label_forwards_stripped_note_to_crud(client):
+    upd = AsyncMock(return_value=(True, None))
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.db.crud.attention.update_acceptance_signal", new=upd),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        resp = client.post("/api/genesis/attention/evt-1/label",
+                           json={"acceptance_signal": "shouldnt", "acceptance_note": "  self-answerable  "})
+    assert resp.status_code == 200
+    _, kwargs = upd.call_args
+    assert kwargs.get("note") == "self-answerable"                  # stripped before store
+    assert resp.get_json()["acceptance_note"] == "self-answerable"  # echoed back
+
+
+def test_label_without_note_omits_note_kwarg(client):
+    # No note in the body → the crud call omits `note` (sentinel) so an existing note survives.
+    upd = AsyncMock(return_value=(True, None))
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.db.crud.attention.update_acceptance_signal", new=upd),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        resp = client.post("/api/genesis/attention/evt-1/label", json={"acceptance_signal": "should"})
+    assert resp.status_code == 200
+    _, kwargs = upd.call_args
+    assert "note" not in kwargs
+
+
+def test_label_rejects_non_string_note(client):
+    # A non-string, non-null acceptance_note (e.g. a number) must 400, not silently clear the note.
+    upd = AsyncMock(return_value=(True, None))
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.db.crud.attention.update_acceptance_signal", new=upd),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        resp = client.post("/api/genesis/attention/evt-1/label",
+                           json={"acceptance_signal": "should", "acceptance_note": 42})
+    assert resp.status_code == 400
+    assert upd.call_count == 0  # never reached the crud layer
+
+
+def test_label_null_note_clears(client):
+    # Explicit null note → crud receives note=None (clear).
+    upd = AsyncMock(return_value=(True, None))
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.db.crud.attention.update_acceptance_signal", new=upd),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        resp = client.post("/api/genesis/attention/evt-1/label",
+                           json={"acceptance_signal": "should", "acceptance_note": None})
+    assert resp.status_code == 200
+    _, kwargs = upd.call_args
+    assert kwargs.get("note") is None and "note" in kwargs
+
+
+def test_list_surfaces_verdict_and_note(client):
+    row = _evrow(
+        l15_verdict=json.dumps({"real": 0.9, "perk": 0.8, "category": "question",
+                                "reason": "a scheduling question", "prompt_version": "v2"}),
+        acceptance_note="declined — I was mid-task",
+    )
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.db.crud.attention.list_events", new=AsyncMock(return_value=[row])),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        resp = client.get("/api/genesis/attention/list")
+    ev = resp.get_json()["events"][0]
+    assert ev["l15_verdict"]["category"] == "question"
+    assert ev["l15_verdict"]["reason"] == "a scheduling question"
+    assert ev["acceptance_note"] == "declined — I was mid-task"
 
 
 def test_label_400_on_invalid_signal(client):

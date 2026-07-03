@@ -33,4 +33,16 @@ echo "--- worktree reaping ---"
 echo "--- cache reclamation ---"
 "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" --apply --if-above 90 || echo "disk_reclaim exited $?"
 
+# Reap orphaned per-session background-CC sandboxes (~/tmp/bg-cc-sessions/<id>).
+# direct_session._run_session removes these in a finally on normal completion;
+# this catches orphans left when a session is hard-SIGKILLed (skips finally).
+# 24h is well past any live session: the Genesis-controlled max timeout is
+# 7200s/2h (CCInvocation.timeout_s); DirectSessionRequest defaults to 3600s/1h.
+echo "--- background CC sandbox reaping ---"
+BG_CC_SANDBOX_DIR="$HOME/tmp/bg-cc-sessions"
+if [ -d "$BG_CC_SANDBOX_DIR" ]; then
+    find "$BG_CC_SANDBOX_DIR" -mindepth 1 -maxdepth 1 -type d -mmin +1440 \
+        -exec rm -rf {} + 2>/dev/null || echo "bg-cc-sandbox reap exited $?"
+fi
+
 echo "=== genesis-disk-hygiene done ==="

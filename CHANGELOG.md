@@ -17,7 +17,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   hard-coded addresses) — closing a gap where these install-specific addresses could otherwise slip
   into a public PR. The commit-message guard gained the same IPv6 coverage.
 
+- **The HTTP client Genesis uses for outbound requests is upgraded to clear 11 security advisories.**
+  `aiohttp` — the library behind health checks, provider pings, and market/price-data fetches — now
+  requires 3.14.1 or newer, which fixes 11 published CVEs (including a cookie-leak-on-redirect issue
+  and several denial-of-service vectors). Genesis uses it only as a client for outbound calls, so
+  real-world exposure was limited, but the newer version removes the advisories outright.
+
 ### Added
+
+- **The Genesis Voice add-on's attention surface now shows the judge's reasoning — and lets you review it.**
+  For the optional passive-listening add-on, the buried "Attention" tab is now a top-level **Genesis Voice →
+  Judgment** review. Each moment the attention gate noticed is scored by a lightweight LLM judge that says
+  whether it was real speech, whether it was worth attention, and — new — a one-word category and a short
+  reason. You review the judge (worth noticing / not worth it / skip) and can jot your own *why*; your notes
+  inform the judge's prompt, not any hidden weights. It stays offline observability — nothing here speaks or
+  acts, and it's hidden entirely when the voice add-on isn't installed.
 
 - **The dashboard's container-health badge now tells the truth about CPU and memory pressure.**
   Previously the badge ignored CPU entirely (it was hardwired to "healthy") and judged memory only by a
@@ -30,6 +44,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Each concurrent session normally uses well under a gigabyte; the Container card now lists per-session RSS, and
   if a single session climbs past a high ceiling — a sign it may be leaking — Genesis raises a health alert
   (reaching Telegram at the critical level) so you can restart just that session instead of finding out the hard way.
+
+- **Genesis can now shelve "someday/maybe" ideas separately from its actionable to-do list.**
+  Until now, every deferred item a session or the ego created landed in the actionable follow-up
+  queue — even low-value "might be worth doing someday" ideas — so the queue filled with things
+  nobody intended to act on. Genesis can now file those into a separate "tabled" lane instead
+  (the dashboard Follow-ups tab already supported this; now Genesis's own sessions and ego can too,
+  and can move an existing item between the two lanes). Tabled items are tracked but never surfaced
+  as work or auto-actioned, keeping the actionable list focused on real commitments.
 
 - **Genesis now catches scheduled jobs that silently stop working — running on schedule but never
   succeeding.** Some background jobs (like the weekly self-assessment and quality calibration) could
@@ -89,6 +111,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   duplicate. Together these keep the procedure store both more complete and less cluttered.
 
 ### Fixed
+
+- **The dashboard now reports each ego's cycle health separately.** Genesis runs two egos (a user-facing
+  one and its own), and both recorded their proactive-cycle health under a single shared key — so on the
+  health surface one ego's last run kept overwriting the other's, making it impossible to tell whether
+  either was actually cycling. Each ego now tracks its own health row, so a stalled or failing ego is
+  visible instead of masked.
+
+- **Memory extraction now runs reliably after a restart.** The job that turns recent conversations into
+  long-term memories was scheduled on a fixed 2-hour interval measured from server start — and that timer
+  reset on every restart, so a box that restarted more often than every two hours could keep deferring
+  extraction indefinitely. It now also runs shortly after each start, so extraction can't be starved by
+  frequent restarts.
 
 - **Guardian's automated recovery now acts on the right service.** Guardian's self-healing (restart,
   journal-freshness, and crash-loop probes) and its diagnostic briefing pointed at a deprecated,

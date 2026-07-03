@@ -51,8 +51,9 @@ TABLES = {
             window_ref        TEXT NOT NULL,               -- JSON {snapshot_id,session_id,utt_ids,ts_start,ts_end} — REFS ONLY
             mode_state        TEXT,
             clarity           REAL,
-            l15_verdict       TEXT,                        -- JSON {real,perk}; NULL in v1 (L1.5 stubbed)
+            l15_verdict       TEXT,                        -- JSON {real,perk,category,reason,...}; the judge's verdict (PR3d)
             acceptance_signal TEXT,                        -- should|shouldnt|skip; back-filled at shadow review (PR2)
+            acceptance_note   TEXT,                        -- reviewer's optional one-line WHY (PR3d); their reasoning, not the judge's
             snapshot_id       TEXT,
             config_version    TEXT,
             created_at        TEXT NOT NULL

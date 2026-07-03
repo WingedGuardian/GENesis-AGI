@@ -123,10 +123,18 @@ async def list_events(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+_NOTE_UNSET = object()  # sentinel: distinguishes "note not provided" from "note set to None (clear)"
+
+
 async def update_acceptance_signal(
-    db: aiosqlite.Connection, event_id: str, signal: str,
+    db: aiosqlite.Connection, event_id: str, signal: str, note=_NOTE_UNSET,
 ) -> tuple[bool, str | None]:
-    """Write a review label. Returns ``(found, prior_signal)`` so the UI can show X->Y.
+    """Write a review label (+ an optional reviewer note). Returns ``(found, prior_signal)``
+    so the UI can show X->Y.
+
+    ``note`` is the reviewer's own one-line WHY — the reasoning that the perk decision is an
+    LLM judgment makes the point of the review (PR3d). It is SENTINEL-defaulted: omitted →
+    the existing note is preserved; passed (a string, or ``None`` to clear) → it is written.
 
     Raises ``ValueError`` for a signal outside ``LABELS`` (route maps it to 400)."""
     if signal not in LABELS:
@@ -138,9 +146,15 @@ async def update_acceptance_signal(
     if row is None:
         return (False, None)
     prior = row["acceptance_signal"]
-    await db.execute(
-        "UPDATE attention_events SET acceptance_signal = ? WHERE id = ?", (signal, event_id)
-    )
+    if note is _NOTE_UNSET:
+        await db.execute(
+            "UPDATE attention_events SET acceptance_signal = ? WHERE id = ?", (signal, event_id)
+        )
+    else:
+        await db.execute(
+            "UPDATE attention_events SET acceptance_signal = ?, acceptance_note = ? WHERE id = ?",
+            (signal, note, event_id),
+        )
     await db.commit()
     return (True, prior)
 
@@ -272,10 +286,35 @@ async def update_l15_verdict(
     UNCONDITIONAL (no ``acceptance_signal IS NULL`` guard) — unlike ``bulk_upsert_events``,
     which guards the human label. ``l15_verdict`` carries no human input, so a later
     ``--l15`` run may safely refresh it even on an already-LABELED row (the label/verdict
-    correlation workflow PR3c-2 needs). Stored floats-only (mirrors ``consumers._to_row``)."""
+    correlation workflow PR3c-2 needs). Stored as the judge's own JSON verdict (mirrors
+    ``consumers._to_row``) — never raw transcript text (firewall)."""
     payload = json.dumps(verdict) if verdict is not None else None
     cursor = await db.execute(
         "UPDATE attention_events SET l15_verdict = ? WHERE id = ?", (payload, event_id)
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def bulk_update_l15_verdicts(
+    db: aiosqlite.Connection, rows: list[tuple[str, str]]
+) -> int:
+    """Unconditionally set ``l15_verdict`` for each ``(event_id, verdict_json)`` pair; returns
+    the count submitted.
+
+    The bulk sibling of ``update_l15_verdict`` for the shadow runner's backfill: ``l15_verdict``
+    is a MACHINE field, so — unlike ``bulk_upsert_events``, whose ``WHERE acceptance_signal IS
+    NULL`` guard FREEZES a labeled row's derived columns — this writes even on LABELED rows.
+    That is exactly what a later ``--l15`` run needs: the verdict must attach to the same rows
+    the human already labeled, or the human∩judge agreement view reads the judge as "missing"
+    on precisely the rows under review. Callers pass already-serialized JSON (mirrors
+    ``ShadowStoreConsumer``, which ``json.dumps`` once) and filter out None verdicts themselves
+    (a no-verdict re-run must not null a stored one). One ``executemany`` in the caller's txn."""
+    if not rows:
+        return 0
+    await db.executemany(
+        "UPDATE attention_events SET l15_verdict = ? WHERE id = ?",
+        [(verdict_json, event_id) for event_id, verdict_json in rows],
+    )
+    await db.commit()
+    return len(rows)
