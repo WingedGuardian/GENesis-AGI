@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -22,7 +23,8 @@ class AudioProcessor:
         if not path.exists():
             raise FileNotFoundError(f"Audio file not found: {source}")
 
-        audio_bytes = path.read_bytes()
+        # Offload the blocking read off the event loop.
+        audio_bytes = await asyncio.to_thread(path.read_bytes)
         text = await transcribe(audio_bytes)
 
         if not text:
