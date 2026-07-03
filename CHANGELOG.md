@@ -90,6 +90,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Guardian's automated recovery now acts on the right service.** Guardian's self-healing (restart,
+  journal-freshness, and crash-loop probes) and its diagnostic briefing pointed at a deprecated,
+  usually-inactive background unit instead of the main Genesis service. As a result a "restart" could
+  report success while healing nothing, and a genuine crash loop of the main service went undetected.
+  Recovery, health probes, and diagnosis now target the main service, and a guardrail test keeps them
+  from drifting back.
+
 - **Superseded and expired memories no longer resurface in Genesis's automatic recall.** Before every
   prompt, Genesis injects the most relevant memories into its working context. That fast-path recall
   wasn't checking whether a memory had expired or been superseded (replaced by a newer, consolidated
