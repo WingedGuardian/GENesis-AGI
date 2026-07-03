@@ -13,6 +13,38 @@ _COMMON = dict(
 )
 
 
+async def test_prune_older_than_deletes_only_old(db):
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    await cost_events.create(
+        db, id="old", **{**_COMMON, "created_at": (now - timedelta(days=120)).isoformat()},
+    )
+    await cost_events.create(
+        db, id="new", **{**_COMMON, "created_at": (now - timedelta(days=10)).isoformat()},
+    )
+    removed = await cost_events.prune_older_than(db, days=90)
+    assert removed == 1
+    assert await cost_events.get_by_id(db, "old") is None
+    assert await cost_events.get_by_id(db, "new") is not None
+
+
+async def test_prune_older_than_respects_monthly_budget_floor(db):
+    """A 30-day-old cost_event is KEPT at the 90d default. Retention must never delete
+    inside the monthly budget window: cost_tracker._period_start('this_month') looks back
+    at most to the 1st of the month (~<=31d), and the 90d floor stays well clear of it."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    await cost_events.create(
+        db, id="within_budget",
+        **{**_COMMON, "created_at": (now - timedelta(days=30)).isoformat()},
+    )
+    removed = await cost_events.prune_older_than(db, days=90)
+    assert removed == 0
+    assert await cost_events.get_by_id(db, "within_budget") is not None
+
+
 async def test_create_and_get(db):
     rid = await cost_events.create(db, id="ce1", **_COMMON)
     assert rid == "ce1"

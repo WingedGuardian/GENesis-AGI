@@ -59,6 +59,23 @@ def _strip_gitnexus_block(path: Path) -> bool:
     return True
 
 
+def _restart_safe_hourly(hours: int, *, minute: int = 0):
+    """Restart-safe replacement for ``IntervalTrigger(hours=N)``.
+
+    A >1h IntervalTrigger measures from the last start and RESETS on every restart
+    (the CLAUDE.md trap), so a server that restarts more often than N never fires the
+    job. A CronTrigger fires on the wall clock and never resets. Callers keep their own
+    ``_recently_completed(..., N)`` cooldown as the true cadence gate, so this trigger
+    only needs to fire frequently ENOUGH: an every-N-hours step for sub-daily N, and a
+    single daily fire for N >= 24 (a cadence the cooldown already rate-limits).
+    """
+    from apscheduler.triggers.cron import CronTrigger
+
+    if hours >= 24:
+        return CronTrigger(hour=4, minute=minute, timezone=user_timezone())
+    return CronTrigger(hour=f"*/{max(1, hours)}", minute=minute, timezone=user_timezone())
+
+
 class SurplusScheduler:
     """The surplus orchestrator — drives task dispatch on its own schedule.
 
@@ -291,19 +308,26 @@ class SurplusScheduler:
             misfire_grace_time=60,
         )
         if self._enable_code_audits:
+            # CronTrigger not IntervalTrigger — same >1h restart-reset trap as
+            # maintenance/code_index (code_audit_hours=12 by default). _code_audit_hours
+            # stays the _recently_completed cooldown; the boot run is covered by the
+            # immediate await in start() below.
             self._scheduler.add_job(
                 self.schedule_code_audit,
-                IntervalTrigger(hours=self._code_audit_hours),
+                _restart_safe_hourly(self._code_audit_hours, minute=5),
                 id="schedule_code_audit",
                 max_instances=1,
                 misfire_grace_time=300,
-                next_run_time=datetime.now(UTC) + timedelta(seconds=60),
             )
         else:
             logger.info("Code audits disabled — skipping job registration")
+        # CronTrigger not IntervalTrigger — a >1h IntervalTrigger resets on every
+        # restart (CLAUDE.md trap), so code indexing starves if the server restarts
+        # more often than code_index_hours. _code_index_hours stays the
+        # _recently_completed cooldown; the boot run is covered by start()'s await below.
         self._scheduler.add_job(
             self.schedule_code_index,
-            IntervalTrigger(hours=self._code_index_hours),
+            _restart_safe_hourly(self._code_index_hours, minute=10),
             id="schedule_code_index",
             max_instances=1,
             misfire_grace_time=300,
@@ -417,9 +441,14 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=3600,
         )
+        # CronTrigger not IntervalTrigger — a >1h IntervalTrigger resets on every
+        # restart (CLAUDE.md trap), starving maintenance (surplus TTL, pending_embeddings,
+        # heartbeats, weak links, transcript archival) under frequent restarts.
+        # _maintenance_hours stays the _recently_completed cooldown (the real cadence
+        # gate); the boot run is covered by the immediate await in start() below.
         self._scheduler.add_job(
             self.schedule_maintenance,
-            IntervalTrigger(hours=self._maintenance_hours),
+            _restart_safe_hourly(self._maintenance_hours, minute=20),
             id="schedule_maintenance",
             max_instances=1,
             misfire_grace_time=300,
@@ -519,7 +548,7 @@ class SurplusScheduler:
         # Run brainstorm check immediately on startup
         await self.brainstorm_check()
         # Run remaining jobs immediately on startup —
-        # otherwise they only fire after their IntervalTrigger elapses.
+        # otherwise they only fire at their next scheduled time.
         if self._enable_code_audits:
             await self.schedule_code_audit()
         await self.schedule_code_index()

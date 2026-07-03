@@ -14,6 +14,27 @@ _COMMON = dict(
 )
 
 
+async def test_prune_older_than_deletes_only_old(db):
+    """Age comes from created_at relative to now -> wall-clock-independent."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    await execution_traces.create(
+        db, id="old", **{**_COMMON, "created_at": (now - timedelta(days=120)).isoformat()},
+    )
+    await execution_traces.create(
+        db, id="new", **{**_COMMON, "created_at": (now - timedelta(days=10)).isoformat()},
+    )
+    removed = await execution_traces.prune_older_than(db, days=90)
+    assert removed == 1
+    assert await execution_traces.get_by_id(db, "old") is None
+    assert await execution_traces.get_by_id(db, "new") is not None
+
+
+async def test_prune_older_than_empty_is_zero(db):
+    assert await execution_traces.prune_older_than(db, days=90) == 0
+
+
 async def test_create_and_get(db):
     rid = await execution_traces.create(db, id="e1", **_COMMON)
     assert rid == "e1"
