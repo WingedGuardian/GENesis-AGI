@@ -403,7 +403,7 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
             f"got '{section['model']}'"
         )
 
-    valid_efforts = {"low", "medium", "high", "xhigh", "max"}
+    valid_efforts = VALID_EFFORT_NAMES
     if "effort" in section and section["effort"] not in valid_efforts:
         errors.append(
             f"inbox_monitor.effort must be one of {sorted(valid_efforts)}, "

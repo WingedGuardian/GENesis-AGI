@@ -119,6 +119,19 @@ def model_supports_effort(model: CCModel) -> bool:
     return model in _MODEL_EFFORT_CEILING
 
 
+def model_name_supports_effort(model_name: str) -> bool:
+    """Whether a model *string* (tier alias or full id) uses the ``--effort`` flag.
+
+    Resolves the string to a tier via :meth:`CCModel.from_full_name`; an
+    unrecognized name (e.g. a roster/provider id) is treated as effort-capable
+    (``True``) so a model we cannot classify isn't silently stripped of effort.
+    Wraps ``from_full_name`` + :func:`model_supports_effort` so call sites that
+    hold a model STRING (Guardian, remote dispatch) don't each re-derive it.
+    """
+    tier = CCModel.from_full_name(model_name)
+    return tier is None or model_supports_effort(tier)
+
+
 def clamp_effort(model: CCModel, effort: EffortLevel) -> EffortLevel:
     """Return *effort* clamped to the maximum supported by *model*.
 

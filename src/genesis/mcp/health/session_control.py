@@ -78,7 +78,7 @@ async def session_config(
     or effort ('think harder', 'low effort', 'max effort'). Both parameters
     are optional — pass only what you want to change.
 
-    Valid models: sonnet, opus, haiku.
+    Valid models: sonnet, opus, haiku, fable.
     Valid efforts: low, medium, high, xhigh, max.
     Pass the Session ID from your system configuration.
     Changes take effect on the next response.

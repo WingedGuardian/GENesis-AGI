@@ -149,8 +149,13 @@ def test_settings_validators_accept_fable_and_full_effort():
 
 
 # ── Mechanical drift guard ──────────────────────────────────────────────────
-# A set/frozenset literal that enumerates the model tiers as strings is a
-# hardcoded selection surface — it must instead derive from VALID_MODEL_NAMES.
+# A set/frozenset/dict literal that enumerates the model tiers as strings is a
+# hardcoded selection surface — it must instead derive from VALID_MODEL_NAMES /
+# the CCModel enum. This AST scan catches those literal shapes. It CANNOT catch
+# regex alternations (cc/intent.py) or if/elif comparison chains — those are
+# guarded behaviorally below (test_intent_* / test_telegram_choices_*) and,
+# structurally, by having those surfaces derive from the enum. HTML/JS selection
+# surfaces (dashboard templates) are out of AST scope entirely.
 # Files with a legitimate non-selection use of these tokens are allowlisted.
 _MODEL_TOKENS = {"opus", "sonnet", "haiku"}
 _ALLOWLIST = {
@@ -160,11 +165,18 @@ _ALLOWLIST = {
 }
 
 
-def _string_set_elements(node: ast.AST) -> set[str] | None:
-    """Return the string elements of a set/frozenset literal, else None."""
+def _string_literal_elements(node: ast.AST) -> set[str] | None:
+    """String elements of a set/frozenset/list/tuple/dict-keys literal, else None.
+
+    Dict nodes contribute their string *keys* (the old telegram ``model_map`` /
+    ``effort_map`` shape). Returns None for anything that isn't a pure
+    string-literal collection.
+    """
     elts: list[ast.expr] | None = None
     if isinstance(node, ast.Set):
         elts = node.elts
+    elif isinstance(node, ast.Dict):
+        elts = [k for k in node.keys if k is not None]  # skip **spread (key None)
     elif (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
@@ -180,11 +192,11 @@ def _string_set_elements(node: ast.AST) -> set[str] | None:
         if isinstance(e, ast.Constant) and isinstance(e.value, str):
             values.add(e.value)
         else:
-            return None  # not a pure string-literal set
+            return None  # not a pure string-literal collection
     return values
 
 
-def test_no_hardcoded_model_tier_sets_outside_allowlist():
+def test_no_hardcoded_model_tier_literals_outside_allowlist():
     pkg_root = Path(genesis.__file__).resolve().parent
     offenders: list[str] = []
     for py in pkg_root.rglob("*.py"):
@@ -196,10 +208,43 @@ def test_no_hardcoded_model_tier_sets_outside_allowlist():
         except (SyntaxError, UnicodeDecodeError):
             continue
         for node in ast.walk(tree):
-            values = _string_set_elements(node)
+            values = _string_literal_elements(node)
             if values is not None and values >= _MODEL_TOKENS:
                 offenders.append(f"{rel}:{getattr(node, 'lineno', '?')}")
     assert not offenders, (
-        "Hardcoded model-tier set literal(s) found — derive from "
-        "genesis.cc.types.VALID_MODEL_NAMES instead:\n  " + "\n  ".join(offenders)
+        "Hardcoded model-tier set/dict literal(s) found — derive from "
+        "genesis.cc.types.VALID_MODEL_NAMES / the CCModel enum instead:\n  "
+        + "\n  ".join(offenders)
     )
+
+
+def test_ast_scan_self_check_flags_a_planted_dict():
+    """The scan must actually catch a dict-keyed model map (regression for the
+    telegram/cmd_effort blind spot that shipped in the first pass)."""
+    planted = ast.parse('M = {"opus": 1, "sonnet": 2, "haiku": 3}')
+    hits = [
+        _string_literal_elements(n)
+        for n in ast.walk(planted)
+        if _string_literal_elements(n) is not None
+        and _string_literal_elements(n) >= _MODEL_TOKENS
+    ]
+    assert hits, "AST scan failed to flag a hardcoded model-tier dict"
+
+
+def test_intent_parser_recognizes_every_tier_and_effort():
+    """Foreground /model + /effort regexes are AST-invisible; guard behaviorally."""
+    from genesis.cc.intent import IntentParser
+
+    parser = IntentParser()
+    for m in CCModel:
+        assert parser.parse(f"/model {m.value}").model_override == m
+    for e in EffortLevel:
+        assert parser.parse(f"/effort {e.value}").effort_override == e
+
+
+def test_telegram_choice_strings_cover_the_roster():
+    """Telegram /model + /effort help/usage text derive from the enums."""
+    import genesis.channels.telegram._handler_commands as tg
+
+    assert set(tg._MODEL_CHOICES.split("|")) == VALID_MODEL_NAMES
+    assert set(tg._EFFORT_CHOICES.split("|")) == VALID_EFFORT_NAMES

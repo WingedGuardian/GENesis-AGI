@@ -2266,7 +2266,7 @@
         },
         _SETTING_CHOICES: {
           provider: ['elevenlabs', 'fish_audio', 'cartesia'],
-          model: ['opus', 'sonnet', 'haiku'],
+          model: ['fable', 'opus', 'sonnet', 'haiku'],
           effort: ['low', 'medium', 'high', 'xhigh', 'max'],
           approval_channel: ['telegram', 'email', 'dashboard'],
           default: ['telegram', 'email', 'dashboard'],
@@ -2274,7 +2274,7 @@
           alert: ['telegram', 'email', 'dashboard'],
           surplus: ['telegram', 'email', 'dashboard'],
           digest: ['telegram', 'email', 'dashboard'],
-          default_model: ['opus', 'sonnet', 'haiku'],
+          default_model: ['fable', 'opus', 'sonnet', 'haiku'],
           default_effort: ['low', 'medium', 'high', 'xhigh', 'max'],
         },
         // Display order for settings domains — most important first
@@ -7565,7 +7565,7 @@
                 <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.2rem;">Model</div>
                 <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
                         @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model: $event.target.value}) })">
-                  <template x-for="m in ['opus', 'sonnet', 'haiku']" :key="m">
+                  <template x-for="m in ['fable', 'opus', 'sonnet', 'haiku']" :key="m">
                     <option :value="m" x-text="m.charAt(0).toUpperCase() + m.slice(1)"
                             :selected="m === ($store.genesisDashboard.egoStatus?.model || 'opus')"></option>
                   </template>
@@ -10379,7 +10379,7 @@
             <label style="display:block; font-size:.75rem; color:var(--color-text-secondary);">Model</label>
             <select x-model="$store.genesisDashboard.campaignEdit.model"
                     style="width:100%; padding:.4rem; margin-bottom:.6rem; background:var(--color-background); border:1px solid var(--color-border); color:var(--color-text); border-radius:4px;">
-              <option value="haiku">haiku</option><option value="sonnet">sonnet</option><option value="opus">opus</option>
+              <option value="haiku">haiku</option><option value="sonnet">sonnet</option><option value="opus">opus</option><option value="fable">fable</option>
             </select>
             <label style="display:block; font-size:.75rem; color:var(--color-text-secondary);">Effort</label>
             <select x-model="$store.genesisDashboard.campaignEdit.effort"

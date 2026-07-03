@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
-from genesis.cc.types import CCModel, model_supports_effort
+from genesis.cc.types import model_name_supports_effort
 from genesis.guardian.briefing import read_guardian_briefing
 from genesis.guardian.collector import DiagnosticSnapshot
 from genesis.guardian.config import GuardianConfig
@@ -436,8 +436,7 @@ class DiagnosisEngine:
         # Emit --effort unless the model doesn't use one (Haiku). Unknown model
         # strings fall through to including it (best-effort; guardian defaults to
         # opus, which supports the full range).
-        _tier = CCModel.from_full_name(effective_model)
-        _include_effort = _tier is None or model_supports_effort(_tier)
+        _include_effort = model_name_supports_effort(effective_model)
         cmd = [
             cc_path, "-p",
             "--model", effective_model,
