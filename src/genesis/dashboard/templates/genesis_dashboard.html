@@ -5153,7 +5153,8 @@
                          :style="(() => { const p = $store.genesisDashboard.health.infrastructure.container_memory.anon_pct ?? $store.genesisDashboard.health.infrastructure.container_memory.used_pct ?? 0; return 'width:' + p + '%; background:' + (p > 85 ? '#d9534f' : p > 75 ? '#f0ad4e' : '#4caf50'); })()"></div>
                   </div>
                   <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
-                        x-text="$store.genesisDashboard.health.infrastructure.container_memory.current_gb?.toFixed(0) + '/' + $store.genesisDashboard.health.infrastructure.container_memory.limit_gb?.toFixed(0) + ' GB'"></span>
+                        :title="(() => { const cm = $store.genesisDashboard.health.infrastructure.container_memory; const avail = cm.available_gb != null ? cm.available_gb.toFixed(0) + ' GB available. ' : ''; return avail + 'Shows non-reclaimable memory (anon+kernel), matching the %. cgroup memory.current is ' + (cm.current_gb ?? 0).toFixed(0) + ' GB including reclaimable page cache, which is not counted here.'; })()"
+                        x-text="(() => { const cm = $store.genesisDashboard.health.infrastructure.container_memory; const used = (cm.anon_gb != null && cm.kernel_gb != null) ? (cm.anon_gb + cm.kernel_gb) : cm.current_gb; return (used ?? 0).toFixed(0) + '/' + (cm.limit_gb ?? 0).toFixed(0) + ' GB'; })()"></span>
                 </div>
               </template>
               <!-- CPU row -->
