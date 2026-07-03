@@ -300,6 +300,17 @@ class CircuitBreakerRegistry:
             return False
         return self.get(name).is_available() and cfg.has_api_key
 
+    def chain_has_available(self, chain: list[str]) -> bool:
+        """True if ANY provider in ``chain`` can currently serve requests.
+
+        Reuses ``_provider_available`` (breaker not OPEN — CLOSED or HALF_OPEN —
+        AND a usable key). Callers use this to FAIL FAST when a whole chain is
+        circuit-breaker-open, instead of firing a doomed ``route_call`` that just
+        emits another ``all_exhausted`` event (and the reactive-cycle storm that
+        feeds off it). An empty or all-unknown chain returns False.
+        """
+        return any(self._provider_available(p) for p in chain)
+
     def uncovered_essential_sites(self) -> list[str]:
         """Essential cloud sites that currently have NO available provider
         (breaker not OPEN and key present).

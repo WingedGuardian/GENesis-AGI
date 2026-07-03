@@ -193,3 +193,60 @@ class TestEgoInitWiring:
             call_kwargs = mock_cadence_cls.call_args[1]
             assert call_kwargs["idle_detector"] is None
             mock_cadence.start.assert_awaited_once()
+
+
+class TestReactiveDomainGate:
+    """L1: routing/provider chain-exhaustion is dropped from the COO reactive path."""
+
+    def test_routing_all_exhausted_is_filtered(self):
+        assert ego._is_non_actionable_infra_event("routing", "all_exhausted") is True
+
+    def test_providers_all_exhausted_is_filtered(self):
+        assert ego._is_non_actionable_infra_event("providers", "all_exhausted") is True
+
+    def test_other_routing_event_stays_actionable(self):
+        # A different routing ERROR (e.g. a future degradation alert) is not gated.
+        assert ego._is_non_actionable_infra_event("routing", "budget.exceeded") is False
+
+    def test_non_infra_subsystem_stays_actionable(self):
+        assert ego._is_non_actionable_infra_event("guardian", "all_exhausted") is False
+        assert ego._is_non_actionable_infra_event("memory", "corruption") is False
+
+    @pytest.mark.asyncio
+    async def test_wiring_gates_all_exhausted_but_forwards_other_routing(self):
+        """End-to-end through the subscriber closure: a routing all_exhausted
+        event is gated (no reactive push); a routing budget.exceeded event still
+        reaches the reactive path. Guards against a future refactor inverting it."""
+        rt = _make_runtime()
+        with (
+            patch("genesis.ego.config.load_ego_config") as mock_load,
+            patch("genesis.ego.session.EgoSession"),
+            patch("genesis.ego.cadence.EgoCadenceManager") as mock_cadence_cls,
+            patch("genesis.ego.compaction.CompactionEngine"),
+            patch("genesis.ego.context.EgoContextBuilder"),
+            patch("genesis.ego.proposals.ProposalWorkflow"),
+            patch("genesis.ego.dispatch.EgoDispatcher"),
+        ):
+            from genesis.ego.types import EgoConfig
+            mock_config = EgoConfig(enabled=True)
+            mock_load.return_value = mock_config
+            mock_cadence = AsyncMock()
+            mock_cadence.push_reactive_event = MagicMock()  # real method is sync
+            mock_cadence_cls.return_value = mock_cadence
+
+            await ego.init(rt)
+            callback = rt._event_bus.subscribe.call_args.args[0]
+
+            def _evt(subsystem, event_type):
+                e = MagicMock()
+                e.subsystem = subsystem
+                e.event_type = event_type
+                e.severity.name = "ERROR"
+                e.message = f"{event_type} from {subsystem}"
+                return e
+
+            await callback(_evt("routing", "all_exhausted"))
+            mock_cadence.push_reactive_event.assert_not_called()
+
+            await callback(_evt("routing", "budget.exceeded"))
+            mock_cadence.push_reactive_event.assert_called_once()
