@@ -123,6 +123,7 @@ class DeepResearcherImpl:
 
         invocation = CCInvocation(
             prompt=prompt,
+            expect_output=True,  # silent-cap detection (research needs output)
             model=CCModel.SONNET,
             effort=EffortLevel.HIGH,
             system_prompt=None,  # Uses default SOUL.md identity

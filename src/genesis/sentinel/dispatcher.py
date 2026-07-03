@@ -1059,6 +1059,7 @@ class SentinelDispatcher:
 
             invocation = CCInvocation(
                 prompt=full_prompt,
+                expect_output=True,  # silent-cap detection (structured diagnosis expected)
                 model=CCModel.OPUS,
                 effort=EffortLevel.HIGH,
                 timeout_s=3600,

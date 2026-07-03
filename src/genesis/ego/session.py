@@ -290,6 +290,7 @@ class EgoSession:
         # Build invocation — ephemeral (no resume)
         invocation = CCInvocation(
             prompt=user_prompt,
+            expect_output=True,  # silent-cap detection (cognitive, always emits text)
             model=model,
             effort=effort,
             resume_session_id=None,
@@ -1062,6 +1063,7 @@ class EgoSession:
         try:
             invocation = CCInvocation(
                 prompt=prompt,
+                expect_output=True,  # silent-cap detection (realist gate needs verdict text)
                 model=CCModel.OPUS,
                 effort=EffortLevel.MEDIUM,
                 skip_permissions=True,
