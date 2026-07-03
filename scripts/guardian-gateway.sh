@@ -16,8 +16,9 @@
 #   test-approval   — E2E test the keyword-reply approval gate (no recovery)
 #   ping            — liveness check
 #
-# SSH authorized_keys entry (replace CONTAINER_IP with your container's IP):
-#   command="~/.local/bin/guardian-gateway.sh",from="CONTAINER_IP" ssh-ed25519 ...
+# SSH authorized_keys entry (replace CONTAINER_IP with the container's
+# host-facing source IP — install_guardian.sh derives and installs this):
+#   from="CONTAINER_IP",command="~/.local/bin/guardian-gateway.sh",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 ...
 #
 # This gives Genesis a fixed allowlist of operations on the host. Nothing else.
 

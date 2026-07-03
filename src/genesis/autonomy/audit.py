@@ -150,6 +150,16 @@ class PostExecutionAuditor:
                             continue
                         if block.get("type") != "tool_use":
                             continue
+                        # LIMITATION: this only sees file mutations made via the
+                        # Write/Edit tools, so a session that changes files via
+                        # Bash (sed -i, redirects, cp/mv) is invisible to the
+                        # protected-path audit below. Currently safe: every
+                        # background profile blocks Bash+Edit except `steward`,
+                        # whose Bash is hard-locked to the `gh` binary by
+                        # scripts/bash_safety_hook.sh (no redirect/pipe/chain),
+                        # so it cannot write files. REVISIT if any profile or
+                        # overlay grants file-writing Bash (see follow-up:
+                        # add Bash file-target coverage to _parse_transcript).
                         if block.get("name") not in ("Write", "Edit"):
                             continue
                         fp = block.get("input", {}).get("file_path", "")
