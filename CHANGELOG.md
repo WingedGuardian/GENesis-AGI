@@ -17,6 +17,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   hard-coded addresses) — closing a gap where these install-specific addresses could otherwise slip
   into a public PR. The commit-message guard gained the same IPv6 coverage.
 
+- **The HTTP client Genesis uses for outbound requests is upgraded to clear 11 security advisories.**
+  `aiohttp` — the library behind health checks, provider pings, and market/price-data fetches — now
+  requires 3.14.1 or newer, which fixes 11 published CVEs (including a cookie-leak-on-redirect issue
+  and several denial-of-service vectors). Genesis uses it only as a client for outbound calls, so
+  real-world exposure was limited, but the newer version removes the advisories outright.
+
 ### Added
 
 - **The Genesis Voice add-on's attention surface now shows the judge's reasoning — and lets you review it.**
