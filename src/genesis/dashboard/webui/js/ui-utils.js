@@ -55,9 +55,11 @@ export function chipClass(state) {
   return `chip chip--${state}`;
 }
 
-/** Shape glyph per state — color-blind support without icon fonts. */
+/** Shape glyph per state — color-blind support without icon fonts.
+ * ("info" is not a health state — chipState never returns it — but chips
+ * using .chip--info via static class can still ask for its glyph.) */
 export function chipGlyph(state) {
-  return { ok: "●", warn: "▲", err: "✕", stale: "◔", info: "●", off: "○" }[state] ?? "●";
+  return { ok: "●", warn: "▲", err: "✕", stale: "◔", info: "ℹ", off: "○" }[state] ?? "●";
 }
 
 function _toMs(ts) {

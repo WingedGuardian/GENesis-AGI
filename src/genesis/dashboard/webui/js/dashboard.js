@@ -3005,15 +3005,12 @@
         },
 
         semanticStateColor(state) {
-          const map = {
-            healthy: "#4caf50",
-            degraded: "#f0ad4e",
-            fallback: "#f0ad4e",
-            warning: "#f0ad4e",
-            unknown: "#888",
-            error: "#d9534f",
-          };
-          return map[state] || "#888";
+          // Colors for status DOTS — classified through the same shared
+          // chipState() the chips use, so the two surfaces can never disagree
+          // about what a state means. Values match the token palette
+          // (--ok/--warn/--err); off/idle/unknown keep the historical dot gray.
+          const colors = { ok: "#4caf50", warn: "#f0ad4e", err: "#d9534f", stale: "#9e9e9e", off: "#888" };
+          return colors[chipState(state)] || "#888";
         },
 
         statusReason(fetchName, semantic) {
@@ -3474,10 +3471,15 @@
         },
 
         formatAgeSeconds(seconds) {
-          // Delegates to the shared fmtAge contract (spec §3.4):
-          // just now (<90s) / Nm / Nh / Nd.
+          // DURATION formatter (a quantity composed into prose: "45s old",
+          // "oldest 3m") — NOT a timestamp age. The fmtAge contract's
+          // "just now" bucket is for standalone ages and reads broken when
+          // composed ("just now old"), so this keeps duration semantics.
           if (seconds == null) return "-";
-          return fmtAge(Date.now() - seconds * 1000);
+          if (seconds < 60) return `${Math.round(seconds)}s`;
+          if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+          if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
+          return `${Math.round(seconds / 86400)}d`;
         },
 
         formatTime(isoStr) {

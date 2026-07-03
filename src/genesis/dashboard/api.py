@@ -18,6 +18,9 @@ def dashboard_page():
     Rendered through Jinja (blueprint template_folder) so the template can be
     split into partials. ETag + conditional handling preserved manually —
     ``send_from_directory`` gave 304s for free; ``render_template`` does not.
+    Known tradeoffs vs the static path (both fine for a page fetched once per
+    browser session): the template renders even on requests that end as 304,
+    and Range/Last-Modified support is dropped (ETag covers revalidation).
     """
     resp = make_response(render_template("genesis_dashboard.html"))
     resp.headers["Cache-Control"] = "no-cache"

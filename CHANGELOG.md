@@ -150,8 +150,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   only data — not the whole 700KB page — is re-fetched. Overview health chips now use one
   consistent 5-state color system with shape glyphs (● ▲ ✕ ◔ ○) so state is readable
   without color, and ages render in one format everywhere ("just now" / 5m / 3h / 2d)
-  instead of mixed styles. Under the hood the single-file dashboard template was split into
-  per-tab partials, which makes upcoming UI work reviewable — rendered output is unchanged.
+  instead of mixed styles.
 
 - **The procedures Genesis learns are now concrete, replayable playbooks instead of vague
   summaries.** Previously every learned procedure was written as a "what this teaches: …"

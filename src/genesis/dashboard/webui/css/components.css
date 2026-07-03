@@ -36,6 +36,8 @@
 .chip--ok    { color: var(--ok);    background: color-mix(in srgb, var(--ok-dim) 45%, transparent);    border-color: var(--ok-dim); }
 .chip--warn  { color: var(--warn);  background: color-mix(in srgb, var(--warn-dim) 45%, transparent);  border-color: var(--warn-dim); }
 .chip--err   { color: var(--err);   background: color-mix(in srgb, var(--err-dim) 45%, transparent);   border-color: var(--err-dim); }
+/* chip--info is NOT a health state (chipState never returns it) — it's for
+ * informational/neutral chips applied via static class, e.g. count badges. */
 .chip--info  { color: var(--info);  background: color-mix(in srgb, var(--info-dim) 45%, transparent);  border-color: var(--info-dim); }
 .chip--stale { color: var(--stale); background: color-mix(in srgb, var(--stale) 12%, transparent);     border-color: color-mix(in srgb, var(--stale) 35%, transparent); }
 .chip--off   { color: var(--t3);    background: transparent;                                           border-color: var(--border); }
