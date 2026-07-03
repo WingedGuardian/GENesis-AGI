@@ -307,3 +307,8 @@ Standard open-source workflow: PRs go directly to the public repo.
   defaults (no `config/campaigns/`). Only campaign infrastructure ships. Express
   reusable session types as generic roles (e.g. the `community-responder`
   profile), not names coupled to a live campaign. See `src/genesis/campaigns/__init__.py`.
+- **External egress is gated; owner-facing egress is not** — any autonomous send to the
+  outside world (Discord, Medium, Twitter/X, Slack, `DistributionManager.distribute`) MUST
+  route through the capability shadow-gate (`autonomy/shadow_gate`) before the enforce stage;
+  the `scripts/check_external_io.py` CI guard backstops new endpoints. Delivery TO the owner
+  (Telegram/voice/email-to-owner) is NEVER gated. Full contract in `autonomy/shadow_gate.py`.

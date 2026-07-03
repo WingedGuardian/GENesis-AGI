@@ -131,6 +131,11 @@ class ContentPipelineModule:
         handles DB record-keeping; platform adapters are registered at
         publish time by the calling session.
         """
+        # GROUNDWORK(autonomous-distribution): when server-side autonomous publishing is
+        # turned on here (registering platform distributors + calling manager.distribute()),
+        # each EXTERNAL send MUST route through the capability shadow-gate (autonomy/
+        # shadow_gate) before the enforce stage. Public targets (medium/discord in
+        # _platform_targets) are gated; owner-facing targets (telegram/voice) are NOT.
         manager = DistributionManager(db=db)
         logger.info("Distribution manager initialized (platforms registered per-session)")
         return manager
