@@ -1,7 +1,7 @@
 """Recovery engine — HOST-SIDE. Executes recovery actions with verification.
 
 Recovery actions in escalation order:
-1. RESTART_SERVICES  — systemctl restart genesis-bridge
+1. RESTART_SERVICES  — systemctl restart genesis-server
 2. IO_TRIAGE         — kill top I/O consumer (one per cycle)
 3. RESOURCE_CLEAR    — clear /tmp, reclaim page cache, restart
 4. REVERT_CODE       — git stash && git revert HEAD, restart
@@ -183,16 +183,16 @@ class RecoveryEngine:
             return False, f"Unknown action: {action}"
 
     async def _restart_services(self, container: str) -> tuple[bool, str]:
-        """Restart genesis-bridge service inside the container."""
+        """Restart genesis-server service inside the container."""
         rc, stdout, stderr = await _run_subprocess(
             "incus", "exec", container, "--",
             "su", "-", "ubuntu", "-c",
-            "systemctl --user restart genesis-bridge",
+            "systemctl --user restart genesis-server",
             timeout=30.0,
         )
         if rc != 0:
             return False, f"systemctl restart failed: {stderr}"
-        return True, "genesis-bridge restarted"
+        return True, "genesis-server restarted"
 
     async def _io_triage(self, container: str) -> tuple[bool, str]:
         """Kill the top I/O consumer. One process per cycle — reassess after.

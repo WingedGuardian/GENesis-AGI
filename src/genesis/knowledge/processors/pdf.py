@@ -14,30 +14,22 @@ class PDFProcessor:
     """Extract text from PDF files using PyMuPDF."""
 
     async def process(self, source: str, **kwargs: object) -> ProcessedContent:
-        import pymupdf
+        from genesis.knowledge.pdf_extract import extract_pdf_text
 
         path = Path(source)
         if not path.exists():
             raise FileNotFoundError(f"PDF file not found: {source}")
 
-        doc = pymupdf.open(str(path))
-        pages: list[str] = []
-        sections: list[str] = []
-
-        for page in doc:
-            text = page.get_text()
-            if text.strip():
-                pages.append(text.strip())
-                sections.append(text.strip())
-
-        full_text = "\n\n".join(pages)
-        doc.close()
+        # PyMuPDF is not thread-safe and can natively crash/hang on adversarial
+        # PDFs; extraction runs in a crash/hang-isolated process pool off the
+        # event loop. Raises PDFExtractionError on crash/timeout (caller degrades).
+        full_text, sections, page_count = await extract_pdf_text(str(path))
 
         return ProcessedContent(
             text=full_text,
             metadata={
                 "filename": path.name,
-                "page_count": len(pages),
+                "page_count": page_count,
                 "size_bytes": path.stat().st_size,
             },
             source_type="pdf",

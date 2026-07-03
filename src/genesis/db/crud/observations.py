@@ -65,6 +65,10 @@ INTERNAL_OBS_TYPES: frozenset[str] = frozenset({
     "interpretation_correction",
     "scope_clarification",
     "feedback_rule",
+    # CC silent-cap detection — per-empty telemetry rows. Internal: only the
+    # aggregate infrastructure_alert (raised by the awareness cap detector when
+    # a run of these accumulates) surfaces to the user.
+    "cc_cap_empty_event",
 })
 
 # Default TTL for types not explicitly listed. Any new type that appears without
@@ -88,6 +92,7 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "process_reaper_kill": timedelta(days=3),
     "operational_alert": timedelta(days=3),
     "infrastructure_alert": timedelta(days=3),
+    "cc_cap_empty_event": timedelta(days=3),
     "strategic_reflection": timedelta(days=3),
     # ── 1-day (transient) ──────────────────────────────────────────────
     "light_escalation_resolved": timedelta(days=1),
@@ -720,6 +725,27 @@ async def count_unresolved_by_types(
         f"SELECT COUNT(*) FROM observations "
         f"WHERE resolved = 0 AND type IN ({placeholders})",
         tuple(types),
+    )
+    row = rows[0] if rows else None
+    return row[0] if row else 0
+
+
+async def count_recent_unresolved_by_type_and_source(
+    db: aiosqlite.Connection,
+    *,
+    type: str,
+    source: str,
+    since: str,
+) -> int:
+    """Count unresolved observations of a type+source created after ``since`` (ISO).
+
+    Used by the awareness silent-cap detector to count recent
+    ``cc_cap_empty_event`` telemetry rows without embedding raw SQL in the loop.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM observations "
+        "WHERE type = ? AND source = ? AND created_at > ? AND resolved = 0",
+        (type, source, since),
     )
     row = rows[0] if rows else None
     return row[0] if row else 0

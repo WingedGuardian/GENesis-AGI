@@ -273,6 +273,7 @@ class CCReflectionBridge:
             mcp_path = None
         invocation = CCInvocation(
             prompt=prompt,
+            expect_output=True,  # silent-cap detection (reflection always emits text)
             model=model,
             effort=effort,
             timeout_s=_DEPTH_TIMEOUT_S.get(depth, 300),
@@ -535,6 +536,7 @@ class CCReflectionBridge:
 
         invocation = CCInvocation(
             prompt=prompt,
+            expect_output=True,  # silent-cap detection (weekly assessment output)
             model=CCModel.SONNET,
             effort=EffortLevel.HIGH,
             system_prompt=load_prompt_file("SELF_ASSESSMENT.md", self._prompt_dir),
@@ -611,6 +613,7 @@ class CCReflectionBridge:
 
         invocation = CCInvocation(
             prompt=prompt,
+            expect_output=True,  # silent-cap detection (quality calibration output)
             model=CCModel.SONNET,
             effort=EffortLevel.HIGH,
             system_prompt=load_prompt_file("QUALITY_CALIBRATION.md", self._prompt_dir),

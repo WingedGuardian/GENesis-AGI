@@ -54,8 +54,8 @@ systemctl --user list-units 'genesis-*' --all    # All units
 
 Other units: `genesis-bridge.service` (Telegram relay, on-demand),
 `genesis-tmp-watchgod.service` (/tmp protection), `genesis-watchdog.timer`
-(health check), `genesis-disk-hygiene.timer` (daily worktree reaping + cache
-reclaim; see `scripts/disk_hygiene.sh`). MCP servers are CC child processes
+(health check), `genesis-disk-hygiene.timer` (daily worktree reaping, cache reclaim, `~/tmp`
+prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`). MCP servers are CC child processes
 (not systemd) — code changes take effect on next CC session start.
 
 ## Common Commands

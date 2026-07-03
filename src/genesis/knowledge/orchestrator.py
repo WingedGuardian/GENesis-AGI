@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import typing
@@ -69,16 +70,10 @@ class KnowledgeOrchestrator:
         on_chunk_done: typing.Callable | None = None,
     ) -> IngestResult:
         """Ingest a single source (file path or URL) into the knowledge base."""
-        # 1. Check for duplicate
-        if self._manifest.has_source(source):
-            existing_ids = self._manifest.get_units_for_source(source)
-            return IngestResult(
-                source=source,
-                source_type="cached",
-                units_created=0,
-                unit_ids=existing_ids,
-                quality_flags=["duplicate_source"],
-            )
+        # NB: dedup is content-hash based and runs AFTER extraction (the
+        # "content-hash dedup gate" below). The old source-identity gate that lived
+        # here was removed so a re-ingest with CHANGED content re-distills instead
+        # of serving now-stale cached units.
 
         # 2. Find processor
         processor = self._registry.get_processor(source)
@@ -94,6 +89,22 @@ class KnowledgeOrchestrator:
         try:
             content = await processor.process(source)
         except Exception as exc:
+            # Regression guard for the content-hash gate move: every re-ingest now
+            # runs the processor BEFORE any dedup check. If a previously-cached
+            # source is now unreachable, serve its cached units instead of failing
+            # (strictly better than pre-move, which also served cache in this case).
+            if self._manifest.has_source(source):
+                logger.warning(
+                    "Re-ingest of %s failed extraction (%s) — serving cached units",
+                    source, exc,
+                )
+                return IngestResult(
+                    source=source,
+                    source_type="cached",
+                    units_created=0,
+                    unit_ids=self._manifest.get_units_for_source(source),
+                    quality_flags=["duplicate_source", "source_unreachable_served_cache"],
+                )
             return IngestResult(
                 source=source,
                 source_type="error",
@@ -107,6 +118,20 @@ class KnowledgeOrchestrator:
                 source_type=content.source_type,
                 units_created=0,
                 quality_flags=["empty_content"],
+            )
+
+        # Content-hash dedup gate (moved here from the top of the method). Now that
+        # the text is extracted, short-circuit ONLY if the content is unchanged;
+        # changed content falls through and re-distills. sha256[:32] mirrors the
+        # content-hash pattern in recon/web_monitoring.py.
+        content_hash = hashlib.sha256(content.text.encode()).hexdigest()[:32]
+        if self._manifest.has_unchanged_source(source, content_hash):
+            return IngestResult(
+                source=source,
+                source_type="cached",
+                units_created=0,
+                unit_ids=self._manifest.get_units_for_source(source),
+                quality_flags=["duplicate_source"],
             )
 
         # 3a. Injection-pattern scan (detect-and-flag, NEVER block; fail-open).
@@ -150,24 +175,37 @@ class KnowledgeOrchestrator:
                 name=f"tree-index-{Path(source).name}",
             )
 
-        # 4. Save extracted text to disk
-        extracted_path = self._manifest.save_extracted_text(
-            source, content.text, content.source_type
-        )
+        # 4-6. Save extracted text + optional original, then distill. If any of
+        # these fail, cancel the in-flight tree-index task first so a failed
+        # ingest can't leak an orphaned PageIndex upload (which polls for up to
+        # 300s), then re-raise. (The storage step below has its own cancel.)
+        try:
+            # 4. Save extracted text to disk
+            extracted_path = self._manifest.save_extracted_text(
+                source, content.text, content.source_type
+            )
 
-        # 5. Optionally save original
-        original_path = None
-        source_path = Path(source)
-        if source_path.exists():
-            original_path = self._manifest.save_original(source, source_path)
+            # 5. Optionally save original
+            original_path = None
+            source_path = Path(source)
+            if source_path.exists():
+                original_path = self._manifest.save_original(source, source_path)
 
-        # 6. Distill
-        units = await self._distillation.distill(
-            content, project_type=project_type, domain=domain,
-            user_context=user_context,
-            on_chunk_done=on_chunk_done,
-            content_source=content_source,
-        )
+            # 6. Distill
+            units = await self._distillation.distill(
+                content, project_type=project_type, domain=domain,
+                user_context=user_context,
+                on_chunk_done=on_chunk_done,
+                content_source=content_source,
+            )
+        except Exception:
+            if tree_task is not None:
+                tree_task.cancel()
+                # CancelledError is a BaseException, so suppress(Exception)
+                # alone would let it escape and mask the real error.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await tree_task
+            raise
 
         if not units:
             self._manifest.add_source(
@@ -175,6 +213,7 @@ class KnowledgeOrchestrator:
                 source_type=content.source_type,
                 extracted_path=extracted_path,
                 original_path=original_path,
+                content_hash=content_hash,
             )
             # Still collect tree result if started
             tree_doc_id = await self._collect_tree_result(tree_task, source)
@@ -201,7 +240,9 @@ class KnowledgeOrchestrator:
             # Cancel tree task to avoid orphaned upload
             if tree_task is not None:
                 tree_task.cancel()
-                with contextlib.suppress(Exception):
+                # CancelledError is a BaseException, so suppress(Exception)
+                # alone would let it escape and mask the real error.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await tree_task
             return IngestResult(
                 source=source,
@@ -217,6 +258,7 @@ class KnowledgeOrchestrator:
             extracted_path=extracted_path,
             original_path=original_path,
             unit_ids=unit_ids,
+            content_hash=content_hash,
         )
 
         quality_flags = []

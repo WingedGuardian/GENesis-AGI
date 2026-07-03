@@ -246,7 +246,7 @@ def _build_default_briefing() -> BriefingContent:
         generated_at=now,
         genesis_version=_detect_genesis_version(),
         service_baseline={
-            "genesis-bridge": "Main orchestration service. If dead, most subsystems are down.",
+            "genesis-server": "Main orchestration service. If dead, most subsystems are down.",
             "qdrant": "Vector DB at localhost:6333. Used by memory system.",
             "genesis-dashboard": "Genesis dashboard on port 5000. Health API lives here.",
         },

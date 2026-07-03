@@ -172,6 +172,9 @@ class CCInvoker:
         on_model_downgrade: (
             Callable[[str, str, str], Awaitable[None]] | None
         ) = None,
+        on_cc_empty_output: (
+            Callable[[CCInvocation, CCOutput], Awaitable[None]] | None
+        ) = None,
         protected_paths: object | None = None,
     ):
         self._claude_path = claude_path
@@ -183,6 +186,7 @@ class CCInvoker:
         self._active_procs: dict[str, asyncio.subprocess.Process] = {}
         self._on_cc_status_change = on_cc_status_change
         self._on_model_downgrade = on_model_downgrade
+        self._on_cc_empty_output = on_cc_empty_output
         self._last_was_error = False
         self._status_lock = asyncio.Lock()
         self._protected_paths = protected_paths
@@ -218,6 +222,28 @@ class CCInvoker:
             )
         except Exception:
             logger.warning("Model downgrade callback failed", exc_info=True)
+
+    async def _fire_empty_output_callback(
+        self, invocation: CCInvocation, output: CCOutput,
+    ) -> None:
+        """Notify the runtime when an output-EXPECTING invocation returns empty.
+
+        The silent-cap signature: an Anthropic-subscription cap makes ``claude -p``
+        return 0-token, no-text output with ``is_error=False`` and no
+        ``rate_limit_event`` — which every success path reads as a completed run.
+        Only invocations that opt in via ``expect_output`` (output-producing
+        cognitive call sites) are considered; the caller has already confirmed the
+        output is genuinely empty and non-error before calling this. This is
+        DETECTION only — it never raises and never alters control flow (the empty
+        output is still returned to the caller exactly as before). Never raises;
+        mirrors ``_fire_downgrade_callback``.
+        """
+        if self._on_cc_empty_output is None:
+            return
+        try:
+            await self._on_cc_empty_output(invocation, output)
+        except Exception:
+            logger.warning("CC empty-output callback failed", exc_info=True)
 
     def _build_args(self, inv: CCInvocation) -> list[str]:
         args = [self._claude_path, "-p"]
@@ -630,6 +656,10 @@ class CCInvoker:
         if self._last_was_error:
             await self._notify_status_change(None)
         await self._fire_downgrade_callback(output)
+        # Silent-cap detection: a non-error, non-rate-limited return that reached
+        # here with empty text (returncode==0 above rules out rate-limit text).
+        if invocation.expect_output and not output.is_error and not output.text.strip():
+            await self._fire_empty_output_callback(invocation, output)
         return output
 
     async def run_streaming(
@@ -880,6 +910,10 @@ class CCInvoker:
             if self._last_was_error:
                 await self._notify_status_change(None)
             await self._fire_downgrade_callback(output)
+            # Silent-cap detection: reaching here means is_error=False AND no
+            # rate_limit_event (both handled above) — empty text is the signal.
+            if invocation.expect_output and not output.is_error and not output.text.strip():
+                await self._fire_empty_output_callback(invocation, output)
             return output
 
         # No result event — treat collected text as response (success path)
@@ -898,6 +932,15 @@ class CCInvoker:
             via_proxy=bool(invocation.anthropic_base_url),
         )
         await self._fire_downgrade_callback(output)
+        # Silent-cap detection (no-result path): also guard on rate_limit_event,
+        # since the rate-limit branch above runs only inside the result_data block.
+        if (
+            invocation.expect_output
+            and not output.is_error
+            and not output.text.strip()
+            and "rate_limit_event" not in event_types
+        ):
+            await self._fire_empty_output_callback(invocation, output)
         return output
 
     @staticmethod

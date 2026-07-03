@@ -204,6 +204,7 @@ class TaskDecomposer:
 
         invocation = CCInvocation(
             prompt=prompt,
+            expect_output=True,  # silent-cap detection (decomposition needs a step list)
             model=CCModel.SONNET,
             effort=EffortLevel.HIGH,
             timeout_s=300,

@@ -95,7 +95,7 @@ Known failure mode inventory (from real incidents):
 |------|---------|------------|----------|
 | OOM kill | Container running, services dead, journal "Killed process" | Memory exhaustion | RESTART_SERVICES or RESTART_CONTAINER |
 | /tmp full | Services degraded, /tmp >95% | Temp dir overflow (CC uses ~/.genesis/cc-tmp via TMPDIR, watchgod protects both zones) | RESOURCE_CLEAR |
-| Bridge crash loop | Health API down, NRestarts high | Code bug or dependency | RESTART_SERVICES, then REVERT_CODE |
+| Server crash loop | Health API down, NRestarts high | Code bug or dependency | RESTART_SERVICES, then REVERT_CODE |
 | Bad deploy | Failure correlates with recent git commit | Code regression | REVERT_CODE |
 | Container freeze | Ping OK, all APIs timeout, D-state processes | I/O deadlock | RESTART_CONTAINER |
 | Qdrant down | Memory retrieval fails, Qdrant service inactive | Qdrant crash | RESTART_SERVICES |
@@ -238,8 +238,8 @@ can cause catastrophic damage:
 Run these via Bash:
 - `incus exec {container_name} -- <cmd>` — Run a command inside the container
 - `incus exec {container_name} -- su - ubuntu -c "<cmd>"` — Run as the ubuntu user
-- `incus exec {container_name} -- su - ubuntu -c "systemctl --user restart genesis-bridge"` — Restart the main service
-- `incus exec {container_name} -- su - ubuntu -c "systemctl --user status genesis-bridge"` — Check service status
+- `incus exec {container_name} -- su - ubuntu -c "systemctl --user restart genesis-server"` — Restart the main service
+- `incus exec {container_name} -- su - ubuntu -c "systemctl --user status genesis-server"` — Check service status
 - `incus exec {container_name} -- su - ubuntu -c "journalctl --user -n 200 --no-pager"` — Read recent logs
 - `incus exec {container_name} -- su - ubuntu -c "cat /sys/fs/cgroup/memory.current"` — Check memory
 - `incus exec {container_name} -- su - ubuntu -c "df -h"` — Check disk
@@ -300,7 +300,7 @@ When you've reached a conclusion, output your final report as a JSON block:
   "confidence_pct": 85,
   "evidence": ["Evidence point 1", "Evidence point 2"],
   "recommended_action": "RESTART_SERVICES",
-  "investigation_steps": ["Read journalctl — found OOM signature", "Checked git log — no recent deploy", "Confirmed genesis-bridge is the only dead service"],
+  "investigation_steps": ["Read journalctl — found OOM signature", "Checked git log — no recent deploy", "Confirmed genesis-server is the only dead service"],
   "outcome": "proposed",
   "reasoning": "Multi-sentence explanation of your investigation and findings"
 }}}}

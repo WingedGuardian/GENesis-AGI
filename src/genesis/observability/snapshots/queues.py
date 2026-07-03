@@ -80,10 +80,12 @@ async def _alert_dead_letter_accumulation(db: aiosqlite.Connection | None, count
             source="dead_letter_monitor",
             type="infrastructure_alert",
             content=(
-                f"Dead letter queue has {count} pending items (threshold: "
-                f"{_DEAD_LETTER_ALERT_THRESHOLD}). Likely cause: provider "
-                f"chain exhaustion or circuit breaker stuck open. "
-                f"Check circuit breaker state and provider health."
+                f"Dead letter queue has {count} STUCK items — pending past their "
+                f"self-heal TTL (threshold: {_DEAD_LETTER_ALERT_THRESHOLD}). Short-"
+                f"TTL self-healing bursts (e.g. chain_exhausted:judge) are excluded, "
+                f"so this is a genuine backlog: the replay/expire drainer is failing "
+                f"or a provider chain is exhausted. Check circuit breaker state, "
+                f"provider health, and the dead_letter_replay surplus task."
             ),
             priority="critical",
             created_at=datetime.now(UTC).isoformat(),
@@ -164,14 +166,19 @@ async def queues(
     dead = None
     if dead_letter:
         try:
+            # Raw total for the snapshot/dashboard (honest count of everything
+            # pending), but ALERT on the genuinely-STUCK subset only: a fresh
+            # burst of short-TTL self-healing items (e.g. chain_exhausted:judge,
+            # 1h) drains itself and must not cry wolf on the critical alert.
             dead = await dead_letter.get_pending_count()
-            # Alert when dead letters accumulate; resolve the alert when the
-            # queue drains. Without the resolve, the observation pipeline is
-            # write-only and stale "DLQ at N" alerts linger until TTL.
-            if dead is not None and dead >= _DEAD_LETTER_ALERT_THRESHOLD:
-                await _alert_dead_letter_accumulation(db, dead)
-            elif dead is not None:
-                await _resolve_dead_letter_alerts(db, dead)
+            stuck = await dead_letter.get_stuck_count()
+            # Alert when STUCK items accumulate; resolve when they clear. Without
+            # the resolve, the observation pipeline is write-only and stale
+            # "DLQ at N" alerts linger until TTL.
+            if stuck >= _DEAD_LETTER_ALERT_THRESHOLD:
+                await _alert_dead_letter_accumulation(db, stuck)
+            else:
+                await _resolve_dead_letter_alerts(db, stuck)
         except Exception:
             errors.append("dead_letters: query failed")
             logger.error("Failed to query dead letter queue", exc_info=True)

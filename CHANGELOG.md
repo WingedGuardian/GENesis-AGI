@@ -32,6 +32,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   including `xhigh` and `max`; previously Sonnet was capped at `high`. Nothing switches automatically — your
   existing defaults are unchanged; this only makes the new options available when you want them.
 
+- **Daily disk hygiene now prunes stale scratch and old attention snapshots.** Housekeeping now
+  age-prunes leftover files in `~/tmp` (older than 7 days) and garbage-collects attention-engine
+  snapshots older than 60 days — but never one behind a moment you've labeled for review, so your
+  labeled history stays revealable. Keeps disk usage from creeping up between the reactive cleanups
+  that previously only fired when the disk was nearly full.
+
+- **Genesis now notices when its Claude Code subscription hits its usage cap — instead of quietly going dark.**
+  A capped Anthropic subscription makes `claude -p` return *empty* output with no error, which Genesis used to
+  record as a successful (but blank) run — so its background thinking (ego cycles, reflections, weekly reviews)
+  could silently produce nothing for days without anyone noticing. Genesis now watches for a run of empty
+  results on calls that should have produced output and, when it sees one, sends a single critical alert
+  ("CC subscription likely capped — degraded until the limit resets") so you know to check. It's detection only:
+  it never changes how a call runs, and it stays quiet during normal idle periods.
+
 - **The Genesis Voice add-on's attention surface now shows the judge's reasoning — and lets you review it.**
   For the optional passive-listening add-on, the buried "Attention" tab is now a top-level **Genesis Voice →
   Judgment** review. Each moment the attention gate noticed is scored by a lightweight LLM judge that says
@@ -119,6 +133,28 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Uploading a large or malformed PDF to the Knowledge tab no longer freezes — or crashes — Genesis.**
+  PDF text extraction used to run directly on the main event loop, so a big document could stall the whole
+  server for seconds (health checks, background thinking, other requests all waited), and a corrupt or
+  hostile PDF could take the process down entirely. Extraction now runs in an isolated worker process with a
+  time limit: a large PDF no longer blocks anything else, and a PDF that crashes or hangs the parser fails
+  just that one ingest — the rest of Genesis keeps running. Uploads that hit a transient database hiccup are
+  now marked "failed" (and can be retried) instead of getting stuck showing "processing" forever.
+
+- **Re-ingesting a knowledge source with changed content now refreshes it instead of serving the stale
+  version.** Previously, once a file or URL was ingested, re-ingesting the same source was skipped on source
+  identity alone — so if the underlying content changed, the knowledge base kept serving the old distilled
+  version indefinitely. Re-ingestion now compares a content fingerprint and re-distills when the content has
+  actually changed (unchanged content is still skipped, and a now-unreachable source falls back to its
+  previously cached version).
+
+- **The dead-letter-queue alert no longer cries wolf on self-healing bursts.** A short burst of low-value
+  retry items (e.g. memory-relevance grades, which are discarded within an hour by design) could push the queue
+  past its alert threshold and fire a *critical* notification for something that clears itself minutes later.
+  The alert now counts only items that are genuinely stuck — pending past their designed self-heal window — so a
+  transient burst stays quiet while a real, un-draining backlog still alerts. The dashboard still shows the full
+  raw count.
+
 - **The dashboard now reports each ego's cycle health separately.** Genesis runs two egos (a user-facing
   one and its own), and both recorded their proactive-cycle health under a single shared key — so on the
   health surface one ego's last run kept overwriting the other's, making it impossible to tell whether
@@ -130,6 +166,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reset on every restart, so a box that restarted more often than every two hours could keep deferring
   extraction indefinitely. It now also runs shortly after each start, so extraction can't be starved by
   frequent restarts.
+
+- **Guardian's automated recovery now acts on the right service.** Guardian's self-healing (restart,
+  journal-freshness, and crash-loop probes) and its diagnostic briefing pointed at a deprecated,
+  usually-inactive background unit instead of the main Genesis service. As a result a "restart" could
+  report success while healing nothing, and a genuine crash loop of the main service went undetected.
+  Recovery, health probes, and diagnosis now target the main service, and a guardrail test keeps them
+  from drifting back.
 
 - **Superseded and expired memories no longer resurface in Genesis's automatic recall.** Before every
   prompt, Genesis injects the most relevant memories into its working context. That fast-path recall
