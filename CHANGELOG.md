@@ -343,6 +343,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   guardian-created snapshots exist, they are deleted (they capture the already-broken state) and the
   restore is retried once.
 
+- **Reflection summaries are no longer degraded to raw JSON dumps when the model wraps its output in a
+  code fence.** Light and strategic reflections store a searchable summary of what they found. When the
+  model wrapped its answer in a markdown ```json fence — which it often does — the summary step failed to
+  parse it and stored a truncated raw dump (fence markers included) instead of the assessment and focus,
+  degrading later recall. A ```json-tagged fence now parses the same as bare JSON (other fence types
+  are left untouched), matching how the rest of the reflection pipeline already reads it.
+
+- **Reflections that omit a confidence score are now recorded honestly instead of masquerading as
+  "0.7 confident".** The reflection prompt explicitly forbids defaulting to 0.7, but when a reflection
+  came back without a confidence value the system silently filled in 0.7 — indistinguishable from the
+  model genuinely reporting it. An absent confidence is now stored as 0.5: deep reflections carry a
+  `confidence_defaulted` marker in the cycle's routing record, and light reflections log the sentinel,
+  so you can tell reported confidence from a filled-in default.
+  The Light reflection prompt also regains its hard output caps and "signals are the only valid
+  evidence" verification rule, which were stranded in a prompt file the loader never used.
+
 - **Skill suggestions now actually fire — and nested skill packs show up in the catalog.** The
   prompt-time skill nudge scored matches against the length of your prompt, so on any wordy prompt a
   genuine match was diluted below the firing threshold and suggestions near-never appeared; a single

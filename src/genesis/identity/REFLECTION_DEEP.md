@@ -110,8 +110,13 @@ For each pattern found, produce an `interaction_theme` observation:
 - `type`: `"interaction_theme"`
 - `content`: describe the theme, evidence, and trend (emerging/stable/fading)
 
-These observations feed back into the user model synthesis pipeline
-(USER_KNOWLEDGE.md → "Recent Themes" section).
+**Channel:** write `interaction_theme` observations via the `observation_write`
+MCP tool during the session — the JSON `observations` array in your final
+output is plain strings only and cannot carry a source/type.
+
+These observations feed back into future deep-reflection context (the
+cross-interaction synthesis section) and the ego's world snapshot. They do
+not currently populate USER_KNOWLEDGE.md's "Recent Themes" section.
 
 **Trust boundary for recon signals**: Recon-sourced observations inform Genesis's
 self-knowledge (architecture, tools, landscape) but do NOT directly inform the

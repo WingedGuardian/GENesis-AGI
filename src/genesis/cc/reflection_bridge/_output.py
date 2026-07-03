@@ -22,6 +22,17 @@ from genesis.perception.types import MIN_DELTA_CONFIDENCE
 logger = logging.getLogger(__name__)
 
 
+def _extract_fenced_json(text: str) -> str:
+    """Strip a markdown ```json fence if present — CC output often wraps JSON.
+
+    Returns the fenced payload when a fence is found, otherwise the text
+    unchanged. Shared by every parse site in this module so fenced and bare
+    output take the same path.
+    """
+    json_match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
+    return json_match.group(1) if json_match else text
+
+
 async def route_deep_output(
     raw_text: str,
     *,
@@ -63,9 +74,7 @@ async def store_reflection_output(depth, tick, output, *, db) -> None:
     focus_area = None
     if depth == Depth.LIGHT:
         try:
-            json_match = re.search(r"```json\s*(.*?)\s*```", output.text, re.DOTALL)
-            raw_json = json_match.group(1) if json_match else output.text
-            parsed = json.loads(raw_json)
+            parsed = json.loads(_extract_fenced_json(output.text))
             focus_area = (parsed.get("focus_area") or "").strip() or None
         except (json.JSONDecodeError, AttributeError, TypeError):
             pass
@@ -134,13 +143,16 @@ async def _process_light_output(output, *, source: str, now: str, db) -> None:
     from genesis.db.crud import observations
 
     try:
-        json_match = re.search(r"```json\s*(.*?)\s*```", output.text, re.DOTALL)
-        raw_json = json_match.group(1) if json_match else output.text
-        data = json.loads(raw_json)
+        data = json.loads(_extract_fenced_json(output.text))
 
-        # Confidence gate — check before extracting downstream data
+        # Confidence gate — check before extracting downstream data.
+        # Same rule as the deep parser: absent confidence gets a 0.5
+        # sentinel, never a silent 0.7 indistinguishable from a reported one.
         cfg = load_confidence_config()
-        cc_confidence = float(data.get("confidence", 0.7))
+        raw_confidence = data.get("confidence")
+        cc_confidence = float(raw_confidence) if raw_confidence is not None else 0.5
+        if raw_confidence is None:
+            logger.info("Light reflection omitted confidence — 0.5 sentinel")
         gated, gate_msg = should_gate(cc_confidence, cfg.observation_write)
         if gate_msg:
             logger.info("CC bridge light confidence gate: %s", gate_msg)
@@ -298,9 +310,7 @@ async def _process_light_output(output, *, source: str, now: str, db) -> None:
 async def _extract_strategic_focus(output, *, now: str, db) -> None:
     """Extract focus_next_week from strategic reflection output."""
     try:
-        json_match = re.search(r"```json\s*(.*?)\s*```", output.text, re.DOTALL)
-        raw_json = json_match.group(1) if json_match else output.text
-        data = json.loads(raw_json)
+        data = json.loads(_extract_fenced_json(output.text))
         focus_week = data.get("focus_next_week", "")
         if focus_week:
             from genesis.db.crud import cognitive_state
@@ -325,7 +335,10 @@ async def _store_reflection_summary(
 
     summary_parts = []
     try:
-        data = json.loads(output.text)
+        # Fence-strip before parsing — the sibling parse sites in this module
+        # already do this; without it, fenced output fell through to the raw
+        # text fallback and the structured summary fields were lost.
+        data = json.loads(_extract_fenced_json(output.text))
         if isinstance(data, dict):
             if data.get("assessment"):
                 summary_parts.append(str(data["assessment"])[:1500])
