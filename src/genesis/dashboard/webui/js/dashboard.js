@@ -1,4 +1,5 @@
     import { fetchApi, getBackoffFailures } from "/js/api.js";
+    import { fmtAge, chipState, chipGlyph } from "/js/ui-utils.js";
 
     document.addEventListener("alpine:init", () => {
       Alpine.store("genesisDashboard", {
@@ -3473,11 +3474,10 @@
         },
 
         formatAgeSeconds(seconds) {
+          // Delegates to the shared fmtAge contract (spec §3.4):
+          // just now (<90s) / Nm / Nh / Nd.
           if (seconds == null) return "-";
-          if (seconds < 60) return `${Math.round(seconds)}s`;
-          if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-          if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
-          return `${Math.round(seconds / 86400)}d`;
+          return fmtAge(Date.now() - seconds * 1000);
         },
 
         formatTime(isoStr) {
@@ -3495,18 +3495,20 @@
         },
 
         relativeTime(value) {
-          if (!value) return "-";
-          const ts = typeof value === "number" ? value : Date.parse(value);
-          if (!ts) return "-";
-          const diff = Math.max(0, Date.now() - ts);
-          const s = Math.round(diff / 1000);
-          if (s < 10) return "just now";
-          if (s < 60) return `${s}s ago`;
-          const m = Math.round(s / 60);
-          if (m < 60) return `${m}m ago`;
-          const h = Math.round(m / 60);
-          if (h < 48) return `${h}h ago`;
-          return `${Math.round(h / 24)}d ago`;
+          // Delegates to the shared fmtAge contract (spec §3.4):
+          // just now (<90s) / Nm / Nh / Nd — no "ago" suffix, one format everywhere.
+          return fmtAge(value);
+        },
+
+        // 5-state chip helpers over the shared status semantics (spec §3.3).
+        // Layered onto the existing .status-chip pill: chip--* supplies the
+        // canonical color + background tint; the glyph is color-blind support.
+        semanticChipClass(state) {
+          return `chip--${chipState(state)}`;
+        },
+
+        semanticChipGlyph(state) {
+          return chipGlyph(chipState(state));
         },
 
         approvalActionState(requestId) {

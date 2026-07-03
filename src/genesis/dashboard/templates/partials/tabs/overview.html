@@ -26,8 +26,8 @@
             <div class="health-card-header">
               <div class="health-card-title">Infrastructure</div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.infrastructureSemantic().state)}`"
-                    x-text="$store.genesisDashboard.infrastructureSemantic().state"></span>
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.infrastructureSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.infrastructureSemantic().state)} ${$store.genesisDashboard.infrastructureSemantic().state}`"></span>
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.infrastructure">
@@ -90,8 +90,8 @@
             <div class="health-card-header">
               <div class="health-card-title">CC Sessions</div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.ccSemantic().state)}`"
-                    x-text="$store.genesisDashboard.ccSemantic().state"></span>
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.ccSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.ccSemantic().state)} ${$store.genesisDashboard.ccSemantic().state}`"></span>
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.cc_sessions">
@@ -126,8 +126,8 @@
             <div class="health-card-header">
               <div class="health-card-title">Cost</div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.costSemantic().state)}`"
-                    x-text="$store.genesisDashboard.costSemantic().state"></span>
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.costSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.costSemantic().state)} ${$store.genesisDashboard.costSemantic().state}`"></span>
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.cost">
@@ -163,8 +163,8 @@
             <div class="health-card-header">
               <div class="health-card-title">Queues</div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.queuesSemantic().state)}`"
-                    x-text="$store.genesisDashboard.queuesSemantic().state"></span>
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.queuesSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.queuesSemantic().state)} ${$store.genesisDashboard.queuesSemantic().state}`"></span>
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.queues">
@@ -339,8 +339,8 @@
             <div class="health-card-header">
               <div class="health-card-title">Surplus <span style="font-size: 0.6rem; opacity: 0.5;">click for details</span></div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.surplusSemantic().state)}`"
-                    x-text="$store.genesisDashboard.surplusSemantic().state"></span>
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.surplusSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.surplusSemantic().state)} ${$store.genesisDashboard.surplusSemantic().state}`"></span>
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.surplus">
@@ -371,8 +371,8 @@
               <div class="health-card-header">
                 <div class="health-card-title">Ego <span style="font-size: 0.6rem; opacity: 0.5;">click for details</span></div>
                 <span class="status-chip"
-                      :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.egoSemantic().state)}`"
-                      x-text="$store.genesisDashboard.egoSemantic().state"></span>
+                      :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.egoSemantic().state)"
+                      x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.egoSemantic().state)} ${$store.genesisDashboard.egoSemantic().state}`"></span>
               </div>
               <div class="health-card-value" style="width: 100%;">
                 <!-- User Ego (CEO) row -->
@@ -447,8 +447,8 @@
             <div class="health-card-header">
               <div class="health-card-title">Services</div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.servicesSemantic().state)}`"
-                    x-text="$store.genesisDashboard.servicesSemantic().state"></span>
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.servicesSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.servicesSemantic().state)} ${$store.genesisDashboard.servicesSemantic().state}`"></span>
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.services">
@@ -532,8 +532,8 @@
             <div class="health-card-header">
               <div class="health-card-title">Container</div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.containerSemantic().state)}`"
-                    x-text="$store.genesisDashboard.containerSemantic().state"></span>
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.containerSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.containerSemantic().state)} ${$store.genesisDashboard.containerSemantic().state}`"></span>
             </div>
             <div class="health-card-value" style="display:flex; flex-direction:column; gap:0.35rem;">
               <!-- Memory row -->
@@ -620,8 +620,8 @@
             <div class="health-card-header">
               <div class="health-card-title">Awareness Loop</div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.awarenessSemantic().state)}`"
-                    x-text="$store.genesisDashboard.awarenessSemantic().state"></span>
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.awarenessSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.awarenessSemantic().state)} ${$store.genesisDashboard.awarenessSemantic().state}`"></span>
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.awareness">
@@ -666,8 +666,8 @@
             <div class="health-card-header">
               <div class="health-card-title">Outreach (7d) <span style="font-size: 0.6rem; opacity: 0.5;">click for details</span></div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.outreachSemantic().state)}`"
-                    x-text="$store.genesisDashboard.outreachSemantic().state"></span>
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.outreachSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.outreachSemantic().state)} ${$store.genesisDashboard.outreachSemantic().state}`"></span>
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.outreach_stats?.total != null">
@@ -689,8 +689,8 @@
             <div class="health-card-header">
               <div class="health-card-title">Conversation</div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.conversationSemantic().state)}`"
-                    x-text="$store.genesisDashboard.conversationSemantic().state"></span>
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.conversationSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.conversationSemantic().state)} ${$store.genesisDashboard.conversationSemantic().state}`"></span>
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.conversation?.last_user_message_age_s != null">
@@ -726,8 +726,8 @@
             <div class="health-card-header">
               <div class="health-card-title">MCP Servers</div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.mcpSemantic().state)}`"
-                    x-text="$store.genesisDashboard.mcpSemantic().state"></span>
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.mcpSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.mcpSemantic().state)} ${$store.genesisDashboard.mcpSemantic().state}`"></span>
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.mcp_servers">
@@ -753,8 +753,8 @@
             <div class="health-card-header">
               <div class="health-card-title">API Keys</div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.apiKeysSemantic().state)}`"
-                    x-text="$store.genesisDashboard.apiKeysSemantic().state"></span>
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.apiKeysSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.apiKeysSemantic().state)} ${$store.genesisDashboard.apiKeysSemantic().state}`"></span>
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.api_keys">

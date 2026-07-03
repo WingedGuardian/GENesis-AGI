@@ -42,10 +42,12 @@ export function chipState(health, lastRun = null, nowMs = Date.now()) {
   if (ms !== null && nowMs - ms > STALE_AFTER_MS) return "stale";
   const h = String(health ?? "").toLowerCase();
   if (["ok", "healthy", "active", "normal", "pass", "success"].includes(h)) return "ok";
-  if (["warn", "warning", "degraded", "partial"].includes(h)) return "warn";
+  if (["warn", "warning", "degraded", "partial", "fallback"].includes(h)) return "warn";
   if (["err", "error", "critical", "failed", "fail", "down"].includes(h)) return "err";
-  if (["off", "disabled", "inactive", "paused"].includes(h)) return "off";
-  return "warn"; // unknown health value: surface it, don't hide it
+  // "idle"/"unknown" render neutral-gray today (semanticStateColor #888) — keep
+  // that meaning: quiet, not alarming.
+  if (["off", "disabled", "inactive", "paused", "idle", "unknown"].includes(h)) return "off";
+  return "warn"; // genuinely novel health value: surface it, don't hide it
 }
 
 /** CSS class for a chip state (pair with the base `chip` class). */
