@@ -44,13 +44,17 @@ async def test_restart_safe_hourly_returns_crontrigger_not_interval():
 
 async def test_restart_safe_hourly_subdaily_is_stepped_and_daily_differs():
     """4h -> every-4-hours step; >=24h -> a single daily fire (the _recently_completed
-    cooldown is the real cadence gate, so the trigger only needs to fire frequently ENOUGH)."""
-    sub = str(_restart_safe_hourly(4, minute=10))
-    daily = str(_restart_safe_hourly(24, minute=20))
-    assert "*/4" in sub
-    assert "minute='10'" in sub
-    assert sub != daily
-    assert "*/24" not in daily  # collapses to a fixed daily hour, not an every-24h step
+    cooldown is the real cadence gate). Assert on trigger fields, not the __str__ repr."""
+    def _field(trig, name):
+        return next(str(f) for f in trig.fields if f.name == name)
+
+    sub = _restart_safe_hourly(4, minute=10)
+    daily = _restart_safe_hourly(24, minute=20)
+    assert _field(sub, "hour") == "*/4"
+    assert _field(sub, "minute") == "10"
+    # >=24h collapses to a single fixed daily hour, not an every-24h step
+    assert _field(daily, "hour") == "4"
+    assert _field(daily, "minute") == "20"
 
 
 async def test_long_interval_jobs_use_restart_safe_crontriggers(db):
