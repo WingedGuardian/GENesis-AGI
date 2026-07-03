@@ -34,6 +34,25 @@ logger = logging.getLogger(__name__)
 CC_JSONL_DIR = str(Path.home() / ".claude" / "projects" / cc_project_dir())
 
 
+def _or_error(result: object) -> object:
+    """Isolate a failed gather section.
+
+    With ``return_exceptions=True`` a raising sub-snapshot lands in the results
+    list as an exception instead of aborting the whole snapshot. Convert a normal
+    ``Exception`` into a ``{"status": "error"}`` section (every consumer reads
+    sections defensively via ``.get()``), but re-raise a ``BaseException`` such as
+    ``CancelledError`` so cooperative cancellation is never swallowed. Applied
+    uniformly to every result so no un-serializable exception object leaks into
+    the snapshot dict.
+    """
+    if isinstance(result, Exception):
+        logger.warning("Health snapshot section failed", exc_info=result)
+        return {"status": "error", "error": str(result)}
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
 class HealthDataService:
     """Aggregates all health sources into a single snapshot dict.
 
@@ -71,9 +90,54 @@ class HealthDataService:
         self._activity_tracker = activity_tracker
         self._provider_health = provider_health_checker
         self._event_bus = event_bus
+        # Single-flight: concurrent snapshot() callers coalesce onto one compute.
+        self._inflight: asyncio.Task | None = None
 
     async def snapshot(self) -> dict:
-        """Return full system health state as a dict."""
+        """Return full system health state, coalescing concurrent callers.
+
+        The snapshot is expensive (systemd subprocesses + DB + network). Callers
+        that overlap — the two ego-context builders on an awareness tick, the
+        sentinel dispatcher, the morning report — share ONE in-flight computation
+        instead of each triggering a full recompute. The returned dict is
+        READ-ONLY by contract (every caller reads via ``.get()``), so it is shared
+        among coalesced callers without a defensive copy.
+
+        The shared task is awaited through ``asyncio.shield`` so one caller's
+        cancellation — e.g. the dashboard route's 15s ``_async_route`` timeout —
+        cannot cancel the in-flight snapshot out from under the other coalesced
+        callers (who catch ``Exception``, not ``CancelledError``). ``_inflight``
+        is released by the task's own done-callback, not a caller's ``finally``,
+        so it survives the cancelling caller unwinding first; the ``.done()`` guard
+        makes correctness independent of when that callback runs.
+        """
+        inflight = self._inflight
+        if inflight is not None and not inflight.done():
+            return await asyncio.shield(inflight)
+        # No await between the done() check and the assignment below → race-free
+        # on the single-threaded loop.
+        task = asyncio.create_task(self._compute_snapshot())
+        self._inflight = task
+        task.add_done_callback(self._release_inflight)
+        return await asyncio.shield(task)
+
+    def _release_inflight(self, task: asyncio.Task) -> None:
+        """Done-callback: drop the in-flight handle when the compute finishes.
+
+        Runs on the loop (scheduled via ``call_soon``). Clears only if the handle
+        is still ours, and retrieves any exception so a fully-orphaned failed
+        compute (every awaiter cancelled before completion) does not emit a
+        "Task exception was never retrieved" warning.
+        """
+        if self._inflight is task:
+            self._inflight = None
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.debug("Orphaned health snapshot compute failed", exc_info=exc)
+
+    async def _compute_snapshot(self) -> dict:
+        """Build the full system health state as a dict (uncoalesced)."""
         from genesis.observability.snapshots import (
             api_key_health,
             awareness,
@@ -89,7 +153,7 @@ class HealthDataService:
             proactive_memory_metrics,
             provider_activity,
             queues,
-            services,
+            services_async,
             surplus_status,
         )
 
@@ -111,11 +175,7 @@ class HealthDataService:
         # instead of the sum: aiosqlite serializes DB queries on the single
         # connection (safe), while network-bound calls (memory_health/Qdrant,
         # mcp_status) overlap with them and each other.
-        (
-            r_call_sites, r_cc_sessions, r_infrastructure, r_queues, r_surplus,
-            r_cost, r_awareness, r_outreach, r_mcp, r_provider_activity,
-            r_memory_health, r_eval_staleness, r_vcr,
-        ) = await asyncio.gather(
+        results = await asyncio.gather(
             call_sites(
                 self._db, self._routing_config, self._breakers,
                 probe_results=probe_results, state_machine=self._state_machine,
@@ -134,7 +194,25 @@ class HealthDataService:
             memory_health(self._db),
             eval_staleness(self._db),
             self._vcr_snapshot(),
+            # Offloaded so NO blocking I/O runs on the event loop. services_async
+            # threads only the systemctl subprocesses (the sentinel read stays
+            # on-loop, atomic); the two file-reading snapshots go to a worker
+            # thread whole. Concurrent with the DB/network calls above → ≈0 added
+            # wall-clock vs. the old serial post-gather calls.
+            services_async(),
+            asyncio.to_thread(conversation_activity),
+            asyncio.to_thread(proactive_memory_metrics),
+            return_exceptions=True,
         )
+        # Isolate any failed section uniformly: one raising sub-snapshot degrades
+        # to {"status": "error"} instead of taking down the whole snapshot.
+        results = [_or_error(r) for r in results]
+        (
+            r_call_sites, r_cc_sessions, r_infrastructure, r_queues, r_surplus,
+            r_cost, r_awareness, r_outreach, r_mcp, r_provider_activity,
+            r_memory_health, r_eval_staleness, r_vcr,
+            r_services, r_conversation, r_proactive,
+        ) = results
 
         return {
             "timestamp": now,
@@ -147,12 +225,12 @@ class HealthDataService:
             "cost": r_cost,
             "awareness": r_awareness,
             "outreach_stats": r_outreach,
-            "services": services(),
+            "services": r_services,
             "api_keys": api_key_health(self._routing_config, breakers=self._breakers),
             "mcp_servers": r_mcp,
-            "conversation": conversation_activity(),
+            "conversation": r_conversation,
             "provider_activity": r_provider_activity,
-            "proactive_memory": proactive_memory_metrics(),
+            "proactive_memory": r_proactive,
             "memory_health": r_memory_health,
             "provider_health": self._serialize_provider_health(),
             "eval_staleness": r_eval_staleness,

@@ -133,6 +133,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The dashboard's system-health view stays responsive under load and no longer errors out when a single
+  check hiccups.** Building the health snapshot used to run its systemd service checks (several `systemctl`
+  calls) and a couple of file scans directly on the main event loop, so gathering health could briefly stall
+  other work; and if any one sub-check raised an unexpected error, the entire health request failed. Those
+  checks now run off the main loop, and a failure in one section degrades just that section to an error state
+  while the rest of the health view loads normally. Overlapping health requests now also share a single
+  computation instead of each recomputing from scratch.
+
 - **Genesis's background egos now keep their thinking rhythm across a restart instead of going quiet.**
   The two egos run proactive cycles on an adaptive schedule that stretches out when things are idle. That
   schedule was re-armed from scratch on every restart, so an install that restarts often (deploys, recovery)

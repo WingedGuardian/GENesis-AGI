@@ -14,16 +14,33 @@ logger = logging.getLogger(__name__)
 _MCP_CRASH_DIR = Path.home() / ".genesis" / "mcp_crashes"
 
 
-def services() -> dict:
-    """Collect systemd service states, watchdog health, and host framework."""
+def _collect_service_status_safe() -> dict:
+    """Subprocess-heavy systemd/watchdog collection — safe to run in a worker thread.
+
+    This is the ONLY loop-blocking part of the services snapshot (up to ~7
+    ``systemctl`` subprocesses @ 5s each). It touches no shared event-loop state,
+    so ``services_async()`` offloads it via ``asyncio.to_thread``.
+    """
     try:
         from genesis.observability.service_status import collect_service_status
 
-        result = collect_service_status()
+        return collect_service_status()
     except Exception:
         logger.warning("Failed to collect service status", exc_info=True)
-        result = {"status": "unknown"}
+        return {"status": "unknown"}
 
+
+def _finish_services(result: dict) -> dict:
+    """Augment a base service-status dict with host framework + sentinel state.
+
+    MUST run on the event loop. It reads the live ``sentinel.state``, which the
+    sentinel dispatcher mutates in place, field-by-field, on the loop; single-
+    threaded execution (no ``await`` mid-read) is what makes that read atomic.
+    Do NOT offload this to a worker thread — that would open a torn-read window
+    (e.g. a fresh ``current_state`` paired with a stale ``last_heartbeat_at``).
+    Host-framework ``detect()`` is near-free (empty detector registry, 30s cache),
+    so it stays here too rather than warranting its own offload.
+    """
     # Host framework detection (USB mode)
     try:
         status = _get_registry().detect()
@@ -100,6 +117,26 @@ def services() -> dict:
         result["sentinel"] = _sentinel_unavailable()
 
     return result
+
+
+def services() -> dict:
+    """Collect systemd service states, watchdog health, and host framework.
+
+    Synchronous composition — kept for the standalone/MCP path and direct tests.
+    On the event loop, prefer ``services_async()`` (offloads the subprocess work).
+    """
+    return _finish_services(_collect_service_status_safe())
+
+
+async def services_async() -> dict:
+    """Event-loop-safe services snapshot.
+
+    Offloads ONLY the subprocess-heavy collection to a worker thread, then
+    assembles host framework + sentinel on the loop (the sentinel read must stay
+    loop-atomic — see ``_finish_services``).
+    """
+    base = await _aio.to_thread(_collect_service_status_safe)
+    return _finish_services(base)
 
 
 def _sentinel_unavailable() -> dict:
