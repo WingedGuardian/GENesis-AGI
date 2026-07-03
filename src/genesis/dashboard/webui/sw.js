@@ -1,6 +1,6 @@
 // Genesis PWA Service Worker — minimal shell cache
-const CACHE = 'genesis-shell-v1';
-const SHELL = ['/genesis', '/vendor/alpine/alpine.min.js', '/js/initFw.js', '/js/api.js', '/index.css'];
+const CACHE = 'genesis-shell-v2';
+const SHELL = ['/genesis', '/vendor/alpine/alpine.min.js', '/js/initFw.js', '/js/api.js', '/js/dashboard.js', '/index.css', '/css/dashboard.css'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
