@@ -5197,15 +5197,17 @@
                         x-text="($store.genesisDashboard.health.infrastructure.disk.total_gb - $store.genesisDashboard.health.infrastructure.disk.free_gb).toFixed(0) + '/' + $store.genesisDashboard.health.infrastructure.disk.total_gb.toFixed(0) + ' GB'"></span>
                 </div>
               </template>
-              <!-- CC slots row (per-session RSS — leak detection) -->
+              <!-- Claude Code sessions row (per-session RSS — leak detection) -->
               <template x-if="($store.genesisDashboard.health.infrastructure?.cc_slots || []).length">
-                <div style="display:flex; align-items:flex-start; gap:0.5rem; font-size:0.8rem;">
-                  <span style="width:3.2rem; color:var(--color-text-secondary);">CC</span>
-                  <div style="flex:1; display:flex; flex-wrap:wrap; gap:0.35rem;">
+                <div style="display:flex; flex-direction:column; gap:0.3rem; font-size:0.8rem;">
+                  <span style="color:var(--color-text-secondary);"
+                        title="Memory (RSS) used by each concurrent Claude Code worker session — leak detection. Green = healthy, amber ≥ 4 GB, red ≥ 6 GB.">Claude Code Sessions</span>
+                  <div style="display:flex; flex-wrap:wrap; gap:0.35rem;">
                     <template x-for="slot in $store.genesisDashboard.health.infrastructure.cc_slots" :key="slot.slot">
                       <span style="font-size:0.7rem; padding:0.05rem 0.3rem; border-radius:3px; background:var(--color-background); white-space:nowrap;"
-                            :style="`color: ${slot.status === 'error' ? '#d9534f' : slot.status === 'degraded' ? '#f0ad4e' : 'var(--color-text-secondary)'}`"
-                            x-text="'cc-' + slot.slot + ' ' + (slot.rss_mb / 1024).toFixed(1) + 'G'"></span>
+                            :style="`color: ${slot.status === 'error' ? '#d9534f' : slot.status === 'degraded' ? '#f0ad4e' : '#4caf50'}`"
+                            :title="'Session ' + slot.slot + ' (pid ' + slot.pid + '): ' + (slot.rss_mb / 1024).toFixed(2) + ' GB RSS'"
+                            x-text="'#' + slot.slot + ' ' + (slot.rss_mb / 1024).toFixed(1) + 'G'"></span>
                     </template>
                   </div>
                 </div>

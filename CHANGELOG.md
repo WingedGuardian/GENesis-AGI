@@ -139,6 +139,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The dashboard's per-session memory row is clearer: "Claude Code Sessions", green when healthy.** The
+  cryptic "CC" row that listed sessions as gray "cc-1 …" chips is now labeled **Claude Code Sessions**,
+  renders each healthy session in green (amber ≥ 4 GB, red ≥ 6 GB), and shows a hover tooltip explaining
+  it's per-session memory for leak detection — so "gray" no longer reads as inactive/unknown.
+
 - **Genesis's COO (self-maintenance ego) no longer burns cognitive cycles reacting to model-provider
   outages it can't fix.** When a provider chain runs out of options (e.g. a temporary DeepSeek outage),
   the "all providers exhausted" alerts no longer wake the ego into a full high-effort reasoning cycle that
