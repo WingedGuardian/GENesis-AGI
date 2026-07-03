@@ -248,3 +248,64 @@ async def test_ingest_scan_failure_is_fail_open(tmp_path: Path):
 
     assert result.units_created == 1
     assert not any("injection_patterns_detected" in f for f in result.quality_flags)
+
+
+# ─── tree-index orphan-task safety (F10.1) ─────────────────────────────────
+
+
+async def test_distill_failure_cancels_orphan_tree_task(tmp_path: Path, monkeypatch):
+    """A distill() failure must cancel the in-flight tree-index task, not orphan it.
+
+    F10.1: the PageIndex upload task was cancelled only on the storage-failure
+    path. A ``distill()`` raise propagated out of ``ingest_source`` while the
+    task was still running (a leaked upload+poll for up to 300s). The fix
+    cancels+awaits the task on any failure before re-raising.
+    """
+    import asyncio
+
+    import pytest
+
+    from genesis.knowledge.processors.base import ProcessedContent
+
+    # Source must live under $HOME to pass the path-traversal guard.
+    monkeypatch.setattr("genesis.knowledge.orchestrator.Path.home", lambda: tmp_path)
+    pdf = tmp_path / "big.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+
+    orch = _make_orchestrator(tmp_path)
+    orch._tree_index = MagicMock()        # enables should_tree_index
+    orch._tree_index_threshold = 1
+
+    proc = MagicMock()
+    proc.process = AsyncMock(return_value=ProcessedContent(
+        text="lots of extracted content", source_type="pdf",
+        metadata={"page_count": 30}, source_path=str(pdf),
+    ))
+    orch._registry.get_processor = MagicMock(return_value=proc)
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def fake_tree_source(source):
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    orch._tree_index_source = fake_tree_source
+
+    async def failing_distill(*args, **kwargs):
+        # Wait until the tree task is actually running, THEN fail — so the test
+        # exercises the "task in flight when distill raises" race deterministically.
+        await started.wait()
+        raise RuntimeError("distill boom")
+
+    orch._distillation.distill = failing_distill
+
+    with pytest.raises(RuntimeError, match="distill boom"):
+        await orch.ingest_source(str(pdf), project_type="test")
+
+    assert started.is_set(), "tree-index task should have started"
+    assert cancelled.is_set(), "tree-index task must be cancelled, not orphaned"
