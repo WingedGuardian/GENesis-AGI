@@ -55,6 +55,12 @@ class DistributionManager:
         Returns:
             List of PostResult, one per platform attempted.
         """
+        # GROUNDWORK(autonomous-distribution): the server-side autonomous publish path.
+        # Dormant today (no prod caller; the distributor registry is empty and Medium/
+        # browser publishing runs from foreground CC sessions). When this goes live, EACH
+        # external platform send below MUST first route through the capability shadow-gate
+        # (autonomy/shadow_gate) — then the enforce stage — per the egress-gating contract.
+        # check_external_io.py cannot see this door (no literal endpoint token on the call).
         results: list[PostResult] = []
 
         for platform in platforms:
