@@ -1364,17 +1364,24 @@ class AwarenessLoop:
                 )
 
     async def _resume_approved_sentinel_dispatches(self) -> None:
-        """Resume sentinel dispatches whose approvals were granted.
+        """Converge a parked sentinel dispatch on its approval's REAL status.
 
-        Mirrors _resume_approved_reflections: checks for approved-but-
-        unconsumed sentinel approvals and resumes the dispatcher.
+        State-keyed: when the sentinel is AWAITING_*, the dispatcher looks
+        up the exact pending request row and applies whatever actually
+        happened to it — approved → resume, rejected → apply the rejection
+        (24h pattern suppression + HEALTHY), expired/cancelled/missing →
+        clear the park, no-pending-id-recorded → clear the inconsistent
+        park. The previous implementation only scanned for approved rows,
+        so a rejection was never delivered and the sentinel stayed parked
+        forever (Gate 2 blocks all other dispatches while parked — this
+        blinded the Sentinel for 26 days in June/July 2026). The old
+        approved-row scan fallback was removed outright: for a park with no
+        recorded pending id it consumed an approval whose id could never
+        match, eating the user's decision while staying parked.
         """
         if self._sentinel is None:
             return
-
-        # Access the approval gate via the sentinel dispatcher
-        gate = getattr(self._sentinel, "_approval_gate", None)
-        if gate is None:
+        if getattr(self._sentinel, "_approval_gate", None) is None:
             return
 
         from genesis.sentinel.state import SentinelState as _SS
@@ -1384,31 +1391,13 @@ class AwarenessLoop:
         if state.state not in (_SS.AWAITING_DISPATCH_APPROVAL, _SS.AWAITING_ACTION_APPROVAL):
             return
 
-        for policy_id in ("sentinel_dispatch", "sentinel_action"):
-            try:
-                approved = await gate.find_recently_approved(
-                    subsystem="sentinel",
-                    policy_id=policy_id,
-                )
-                if not approved:
-                    continue
-
-                # Atomic consume — prevents double-dispatch
-                consumed = await gate.mark_consumed(approved["id"])
-                if not consumed:
-                    continue
-
-                logger.info(
-                    "Resuming sentinel %s from approved request %s",
-                    policy_id, approved["id"][:8],
-                )
-                await self._sentinel.resume_from_approval(
-                    approved["id"], "approved",
-                )
-            except Exception:
-                logger.error(
-                    "Failed to resume sentinel %s", policy_id, exc_info=True,
-                )
+        try:
+            await self._sentinel.converge_pending_approval()
+        except Exception:
+            logger.error(
+                "Failed to converge sentinel on pending approval",
+                exc_info=True,
+            )
 
     async def _retry_deferred_reflection(self, current_tick: TickResult) -> None:
         """Retry ONE deferred reflection per tick using current tick's fresh data.

@@ -583,3 +583,138 @@ async def test_session_set_effort_empty_session_id():
     result = await _impl_session_set_effort("  ", "high")
     assert "error" in result
     assert "required" in result["error"].lower()
+
+
+class TestBackupAlertGate:
+    """Backup alerts are gated on backups being ENABLED on this install
+    (GENESIS_BACKUP_REPO). A failed/stale status file on an install where
+    backups are intentionally disabled is a dishonest CRITICAL — it wedged
+    the Sentinel for 26 days via a rejected approval that could never be
+    re-resolved. Where backups ARE enabled, real failures still alert.
+    """
+
+    def _svc(self):
+        svc = AsyncMock()
+        svc.snapshot.return_value = {
+            "call_sites": {},
+            "cc_sessions": {"background": {}},
+            "infrastructure": {},
+            "queues": {},
+            "awareness": {},
+        }
+        return svc
+
+    def _fake_home(self, tmp_path, status: dict | None):
+        import json as _json
+
+        fake_home = tmp_path / "fakehome"
+        (fake_home / ".genesis").mkdir(parents=True)
+        if status is not None:
+            (fake_home / ".genesis" / "backup_status.json").write_text(
+                _json.dumps(status),
+            )
+        return fake_home
+
+    async def _alerts(self, monkeypatch, tmp_path, *, status, enabled):
+        from pathlib import Path
+
+        fake_home = self._fake_home(tmp_path, status)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+        monkeypatch.setattr(
+            "genesis.mcp.health.errors._backups_enabled", lambda: enabled,
+        )
+        old_service = health_mcp_mod._service
+        old_history = health_mcp_mod._alert_history.copy()
+        try:
+            health_mcp_mod._service = self._svc()
+            health_mcp_mod._alert_history = {}
+            return await _impl_health_alerts()
+        finally:
+            health_mcp_mod._service = old_service
+            health_mcp_mod._alert_history = old_history
+
+    async def test_disabled_install_emits_no_backup_alerts(self, monkeypatch, tmp_path):
+        alerts = await self._alerts(
+            monkeypatch, tmp_path,
+            status={"timestamp": "2026-07-02T18:38:34Z", "success": False,
+                    "failure_reason": "Cannot clone backup repo without GENESIS_BACKUP_REPO"},
+            enabled=False,
+        )
+        assert not [a for a in alerts if a["id"].startswith("backup:")]
+
+    async def test_disabled_install_no_not_configured_nag(self, monkeypatch, tmp_path):
+        alerts = await self._alerts(monkeypatch, tmp_path, status=None, enabled=False)
+        assert not [a for a in alerts if a["id"].startswith("backup:")]
+
+    async def test_enabled_install_failed_backup_still_alerts(self, monkeypatch, tmp_path):
+        alerts = await self._alerts(
+            monkeypatch, tmp_path,
+            status={"timestamp": "2026-07-02T18:38:34Z", "success": False,
+                    "failure_reason": "push failed"},
+            enabled=True,
+        )
+        failed = [a for a in alerts if a["id"] == "backup:last_failed"]
+        assert len(failed) == 1
+        assert failed[0]["severity"] == "CRITICAL"
+
+    async def test_enabled_install_missing_status_still_nags(self, monkeypatch, tmp_path):
+        alerts = await self._alerts(monkeypatch, tmp_path, status=None, enabled=True)
+        assert [a for a in alerts if a["id"] == "backup:not_configured"]
+
+
+class TestBackupsEnabledHelper:
+    """_backups_enabled: env first (server process), secrets.env file as
+    fallback (the standalone MCP server only imports an allowlist of vars,
+    so the env alone under-reports there)."""
+
+    def test_env_var_set(self, monkeypatch):
+        from genesis.mcp.health.errors import _backups_enabled
+
+        monkeypatch.setenv("GENESIS_BACKUP_REPO", "https://example.com/o/backups.git")
+        assert _backups_enabled() is True
+
+    def test_unset_everywhere(self, monkeypatch, tmp_path):
+        from genesis.mcp.health.errors import _backups_enabled
+
+        monkeypatch.delenv("GENESIS_BACKUP_REPO", raising=False)
+        monkeypatch.setattr(
+            "genesis.env.secrets_path", lambda: tmp_path / "secrets.env",
+        )
+        assert _backups_enabled() is False
+
+    def test_secrets_file_fallback(self, monkeypatch, tmp_path):
+        from genesis.mcp.health.errors import _backups_enabled
+
+        monkeypatch.delenv("GENESIS_BACKUP_REPO", raising=False)
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text(
+            "API_KEY_DEEPINFRA=abc\n"
+            'GENESIS_BACKUP_REPO="https://example.com/o/backups.git"\n'
+        )
+        monkeypatch.setattr("genesis.env.secrets_path", lambda: secrets)
+        assert _backups_enabled() is True
+
+    def test_secrets_file_empty_value(self, monkeypatch, tmp_path):
+        from genesis.mcp.health.errors import _backups_enabled
+
+        monkeypatch.delenv("GENESIS_BACKUP_REPO", raising=False)
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("GENESIS_BACKUP_REPO=\n")
+        monkeypatch.setattr("genesis.env.secrets_path", lambda: secrets)
+        assert _backups_enabled() is False
+
+    def test_existing_clone_counts_as_enabled(self, monkeypatch, tmp_path):
+        """backup.sh only needs GENESIS_BACKUP_REPO for the FIRST clone —
+        an existing clone (e.g. created by restore.sh --from <url>) keeps
+        backing up off the clone's remote with the var never persisted.
+        Such an install must still alert on failures.
+        """
+        from pathlib import Path
+
+        from genesis.mcp.health.errors import _backups_enabled
+
+        fake_home = tmp_path / "fakehome"
+        (fake_home / "backups" / "genesis-backups" / ".git").mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+        monkeypatch.delenv("GENESIS_BACKUP_REPO", raising=False)
+        assert _backups_enabled() is True

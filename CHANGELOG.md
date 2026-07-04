@@ -158,6 +158,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **The Sentinel (Genesis's internal emergency responder) now only wakes for problems it can
+  actually fix.** Previously any CRITICAL health alert woke it — including things it has no way to
+  remediate, like backups failing to reach a remote repo, a provider running out of credits, or an
+  external API outage. Those now stay visible on the dashboard and still notify you directly (backup
+  failures were added to the immediate-notification list), but they no longer trigger an automated
+  diagnostic session that can only conclude "nothing I can do." Each alert is matched against the
+  remediation tools available on your install, so e.g. a Guardian alarm only wakes the Sentinel where
+  a Guardian is actually configured. Installs that intentionally don't run backups no longer see a
+  false "backup failed" critical alert at all.
+
+- **A rejected Sentinel approval can no longer freeze the Sentinel.** If you rejected (or let
+  expire) a Sentinel dispatch approval while the underlying alarm stayed active, the Sentinel parked
+  itself waiting forever and silently ignored every new alarm. It now applies your decision on the
+  next check: a rejection suppresses that alarm pattern for 24h and returns the Sentinel to healthy,
+  ready for the next real emergency. Sentinel state changes also now appear in the event log under
+  their own "sentinel" subsystem, so a parked or wedged state is visible instead of silent.
+
 - **The dashboard loads faster and shows consistent status/time formats.** The web UI's
   scripts and styles moved out of the page into cacheable files, so after your first visit
   only data — not the whole 700KB page — is re-fetched. Overview health chips now use one

@@ -40,6 +40,11 @@ class OutreachConfig:
         "provider:credit_exhaustion",  # Prefix — matches any provider
         "awareness:tick_overdue",
         "service:health_data_uninitialized",
+        # Backups are outside Sentinel scope (external target — see
+        # sentinel/remediation_map.py), so this whitelist is the push
+        # channel for real backup failures on installs where backups
+        # are enabled. Prefix — matches backup:last_failed / backup:overdue.
+        "backup:",
     )
     # Voice proactive chiming — the spoken-aloud allowlist. This IS the menu:
     # a request is spoken only if its signal_type or a source_id part matches
@@ -93,6 +98,7 @@ _DEFAULTS = OutreachConfig(
         "provider:credit_exhaustion",  # Prefix — matches any provider
         "awareness:tick_overdue",
         "service:health_data_uninitialized",
+        "backup:",  # Prefix — push channel now that backups are out of Sentinel scope
     ),
     delivery_routing={"default": "supergroup"},
 )
