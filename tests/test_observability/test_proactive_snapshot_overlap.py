@@ -89,6 +89,27 @@ class TestOverlap7d:
         assert result["overlap_pct_7d"] == 0.0
         assert result["repeat_prompt_rate_7d"] == 0.0
 
+    def test_invalid_utf8_does_not_abort_aggregation(self, tmp_path: Path) -> None:
+        """A log file with invalid UTF-8 bytes must not kill the whole rollup.
+
+        Pre-hardening, read_text() raised UnicodeDecodeError (a ValueError,
+        NOT caught by the per-file OSError guard) which escaped to the outer
+        catch and silently dropped every remaining session. Valid lines in
+        the corrupt file itself must still be salvaged.
+        """
+        recent = _NOW - timedelta(days=1)
+        bad_dir = tmp_path / "s-corrupt"
+        bad_dir.mkdir(parents=True)
+        with open(bad_dir / "injection_log.jsonl", "wb") as f:
+            f.write(b"\xff\xfe corrupt bytes\n")
+            f.write((json.dumps(_rec(recent, 2, 1)) + "\n").encode())
+        _write_log(tmp_path, "s-good", [_rec(recent, 4, 1)])
+        result = pm._overlap_7d(sessions_dir=tmp_path, now=_NOW)
+        # Both the salvaged line AND the other session must count
+        assert result["prompts_with_injection_7d"] == 2
+        assert result["sessions_7d"] == 2
+        assert result["overlap_pct_7d"] == round(100.0 * 2 / 6, 1)
+
     def test_empty_dir_returns_zeros(self, tmp_path: Path) -> None:
         result = pm._overlap_7d(sessions_dir=tmp_path, now=_NOW)
         assert result["overlap_pct_7d"] == 0.0

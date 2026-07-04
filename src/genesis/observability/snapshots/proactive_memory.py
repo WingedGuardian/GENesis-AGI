@@ -47,7 +47,11 @@ def _overlap_7d(sessions_dir: Path | None = None, now: datetime | None = None) -
                 if log_path.stat().st_mtime < cutoff_epoch:
                     continue  # Whole file predates the window
                 counted_this_session = False
-                for line in log_path.read_text().splitlines():
+                # errors="replace": invalid bytes must cost only their own
+                # line (json.loads fails, line skipped), never the whole
+                # file or — via the outer catch — the remaining sessions.
+                text = log_path.read_text(encoding="utf-8", errors="replace")
+                for line in text.splitlines():
                     line = line.strip()
                     if not line:
                         continue

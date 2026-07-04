@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -123,6 +124,16 @@ def test_procedure_surfacing_subprocess(seeded_db, tmp_path: Path):
     # NOT the real ~/.genesis. The injection log feeds the live 7-day
     # overlap measurement; test runs must never pollute it.
     env["HOME"] = str(tmp_path)
+    # ...but install CONFIG must come along: the hook resolves the
+    # embedding backend (e.g. network.ollama_enabled) from
+    # ~/.genesis/config/genesis.yaml via HOME. Isolate mutable state,
+    # not the install's config, or the subprocess loses its only
+    # embedding backend on installs without cloud keys in the env.
+    real_config = Path.home() / ".genesis" / "config" / "genesis.yaml"
+    if real_config.exists():
+        iso_config_dir = tmp_path / ".genesis" / "config"
+        iso_config_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(real_config, iso_config_dir / "genesis.yaml")
     # Qdrant URL — use the real one (needed for memory recall, but
     # we're testing procedure surfacing which uses SQLite only)
     env.setdefault("QDRANT_URL", "http://localhost:6333")

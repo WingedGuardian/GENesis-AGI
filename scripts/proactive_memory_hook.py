@@ -425,6 +425,70 @@ def _append_injection_log(session_id: str, record: dict) -> None:
         pass  # Never block
 
 
+def _ws_measure(
+    fused: list[dict],
+    session_id: str,
+    surfaced_proc_id: str | None,
+    now_iso: str,
+) -> dict:
+    """The whole working-set measurement step for one prompt.
+
+    Computes overlap vs the PRE-update working set, records this prompt's
+    injection, and appends the injection-log line. Contract: NEVER prints
+    (hook stdout is context injected into the conversation) and NEVER
+    raises — any internal failure returns the stats gathered so far with
+    safe defaults for the rest.
+    """
+    stats: dict = {
+        "injected_ids": [],
+        "repeat_count": 0,
+        "overlap_pct": None,
+        "working_set_size": None,
+        "zero_retrieved_injected": 0,
+        "procedure_repeat": False,
+    }
+    try:
+        stats["injected_ids"] = [r["memory_id"] for r in fused if r.get("memory_id")]
+        # Baseline for the PR2 serendipity boost: how often does today's
+        # ranking already surface never-retrieved episodic memories?
+        # FTS-only entries lack _retrieved_count → excluded (unknown ≠ 0).
+        stats["zero_retrieved_injected"] = sum(
+            1
+            for r in fused
+            if r.get("collection") != "knowledge_base"
+            and r.get("_retrieved_count", -1) == 0
+        )
+        if session_id and (stats["injected_ids"] or surfaced_proc_id):
+            ws = _load_working_set(session_id)
+            repeats, overlap_pct = _ws_overlap(ws, stats["injected_ids"])
+            stats["repeat_count"] = len(repeats)
+            stats["overlap_pct"] = overlap_pct
+            stats["procedure_repeat"] = bool(
+                surfaced_proc_id and surfaced_proc_id in ws.get("procedures", {})
+            )
+            _ws_record(
+                ws,
+                [(r["memory_id"], _ws_kind(r)) for r in fused if r.get("memory_id")],
+                surfaced_proc_id,
+                now_iso,
+            )
+            _save_working_set(session_id, ws)
+            stats["working_set_size"] = len(ws.get("entries", {}))
+            _append_injection_log(session_id, {
+                "ts": now_iso,
+                "turn": ws.get("turn", 0),
+                "injected": len(stats["injected_ids"]),
+                "repeats": stats["repeat_count"],
+                "overlap_pct": stats["overlap_pct"],
+                "ws_size": stats["working_set_size"],
+                "proc": bool(surfaced_proc_id),
+                "proc_repeat": stats["procedure_repeat"],
+            })
+    except Exception:
+        pass  # Measurement must never block the prompt
+    return stats
+
+
 def _is_garbage(content: str) -> bool:
     """Filter out content that should never surface as proactive memory."""
     # NOTE (PR2): we deliberately no longer drop content merely for containing
@@ -1591,50 +1655,7 @@ async def _run(prompt: str, session_id: str = "") -> None:
     # Overlap stats feed the PR2 novelty-gate decision. Runs after all
     # stdout is flushed — never touches injection output. Placed inside
     # the total_ms window so budget_exceeded watches its file I/O too.
-    injected_ids: list[str] = []
-    repeat_count = 0
-    overlap_pct: float | None = None
-    working_set_size: int | None = None
-    zero_retrieved_injected = 0
-    procedure_repeat = False
-    try:
-        injected_ids = [r["memory_id"] for r in fused if r.get("memory_id")]
-        # Baseline for the PR2 serendipity boost: how often does today's
-        # ranking already surface never-retrieved episodic memories?
-        # FTS-only entries lack _retrieved_count → excluded (unknown ≠ 0).
-        zero_retrieved_injected = sum(
-            1
-            for r in fused
-            if r.get("collection") != "knowledge_base"
-            and r.get("_retrieved_count", -1) == 0
-        )
-        if session_id and (injected_ids or _surfaced_proc_id):
-            ws = _load_working_set(session_id)
-            repeats, overlap_pct = _ws_overlap(ws, injected_ids)
-            repeat_count = len(repeats)
-            procedure_repeat = bool(
-                _surfaced_proc_id and _surfaced_proc_id in ws.get("procedures", {})
-            )
-            _ws_record(
-                ws,
-                [(r["memory_id"], _ws_kind(r)) for r in fused if r.get("memory_id")],
-                _surfaced_proc_id,
-                now_iso,
-            )
-            _save_working_set(session_id, ws)
-            working_set_size = len(ws.get("entries", {}))
-            _append_injection_log(session_id, {
-                "ts": now_iso,
-                "turn": ws.get("turn", 0),
-                "injected": len(injected_ids),
-                "repeats": repeat_count,
-                "overlap_pct": overlap_pct,
-                "ws_size": working_set_size,
-                "proc": bool(_surfaced_proc_id),
-                "proc_repeat": procedure_repeat,
-            })
-    except Exception:
-        pass  # Measurement must never block the prompt
+    ws_stats = _ws_measure(fused, session_id, _surfaced_proc_id, now_iso)
 
     total_ms = (time.monotonic() - start) * 1000
 
@@ -1652,12 +1673,12 @@ async def _run(prompt: str, session_id: str = "") -> None:
         total_latency_ms=total_ms,
         fts_only_fallback=fts_only_fallback,
         heartbeat_ms=heartbeat_ms,
-        injected_ids=injected_ids,
-        repeat_count=repeat_count,
-        overlap_pct=overlap_pct,
-        working_set_size=working_set_size,
-        zero_retrieved_injected=zero_retrieved_injected,
-        procedure_repeat=procedure_repeat,
+        injected_ids=ws_stats["injected_ids"],
+        repeat_count=ws_stats["repeat_count"],
+        overlap_pct=ws_stats["overlap_pct"],
+        working_set_size=ws_stats["working_set_size"],
+        zero_retrieved_injected=ws_stats["zero_retrieved_injected"],
+        procedure_repeat=ws_stats["procedure_repeat"],
     )
 
 

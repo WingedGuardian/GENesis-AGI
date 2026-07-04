@@ -185,6 +185,73 @@ class TestInjectionLog:
         assert list(tmp_path.iterdir()) == []
 
 
+class TestWsMeasure:
+    """_ws_measure is the whole measurement step — it must NEVER print or
+    raise (the hook's stdout is context injected into the conversation)."""
+
+    _FUSED = [
+        {"memory_id": "a", "collection": "episodic_memory", "_retrieved_count": 0},
+        {"memory_id": "kb1", "collection": "knowledge_base", "_retrieved_count": 0},
+    ]
+
+    def test_happy_path_records_and_stays_silent(self, tmp_path: Path, capsys) -> None:
+        with patch.object(_mod, "_TRAIL_DIR", tmp_path):
+            stats = _mod._ws_measure(self._FUSED, "s1", "proc-1", _NOW)
+        assert capsys.readouterr().out == ""
+        assert stats["injected_ids"] == ["a", "kb1"]
+        assert stats["repeat_count"] == 0
+        assert stats["overlap_pct"] == 0.0
+        assert stats["working_set_size"] == 2
+        # KB entries never count toward the serendipity baseline
+        assert stats["zero_retrieved_injected"] == 1
+        assert stats["procedure_repeat"] is False
+        assert (tmp_path / "s1" / "surfaced_memories.json").exists()
+        assert (tmp_path / "s1" / "injection_log.jsonl").exists()
+
+    def test_repeat_detected_on_second_call(self, tmp_path: Path) -> None:
+        with patch.object(_mod, "_TRAIL_DIR", tmp_path):
+            _mod._ws_measure(self._FUSED, "s1", "proc-1", _NOW)
+            stats = _mod._ws_measure(self._FUSED, "s1", "proc-1", _LATER)
+        assert stats["repeat_count"] == 2
+        assert stats["overlap_pct"] == 100.0
+        assert stats["procedure_repeat"] is True
+
+    def test_internal_failure_never_prints_or_raises(self, tmp_path: Path, capsys) -> None:
+        def _boom(session_id: str) -> dict:
+            raise RuntimeError("boom")
+
+        with patch.object(_mod, "_TRAIL_DIR", tmp_path), \
+             patch.object(_mod, "_load_working_set", _boom):
+            stats = _mod._ws_measure(self._FUSED, "s1", None, _NOW)
+        assert capsys.readouterr().out == ""
+        # Pre-failure fields survive; ws-dependent fields keep safe defaults
+        assert stats["injected_ids"] == ["a", "kb1"]
+        assert stats["overlap_pct"] is None
+        assert stats["working_set_size"] is None
+
+    def test_save_failure_contained(self, tmp_path: Path, capsys) -> None:
+        def _boom_save(session_id: str, ws: dict) -> None:
+            raise OSError("disk full")
+
+        with patch.object(_mod, "_TRAIL_DIR", tmp_path), \
+             patch.object(_mod, "_save_working_set", _boom_save):
+            _mod._ws_measure(self._FUSED, "s1", None, _NOW)
+        assert capsys.readouterr().out == ""
+
+    def test_no_session_id_skips_files(self, tmp_path: Path) -> None:
+        with patch.object(_mod, "_TRAIL_DIR", tmp_path):
+            stats = _mod._ws_measure(self._FUSED, "", None, _NOW)
+        assert stats["injected_ids"] == ["a", "kb1"]
+        assert stats["working_set_size"] is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_nothing_injected_no_files(self, tmp_path: Path) -> None:
+        with patch.object(_mod, "_TRAIL_DIR", tmp_path):
+            stats = _mod._ws_measure([], "s1", None, _NOW)
+        assert stats["injected_ids"] == []
+        assert list(tmp_path.iterdir()) == []
+
+
 class TestRecordDetailOverlapFields:
     def test_new_fields_present(self, tmp_path: Path) -> None:
         metrics_path = tmp_path / "proactive_metrics.json"
