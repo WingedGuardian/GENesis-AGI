@@ -51,6 +51,13 @@ def chained_hash(content_hash_val: str, previous_hash: str | None) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+# GROUNDWORK(chain-verify): NOT wired — and cannot be naively wired. The ego/
+# approval chains form a single GLOBAL chain written by both egos concurrently
+# (crud/ego.py), so a TOCTOU fork (two records sharing one previous_hash) is
+# expected and is NOT tampering. This linear walk returns (False, idx) at the
+# first fork, so a periodic verify would false-alarm. Real tamper detection needs
+# a fork-tolerant check (verify each record's chain_hash independently). Kept for
+# that future check + as the fork/tamper reference. NOT dead code — do not remove.
 def verify_chain(records: list[dict]) -> tuple[bool, int]:
     """Walk records oldest-first and verify chain integrity.
 

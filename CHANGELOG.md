@@ -170,6 +170,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The watchdog's memory-reclaim cooldown now survives its own restarts, so it can't trigger an
+  I/O storm under sustained memory pressure.** When container memory runs high, the watchdog reclaims
+  a small, capped amount of page cache — throttled to at most once every 5 minutes to avoid an I/O
+  spiral. That throttle lived only in memory, but the watchdog runs as a fresh short-lived process on
+  each check, so it reset every run and never actually held. The cooldown is now persisted, so
+  repeated reclaims stay correctly spaced even across the watchdog's process boundary.
+
 - **Skill suggestions now actually fire — and nested skill packs show up in the catalog.** The
   prompt-time skill nudge scored matches against the length of your prompt, so on any wordy prompt a
   genuine match was diluted below the firing threshold and suggestions near-never appeared; a single
