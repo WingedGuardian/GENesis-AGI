@@ -139,3 +139,39 @@ def test_allowlist_blocks_chaining_and_substitution(cmd):
 def test_allowlist_still_blocks_destructive_first_token():
     """Destructive ops are blocked regardless of allowlist (defense in depth)."""
     assert _run("rm -rf /", ALLOW).returncode == 2
+
+
+# --- Worktree runtime-boot guard (2026-07-03 container-OOM incident) ---
+
+def _run_cwd(command: str, cwd) -> subprocess.CompletedProcess:
+    """Like _run but with an explicit cwd, so worktree-cwd detection is
+    deterministic regardless of where pytest itself runs."""
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+    env = dict(os.environ)
+    env.pop("GENESIS_BASH_ALLOWLIST", None)
+    return subprocess.run(
+        ["bash", str(HOOK)],
+        input=payload, capture_output=True, text=True, env=env, cwd=str(cwd),
+    )
+
+
+@pytest.mark.parametrize("cmd", [
+    "PYTHONPATH=/home/u/genesis/.claude/worktrees/foo/src python -m genesis serve --port 5000",
+    "cd .claude/worktrees/my-branch && python -m genesis serve",
+    "PYTHONPATH=.claude/worktrees/x/src .venv/bin/python -m genesis serve",
+])
+def test_worktree_serve_blocked(cmd, tmp_path):
+    """Booting the full runtime from/against a worktree is blocked (exit 2)."""
+    result = _run_cwd(cmd, tmp_path)
+    assert result.returncode == 2
+    assert "BLOCKED" in result.stderr
+
+
+@pytest.mark.parametrize("cmd", [
+    "systemctl --user restart genesis-server",
+    "journalctl --user -u genesis-server -n 50",
+    "python -m genesis serve --port 5000",  # no worktree ref, non-worktree cwd
+])
+def test_non_worktree_serve_paths_allowed(cmd, tmp_path):
+    """Server management and plain serve (outside a worktree) pass this guard."""
+    assert _run_cwd(cmd, tmp_path).returncode == 0

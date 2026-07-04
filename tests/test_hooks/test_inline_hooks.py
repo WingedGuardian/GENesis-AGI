@@ -90,6 +90,83 @@ class TestBashHookPipEditable:
 
 
 # ---------------------------------------------------------------------------
+# Bash hook: genesis serve from/against a worktree
+# ---------------------------------------------------------------------------
+
+
+class TestBashHookWorktreeServe:
+    """Block booting the full Genesis runtime from/against a worktree.
+
+    Children inherit PYTHONPATH and path-keyed subsystems (LSP, indexers)
+    treat the worktree as a new project — OOM-crashed the container on
+    2026-07-03. (Like the pip -e tests above, the allowed cases assume a
+    non-worktree cwd; the hook's cwd check is exercised in real sessions.)
+    """
+
+    def test_serve_with_worktree_pythonpath_blocked(
+        self, bash_hook_command: str
+    ) -> None:
+        """PYTHONPATH=<worktree>/src python -m genesis serve -> BLOCKED."""
+        result = run_hook(
+            bash_hook_command,
+            {
+                "command": (
+                    "PYTHONPATH=/home/ubuntu/genesis/.claude/worktrees/foo/src "
+                    "python -m genesis serve --port 5000"
+                )
+            },
+        )
+        assert result.returncode == 2
+        assert "BLOCKED" in result.stderr
+        assert "merge-then-verify" in result.stderr  # suggests the alternative
+
+    def test_serve_with_worktree_cd_blocked(self, bash_hook_command: str) -> None:
+        """cd into a worktree && genesis serve -> BLOCKED."""
+        result = run_hook(
+            bash_hook_command,
+            {
+                "command": (
+                    "cd .claude/worktrees/my-branch && "
+                    "python -m genesis serve --port 5050"
+                )
+            },
+        )
+        assert result.returncode == 2
+        assert "BLOCKED" in result.stderr
+
+    def test_systemctl_restart_genesis_server_allowed(
+        self, bash_hook_command: str
+    ) -> None:
+        """systemctl --user restart genesis-server -> allowed (not 'genesis serve')."""
+        result = run_hook(
+            bash_hook_command,
+            {"command": "systemctl --user restart genesis-server"},
+        )
+        assert result.returncode == 0
+
+    def test_journalctl_genesis_server_allowed(
+        self, bash_hook_command: str
+    ) -> None:
+        """journalctl --user -u genesis-server -> allowed."""
+        result = run_hook(
+            bash_hook_command,
+            {"command": "journalctl --user -u genesis-server -n 50"},
+        )
+        assert result.returncode == 0
+
+    def test_plain_serve_without_worktree_allowed(
+        self, bash_hook_command: str
+    ) -> None:
+        """python -m genesis serve (no worktree reference) -> allowed by THIS
+        guard (the lock-file discipline for bare serves is a separate rule)."""
+        result = run_hook(
+            bash_hook_command,
+            {"command": "python -m genesis serve --port 5000"},
+        )
+        assert result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
 # Bash hook: git worktree remove --force / -f
 # ---------------------------------------------------------------------------
 

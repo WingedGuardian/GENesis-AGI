@@ -51,6 +51,31 @@ if echo "$CMD" | grep -qE "pip install.*(-e|--editable)"; then
     fi
 fi
 
+# genesis serve from/against a worktree — booting the FULL runtime from a
+# worktree spawns children that inherit its PYTHONPATH and cold-starts every
+# path-keyed subsystem (Serena LSP, code indexers, GitNexus) against the
+# worktree as a "new" ~190K-LOC project. This OOM-crashed the container on
+# 2026-07-03 (same failure family as the 2026-03-16 editable-install spiral).
+# PYTHONPATH-to-worktree is for pytest ONLY; runtime verification of worktree
+# code goes through merge-then-verify or a minimal blueprint-only harness.
+if echo "$CMD" | grep -qE "genesis[[:space:]]+serve"; then
+    _block=0
+    # Check 1: explicit worktree path anywhere in the command (incl. PYTHONPATH=)
+    echo "$CMD" | grep -qiE "worktree" && _block=1
+    # Check 2: CWD is a git worktree (git-common-dir != git-dir)
+    _gc=$(git rev-parse --git-common-dir 2>/dev/null)
+    _gd=$(git rev-parse --git-dir 2>/dev/null)
+    [ -n "$_gc" ] && [ -n "$_gd" ] && [ "$_gc" != "$_gd" ] && _block=1
+    if [ "$_block" = 1 ]; then
+        echo "BLOCKED: never boot the full Genesis runtime from/against a worktree." >&2
+        echo "Children inherit PYTHONPATH and path-keyed subsystems reindex the worktree" >&2
+        echo "as a new project — this OOM-crashed the container on 2026-07-03." >&2
+        echo "PYTHONPATH to a worktree is for pytest only. For runtime verification:" >&2
+        echo "merge-then-verify with rollback, or a blueprint-only Flask harness." >&2
+        exit 2
+    fi
+fi
+
 # git worktree remove --force / -f
 if echo "$CMD" | grep -qE "worktree remove.*(--force|-f )"; then
     echo "BLOCKED: git worktree remove --force destroys uncommitted work in the worktree." >&2
