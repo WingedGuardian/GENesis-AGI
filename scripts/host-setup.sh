@@ -543,6 +543,15 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
     echo "  + Container ready"
 fi
 
+# Always come back after a host reboot — including an UNCLEAN one, where
+# incus's "restore last state" behavior can leave the container stopped
+# (2026-07-04 outage: unclean host reboot → container stayed down, taking
+# Genesis and its network node with it). Applied outside the creation block
+# so re-running host-setup on an existing install enforces it too.
+incus config set "$CONTAINER_NAME" boot.autostart true
+incus config set "$CONTAINER_NAME" boot.autostart.delay 5
+echo "  + boot.autostart enabled (container survives host reboots)"
+
 # ── Split-disk: ensure container home has adequate space ─────────────────────
 # If /home is on a separate larger disk but the Incus pool was initialized on
 # root (common when Incus was pre-installed before host-setup.sh ran, e.g. on

@@ -948,3 +948,70 @@ class TestTwoGateApproval:
 
         recovery_engine.execute.assert_not_called()
         assert sm.state.down_alert_sent is False
+
+
+class TestHealthySnapshotWiring:
+    """_maintain_snapshots must produce the offline lifeline: a daily healthy
+    snapshot, taken ONLY when the guardian state is HEALTHY this tick.
+
+    Before this wiring, mark_healthy() had zero callers — SNAPSHOT_ROLLBACK
+    could never succeed because nothing ever created a healthy snapshot.
+    """
+
+    def _snapshots_mock(self) -> MagicMock:
+        snapshots = MagicMock()
+        snapshots.prune = AsyncMock(return_value=0)
+        snapshots.enforce_expiry_policy = AsyncMock(return_value=True)
+        snapshots.mark_healthy = AsyncMock(
+            return_value="guardian-20260703-000000-healthy",
+        )
+        return snapshots
+
+    @pytest.mark.asyncio
+    async def test_takes_healthy_snapshot_when_healthy(
+        self, config: GuardianConfig,
+    ) -> None:
+        snapshots = self._snapshots_mock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True)
+        snapshots.mark_healthy.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_healthy_snapshot_when_not_healthy(
+        self, config: GuardianConfig,
+    ) -> None:
+        """NEVER snapshot a broken container as 'healthy'."""
+        snapshots = self._snapshots_mock()
+        await _maintain_snapshots(config, snapshots, is_healthy=False)
+        snapshots.mark_healthy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_healthy_snapshot_when_disabled(
+        self, config: GuardianConfig,
+    ) -> None:
+        config.snapshots.healthy_enabled = False
+        snapshots = self._snapshots_mock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True)
+        snapshots.mark_healthy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_healthy_snapshot_respects_daily_marker(
+        self, config: GuardianConfig,
+    ) -> None:
+        from datetime import UTC, datetime
+        marker = config.state_path / ".last_prune"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(datetime.now(UTC).isoformat())
+
+        snapshots = self._snapshots_mock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True)
+        snapshots.mark_healthy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mark_healthy_failure_does_not_stop_marker(
+        self, config: GuardianConfig,
+    ) -> None:
+        """A failing healthy-take must not wedge the daily cadence."""
+        snapshots = self._snapshots_mock()
+        snapshots.mark_healthy = AsyncMock(side_effect=RuntimeError("incus down"))
+        await _maintain_snapshots(config, snapshots, is_healthy=True)
+        assert (config.state_path / ".last_prune").exists()

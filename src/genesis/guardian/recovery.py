@@ -318,22 +318,59 @@ class RecoveryEngine:
         return svc_ok, f"Code reverted, {svc_detail}"
 
     async def _restart_container(self, container: str) -> tuple[bool, str]:
-        """Restart the entire container."""
+        """Restart the entire container (or start it, if stopped).
+
+        `incus restart` FAILS on a stopped instance — the 2026-07-04 outage
+        (unclean host reboot left the container stopped) made this recovery
+        action a guaranteed no-op exactly when it was needed. On restart
+        failure, fall back to `incus start`: if the container was merely
+        stopped, start brings it back; if it was running (restart failed for
+        another reason), start fails too and the original error is reported.
+        """
         rc, stdout, stderr = await _run_subprocess(
             "incus", "restart", container, "--timeout", "30",
             timeout=60.0,
         )
-        if rc != 0:
-            return False, f"incus restart failed: {stderr}"
-        return True, "Container restarted"
+        if rc == 0:
+            return True, "Container restarted"
+
+        start_rc, _, start_err = await _run_subprocess(
+            "incus", "start", container,
+            timeout=60.0,
+        )
+        if start_rc == 0:
+            return True, "Container started (was stopped — restart cannot start a stopped instance)"
+        return False, f"incus restart failed: {stderr}"
 
     async def _snapshot_rollback(self) -> tuple[bool, str]:
-        """Rollback to the last healthy snapshot."""
+        """Rollback to the last healthy snapshot.
+
+        If the restore fails and NEWER guardian snapshots exist, delete them
+        and retry once: some storage drivers (documented: ZFS) refuse to
+        restore a non-latest snapshot. The newer snapshots are guardian-made
+        captures of the already-broken state (e.g. pre-recovery) — the healthy
+        restore is last-resort, so sacrificing them is the right trade.
+        """
         healthy = await self._snapshots.get_latest_healthy()
         if not healthy:
             return False, "No healthy snapshot available for rollback"
 
         ok = await self._snapshots.restore(healthy)
+        if not ok:
+            # Names are timestamped and sort newest-first; anything sorting
+            # above the healthy name is newer.
+            newer = [
+                n for n in await self._snapshots.list_snapshots() if n > healthy
+            ]
+            if newer:
+                logger.warning(
+                    "Restore of %s failed with newer snapshots present — "
+                    "deleting %s and retrying once",
+                    healthy, ", ".join(newer),
+                )
+                for name in newer:
+                    await self._snapshots.delete(name)
+                ok = await self._snapshots.restore(healthy)
         if not ok:
             return False, f"Failed to restore snapshot {healthy}"
         return True, f"Restored snapshot {healthy}"

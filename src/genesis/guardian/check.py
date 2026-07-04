@@ -211,7 +211,14 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # a guardian stuck in confirmed_dead/recovering for weeks must still
         # enforce expiry + prune stale snapshots (the incident: prune only ran
         # in HEALTHY, so it never fired while the pool silently filled).
-        await _maintain_snapshots(config, snapshots)
+        # is_healthy reflects THIS tick's post-cycle state: the daily healthy
+        # snapshot (offline rollback lifeline) is only taken when HEALTHY.
+        await _maintain_snapshots(
+            config,
+            snapshots,
+            is_healthy=sm.current_state == GuardianState.HEALTHY,
+            snapshot_size_history=sm.state.snapshot_size_history,
+        )
         # Storage-pool monitoring runs every cycle regardless of state — a
         # filling thin pool is the exact silent failure that caused the outage.
         await _check_storage_pool_and_alert(config, dispatcher)
@@ -329,14 +336,22 @@ async def _handle_healthy(
 async def _maintain_snapshots(
     config: GuardianConfig,
     snapshots: SnapshotManager,
+    is_healthy: bool = False,
+    snapshot_size_history: list[int] | None = None,
 ) -> None:
-    """Enforce snapshot expiry policy and prune, on a daily cadence.
+    """Enforce snapshot expiry, prune, and take the daily healthy snapshot.
 
     Runs after every check cycle regardless of guardian state, but the actual
     work (an ``incus config set`` + a list/delete pass) is throttled to once
     per 24h via a marker — the first tick has no marker so both fire
     immediately on deploy, then daily. `snapshots.expiry` is a persistent incus
     setting, so re-asserting it daily is ample and avoids a per-tick subprocess.
+
+    The healthy snapshot (``is_healthy`` must reflect THIS tick's state — never
+    snapshot a broken container as "healthy") is the offline SNAPSHOT_ROLLBACK
+    lifeline: before this wiring, ``mark_healthy`` had no callers, so rollback
+    could never find a target. Taken after prune so the pool is at its
+    cleanest; rotation inside ``mark_healthy`` keeps exactly one.
     """
     prune_marker = config.state_path / ".last_prune"
     should_run = True
@@ -364,6 +379,19 @@ async def _maintain_snapshots(
             logger.info("Pruned %d old snapshots", pruned)
     except Exception:
         logger.warning("Snapshot prune failed", exc_info=True)
+
+    if is_healthy and config.snapshots.healthy_enabled:
+        try:
+            name = await snapshots.mark_healthy(snapshot_size_history)
+            if name:
+                logger.info("Healthy snapshot refreshed: %s", name)
+            else:
+                logger.warning(
+                    "Healthy snapshot NOT taken (pool gate or create failure) "
+                    "— offline rollback lifeline not refreshed this cycle",
+                )
+        except Exception:
+            logger.warning("Healthy snapshot take failed", exc_info=True)
 
     prune_marker.parent.mkdir(parents=True, exist_ok=True)
     prune_marker.write_text(datetime.now(UTC).isoformat())
