@@ -10,6 +10,7 @@ from genesis.resilience.deferred_work import (
     DISCARD,
     DRAIN,
     FOREGROUND,
+    MEMORY_OPS,
     MORNING_REPORT,
     REFLECTION,
     REFRESH,
@@ -181,3 +182,35 @@ class TestCountPending:
         await queue.enqueue("b", None, SURPLUS, '{}', "reason")
         assert await queue.count_pending(work_type="a") == 2
         assert await queue.count_pending(work_type="b") == 1
+
+
+class TestSupersede:
+    @pytest.mark.asyncio
+    async def test_deletes_batch_but_preserves_processing(self, queue):
+        """supersede removes a work_type's pending/completed residue but never
+        yanks an in-flight (processing) item out from under its worker."""
+        a = await queue.enqueue("dream_synthesis_slice", None, MEMORY_OPS, "{}", "weekly")
+        b = await queue.enqueue("dream_synthesis_slice", None, MEMORY_OPS, "{}", "weekly")
+        c = await queue.enqueue("dream_synthesis_slice", None, MEMORY_OPS, "{}", "weekly")
+        await queue.enqueue("reflection", None, REFLECTION, "{}", "cloud_down")
+        await queue.mark_completed(a)
+        await queue.mark_processing(b)
+
+        removed = await queue.supersede("dream_synthesis_slice")
+
+        # completed a + pending c removed; processing b preserved
+        assert removed == 2
+        assert await queue.count_pending("dream_synthesis_slice") == 0
+        cursor = await queue._db.execute(
+            "SELECT id, status FROM deferred_work_queue WHERE work_type = ?",
+            ("dream_synthesis_slice",),
+        )
+        rows = await cursor.fetchall()
+        assert [(r["id"], r["status"]) for r in rows] == [(b, "processing")]
+        assert c not in [r["id"] for r in rows]
+        # other work_types untouched
+        assert await queue.count_pending("reflection") == 1
+
+    @pytest.mark.asyncio
+    async def test_supersede_empty_returns_zero(self, queue):
+        assert await queue.supersede("dream_synthesis_slice") == 0

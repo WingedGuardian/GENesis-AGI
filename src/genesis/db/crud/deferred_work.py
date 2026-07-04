@@ -32,6 +32,35 @@ async def create(
     return id
 
 
+async def delete_by_work_type(
+    db: aiosqlite.Connection,
+    *,
+    work_type: str,
+    exclude_status: str | None = "processing",
+) -> int:
+    """Delete all rows for a work_type, optionally preserving one status.
+
+    Used to supersede an ephemeral batch worklist (e.g. dream-cycle re-clustering
+    replaces last week's synthesis worklist and its completed/discarded residue).
+    ``exclude_status`` defaults to ``'processing'`` so an in-flight drain item is
+    never yanked out from under the worker. Returns the count deleted. This is an
+    explicit synchronous supersede — NOT a staleness policy — so it never races
+    the recovery ``expire_by_policy`` cadence (which only touches refresh/discard).
+    """
+    if exclude_status is not None:
+        cursor = await db.execute(
+            "DELETE FROM deferred_work_queue WHERE work_type = ? AND status != ?",
+            (work_type, exclude_status),
+        )
+    else:
+        cursor = await db.execute(
+            "DELETE FROM deferred_work_queue WHERE work_type = ?",
+            (work_type,),
+        )
+    await db.commit()
+    return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+
 async def query_pending(
     db: aiosqlite.Connection,
     *,

@@ -151,6 +151,18 @@ class DeferredWorkQueue:
         """Count pending items, optionally filtered by work_type."""
         return await crud.count_pending(self._db, work_type=work_type)
 
+    async def supersede(self, work_type: str) -> int:
+        """Delete all non-in-flight rows for a work_type (supersede a batch).
+
+        Removes pending/completed/discarded/expired rows for ``work_type`` but
+        leaves any ``processing`` item alone. For ephemeral batch worklists that
+        a fresh producer run fully replaces (e.g. the weekly dream-cycle synthesis
+        worklist). Returns the count removed.
+        """
+        return await crud.delete_by_work_type(
+            self._db, work_type=work_type, exclude_status="processing",
+        )
+
     async def drain_by_priority(self, limit: int = 10) -> list[dict]:
         """Return up to `limit` pending items ordered by priority."""
         return await crud.drain_by_priority(self._db, limit=limit)
