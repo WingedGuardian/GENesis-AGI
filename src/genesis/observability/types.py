@@ -34,6 +34,7 @@ class Subsystem(StrEnum):
     MAIL = "mail"
     OBSERVABILITY = "observability"
     GUARDIAN = "guardian"
+    SENTINEL = "sentinel"
 
 
 class ProbeStatus(StrEnum):

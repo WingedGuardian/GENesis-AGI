@@ -621,6 +621,18 @@ class AutonomousCliApprovalGate:
             subsystem=subsystem, policy_id=policy_id,
         )
 
+    async def get_request(self, request_id: str) -> dict[str, Any] | None:
+        """Fetch one approval request row by id, or None if it doesn't exist.
+
+        Used by the sentinel resume mechanism to converge a parked dispatch
+        on the row's OBSERVED status (approved/rejected/expired/cancelled)
+        instead of only scanning for approvals — a rejection that is never
+        delivered leaves the Sentinel parked forever.
+        """
+        from genesis.db.crud import approval_requests as ar_crud
+
+        return await ar_crud.get_by_id(self._approval_manager._db, request_id)
+
     async def mark_consumed(self, request_id: str) -> bool:
         """Mark an approved request as consumed (action dispatched).
 

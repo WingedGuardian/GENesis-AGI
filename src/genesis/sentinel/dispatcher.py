@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from genesis.sentinel.classifier import FireAlarm, classify_alerts, worst_tier
 from genesis.sentinel.context import assemble_diagnostic_context
+from genesis.sentinel.remediation_map import available_tools
 from genesis.sentinel.shared import append_log, write_last_run, write_state_for_guardian
 from genesis.sentinel.state import (
     SentinelState,
@@ -300,7 +301,7 @@ class SentinelDispatcher:
             logger.warning("Re-verification failed — proceeding with dispatch", exc_info=True)
             return True  # Fail-open
 
-        current_alarms = classify_alerts(alerts or [])
+        current_alarms = classify_alerts(alerts or [], available_tools())
         current_ids = {a.alert_id for a in current_alarms}
         overlap = original_ids & current_ids
 
@@ -316,6 +317,26 @@ class SentinelDispatcher:
             len(original_ids), current_ids or "none",
         )
         return False
+
+    async def _emit_event(self, severity_name: str, event_type: str, message: str) -> None:
+        """Emit a sentinel event to the bus (no-op without a bus, never raises).
+
+        Sentinel state transitions were historically invisible in the events
+        table (only dispatch/completion emitted, and under the guardian
+        subsystem) — which is how a 26-day approval wedge went unnoticed.
+        Every user-relevant transition now emits under Subsystem.SENTINEL.
+        """
+        if self._event_bus is None:
+            return
+        try:
+            from genesis.observability.types import Severity, Subsystem
+
+            await self._event_bus.emit(
+                Subsystem.SENTINEL, getattr(Severity, severity_name),
+                event_type, message,
+            )
+        except Exception:
+            logger.error("Failed to emit sentinel event %s", event_type, exc_info=True)
 
     async def _gated_dispatch(self, request: SentinelRequest) -> SentinelResult:
         """Gate checks and dispatch, protected by asyncio.Lock."""
@@ -423,6 +444,11 @@ class SentinelDispatcher:
                     )
                     save_state(self._state)
                     append_log({"event": "dispatch_approval_pending", "request_id": request_id})
+                    await self._emit_event(
+                        "INFO", "sentinel.approval_pending",
+                        f"Sentinel dispatch parked awaiting approval "
+                        f"({pattern}): {request.trigger_reason[:120]}",
+                    )
                     return SentinelResult(
                         dispatched=False,
                         reason=f"Dispatch approval pending: {reason}",
@@ -435,6 +461,11 @@ class SentinelDispatcher:
                     self._state.transition(SentinelState.HEALTHY, reason="dispatch rejected via approval gate")
                     save_state(self._state)
                     append_log({"event": "dispatch_rejected", "request_id": request_id})
+                    await self._emit_event(
+                        "INFO", "sentinel.dispatch_rejected",
+                        f"Sentinel dispatch rejected by user ({pattern}) — "
+                        f"pattern suppressed 24h",
+                    )
                     return SentinelResult(
                         dispatched=False,
                         reason="User rejected Sentinel dispatch",
@@ -505,13 +536,10 @@ class SentinelDispatcher:
         })
 
         # Emit event
-        if self._event_bus:
-            from genesis.observability.types import Severity, Subsystem
-            await self._event_bus.emit(
-                Subsystem.GUARDIAN, Severity.INFO,
-                "sentinel.dispatched",
-                f"Sentinel dispatched: {request.trigger_source} — {request.trigger_reason}",
-            )
+        await self._emit_event(
+            "INFO", "sentinel.dispatched",
+            f"Sentinel dispatched: {request.trigger_source} — {request.trigger_reason}",
+        )
 
         # Transition to REMEDIATING and dispatch CC
         self._state.transition(SentinelState.REMEDIATING, reason="dispatching CC session")
@@ -748,15 +776,12 @@ class SentinelDispatcher:
                 logger.error("Failed to create sentinel observation", exc_info=True)
 
         # Emit completion event
-        if self._event_bus:
-            from genesis.observability.types import Severity, Subsystem
-            severity = Severity.INFO if result.resolved else Severity.WARNING
-            await self._event_bus.emit(
-                Subsystem.GUARDIAN, severity,
-                "sentinel.completed",
-                f"Sentinel {'resolved' if result.resolved else 'escalated'}: "
-                f"{result.diagnosis[:100] if result.diagnosis else 'no diagnosis'}",
-            )
+        await self._emit_event(
+            "INFO" if result.resolved else "WARNING",
+            "sentinel.completed",
+            f"Sentinel {'resolved' if result.resolved else 'escalated'}: "
+            f"{result.diagnosis[:100] if result.diagnosis else 'no diagnosis'}",
+        )
 
         return result
 
@@ -893,13 +918,81 @@ class SentinelDispatcher:
 
         return None
 
+    async def converge_pending_approval(self) -> None:
+        """Converge a parked dispatch on its approval row's OBSERVED status.
+
+        Called from the awareness loop each tick while the sentinel is
+        AWAITING_*. Looks up the exact pending request row and applies
+        whatever actually happened to it: approved → consume + resume;
+        rejected → apply the rejection (24h pattern suppression + HEALTHY);
+        expired/cancelled/missing → clear the park. A previous
+        implementation only scanned for approved rows, so a rejection was
+        never delivered and the sentinel stayed parked forever — Gate 2
+        blocks all other dispatches while parked, which blinded the
+        Sentinel for 26 days in June/July 2026.
+
+        State mutations all route through lock-protected, id-re-checking
+        methods (``resume_from_approval`` / ``handle_approval_resolution``),
+        so concurrent ticks race safely: the loser finds the pending id
+        already cleared and no-ops.
+        """
+        if self._approval_gate is None:
+            return
+        if self._state.state not in (
+            SentinelState.AWAITING_DISPATCH_APPROVAL,
+            SentinelState.AWAITING_ACTION_APPROVAL,
+        ):
+            return
+
+        pending_id = self._state.pending_request_id
+        if not pending_id:
+            return  # Inconsistent park — the awareness loop's legacy scan covers it.
+
+        row = await self._approval_gate.get_request(pending_id)
+        status = str(row.get("status") or "pending") if row else "missing"
+
+        if status == "pending":
+            return  # Legitimately parked — the user hasn't decided yet.
+
+        if status == "approved":
+            # Atomic consume — prevents double-dispatch across ticks.
+            if await self._approval_gate.mark_consumed(pending_id):
+                logger.info("Resuming sentinel from approved request %s", pending_id[:8])
+                await self.resume_from_approval(pending_id, "approved")
+            else:
+                # Approved but already consumed while we're still parked — a
+                # prior resume died mid-flight. Don't re-run (can't tell
+                # whether the CC session already executed); clear the stale
+                # park. If the alarm is real it re-fires next tick into a
+                # fresh backoff-gated cycle.
+                logger.warning(
+                    "Sentinel pending approval %s already consumed — clearing stale park",
+                    pending_id[:8],
+                )
+                await self.handle_approval_resolution(pending_id, "cancelled")
+            return
+
+        logger.info(
+            "Sentinel pending approval %s is %s — converging", pending_id[:8], status,
+        )
+        await self.handle_approval_resolution(
+            pending_id,
+            status if status in ("rejected", "cancelled", "expired") else "missing",
+        )
+
     async def handle_approval_resolution(
         self, request_id: str, status: str,
     ) -> SentinelResult | None:
-        """Handle a rejected or cancelled approval.
+        """Converge a parked dispatch on its approval row's observed status.
 
-        Called by the awareness loop or alarm-clearing cancellation.
-        Lock-protected to prevent races with check_fire_alarms.
+        Called by the awareness loop (state-keyed convergence) or the
+        alarm-clearing cancellation. ``rejected`` suppresses the pattern for
+        24h; ``cancelled``/``expired``/``missing`` just clear the park. All
+        paths return to HEALTHY — a resolved (or vanished) approval must
+        never leave the Sentinel parked: a rejected-but-still-active alarm
+        wedged it for 26 days (2026-06-08 → 2026-07-04) because rejections
+        were never delivered here and Gate 2 blocks every other dispatch
+        while parked. Lock-protected to prevent races with check_fire_alarms.
         """
         async with self._lock:
             if self._state.pending_request_id != request_id:
@@ -916,14 +1009,29 @@ class SentinelDispatcher:
                 self._state.transition(SentinelState.HEALTHY, reason=f"{policy_id} rejected by user")
                 save_state(self._state)
                 append_log({"event": f"{policy_id}_rejected", "request_id": request_id})
+                await self._emit_event(
+                    "INFO", "sentinel.approval_rejected",
+                    f"Sentinel {policy_id} rejection applied ({pattern}) — "
+                    f"pattern suppressed 24h, back to HEALTHY",
+                )
                 return SentinelResult(dispatched=False, reason=f"{policy_id} rejected")
 
-            if status == "cancelled":
+            if status in ("cancelled", "expired", "missing"):
                 self._state.clear_pending()
-                self._state.transition(SentinelState.HEALTHY, reason=f"{policy_id} cancelled (alarm cleared)")
+                self._state.transition(
+                    SentinelState.HEALTHY,
+                    reason=f"{policy_id} approval {status} — park cleared",
+                )
                 save_state(self._state)
-                append_log({"event": f"{policy_id}_cancelled", "request_id": request_id})
-                return SentinelResult(dispatched=False, reason=f"{policy_id} cancelled: alarm cleared")
+                append_log({"event": f"{policy_id}_{status}", "request_id": request_id})
+                await self._emit_event(
+                    "INFO", "sentinel.approval_cleared",
+                    f"Sentinel {policy_id} approval {status} ({pattern}) — "
+                    f"park cleared, back to HEALTHY",
+                )
+                return SentinelResult(
+                    dispatched=False, reason=f"{policy_id} {status}: park cleared",
+                )
 
         return None
 
@@ -1461,7 +1569,7 @@ class SentinelDispatcher:
         self._state.record_heartbeat()
         save_state(self._state)
 
-        alarms = classify_alerts(alerts or [])
+        alarms = classify_alerts(alerts or [], available_tools())
         current_ids = {a.alert_id for a in alarms}
 
         # Update the ring buffer with this tick's alarm ids (always — even
@@ -1504,6 +1612,11 @@ class SentinelDispatcher:
                     self._state.clear_pending()
                     self._state.transition(SentinelState.HEALTHY, reason="pending alarms cleared while awaiting approval")
                     save_state(self._state)
+                await self._emit_event(
+                    "INFO", "sentinel.approval_cleared",
+                    f"Pending alarms {sorted(pending_ids)} cleared while "
+                    f"awaiting approval — park cancelled, back to HEALTHY",
+                )
                 return None
 
         if not alarms:

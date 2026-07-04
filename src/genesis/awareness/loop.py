@@ -1364,10 +1364,19 @@ class AwarenessLoop:
                 )
 
     async def _resume_approved_sentinel_dispatches(self) -> None:
-        """Resume sentinel dispatches whose approvals were granted.
+        """Converge a parked sentinel dispatch on its approval's REAL status.
 
-        Mirrors _resume_approved_reflections: checks for approved-but-
-        unconsumed sentinel approvals and resumes the dispatcher.
+        State-keyed: when the sentinel is AWAITING_*, look up the exact
+        pending request row and apply whatever actually happened to it —
+        approved → resume, rejected → apply the rejection (24h pattern
+        suppression + HEALTHY), expired/cancelled/missing → clear the park.
+        The previous implementation only scanned for approved rows, so a
+        rejection was never delivered and the sentinel stayed parked forever
+        (Gate 2 blocks all other dispatches while parked — this blinded the
+        Sentinel for 26 days in June/July 2026).
+
+        The legacy approved-row scan is kept as a fallback for the
+        inconsistent case where the state lost its pending_request_id.
         """
         if self._sentinel is None:
             return
@@ -1384,6 +1393,18 @@ class AwarenessLoop:
         if state.state not in (_SS.AWAITING_DISPATCH_APPROVAL, _SS.AWAITING_ACTION_APPROVAL):
             return
 
+        if state.pending_request_id:
+            try:
+                await self._sentinel.converge_pending_approval()
+            except Exception:
+                logger.error(
+                    "Failed to converge sentinel on pending approval",
+                    exc_info=True,
+                )
+            return
+
+        # Inconsistent: AWAITING with no pending id recorded. Fall back to
+        # the legacy scan for an approved-but-unconsumed sentinel row.
         for policy_id in ("sentinel_dispatch", "sentinel_action"):
             try:
                 approved = await gate.find_recently_approved(

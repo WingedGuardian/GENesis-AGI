@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import UTC, datetime
 
 from genesis.mcp.health import mcp  # noqa: E402
@@ -125,6 +126,37 @@ async def _impl_health_errors(
         return list(grouped.values())
 
     return errors
+
+
+def _backups_enabled() -> bool:
+    """Whether backups are configured on this install (GENESIS_BACKUP_REPO).
+
+    Checks the process environment first (genesis-server load_dotenv()s all
+    of secrets.env at startup), then falls back to reading secrets.env
+    directly — the standalone MCP health server only imports an allowlist
+    of vars (scripts/genesis_mcp_server.py _MCP_VARS), so the env alone
+    would wrongly report "disabled" there even on a fully configured
+    install. Fails OPEN (enabled) on read errors: never hide a real backup
+    failure because we couldn't determine the configuration.
+    """
+    val = os.environ.get("GENESIS_BACKUP_REPO", "").strip()
+    if val and val not in ("None", "NA"):
+        return True
+    try:
+        from genesis.env import secrets_path
+
+        path = secrets_path()
+        if not path.is_file():
+            return False
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("GENESIS_BACKUP_REPO="):
+                v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                return bool(v) and v not in ("None", "NA")
+        return False
+    except Exception:
+        logger.warning("Could not determine backup configuration", exc_info=True)
+        return True
 
 
 async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
@@ -618,10 +650,20 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             logger.error("Genesis update alert check failed", exc_info=True)
 
     # ── Backup health ───────────────────────────────────────────────
+    # Gated on backups being ENABLED on this install: GENESIS_BACKUP_REPO is
+    # the same signal backup.sh itself requires. On an install where backups
+    # are intentionally disabled (another machine owns the offsite backups),
+    # a stale/failed local status file is a dishonest CRITICAL — same class
+    # as the call_site:* source-gating above. Where backups ARE enabled,
+    # real failures still alert (user-facing: dashboard + the outreach
+    # immediate-escalation whitelist — backup targets are external, so this
+    # never wakes the Sentinel; see sentinel/remediation_map.py).
     from pathlib import Path
 
     backup_status_file = Path.home() / ".genesis" / "backup_status.json"
-    if backup_status_file.is_file():
+    if not _backups_enabled():
+        pass
+    elif backup_status_file.is_file():
         try:
             backup_data = json.loads(backup_status_file.read_text())
             if not backup_data.get("success", False):
