@@ -107,6 +107,10 @@ def _verify_triage(payload: dict) -> TraceResult:
     )
 
 
+# GROUNDWORK(trace-verify): Built but not wired. Verifies stated_reason vs
+# actual_data for decisions, but nothing feeds it — execution_traces has 0 rows
+# and the trace-capture pipeline is a separate, parked workstream (audit 2026-07
+# §8). Wire this once decision traces are persisted. NOT dead code — do not remove.
 class TraceVerifier:
     """Programmatically verifies that stated reasons match actual data.
 

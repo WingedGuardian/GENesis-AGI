@@ -35,6 +35,8 @@ async def init(rt: GenesisRuntime) -> None:
         rt._action_classifier = ActionClassifier()
         logger.info("Action classifier loaded")
 
+        # GROUNDWORK(task-verify): constructed + validator-registered here, but
+        # .verify() is never invoked on any live path yet (see verification.py).
         rt._task_verifier = TaskVerifier()
 
         from genesis.autonomy.verification import _code_task_validator

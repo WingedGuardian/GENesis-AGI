@@ -21,6 +21,10 @@ class VerificationResult:
     warnings: list[str] = field(default_factory=list)
 
 
+# GROUNDWORK(task-verify): Constructed at runtime init (runtime/init/autonomy.py)
+# with a "code" validator, but .verify() is never called on any dispatch path —
+# the executor uses the LLM TaskReviewer.verify_deliverable instead. Kept as the
+# structural (non-LLM) gate to wire if a cheap pre-check is wanted. NOT dead code.
 class TaskVerifier:
     """Runs structural and custom checks on task completion artifacts."""
 
