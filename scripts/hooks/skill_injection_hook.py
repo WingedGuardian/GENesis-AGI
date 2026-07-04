@@ -20,13 +20,15 @@ from pathlib import Path
 CATALOG_PATH = Path.home() / ".genesis" / "skill_catalog.json"
 _CATALOG_MAX_AGE_S = 3600  # Regenerate catalog if older than 1h
 
-# Minimum confidence threshold — even 1-2 keyword matches should surface
-# the skill. With 10 prompt keywords, a single keyword match = 0.1 (name)
-# or 0.05 (desc). Threshold of 0.1 means 1 name/keyword match suffices.
-_MIN_CONFIDENCE = 0.1
-# Total nudge budget per prompt (process + catalog combined).
-# If process nudges consume slots, catalog gets fewer.
-_MAX_TOTAL_NUDGES = 2
+# Minimum raw match score — a single name or explicit-keyword hit scores
+# 2 points and is enough to surface the skill. A lone description hit
+# (1 point) is not. Raw points, NOT normalized by prompt keyword count:
+# normalization made keyword-rich prompts dilute genuine hits below the
+# threshold, so catalog nudges near-never fired.
+_MIN_SCORE = 2
+# Catalog nudge budget per prompt. Process (superpowers) nudges have their
+# own separate budget and never compete for these slots.
+_MAX_CATALOG_NUDGES = 2
 
 # --- Process Discipline Detection ---
 # Superpowers skills aren't in the Genesis catalog but need nudges
@@ -57,24 +59,32 @@ _EXCLUDE_KEYWORDS = {
 
 
 def _ensure_catalog_fresh() -> None:
-    """Regenerate the skill catalog if it's missing or stale (>1h old)."""
+    """Spawn a detached catalog regeneration if it's missing or stale (>1h).
+
+    Regeneration is out-of-band: the spawn is fire-and-forget and the
+    current prompt uses the stale catalog, so the hook's 500ms timeout can
+    never kill nudge output while waiting on the generator. The refreshed
+    catalog serves the next prompt.
+    """
     try:
         if CATALOG_PATH.exists():
             import time
             age = time.time() - CATALOG_PATH.stat().st_mtime
             if age < _CATALOG_MAX_AGE_S:
                 return
-        # Locate and run the generator
+        # Locate the generator and spawn it detached
         gen_script = Path(__file__).resolve().parents[1] / "generate_skill_catalog.py"
         if gen_script.exists():
             import subprocess
-            subprocess.run(
+            subprocess.Popen(
                 [sys.executable, str(gen_script)],
-                capture_output=True, timeout=5,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
     except Exception as exc:
         # Never block prompt, but emit diagnostics
-        print(f"Catalog refresh failed: {exc}", file=sys.stderr)
+        print(f"Catalog refresh spawn failed: {exc}", file=sys.stderr)
 
 
 def _load_catalog() -> dict:
@@ -117,7 +127,12 @@ def _save_session_nudge(session_id: str, skill_name: str) -> None:
 
 
 def _score_skill(skill: dict, keywords: list[str]) -> float:
-    """Score a skill against prompt keywords. Returns 0.0-1.0."""
+    """Score a skill against prompt keywords. Returns raw match points.
+
+    Name and explicit-keyword hits score 2 points each, description hits 1.
+    Deliberately NOT normalized by prompt keyword count — a long prompt
+    must not dilute a genuine hit below the firing threshold.
+    """
     if not keywords:
         return 0.0
 
@@ -135,8 +150,7 @@ def _score_skill(skill: dict, keywords: list[str]) -> float:
         elif kw_lower in desc_lower:
             matches += 1
 
-    max_score = 2 * len(keywords)
-    return min(matches / max_score, 1.0) if max_score > 0 else 0.0
+    return float(matches)
 
 
 def _extract_keywords(prompt: str) -> list[str]:
@@ -244,20 +258,25 @@ def main() -> None:
             if name in already_nudged:
                 continue
             score = _score_skill(skill, keywords)
-            if score >= _MIN_CONFIDENCE:
+            if score >= _MIN_SCORE:
                 candidates.append((score, skill))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
 
-        # Dynamic budget: total nudges (process + catalog) capped at _MAX_TOTAL_NUDGES
-        catalog_budget = max(0, _MAX_TOTAL_NUDGES - len(process_nudges))
-        for _score, skill in candidates[:catalog_budget]:
+        # Catalog budget is independent of process nudges — process nudges
+        # keep their own slots and never crowd out skill suggestions.
+        for _score, skill in candidates[:_MAX_CATALOG_NUDGES]:
             name = skill.get("name", "")
             tier = skill.get("tier", "?")
             desc = skill.get("description", "")
 
             if tier == 1:
                 print(f"[Skill] The '{name}' skill is relevant here. {desc[:80]}")
+            elif skill.get("path"):
+                print(
+                    f"[Skill] The '{name}' skill matches this task. "
+                    f"Read {skill['path']}/SKILL.md. {desc[:60]}"
+                )
             else:
                 print(
                     f"[Skill] The '{name}' skill matches this task. "
