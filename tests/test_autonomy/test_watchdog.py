@@ -434,6 +434,21 @@ class TestPageCacheReclaim:
         with patch("genesis.autonomy.watchdog.Path", return_value=reclaim_file):
             assert reclaim_page_cache("128M") is True
 
+    def test_reclaim_not_wedged_by_future_timestamp(self, tmp_path: Path):
+        """A FUTURE persisted timestamp (pre-NTP boot clock skew / backward clock
+        jump) must NOT wedge reclaim off: negative elapsed is treated as expired
+        so the cooldown self-heals in one cycle rather than blocking for up to an
+        hour during real memory pressure."""
+        import genesis.autonomy.watchdog as w
+        w._RECLAIM_STATE_PATH.write_text(json.dumps({"last_reclaim_at": time.time() + 3600}))
+        reclaim_file = tmp_path / "memory.reclaim"
+        reclaim_file.write_text("")
+        with patch("genesis.autonomy.watchdog.Path", return_value=reclaim_file):
+            assert reclaim_page_cache("128M") is True  # not wedged
+        # and it re-persisted a sane now-based timestamp, healing the cooldown
+        saved = json.loads(w._RECLAIM_STATE_PATH.read_text())
+        assert saved["last_reclaim_at"] <= time.time() + 1
+
 
 class TestGetContainerMemory:
     def test_reads_cgroup_files(self, tmp_path: Path):

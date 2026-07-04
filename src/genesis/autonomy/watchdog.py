@@ -553,10 +553,13 @@ def reclaim_page_cache(target_bytes: str = "128M") -> bool:
 
     # Cooldown: don't reclaim more than once per 5 minutes. Repeated
     # reclaims cause I/O storms in I/O-limited containers (incident 2026-03-16).
+    # The `0 <=` lower bound treats a *future* persisted timestamp (pre-NTP boot
+    # clock skew) or a backward clock jump as expired, so it self-heals in one
+    # cycle instead of wedging reclaim off until wall-clock catches up.
     _RECLAIM_COOLDOWN_S = 300.0
-    if now - last_reclaim < _RECLAIM_COOLDOWN_S:
-        remaining = _RECLAIM_COOLDOWN_S - (now - last_reclaim)
-        logger.debug("Skipping reclaim — cooldown %.0fs remaining", remaining)
+    elapsed = now - last_reclaim
+    if 0 <= elapsed < _RECLAIM_COOLDOWN_S:
+        logger.debug("Skipping reclaim — cooldown %.0fs remaining", _RECLAIM_COOLDOWN_S - elapsed)
         return False
 
     # Cap at 256M: small reclaims let the kernel LRU pick inactive pages
