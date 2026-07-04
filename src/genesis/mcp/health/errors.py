@@ -129,18 +129,30 @@ async def _impl_health_errors(
 
 
 def _backups_enabled() -> bool:
-    """Whether backups are configured on this install (GENESIS_BACKUP_REPO).
+    """Whether backups are configured on this install.
 
-    Checks the process environment first (genesis-server load_dotenv()s all
-    of secrets.env at startup), then falls back to reading secrets.env
-    directly — the standalone MCP health server only imports an allowlist
-    of vars (scripts/genesis_mcp_server.py _MCP_VARS), so the env alone
-    would wrongly report "disabled" there even on a fully configured
-    install. Fails OPEN (enabled) on read errors: never hide a real backup
-    failure because we couldn't determine the configuration.
+    Three "enabled" signals, any of which suffices:
+
+    1. ``GENESIS_BACKUP_REPO`` in the process environment (genesis-server
+       load_dotenv()s all of secrets.env at startup).
+    2. The var in secrets.env itself — the standalone MCP health server
+       only imports an allowlist of vars (scripts/genesis_mcp_server.py
+       _MCP_VARS), so the env alone would wrongly report "disabled" there
+       even on a fully configured install.
+    3. An existing backup clone at backup.sh's BACKUP_DIR — backup.sh only
+       needs the repo var for the FIRST clone (restore.sh --from <url>, or
+       a transient shell var, creates the clone without persisting the
+       var), and runs indefinitely off the clone's remote afterwards.
+
+    Fails OPEN (enabled) on read errors: never hide a real backup failure
+    because we couldn't determine the configuration.
     """
     val = os.environ.get("GENESIS_BACKUP_REPO", "").strip()
     if val and val not in ("None", "NA"):
+        return True
+    from pathlib import Path as _Path
+
+    if (_Path.home() / "backups" / "genesis-backups" / ".git").is_dir():
         return True
     try:
         from genesis.env import secrets_path

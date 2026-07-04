@@ -702,3 +702,19 @@ class TestBackupsEnabledHelper:
         secrets.write_text("GENESIS_BACKUP_REPO=\n")
         monkeypatch.setattr("genesis.env.secrets_path", lambda: secrets)
         assert _backups_enabled() is False
+
+    def test_existing_clone_counts_as_enabled(self, monkeypatch, tmp_path):
+        """backup.sh only needs GENESIS_BACKUP_REPO for the FIRST clone —
+        an existing clone (e.g. created by restore.sh --from <url>) keeps
+        backing up off the clone's remote with the var never persisted.
+        Such an install must still alert on failures.
+        """
+        from pathlib import Path
+
+        from genesis.mcp.health.errors import _backups_enabled
+
+        fake_home = tmp_path / "fakehome"
+        (fake_home / "backups" / "genesis-backups" / ".git").mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+        monkeypatch.delenv("GENESIS_BACKUP_REPO", raising=False)
+        assert _backups_enabled() is True

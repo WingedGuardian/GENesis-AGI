@@ -960,3 +960,25 @@ class TestConvergePendingApproval:
 
         gate.get_request.assert_not_awaited()
         assert d._state.state == SentinelState.HEALTHY
+
+    @pytest.mark.asyncio
+    async def test_awaiting_with_no_pending_id_clears_park(self):
+        """AWAITING with an empty pending_request_id (partial state write)
+        can never be resolved by id-matched resume paths — converge must
+        clear it. The removed legacy scan made this WORSE: it consumed an
+        approved row whose id could never match the empty pending id,
+        eating the approval while staying parked.
+        """
+        gate = AsyncMock()
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.transition(
+            SentinelState.AWAITING_DISPATCH_APPROVAL, reason="test park",
+        )
+        d._state.pending_request_id = ""
+
+        with patch("genesis.sentinel.dispatcher.save_state"):
+            await d.converge_pending_approval()
+
+        gate.get_request.assert_not_awaited()
+        gate.mark_consumed.assert_not_awaited()
+        assert d._state.state == SentinelState.HEALTHY

@@ -946,7 +946,30 @@ class SentinelDispatcher:
 
         pending_id = self._state.pending_request_id
         if not pending_id:
-            return  # Inconsistent park — the awareness loop's legacy scan covers it.
+            # Inconsistent park: AWAITING with no pending request recorded
+            # (e.g. a partial state-file write). Nothing can ever resolve
+            # this — resume paths are id-matched — so clear it. The old
+            # "legacy scan" fallback for this case was worse than nothing:
+            # it consumed a matching approved row whose id could never
+            # match the empty pending id, eating the approval AND staying
+            # parked.
+            async with self._lock:
+                if self._state.state in (
+                    SentinelState.AWAITING_DISPATCH_APPROVAL,
+                    SentinelState.AWAITING_ACTION_APPROVAL,
+                ) and not self._state.pending_request_id:
+                    self._state.clear_pending()
+                    self._state.transition(
+                        SentinelState.HEALTHY,
+                        reason="awaiting approval with no pending request — inconsistent park cleared",
+                    )
+                    save_state(self._state)
+            await self._emit_event(
+                "WARNING", "sentinel.approval_cleared",
+                "Sentinel was awaiting approval with no pending request "
+                "recorded — inconsistent park cleared, back to HEALTHY",
+            )
+            return
 
         row = await self._approval_gate.get_request(pending_id)
         status = str(row.get("status") or "pending") if row else "missing"
