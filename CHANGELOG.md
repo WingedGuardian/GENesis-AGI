@@ -42,6 +42,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Three session skills now ship with the repo: `/shelve`, `/unshelve`, and `genesis-voice`.** `/shelve`
+  bookmarks the current session with tags and a context note; `/unshelve` finds bookmarked sessions later by
+  keyword and gives you the resume command. `genesis-voice` is the style guide Genesis applies when it writes
+  as itself (outreach, community posts, DMs) — first person, prove-don't-claim, with a mandatory anti-slop
+  pass anchored to the voice-master audit. Previously these existed only as untracked files on the
+  development install.
+
 - **Off-site backups now self-prune on a grandfather-father-son schedule instead of growing forever.**
   When you back up to an off-site target (NAS/SMB or a mounted path), each run now prunes old dated
   snapshots — keeping the last 7 daily, 4 weekly, and 6 monthly — so remote storage stays bounded. It

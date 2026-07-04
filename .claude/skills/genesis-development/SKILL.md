@@ -108,8 +108,8 @@ every edit" mandate — that just gates work behind a tool that's stale-by-desig
 - **Custom questions:** `gitnexus cypher` — LadybugDB uses `CodeRelation` with a
   `type` property for edges, not Neo4j-style named edge labels.
 
-Full syntax, Cypher examples, and decision matrix:
-`.claude/docs/code-intelligence-guide.md`
+Full syntax and Cypher examples: `.claude/docs/code-intelligence-guide.md`;
+tool-selection decision matrix: `.claude/docs/code-intelligence.md`
 
 ### Common Traps
 
