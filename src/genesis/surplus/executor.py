@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import observations
-from genesis.surplus.intake import _FENCE_RE
+from genesis.surplus.intake import FENCE_RE
 from genesis.surplus.types import ExecutorResult, SurplusTask, TaskType
 
 if TYPE_CHECKING:
@@ -50,7 +50,7 @@ def _parse_search_queries(llm_output: str, max_queries: int = 5) -> list[str]:
     return queries
 
 
-# _FENCE_RE (whole-message ```json fence matcher) is single-sourced in
+# FENCE_RE (whole-message ```json fence matcher) is single-sourced in
 # intake.py — see the comment there for exact matching semantics.
 
 
@@ -71,7 +71,7 @@ def _humanize_surplus_content(content: str) -> str:
     if not content:
         return content
     text = content.strip()
-    match = _FENCE_RE.match(text)
+    match = FENCE_RE.match(text)
     unwrapped = match.group(1).strip() if match else text
     try:
         data = json.loads(unwrapped)

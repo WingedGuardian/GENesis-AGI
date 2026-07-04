@@ -356,6 +356,28 @@ async def list_by_domain(
     return result
 
 
+async def select_fenced_intake_rows(db: aiosqlite.Connection) -> list[dict]:
+    """Return intake-provenance units whose body still carries a ```json fence.
+
+    Selection for ``scripts/cleanup_fenced_knowledge_units.py`` (2026-07-03
+    context-layer audit): before the atomizer learned to unwrap fences,
+    surplus-intake output was stored verbatim as fenced envelopes. Scoped to
+    intake provenance so legitimate documents that merely contain inline JSON
+    fences are never selected. Ordered oldest-first so a resumed cleanup run
+    processes rows in a stable order.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT id, project_type, domain, source_doc, source_pipeline, "
+        "body, confidence, ingested_at, qdrant_id "
+        "FROM knowledge_units "
+        "WHERE source_doc LIKE 'intake:%' AND body LIKE '%```json%' "
+        "ORDER BY ingested_at",
+    )
+    keys = ("id", "project_type", "domain", "source_doc", "source_pipeline",
+            "body", "confidence", "ingested_at", "qdrant_id")
+    return [dict(zip(keys, row, strict=True)) for row in rows]
+
+
 async def increment_retrieved_batch(
     db: aiosqlite.Connection,
     qdrant_ids: list[str],

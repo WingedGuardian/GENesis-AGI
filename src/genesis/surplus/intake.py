@@ -81,7 +81,7 @@ _TASK_TYPE_TO_SOURCE: dict[str, IntakeSource] = {
 }
 
 # Task types that typically produce multiple findings and should be atomized.
-_MULTI_FINDING_TASK_TYPES = frozenset({
+MULTI_FINDING_TASK_TYPES = frozenset({
     "anticipatory_research",
     "code_audit",
     "gap_clustering",
@@ -144,7 +144,7 @@ class IntakeStats:
 # spans the entire message — inline fences (mid-text) and other-language blocks
 # (```python, bare ```) are deliberately NOT matched and pass through untouched.
 # Single source of truth for the surplus package (executor.py imports it too).
-_FENCE_RE = re.compile(r"^\s*```(?i:json)\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL)
+FENCE_RE = re.compile(r"^\s*```(?i:json)\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL)
 
 
 def _finding_from_item(item: object, index: int, default_title: str) -> AtomicFinding | None:
@@ -197,7 +197,7 @@ def atomize(content: str, source_task_type: str) -> tuple[list[AtomicFinding], s
         return [], "empty"
 
     # Single-output task types skip atomization entirely.
-    if source_task_type not in _MULTI_FINDING_TASK_TYPES:
+    if source_task_type not in MULTI_FINDING_TASK_TYPES:
         return [AtomicFinding(
             title=source_task_type.replace("_", " ").title(),
             content=content.strip(),
@@ -207,7 +207,7 @@ def atomize(content: str, source_task_type: str) -> tuple[list[AtomicFinding], s
     # payload in a ```json fence despite instructions — unwrap a whole-message
     # fence first so the parse attempt sees bare JSON.
     json_text = content
-    fence_match = _FENCE_RE.match(content)
+    fence_match = FENCE_RE.match(content)
     if fence_match:
         json_text = fence_match.group(1)
     try:

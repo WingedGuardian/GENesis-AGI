@@ -51,14 +51,6 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("cleanup_fenced_ku")
 
-_SELECT_SQL = """
-SELECT id, project_type, domain, source_doc, source_pipeline, body,
-       confidence, ingested_at, qdrant_id
-FROM knowledge_units
-WHERE source_doc LIKE 'intake:%' AND body LIKE '%```json%'
-ORDER BY ingested_at
-"""
-
 
 def _derive_task_type(title: str, multi_types: frozenset[str]) -> str:
     """Reverse the single_item title back to a task type for re-atomization.
@@ -84,7 +76,7 @@ async def main(execute: bool, limit: int | None) -> int:
     from genesis.memory.store import MemoryStore
     from genesis.surplus import intake
 
-    if not hasattr(intake, "_FENCE_RE"):
+    if not hasattr(intake, "FENCE_RE"):
         logger.error("intake.py fence fix is not present — refusing to run.")
         return 1
 
@@ -110,8 +102,7 @@ async def main(execute: bool, limit: int | None) -> int:
         logger.info("Deleted-row backup: %s", backup_path)
 
     try:
-        cursor = await db.execute(_SELECT_SQL)
-        rows = [dict(r) for r in await cursor.fetchall()]
+        rows = await knowledge_crud.select_fenced_intake_rows(db)
         if limit is not None:
             rows = rows[:limit]
         logger.info("Selected %d fence-polluted intake rows%s", len(rows),
@@ -131,7 +122,7 @@ async def main(execute: bool, limit: int | None) -> int:
             if not sep:
                 payload = row["body"]
                 title = ""
-            task_type = _derive_task_type(title, intake._MULTI_FINDING_TASK_TYPES)
+            task_type = _derive_task_type(title, intake.MULTI_FINDING_TASK_TYPES)
             findings, path = intake.atomize(payload, task_type)
 
             if path in ("json_findings", "json_single") and findings:

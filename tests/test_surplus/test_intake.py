@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 
 from genesis.surplus.intake import (
-    _MULTI_FINDING_TASK_TYPES,
+    MULTI_FINDING_TASK_TYPES,
     AtomicFinding,
     IntakeSource,
     atomize,
@@ -186,7 +186,7 @@ class TestBareArrayPayload:
 
 class TestWingAudit:
     def test_wing_audit_in_multi_finding_set(self):
-        assert "wing_audit" in _MULTI_FINDING_TASK_TYPES
+        assert "wing_audit" in MULTI_FINDING_TASK_TYPES
 
     def test_wing_audit_fenced_findings_atomized(self):
         findings, path = atomize(f"```json\n{_FINDINGS_JSON}\n```", "wing_audit")
