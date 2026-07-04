@@ -736,6 +736,54 @@ async def test_store_reflection_output_strategic_keeps_primary(db):
     assert len(rows) == 1, "Strategic should still create reflection_output"
 
 
+@pytest.mark.asyncio
+async def test_strategic_fenced_output_extracts_focus_and_summary(db):
+    """A ```json-fenced STRATEGIC output still yields focus_next_week and a
+    structured summary — pins the fence handling on the strategic path
+    (_extract_strategic_focus), not just LIGHT."""
+    from genesis.cc.reflection_bridge._output import store_reflection_output
+
+    tick = TickResult(
+        tick_id="tick-strat-fenced-1",
+        timestamp="2026-05-30T15:00:00",
+        source="scheduled",
+        signals=[],
+        scores=[],
+        classified_depth=Depth.STRATEGIC,
+        trigger_reason="test",
+    )
+    payload = json.dumps({
+        "assessment": "Strategic fenced output parsed correctly.",
+        "observations": [],
+        "focus_next_week": "Consolidate the intake pipeline fixes.",
+    })
+    output = CCOutput(
+        session_id="refl-strat-fenced-1",
+        text=f"```json\n{payload}\n```",
+        model_used="opus",
+        cost_usd=0.10,
+        input_tokens=2000,
+        output_tokens=1000,
+        duration_ms=30000,
+        exit_code=0,
+    )
+
+    await store_reflection_output(Depth.STRATEGIC, tick, output, db=db)
+
+    focus_rows = await db.execute_fetchall(
+        "SELECT content FROM cognitive_state WHERE section = 'pending_actions'"
+    )
+    assert len(focus_rows) == 1, "Fenced strategic output should store focus_next_week"
+    assert "Consolidate the intake pipeline fixes." in focus_rows[0]["content"]
+
+    summary_rows = await db.execute_fetchall(
+        "SELECT content FROM observations WHERE source = 'cc_reflection_strategic' "
+        "AND type = 'reflection_summary'"
+    )
+    assert len(summary_rows) == 1
+    assert "```" not in summary_rows[0]["content"]
+
+
 # ── build_light_prompt_enriched: prior context injection ────────────
 
 
