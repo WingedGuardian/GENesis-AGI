@@ -18,6 +18,12 @@ from genesis.guardian.pool import measure_storage_pool
 
 logger = logging.getLogger(__name__)
 
+# Label suffix marking the offline snapshot-rollback lifeline. take(label=
+# _HEALTHY_LABEL) produces names ending in this suffix; prune()/take()
+# eviction exempt the latest one and mark_healthy() rotates the rest.
+_HEALTHY_LABEL = "healthy"
+_HEALTHY_SUFFIX = f"-{_HEALTHY_LABEL}"
+
 
 def _parse_created_at(raw: object) -> datetime | None:
     """Parse an incus snapshot `created_at` into an aware UTC datetime.
@@ -224,7 +230,7 @@ class SnapshotManager:
         # successful create — no zero-lifeline window).
         existing = await self.list_snapshots()
         latest_healthy = next(
-            (n for n in existing if n.endswith("-healthy")), None,
+            (n for n in existing if n.endswith(_HEALTHY_SUFFIX)), None,
         )
         candidates = [n for n in existing if n != latest_healthy]
         if candidates and len(candidates) >= self._retention:
@@ -269,10 +275,15 @@ class SnapshotManager:
         return name
 
     async def delete(self, name: str) -> bool:
-        """Delete a snapshot by name. Returns True on success."""
+        """Delete a snapshot by name. Returns True on success.
+
+        120s timeout: deleting a long-lived LVM-thin snapshot with heavy CoW
+        divergence involves real kernel metadata work (the incident snapshots
+        were months old) — 60s can genuinely be exceeded.
+        """
         rc, _, stderr = await _run_subprocess(
             "incus", "snapshot", "delete", self._container, name,
-            timeout=60.0,
+            timeout=120.0,
         )
         if rc != 0:
             logger.warning("Failed to delete snapshot %s: %s", name, stderr)
@@ -344,7 +355,7 @@ class SnapshotManager:
             return 0
 
         names = [name for name, _ in meta]
-        healthy = [n for n in names if n.endswith("-healthy")]
+        healthy = [n for n in names if n.endswith(_HEALTHY_SUFFIX)]
         latest_healthy = healthy[0] if healthy else None
 
         # Retention rule: keep newest N + latest healthy.
@@ -366,15 +377,9 @@ class SnapshotManager:
 
         deleted = 0
         for name in sorted(to_delete):
-            rc, _, stderr = await _run_subprocess(
-                "incus", "snapshot", "delete", self._container, name,
-                timeout=120.0,
-            )
-            if rc == 0:
+            if await self.delete(name):
                 logger.info("Pruned snapshot: %s", name)
                 deleted += 1
-            else:
-                logger.warning("Failed to prune snapshot %s: %s", name, stderr)
 
         return deleted
 
@@ -414,13 +419,13 @@ class SnapshotManager:
         maintenance interval (the incident was 2 months of divergence).
         """
         name = await self.take(
-            label="healthy", snapshot_size_history=snapshot_size_history,
+            label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
         )
         if name is None:
             return None
 
         for old_name in await self.list_snapshots():
-            is_superseded = old_name.endswith("-healthy") and old_name != name
+            is_superseded = old_name.endswith(_HEALTHY_SUFFIX) and old_name != name
             if is_superseded and await self.delete(old_name):
                 logger.info("Rotated superseded healthy snapshot: %s", old_name)
         return name
@@ -429,6 +434,6 @@ class SnapshotManager:
         """Get the name of the most recent 'healthy' snapshot."""
         snapshots = await self.list_snapshots()
         for name in snapshots:
-            if name.endswith("-healthy"):
+            if name.endswith(_HEALTHY_SUFFIX):
                 return name
         return None
