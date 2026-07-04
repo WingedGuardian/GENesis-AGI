@@ -468,3 +468,125 @@ async def test_start_registers_db_integrity_check(db):
         await sched.start()
     assert sched._scheduler.get_job("db_integrity_check") is not None
     await sched.stop()
+
+
+# ── run_dream_synthesis_drain wrapper ──────────────────────────────────────
+
+
+def _fake_runtime(db):
+    """Runtime stand-in for the drain wrapper: healthy deps, no flags set."""
+    from unittest.mock import MagicMock
+    rt = MagicMock()
+    rt.paused = False
+    rt.heavy_workload = None  # MagicMock auto-attrs are truthy — must be explicit
+    rt._heavy_workload = None
+    rt._heavy_workload_since = None
+    rt.db = db
+    rt.router = AsyncMock()
+    rt.memory_store = MagicMock()
+    rt.memory_store.qdrant_client = MagicMock()
+    return rt
+
+
+_DRAIN_REPORT = {
+    "run_id": "t", "dry_run": True, "drained": 2, "would_merge": 2,
+    "stale_skipped": 0, "errors": [],
+}
+_RT_CLS = "genesis.runtime.GenesisRuntime"
+_DRAIN_FN = "genesis.memory.dream_cycle.run_synthesis_drain"
+
+
+async def test_drain_wrapper_happy_path_shadow(db):
+    """Wrapper drives the drain in SHADOW, records job health, writes the
+    observation, and clears its own heavy_workload flag."""
+    sched, _ = _make_scheduler(db)
+    rt = _fake_runtime(db)
+    with patch(_RT_CLS) as rt_cls, \
+         patch(_DRAIN_FN, new_callable=AsyncMock, return_value=dict(_DRAIN_REPORT)) as drain:
+        rt_cls.instance.return_value = rt
+        await sched.run_dream_synthesis_drain()
+
+    drain.assert_awaited_once()
+    assert drain.call_args.kwargs["dry_run"] is True  # SHADOW hardwired in PR1
+    rt.record_job_start.assert_called_once_with("dream_synthesis_drain")
+    rt.record_job_success.assert_called_once_with("dream_synthesis_drain")
+    rt.record_job_failure.assert_not_called()
+    assert rt._heavy_workload is None  # cleared by the owner-guarded finally
+    cur = await db.execute(
+        "SELECT content FROM observations WHERE type = 'dream_synthesis_drain_report'"
+    )
+    rows = await cur.fetchall()
+    assert len(rows) == 1
+    assert "SHADOW" in rows[0]["content"]
+    assert "2 would merge" in rows[0]["content"]
+
+
+async def test_drain_wrapper_paused_skips(db):
+    sched, _ = _make_scheduler(db)
+    rt = _fake_runtime(db)
+    rt.paused = True
+    with patch(_RT_CLS) as rt_cls, \
+         patch(_DRAIN_FN, new_callable=AsyncMock) as drain:
+        rt_cls.instance.return_value = rt
+        await sched.run_dream_synthesis_drain()
+    drain.assert_not_awaited()
+    rt.record_job_start.assert_not_called()
+
+
+async def test_drain_wrapper_heavy_workload_skips(db):
+    """Weekly clustering still running -> the drain defers to tomorrow (F6)."""
+    sched, _ = _make_scheduler(db)
+    rt = _fake_runtime(db)
+    rt.heavy_workload = "dream_cycle"
+    rt._heavy_workload = "dream_cycle"
+    with patch(_RT_CLS) as rt_cls, \
+         patch(_DRAIN_FN, new_callable=AsyncMock) as drain:
+        rt_cls.instance.return_value = rt
+        await sched.run_dream_synthesis_drain()
+    drain.assert_not_awaited()
+    rt.record_job_start.assert_not_called()
+    # the skip path must not touch the other job's flag
+    assert rt._heavy_workload == "dream_cycle"
+
+
+async def test_drain_wrapper_missing_deps_skip_before_job_start(db):
+    """Dependency checks precede record_job_start — a misconfigured deploy
+    must not leave the job perpetually 'started' in job_health."""
+    sched, _ = _make_scheduler(db)
+    rt = _fake_runtime(db)
+    rt.db = None
+    with patch(_RT_CLS) as rt_cls, \
+         patch(_DRAIN_FN, new_callable=AsyncMock) as drain:
+        rt_cls.instance.return_value = rt
+        await sched.run_dream_synthesis_drain()
+    drain.assert_not_awaited()
+    rt.record_job_start.assert_not_called()
+
+
+async def test_drain_wrapper_failure_records_and_clears_flag(db):
+    sched, _ = _make_scheduler(db)
+    rt = _fake_runtime(db)
+    with patch(_RT_CLS) as rt_cls, \
+         patch(_DRAIN_FN, new_callable=AsyncMock, side_effect=RuntimeError("boom")):
+        rt_cls.instance.return_value = rt
+        await sched.run_dream_synthesis_drain()
+    rt.record_job_failure.assert_called_once()
+    assert rt.record_job_failure.call_args.args[0] == "dream_synthesis_drain"
+    assert rt._heavy_workload is None
+
+
+async def test_drain_wrapper_finally_is_owner_guarded(db):
+    """If another job's flag replaced ours mid-run, the finally must NOT
+    clear it — the two dream jobs share rt._heavy_workload."""
+    sched, _ = _make_scheduler(db)
+    rt = _fake_runtime(db)
+
+    async def _drain_then_flag_stolen(**kw):
+        rt._heavy_workload = "dream_cycle"  # weekly job took the flag
+        return dict(_DRAIN_REPORT)
+
+    with patch(_RT_CLS) as rt_cls, \
+         patch(_DRAIN_FN, new_callable=AsyncMock, side_effect=_drain_then_flag_stolen):
+        rt_cls.instance.return_value = rt
+        await sched.run_dream_synthesis_drain()
+    assert rt._heavy_workload == "dream_cycle"  # not clobbered
