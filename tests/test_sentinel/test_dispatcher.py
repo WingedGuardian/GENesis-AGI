@@ -227,9 +227,9 @@ class TestExtractPattern:
         req = SentinelRequest(
             trigger_source="fire_alarm",
             trigger_reason="Tier 2: Memory >90%",
-            alarms=[FireAlarm(tier=2, alert_id="memory:critical", severity="CRITICAL", message="mem")],
+            alarms=[FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")],
         )
-        assert _extract_pattern(req) == "memory:critical"
+        assert _extract_pattern(req) == "infra:container_memory_high"
 
     def test_direct_escalation_uses_trigger_source(self):
         req = SentinelRequest(
@@ -245,7 +245,7 @@ class TestExtractPattern:
             trigger_reason="multi",
             alarms=[
                 FireAlarm(tier=1, alert_id="service:watchdog_blind", severity="WARNING", message="a"),
-                FireAlarm(tier=2, alert_id="memory:critical", severity="CRITICAL", message="b"),
+                FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="b"),
             ],
         )
         assert _extract_pattern(req) == "service:watchdog_blind"
@@ -254,55 +254,55 @@ class TestExtractPattern:
 class TestBackoffReady:
     def test_first_attempt_immediate(self):
         d = _make_dispatcher()
-        ready, _ = d._backoff_ready("memory:critical")
+        ready, _ = d._backoff_ready("infra:container_memory_high")
         assert ready is True
 
     def test_second_attempt_blocked_until_15min(self):
         d = _make_dispatcher()
         # Simulate one prior attempt, just now
-        d._pattern_attempts["memory:critical"] = [time.monotonic()]
-        ready, reason = d._backoff_ready("memory:critical")
+        d._pattern_attempts["infra:container_memory_high"] = [time.monotonic()]
+        ready, reason = d._backoff_ready("infra:container_memory_high")
         assert ready is False
         assert "backoff" in reason.lower()
 
     def test_second_attempt_ready_after_15min(self):
         d = _make_dispatcher()
         # Simulate one prior attempt >15 min ago
-        d._pattern_attempts["memory:critical"] = [time.monotonic() - (16 * 60)]
-        ready, _ = d._backoff_ready("memory:critical")
+        d._pattern_attempts["infra:container_memory_high"] = [time.monotonic() - (16 * 60)]
+        ready, _ = d._backoff_ready("infra:container_memory_high")
         assert ready is True
 
     def test_third_attempt_needs_45min(self):
         d = _make_dispatcher()
         now = time.monotonic()
         # Two prior attempts; last was 30 min ago (< 45 min required)
-        d._pattern_attempts["memory:critical"] = [now - 3600, now - (30 * 60)]
-        ready, _ = d._backoff_ready("memory:critical")
+        d._pattern_attempts["infra:container_memory_high"] = [now - 3600, now - (30 * 60)]
+        ready, _ = d._backoff_ready("infra:container_memory_high")
         assert ready is False
 
         # Bump the last attempt to 50 min ago — should clear
-        d._pattern_attempts["memory:critical"] = [now - 7200, now - (50 * 60)]
-        ready, _ = d._backoff_ready("memory:critical")
+        d._pattern_attempts["infra:container_memory_high"] = [now - 7200, now - (50 * 60)]
+        ready, _ = d._backoff_ready("infra:container_memory_high")
         assert ready is True
 
     def test_fourth_attempt_needs_2h(self):
         d = _make_dispatcher()
         now = time.monotonic()
         # Three prior attempts, last was 1h ago (< 2h)
-        d._pattern_attempts["memory:critical"] = [
+        d._pattern_attempts["infra:container_memory_high"] = [
             now - 7200, now - 5400, now - 3600,
         ]
-        ready, _ = d._backoff_ready("memory:critical")
+        ready, _ = d._backoff_ready("infra:container_memory_high")
         assert ready is False
 
     def test_fifth_attempt_hits_escalation(self):
         """4 prior attempts → the 5th attempt = escalation threshold."""
         d = _make_dispatcher()
         now = time.monotonic()
-        d._pattern_attempts["memory:critical"] = [
+        d._pattern_attempts["infra:container_memory_high"] = [
             now - 10000, now - 8000, now - 6000, now - 3000,
         ]
-        ready, reason = d._backoff_ready("memory:critical")
+        ready, reason = d._backoff_ready("infra:container_memory_high")
         # _backoff_ready returns ready=True at the threshold — the dispatcher
         # distinguishes escalation from normal dispatch separately.
         assert ready is True
@@ -310,14 +310,14 @@ class TestBackoffReady:
 
     def test_escalated_pattern_always_blocked(self):
         d = _make_dispatcher()
-        d._escalated_patterns["memory:critical"] = "2026-04-09T23:00:00+00:00"
-        ready, reason = d._backoff_ready("memory:critical")
+        d._escalated_patterns["infra:container_memory_high"] = "2026-04-09T23:00:00+00:00"
+        ready, reason = d._backoff_ready("infra:container_memory_high")
         assert ready is False
         assert "escalated" in reason.lower()
 
     def test_different_patterns_have_independent_backoff(self):
         d = _make_dispatcher()
-        d._pattern_attempts["memory:critical"] = [time.monotonic()]
+        d._pattern_attempts["infra:container_memory_high"] = [time.monotonic()]
         # Other pattern should still be ready
         ready, _ = d._backoff_ready("infra:disk_low")
         assert ready is True
@@ -345,9 +345,9 @@ class TestPatternResetOnResolve:
         d._state.started_at = "2020-01-01T00:00:00+00:00"
         # Pre-seed one old attempt (past 15-min wait) so the next attempt
         # is ready — and then verify the whole counter gets wiped on resolve.
-        d._pattern_attempts["memory:critical"] = [time.monotonic() - (20 * 60)]
+        d._pattern_attempts["infra:container_memory_high"] = [time.monotonic() - (20 * 60)]
 
-        alarm = FireAlarm(tier=2, alert_id="memory:critical", severity="CRITICAL", message="mem")
+        alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
         with patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
@@ -362,7 +362,7 @@ class TestPatternResetOnResolve:
         assert result.dispatched
         assert result.resolved
         # Pattern cleared after resolution
-        assert "memory:critical" not in d._pattern_attempts
+        assert "infra:container_memory_high" not in d._pattern_attempts
 
     @pytest.mark.asyncio
     async def test_unresolved_dispatch_keeps_pattern(self):
@@ -374,7 +374,7 @@ class TestPatternResetOnResolve:
         mock_output.text = '{"diagnosis": "cannot fix", "actions_taken": [], "resolved": false}'
         d._invoker.run = AsyncMock(return_value=mock_output)
 
-        alarm = FireAlarm(tier=2, alert_id="memory:critical", severity="CRITICAL", message="mem")
+        alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
         with patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
@@ -387,8 +387,8 @@ class TestPatternResetOnResolve:
             ))
 
         # Pattern is recorded so next attempt hits backoff
-        assert "memory:critical" in d._pattern_attempts
-        assert len(d._pattern_attempts["memory:critical"]) == 1
+        assert "infra:container_memory_high" in d._pattern_attempts
+        assert len(d._pattern_attempts["infra:container_memory_high"]) == 1
 
 
 class TestResolvedCooldown:
@@ -399,7 +399,7 @@ class TestResolvedCooldown:
         """After a pattern resolves, the same pattern is blocked by cooldown."""
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
-        alarm = FireAlarm(tier=2, alert_id="memory:critical", severity="CRITICAL", message="mem")
+        alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
 
         with patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.write_last_run"), \
@@ -414,7 +414,7 @@ class TestResolvedCooldown:
         assert r1.dispatched and r1.resolved
 
         # Cooldown recorded
-        assert "memory:critical" in d._resolved_cooldowns
+        assert "infra:container_memory_high" in d._resolved_cooldowns
 
         with patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.write_last_run"), \
@@ -435,20 +435,20 @@ class TestResolvedCooldown:
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
         # Simulate a cooldown that already expired
-        d._resolved_cooldowns["memory:critical"] = time.monotonic() - (_RESOLVED_COOLDOWN_S + 1)
+        d._resolved_cooldowns["infra:container_memory_high"] = time.monotonic() - (_RESOLVED_COOLDOWN_S + 1)
 
-        ready, reason = d._backoff_ready("memory:critical")
+        ready, reason = d._backoff_ready("infra:container_memory_high")
         assert ready
         # Expired cooldown should be cleaned up
-        assert "memory:critical" not in d._resolved_cooldowns
+        assert "infra:container_memory_high" not in d._resolved_cooldowns
 
     @pytest.mark.asyncio
     async def test_cooldown_independent_per_pattern(self):
         """Cooldown on one pattern doesn't block a different pattern."""
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
-        # memory:critical is in cooldown
-        d._resolved_cooldowns["memory:critical"] = time.monotonic()
+        # infra:container_memory_high is in cooldown
+        d._resolved_cooldowns["infra:container_memory_high"] = time.monotonic()
 
         # Different pattern should be unaffected
         ready, reason = d._backoff_ready("disk:critical")
@@ -465,11 +465,11 @@ class TestEscalation:
         d._state.started_at = "2020-01-01T00:00:00+00:00"
         # Pre-seed 4 prior attempts (escalation = 5th)
         now = time.monotonic()
-        d._pattern_attempts["memory:critical"] = [
+        d._pattern_attempts["infra:container_memory_high"] = [
             now - 20000, now - 16000, now - 10000, now - 5000,
         ]
 
-        alarm = FireAlarm(tier=2, alert_id="memory:critical", severity="CRITICAL", message="mem")
+        alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
         with patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             result = await d.dispatch(SentinelRequest(
@@ -484,7 +484,7 @@ class TestEscalation:
         # Outreach was posted
         assert outreach.submit_raw.await_count == 1
         # Pattern is now marked escalated
-        assert "memory:critical" in d._escalated_patterns
+        assert "infra:container_memory_high" in d._escalated_patterns
         # Invoker was NOT called (no CC session spun up)
         d._invoker.run.assert_not_called()
 
@@ -498,11 +498,11 @@ class TestEscalation:
         d = _make_dispatcher(outreach_pipeline=outreach)
         d._state.started_at = "2020-01-01T00:00:00+00:00"
         now = time.monotonic()
-        d._pattern_attempts["memory:critical"] = [
+        d._pattern_attempts["infra:container_memory_high"] = [
             now - 20000, now - 16000, now - 10000, now - 5000,
         ]
 
-        alarm = FireAlarm(tier=2, alert_id="memory:critical", severity="CRITICAL", message="mem")
+        alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
         with patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             await d.dispatch(SentinelRequest(
@@ -520,7 +520,7 @@ class TestEscalation:
         assert "dispatch attempts" in message_body
         assert "4 dispatch attempts" in message_body  # 4 prior + current = 5th triggers
         # Pattern identifier is visible to user
-        assert "memory:critical" in message_body
+        assert "infra:container_memory_high" in message_body
 
     @pytest.mark.asyncio
     async def test_escalation_marks_pattern_even_without_outreach(self):
@@ -531,11 +531,11 @@ class TestEscalation:
         d = _make_dispatcher(outreach_pipeline=None)
         d._state.started_at = "2020-01-01T00:00:00+00:00"
         now = time.monotonic()
-        d._pattern_attempts["memory:critical"] = [
+        d._pattern_attempts["infra:container_memory_high"] = [
             now - 20000, now - 16000, now - 10000, now - 5000,
         ]
 
-        alarm = FireAlarm(tier=2, alert_id="memory:critical", severity="CRITICAL", message="mem")
+        alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
         with patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             result = await d.dispatch(SentinelRequest(
@@ -547,15 +547,15 @@ class TestEscalation:
 
         assert not result.dispatched
         # Still marked escalated even though no outreach pipeline
-        assert "memory:critical" in d._escalated_patterns
+        assert "infra:container_memory_high" in d._escalated_patterns
 
     @pytest.mark.asyncio
     async def test_escalated_pattern_blocks_subsequent_attempts(self):
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
-        d._escalated_patterns["memory:critical"] = "2026-04-09T23:00:00+00:00"
+        d._escalated_patterns["infra:container_memory_high"] = "2026-04-09T23:00:00+00:00"
 
-        alarm = FireAlarm(tier=2, alert_id="memory:critical", severity="CRITICAL", message="mem")
+        alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
         with patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             result = await d.dispatch(SentinelRequest(
@@ -579,7 +579,7 @@ class TestRingBufferDebounce:
         d._state.started_at = "2020-01-01T00:00:00+00:00"
 
         with patch("genesis.mcp.health_mcp._impl_health_alerts", new=AsyncMock(return_value=[
-            {"id": "memory:critical", "severity": "CRITICAL", "message": "mem"},
+            {"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"},
         ])):
             result = await d.check_fire_alarms()
 
@@ -593,7 +593,7 @@ class TestRingBufferDebounce:
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
 
-        alerts = [{"id": "memory:critical", "severity": "CRITICAL", "message": "mem"}]
+        alerts = [{"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"}]
         with patch("genesis.mcp.health_mcp._impl_health_alerts", new=AsyncMock(return_value=alerts)), \
              patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.write_last_run"), \
@@ -612,7 +612,7 @@ class TestRingBufferDebounce:
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
 
-        alerts_on = [{"id": "memory:critical", "severity": "CRITICAL", "message": "mem"}]
+        alerts_on = [{"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"}]
         alerts_off: list = []
 
         async def _alerts_side_effect(*args, **kwargs):
@@ -638,7 +638,7 @@ class TestRingBufferDebounce:
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
 
-        alerts_on = [{"id": "memory:critical", "severity": "CRITICAL", "message": "mem"}]
+        alerts_on = [{"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"}]
         alerts_off: list = []
 
         async def _alerts_side_effect(*args, **kwargs):
@@ -662,8 +662,8 @@ class TestRejectionWindow:
         """Pattern with active rejection window returns not-ready."""
         d = _make_dispatcher()
         expiry = (datetime.now(UTC) + timedelta(hours=23)).isoformat()
-        d._state.rejected_patterns["memory:critical"] = expiry
-        ready, reason = d._backoff_ready("memory:critical")
+        d._state.rejected_patterns["infra:container_memory_high"] = expiry
+        ready, reason = d._backoff_ready("infra:container_memory_high")
         assert ready is False
         assert "rejected" in reason.lower()
 
@@ -671,19 +671,19 @@ class TestRejectionWindow:
         """Pattern with expired rejection window is allowed and entry cleaned."""
         d = _make_dispatcher()
         expiry = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
-        d._state.rejected_patterns["memory:critical"] = expiry
+        d._state.rejected_patterns["infra:container_memory_high"] = expiry
 
         with patch("genesis.sentinel.dispatcher.save_state"):
-            ready, _ = d._backoff_ready("memory:critical")
+            ready, _ = d._backoff_ready("infra:container_memory_high")
 
         assert ready is True
-        assert "memory:critical" not in d._state.rejected_patterns
+        assert "infra:container_memory_high" not in d._state.rejected_patterns
 
     def test_rejection_independent_per_pattern(self):
         """Rejecting one pattern doesn't block another."""
         d = _make_dispatcher()
         expiry = (datetime.now(UTC) + timedelta(hours=23)).isoformat()
-        d._state.rejected_patterns["memory:critical"] = expiry
+        d._state.rejected_patterns["infra:container_memory_high"] = expiry
         ready, _ = d._backoff_ready("infra:disk_low")
         assert ready is True
 
@@ -692,14 +692,14 @@ class TestRejectionWindow:
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
         expiry = (datetime.now(UTC) + timedelta(hours=20)).isoformat()
-        d._state.rejected_patterns["memory:critical"] = expiry
+        d._state.rejected_patterns["infra:container_memory_high"] = expiry
 
         # Simulate resolve by directly calling the logic from _finalize_dispatch
-        pattern = "memory:critical"
+        pattern = "infra:container_memory_high"
         if pattern in d._state.rejected_patterns:
             del d._state.rejected_patterns[pattern]
 
-        assert "memory:critical" not in d._state.rejected_patterns
+        assert "infra:container_memory_high" not in d._state.rejected_patterns
 
     @pytest.mark.asyncio
     async def test_handle_approval_resolution_rejected(self):
@@ -708,7 +708,7 @@ class TestRejectionWindow:
         d._state.current_state = "awaiting_dispatch_approval"
         d._state.pending_request_id = "req-123"
         d._state.pending_policy_id = "sentinel_dispatch"
-        d._state.pending_pattern = "memory:critical"
+        d._state.pending_pattern = "infra:container_memory_high"
 
         with patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.append_log"):
@@ -716,9 +716,9 @@ class TestRejectionWindow:
 
         assert result is not None
         assert result.dispatched is False
-        assert "memory:critical" in d._state.rejected_patterns
+        assert "infra:container_memory_high" in d._state.rejected_patterns
         # Verify the expiry is ~24h from now
-        expiry = datetime.fromisoformat(d._state.rejected_patterns["memory:critical"])
+        expiry = datetime.fromisoformat(d._state.rejected_patterns["infra:container_memory_high"])
         diff = expiry - datetime.now(UTC)
         assert timedelta(hours=23) < diff < timedelta(hours=25)
         # State transitioned to HEALTHY
@@ -730,14 +730,14 @@ class TestRejectionWindow:
 
         state = SentinelStateData()
         expiry = (datetime.now(UTC) + timedelta(hours=12)).isoformat()
-        state.rejected_patterns["memory:critical"] = expiry
+        state.rejected_patterns["infra:container_memory_high"] = expiry
 
         state_file = tmp_path / "sentinel_state.json"
         save_state(state, path=state_file)
         loaded = load_state(path=state_file)
 
-        assert "memory:critical" in loaded.rejected_patterns
-        assert loaded.rejected_patterns["memory:critical"] == expiry
+        assert "infra:container_memory_high" in loaded.rejected_patterns
+        assert loaded.rejected_patterns["infra:container_memory_high"] == expiry
 
 
 # ---------------------------------------------------------------------------
@@ -858,3 +858,105 @@ class TestSentinelActionStalenessGuard:
             result = await d.resume_from_approval("req-wrong-id", "approved")
 
         assert result is None
+
+
+class TestConvergePendingApproval:
+    """State-keyed convergence: a parked dispatch must follow whatever
+    actually happened to its approval row. The approved-only resume scan
+    left a REJECTED row undelivered for 26 days (June–July 2026) while
+    Gate 2 blocked every other dispatch — these tests pin every branch.
+    """
+
+    def _parked(self, gate):
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.transition(
+            SentinelState.AWAITING_DISPATCH_APPROVAL, reason="test park",
+        )
+        d._state.pending_request_id = "req-123"
+        d._state.pending_policy_id = "sentinel_dispatch"
+        d._state.pending_pattern = "backup:last_failed"
+        d._state.pending_request_json = (
+            '{"trigger_source": "fire_alarm", "trigger_reason": "t",'
+            ' "tier": 2, "alarms": [], "context": {}}'
+        )
+        return d
+
+    @pytest.mark.asyncio
+    async def test_rejected_row_converges_healthy_and_suppresses(self):
+        gate = AsyncMock()
+        gate.get_request = AsyncMock(return_value={"id": "req-123", "status": "rejected"})
+        d = self._parked(gate)
+
+        with patch("genesis.sentinel.dispatcher.save_state"):
+            await d.converge_pending_approval()
+
+        assert d._state.state == SentinelState.HEALTHY
+        assert d._state.pending_request_id == ""
+        assert "backup:last_failed" in d._state.rejected_patterns
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("row", [None, {"id": "req-123", "status": "expired"},
+                                     {"id": "req-123", "status": "cancelled"}])
+    async def test_gone_row_clears_park(self, row):
+        gate = AsyncMock()
+        gate.get_request = AsyncMock(return_value=row)
+        d = self._parked(gate)
+
+        with patch("genesis.sentinel.dispatcher.save_state"):
+            await d.converge_pending_approval()
+
+        assert d._state.state == SentinelState.HEALTHY
+        assert d._state.pending_request_id == ""
+        # No rejection happened — the pattern must NOT be suppressed.
+        assert "backup:last_failed" not in d._state.rejected_patterns
+
+    @pytest.mark.asyncio
+    async def test_pending_row_stays_parked(self):
+        gate = AsyncMock()
+        gate.get_request = AsyncMock(return_value={"id": "req-123", "status": "pending"})
+        d = self._parked(gate)
+
+        with patch("genesis.sentinel.dispatcher.save_state"):
+            await d.converge_pending_approval()
+
+        assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
+        assert d._state.pending_request_id == "req-123"
+
+    @pytest.mark.asyncio
+    async def test_approved_unconsumed_resumes(self):
+        gate = AsyncMock()
+        gate.get_request = AsyncMock(return_value={"id": "req-123", "status": "approved"})
+        gate.mark_consumed = AsyncMock(return_value=True)
+        d = self._parked(gate)
+        d.resume_from_approval = AsyncMock(return_value=None)
+
+        with patch("genesis.sentinel.dispatcher.save_state"):
+            await d.converge_pending_approval()
+
+        gate.mark_consumed.assert_awaited_once_with("req-123")
+        d.resume_from_approval.assert_awaited_once_with("req-123", "approved")
+
+    @pytest.mark.asyncio
+    async def test_approved_already_consumed_clears_stale_park(self):
+        gate = AsyncMock()
+        gate.get_request = AsyncMock(return_value={"id": "req-123", "status": "approved"})
+        gate.mark_consumed = AsyncMock(return_value=False)
+        d = self._parked(gate)
+        d.resume_from_approval = AsyncMock(return_value=None)
+
+        with patch("genesis.sentinel.dispatcher.save_state"):
+            await d.converge_pending_approval()
+
+        d.resume_from_approval.assert_not_awaited()
+        assert d._state.state == SentinelState.HEALTHY
+        assert d._state.pending_request_id == ""
+
+    @pytest.mark.asyncio
+    async def test_not_parked_is_noop(self):
+        gate = AsyncMock()
+        d = _make_dispatcher(approval_gate=gate)
+
+        await d.converge_pending_approval()
+
+        gate.get_request.assert_not_awaited()
+        assert d._state.state == SentinelState.HEALTHY
