@@ -1508,19 +1508,9 @@ class SurplusScheduler:
                     rt.heavy_workload,
                 )
                 return
-        except Exception:
-            logger.warning(
-                "Pause check failed — skipping dream synthesis drain",
-                exc_info=True,
-            )
-            return
-
-        with contextlib.suppress(Exception):
-            GenesisRuntime.instance().record_job_start("dream_synthesis_drain")
-
-        try:
-            from genesis.memory import dream_cycle
-
+            # Dependency checks BEFORE record_job_start — a skip on a
+            # misconfigured deploy must not leave the job perpetually
+            # "started" in job_health (masks real stuck-job detection).
             store = rt.memory_store
             if rt.db is None or store is None or rt.router is None:
                 logger.warning(
@@ -1533,6 +1523,18 @@ class SurplusScheduler:
                     "Dream synthesis drain skipped — MemoryStore has no Qdrant client"
                 )
                 return
+        except Exception:
+            logger.warning(
+                "Pause check failed — skipping dream synthesis drain",
+                exc_info=True,
+            )
+            return
+
+        with contextlib.suppress(Exception):
+            GenesisRuntime.instance().record_job_start("dream_synthesis_drain")
+
+        try:
+            from genesis.memory import dream_cycle
 
             rt._heavy_workload = "dream_synthesis_drain"
             rt._heavy_workload_since = datetime.now(UTC)

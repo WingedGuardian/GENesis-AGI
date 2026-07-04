@@ -911,6 +911,11 @@ async def _synthesize_clusters(
     into a saturated chain. Genuine quality blocks reset the streak and never
     trip the breaker.
     """
+    # Deliberate re-sort: the worklist was value-ranked at enqueue, but
+    # rehydration can shrink clusters (members deprecated since Sunday) — the
+    # POST-rehydration size is the fresher value signal, so attempt order may
+    # diverge from queue order for shrunk clusters. PR2's per-item lifecycle
+    # supersedes this batch call.
     all_clusters.sort(key=len, reverse=True)
     merged = 0
     breaker = _CapacityBreaker(_CAPACITY_ABORT_THRESHOLD)
