@@ -76,6 +76,9 @@ def row_to_utterance(row: dict) -> AmbientUtterance | None:
         rms=float(audio.get("rms") or 0.0),
         mode_state="unknown",  # ambient_transcripts carries no interaction-plane state
         source=row.get("source") or "",
+        # no audio block (OMI / absent-or-corrupt meta) -> text-only clarity path:
+        # loudness is unknowable, not quiet — don't fabricate an rms=0 penalty.
+        has_audio=bool(audio),
     )
 
 

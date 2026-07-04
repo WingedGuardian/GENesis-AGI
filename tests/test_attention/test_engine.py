@@ -25,12 +25,13 @@ def make_config(**over) -> AttentionConfig:
 
 
 def make_utt(id, ts, text="", *, is_user=None, speaker_total=None, rms=0.2,
-             duration_s=5.0, frac_lt_1=0.0, n_tokens=20, mode_state="unknown") -> AmbientUtterance:
+             duration_s=5.0, frac_lt_1=0.0, n_tokens=20, mode_state="unknown",
+             has_audio=True) -> AmbientUtterance:
     # defaults = clean / high-clarity so tests isolate the trigger + threshold logic.
     return AmbientUtterance(
         id=id, ts=ts, text=text, duration_s=duration_s, is_user=is_user,
         speaker_total=speaker_total, n_tokens=n_tokens, frac_lt_1=frac_lt_1, rms=rms,
-        mode_state=mode_state, source="test",
+        mode_state=mode_state, source="test", has_audio=has_audio,
     )
 
 
@@ -103,6 +104,18 @@ def test_blip_ignored_and_not_windowed():
     state, ev = evaluate(make_utt(1, 100.0, "hey genesis", rms=0.01, duration_s=0.3, n_tokens=1), state, cfg)
     assert ev is None                 # blip short-circuits even with an alias
     assert len(state.window) == 0     # never added to the window
+
+
+def test_text_only_short_utterance_not_blipped():
+    # a text-only (has_audio=False) source has no rms — a short utt must be EVALUATED,
+    # not dropped as a near-silence physics blip (rms=0 + duration<1 blips audio rows).
+    cfg = make_config()
+    state = EngineState()
+    utt = make_utt(1, 100.0, "hey genesis look at this", rms=0.0, duration_s=0.5,
+                   n_tokens=5, has_audio=False)
+    state, ev = evaluate(utt, state, cfg)
+    assert ev is not None and ev.activation == Activation.HARD
+    assert len(state.window) == 1
 
 
 def test_new_session_on_gap_clears_window():

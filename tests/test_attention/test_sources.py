@@ -51,6 +51,23 @@ def test_row_corrupt_meta_tolerated():
     assert u is not None and u.n_tokens == 0 and u.rms == 0.0
 
 
+def test_row_with_audio_meta_has_audio_true():
+    assert row_to_utterance(_row()).has_audio is True
+
+
+def test_row_without_audio_block_is_text_only():
+    # a text-only source (OMI) carries asr-ish feats but NO audio block
+    meta = json.dumps({"asr_feats": {"ys_log_probs": [], "n_tokens": 3}})
+    assert row_to_utterance(_row(meta=meta)).has_audio is False
+
+
+def test_row_missing_or_corrupt_meta_treated_text_only():
+    # no physics available -> text-only path (don't fabricate a loudness-0 penalty
+    # or blip-drop a row whose capture stats are simply absent/corrupt)
+    assert row_to_utterance(_row(meta=None)).has_audio is False
+    assert row_to_utterance(_row(meta="{not valid json")).has_audio is False
+
+
 def test_speaker_total_parse():
     assert _speaker_total("w500:2/5") == 5
     assert _speaker_total("w1:1/1") == 1

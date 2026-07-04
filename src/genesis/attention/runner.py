@@ -98,7 +98,7 @@ async def run_shadow(
     for utt in src.iter_utterances():
         total += 1
         utt_by_id[utt.id] = utt
-        if is_blip(utt.rms, utt.duration_s, utt.n_tokens):
+        if is_blip(utt.rms, utt.duration_s, utt.n_tokens, has_audio=utt.has_audio):
             continue
         evaluated += 1
         state, ev = evaluate(utt, state, config)

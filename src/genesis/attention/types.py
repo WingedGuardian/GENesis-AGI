@@ -45,6 +45,7 @@ class AmbientUtterance:
     rms: float
     mode_state: str = "unknown"  # edge: space-separated active modes ("listen_active s2s_active global_mute"); "unknown" offline. Suppressors test `<mode> in mode_state.split()`.
     source: str = ""            # connection/device id
+    has_audio: bool = True      # False = text-only source (OMI): no capture physics (rms) to judge
 
 
 @dataclass(frozen=True)

@@ -1,6 +1,8 @@
 """capture-clarity pure-function tests (runtime copy of the garble_features math)."""
 import math
 
+import pytest
+
 from genesis.attention.clarity import capture_clarity, frac_below, is_blip
 
 
@@ -34,3 +36,35 @@ def test_is_blip():
     assert is_blip(rms=0.01, duration_s=0.4, n_tokens=1) is True     # near-silence + short
     assert is_blip(rms=0.01, duration_s=5.0, n_tokens=20) is False   # quiet but long + rich
     assert is_blip(rms=0.2, duration_s=0.2, n_tokens=1) is False     # loud -> not a blip
+
+
+# ── has_audio=False: the text-only path (OMI — no capture physics to judge) ─────────
+
+
+def test_capture_clarity_no_audio_is_three_term_mean():
+    # loudness dropped: mean of (confidence, length, richness) only.
+    # confidence=1.0, length=2.0/4.0, richness=4/8 -> (1.0 + 0.5 + 0.5) / 3
+    v = capture_clarity(rms=0.0, duration_s=2.0, frac_lt_1=0.0, n_tokens=4, has_audio=False)
+    assert v == pytest.approx(2.0 / 3.0)
+
+
+def test_capture_clarity_no_audio_ignores_rms():
+    a = capture_clarity(rms=0.0, duration_s=2.0, frac_lt_1=0.1, n_tokens=4, has_audio=False)
+    b = capture_clarity(rms=0.9, duration_s=2.0, frac_lt_1=0.1, n_tokens=4, has_audio=False)
+    assert a == b
+
+
+def test_capture_clarity_default_reproduces_four_term_mean():
+    # regression pin: the default (audio) path must stay byte-identical to the
+    # pre-has_audio math (also guards the mirrored edge-vendored copy's behaviour).
+    conf, loud = 1.0 - 0.2, (0.095 - 0.02) / (0.17 - 0.02)
+    length, rich = 2.0 / 4.0, 4 / 8.0
+    expected = (conf + loud + length + rich) / 4.0
+    assert capture_clarity(rms=0.095, duration_s=2.0, frac_lt_1=0.2, n_tokens=4) == pytest.approx(expected)
+
+
+def test_is_blip_no_audio_only_empty_text():
+    # no physics to judge: any tokens at all -> never a blip...
+    assert is_blip(rms=0.0, duration_s=0.2, n_tokens=1, has_audio=False) is False
+    # ...but a token-less row is still junk.
+    assert is_blip(rms=0.0, duration_s=0.2, n_tokens=0, has_audio=False) is True
