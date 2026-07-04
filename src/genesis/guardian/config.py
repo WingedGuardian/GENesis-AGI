@@ -104,9 +104,19 @@ class BriefingConfig:
 class SnapshotConfig:
     """Incus snapshot management settings."""
 
-    retention: int = 1
+    # Non-healthy snapshots kept by take()'s delete-before-create (the latest
+    # healthy snapshot is exempt there and rotated by mark_healthy instead).
+    # 2 so the healthy lifeline and the newest pre-recovery snapshot coexist.
+    retention: int = 2
     prefix: str = "guardian-"
     take_pre_recovery: bool = True  # Take snapshot before recovery action
+    # Daily 'healthy' snapshot while the guardian state is HEALTHY — produces
+    # the offline SNAPSHOT_ROLLBACK lifeline (without it, rollback has no
+    # target and always fails). Rotated on each take: exactly one healthy
+    # snapshot, ≤1 maintenance interval old, so CoW divergence never
+    # accumulates. Set false to stop taking (existing healthy snapshots then
+    # age out via max_age_days / expiry).
+    healthy_enabled: bool = True
     max_pool_usage_pct: float = 80.0  # Fallback threshold if headroom check unavailable
     min_headroom_gb: float = 5.0  # Minimum free space floor for headroom check
     # Age-based prune: delete guardian-* snapshots older than this many days,

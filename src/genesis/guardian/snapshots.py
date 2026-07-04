@@ -14,8 +14,15 @@ from datetime import UTC, datetime, timedelta
 
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.config import GuardianConfig
+from genesis.guardian.pool import measure_storage_pool
 
 logger = logging.getLogger(__name__)
+
+# Label suffix marking the offline snapshot-rollback lifeline. take(label=
+# _HEALTHY_LABEL) produces names ending in this suffix; prune()/take()
+# eviction exempt the latest one and mark_healthy() rotates the rest.
+_HEALTHY_LABEL = "healthy"
+_HEALTHY_SUFFIX = f"-{_HEALTHY_LABEL}"
 
 
 def _parse_created_at(raw: object) -> datetime | None:
@@ -117,6 +124,10 @@ class SnapshotManager:
         """Check if it's safe to take a snapshot using headroom-based gating.
 
         Strategy:
+        - LVM-thin pool detected: gate on REAL pool allocation (lvs data% /
+          metadata%) at the storage-pool `high` tiers. The df paths below
+          measure the host rootfs on LVM backends — the exact blindness behind
+          the thin-pool-exhaustion incident — so lvs is authoritative here.
         - With snapshot size history: require free > max(min_headroom_gb, 2x avg
           of last 3 snapshot sizes). Adapts to actual snapshot sizes.
         - Without history: require at least 10% of pool free (safe default for
@@ -124,6 +135,31 @@ class SnapshotManager:
         - If pool detection fails entirely: fall back to percentage threshold
           (max_pool_usage_pct) for robustness.
         """
+        try:
+            pool_status = await measure_storage_pool(self._config)
+        except Exception:
+            logger.warning("Pool measurement failed — using df fallback", exc_info=True)
+            pool_status = None
+        if pool_status is not None and pool_status.detected and (
+            pool_status.data_pct is not None or pool_status.metadata_pct is not None
+        ):
+            tiers = self._config.storage_pool
+            data = pool_status.data_pct
+            meta = pool_status.metadata_pct
+            if data is not None and data >= tiers.data_high_pct:
+                logger.error(
+                    "Pool data %.1f%% >= %.0f%% high tier — refusing snapshot",
+                    data, tiers.data_high_pct,
+                )
+                return False
+            if meta is not None and meta >= tiers.metadata_high_pct:
+                logger.error(
+                    "Pool metadata %.1f%% >= %.0f%% high tier — refusing snapshot",
+                    meta, tiers.metadata_high_pct,
+                )
+                return False
+            return True
+
         pool_info = await self._get_pool_free_bytes()
         if pool_info is None:
             # Can't get byte-level info — fall back to percentage check
@@ -185,18 +221,22 @@ class SnapshotManager:
         if not await self.safe_to_snapshot(snapshot_size_history):
             return None
 
-        # Delete-before-create: remove excess snapshots to stay within retention
+        # Delete-before-create: remove excess snapshots to stay within
+        # retention — but NEVER evict the latest healthy snapshot (the offline
+        # snapshot-rollback lifeline). prune() has the same exemption; without
+        # it here, a pre-recovery take at retention=1 would delete the healthy
+        # snapshot right before the risky action that might need it. Rotation
+        # of superseded healthy snapshots is mark_healthy()'s job (after a
+        # successful create — no zero-lifeline window).
         existing = await self.list_snapshots()
-        if existing and len(existing) >= self._retention:
-            for old_name in existing[self._retention - 1:]:
-                rc, _, stderr = await _run_subprocess(
-                    "incus", "snapshot", "delete", self._container, old_name,
-                    timeout=60.0,
-                )
-                if rc == 0:
+        latest_healthy = next(
+            (n for n in existing if n.endswith(_HEALTHY_SUFFIX)), None,
+        )
+        candidates = [n for n in existing if n != latest_healthy]
+        if candidates and len(candidates) >= self._retention:
+            for old_name in candidates[self._retention - 1:]:
+                if await self.delete(old_name):
                     logger.info("Deleted snapshot before create: %s", old_name)
-                else:
-                    logger.warning("Failed to delete snapshot %s: %s", old_name, stderr)
 
         ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         name = f"{self._prefix}{ts}"
@@ -233,6 +273,22 @@ class SnapshotManager:
                     )
 
         return name
+
+    async def delete(self, name: str) -> bool:
+        """Delete a snapshot by name. Returns True on success.
+
+        120s timeout: deleting a long-lived LVM-thin snapshot with heavy CoW
+        divergence involves real kernel metadata work (the incident snapshots
+        were months old) — 60s can genuinely be exceeded.
+        """
+        rc, _, stderr = await _run_subprocess(
+            "incus", "snapshot", "delete", self._container, name,
+            timeout=120.0,
+        )
+        if rc != 0:
+            logger.warning("Failed to delete snapshot %s: %s", name, stderr)
+            return False
+        return True
 
     async def restore(self, name: str) -> bool:
         """Restore a snapshot. Returns True on success."""
@@ -299,7 +355,7 @@ class SnapshotManager:
             return 0
 
         names = [name for name, _ in meta]
-        healthy = [n for n in names if n.endswith("-healthy")]
+        healthy = [n for n in names if n.endswith(_HEALTHY_SUFFIX)]
         latest_healthy = healthy[0] if healthy else None
 
         # Retention rule: keep newest N + latest healthy.
@@ -321,15 +377,9 @@ class SnapshotManager:
 
         deleted = 0
         for name in sorted(to_delete):
-            rc, _, stderr = await _run_subprocess(
-                "incus", "snapshot", "delete", self._container, name,
-                timeout=120.0,
-            )
-            if rc == 0:
+            if await self.delete(name):
                 logger.info("Pruned snapshot: %s", name)
                 deleted += 1
-            else:
-                logger.warning("Failed to prune snapshot %s: %s", name, stderr)
 
         return deleted
 
@@ -360,15 +410,30 @@ class SnapshotManager:
     async def mark_healthy(
         self, snapshot_size_history: list[int] | None = None,
     ) -> str | None:
-        """Take a snapshot labeled 'healthy'."""
-        return await self.take(
-            label="healthy", snapshot_size_history=snapshot_size_history,
+        """Take a 'healthy' snapshot, then rotate superseded healthy ones.
+
+        Create-then-delete ordering: the new lifeline must exist before the
+        old one goes, so a failed create leaves the previous healthy snapshot
+        intact and there is never a zero-lifeline window. Rotation keeps
+        exactly one healthy snapshot → CoW divergence stays bounded to one
+        maintenance interval (the incident was 2 months of divergence).
+        """
+        name = await self.take(
+            label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
         )
+        if name is None:
+            return None
+
+        for old_name in await self.list_snapshots():
+            is_superseded = old_name.endswith(_HEALTHY_SUFFIX) and old_name != name
+            if is_superseded and await self.delete(old_name):
+                logger.info("Rotated superseded healthy snapshot: %s", old_name)
+        return name
 
     async def get_latest_healthy(self) -> str | None:
         """Get the name of the most recent 'healthy' snapshot."""
         snapshots = await self.list_snapshots()
         for name in snapshots:
-            if name.endswith("-healthy"):
+            if name.endswith(_HEALTHY_SUFFIX):
                 return name
         return None

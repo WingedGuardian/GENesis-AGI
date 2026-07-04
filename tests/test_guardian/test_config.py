@@ -68,9 +68,11 @@ class TestGuardianConfigDefaults:
 
     def test_snapshot_defaults(self) -> None:
         cfg = GuardianConfig()
-        assert cfg.snapshots.retention == 1
+        # 2 = the healthy lifeline + the newest pre-recovery coexist.
+        assert cfg.snapshots.retention == 2
         assert cfg.snapshots.prefix == "guardian-"
         assert cfg.snapshots.take_pre_recovery is True
+        assert cfg.snapshots.healthy_enabled is True
         assert cfg.snapshots.max_pool_usage_pct == 80.0
 
 

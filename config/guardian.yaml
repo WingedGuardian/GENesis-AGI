@@ -50,9 +50,16 @@ briefing:
   max_age_s: 600
 
 snapshots:
-  retention: 1
+  # Non-healthy snapshots kept by delete-before-create (the latest healthy is
+  # exempt and rotated separately): 2 = healthy lifeline + newest pre-recovery.
+  retention: 2
   prefix: "guardian-"
   take_pre_recovery: false
+  # Daily 'healthy' snapshot while state is HEALTHY — the offline
+  # SNAPSHOT_ROLLBACK lifeline (rotated: exactly one, <=1 day old, so CoW
+  # divergence never accumulates). Requires pool headroom (refused at the
+  # storage_pool high tiers). Set false to disable.
+  healthy_enabled: true
   max_pool_usage_pct: 80
   # Age-prune backstop: delete guardian-* snapshots older than this many days,
   # except the newest and the latest healthy (the rollback lifeline). Catches

@@ -244,3 +244,94 @@ class TestRecoveryRevertCode:
             result = await engine.execute(_diagnosis(RecoveryAction.REVERT_CODE))
         assert result.success is True
         assert "reverted" in result.detail.lower()
+
+
+class TestRestartContainerStopped:
+    """`incus restart` fails on a STOPPED instance (2026-07-04 outage: unclean
+    host reboot left the container stopped and the guardian's designed
+    recovery action was a guaranteed no-op). Fall back to `incus start`."""
+
+    @pytest.mark.asyncio
+    async def test_start_fallback_when_stopped(
+        self, engine: RecoveryEngine,
+    ) -> None:
+        calls: list[tuple] = []
+
+        async def mock(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("incus", "restart"):
+                return (1, "", "Error: The instance is not running")
+            if args[:2] == ("incus", "start"):
+                return (0, "", "")
+            return (0, "", "")
+
+        with patch("genesis.guardian.recovery._run_subprocess", mock):
+            ok, detail = await engine._restart_container("genesis")
+        assert ok is True
+        assert "start" in detail.lower()
+        assert calls[-1][:3] == ("incus", "start", "genesis")
+
+    @pytest.mark.asyncio
+    async def test_reports_restart_error_when_start_also_fails(
+        self, engine: RecoveryEngine,
+    ) -> None:
+        async def mock(*args, **kwargs):
+            if args[:2] == ("incus", "restart"):
+                return (1, "", "restart boom")
+            if args[:2] == ("incus", "start"):
+                return (1, "", "already running")
+            return (0, "", "")
+
+        with patch("genesis.guardian.recovery._run_subprocess", mock):
+            ok, detail = await engine._restart_container("genesis")
+        assert ok is False
+        assert "restart boom" in detail
+
+
+class TestSnapshotRollbackRetry:
+    """Restore can fail when newer snapshots exist (documented ZFS behavior;
+    driver-agnostic hardening): delete newer guardian-* snapshots, retry once."""
+
+    def _engine_with(self, config, sm, dispatcher, snapshots) -> RecoveryEngine:
+        return RecoveryEngine(config, sm, snapshots, dispatcher)
+
+    @pytest.mark.asyncio
+    async def test_retry_after_deleting_newer(
+        self, config: GuardianConfig, sm, dispatcher,
+    ) -> None:
+        from unittest.mock import MagicMock
+        snapshots = MagicMock()
+        healthy = "guardian-20260701-000000-healthy"
+        snapshots.get_latest_healthy = AsyncMock(return_value=healthy)
+        snapshots.restore = AsyncMock(side_effect=[False, True])
+        snapshots.list_snapshots = AsyncMock(return_value=[
+            "guardian-20260702-000000-pre-recovery",  # newer than healthy
+            healthy,
+        ])
+        snapshots.delete = AsyncMock(return_value=True)
+
+        engine = self._engine_with(config, sm, dispatcher, snapshots)
+        ok, detail = await engine._snapshot_rollback()
+        assert ok is True
+        snapshots.delete.assert_called_once_with(
+            "guardian-20260702-000000-pre-recovery",
+        )
+        assert snapshots.restore.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_nothing_newer(
+        self, config: GuardianConfig, sm, dispatcher,
+    ) -> None:
+        from unittest.mock import MagicMock
+        snapshots = MagicMock()
+        healthy = "guardian-20260701-000000-healthy"
+        snapshots.get_latest_healthy = AsyncMock(return_value=healthy)
+        snapshots.restore = AsyncMock(return_value=False)
+        snapshots.list_snapshots = AsyncMock(return_value=[healthy])
+        snapshots.delete = AsyncMock(return_value=True)
+
+        engine = self._engine_with(config, sm, dispatcher, snapshots)
+        ok, _ = await engine._snapshot_rollback()
+        assert ok is False
+        snapshots.delete.assert_not_called()
+        assert snapshots.restore.call_count == 1

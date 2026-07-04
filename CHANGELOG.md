@@ -42,6 +42,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The Guardian now maintains a rolling "healthy" snapshot of the container — the restore point its
+  snapshot-rollback recovery always needed.** Once a day, while every health check passes, the Guardian
+  takes a `-healthy` container snapshot and deletes the previous one (exactly one exists, never more
+  than a day old, so copy-on-write growth can't quietly fill the storage pool the way stale snapshots
+  once did). Snapshot rollback — the one recovery action that works even with the network down — now
+  has a real target; before this, nothing ever created a healthy snapshot, so rollback could never
+  succeed. Kill switch: `snapshots.healthy_enabled: false` in `guardian.yaml`.
+
+- **The Genesis container now comes back on its own after a host reboot — including an unclean one.**
+  `host-setup.sh` sets incus `boot.autostart` on the container (applied to existing installs on
+  re-run, not just fresh ones). Previously an unclean host reboot could leave the container stopped
+  indefinitely, taking Genesis and its network access down until someone noticed.
+
 - **Three session skills now ship with the repo: `/shelve`, `/unshelve`, and `genesis-voice`.** `/shelve`
   bookmarks the current session with tags and a context note; `/unshelve` finds bookmarked sessions later by
   keyword and gives you the resume command. `genesis-voice` is the style guide Genesis applies when it writes
@@ -176,6 +189,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   spiral. That throttle lived only in memory, but the watchdog runs as a fresh short-lived process on
   each check, so it reset every run and never actually held. The cooldown is now persisted, so
   repeated reclaims stay correctly spaced even across the watchdog's process boundary.
+
+- **The Guardian's snapshot safety gate now measures real LVM thin-pool allocation instead of the
+  host root filesystem.** On LVM-backed storage, the free-space check behind "is it safe to take a
+  snapshot" ran `df` against a path that lives on the host's root disk — so it could happily approve
+  snapshots while the actual thin pool was nearly full (the same blindness behind the pool-exhaustion
+  outage). The gate now reads the pool's own data/metadata usage and refuses at the configured high
+  tiers; non-LVM backends keep the existing byte-headroom check, where `df` is correct.
+
+- **The Guardian can now recover a container that is fully stopped.** Its container-restart recovery
+  action used `incus restart`, which errors out on a stopped instance — exactly the state an unclean
+  host reboot leaves behind. On restart failure it now falls back to `incus start`.
+
+- **Taking a pre-recovery snapshot can no longer evict the healthy rollback snapshot.** The
+  make-room-before-create step deleted the oldest snapshots purely by count, and at the default
+  retention that meant deleting the healthy restore point right before the risky recovery action that
+  might need it. The latest healthy snapshot is now exempt, mirroring the existing prune exemption.
+
+- **Snapshot rollback now recovers when the storage driver refuses to restore a non-latest
+  snapshot.** ZFS (documented) won't restore past newer snapshots; if the restore fails and newer
+  guardian-created snapshots exist, they are deleted (they capture the already-broken state) and the
+  restore is retried once.
 
 - **Skill suggestions now actually fire — and nested skill packs show up in the catalog.** The
   prompt-time skill nudge scored matches against the length of your prompt, so on any wordy prompt a
