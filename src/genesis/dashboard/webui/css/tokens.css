@@ -1,0 +1,63 @@
+/* Genesis design tokens — single source of truth for all dashboard surfaces.
+ *
+ * Loaded by all five pages (dashboard, neural monitor, event log, error log,
+ * voice) immediately after index.css. ADDITIVE in P1: the legacy --color-*
+ * tokens in index.css are untouched so existing surfaces keep their exact
+ * colors; new/refactored components use these tokens, and existing surfaces
+ * migrate tab-by-tab in later phases (each migration is its own reviewed,
+ * intentional visual change).
+ *
+ * Spec: ~/.genesis/output/specs/dashboard-ui-spec.md §3.
+ */
+
+:root {
+  /* Surfaces (dark, 4 elevation steps) */
+  --s0: #0a0c0e;
+  --s1: #111417;
+  --s2: #191d21;
+  --s3: #22272c;
+  --border: #2c3238;
+  --border-strong: #3a424a;
+
+  /* Text (3-step hierarchy) */
+  --t1: #e8eaed;
+  --t2: #9aa3ab;
+  --t3: #6b7480;
+
+  /* Status — ONE canonical set, two intensities each.
+   * Five states everywhere: ok / warn / err / stale / off.
+   * `stale` is load-bearing: anything with last_run > 7d renders gray
+   * regardless of its health value. */
+  --ok: #4caf50;
+  --ok-dim: #2e5c33;
+  --warn: #f0ad4e;
+  --warn-dim: #6b4e1e;
+  --err: #d9534f;
+  --err-dim: #5c2624;
+  --info: #2196f3;
+  --info-dim: #1a3a5c;
+  --stale: #9e9e9e;
+  --accent: #7c4dff; /* ego/cognitive purple, already in use */
+
+  /* Type */
+  --font-ui: "Rubik", system-ui, sans-serif; /* Rubik loaded via index.css @import */
+  --font-data: "Roboto Mono", ui-monospace, monospace;
+  --fs-xs: 11px;
+  --fs-sm: 12.5px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+
+  /* Geometry */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --sp: 8px; /* 8px spacing grid: use multiples only */
+}
+
+/* Typography utilities — numbers/ids/timestamps/paths use the data font with
+ * tabular numerals so live-updating values don't cause layout shift. */
+.font-data,
+.num {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+}

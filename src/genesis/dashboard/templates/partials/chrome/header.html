@@ -1,0 +1,137 @@
+
+
+    <!-- Nav -->
+    <nav class="genesis-nav">
+      <a href="/genesis" class="active">Dashboard</a>
+      <a href="/genesis/logs">Event Log</a>
+      <a href="/genesis/errors">Error Log</a>
+      <a href="/genesis/monitor">Neural Monitor</a>
+    <a href="/genesis/voice" data-voice-nav style="display:none">Genesis Voice</a>
+    </nav>
+
+    <!-- Error banner -->
+    <div class="error-banner" x-show="$store.genesisDashboard.error" x-transition>
+      <span class="material-symbols-outlined">warning</span>
+      <span x-text="$store.genesisDashboard.error"></span>
+    </div>
+
+    <template x-if="$store.genesisDashboard.attentionItems.length > 0">
+      <div class="attention-strip">
+        <template x-for="(item, idx) in $store.genesisDashboard.attentionItems" :key="idx">
+          <a class="attention-card"
+             :href="item.tab ? '#' : (item.href || '#')"
+             :style="`text-decoration:none; color:inherit; border-color:${$store.genesisDashboard.attentionLevelColor(item.level)}55; background:${item.level === 'critical' ? 'rgba(217,83,79,0.09)' : item.level === 'warning' ? 'rgba(240,173,78,0.08)' : 'rgba(33,150,243,0.08)'}`"
+             @click="if (item.tab) { $event.preventDefault(); $store.genesisDashboard.navigateTo(item.tab, item.anchor); } else if (!item.href) { $event.preventDefault(); }">
+            <div class="attention-card-title" :style="`color:${$store.genesisDashboard.attentionLevelColor(item.level)}`">
+              <span class="status-dot" :style="`background:${$store.genesisDashboard.attentionLevelColor(item.level)}`"></span>
+              <span x-text="item.title"></span>
+            </div>
+            <div class="attention-card-detail" x-text="item.detail"></div>
+          </a>
+        </template>
+      </div>
+    </template>
+
+    <!-- Header -->
+    <h1>
+      <span class="material-symbols-outlined">neurology</span>
+      Genesis Dashboard
+      <span style="margin-left: auto; display: flex; gap: 0.5rem; align-items: center;">
+        <button @click="$store.genesisDashboard.restartBridge()"
+                :disabled="$store.genesisDashboard._restartingBridge"
+                style="font-size: 0.7rem; padding: 3px 8px; background: #1a237e; color: #90caf9; border: 1px solid #283593; border-radius: 4px; cursor: pointer;"
+                x-text="$store.genesisDashboard._restartingBridge ? 'Restarting...' : ('Restart ' + ($store.genesisDashboard.health.services?.bridge?.service_label || 'Genesis'))"></button>
+        <template x-if="$store.genesisDashboard.health.services?.host_framework?.detected">
+          <button @click="$store.genesisDashboard.restartHostFramework()"
+                  :disabled="$store.genesisDashboard._restartingHF"
+                  style="font-size: 0.7rem; padding: 3px 8px; background: #4a1400; color: #ef9a9a; border: 1px solid #5d1a00; border-radius: 4px; cursor: pointer;"
+                  x-text="$store.genesisDashboard._restartingHF ? 'Restarting...' : 'Restart ' + ($store.genesisDashboard.health.services.host_framework.name || 'Host')"></button>
+        </template>
+        <a href="#" @click.prevent="$store.genesisDashboard.navigateTo('chat')" class="back-link">
+          <span class="material-symbols-outlined" style="font-size:1rem">terminal</span>
+          Terminal
+        </a>
+        <template x-if="$store.genesisDashboard.authEnabled">
+          <button @click="$store.genesisDashboard.logout()"
+                  title="Logout"
+                  style="font-size: 0.7rem; padding: 3px 8px; background: transparent; color: var(--color-text-secondary); border: 1px solid var(--color-border); border-radius: 4px; cursor: pointer;">
+            <span class="material-symbols-outlined" style="font-size:0.9rem; vertical-align:middle;">logout</span>
+          </button>
+        </template>
+      </span>
+    </h1>
+
+    <!-- Tab navigation -->
+    <nav class="genesis-tabs">
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'overview' }"
+              @click="location.hash = 'overview'">Overview</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'chat' }"
+              @click="location.hash = 'chat'">Chat</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'work' }"
+              @click="location.hash = 'work'">Work</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'follow-ups' }"
+              @click="location.hash = 'follow-ups'">Follow-ups</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'observations' }"
+              @click="location.hash = 'observations'">Observations
+        <span x-show="$store.genesisDashboard.observationsCounts.total_unsurfaced > 0"
+              style="background:#ffa726; color:#000; border-radius:8px; padding:0 5px; font-size:0.6rem; margin-left:4px; font-weight:700;"
+              x-text="$store.genesisDashboard.observationsCounts.total_unsurfaced"></span>
+      </button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'traces' }"
+              @click="location.hash = 'traces'">Traces</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'autonomy' }"
+              @click="location.hash = 'autonomy'">Autonomy</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'memory' }"
+              @click="location.hash = 'memory'">Memory</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'knowledge' }"
+              @click="location.hash = 'knowledge'">Knowledge</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'campaigns' }"
+              @click="location.hash = 'campaigns'">Campaigns</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'references' }"
+              @click="location.hash = 'references'">References</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'files' }"
+              @click="location.hash = 'files'">Files</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'config' }"
+              @click="location.hash = 'config'">Configuration</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'internals' }"
+              @click="location.hash = 'internals'">Internals</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'backup' }"
+              @click="location.hash = 'backup'">Backup & Updates</button>
+    </nav>
+
+    <!-- Global system banners (page-top, full-width block flow, visible on every
+         tab). Kept OUTSIDE the flex-row .panel so each renders as a slim top bar,
+         not a stretched column, and so these global conditions surface on all tabs. -->
+    <!-- Stale data warning -->
+    <template x-if="$store.genesisDashboard.healthStale">
+      <div style="background: #d9534f; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;">
+        Health data stale — API unreachable. Data shown may be outdated.
+      </div>
+    </template>
+    <!-- Genesis paused banner -->
+    <template x-if="$store.genesisDashboard.pauseState.paused">
+      <div style="background: #f0ad4e; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;">
+        Genesis is paused — background processing suspended. Use the pause button or /pause off in Telegram to resume.
+      </div>
+    </template>
+    <!-- CC model-fallback banner: the server-side conversation is failed over to a
+         roster peer because the home model (Claude) is rate-limited account-wide. -->
+    <template x-if="$store.genesisDashboard.health.cc_sessions?.fallback?.is_fallback">
+      <div style="background: #f0ad4e; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;"
+           x-text="'⚠ Running on ' + ($store.genesisDashboard.health.cc_sessions.fallback.fallback || 'a roster peer') + ' — Claude ' + ($store.genesisDashboard.health.cc_sessions.fallback.reason || 'unavailable').replace(/_/g, ' ') + ' since ' + (($store.genesisDashboard.health.cc_sessions.fallback.since || '').replace('T', ' ').slice(0, 16) || 'unknown')"></div>
+    </template>
+    <!-- Resilience degradation banner -->
+    <template x-if="$store.genesisDashboard.health.resilience?.level && $store.genesisDashboard.health.resilience.level !== 'L0' && $store.genesisDashboard.health.resilience.level !== 'not configured'">
+      <div :style="`background: ${['L3', 'L4', 'L5', 'error'].includes($store.genesisDashboard.health.resilience.level) ? '#d9534f' : '#f0ad4e'}; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center; overflow-wrap: break-word; white-space: normal; line-height: 1.3;`"
+           x-text="'Resilience: ' + $store.genesisDashboard.health.resilience.level + ' — ' + ($store.genesisDashboard.health.resilience.summary || 'system is operating in degraded mode')">
+      </div>
+    </template>
+    <!-- Provider alert banners (credit exhaustion, missing critical keys) -->
+    <template x-for="alert in ($store.genesisDashboard.health.api_keys?.alerts || []).filter(a => a.severity === 'critical')" :key="'prov-crit-' + alert.provider_type">
+      <div style="background: rgba(217,83,79,0.15); border: 1px solid #d9534f; border-radius: 6px; padding: 0.5rem 1rem; margin: 0.25rem 0.5rem; font-size: 0.82rem; font-weight: 600; color: #d9534f; text-align: center;"
+           x-text="alert.message"></div>
+    </template>
+    <template x-for="alert in ($store.genesisDashboard.health.api_keys?.alerts || []).filter(a => a.severity === 'warning')" :key="'prov-warn-' + alert.provider_type">
+      <div style="background: rgba(240,173,78,0.15); border: 1px solid #f0ad4e; border-radius: 6px; padding: 0.5rem 1rem; margin: 0.25rem 0.5rem; font-size: 0.82rem; font-weight: 600; color: #f0ad4e; text-align: center;"
+           x-text="alert.message"></div>
+    </template>

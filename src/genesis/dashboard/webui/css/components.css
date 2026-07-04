@@ -1,0 +1,65 @@
+/* Genesis shared UI components — built exclusively on tokens.css.
+ *
+ * Loaded by all five pages after tokens.css. New primitives only: names are
+ * chosen not to collide with existing per-page classes (.status-chip,
+ * .empty-state stay untouched until their call sites migrate).
+ *
+ * Spec: ~/.genesis/output/specs/dashboard-ui-spec.md §3.3.
+ */
+
+/* ── Status chip ─────────────────────────────────────────────────────────
+ * Five states: ok / warn / err / stale / off. Shape glyphs (set by
+ * ui-utils.js chipGlyph) give color-blind support: ● ok, ▲ warn, ✕ err,
+ * ◔ stale, ○ off. Markup:
+ *   <span class="chip chip--ok">● healthy <time class="num">3m</time></span>
+ */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--sp) / 2);
+  padding: 2px calc(var(--sp) * 1);
+  border-radius: var(--r-sm);
+  font-family: var(--font-ui);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  line-height: 1.6;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.chip time,
+.chip .num {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+
+.chip--ok    { color: var(--ok);    background: color-mix(in srgb, var(--ok-dim) 45%, transparent);    border-color: var(--ok-dim); }
+.chip--warn  { color: var(--warn);  background: color-mix(in srgb, var(--warn-dim) 45%, transparent);  border-color: var(--warn-dim); }
+.chip--err   { color: var(--err);   background: color-mix(in srgb, var(--err-dim) 45%, transparent);   border-color: var(--err-dim); }
+/* chip--info is NOT a health state (chipState never returns it) — it's for
+ * informational/neutral chips applied via static class, e.g. count badges. */
+.chip--info  { color: var(--info);  background: color-mix(in srgb, var(--info-dim) 45%, transparent);  border-color: var(--info-dim); }
+.chip--stale { color: var(--stale); background: color-mix(in srgb, var(--stale) 12%, transparent);     border-color: color-mix(in srgb, var(--stale) 35%, transparent); }
+.chip--off   { color: var(--t3);    background: transparent;                                           border-color: var(--border); }
+
+/* ── Skeleton shimmer (loading placeholder) ──────────────────────────────
+ * Replaces flash-of-wrong-empty-state: show while `loaded` is false.
+ *   <div class="gskeleton" style="width: 12ch"></div>
+ */
+.gskeleton {
+  display: inline-block;
+  height: 1em;
+  border-radius: var(--r-sm);
+  background: linear-gradient(90deg, var(--s2) 25%, var(--s3) 50%, var(--s2) 75%);
+  background-size: 200% 100%;
+  animation: gskeleton-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes gskeleton-shimmer {
+  from { background-position: 200% 0; }
+  to   { background-position: -200% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gskeleton { animation: none; background: var(--s2); }
+}

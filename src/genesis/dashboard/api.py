@@ -6,19 +6,26 @@ submodules under genesis.dashboard.routes.
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from flask import send_from_directory
+from flask import make_response, render_template, request
 
 from genesis.dashboard._blueprint import blueprint
-
-TEMPLATE_DIR = Path(__file__).parent / "templates"
 
 
 @blueprint.route("/genesis")
 def dashboard_page():
-    """Serve the Genesis dashboard HTML page."""
-    return send_from_directory(str(TEMPLATE_DIR), "genesis_dashboard.html")
+    """Serve the Genesis dashboard HTML page.
+
+    Rendered through Jinja (blueprint template_folder) so the template can be
+    split into partials. ETag + conditional handling preserved manually —
+    ``send_from_directory`` gave 304s for free; ``render_template`` does not.
+    Known tradeoffs vs the static path (both fine for a page fetched once per
+    browser session): the template renders even on requests that end as 304,
+    and Range/Last-Modified support is dropped (ETag covers revalidation).
+    """
+    resp = make_response(render_template("genesis_dashboard.html"))
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.add_etag()
+    return resp.make_conditional(request)
 
 
 import genesis.dashboard.auth  # noqa: F401,E402 — registers before_request + auth routes

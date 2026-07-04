@@ -29,6 +29,15 @@ Multiple Claude Code sessions may work on this repo simultaneously. Rules:
   code from the worktree instead of main. This caused an I/O death spiral and
   repeated system crashes on 2026-03-16. Use `PYTHONPATH` instead.
   Enforced by PreToolUse hook.
+- **NEVER boot the full Genesis runtime (`genesis serve`) from/against a
+  worktree** — not even with the systemd unit stopped first. Spawned children
+  inherit the worktree `PYTHONPATH`, and path-keyed subsystems (Serena LSP,
+  code indexers, GitNexus) treat the worktree as a NEW ~190K-LOC project and
+  cold-index it in parallel. This OOM-crashed the container on 2026-07-03.
+  `PYTHONPATH` to a worktree is for **pytest only**. To verify worktree code
+  at runtime: merge-then-verify with instant `git revert` (for isolated /
+  frontend-only diffs), or a minimal Flask harness registering only the
+  blueprint under test. Enforced by PreToolUse hook.
 - **NEVER assume other worktrees are stale.** Always treat them as active
   sessions with uncommitted work. When the pre-commit hook blocks a main
   commit due to worktrees: USE A BRANCH. Never try to remove worktrees to

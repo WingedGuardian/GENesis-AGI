@@ -17,6 +17,9 @@ TEMPLATE_DIR = Path(__file__).parent / "templates"
 blueprint = Blueprint(
     "genesis_dashboard",
     __name__,
+    # Jinja search path for render_template — resolves relative to this package,
+    # so /genesis renders identically under standalone AND Agent Zero hosting.
+    template_folder="templates",
 )
 
 

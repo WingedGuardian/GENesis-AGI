@@ -1,0 +1,642 @@
+
+
+    <!-- Panel: Budgets & Operator Controls [Tab: config] -->
+    <div class="panel" id="budget-controls" x-show="$store.genesisDashboard.activeTab === 'config'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">account_balance_wallet</span>
+        Budgets & Operator Controls
+        <span class="panel-status">
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('budgets')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('budgets')"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <template x-if="$store.genesisDashboard.panelStatusDetail('budgets')">
+          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('budgets')"></div>
+        </template>
+        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem;">
+          <div style="background:var(--color-background); border:1px solid var(--color-border); border-radius:6px; padding:0.75rem;">
+            <div class="health-card-title">Active budgets</div>
+            <template x-if="$store.genesisDashboard.budgets.length === 0">
+              <div class="empty-state" style="padding:0.5rem 0;">No active budgets configured.</div>
+            </template>
+            <template x-for="b in $store.genesisDashboard.budgets" :key="b.budget_type">
+              <div style="font-size:0.8rem; padding:0.2rem 0;">
+                <div style="display:flex; justify-content:space-between; margin-bottom:0.15rem;">
+                  <span style="text-transform:capitalize;" x-text="b.budget_type"></span>
+                  <span x-text="(() => {
+                    const cost = $store.genesisDashboard.health.cost || {};
+                    const spent = b.budget_type === 'daily' ? cost.daily_usd
+                                : b.budget_type === 'weekly' ? cost.weekly_usd
+                                : cost.monthly_usd;
+                    return '$' + (spent || 0).toFixed(2) + ' / $' + Number(b.limit_usd).toFixed(2);
+                  })()"></span>
+                </div>
+                <div style="height:4px; background:rgba(255,255,255,0.08); border-radius:2px; overflow:hidden;">
+                  <div :style="(() => {
+                    const cost = $store.genesisDashboard.health.cost || {};
+                    const spent = b.budget_type === 'daily' ? cost.daily_usd
+                                : b.budget_type === 'weekly' ? cost.weekly_usd
+                                : cost.monthly_usd;
+                    const pct = Math.min(100, ((spent || 0) / Number(b.limit_usd)) * 100);
+                    const color = pct >= 100 ? '#d9534f' : pct >= Number(b.warning_pct) * 100 ? '#f0ad4e' : '#4caf50';
+                    return 'width:' + pct + '%; height:100%; background:' + color + '; border-radius:2px; transition:width 0.3s';
+                  })()"></div>
+                </div>
+              </div>
+            </template>
+          </div>
+          <div style="background:var(--color-background); border:1px solid var(--color-border); border-radius:6px; padding:0.75rem;">
+            <div class="health-card-title">Edit budget</div>
+            <div style="display:grid; gap:0.45rem; margin-top:0.3rem;">
+              <label style="font-size:0.72rem; color:var(--color-text-secondary);">
+                Budget type
+                <select x-model="$store.genesisDashboard.budgetEditor.budget_type"
+                        @change="$store.genesisDashboard.selectBudgetType($event.target.value)"
+                        style="display:block; width:100%; margin-top:0.15rem; font-size:0.76rem; padding:0.36rem 0.4rem; border-radius:4px; border:1px solid var(--color-border); background:rgba(255,255,255,0.03); color:var(--color-text-primary);">
+                  <option value="daily">daily</option>
+                  <option value="weekly">weekly</option>
+                  <option value="monthly">monthly</option>
+                </select>
+              </label>
+              <label style="font-size:0.72rem; color:var(--color-text-secondary);">
+                Limit (USD)
+                <input type="number" min="0.01" step="0.01"
+                       x-model="$store.genesisDashboard.budgetEditor.limit_usd"
+                       style="display:block; width:100%; box-sizing:border-box; margin-top:0.15rem; font-size:0.76rem; padding:0.36rem 0.4rem; border-radius:4px; border:1px solid var(--color-border); background:rgba(255,255,255,0.03); color:var(--color-text-primary);">
+              </label>
+              <label style="font-size:0.72rem; color:var(--color-text-secondary);">
+                Warning threshold
+                <input type="number" min="0.01" max="1" step="0.01"
+                       x-model="$store.genesisDashboard.budgetEditor.warning_pct"
+                       style="display:block; width:100%; box-sizing:border-box; margin-top:0.15rem; font-size:0.76rem; padding:0.36rem 0.4rem; border-radius:4px; border:1px solid var(--color-border); background:rgba(255,255,255,0.03); color:var(--color-text-primary);">
+              </label>
+              <div style="display:flex; gap:0.45rem; align-items:center; flex-wrap:wrap;">
+                <button type="button"
+                        style="font-size:0.74rem; padding:0.3rem 0.55rem; border-radius:4px; border:1px solid rgba(33,150,243,0.28); color:#2196F3; background:transparent; cursor:pointer;"
+                        :disabled="$store.genesisDashboard.budgetEditor.saving"
+                        @click="$store.genesisDashboard.saveBudget()"
+                        x-text="$store.genesisDashboard.budgetEditor.saving ? 'Saving...' : 'Save budget'"></button>
+                <span style="font-size:0.68rem; color:var(--color-text-secondary);">Threshold is stored as 0.01-1.00.</span>
+              </div>
+              <template x-if="$store.genesisDashboard.budgetEditor.message">
+                <div style="font-size:0.68rem; color:#4caf50;" x-text="$store.genesisDashboard.budgetEditor.message"></div>
+              </template>
+              <template x-if="$store.genesisDashboard.budgetEditor.error">
+                <div style="font-size:0.68rem; color:#d9534f;" x-text="$store.genesisDashboard.budgetEditor.error"></div>
+              </template>
+            </div>
+          </div>
+          <!-- Total Cost Picture: provider + CC shadow -->
+          <div style="background:var(--color-background); border:1px solid var(--color-border); border-radius:6px; padding:0.75rem;">
+            <div class="health-card-title">Total Cost</div>
+            <div style="font-size:0.78rem; line-height:1.7;">
+              <div style="display:flex; justify-content:space-between;">
+                <span>Provider (today)</span>
+                <span x-text="'$' + ($store.genesisDashboard.health.cost?.daily_usd?.toFixed(3) ?? '—')"></span>
+              </div>
+              <div style="display:flex; justify-content:space-between;">
+                <span>CC shadow (today)</span>
+                <span x-text="'$' + ($store.genesisDashboard.health.cc_sessions?.shadow_cost_today?.toFixed(3) ?? '—')"></span>
+              </div>
+              <div style="display:flex; justify-content:space-between; border-top:1px solid var(--color-border); padding-top:0.15rem; font-weight:600;">
+                <span>Combined (today)</span>
+                <span x-text="$store.genesisDashboard.health.cost?.daily_usd != null ? '$' + ($store.genesisDashboard.health.cost.daily_usd + ($store.genesisDashboard.health.cc_sessions?.shadow_cost_today || 0)).toFixed(3) : 'unavailable'"></span>
+              </div>
+              <div style="display:flex; justify-content:space-between; margin-top:0.3rem;">
+                <span>Provider (month)</span>
+                <span x-text="$store.genesisDashboard.health.cost?.monthly_usd != null ? '$' + $store.genesisDashboard.health.cost.monthly_usd.toFixed(2) : '—'"></span>
+              </div>
+              <div style="display:flex; justify-content:space-between;">
+                <span>CC shadow (month)</span>
+                <span x-text="$store.genesisDashboard.health.cc_sessions?.shadow_cost_month != null ? '$' + $store.genesisDashboard.health.cc_sessions.shadow_cost_month.toFixed(2) : '—'"></span>
+              </div>
+              <div style="display:flex; justify-content:space-between; border-top:1px solid var(--color-border); padding-top:0.15rem; font-weight:600;">
+                <span>Combined (month)</span>
+                <span x-text="$store.genesisDashboard.health.cost?.monthly_usd != null ? '$' + ($store.genesisDashboard.health.cost.monthly_usd + ($store.genesisDashboard.health.cc_sessions?.shadow_cost_month || 0)).toFixed(2) : 'unavailable'"></span>
+              </div>
+            </div>
+            <div class="health-card-detail" style="margin-top:0.35rem;">Provider cost is checked against budget limits. CC shadow cost is the Anthropic subscription usage from reflections and tasks — not gated by budget.</div>
+          </div>
+          <!-- Cost Attribution -->
+          <div style="background:var(--color-background); border:1px solid var(--color-border); border-radius:6px; padding:0.75rem;">
+            <div class="health-card-title">Cost Attribution (month)</div>
+            <template x-if="!($store.genesisDashboard.health.cost?.cost_by_provider || []).length">
+              <div class="empty-state" style="padding:0.3rem 0;">No cost events this month.</div>
+            </template>
+            <template x-for="p in ($store.genesisDashboard.health.cost?.cost_by_provider || [])" :key="p.provider">
+              <div style="font-size:0.76rem; display:flex; justify-content:space-between; padding:0.12rem 0;">
+                <span x-text="p.provider"></span>
+                <span x-text="'$' + p.month_usd.toFixed(3) + ' (' + p.calls + ')'"></span>
+              </div>
+            </template>
+            <template x-if="($store.genesisDashboard.health.cost?.cost_by_call_site || []).length > 0">
+              <div style="margin-top:0.35rem; border-top:1px solid var(--color-border); padding-top:0.25rem;">
+                <div style="font-size:0.68rem; font-weight:600; margin-bottom:0.15rem;">By call site</div>
+                <template x-for="cs in $store.genesisDashboard.health.cost.cost_by_call_site" :key="cs.call_site">
+                  <div style="font-size:0.72rem; display:flex; justify-content:space-between; padding:0.08rem 0;">
+                    <span style="opacity:0.7" x-text="cs.call_site"></span>
+                    <span x-text="'$' + cs.month_usd.toFixed(3)"></span>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+          <!-- Pressure & Enforcement -->
+          <div style="background:var(--color-background); border:1px solid var(--color-border); border-radius:6px; padding:0.75rem;">
+            <div class="health-card-title">Pressure & Enforcement</div>
+            <div style="font-size:0.78rem; line-height:1.6;">
+              <div>
+                Monthly pacing:
+                <span x-text="$store.genesisDashboard.health.cost?.forecast_monthly_usd != null ? '$' + $store.genesisDashboard.health.cost.forecast_monthly_usd.toFixed(2) + '/mo' : 'unknown'"
+                      :style="$store.genesisDashboard.health.cost?.budget_monthly_limit && $store.genesisDashboard.health.cost?.forecast_monthly_usd > $store.genesisDashboard.health.cost?.budget_monthly_limit ? 'color:#d9534f; font-weight:600' : ''"></span>
+              </div>
+              <div>
+                CC rate limits (24h):
+                <span x-text="$store.genesisDashboard.health.cc_sessions?.rate_limited_24h ?? 0"
+                      :style="($store.genesisDashboard.health.cc_sessions?.rate_limited_24h || 0) > 0 ? 'color:#d9534f; font-weight:600' : ''"></span>
+              </div>
+              <div>
+                Failed sessions (24h):
+                <span x-text="$store.genesisDashboard.health.cc_sessions?.failed_24h ?? 0"
+                      :style="($store.genesisDashboard.health.cc_sessions?.failed_24h || 0) > 0 ? 'color:#d9534f; font-weight:600' : ''"></span>
+              </div>
+            </div>
+            <div style="margin-top:0.4rem; padding:0.35rem 0.45rem; background:rgba(33,150,243,0.05); border-radius:4px; font-size:0.66rem; color:var(--color-text-secondary); line-height:1.5;">
+              <strong>Budget enforcement:</strong> When a budget is exceeded, paid LLM providers are skipped in genesis.routing — calls fall back to free providers. CC session costs are tracked separately and not gated by budget limits.
+            </div>
+          </div>
+          <!-- Operator Shortcuts -->
+          <div style="background:var(--color-background); border:1px solid var(--color-border); border-radius:6px; padding:0.75rem;">
+            <div class="health-card-title">Operator shortcuts</div>
+            <div style="display:flex; gap:0.45rem; flex-wrap:wrap; margin-top:0.25rem;">
+              <a href="/genesis/errors" style="font-size:0.76rem; padding:0.28rem 0.55rem; border-radius:4px; border:1px solid rgba(217,83,79,0.35); color:#d9534f; text-decoration:none;">Open errors</a>
+              <button style="font-size:0.76rem; padding:0.28rem 0.55rem; border-radius:4px; border:1px solid rgba(33,150,243,0.22); color:#2196F3; background:transparent; cursor:pointer;"
+                      @click="$store.genesisDashboard.navigateTo('internals', 'routing-health')">Review routing</button>
+              <a href="/genesis/logs" style="font-size:0.76rem; padding:0.28rem 0.55rem; border-radius:4px; border:1px solid var(--color-border); color:var(--color-text-secondary); text-decoration:none;">Open logs</a>
+              <button style="font-size:0.76rem; padding:0.28rem 0.55rem; border-radius:4px; border:1px solid rgba(240,173,78,0.35); color:#f0ad4e; background:transparent; cursor:pointer;"
+                      @click="$store.genesisDashboard.apiKeysModal.open = true">Review provider keys</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel: Autonomous CLI Policy [Tab: config] -->
+    <div class="panel" id="autonomous-cli-policy" x-show="$store.genesisDashboard.activeTab === 'config'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">policy</span>
+        Autonomous CLI Policy
+        <span class="panel-status">
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('autonomousCliPolicy')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('autonomousCliPolicy')"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <template x-if="$store.genesisDashboard.panelStatusDetail('autonomousCliPolicy')">
+          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('autonomousCliPolicy')"></div>
+        </template>
+        <template x-if="!$store.genesisDashboard.autonomousCliPolicy">
+          <div class="empty-state">Policy status not loaded yet.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.autonomousCliPolicy">
+          <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem;">
+            <div style="background:var(--color-background); border:1px solid var(--color-border); border-radius:6px; padding:0.75rem;">
+              <div class="health-card-title">Effective policy</div>
+              <div style="font-size:0.78rem; line-height:1.7;">
+                <div style="display:flex; justify-content:space-between;"><span>CLI fallback</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.autonomous_cli_fallback_enabled ? 'enabled' : 'disabled'"></span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Manual approval</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.manual_approval_required ? 'required' : 'not required'"></span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Channel</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.approval_channel || 'telegram'"></span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Re-ask</span><span x-text="(($store.genesisDashboard.autonomousCliPolicy.effective_policy?.reask_interval_hours || 24) + 'h')"></span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Source</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.source || 'unknown'"></span></div>
+              </div>
+            </div>
+            <div style="background:var(--color-background); border:1px solid var(--color-border); border-radius:6px; padding:0.75rem;">
+              <div class="health-card-title">Guardian export</div>
+              <div style="font-size:0.78rem; line-height:1.7;">
+                <div style="display:flex; justify-content:space-between;"><span>Shared export</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.shared_export_enabled ? 'enabled' : 'disabled'"></span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Last export</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.last_export_at ? $store.genesisDashboard.relativeTime($store.genesisDashboard.autonomousCliPolicy.last_export_at) : 'not exported'"></span></div>
+                <div style="display:flex; justify-content:space-between; gap:0.5rem;"><span>Path</span><span style="text-align:right; word-break:break-all;" x-text="$store.genesisDashboard.autonomousCliPolicy.last_export_path || 'pending'"></span></div>
+              </div>
+              <template x-if="$store.genesisDashboard.autonomousCliPolicy.last_export_error">
+                <div style="margin-top:0.45rem; font-size:0.7rem; color:#d9534f;" x-text="$store.genesisDashboard.autonomousCliPolicy.last_export_error"></div>
+              </template>
+            </div>
+            <div style="background:var(--color-background); border:1px solid var(--color-border); border-radius:6px; padding:0.75rem;">
+              <div class="health-card-title">Operator actions</div>
+              <div style="font-size:0.74rem; color:var(--color-text-secondary); line-height:1.6;">
+                Edit the <code>autonomous_cli_policy</code> settings domain below to change the global fallback gate. Changes hot-reload for Genesis-side routing and are exported to the shared Guardian mount.
+              </div>
+              <div style="display:flex; gap:0.45rem; flex-wrap:wrap; margin-top:0.55rem;">
+                <button style="font-size:0.76rem; padding:0.28rem 0.55rem; border-radius:4px; border:1px solid rgba(33,150,243,0.28); color:#2196F3; background:transparent; cursor:pointer;"
+                        @click="$store.genesisDashboard.fetchSettingsData('autonomous_cli_policy'); $store.genesisDashboard.settingsEditing = 'autonomous_cli_policy'; $nextTick(() => { const el = document.querySelector('[data-settings-domain=autonomous_cli_policy]'); if (el) el.scrollIntoView({behavior:'smooth', block:'center'}); })">Edit policy</button>
+                <button style="font-size:0.76rem; padding:0.28rem 0.55rem; border-radius:4px; border:1px solid var(--color-border); color:var(--color-text-secondary); background:transparent; cursor:pointer;"
+                        @click="$store.genesisDashboard.fetchAutonomousCliPolicy()">Refresh status</button>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Settings Hub [Tab: config] -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'config'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">tune</span>
+        Settings
+      </div>
+      <div class="panel-body">
+        <!-- Restart banner (shown after saving a setting that needs restart) -->
+        <template x-if="$store.genesisDashboard.settingsRestartMessage">
+          <div style="padding:0.5rem 0.75rem; border-radius:4px; margin-bottom:0.75rem; font-size:0.74rem; background:rgba(255,193,7,0.12); color:#856404; border:1px solid rgba(255,193,7,0.25); display:flex; align-items:center; gap:0.5rem;">
+            <span x-text="$store.genesisDashboard.settingsRestartMessage"></span>
+            <button style="font-size:0.7rem; padding:2px 8px; border-radius:3px; border:1px solid rgba(33,150,243,0.3); color:#2196F3; background:transparent; cursor:pointer;"
+                    @click="$store.genesisDashboard.restartBridge(); $store.genesisDashboard.settingsRestartMessage = null;">Restart Genesis</button>
+            <button class="btn-secondary" style="font-size:0.7rem; padding:2px 8px;"
+                    @click="$store.genesisDashboard.settingsRestartMessage = null">Dismiss</button>
+          </div>
+        </template>
+        <!-- System timezone display -->
+        <div style="font-size:0.72rem; color:var(--color-text-secondary); margin-bottom:0.75rem; display:flex; align-items:center; gap:0.4rem;">
+          <span class="material-symbols-outlined" style="font-size:0.9rem;">schedule</span>
+          System timezone: <strong x-text="$store.genesisDashboard.systemTimezone || 'loading...'" style="color:var(--color-text);"></strong>
+          <span style="font-size:0.65rem;">(all schedules use this timezone)</span>
+        </div>
+        <template x-if="!$store.genesisDashboard.settingsDomains">
+          <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
+        </template>
+        <template x-if="$store.genesisDashboard.settingsDomains">
+          <div>
+            <!-- Form domains (TTS, Ego, Inbox, Outreach) -->
+            <template x-for="domain in $store.genesisDashboard._sortedDomains($store.genesisDashboard.settingsDomains.filter(d => d.has_form))" :key="domain.name">
+              <div class="card" :data-settings-domain="domain.name" style="padding:1rem; margin-bottom:0.75rem;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+                  <div>
+                    <strong x-text="$store.genesisDashboard._DOMAIN_LABELS[domain.name] || domain.name"></strong>
+                    <span style="font-size:0.75rem; color:var(--color-text-secondary); margin-left:0.5rem;" x-text="domain.description"></span>
+                  </div>
+                  <div style="display:flex; gap:0.5rem; align-items:center;">
+                    <template x-if="domain.needs_restart">
+                      <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes to this setting require a genesis-server restart to take effect">Changing these settings requires a restart to apply</span>
+                    </template>
+                    <template x-if="$store.genesisDashboard.settingsEditing !== domain.name">
+                      <button style="font-size:0.75rem; padding:2px 10px;" @click="$store.genesisDashboard.startEditSettings(domain.name)">Edit</button>
+                    </template>
+                  </div>
+                </div>
+                <template x-if="domain.name === 'ego' && $store.genesisDashboard.egoStatus">
+                  <div style="font-size:0.72rem; background:rgba(192,132,252,0.06); border:1px solid rgba(192,132,252,0.15); border-radius:4px; padding:0.4rem 0.6rem; margin-bottom:0.5rem; display:flex; align-items:center; gap:0.4rem;">
+                    <span class="status-dot" :style="`background: ${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.egoSemantic().state)}`"></span>
+                    <span :style="`color: ${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.egoSemantic().state)}`"
+                          x-text="$store.genesisDashboard.egoStatus.enabled ? 'Ego active' : 'Ego disabled'"></span>
+                    <span style="color:var(--color-text-secondary);" x-text="' — ' + ($store.genesisDashboard.egoStatus.focus_summary || 'no focus')"></span>
+                  </div>
+                </template>
+                <!-- Collapsed view: show key values -->
+                <template x-if="$store.genesisDashboard.settingsEditing !== domain.name">
+                  <div style="font-size:0.78rem; color:var(--color-text-secondary);">
+                    <template x-if="$store.genesisDashboard.settingsData[domain.name]">
+                      <div style="display:flex; flex-wrap:wrap; gap:0.5rem 1.5rem;">
+                        <template x-for="[k, v] in Object.entries($store.genesisDashboard.settingsData[domain.name]).filter(([k]) => !k.startsWith('_')).slice(0, 8)" :key="k">
+                          <span><span style="color:var(--color-text-secondary);" x-text="($store.genesisDashboard._settingLabel(k)) + ': '"></span><span x-text="typeof v === 'object' ? '...' : v"></span></span>
+                        </template>
+                      </div>
+                    </template>
+                    <template x-if="!$store.genesisDashboard.settingsData[domain.name]">
+                      <span style="cursor:pointer; text-decoration:underline;" @click="$store.genesisDashboard.fetchSettingsData(domain.name)">Load settings</span>
+                    </template>
+                  </div>
+                </template>
+                <!-- Expanded edit view -->
+                <template x-if="$store.genesisDashboard.settingsEditing === domain.name && $store.genesisDashboard.settingsData[domain.name]">
+                  <div>
+                    <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:0.5rem; margin-top:0.5rem;">
+                      <template x-for="[key, val] in Object.entries($store.genesisDashboard.settingsData[domain.name]).filter(([k, v]) => typeof v !== 'object')" :key="key">
+                        <div style="display:flex; flex-direction:column; gap:2px;">
+                          <label style="font-size:0.7rem; color:var(--color-text-secondary);"
+                                 x-text="$store.genesisDashboard._settingLabel(key)"
+                                 :title="$store.genesisDashboard._settingDesc(key)"></label>
+                          <template x-if="typeof val === 'boolean'">
+                            <select style="font-size:0.78rem; padding:3px 6px;"
+                                    @change="$store.genesisDashboard.settingsData[domain.name][key] = $event.target.value === 'true'"
+                                    :value="val">
+                              <option value="true" :selected="val === true">true</option>
+                              <option value="false" :selected="val === false">false</option>
+                            </select>
+                          </template>
+                          <template x-if="typeof val === 'number'">
+                            <input type="number" style="font-size:0.78rem; padding:3px 6px; width:100%;"
+                                   :value="val" step="any"
+                                   @change="$store.genesisDashboard.settingsData[domain.name][key] = parseFloat($event.target.value)">
+                          </template>
+                          <template x-if="typeof val === 'string' && $store.genesisDashboard._SETTING_CHOICES[key]">
+                            <select style="font-size:0.78rem; padding:3px 6px; width:100%;"
+                                    @change="$store.genesisDashboard.settingsData[domain.name][key] = $event.target.value"
+                                    :value="val">
+                              <template x-for="opt in $store.genesisDashboard._SETTING_CHOICES[key]" :key="opt">
+                                <option :value="opt" :selected="val === opt" x-text="opt"></option>
+                              </template>
+                            </select>
+                          </template>
+                          <template x-if="typeof val === 'string' && !$store.genesisDashboard._SETTING_CHOICES[key]">
+                            <input type="text" style="font-size:0.78rem; padding:3px 6px; width:100%;"
+                                   :value="val"
+                                   @change="$store.genesisDashboard.settingsData[domain.name][key] = $event.target.value">
+                          </template>
+                        </div>
+                      </template>
+                    </div>
+                    <!-- Nested objects -->
+                    <template x-for="[key, val] in Object.entries($store.genesisDashboard.settingsData[domain.name]).filter(([k, v]) => typeof v === 'object' && v !== null)" :key="key">
+                      <div style="margin-top:0.5rem;">
+                        <div style="font-size:0.7rem; color:var(--color-text-secondary); margin-bottom:2px;" x-text="$store.genesisDashboard._settingLabel(key)"></div>
+                        <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:0.5rem;">
+                          <template x-for="[sk, sv] in Object.entries(val)" :key="sk">
+                            <div style="display:flex; flex-direction:column; gap:2px;">
+                              <label style="font-size:0.7rem; color:var(--color-text-secondary);"
+                                     x-text="$store.genesisDashboard._settingLabel(sk)"
+                                     :title="$store.genesisDashboard._settingDesc(sk)"></label>
+                              <template x-if="typeof sv === 'boolean'">
+                                <select style="font-size:0.78rem; padding:3px 6px;"
+                                        @change="$store.genesisDashboard.settingsData[domain.name][key][sk] = $event.target.value === 'true'"
+                                        :value="sv">
+                                  <option value="true" :selected="sv === true">true</option>
+                                  <option value="false" :selected="sv === false">false</option>
+                                </select>
+                              </template>
+                              <template x-if="typeof sv === 'number'">
+                                <input type="number" style="font-size:0.78rem; padding:3px 6px; width:100%;"
+                                       :value="sv" step="any"
+                                       @change="$store.genesisDashboard.settingsData[domain.name][key][sk] = parseFloat($event.target.value)">
+                              </template>
+                              <template x-if="typeof sv === 'string' && $store.genesisDashboard._SETTING_CHOICES[sk]">
+                                <select style="font-size:0.78rem; padding:3px 6px; width:100%;"
+                                        @change="$store.genesisDashboard.settingsData[domain.name][key][sk] = $event.target.value"
+                                        :value="sv">
+                                  <template x-for="opt in $store.genesisDashboard._SETTING_CHOICES[sk]" :key="opt">
+                                    <option :value="opt" :selected="sv === opt" x-text="opt"></option>
+                                  </template>
+                                </select>
+                              </template>
+                              <template x-if="typeof sv === 'string' && !$store.genesisDashboard._SETTING_CHOICES[sk]">
+                                <input type="text" style="font-size:0.78rem; padding:3px 6px; width:100%;"
+                                       :value="sv"
+                                       @change="$store.genesisDashboard.settingsData[domain.name][key][sk] = $event.target.value">
+                              </template>
+                            </div>
+                          </template>
+                        </div>
+                      </div>
+                    </template>
+                    <div style="display:flex; gap:0.5rem; margin-top:0.75rem;">
+                      <button @click="$store.genesisDashboard.saveSettings(domain.name)"
+                              :disabled="$store.genesisDashboard.settingsSaving"
+                              x-text="$store.genesisDashboard.settingsSaving ? 'Saving...' : 'Save'"></button>
+                      <button class="btn-secondary"
+                              @click="$store.genesisDashboard.settingsEditing = null; $store.genesisDashboard.fetchSettingsData(domain.name)">Cancel</button>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </template>
+
+            <!-- Settings Index: non-form domains -->
+            <div style="margin-top:1rem;">
+              <h3 style="font-size:0.85rem; margin:0 0 0.5rem 0; color:var(--color-text-secondary);">Other Settings</h3>
+              <table style="width:100%; font-size:0.78rem; border-collapse:collapse;">
+                <thead>
+                  <tr style="border-bottom:1px solid var(--color-border); text-align:left;">
+                    <th style="padding:4px 8px;">Setting</th>
+                    <th style="padding:4px 8px;">How to Change</th>
+                    <th style="padding:4px 8px;">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="domain in $store.genesisDashboard._sortedDomains($store.genesisDashboard.settingsDomains.filter(d => !d.has_form))" :key="domain.name">
+                    <tr style="border-bottom:1px solid var(--color-border);"
+                        :style="domain.readonly ? 'cursor:pointer;' : ''"
+                        @click="domain.readonly && $store.genesisDashboard.viewSettings(domain.name)">
+                      <td style="padding:4px 8px;">
+                        <strong x-text="$store.genesisDashboard._DOMAIN_LABELS[domain.name] || domain.name"></strong>
+                        <div style="font-size:0.7rem; color:var(--color-text-secondary);" x-text="domain.description"></div>
+                        <!-- Expandable readonly config viewer -->
+                        <template x-if="domain.readonly && $store.genesisDashboard.settingsViewing === domain.name">
+                          <div style="margin-top:0.4rem; padding:0.5rem; background:var(--color-bg-secondary); border:1px solid var(--color-border); border-radius:4px;" @click.stop>
+                            <template x-if="!$store.genesisDashboard.settingsData[domain.name]">
+                              <span style="font-size:0.72rem; color:var(--color-text-secondary);">Loading...</span>
+                            </template>
+                            <template x-if="domain.dedicated_tool && $store.genesisDashboard.settingsData[domain.name]">
+                              <div style="font-size:0.72rem; color:var(--color-text-secondary);">
+                                Managed by a dedicated tool. Ask Genesis: <em x-text="'&quot;show my ' + domain.name.replace(/_/g, ' ') + '&quot;'"></em>
+                              </div>
+                            </template>
+                            <template x-if="!domain.dedicated_tool && $store.genesisDashboard.settingsData[domain.name]">
+                              <div>
+                                <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:0.3rem 1rem; font-size:0.72rem;">
+                                  <template x-for="[key, val] in Object.entries($store.genesisDashboard.settingsData[domain.name]).filter(([k, v]) => typeof v !== 'object' && !k.startsWith('_'))" :key="key">
+                                    <div>
+                                      <span style="color:var(--color-text-secondary);" x-text="$store.genesisDashboard._settingLabel(key) + ':'"></span>
+                                      <span style="margin-left:0.25rem;" x-text="String(val)"></span>
+                                    </div>
+                                  </template>
+                                </div>
+                                <template x-for="[key, val] in Object.entries($store.genesisDashboard.settingsData[domain.name]).filter(([k, v]) => typeof v === 'object' && v !== null && !k.startsWith('_'))" :key="key">
+                                  <div style="margin-top:0.35rem;">
+                                    <div style="font-size:0.68rem; color:var(--color-text-secondary); font-weight:600; margin-bottom:2px;" x-text="$store.genesisDashboard._settingLabel(key)"></div>
+                                    <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:0.2rem 1rem; font-size:0.72rem; padding-left:0.5rem;">
+                                      <template x-for="[sk, sv] in Object.entries(val)" :key="sk">
+                                        <div>
+                                          <span style="color:var(--color-text-secondary);" x-text="$store.genesisDashboard._settingLabel(sk) + ':'"></span>
+                                          <span style="margin-left:0.25rem;" x-text="typeof sv === 'object' ? JSON.stringify(sv) : String(sv)"></span>
+                                        </div>
+                                      </template>
+                                    </div>
+                                  </div>
+                                </template>
+                                <div x-show="domain.readonly_reason" style="font-size:0.65rem; color:var(--color-text-secondary); margin-top:0.4rem; padding-top:0.3rem; border-top:1px solid var(--color-border);"
+                                     x-text="domain.readonly_reason"></div>
+                              </div>
+                            </template>
+                          </div>
+                        </template>
+                      </td>
+                      <td style="padding:4px 8px;">
+                        <template x-if="!domain.readonly && domain.dedicated_tool">
+                          <span title="Say this to Genesis in conversation to change these settings" style="cursor:help;">Chat: <em x-text="'&quot;update my ' + domain.name.replace(/_/g, ' ') + '&quot;'"></em></span>
+                        </template>
+                        <template x-if="!domain.readonly && !domain.dedicated_tool">
+                          <span title="Say this to Genesis in conversation to change these settings" style="cursor:help;">Chat: <em x-text="'&quot;update ' + domain.name.replace(/_/g, ' ') + ' settings&quot;'"></em></span>
+                        </template>
+                        <template x-if="domain.readonly">
+                          <span style="color:var(--color-text-secondary); cursor:help;"
+                                :title="domain.readonly_reason || 'This setting cannot be edited from the dashboard'"
+                                x-text="domain.readonly_reason || 'Read-only'"></span>
+                        </template>
+                      </td>
+                      <td style="padding:4px 8px;">
+                        <template x-if="domain.readonly">
+                          <span style="font-size:0.65rem; background:var(--color-background); padding:2px 6px; border-radius:3px; cursor:pointer;"
+                                @click.stop="$store.genesisDashboard.viewSettings(domain.name)"
+                                x-text="$store.genesisDashboard.settingsViewing === domain.name ? '\u25BC viewing' : '\u25B6 view'"></span>
+                        </template>
+                        <template x-if="domain.needs_restart && !domain.readonly">
+                          <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes require a genesis-server restart to take effect">Changing these settings requires a restart to apply</span>
+                        </template>
+                        <template x-if="!domain.readonly && !domain.needs_restart">
+                          <span style="font-size:0.65rem; background:#d4edda; color:#155724; padding:2px 6px; border-radius:3px;">hot-reload</span>
+                        </template>
+                      </td>
+                    </tr>
+                  </template>
+                  <!-- Non-MCP settings -->
+                  <tr style="border-bottom:1px solid var(--color-border);">
+                    <td style="padding:4px 8px;"><strong>Budgets</strong><div style="font-size:0.7rem; color:var(--color-text-secondary);">Daily/weekly/monthly cost limits</div></td>
+                    <td style="padding:4px 8px;"><span style="color:#4caf50;">Budget panel above</span></td>
+                    <td style="padding:4px 8px;"><span style="font-size:0.65rem; background:#d4edda; color:#155724; padding:2px 6px; border-radius:3px;">hot-reload</span></td>
+                  </tr>
+                  <tr style="border-bottom:1px solid var(--color-border);">
+                    <td style="padding:4px 8px;"><strong>Model Routing</strong><div style="font-size:0.7rem; color:var(--color-text-secondary);">Provider chains per call site</div></td>
+                    <td style="padding:4px 8px;">Routing panel on <a href="#internals" style="color:var(--color-primary);">Internals tab</a></td>
+                    <td style="padding:4px 8px;"><span style="font-size:0.65rem; background:#d4edda; color:#155724; padding:2px 6px; border-radius:3px;">hot-reload</span></td>
+                  </tr>
+                  <tr style="border-bottom:1px solid var(--color-border);">
+                    <td style="padding:4px 8px;"><strong>Modules</strong><div style="font-size:0.7rem; color:var(--color-text-secondary);">Enable/disable capability modules</div></td>
+                    <td style="padding:4px 8px;">Module cards on <a href="#internals" style="color:var(--color-primary);">Internals tab</a></td>
+                    <td style="padding:4px 8px;"><span style="font-size:0.65rem; background:#d4edda; color:#155724; padding:2px 6px; border-radius:3px;">hot-reload</span></td>
+                  </tr>
+                  <tr>
+                    <td style="padding:4px 8px;"><strong>Identity & Skills</strong><div style="font-size:0.7rem; color:var(--color-text-secondary);">SOUL.md, CONVERSATION.md, skill files</div></td>
+                    <td style="padding:4px 8px;"><span style="color:#4caf50;">Config Files panel below</span></td>
+                    <td style="padding:4px 8px;"><span style="font-size:0.65rem; background:#d4edda; color:#155724; padding:2px 6px; border-radius:3px;">hot-reload</span></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Provider Keys [Tab: config] -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'config'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">key</span>
+        Provider Keys
+      </div>
+      <div class="panel-body">
+        <div style="font-size:0.74rem; color:var(--color-text-secondary); margin-bottom:0.75rem;">
+          Manage API keys and credentials for external providers.
+        </div>
+        <!-- Message banner -->
+        <template x-if="$store.genesisDashboard.secretsMessage">
+          <div style="padding:0.5rem 0.75rem; border-radius:4px; margin-bottom:0.75rem; font-size:0.74rem;"
+               :style="{
+                 'background': $store.genesisDashboard.secretsMessage.type === 'error' ? 'rgba(217,83,79,0.12)' : 'rgba(255,193,7,0.12)',
+                 'color': $store.genesisDashboard.secretsMessage.type === 'error' ? '#d9534f' : '#856404',
+                 'border': $store.genesisDashboard.secretsMessage.type === 'error' ? '1px solid rgba(217,83,79,0.25)' : '1px solid rgba(255,193,7,0.25)'
+               }">
+            <span x-text="$store.genesisDashboard.secretsMessage.text"></span>
+            <template x-if="$store.genesisDashboard.secretsMessage.type === 'restart'">
+              <button style="margin-left:0.5rem; font-size:0.7rem; padding:2px 8px; border-radius:3px; border:1px solid rgba(33,150,243,0.3); color:#2196F3; background:transparent; cursor:pointer;"
+                      @click="$store.genesisDashboard.restartBridge()">Restart Genesis</button>
+            </template>
+          </div>
+        </template>
+        <!-- Loading state -->
+        <template x-if="!$store.genesisDashboard.secretsGroups">
+          <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
+        </template>
+        <!-- Key groups -->
+        <template x-if="$store.genesisDashboard.secretsGroups">
+          <div>
+            <template x-for="group in $store.genesisDashboard.secretsGroups" :key="group.name">
+              <div style="margin-bottom:0.75rem;">
+                <div style="font-size:0.72rem; font-weight:600; color:var(--color-text-secondary); margin-bottom:0.35rem; text-transform:uppercase; letter-spacing:0.03em;" x-text="group.name"></div>
+                <template x-for="k in group.keys" :key="k.key">
+                  <div style="display:flex; align-items:center; gap:0.5rem; padding:0.35rem 0; border-bottom:1px solid var(--color-border); font-size:0.78rem; flex-wrap:wrap;">
+                    <!-- Status dot (health-aware) -->
+                    <span class="status-dot" :style="`background:${$store.genesisDashboard.secretStatusColor($store.genesisDashboard.secretHealthStatus(k))}`"></span>
+                    <!-- Label + env var -->
+                    <span style="font-weight:600; min-width:90px;" x-text="k.label"></span>
+                    <code style="font-size:0.65rem; color:var(--color-text-secondary);" x-text="k.key"></code>
+                    <!-- Status text (health-aware) -->
+                    <span style="margin-left:auto; min-width:70px; text-align:right;"
+                          :style="`color:${$store.genesisDashboard.secretStatusColor($store.genesisDashboard.secretHealthStatus(k))}`"
+                          :title="$store.genesisDashboard.secretHealthStatus(k) === 'error' ? 'Circuit breaker OPEN — provider unreachable or failing' : $store.genesisDashboard.secretHealthStatus(k) === 'degraded' ? 'Some providers using this key have circuit breakers open' : ''"
+                          x-text="({healthy:'healthy', configured:'configured', validated:'validated', degraded:'degraded', error:'unreachable', not_set:'not set'})[$store.genesisDashboard.secretHealthStatus(k)] || 'not set'"></span>
+                    <!-- Signup link -->
+                    <template x-if="k.signup_url && k.status === 'not_set'">
+                      <a :href="'https://' + k.signup_url" target="_blank" rel="noopener"
+                         style="font-size:0.65rem; color:var(--color-primary); text-decoration:none;"
+                         x-text="k.signup_url"></a>
+                    </template>
+                    <!-- Edit/Set button -->
+                    <button class="btn-secondary" style="font-size:0.68rem;"
+                            @click="$store.genesisDashboard.toggleSecretEdit(k.key)"
+                            x-text="$store.genesisDashboard.secretsEditing[k.key] ? 'Cancel' : (k.status === 'not_set' ? 'Set' : 'Edit')"></button>
+                    <!-- Inline edit row -->
+                    <template x-if="$store.genesisDashboard.secretsEditing[k.key]">
+                      <div style="width:100%; display:flex; gap:0.4rem; align-items:center; margin-top:0.25rem;">
+                        <input type="text" placeholder="Enter value..."
+                               style="flex:1; font-size:0.76rem; padding:4px 8px; border:1px solid var(--color-border); border-radius:4px; background:var(--color-background); color:var(--color-text);"
+                               :value="$store.genesisDashboard.secretsValues[k.key] ?? k.value ?? ''"
+                               @input="$store.genesisDashboard.secretsValues = {...$store.genesisDashboard.secretsValues, [k.key]: $event.target.value}">
+                        <button style="font-size:0.7rem; padding:3px 10px; border-radius:4px; border:1px solid rgba(33,150,243,0.3); color:#2196F3; background:transparent; cursor:pointer;"
+                                :disabled="$store.genesisDashboard.secretsSaving"
+                                @click="$store.genesisDashboard.saveSecret(k.key)"
+                                x-text="$store.genesisDashboard.secretsSaving ? 'Saving...' : 'Save'"></button>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Config Files (Collapsible) [Tab: config] -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'config'">
+      <div class="panel-header config-toggle"
+           @click="$store.genesisDashboard.configExpanded = !$store.genesisDashboard.configExpanded">
+        <span class="material-symbols-outlined"
+              :style="$store.genesisDashboard.configExpanded ? 'transform: rotate(90deg)' : ''">
+          chevron_right
+        </span>
+        <span class="material-symbols-outlined">description</span>
+        Config Files
+      </div>
+      <div class="panel-body" x-show="$store.genesisDashboard.configExpanded" x-transition>
+        <div style="display:flex;gap:0.3rem;flex-wrap:wrap;margin-bottom:0.75rem;">
+          <button style="font-size:0.68rem;padding:0.2rem 0.5rem;border-radius:3px;cursor:pointer;border:1px solid var(--color-border);background:transparent;color:var(--color-text-secondary);"
+                  :style="!$store.genesisDashboard.configCategoryFilter ? 'background:rgba(33,150,243,0.15);color:#2196F3;border-color:rgba(33,150,243,0.3)' : ''"
+                  @click="$store.genesisDashboard.configCategoryFilter = null">All</button>
+          <template x-for="cat in [...new Set($store.genesisDashboard.configFiles.map(f => f.category))].sort()" :key="cat">
+            <button style="font-size:0.68rem;padding:0.2rem 0.5rem;border-radius:3px;cursor:pointer;border:1px solid var(--color-border);background:transparent;color:var(--color-text-secondary);"
+                    :style="$store.genesisDashboard.configCategoryFilter === cat ? 'background:rgba(33,150,243,0.15);color:#2196F3;border-color:rgba(33,150,243,0.3)' : ''"
+                    @click="$store.genesisDashboard.configCategoryFilter = cat"
+                    x-text="cat"></button>
+          </template>
+        </div>
+        <template x-for="(files, category) in (() => {
+          const grouped = $store.genesisDashboard.groupedConfigFiles;
+          const filter = $store.genesisDashboard.configCategoryFilter;
+          if (!filter) return grouped;
+          const r = {}; if (grouped[filter]) r[filter] = grouped[filter]; return r;
+        })()" :key="category">
+          <div class="config-category">
+            <div class="config-category-title" x-text="category"></div>
+            <template x-for="file in files" :key="file.path || file.name">
+              <div class="config-file">
+                <span class="config-file-name" x-text="file.name"></span>
+                <button class="config-edit-btn"
+                        @click="$store.genesisDashboard.openConfigFile(file)"
+                        x-text="file.editable !== false ? 'Edit' : 'View'">
+                </button>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+    </div>

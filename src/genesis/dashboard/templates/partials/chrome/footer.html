@@ -1,0 +1,36 @@
+
+
+  <!-- Kill Switch Footer -->
+  <div style="position: fixed; bottom: 0; left: 0; right: 0; z-index: 1000;
+              background: var(--color-bg); border-top: 1px solid var(--color-border);
+              padding: 0.5rem 1.5rem; display: flex; align-items: center; justify-content: space-between;"
+       x-data>
+    <div style="display: flex; align-items: center; gap: 0.75rem; font-size: 0.78rem;">
+      <template x-if="$store.genesisDashboard.pauseState.paused">
+        <div style="display: flex; align-items: center; gap: 0.5rem;">
+          <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #ffa726;"></span>
+          <span style="color: #ffa726; font-weight: 600;">PAUSED</span>
+          <span style="color: var(--color-text-secondary);"
+                x-text="$store.genesisDashboard.pauseState.since
+                  ? 'since ' + new Date($store.genesisDashboard.pauseState.since).toLocaleTimeString()
+                  : ''"></span>
+        </div>
+      </template>
+      <template x-if="!$store.genesisDashboard.pauseState.paused">
+        <div style="display: flex; align-items: center; gap: 0.5rem;">
+          <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #66bb6a;"></span>
+          <span style="color: #66bb6a; font-weight: 600;">RUNNING</span>
+        </div>
+      </template>
+    </div>
+    <button @click="$store.genesisDashboard.togglePause()"
+            :disabled="$store.genesisDashboard.pauseState.toggling"
+            style="font-size: 0.74rem; padding: 0.35rem 0.9rem; border-radius: 4px; cursor: pointer;
+                   font-weight: 500; transition: all 0.15s;"
+            :style="$store.genesisDashboard.pauseState.paused
+              ? 'background: rgba(102,187,106,0.12); color: #66bb6a; border: 1px solid rgba(102,187,106,0.3);'
+              : 'background: rgba(255,167,38,0.12); color: #ffa726; border: 1px solid rgba(255,167,38,0.3);'"
+            x-text="$store.genesisDashboard.pauseState.toggling ? '...'
+              : $store.genesisDashboard.pauseState.paused ? 'Resume Genesis' : 'Pause Genesis'">
+    </button>
+  </div>

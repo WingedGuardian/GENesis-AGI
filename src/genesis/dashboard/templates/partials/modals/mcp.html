@@ -1,0 +1,50 @@
+
+
+  <!-- MCP Tools Modal -->
+  <div class="config-modal-overlay" x-show="$store.genesisDashboard.mcpModal.open"
+       @click.self="$store.genesisDashboard.mcpModal.open = false" x-transition>
+    <div class="config-modal" style="max-width: 600px;">
+      <div class="config-modal-header">
+        <span>MCP Server Tools</span>
+        <span class="panel-status">
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.modalStateColor($store.genesisDashboard.mcpModal)}`"></span>
+          <span x-text="$store.genesisDashboard.modalStateLabel($store.genesisDashboard.mcpModal)"></span>
+        </span>
+        <button @click="$store.genesisDashboard.mcpModal.open = false">&times;</button>
+      </div>
+      <div class="config-modal-body">
+        <template x-if="$store.genesisDashboard.modalStatusDetail($store.genesisDashboard.mcpModal)">
+          <div class="panel-status-detail" style="margin-bottom: 0.75rem;"
+               x-text="$store.genesisDashboard.modalStatusDetail($store.genesisDashboard.mcpModal)"></div>
+        </template>
+        <div x-show="$store.genesisDashboard.mcpModal.fetch.state === 'loading' && !$store.genesisDashboard.mcpModal.data"
+             style="text-align: center; padding: 2rem; color: var(--color-text-secondary);">Loading...</div>
+        <div x-show="$store.genesisDashboard.mcpModal.fetch.state === 'error' && !$store.genesisDashboard.mcpModal.data"
+             class="empty-state">MCP tool inventory unavailable.</div>
+        <template x-if="$store.genesisDashboard.mcpModal.data">
+          <div>
+            <template x-for="(info, name) in $store.genesisDashboard.mcpModal.data" :key="name">
+              <div style="margin-bottom: 1rem;">
+                <div style="font-weight: 600; font-size: 0.85rem; margin-bottom: 0.3rem;">
+                  <span class="status-dot" :style="`background: ${info.status === 'up' ? '#4caf50' : '#d9534f'}`"></span>
+                  <span x-text="name"></span>
+                  <span style="opacity: 0.5; font-size: 0.72rem;" x-text="'(' + (info.tools?.length || 0) + ' tools)'"></span>
+                </div>
+                <template x-if="info.tools && info.tools.length > 0">
+                  <div style="display: flex; flex-wrap: wrap; gap: 0.25rem; padding-left: 1rem;">
+                    <template x-for="tool in info.tools" :key="tool">
+                      <span style="font-size: 0.68rem; padding: 0.1rem 0.4rem; background: rgba(255,255,255,0.06); border-radius: 3px; color: var(--color-text-secondary);"
+                            x-text="tool"></span>
+                    </template>
+                  </div>
+                </template>
+                <template x-if="info.error">
+                  <div style="font-size: 0.72rem; color: #d9534f; padding-left: 1rem;" x-text="info.error"></div>
+                </template>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>

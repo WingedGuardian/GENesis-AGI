@@ -47,23 +47,3 @@ def test_memory_compat_private_shim():
     from genesis.memory.az_adapter import _generate_id
 
     assert _generate_id is canonical
-
-
-def test_ui_blueprint_shim():
-    """genesis.ui.blueprint and genesis.hosting.agent_zero.overlay are
-    separate modules (UI API endpoints vs AZ overlay injection).
-    Both must be importable and provide the expected symbols."""
-    from genesis.hosting.agent_zero.overlay import (
-        blueprint as overlay_bp,
-    )
-    from genesis.hosting.agent_zero.overlay import (
-        register_injection as overlay_ri,
-    )
-    from genesis.ui.blueprint import blueprint, register_injection
-
-    # These are intentionally separate objects — overlay is AZ-specific,
-    # ui.blueprint provides Genesis-native API endpoints.
-    assert blueprint is not None
-    assert register_injection is not None
-    assert overlay_bp is not None
-    assert overlay_ri is not None

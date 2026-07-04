@@ -1,0 +1,271 @@
+
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         Panel: Work [Tab: work] — Tasks + Sessions + Follow-ups
+         ═══════════════════════════════════════════════════════════════ -->
+
+    <!-- Work: Tasks -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'work'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">task_alt</span>
+        Tasks
+        <span class="panel-status" x-show="Object.keys($store.genesisDashboard.taskActive).length > 0">
+          <span class="status-dot" style="background:#66bb6a;"></span>
+          <span x-text="Object.keys($store.genesisDashboard.taskActive).length + ' active'"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <!-- Active / Completed toggle -->
+        <div style="display:flex; gap:0.25rem; margin-bottom:0.75rem;">
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.tasksView === 'active' ? 'background:#4caf5033; border:1px solid #4caf50; color:#4caf50; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.tasksView = 'active'">Active</button>
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.tasksView === 'completed' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.tasksView = 'completed'">Completed</button>
+        </div>
+        <!-- Task list -->
+        <template x-if="$store.genesisDashboard.taskList.filter(t => {
+          const phase = (t.current_phase || '').toLowerCase();
+          const active = ['executing','paused','blocked','pending'].includes(phase);
+          return $store.genesisDashboard.tasksView === 'active' ? active : !active;
+        }).length === 0">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;"
+               x-text="$store.genesisDashboard.tasksView === 'active' ? 'No active tasks.' : 'No completed tasks.'">
+          </div>
+        </template>
+        <div class="activity-feed">
+          <template x-for="task in $store.genesisDashboard.taskList.filter(t => {
+            const phase = (t.current_phase || '').toLowerCase();
+            const active = ['executing','paused','blocked','pending'].includes(phase);
+            return $store.genesisDashboard.tasksView === 'active' ? active : !active;
+          })" :key="task.task_id">
+            <div>
+              <div class="activity-row"
+                   @click="$store.genesisDashboard.fetchTaskDetail(task.task_id)"
+                   style="cursor:pointer; display:flex; align-items:center; gap:0.5rem;">
+                <!-- Phase badge -->
+                <span style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0;"
+                      :style="{
+                        'executing': 'background:rgba(33,150,243,0.15); color:#2196F3;',
+                        'completed': 'background:rgba(102,187,106,0.15); color:#66bb6a;',
+                        'failed':    'background:rgba(239,154,154,0.15); color:#ef9a9a;',
+                        'cancelled': 'background:rgba(158,158,158,0.15); color:#9e9e9e;',
+                        'paused':    'background:rgba(255,167,38,0.15); color:#ffa726;',
+                        'blocked':   'background:rgba(255,167,38,0.15); color:#ffa726;',
+                        'pending':   'background:rgba(158,158,158,0.15); color:#9e9e9e;',
+                      }[task.current_phase?.toLowerCase()] || 'background:rgba(33,150,243,0.15); color:#2196F3;'"
+                      x-text="task.current_phase || 'unknown'"></span>
+                <!-- Description -->
+                <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.73rem;"
+                      x-text="task.description || task.task_id"></span>
+                <!-- Task ID -->
+                <span style="color:var(--color-text-secondary); font-size:0.65rem; font-family:monospace; flex-shrink:0;"
+                      x-text="task.task_id?.substring(0,10)"></span>
+                <!-- Timestamp -->
+                <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
+                      x-text="$store.genesisDashboard.formatTime(task.created_at)"></span>
+                <!-- Expand arrow -->
+                <span class="material-symbols-outlined" style="font-size:0.9rem; color:var(--color-text-secondary); transition:transform 0.15s;"
+                      :style="$store.genesisDashboard.taskExpanded === task.task_id ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+              </div>
+
+              <!-- Expanded detail -->
+              <template x-if="$store.genesisDashboard.taskExpanded === task.task_id && $store.genesisDashboard.taskDetail">
+                <div style="padding:0.5rem 0.75rem; background:rgba(0,0,0,0.15); border-radius:4px; margin:0.25rem 0 0.5rem 0; font-size:0.72rem;">
+                  <!-- Actions bar -->
+                  <div style="display:flex; gap:0.3rem; margin-bottom:0.5rem;">
+                    <template x-if="$store.genesisDashboard.taskActive[task.task_id]">
+                      <button @click.stop="$store.genesisDashboard.taskAction(task.task_id, 'pause')"
+                              style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;
+                                     background:rgba(255,167,38,0.1); color:#ffa726; border:1px solid rgba(255,167,38,0.2);">Pause</button>
+                    </template>
+                    <template x-if="task.current_phase?.toLowerCase() === 'paused'">
+                      <button @click.stop="$store.genesisDashboard.taskAction(task.task_id, 'resume')"
+                              style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;
+                                     background:rgba(102,187,106,0.1); color:#66bb6a; border:1px solid rgba(102,187,106,0.2);">Resume</button>
+                    </template>
+                    <template x-if="$store.genesisDashboard.taskActive[task.task_id]">
+                      <button @click.stop="$store.genesisDashboard.taskAction(task.task_id, 'cancel')"
+                              style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;
+                                     background:rgba(239,154,154,0.1); color:#ef9a9a; border:1px solid rgba(239,154,154,0.2);">Cancel</button>
+                    </template>
+                  </div>
+                  <!-- Phase Timeline -->
+                  <template x-if="$store.genesisDashboard.taskTimeline.length > 0">
+                    <div style="margin-bottom:0.5rem;">
+                      <div style="font-weight:600; margin-bottom:0.2rem; color:var(--color-text-secondary); font-size:0.65rem;">Phase Timeline</div>
+                      <div style="display:flex; height:6px; border-radius:3px; overflow:hidden; background:rgba(255,255,255,0.05);">
+                        <template x-for="(phase, idx) in $store.genesisDashboard.taskTimeline" :key="idx">
+                          <div :style="`flex:${phase.duration_s || 1}; background:${$store.genesisDashboard.phaseColor(phase.phase)};`"
+                               :title="`${phase.phase}: ${phase.duration_s ? Math.round(phase.duration_s) + 's' : 'active'}`"></div>
+                        </template>
+                      </div>
+                      <div style="display:flex; gap:0.4rem; margin-top:0.15rem; flex-wrap:wrap;">
+                        <template x-for="(phase, idx) in $store.genesisDashboard.taskTimeline" :key="'lbl'+idx">
+                          <span style="font-size:0.6rem; display:inline-flex; align-items:center; gap:0.15rem;">
+                            <span :style="`width:6px; height:6px; border-radius:50%; background:${$store.genesisDashboard.phaseColor(phase.phase)};`"></span>
+                            <span style="color:var(--color-text-secondary);"
+                                  x-text="`${phase.phase} ${phase.duration_s ? '(' + (phase.duration_s > 60 ? Math.round(phase.duration_s/60) + 'm' : Math.round(phase.duration_s) + 's') + ')' : '(active)'}`"></span>
+                          </span>
+                        </template>
+                      </div>
+                    </div>
+                  </template>
+                  <!-- Steps -->
+                  <div style="margin-top:0.3rem;">
+                    <div style="font-weight:600; margin-bottom:0.3rem; color:var(--color-text-secondary);">Steps</div>
+                    <template x-for="step in $store.genesisDashboard.taskDetailSteps" :key="step.step_idx">
+                      <div style="display:flex; align-items:flex-start; gap:0.4rem; padding:0.2rem 0; border-bottom:1px solid rgba(255,255,255,0.05); transition:all 0.15s;"
+                           :style="step.status === 'executing' ? 'background:rgba(33,150,243,0.06); border-left:2px solid #2196F3; padding-left:0.3rem; margin-left:-0.3rem;' : ''">
+                        <span class="material-symbols-outlined" style="font-size:0.85rem; flex-shrink:0; margin-top:0.05rem;"
+                              :style="{
+                                'completed': 'color:#66bb6a',
+                                'executing': 'color:#2196F3',
+                                'failed':    'color:#ef9a9a',
+                                'pending':   'color:#9e9e9e',
+                                'blocked':   'color:#ffa726',
+                              }[step.status] || 'color:#9e9e9e'"
+                              x-text="{
+                                'completed': 'check_circle',
+                                'executing': 'sync',
+                                'failed':    'error',
+                                'pending':   'radio_button_unchecked',
+                                'blocked':   'block',
+                              }[step.status] || 'radio_button_unchecked'"></span>
+                        <div style="flex:1; min-width:0;">
+                          <div style="display:flex; justify-content:space-between; gap:0.5rem;">
+                            <span x-text="step.description || `Step ${step.step_idx}`" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+                            <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
+                                  x-text="step.step_type"></span>
+                          </div>
+                          <div style="display:flex; gap:0.5rem; color:var(--color-text-secondary); font-size:0.65rem; margin-top:0.1rem;">
+                            <span x-show="step.model_used" x-text="step.model_used"></span>
+                            <span x-show="step.cost_usd" x-text="'$' + step.cost_usd?.toFixed(4)"></span>
+                            <span x-show="step.started_at && step.completed_at" style="display:inline-flex; align-items:center; gap:0.2rem;">
+                              <span x-text="((new Date(step.completed_at) - new Date(step.started_at)) / 1000).toFixed(0) + 's'"></span>
+                              <span style="display:inline-block; height:3px; border-radius:2px; background:#2196F3;"
+                                    :style="`width:${Math.min(50, Math.max(4, ((new Date(step.completed_at) - new Date(step.started_at)) / 1000) * 0.5))}px;`"></span>
+                            </span>
+                          </div>
+                          <template x-if="step.result_json && step.result_json.result">
+                            <div style="margin-top:0.2rem; padding:0.2rem 0.4rem; background:rgba(0,0,0,0.2); border-radius:3px;
+                                        font-family:monospace; font-size:0.65rem; max-height:80px; overflow:hidden; color:var(--color-text-secondary);"
+                                 x-text="(typeof step.result_json.result === 'string' ? step.result_json.result : JSON.stringify(step.result_json.result)).substring(0, 500)">
+                            </div>
+                          </template>
+                        </div>
+                      </div>
+                    </template>
+                    <template x-if="$store.genesisDashboard.taskDetailSteps.length === 0">
+                      <div style="color:var(--color-text-secondary); font-size:0.7rem; padding:0.3rem 0;">No steps recorded yet.</div>
+                    </template>
+                  </div>
+                  <template x-if="$store.genesisDashboard.taskDetail.blockers">
+                    <div style="margin-top:0.5rem; padding:0.3rem 0.5rem; background:rgba(255,167,38,0.08); border-radius:3px; border:1px solid rgba(255,167,38,0.15);">
+                      <div style="font-weight:600; color:#ffa726; font-size:0.68rem; margin-bottom:0.15rem;">Blockers</div>
+                      <div style="font-size:0.7rem; color:var(--color-text-secondary);"
+                           x-text="JSON.stringify($store.genesisDashboard.taskDetail.blockers)"></div>
+                    </div>
+                  </template>
+                  <!-- Linked Follow-ups -->
+                  <template x-if="$store.genesisDashboard.taskLinkedFollowUps.length > 0">
+                    <div style="margin-top:0.5rem; padding:0.3rem 0.5rem; background:rgba(33,150,243,0.05); border-radius:3px; border:1px solid rgba(33,150,243,0.1);">
+                      <div style="font-weight:600; color:#64b5f6; font-size:0.68rem; margin-bottom:0.15rem;">
+                        Linked Follow-ups <span style="font-weight:400; opacity:0.7;" x-text="'(' + $store.genesisDashboard.taskLinkedFollowUps.length + ')'"></span>
+                      </div>
+                      <template x-for="fu in $store.genesisDashboard.taskLinkedFollowUps" :key="fu.id">
+                        <div style="display:flex; gap:0.3rem; align-items:flex-start; font-size:0.68rem; padding:0.15rem 0; border-bottom:1px solid rgba(255,255,255,0.03);">
+                          <span style="font-size:0.6rem; padding:0.05rem 0.25rem; border-radius:2px; flex-shrink:0; text-transform:uppercase; font-weight:600;"
+                                :style="{
+                                  'completed': 'background:rgba(102,187,106,0.15); color:#66bb6a;',
+                                  'pending':   'background:rgba(158,158,158,0.15); color:#9e9e9e;',
+                                  'in_progress': 'background:rgba(33,150,243,0.15); color:#2196F3;',
+                                  'blocked':   'background:rgba(255,167,38,0.15); color:#ffa726;',
+                                  'failed':    'background:rgba(239,154,154,0.15); color:#ef9a9a;',
+                                }[fu.status] || 'background:rgba(158,158,158,0.15); color:#9e9e9e;'"
+                                x-text="fu.status"></span>
+                          <span style="color:var(--color-text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                x-text="fu.content"></span>
+                        </div>
+                      </template>
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- Work: Background Sessions -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'work'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">terminal</span>
+        Background Sessions
+        <span class="panel-status" x-show="$store.genesisDashboard.sessionsList.filter(s => ['active','running','executing'].includes(s.status?.toLowerCase())).length > 0">
+          <span class="status-dot" style="background:#80cbc4;"></span>
+          <span x-text="$store.genesisDashboard.sessionsList.filter(s => ['active','running','executing'].includes(s.status?.toLowerCase())).length + ' active'"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <!-- Active / History toggle -->
+        <div style="display:flex; gap:0.25rem; margin-bottom:0.75rem;">
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.sessionsView === 'active' ? 'background:#4caf5033; border:1px solid #4caf50; color:#4caf50; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.sessionsView = 'active'; $store.genesisDashboard.fetchWorkSessions()">Active</button>
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.sessionsView === 'history' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.sessionsView = 'history'; $store.genesisDashboard.fetchWorkSessions()">History</button>
+        </div>
+        <template x-if="$store.genesisDashboard.sessionsList.length === 0">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            No background sessions found.
+          </div>
+        </template>
+        <div class="activity-feed">
+          <template x-for="item in $store.genesisDashboard.sessionsList" :key="item.id">
+            <div>
+              <div class="activity-row" style="cursor:pointer; display:flex; align-items:center; gap:0.5rem;"
+                   @click="$store.genesisDashboard.sessionsExpanded = $store.genesisDashboard.sessionsExpanded === item.id ? null : item.id">
+                <!-- Status badge -->
+                <span style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0;"
+                      :style="{
+                        'active':    'background:rgba(102,187,106,0.15); color:#66bb6a;',
+                        'running':   'background:rgba(33,150,243,0.15); color:#2196F3;',
+                        'executing': 'background:rgba(33,150,243,0.15); color:#2196F3;',
+                        'completed': 'background:rgba(102,187,106,0.15); color:#66bb6a;',
+                        'failed':    'background:rgba(239,154,154,0.15); color:#ef9a9a;',
+                        'cancelled': 'background:rgba(158,158,158,0.15); color:#9e9e9e;',
+                      }[item.status?.toLowerCase()] || 'background:rgba(158,158,158,0.15); color:#9e9e9e;'"
+                      x-text="item.status"></span>
+                <!-- Description -->
+                <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.73rem;"
+                      x-text="item.description || item.id"></span>
+                <!-- Model -->
+                <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
+                      x-text="item.model || ''"></span>
+                <!-- Timestamp -->
+                <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
+                      x-text="$store.genesisDashboard.formatTime(item.created_at)"></span>
+                <!-- Expand arrow -->
+                <span class="material-symbols-outlined" style="font-size:0.9rem; color:var(--color-text-secondary); transition:transform 0.15s;"
+                      :style="$store.genesisDashboard.sessionsExpanded === item.id ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+              </div>
+              <!-- Expanded detail -->
+              <template x-if="$store.genesisDashboard.sessionsExpanded === item.id">
+                <div style="padding:0.5rem 0.75rem; background:rgba(0,0,0,0.15); border-radius:4px; margin:0.25rem 0 0.5rem 0; font-size:0.72rem;">
+                  <div style="display:flex; gap:1rem; flex-wrap:wrap; color:var(--color-text-secondary); font-size:0.7rem;">
+                    <span x-text="'Type: ' + (item.session_type || 'unknown')"></span>
+                    <span x-text="'Model: ' + (item.model || 'unknown')"></span>
+                    <span x-show="item.cost_usd != null" x-text="'Cost: $' + (item.cost_usd || 0).toFixed(4)"></span>
+                    <span x-text="'Started: ' + $store.genesisDashboard.formatTime(item.created_at)"></span>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>

@@ -1,0 +1,98 @@
+
+
+  <!-- Surplus Detail Modal -->
+  <div class="config-modal-overlay" x-show="$store.genesisDashboard.surplusModal.open"
+       @click.self="$store.genesisDashboard.surplusModal.open = false" x-transition>
+    <div class="config-modal" style="max-width: 800px;">
+      <div class="config-modal-header">
+        <span>Surplus Compute Detail</span>
+        <span class="panel-status">
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.modalStateColor($store.genesisDashboard.surplusModal)}`"></span>
+          <span x-text="$store.genesisDashboard.modalStateLabel($store.genesisDashboard.surplusModal)"></span>
+        </span>
+        <button @click="$store.genesisDashboard.surplusModal.open = false">&times;</button>
+      </div>
+      <div class="config-modal-body">
+        <template x-if="$store.genesisDashboard.modalStatusDetail($store.genesisDashboard.surplusModal)">
+          <div class="panel-status-detail" style="margin-bottom: 0.75rem;"
+               x-text="$store.genesisDashboard.modalStatusDetail($store.genesisDashboard.surplusModal)"></div>
+        </template>
+        <div x-show="$store.genesisDashboard.surplusModal.fetch.state === 'loading' && !$store.genesisDashboard.surplusModal.data"
+             style="text-align: center; padding: 2rem; color: var(--color-text-secondary);">Loading...</div>
+        <div x-show="$store.genesisDashboard.surplusModal.fetch.state === 'error' && !$store.genesisDashboard.surplusModal.data"
+             class="empty-state">Surplus detail unavailable.</div>
+        <template x-if="$store.genesisDashboard.surplusModal.data">
+          <div>
+            <!-- Summary stats (clickable filters) -->
+            <div style="display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap;">
+              <div style="font-size: 0.82rem; padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; transition: opacity 0.15s;"
+                   :style="`background: rgba(76,175,80,${$store.genesisDashboard.surplusModal.filter === 'completed' ? '0.3' : '0.12'}); color: #4caf50; opacity: ${!$store.genesisDashboard.surplusModal.filter || $store.genesisDashboard.surplusModal.filter === 'completed' ? '1' : '0.5'}`"
+                   @click="$store.genesisDashboard.surplusModal.filter = $store.genesisDashboard.surplusModal.filter === 'completed' ? null : 'completed'">
+                <span x-text="($store.genesisDashboard.surplusModal.data.stats?.completed || 0)"></span> completed
+              </div>
+              <div style="font-size: 0.82rem; padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; transition: opacity 0.15s;"
+                   :style="`background: rgba(217,83,79,${$store.genesisDashboard.surplusModal.filter === 'failed' ? '0.3' : '0.12'}); color: #d9534f; opacity: ${!$store.genesisDashboard.surplusModal.filter || $store.genesisDashboard.surplusModal.filter === 'failed' ? '1' : '0.5'}`"
+                   @click="$store.genesisDashboard.surplusModal.filter = $store.genesisDashboard.surplusModal.filter === 'failed' ? null : 'failed'">
+                <span x-text="($store.genesisDashboard.surplusModal.data.stats?.failed || 0)"></span> failed
+              </div>
+              <div style="font-size: 0.82rem; padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; transition: opacity 0.15s;"
+                   :style="`background: rgba(240,173,78,${$store.genesisDashboard.surplusModal.filter === 'pending' ? '0.3' : '0.12'}); color: #f0ad4e; opacity: ${!$store.genesisDashboard.surplusModal.filter || $store.genesisDashboard.surplusModal.filter === 'pending' ? '1' : '0.5'}`"
+                   @click="$store.genesisDashboard.surplusModal.filter = $store.genesisDashboard.surplusModal.filter === 'pending' ? null : 'pending'">
+                <span x-text="($store.genesisDashboard.surplusModal.data.stats?.pending || 0)"></span> pending
+              </div>
+              <template x-if="($store.genesisDashboard.surplusModal.data.stats?.stub_completions || 0) > 0">
+                <div style="font-size: 0.82rem; padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; transition: opacity 0.15s;"
+                     :style="`background: rgba(100,116,139,${$store.genesisDashboard.surplusModal.filter === 'stub' ? '0.3' : '0.12'}); color: #94a3b8; opacity: ${!$store.genesisDashboard.surplusModal.filter || $store.genesisDashboard.surplusModal.filter === 'stub' ? '1' : '0.5'}`"
+                     title="Heuristic: tasks that completed in under 1 second and may be stub outputs"
+                     @click="$store.genesisDashboard.surplusModal.filter = $store.genesisDashboard.surplusModal.filter === 'stub' ? null : 'stub'">
+                  <span x-text="$store.genesisDashboard.surplusModal.data.stats.stub_completions"></span> stubs
+                </div>
+              </template>
+            </div>
+
+            <!-- Failure reasons -->
+            <template x-if="Object.keys($store.genesisDashboard.surplusModal.data.failure_reasons || {}).length > 0">
+              <div style="margin-bottom: 1rem; padding: 0.5rem 0.8rem; background: rgba(217,83,79,0.08); border-radius: 6px; border: 1px solid rgba(217,83,79,0.2);">
+                <div style="font-size: 0.78rem; font-weight: 600; color: #d9534f; margin-bottom: 0.3rem;">Failure Reasons</div>
+                <template x-for="[reason, count] in Object.entries($store.genesisDashboard.surplusModal.data.failure_reasons)" :key="reason">
+                  <div style="font-size: 0.75rem; color: #f87171;">
+                    <span x-text="reason"></span>
+                    <span style="opacity: 0.6;" x-text="'(' + count + 'x)'"></span>
+                  </div>
+                </template>
+              </div>
+            </template>
+
+            <!-- Task history table -->
+            <h4 style="margin: 0 0 0.5rem; font-size: 0.85rem;">Task History</h4>
+            <template x-if="($store.genesisDashboard.surplusModal.data.tasks || []).length === 0">
+              <div style="font-size: 0.78rem; color: var(--color-text-secondary); padding: 1rem; text-align: center;">
+                No surplus tasks have been created yet. The system schedules brainstorm tasks daily when idle compute is available.
+              </div>
+            </template>
+            <div style="max-height: 400px; overflow-y: auto;">
+              <template x-for="t in ($store.genesisDashboard.surplusModal.data.tasks || []).filter(t => {
+                const f = $store.genesisDashboard.surplusModal.filter;
+                if (!f) return true;
+                if (f === 'stub') return t.stub;
+                return t.status === f;
+              })" :key="t.id">
+                <div style="font-size: 0.78rem; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--color-border); display: flex; align-items: center; gap: 0.5rem;">
+                  <span class="status-dot" :style="`background: ${t.status === 'completed' ? (t.stub ? '#64748b' : '#4caf50') : t.status === 'failed' ? '#d9534f' : '#f0ad4e'}`"></span>
+                  <span x-text="t.task_type" style="font-weight: 600; min-width: 130px;"></span>
+                  <span style="color: var(--color-text-secondary); min-width: 130px;" x-text="t.created_at ? $store.genesisDashboard.formatDateTime(t.created_at) : '-'"></span>
+                  <span :style="`min-width: 80px; color: ${t.status === 'completed' ? (t.stub ? '#64748b' : '#4caf50') : t.status === 'failed' ? '#d9534f' : '#f0ad4e'}`"
+                        x-text="t.status + (t.stub ? ' (stub heuristic)' : '')"></span>
+                  <span style="color: var(--color-text-secondary); min-width: 70px;"
+                        x-text="t.duration_s != null ? (t.duration_s < 1 ? t.duration_s + 's' : Math.round(t.duration_s) + 's') : '-'"></span>
+                  <span style="color: #f87171; font-size: 0.72rem; flex: 1; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;"
+                        x-text="t.failure_reason || ''"
+                        :title="t.failure_reason || ''"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>

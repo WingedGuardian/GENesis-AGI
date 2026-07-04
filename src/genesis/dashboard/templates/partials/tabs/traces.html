@@ -1,0 +1,118 @@
+
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Traces (trace waterfall) [Tab: traces]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'traces'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">account_tree</span>
+        Traces
+      </div>
+      <div class="panel-body">
+        <div style="font-size:0.68rem; color:var(--color-text-secondary); margin-bottom:0.6rem;">
+          Each trace is one cognitive operation (reflection / ego cycle / dispatched session) with its nested LLM calls, sub-sessions, and tools. Click a trace to expand its waterfall; click a span for details.
+        </div>
+
+        <!-- Empty state -->
+        <template x-if="$store.genesisDashboard.tracesList.length === 0">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            No traces recorded yet.
+          </div>
+        </template>
+
+        <!-- Recent traces list -->
+        <div class="activity-feed" style="max-height:none;">
+          <template x-for="t in $store.genesisDashboard.tracesList" :key="t.trace_id">
+            <div>
+              <div class="activity-row" style="cursor:pointer; align-items:center;"
+                   @click="$store.genesisDashboard.fetchTraceDetail(t.trace_id)">
+                <span class="status-dot" :style="`background:${$store.genesisDashboard.spanKindColor(t.kind)}; margin-right:0;`"></span>
+                <span style="flex:1; font-family:monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                      x-text="t.name"></span>
+                <span x-show="t.status === 'error'" style="color:#ef4444; font-size:0.6rem; font-weight:600;">ERROR</span>
+                <span style="color:var(--color-text-secondary); font-size:0.62rem;" x-text="t.span_count + ' spans'"></span>
+                <span style="color:var(--color-text-secondary); font-size:0.62rem; font-family:monospace; min-width:48px; text-align:right;"
+                      x-text="$store.genesisDashboard.formatUs(t.duration_us)"></span>
+                <span style="color:var(--color-text-secondary); font-size:0.62rem; min-width:64px; text-align:right;"
+                      x-text="$store.genesisDashboard.relativeTime(t.start_unix_us / 1000)"></span>
+                <span class="material-symbols-outlined" style="font-size:1rem; color:var(--color-text-secondary);"
+                      :style="$store.genesisDashboard.tracesExpanded === t.trace_id ? 'transform:rotate(90deg);' : ''">chevron_right</span>
+              </div>
+
+              <!-- Inline full-width waterfall -->
+              <template x-if="$store.genesisDashboard.tracesExpanded === t.trace_id">
+                <div style="padding:0.5rem 0.25rem; background:rgba(0,0,0,0.12); border-radius:4px; margin:0.25rem 0 0.75rem;">
+                  <template x-if="$store.genesisDashboard.tracesLoadingTrace">
+                    <div style="padding:0.75rem; text-align:center; color:var(--color-text-secondary); font-size:0.7rem;">Loading…</div>
+                  </template>
+                  <template x-if="!$store.genesisDashboard.tracesLoadingTrace && $store.genesisDashboard.tracesWaterfall.rows.length === 0">
+                    <div style="padding:0.75rem; text-align:center; color:var(--color-text-secondary); font-size:0.7rem;">No spans for this trace.</div>
+                  </template>
+                  <div class="waterfall">
+                    <template x-for="row in $store.genesisDashboard.tracesWaterfall.rows" :key="row.span_id">
+                      <div>
+                        <div class="wf-row"
+                             :class="{ 'wf-row-selected': $store.genesisDashboard.tracesSpanExpanded === row.span_id, 'wf-row-error': row.status === 'error' }"
+                             @click="$store.genesisDashboard.tracesSpanExpanded = $store.genesisDashboard.tracesSpanExpanded === row.span_id ? null : row.span_id">
+                          <div class="wf-label" :style="`padding-left:${row.depth * 14}px;`">
+                            <span class="wf-kind-dot" :style="`background:${$store.genesisDashboard.spanKindColor(row.kind)};`"></span>
+                            <span class="wf-name" :title="row.name" x-text="row.name"></span>
+                          </div>
+                          <div class="wf-track">
+                            <template x-if="!row.isPoint">
+                              <div class="wf-bar"
+                                   :style="`left:${row.offsetPct}%; width:${row.widthPct}%; background:${$store.genesisDashboard.spanKindColor(row.kind)};` + (row.status === 'error' ? ' outline:1px solid #ef4444;' : '')"></div>
+                            </template>
+                            <template x-if="row.isPoint">
+                              <div class="wf-tick" :style="`left:${row.offsetPct}%; background:${$store.genesisDashboard.spanKindColor(row.kind)};`"></div>
+                            </template>
+                          </div>
+                          <div class="wf-dur" x-text="$store.genesisDashboard.formatUs(row.duration_us)"></div>
+                        </div>
+
+                        <!-- Span detail -->
+                        <template x-if="$store.genesisDashboard.tracesSpanExpanded === row.span_id">
+                          <div class="health-card" style="margin:0.25rem 0 0.5rem 1.5rem; font-size:0.72rem;">
+                            <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.4rem;">
+                              <span class="wf-kind-dot" :style="`background:${$store.genesisDashboard.spanKindColor(row.kind)};`"></span>
+                              <strong x-text="row.name"></strong>
+                              <span style="font-size:0.6rem; padding:0.1rem 0.4rem; border-radius:3px;"
+                                    :style="row.status === 'error' ? 'background:rgba(239,68,68,0.15); color:#ef4444;' : 'background:rgba(74,222,128,0.13); color:#4ade80;'"
+                                    x-text="row.status"></span>
+                            </div>
+                            <template x-if="row.status === 'error' && row.status_message">
+                              <div style="margin-bottom:0.4rem; padding:0.25rem 0.5rem; background:rgba(239,68,68,0.08); border-radius:3px; color:#ef4444; white-space:pre-wrap; word-break:break-word;"
+                                   x-text="row.status_message"></div>
+                            </template>
+                            <div style="display:flex; gap:0.75rem; flex-wrap:wrap; color:var(--color-text-secondary); font-size:0.65rem; margin-bottom:0.3rem;">
+                              <span x-text="'kind: ' + row.kind"></span>
+                              <span x-text="'duration: ' + $store.genesisDashboard.formatUs(row.duration_us)"></span>
+                              <span x-show="row.session_id" x-text="'session: ' + (row.session_id || '')"></span>
+                              <span x-show="row.process" x-text="'process: ' + (row.process || '')"></span>
+                            </div>
+                            <template x-if="row.kind === 'llm'">
+                              <div style="display:flex; gap:0.75rem; flex-wrap:wrap; font-size:0.65rem; margin-bottom:0.3rem;">
+                                <span x-show="row.provider" x-text="'provider: ' + (row.provider || '')"></span>
+                                <span x-show="row.model_id" x-text="'model: ' + (row.model_id || '')"></span>
+                                <span x-show="row.call_site" x-text="'call_site: ' + (row.call_site || '')"></span>
+                                <span x-show="row.input_tokens != null" x-text="'in: ' + row.input_tokens + ' tok'"></span>
+                                <span x-show="row.output_tokens != null" x-text="'out: ' + row.output_tokens + ' tok'"></span>
+                                <span x-show="row.cost_usd != null" x-text="'$' + Number(row.cost_usd).toFixed(4) + (row.cost_known ? '' : ' (est)')"></span>
+                              </div>
+                            </template>
+                            <template x-if="row.attributes && Object.keys(row.attributes).length">
+                              <pre style="margin:0.3rem 0 0; padding:0.4rem 0.5rem; background:rgba(0,0,0,0.2); border-radius:3px; font-size:0.63rem; max-height:200px; overflow:auto; white-space:pre-wrap; word-break:break-word;"
+                                   x-text="JSON.stringify(row.attributes, null, 2)"></pre>
+                            </template>
+                          </div>
+                        </template>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
