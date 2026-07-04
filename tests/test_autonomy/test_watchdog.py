@@ -371,14 +371,12 @@ class TestYamlLoading:
 
 class TestPageCacheReclaim:
     @pytest.fixture(autouse=True)
-    def _reset_reclaim_cooldown(self):
-        """Reset the module-level cooldown so each test starts fresh."""
-        import time
-
+    def _reset_reclaim_cooldown(self, tmp_path: Path, monkeypatch):
+        """Point the persisted reclaim-cooldown sidecar at a fresh tmp file so
+        each test starts with no prior reclaim (cooldown expired) and never
+        touches the real ~/.genesis state."""
         import genesis.autonomy.watchdog as w
-        # Set to far in the past so cooldown check passes even on fresh CI runners
-        # where time.monotonic() may be small (recently booted).
-        w._last_reclaim_time = time.monotonic() - 600
+        monkeypatch.setattr(w, "_RECLAIM_STATE_PATH", tmp_path / "watchdog_reclaim.json")
 
     def test_reclaim_succeeds_when_path_exists(self, tmp_path: Path):
         reclaim_file = tmp_path / "memory.reclaim"
@@ -399,6 +397,42 @@ class TestPageCacheReclaim:
         with patch("genesis.autonomy.watchdog.Path") as mock_path:
             mock_path.return_value.exists.return_value = False
             assert reclaim_page_cache() is False
+
+    def test_reclaim_cooldown_persists_across_process_restart(self, tmp_path: Path):
+        """Regression for the dead module-global cooldown: the watchdog is a
+        systemd *oneshot* (fresh process each run), so the cooldown must be read
+        from the persisted sidecar, not in-memory state. A recent persisted
+        reclaim must block a new reclaim even with no in-process history."""
+        import genesis.autonomy.watchdog as w
+        # Seed a recent reclaim in the sidecar, as a prior oneshot run would have.
+        w._RECLAIM_STATE_PATH.write_text(json.dumps({"last_reclaim_at": time.time()}))
+
+        reclaim_file = tmp_path / "memory.reclaim"
+        reclaim_file.write_text("")  # exists + writable → would reclaim if cooldown ignored
+        with patch("genesis.autonomy.watchdog.Path", return_value=reclaim_file):
+            assert reclaim_page_cache("256M") is False  # in cooldown from the sidecar
+        assert reclaim_file.read_text() == ""  # and it did NOT write to the cgroup file
+
+    def test_reclaim_persists_timestamp_on_success(self, tmp_path: Path):
+        """A successful reclaim records its time to the sidecar so the NEXT
+        oneshot run sees the cooldown."""
+        import genesis.autonomy.watchdog as w
+        reclaim_file = tmp_path / "memory.reclaim"
+        reclaim_file.write_text("")
+        with patch("genesis.autonomy.watchdog.Path", return_value=reclaim_file):
+            assert reclaim_page_cache("128M") is True
+        saved = json.loads(w._RECLAIM_STATE_PATH.read_text())
+        assert abs(saved["last_reclaim_at"] - time.time()) < 5
+
+    def test_reclaim_corrupt_sidecar_fails_open(self, tmp_path: Path):
+        """A corrupt/unreadable sidecar is treated as 'never reclaimed' (reclaim
+        allowed) — it must never crash the watchdog."""
+        import genesis.autonomy.watchdog as w
+        w._RECLAIM_STATE_PATH.write_text("{not valid json")
+        reclaim_file = tmp_path / "memory.reclaim"
+        reclaim_file.write_text("")
+        with patch("genesis.autonomy.watchdog.Path", return_value=reclaim_file):
+            assert reclaim_page_cache("128M") is True
 
 
 class TestGetContainerMemory:

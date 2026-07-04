@@ -299,7 +299,7 @@ class WatchdogChecker:
     def _check_memory_pressure(self) -> None:
         """Proactive memory check — reclaim page cache if approaching limit.
 
-        Runs every watchdog cycle (60s). Uses anon+kernel memory (non-reclaimable)
+        Runs every watchdog cycle (300s). Uses anon+kernel memory (non-reclaimable)
         for threshold decisions. Total cgroup usage (memory.current) includes
         reclaimable page cache, which inflates the metric and causes false alarms.
         """
@@ -507,7 +507,31 @@ class WatchdogChecker:
         return Path("src") / Path(*parts).with_suffix(".py")
 
 
-_last_reclaim_time: float = 0.0
+# Reclaim-cooldown state is persisted to this sidecar rather than an in-process
+# global: the watchdog runs as a systemd *oneshot* (a fresh process every timer
+# fire), so a module global would reset to 0.0 each run and the cooldown would
+# never actually gate — letting reclaims fire back-to-back during memory pressure,
+# the exact I/O storm the cooldown exists to prevent (incident 2026-03-16).
+_RECLAIM_STATE_PATH = Path("~/.genesis/watchdog_reclaim.json").expanduser()
+
+
+def _load_last_reclaim() -> float:
+    """Epoch seconds of the last successful page-cache reclaim, persisted across
+    the watchdog's oneshot runs. Returns 0.0 when absent/unreadable (fail-open:
+    "never reclaimed" ⇒ a reclaim is allowed)."""
+    try:
+        return float(json.loads(_RECLAIM_STATE_PATH.read_text())["last_reclaim_at"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return 0.0
+
+
+def _save_last_reclaim(ts: float) -> None:
+    """Persist the last-reclaim time so the cooldown survives the next oneshot run."""
+    try:
+        _RECLAIM_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _RECLAIM_STATE_PATH.write_text(json.dumps({"last_reclaim_at": ts}))
+    except OSError:
+        logger.warning("Failed to persist reclaim cooldown to %s", _RECLAIM_STATE_PATH)
 
 
 def reclaim_page_cache(target_bytes: str = "128M") -> bool:
@@ -518,16 +542,20 @@ def reclaim_page_cache(target_bytes: str = "128M") -> bool:
     I/O-limited containers because evicted active pages are immediately
     re-faulted from disk, saturating the cgroup I/O budget and creating
     a death spiral (incident 2026-03-16).
-    """
-    global _last_reclaim_time
 
-    now = time.monotonic()
+    The 5-min cooldown is persisted (``_RECLAIM_STATE_PATH``) so it holds
+    across the watchdog's oneshot process boundary, not just within one run.
+    """
+    # Wall-clock time.time() (not monotonic): the value is persisted and compared
+    # across the oneshot's separate processes, where a monotonic reference resets.
+    now = time.time()
+    last_reclaim = _load_last_reclaim()
 
     # Cooldown: don't reclaim more than once per 5 minutes. Repeated
     # reclaims cause I/O storms in I/O-limited containers (incident 2026-03-16).
     _RECLAIM_COOLDOWN_S = 300.0
-    if now - _last_reclaim_time < _RECLAIM_COOLDOWN_S:
-        remaining = _RECLAIM_COOLDOWN_S - (now - _last_reclaim_time)
+    if now - last_reclaim < _RECLAIM_COOLDOWN_S:
+        remaining = _RECLAIM_COOLDOWN_S - (now - last_reclaim)
         logger.debug("Skipping reclaim — cooldown %.0fs remaining", remaining)
         return False
 
@@ -552,7 +580,7 @@ def reclaim_page_cache(target_bytes: str = "128M") -> bool:
 
     try:
         reclaim_path.write_text(target_bytes)
-        _last_reclaim_time = now
+        _save_last_reclaim(now)
         logger.info("Page cache reclaim succeeded (requested %s)", target_bytes)
         return True
     except OSError as exc:
