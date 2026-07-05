@@ -16,6 +16,10 @@
 #   test-approval   — E2E test the keyword-reply approval gate (no recovery)
 #   disk-status     — read-only storage-pool + snapshot JSON (Genesis's window
 #                     into host capacity: lvs data%/metadata%, VG free, snapshots)
+#   reharden-key    — rewrite the guardian authorized_keys line to the canonical
+#                     hardened options with a self-proving from= (dead-man's-
+#                     switch restores the previous file unless a fresh
+#                     connection confirms the rewrite works)
 #   ping            — liveness check
 #
 # SSH authorized_keys entry (replace CONTAINER_IP with the container's
@@ -99,8 +103,46 @@ PYEOF
         # code can be current while ~/.local/bin/guardian-gateway.sh lags).
         GW_SHA=$(sha256sum "$HOME/.local/bin/guardian-gateway.sh" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
         [ -n "$GW_SHA" ] || GW_SHA="unknown"
-        printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s", "deployed_commit": "%s", "gateway_sha": "%s"}\n' \
-            "$CC_VER" "$NODE_VER" "$CODE_VER" "$CODE_DATE" "$DEPLOYED" "$GW_SHA"
+        # --- authorized_keys hardening indicators (consumed by the container's
+        # _check_authkey_hardening reconciler; healed via `reharden-key`).
+        # Least disclosure: booleans + sha256 hashes only — never the raw key
+        # blob, the stored from= literal, or the observed source address.
+        AK_NO_PTY=false; AK_HAS_FROM=false; AK_FROM_MATCHES=false
+        AK_OPTS_HASH=""; AK_SRC_HASH=""
+        AK_SRC=$(printf '%s' "${SSH_CONNECTION:-}" | awk '{print $1}')
+        if [ -n "$AK_SRC" ]; then
+            AK_SRC_HASH=$(printf '%s' "$AK_SRC" | sha256sum | cut -d' ' -f1)
+        fi
+        AK_LINE=$(grep -F "genesis-guardian-control" "$HOME/.ssh/authorized_keys" 2>/dev/null | head -1 || true)
+        if [ -n "$AK_LINE" ]; then
+            # Options = the line minus the keytype/blob/comment tail. The
+            # keytype anchor is robust against options containing spaces.
+            AK_KEYPART=$(printf '%s\n' "$AK_LINE" | grep -oE '(ssh|ecdsa|sk)-[A-Za-z0-9@.-]+ [A-Za-z0-9+/=]+( .*)?$' || true)
+            AK_OPTS="${AK_LINE%"$AK_KEYPART"}"
+            AK_OPTS="${AK_OPTS% }"
+            case ",$AK_OPTS," in *,no-pty,*) AK_NO_PTY=true;; esac
+            if [ -n "$AK_OPTS" ]; then
+                AK_OPTS_HASH=$(printf '%s' "$AK_OPTS" | tr ',' '\n' | sort | sha256sum | cut -d' ' -f1)
+            fi
+            AK_FROM=$(printf '%s\n' "$AK_OPTS" | grep -oE 'from="[^"]*"' | head -1 | sed 's/^from="//;s/"$//' || true)
+            if [ -n "$AK_FROM" ]; then
+                AK_HAS_FROM=true
+                if [ -n "$AK_SRC" ]; then
+                    # sshd-style match: comma-separated fnmatch patterns.
+                    # Negated (!) patterns are skipped — never report an
+                    # operator's manual negation as a mismatch to "fix".
+                    IFS=',' read -ra _AK_PATS <<< "$AK_FROM"
+                    for _pat in "${_AK_PATS[@]}"; do
+                        case "$_pat" in "!"*) continue;; esac
+                        # shellcheck disable=SC2254  # glob match is the point (sshd fnmatch semantics)
+                        case "$AK_SRC" in $_pat) AK_FROM_MATCHES=true; break;; esac
+                    done
+                fi
+            fi
+        fi
+        printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s", "deployed_commit": "%s", "gateway_sha": "%s", "authkey_no_pty": %s, "authkey_has_from": %s, "authkey_from_matches": %s, "authkey_observed_src_hash": "%s", "authkey_opts_hash": "%s"}\n' \
+            "$CC_VER" "$NODE_VER" "$CODE_VER" "$CODE_DATE" "$DEPLOYED" "$GW_SHA" \
+            "$AK_NO_PTY" "$AK_HAS_FROM" "$AK_FROM_MATCHES" "$AK_SRC_HASH" "$AK_OPTS_HASH"
         ;;
     update)
         INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
@@ -492,6 +534,104 @@ PYEOF
             echo '{"ok": false, "action": "sync-gateway", "error": "failed to deploy gateway"}' >&2
             exit 1
         fi
+        ;;
+    reharden-key)
+        # Rewrite the guardian authorized_keys line to the canonical hardened
+        # options, deriving from= from THIS connection's source address —
+        # self-proving: sshd authenticated this very connection from that
+        # address, and the container always re-dials the same host_ip, so the
+        # next connection presents the same source. Zero input is taken from
+        # the caller; key material comes from the FILE, options are hardcoded.
+        #
+        # Un-brickable by construction: the previous file is snapshotted and a
+        # systemd dead-man's-switch restores it after 120s unless a fresh
+        # connection arrives to cancel it. Any arrival at this verb
+        # authenticated against the CURRENT file is living proof the file
+        # works — so the container's second call doubles as the confirm.
+        AK="$HOME/.ssh/authorized_keys"
+        AK_BAK="$AK.guardian-bak"
+        AK_MARKER="genesis-guardian-control"
+        # Canonical hardened options. Deliberately duplicated from
+        # install_guardian.sh Step 11 (this script must stay hermetic — it is
+        # the recovery path when the install dir is broken); byte-identity is
+        # enforced by tests/test_guardian/test_gateway_reharden.py
+        # (TestOptionsDivergenceGuardrail).
+        GUARD_BASE_OPTS="command=\"$HOME/.local/bin/guardian-gateway.sh\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty"
+
+        # A connection reaching this verb proves the current file works →
+        # cancel any pending restore (the confirm path after a rewrite).
+        systemctl --user stop genesis-authkey-restore.timer 2>/dev/null || true
+        systemctl --user stop genesis-authkey-restore.service 2>/dev/null || true
+
+        COUNT=$(grep -cF "$AK_MARKER" "$AK" 2>/dev/null) || COUNT=0
+        if [ "$COUNT" -ne 1 ]; then
+            # 0 = nothing safe to rewrite; >1 = ambiguous/tampered. Refuse —
+            # a human must resolve this, the reconciler will escalate.
+            printf '{"ok": false, "action": "reharden-key", "error": "expected exactly 1 guardian line, found %s"}\n' "$COUNT" >&2
+            exit 1
+        fi
+        AK_LINE=$(grep -F "$AK_MARKER" "$AK")
+        # keytype anchor tolerates options containing spaces; blob + comment
+        # are preserved exactly as stored.
+        KEYPART=$(printf '%s\n' "$AK_LINE" | grep -oE '(ssh|ecdsa|sk)-[A-Za-z0-9@.-]+ [A-Za-z0-9+/=]+( .*)?$' || true)
+        BLOB=$(printf '%s\n' "$KEYPART" | awk '{print $2}')
+        if [ -z "$KEYPART" ] || [ -z "$BLOB" ]; then
+            echo '{"ok": false, "action": "reharden-key", "error": "cannot parse guardian key line"}' >&2
+            exit 1
+        fi
+        SRC=$(printf '%s' "${SSH_CONNECTION:-}" | awk '{print $1}')
+        HAS_FROM=false
+        if [ -n "$SRC" ]; then
+            NEW_LINE="from=\"${SRC}\",${GUARD_BASE_OPTS} ${KEYPART}"
+            HAS_FROM=true
+        else
+            # Never guess a source. Hardened-without-from matches the
+            # installer's fallback and cannot lock the container out.
+            NEW_LINE="${GUARD_BASE_OPTS} ${KEYPART}"
+        fi
+        if [ "$NEW_LINE" = "$AK_LINE" ]; then
+            printf '{"ok": true, "action": "reharden-key", "changed": false, "has_from": %s}\n' "$HAS_FROM"
+            exit 0
+        fi
+        # Validate the rebuilt line parses as an authorized_keys entry BEFORE
+        # touching the real file. mktemp beside the target (tiny file; also
+        # keeps everything on one filesystem).
+        CHECK_TMP=$(mktemp "$AK.check.XXXXXX")
+        printf '%s\n' "$NEW_LINE" > "$CHECK_TMP"
+        if ! ssh-keygen -l -f "$CHECK_TMP" >/dev/null 2>&1; then
+            rm -f "$CHECK_TMP"
+            echo '{"ok": false, "action": "reharden-key", "error": "rebuilt line failed ssh-keygen validation"}' >&2
+            exit 1
+        fi
+        rm -f "$CHECK_TMP"
+        # Snapshot + arm the dead-man's-switch BEFORE any write. No armed
+        # switch → no safety net → refuse to modify the file at all. The
+        # fixed unit name doubles as a concurrency lock (a second concurrent
+        # reharden's systemd-run fails while one is pending).
+        cp "$AK" "$AK_BAK"
+        if ! systemd-run --user --collect --on-active=120 \
+                --unit=genesis-authkey-restore \
+                /bin/cp "$AK_BAK" "$AK" >/dev/null 2>&1; then
+            rm -f "$AK_BAK"
+            echo '{"ok": false, "action": "reharden-key", "error": "cannot arm restore switch (systemd-run failed); refusing to modify authorized_keys"}' >&2
+            exit 1
+        fi
+        AK_TMP=$(mktemp "$AK.XXXXXX")
+        # Drop the guardian line by its blob (unique key material — immune to
+        # option/comment drift), keep every other line untouched, append the
+        # rebuilt line.
+        grep -vF "$BLOB" "$AK" > "$AK_TMP" || true
+        printf '%s\n' "$NEW_LINE" >> "$AK_TMP"
+        OLD_N=$(grep -c '' "$AK") || OLD_N=0
+        NEW_N=$(grep -c '' "$AK_TMP") || NEW_N=0
+        if [ "$OLD_N" -ne "$NEW_N" ]; then
+            rm -f "$AK_TMP"
+            printf '{"ok": false, "action": "reharden-key", "error": "line-count invariant violated (%s -> %s); file untouched"}\n' "$OLD_N" "$NEW_N" >&2
+            exit 1
+        fi
+        chmod 600 "$AK_TMP"
+        mv "$AK_TMP" "$AK"
+        printf '{"ok": true, "action": "reharden-key", "changed": true, "has_from": %s}\n' "$HAS_FROM"
         ;;
     ping)
         echo '{"ok": true, "action": "ping"}'
