@@ -516,24 +516,60 @@ _register_mcp() {
     local name="$1" scope="$2"
     shift 2
     local cmd_args=("$@")
-    if command -v claude &>/dev/null; then
+    if ! command -v claude &>/dev/null; then
+        echo "  WARNING: 'claude' CLI not found — skipping $name registration"
+        return 0
+    fi
+    if [ "$scope" = "user" ]; then
+        # User scope: read ~/.claude.json directly. `claude mcp list` merges
+        # scopes, so a same-named project-scope entry can mask a STALE
+        # user-scope command and freeze it behind "already registered" (real
+        # case: codebase-memory-mcp stayed pointed at the bare binary,
+        # bypassing the memory-cap launcher below). Compare the registered
+        # command and re-register on drift.
+        local registered
+        registered="$(python3 - "$name" <<'PYEOF' 2>/dev/null
+import json, os, sys
+try:
+    cfg = json.load(open(os.path.expanduser("~/.claude.json")))
+    print(cfg.get("mcpServers", {}).get(sys.argv[1], {}).get("command", ""))
+except Exception:
+    print("")
+PYEOF
+)"
+        # Compare basenames, not full strings: `claude mcp add` may store the
+        # RESOLVED absolute path for a command registered by bare name (e.g.
+        # "gitnexus" → "~/.local/bin/gitnexus"), which is not drift. A wrapper
+        # swap genuinely changes the basename (codebase-memory-mcp →
+        # run-codebase-memory), which is.
+        if [ -n "$registered" ] && [ "$(basename "$registered")" = "$(basename "${cmd_args[0]}")" ]; then
+            echo "  $name: already registered"
+            return 0
+        fi
+        if [ -n "$registered" ]; then
+            echo "  $name: registered command drifted ($registered) — re-registering"
+            claude mcp remove "$name" -s "$scope" 2>/dev/null || true
+        fi
+    else
         if claude mcp list 2>/dev/null | grep -q "^$name:"; then
             echo "  $name: already registered"
             return 0
         fi
-        claude mcp add "$name" -s "$scope" -- "${cmd_args[@]}" 2>/dev/null \
-            && echo "  $name: registered ($scope)" \
-            || echo "  WARNING: Failed to register $name"
-    else
-        echo "  WARNING: 'claude' CLI not found — skipping $name registration"
     fi
+    claude mcp add "$name" -s "$scope" -- "${cmd_args[@]}" 2>/dev/null \
+        && echo "  $name: registered ($scope)" \
+        || echo "  WARNING: Failed to register $name"
 }
 
 if command -v gitnexus &>/dev/null; then
     _register_mcp "gitnexus" "user" "gitnexus" "mcp"
 fi
 if command -v codebase-memory-mcp &>/dev/null; then
-    _register_mcp "codebase-memory-mcp" "user" "codebase-memory-mcp"
+    # Registered via the repo launcher (NOT the bare binary): the launcher
+    # wraps the server in a systemd scope with MemoryMax to contain upstream's
+    # unbounded leak (DeusData/codebase-memory-mcp#581). See
+    # .claude/mcp/run-codebase-memory for the full rationale.
+    _register_mcp "codebase-memory-mcp" "user" "$GENESIS_ROOT/.claude/mcp/run-codebase-memory"
 fi
 if command -v serena &>/dev/null; then
     _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT"

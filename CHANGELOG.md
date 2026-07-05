@@ -9,6 +9,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **The codebase-memory code-intelligence server can no longer eat all your RAM.** The third-party
+  `codebase-memory-mcp` binary has a known upstream memory leak (grows without bound over hours of
+  use — several gigabytes per Claude Code session, enough to freeze the whole container when a few
+  sessions run at once). Every instance now starts inside a hard 2 GB memory cap: when the leak hits
+  the cap, only that server is killed and the session keeps working (reconnect it with `/mcp`).
+  Existing installs pick the cap up automatically on their next update — the setup script now also
+  detects and re-points a stale registration that would have bypassed the capped launcher. Override
+  with `CODEBASE_MEMORY_MCP_MEMORY_MAX` if your machine has RAM to spare.
+
 ### Security
 
 - **The contribution sanitizer now blocks Tailscale addresses before they can reach the public

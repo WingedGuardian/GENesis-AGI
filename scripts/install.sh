@@ -896,8 +896,11 @@ if command -v claude &>/dev/null; then
     }
     command -v gitnexus &>/dev/null && \
         _register_ci_mcp "gitnexus" "user" "gitnexus" "mcp"
+    # Via the repo launcher (NOT the bare binary): wraps the server in a
+    # systemd scope with MemoryMax=2G to contain upstream's unbounded memory
+    # leak (DeusData/codebase-memory-mcp#581). Rationale in the launcher.
     command -v codebase-memory-mcp &>/dev/null && \
-        _register_ci_mcp "codebase-memory-mcp" "user" "codebase-memory-mcp"
+        _register_ci_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
     command -v serena &>/dev/null && \
         _register_ci_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
 fi
