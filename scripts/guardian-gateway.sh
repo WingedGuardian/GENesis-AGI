@@ -625,7 +625,12 @@ PYEOF
         OLD_N=$(grep -c '' "$AK") || OLD_N=0
         NEW_N=$(grep -c '' "$AK_TMP") || NEW_N=0
         if [ "$OLD_N" -ne "$NEW_N" ]; then
+            # Aborting WITHOUT writing → the file is unchanged, so disarm the
+            # switch we armed above (keep "armed iff we wrote" symmetry). The
+            # restore would be a harmless self-copy either way, but leaving a
+            # pending timer around is untidy.
             rm -f "$AK_TMP"
+            systemctl --user stop genesis-authkey-restore.timer 2>/dev/null || true
             printf '{"ok": false, "action": "reharden-key", "error": "line-count invariant violated (%s -> %s); file untouched"}\n' "$OLD_N" "$NEW_N" >&2
             exit 1
         fi
