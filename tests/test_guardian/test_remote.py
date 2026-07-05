@@ -155,3 +155,102 @@ class TestSyncGateway:
             result = await remote.sync_gateway()
         assert result["ok"] is False
         assert "error" in result
+
+
+class TestRehardenKey:
+    """Verb call + confirm flow: a changed key must be proven by a SECOND
+    fresh SSH connection (which doubles as the dead-man's-switch cancel)."""
+
+    @pytest.mark.asyncio
+    async def test_unchanged_needs_no_confirm(self, remote):
+        with patch.object(
+            remote, "_ssh_command",
+            return_value=(True, '{"ok": true, "changed": false}'),
+        ) as ssh:
+            result = await remote.reharden_key()
+        assert result["ok"] is True
+        assert result["changed"] is False
+        ssh.assert_awaited_once()  # idempotent no-op → no second connection
+
+    @pytest.mark.asyncio
+    async def test_changed_confirms_with_second_connection(self, remote):
+        with patch.object(
+            remote, "_ssh_command",
+            side_effect=[
+                (True, '{"ok": true, "changed": true, "has_from": true}'),
+                (True, '{"ok": true, "changed": false}'),
+            ],
+        ) as ssh:
+            result = await remote.reharden_key()
+        assert ssh.await_count == 2
+        assert result["ok"] is True
+        assert result["changed"] is True
+        assert result["confirmed"] is True
+
+    @pytest.mark.asyncio
+    async def test_confirm_failure_reports_restore_pending(self, remote):
+        """Second connection failing means the rewritten line may not work —
+        the host's dead-man's-switch will restore it; surface that instead
+        of claiming success."""
+        with patch.object(
+            remote, "_ssh_command",
+            side_effect=[
+                (True, '{"ok": true, "changed": true, "has_from": true}'),
+                (False, "timeout"),
+            ],
+        ):
+            result = await remote.reharden_key()
+        assert result["ok"] is False
+        assert result["changed"] is True
+        assert result["confirmed"] is False
+        assert result["restore_pending"] is True
+
+    @pytest.mark.asyncio
+    async def test_ssh_failure(self, remote):
+        with patch.object(remote, "_ssh_command", return_value=(False, "timeout")):
+            result = await remote.reharden_key()
+        assert result["ok"] is False
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_non_json_response_is_failure(self, remote):
+        """Unlike sync-gateway, an unparseable reharden response is NOT a
+        success — we can't know whether the key file changed."""
+        with patch.object(remote, "_ssh_command", return_value=(True, "not json")):
+            result = await remote.reharden_key()
+        assert result["ok"] is False
+
+
+class TestAddressFamilyPin:
+    """_ssh_command must pin AddressFamily=inet for v4/hostname targets so a
+    dual-stack resolution can't flip the source address sshd sees (which
+    from= matches against). A v6-literal host_ip must NOT get the pin."""
+
+    async def _spawn_args(self, remote_obj) -> list[str]:
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate.return_value = (b'{"ok": true}', b"")
+        with patch(
+            "asyncio.create_subprocess_exec", return_value=mock_proc,
+        ) as spawn:
+            await remote_obj._ssh_command("status")
+        return [str(a) for a in spawn.call_args.args]
+
+    @pytest.mark.asyncio
+    async def test_v4_literal_gets_pin(self, remote):
+        args = await self._spawn_args(remote)
+        assert "AddressFamily=inet" in args
+
+    @pytest.mark.asyncio
+    async def test_hostname_gets_pin(self):
+        r = GuardianRemote(host_ip="guardian.example.internal", host_user="u",
+                           key_path="/tmp/test_key")
+        args = await self._spawn_args(r)
+        assert "AddressFamily=inet" in args
+
+    @pytest.mark.asyncio
+    async def test_v6_literal_skips_pin(self):
+        r = GuardianRemote(host_ip="fd00::1", host_user="u",
+                           key_path="/tmp/test_key")
+        args = await self._spawn_args(r)
+        assert "AddressFamily=inet" not in args

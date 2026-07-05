@@ -20,6 +20,11 @@
 # Options:
 #   --container-name NAME  Container name (default: auto-detect or "genesis")
 #   --non-interactive      Skip prompts
+#   --reharden-key-only    Only (re)install the hardened guardian SSH key, then
+#                          exit. Out-of-band Tier-3 recovery for an existing
+#                          install whose live key predates the current hardening
+#                          (the container's reharden-key gateway verb is the
+#                          normal, Genesis-driven path — this is the manual one).
 #   -h, --help             Show this help
 #
 # This script is idempotent — safe to run multiple times.
@@ -30,6 +35,7 @@ set -euo pipefail
 
 CONTAINER_NAME=""
 NON_INTERACTIVE=0
+REHARDEN_KEY_ONLY=0
 INSTALL_DIR="$HOME/.local/share/genesis-guardian"
 STATE_DIR="$HOME/.local/state/genesis-guardian"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
@@ -41,6 +47,7 @@ while [ $# -gt 0 ]; do
         --container-name) [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; CONTAINER_NAME="$2"; shift ;;
         --repo-url)       echo "WARN: --repo-url is deprecated (code is copied from local repo)"; shift ;;
         --non-interactive) NON_INTERACTIVE=1 ;;
+        --reharden-key-only) REHARDEN_KEY_ONLY=1 ;;
         -h|--help)
             sed -n '2,/^$/{ s/^# \?//; p }' "$0"
             exit 0
@@ -49,6 +56,155 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# ── Reusable functions ───────────────────────────────────────────────
+
+# Derive TS_IP: the host address the container uses for approval URLs and as
+# the target for the guardian key's from= derivation. Prefers Tailscale, falls
+# back to the host's default-route source IP. Sets the global TS_IP.
+derive_ts_ip() {
+    if command -v tailscale &>/dev/null; then
+        TS_IP=$(tailscale ip -4 2>/dev/null || echo "")
+        if [ -n "$TS_IP" ]; then
+            echo "  OK    Tailscale: $TS_IP (will use for approval URLs)"
+        else
+            echo "  WARN  Tailscale running but no IPv4"
+        fi
+    fi
+    if [ -z "${TS_IP:-}" ]; then
+        TS_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo "")
+        if [ -n "$TS_IP" ]; then
+            echo "  OK    Host LAN IP: $TS_IP (will use for approval URLs)"
+        else
+            echo "  WARN  Could not detect host IP — set approval.bind_host manually"
+        fi
+    fi
+}
+
+# Generate the container's guardian keypair (if absent) and install a
+# command-restricted, hardened authorized_keys entry on this host, then verify
+# the container→host link and self-heal a wrong from= by dropping it. Idempotent
+# by key material. Requires CONTAINER_NAME, CONTAINER_USER, TS_IP set.
+setup_bidirectional_ssh() {
+    local GUARDIAN_KEY="/home/${CONTAINER_USER}/.ssh/genesis_guardian_ed25519"
+
+    # Generate dedicated keypair in container (if not already present)
+    if incus exec "$CONTAINER_NAME" -- test -f "$GUARDIAN_KEY" 2>/dev/null; then
+        echo "  Guardian SSH key already exists in container"
+    else
+        incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c \
+            "ssh-keygen -t ed25519 -f $GUARDIAN_KEY -N '' -C 'genesis-guardian-control'" 2>/dev/null
+        echo "  Generated guardian SSH keypair in container"
+    fi
+
+    # Pull public key from container
+    local PUBKEY
+    PUBKEY=$(incus exec "$CONTAINER_NAME" -- cat "${GUARDIAN_KEY}.pub" 2>/dev/null || echo "")
+    if [ -z "$PUBKEY" ]; then
+        echo "  WARNING: Could not read guardian public key — bidirectional monitoring disabled"
+        return 0
+    fi
+
+    # Install command-restricted authorized_keys entry (idempotent by key material)
+    local PUBKEY_BLOB GUARD_FROM_IP GUARD_BASE_OPTS
+    PUBKEY_BLOB=$(echo "$PUBKEY" | awk '{print $2}')
+    GUARD_FROM_IP=""
+    GUARD_BASE_OPTS="command=\"$HOME/.local/bin/guardian-gateway.sh\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty"
+    # Treat the key as installed only if it is present AND hardened (no-pty is
+    # the marker for this installer version's options). A key present without
+    # no-pty is an older, under-hardened entry — re-install to upgrade it.
+    if grep -F "$PUBKEY_BLOB" "$HOME/.ssh/authorized_keys" 2>/dev/null | grep -q 'no-pty'; then
+        echo "  Authorized key already installed and hardened"
+    else
+        # Remove any existing control entry (stale key OR older un-hardened one)
+        if grep -q "genesis-guardian-control" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+            sed -i '/genesis-guardian-control/d' "$HOME/.ssh/authorized_keys"
+            echo "  Removed prior guardian key entry (re-installing hardened)"
+        fi
+        mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+        # Harden beyond the ForceCommand:
+        #   no-pty  — the gateway is a non-interactive JSON contract, never a shell.
+        #   from="" — bind the key to the container's source IP so a stolen key
+        #             can't be used from any other LAN host. Derive that IP from
+        #             the container's ACTUAL egress route to the host, NOT
+        #             `incus list -c4` (which can return the tailscale address the
+        #             host never sees). If it can't be derived, install without
+        #             from= (no-pty still applies) rather than guess and risk a
+        #             lockout; a wrong from= is caught + rolled back by the
+        #             connectivity test below.
+        GUARD_FROM_IP=$(incus exec "$CONTAINER_NAME" -- ip -4 route get "${TS_IP:-}" 2>/dev/null | grep -oP 'src \K\S+' | head -1 || true)
+        if [ -n "$GUARD_FROM_IP" ]; then
+            echo "from=\"${GUARD_FROM_IP}\",${GUARD_BASE_OPTS} ${PUBKEY}" >> "$HOME/.ssh/authorized_keys"
+        else
+            echo "  NOTE: could not derive container source IP — installing without from= (no-pty still applied)"
+            echo "${GUARD_BASE_OPTS} ${PUBKEY}" >> "$HOME/.ssh/authorized_keys"
+        fi
+        chmod 600 "$HOME/.ssh/authorized_keys"
+        echo "  Installed hardened command-restricted SSH key for Genesis→Guardian control"
+    fi
+
+    # Write connection config into container for Genesis to read
+    local HOST_USER HOST_IP
+    HOST_USER="$(whoami)"
+    HOST_IP="${TS_IP:-}"
+    incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c \
+        "mkdir -p ~/.genesis && cat > ~/.genesis/guardian_remote.yaml" <<REMOTECONF
+# Auto-generated by install_guardian.sh — $(date -Is)
+# Genesis reads this to SSH to the host for Guardian management.
+host_ip: "${HOST_IP}"
+host_user: "${HOST_USER}"
+ssh_key: "~/.ssh/genesis_guardian_ed25519"
+REMOTECONF
+    echo "  Wrote guardian_remote.yaml into container"
+
+    # Verify SSH connectivity: container → host
+    echo "  Testing SSH connectivity (container → host)..."
+    _guardian_ssh_test() {
+        incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c \
+            "ssh -i ${GUARDIAN_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=5 ${HOST_USER}@${HOST_IP} ping 2>&1" || echo "FAILED"
+    }
+    local SSH_TEST
+    SSH_TEST=$(_guardian_ssh_test)
+    if echo "$SSH_TEST" | grep -q '"ok": true'; then
+        echo "  SSH bidirectional link verified${GUARD_FROM_IP:+ (source-restricted to ${GUARD_FROM_IP})}"
+    elif grep -F "$PUBKEY_BLOB" "$HOME/.ssh/authorized_keys" 2>/dev/null | grep -q 'from='; then
+        # The guardian key carries a from= restriction and the link is down — the
+        # restriction likely doesn't match the source IP the host observes (wrong
+        # derivation, or the container's address changed since the key was
+        # written). A wrong from= silently locks Guardian out, so drop it (keeping
+        # no-pty + the other options) and re-test. Keyed on the PRESENCE of from=
+        # (not on whether we wrote it this run), so a stale from= also self-heals
+        # on a plain re-run. Remove by key material (grep -vF on the blob), not
+        # the comment, so it works regardless of the key's comment field.
+        echo "  SSH test failed while a from= restriction is set on the guardian key — dropping from= (keeping no-pty) and retrying..."
+        local _ak="$HOME/.ssh/authorized_keys" _tmp="$HOME/.ssh/authorized_keys.tmp.$$"
+        grep -vF "$PUBKEY_BLOB" "$_ak" > "$_tmp" 2>/dev/null || true
+        echo "${GUARD_BASE_OPTS} ${PUBKEY}" >> "$_tmp"
+        mv "$_tmp" "$_ak"
+        chmod 600 "$_ak"
+        SSH_TEST=$(_guardian_ssh_test)
+        if echo "$SSH_TEST" | grep -q '"ok": true'; then
+            echo "  SSH link verified WITHOUT from= — the source-IP restriction did not match what the host observes."
+            echo "  Guardian works; the LAN key-theft restriction is NOT enforced. To enable it, add"
+            echo "  from=\"<container's host-facing source IP>\" to the guardian key in ~/.ssh/authorized_keys."
+        else
+            echo ""
+            echo "  WARNING: SSH test still failing after dropping from=. Guardian bidirectional monitoring may not work."
+            echo "  Error: $SSH_TEST"
+            echo "  To fix manually, add this to ~/.ssh/authorized_keys on the host:"
+            echo "    ${GUARD_BASE_OPTS} ${PUBKEY}"
+            echo ""
+        fi
+    else
+        echo ""
+        echo "  WARNING: SSH test failed. Guardian bidirectional monitoring may not work."
+        echo "  Error: $SSH_TEST"
+        echo ""
+        echo "  To fix manually, add this to ~/.ssh/authorized_keys on the host:"
+        echo "    ${GUARD_BASE_OPTS} ${PUBKEY}"
+        echo ""
+    fi
+}
 
 # ── Auto-detect container ─────────────────────────────────────────────
 
@@ -80,6 +236,27 @@ if [ -z "$CONTAINER_IP" ]; then
     echo "ERROR: Cannot detect IP for container '$CONTAINER_NAME'"
     echo "  Is the container running? Try: incus start $CONTAINER_NAME"
     exit 1
+fi
+
+# ── Out-of-band key re-harden (Tier-3 recovery) ──────────────────────
+# Only (re)install the hardened guardian SSH key on an existing install, then
+# exit — skips prerequisites, venv, systemd, mounts. The container's
+# reharden-key gateway verb is the normal Genesis-driven path; this is the
+# manual fallback when that channel is unavailable.
+if [ "$REHARDEN_KEY_ONLY" -eq 1 ]; then
+    echo ""
+    echo "  Re-hardening guardian SSH key only (container: $CONTAINER_NAME)"
+    echo ""
+    derive_ts_ip
+    if [ ! -f "$HOME/.local/bin/guardian-gateway.sh" ]; then
+        echo "  ERROR: guardian gateway not installed at ~/.local/bin/guardian-gateway.sh"
+        echo "  Run the full installer first: bash install_guardian.sh"
+        exit 1
+    fi
+    setup_bidirectional_ssh
+    echo ""
+    echo "  Guardian SSH key re-harden complete."
+    exit 0
 fi
 
 # Auto-detect health API port (default 5000)
@@ -129,25 +306,8 @@ fi
 echo "  OK    incus: $(incus version 2>/dev/null || echo 'available')"
 echo "  OK    Container '$CONTAINER_NAME': $CONTAINER_IP"
 
-# Tailscale (optional, preferred for approval URLs)
-if command -v tailscale &>/dev/null; then
-    TS_IP=$(tailscale ip -4 2>/dev/null || echo "")
-    if [ -n "$TS_IP" ]; then
-        echo "  OK    Tailscale: $TS_IP (will use for approval URLs)"
-    else
-        echo "  WARN  Tailscale running but no IPv4"
-    fi
-fi
-
-# Fallback: use host LAN IP if no Tailscale
-if [ -z "${TS_IP:-}" ]; then
-    TS_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo "")
-    if [ -n "$TS_IP" ]; then
-        echo "  OK    Host LAN IP: $TS_IP (will use for approval URLs)"
-    else
-        echo "  WARN  Could not detect host IP — set approval.bind_host manually"
-    fi
-fi
+# Sets the global TS_IP (host address the container reaches + approval URLs).
+derive_ts_ip
 
 # Claude CLI (optional)
 CLAUDE_PATH=$(command -v claude 2>/dev/null)
@@ -520,119 +680,7 @@ echo "  Installed guardian-gateway.sh"
 echo ""
 echo "[11/14] Setting up bidirectional SSH..."
 
-GUARDIAN_KEY="/home/${CONTAINER_USER}/.ssh/genesis_guardian_ed25519"
-
-# Generate dedicated keypair in container (if not already present)
-if incus exec "$CONTAINER_NAME" -- test -f "$GUARDIAN_KEY" 2>/dev/null; then
-    echo "  Guardian SSH key already exists in container"
-else
-    incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c \
-        "ssh-keygen -t ed25519 -f $GUARDIAN_KEY -N '' -C 'genesis-guardian-control'" 2>/dev/null
-    echo "  Generated guardian SSH keypair in container"
-fi
-
-# Pull public key from container
-PUBKEY=$(incus exec "$CONTAINER_NAME" -- cat "${GUARDIAN_KEY}.pub" 2>/dev/null || echo "")
-if [ -z "$PUBKEY" ]; then
-    echo "  WARNING: Could not read guardian public key — bidirectional monitoring disabled"
-else
-    # Install command-restricted authorized_keys entry (idempotent by key material)
-    PUBKEY_BLOB=$(echo "$PUBKEY" | awk '{print $2}')
-    GUARD_FROM_IP=""
-    GUARD_BASE_OPTS="command=\"$HOME/.local/bin/guardian-gateway.sh\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty"
-    # Treat the key as installed only if it is present AND hardened (no-pty is
-    # the marker for this installer version's options). A key present without
-    # no-pty is an older, under-hardened entry — re-install to upgrade it.
-    if grep -F "$PUBKEY_BLOB" "$HOME/.ssh/authorized_keys" 2>/dev/null | grep -q 'no-pty'; then
-        echo "  Authorized key already installed and hardened"
-    else
-        # Remove any existing control entry (stale key OR older un-hardened one)
-        if grep -q "genesis-guardian-control" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
-            sed -i '/genesis-guardian-control/d' "$HOME/.ssh/authorized_keys"
-            echo "  Removed prior guardian key entry (re-installing hardened)"
-        fi
-        mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-        # Harden beyond the ForceCommand:
-        #   no-pty  — the gateway is a non-interactive JSON contract, never a shell.
-        #   from="" — bind the key to the container's source IP so a stolen key
-        #             can't be used from any other LAN host. Derive that IP from
-        #             the container's ACTUAL egress route to the host, NOT
-        #             `incus list -c4` (which can return the tailscale address the
-        #             host never sees). If it can't be derived, install without
-        #             from= (no-pty still applies) rather than guess and risk a
-        #             lockout; a wrong from= is caught + rolled back by the
-        #             connectivity test below.
-        GUARD_FROM_IP=$(incus exec "$CONTAINER_NAME" -- ip -4 route get "${TS_IP:-}" 2>/dev/null | grep -oP 'src \K\S+' | head -1 || true)
-        if [ -n "$GUARD_FROM_IP" ]; then
-            echo "from=\"${GUARD_FROM_IP}\",${GUARD_BASE_OPTS} ${PUBKEY}" >> "$HOME/.ssh/authorized_keys"
-        else
-            echo "  NOTE: could not derive container source IP — installing without from= (no-pty still applied)"
-            echo "${GUARD_BASE_OPTS} ${PUBKEY}" >> "$HOME/.ssh/authorized_keys"
-        fi
-        chmod 600 "$HOME/.ssh/authorized_keys"
-        echo "  Installed hardened command-restricted SSH key for Genesis→Guardian control"
-    fi
-
-    # Write connection config into container for Genesis to read
-    HOST_USER="$(whoami)"
-    HOST_IP="${TS_IP:-}"
-    incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c \
-        "mkdir -p ~/.genesis && cat > ~/.genesis/guardian_remote.yaml" <<REMOTECONF
-# Auto-generated by install_guardian.sh — $(date -Is)
-# Genesis reads this to SSH to the host for Guardian management.
-host_ip: "${HOST_IP}"
-host_user: "${HOST_USER}"
-ssh_key: "~/.ssh/genesis_guardian_ed25519"
-REMOTECONF
-    echo "  Wrote guardian_remote.yaml into container"
-
-    # Verify SSH connectivity: container → host
-    echo "  Testing SSH connectivity (container → host)..."
-    _guardian_ssh_test() {
-        incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c \
-            "ssh -i ${GUARDIAN_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=5 ${HOST_USER}@${HOST_IP} ping 2>&1" || echo "FAILED"
-    }
-    SSH_TEST=$(_guardian_ssh_test)
-    if echo "$SSH_TEST" | grep -q '"ok": true'; then
-        echo "  SSH bidirectional link verified${GUARD_FROM_IP:+ (source-restricted to ${GUARD_FROM_IP})}"
-    elif grep -F "$PUBKEY_BLOB" "$HOME/.ssh/authorized_keys" 2>/dev/null | grep -q 'from='; then
-        # The guardian key carries a from= restriction and the link is down — the
-        # restriction likely doesn't match the source IP the host observes (wrong
-        # derivation, or the container's address changed since the key was
-        # written). A wrong from= silently locks Guardian out, so drop it (keeping
-        # no-pty + the other options) and re-test. Keyed on the PRESENCE of from=
-        # (not on whether we wrote it this run), so a stale from= also self-heals
-        # on a plain re-run. Remove by key material (grep -vF on the blob), not
-        # the comment, so it works regardless of the key's comment field.
-        echo "  SSH test failed while a from= restriction is set on the guardian key — dropping from= (keeping no-pty) and retrying..."
-        _ak="$HOME/.ssh/authorized_keys"; _tmp="${_ak}.tmp.$$"
-        grep -vF "$PUBKEY_BLOB" "$_ak" > "$_tmp" 2>/dev/null || true
-        echo "${GUARD_BASE_OPTS} ${PUBKEY}" >> "$_tmp"
-        mv "$_tmp" "$_ak"
-        chmod 600 "$_ak"
-        SSH_TEST=$(_guardian_ssh_test)
-        if echo "$SSH_TEST" | grep -q '"ok": true'; then
-            echo "  SSH link verified WITHOUT from= — the source-IP restriction did not match what the host observes."
-            echo "  Guardian works; the LAN key-theft restriction is NOT enforced. To enable it, add"
-            echo "  from=\"<container's host-facing source IP>\" to the guardian key in ~/.ssh/authorized_keys."
-        else
-            echo ""
-            echo "  WARNING: SSH test still failing after dropping from=. Guardian bidirectional monitoring may not work."
-            echo "  Error: $SSH_TEST"
-            echo "  To fix manually, add this to ~/.ssh/authorized_keys on the host:"
-            echo "    ${GUARD_BASE_OPTS} ${PUBKEY}"
-            echo ""
-        fi
-    else
-        echo ""
-        echo "  WARNING: SSH test failed. Guardian bidirectional monitoring may not work."
-        echo "  Error: $SSH_TEST"
-        echo ""
-        echo "  To fix manually, add this to ~/.ssh/authorized_keys on the host:"
-        echo "    ${GUARD_BASE_OPTS} ${PUBKEY}"
-        echo ""
-    fi
-fi
+setup_bidirectional_ssh
 
 # ── Step 12: Configure shared filesystem mounts ─────────────────────
 # Incus disk devices give Genesis and Guardian a shared data plane.

@@ -42,6 +42,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now re-hardens its own host SSH key automatically — no human on the host required.** The
+  Guardian's control key (the one the container uses to manage the host) is supposed to carry `no-pty`
+  and a source-IP `from=` restriction, but before this those were applied only at install time, so an
+  install set up before the hardening — or one whose container address changed — kept a weaker key
+  until someone re-ran the installer by hand. The watchdog now checks the key's hardening every cycle
+  and, when it has drifted, calls a new `reharden-key` gateway operation that rewrites the key to the
+  hardened form and proves the rewrite still works before committing to it (a built-in 120-second
+  dead-man's-switch restores the previous key otherwise, so it can never lock Genesis out of its own
+  host). A moved-but-stable source address heals on its own; a flapping address is left alone and
+  reported instead of chased. For the rare manual case, `install_guardian.sh --reharden-key-only`
+  re-hardens the key without a full re-install.
+
 - **The Guardian now maintains a rolling "healthy" snapshot of the container — the restore point its
   snapshot-rollback recovery always needed.** Once a day, while every health check passes, the Guardian
   takes a `-healthy` container snapshot and deletes the previous one (exactly one exists, never more
