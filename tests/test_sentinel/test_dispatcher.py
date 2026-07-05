@@ -982,3 +982,50 @@ class TestConvergePendingApproval:
         gate.get_request.assert_not_awaited()
         gate.mark_consumed.assert_not_awaited()
         assert d._state.state == SentinelState.HEALTHY
+
+
+class TestOperationalBrief:
+    def test_brief_has_orientation_and_doc_pointers(self):
+        from genesis.sentinel.dispatcher import _build_operational_brief
+
+        brief = _build_operational_brief()
+        assert "Operational Orientation" in brief
+        assert "immune responder" in brief
+        # architecture doc pointers resolve to real files in this checkout
+        assert "genesis-v3-self-healing-design.md" in brief
+
+    def test_brief_degrades_gracefully_without_docs(self, monkeypatch):
+        """If the docs tree can't be resolved, the brief still returns the
+        orientation (no crash, no pointer lines)."""
+        from genesis.sentinel.dispatcher import _build_operational_brief
+
+        def boom(self):
+            raise OSError("no filesystem")
+
+        monkeypatch.setattr("pathlib.Path.is_file", boom)
+        brief = _build_operational_brief()
+        assert "Operational Orientation" in brief
+        assert "genesis-v3-self-healing-design.md" not in brief
+
+    @pytest.mark.asyncio
+    async def test_dispatch_appends_brief_to_system_prompt(self):
+        """The dispatched CC session's system prompt = SENTINEL.md charter +
+        the operational brief (appended, not replacing)."""
+        d = _make_dispatcher()
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+
+        with patch("genesis.sentinel.dispatcher.save_state"), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"):
+            await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test",
+            ))
+
+        assert d._invoker.run.await_count == 1
+        invocation = d._invoker.run.await_args.args[0]
+        # brief appended
+        assert "Operational Orientation" in invocation.system_prompt
+        # SENTINEL.md charter still present (append, not replace)
+        assert "Three-Way Disposition" in invocation.system_prompt
+        assert invocation.append_system_prompt is True

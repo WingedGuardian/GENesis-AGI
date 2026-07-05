@@ -41,6 +41,53 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _build_operational_brief() -> str:
+    """A short launch-context brief appended to the Sentinel's system prompt.
+
+    Gives the firefighter (a) a compact orientation to what Genesis actually is
+    at the infrastructure level and (b) absolute paths to architecture docs it
+    can ``Read`` at runtime for depth. Deliberately NOT the genesis-development
+    skill — that skill is about writing PRs (worktrees, commit gates), which is
+    irrelevant to an emergency responder and would bloat every dispatch.
+
+    Doc paths are resolved from this file's location so they are correct for
+    whatever install the code runs in; only files that actually exist are
+    listed, so a trimmed install degrades to just the orientation.
+    """
+    from pathlib import Path
+
+    orientation = (
+        "## Operational Orientation\n\n"
+        "Genesis is a single autonomous cognitive system running inside this "
+        "container: a Python server process (systemd user unit `genesis-server`) "
+        "fronting a SQLite/WAL database (`~/genesis/data/genesis.db`), a local "
+        "Qdrant vector store, and an event/health observability layer. You are "
+        "its container-internal immune responder. You run *inside* the server "
+        "process, so you never restart your own host — you propose exact commands "
+        "and the dispatcher executes them after approval."
+    )
+
+    try:
+        arch = Path(__file__).resolve().parents[3] / "docs" / "architecture"
+        candidates = (
+            "genesis-v3-self-healing-design.md",
+            "genesis-v3-resilience-architecture.md",
+            "genesis-v3-vision.md",
+        )
+        present = [arch / name for name in candidates if (arch / name).is_file()]
+        if present:
+            pointer_lines = "\n".join(f"- {p}" for p in present)
+            orientation += (
+                "\n\nFor deeper architecture context, `Read` any of these at "
+                "runtime when a diagnosis needs it:\n" + pointer_lines
+            )
+    except Exception:
+        logger.debug("Could not resolve architecture doc pointers", exc_info=True)
+
+    return orientation
+
+
 # Per-pattern exponential backoff. Index = prior attempt count, value = seconds
 # to wait since the last attempt before trying again. Attempt 0 is immediate.
 # After the last entry is consumed, the pattern escalates to the user instead
@@ -1153,6 +1200,7 @@ class SentinelDispatcher:
             trigger_source=request.trigger_source,
             trigger_reason=request.trigger_reason,
             health_snapshot=health_snapshot,
+            scope=available_tools(),
             db=self._db,
         )
 
@@ -1165,6 +1213,16 @@ class SentinelDispatcher:
                 "You are the Sentinel — Genesis's internal health guardian. "
                 "Diagnose the problem and fix it. Use outreach_send_and_wait "
                 "to get approval before taking any action."
+            )
+
+        # Append the operational brief (orientation + architecture doc pointers)
+        # so the firefighter launches knowing what Genesis is and where to read
+        # more. Purpose-written and compact — NOT the dev-workflow skill.
+        try:
+            system_prompt = f"{system_prompt}\n\n{_build_operational_brief()}"
+        except Exception:
+            logger.warning(
+                "Failed to append operational brief to Sentinel prompt", exc_info=True
             )
 
         full_prompt = f"{context_str}\n\n---\n\nDiagnose and fix the above issues."

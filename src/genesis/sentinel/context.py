@@ -12,6 +12,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from genesis.sentinel.remediation_map import (
+    TOOLS,
+    available_tools,
+    required_tools,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,29 +28,72 @@ async def assemble_diagnostic_context(
     trigger_reason: str,
     health_snapshot: dict | None = None,
     remediation_history: list[dict] | None = None,
+    scope: frozenset[str] | None = None,
     db=None,
 ) -> str:
     """Build a diagnostic context string for the Sentinel CC session.
 
     Includes:
-    - Fire alarm details (what triggered the Sentinel)
+    - Fire alarm details (what triggered the Sentinel) + why each woke it
+    - The live remediation-tool inventory available on THIS install
     - Current health alerts
     - Recent remediation outcomes
     - Infrastructure health snapshot
     - Recent observations (if DB available)
+
+    ``scope`` is the set of remediation-tool ids available right now (from
+    :func:`available_tools`). The dispatcher computes it once per dispatch and
+    threads it in; when omitted it is evaluated here so the function stays
+    self-contained for tests and other callers.
     """
     sections: list[str] = []
     now = datetime.now(UTC).isoformat()
 
+    # Live remediation inventory — evaluated once, reused for the per-alarm
+    # rationale (below) and the tool-inventory section.
+    tool_scope = scope if scope is not None else available_tools()
+
     # 1. Trigger context
     sections.append(f"## Trigger\n\nSource: {trigger_source}\nReason: {trigger_reason}\nTime: {now}")
 
-    # 2. Fire alarms
+    # 2. Fire alarms — each line names the remediation path that made it wake
+    #    the Sentinel ("why you were woken"). Direct escalations bypass the
+    #    map, so an alarm may have no mapped tools; that is fine.
     if alarms:
         alarm_lines = []
         for a in alarms:
-            alarm_lines.append(f"- **Tier {a.tier}** [{a.alert_id}] {a.severity}: {a.message}")
+            line = f"- **Tier {a.tier}** [{a.alert_id}] {a.severity}: {a.message}"
+            req = required_tools(a.alert_id)
+            if req:
+                actionable = sorted(req & tool_scope)
+                if actionable:
+                    line += f"\n  ↳ you can act on this with: {', '.join(actionable)}"
+                else:
+                    line += (
+                        f"\n  ↳ mapped remediation ({', '.join(sorted(req))}) is "
+                        "not available on this install — escalate with your diagnosis"
+                    )
+            alarm_lines.append(line)
         sections.append("## Active Fire Alarms\n\n" + "\n".join(alarm_lines))
+
+    # 2b. Available remediation tools — what the Sentinel can actually do on
+    #     THIS install right now. Proposed actions must be achievable with
+    #     these; anything else is an escalation, not a fix.
+    if tool_scope:
+        tool_lines = [
+            f"- **{tool.id}** — {tool.description}"
+            for tool in TOOLS
+            if tool.id in tool_scope
+        ]
+        if tool_lines:
+            sections.append(
+                "## Available Remediation Tools\n\n"
+                "These are the remediation capabilities available on THIS install "
+                "right now. Your `proposed_actions` must be achievable with these; "
+                "if the fix needs something not listed here, say so in "
+                "`recommendation` and escalate rather than inventing a command.\n\n"
+                + "\n".join(tool_lines)
+            )
 
     # 3. Health snapshot
     if health_snapshot:
