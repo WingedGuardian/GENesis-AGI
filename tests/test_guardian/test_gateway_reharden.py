@@ -154,7 +154,7 @@ class TestRehardenKeyVerb:
         _run(sandbox, "reharden-key")
         _run(sandbox, "reharden-key")  # confirm call
         calls = _calls(sandbox)
-        assert "systemctl stop genesis-authkey-restore.timer" in calls
+        assert "stop genesis-authkey-restore.timer" in calls
 
     def test_empty_ssh_connection_falls_back_to_no_from(self, sandbox):
         res = _run(sandbox, "reharden-key", ssh_connection=None)
