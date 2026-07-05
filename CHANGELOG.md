@@ -180,6 +180,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   a Guardian is actually configured. Installs that intentionally don't run backups no longer see a
   false "backup failed" critical alert at all.
 
+- **When the Sentinel does wake, it now launches knowing exactly what it can act on.** Its diagnostic
+  session is handed the live list of remediation tools available on your install and told which one
+  applies to each firing alarm, so its proposed fixes stay grounded in what's actually possible here
+  — and it escalates with its diagnosis instead of inventing a command when nothing available can fix
+  the problem. It also launches with a short orientation to your system's shape and pointers to the
+  architecture docs it can consult.
+
 - **A rejected Sentinel approval can no longer freeze the Sentinel.** If you rejected (or let
   expire) a Sentinel dispatch approval while the underlying alarm stayed active, the Sentinel parked
   itself waiting forever and silently ignored every new alarm. It now applies your decision on the
