@@ -678,8 +678,8 @@ class GuardianWatchdog:
         if not self._authkey_reharden_attempted:
             self._authkey_reharden_attempted = True
             logger.warning(
-                "Guardian authkey from= stably moved (%s consecutive ticks) — reharden-key",
-                self._authkey_drift_count,
+                "Guardian authkey from= stably moved (drift streak hit threshold) "
+                "— reharden-key",
             )
             await self._run_reharden(reason="from= no longer matches container source")
             return
