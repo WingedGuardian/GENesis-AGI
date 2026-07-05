@@ -240,6 +240,34 @@ Verify before any commit:
   Check CI via `gh pr checks`. Bare `pytest` without a file path is banned.
 - **Commit continuously**: after every logical unit of work. Uncommitted = lost.
 
+## Host-Deploy Gate (merged ≠ deployed)
+
+A merged PR that touches host-deployed paths is **NOT done at merge**. The
+guardian and the host VM only pick up changes when `scripts/update.sh` runs —
+merging and walking away leaves the host running stale code indefinitely
+(observed live: a host guardian sat 3 PRs behind for a week because every
+session assumed deploy "happens somehow").
+
+**Trigger paths** (match = this gate applies): `src/genesis/guardian/`,
+`scripts/guardian-gateway.sh`, `scripts/install_guardian.sh`,
+`scripts/host-setup.sh`, `scripts/update.sh`, `scripts/lib/cc_version.sh`.
+
+**After merging such a PR, in the same session:**
+
+1. Run `scripts/update.sh` from `~/genesis` (it redeploys the guardian when
+   guardian-relevant paths changed and heals host/container CC + Node pin
+   drift — including on a no-delta run).
+2. Verify the deploy landed: gateway `version` op reports the expected
+   `deployed_commit` / CC version; guardian tick healthy in its journal.
+3. State the deploy + verification result explicitly in the wrap-up. If the
+   deploy cannot happen this session (host unreachable), create a follow-up
+   via `follow_up_create` — never leave deploy as an implicit assumption.
+
+**The reverse direction is equally binding**: host VMs are deploy targets,
+never edit-in-place dev environments. An emergency hand-edit on a host gets a
+same-day PR that lands the same change at source — a host divergence that
+outlives its incident is a bug.
+
 ## Pre-Merge Gate
 
 `git_push_guard.py` enforces a **hard gate** on review findings:
