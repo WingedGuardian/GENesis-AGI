@@ -730,3 +730,177 @@ class TestAlertUser:
         outreach.submit_raw.side_effect = Exception("telegram down")
         wd = GuardianWatchdog(AsyncMock(), event_bus=None, outreach_pipeline=outreach)
         await wd._alert_user(topic="t", context="c", source_id="guardian:x")  # swallowed
+
+
+# --- Authorized-keys hardening reconciler -----------------------------------
+
+# sha256 hexdigests of the host-observed SSH source (values arbitrary).
+_SRC_A = "c" * 64
+_SRC_B = "d" * 64
+_SRC_C = "e" * 64
+
+
+def _authkey_vi(*, no_pty=True, has_from=True, from_matches=True,
+                src_hash=_SRC_A) -> dict:
+    """version() payload carrying the authkey_* hardening indicators."""
+    return {
+        "gateway_sha": _EXPECTED_GW_SHA,
+        "code_version": "abc1234",
+        "authkey_no_pty": no_pty,
+        "authkey_has_from": has_from,
+        "authkey_from_matches": from_matches,
+        "authkey_observed_src_hash": src_hash,
+        "authkey_opts_hash": "f" * 64,
+    }
+
+
+def _ak_watchdog():
+    wd, r, eb, outreach = _gw_watchdog()
+    r.reharden_key = AsyncMock(
+        return_value={"ok": True, "changed": True, "confirmed": True})
+    return wd, r, eb, outreach
+
+
+def _alert_ids(outreach) -> list[str]:
+    return [c.args[1].source_id for c in outreach.submit_raw.call_args_list]
+
+
+class TestAuthkeyHardening:
+    """Self-heal reconciler for the host guardian authorized_keys line.
+
+    Two trigger classes: a hardening REGRESSION (no-pty stripped, or from=
+    missing while the source is derivable) heals immediately — those states
+    don't oscillate. A from= MISMATCH heals only after a stable streak (same
+    observed-source hash for DRIFT_ALERT_THRESHOLD consecutive ticks); a
+    source that changes between ticks is a flap and must NEVER be chased —
+    escalate instead. The flap guard is non-sticky: a source that later
+    stabilizes reaches the streak and heals.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_fields_skips(self):
+        """Old gateway without authkey_* fields → never act, never alarm."""
+        wd, r, eb, outreach = _ak_watchdog()
+        await wd._check_authkey_hardening(
+            {"gateway_sha": _EXPECTED_GW_SHA, "code_version": "abc1234"})
+        r.reharden_key.assert_not_called()
+        outreach.submit_raw.assert_not_called()
+        assert wd._authkey_drift_count == 0
+
+    @pytest.mark.asyncio
+    async def test_healthy_resets_state(self):
+        wd, r, _, _ = _ak_watchdog()
+        wd._authkey_drift_count = 2
+        wd._authkey_reharden_attempted = True
+        wd._authkey_escalated = True
+        wd._authkey_flap_escalated = True
+        wd._authkey_last_src_hash = _SRC_B
+        await wd._check_authkey_hardening(_authkey_vi())
+        r.reharden_key.assert_not_called()
+        assert wd._authkey_drift_count == 0
+        assert wd._authkey_reharden_attempted is False
+        assert wd._authkey_escalated is False
+        assert wd._authkey_flap_escalated is False
+        assert wd._authkey_last_src_hash is None
+
+    @pytest.mark.asyncio
+    async def test_no_pty_regression_heals_immediately(self):
+        """A stripped no-pty is a non-oscillating regression → heal on the
+        FIRST tick, and tell the operator a reharden happened."""
+        wd, r, eb, outreach = _ak_watchdog()
+        await wd._check_authkey_hardening(_authkey_vi(no_pty=False))
+        r.reharden_key.assert_awaited_once()
+        assert any("authkey" in e for e in _emitted_events(eb))
+        assert "guardian:authkey_rehardened" in _alert_ids(outreach)
+
+    @pytest.mark.asyncio
+    async def test_regression_heals_once_then_escalates_once(self):
+        wd, r, _, outreach = _ak_watchdog()
+        vi = _authkey_vi(no_pty=False)
+        for _ in range(4):
+            await wd._check_authkey_hardening(vi)
+        r.reharden_key.assert_awaited_once()  # one heal per episode
+        drift_alerts = [s for s in _alert_ids(outreach)
+                        if s == "guardian:authkey_drift"]
+        assert len(drift_alerts) == 1  # escalated exactly once
+
+    @pytest.mark.asyncio
+    async def test_missing_from_with_src_heals(self):
+        wd, r, _, _ = _ak_watchdog()
+        await wd._check_authkey_hardening(
+            _authkey_vi(has_from=False, from_matches=False))
+        r.reharden_key.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_from_without_src_never_heals(self):
+        """No observable source → a reharden could not add from= anyway;
+        do nothing rather than churn (fail-safe)."""
+        wd, r, _, outreach = _ak_watchdog()
+        vi = _authkey_vi(has_from=False, from_matches=False, src_hash="")
+        for _ in range(_THRESHOLD + 1):
+            await wd._check_authkey_hardening(vi)
+        r.reharden_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_from_mismatch_heals_only_at_stable_streak(self):
+        """A moved-but-stable source heals exactly once, and only after
+        DRIFT_ALERT_THRESHOLD consecutive ticks with the SAME source hash."""
+        wd, r, _, _ = _ak_watchdog()
+        vi = _authkey_vi(from_matches=False, src_hash=_SRC_B)
+        for _ in range(_THRESHOLD - 1):
+            await wd._check_authkey_hardening(vi)
+        r.reharden_key.assert_not_called()
+        await wd._check_authkey_hardening(vi)  # threshold tick
+        r.reharden_key.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_from_mismatch_empty_src_never_heals(self):
+        """Mismatch reported but the source is unobservable → no streak can
+        form; never reharden on it."""
+        wd, r, _, _ = _ak_watchdog()
+        vi = _authkey_vi(from_matches=False, src_hash="")
+        for _ in range(_THRESHOLD + 1):
+            await wd._check_authkey_hardening(vi)
+        r.reharden_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_flap_never_heals_escalates_once(self):
+        """Source hash differing between mismatch ticks = flapping network —
+        rewriting from= each tick would churn the key file forever. Never
+        heal; escalate exactly once with the real remedy."""
+        wd, r, _, outreach = _ak_watchdog()
+        for h in (_SRC_A, _SRC_B, _SRC_C, _SRC_A, _SRC_B):
+            await wd._check_authkey_hardening(
+                _authkey_vi(from_matches=False, src_hash=h))
+        r.reharden_key.assert_not_called()
+        flap_alerts = [s for s in _alert_ids(outreach)
+                       if s == "guardian:authkey_flap"]
+        assert len(flap_alerts) == 1
+
+    @pytest.mark.asyncio
+    async def test_flap_then_stable_source_recovers(self):
+        """The flap guard is NON-STICKY: once the source stabilizes for a
+        full streak, the reconciler heals — no wedged state needing a
+        restart."""
+        wd, r, _, _ = _ak_watchdog()
+        await wd._check_authkey_hardening(
+            _authkey_vi(from_matches=False, src_hash=_SRC_A))
+        for _ in range(_THRESHOLD):  # stabilizes on B
+            await wd._check_authkey_hardening(
+                _authkey_vi(from_matches=False, src_hash=_SRC_B))
+        r.reharden_key.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resolved_resets_and_rearms(self):
+        """After a healed episode resolves, a NEW episode must self-heal
+        again (no 'quiet forever')."""
+        wd, r, _, _ = _ak_watchdog()
+        for _ in range(_THRESHOLD):  # episode 1: stable move → heal
+            await wd._check_authkey_hardening(
+                _authkey_vi(from_matches=False, src_hash=_SRC_B))
+        assert r.reharden_key.await_count == 1
+        await wd._check_authkey_hardening(_authkey_vi())  # resolved → reset
+        for _ in range(_THRESHOLD):  # episode 2 → re-armed
+            await wd._check_authkey_hardening(
+                _authkey_vi(from_matches=False, src_hash=_SRC_C))
+        assert r.reharden_key.await_count == 2
