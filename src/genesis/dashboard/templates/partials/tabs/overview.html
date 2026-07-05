@@ -31,8 +31,8 @@
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.infrastructure">
-                <template x-for="(probe, name) in $store.genesisDashboard.health.infrastructure" :key="name">
-                  <div x-show="!['container_memory', 'disk', 'cpu'].includes(name)"
+                <template x-for="(probe, name) in $store.genesisDashboard.sortedInfrastructure" :key="name">
+                  <div x-show="!['container_memory', 'disk', 'cpu', 'cc_slots'].includes(name)"
                        style="margin-bottom: 0.2rem; cursor: default;"
                        :title="probe.error
                          ? $store.genesisDashboard.infraLabel(name) + ': ERROR — ' + probe.error

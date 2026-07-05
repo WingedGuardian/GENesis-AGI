@@ -200,6 +200,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The dashboard's Infrastructure card is clearer at a glance: failed probes sort to the top, and a
+  stray raw row is gone.** Probes now order worst-first (down/error, then degraded, then healthy) so
+  problems surface at the top of the card instead of wherever they happened to fall in insertion
+  order. The "Claude Code Sessions" data no longer also leaks out as a raw, unlabeled `cc_slots` row
+  — it appears only in its dedicated section. And when an infrastructure probe crosses the
+  healthy↔unhealthy line (e.g. Qdrant goes down, then recovers), that transition is now recorded in
+  the Activity feed — with startup-grace and flap dampening so a restart blip or a rapidly-bouncing
+  probe won't spam it.
+
 - **The watchdog's memory-reclaim cooldown now survives its own restarts, so it can't trigger an
   I/O storm under sustained memory pressure.** When container memory runs high, the watchdog reclaims
   a small, capped amount of page cache — throttled to at most once every 5 minutes to avoid an I/O

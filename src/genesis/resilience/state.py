@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -83,7 +84,10 @@ class ResilienceState:
     cc: CCStatus = CCStatus.NORMAL
     tmp_pressure: TmpPressureStatus = TmpPressureStatus.NORMAL
     timestamp: str = ""
-    transitions: list[StateTransition] = field(default_factory=list)
+    # Bounded append-only observability log (never read by routing). Capped so a
+    # long-lived server can't grow it without limit; flap detection uses a
+    # separate per-axis window (`_FlapState.transition_times`), not this deque.
+    transitions: deque[StateTransition] = field(default_factory=lambda: deque(maxlen=200))
 
     def to_legacy_degradation_level(self) -> DegradationLevel:
         """Map composite state to single DegradationLevel for backward compat."""
