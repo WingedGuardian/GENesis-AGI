@@ -59,6 +59,30 @@ host (or container) can be rolled back to an older known-good version the same w
 (`update-cc <older>`) if a release regresses — exactly what the 2.1.90→2.1.87
 rollback needed.
 
+### One-canonical-copy policy (`cc_shadow_scan`)
+
+The pin machinery only manages ONE copy of Claude Code per machine. Any second
+copy drifts silently and eventually shadows the pinned one in some PATH context
+— four real incidents in one week (2026-07): an nvm-tree copy that won
+interactive PATH and showed a months-old version; a native-installer symlink in
+`~/.local/bin` doing the same; ~490MB of leftover native version blobs; and a
+user-prefix copy invisible to non-interactive shells, which made the updater
+"reinstall" CC on every run AND silently skipped MCP registration.
+
+`cc_shadow_scan` (in `scripts/lib/cc_version.sh`, run by install/bootstrap/
+update/host-setup; mirrored compactly in the gateway's `update-cc` op for the
+host) enforces the policy: the canonical copy is what `command -v claude`
+resolves (all automation runs that one); every other copy on a known surface
+(nvm trees, `~/.claude/local`, `~/.local/bin`, native version blobs, stale npm
+prefixes) is removed — but only when provably a claude-code install; anything
+ambiguous is warned about and left alone, as are `alias claude=` lines in rc
+files (detected, never edited). The gateway variant is user-dir-only (it never
+sudo-removes). Deliberate multi-copy setups: `CC_SHADOW_SCAN=0` opts out.
+
+`cc_ensure_local` also probes known prefixes (`CC_PROBE_DIRS`) before declaring
+CC "not installed", so a PATH-blind install is aligned in place instead of
+reinstalled forever.
+
 ---
 
 ## Integration Surface — Genesis Components That Use CC

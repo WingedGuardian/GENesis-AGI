@@ -298,6 +298,7 @@ _sync_deploy_targets() {
         # shellcheck source=/dev/null
         source "$_cc_env"
         cc_ensure_local || true
+        cc_shadow_scan || true
     else
         echo "  WARNING: $_cc_env missing — skipping container CC sync"
     fi

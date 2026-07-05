@@ -390,11 +390,49 @@ PYEOF
             echo '{"ok": false, "action": "update-cc", "error": "npm install failed"}' >&2
             exit 1
         fi
+        # One-canonical-copy sweep — compact mirror of cc_shadow_scan in
+        # scripts/lib/cc_version.sh (this script must stay hermetic; it is the
+        # path that manages host CC when the install dir may be broken). Every
+        # host shadow incident to date was a USER-dir copy (nvm tree, native
+        # installer symlink + version blobs), so this sweep is user-dir-only —
+        # the gateway never sudo-removes files. Silent on stdout (consumers
+        # parse the JSON line below); count reported in the JSON.
+        SHADOWS_REMOVED=0
+        CANON="$(readlink -f "$(command -v claude 2>/dev/null)" 2>/dev/null || true)"
+        if [ -n "$CANON" ] && [ "${CC_SHADOW_SCAN:-1}" != "0" ]; then
+            for SHADOW in "$HOME"/.nvm/versions/node/*/bin/claude \
+                          "$HOME/.local/bin/claude" \
+                          "$HOME/.claude/local/claude" \
+                          "$HOME/.npm-global/bin/claude"; do
+                { [ -e "$SHADOW" ] || [ -L "$SHADOW" ]; } || continue
+                [ "$(readlink -f "$SHADOW" 2>/dev/null)" = "$CANON" ] && continue
+                T="$(readlink "$SHADOW" 2>/dev/null || true)"
+                case "$T" in
+                    *@anthropic-ai/claude-code*)
+                        PKG="$(cd "$(dirname "$SHADOW")" 2>/dev/null && cd "$(dirname "$T")" 2>/dev/null && pwd || true)"
+                        PKG="${PKG%%/@anthropic-ai/claude-code*}/@anthropic-ai/claude-code"
+                        rm -f "$SHADOW"
+                        case "$PKG" in
+                            */@anthropic-ai/claude-code) [ -d "$PKG" ] && rm -rf "$PKG" ;;
+                        esac
+                        SHADOWS_REMOVED=$((SHADOWS_REMOVED + 1))
+                        ;;
+                    */.local/share/claude/*)
+                        rm -f "$SHADOW"
+                        SHADOWS_REMOVED=$((SHADOWS_REMOVED + 1))
+                        ;;
+                esac
+            done
+            if [ -d "$HOME/.local/share/claude/versions" ]; then
+                rm -rf "$HOME/.local/share/claude/versions"
+                SHADOWS_REMOVED=$((SHADOWS_REMOVED + 1))
+            fi
+        fi
         # Verify: the in-use claude must now report exactly the requested version.
         INSTALLED="$(claude --version 2>/dev/null || echo unknown)"
         INSTALLED_VER="$(printf '%s' "$INSTALLED" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)"
         if [ "$INSTALLED_VER" = "$VERSION" ]; then
-            printf '{"ok": true, "action": "update-cc", "version": "%s", "installed": "%s"}\n' "$VERSION" "$INSTALLED"
+            printf '{"ok": true, "action": "update-cc", "version": "%s", "installed": "%s", "shadows_removed": %s}\n' "$VERSION" "$INSTALLED" "$SHADOWS_REMOVED"
         else
             printf '{"ok": false, "action": "update-cc", "error": "version mismatch after install", "requested": "%s", "installed": "%s"}\n' "$VERSION" "$INSTALLED" >&2
             exit 1

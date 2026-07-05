@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Stale duplicate copies of Claude Code are now detected and removed automatically.** If your
+  machine ever accumulated a second Claude Code install (an old nvm-tree copy, a native-installer
+  leftover, or an install in a directory only interactive shells can see), it could silently shadow
+  the version Genesis pins — you'd see a months-old Claude Code in your terminal while Genesis
+  believed everything was current, or updates would pointlessly reinstall on every run. The
+  install/update scripts now enforce a single canonical copy: provable duplicates are removed (with
+  clear logging), ambiguous files are only warned about, and shell aliases that shadow the real
+  binary are flagged. Set `CC_SHADOW_SCAN=0` if you deliberately run multiple copies.
+
 - **The codebase-memory code-intelligence server can no longer eat all your RAM.** The third-party
   `codebase-memory-mcp` binary has a known upstream memory leak (grows without bound over hours of
   use — several gigabytes per Claude Code session, enough to freeze the whole container when a few
