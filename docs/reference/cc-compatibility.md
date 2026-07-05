@@ -33,7 +33,11 @@ Code" below).
 
 One pin, both machines, no drift:
 
-1. Edit `CC_VERSION` in `scripts/lib/cc_version.sh` (one line).
+1. Edit `CC_VERSION` in `scripts/lib/cc_version.sh` (one line). If the new CC
+   version raises its `engines.node` floor, bump `NODE_MAJOR` in the same file
+   in lockstep — the `cc-node-lockstep` CI job (`scripts/check_cc_node_lockstep.py`)
+   fails the PR if `NODE_MAJOR` is below the pinned CC's required Node major, so
+   this can't be forgotten (it fails open on a transient npm-registry error).
 2. Merge to `main`.
 3. Run `scripts/update.sh`. It updates the container, redeploys the Guardian
    (carrying the new gateway script), then queries the host's CC version and —
