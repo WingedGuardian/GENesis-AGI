@@ -14,7 +14,6 @@ One real-cgroup smoke test runs only where ``systemd-run --user`` works.
 from __future__ import annotations
 
 import os
-import re
 import stat
 import subprocess
 from pathlib import Path
@@ -23,7 +22,7 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LAUNCHER = _REPO_ROOT / ".claude" / "mcp" / "run-codebase-memory"
-_BOOTSTRAP = _REPO_ROOT / "scripts" / "bootstrap.sh"
+_REGISTER_LIB = _REPO_ROOT / "scripts" / "lib" / "mcp_register.sh"
 
 _SYSTEM_PATH = "/usr/bin:/bin"  # real python3/bash/coreutils for harnesses
 
@@ -128,10 +127,50 @@ def test_args_passthrough_scope_path(tmp_path):
     assert "ARGS:cli impact" in blog.read_text()
 
 
+def _minimal_path(tmp_path: Path) -> Path:
+    """A PATH dir with ONLY bash + env (genuinely no systemd-run).
+
+    ``/usr/bin:/bin`` contains the real systemd-run on most Linux hosts, so
+    using it would exercise the probe-fail path, not the absent-binary path.
+    """
+    d = tmp_path / "minbin"
+    d.mkdir(exist_ok=True)
+    for tool in ("bash", "env", "sh"):
+        src = Path("/usr/bin") / tool
+        if not src.exists():
+            src = Path("/bin") / tool
+        (d / tool).symlink_to(src)
+    return d
+
+
 def test_fallback_when_systemd_run_absent(tmp_path):
-    # No systemd-run on PATH at all → ulimit fallback (2G = 2097152 KB).
-    res, blog = _run_launcher(tmp_path, fakebin=None)
+    # command -v systemd-run itself fails → ulimit fallback (2G = 2097152 KB).
+    minbin = _minimal_path(tmp_path)
+    binary, blog = _fake_binary(tmp_path)
+    res = subprocess.run(
+        ["bash", str(_LAUNCHER)],
+        env={"PATH": str(minbin), "HOME": str(tmp_path),
+             "CODEBASE_MEMORY_MCP_BIN": str(binary)},
+        capture_output=True, text=True, timeout=30,
+    )
     assert res.returncode == 0, res.stderr
+    assert "ULIMIT_V:2097152" in blog.read_text()
+
+
+def test_fallback_fractional_gig_truncates_cleanly(tmp_path):
+    # 2.5G is valid for systemd but the rlimit fallback truncates to 2G —
+    # and must NOT spray a bash arithmetic error on stderr.
+    minbin = _minimal_path(tmp_path)
+    binary, blog = _fake_binary(tmp_path)
+    res = subprocess.run(
+        ["bash", str(_LAUNCHER)],
+        env={"PATH": str(minbin), "HOME": str(tmp_path),
+             "CODEBASE_MEMORY_MCP_BIN": str(binary),
+             "CODEBASE_MEMORY_MCP_MEMORY_MAX": "2.5G"},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+    assert "arithmetic" not in res.stderr
     assert "ULIMIT_V:2097152" in blog.read_text()
 
 
@@ -188,14 +227,7 @@ def test_real_scope_applies_memory_max(tmp_path):
     assert res.stdout.strip() == str(2 * 1024**3)  # MemoryMax=2G
 
 
-# ── bootstrap _register_mcp drift-healing (extracted from the real script) ─
-
-
-def _extract_register_mcp() -> str:
-    text = _BOOTSTRAP.read_text(encoding="utf-8")
-    m = re.search(r"^_register_mcp\(\) \{$.*?^\}$", text, re.M | re.S)
-    assert m, "_register_mcp() not found in bootstrap.sh"
-    return m.group(0)
+# ── _register_mcp drift-healing (sources the REAL shared lib) ─────────────
 
 
 def _run_register(tmp_path: Path, args: list[str], claude_json: dict | None,
@@ -219,7 +251,7 @@ def _run_register(tmp_path: Path, args: list[str], claude_json: dict | None,
     harness = tmp_path / "harness.sh"
     quoted = " ".join(f"'{a}'" for a in args)
     harness.write_text(
-        "#!/usr/bin/env bash\n" + _extract_register_mcp() + f"\n_register_mcp {quoted}\n",
+        f'#!/usr/bin/env bash\n. "{_REGISTER_LIB}"\n_register_mcp {quoted}\n',
         encoding="utf-8",
     )
     res = subprocess.run(
@@ -256,6 +288,41 @@ def test_register_user_scope_drift_reregisters(tmp_path):
     assert "mcp remove codebase-memory-mcp -s user" in calls
     assert "mcp add codebase-memory-mcp -s user -- /repo/.claude/mcp/run-codebase-memory" in calls
     assert calls.index("mcp remove") < calls.index("mcp add")
+
+
+def test_register_user_scope_absolute_path_drift_reregisters(tmp_path):
+    # Same basename, different absolute path (e.g. a launcher registered from
+    # a since-reaped worktree) IS drift for an absolute intended command.
+    stale = "/repo/.claude/worktrees/old/.claude/mcp/run-codebase-memory"
+    cfg = {"mcpServers": {"codebase-memory-mcp": {"command": stale}}}
+    res, clog = _run_register(
+        tmp_path,
+        ["codebase-memory-mcp", "user", "/repo/.claude/mcp/run-codebase-memory"], cfg,
+    )
+    assert res.returncode == 0
+    calls = clog.read_text()
+    assert "mcp remove codebase-memory-mcp -s user" in calls
+    assert "mcp add codebase-memory-mcp -s user -- /repo/.claude/mcp/run-codebase-memory" in calls
+
+
+def test_register_warns_on_local_scope_shadow(tmp_path):
+    # A local-scope (per-project) entry takes precedence over user scope and
+    # must be surfaced, never silently shadowed. It is warned, not removed.
+    cfg = {
+        "mcpServers": {"codebase-memory-mcp":
+                       {"command": "/repo/.claude/mcp/run-codebase-memory"}},
+        "projects": {"/some/project": {"mcpServers": {
+            "codebase-memory-mcp": {"command": "/old/bare-binary"}}}},
+    }
+    res, clog = _run_register(
+        tmp_path,
+        ["codebase-memory-mcp", "user", "/repo/.claude/mcp/run-codebase-memory"], cfg,
+    )
+    assert res.returncode == 0
+    assert "already registered" in res.stdout
+    assert "LOCAL-scope" in res.stdout
+    assert "/old/bare-binary" in res.stdout
+    assert "mcp remove" not in (clog.read_text() if clog.exists() else "")
 
 
 def test_register_project_scope_existing_is_noop(tmp_path):

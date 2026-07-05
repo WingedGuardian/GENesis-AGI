@@ -887,22 +887,19 @@ fi
 
 # Register code intelligence tools as MCP servers
 if command -v claude &>/dev/null; then
-    _register_ci_mcp() {
-        local name="$1" scope="$2"; shift 2
-        if ! claude mcp list 2>/dev/null | grep -q "^$name:"; then
-            claude mcp add "$name" -s "$scope" -- "$@" 2>/dev/null \
-                && echo "    + MCP: $name registered ($scope)" || true
-        fi
-    }
+    # Shared with bootstrap.sh: registers AND drift-heals user-scope entries
+    # (a re-run installer must re-point a stale registration, not skip it).
+    # shellcheck source=lib/mcp_register.sh
+    . "$SCRIPT_DIR/lib/mcp_register.sh"
     command -v gitnexus &>/dev/null && \
-        _register_ci_mcp "gitnexus" "user" "gitnexus" "mcp"
+        _register_mcp "gitnexus" "user" "gitnexus" "mcp"
     # Via the repo launcher (NOT the bare binary): wraps the server in a
     # systemd scope with MemoryMax=2G to contain upstream's unbounded memory
     # leak (DeusData/codebase-memory-mcp#581). Rationale in the launcher.
     command -v codebase-memory-mcp &>/dev/null && \
-        _register_ci_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
+        _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
     command -v serena &>/dev/null && \
-        _register_ci_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
+        _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
 fi
 
 # Trigger initial code intelligence indexing (background)

@@ -28,10 +28,14 @@ fi
 
 # Preferred: cgroup cap via a transient scope. Probe first — exec has no
 # fallback once taken, and systemd-run needs a reachable user manager (absent
-# in some CI/containers). MemorySwapMax=0 keeps a future swap enablement from
-# letting the leak thrash swap instead of being killed.
+# in some CI/containers). The probe sets the SAME properties as the real
+# invocation so a property the manager rejects fails at probe time, not after
+# exec. MemorySwapMax=0 keeps a future swap enablement from letting the leak
+# thrash swap instead of being killed.
 if command -v systemd-run >/dev/null 2>&1 \
-    && systemd-run --user --scope --quiet -p "MemoryMax=${MEM_MAX}" -- /bin/true >/dev/null 2>&1; then
+    && systemd-run --user --scope --quiet \
+        -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
+        -- /bin/true >/dev/null 2>&1; then
     exec systemd-run --user --scope --quiet \
         --description="codebase-memory-mcp (MemoryMax=${MEM_MAX})" \
         -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
@@ -40,14 +44,16 @@ fi
 
 # Fallback: no usable user manager — bound the address space instead. Coarser
 # than a cgroup cap (allocation failure instead of a clean kill), but still a
-# hard ceiling. Only G/M suffixes are converted; anything else runs uncapped
-# with a warning rather than mis-capping.
-case "$MEM_MAX" in
-    *G) _kb=$(( ${MEM_MAX%G} * 1024 * 1024 )) ;;
-    *M) _kb=$(( ${MEM_MAX%M} * 1024 )) ;;
-    *)  _kb="" ;;
-esac
-if [[ -n "$_kb" ]]; then
+# hard ceiling. Accepts systemd-style <int>[.<frac>]G/M (case-insensitive),
+# truncating any fraction; anything else runs uncapped with a warning rather
+# than mis-capping (never let a malformed value become a bash arithmetic
+# error on the MCP stderr).
+if [[ "$MEM_MAX" =~ ^([0-9]+)(\.[0-9]+)?([GgMm])$ ]]; then
+    _int="${BASH_REMATCH[1]}"
+    case "${BASH_REMATCH[3]}" in
+        G|g) _kb=$(( _int * 1024 * 1024 )) ;;
+        *)   _kb=$(( _int * 1024 )) ;;
+    esac
     ulimit -v "$_kb" 2>/dev/null \
         || printf 'run-codebase-memory: WARNING: could not apply ulimit -v %s\n' "$_kb" >&2
 else

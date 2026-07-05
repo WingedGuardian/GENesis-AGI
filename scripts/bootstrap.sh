@@ -512,54 +512,10 @@ echo
 
 # --- MCP Server Registration (Code Intelligence) ---
 echo "--- Registering code intelligence MCP servers ---"
-_register_mcp() {
-    local name="$1" scope="$2"
-    shift 2
-    local cmd_args=("$@")
-    if ! command -v claude &>/dev/null; then
-        echo "  WARNING: 'claude' CLI not found — skipping $name registration"
-        return 0
-    fi
-    if [ "$scope" = "user" ]; then
-        # User scope: read ~/.claude.json directly. `claude mcp list` merges
-        # scopes, so a same-named project-scope entry can mask a STALE
-        # user-scope command and freeze it behind "already registered" (real
-        # case: codebase-memory-mcp stayed pointed at the bare binary,
-        # bypassing the memory-cap launcher below). Compare the registered
-        # command and re-register on drift.
-        local registered
-        registered="$(python3 - "$name" <<'PYEOF' 2>/dev/null
-import json, os, sys
-try:
-    cfg = json.load(open(os.path.expanduser("~/.claude.json")))
-    print(cfg.get("mcpServers", {}).get(sys.argv[1], {}).get("command", ""))
-except Exception:
-    print("")
-PYEOF
-)"
-        # Compare basenames, not full strings: `claude mcp add` may store the
-        # RESOLVED absolute path for a command registered by bare name (e.g.
-        # "gitnexus" → "~/.local/bin/gitnexus"), which is not drift. A wrapper
-        # swap genuinely changes the basename (codebase-memory-mcp →
-        # run-codebase-memory), which is.
-        if [ -n "$registered" ] && [ "$(basename "$registered")" = "$(basename "${cmd_args[0]}")" ]; then
-            echo "  $name: already registered"
-            return 0
-        fi
-        if [ -n "$registered" ]; then
-            echo "  $name: registered command drifted ($registered) — re-registering"
-            claude mcp remove "$name" -s "$scope" 2>/dev/null || true
-        fi
-    else
-        if claude mcp list 2>/dev/null | grep -q "^$name:"; then
-            echo "  $name: already registered"
-            return 0
-        fi
-    fi
-    claude mcp add "$name" -s "$scope" -- "${cmd_args[@]}" 2>/dev/null \
-        && echo "  $name: registered ($scope)" \
-        || echo "  WARNING: Failed to register $name"
-}
+# _register_mcp lives in scripts/lib/mcp_register.sh — shared with install.sh
+# so fresh installs and updates register (and drift-heal) identically.
+# shellcheck source=lib/mcp_register.sh
+. "$SCRIPT_DIR/lib/mcp_register.sh"
 
 if command -v gitnexus &>/dev/null; then
     _register_mcp "gitnexus" "user" "gitnexus" "mcp"
