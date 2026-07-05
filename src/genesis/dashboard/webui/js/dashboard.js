@@ -3432,8 +3432,31 @@
         // Display label for infrastructure probe keys: the internal dict key stays
         // canonical (e.g. "ambient"); only the surfaced name is user-facing. The
         // ambient-capture edge bridge is shown as "Voice Bridge" on the card.
+        // Infrastructure probes ordered failed-first so operators see problems at
+        // the top of the card. Severity is derived from probeStatusColor so the
+        // sort order always matches the status dots the user sees (RED > YELLOW >
+        // GRAY > GREEN). Rebuilds an object rather than an array: infra keys are
+        // non-integer strings, so insertion order is preserved and the existing
+        // `(probe, name) in ...` template iterates in sorted order unchanged.
+        get sortedInfrastructure() {
+          const infra = this.health.infrastructure;
+          if (!infra || typeof infra !== "object") return infra;
+          const rankOf = (probe) => (
+            { "#d9534f": 3, "#f0ad4e": 2, "#888": 1, "#666": 1 }[this.probeStatusColor(probe)] ?? 0
+          );
+          // Array.prototype.sort is stable in modern engines → within-rank order
+          // stays as the backend emitted it.
+          const sorted = Object.entries(infra).sort((a, b) => rankOf(b[1]) - rankOf(a[1]));
+          const out = {};
+          for (const [name, probe] of sorted) out[name] = probe;
+          return out;
+        },
+
         infraLabel(name) {
-          const labels = { ambient: "Voice Bridge" };
+          // cc_slots renders in its own dedicated "Claude Code Sessions" section
+          // (it's an array, not a probe) and is excluded from the probe grid; the
+          // label here is defensive in case infraLabel is ever called for it.
+          const labels = { ambient: "Voice Bridge", cc_slots: "Claude Code Sessions" };
           return labels[name] || name;
         },
 

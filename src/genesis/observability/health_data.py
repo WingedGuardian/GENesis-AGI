@@ -27,11 +27,27 @@ if TYPE_CHECKING:
     from genesis.surplus.scheduler import SurplusScheduler
 
 from genesis.env import cc_project_dir
+from genesis.observability.probe_transitions import ProbeTransition, ProbeTransitionTracker
+from genesis.observability.types import Severity, Subsystem
 
 logger = logging.getLogger(__name__)
 
 # Backward-compat constant still imported by reflection/context code.
 CC_JSONL_DIR = str(Path.home() / ".claude" / "projects" / cc_project_dir())
+
+# Infra probes carrying a stable string ``status`` field worth tracking for
+# healthy<->unhealthy transitions. Deliberately EXCLUDES: cpu (utilization noise
+# — a flip at 95% would spam the feed), disk (no ``status`` on success), cc_tmp
+# (tier-nested, no top-level status), cc_slots (a list), and the conditional
+# ambient/ollama probes. Excluded on purpose, not silently dropped.
+_TRACKED_PROBES: tuple[str, ...] = (
+    "genesis.db",
+    "qdrant",
+    "guardian",
+    "qdrant_collections",
+    "scheduler",
+    "container_memory",
+)
 
 
 def _or_error(result: object) -> object:
@@ -90,6 +106,12 @@ class HealthDataService:
         self._activity_tracker = activity_tracker
         self._provider_health = provider_health_checker
         self._event_bus = event_bus
+        # One tracker per service instance. This service is a singleton in the
+        # server process (constructed only in runtime/init/health_data.py), so the
+        # tracker sees every snapshot and is the sole emitter of probe transitions.
+        # It detects healthy<->unhealthy boundary crossings; it NEVER touches
+        # routing state (that is resilience.state's job, kept strictly separate).
+        self._probe_tracker = ProbeTransitionTracker()
         # Single-flight: concurrent snapshot() callers coalesce onto one compute.
         self._inflight: asyncio.Task | None = None
 
@@ -214,6 +236,13 @@ class HealthDataService:
             r_services, r_conversation, r_proactive,
         ) = results
 
+        # Surface infra probe healthy<->unhealthy transitions to the activity
+        # feed. Best-effort: a bad emit must never poison the shared snapshot.
+        try:
+            await self._emit_probe_transitions(r_infrastructure)
+        except Exception:
+            logger.debug("Probe-transition emit pass failed", exc_info=True)
+
         return {
             "timestamp": now,
             "call_sites": r_call_sites,
@@ -236,6 +265,68 @@ class HealthDataService:
             "eval_staleness": r_eval_staleness,
             "vcr": r_vcr,
         }
+
+    async def _emit_probe_transitions(self, infra: object) -> None:
+        """Drive the probe-transition tracker from the freshly-built infra dict,
+        emitting one activity event per healthy<->unhealthy crossing.
+
+        Storm guard: if the whole infrastructure section failed (not a dict, or a
+        top-level ``status == "error"`` injected by ``_or_error``), skip the cycle
+        entirely — otherwise every tracked probe would read "down" at once and
+        flood the feed with a false N-probe outage on one transient snapshot error.
+        """
+        if self._event_bus is None:
+            return
+        if not isinstance(infra, dict) or infra.get("status") == "error":
+            return
+        for probe_id in _TRACKED_PROBES:
+            entry = infra.get(probe_id)
+            if not isinstance(entry, dict):
+                continue
+            status = entry.get("status")
+            if not status:
+                continue
+            try:
+                transition = self._probe_tracker.observe(probe_id, status)
+            except Exception:
+                logger.debug("Probe-transition observe failed for %s", probe_id, exc_info=True)
+                continue
+            if transition is not None:
+                await self._emit_transition_event(transition)
+
+    async def _emit_transition_event(self, t: ProbeTransition) -> None:
+        """Emit a single ``probe_transition`` activity event (best-effort).
+
+        Recovery (→ healthy) is INFO; a hard down/error is ERROR; a softer
+        unhealthy state (e.g. degraded) is WARNING.
+        """
+        if t.new_class == "healthy":
+            severity = Severity.INFO
+        elif t.new_status in ("down", "error"):
+            severity = Severity.ERROR
+        else:
+            severity = Severity.WARNING
+        message = f"{t.probe_id}: {t.old_status} → {t.new_status}"
+        if t.flapping:
+            message += " (flapping)"
+        try:
+            # "from" is a keyword — details MUST be passed via dict-unpack.
+            await self._event_bus.emit(
+                Subsystem.HEALTH,
+                severity,
+                "probe_transition",
+                message,
+                **{
+                    "probe": t.probe_id,
+                    "from": t.old_status,
+                    "to": t.new_status,
+                    "from_class": t.old_class,
+                    "to_class": t.new_class,
+                    "flapping": t.flapping,
+                },
+            )
+        except Exception:
+            logger.debug("Probe-transition emit failed for %s", t.probe_id, exc_info=True)
 
     async def _vcr_snapshot(self) -> dict:
         """Verified Completion Rate for ego proposals."""

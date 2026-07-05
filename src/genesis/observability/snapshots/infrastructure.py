@@ -19,7 +19,7 @@ from genesis.observability.health import (
     probe_scheduler,
     probe_wal,
 )
-from genesis.observability.types import ProbeStatus
+from genesis.observability.types import STATUS_RANK, ProbeStatus
 from genesis.routing.types import DegradationLevel, RoutingConfig
 
 if TYPE_CHECKING:
@@ -114,13 +114,9 @@ def _read_psi(path: str) -> dict:
         return {}
 
 
-# Health-status ranking (higher = worse) for composing multiple signals.
-_STATUS_RANK = {"healthy": 0, "unknown": 1, "unavailable": 1, "degraded": 2, "down": 3, "error": 3}
-
-
 def _worse_status(a: str, b: str) -> str:
     """Return the worse (higher-ranked) of two health statuses."""
-    return a if _STATUS_RANK.get(a, 0) >= _STATUS_RANK.get(b, 0) else b
+    return a if STATUS_RANK.get(a, 0) >= STATUS_RANK.get(b, 0) else b
 
 
 # Container memory PSI thresholds (full.avg60 %). Sustained memory stall is REAL

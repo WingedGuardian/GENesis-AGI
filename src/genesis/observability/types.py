@@ -43,6 +43,32 @@ class ProbeStatus(StrEnum):
     DOWN = "down"
 
 
+# Health-status ranking (higher = worse) for composing multiple signals and for
+# classifying probe transitions. Shared so snapshot code and the probe-transition
+# tracker rank identically. Unknown/unavailable rank 1 = "no signal", distinct
+# from healthy(0) and from degraded/down(2/3).
+STATUS_RANK: dict[str, int] = {
+    "healthy": 0,
+    "unknown": 1,
+    "unavailable": 1,
+    "degraded": 2,
+    "down": 3,
+    "error": 3,
+}
+
+
+def status_class(status: str) -> str | None:
+    """Collapse a raw probe status to a coarse health class for transition
+    detection: "healthy" (rank 0), "unhealthy" (rank >= 2), or None for
+    rank-1 "no signal" states (unknown/unavailable) which must NOT count as a
+    crossing — a probe flickering healthy->unknown->healthy should emit nothing.
+    """
+    rank = STATUS_RANK.get(status)
+    if rank is None or rank == 1:
+        return None
+    return "healthy" if rank == 0 else "unhealthy"
+
+
 @dataclass(frozen=True)
 class GenesisEvent:
     """A single observability event emitted by a Genesis subsystem."""
