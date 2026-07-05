@@ -110,7 +110,12 @@ cc_ensure_local() {
     fi
     hash -r 2>/dev/null || true   # drop bash's cached path to the old binary
     local installed
-    installed="$(claude --version 2>/dev/null | awk '{print $1}')"
+    # Verify against the binary we just installed, NOT a PATH lookup: in
+    # non-interactive shells a user npm prefix (~/.npm-global, nvm) is often
+    # absent from PATH, which made a SUCCESSFUL install report a false
+    # "PATH mismatch" warning (seen live on a parity run 2026-07-04).
+    installed="$("$prefix/bin/claude" --version 2>/dev/null | awk '{print $1}')"
+    [ -n "$installed" ] || installed="$(claude --version 2>/dev/null | awk '{print $1}')"
     if [ "$installed" = "$pin" ]; then
         echo "  + Claude Code now at pin ($pin)"
         return 0
