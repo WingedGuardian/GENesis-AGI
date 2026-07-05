@@ -237,6 +237,22 @@ jobs:
       - name: External-I/O egress guard
         run: python scripts/check_external_io.py
 
+  cc-node-lockstep:
+    # Enforce the CC↔Node pin lockstep: NODE_MAJOR in scripts/lib/cc_version.sh
+    # must satisfy the pinned Claude Code's engines.node floor. Prevents the
+    # "bumped CC past a Node floor, forgot NODE_MAJOR" mistake that left a host
+    # unable to run `claude -p`. Fails closed on a real mismatch / typo'd pin;
+    # fails open (warn) on a transient npm-registry error. See
+    # scripts/check_cc_node_lockstep.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: CC↔Node pin-lockstep guard
+        run: python scripts/check_cc_node_lockstep.py
+
   test:
     runs-on: ubuntu-latest
     # CI is blocking — local full-suite runs are banned. See procedure
