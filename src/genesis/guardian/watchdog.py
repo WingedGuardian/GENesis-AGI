@@ -69,6 +69,14 @@ class GuardianWatchdog:
         self._gateway_drift_count: int = 0
         self._gateway_resync_attempted: bool = False
         self._gateway_escalated: bool = False
+        # authorized_keys hardening reconciler: heal a guardian key line that
+        # lost no-pty/from= (regression) or whose from= no longer matches the
+        # container's source (a stable move heals; a flapping source escalates).
+        self._authkey_drift_count: int = 0
+        self._authkey_reharden_attempted: bool = False
+        self._authkey_escalated: bool = False
+        self._authkey_flap_escalated: bool = False
+        self._authkey_last_src_hash: str | None = None
 
     async def _alert_user(self, *, topic: str, context: str, source_id: str) -> None:
         """Deliver a user-facing (Telegram) alert about a Guardian degradation.
@@ -330,6 +338,11 @@ class GuardianWatchdog:
         with contextlib.suppress(Exception):
             await self._check_gateway_staleness(version_info)
 
+        # Authorized_keys hardening reconciler reuses the same version() payload.
+        # Own suppress so a failure here can't skip code-drift logic below.
+        with contextlib.suppress(Exception):
+            await self._check_authkey_hardening(version_info)
+
         host_hash = version_info.get("deployed_commit", "unknown")
 
         if not isinstance(host_hash, str) or host_hash == "unknown":
@@ -571,3 +584,169 @@ class GuardianWatchdog:
                 ),
                 source_id="guardian:gateway_stale",
             )
+
+    def _reset_authkey_state(self) -> None:
+        self._authkey_drift_count = 0
+        self._authkey_reharden_attempted = False
+        self._authkey_escalated = False
+        self._authkey_flap_escalated = False
+        self._authkey_last_src_hash = None
+
+    async def _check_authkey_hardening(self, version_info: dict) -> None:
+        """Detect (and self-heal) an under-hardened guardian authorized_keys line.
+
+        The host's ``version`` reports whether its guardian key line still
+        carries ``no-pty`` + ``from=`` and whether the stored ``from=`` matches
+        the source of THIS connection (plus a hash of that source). Two trigger
+        classes, deliberately treated differently because the reconciler runs
+        live from merge:
+
+        * **Regression** — ``no-pty`` stripped, or ``from=`` missing while a
+          source is observable. These states do not oscillate, so heal on the
+          first tick (one guarded ``reharden-key`` per episode), then escalate
+          if still bad.
+        * **Source mismatch** — ``from=`` present but no longer matching. A
+          rewrite chases the source, so only heal a CONFIRMED STABLE move:
+          ``DRIFT_ALERT_THRESHOLD`` consecutive ticks with the SAME observed
+          source hash. A source that differs between ticks is a flap — never
+          reharden it (that would churn the key file forever); escalate once.
+          The guard is non-sticky: a source that later stabilizes reaches the
+          streak and heals, so no episode can wedge until a process restart.
+
+        Best-effort (invoked under _check_code_drift's suppress). Least
+        disclosure: the host sends booleans + hashes, never the raw address.
+        """
+        no_pty = version_info.get("authkey_no_pty")
+        has_from = version_info.get("authkey_has_from")
+        from_matches = version_info.get("authkey_from_matches")
+        src_hash = version_info.get("authkey_observed_src_hash")
+        # Old gateway without the authkey_* fields → nothing to reconcile.
+        if no_pty is None or has_from is None:
+            return
+        src_available = isinstance(src_hash, str) and src_hash != ""
+
+        # A reharden can only add from= when a source is observable; treat a
+        # missing from= as a healable regression ONLY when we have a source.
+        regression = (no_pty is False) or (has_from is False and src_available)
+        # A pure source-mismatch (opts otherwise fine): from= present, no longer
+        # matching. Needs a stable-move streak, never healed on a flap.
+        mismatch = (not regression) and has_from is True and from_matches is False
+
+        if not regression and not mismatch:
+            # Fully hardened + matching (or unfixable no-src state) → resolved.
+            if self._authkey_drift_count > 0 or self._authkey_last_src_hash:
+                logger.info("Guardian authkey hardening resolved")
+            self._reset_authkey_state()
+            return
+
+        if regression:
+            await self._heal_authkey_regression(no_pty, has_from)
+            return
+
+        # --- source mismatch: require a stable streak, guard against flaps ---
+        if not src_available:
+            return  # can't form a streak on an unobservable source
+        if self._authkey_last_src_hash is None:
+            self._authkey_last_src_hash = src_hash
+            self._authkey_drift_count = 1
+        elif src_hash == self._authkey_last_src_hash:
+            self._authkey_drift_count += 1
+        else:
+            # Source moved again mid-episode → flapping. Never chase it.
+            self._authkey_last_src_hash = src_hash
+            self._authkey_drift_count = 1
+            await self._escalate_authkey_flap()
+            return
+
+        if self._authkey_drift_count < self.DRIFT_ALERT_THRESHOLD:
+            return
+        await self._heal_authkey_mismatch()
+
+    async def _heal_authkey_regression(self, no_pty, has_from) -> None:
+        detail = "no-pty missing" if no_pty is False else "from= missing"
+        if not self._authkey_reharden_attempted:
+            self._authkey_reharden_attempted = True
+            logger.warning("Guardian authkey under-hardened (%s) — reharden-key", detail)
+            await self._run_reharden(reason=detail)
+            return
+        await self._escalate_authkey(
+            f"Guardian authorized_keys STILL under-hardened ({detail}) after "
+            f"auto reharden-key. Manual check needed.",
+        )
+
+    async def _heal_authkey_mismatch(self) -> None:
+        if not self._authkey_reharden_attempted:
+            self._authkey_reharden_attempted = True
+            logger.warning(
+                "Guardian authkey from= stably moved (%s consecutive ticks) — reharden-key",
+                self._authkey_drift_count,
+            )
+            await self._run_reharden(reason="from= no longer matches container source")
+            return
+        await self._escalate_authkey(
+            "Guardian authorized_keys from= STILL mismatched after auto "
+            "reharden-key. Manual check needed.",
+        )
+
+    async def _run_reharden(self, *, reason: str) -> None:
+        """Run one guarded reharden-key and notify (a reharden means the
+        container's host-facing source changed — the operator should know)."""
+        try:
+            res = await self._remote.reharden_key()
+        except Exception:
+            logger.exception("reharden-key self-heal raised")
+            res = {"ok": False}
+        if self._event_bus:
+            from genesis.observability.types import Severity, Subsystem
+            await self._event_bus.emit(
+                Subsystem.GUARDIAN, Severity.WARNING,
+                "guardian.authkey_reharden",
+                f"Guardian authorized_keys re-hardened ({reason}); "
+                f"ok={res.get('ok')} changed={res.get('changed')}. "
+                f"Re-verifying next tick.",
+            )
+        await self._alert_user(
+            topic="Guardian key re-hardened",
+            context=(
+                f"Guardian re-hardened its host SSH key ({reason}). "
+                f"ok={res.get('ok')} changed={res.get('changed')} "
+                f"confirmed={res.get('confirmed')}."
+            ),
+            source_id="guardian:authkey_rehardened",
+        )
+
+    async def _escalate_authkey(self, message: str) -> None:
+        if self._authkey_escalated:
+            return
+        self._authkey_escalated = True
+        logger.error(message)
+        if self._event_bus:
+            from genesis.observability.types import Severity, Subsystem
+            await self._event_bus.emit(
+                Subsystem.GUARDIAN, Severity.ERROR, "guardian.authkey_drift", message)
+        await self._alert_user(
+            topic="Guardian key hardening failed",
+            context=message,
+            source_id="guardian:authkey_drift",
+        )
+
+    async def _escalate_authkey_flap(self) -> None:
+        if self._authkey_flap_escalated:
+            return
+        self._authkey_flap_escalated = True
+        message = (
+            "Guardian authorized_keys from= no longer matches and the "
+            "container's source address is FLAPPING (differs between checks). "
+            "Refusing to rewrite the key on a moving target — set a stable "
+            "address or a subnet from= manually."
+        )
+        logger.error(message)
+        if self._event_bus:
+            from genesis.observability.types import Severity, Subsystem
+            await self._event_bus.emit(
+                Subsystem.GUARDIAN, Severity.ERROR, "guardian.authkey_flap", message)
+        await self._alert_user(
+            topic="Guardian key source flapping",
+            context=message,
+            source_id="guardian:authkey_flap",
+        )
