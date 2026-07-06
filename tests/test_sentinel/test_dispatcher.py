@@ -1029,3 +1029,173 @@ class TestOperationalBrief:
         # SENTINEL.md charter still present (append, not replace)
         assert "Three-Way Disposition" in invocation.system_prompt
         assert invocation.append_system_prompt is True
+
+
+# ---------------------------------------------------------------------------
+# Shadow reversibility classification (observe-only)
+# ---------------------------------------------------------------------------
+
+
+def _proposed_actions_output():
+    """Invoker output proposing one auto-eligible and one gated action."""
+    import json
+    mock_output = MagicMock()
+    mock_output.text = json.dumps({
+        "diagnosis": "test diagnosis",
+        "root_cause": "test",
+        "proposed_actions": [
+            {
+                "description": "restart qdrant",
+                "command": "sudo systemctl restart qdrant",
+                "safe": True,
+                "reversible": True,
+            },
+            {
+                "description": "push a fix",
+                "command": "git push origin main",
+                "safe": True,
+                "reversible": False,
+            },
+        ],
+        "resolved": False,
+    })
+    return mock_output
+
+
+def _policy_gate(action_status, request_id):
+    """Gate that approves the dispatch policy and answers `action_status`
+    for the sentinel_action policy (the gate is consulted for both)."""
+    async def _ensure(**kwargs):
+        if kwargs.get("policy_id") == "sentinel_action":
+            return (action_status, request_id, "test")
+        return ("approved", "req-dispatch", "test")
+
+    gate = MagicMock()
+    gate.ensure_approval = AsyncMock(side_effect=_ensure)
+    return gate
+
+
+def _action_policy_calls(gate):
+    return [
+        c for c in gate.ensure_approval.await_args_list
+        if c.kwargs.get("policy_id") == "sentinel_action"
+    ]
+
+
+def _shadow_events(mock_append_log):
+    return [
+        c.args[0] for c in mock_append_log.call_args_list
+        if c.args and c.args[0].get("event") == "shadow_classification"
+    ]
+
+
+class TestShadowClassification:
+    def test_default_mode_is_shadow(self):
+        d = _make_dispatcher()
+        assert d._autonomy_mode == "shadow"
+
+    def test_live_mode_coerced_to_shadow(self):
+        """mode=live is reserved but unimplemented — must run as shadow."""
+        with patch(
+            "genesis.sentinel.auto_eligibility.load_sentinel_autonomy_mode",
+            return_value="live",
+        ):
+            d = _make_dispatcher()
+        assert d._autonomy_mode == "shadow"
+
+    @pytest.mark.asyncio
+    async def test_shadow_logs_would_decisions_and_gate_still_consulted(self):
+        """Shadow logs per-action would-decisions; approval gate is still
+        the sole executor path (behavior unchanged)."""
+        gate = _policy_gate("approved", "req-1")
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._invoker.run = AsyncMock(return_value=_proposed_actions_output())
+
+        mock_execute = AsyncMock(return_value=[])
+        with patch("genesis.sentinel.dispatcher.save_state"), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log") as mock_log, \
+             patch.object(d, "_execute_approved_actions", mock_execute):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+
+        assert result.dispatched
+        assert len(_action_policy_calls(gate)) == 1
+        mock_execute.assert_awaited_once()
+
+        events = _shadow_events(mock_log)
+        assert len(events) == 1
+        decisions = {a["command"]: a["decision"] for a in events[0]["actions"]}
+        assert decisions["sudo systemctl restart qdrant"] == "would_auto_run"
+        assert decisions["git push origin main"] == "would_gate"
+        assert events[0]["mode"] == "shadow"
+
+    @pytest.mark.asyncio
+    async def test_shadow_never_executes_when_approval_pending(self):
+        """Pending approval parks the dispatch exactly as before — shadow
+        classification logs but nothing executes."""
+        gate = _policy_gate("pending", "req-2")
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._invoker.run = AsyncMock(return_value=_proposed_actions_output())
+
+        mock_execute = AsyncMock(return_value=[])
+        with patch("genesis.sentinel.dispatcher.save_state"), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log") as mock_log, \
+             patch.object(d, "_execute_approved_actions", mock_execute):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+
+        mock_execute.assert_not_awaited()
+        assert "pending" in result.reason.lower()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+        assert len(_shadow_events(mock_log)) == 1
+
+    @pytest.mark.asyncio
+    async def test_shadow_failure_cannot_break_dispatch(self):
+        """A crashing classifier must never break the dispatch path."""
+        gate = _policy_gate("approved", "req-3")
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._invoker.run = AsyncMock(return_value=_proposed_actions_output())
+
+        mock_execute = AsyncMock(return_value=[])
+        with patch("genesis.sentinel.dispatcher.save_state"), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"), \
+             patch(
+                 "genesis.sentinel.auto_eligibility.classify_action",
+                 side_effect=RuntimeError("classifier boom"),
+             ), \
+             patch.object(d, "_execute_approved_actions", mock_execute):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+
+        assert result.dispatched
+        assert len(_action_policy_calls(gate)) == 1
+        mock_execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_shadow_event_without_proposed_actions(self):
+        """Zero-action dispatches must not emit shadow_classification."""
+        d = _make_dispatcher()  # default invoker output proposes no actions
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+
+        with patch("genesis.sentinel.dispatcher.save_state"), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log") as mock_log:
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+
+        assert result.dispatched
+        assert _shadow_events(mock_log) == []

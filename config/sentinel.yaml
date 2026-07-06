@@ -1,0 +1,14 @@
+# Sentinel configuration
+#
+# autonomy.mode — reversibility-autonomy rollout state:
+#   shadow (default): every proposed action still requires human approval;
+#     the Sentinel additionally LOGS a per-action would-decision
+#     (would_auto_run / would_gate) to sentinel_log.jsonl so the
+#     auto-eligibility allowlist can be calibrated against real incidents.
+#   live: RESERVED — not implemented yet. When it ships, auto-eligible
+#     (reversible + safe + allowlisted) actions will execute without
+#     approval and notify the owner. Flipping an install to live is a
+#     per-install decision: set it in config/sentinel.local.yaml (gitignored
+#     overlay), never in this tracked file.
+autonomy:
+  mode: shadow
