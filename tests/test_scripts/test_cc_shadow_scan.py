@@ -69,6 +69,7 @@ def _run(tmp_path: Path, script: str, *, extra_env: dict | None = None,
     harness.write_text(f'#!/usr/bin/env bash\n. "{_LIB}"\n{script}\n', encoding="utf-8")
     env = {"PATH": ":".join(path_dirs), "HOME": str(home),
            "CC_PROBE_DIRS": str(tmp_path / "probe-nowhere"),
+           "CC_VERSION": "2.1.201",
            **(extra_env or {})}
     return subprocess.run(["bash", str(harness)], env=env,
                           capture_output=True, text=True, timeout=30)
@@ -133,16 +134,97 @@ def test_canonical_on_a_scanned_surface_is_kept(tmp_path):
 def test_system_path_shadow_skipped_without_sudo(tmp_path):
     # PATH has no sudo → a /usr/* candidate must be warned about, never rm'd.
     # (Also the safety net that keeps THIS test suite from touching the real
-    # /usr/local/bin/claude on dev machines.)
+    # /usr/local/bin/claude on dev machines.) Snapshot BEFORE the scan so a
+    # gate regression that deletes a real system copy fails loudly on dev
+    # boxes; on CI (no /usr/*/claude) only the exit-0 half is meaningful.
+    before = {p: (Path(p).exists() or Path(p).is_symlink())
+              for p in ("/usr/local/bin/claude", "/usr/bin/claude")}
     canon = _canonical(tmp_path)
     res = _run(tmp_path, "cc_shadow_scan", canonical=canon)
     assert res.returncode == 0, res.stderr
-    # Real system copies (if any on this machine) still present.
-    for sys_path in ("/usr/local/bin/claude", "/usr/bin/claude"):
-        p = Path(sys_path)
-        existed_before = p.exists() or p.is_symlink()
-        if existed_before:
-            assert p.exists() or p.is_symlink()
+    for p, existed in before.items():
+        if existed:
+            assert Path(p).exists() or Path(p).is_symlink(), \
+                f"scan removed real system copy {p} despite no-sudo PATH"
+            assert "needs sudo to remove — skipped" in res.stderr
+
+
+def test_stale_path_first_copy_is_not_crowned_canonical(tmp_path):
+    # THE inverted-incident case: a STALE copy wins the invoking shell's PATH
+    # while the pinned copy sits in a probe dir. Canonical selection is
+    # pin-verified, so the stale PATH-first copy must be removed and the
+    # pinned copy kept — never the other way around.
+    home = tmp_path / "home"
+    stale = _plant_npm_tree(home / ".nvm" / "versions" / "node" / "v24.15.0",
+                            version="2.1.150")
+    pinned = _canonical(tmp_path)  # prints the pin
+    res = _run(
+        tmp_path, "cc_shadow_scan",
+        canonical=stale,  # stale dir goes FIRST on PATH
+        extra_env={"CC_PROBE_DIRS": str(pinned.parent)},
+    )
+    assert res.returncode == 0, res.stderr
+    assert pinned.exists()
+    assert not stale.exists()
+    assert "removing shadow copy" in res.stdout
+
+
+def test_no_pinned_copy_refuses_all_removal(tmp_path):
+    # Fail-safe: ONLY stale copies exist (nothing at the pin) → refuse to
+    # remove anything at all.
+    home = tmp_path / "home"
+    stale = _plant_npm_tree(home / ".nvm" / "versions" / "node" / "v24.15.0",
+                            version="2.1.150")
+    res = _run(tmp_path, "cc_shadow_scan", canonical=stale)
+    assert res.returncode == 0, res.stderr
+    assert stale.exists()
+    assert "REFUSING to remove anything" in res.stderr
+
+
+def test_native_canonical_is_protected(tmp_path):
+    # Canonical IS a native install (~/.local/bin/claude → versions blob at
+    # the pin): the blob sweep must keep the versions dir AND the link.
+    home = tmp_path / "home"
+    blob = _write_exec(home / ".local" / "share" / "claude" / "versions" / "2.1.201",
+                       '#!/usr/bin/env bash\necho "2.1.201 (Claude Code)"\n')
+    link = home / ".local" / "bin" / "claude"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(blob)
+    res = _run(tmp_path, "cc_shadow_scan", canonical=link)
+    assert res.returncode == 0, res.stderr
+    assert blob.exists() and link.exists()
+    assert "keeping" in res.stderr
+
+
+def test_stale_link_into_canonical_package_loses_link_only(tmp_path):
+    # A leftover second symlink pointing at a DIFFERENT entry file of the
+    # CANONICAL package must lose only the link — never the package.
+    home = tmp_path / "home"
+    canon_link = _plant_npm_tree(home / ".npm-global", version="2.1.201")
+    pkg = home / ".npm-global" / "lib" / "node_modules" / "@anthropic-ai" / "claude-code"
+    (pkg / "cli.js").write_text("// old entry\n", encoding="utf-8")
+    stale_link = home / ".local" / "bin" / "claude"
+    stale_link.parent.mkdir(parents=True)
+    stale_link.symlink_to(pkg / "cli.js")
+    res = _run(tmp_path, "cc_shadow_scan", canonical=canon_link)
+    assert res.returncode == 0, res.stderr
+    assert not stale_link.exists() and not stale_link.is_symlink()
+    assert canon_link.exists() and pkg.is_dir()
+    assert "CANONICAL package — removing the link only" in res.stdout
+
+
+def test_migrate_installer_removes_launcher_and_package(tmp_path):
+    canon = _canonical(tmp_path)
+    home = tmp_path / "home"
+    launcher = _write_exec(home / ".claude" / "local" / "claude",
+                           "#!/usr/bin/env bash\n")
+    pkg = home / ".claude" / "local" / "node_modules" / "@anthropic-ai" / "claude-code"
+    pkg.mkdir(parents=True)
+    (pkg / "package.json").write_text("{}", encoding="utf-8")
+    res = _run(tmp_path, "cc_shadow_scan", canonical=canon)
+    assert res.returncode == 0, res.stderr
+    assert not launcher.exists()
+    assert not pkg.exists()
 
 
 def test_opt_out_env(tmp_path):
@@ -166,13 +248,10 @@ def test_alias_warning(tmp_path):
     assert "alias" in res.stderr and ".bashrc" in res.stderr
 
 
-def test_no_canonical_is_a_noop(tmp_path):
-    home = tmp_path / "home"
-    link = _plant_npm_tree(home / ".nvm" / "versions" / "node" / "v24.15.0")
-    res = _run(tmp_path, "cc_shadow_scan")  # no canonical anywhere
+def test_no_claude_anywhere_is_a_noop(tmp_path):
+    res = _run(tmp_path, "cc_shadow_scan")  # no claude at all
     assert res.returncode == 0, res.stderr
-    assert link.exists()
-    assert "no canonical claude found" in res.stderr
+    assert "REFUSING to remove anything" in res.stderr
 
 
 # ── gateway mirror parity ─────────────────────────────────────────────────
@@ -199,31 +278,26 @@ def test_gateway_compact_scan_covers_same_user_surfaces():
 
 def test_ensure_local_finds_path_blind_install_at_pin(tmp_path):
     # claude NOT on PATH, but present at a probe dir AND at the pin →
-    # "already at pin", no npm invocation (npm absent from PATH would fail).
+    # "already at pin", no npm install attempted (the fake npm logs any call).
     blind = _write_exec(tmp_path / "blind" / "claude",
                         '#!/usr/bin/env bash\necho "2.1.201 (Claude Code)"\n')
-    fake_npm = _write_exec(tmp_path / "minbin-extra" / "npm",
-                           f'#!/usr/bin/env bash\necho npm-called >> "{tmp_path}/npm.log"\n')
-    res = _run(
-        tmp_path, "CC_VERSION=2.1.201 cc_ensure_local",
-        extra_env={"CC_PROBE_DIRS": str(blind.parent),
-                   "CC_VERSION": "2.1.201"},
-    )
-    # npm gate fires first; give it npm via PATH by re-running with npm dir.
-    if "npm not found" in res.stderr:
-        home = tmp_path / "home"
-        minbin = tmp_path / "minbin"
-        env = {"PATH": f"{fake_npm.parent}:{minbin}", "HOME": str(home),
-               "CC_PROBE_DIRS": str(blind.parent), "CC_VERSION": "2.1.201"}
-        harness = tmp_path / "harness.sh"
-        harness.write_text(f'#!/usr/bin/env bash\n. "{_LIB}"\ncc_ensure_local\n',
-                           encoding="utf-8")
-        res = subprocess.run(["bash", str(harness)], env=env,
-                             capture_output=True, text=True, timeout=30)
+    fake_npm = _write_exec(tmp_path / "npmbin" / "npm",
+                           f'#!/usr/bin/env bash\necho "$*" >> "{tmp_path}/npm.log"\n')
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    minbin = _minimal_bin(tmp_path)
+    harness = tmp_path / "harness.sh"
+    harness.write_text(f'#!/usr/bin/env bash\n. "{_LIB}"\ncc_ensure_local\n',
+                       encoding="utf-8")
+    env = {"PATH": f"{fake_npm.parent}:{minbin}", "HOME": str(home),
+           "CC_PROBE_DIRS": str(blind.parent), "CC_VERSION": "2.1.201"}
+    res = subprocess.run(["bash", str(harness)], env=env,
+                         capture_output=True, text=True, timeout=30)
     assert res.returncode == 0, res.stderr
     assert "already at pin" in res.stdout
     assert "NOT on this shell's PATH" in res.stderr
-    assert not (tmp_path / "npm.log").exists()  # no reinstall attempted
+    log = tmp_path / "npm.log"
+    assert not log.exists() or "install" not in log.read_text()
 
 
 def test_ensure_local_absent_everywhere_still_installs(tmp_path):

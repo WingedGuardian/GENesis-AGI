@@ -71,13 +71,20 @@ user-prefix copy invisible to non-interactive shells, which made the updater
 
 `cc_shadow_scan` (in `scripts/lib/cc_version.sh`, run by install/bootstrap/
 update/host-setup; mirrored compactly in the gateway's `update-cc` op for the
-host) enforces the policy: the canonical copy is what `command -v claude`
-resolves (all automation runs that one); every other copy on a known surface
-(nvm trees, `~/.claude/local`, `~/.local/bin`, native version blobs, stale npm
-prefixes) is removed — but only when provably a claude-code install; anything
-ambiguous is warned about and left alone, as are `alias claude=` lines in rc
-files (detected, never edited). The gateway variant is user-dir-only (it never
-sudo-removes). Deliberate multi-copy setups: `CC_SHADOW_SCAN=0` opts out.
+host) enforces the policy. The canonical copy is **pin-verified**: the first
+copy (PATH resolution, then `CC_PROBE_DIRS`) that actually reports
+`CC_VERSION` — never a bare `command -v`, because an interactive PATH can put
+a stale copy first, and crowning that one would delete the good copy.
+**Fail-safe: if no copy at the pin exists anywhere, nothing is removed.**
+Every other copy on a known surface (nvm trees, `~/.claude/local`,
+`~/.local/bin`, native version blobs, stale npm prefixes) is removed — but
+only when provably a claude-code install; the canonical's own package dir is
+never removed (a stale second link into it loses only the link), a
+native-install canonical keeps its versions dir, and anything ambiguous is
+warned about and left alone, as are `alias claude=` lines in rc files
+(detected, never edited). The gateway variant is user-dir-only (it never
+sudo-removes) and runs only after its post-install verify proves the pin.
+Deliberate multi-copy setups: `CC_SHADOW_SCAN=0` opts out.
 
 `cc_ensure_local` also probes known prefixes (`CC_PROBE_DIRS`) before declaring
 CC "not installed", so a PATH-blind install is aligned in place instead of

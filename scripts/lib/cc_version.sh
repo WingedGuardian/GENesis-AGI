@@ -159,13 +159,20 @@ cc_ensure_local() {
 # non-interactive shells. Shadow copies drift silently because update-cc /
 # cc_ensure_local only manage the canonical copy.
 #
-# Canonical = what `command -v claude` resolves in THIS (non-interactive)
-# shell — i.e. the copy all automation actually runs — falling back to the
-# known-prefix probe order used by cc_ensure_local. Every OTHER copy on a
-# known surface is removed, with loud logging. Removal is gated on the
-# artifact being PROVABLY a claude-code install (npm package dir or a symlink
-# into one, or the native-installer layout); anything unprovable is warned
-# about and left alone.
+# Canonical = a copy that REPORTS THE PIN ($CC_VERSION): first the PATH
+# resolution if it's at the pin, else the first at-pin copy in CC_PROBE_DIRS.
+# Version-verified selection is the core safety property — `command -v` alone
+# follows the INVOKING shell's PATH, and an interactive PATH can put a stale
+# copy first (the exact incident class this scan exists to fix), which would
+# otherwise crown the stale copy canonical and sudo-remove the good one.
+# FAIL-SAFE: if NO copy at the pin exists anywhere, nothing is removed —
+# a scan that cannot prove a good copy exists has no business deleting.
+#
+# Every OTHER copy on a known surface is removed, with loud logging. Removal
+# is gated on the artifact being PROVABLY a claude-code install (npm package
+# dir or a symlink into one, or the native-installer layout); anything
+# unprovable is warned about and left alone. The canonical's own package dir
+# and (for a native canonical) the native versions dir are never touched.
 #
 # Opt-out for deliberate multi-copy setups: CC_SHADOW_SCAN=0.
 # Non-fatal by design; call as `cc_shadow_scan || true`.
@@ -174,31 +181,61 @@ cc_shadow_scan() {
         echo "  cc_shadow_scan: disabled (CC_SHADOW_SCAN=0)"
         return 0
     fi
-
-    local canonical="" canon_real="" p
-    canonical="$(command -v claude 2>/dev/null || true)"
-    if [ -z "$canonical" ]; then
-        local _oldIFS="$IFS"
-        IFS=':'
-        for p in $CC_PROBE_DIRS; do
-            [ -x "$p/claude" ] && canonical="$p/claude" && break
-        done
-        IFS="$_oldIFS"
+    local pin="${CC_VERSION:-}"
+    if [ -z "$pin" ]; then
+        echo "  cc_shadow_scan: CC_VERSION unset — skipping (cannot verify a canonical)" >&2
+        return 0
     fi
+
+    local canonical="" canon_real="" canon_pkg="" p v
+    local -a _candidates=()
+    p="$(command -v claude 2>/dev/null || true)"
+    [ -n "$p" ] && _candidates+=("$p")
+    local _oldIFS="$IFS"
+    IFS=':'
+    for p in $CC_PROBE_DIRS; do
+        _candidates+=("$p/claude")
+    done
+    IFS="$_oldIFS"
+    for p in "${_candidates[@]}"; do
+        [ -x "$p" ] || continue
+        v="$("$p" --version 2>/dev/null | awk '{print $1}')"
+        if [ "$v" = "$pin" ]; then
+            canonical="$p"
+            break
+        fi
+    done
     if [ -z "$canonical" ]; then
-        echo "  cc_shadow_scan: no canonical claude found — skipping (nothing to protect)" >&2
+        echo "  cc_shadow_scan: no claude at the pin ($pin) found — REFUSING to remove anything (align with cc_ensure_local / update-cc first)" >&2
         return 0
     fi
     canon_real="$(readlink -f "$canonical" 2>/dev/null || echo "$canonical")"
+    # The canonical's own npm package dir — never removed, even when a STALE
+    # extra symlink points into it (that link alone goes; nuking the package
+    # would destroy the canonical).
+    case "$canon_real" in
+        */@anthropic-ai/claude-code/*)
+            canon_pkg="$(readlink -f "${canon_real%%/@anthropic-ai/claude-code/*}/@anthropic-ai/claude-code" 2>/dev/null || true)"
+            ;;
+    esac
 
     # Native-installer version blobs: shadows by definition under the npm-only
-    # canon (docs/reference/cc-compatibility.md), and BIG (~250MB each).
+    # canon (docs/reference/cc-compatibility.md), and BIG (~250MB each) —
+    # UNLESS the canonical itself is a native install (then they ARE the
+    # canonical's payload; leave them and let the operator migrate to npm).
     if [ -d "$HOME/.local/share/claude/versions" ]; then
-        echo "  cc_shadow_scan: removing native-installer version blobs ($HOME/.local/share/claude/versions)"
-        rm -rf "$HOME/.local/share/claude/versions"
+        case "$canon_real" in
+            "$HOME/.local/share/claude/"*)
+                echo "  cc_shadow_scan: canonical is a native install — keeping $HOME/.local/share/claude/versions (consider migrating to the npm install path)" >&2
+                ;;
+            *)
+                echo "  cc_shadow_scan: removing native-installer version blobs ($HOME/.local/share/claude/versions)"
+                rm -rf "$HOME/.local/share/claude/versions"
+                ;;
+        esac
     fi
 
-    local candidate real target
+    local candidate real
     for candidate in \
         "$HOME"/.nvm/versions/node/*/bin/claude \
         "$HOME/.claude/local/claude" \
@@ -211,7 +248,7 @@ cc_shadow_scan() {
         # The canonical copy itself (or a same-file alias like /bin vs /usr/bin
         # under usrmerge) is never touched.
         [ "$real" = "$canon_real" ] && continue
-        _cc_remove_shadow "$candidate"
+        _cc_remove_shadow "$candidate" "$canon_pkg"
     done
 
     # Aliases/functions can shadow every file-level fix — detect, never edit
@@ -225,11 +262,13 @@ cc_shadow_scan() {
     return 0
 }
 
-# _cc_remove_shadow <path> — remove one shadow copy, ONLY if provably a
-# claude-code install. System-prefix removals need passwordless sudo; user
-# paths are removed directly. Unprovable artifacts are warned and kept.
+# _cc_remove_shadow <path> <canon_pkg> — remove one shadow copy, ONLY if
+# provably a claude-code install. System-prefix removals need passwordless
+# sudo; user paths are removed directly. Unprovable artifacts are warned and
+# kept. A package dir equal to <canon_pkg> (the canonical's own package) is
+# never removed — only the stale link into it.
 _cc_remove_shadow() {
-    local candidate="$1" target pkg_dir=""
+    local candidate="$1" canon_pkg="${2:-}" target pkg_dir=""
     target="$(readlink "$candidate" 2>/dev/null || true)"
 
     if [[ "$target" == *"@anthropic-ai/claude-code"* ]]; then
@@ -238,13 +277,27 @@ _cc_remove_shadow() {
         pkg_dir="$(cd "$(dirname "$candidate")" 2>/dev/null && cd "$(dirname "$target")" 2>/dev/null && pwd)"
         pkg_dir="${pkg_dir%%/@anthropic-ai/claude-code*}/@anthropic-ai/claude-code"
         [[ "$pkg_dir" == *"@anthropic-ai/claude-code" && -d "$pkg_dir" ]] || pkg_dir=""
-    elif [[ "$target" == *"/.local/share/claude/"* || "$candidate" == "$HOME/.claude/local/claude" ]]; then
-        # Native-installer symlink (target dir handled by the blob sweep) or
-        # the migrate-installer launcher — the launcher/link itself goes.
+    elif [[ "$candidate" == "$HOME/.claude/local/claude" ]]; then
+        # migrate-installer layout: the launcher plus its own npm subtree
+        # (~/.claude/local/node_modules/...) — remove both, not just the
+        # launcher (the package tree is hundreds of MB of dead weight).
+        pkg_dir="$HOME/.claude/local/node_modules/@anthropic-ai/claude-code"
+        [ -d "$pkg_dir" ] || pkg_dir=""
+    elif [[ "$target" == *"/.local/share/claude/"* ]]; then
+        # Native-installer symlink — the blob dir is handled (and guarded)
+        # by the sweep in cc_shadow_scan; only the link goes here.
         pkg_dir=""
     else
         echo "  WARNING: cc_shadow_scan: $candidate is not provably a claude-code install — left in place (remove manually if it is one)" >&2
         return 1
+    fi
+
+    # Never rm -rf the canonical's own package — a stale SECOND link into it
+    # (e.g. an old entry-file path) loses only the link.
+    if [ -n "$pkg_dir" ] && [ -n "$canon_pkg" ] \
+        && [ "$(readlink -f "$pkg_dir" 2>/dev/null)" = "$canon_pkg" ]; then
+        echo "  cc_shadow_scan: $candidate is a stale link into the CANONICAL package — removing the link only"
+        pkg_dir=""
     fi
 
     local -a rm_link=(rm -f "$candidate")
