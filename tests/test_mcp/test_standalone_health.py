@@ -137,6 +137,55 @@ class TestStandaloneBootstrapAndJobHealth:
         # Should return a dict (either real data or graceful unavailable)
         assert isinstance(result, dict)
 
+    async def test_bootstrap_manifest_falls_back_to_capabilities_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Out-of-process (MCP) reads answer from the persisted capabilities file."""
+        from genesis.mcp.health import manifest as manifest_mod
+
+        cap_file = tmp_path / "capabilities.json"
+        cap_file.write_text(json.dumps({
+            "db": {"status": "active", "description": "SQLite"},
+            "outreach": {"status": "degraded", "description": "Outreach"},
+            "voice": {"status": "failed", "description": "Voice", "error": "no api key"},
+            "module:crypto_ops": {"status": "active", "description": "module"},
+        }))
+        monkeypatch.setattr(manifest_mod, "_CAPABILITIES_FILE", cap_file)
+
+        result = manifest_mod._manifest_from_capabilities_file()
+        assert result is not None
+        assert result["bootstrapped"] is True
+        assert result["source"] == "capabilities_file"
+        assert result["manifest"] == {
+            "db": "ok",
+            "outreach": "degraded",
+            "voice": "failed: no api key",
+        }
+        assert "module:crypto_ops" not in result["manifest"]
+        assert result["persisted_at"]  # ISO timestamp present
+
+    async def test_bootstrap_manifest_missing_file_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No capabilities file → fallback declines (caller reports empty manifest)."""
+        from genesis.mcp.health import manifest as manifest_mod
+
+        monkeypatch.setattr(
+            manifest_mod, "_CAPABILITIES_FILE", tmp_path / "nope.json"
+        )
+        assert manifest_mod._manifest_from_capabilities_file() is None
+
+    async def test_bootstrap_manifest_corrupt_file_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unparseable capabilities file → fallback declines instead of raising."""
+        from genesis.mcp.health import manifest as manifest_mod
+
+        cap_file = tmp_path / "capabilities.json"
+        cap_file.write_text("{not json")
+        monkeypatch.setattr(manifest_mod, "_CAPABILITIES_FILE", cap_file)
+        assert manifest_mod._manifest_from_capabilities_file() is None
+
     async def test_job_health_does_not_crash(self) -> None:
         """job_health should never crash, even without a running runtime."""
         from genesis.mcp.health_mcp import _impl_job_health

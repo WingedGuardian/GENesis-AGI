@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,23 +63,83 @@ def _annotate_staleness(jobs: dict) -> dict:
     return annotated
 
 
+# Module-level so tests can monkeypatch the location.
+_CAPABILITIES_FILE = Path.home() / ".genesis" / "capabilities.json"
+
+
+def _manifest_from_capabilities_file() -> dict | None:
+    """Reconstruct the bootstrap manifest from ``~/.genesis/capabilities.json``.
+
+    MCP servers run as separate processes from genesis-server, so the
+    in-process runtime singleton never bootstraps here. The server persists
+    a manifest-derived capabilities file at the tail of its own bootstrap
+    (``runtime/_capabilities.py``) — map its statuses back to manifest form.
+    Returns None when the file is missing or unreadable.
+    """
+    if not _CAPABILITIES_FILE.exists():
+        return None
+    try:
+        caps = json.loads(_CAPABILITIES_FILE.read_text())
+        persisted_at = datetime.fromtimestamp(
+            _CAPABILITIES_FILE.stat().st_mtime, tz=UTC
+        ).isoformat()
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error("Failed to read %s: %s", _CAPABILITIES_FILE, exc)
+        return None
+
+    manifest: dict[str, str] = {}
+    for name, info in caps.items():
+        if name.startswith("module:"):
+            continue  # module-registry entries, not bootstrap init steps
+        status = info.get("status", "unknown")
+        if status == "active":
+            manifest[name] = "ok"
+        elif status == "failed":
+            manifest[name] = f"failed: {info.get('error', 'unknown')}"
+        else:
+            manifest[name] = status  # degraded / disabled / unknown
+    return {
+        "bootstrapped": True,
+        "manifest": manifest,
+        "source": "capabilities_file",
+        "persisted_at": persisted_at,
+        "note": (
+            "Out-of-process read: reconstructed from ~/.genesis/"
+            "capabilities.json, persisted by genesis-server at its last "
+            "bootstrap. Check subsystem_heartbeats for current liveness."
+        ),
+    }
+
+
 async def _impl_bootstrap_manifest() -> dict:
     try:
         from genesis.runtime import GenesisRuntime
 
         rt = GenesisRuntime.instance()
+        if rt.is_bootstrapped:
+            return {
+                "bootstrapped": True,
+                "manifest": rt.bootstrap_manifest,
+                "source": "runtime",
+            }
+        # Not bootstrapped in THIS process — the normal case for MCP
+        # servers (CC child processes, separate from genesis-server).
+        # Fall back to the manifest the server persisted at bootstrap.
+        persisted = _manifest_from_capabilities_file()
+        if persisted is not None:
+            return persisted
         return {
-            "bootstrapped": rt.is_bootstrapped,
-            "manifest": rt.bootstrap_manifest,
+            "bootstrapped": False,
+            "manifest": {},
+            "source": "runtime",
         }
     except (ImportError, AttributeError, RuntimeError):
         # Narrow catch: runtime module genuinely unimportable, singleton
         # __init__ failed, or runtime attribute access failure. In the
-        # common "standalone mode" path the runtime IS importable and
-        # the happy path returns {"bootstrapped": False, "manifest": {}}
-        # via the real singleton — this except branch only fires on a
-        # real bug, which is why it logs at ERROR. A broader catch
-        # would hide those bugs.
+        # common "standalone mode" path the runtime IS importable and the
+        # happy path answers from the persisted capabilities file — this
+        # except branch only fires on a real bug, which is why it logs at
+        # ERROR. A broader catch would hide those bugs.
         logger.error(
             "bootstrap_manifest fallback fired — runtime unreachable",
             exc_info=True,
