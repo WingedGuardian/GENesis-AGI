@@ -130,6 +130,12 @@ class MemoryStore:
             collection: Explicit Qdrant collection override. If provided, bypasses
                 ``_COLLECTION_MAP`` lookup. Default routing: ``episodic`` types →
                 ``episodic_memory``, ``knowledge`` types → ``knowledge_base``.
+            source_subsystem: For INTERNAL Genesis-subsystem writers only (ego,
+                triage, reflection, autonomy). Forces the write FTS5+metadata-only
+                (no Qdrant embed) and excludes it from default recall. Do NOT set
+                it for user-sourced content, nor for ``modules/**`` writers — a
+                module is an external capability, never a subsystem (see
+                modules/base.py; enforced by test_store_subsystem_coverage).
         """
         # Validate life_domain if explicitly provided
         if life_domain is not None:
