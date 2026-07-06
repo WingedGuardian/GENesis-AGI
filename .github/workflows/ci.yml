@@ -16,8 +16,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install ruff
@@ -32,8 +32,8 @@ jobs:
     # checks). Complements GitHub's already-enabled Dependabot security alerts.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install runtime deps + pip-audit
@@ -66,9 +66,9 @@ jobs:
     # leaked into the codebase. Blocking — PRs must pass this.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -206,7 +206,7 @@ jobs:
     # the same NNNN_*.py prefix will collide at runtime.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check migration prefix uniqueness
         run: |
           set -euo pipefail
@@ -230,8 +230,8 @@ jobs:
     # See scripts/check_external_io.py.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: External-I/O egress guard
@@ -246,8 +246,8 @@ jobs:
     # scripts/check_cc_node_lockstep.py.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: CC↔Node pin-lockstep guard
@@ -258,8 +258,8 @@ jobs:
     # CI is blocking — local full-suite runs are banned. See procedure
     # test_verification and CLAUDE.md "Targeted tests during development."
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install dependencies
