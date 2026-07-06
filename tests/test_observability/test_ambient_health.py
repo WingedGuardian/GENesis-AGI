@@ -211,3 +211,81 @@ def test_bridge_snapshot_verdict_logic_reused_not_reimplemented(monkeypatch):
     assert out["reachable"] is True
     assert out["verdict"] == "down"
     assert any("stale" in r for r in out["reasons"])
+
+
+# --- RSS-threshold alert: leak-class regression watch on the health snapshot ---
+# Thresholds sit ~2x the worst observed post-arena-off burst (soak closed
+# 2026-07-06: total plateau ~470 MB / bursts ~780; child flat ~170 / bursts ~280)
+# so workload breathing never fires them, only a real regression does.
+
+
+def test_rss_total_over_ceiling_is_degraded():
+    verdict = evaluate_ambient_health(_snapshot(rss_total_mb=1200.0), now=NOW)
+    assert verdict.status == "degraded"
+    assert any("RSS" in r and "1200" in r for r in verdict.reasons)
+
+
+def test_rss_child_over_ceiling_is_degraded():
+    verdict = evaluate_ambient_health(_snapshot(rss_diar_child_mb=600.0), now=NOW)
+    assert verdict.status == "degraded"
+    assert any("diar child" in r for r in verdict.reasons)
+
+
+def test_rss_at_plateau_is_ok():
+    verdict = evaluate_ambient_health(
+        _snapshot(rss_total_mb=470.0, rss_diar_child_mb=170.0, rss_parent_mb=300.0),
+        now=NOW,
+    )
+    assert verdict.status == "ok"
+
+
+def test_rss_keys_absent_or_null_do_not_trigger():
+    # Lazy pool spawn → child key is null until the first diar window; absent
+    # keys (older edge) must also be a no-op. Null/absent != breach.
+    assert evaluate_ambient_health(_snapshot(rss_diar_child_mb=None), now=NOW).status == "ok"
+    assert evaluate_ambient_health(_snapshot(), now=NOW).status == "ok"
+
+
+def test_rss_non_numeric_is_ignored():
+    verdict = evaluate_ambient_health(_snapshot(rss_total_mb="lots"), now=NOW)
+    assert verdict.status == "ok"
+
+
+def test_rss_breach_does_not_mask_down():
+    # A dead bridge (stale heartbeat) stays "down" even when RSS also breaches;
+    # the RSS reason is still appended for the operator.
+    stale = (NOW - timedelta(minutes=10)).isoformat()
+    verdict = evaluate_ambient_health(
+        _snapshot(ts=stale, rss_total_mb=1200.0), now=NOW,
+    )
+    assert verdict.status == "down"
+    assert any("RSS" in r for r in verdict.reasons)
+
+
+def test_causes_are_stable_machine_keys():
+    # Consumers (the outreach alert state machine) need value-free keys to
+    # detect a NEW fault while already degraded — reason strings embed live
+    # numbers, and the bare status can't distinguish causes.
+    assert evaluate_ambient_health(_snapshot(), now=NOW).causes == ()
+    assert evaluate_ambient_health(None, now=NOW).causes == ("unreachable",)
+    stale = (NOW - timedelta(minutes=10)).isoformat()
+    assert evaluate_ambient_health(_snapshot(ts=stale), now=NOW).causes == ("bridge-dead",)
+    assert evaluate_ambient_health(
+        _snapshot(diar_worker_alive=False), now=NOW,
+    ).causes == ("diar-worker",)
+    verdict = evaluate_ambient_health(
+        _snapshot(rss_total_mb=1200.0, rss_diar_child_mb=600.0), now=NOW,
+    )
+    assert verdict.causes == ("rss-total", "rss-diar-child")
+
+
+def test_bridge_snapshot_carries_causes(monkeypatch):
+    monkeypatch.setattr(ambient_health, "load_ambient_remote_config", _cfg)
+    snap = _snapshot(rss_total_mb=1200.0)
+
+    async def _data(cfg):
+        return snap
+
+    monkeypatch.setattr(ambient_health, "read_edge_health", _data)
+    out = asyncio.run(ambient_health.bridge_snapshot(now=NOW))
+    assert out["causes"] == ["rss-total"]

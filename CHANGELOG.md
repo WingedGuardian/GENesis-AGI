@@ -11,6 +11,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Ambient bridge memory-leak regression alert.** If the edge bridge's RSS ever climbs past the
+  healthy plateau again (total > 1000 MB or diarization child > 450 MB), ambient health flips to
+  degraded and you get a one-time Telegram alert naming the breach — no nagging, and normal
+  workload bursts never trigger it. Requires an ambient edge reporting the `rss_*` health keys.
+
 - **The voice dashboard's Bridge tab is now a full cockpit.** Instead of a bare status line, it
   shows the ambient edge bridge's complete live health, grouped for scanning: memory leak-watch
   (parent / diarization-child / total RSS, ORT-arena state, pool recycles), capture activity

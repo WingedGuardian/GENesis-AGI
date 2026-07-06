@@ -333,3 +333,95 @@ async def test_drain_ages_out_naive_timestamp_row(config, db):
 
     pipeline.submit.assert_not_called()
     assert await _remaining(db) == []
+
+
+# ── ambient health alert gating (cause-aware state machine) ─────────────────
+# governance dedups ambient_health with window=0 ("the monitor's state machine
+# gates re-alerts") — so THIS state machine is the only thing standing between
+# the user and a silently-swallowed second fault.
+
+
+def _ambient_snapshot(**overrides):
+    from datetime import UTC, datetime
+
+    base = {
+        "ts": datetime.now(UTC).isoformat(),
+        "active_connections": 1,
+        "diar_enabled": True,
+        "diar_worker_alive": True,
+    }
+    base.update(overrides)
+    return base
+
+
+async def _ambient_tick(scheduler, snapshot):
+    with (
+        patch(
+            "genesis.observability.ambient_health.load_ambient_remote_config",
+            return_value=object(),
+        ),
+        patch(
+            "genesis.observability.ambient_health.read_edge_health",
+            AsyncMock(return_value=snapshot),
+        ),
+    ):
+        await scheduler._ambient_health_job()
+
+
+def _make_scheduler(config, db):
+    return OutreachScheduler(AsyncMock(), AsyncMock(), AsyncMock(), config, db)
+
+
+@pytest.mark.asyncio
+async def test_ambient_new_cause_realerts_while_already_degraded(config, db):
+    scheduler = _make_scheduler(config, db)
+
+    # Tick 1: diar worker dead -> degraded, alert fires.
+    await _ambient_tick(scheduler, _ambient_snapshot(diar_worker_alive=False))
+    assert scheduler._pipeline.submit_raw.call_count == 1
+
+    # Tick 2: diar recovered, but an INDEPENDENT fault (RSS regression)
+    # appeared while still degraded — a bare status-edge gate would swallow
+    # it and the user would never hear about the leak.
+    await _ambient_tick(scheduler, _ambient_snapshot(rss_total_mb=1200.0))
+    assert scheduler._pipeline.submit_raw.call_count == 2
+    assert "RSS" in scheduler._pipeline.submit_raw.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_ambient_same_cause_does_not_nag(config, db):
+    scheduler = _make_scheduler(config, db)
+    await _ambient_tick(scheduler, _ambient_snapshot(rss_total_mb=1200.0))
+    # Same cause next tick, different live value — must NOT re-alert.
+    await _ambient_tick(scheduler, _ambient_snapshot(rss_total_mb=1300.0))
+    assert scheduler._pipeline.submit_raw.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ambient_down_then_new_degraded_cause_alerts(config, db):
+    from datetime import UTC, datetime, timedelta
+
+    scheduler = _make_scheduler(config, db)
+    stale = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    await _ambient_tick(scheduler, _ambient_snapshot(ts=stale))  # down, alert 1
+    # Heartbeat recovers but lands straight on an RSS breach: new cause, alert 2.
+    await _ambient_tick(scheduler, _ambient_snapshot(rss_total_mb=1200.0))
+    assert scheduler._pipeline.submit_raw.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_ambient_recovery_then_rebreach_realerts(config, db):
+    scheduler = _make_scheduler(config, db)
+    await _ambient_tick(scheduler, _ambient_snapshot(rss_total_mb=1200.0))  # alert 1
+    await _ambient_tick(scheduler, _ambient_snapshot())  # recovery notice (2)
+    await _ambient_tick(scheduler, _ambient_snapshot(rss_total_mb=1200.0))  # alert 3
+    assert scheduler._pipeline.submit_raw.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_ambient_rss_alert_text_names_leak_not_down(config, db):
+    scheduler = _make_scheduler(config, db)
+    await _ambient_tick(scheduler, _ambient_snapshot(rss_total_mb=1200.0))
+    text = scheduler._pipeline.submit_raw.call_args[0][0]
+    assert "down/hung" not in text  # the bridge is alive — don't misdiagnose
+    assert "RSS" in text

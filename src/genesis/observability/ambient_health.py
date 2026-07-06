@@ -34,6 +34,15 @@ _DEFAULT_KEY = "~/.ssh/id_ed25519"
 _HEARTBEAT_STALE_S = 300.0
 _SSH_TIMEOUT_S = 10.0
 
+# RSS ceilings for the leak-class regression watch. Calibrated from the
+# post-arena-off soak (closed 2026-07-06, 4.6 days): total plateau ~470 MB with
+# activity bursts to ~780; diar child flat ~170 with window excursions to ~280.
+# Ceilings sit ~2x the worst observed burst so workload breathing never fires
+# them — only a real regression of the leak class does (pre-fix pathology was
+# 1.67 GB total / 840+ MB child).
+_RSS_TOTAL_ALERT_MB = 1000.0
+_RSS_DIAR_CHILD_ALERT_MB = 450.0
+
 
 @dataclass(frozen=True)
 class AmbientRemoteConfig:
@@ -132,6 +141,12 @@ async def read_edge_health(cfg: AmbientRemoteConfig) -> dict | None:
 class AmbientVerdict:
     status: str  # "ok" | "degraded" | "down" | "unknown"
     reasons: list[str]
+    # Stable, value-free keys for the reasons ("bridge-dead" | "diar-worker" |
+    # "rss-total" | "rss-diar-child" | "unreachable"). Consumers need these to
+    # detect a NEW fault appearing while already degraded — reason strings
+    # embed live numbers and the bare status can't distinguish causes, so a
+    # status-edge alert gate would silently swallow a second, independent fault.
+    causes: tuple[str, ...] = ()
 
 
 def _parse_ts(value: object) -> datetime | None:
@@ -164,15 +179,19 @@ def evaluate_ambient_health(
     not a fault to alert on.
     """
     if data is None:
-        return AmbientVerdict("unknown", ["edge health unreachable / unreadable"])
+        return AmbientVerdict(
+            "unknown", ["edge health unreachable / unreadable"], ("unreachable",),
+        )
 
     now = now or datetime.now(UTC)
     reasons: list[str] = []
+    causes: list[str] = []
     status = "ok"
 
     ts = _parse_ts(data.get("ts"))
     if ts is None:
         reasons.append("health file has no/invalid heartbeat ts")
+        causes.append("bridge-dead")
         status = "down"
     else:
         age = (now - ts).total_seconds()
@@ -180,16 +199,36 @@ def evaluate_ambient_health(
             reasons.append(
                 f"heartbeat stale ({age:.0f}s > {_HEARTBEAT_STALE_S:.0f}s) — bridge dead/hung",
             )
+            causes.append("bridge-dead")
             status = "down"
 
     if data.get("diar_enabled") and not data.get("diar_worker_alive", False):
         reasons.append("diarization worker not alive")
+        causes.append("diar-worker")
         if status == "ok":
             status = "degraded"
 
+    # Leak-class regression watch: RSS beyond the trusted post-arena-off
+    # plateau ceiling. Null/absent keys are normal (lazy diar-pool spawn,
+    # older edge builds) — never a breach. Only upgrades ok -> degraded;
+    # a dead bridge stays "down" (but the reason is still appended).
+    for key, ceiling, label, cause in (
+        ("rss_total_mb", _RSS_TOTAL_ALERT_MB, "total", "rss-total"),
+        ("rss_diar_child_mb", _RSS_DIAR_CHILD_ALERT_MB, "diar child", "rss-diar-child"),
+    ):
+        value = data.get(key)
+        if isinstance(value, (int, float)) and value > ceiling:
+            reasons.append(
+                f"{label} RSS {value:.0f} MB exceeds the {ceiling:.0f} MB "
+                "plateau ceiling — possible leak regression",
+            )
+            causes.append(cause)
+            if status == "ok":
+                status = "degraded"
+
     if status == "ok":
         reasons.append("healthy")
-    return AmbientVerdict(status, reasons)
+    return AmbientVerdict(status, reasons, tuple(causes))
 
 
 async def bridge_snapshot(*, now: datetime | None = None) -> dict:
@@ -226,6 +265,7 @@ async def bridge_snapshot(*, now: datetime | None = None) -> dict:
         "reachable": data is not None,
         "verdict": verdict.status,
         "reasons": verdict.reasons,
+        "causes": list(verdict.causes),
         "latency_ms": latency_ms,
     }
     if data is not None:
