@@ -130,6 +130,39 @@ fi
 # Untracked files (^??) are excluded — merge/reset never touches them.
 # git reset --hard in _do_rollback would silently discard uncommitted work.
 #
+# Pure redeploy-decision helper (facts in → reason string out; no git/ssh) so
+# the guardian-redeploy matrix is unit-testable. Emits a non-empty reason to
+# stdout when the host guardian must be redeployed, empty when it is in sync.
+#   $1 reachable          "1" if the gateway `version` op returned (host state readable)
+#   $2 recognized         "1" if the host's deployed_commit resolves to a local commit
+#   $3 host_commit        host's reported deployed_commit (message only)
+#   $4 head_commit        local HEAD short-sha (message only)
+#   $5 host_paths_differ  "1" if guardian paths differ host_commit..HEAD (meaningful iff recognized)
+#   $6 pull_paths_differ  "1" if guardian paths differ OLD_COMMIT..HEAD (legacy pull-delta fallback)
+_guardian_redeploy_reason() {
+    local reachable="$1" recognized="$2" host_commit="$3" head_commit="$4"
+    local host_paths_differ="$5" pull_paths_differ="$6"
+    if [ "$reachable" != "1" ]; then
+        # Host state unreadable — fall back to the legacy "did this run's pull
+        # touch guardian paths" trigger (best effort; the redeploy SSH will
+        # itself fail-soft if the host is genuinely down).
+        if [ "$pull_paths_differ" = "1" ]; then
+            echo "gateway unreachable — pull-delta: guardian paths changed this run"
+        fi
+        return 0
+    fi
+    if [ "$recognized" != "1" ]; then
+        # deployed_commit is unknown/empty or a since-rebased/GC'd orphan we
+        # cannot diff against — converge unconditionally onto HEAD.
+        echo "host deployed_commit '${host_commit:-unknown}' unrecognized — reconciling to $head_commit"
+        return 0
+    fi
+    if [ "$host_paths_differ" = "1" ]; then
+        echo "host $host_commit vs HEAD $head_commit — guardian code drift"
+    fi
+    return 0
+}
+
 # ── Deploy-target sync: guardian redeploy + host Node/CC + container CC ──
 # Extracted into a function so it runs on BOTH paths: the normal post-update
 # path AND the "Already up to date" path. Drift healing (pin alignment on the
@@ -161,8 +194,48 @@ _sync_deploy_targets() {
             GUARDIAN_PATHS="src/genesis/guardian src/genesis/util src/genesis/env.py src/genesis/observability src/genesis/db config/guardian-claude.md pyproject.toml scripts/install_guardian.sh scripts/guardian-gateway.sh"
             DEPLOY_HASH=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 
+            # ── Read host state ONCE: deployed_commit + node/cc versions ──
+            # A single `version` gateway call feeds BOTH the redeploy decision
+            # (deployed_commit) and the Node/CC pin sync further below. Fetched
+            # up front so the redeploy trigger keys on the host's ACTUAL deployed
+            # commit (observable state), NOT on whether THIS run's git pull
+            # happened to touch guardian paths. The old pull-delta gate
+            # ("$OLD_COMMIT"→HEAD) silently skipped the redeploy whenever the host
+            # was last deployed from a since-rebased local HEAD (a no-op run has
+            # OLD_COMMIT == HEAD), stranding it on an orphan commit indefinitely.
+            HOST_VER_RAW="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
+            HOST_DEPLOYED_COMMIT="$(printf '%s' "$HOST_VER_RAW" \
+                | sed -n 's/.*"deployed_commit": "\([^"]*\)".*/\1/p' || true)"
+
+            # Compute redeploy-decision facts (no side effects) and let the pure
+            # _guardian_redeploy_reason helper resolve the reason string.
+            if [ -n "$HOST_VER_RAW" ]; then _gv_reachable=1; else _gv_reachable=0; fi
+            # recognized = deployed_commit resolves to a real local commit (so we
+            # can diff it). Empty / "unknown" / orphaned-or-GC'd shas → 0.
+            if [ -n "$HOST_DEPLOYED_COMMIT" ] && [ "$HOST_DEPLOYED_COMMIT" != "unknown" ] \
+               && git -C "$GENESIS_ROOT" cat-file -e "${HOST_DEPLOYED_COMMIT}^{commit}" 2>/dev/null; then
+                _gv_recognized=1
+            else
+                _gv_recognized=0
+            fi
+            # host-state drift: guardian content differs between what the host
+            # actually runs and HEAD (only meaningful when recognized).
+            _gv_host_differ=0
+            if [ "$_gv_recognized" = 1 ] \
+               && ! git -C "$GENESIS_ROOT" diff --quiet "$HOST_DEPLOYED_COMMIT" HEAD -- $GUARDIAN_PATHS 2>/dev/null; then
+                _gv_host_differ=1
+            fi
+            # legacy pull-delta (only used as the unreachable-host fallback).
+            _gv_pull_differ=0
             if ! git -C "$GENESIS_ROOT" diff --quiet "$OLD_COMMIT" HEAD -- $GUARDIAN_PATHS 2>/dev/null; then
-                echo "--- Guardian-relevant paths changed — redeploying to host ---"
+                _gv_pull_differ=1
+            fi
+            _gv_reason="$(_guardian_redeploy_reason "$_gv_reachable" "$_gv_recognized" \
+                "$HOST_DEPLOYED_COMMIT" "$DEPLOY_HASH" "$_gv_host_differ" "$_gv_pull_differ")"
+
+            if [ -n "$_gv_reason" ]; then
+                echo "--- Guardian redeploy needed ($_gv_reason) — redeploying to host ---"
                 # Try push-based redeploy (new gateway verb)
                 # Archive excludes config/guardian.yaml (host-specific, generated by installer)
                 ARCHIVE_CMD=(git -C "$GENESIS_ROOT" archive HEAD -- src/ scripts/ pyproject.toml config/guardian-claude.md)
@@ -191,7 +264,7 @@ _sync_deploy_targets() {
                     fi
                 fi
             else
-                echo "--- No Guardian-relevant changes — skipping host redeploy ---"
+                echo "--- Guardian in sync (host ${HOST_DEPLOYED_COMMIT:-unknown} @ HEAD $DEPLOY_HASH) — skipping host redeploy ---"
             fi
 
             # ── Sync host Node.js + Claude Code to the pinned versions (WS-16) ──
@@ -214,10 +287,8 @@ _sync_deploy_targets() {
                 echo "  WARNING: $_cc_env missing — skipping host Node/CC sync"
             fi
 
-            # One `version` call yields both node_version and cc_version.
-            HOST_VER_RAW="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
-                "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
-
+            # HOST_VER_RAW was fetched up front (feeds the redeploy decision too);
+            # parse node/cc from that same single `version` response here.
             if [ -z "$HOST_VER_RAW" ]; then
                 # Genuinely could not reach/parse the gateway — DISTINCT from "CC
                 # absent" (the conflation the old message got wrong).
