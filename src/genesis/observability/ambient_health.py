@@ -34,6 +34,15 @@ _DEFAULT_KEY = "~/.ssh/id_ed25519"
 _HEARTBEAT_STALE_S = 300.0
 _SSH_TIMEOUT_S = 10.0
 
+# RSS ceilings for the leak-class regression watch. Calibrated from the
+# post-arena-off soak (closed 2026-07-06, 4.6 days): total plateau ~470 MB with
+# activity bursts to ~780; diar child flat ~170 with window excursions to ~280.
+# Ceilings sit ~2x the worst observed burst so workload breathing never fires
+# them — only a real regression of the leak class does (pre-fix pathology was
+# 1.67 GB total / 840+ MB child).
+_RSS_TOTAL_ALERT_MB = 1000.0
+_RSS_DIAR_CHILD_ALERT_MB = 450.0
+
 
 @dataclass(frozen=True)
 class AmbientRemoteConfig:
@@ -186,6 +195,23 @@ def evaluate_ambient_health(
         reasons.append("diarization worker not alive")
         if status == "ok":
             status = "degraded"
+
+    # Leak-class regression watch: RSS beyond the trusted post-arena-off
+    # plateau ceiling. Null/absent keys are normal (lazy diar-pool spawn,
+    # older edge builds) — never a breach. Only upgrades ok -> degraded;
+    # a dead bridge stays "down" (but the reason is still appended).
+    for key, ceiling, label in (
+        ("rss_total_mb", _RSS_TOTAL_ALERT_MB, "total"),
+        ("rss_diar_child_mb", _RSS_DIAR_CHILD_ALERT_MB, "diar child"),
+    ):
+        value = data.get(key)
+        if isinstance(value, (int, float)) and value > ceiling:
+            reasons.append(
+                f"{label} RSS {value:.0f} MB exceeds the {ceiling:.0f} MB "
+                "plateau ceiling — possible leak regression",
+            )
+            if status == "ok":
+                status = "degraded"
 
     if status == "ok":
         reasons.append("healthy")
