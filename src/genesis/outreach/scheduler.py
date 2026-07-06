@@ -63,6 +63,11 @@ class OutreachScheduler:
         self._cached_critical_obs_at: float = 0.0  # monotonic time of cache
         # Ambient-capture health — last-known status (alert only on a state change).
         self._ambient_health_status: str = "ok"
+        # Cause keys already alerted on (from AmbientVerdict.causes). A bare
+        # status-edge gate would swallow a NEW independent fault that appears
+        # while the bridge is already degraded/down (e.g. an RSS regression
+        # during a diar-worker outage) — track causes so new ones re-alert.
+        self._ambient_health_causes: set[str] = set()
 
     @property
     def is_running(self) -> bool:
@@ -490,13 +495,15 @@ class OutreachScheduler:
             await self._record_job_result("critical_observations", error=str(exc))
 
     async def _ambient_health_job(self) -> None:
-        """Alert when the edge ambient-capture bridge goes dark.
+        """Alert when the edge ambient-capture bridge goes dark or regresses.
 
         SSH-reads the edge health file, evaluates it, and alerts the user
-        (Telegram) on a transition into a bad state, with a recovery note when it
-        comes back. No-op if ~/.genesis/ambient_remote.yaml is not configured.
-        Runs even when paused (observability, not a dispatch). A single "unknown"
-        (transient SSH failure) does not flip the alert state.
+        (Telegram) on a transition into a bad state OR when a new independent
+        fault cause appears while already bad (see ``AmbientVerdict.causes``),
+        with a recovery note when it comes back. No-op if
+        ~/.genesis/ambient_remote.yaml is not configured. Runs even when paused
+        (observability, not a dispatch). A single "unknown" (transient SSH
+        failure) does not flip the alert state.
         """
         try:
             from genesis.observability.ambient_health import (
@@ -525,13 +532,17 @@ class OutreachScheduler:
             prev = self._ambient_health_status
 
             if verdict.status in ("down", "degraded"):
-                # Alert ONCE on entering a bad state — no nagging, no periodic re-alert.
-                if prev not in ("down", "degraded"):
+                # Alert ONCE on entering a bad state — no nagging on the same
+                # persisting cause — but DO re-alert when a NEW independent
+                # fault appears while already bad (cause keys are value-free,
+                # so a changing RSS number never counts as "new").
+                new_causes = set(verdict.causes) - self._ambient_health_causes
+                if prev not in ("down", "degraded") or new_causes:
                     emoji = "\U0001f534" if verdict.status == "down" else "\U0001f7e1"
                     text = (
                         f"{emoji} Ambient capture {verdict.status.upper()}\n"
                         + "\n".join(f"• {r}" for r in verdict.reasons)
-                        + "\n\n(ambient bridge process down/hung — check/restart ambient-bridge.service)"
+                        + f"\n\n{self._ambient_remedy_hint(verdict.causes)}"
                     )
                     envelope = OutreachRequest(
                         category=OutreachCategory.BLOCKER,
@@ -544,6 +555,7 @@ class OutreachScheduler:
                     result = await self._pipeline.submit_raw(text, envelope)
                     logger.info("Ambient health alert (%s): %s", verdict.status, result.status.value)
                 self._ambient_health_status = verdict.status
+                self._ambient_health_causes = set(verdict.causes)
             elif verdict.status == "ok":
                 if prev in ("down", "degraded"):
                     text = "\U0001f7e2 Ambient capture recovered (healthy)."
@@ -558,12 +570,31 @@ class OutreachScheduler:
                     await self._pipeline.submit_raw(text, envelope)
                     logger.info("Ambient health recovered")
                 self._ambient_health_status = "ok"
+                self._ambient_health_causes = set()
             # status == "unknown": transient — leave _ambient_health_status as-is
 
             await self._record_job_result("ambient_health")
         except Exception as exc:
             logger.exception("Ambient health monitor job failed")
             await self._record_job_result("ambient_health", error=str(exc))
+
+    @staticmethod
+    def _ambient_remedy_hint(causes: tuple[str, ...]) -> str:
+        """Cause-aware remediation line for the ambient alert (worst cause wins).
+
+        "degraded" is a multi-cause bucket (dead diar worker, RSS regression) —
+        a fixed "process down/hung" suffix misdiagnoses a live-but-leaking bridge.
+        """
+        if "bridge-dead" in causes:
+            return "(ambient bridge process down/hung — check/restart ambient-bridge.service)"
+        if "diar-worker" in causes:
+            return "(diarization worker crashed — a bridge restart respawns it: systemctl --user restart ambient-bridge)"
+        if "rss-total" in causes or "rss-diar-child" in causes:
+            return (
+                "(RSS past the healthy plateau — possible leak regression; a bridge "
+                "restart reclaims memory, but investigate before the VM feels it)"
+            )
+        return "(check the bridge: journalctl --user -u ambient-bridge)"
 
     async def _calibration_job(self) -> None:
         """Reconcile predictions and recompute calibration curves."""

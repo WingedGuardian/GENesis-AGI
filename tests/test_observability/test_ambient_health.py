@@ -260,3 +260,32 @@ def test_rss_breach_does_not_mask_down():
     )
     assert verdict.status == "down"
     assert any("RSS" in r for r in verdict.reasons)
+
+
+def test_causes_are_stable_machine_keys():
+    # Consumers (the outreach alert state machine) need value-free keys to
+    # detect a NEW fault while already degraded — reason strings embed live
+    # numbers, and the bare status can't distinguish causes.
+    assert evaluate_ambient_health(_snapshot(), now=NOW).causes == ()
+    assert evaluate_ambient_health(None, now=NOW).causes == ("unreachable",)
+    stale = (NOW - timedelta(minutes=10)).isoformat()
+    assert evaluate_ambient_health(_snapshot(ts=stale), now=NOW).causes == ("bridge-dead",)
+    assert evaluate_ambient_health(
+        _snapshot(diar_worker_alive=False), now=NOW,
+    ).causes == ("diar-worker",)
+    verdict = evaluate_ambient_health(
+        _snapshot(rss_total_mb=1200.0, rss_diar_child_mb=600.0), now=NOW,
+    )
+    assert verdict.causes == ("rss-total", "rss-diar-child")
+
+
+def test_bridge_snapshot_carries_causes(monkeypatch):
+    monkeypatch.setattr(ambient_health, "load_ambient_remote_config", _cfg)
+    snap = _snapshot(rss_total_mb=1200.0)
+
+    async def _data(cfg):
+        return snap
+
+    monkeypatch.setattr(ambient_health, "read_edge_health", _data)
+    out = asyncio.run(ambient_health.bridge_snapshot(now=NOW))
+    assert out["causes"] == ["rss-total"]
