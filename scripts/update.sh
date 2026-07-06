@@ -846,6 +846,13 @@ if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     # pins): a pin bump pulled MANUALLY before this run, or an earlier failed
     # sync, must not leave drift in place just because the merge was a no-op.
     _sync_deploy_targets
+    # Persist any host-side degradation the drift healing just found — this
+    # path exits before the success-path recording, so without this the flag
+    # would only ever reach stdout on no-op runs.
+    if [ -n "$HOST_CC_DEGRADED" ]; then
+        echo "  NOTE: recording degraded subsystem: $HOST_CC_DEGRADED"
+        _record_update_history "success" "" "$HOST_CC_DEGRADED"
+    fi
     echo ""
     echo "  Nothing to do."
     exit 0
