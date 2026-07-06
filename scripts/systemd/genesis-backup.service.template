@@ -20,5 +20,11 @@ Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=yes
-ProtectSystem=strict
-ReadWritePaths=%h
+# No ProtectSystem=strict / ReadWritePaths sandbox here (unlike the watchdog and
+# disk-hygiene units, which only touch $HOME). backup.sh orchestrates external
+# tools that write OUTSIDE $HOME: gpg drives gpg-agent over its socket in
+# /run/user/%U, and the Tier-2 COMPLETE marker uses a bare `mktemp` in /tmp —
+# both are read-only under ProtectSystem=strict, so a hardened unit would fail
+# Tier-1 encryption (non-deterministically, depending on whether gpg-agent is
+# already alive) and the Tier-2 marker outright. The sandbox also delivers
+# little for an unprivileged user unit that cannot write system paths regardless.

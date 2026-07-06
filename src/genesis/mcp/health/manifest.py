@@ -64,49 +64,47 @@ def _annotate_staleness(jobs: dict) -> dict:
 
 
 # Module-level so tests can monkeypatch the location.
-_CAPABILITIES_FILE = Path.home() / ".genesis" / "capabilities.json"
+_MANIFEST_FILE = Path.home() / ".genesis" / "bootstrap_manifest.json"
 
 
-def _manifest_from_capabilities_file() -> dict | None:
-    """Reconstruct the bootstrap manifest from ``~/.genesis/capabilities.json``.
+def _read_persisted_manifest() -> dict | None:
+    """Read the manifest genesis-server persisted at its last bootstrap.
 
-    MCP servers run as separate processes from genesis-server, so the
-    in-process runtime singleton never bootstraps here. The server persists
-    a manifest-derived capabilities file at the tail of its own bootstrap
-    (``runtime/_capabilities.py``) — map its statuses back to manifest form.
-    Returns None when the file is missing or unreadable.
+    MCP servers run in a separate CC-child process that never bootstraps the
+    runtime, so the in-process singleton has no manifest. genesis-server writes
+    the verbatim manifest to ``~/.genesis/bootstrap_manifest.json`` at the tail
+    of its own bootstrap (``runtime/_capabilities.py``); read it directly — no
+    reverse mapping, exact fidelity. Returns None when the file is missing or
+    unreadable so the caller can report an honest empty result.
+
+    This is last-known state, NOT a liveness signal: the file survives a server
+    crash, so it never asserts the server is currently up. ``bootstrapped`` is
+    reported False (this process did not bootstrap); the populated manifest is
+    labelled ``source='persisted_manifest'`` with ``persisted_at`` and a pointer
+    to ``subsystem_heartbeats`` for current liveness.
     """
-    if not _CAPABILITIES_FILE.exists():
-        return None
     try:
-        caps = json.loads(_CAPABILITIES_FILE.read_text())
-        persisted_at = datetime.fromtimestamp(
-            _CAPABILITIES_FILE.stat().st_mtime, tz=UTC
-        ).isoformat()
+        raw = json.loads(_MANIFEST_FILE.read_text())
+    except FileNotFoundError:
+        return None
     except (json.JSONDecodeError, OSError) as exc:
-        logger.error("Failed to read %s: %s", _CAPABILITIES_FILE, exc)
+        logger.error("Failed to read %s: %s", _MANIFEST_FILE, exc)
         return None
 
-    manifest: dict[str, str] = {}
-    for name, info in caps.items():
-        if name.startswith("module:"):
-            continue  # module-registry entries, not bootstrap init steps
-        status = info.get("status", "unknown")
-        if status == "active":
-            manifest[name] = "ok"
-        elif status == "failed":
-            manifest[name] = f"failed: {info.get('error', 'unknown')}"
-        else:
-            manifest[name] = status  # degraded / disabled / unknown
+    manifest = raw.get("manifest") if isinstance(raw, dict) else None
+    if not isinstance(manifest, dict):
+        logger.error("Malformed bootstrap manifest file: %s", _MANIFEST_FILE)
+        return None
+
     return {
-        "bootstrapped": True,
+        "bootstrapped": False,  # THIS process didn't bootstrap; liveness ≠ file
         "manifest": manifest,
-        "source": "capabilities_file",
-        "persisted_at": persisted_at,
+        "source": "persisted_manifest",
+        "persisted_at": raw.get("persisted_at"),
         "note": (
-            "Out-of-process read: reconstructed from ~/.genesis/"
-            "capabilities.json, persisted by genesis-server at its last "
-            "bootstrap. Check subsystem_heartbeats for current liveness."
+            "Last-known manifest persisted by genesis-server at its last "
+            "bootstrap (this MCP process does not bootstrap the runtime). "
+            "Does NOT indicate current liveness — check subsystem_heartbeats."
         ),
     }
 
@@ -124,8 +122,8 @@ async def _impl_bootstrap_manifest() -> dict:
             }
         # Not bootstrapped in THIS process — the normal case for MCP
         # servers (CC child processes, separate from genesis-server).
-        # Fall back to the manifest the server persisted at bootstrap.
-        persisted = _manifest_from_capabilities_file()
+        # Serve the manifest genesis-server persisted at its bootstrap.
+        persisted = _read_persisted_manifest()
         if persisted is not None:
             return persisted
         return {
