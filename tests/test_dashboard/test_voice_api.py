@@ -63,3 +63,29 @@ def test_page_served_when_configured(client):
         resp = client.get("/genesis/voice")
     assert resp.status_code == 200
     assert b"Genesis Voice" in resp.data  # the served template
+
+
+# ── /api/genesis/voice/bridge (wiring: route registered, snapshot passthrough) ──
+
+def test_bridge_route_returns_snapshot_verbatim(client):
+    snap = {
+        "configured": True, "reachable": True, "verdict": "ok",
+        "reasons": ["healthy"], "latency_ms": 12.3,
+        "health": {"ts": "2026-06-18T12:00:00+00:00", "rss_total_mb": 438.0},
+    }
+    with patch(
+        "genesis.observability.ambient_health.bridge_snapshot", return_value=snap,
+    ):
+        resp = client.get("/api/genesis/voice/bridge")
+    assert resp.status_code == 200
+    assert resp.get_json() == snap
+
+
+def test_bridge_route_not_configured_is_200(client):
+    snap = {"configured": False, "reason": "no ambient edge configured"}
+    with patch(
+        "genesis.observability.ambient_health.bridge_snapshot", return_value=snap,
+    ):
+        resp = client.get("/api/genesis/voice/bridge")
+    assert resp.status_code == 200
+    assert resp.get_json()["configured"] is False

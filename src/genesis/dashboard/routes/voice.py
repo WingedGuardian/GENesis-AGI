@@ -7,10 +7,10 @@ visibility. Voice is an OPTIONAL add-on: on a stock clone with no
 non-voice installs never see voice surfaces.
 
 The page's sub-tabs (Judgment / Bridge / STT / S2S / Device) are all in the served
-template. The Bridge tab reuses the existing ``/api/genesis/health``
-``infrastructure.ambient`` block; the Device tab reads live Voice PE hardware vitals
-from Home Assistant via ``GET /api/genesis/voice/device`` (below) — the one
-voice-specific endpoint here, on-demand so it never burdens the health snapshot.
+template. The Bridge tab reads the full edge health payload on demand via
+``GET /api/genesis/voice/bridge`` (below); the Device tab reads live Voice PE
+hardware vitals from Home Assistant via ``GET /api/genesis/voice/device`` (below).
+Both are on-demand so they never burden the cached health snapshot.
 """
 from __future__ import annotations
 
@@ -55,6 +55,22 @@ def voice_enabled():
     """Whether the optional voice add-on is configured — drives nav-link visibility.
     Non-sensitive boolean; open like the rest of the ``/api`` surface."""
     return jsonify({"enabled": _voice_configured()})
+
+
+@blueprint.route("/api/genesis/voice/bridge")
+@_async_route(timeout=20.0)
+async def voice_bridge():
+    """Full ambient edge-bridge health for the Bridge tab, SSH-read on demand.
+
+    Returns ``bridge_snapshot()`` verbatim: verdict + reasons + the complete
+    ``ambient_health.json`` payload under ``health``. Always HTTP 200 with
+    ``configured``/``reachable`` flags so the tab degrades gracefully — never a
+    5xx the frontend would treat as a server fault. Timeout 20s: strictly a
+    backstop above the SSH read's own ~15s internal bound (ConnectTimeout 10s +
+    communicate wait), so the inner path always resolves first."""
+    from genesis.observability.ambient_health import bridge_snapshot
+
+    return jsonify(await bridge_snapshot())
 
 
 @blueprint.route("/api/genesis/voice/device")

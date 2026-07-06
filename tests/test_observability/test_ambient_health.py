@@ -1,8 +1,10 @@
-"""Unit tests for the pure ambient-health evaluator.
+"""Unit tests for the pure ambient-health evaluator + the bridge snapshot.
 
-Covers the alert-decision logic (the testable core); the SSH read + scheduler
-wiring are verified on-device (they need the edge + a running scheduler).
+Covers the alert-decision logic (the testable core) and ``bridge_snapshot``'s
+composition/contract; the SSH read + scheduler wiring are verified on-device
+(they need the edge + a running scheduler).
 """
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -130,3 +132,82 @@ def test_load_unparseable_raises(tmp_path, monkeypatch):
     _point_config_at(tmp_path, monkeypatch, "host_ip: [1, 2\n")
     with pytest.raises(AmbientRemoteConfigError):
         load_ambient_remote_config()
+
+
+# --- bridge_snapshot: the voice Bridge tab's one-call data contract ---
+# Composes load_ambient_remote_config + read_edge_health + evaluate_ambient_health;
+# must NEVER raise (the dashboard route serializes whatever comes back).
+
+
+def _cfg() -> AmbientRemoteConfig:
+    return AmbientRemoteConfig(host_ip="192.0.2.9", host_user="edge")
+
+
+def test_bridge_snapshot_not_configured(monkeypatch):
+    monkeypatch.setattr(ambient_health, "load_ambient_remote_config", lambda: None)
+    out = asyncio.run(ambient_health.bridge_snapshot())
+    assert out == {"configured": False, "reason": "no ambient edge configured"}
+
+
+def test_bridge_snapshot_misconfigured(monkeypatch):
+    # Present-but-broken config must surface VISIBLY (not raise, not look absent).
+    def _raise():
+        raise AmbientRemoteConfigError("enabled but missing host_ip/host_user")
+
+    monkeypatch.setattr(ambient_health, "load_ambient_remote_config", _raise)
+    out = asyncio.run(ambient_health.bridge_snapshot())
+    assert out["configured"] is True
+    assert out["reachable"] is False
+    assert out["verdict"] == "misconfigured"
+    assert any("host_ip" in r for r in out["reasons"])
+    assert "health" not in out
+
+
+def test_bridge_snapshot_unreachable_edge(monkeypatch):
+    monkeypatch.setattr(ambient_health, "load_ambient_remote_config", _cfg)
+
+    async def _none(cfg):
+        return None
+
+    monkeypatch.setattr(ambient_health, "read_edge_health", _none)
+    out = asyncio.run(ambient_health.bridge_snapshot(now=NOW))
+    assert out["configured"] is True
+    assert out["reachable"] is False
+    assert out["verdict"] == "unknown"
+    assert isinstance(out["latency_ms"], float)
+    assert "health" not in out
+
+
+def test_bridge_snapshot_happy_passthrough(monkeypatch):
+    monkeypatch.setattr(ambient_health, "load_ambient_remote_config", _cfg)
+    snap = _snapshot(rss_total_mb=438.0, ort_arena_off=True)
+
+    async def _data(cfg):
+        return snap
+
+    monkeypatch.setattr(ambient_health, "read_edge_health", _data)
+    out = asyncio.run(ambient_health.bridge_snapshot(now=NOW))
+    assert out["configured"] is True
+    assert out["reachable"] is True
+    assert out["verdict"] == "ok"
+    assert out["reasons"] == ["healthy"]
+    # Full passthrough under a "health" sub-key — no filtering, so future edge
+    # keys surface without a Genesis-side change.
+    assert out["health"]["rss_total_mb"] == 438.0
+    assert isinstance(out["latency_ms"], float)
+
+
+def test_bridge_snapshot_verdict_logic_reused_not_reimplemented(monkeypatch):
+    # A stale heartbeat must flow through evaluate_ambient_health as "down":
+    # the SSH read WORKED (reachable=True) — it's the bridge process that's dead.
+    monkeypatch.setattr(ambient_health, "load_ambient_remote_config", _cfg)
+    stale = _snapshot(ts=(NOW - timedelta(minutes=10)).isoformat())
+
+    async def _data(cfg):
+        return stale
+
+    monkeypatch.setattr(ambient_health, "read_edge_health", _data)
+    out = asyncio.run(ambient_health.bridge_snapshot(now=NOW))
+    assert out["reachable"] is True
+    assert out["verdict"] == "down"
+    assert any("stale" in r for r in out["reasons"])
