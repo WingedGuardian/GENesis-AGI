@@ -1913,52 +1913,62 @@ class SurplusScheduler:
                     len(content.strip()), task.id[:8],
                 )
             else:
-                try:
-                    from genesis.surplus.intake import (
-                        run_intake,
-                        source_for_task_type,
-                    )
-                    source = source_for_task_type(str(task.task_type))
-                    intake_stats = await run_intake(
-                        content=content,
-                        source=source,
-                        source_task_type=str(task.task_type),
-                        generating_model=insight.get("generating_model", "unknown"),
-                        db=self._db,
-                    )
-                    logger.info(
-                        "Intake routed %d findings (k=%d, o=%d, d=%d) for task %s",
-                        intake_stats.findings_count,
-                        intake_stats.routed_knowledge,
-                        intake_stats.routed_observation,
-                        intake_stats.routed_discard,
-                        task.id[:8],
-                    )
-                    # Use a synthetic staging_id for tracking
+                if task.task_type == _TT.CODE_AUDIT:
+                    # Code-audit output is ingested per-finding by
+                    # FindingsBridge below, behind its confidence gate and
+                    # slop filter. Routing the raw findings array through
+                    # generic intake as well would double-ingest every
+                    # finding and bypass both gates. Synthetic staging_id
+                    # for tracking; the quality judge below still runs.
                     content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
                     staging_id = f"{task.task_type.value}-{content_hash}"
-                except Exception:
-                    # Fallback: write to surplus_insights staging (old behavior)
-                    logger.warning(
-                        "Intake pipeline failed — falling back to surplus_insights staging",
-                        exc_info=True,
-                    )
-                    content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
-                    staging_id = f"{task.task_type.value}-{content_hash}"
-                    now = self._clock()
-                    ttl = (now + timedelta(days=7)).isoformat()
-                    now_iso = now.isoformat()
-                    await surplus_crud.upsert(
-                        self._db,
-                        id=staging_id,
-                        content=content,
-                        source_task_type=str(task.task_type),
-                        generating_model=insight.get("generating_model", "unknown"),
-                        drive_alignment=task.drive_alignment,
-                        confidence=insight.get("confidence", 0.0),
-                        created_at=now_iso,
-                        ttl=ttl,
-                    )
+                else:
+                    try:
+                        from genesis.surplus.intake import (
+                            run_intake,
+                            source_for_task_type,
+                        )
+                        source = source_for_task_type(str(task.task_type))
+                        intake_stats = await run_intake(
+                            content=content,
+                            source=source,
+                            source_task_type=str(task.task_type),
+                            generating_model=insight.get("generating_model", "unknown"),
+                            db=self._db,
+                        )
+                        logger.info(
+                            "Intake routed %d findings (k=%d, o=%d, d=%d) for task %s",
+                            intake_stats.findings_count,
+                            intake_stats.routed_knowledge,
+                            intake_stats.routed_observation,
+                            intake_stats.routed_discard,
+                            task.id[:8],
+                        )
+                        # Use a synthetic staging_id for tracking
+                        content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                        staging_id = f"{task.task_type.value}-{content_hash}"
+                    except Exception:
+                        # Fallback: write to surplus_insights staging (old behavior)
+                        logger.warning(
+                            "Intake pipeline failed — falling back to surplus_insights staging",
+                            exc_info=True,
+                        )
+                        content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                        staging_id = f"{task.task_type.value}-{content_hash}"
+                        now = self._clock()
+                        ttl = (now + timedelta(days=7)).isoformat()
+                        now_iso = now.isoformat()
+                        await surplus_crud.upsert(
+                            self._db,
+                            id=staging_id,
+                            content=content,
+                            source_task_type=str(task.task_type),
+                            generating_model=insight.get("generating_model", "unknown"),
+                            drive_alignment=task.drive_alignment,
+                            confidence=insight.get("confidence", 0.0),
+                            created_at=now_iso,
+                            ttl=ttl,
+                        )
 
                 # Measurement-only verified-correctness verdict. Runs whether
                 # intake succeeded or fell back (content is valid to judge either

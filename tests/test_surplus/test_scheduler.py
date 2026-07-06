@@ -251,6 +251,36 @@ async def test_dispatch_judge_outage_stays_null(db):
     assert row["judge_detail"] is None
 
 
+async def test_code_audit_skips_generic_intake(db):
+    """CODE_AUDIT output is ingested per-finding by FindingsBridge (behind its
+    confidence gate and slop filter); the generic intake route must not
+    double-ingest the raw findings array or bypass those gates."""
+    from genesis.surplus.intake import IntakeStats
+
+    sched, compute = _make_scheduler(db, idle=True)
+    await sched._queue.enqueue(
+        TaskType.CODE_AUDIT, ComputeTier.FREE_API, 0.8, "curiosity",
+    )
+    intake_mock = AsyncMock(return_value=IntakeStats(findings_count=1))
+    with patch.object(
+        compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False,
+    ), patch(
+        "genesis.surplus.intake.run_intake", intake_mock,
+    ), patch(
+        "genesis.surplus.quality_judge.run_quality_judge",
+        new_callable=AsyncMock, return_value=(None, None, None),
+    ):
+        assert await sched.dispatch_once() is True
+    intake_mock.assert_not_awaited()
+    cur = await db.execute(
+        "SELECT status, result_staging_id FROM surplus_tasks "
+        "WHERE status='completed'"
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    assert row["result_staging_id"]  # synthetic tracking id still recorded
+
+
 async def test_dispatch_non_insight_type_skips_judge(db):
     # An action / non-insight type must NOT invoke the judge (cost) and stays NULL.
     row, judge = await _dispatch_with_judge(
