@@ -1,0 +1,24 @@
+[Unit]
+Description=Genesis Backup — Tier-1 encrypted push (+ Tier-2 off-site when configured)
+After=genesis-server.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=/bin/bash __REPO_DIR__/scripts/backup.sh
+# A large install's SQLite dump + GPG + Qdrant snapshots + Tier-2 upload over
+# LAN can run well past the 90s default TimeoutStartSec, which would SIGTERM a
+# healthy backup mid-encryption. Project floor (timeout policy): 2h.
+TimeoutStartSec=7200
+# git push authenticates via ~/.gitconfig's `gh auth git-credential` helper
+# (/usr/bin/gh, hosts.yml-backed) — no shell env or GH_TOKEN needed. sqlite3,
+# gpg, curl, smbclient all live in the system paths below.
+Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+# NOTE: no TMPDIR override. backup.sh routes its large intermediates to ~/tmp
+# itself (GENESIS_BIG_TMP); pointing TMPDIR at the watchgod-policed cc-tmp
+# would risk killing CC sessions on a big dump.
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h

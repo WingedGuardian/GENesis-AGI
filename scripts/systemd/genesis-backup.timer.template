@@ -1,0 +1,13 @@
+[Unit]
+Description=Genesis Backup — every 6h
+
+[Timer]
+# :10 offset avoids the :00 cron reapers; Persistent catches up a missed
+# window after downtime. systemd skips a fire while the service is still
+# running, so overlapping backups can't stack.
+OnCalendar=00/6:10
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

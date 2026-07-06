@@ -684,11 +684,14 @@ if [ -f "$GENESIS_ROOT/secrets.env" ]; then
     fi
 fi
 
-# NOTE: Backups are NOT auto-enabled here. Backup is a deliberate setup step
-# (both tiers + passphrase + a verify run) handled in the onboarding skill —
-# auto-installing a 6h cron on bootstrap just because GENESIS_BACKUP_REPO is set
-# gives a false sense of safety (large data is local-only until Tier 2/NAS is
-# configured) and isn't a switch to flip for every new user.
+# NOTE: Backups are NOT auto-enabled here. The genesis-backup.{service,timer}
+# unit FILES are installed by the template-sync loop above, but the timer is
+# left disabled: backup is a deliberate setup step (both tiers + passphrase +
+# a verify run — see SETUP.md "Backups") handled in the onboarding skill.
+# Auto-enabling a 6h schedule on bootstrap just because GENESIS_BACKUP_REPO is
+# set gives a false sense of safety (large data is local-only until Tier 2/NAS
+# is configured) and isn't a switch to flip for every new user. Enable with:
+#   systemctl --user enable --now genesis-backup.timer
 
 # --- VNC stack (collaborative browser mode) ---
 echo "--- Setting up VNC stack ---"

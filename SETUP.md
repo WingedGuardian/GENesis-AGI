@@ -102,7 +102,8 @@ Populates the voice exemplar library with samples of your writing style.
 
 ## Backups
 
-Backups run every 6 hours via cron and split into two tiers:
+Backups run every 6 hours via the `genesis-backup.timer` systemd user unit
+and split into two tiers:
 
 - **Tier 1** (git → GitHub): Memory files, configs, secrets (~1MB). Automatic.
 - **Tier 2** (smbclient → NAS/remote): Qdrant snapshots, SQL dumps (~200MB+). Opt-in.
@@ -119,6 +120,18 @@ GENESIS_BACKUP_NAS_PASS=password
 ```
 
 Requires `smbclient` (`sudo apt-get install smbclient`).
+
+Bootstrap installs the timer's unit files but does **not** enable them —
+scheduling a backup that silently leaves your database local-only would give a
+false sense of safety. Once `GENESIS_BACKUP_REPO` and
+`GENESIS_BACKUP_PASSPHRASE` are set (and Tier 2, if you want off-site copies of
+the large payloads), enable it deliberately and verify one run:
+
+```bash
+systemctl --user enable --now genesis-backup.timer
+systemctl --user start genesis-backup.service   # fire one run now
+cat ~/.genesis/backup_status.json               # expect "success":true
+```
 
 ## Verify Installation
 
