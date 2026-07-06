@@ -11,6 +11,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A false "deferred work backlog" health warning no longer fires every few minutes.** The
+  weekly memory dream-cycle parks a large synthesis worklist that drains a little each day by
+  design; the health check was counting that scheduled batch against the "postponed due to
+  degradation" queue alarm, so it tripped a WARNING on every awareness tick. The alarm now
+  watches only genuine recovery backlog (a stalled worklist still surfaces after a full drain
+  cycle), and the dashboard shows the batch worklist separately from recovery work.
+
+- **Automatic Qdrant restart works again.** The self-heal action that restarts a downed Qdrant
+  targeted the wrong systemd manager and failed with "Access denied," leaving the vector store
+  without automatic recovery. It now restarts the correct user-scoped service.
+
+- **The emergency responder can't stall its own monitoring anymore.** If a Sentinel remediation
+  session was running when a health tick fired, the tick could block behind it long enough to
+  trip the very "monitoring is overdue" alarm the Sentinel exists to prevent. The tick now skips
+  cleanly when a remediation is already in flight.
+
 - **`update.sh` was silently skipping the host-VM sync (guardian redeploy + host Node/Claude Code
   pin healing).** A recent refactor re-indented the two inline Python snippets that read
   `guardian_remote.yaml`; the resulting parse error was suppressed, the host address resolved
