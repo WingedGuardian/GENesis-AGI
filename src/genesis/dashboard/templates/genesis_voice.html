@@ -550,6 +550,7 @@
                   <div class="bridge-row"><span>Longest gap</span><span x-text="gv._num(h.conn_longest_gap_s, ' s')"></span></div>
                   <div class="bridge-row"><span>Last device link</span><span :title="h.last_connection_ts || ''" x-text="gv._age(h.last_connection_ts)"></span></div>
                   <div class="bridge-row" x-show="h.conn_dark_for_s != null"><span>Dark for</span><span style="color:var(--color-warning-text);" x-text="gv._num(h.conn_dark_for_s, ' s')"></span></div>
+                  <div class="bridge-row" x-show="h.conn_dark_since != null"><span>Dark since</span><span style="color:var(--color-warning-text);" :title="h.conn_dark_since || ''" x-text="gv._age(h.conn_dark_since)"></span></div>
                 </div>
                 <div>
                   <div class="bridge-group-title">Speaker ID</div>
