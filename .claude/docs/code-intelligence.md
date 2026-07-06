@@ -88,6 +88,23 @@ extension — it degrades gracefully (skips FTS, no crash).
 **Grep/Glob/Read** — Always available, zero overhead. Preferred for config
 files, markdown, YAML, JSON, shell scripts, SQL, and any non-code content.
 
+## Worktrees Are Never Indexed
+
+Linked git worktrees get NO CBM/GitNexus indexing — by design, not oversight.
+Each worktree index builds a full separate graph (gigabytes of RAM + heavy
+disk writes); three concurrent worktree indexers once saturated the
+container's disk-write throttle and wedged the whole container in a D-state
+I/O storm. In a worktree session, use **Serena** (live LSP, no index needed)
+plus the main repo's existing CBM/GitNexus graphs.
+
+All out-of-session index spawns route through
+`scripts/lib/code_intel_index.sh` — the single entrypoint enforcing
+worktree-skip, a per-repo single-flight lock, and memory/IO/CPU caps
+(`CODE_INTEL_INDEX_DISABLE=1` to skip entirely). A guardrail test
+(`tests/test_scripts/test_code_intel_index.py`) fails the build on any new
+raw spawn site. In-session MCP indexing (e.g. CBM's `index_repository` tool)
+is unaffected — it runs inside the already-capped server process.
+
 ---
 
 For deep GitNexus reference (Cypher syntax, edge types, MCP resources,

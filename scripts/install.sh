@@ -902,18 +902,15 @@ if command -v claude &>/dev/null; then
         _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
 fi
 
-# Trigger initial code intelligence indexing (background)
+# Trigger initial code intelligence indexing (background) — through the
+# single locked + resource-capped entrypoint ONLY (raw indexer spawns once
+# wedged the container in a D-state I/O storm; a guardrail test bans them).
 CI_LOG="$HOME/.genesis/code-intelligence-setup.log"
 mkdir -p "$(dirname "$CI_LOG")"
-if command -v gitnexus &>/dev/null && [ ! -d "$REPO_DIR/.gitnexus" ]; then
-    ( cd "$REPO_DIR" && gitnexus analyze --quiet >> "$CI_LOG" 2>&1 ) &
+if [ -f "$REPO_DIR/scripts/lib/code_intel_index.sh" ]; then
+    ( bash "$REPO_DIR/scripts/lib/code_intel_index.sh" "$REPO_DIR" both >> "$CI_LOG" 2>&1 ) &
     disown 2>/dev/null || true
-    echo "    + GitNexus: initial indexing (background)"
-fi
-if command -v codebase-memory-mcp &>/dev/null; then
-    ( codebase-memory-mcp cli index_repository "{\"repo_path\": \"$REPO_DIR\"}" >> "$CI_LOG" 2>&1 ) &
-    disown 2>/dev/null || true
-    echo "    + codebase-memory-mcp: indexing (background)"
+    echo "    + code intelligence: indexing (background, locked + capped)"
 fi
 
 
