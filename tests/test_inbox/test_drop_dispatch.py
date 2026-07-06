@@ -663,3 +663,188 @@ async def test_follow_up_dedup_key_persisted(db, inbox_dir, mock_invoker, mock_s
     assert len(row) == 1
     assert row[0]["dedup_key"]  # non-null
     assert await follow_ups.exists_by_dedup_key(db, row[0]["dedup_key"]) is True
+
+
+# ── Refresh folds parked files into one batch (oscillator regression) ────
+
+
+class _StatefulGate:
+    """Model the REAL gate contract for the inbox site (stable approval key):
+    at most ONE pending request per site; route() while pending parks on the
+    existing request; cancel() clears it; the next route() after a cancel
+    creates a fresh request id (in production: a fresh Telegram message).
+    """
+
+    def __init__(self, clock):
+        self._clock = clock
+        self.pending_id: str | None = None
+        self.created_at: str = ""
+        self.approved: set[str] = set()
+        self.request_count = 0
+        self.cancel_calls: list[str] = []
+
+    async def route(self, request):
+        if self.pending_id is None:
+            self.request_count += 1
+            self.pending_id = f"req-{self.request_count}"
+            self.created_at = self._clock().isoformat()
+        return AutonomousDispatchDecision(
+            mode="blocked", reason="approval requested",
+            approval_request_id=self.pending_id,
+        )
+
+    async def find_site_pending(self, *, subsystem, policy_id):
+        if self.pending_id is None:
+            return None
+        return {"id": self.pending_id, "created_at": self.created_at}
+
+    async def cancel(self, request_id):
+        self.cancel_calls.append(request_id)
+        if request_id == self.pending_id:
+            self.pending_id = None
+        return True
+
+    def approve(self):
+        assert self.pending_id is not None
+        self.approved.add(self.pending_id)
+        self.pending_id = None
+
+    async def get_by_id(self, request_id):
+        if request_id == self.pending_id:
+            return {"status": "pending"}
+        if request_id in self.approved:
+            return {"status": "approved"}
+        return {"status": "cancelled"}
+
+
+def _stateful_dispatcher(clock):
+    gate = _StatefulGate(clock)
+    d = SimpleNamespace()
+    d.route = gate.route
+    d.approval_gate = SimpleNamespace(
+        find_site_pending=gate.find_site_pending,
+        approval_manager=SimpleNamespace(
+            get_by_id=gate.get_by_id, cancel=gate.cancel,
+        ),
+        mark_consumed=AsyncMock(return_value=True),
+    )
+    return d, gate
+
+
+@pytest.mark.asyncio
+async def test_refresh_folds_parked_files_no_oscillation(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """Two files parked on one approval + one file edited → the refresh must
+    cancel ONCE and re-park BOTH files on the fresh request.
+
+    Without folding the parked files into the refresh batch, the
+    not-refreshed file's rows are invalidated but never re-dispatched, so it
+    re-surfaces as phantom-"new" next scan and the two files leapfrog:
+    cancel + recreate every scan (a Telegram message each time) with NO disk
+    change — the 30-minute approval nag.
+    """
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    disp, gate = _stateful_dispatcher(mon._clock)
+    mon._autonomous_dispatcher = disp
+    file_a = inbox_dir / "Genesis.md"
+    file_b = inbox_dir / "Capabilities.md"
+    file_a.write_text(_urls(2))
+    file_b.write_text("https://example.com/b0\nhttps://example.com/b1")
+
+    # Scan 1: both drops park on the single site-stable request.
+    await mon.check_once()
+    parked = await inbox_items.get_awaiting_approval(db)
+    assert {p["file_path"] for p in parked} == {str(file_a), str(file_b)}
+    assert gate.request_count == 1
+
+    # The user edits B while the approval is pending.
+    file_b.write_text("https://example.com/b9")
+
+    # Scan 2: ONE cancel, and the refreshed request covers BOTH files.
+    await mon.check_once()
+    assert gate.cancel_calls == ["req-1"]
+    parked = await inbox_items.get_awaiting_approval(db)
+    assert {p["file_path"] for p in parked} == {str(file_a), str(file_b)}, (
+        "parked files must fold into the refresh batch"
+    )
+    assert gate.request_count == 2
+
+    # Scans 3-4, disk unchanged: detection stays quiet — no cancel, no new
+    # request, no dispatch. (Unfixed: A and B alternate forever.)
+    await mon.check_once()
+    await mon.check_once()
+    assert gate.cancel_calls == ["req-1"], "approval churned on unchanged disk"
+    assert gate.request_count == 2
+    assert mock_invoker.run.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_does_not_resurrect_deleted_parked_file(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """A parked file deleted from disk must NOT be folded back into the
+    refresh batch, and must not oscillate afterwards."""
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    disp, gate = _stateful_dispatcher(mon._clock)
+    mon._autonomous_dispatcher = disp
+    file_a = inbox_dir / "Genesis.md"
+    file_b = inbox_dir / "Capabilities.md"
+    file_a.write_text(_urls(2))
+    file_b.write_text("https://example.com/b0")
+
+    await mon.check_once()  # both park on req-1
+    file_a.unlink()
+    file_b.write_text("https://example.com/b9")
+
+    await mon.check_once()  # refresh: only B re-parks
+    parked = await inbox_items.get_awaiting_approval(db)
+    assert {p["file_path"] for p in parked} == {str(file_b)}
+
+    await mon.check_once()  # deleted file stays gone; no churn
+    parked = await inbox_items.get_awaiting_approval(db)
+    assert {p["file_path"] for p in parked} == {str(file_b)}
+    assert gate.request_count == 2
+
+
+@pytest.mark.asyncio
+async def test_folded_file_reevaluates_only_unprocessed_delta(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """A folded parked file must go through the same delta batching as any
+    modified file: URLs already evaluated in a prior approved run are NOT
+    re-evaluated when the file is folded into a refresh batch."""
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    disp, gate = _stateful_dispatcher(mon._clock)
+    mon._autonomous_dispatcher = disp
+    file_a = inbox_dir / "Genesis.md"
+    file_a.write_text(_urls(2))  # a0, a1
+
+    await mon.check_once()          # A parks on req-1
+    gate.approve()
+    await mon.check_once()          # resume: a0/a1 evaluated (baseline)
+    assert mock_invoker.run.call_count == 1
+
+    # User appends 2 new URLs -> parks on req-2 (delta batch only).
+    file_a.write_text(_urls(4))     # a0..a3
+    await mon.check_once()
+    assert gate.request_count == 2
+
+    # A second file arrives while req-2 is pending -> refresh folds A.
+    file_b = inbox_dir / "Capabilities.md"
+    file_b.write_text("https://example.com/b0")
+    await mon.check_once()
+    assert gate.cancel_calls == ["req-2"]
+    parked = await inbox_items.get_awaiting_approval(db)
+    assert {p["file_path"] for p in parked} == {str(file_a), str(file_b)}
+
+    # Approve the merged request: only the delta + the new file are evaluated.
+    gate.approve()
+    await mon.check_once()
+    prompts = " ".join(
+        c.args[0].prompt for c in mock_invoker.run.call_args_list[1:]
+    )
+    assert "https://example.com/a2" in prompts
+    assert "https://example.com/a3" in prompts
+    assert "https://example.com/b0" in prompts
+    assert "https://example.com/a0" not in prompts, "re-evaluated processed URL"
