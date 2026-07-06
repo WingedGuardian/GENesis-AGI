@@ -682,7 +682,15 @@ class InboxMonitor:
                     exc_info=True,
                 )
 
-            # Invalidate inbox_items parked on the cancelled approval.
+            # Invalidate inbox_items parked on the cancelled approval and
+            # fold their files into THIS refresh. Invalidated rows are
+            # excluded from get_all_known and from retry by design ("fresh
+            # rows with fresh approvals"), so a parked file that is not
+            # re-dispatched here re-surfaces as phantom-new next scan and
+            # cancels the fresh approval in turn — two parked files then
+            # leapfrog forever: a cancel + a new request (a Telegram
+            # message) every scan with no disk change.
+            parked_paths: list[str] = []
             try:
                 awaiting = await inbox_items.get_awaiting_approval(self._db)
                 for row in awaiting:
@@ -699,11 +707,25 @@ class InboxMonitor:
                             ),
                             processed_at=self._clock().isoformat(),
                         )
+                        parked_paths.append(str(row["file_path"]))
             except Exception:
                 logger.warning(
                     "Failed to invalidate parked inbox items for %s",
                     pending_id,
                     exc_info=True,
+                )
+
+            detected = {str(p) for p in new_files}
+            detected |= {str(p) for p in modified_files}
+            folded = [
+                Path(fp) for fp in dict.fromkeys(parked_paths)
+                if fp not in detected and Path(fp).exists()
+            ]
+            if folded:
+                modified_files = [*modified_files, *folded]
+                logger.info(
+                    "Folded %d parked file(s) into the refresh batch: %s",
+                    len(folded), ", ".join(p.name for p in folded),
                 )
 
             return new_files, modified_files
