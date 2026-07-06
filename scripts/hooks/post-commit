@@ -31,20 +31,19 @@ if [[ -z "$COMMIT_SHA" || -z "$COMMIT_SUBJECT" ]]; then
 fi
 
 # ─── Code intelligence reindex (every commit, fire-and-forget) ────────────
-# Keeps codebase-memory-mcp and GitNexus indexes fresh after each commit.
+# Keeps codebase-memory-mcp and GitNexus indexes fresh after each commit —
+# via the single locked entrypoint ONLY. This hook fires for commits in
+# EVERY worktree (hooks live in the git common dir); the raw spawns that
+# used to live here piled three concurrent uncapped indexers onto one
+# worktree and wedged the container (D-state I/O storm). The entrypoint
+# enforces worktree-skip, a per-repo single-flight lock, and resource caps.
 # Fail-open: errors logged, never block the commit.
 _REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-if [[ -n "$_REPO_ROOT" ]]; then
+if [[ -n "$_REPO_ROOT" && -f "$_REPO_ROOT/scripts/lib/code_intel_index.sh" ]]; then
     _CI_LOG="$GENESIS_HOME/code-intelligence-hook.log"
-    if command -v codebase-memory-mcp &>/dev/null; then
-        ( codebase-memory-mcp cli index_repository "{\"repo_path\": \"$_REPO_ROOT\"}" \
-            >> "$_CI_LOG" 2>&1 ) &
-        disown 2>/dev/null || true
-    fi
-    if command -v npx &>/dev/null; then
-        ( cd "$_REPO_ROOT" && npx gitnexus analyze --quiet >> "$_CI_LOG" 2>&1 ) &
-        disown 2>/dev/null || true
-    fi
+    ( bash "$_REPO_ROOT/scripts/lib/code_intel_index.sh" "$_REPO_ROOT" both \
+        >> "$_CI_LOG" 2>&1 ) &
+    disown 2>/dev/null || true
 fi
 
 # ─── Stale-branch cleanup on public releases ──────────────────────────────

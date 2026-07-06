@@ -142,49 +142,46 @@ def configure_global_settings(genesis_root: Path, dry_run: bool) -> None:
 def trigger_indexing(genesis_root: Path, dry_run: bool) -> None:
     """Trigger code intelligence indexing in background (non-blocking).
 
+    All indexing goes through scripts/lib/code_intel_index.sh — the single
+    entrypoint that enforces worktree-skip, a per-repo single-flight lock,
+    and resource caps. Raw indexer spawns are banned (three concurrent
+    uncapped index jobs once wedged the whole container by saturating its
+    disk-write throttle); a guardrail test enforces the ban.
+
     Uses start_new_session=True + explicit log file to avoid inheriting
     open pipes from the caller (e.g. bootstrap's `| tail -10` pipe),
     which would cause SIGPIPE if the parent exits before the indexer finishes.
     """
-    import shutil
     import subprocess
 
     if dry_run:
         print("\nCode intelligence: (dry run — skipping indexing)")
         return
 
+    if (genesis_root / ".git").is_file():
+        # Linked git worktree — never indexed (each index builds a full
+        # separate graph for near-identical code; Serena covers worktrees).
+        print("\nCode intelligence: worktree detected — indexing skipped (use Serena here)")
+        return
+
+    entrypoint = genesis_root / "scripts" / "lib" / "code_intel_index.sh"
+    if not entrypoint.exists():
+        print("\nCode intelligence: index entrypoint missing — skipping")
+        return
+
     log_path = Path.home() / ".genesis" / "code-intelligence-setup.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = open(log_path, "a")  # noqa: SIM115 — kept open for subprocess lifetime
 
-    launched = []
-    if shutil.which("codebase-memory-mcp"):
-        subprocess.Popen(
-            ["codebase-memory-mcp", "cli", "index_repository",
-             f'{{"repo_path": "{genesis_root}"}}'],
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            close_fds=True,
-            start_new_session=True,
-        )
-        launched.append("codebase-memory-mcp")
-
-    if shutil.which("npx"):
-        subprocess.Popen(
-            ["npx", "gitnexus", "analyze", "--quiet"],
-            cwd=str(genesis_root),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            close_fds=True,
-            start_new_session=True,
-        )
-        launched.append("GitNexus")
-
-    if launched:
-        print(f"\nCode intelligence: indexing in background ({', '.join(launched)})")
-        print(f"  Log: {log_path}")
-    else:
-        print("\nCode intelligence: no indexers found (install codebase-memory-mcp to enable)")
+    subprocess.Popen(
+        ["bash", str(entrypoint), str(genesis_root), "both"],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        close_fds=True,
+        start_new_session=True,
+    )
+    print("\nCode intelligence: indexing in background (locked + resource-capped)")
+    print(f"  Log: {log_path}")
 
 
 def main():

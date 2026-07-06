@@ -27,6 +27,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   trip the very "monitoring is overdue" alarm the Sentinel exists to prevent. The tick now skips
   cleanly when a remediation is already in flight.
 
+- **Background code-intelligence indexing can no longer freeze your machine.** Creating a git
+  worktree (or running install/bootstrap) could fire several full-repo indexing jobs at once —
+  uncapped, each building its own multi-gigabyte code graph — saturating the container's disk-write
+  limit until SSH and the dashboard stopped responding. All background indexing now goes through a
+  single entrypoint that skips worktrees entirely (the live LSP covers those sessions with no index
+  needed), runs at most one index per repo at a time, and caps the indexer's memory/IO/CPU so even
+  a single job can't starve the system. A repo-wide test blocks any future code path from spawning
+  a raw indexer again. Set `CODE_INTEL_INDEX_DISABLE=1` to opt out of background indexing entirely.
+
 - **`update.sh` was silently skipping the host-VM sync (guardian redeploy + host Node/Claude Code
   pin healing).** A recent refactor re-indented the two inline Python snippets that read
   `guardian_remote.yaml`; the resulting parse error was suppressed, the host address resolved

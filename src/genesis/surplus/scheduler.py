@@ -1596,9 +1596,9 @@ class SurplusScheduler:
     async def run_gitnexus_reindex(self) -> None:
         """Reindex the GitNexus code graph (Mon & Thu 5am UTC).
 
-        Runs ``gitnexus analyze`` as a subprocess.
-        CPU-only AST parsing, no ONNX/GPU (embeddings off by default).
-        Incremental since GitNexus 1.6.5 — fast on unchanged repos.
+        Runs the GitNexus reindex as a subprocess via the locked index
+        entrypoint. CPU-only AST parsing, no ONNX/GPU (embeddings off by
+        default). Incremental since GitNexus 1.6.5 — fast on unchanged repos.
         """
         import asyncio
         import shutil
@@ -1619,11 +1619,31 @@ class SurplusScheduler:
 
         try:
             repo_root = str(Path.home() / "genesis")
+            # Route through the single locked+capped index entrypoint.
+            # max_instances=1 only dedups within THIS process; the
+            # post-commit hook and bootstrap spawn indexers out-of-process,
+            # so the entrypoint's flock is the cross-process single-flight
+            # guard (and its systemd scope caps memory/IO/CPU). No bare
+            # binary fallback — raw indexer spawns are banned (guardrail
+            # test), and the entrypoint ships with the repo.
+            entrypoint = Path(repo_root) / "scripts" / "lib" / "code_intel_index.sh"
+            if not entrypoint.is_file():
+                logger.warning(
+                    "GitNexus reindex skipped — index entrypoint missing at %s",
+                    entrypoint,
+                )
+                return
             proc = await asyncio.create_subprocess_exec(
-                gitnexus, "analyze",
+                "bash", str(entrypoint), repo_root, "gitnexus",
                 cwd=repo_root,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # Own process group: proc is a bash wrapper — the actual
+                # indexer is its (grand)child, so a timeout kill must hit
+                # the whole group or it orphans the indexer (which keeps
+                # running AND holds the stdout pipe, blocking communicate()
+                # forever and wedging the max_instances=1 slot for good).
+                start_new_session=True,
             )
             try:
                 # 2-hour cap: gitnexus analyze is AST-only (no ONNX), but a
@@ -1633,13 +1653,38 @@ class SurplusScheduler:
                     proc.communicate(), timeout=7200
                 )
             except TimeoutError:
-                proc.kill()
-                await proc.communicate()
+                import os
+                import signal
+                # pgid > 1 guard: killpg(1) == kill ALL user processes
+                # (and mocked procs default to pid 1 in tests).
+                if isinstance(proc.pid, int) and proc.pid > 1:
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                # Bounded drain: after a group SIGKILL this returns at once;
+                # the bound only guards against a pipe-holder that escaped
+                # the group (e.g. via its own setsid) re-wedging the slot.
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(proc.communicate(), timeout=30)
                 logger.error("GitNexus reindex timed out after 2h — killed")
                 with contextlib.suppress(Exception):
                     GenesisRuntime.instance().record_job_failure(
                         "gitnexus_reindex", "timed out after 2h",
                     )
+                return
+            out_text = (stdout or b"").decode(errors="replace")
+            if proc.returncode == 0 and (
+                "skip:" in out_text or "disabled via" in out_text
+            ):
+                # Entrypoint no-op (lock held by a concurrent index, or
+                # indexing disabled) — do NOT claim a reindex happened.
+                logger.info(
+                    "GitNexus reindex skipped by entrypoint: %s",
+                    out_text.strip()[:200],
+                )
+                with contextlib.suppress(Exception):
+                    GenesisRuntime.instance().record_job_success("gitnexus_reindex")
                 return
             if proc.returncode == 0:
                 logger.info("GitNexus reindex complete")

@@ -534,28 +534,13 @@ fi
 echo
 
 # --- Code Intelligence Indexing ---
-echo "--- Triggering code intelligence indexing ---"
-CI_LOG="$HOME/.genesis/code-intelligence-setup.log"
-mkdir -p "$(dirname "$CI_LOG")"
-
-if command -v gitnexus &>/dev/null; then
-    if [[ ! -d "$GENESIS_ROOT/.gitnexus" ]]; then
-        echo "  GitNexus: running initial analysis (background)..."
-        ( cd "$GENESIS_ROOT" && gitnexus analyze --quiet >> "$CI_LOG" 2>&1 ) &
-        disown 2>/dev/null || true
-    else
-        echo "  GitNexus: index exists (use 'gitnexus analyze' to rebuild)"
-    fi
-fi
-
-if command -v codebase-memory-mcp &>/dev/null; then
-    echo "  codebase-memory-mcp: indexing repository (background)..."
-    ( codebase-memory-mcp cli index_repository "{\"repo_path\": \"$GENESIS_ROOT\"}" \
-        >> "$CI_LOG" 2>&1 ) &
-    disown 2>/dev/null || true
-fi
-
-echo "  Log: $CI_LOG"
+# No direct indexer spawns here: setup_claude_config.py (invoked earlier)
+# already triggers indexing through scripts/lib/code_intel_index.sh — the
+# single locked + resource-capped entrypoint. The raw spawns this block used
+# to hold ran a SECOND concurrent index of the same repo on every bootstrap
+# (and a third via the post-commit hook), which once wedged the container in
+# a D-state I/O storm. All indexing must go through the entrypoint.
+echo "--- Code intelligence indexing: handled by setup_claude_config (locked entrypoint) ---"
 echo
 
 # --- Timezone ---
