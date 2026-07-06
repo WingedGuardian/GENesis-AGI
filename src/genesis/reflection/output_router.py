@@ -91,6 +91,11 @@ def parse_deep_reflection_output(raw_json: str) -> DeepReflectionOutput:
             options=[str(o) for o in uq_data.get("options", [])],
         )
 
+    # Absent confidence gets a 0.5 sentinel + flag, NOT 0.7 — the prompt
+    # forbids 0.7-as-default, so a silent 0.7 here would be indistinguishable
+    # from the model genuinely reporting 0.7.
+    raw_confidence = data.get("confidence")
+
     return DeepReflectionOutput(
         observations=data.get("observations", []),
         cognitive_state_update=data.get("cognitive_state_update"),
@@ -102,7 +107,8 @@ def parse_deep_reflection_output(raw_json: str) -> DeepReflectionOutput:
         contradictions=data.get("contradictions", []),
         learnings=data.get("learnings", []),
         focus_next=data.get("focus_next", ""),
-        confidence=float(data.get("confidence", 0.7)),
+        confidence=float(raw_confidence) if raw_confidence is not None else 0.5,
+        confidence_defaulted=raw_confidence is None,
         separability=float(data["separability"]) if data.get("separability") is not None else None,
         alternative_assessment=data.get("alternative_assessment"),
     )
@@ -226,6 +232,11 @@ class OutputRouter:
             "surplus_tasks_enqueued": 0,
             "question_surfaced": False,
         }
+        # Persisted with the deep_reflection.completed event details (and
+        # returned to the bridge) so an absent-confidence cycle stays
+        # distinguishable from one where the model reported 0.5.
+        if output.confidence_defaulted:
+            summary["confidence_defaulted"] = True
 
         # Quality gate — reject parse failures and all-zero output
         if output.parse_failed:
@@ -272,9 +283,13 @@ class OutputRouter:
         if gate_msg:
             logger.warning("Deep reflection confidence gate: %s (conf=%.2f)", gate_msg, output.confidence)
         if gated:
+            conf_label = (
+                f"{output.confidence:.2f} (defaulted — model omitted confidence)"
+                if output.confidence_defaulted else f"{output.confidence:.2f}"
+            )
             await self._write_observation(
                 db, source="deep_reflection", type="quarantined_reflection",
-                content=f"Low-confidence reflection quarantined (conf={output.confidence:.2f}): "
+                content=f"Low-confidence reflection quarantined (conf={conf_label}): "
                 + "; ".join(output.observations[:2]),
                 priority="low",
             )
