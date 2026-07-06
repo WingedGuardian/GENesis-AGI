@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 AUTONOMY_MODE_SHADOW = "shadow"
 AUTONOMY_MODE_LIVE = "live"
 
+# Repo-root derivation assumes the src-layout editable install Genesis
+# ships with; under a site-packages install the path misses and the mode
+# silently defaults to shadow — the safe direction.
 _CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "sentinel.yaml"
 
 # ── Self-fatal deny patterns (checked first, match anywhere) ─────────────
@@ -47,21 +50,35 @@ _CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "sentinel.yaml"
 # radius for an autonomous tier (and can kill the CC shell / working dir).
 _SELF_FATAL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
-        re.compile(r"systemctl\s+(?:--user\s+)?(?:restart|stop|kill)\s+\S*genesis-server"),
-        "genesis-server restart/stop (kills the Sentinel's own host process)",
+        # ANY systemctl invocation naming genesis-server: restart/stop/kill
+        # take down the Sentinel's own host process, verb-anchored patterns
+        # are bypassable via flag interposition (--no-block etc.), and even
+        # `start` is nonsensical from in here (if the server is down, so is
+        # the Sentinel). (?s) so an embedded newline can't split the match.
+        re.compile(r"(?s)\bsystemctl\b.*genesis-server"),
+        "systemctl on genesis-server (the Sentinel's own host process)",
     ),
     (re.compile(r"\b(?:kill|pkill|killall)\b"), "process kill"),
-    (re.compile(r"\brm\s+(?:-\w*[rR]\w*\s+)+"), "recursive rm"),
+    (
+        # Short (-r/-R, possibly bundled) and long (--recursive) forms.
+        re.compile(r"(?s)\brm\b(?=.*\s(?:-\w*[rR]|--recursive))"),
+        "recursive rm",
+    ),
 )
 
 # ── Allowlist: anchored full-command shapes from the Failure Inventory ───
-# Unit names are restricted to systemd-safe characters; genesis-server is
-# already excluded by the self-fatal check above.
-_UNIT = r"[A-Za-z0-9@._-]+"
+# Whitespace note: \s matches newlines, but fullmatch + the tight unit
+# charset (no metacharacters, no spaces) means an embedded payload can
+# never ride along — keep the charset tight if you extend this.
+#
+# Only KNOWN-SAFE units, not any unit: a generic pattern would mark e.g.
+# `genesis-tmp-watchgod` (which kills CC sessions when it acts) as
+# auto-eligible. Extend from shadow data, not speculation.
+_SAFE_UNITS = r"(?:genesis-watchdog|genesis-bridge|qdrant)(?:\.(?:service|timer))?"
 _ALLOWLIST: tuple[tuple[re.Pattern[str], str], ...] = (
     (
-        re.compile(rf"^systemctl\s+--user\s+(?:start|restart)\s+{_UNIT}$"),
-        "user-unit start/restart",
+        re.compile(rf"^systemctl\s+--user\s+(?:start|restart)\s+{_SAFE_UNITS}$"),
+        "known-safe user-unit start/restart",
     ),
     (
         re.compile(r"^(?:sudo\s+)?systemctl\s+restart\s+qdrant(?:\.service)?$"),
@@ -71,7 +88,7 @@ _ALLOWLIST: tuple[tuple[re.Pattern[str], str], ...] = (
         # Non-zero value shape only: `--vacuum-size=0` would wipe all logs.
         re.compile(
             r"^(?:sudo\s+)?journalctl\s+--vacuum-(?:size=[1-9][0-9]*[KMG]"
-            r"|time=[1-9][0-9]*(?:s|min|h|days?|d|weeks?|months?|m|y))$",
+            r"|time=[1-9][0-9]*(?:s|min|h|days?|d|weeks?|w|months?|y))$",
         ),
         "journal vacuum",
     ),

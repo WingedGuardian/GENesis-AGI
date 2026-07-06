@@ -64,11 +64,18 @@ class TestClassifySelfFatal:
             "systemctl --user restart genesis-server.service",
             "systemctl --user stop genesis-server",
             "sudo systemctl restart genesis-server",
+            # verb-flag interposition and `start` must not slip the deny
+            "systemctl --user --no-block stop genesis-server",
+            "systemctl --no-block --user restart genesis-server",
+            "systemctl --user start genesis-server",
             "kill -9 1234",
             "pkill -f genesis",
             "killall python",
+            "/usr/bin/kill -9 42",
+            "ps aux | grep genesis | xargs kill",
             "rm -rf ~/genesis",
             "rm -r /home/ubuntu/.genesis",
+            "rm --recursive --force /home/ubuntu",
         ],
     )
     def test_self_fatal_always_gated(self, cmd):
@@ -108,8 +115,13 @@ class TestClassifyFailSafe:
             "find / -type f -delete",
             "find /tmp -type f -delete",
             "find /tmp -type f -not -name '*.sock' -mmin +5 -delete",
-            # vacuum to zero would wipe all logs
+            # vacuum to zero would wipe all logs; lone `m` is ambiguous
             "sudo journalctl --vacuum-size=0",
+            "journalctl --vacuum-time=100m",
+            # only KNOWN-SAFE units are allowlisted, not any user unit
+            "systemctl --user restart genesis-tmp-watchgod",
+            "systemctl --user restart genesis-tmp-watchgod.service",
+            "systemctl --user start some-random.service",
             # systemctl on the system bus for arbitrary units
             "sudo systemctl restart nginx",
         ],

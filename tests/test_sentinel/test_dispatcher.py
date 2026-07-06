@@ -1182,3 +1182,20 @@ class TestShadowClassification:
         assert result.dispatched
         assert len(_action_policy_calls(gate)) == 1
         mock_execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_shadow_event_without_proposed_actions(self):
+        """Zero-action dispatches must not emit shadow_classification."""
+        d = _make_dispatcher()  # default invoker output proposes no actions
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+
+        with patch("genesis.sentinel.dispatcher.save_state"), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log") as mock_log:
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+
+        assert result.dispatched
+        assert _shadow_events(mock_log) == []
