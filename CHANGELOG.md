@@ -24,6 +24,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Assistant on demand (`GET /api/genesis/voice/device`; set `HA_VOICE_PE_PREFIX`). *(Shipped
   earlier in #876; the changelog entry was missed at the time.)*
 
+### Changed
+
+- **The idle-time code auditor now hunts the failure modes AI-generated code actually has.** Its
+  briefing gained a research-backed taxonomy — swallowed async errors, orphan state without
+  teardown, race surfaces, phantom guards, near-duplicate helpers, cosmetic abstractions, pattern
+  abandonment, and constraints quietly removed during refinement cycles — so audit findings target
+  the defect classes iterative LLM development is known to produce instead of only generic lint
+  categories. Development guidance gained the matching discipline: iterate with scoped explicit
+  prompts (never "improve this"), and diff refinements for what they *removed*.
+
 ### Fixed
 
 - **A false "deferred work backlog" health warning no longer fires every few minutes.** The

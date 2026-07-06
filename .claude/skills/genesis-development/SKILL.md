@@ -133,6 +133,22 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   fires. Use `CronTrigger` for anything longer than a few hours.
   Bit us with `user_model_evolution` (48h interval, daily restarts).
 
+### Iterative-Refinement Discipline
+
+AI refinement cycles degrade code they were asked to "improve" — validation
+gets stripped, types relaxed, function scope widened. Published measurements
+show vague improvement prompts degrade security fastest across iterations.
+Three binding rules:
+
+1. **Iterate with scoped, explicit prompts** ("fix the race in X by
+   serializing on Y"), never "improve/clean up/make robust".
+2. **Be security-explicit when touching validation, auth, or boundaries** —
+   state what must not be weakened.
+3. **Diff each refinement for what it REMOVED** (constraints, guards, type
+   enforcement), not just what it added.
+
+Full failure-mode taxonomy + ordered audit passes: `references/ai-code-audit.md`.
+
 ### Anti-Rationalization
 
 These are excuses sessions use to skip discipline. If you catch yourself
@@ -305,6 +321,7 @@ references on every trigger.
 | V3 state, build order, GROUNDWORK, architecture docs | `references/architecture.md` |
 | Phase 6 contribution pipeline, sanitizer | `references/contribution.md` |
 | Pending work, active incidents, subsystem status | `references/build-state.md` |
+| Auditing/deep-reviewing AI-generated code (failure taxonomy, audit passes) | `references/ai-code-audit.md` |
 | Which code tool to use (CBM vs Serena vs GitNexus vs Grep) | `.claude/docs/code-intelligence.md` |
 
 **Freshness rule:** On first read of `codebase-map.md` in a session,
