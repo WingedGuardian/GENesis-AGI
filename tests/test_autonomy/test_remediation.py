@@ -79,6 +79,30 @@ def _l4_action() -> RemediationAction:
 # Registration
 # ---------------------------------------------------------------------------
 
+class TestDefaultCommandScoping:
+    """Guardrail: systemctl unit restarts must target the user manager.
+
+    Genesis services (qdrant, genesis-bridge) are systemd USER units; a bare
+    `systemctl restart X` hits the system manager and fails rc=4 Access denied,
+    silently disabling self-heal. Regression pin so a new action can't drop
+    --user. (Non-systemctl commands like the disk_reclaim python script, which
+    legitimately uses a --system flag of its own, are out of scope.)
+    """
+
+    def test_qdrant_restart_uses_user_manager(self):
+        qdrant = [a for a in DEFAULT_REMEDIATIONS if a.name == "qdrant_restart"][0]
+        assert qdrant.command == ["systemctl", "--user", "restart", "qdrant"]
+
+    def test_all_systemctl_restarts_are_user_scoped(self):
+        for action in DEFAULT_REMEDIATIONS:
+            cmd = action.command
+            if cmd and cmd[0] == "systemctl":
+                assert "--user" in cmd, (
+                    f"{action.name}: systemctl command {cmd} missing --user — "
+                    f"will fail against the system manager (Access denied)"
+                )
+
+
 class TestRegistration:
     def test_register_action(self):
         reg = RemediationRegistry()

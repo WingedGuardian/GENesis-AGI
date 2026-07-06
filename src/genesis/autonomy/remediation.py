@@ -378,7 +378,11 @@ DEFAULT_REMEDIATIONS: list[RemediationAction] = [
         name="qdrant_restart",
         probe_name="qdrant",
         condition="Qdrant health probe returns DOWN",
-        command=["systemctl", "restart", "qdrant"],
+        # Qdrant is a systemd USER unit (~/.config/systemd/user/qdrant.service);
+        # without --user this targets the system manager and fails with
+        # "Access denied" (rc=4), leaving qdrant self-heal non-functional.
+        # Mirrors awareness_restart below.
+        command=["systemctl", "--user", "restart", "qdrant"],
         governance_level=2,
         reversible=True,
         cooldown_s=300,
