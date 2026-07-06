@@ -1192,6 +1192,12 @@ else
     echo "  . Claude Code already on host ($(claude --version 2>/dev/null))"
 fi
 
+# Enforce the one-canonical-copy policy: remove shadow CC copies (nvm trees,
+# native-installer artifacts, stale prefixes) that drift silently because
+# update-cc only manages the canonical copy. See cc_shadow_scan in
+# scripts/lib/cc_version.sh (sourced above). CC_SHADOW_SCAN=0 opts out.
+cc_shadow_scan || true
+
 # Suppress CC auto-updater via user-level ~/.claude/settings.json on the host.
 # The repo's .claude/settings.json doesn't apply when CC runs outside the project
 # directory, and CC's auto-updater silently bumps the version in that context.

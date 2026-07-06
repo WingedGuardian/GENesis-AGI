@@ -281,6 +281,7 @@ if [ -f "$_cc_env" ]; then
     # shellcheck source=/dev/null
     source "$_cc_env"
     cc_ensure_local || true
+    cc_shadow_scan || true
 fi
 
 # bubblewrap (sandbox for codex exec — optional)

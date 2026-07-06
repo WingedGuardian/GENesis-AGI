@@ -1174,6 +1174,7 @@ if ! cc_ensure_local; then
     echo "    Install manually: npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
     SETUP_WARNINGS=1
 fi
+cc_shadow_scan || true
 
 # Genesis wrapper — lets users type 'genesis' from anywhere inside the container
 # to launch Claude Code in the right directory with all hooks/MCP active.

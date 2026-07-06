@@ -28,6 +28,12 @@ CC_VERSION="${CC_VERSION:-2.1.201}"
 # host VM via the guardian-gateway `update-node` op — mirroring `update-cc`.
 NODE_MAJOR="${NODE_MAJOR:-22}"
 
+# Known CC install prefixes (bin dirs), probed when `command -v claude` fails —
+# a PATH-blind install (user npm prefix whose PATH export only fires in
+# interactive shells) must be treated as installed, not reinstalled forever.
+# Colon-separated; overridable for tests and exotic layouts.
+CC_PROBE_DIRS="${CC_PROBE_DIRS:-/usr/local/bin:/usr/bin:$HOME/.npm-global/bin}"
+
 
 # cc_ensure_local — install or align the LOCAL Claude Code CLI to $CC_VERSION.
 #
@@ -62,10 +68,29 @@ cc_ensure_local() {
         return 0
     fi
 
-    local existing current prefix
+    local existing current prefix p
     existing="$(command -v claude 2>/dev/null || true)"
+    if [ -z "$existing" ]; then
+        # PATH-blind check before declaring absence: a user-prefix install
+        # (~/.npm-global with its PATH export in .bashrc AFTER the interactive
+        # early-exit) is invisible to every non-interactive shell — which made
+        # this function reinstall CC on EVERY update run on one machine while
+        # a perfectly good copy sat one directory away.
+        local _oldIFS="$IFS"
+        IFS=':'
+        for p in $CC_PROBE_DIRS; do
+            if [ -x "$p/claude" ]; then
+                existing="$p/claude"
+                echo "  cc_ensure_local: claude found at $existing but NOT on this shell's PATH — treating as installed (fix the PATH wiring, or move the install to a system prefix)" >&2
+                break
+            fi
+        done
+        IFS="$_oldIFS"
+    fi
     if [ -n "$existing" ]; then
-        current="$(claude --version 2>/dev/null | awk '{print $1}')"
+        # Version via the resolved binary, not a PATH lookup — $existing may
+        # have come from the PATH-blind prefix probe above.
+        current="$("$existing" --version 2>/dev/null | awk '{print $1}')"
         if [ "$current" = "$pin" ]; then
             echo "  Claude Code already at pin ($pin)"
             return 0
@@ -122,4 +147,174 @@ cc_ensure_local() {
     fi
     echo "  WARNING: cc_ensure_local: install ran but 'claude --version' is ${installed:-unknown} (expected $pin) — possible npm-prefix/PATH mismatch" >&2
     return 1
+}
+
+
+# cc_shadow_scan — enforce the ONE-canonical-copy policy for Claude Code.
+#
+# Four real incidents motivated this (2026-07): an nvm-tree copy that shadowed
+# the pinned CC in interactive shells only (user saw a months-old version); a
+# native-installer symlink in ~/.local/bin doing the same; leftover native
+# version blobs (~490MB dead weight); and a user-prefix copy invisible to
+# non-interactive shells. Shadow copies drift silently because update-cc /
+# cc_ensure_local only manage the canonical copy.
+#
+# Canonical = a copy that REPORTS THE PIN ($CC_VERSION): first the PATH
+# resolution if it's at the pin, else the first at-pin copy in CC_PROBE_DIRS.
+# Version-verified selection is the core safety property — `command -v` alone
+# follows the INVOKING shell's PATH, and an interactive PATH can put a stale
+# copy first (the exact incident class this scan exists to fix), which would
+# otherwise crown the stale copy canonical and sudo-remove the good one.
+# FAIL-SAFE: if NO copy at the pin exists anywhere, nothing is removed —
+# a scan that cannot prove a good copy exists has no business deleting.
+#
+# Every OTHER copy on a known surface is removed, with loud logging. Removal
+# is gated on the artifact being PROVABLY a claude-code install (npm package
+# dir or a symlink into one, or the native-installer layout); anything
+# unprovable is warned about and left alone. The canonical's own package dir
+# and (for a native canonical) the native versions dir are never touched.
+#
+# Opt-out for deliberate multi-copy setups: CC_SHADOW_SCAN=0.
+# Non-fatal by design; call as `cc_shadow_scan || true`.
+cc_shadow_scan() {
+    if [ "${CC_SHADOW_SCAN:-1}" = "0" ]; then
+        echo "  cc_shadow_scan: disabled (CC_SHADOW_SCAN=0)"
+        return 0
+    fi
+    local pin="${CC_VERSION:-}"
+    if [ -z "$pin" ]; then
+        echo "  cc_shadow_scan: CC_VERSION unset — skipping (cannot verify a canonical)" >&2
+        return 0
+    fi
+
+    local canonical="" canon_real="" canon_pkg="" p v
+    local -a _candidates=()
+    p="$(command -v claude 2>/dev/null || true)"
+    [ -n "$p" ] && _candidates+=("$p")
+    local _oldIFS="$IFS"
+    IFS=':'
+    for p in $CC_PROBE_DIRS; do
+        _candidates+=("$p/claude")
+    done
+    IFS="$_oldIFS"
+    for p in "${_candidates[@]}"; do
+        [ -x "$p" ] || continue
+        v="$("$p" --version 2>/dev/null | awk '{print $1}')"
+        if [ "$v" = "$pin" ]; then
+            canonical="$p"
+            break
+        fi
+    done
+    if [ -z "$canonical" ]; then
+        echo "  cc_shadow_scan: no claude at the pin ($pin) found — REFUSING to remove anything (align with cc_ensure_local / update-cc first)" >&2
+        return 0
+    fi
+    canon_real="$(readlink -f "$canonical" 2>/dev/null || echo "$canonical")"
+    # The canonical's own npm package dir — never removed, even when a STALE
+    # extra symlink points into it (that link alone goes; nuking the package
+    # would destroy the canonical).
+    case "$canon_real" in
+        */@anthropic-ai/claude-code/*)
+            canon_pkg="$(readlink -f "${canon_real%%/@anthropic-ai/claude-code/*}/@anthropic-ai/claude-code" 2>/dev/null || true)"
+            ;;
+    esac
+
+    # Native-installer version blobs: shadows by definition under the npm-only
+    # canon (docs/reference/cc-compatibility.md), and BIG (~250MB each) —
+    # UNLESS the canonical itself is a native install (then they ARE the
+    # canonical's payload; leave them and let the operator migrate to npm).
+    if [ -d "$HOME/.local/share/claude/versions" ]; then
+        case "$canon_real" in
+            "$HOME/.local/share/claude/"*)
+                echo "  cc_shadow_scan: canonical is a native install — keeping $HOME/.local/share/claude/versions (consider migrating to the npm install path)" >&2
+                ;;
+            *)
+                echo "  cc_shadow_scan: removing native-installer version blobs ($HOME/.local/share/claude/versions)"
+                rm -rf "$HOME/.local/share/claude/versions"
+                ;;
+        esac
+    fi
+
+    local candidate real
+    for candidate in \
+        "$HOME"/.nvm/versions/node/*/bin/claude \
+        "$HOME/.claude/local/claude" \
+        "$HOME/.local/bin/claude" \
+        "$HOME/.npm-global/bin/claude" \
+        /usr/local/bin/claude \
+        /usr/bin/claude; do
+        [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+        real="$(readlink -f "$candidate" 2>/dev/null || echo "$candidate")"
+        # The canonical copy itself (or a same-file alias like /bin vs /usr/bin
+        # under usrmerge) is never touched.
+        [ "$real" = "$canon_real" ] && continue
+        _cc_remove_shadow "$candidate" "$canon_pkg"
+    done
+
+    # Aliases/functions can shadow every file-level fix — detect, never edit
+    # a user's rc files.
+    local rc hits
+    for rc in "$HOME/.bashrc" "$HOME/.bash_aliases" "$HOME/.zshrc" "$HOME/.profile"; do
+        [ -f "$rc" ] || continue
+        hits="$(grep -nE '^[[:space:]]*alias claude=' "$rc" 2>/dev/null || true)"
+        [ -n "$hits" ] && echo "  WARNING: cc_shadow_scan: 'claude' alias in $rc shadows the canonical copy — remove it manually: $hits" >&2
+    done
+    return 0
+}
+
+# _cc_remove_shadow <path> <canon_pkg> — remove one shadow copy, ONLY if
+# provably a claude-code install. System-prefix removals need passwordless
+# sudo; user paths are removed directly. Unprovable artifacts are warned and
+# kept. A package dir equal to <canon_pkg> (the canonical's own package) is
+# never removed — only the stale link into it.
+_cc_remove_shadow() {
+    local candidate="$1" canon_pkg="${2:-}" target pkg_dir=""
+    target="$(readlink "$candidate" 2>/dev/null || true)"
+
+    if [[ "$target" == *"@anthropic-ai/claude-code"* ]]; then
+        # npm-style symlink → the package dir it points into (resolve relative
+        # to the symlink's own directory).
+        pkg_dir="$(cd "$(dirname "$candidate")" 2>/dev/null && cd "$(dirname "$target")" 2>/dev/null && pwd)"
+        pkg_dir="${pkg_dir%%/@anthropic-ai/claude-code*}/@anthropic-ai/claude-code"
+        [[ "$pkg_dir" == *"@anthropic-ai/claude-code" && -d "$pkg_dir" ]] || pkg_dir=""
+    elif [[ "$candidate" == "$HOME/.claude/local/claude" ]]; then
+        # migrate-installer layout: the launcher plus its own npm subtree
+        # (~/.claude/local/node_modules/...) — remove both, not just the
+        # launcher (the package tree is hundreds of MB of dead weight).
+        pkg_dir="$HOME/.claude/local/node_modules/@anthropic-ai/claude-code"
+        [ -d "$pkg_dir" ] || pkg_dir=""
+    elif [[ "$target" == *"/.local/share/claude/"* ]]; then
+        # Native-installer symlink — the blob dir is handled (and guarded)
+        # by the sweep in cc_shadow_scan; only the link goes here.
+        pkg_dir=""
+    else
+        echo "  WARNING: cc_shadow_scan: $candidate is not provably a claude-code install — left in place (remove manually if it is one)" >&2
+        return 1
+    fi
+
+    # Never rm -rf the canonical's own package — a stale SECOND link into it
+    # (e.g. an old entry-file path) loses only the link.
+    if [ -n "$pkg_dir" ] && [ -n "$canon_pkg" ] \
+        && [ "$(readlink -f "$pkg_dir" 2>/dev/null)" = "$canon_pkg" ]; then
+        echo "  cc_shadow_scan: $candidate is a stale link into the CANONICAL package — removing the link only"
+        pkg_dir=""
+    fi
+
+    local -a rm_link=(rm -f "$candidate")
+    local -a rm_pkg=()
+    [ -n "$pkg_dir" ] && rm_pkg=(rm -rf "$pkg_dir")
+    case "$candidate" in
+        /usr/*|/opt/*)
+            if ! sudo -n true 2>/dev/null; then
+                echo "  WARNING: cc_shadow_scan: shadow at $candidate needs sudo to remove — skipped" >&2
+                return 1
+            fi
+            rm_link=(sudo -n "${rm_link[@]}")
+            [ -n "$pkg_dir" ] && rm_pkg=(sudo -n "${rm_pkg[@]}")
+            ;;
+    esac
+    echo "  cc_shadow_scan: removing shadow copy $candidate${pkg_dir:+ (+ $pkg_dir)}"
+    "${rm_link[@]}"
+    [ -n "$pkg_dir" ] && "${rm_pkg[@]}"
+    return 0
 }
