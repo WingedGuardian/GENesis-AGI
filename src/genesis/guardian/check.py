@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import UTC, datetime
 from html import escape as html_escape
 from pathlib import Path
@@ -138,6 +139,92 @@ def _build_dispatcher(config: GuardianConfig) -> AlertDispatcher:
     return dispatcher
 
 
+def _build_provisioning_adapter(config: GuardianConfig):
+    """Build a Proxmox provisioning adapter from config + tokens, or None.
+
+    Returns None when provisioning is disabled or unconfigured. Tokens are
+    resolved all-or-nothing per source (mirrors ``_build_dispatcher``): the
+    first source that carries an audit token supplies BOTH its tokens —
+    env → shared-mount bridge → legacy secrets.env. The audit token is
+    required (reads); the provision token enables mutations (absent ⇒ a
+    read-only adapter — grows will 401 as a safe degradation, never a crash).
+    """
+    pc = config.provisioning
+    if not pc.enabled:
+        return None
+    if not (pc.api_host and pc.node and pc.vmid):
+        logger.warning(
+            "provisioning enabled but api_host/node/vmid unset — no adapter built",
+        )
+        return None
+
+    def _from_env() -> tuple[str, str]:
+        return (
+            os.environ.get("PROXMOX_AUDIT_TOKEN", ""),
+            os.environ.get("PROXMOX_PROVISION_TOKEN", ""),
+        )
+
+    def _from_bridge() -> tuple[str, str]:
+        from genesis.guardian.credential_bridge import load_provisioning_credentials
+        creds = load_provisioning_credentials(config.state_dir)
+        return (
+            creds.get("PROXMOX_AUDIT_TOKEN", ""),
+            creds.get("PROXMOX_PROVISION_TOKEN", ""),
+        )
+
+    def _from_legacy() -> tuple[str, str]:
+        secrets = load_secrets()
+        return (
+            secrets.get("PROXMOX_AUDIT_TOKEN", ""),
+            secrets.get("PROXMOX_PROVISION_TOKEN", ""),
+        )
+
+    audit = provision = ""
+    for source in (_from_env, _from_bridge, _from_legacy):
+        a, p = source()
+        a, p = a.strip(), p.strip()
+        if a:  # all-or-nothing: this source owns both tokens
+            audit, provision = a, p
+            break
+
+    if not audit:
+        logger.warning(
+            "provisioning enabled but no PROXMOX_AUDIT_TOKEN in env/bridge/secrets",
+        )
+        return None
+
+    from genesis.guardian.provisioning.proxmox import ProxmoxAdapter
+    return ProxmoxAdapter(pc, audit_token=audit, provision_token=provision)
+
+
+async def _maybe_propose_provisioning(
+    config: GuardianConfig,
+    dispatcher: AlertDispatcher,
+) -> None:
+    """Autonomous pool-crit → PROPOSE a disk grow (Genesis-DOWN path only).
+
+    Caller gates on ``genesis_down`` — invoked only when the main Genesis bot
+    is dead, so the guardian's getUpdates approval read is uncontended. When
+    Genesis is UP the container owns any grow; the guardian just alerts.
+    Never raises into the tick.
+    """
+    pc = config.provisioning
+    if not (pc.enabled and pc.propose_on_pool_crit):
+        return
+    adapter = _build_provisioning_adapter(config)
+    if adapter is None:
+        return
+    from genesis.guardian.provisioning.flow import maybe_propose_pool_grow
+    from genesis.guardian.provisioning.ledger import ProvisioningLedger
+
+    try:
+        await maybe_propose_pool_grow(
+            config, adapter, dispatcher, ProvisioningLedger(config.state_dir),
+        )
+    except Exception:
+        logger.warning("autonomous pool-grow proposal failed", exc_info=True)
+
+
 async def _write_guardian_heartbeat(config: GuardianConfig) -> None:
     """Write heartbeat file into the container so Genesis knows Guardian is alive.
 
@@ -221,7 +308,13 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         )
         # Storage-pool monitoring runs every cycle regardless of state — a
         # filling thin pool is the exact silent failure that caused the outage.
-        await _check_storage_pool_and_alert(config, dispatcher)
+        # genesis_down gates the autonomous provisioning propose: only when
+        # Genesis is CONFIRMED_DEAD is the main bot not polling, so only then
+        # can the guardian read an APPROVE via getUpdates without a 409.
+        await _check_storage_pool_and_alert(
+            config, dispatcher,
+            genesis_down=(sm.current_state == GuardianState.CONFIRMED_DEAD),
+        )
         # Heartbeat means "Guardian process is alive and watching" —
         # NOT "Genesis container is healthy". Any successful check cycle
         # (regardless of resulting state) should refresh liveness. A
@@ -407,6 +500,7 @@ _POOL_TIER_SEVERITY = {
 async def _check_storage_pool_and_alert(
     config: GuardianConfig,
     dispatcher: AlertDispatcher,
+    genesis_down: bool = False,
 ) -> None:
     """Measure the host storage pool and emit tiered alerts with hysteresis.
 
@@ -484,6 +578,14 @@ async def _check_storage_pool_and_alert(
         }))
     except OSError:
         logger.warning("failed to persist pool alert state", exc_info=True)
+
+    # Autonomous provisioning rung: only when the pool is CRITICAL *and* Genesis
+    # is confirmed down this tick (so the guardian's getUpdates approval read is
+    # uncontended — the outage-recovery path). When Genesis is up, the container
+    # owns any grow; here we only alerted. The min_repropose_hours damper inside
+    # maybe_propose_pool_grow prevents re-offering every tick.
+    if tier == TIER_CRIT and genesis_down:
+        await _maybe_propose_provisioning(config, dispatcher)
 
 
 async def _handle_confirming(
