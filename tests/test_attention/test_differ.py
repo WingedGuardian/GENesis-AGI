@@ -206,7 +206,7 @@ def _full_row(id_, config_version, *, utt_ids=(1, 2, 3), activation="soft",
     return (
         id_, "2026-07-01T00:00:00+00:00", "s1", activation, 0.6, triggers_json,
         json.dumps([]), window_ref, "unknown", 0.9, None, None, "s", config_version,
-        "2026-07-01T00:00:00+00:00",
+        "2026-07-01T00:00:00+00:00", "",
     )
 
 

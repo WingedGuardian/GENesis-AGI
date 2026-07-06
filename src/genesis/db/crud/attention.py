@@ -20,7 +20,7 @@ import aiosqlite
 COLUMNS = (
     "id", "ts", "session_id", "activation", "score", "triggers_fired", "suppressors",
     "window_ref", "mode_state", "clarity", "l15_verdict", "acceptance_signal",
-    "snapshot_id", "config_version", "created_at",
+    "snapshot_id", "config_version", "created_at", "source",
 )
 
 # On a re-run over the same snapshot+config the row id collides. Refresh the derived
@@ -75,6 +75,7 @@ async def list_events(
     unlabeled: bool = False,
     session_id: str | None = None,
     config_version: str | None = None,
+    source: str | None = None,
     limit: int = 200,
     offset: int = 0,
 ) -> list[dict]:
@@ -84,7 +85,8 @@ async def list_events(
     ``name`` (via ``json_each``, not ``LIKE``). ``is_user=True`` additionally requires the
     ``is_user`` trigger — i.e. the *trigger utterance* (window end) had ``is_user=1``.
     ``unlabeled=True`` restricts to ``acceptance_signal IS NULL`` (the review queue).
-    ``config_version`` scopes to one shadow-run config (the calibration A/B filter — PR3c-1)."""
+    ``config_version`` scopes to one shadow-run config (the calibration A/B filter — PR3c-1).
+    ``source`` scopes to one device (exact match — the Judgment tab's device filter)."""
     where: list[str] = []
     params: list = []
     if activation is not None:
@@ -96,6 +98,9 @@ async def list_events(
     if session_id is not None:
         where.append("session_id = ?")
         params.append(session_id)
+    if source is not None:
+        where.append("source = ?")
+        params.append(source)
     if unlabeled:
         where.append("acceptance_signal IS NULL")
     # Exact name match on a triggers_fired[] element. EXISTS composes for AND without a
@@ -243,6 +248,16 @@ async def config_versions(db: aiosqlite.Connection) -> list[str]:
         "WHERE config_version IS NOT NULL ORDER BY config_version"
     )
     return [r["config_version"] for r in await cursor.fetchall()]
+
+
+async def sources(db: aiosqlite.Connection) -> list[str]:
+    """Every distinct non-empty ``source`` present (UNFILTERED — populates the Judgment
+    tab's device-filter dropdown, mirroring ``config_versions``)."""
+    cursor = await db.execute(
+        "SELECT DISTINCT source FROM attention_events "
+        "WHERE source IS NOT NULL AND source != '' ORDER BY source"
+    )
+    return [r["source"] for r in await cursor.fetchall()]
 
 
 # ── calibration tooling (PR3c-1) ──────────────────────────────────────────────────

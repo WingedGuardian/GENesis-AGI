@@ -103,6 +103,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Attention events now record which device they came from, and the Judgment tab can filter by it.**
+  Every "perk-up" event the passive-listening engine emits now carries the source device (the home
+  edge connection, or `omi` once the wearable connector lands), and the dashboard's Judgment review
+  gains a device dropdown plus a per-event source pill — so you can review one device's moments in
+  isolation. The engine also stops penalizing text-only sources: an utterance with no audio capture
+  (no loudness to measure) is scored on its text signals instead of being docked 25% clarity or
+  dropped as near-silence junk, which is what OMI wearable transcripts will need.
+
 - **The Sentinel now learns which infrastructure fixes would be safe to run itself — observe-only.**
   Every fix the Sentinel proposes still requires your approval, exactly as before. What's new: each
   proposed action is additionally classified as "would run autonomously" (reversible, programmatic,

@@ -45,6 +45,7 @@ class AmbientUtterance:
     rms: float
     mode_state: str = "unknown"  # edge: space-separated active modes ("listen_active s2s_active global_mute"); "unknown" offline. Suppressors test `<mode> in mode_state.split()`.
     source: str = ""            # connection/device id
+    has_audio: bool = True      # False = text-only source (OMI): no capture physics (rms) to judge
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class AttentionEvent:
     mode_state: str
     clarity: float                 # capture_clarity of the triggering utterance
     l15_verdict: dict | None = None  # {real, perk} from L1.5 — always None in v1 (stub)
+    source: str = ""               # device provenance of the trigger utterance (e.g. omi / edge id)
 
 
 @dataclass

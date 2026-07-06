@@ -62,6 +62,7 @@ def _evrow(**over):
         "snapshot_id": "20260701T013412Z",
         "config_version": "0.1.0-default",
         "created_at": "2026-07-01T00:00:04+00:00",
+        "source": "ambient-edge",
     }
     row.update(over)
     return row
@@ -109,6 +110,7 @@ def test_stats_aggregates(client):
         patch("genesis.db.crud.attention.trigger_stats", new=AsyncMock(return_value={"multi_speaker": 2})),
         patch("genesis.db.crud.attention.suppressor_stats", new=AsyncMock(return_value={})),
         patch("genesis.db.crud.attention.config_versions", new=AsyncMock(return_value=["0.1.0-default"])),
+        patch("genesis.db.crud.attention.sources", new=AsyncMock(return_value=[])),
     ):
         MockRT.instance.return_value = _mock_rt()
         resp = client.get("/api/genesis/attention/stats")
@@ -146,6 +148,7 @@ def test_stats_scopes_aggregates_but_lists_all_versions(client):
         patch("genesis.db.crud.attention.suppressor_stats", new=AsyncMock(return_value={})),
         patch("genesis.db.crud.attention.config_versions",
               new=AsyncMock(return_value=["0.1.0-default", "0.2.0-taxonomy"])),
+        patch("genesis.db.crud.attention.sources", new=AsyncMock(return_value=[])),
     ):
         MockRT.instance.return_value = _mock_rt()
         resp = client.get("/api/genesis/attention/stats?config_version=0.1.0-default")
@@ -154,6 +157,39 @@ def test_stats_scopes_aggregates_but_lists_all_versions(client):
     assert data["config_versions"] == ["0.1.0-default", "0.2.0-taxonomy"]  # UNFILTERED
     args, _ = act.call_args
     assert args[1] == "0.1.0-default"                                      # aggregate scoped
+
+
+# ── source (device provenance) filter — PR-4 ───────────────────────────────
+
+def test_list_threads_source_and_summary_includes_it(client):
+    le = AsyncMock(return_value=[_evrow(source="omi")])
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.db.crud.attention.list_events", new=le),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        resp = client.get("/api/genesis/attention/list?source=omi")
+    assert resp.status_code == 200
+    assert resp.get_json()["events"][0]["source"] == "omi"   # surfaced in the summary
+    _, kwargs = le.call_args
+    assert kwargs["source"] == "omi"                          # threaded to the crud call
+
+
+def test_stats_includes_sources_dropdown(client):
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.db.crud.attention.label_counts",
+              new=AsyncMock(return_value={"total": 0, "labeled": 0, "unlabeled": 0, "by_signal": {}})),
+        patch("genesis.db.crud.attention.activation_stats", new=AsyncMock(return_value={})),
+        patch("genesis.db.crud.attention.trigger_stats", new=AsyncMock(return_value={})),
+        patch("genesis.db.crud.attention.suppressor_stats", new=AsyncMock(return_value={})),
+        patch("genesis.db.crud.attention.config_versions", new=AsyncMock(return_value=[])),
+        patch("genesis.db.crud.attention.sources", new=AsyncMock(return_value=["ambient-edge", "omi"])),
+    ):
+        MockRT.instance.return_value = _mock_rt()
+        resp = client.get("/api/genesis/attention/stats")
+    assert resp.status_code == 200
+    assert resp.get_json()["sources"] == ["ambient-edge", "omi"]  # device-filter dropdown, UNFILTERED
 
 
 # ── reveal-text ───────────────────────────────────────────────────────────

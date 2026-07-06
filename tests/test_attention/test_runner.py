@@ -56,6 +56,19 @@ def test_load_runner_config_falls_back_to_builtin(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_shadow_text_only_short_utt_not_blipped(tmp_path):
+    # the runner pre-filters physics blips; a text-only row (no meta.audio -> has_audio=False)
+    # must pass through even when short (rms=0 + duration<1 would blip an audio row).
+    snap = tmp_path / "ambient.db"
+    meta = json.dumps({"asr_feats": {"ys_log_probs": [-0.1] * 5, "n_tokens": 5}})  # no audio block
+    _make_ambient(snap, [(1, "2026-06-30T12:00:00+00:00", "hey genesis quick one", 0.5, "w1:1/1", meta, 1)])
+    cfg = AttentionConfig.from_dict(default_config_dict())
+    report = await run_shadow(snap, cfg, snapshot_id="t", sample_n=5)
+    assert report.evaluated == 1     # NOT dropped by the physics blip pre-filter
+    assert report.events == 1        # wake alias -> HARD
+
+
+@pytest.mark.asyncio
 async def test_run_shadow_over_snapshot(tmp_path):
     snap = tmp_path / "ambient.db"
     _make_ambient(snap, [
