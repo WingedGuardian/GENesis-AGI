@@ -16,6 +16,7 @@ class-level guardrail scans every shell script for the indented-multiline
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -126,3 +127,99 @@ def test_unusable_guardian_config_warns_and_marks_degraded(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "host sync SKIPPED" in result.stdout
     assert "DEGRADED=guardian_config_unreadable" in result.stdout
+
+
+# ── Guardian redeploy reconciliation (PR-D) ─────────────────────────────────
+# The redeploy trigger keys on the host's ACTUAL deployed_commit (observable
+# state), not on whether THIS run's git pull touched guardian paths. The old
+# pull-delta gate (OLD_COMMIT→HEAD) silently skipped the redeploy whenever the
+# host was last deployed from a since-rebased local HEAD, stranding it on an
+# orphan commit. These tests run the shipped pure decision helper directly.
+
+
+def _extract_reason_function() -> str:
+    text = UPDATE_SH.read_text()
+    start = text.index("_guardian_redeploy_reason() {")
+    end = text.index("\n}", start) + 2
+    return text[start:end]
+
+
+def _run_reason(*args: str) -> subprocess.CompletedProcess:
+    """Source the REAL _guardian_redeploy_reason from update.sh and invoke it.
+
+    Runs under ``set -euo pipefail`` so a set -e / unbound-var regression in the
+    helper surfaces as a non-zero exit, not a silently-empty reason.
+
+    Arg order: reachable recognized host_commit head_commit host_differ pull_differ
+    """
+    harness = (
+        "set -euo pipefail\n"
+        + _extract_reason_function()
+        + "\n_guardian_redeploy_reason "
+        + " ".join(shlex.quote(a) for a in args)
+        + "\n"
+    )
+    return subprocess.run(
+        ["bash", "-c", harness], capture_output=True, text=True, timeout=30
+    )
+
+
+def test_reason_in_sync_is_empty():
+    """Reachable host, recognized commit, no guardian-path drift → no redeploy
+    (and specifically NOT triggered by an unrelated pull-delta)."""
+    r = _run_reason("1", "1", "abc1234", "def5678", "0", "1")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "", r.stdout
+
+
+def test_reason_host_drift_redeploys():
+    r = _run_reason("1", "1", "abc1234", "def5678", "1", "0")
+    assert r.returncode == 0, r.stderr
+    assert "drift" in r.stdout
+    assert "abc1234" in r.stdout and "def5678" in r.stdout
+
+
+def test_reason_unrecognized_commit_redeploys():
+    """Orphaned / GC'd deployed_commit we cannot diff → reconcile unconditionally."""
+    r = _run_reason("1", "0", "0ffaced", "def5678", "0", "0")
+    assert r.returncode == 0, r.stderr
+    assert "unrecognized" in r.stdout
+    assert "def5678" in r.stdout
+
+
+def test_reason_unknown_deployed_commit_redeploys():
+    """Host never deployed / gateway returned "unknown" → reconcile."""
+    r = _run_reason("1", "0", "unknown", "def5678", "0", "0")
+    assert r.returncode == 0, r.stderr
+    assert "unrecognized" in r.stdout
+
+
+def test_reason_unreachable_falls_back_to_pull_delta():
+    """Cannot read host state; legacy pull-delta says guardian paths changed."""
+    r = _run_reason("0", "0", "", "def5678", "0", "1")
+    assert r.returncode == 0, r.stderr
+    assert "pull-delta" in r.stdout
+
+
+def test_reason_unreachable_no_pull_delta_skips():
+    """Cannot read host state and nothing changed this run → skip (legacy)."""
+    r = _run_reason("0", "0", "", "def5678", "0", "0")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == ""
+
+
+def test_redeploy_gate_reconciles_against_host_deployed_commit():
+    """Structural regression guard: the redeploy trigger must content-diff
+    guardian paths against the host's reported deployed_commit and drive the
+    decision through _guardian_redeploy_reason — never revert to the old
+    pull-delta-only gate (OLD_COMMIT→HEAD) that stranded hosts on orphans."""
+    fn = _extract_sync_function()
+    assert 'diff --quiet "$HOST_DEPLOYED_COMMIT" HEAD -- $GUARDIAN_PATHS' in fn, (
+        "redeploy decision must content-diff against the host's deployed_commit"
+    )
+    assert "_guardian_redeploy_reason" in fn, (
+        "redeploy decision must route through the pure reason helper"
+    )
+    assert 'if [ -n "$_gv_reason" ]; then' in fn, (
+        "redeploy must be gated on the helper's reason, not a raw pull-delta diff"
+    )

@@ -45,7 +45,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   guardian config now prints a loud warning and is recorded as a degraded subsystem, and a
   repo-wide test guards against any shell script reintroducing the indented-snippet shape.
 
-- **Stale duplicate copies of Claude Code are now detected and removed automatically.** If your
+- **The host Guardian no longer gets stranded on an old commit.** `update.sh` decided whether to
+  redeploy the Guardian by looking only at what the *current* update pulled in — so on a run that
+  pulled nothing, a host that was already behind stayed behind indefinitely (and it could fall
+  behind whenever it had last been deployed from a commit that was later rebased away). The
+  redeploy now compares the host's actually-deployed commit against the current code and reconciles
+  the difference: it redeploys when Guardian-relevant code differs, converges a host on an
+  unrecognized/orphaned commit back onto current, and only falls back to the old behavior when the
+  host can't be reached — so a lagging host heals itself on the next update instead of drifting. If your
   machine ever accumulated a second Claude Code install (an old nvm-tree copy, a native-installer
   leftover, or an install in a directory only interactive shells can see), it could silently shadow
   the version Genesis pins — you'd see a months-old Claude Code in your terminal while Genesis
