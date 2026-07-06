@@ -1,19 +1,31 @@
-"""Provisioning flow — capacity → gate → approval → execute → verify → ledger.
+"""Provisioning flow — approval ownership split under ONE shared Telegram bot.
 
-The single orchestration path for every grow, manual or autonomous:
+Telegram allows exactly one ``getUpdates`` consumer per bot token, and the main
+Genesis bot polls continuously while it is up. So approval is owned by whoever
+can actually read the user's reply this instant:
 
-  1. read capacity + rate/backup context
-  2. due-diligence gate (ALL checks) — fail ⇒ refuse + alert, NEVER propose
-  3. no Telegram channel ⇒ refuse + alert (can't gate ⇒ never mutate)
-  4. send the proposal (full check table) and block for an APPROVE/DENY reply,
-     bounded by approval_timeout_s (tolerating getUpdates 409 with backoff)
-  5. on APPROVE, RE-RUN capacity+gate fresh (state may have moved) before mutating
-  6. execute exactly once, ledger it (even unverified — it may have landed),
+  • **Genesis UP → the CONTAINER owns approval.** It approves via its own bot
+    (``outreach_send_and_wait``) — zero contention — then invokes the host
+    gateway verb, which runs :func:`execute_provisioning_action` (execute-only:
+    fresh re-check + execute + ledger, NO Telegram gate).
+  • **Genesis DOWN → the GUARDIAN owns approval** via ``getUpdates`` (uncontended
+    — the main bot is dead). This is the pool-full → rootfs-RO → Genesis-down
+    outage-recovery path. :func:`run_provisioning_flow` is that path: it layers
+    the getUpdates gate on top of the shared execute core.
+
+:func:`execute_provisioning_action` is the shared execute-only core used by BOTH
+owners AFTER approval:
+
+  1. RE-RUN capacity+gate fresh (state may have moved since approval; also
+     enforces the rate cap) — fail ⇒ abort + alert, no mutation
+  2. execute exactly once, ledger it (even unverified — it may have landed),
      optionally run in-process storage-expand to absorb a disk grow
-  7. result alert — CRITICAL + "no auto-retry" on failure/unverified
+  3. result alert — CRITICAL + "no auto-retry" on failure/unverified
 
-Kept import-light and free of any check.py import so check.py can import THIS
-for the pool-crit propose hook without a cycle.
+:func:`run_provisioning_flow` wraps that core with the getUpdates approval gate
+(capacity → gate → propose → APPROVE/DENY → core). Kept import-light and free of
+any check.py import so check.py can import THIS for the pool-crit propose hook
+without a cycle.
 """
 
 from __future__ import annotations
@@ -103,8 +115,11 @@ async def _wait_for_provision_reply(
 ) -> str | None:
     """Bounded wait for APPROVE/DENY. Returns the keyword, or None on timeout.
 
-    Unlike the recovery gate, this NEVER self-cancels on health recovery
-    (provisioning is not tied to a down/up transition) and IS time-bounded.
+    Guardian-only (Genesis-DOWN) path. A getUpdates 409 here means the main
+    Genesis bot started polling again mid-approval — i.e. Genesis RECOVERED and
+    now owns approval. We back off and keep trying to the deadline (the user can
+    still re-initiate the grow from Genesis). Unlike the recovery gate, this
+    NEVER self-cancels on health recovery and IS time-bounded.
     """
     deadline = time.monotonic() + timeout_s
     conflicts = 0
@@ -118,11 +133,12 @@ async def _wait_for_provision_reply(
             if conflicts >= _CONFLICT_ALERT_THRESHOLD:
                 await dispatcher.send(Alert(
                     severity=AlertSeverity.WARNING,
-                    title="Provisioning approval blocked (getUpdates conflict)",
+                    title="Guardian approval yielded — Genesis is back",
                     body=(
-                        "The main Genesis bot is polling the same Telegram token, "
-                        "so Guardian can't read your APPROVE/DENY. Retrying; a "
-                        "dedicated guardian bot token removes this contention."
+                        "The main Genesis bot is polling again, so Genesis has "
+                        "recovered and now owns approval. Re-initiate the grow "
+                        "from Genesis (it can read your reply); Guardian stands "
+                        "down on this one."
                     ),
                 ))
                 conflicts = 0
@@ -141,70 +157,40 @@ async def _execute(request: ProvisionRequest, adapter: ProvisioningAdapter):
     return await adapter.grow_vm_memory(request.new_mib)
 
 
-async def run_provisioning_flow(
+async def execute_provisioning_action(
     config: GuardianConfig,
     request: ProvisionRequest,
     adapter: ProvisioningAdapter,
     dispatcher: AlertDispatcher,
     ledger: ProvisioningLedger,
 ) -> dict:
-    pc = config.provisioning
+    """Execute an ALREADY-APPROVED provisioning action. No approval gate here.
 
-    # 1-2. Capacity + due-diligence gate.
+    Shared execute-only core for both owners of approval (container-when-up,
+    guardian-when-down). Re-runs the due-diligence gate FRESH (state may have
+    moved since approval; also enforces the rate cap), executes exactly once,
+    ledgers even an unverified mutation, optionally absorbs a disk grow, and
+    emits a result alert (CRITICAL on failure/unverified — never auto-retries).
+
+    Callers MUST have obtained a fresh APPROVE before invoking this.
+    """
+    # 1. Fresh re-check (capacity + backup + rate cap) — no mutation on failure.
     cap = await adapter.get_capacity()
-    backup_age = await adapter.newest_backup_age_days()
-    actions = ledger.actions_in_window()
-    report = _evaluate(request, cap, config, actions, backup_age)
-
+    report = _evaluate(
+        request, cap, config, ledger.actions_in_window(),
+        await adapter.newest_backup_age_days(),
+    )
     if not report.passed:
         await dispatcher.send(Alert(
             severity=AlertSeverity.WARNING,
-            title=f"Provisioning refused: {report.requested}",
-            body="Due-diligence gate failed:\n" + "\n".join(report.as_lines()),
-        ))
-        return {"ok": False, "stage": "refused_gate", "requested": report.requested,
-                "checks": report.as_lines()}
-
-    # 3. No channel ⇒ we cannot obtain approval ⇒ never mutate.
-    channel = _find_telegram_channel(dispatcher)
-    if channel is None:
-        await dispatcher.send(Alert(
-            severity=AlertSeverity.WARNING,
-            title=f"Provisioning not executed: {report.requested}",
-            body="No Telegram channel configured — cannot obtain approval; refusing.",
-        ))
-        return {"ok": False, "stage": "no_channel", "requested": report.requested}
-
-    # 4. Propose + block for approval.
-    msg_id = await channel.send_text(_proposal_html(request, report))
-    if not msg_id:
-        return {"ok": False, "stage": "no_channel", "requested": report.requested,
-                "error": "failed to send proposal"}
-    kw = await _wait_for_provision_reply(channel, dispatcher, msg_id, pc.approval_timeout_s)
-    if kw != "APPROVE":
-        stage = "denied" if kw == "DENY" else "timeout"
-        await dispatcher.send(Alert(
-            severity=AlertSeverity.INFO if kw == "DENY" else AlertSeverity.WARNING,
-            title=f"Provisioning {stage}: {report.requested}",
-            body=("Denied by user." if kw == "DENY"
-                  else f"No reply within {pc.approval_timeout_s}s — not executed."),
-        ))
-        return {"ok": False, "stage": stage, "requested": report.requested}
-
-    # 5. Re-run capacity + gate FRESH after approval (state may have moved).
-    cap2 = await adapter.get_capacity()
-    report2 = _evaluate(request, cap2, config, ledger.actions_in_window(), backup_age)
-    if not report2.passed:
-        await dispatcher.send(Alert(
-            severity=AlertSeverity.WARNING,
-            title=f"Provisioning aborted after approval: {report.requested}",
-            body="State changed between approval and execution:\n"
-                 + "\n".join(report2.as_lines()),
+            title=f"Provisioning aborted before execution: {report.requested}",
+            body="Due-diligence re-check failed at execute time:\n"
+                 + "\n".join(report.as_lines()),
         ))
         return {"ok": False, "stage": "recheck_failed", "requested": report.requested,
-                "checks": report2.as_lines()}
+                "checks": report.as_lines()}
 
-    # 6. Execute once + ledger (even if unverified — it may have landed).
+    # 2. Execute once + ledger (even if unverified — it may have landed).
     result = await _execute(request, adapter)
     ledger.record_action(result.action, result.requested, result.ok, result.verified)
 
@@ -212,7 +198,7 @@ async def run_provisioning_flow(
     if request.kind == "disk" and request.absorb_after and result.ok and result.verified:
         expand_result = await expand_storage(config)
 
-    # 7. Result alert.
+    # 3. Result alert.
     if result.ok and result.verified:
         extra = ""
         if result.requires_reboot:
@@ -244,6 +230,68 @@ async def run_provisioning_flow(
         "error": result.error,
         "expand": expand_result,
     }
+
+
+async def run_provisioning_flow(
+    config: GuardianConfig,
+    request: ProvisionRequest,
+    adapter: ProvisioningAdapter,
+    dispatcher: AlertDispatcher,
+    ledger: ProvisioningLedger,
+) -> dict:
+    """Genesis-DOWN approval path: getUpdates gate → shared execute core.
+
+    Used ONLY when the main Genesis bot is not polling (container down/dead) —
+    otherwise getUpdates 409s against it. When Genesis is UP the CONTAINER owns
+    approval (outreach) and calls :func:`execute_provisioning_action` via the
+    host gateway verb.
+    """
+    pc = config.provisioning
+
+    # 1-2. Capacity + due-diligence gate — fail ⇒ refuse + alert, NEVER propose.
+    cap = await adapter.get_capacity()
+    backup_age = await adapter.newest_backup_age_days()
+    report = _evaluate(request, cap, config, ledger.actions_in_window(), backup_age)
+
+    if not report.passed:
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.WARNING,
+            title=f"Provisioning refused: {report.requested}",
+            body="Due-diligence gate failed:\n" + "\n".join(report.as_lines()),
+        ))
+        return {"ok": False, "stage": "refused_gate", "requested": report.requested,
+                "checks": report.as_lines()}
+
+    # 3. No channel ⇒ we cannot obtain approval ⇒ never mutate.
+    channel = _find_telegram_channel(dispatcher)
+    if channel is None:
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.WARNING,
+            title=f"Provisioning not executed: {report.requested}",
+            body="No Telegram channel configured — cannot obtain approval; refusing.",
+        ))
+        return {"ok": False, "stage": "no_channel", "requested": report.requested}
+
+    # 4. Propose + block for approval (getUpdates).
+    msg_id = await channel.send_text(_proposal_html(request, report))
+    if not msg_id:
+        return {"ok": False, "stage": "no_channel", "requested": report.requested,
+                "error": "failed to send proposal"}
+    kw = await _wait_for_provision_reply(channel, dispatcher, msg_id, pc.approval_timeout_s)
+    if kw != "APPROVE":
+        stage = "denied" if kw == "DENY" else "timeout"
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.INFO if kw == "DENY" else AlertSeverity.WARNING,
+            title=f"Provisioning {stage}: {report.requested}",
+            body=("Denied by user." if kw == "DENY"
+                  else f"No reply within {pc.approval_timeout_s}s — not executed."),
+        ))
+        return {"ok": False, "stage": stage, "requested": report.requested}
+
+    # 5. Approved → hand to the shared execute core (fresh re-check inside).
+    return await execute_provisioning_action(
+        config, request, adapter, dispatcher, ledger,
+    )
 
 
 async def maybe_propose_pool_grow(

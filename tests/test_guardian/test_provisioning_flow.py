@@ -11,6 +11,7 @@ from genesis.guardian.config import GuardianConfig
 from genesis.guardian.provisioning.base import HostCapacity, ProvisionResult
 from genesis.guardian.provisioning.flow import (
     ProvisionRequest,
+    execute_provisioning_action,
     maybe_propose_pool_grow,
     run_provisioning_flow,
 )
@@ -208,6 +209,59 @@ async def test_memory_grow_reboot_notice(tmp_path):
     res = await run_provisioning_flow(_cfg(), req, adapter, disp, ProvisioningLedger(tmp_path))
     assert res["ok"] is True and res["requires_reboot"] is True
     assert adapter.grow_mem_calls == 1
+
+
+# ── execute-only core (the container-approved / Genesis-UP path) ───────────
+async def test_execute_core_needs_no_channel_and_executes(tmp_path):
+    """execute_provisioning_action runs WITHOUT any Telegram gate — the
+    container already approved via its own bot. No channel on the dispatcher."""
+    disp = FakeDispatcher(None)  # deliberately no Telegram channel
+    result = ProvisionResult(ok=True, action="grow_vm_disk", requested="scsi1 +32G",
+                             before="32.0G", after="64.0G", verified=True)
+    adapter = FakeAdapter(_good_cap(), disk_result=result)
+    led = ProvisioningLedger(tmp_path)
+    res = await execute_provisioning_action(_cfg(), _disk_req(), adapter, disp, led)
+    assert res["stage"] == "executed" and res["ok"] is True
+    assert adapter.grow_disk_calls == 1
+    assert adapter._cap_calls == 1  # single fresh re-check, no separate propose read
+    assert led.actions_in_window() == 1
+    assert "critical" not in _sev(disp.alerts)
+
+
+async def test_execute_core_recheck_fail_aborts(tmp_path):
+    disp = FakeDispatcher(None)
+    adapter = FakeAdapter(HostCapacity(detected=False, detail="vanished"))
+    res = await execute_provisioning_action(_cfg(), _disk_req(), adapter, disp,
+                                            ProvisioningLedger(tmp_path))
+    assert res["stage"] == "recheck_failed"
+    assert adapter.grow_disk_calls == 0
+
+
+async def test_execute_core_enforces_rate_cap_independently(tmp_path):
+    """Even with container approval, the HOST execute path re-enforces the rate
+    cap — a fresh gate at execute time, all-or-nothing."""
+    led = ProvisioningLedger(tmp_path)
+    led.record_action("grow_vm_disk", "scsi1 +32G", True, True)
+    led.record_action("grow_vm_disk", "scsi1 +32G", True, True)  # == max_actions_per_week
+    disp = FakeDispatcher(None)
+    adapter = FakeAdapter(_good_cap(),
+                          disk_result=ProvisionResult(ok=True, action="grow_vm_disk", verified=True))
+    res = await execute_provisioning_action(_cfg(max_actions_per_week=2), _disk_req(),
+                                            adapter, disp, led)
+    assert res["stage"] == "recheck_failed"
+    assert adapter.grow_disk_calls == 0  # rate cap blocked before mutation
+
+
+async def test_execute_core_unverified_criticals_and_ledgers(tmp_path):
+    disp = FakeDispatcher(None)
+    result = ProvisionResult(ok=False, action="grow_vm_disk", requested="scsi1 +32G",
+                             verified=False, error="re-read did not confirm")
+    adapter = FakeAdapter(_good_cap(), disk_result=result)
+    led = ProvisioningLedger(tmp_path)
+    res = await execute_provisioning_action(_cfg(), _disk_req(), adapter, disp, led)
+    assert res["ok"] is False and res["stage"] == "executed"
+    assert led.actions_in_window() == 1
+    assert "critical" in _sev(disp.alerts)
 
 
 # ── autonomous propose damper ──────────────────────────────────────────────
