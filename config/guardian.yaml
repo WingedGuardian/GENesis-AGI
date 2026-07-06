@@ -87,3 +87,34 @@ storage_pool:
 recovery:
   verification_delay_s: 30
   max_escalations: 3
+
+# Hypervisor provisioning (rung 5 of the escalation ladder) — grow this VM's
+# virtual disk or RAM from Proxmox to fix the structural vg_free=0 cause of a
+# thin-pool outage. DISABLED BY DEFAULT and OFF unless you deliberately opt in.
+# Every mutation is approval-gated (APPROVE/DENY) and rate-capped; the code
+# never raises and never auto-retries. Full setup (scoped pveum tokens + the
+# ACL gotcha, credential bridge, two-owner approval model, threat model):
+#   docs/reference/proxmox-provisioning.md
+# The two Proxmox API tokens are the ONLY secrets — they live in secrets.env
+# (PROXMOX_AUDIT_TOKEN / PROXMOX_PROVISION_TOKEN), not here. Everything below
+# is non-secret machine config. Kill switch: GUARDIAN_PROVISIONING_ENABLED=0.
+provisioning:
+  enabled: false
+  provider: proxmox
+  api_host: ""            # PVE host, e.g. 192.168.x.y — empty = unconfigured
+  api_port: 8006
+  verify_tls: true        # self-signed PVE → set false per-install (documented)
+  node: ""                # PVE node name, e.g. "pve"
+  vmid: 0                 # this container's host VM id, e.g. 300
+  target_disk: scsi1      # the disk backing the LVM-thin PV
+  storage: local-lvm      # PVE storage the disk lives on
+  max_disk_step_gib: 32       # hard cap per single disk grow
+  max_memory_step_mib: 4096   # hard cap per single memory grow
+  storage_margin_gib: 64      # required free storage headroom above the grow
+  node_memory_margin_mib: 8192  # required node-RAM headroom (keys on available)
+  max_actions_per_week: 2     # rate cap (counts EXECUTED mutations)
+  require_recent_backup: true # refuse a grow without a recent backup
+  backup_max_age_days: 14
+  approval_timeout_s: 1800    # bounded wait for APPROVE/DENY
+  min_repropose_hours: 24     # damper on autonomous pool-crit re-proposals
+  propose_on_pool_crit: true  # autonomous propose (Genesis-DOWN path) at crit tier

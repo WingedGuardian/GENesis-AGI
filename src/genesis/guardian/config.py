@@ -183,11 +183,11 @@ class ProvisioningConfig:
 
     enabled: bool = False
     provider: str = "proxmox"  # only "proxmox" implemented; ABC allows others
-    api_host: str = ""         # e.g. 192.168.50.220 — empty = unconfigured
+    api_host: str = ""         # PVE host, e.g. 192.168.1.10 — empty = unconfigured
     api_port: int = 8006
     verify_tls: bool = True     # self-signed PVE → set false per-install (documented)
-    node: str = ""             # PVE node name, e.g. "proxmox"
-    vmid: int = 0              # this container's host VM id, e.g. 300; 0 = unconfigured
+    node: str = ""             # PVE node name, e.g. "pve"
+    vmid: int = 0              # this container's host VM id, e.g. 100; 0 = unconfigured
     target_disk: str = "scsi1"  # the disk backing the LVM-thin PV
     storage: str = "local-lvm"  # PVE storage the disk lives on
     # Per-action grow caps (a single approval can never exceed these).

@@ -20,7 +20,8 @@ from genesis.guardian.provisioning.proxmox import (
 
 _GIB = 1024**3
 
-# Live shapes (2026-07-06 probe of node 'proxmox', VM 300 'assistbot').
+# PVE 9.x API response shapes (field names/nesting taken from a live probe;
+# all identifiers below are synthetic).
 _LIVE_STATUS = {
     "memory": {
         "free": 1658970112,
@@ -40,11 +41,11 @@ _LIVE_STORAGE = [
     },
 ]
 _LIVE_CONFIG = {
-    "name": "assistbot",
+    "name": "genesis-vm",
     "cores": 5,
     "memory": "21500",
-    "scsi0": "local-lvm:vm-300-disk-0,cache=writeback,iothread=1,size=32G",
-    "scsi1": "local-lvm:vm-300-disk-2,cache=writeback,iothread=1,size=32G",
+    "scsi0": "local-lvm:vm-100-disk-0,cache=writeback,iothread=1,size=32G",
+    "scsi1": "local-lvm:vm-100-disk-2,cache=writeback,iothread=1,size=32G",
     "ide2": "local:iso/installer.iso,media=cdrom,size=1000M",
 }
 
@@ -98,7 +99,7 @@ class FakePVE:
 def _adapter(fake: FakePVE) -> ProxmoxAdapter:
     cfg = ProvisioningConfig(
         enabled=True, api_host="10.0.0.9", api_port=8006, verify_tls=False,
-        node="proxmox", vmid=300, target_disk="scsi1", storage="local-lvm",
+        node="pve", vmid=100, target_disk="scsi1", storage="local-lvm",
     )
     a = ProxmoxAdapter(cfg, audit_token="AUDIT", provision_token="PROVISION")
     a._request_sync = fake  # type: ignore[assignment]

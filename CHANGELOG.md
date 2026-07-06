@@ -9,6 +9,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **Genesis can now grow this VM's disk or RAM from the hypervisor — with your
+  approval — to fix the one storage failure nothing else could.** When the
+  container's storage pool has no room left to auto-expand into (the structural
+  cause of a full-pool outage), the only real fix is to add space at the
+  Proxmox layer. Genesis can now propose that grow, ask you to APPROVE or DENY,
+  and on approval grow the virtual disk and absorb it into the pool — or, if
+  Genesis itself is down in the outage, the host-side guardian can do it as part
+  of recovery. It is **off by default**, every change is approval-gated and
+  rate-capped, grows are one-attempt/never-auto-retried, and only two
+  read/write-split Proxmox tokens are ever stored. Setup and the full safety
+  model: `docs/reference/proxmox-provisioning.md`.
+
 ### Fixed
 
 - **A false "deferred work backlog" health warning no longer fires every few minutes.** The

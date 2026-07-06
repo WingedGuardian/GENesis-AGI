@@ -210,7 +210,7 @@ def _prov_cfg(config: GuardianConfig) -> GuardianConfig:
     config.provisioning.enabled = True
     config.provisioning.api_host = "10.0.0.9"
     config.provisioning.node = "pve"
-    config.provisioning.vmid = 300
+    config.provisioning.vmid = 100
     return config
 
 
