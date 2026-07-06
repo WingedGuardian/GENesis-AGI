@@ -1716,6 +1716,27 @@ class SentinelDispatcher:
         # if empty, an empty set is data that confirms absence).
         self._recent_alarm_sets.append(current_ids)
 
+        # Lock-starvation guard. dispatch() and resume_from_approval() hold
+        # self._lock for the whole of an ACTIVE CC remediation (up to timeout_s,
+        # default 3600s). Because check_fire_alarms is awaited inline in the
+        # awareness tick, blocking on that lock below — both the approval-cancel
+        # branch (async with self._lock) and the dispatch() tail acquire it —
+        # would stall the tick and can self-inflict awareness:tick_overdue, which
+        # is itself a Tier-1 alarm. If a remediation is already in flight there is
+        # nothing useful to do this tick, so bail fast: the heartbeat is already
+        # stamped (staleness accounting intact) and these alarm ids are already in
+        # the ring buffer (debounce intact), so they are reconsidered next tick.
+        # The lock is RELEASED while merely parked awaiting approval (dispatch
+        # returns on a pending gate), so the approval-cancel path below is never
+        # starved by this guard.
+        if self._lock.locked():
+            logger.debug(
+                "Sentinel busy (remediation in flight) — skipping this tick's "
+                "fire-alarm dispatch; alarms retained in the ring buffer for "
+                "the next tick"
+            )
+            return None
+
         # If the specific alarm(s) that triggered this dispatch have cleared
         # while we're waiting for approval, cancel the pending approval and
         # go back to HEALTHY.  We check the *pending* alarm IDs specifically
