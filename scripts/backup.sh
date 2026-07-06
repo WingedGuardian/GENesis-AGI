@@ -20,6 +20,12 @@
 #   GENESIS_DIR                — Genesis repo root (default: ~/genesis)
 #   QDRANT_URL                 — Qdrant server URL (default: http://localhost:6333)
 #   SECRETS_PATH               — Path to secrets.env (default: $GENESIS_DIR/secrets.env)
+#   GENESIS_BACKUP_NAS_HOST    — Tier-2 off-site host dir label under Genesis/
+#                                (default: $(hostname)). SET THIS to a distinct
+#                                value when two machines share a hostname and back
+#                                up to the same NAS, or their GFS prunes delete
+#                                each other's snapshots. Read symmetrically by
+#                                restore.sh to locate the source snapshot dir.
 set -euo pipefail
 
 # Pluggable Tier-2 (off-site) backend interface — selects none/local/smb at runtime
@@ -343,7 +349,13 @@ elif ! backend_available; then
         _T2_STATUS="not_configured"
     fi
 else
-    _T2_HOST_DIR="Genesis/$(hostname)"
+    # Off-site host dir. Defaults to $(hostname), but an explicit
+    # GENESIS_BACKUP_NAS_HOST override is REQUIRED when two machines share a
+    # hostname AND a Tier-2 target: the GFS prune below deletes stale COMPLETE
+    # snapshots under _T2_HOST_DIR, so two same-hostname machines writing to one
+    # NAS would prune each other's history. Symmetric with restore.sh, which
+    # already reads GENESIS_BACKUP_NAS_HOST to locate the source snapshot dir.
+    _T2_HOST_DIR="Genesis/${GENESIS_BACKUP_NAS_HOST:-$(hostname)}"
     # Per-run DATED snapshot dir — a consistent point-in-time copy that restore.sh
     # selects the latest COMPLETE of (and GFS retention prunes).
     _T2_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
