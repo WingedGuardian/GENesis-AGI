@@ -783,8 +783,13 @@ async def test_refresh_folds_parked_files_no_oscillation(
 async def test_refresh_does_not_resurrect_deleted_parked_file(
     db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
 ):
-    """A parked file deleted from disk must NOT be folded back into the
-    refresh batch, and must not oscillate afterwards."""
+    """End-to-end: a parked file deleted from disk stays out of the refresh
+    batch and does not oscillate afterwards.
+
+    (In the full check_once flow the resume phase's vanished-file check
+    invalidates the row before the fold runs — the fold's own exists() guard
+    is isolated in test_fold_skips_parked_path_missing_from_disk.)
+    """
     mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
     disp, gate = _stateful_dispatcher(mon._clock)
     mon._autonomous_dispatcher = disp
@@ -805,6 +810,45 @@ async def test_refresh_does_not_resurrect_deleted_parked_file(
     parked = await inbox_items.get_awaiting_approval(db)
     assert {p["file_path"] for p in parked} == {str(file_b)}
     assert gate.request_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fold_skips_parked_path_missing_from_disk(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """Isolates the fold's exists() guard in _phase_detect_changes: a parked
+    row whose file is gone by the time the refresh folds (deleted mid-cycle,
+    after the resume phase's own vanished-file check already ran) must be
+    invalidated but NOT folded into the refresh batch."""
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    disp, gate = _stateful_dispatcher(mon._clock)
+    mon._autonomous_dispatcher = disp
+    gate.pending_id = "req-1"
+    gate.created_at = mon._clock().isoformat()
+
+    ghost = inbox_dir / "Ghost.md"  # parked row exists; file never on disk
+    await inbox_items.create(
+        db, id="row-g", file_path=str(ghost), content_hash="h",
+        status="processing", created_at="2026-06-30T11:00:00+00:00",
+        drop_id="DG", batch_items="https://example.com/g0",
+    )
+    await inbox_items.update_status(
+        db, "row-g", status="processing",
+        error_message=f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-1",
+    )
+    live = inbox_dir / "Live.md"
+    live.write_text("https://example.com/n0")  # triggers the refresh
+
+    new_files, modified_files = await mon._phase_detect_changes(
+        inbox_dir, resumed_paths=set(),
+    )
+
+    returned = {str(p) for p in [*new_files, *modified_files]}
+    assert str(live) in returned
+    assert str(ghost) not in returned, "vanished parked file was folded"
+    row = await inbox_items.get_by_id(db, "row-g")
+    assert row["status"] == "failed"  # still invalidated, just not re-dispatched
+    assert gate.cancel_calls == ["req-1"]
 
 
 @pytest.mark.asyncio
