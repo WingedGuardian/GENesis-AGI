@@ -146,6 +146,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   pass anchored to the voice-master audit. Previously these existed only as untracked files on the
   development install.
 
+- **Genesis now measures how often its automatic memory surfacing repeats itself within a session.**
+  Each prompt's surfaced memories are tracked per session, and the health snapshot's proactive-memory
+  section gains an `overlap_7d` rollup — the share of surfaced memories over the last 7 days that had
+  already been shown earlier in the same session. Measurement only: what gets surfaced is unchanged.
+  This data decides whether a planned improvement ships (skipping re-injection of memories already in
+  context to free slots for novel ones).
+
 - **Off-site backups now self-prune on a grandfather-father-son schedule instead of growing forever.**
   When you back up to an off-site target (NAS/SMB or a mounted path), each run now prunes old dated
   snapshots — keeping the last 7 daily, 4 weekly, and 6 monthly — so remote storage stays bounded. It
