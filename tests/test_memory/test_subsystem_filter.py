@@ -67,6 +67,25 @@ class TestResolveSubsystemFilter:
         with pytest.raises(ValueError, match="non-empty"):
             _resolve_subsystem_filter([], None)
 
+    def test_unknown_only_subsystem_raises(self) -> None:
+        """A typo like 'automation' must fail loudly, not return nothing."""
+        with pytest.raises(ValueError, match="unknown subsystem"):
+            _resolve_subsystem_filter(False, "automation")
+
+    def test_unknown_only_subsystem_in_list_raises(self) -> None:
+        with pytest.raises(ValueError, match="unknown subsystem"):
+            _resolve_subsystem_filter(False, ["ego", "bogus"])
+
+    def test_unknown_include_subsystem_raises(self) -> None:
+        with pytest.raises(ValueError, match="unknown subsystem"):
+            _resolve_subsystem_filter(["not_a_subsystem"], None)
+
+    def test_known_only_subsystem_still_valid(self) -> None:
+        """Regression: a valid name after adding validation still resolves."""
+        exclude, include_only = _resolve_subsystem_filter(False, "reflection")
+        assert include_only == ["reflection"]
+        assert exclude is None
+
     def test_known_subsystems_matches_observation_writer_map(self) -> None:
         """Sanity check: every value in the writer map must be a known subsystem."""
         for subsystem in _SUBSYSTEM_FROM_SOURCE.values():

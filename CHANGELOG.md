@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Memory recall no longer surfaces Genesis's own internal noise.** Machine-generated
+  decisional output — background reflections, autonomy task retrospectives, and ego-dispatch
+  records — was leaking into normal recall because several writers didn't mark themselves as
+  internal-subsystem writes. Those writers are now tagged, so the content stays available to the
+  subsystem that produced it but no longer pollutes user-facing recall (which measurably improves
+  results on reflection-adjacent queries). Existing installs can purge already-embedded legacy
+  noise with the new `scripts/backfill_source_subsystem.py`, then
+  `scripts/cleanup_subsystem_qdrant.py` — both dry-run by default; add `--apply` to commit.
+
 - **A false "deferred work backlog" health warning no longer fires every few minutes.** The
   weekly memory dream-cycle parks a large synthesis worklist that drains a little each day by
   design; the health check was counting that scheduled batch against the "postponed due to
