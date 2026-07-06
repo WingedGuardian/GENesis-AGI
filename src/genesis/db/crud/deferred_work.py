@@ -124,6 +124,57 @@ async def count_pending(
     return int(row[0])
 
 
+async def count_pending_in(
+    db: aiosqlite.Connection,
+    *,
+    work_types: frozenset[str],
+) -> int:
+    """Count pending items whose work_type is in ``work_types`` (empty → 0)."""
+    if not work_types:
+        return 0
+    placeholders = ",".join("?" * len(work_types))
+    cursor = await db.execute(
+        f"SELECT COUNT(*) FROM deferred_work_queue "
+        f"WHERE status = 'pending' AND work_type IN ({placeholders})",
+        list(work_types),
+    )
+    row = await cursor.fetchone()
+    return int(row[0])
+
+
+async def count_recovery_pending(
+    db: aiosqlite.Connection,
+    *,
+    batch_work_types: frozenset[str],
+    stale_cutoff_iso: str,
+) -> int:
+    """Count pending items that should trip the recovery-backlog depth alarm.
+
+    Genuine resilience-recovery deferred work always counts. Batch worklist
+    items (e.g. the dream-synthesis worklist, which legitimately parks hundreds
+    of slices and drains over a cadence) are EXCLUDED — unless they have been
+    pending past a full drain cycle (``deferred_at < stale_cutoff_iso``), which
+    means the drain has actually stalled and the backlog is real again.
+
+    With no batch types the count is simply all pending (identical to
+    ``count_pending``), so callers can pass an empty set to opt out.
+    """
+    if not batch_work_types:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM deferred_work_queue WHERE status = 'pending'"
+        )
+        row = await cursor.fetchone()
+        return int(row[0])
+    placeholders = ",".join("?" * len(batch_work_types))
+    cursor = await db.execute(
+        f"SELECT COUNT(*) FROM deferred_work_queue WHERE status = 'pending' "
+        f"AND (work_type NOT IN ({placeholders}) OR deferred_at < ?)",
+        [*batch_work_types, stale_cutoff_iso],
+    )
+    row = await cursor.fetchone()
+    return int(row[0])
+
+
 async def drain_by_priority(
     db: aiosqlite.Connection,
     *,

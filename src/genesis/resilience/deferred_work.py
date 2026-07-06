@@ -31,6 +31,26 @@ REFRESH = "refresh"
 DISCARD = "discard"
 TTL = "ttl"
 
+# ── Batch-worklist work types ────────────────────────────────────────────────
+#
+# Work types that are *scheduled bulk worklists*, not resilience-recovery work.
+# The dream-cycle synthesis worklist (``dream_synthesis_slice``) enqueues ~500
+# value-ranked slices weekly and drains a bounded budget PER DAY — so hundreds
+# sit pending for days by design. That must NOT trip the ``queue:deferred_work``
+# recovery-backlog depth alarm (which exists to catch genuinely-stuck recovery
+# work), or the Sentinel fires a Tier-3 alarm on every awareness tick.
+#
+# Kept here (low-level) rather than in ``memory/dream_cycle`` so the observability
+# snapshot can import it without a memory→observability dependency inversion.
+# A drift-guard test pins this against ``dream_cycle.WORKLIST_WORK_TYPE``.
+BATCH_WORK_TYPES: frozenset[str] = frozenset({"dream_synthesis_slice"})
+
+# A batch worklist item pending longer than this is treated as genuinely stalled
+# (the daily drain has broken) and folded BACK into the recovery-backlog count so
+# it re-trips the depth alarm. One full weekly drain cycle (~5 days at 100/day for
+# a 500-slice worklist) plus slack.
+STALE_WORKLIST_DAYS: int = 8
+
 
 class DeferredWorkQueue:
     """Queue for work items deferred due to degraded resilience state."""
@@ -150,6 +170,32 @@ class DeferredWorkQueue:
     async def count_pending(self, work_type: str | None = None) -> int:
         """Count pending items, optionally filtered by work_type."""
         return await crud.count_pending(self._db, work_type=work_type)
+
+    async def count_worklist_pending(self) -> int:
+        """Count pending batch-worklist items (dream synthesis etc.).
+
+        The honest total of scheduled bulk work parked in the queue — exposed for
+        display, deliberately NOT summed into the recovery-backlog depth alarm.
+        """
+        return await crud.count_pending_in(self._db, work_types=BATCH_WORK_TYPES)
+
+    async def count_recovery_pending(
+        self, stale_worklist_days: int = STALE_WORKLIST_DAYS
+    ) -> int:
+        """Count pending items that should trip the recovery-backlog depth alarm.
+
+        Genuine resilience-recovery work always counts; batch worklist items are
+        excluded unless they've been pending past ``stale_worklist_days`` (drain
+        stalled → real backlog). See ``BATCH_WORK_TYPES``.
+        """
+        from datetime import timedelta
+
+        cutoff = (self._clock() - timedelta(days=stale_worklist_days)).isoformat()
+        return await crud.count_recovery_pending(
+            self._db,
+            batch_work_types=BATCH_WORK_TYPES,
+            stale_cutoff_iso=cutoff,
+        )
 
     async def supersede(self, work_type: str) -> int:
         """Delete all non-in-flight rows for a work_type (supersede a batch).

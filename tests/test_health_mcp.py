@@ -184,15 +184,31 @@ class TestHealthAlerts:
 
     @pytest.mark.asyncio
     async def test_high_queue_depth_generates_warning(self):
+        # The depth alarm watches `deferred_recovery` (genuine recovery backlog),
+        # not the raw `deferred_work` total — the latter includes scheduled batch
+        # worklists that legitimately sit hundreds-deep by design.
         svc = _mock_service({
             "call_sites": {},
-            "queues": {"deferred_work": 150},
+            "queues": {"deferred_recovery": 150},
             "cc_sessions": {},
         })
         health_mcp.init_health_mcp(svc)
         result = await _impl_health_alerts()
         warnings = [a for a in result if a["severity"] == "WARNING"]
-        assert any("deferred_work" in w["message"] for w in warnings)
+        assert any("deferred_recovery" in w["message"] for w in warnings)
+
+    @pytest.mark.asyncio
+    async def test_raw_deferred_work_total_does_not_alarm(self):
+        # Regression: a large raw deferred_work total (batch worklist parked) must
+        # NOT trip the depth alarm on its own — that was the every-tick false WARNING.
+        svc = _mock_service({
+            "call_sites": {},
+            "queues": {"deferred_work": 400, "deferred_recovery": 0, "deferred_worklist": 400},
+            "cc_sessions": {},
+        })
+        health_mcp.init_health_mcp(svc)
+        result = await _impl_health_alerts()
+        assert not any(a.get("id") == "queue:deferred_work" for a in result)
 
     @pytest.mark.asyncio
     async def test_cc_throttled_generates_warning(self):

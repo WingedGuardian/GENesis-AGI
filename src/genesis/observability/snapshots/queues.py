@@ -154,14 +154,25 @@ async def queues(
     errors: list[str] = []
 
     deferred = None
+    # Recovery-backlog subset (what the depth alarm should watch) vs the raw
+    # total (honest display). Batch worklists like the dream-synthesis slice
+    # legitimately park hundreds of pending items and drain on a cadence — they
+    # inflate the raw total but are NOT stuck recovery work, so alerting on the
+    # raw total cries wolf on every tick. Mirror the dead_letter raw-vs-stuck
+    # split below.
+    deferred_recovery = None
+    deferred_worklist = 0
     if deferred_queue:
         try:
             deferred = await deferred_queue.count_pending()
+            deferred_recovery = await deferred_queue.count_recovery_pending()
+            deferred_worklist = await deferred_queue.count_worklist_pending()
         except Exception:
             errors.append("deferred_work: query failed")
             logger.error("Failed to query deferred work queue", exc_info=True)
     else:
         deferred = 0
+        deferred_recovery = 0
 
     dead = None
     if dead_letter:
@@ -329,6 +340,13 @@ async def queues(
 
     result = {
         "deferred_work": deferred,
+        # Alarm-eligible subset: genuine recovery backlog, excluding scheduled
+        # batch worklists unless they've stalled past a full drain cycle. This
+        # is what errors.py:_QUEUE_DEPTH_FIELDS thresholds on (not the raw total).
+        "deferred_recovery": deferred_recovery,
+        # Batch worklist depth (dream synthesis etc.) — display only, never
+        # summed into the depth alarm.
+        "deferred_worklist": deferred_worklist,
         "deferred_oldest_age_seconds": deferred_oldest_s,
         "deferred_processing": deferred_processing,
         "deferred_stuck": deferred_stuck,

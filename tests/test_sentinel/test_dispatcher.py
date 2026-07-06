@@ -570,6 +570,55 @@ class TestEscalation:
         d._invoker.run.assert_not_called()
 
 
+class TestLockStarvationGuard:
+    """check_fire_alarms must not block on self._lock while an active CC
+    remediation holds it — that stalls the awareness tick and can self-inflict
+    awareness:tick_overdue (Tier 1). It bails fast, but only AFTER stamping the
+    heartbeat and recording the ring buffer (staleness + debounce accounting).
+    """
+
+    @pytest.mark.asyncio
+    async def test_busy_lock_skips_dispatch_but_keeps_accounting(self):
+        d = _make_dispatcher()
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        alerts = [{"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"}]
+
+        await d._lock.acquire()  # simulate an in-flight remediation holding the lock
+        try:
+            with patch("genesis.mcp.health_mcp._impl_health_alerts", new=AsyncMock(return_value=alerts)), \
+                 patch("genesis.sentinel.dispatcher.save_state"):
+                # Two consecutive confirmed ticks would normally dispatch on the
+                # second — while the lock is held, neither does (and neither blocks).
+                r1 = await d.check_fire_alarms()
+                r2 = await d.check_fire_alarms()
+        finally:
+            d._lock.release()
+
+        assert r1 is None and r2 is None
+        # Guard sits AFTER heartbeat + ring-buffer append, so accounting persisted.
+        assert len(d._recent_alarm_sets) == 2
+        d._invoker.run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_free_lock_dispatches_normally(self):
+        """Control: identical alarm scenario with the lock free confirms and
+        dispatches on the second tick — proving the guard is what suppresses it."""
+        d = _make_dispatcher()
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        alerts = [{"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"}]
+
+        with patch("genesis.mcp.health_mcp._impl_health_alerts", new=AsyncMock(return_value=alerts)), \
+             patch("genesis.sentinel.dispatcher.save_state"), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"):
+            r1 = await d.check_fire_alarms()
+            r2 = await d.check_fire_alarms()
+
+        assert r1 is None
+        assert r2 is not None and r2.dispatched
+
+
 class TestRingBufferDebounce:
     """2-of-3 debouncing: single-tick flaps are filtered out."""
 

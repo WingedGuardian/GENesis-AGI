@@ -176,13 +176,18 @@
                           :style="($store.genesisDashboard.health.queues.dead_letters || 0) > 0 ? 'color: #d9534f; font-weight: 700' : 'color: #4caf50'"></span>
                   </div>
                   <div style="font-size: 0.82rem; cursor: default;"
-                       title="Tasks postponed due to service degradation">
+                       title="Tasks postponed due to service degradation (recovery backlog only — scheduled batch worklists are counted separately)">
                     Deferred Pending:
-                    <span x-text="$store.genesisDashboard.health.queues.deferred_work ?? 0"
-                          :style="($store.genesisDashboard.health.queues.deferred_work || 0) > 0 ? 'color: #f0ad4e; font-weight: 700' : 'color: #4caf50'"></span>
-                    <template x-if="$store.genesisDashboard.health.queues.deferred_oldest_age_seconds > 0">
+                    <span x-text="$store.genesisDashboard.health.queues.deferred_recovery ?? 0"
+                          :style="($store.genesisDashboard.health.queues.deferred_recovery || 0) > 0 ? 'color: #f0ad4e; font-weight: 700' : 'color: #4caf50'"></span>
+                    <template x-if="($store.genesisDashboard.health.queues.deferred_recovery || 0) > 0 && $store.genesisDashboard.health.queues.deferred_oldest_age_seconds > 0">
                       <span style="font-size: 0.68rem; color: var(--color-text-secondary);"
                             x-text="'(oldest: ' + (() => { const s = $store.genesisDashboard.health.queues.deferred_oldest_age_seconds; return s > 3600 ? Math.round(s/3600) + 'h' : Math.round(s/60) + 'm'; })() + ')'"></span>
+                    </template>
+                    <template x-if="($store.genesisDashboard.health.queues.deferred_worklist || 0) > 0">
+                      <span style="font-size: 0.68rem; color: var(--color-text-secondary);"
+                            :title="'Dream-synthesis worklist — drains on a daily cadence, not stuck'"
+                            x-text="'(+' + $store.genesisDashboard.health.queues.deferred_worklist + ' worklist)'"></span>
                     </template>
                   </div>
                   <template x-if="($store.genesisDashboard.health.queues.deferred_processing || 0) > 0">

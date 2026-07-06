@@ -236,8 +236,17 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
     queues = snap.get("queues", {})
     # Only check fields that represent actual queue depths — exclude
     # cumulative counters (embedded_total), timestamps, error messages, etc.
+    #
+    # NOTE: we alarm on `deferred_recovery` (genuine recovery backlog), NOT the
+    # raw `deferred_work` total. The raw total includes scheduled batch worklists
+    # (dream synthesis, ~500 slices draining over a week) that legitimately sit
+    # hundreds-deep by design — alerting on the raw total fired `queue:deferred_work`
+    # WARNING on every awareness tick. `deferred_recovery` folds a stalled worklist
+    # back in (see resilience/deferred_work.py:STALE_WORKLIST_DAYS), so a genuinely
+    # broken drain still surfaces. `deferred_work`/`deferred_worklist` stay in the
+    # snapshot for honest display but are not depth-alarmed here.
     _QUEUE_DEPTH_FIELDS = {
-        "pending_embeddings", "dead_letters", "deferred_work",
+        "pending_embeddings", "dead_letters", "deferred_recovery",
         "deferred_processing", "deferred_stuck", "failed_embeddings",
         "discarded_count",
     }
