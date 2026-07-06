@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **`update.sh` was silently skipping the host-VM sync (guardian redeploy + host Node/Claude Code
+  pin healing).** A recent refactor re-indented the two inline Python snippets that read
+  `guardian_remote.yaml`; the resulting parse error was suppressed, the host address resolved
+  empty, and the entire host-side block quietly skipped on every update — guardian code stopped
+  reaching the host and host pin drift went unhealed, while update history still reported the host
+  as healthy. The snippets are now single-line (immune to the indentation class), an unusable
+  guardian config now prints a loud warning and is recorded as a degraded subsystem, and a
+  repo-wide test guards against any shell script reintroducing the indented-snippet shape.
+
 - **Stale duplicate copies of Claude Code are now detected and removed automatically.** If your
   machine ever accumulated a second Claude Code install (an old nvm-tree copy, a native-installer
   leftover, or an install in a directory only interactive shells can see), it could silently shadow

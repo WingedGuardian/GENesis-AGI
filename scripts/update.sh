@@ -146,16 +146,14 @@ _sync_deploy_targets() {
     # ── Update Guardian on host VM (if configured) ──────────
     GUARDIAN_CONFIG="$HOME/.genesis/guardian_remote.yaml"
     if [ -f "$GUARDIAN_CONFIG" ]; then
-        HOST_IP=$("$VENV_DIR/bin/python" -c "
-    import yaml, pathlib
-    cfg = yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text())
-    print(cfg.get('host_ip', ''))
-    " 2>/dev/null || true)
-        HOST_USER=$("$VENV_DIR/bin/python" -c "
-    import yaml, pathlib
-    cfg = yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text())
-    print(cfg.get('host_user', 'ubuntu'))
-    " 2>/dev/null || echo "ubuntu")
+        # Single-line python -c on purpose: a multi-line body picks up the
+        # shell's indentation, which is a top-level IndentationError — the
+        # 2>/dev/null then silently empties HOST_IP and the ENTIRE host sync
+        # (guardian redeploy + Node/CC pin healing) skips on every run.
+        # That exact regression shipped once when this block was re-indented
+        # into a function; test_update_host_sync.py guards the class.
+        HOST_IP=$("$VENV_DIR/bin/python" -c "import yaml, pathlib; print(yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text()).get('host_ip', ''))" 2>/dev/null || true)
+        HOST_USER=$("$VENV_DIR/bin/python" -c "import yaml, pathlib; print(yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text()).get('host_user', 'ubuntu'))" 2>/dev/null || echo "ubuntu")
         SSH_KEY="$HOME/.ssh/genesis_guardian_ed25519"
 
         if [ -n "$HOST_IP" ] && [ -f "$SSH_KEY" ]; then
@@ -281,6 +279,12 @@ _sync_deploy_targets() {
                 fi
             fi
             echo ""
+        else
+            # guardian_remote.yaml exists but is unusable — never skip silently:
+            # a skipped sync here means guardian redeploy AND host pin healing
+            # are dead, which is exactly the drift this function exists to heal.
+            echo "  WARNING: guardian_remote.yaml present but host_ip unparseable or SSH key missing — host sync SKIPPED"
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}guardian_config_unreadable"
         fi
     fi
 
@@ -842,6 +846,13 @@ if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     # pins): a pin bump pulled MANUALLY before this run, or an earlier failed
     # sync, must not leave drift in place just because the merge was a no-op.
     _sync_deploy_targets
+    # Persist any host-side degradation the drift healing just found — this
+    # path exits before the success-path recording, so without this the flag
+    # would only ever reach stdout on no-op runs.
+    if [ -n "$HOST_CC_DEGRADED" ]; then
+        echo "  NOTE: recording degraded subsystem: $HOST_CC_DEGRADED"
+        _record_update_history "success" "" "$HOST_CC_DEGRADED"
+    fi
     echo ""
     echo "  Nothing to do."
     exit 0
