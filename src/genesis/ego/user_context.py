@@ -1536,7 +1536,6 @@ class UserEgoContextBuilder:
             '  "resolved_directives": [{"id": "directive_id", "resolution": "what you decided"}],\n'
             '  "intentions": {"review": [{"id": "...", "action": "keep|fire|withdraw|renew"}], '
             '"new": [{"content": "...", "trigger_condition": "...", "reasoning": "..."}]},\n'
-            '  "morning_report": "only if this is a morning trigger",\n'
             '  "goal_assessment": "free-text analysis of the focused goal (goal_review cycles only)",\n'
             '  "goal_status_recommendation": "continue|pause|deprioritize|close (goal_review cycles only)"\n'
             "}\n"

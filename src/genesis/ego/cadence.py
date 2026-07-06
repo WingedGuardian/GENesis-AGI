@@ -292,14 +292,14 @@ class EgoCadenceManager:
         if not self._running or self._paused:
             return
 
+        # No model/effort override: each ego's base config rules. Forcing
+        # Opus/high here caused provider-exhaustion storms on event bursts.
         signal = EgoSignal(
             signal_type="event",
             focus_category="reactive",
             summary=event.get("summary", "")[:200],
             priority=_map_priority(event.get("priority", "high")),
             metadata={
-                "model_override": "opus",
-                "effort_override": "high",
                 "event_type": event.get("type"),
                 "source": event.get("source"),
             },
@@ -319,14 +319,16 @@ class EgoCadenceManager:
         if not self._running or self._paused:
             return
 
+        # No model override: each ego's base config rules. Effort is forced
+        # to high — never think less about a CRITICAL escalation than a
+        # routine tick.
         signal = EgoSignal(
             signal_type="event",
             focus_category="escalation",
             summary=event.get("summary", "")[:200],
             priority="critical",
             metadata={
-                "model_override": "sonnet",
-                "effort_override": "medium",
+                "effort_override": "high",
                 "event_type": event.get("type"),
                 "source": event.get("source"),
             },
@@ -787,9 +789,9 @@ class EgoCadenceManager:
                 signals = non_reactive
                 has_reactive = False
 
-        # Extract overrides from signal metadata (deep-think model, morning effort,
-        # reactive model/effort). Use `is None` checks (not falsy) so empty
-        # strings don't slip through.
+        # Extract overrides from signal metadata (deep-think model, morning
+        # effort, escalation effort). Use `is None` checks (not falsy) so
+        # empty strings don't slip through.
         model_override = None
         effort_override = None
         for sig in signals:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import aiosqlite
@@ -130,10 +131,18 @@ def config():
 
 
 @pytest.fixture
+def prompt_file(tmp_path):
+    """Synthetic per-ego prompt file (EgoSession requires an explicit path)."""
+    path = tmp_path / "TEST_EGO_SESSION.md"
+    path.write_text("You are a test ego. Output valid JSON.")
+    return path
+
+
+@pytest.fixture
 def ego_session(
     mock_invoker, mock_session_manager, mock_compaction,
     mock_context_builder, mock_proposal_workflow, dispatcher,
-    config, db,
+    config, db, prompt_file,
 ):
     return EgoSession(
         invoker=mock_invoker,
@@ -145,6 +154,7 @@ def ego_session(
         config=config,
         db=db,
         mcp_config_path=None,
+        prompt_path=prompt_file,
     )
 
 
@@ -263,7 +273,10 @@ class TestUnifiedCycle:
 
         invocation = mock_invoker.run.call_args_list[0][0][0]
         assert "DAILY BRIEFING" in invocation.prompt
-        assert "morning_report" in invocation.prompt
+        assert "needs today" in invocation.prompt
+        # The morning report is produced by its own pipeline — the ego
+        # must not be instructed to emit a morning_report field.
+        assert "morning_report" not in invocation.prompt
 
     async def test_reactive_prompt(self, ego_session, mock_invoker):
         """Reactive signal → REACTIVE directive in prompt."""
@@ -342,7 +355,7 @@ class TestProcessExecutionBriefs:
     def ego_with_runner(
         self, mock_invoker, mock_session_manager, mock_compaction,
         mock_context_builder, mock_proposal_workflow, dispatcher,
-        config, db, mock_direct_runner,
+        config, db, mock_direct_runner, prompt_file,
     ):
         return EgoSession(
             invoker=mock_invoker,
@@ -355,6 +368,7 @@ class TestProcessExecutionBriefs:
             db=db,
             mcp_config_path=None,
             direct_session_runner=mock_direct_runner,
+            prompt_path=prompt_file,
         )
 
     async def _insert_proposal(self, db, proposal_id, status="approved",
@@ -816,3 +830,90 @@ class TestGoalStatusRecommendationRouting:
         )
 
         ego_session._proposals.create_batch.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Prompt loading — fail loud on missing per-ego prompt
+# ---------------------------------------------------------------------------
+
+
+class TestPromptLoading:
+    """EgoSession must refuse to run without its real identity prompt."""
+
+    def _build(self, prompt_path, *, mock_invoker, mock_session_manager,
+               mock_compaction, mock_context_builder, mock_proposal_workflow,
+               dispatcher, config, db):
+        return EgoSession(
+            invoker=mock_invoker,
+            session_manager=mock_session_manager,
+            compaction_engine=mock_compaction,
+            context_builder=mock_context_builder,
+            proposal_workflow=mock_proposal_workflow,
+            dispatcher=dispatcher,
+            config=config,
+            db=db,
+            mcp_config_path=None,
+            prompt_path=prompt_path,
+        )
+
+    async def test_missing_prompt_file_raises(
+        self, mock_invoker, mock_session_manager, mock_compaction,
+        mock_context_builder, mock_proposal_workflow, dispatcher,
+        config, db, tmp_path,
+    ):
+        """A prompt_path pointing at a nonexistent file raises, naming the path."""
+        missing = tmp_path / "NO_SUCH_PROMPT.md"
+        with pytest.raises(RuntimeError, match="NO_SUCH_PROMPT.md"):
+            self._build(
+                missing,
+                mock_invoker=mock_invoker,
+                mock_session_manager=mock_session_manager,
+                mock_compaction=mock_compaction,
+                mock_context_builder=mock_context_builder,
+                mock_proposal_workflow=mock_proposal_workflow,
+                dispatcher=dispatcher,
+                config=config,
+                db=db,
+            )
+
+    async def test_no_prompt_path_raises(
+        self, mock_invoker, mock_session_manager, mock_compaction,
+        mock_context_builder, mock_proposal_workflow, dispatcher,
+        config, db,
+    ):
+        """Omitting prompt_path raises — the legacy EGO_SESSION.md default is gone."""
+        with pytest.raises(RuntimeError, match="prompt_path"):
+            self._build(
+                None,
+                mock_invoker=mock_invoker,
+                mock_session_manager=mock_session_manager,
+                mock_compaction=mock_compaction,
+                mock_context_builder=mock_context_builder,
+                mock_proposal_workflow=mock_proposal_workflow,
+                dispatcher=dispatcher,
+                config=config,
+                db=db,
+            )
+
+    async def test_real_per_ego_prompts_load(
+        self, mock_invoker, mock_session_manager, mock_compaction,
+        mock_context_builder, mock_proposal_workflow, dispatcher,
+        config, db,
+    ):
+        """Both shipped per-ego prompts exist and load as the static prompt."""
+        import genesis.identity as identity_pkg
+
+        identity_dir = Path(identity_pkg.__file__).resolve().parent
+        for name in ("USER_EGO_SESSION.md", "GENESIS_EGO_SESSION.md"):
+            session = self._build(
+                identity_dir / name,
+                mock_invoker=mock_invoker,
+                mock_session_manager=mock_session_manager,
+                mock_compaction=mock_compaction,
+                mock_context_builder=mock_context_builder,
+                mock_proposal_workflow=mock_proposal_workflow,
+                dispatcher=dispatcher,
+                config=config,
+                db=db,
+            )
+            assert session._static_prompt.strip()

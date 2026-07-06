@@ -4,9 +4,10 @@ Orchestrates: context assembly → CC invocation → output parsing →
 cycle storage → proposal creation → follow-up recording.
 
 Each ego cycle is a fresh CC session (no --resume). The system prompt
-contains ONLY the static identity (EGO_SESSION.md), making it fully
-cacheable. Operational context is injected via the user message.
-Durable knowledge lives in the memory system (memory_store/recall).
+contains ONLY the static per-ego identity (USER_EGO_SESSION.md or
+GENESIS_EGO_SESSION.md), making it fully cacheable. Operational context
+is injected via the user message. Durable knowledge lives in the memory
+system (memory_store/recall).
 """
 
 from __future__ import annotations
@@ -55,7 +56,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PROMPT_PATH = Path(__file__).resolve().parent.parent / "identity" / "EGO_SESSION.md"
 _DEFAULT_CALL_SITE = "7_ego_cycle"
 _DEFAULT_FOCUS_SUMMARY_KEY = "ego_focus_summary"
 
@@ -146,16 +146,24 @@ class EgoSession:
         self._focus_selector = None  # Lazy-init in _perceive
         self._sweep_lock = asyncio.Lock()
         self._last_realist_cost_usd = 0.0  # accumulated by _filter_proposals
-        # Cache the static system prompt (read once, not every cycle)
-        actual_prompt_path = prompt_path or _DEFAULT_PROMPT_PATH
-        if actual_prompt_path.exists():
-            self._static_prompt = actual_prompt_path.read_text()
-        else:
-            logger.warning("Ego prompt not found at %s", actual_prompt_path)
-            self._static_prompt = (
-                "You are Genesis's executive function. "
-                "Output valid JSON matching the ego output schema."
+        # Cache the static system prompt (read once, not every cycle).
+        # Fail loud: a missing per-ego prompt must never silently degrade
+        # to a placeholder identity (the legacy identity/EGO_SESSION.md
+        # fallback was removed).
+        if prompt_path is None:
+            raise RuntimeError(
+                "EgoSession requires an explicit prompt_path (e.g. "
+                "identity/USER_EGO_SESSION.md or "
+                "identity/GENESIS_EGO_SESSION.md) — the legacy "
+                "identity/EGO_SESSION.md default was removed."
             )
+        if not prompt_path.exists():
+            raise RuntimeError(
+                f"Ego prompt not found at {prompt_path} — refusing to run "
+                "with a placeholder identity. Restore the prompt file or "
+                "fix the configured prompt_path."
+            )
+        self._static_prompt = prompt_path.read_text()
         # Prompt versioning: hash the static prompt for outcome linkage
         from genesis.db.crud.prompt_versions import compute_prompt_hash
         self._prompt_hash = compute_prompt_hash(self._static_prompt)
@@ -937,8 +945,11 @@ class EgoSession:
         # Focus-specific instructions
         if focus.focus_type == "daily_briefing":
             directive += (
-                "\n\nThis is a DAILY BRIEFING cycle. Include the morning_report "
-                "field with your daily briefing for the user."
+                "\n\nThis is a DAILY BRIEFING cycle. Prioritize what the "
+                "user needs today: review upcoming events, deadlines, and "
+                "open threads, and propose the highest-value actions for "
+                "the day. The morning report itself is produced by a "
+                "separate pipeline — do not write one."
             )
         elif focus.focus_type == "goal_review":
             directive += (
