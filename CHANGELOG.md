@@ -62,6 +62,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The Sentinel now learns which infrastructure fixes would be safe to run itself — observe-only.**
+  Every fix the Sentinel proposes still requires your approval, exactly as before. What's new: each
+  proposed action is additionally classified as "would run autonomously" (reversible, programmatic,
+  and matching a conservative allowlist of known-safe command shapes — service restarts, journal
+  vacuums, cache drops) or "would still ask you" (anything permanent, data-mutating, unlisted, or
+  that could take down the Sentinel's own host process), and the verdict is logged to
+  `sentinel_log.jsonl`. This shadow data calibrates a future opt-in autonomous tier against real
+  incidents before it is ever allowed to act. The mode lives in `config/sentinel.yaml`
+  (`autonomy.mode: shadow`); `live` is reserved and not yet implemented — nothing executes without
+  approval regardless of the setting.
+
 - **Genesis now re-hardens its own host SSH key automatically — no human on the host required.** The
   Guardian's control key (the one the container uses to manage the host) is supposed to carry `no-pty`
   and a source-IP `from=` restriction, but before this those were applied only at install time, so an

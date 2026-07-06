@@ -285,6 +285,27 @@ class SentinelDispatcher:
         except Exception:
             self._require_approval = True
 
+        # Reversibility-autonomy mode (config/sentinel.yaml, decoupled from
+        # manual_approval_required). Only "shadow" is implemented: classify
+        # each proposed action and log the would-decision, execution path
+        # unchanged. "live" is reserved for a data-gated follow-up flip.
+        try:
+            from genesis.sentinel.auto_eligibility import (
+                AUTONOMY_MODE_LIVE,
+                AUTONOMY_MODE_SHADOW,
+                load_sentinel_autonomy_mode,
+            )
+            self._autonomy_mode = load_sentinel_autonomy_mode()
+            if self._autonomy_mode == AUTONOMY_MODE_LIVE:
+                logger.warning(
+                    "sentinel autonomy mode 'live' is not implemented yet — "
+                    "running in shadow (observe-only) mode",
+                )
+                self._autonomy_mode = AUTONOMY_MODE_SHADOW
+        except Exception:
+            logger.warning("Failed to load sentinel autonomy mode", exc_info=True)
+            self._autonomy_mode = "shadow"
+
         # On startup, clean up stale AWAITING_* states if no matching
         # approval row exists in the DB. This handles restarts where the
         # approval was resolved while the process was down.
@@ -603,6 +624,16 @@ class SentinelDispatcher:
 
         # ── Phase 3: Action approval + execution ───────────────────
         if result.dispatched and result.proposed_actions:
+            # Shadow reversibility classification — observe-only. Logs the
+            # per-action would-decision; never changes the execution path.
+            # Classification happens once here, ahead of both approval
+            # paths, so parked-and-resumed actions (resume path further
+            # down this file) are already covered by their original pass.
+            # GROUNDWORK(sentinel-live-autonomy): a future mode=live must
+            # ALSO reclassify at the resume path before executing
+            # deserialized actions — do not gate live execution on this
+            # dispatch-time pass alone.
+            self._shadow_classify_actions(result)
             if self._approval_gate is not None:
                 try:
                     action_result = await self._gated_action_approval(result, request, pattern)
@@ -695,6 +726,34 @@ class SentinelDispatcher:
         logger.info("Sentinel actions approved (%s)", request_id)
         append_log({"event": "actions_approved", "request_id": request_id})
         return None
+
+    def _shadow_classify_actions(self, result: SentinelResult) -> None:
+        """Log the would-be autonomy decision for each proposed action.
+
+        Observe-only: builds calibration data for a future autonomous tier
+        (would this action have run without approval?). Logs only primitive
+        dicts and swallows every exception — shadow classification must be
+        provably unable to break the dispatch path.
+        """
+        try:
+            from genesis.sentinel.auto_eligibility import classify_action
+
+            actions = []
+            for action in result.proposed_actions:
+                c = classify_action(action)
+                actions.append({
+                    "command": c.command[:200],
+                    "decision": "would_auto_run" if c.decision == "auto_eligible" else "would_gate",
+                    "reason": c.reason[:200],
+                })
+            append_log({
+                "event": "shadow_classification",
+                "mode": self._autonomy_mode,
+                "session_id": result.session_id,
+                "actions": actions,
+            })
+        except Exception:
+            logger.warning("Sentinel shadow classification failed", exc_info=True)
 
     async def _execute_approved_actions(self, proposed_actions: list[dict]) -> list[dict]:
         """Execute a list of approved shell commands."""

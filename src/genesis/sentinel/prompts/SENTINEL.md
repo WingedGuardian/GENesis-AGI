@@ -214,4 +214,9 @@ will present these to the user for approval and execute them if approved.
 - `proposed_actions` is a list of commands for the dispatcher to execute after approval
 - Each action needs a `description` (human-readable), `command` (exact shell command),
   and `safe`/`reversible` flags
+- Tag `safe`/`reversible` honestly — they feed autonomy calibration, not just
+  display. `reversible: true` means the action can be fully undone or the
+  system returns to the prior state on its own (service restart, cache drop).
+  Anything that deletes data, edits code/config, or changes state you cannot
+  restore is `reversible: false`. When unsure, tag `false`.
 - If you cannot diagnose the issue, explain what you found and set `proposed_actions` to `[]`
