@@ -121,6 +121,15 @@ GENESIS_BACKUP_NAS_PASS=password
 
 Requires `smbclient` (`sudo apt-get install smbclient`).
 
+Off-site snapshots are written under `<share>/Genesis/<host>/`, where `<host>`
+defaults to the machine's hostname. **If you back up two machines that share a
+hostname to the same NAS, give each a distinct label** or their retention prunes
+will delete each other's snapshots:
+```
+GENESIS_BACKUP_NAS_HOST=this-machine-label
+```
+(`restore.sh` reads the same variable to find the source snapshot dir.)
+
 Bootstrap installs the timer's unit files but does **not** enable them —
 scheduling a backup that silently leaves your database local-only would give a
 false sense of safety. Once `GENESIS_BACKUP_REPO` and
