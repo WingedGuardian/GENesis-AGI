@@ -44,6 +44,20 @@ logger = logging.getLogger(__name__)
 
 _OBS_TAG = re.compile(r"obs:([0-9a-fA-F-]{8,})")
 
+# Qdrant ``source_pipeline`` values produced by internal machine subsystems.
+# Points carrying these are decisional/reflection output that must not surface
+# in default recall. The SQLite-driven delete below covers those with a tagged
+# ``memory_metadata`` row; the payload orphan sweep (Step 2b) covers legacy
+# points embedded WITHOUT a metadata row (Qdrant-only orphans).
+_LEAK_PIPELINES: frozenset[str] = frozenset({
+    "reflection",
+    "deep_reflection",
+    "quality_calibration",
+    "weekly_assessment",
+    "surplus_promotion",
+    "module:automaton_supervisor",
+})
+
 
 async def main(apply: bool = False) -> None:
     import aiosqlite
@@ -64,7 +78,7 @@ async def main(apply: bool = False) -> None:
         cursor = await db.execute(
             "SELECT memory_id, source_subsystem, collection, invalid_at "
             "FROM memory_metadata "
-            "WHERE source_subsystem IN ('ego', 'triage', 'reflection')"
+            "WHERE source_subsystem IS NOT NULL"
         )
         rows = await cursor.fetchall()
         if not rows:
@@ -142,6 +156,54 @@ async def main(apply: bool = False) -> None:
                 len(rows),
             )
 
+        # --- Step 2b: payload-based orphan sweep ---------------------------
+        # Step 2 only deletes points that have a tagged memory_metadata row.
+        # Legacy machine-leak points embedded in Qdrant with NO metadata row
+        # (orphans) would survive Step 2 and keep leaking into vector recall.
+        # Delete them by payload: any episodic_memory point whose
+        # source_pipeline is a known machine pipeline AND which has no
+        # memory_metadata row. Verified: such orphans have no FTS5/SQLite copy
+        # either, so deleting the vector loses no user-facing content.
+        cursor = await db.execute("SELECT memory_id FROM memory_metadata")
+        known_ids = {r[0] for r in await cursor.fetchall()}
+        orphan_ids: list[str] = []
+        next_offset = None
+        while True:
+            points, next_offset = qdrant.scroll(
+                collection_name="episodic_memory",
+                limit=1000,
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in points:
+                pipeline = (point.payload or {}).get("source_pipeline")
+                if pipeline in _LEAK_PIPELINES and str(point.id) not in known_ids:
+                    orphan_ids.append(str(point.id))
+            if next_offset is None:
+                break
+
+        logger.info(
+            "Orphan sweep: %d machine-leak point(s) in Qdrant with no "
+            "metadata row", len(orphan_ids),
+        )
+        if orphan_ids:
+            if apply:
+                from qdrant_client.models import PointIdsList
+                for start in range(0, len(orphan_ids), 500):
+                    qdrant.delete(
+                        collection_name="episodic_memory",
+                        points_selector=PointIdsList(
+                            points=orphan_ids[start:start + 500],
+                        ),
+                    )
+                logger.info("Orphan sweep: deleted %d point(s)", len(orphan_ids))
+            else:
+                logger.info(
+                    "DRY-RUN: would delete %d orphan point(s) via payload sweep",
+                    len(orphan_ids),
+                )
+
         # --- Step 3: invalid_at backfill via obs:<uuid> tag JOIN -----------
         # Find subsystem rows that still have NULL invalid_at, parse the
         # obs:<uuid> tag from memory_fts.tags, JOIN observations.expires_at,
@@ -150,7 +212,7 @@ async def main(apply: bool = False) -> None:
             "SELECT mm.memory_id, mf.tags "
             "FROM memory_metadata mm "
             "LEFT JOIN memory_fts mf ON mm.memory_id = mf.memory_id "
-            "WHERE mm.source_subsystem IN ('ego', 'triage', 'reflection') "
+            "WHERE mm.source_subsystem IS NOT NULL "
             "AND mm.invalid_at IS NULL"
         )
         candidates = list(await cursor.fetchall())
