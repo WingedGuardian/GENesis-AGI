@@ -185,7 +185,7 @@ Without these, Genesis uses cloud embedding APIs. With them: private, faster, fr
 
 Your Genesis install is one operational system: the public `GENesis-AGI` codebase, your private fork for customizations, and your private encrypted backups repo. See [`.claude/docs/your-genesis.md`](.claude/docs/your-genesis.md) for the full model.
 
-- **Backup** — runs every 6h via cron. SQLite, Qdrant snapshots, memory, transcripts, secrets—GPG-encrypted before push.
+- **Backup** — runs every 6h via a systemd user timer (enable it once configured — see [SETUP.md](SETUP.md)). SQLite, Qdrant snapshots, memory, transcripts, secrets—GPG-encrypted before push.
 - **Restore** — `git clone <your-fork>` → `scripts/bootstrap.sh` → `scripts/restore.sh`. Back in minutes.
 - **Contribute** — a distributed bug fixing pipeline automatically detects eligible fixes, pushes them to GitHub for inspection, and opens upstream PRs.
 

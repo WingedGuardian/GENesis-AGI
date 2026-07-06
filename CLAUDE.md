@@ -21,7 +21,8 @@ reflection) → Services (routing, memory, outreach, autonomy, surplus) → Data
 - **Qdrant**: `localhost:6333` (systemd service)
 - **GitHub**: configured in `~/.genesis/config/genesis.yaml` (`github.user` / `github.public_repo`)
 - **Database**: `~/genesis/data/genesis.db` (NOT `~/genesis/genesis.db`)
-- **Backups**: encrypted 6h cron via `scripts/backup.sh` → your private
+- **Backups**: encrypted, every 6h via `genesis-backup.timer` (systemd user
+  unit; enable deliberately after configuring) running `scripts/backup.sh` → your private
   `genesis-backups` repo (SQLite, Qdrant, memory, transcripts, config,
   secrets). Restore via `scripts/restore.sh` or `python -m genesis restore`.
 - **Env scrub**: `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` is NOT used — Genesis
@@ -53,7 +54,8 @@ systemctl --user list-units 'genesis-*' --all    # All units
 
 Other units: `genesis-bridge.service` (Telegram relay, on-demand),
 `genesis-tmp-watchgod.service` (/tmp protection), `genesis-watchdog.timer`
-(health check), `genesis-disk-hygiene.timer` (daily worktree reaping, cache reclaim, `~/tmp`
+(health check), `genesis-backup.timer` (6h encrypted backup via
+`scripts/backup.sh`), `genesis-disk-hygiene.timer` (daily worktree reaping, cache reclaim, `~/tmp`
 prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`). MCP servers are CC child processes
 (not systemd) — code changes take effect on next CC session start.
 

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Genesis automated backup — runs every 6h via cron.
+# Genesis automated backup — runs every 6h via the genesis-backup.timer
+# systemd user unit. Unit files are installed by bootstrap.sh; enabling is a
+# deliberate step once backup is configured (see SETUP.md "Backups"):
+#   systemctl --user enable --now genesis-backup.timer
 # Writes your Genesis state to <your-gh-user>/genesis-backups.
 # All PII-bearing payloads are GPG-encrypted with GENESIS_BACKUP_PASSPHRASE.
 #
@@ -89,7 +92,7 @@ _send_telegram() {
 
 # Large intermediate files (the multi-hundred-MB SQLite .dump) must NOT land in the
 # inherited TMPDIR: for a CC-launched run that is ~/.genesis/cc-tmp (the watchgod-policed
-# "oxygen" folder — filling it kills CC sessions); for the 6h cron it is /tmp (tmpfs/RAM).
+# "oxygen" folder — filling it kills CC sessions); for the 6h timer unit it is /tmp (tmpfs/RAM).
 # Route them to a dedicated on-disk dir, per the tmp_filesystem_limit procedure ("use ~/tmp
 # for large temporary files"). We do NOT export TMPDIR — only the big files move; everything
 # else (and Claude Code) keeps its normal TMPDIR.

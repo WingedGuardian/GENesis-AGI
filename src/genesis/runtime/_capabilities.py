@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -140,3 +141,45 @@ def write_capabilities_file(runtime: GenesisRuntime) -> None:
         logger.info("Capabilities file written: %d entries", len(capabilities))
     except OSError:
         logger.error("Failed to write capabilities file", exc_info=True)
+
+    _write_bootstrap_manifest_file(runtime)
+
+
+def _write_bootstrap_manifest_file(runtime: GenesisRuntime) -> None:
+    """Persist the raw bootstrap manifest to ``~/.genesis/bootstrap_manifest.json``.
+
+    ``capabilities.json`` above is a lossy human-facing projection (manifest
+    string → status/description triple). This sibling file preserves the
+    verbatim ``runtime._bootstrap_manifest`` so out-of-process readers (the
+    ``bootstrap_manifest`` MCP tool, which runs in a separate CC-child process
+    that never bootstraps the runtime) get exact fidelity with no reverse
+    mapping. Best-effort: a write failure here must not fail bootstrap.
+
+    In ``readonly`` bootstrap mode we do NOT overwrite the primary runtime's
+    file — a readonly probe's manifest would clobber the real one.
+    """
+    if getattr(runtime, "_bootstrap_mode", "") == "readonly":
+        return
+
+    manifest_file = Path.home() / ".genesis" / "bootstrap_manifest.json"
+    payload = {
+        "bootstrapped": True,
+        "manifest": dict(runtime._bootstrap_manifest),
+        "persisted_at": datetime.now(UTC).isoformat(),
+    }
+    try:
+        manifest_file.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=manifest_file.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp_path, manifest_file)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
+        logger.info(
+            "Bootstrap manifest persisted: %d entries", len(payload["manifest"])
+        )
+    except OSError:
+        logger.error("Failed to write bootstrap manifest file", exc_info=True)

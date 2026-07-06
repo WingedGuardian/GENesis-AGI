@@ -31,8 +31,12 @@ async def _impl_ego_calibration_status(domain: str = "ego") -> dict:
         return {
             "status": "no_data",
             "message": (
-                f"No calibration snapshots yet for domain={domain!r}. Computed at "
-                f"09:00/21:00 once the Outcome Bus has ground-truth (T1) rows."
+                f"No calibration snapshots yet for domain={domain!r}. Computed "
+                f"at 09:00/21:00 once the Outcome Bus has {domain}-sourced "
+                f"ground-truth rows (calibration_pairs requires "
+                f"source={domain!r} with stated confidence; T1 volume from "
+                f"other sources doesn't count). Expected while that source's "
+                f"proposal loop has no resolved, confidence-stated outcomes."
             ),
         }
 

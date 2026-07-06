@@ -222,12 +222,14 @@ are, not asking for keys. Let the user choose their comfort level.
    `~/.genesis/backup_status.json` shows `"success": true` (and
    `"tier2_status": "ok"` if a NAS was configured).
 
-9. **Install the 6h backup cron — only after the verify run passed.** Add it if
-   absent (`crontab -l 2>/dev/null | grep -q 'backup\.sh'`):
-   `0 */6 * * * $HOME/genesis/scripts/backup.sh >> $HOME/genesis/logs/backup.log 2>&1`
-   (`mkdir -p $HOME/genesis/logs` first). This is done HERE, deliberately —
-   never auto-installed at bootstrap — so backups are an opt-in, verified setup,
-   not a switch flipped for every install.
+9. **Enable the 6h backup timer — only after the verify run passed.**
+   `systemctl --user enable --now genesis-backup.timer` (the unit files are
+   installed by bootstrap but left disabled). Confirm with
+   `systemctl --user list-timers genesis-backup.timer`. This is done HERE,
+   deliberately — never auto-enabled at bootstrap — so backups are an opt-in,
+   verified setup, not a switch flipped for every install. (Do NOT also add a
+   crontab entry — the timer is the single scheduler; two would double every
+   backup.)
 
 ---
 

@@ -137,6 +137,68 @@ class TestStandaloneBootstrapAndJobHealth:
         # Should return a dict (either real data or graceful unavailable)
         assert isinstance(result, dict)
 
+    async def test_bootstrap_manifest_reads_persisted_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Out-of-process (MCP) reads the manifest genesis-server persisted verbatim."""
+        from genesis.mcp.health import manifest as manifest_mod
+
+        mf = tmp_path / "bootstrap_manifest.json"
+        mf.write_text(json.dumps({
+            "bootstrapped": True,
+            "manifest": {"db": "ok", "outreach": "degraded: no token",
+                         "voice": "failed: no api key"},
+            "persisted_at": "2026-07-06T01:00:00+00:00",
+        }))
+        monkeypatch.setattr(manifest_mod, "_MANIFEST_FILE", mf)
+
+        result = manifest_mod._read_persisted_manifest()
+        assert result is not None
+        # Liveness is NOT asserted from a persisted file — this process
+        # did not bootstrap, so bootstrapped is False even with data present.
+        assert result["bootstrapped"] is False
+        assert result["source"] == "persisted_manifest"
+        # Exact fidelity — "degraded: reason" survives (no lossy round-trip).
+        assert result["manifest"] == {
+            "db": "ok",
+            "outreach": "degraded: no token",
+            "voice": "failed: no api key",
+        }
+        assert result["persisted_at"] == "2026-07-06T01:00:00+00:00"
+
+    async def test_bootstrap_manifest_missing_file_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No persisted file → reader declines (caller reports empty manifest)."""
+        from genesis.mcp.health import manifest as manifest_mod
+
+        monkeypatch.setattr(
+            manifest_mod, "_MANIFEST_FILE", tmp_path / "nope.json"
+        )
+        assert manifest_mod._read_persisted_manifest() is None
+
+    async def test_bootstrap_manifest_corrupt_file_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unparseable file → reader declines instead of raising."""
+        from genesis.mcp.health import manifest as manifest_mod
+
+        mf = tmp_path / "bootstrap_manifest.json"
+        mf.write_text("{not json")
+        monkeypatch.setattr(manifest_mod, "_MANIFEST_FILE", mf)
+        assert manifest_mod._read_persisted_manifest() is None
+
+    async def test_bootstrap_manifest_non_dict_manifest_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A malformed manifest value doesn't collapse the whole tool (corr. #3)."""
+        from genesis.mcp.health import manifest as manifest_mod
+
+        mf = tmp_path / "bootstrap_manifest.json"
+        mf.write_text(json.dumps({"bootstrapped": True, "manifest": "oops"}))
+        monkeypatch.setattr(manifest_mod, "_MANIFEST_FILE", mf)
+        assert manifest_mod._read_persisted_manifest() is None
+
     async def test_job_health_does_not_crash(self) -> None:
         """job_health should never crash, even without a running runtime."""
         from genesis.mcp.health_mcp import _impl_job_health

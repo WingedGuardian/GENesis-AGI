@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,23 +63,81 @@ def _annotate_staleness(jobs: dict) -> dict:
     return annotated
 
 
+# Module-level so tests can monkeypatch the location.
+_MANIFEST_FILE = Path.home() / ".genesis" / "bootstrap_manifest.json"
+
+
+def _read_persisted_manifest() -> dict | None:
+    """Read the manifest genesis-server persisted at its last bootstrap.
+
+    MCP servers run in a separate CC-child process that never bootstraps the
+    runtime, so the in-process singleton has no manifest. genesis-server writes
+    the verbatim manifest to ``~/.genesis/bootstrap_manifest.json`` at the tail
+    of its own bootstrap (``runtime/_capabilities.py``); read it directly — no
+    reverse mapping, exact fidelity. Returns None when the file is missing or
+    unreadable so the caller can report an honest empty result.
+
+    This is last-known state, NOT a liveness signal: the file survives a server
+    crash, so it never asserts the server is currently up. ``bootstrapped`` is
+    reported False (this process did not bootstrap); the populated manifest is
+    labelled ``source='persisted_manifest'`` with ``persisted_at`` and a pointer
+    to ``subsystem_heartbeats`` for current liveness.
+    """
+    try:
+        raw = json.loads(_MANIFEST_FILE.read_text())
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error("Failed to read %s: %s", _MANIFEST_FILE, exc)
+        return None
+
+    manifest = raw.get("manifest") if isinstance(raw, dict) else None
+    if not isinstance(manifest, dict):
+        logger.error("Malformed bootstrap manifest file: %s", _MANIFEST_FILE)
+        return None
+
+    return {
+        "bootstrapped": False,  # THIS process didn't bootstrap; liveness ≠ file
+        "manifest": manifest,
+        "source": "persisted_manifest",
+        "persisted_at": raw.get("persisted_at"),
+        "note": (
+            "Last-known manifest persisted by genesis-server at its last "
+            "bootstrap (this MCP process does not bootstrap the runtime). "
+            "Does NOT indicate current liveness — check subsystem_heartbeats."
+        ),
+    }
+
+
 async def _impl_bootstrap_manifest() -> dict:
     try:
         from genesis.runtime import GenesisRuntime
 
         rt = GenesisRuntime.instance()
+        if rt.is_bootstrapped:
+            return {
+                "bootstrapped": True,
+                "manifest": rt.bootstrap_manifest,
+                "source": "runtime",
+            }
+        # Not bootstrapped in THIS process — the normal case for MCP
+        # servers (CC child processes, separate from genesis-server).
+        # Serve the manifest genesis-server persisted at its bootstrap.
+        persisted = _read_persisted_manifest()
+        if persisted is not None:
+            return persisted
         return {
-            "bootstrapped": rt.is_bootstrapped,
-            "manifest": rt.bootstrap_manifest,
+            "bootstrapped": False,
+            "manifest": {},
+            "source": "runtime",
         }
     except (ImportError, AttributeError, RuntimeError):
         # Narrow catch: runtime module genuinely unimportable, singleton
         # __init__ failed, or runtime attribute access failure. In the
-        # common "standalone mode" path the runtime IS importable and
-        # the happy path returns {"bootstrapped": False, "manifest": {}}
-        # via the real singleton — this except branch only fires on a
-        # real bug, which is why it logs at ERROR. A broader catch
-        # would hide those bugs.
+        # common "standalone mode" path the runtime IS importable and the
+        # happy path answers from the persisted capabilities file — this
+        # except branch only fires on a real bug, which is why it logs at
+        # ERROR. A broader catch would hide those bugs.
         logger.error(
             "bootstrap_manifest fallback fired — runtime unreachable",
             exc_info=True,

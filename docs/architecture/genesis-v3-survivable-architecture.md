@@ -484,7 +484,7 @@ what's NOT in this list.
 |---|---|---|---|---|
 | Qdrant data deletion | Tests without delete guard | Production data lost | Delete guard + backup verify | 2026-03-16 |
 | Backup failure | Passphrase not set, push failure | No recovery point | Backup log monitoring | Ongoing (secrets) |
-| Cron job failure | Path error, permission issue | Backups/inbox sync stop | Cron output monitoring | Not yet hit |
+| Scheduler job failure | Path error, permission issue | Backups (genesis-backup.timer) / inbox sync (cron) stop | Timer + cron output monitoring | Not yet hit |
 
 ### What's NOT in this list (prompt for forecast LLM)
 

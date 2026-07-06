@@ -59,7 +59,11 @@ async def _impl_self_improvement_status() -> dict:
             "status": "no_data",
             "message": (
                 "No ego calibration snapshot yet — computed at 09:00/21:00 once "
-                "the Outcome Bus has ground-truth (T1) rows."
+                "the Outcome Bus has ego-sourced ground-truth rows "
+                "(calibration_pairs requires source='ego' with stated "
+                "confidence; T1 volume from other sources doesn't count). "
+                "Expected while the ego-proposal loop has no resolved "
+                "proposals — not a pipeline fault."
             ),
         }
     else:
