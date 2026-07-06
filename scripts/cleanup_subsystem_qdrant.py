@@ -82,8 +82,13 @@ async def main(apply: bool = False) -> None:
         )
         rows = await cursor.fetchall()
         if not rows:
-            logger.info("No subsystem-tagged rows found. Nothing to do.")
-            return
+            # No tagged rows to purge, but DO NOT return — the payload orphan
+            # sweep (Step 2b) still needs to run: metadata-less Qdrant orphans
+            # exist independently of any tagged metadata row (e.g. legacy
+            # points embedded before memory_metadata existed).
+            logger.info(
+                "No subsystem-tagged rows found; running orphan sweep only.",
+            )
 
         by_subsystem: dict[str, list[tuple[str, str, str | None]]] = {}
         for memory_id, subsystem, collection, invalid_at in rows:
@@ -164,6 +169,9 @@ async def main(apply: bool = False) -> None:
         # source_pipeline is a known machine pipeline AND which has no
         # memory_metadata row. Verified: such orphans have no FTS5/SQLite copy
         # either, so deleting the vector loses no user-facing content.
+        # Episodic-only by construction: reflection/autonomy/automaton are
+        # episodic writes; knowledge_base holds ingested external knowledge,
+        # never machine-subsystem output (mirrors the backfill's scope).
         cursor = await db.execute("SELECT memory_id FROM memory_metadata")
         known_ids = {r[0] for r in await cursor.fetchall()}
         orphan_ids: list[str] = []

@@ -101,3 +101,29 @@ def test_dry_run_deletes_nothing(scenario):
     module, stub = scenario
     asyncio.run(module.main(apply=False))
     assert stub.deleted == []
+
+
+def test_orphan_sweep_runs_with_no_tagged_rows(tmp_path, monkeypatch):
+    """Regression: the sweep must run even when memory_metadata has no tagged
+    rows (pure-orphan install), i.e. the early return must not skip Step 2b."""
+    db = tmp_path / "genesis.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE memory_metadata (memory_id TEXT PRIMARY KEY, "
+        "source_subsystem TEXT, collection TEXT, invalid_at TEXT)"
+    )
+    conn.execute("CREATE TABLE memory_fts (memory_id TEXT, tags TEXT)")
+    conn.execute("CREATE TABLE observations (id TEXT PRIMARY KEY, expires_at TEXT)")
+    conn.commit()
+    conn.close()  # no source_subsystem-tagged rows at all
+
+    stub = _StubQdrant([_Point("orphan-1", "reflection")])
+    module = _load_script()
+    import genesis.env as genv
+
+    monkeypatch.setattr(genv, "genesis_db_path", lambda: db)
+    monkeypatch.setattr(genv, "qdrant_url", lambda: "http://stub")
+    monkeypatch.setattr("qdrant_client.QdrantClient", lambda **_kw: stub)
+
+    asyncio.run(module.main(apply=True))
+    assert "orphan-1" in stub.deleted
