@@ -71,10 +71,12 @@ async def init_guardian_monitoring(rt) -> None:
             host_user, host_ip,
         )
 
-        # Propagate Telegram credentials to shared mount for Guardian
-        from genesis.guardian.credential_bridge import propagate_telegram_credentials
-        rt._awareness_loop.set_credential_bridge(propagate_telegram_credentials)
-        logger.info("Telegram credential bridge wired to awareness loop")
+        # Propagate Guardian credentials (Telegram + Proxmox provisioning tokens)
+        # to the shared mount every tick. Combined bridge — each leg guarded, so
+        # a provisioning-creds absence never blocks the Telegram bridge.
+        from genesis.guardian.credential_bridge import propagate_guardian_credentials
+        rt._awareness_loop.set_credential_bridge(propagate_guardian_credentials)
+        logger.info("Guardian credential bridge (telegram+provisioning) wired to awareness loop")
 
         exporter = getattr(rt, "_autonomous_cli_policy_exporter", None)
         if exporter is not None:
