@@ -45,10 +45,13 @@ _CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "sentinel.yaml"
 # it, or broad process kills, take down the Sentinel itself mid-action.
 # rm -rf class is excluded because recursive deletion is unbounded blast
 # radius for an autonomous tier (and can kill the CC shell / working dir).
-_SELF_FATAL_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"systemctl\s+(?:--user\s+)?(?:restart|stop|kill)\s+\S*genesis-server"),
-    re.compile(r"\b(?:kill|pkill|killall)\b"),
-    re.compile(r"\brm\s+(?:-\w*[rR]\w*\s+)+"),
+_SELF_FATAL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"systemctl\s+(?:--user\s+)?(?:restart|stop|kill)\s+\S*genesis-server"),
+        "genesis-server restart/stop (kills the Sentinel's own host process)",
+    ),
+    (re.compile(r"\b(?:kill|pkill|killall)\b"), "process kill"),
+    (re.compile(r"\brm\s+(?:-\w*[rR]\w*\s+)+"), "recursive rm"),
 )
 
 # ── Allowlist: anchored full-command shapes from the Failure Inventory ───
@@ -100,11 +103,9 @@ def classify_action(action: dict[str, Any] | Any) -> ClassifiedAction:
         return ClassifiedAction("", "gated", "malformed action (no command)")
     command = command.strip()
 
-    for pattern in _SELF_FATAL_PATTERNS:
+    for pattern, label in _SELF_FATAL_PATTERNS:
         if pattern.search(command):
-            return ClassifiedAction(
-                command, "gated", f"self-fatal command shape ({pattern.pattern})",
-            )
+            return ClassifiedAction(command, "gated", f"self-fatal: {label}")
 
     if action.get("safe") is not True:
         return ClassifiedAction(command, "gated", "not tagged safe=true by diagnosis")
