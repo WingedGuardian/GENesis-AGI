@@ -4,7 +4,10 @@ The ambient bridge runs on a separate edge VM and writes ``ambient_health.json``
 every 60s. This module SSH-reads that file (connection in
 ``~/.genesis/ambient_remote.yaml``, mirroring ``guardian_remote.yaml``) and turns
 a snapshot into an alert verdict. ``OutreachScheduler._ambient_health_job`` runs
-the read + evaluate on a cadence and alerts the user on a bad-state transition.
+the read + evaluate on a cadence and alerts the user on a bad-state transition;
+``probe_ambient_health`` surfaces the verdict in the infrastructure snapshot; and
+``bridge_snapshot`` serves the dashboard voice Bridge tab the full health payload
+on demand (``GET /api/genesis/voice/bridge``).
 
 No config file -> the monitor is a silent no-op, so installs without an ambient
 edge are unaffected. The edge host/IP lives ONLY in the install-local config,
@@ -15,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -186,3 +190,44 @@ def evaluate_ambient_health(
     if status == "ok":
         reasons.append("healthy")
     return AmbientVerdict(status, reasons)
+
+
+async def bridge_snapshot(*, now: datetime | None = None) -> dict:
+    """One-call data contract for the dashboard voice Bridge tab.
+
+    Composes the module's own pieces — config load, SSH read, verdict — and
+    returns the FULL edge health payload under a ``health`` sub-key (no
+    filtering, so future edge keys surface without a Genesis-side change).
+    Deliberately separate from ``probe_ambient_health``: that shared
+    infrastructure card carries only the verdict and sits behind snapshot +
+    SSH-TTL caches; the cockpit tab wants the whole payload, fresh, on demand.
+
+    Never raises. ``now`` is a test seam for verdict staleness (defaults to
+    real time in :func:`evaluate_ambient_health`).
+    """
+    try:
+        cfg = load_ambient_remote_config()
+    except AmbientRemoteConfigError as exc:
+        return {
+            "configured": True,
+            "reachable": False,
+            "verdict": "misconfigured",
+            "reasons": [str(exc)],
+        }
+    if cfg is None:
+        return {"configured": False, "reason": "no ambient edge configured"}
+
+    start = time.monotonic()
+    data = await read_edge_health(cfg)  # None on any failure, never raises
+    latency_ms = round((time.monotonic() - start) * 1000, 2)
+    verdict = evaluate_ambient_health(data, now=now)
+    out = {
+        "configured": True,
+        "reachable": data is not None,
+        "verdict": verdict.status,
+        "reasons": verdict.reasons,
+        "latency_ms": latency_ms,
+    }
+    if data is not None:
+        out["health"] = data
+    return out
