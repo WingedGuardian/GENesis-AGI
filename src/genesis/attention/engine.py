@@ -121,5 +121,6 @@ def evaluate(
         ts=utt.ts,
         mode_state=utt.mode_state,
         clarity=round(clarity, 4),
+        source=utt.source,
     )
     return state, event

@@ -85,6 +85,7 @@ class AttentionEvent:
     mode_state: str
     clarity: float                 # capture_clarity of the triggering utterance
     l15_verdict: dict | None = None  # {real, perk} from L1.5 — always None in v1 (stub)
+    source: str = ""               # device provenance of the trigger utterance (e.g. omi / edge id)
 
 
 @dataclass

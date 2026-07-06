@@ -152,6 +152,12 @@ def test_cooldown_raises_threshold():
     assert e3 is not None and e3.activation == Activation.SOFT  # 40s > cooldown -> fires again
 
 
+def test_event_carries_source_of_trigger_utterance():
+    # device provenance must reach the event (else the store can't tell OMI from home edge)
+    ev = run([make_utt(7, 100.0, "hey genesis check this")], make_config())[0]
+    assert ev.source == "test"   # make_utt's source, threaded onto the event
+
+
 def test_event_carries_refs_not_text():
     ev = run([make_utt(7, 100.0, "hey genesis secret plan")], make_config())[0]
     # AttentionEvent must expose no raw transcript — window_ref is ids + ts only.

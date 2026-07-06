@@ -261,7 +261,7 @@ def _row_tuple(id_, config_version, *, activation="soft", score=0.65, clarity=0.
                              "ts_start": 0.0, "ts_end": 1.0})
     ts = "2026-07-01T00:00:00+00:00"
     return (id_, ts, "s1", activation, score, triggers_json, json.dumps([]), window_ref,
-            "unknown", clarity, None, signal, "s", config_version, ts)
+            "unknown", clarity, None, signal, "s", config_version, ts, "")
 
 
 async def _seed(path, rows):

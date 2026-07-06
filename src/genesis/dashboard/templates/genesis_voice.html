@@ -26,7 +26,7 @@
         //    keys to read on first load (before any fetch returns) ──
         attentionEvents: [],
         attentionStats: null,
-        attentionFilters: { activation: "", trigger: "", is_user: false, unlabeled: true, config_version: "" },
+        attentionFilters: { activation: "", trigger: "", is_user: false, unlabeled: true, config_version: "", source: "" },
         _attentionVersionDefaulted: false,   // one-time guard: default the filter to newest version once
         _attentionEventsGen: 0,   // request generation — discard a stale events response superseded by a newer fetch
         attentionRevealed: {},   // {event_id: [window rows] | "unavailable"}
@@ -99,6 +99,7 @@
           if (f.is_user) p.set("is_user", "true");
           if (f.unlabeled) p.set("unlabeled", "true");
           if (f.config_version) p.set("config_version", f.config_version);
+          if (f.source) p.set("source", f.source);
           return p.toString();
         },
         async fetchAttentionEvents() {
@@ -369,6 +370,14 @@
             <option :value="v" x-text="v"></option>
           </template>
         </select>
+        <!-- source: device provenance filter (omi vs home edge); list-only, dropdown fed by stats.sources -->
+        <select x-model="$store.genesisVoice.attentionFilters.source" @change="$store.genesisVoice.fetchAttentionEvents()"
+                style="padding: .4rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
+          <option value="">All devices</option>
+          <template x-for="s in ($store.genesisVoice.attentionStats?.sources || [])" :key="s">
+            <option :value="s" x-text="s"></option>
+          </template>
+        </select>
         <label style="font-size:.8rem; display:flex; align-items:center; gap:.3rem;">
           <input type="checkbox" x-model="$store.genesisVoice.attentionFilters.is_user" @change="$store.genesisVoice.fetchAttentionEvents()"> is_user
         </label>
@@ -392,6 +401,7 @@
                       x-text="ev.activation"></span>
                 <span style="font-size:.72rem; color:var(--color-text-secondary);" x-text="'score ' + (typeof ev.score === 'number' ? ev.score.toFixed(2) : ev.score)"></span>
                 <span style="font-size:.72rem; color:var(--color-text-secondary);" x-text="(ev.ts||'').substring(0,19).replace('T',' ')"></span>
+                <span x-show="ev.source" style="font-size:.6rem; padding:1px 6px; border-radius:3px; color:var(--color-text-secondary); border:1px solid var(--color-border);" x-text="ev.source"></span>
                 <template x-for="t in (ev.triggers_fired||[])" :key="t.name">
                   <span style="font-size:.6rem; padding:1px 5px; border-radius:3px; background:var(--color-panel);" x-text="t.name"></span>
                 </template>

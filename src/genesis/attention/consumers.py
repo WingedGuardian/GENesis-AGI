@@ -78,7 +78,7 @@ class ShadowStoreConsumer:
             triggers, json.dumps(list(ev.suppressors)), window_ref, ev.mode_state,
             ev.clarity, json.dumps(ev.l15_verdict) if ev.l15_verdict is not None else None,
             None,  # acceptance_signal — back-filled at review (PR2)
-            self.snapshot_id, self.config_version, self._created_at,
+            self.snapshot_id, self.config_version, self._created_at, ev.source,
         )
 
     async def flush(self) -> int:
