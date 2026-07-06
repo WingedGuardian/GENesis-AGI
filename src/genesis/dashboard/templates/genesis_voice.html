@@ -16,6 +16,7 @@
 
   <script type="module">
     import { fetchApi } from "/js/api.js";
+    import { fmtAge, chipState, chipClass, chipGlyph } from "/js/ui-utils.js";
 
     document.addEventListener("alpine:init", () => {
       Alpine.store("genesisVoice", {
@@ -33,32 +34,38 @@
         attentionLabeling: {},   // {event_id: true} while a label POST is in flight
         attentionNotes: {},      // {event_id: draft note text} — the reviewer's WHY, sent with the label
 
-        // ── Bridge (ambient edge) — reuses /api/genesis/health infrastructure.ambient ──
-        bridge: null,
+        // ── Bridge (ambient edge) — full health snapshot via /api/genesis/voice/bridge ──
+        bridge: null,          // {configured, reachable, verdict, reasons, latency_ms, health?}
         bridgeError: null,
         bridgeLoading: true,
         async fetchBridge() {
           this.bridgeLoading = true;
           try {
-            const resp = await fetchApi("/api/genesis/health");
+            const resp = await fetchApi("/api/genesis/voice/bridge");
             if (resp && resp.ok) {
-              const data = await resp.json();
-              this.bridge = (data.infrastructure || {}).ambient || null;
-              this.bridgeError = this.bridge ? null : "no ambient bridge in the health snapshot (edge not reporting)";
-            } else { this.bridgeError = `health fetch failed (${resp ? resp.status : "network error"})`; }
-          } catch (e) { this.bridgeError = String(e); }
+              const d = await resp.json();
+              if (d && d.configured === false) { this.bridge = null; this.bridgeError = d.reason || "no ambient edge configured"; }
+              // unreachable/misconfigured stay renderable: the verdict chip + reasons tell the story
+              else { this.bridge = d; this.bridgeError = null; }
+            } else { this.bridge = null; this.bridgeError = `bridge fetch failed (${resp ? resp.status : "network error"})`; }
+          } catch (e) { this.bridge = null; this.bridgeError = String(e); }
           finally { this.bridgeLoading = false; }
         },
-        _bridgeColor(status) {
-          const s = (status || "").toLowerCase();
-          if (s === "healthy" || s === "ok") return "var(--color-primary)";
-          if (s === "degraded") return "var(--color-warning-text)";
-          if (s === "down" || s === "error") return "#ef4444";
-          return "var(--color-text-secondary)";
-        },
+        bridgeHealth() { return (this.bridge && this.bridge.health) || {}; },
+        // shared ui-utils wrappers — Alpine template expressions can't reach module imports
+        _age(ts) { return fmtAge(ts); },
+        _chip(verdict) { return chipClass(chipState(verdict)); },
+        _chipGlyph(verdict) { return chipGlyph(chipState(verdict)); },
+        _yn(v) { return v === true ? "yes" : v === false ? "no" : (v ?? "—"); },
+        _num(v, unit) { return (v === null || v === undefined) ? "—" : `${v}${unit || ""}`; },
+        // keys the panel renders explicitly; anything else the edge adds shows under "Other"
+        _bridgeShown: ["ts","mode","active_connections","last_connection_ts","utterances_total",
+          "rows_last_hour","total_rows","last_ts","diar_enabled","diar_worker_alive","diar_queue_depth",
+          "diar_windows_dropped","diar_pool_recycles","ort_arena_off","rss_parent_mb","rss_diar_child_mb",
+          "rss_total_mb","conn_total_connects","conn_total_disconnects","conn_dark_events","conn_last_gap_s",
+          "conn_longest_gap_s","conn_dark_since","conn_dark_for_s","speaker_id_enabled","enrolling"],
         bridgeExtras() {
-          const b = this.bridge || {};
-          return Object.entries(b).filter(([k]) => !["status","latency_ms","message"].includes(k));
+          return Object.entries(this.bridgeHealth()).filter(([k]) => !this._bridgeShown.includes(k));
         },
 
         // ── Device (Voice PE hardware vitals via Home Assistant) ──
@@ -227,6 +234,9 @@
     .voice-tabs button { background:transparent; border:none; color:var(--color-text-secondary); padding:.5rem 1rem; cursor:pointer; border-bottom:2px solid transparent; font-size:.9rem; }
     .voice-tabs button.active { color:var(--color-text); border-bottom-color:var(--color-primary); font-weight:600; }
     .voice-stat { flex:1; min-width:120px; background:var(--color-background); border-radius:6px; padding:.75rem; text-align:center; }
+    .bridge-group-title { font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; color:var(--color-text-secondary); margin-bottom:.4rem; font-weight:600; }
+    .bridge-row { display:flex; gap:.5rem; font-size:.8rem; margin-bottom:.25rem; }
+    .bridge-row span:first-child { min-width:140px; color:var(--color-text-secondary); flex-shrink:0; }
   </style>
 </head>
 
@@ -471,28 +481,88 @@
       <div class="panel-header"><span class="material-symbols-outlined">sensors</span> Ambient Bridge</div>
       <div style="padding:1rem;">
         <div style="color:var(--color-text-secondary); font-size:.85em; margin-bottom:1rem;">
-          Live health of the edge ambient-capture bridge (from the <code>infrastructure.ambient</code> probe). An absent bridge is not a fault.
+          Live health of the edge ambient-capture bridge, read on demand from the edge's <code>ambient_health.json</code>. An absent device is not a fault.
         </div>
         <template x-if="$store.genesisVoice.bridgeLoading && !$store.genesisVoice.bridge">
-          <p style="color:var(--color-text-secondary);">Loading bridge status…</p>
+          <p style="color:var(--color-text-secondary);">Loading bridge health…</p>
         </template>
         <template x-if="$store.genesisVoice.bridge">
-          <div>
+          <div x-data="{ get gv() { return $store.genesisVoice; }, get b() { return $store.genesisVoice.bridge || {}; }, get h() { return $store.genesisVoice.bridgeHealth(); } }">
+            <!-- verdict chip + reasons -->
+            <div style="display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; margin-bottom:1rem;">
+              <span :class="gv._chip(b.verdict)"><span x-text="gv._chipGlyph(b.verdict)"></span> <span style="text-transform:uppercase;" x-text="b.verdict || 'unknown'"></span></span>
+              <span style="font-size:.8rem; color:var(--color-text-secondary);" x-text="(b.reasons || []).join('; ')"></span>
+            </div>
+            <!-- headline stat cards -->
             <div style="display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1rem;">
               <div class="voice-stat">
-                <div style="font-size:1.3rem; font-weight:700; text-transform:uppercase;" :style="`color:${$store.genesisVoice._bridgeColor($store.genesisVoice.bridge.status)}`" x-text="$store.genesisVoice.bridge.status || 'unknown'"></div>
-                <div style="font-size:.75rem; color:var(--color-text-secondary);">Status</div>
+                <div style="font-size:1.3rem; font-weight:700; text-transform:uppercase;" x-text="h.mode || '—'"></div>
+                <div style="font-size:.75rem; color:var(--color-text-secondary);">Mode</div>
               </div>
-              <div class="voice-stat" x-show="$store.genesisVoice.bridge.latency_ms != null">
-                <div style="font-size:1.3rem; font-weight:700;" x-text="Math.round($store.genesisVoice.bridge.latency_ms) + ' ms'"></div>
+              <div class="voice-stat">
+                <div style="font-size:1.3rem; font-weight:700;" :style="`color:${(h.active_connections || 0) > 0 ? 'var(--color-primary)' : 'var(--color-text-secondary)'}`" x-text="(h.active_connections || 0) > 0 ? 'connected' : 'no device'"></div>
+                <div style="font-size:.75rem; color:var(--color-text-secondary);">Device</div>
+              </div>
+              <div class="voice-stat">
+                <div style="font-size:1.3rem; font-weight:700;" :title="h.ts || ''" x-text="gv._age(h.ts)"></div>
+                <div style="font-size:.75rem; color:var(--color-text-secondary);">Heartbeat</div>
+              </div>
+              <div class="voice-stat" x-show="h.rss_total_mb != null">
+                <div style="font-size:1.3rem; font-weight:700;" x-text="gv._num(h.rss_total_mb, ' MB')"></div>
+                <div style="font-size:.75rem; color:var(--color-text-secondary);">Total RSS</div>
+              </div>
+              <div class="voice-stat" x-show="b.latency_ms != null">
+                <div style="font-size:1.3rem; font-weight:700;" x-text="Math.round(b.latency_ms) + ' ms'"></div>
                 <div style="font-size:.75rem; color:var(--color-text-secondary);">Probe latency</div>
               </div>
             </div>
-            <div x-show="$store.genesisVoice.bridge.message" style="color:var(--color-text-secondary); margin-bottom:1rem;" x-text="$store.genesisVoice.bridge.message"></div>
-            <template x-if="$store.genesisVoice.bridgeExtras().length">
-              <div style="display:flex; flex-direction:column; gap:.25rem; font-size:.8rem;">
-                <template x-for="[k,v] in $store.genesisVoice.bridgeExtras()" :key="k">
-                  <div style="display:flex; gap:.5rem;"><span style="min-width:160px; color:var(--color-text-secondary);" x-text="k"></span><span x-text="typeof v === 'object' ? JSON.stringify(v) : v"></span></div>
+            <!-- detail groups (only when the edge payload came back) -->
+            <template x-if="b.health">
+              <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:1.25rem;">
+                <div>
+                  <div class="bridge-group-title">Memory (leak watch)</div>
+                  <div class="bridge-row"><span>Parent RSS</span><span x-text="gv._num(h.rss_parent_mb, ' MB')"></span></div>
+                  <div class="bridge-row"><span>Diar child RSS</span><span x-text="gv._num(h.rss_diar_child_mb, ' MB')"></span></div>
+                  <div class="bridge-row"><span>Total RSS</span><span x-text="gv._num(h.rss_total_mb, ' MB')"></span></div>
+                  <div class="bridge-row"><span>ORT arena off</span><span x-text="gv._yn(h.ort_arena_off)"></span></div>
+                  <div class="bridge-row"><span>Pool recycles</span><span x-text="gv._num(h.diar_pool_recycles)"></span></div>
+                </div>
+                <div>
+                  <div class="bridge-group-title">Capture</div>
+                  <div class="bridge-row"><span>Utterances total</span><span x-text="gv._num(h.utterances_total)"></span></div>
+                  <div class="bridge-row"><span>Rows last hour</span><span x-text="gv._num(h.rows_last_hour)"></span></div>
+                  <div class="bridge-row"><span>Total rows</span><span x-text="gv._num(h.total_rows)"></span></div>
+                  <div class="bridge-row"><span>Last utterance</span><span :title="h.last_ts || ''" x-text="gv._age(h.last_ts)"></span></div>
+                </div>
+                <div>
+                  <div class="bridge-group-title">Diarization</div>
+                  <div class="bridge-row"><span>Enabled</span><span x-text="gv._yn(h.diar_enabled)"></span></div>
+                  <div class="bridge-row"><span>Worker alive</span><span x-text="gv._yn(h.diar_worker_alive)"></span></div>
+                  <div class="bridge-row"><span>Queue depth</span><span x-text="gv._num(h.diar_queue_depth)"></span></div>
+                  <div class="bridge-row"><span>Windows dropped</span><span x-text="gv._num(h.diar_windows_dropped)"></span></div>
+                </div>
+                <div>
+                  <div class="bridge-group-title">Connection stability</div>
+                  <div class="bridge-row"><span>Connects</span><span x-text="gv._num(h.conn_total_connects)"></span></div>
+                  <div class="bridge-row"><span>Disconnects</span><span x-text="gv._num(h.conn_total_disconnects)"></span></div>
+                  <div class="bridge-row"><span>Dark events</span><span x-text="gv._num(h.conn_dark_events)"></span></div>
+                  <div class="bridge-row"><span>Last gap</span><span x-text="gv._num(h.conn_last_gap_s, ' s')"></span></div>
+                  <div class="bridge-row"><span>Longest gap</span><span x-text="gv._num(h.conn_longest_gap_s, ' s')"></span></div>
+                  <div class="bridge-row"><span>Last device link</span><span :title="h.last_connection_ts || ''" x-text="gv._age(h.last_connection_ts)"></span></div>
+                  <div class="bridge-row" x-show="h.conn_dark_for_s != null"><span>Dark for</span><span style="color:var(--color-warning-text);" x-text="gv._num(h.conn_dark_for_s, ' s')"></span></div>
+                </div>
+                <div>
+                  <div class="bridge-group-title">Speaker ID</div>
+                  <div class="bridge-row"><span>Enabled</span><span x-text="gv._yn(h.speaker_id_enabled)"></span></div>
+                  <div class="bridge-row"><span>Enrolling</span><span x-text="h.enrolling || '—'"></span></div>
+                </div>
+                <template x-if="gv.bridgeExtras().length">
+                  <div>
+                    <div class="bridge-group-title">Other</div>
+                    <template x-for="[k,v] in gv.bridgeExtras()" :key="k">
+                      <div class="bridge-row"><span x-text="k"></span><span x-text="typeof v === 'object' ? JSON.stringify(v) : String(v)"></span></div>
+                    </template>
+                  </div>
                 </template>
               </div>
             </template>

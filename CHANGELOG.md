@@ -9,6 +9,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **The voice dashboard's Bridge tab is now a full cockpit.** Instead of a bare status line, it
+  shows the ambient edge bridge's complete live health, grouped for scanning: memory leak-watch
+  (parent / diarization-child / total RSS, ORT-arena state, pool recycles), capture activity
+  (utterances, rows per hour, last-utterance age), diarization worker state, connection
+  stability (connects, dark events, gap durations), and speaker-ID status — read on demand from
+  the edge via the new `GET /api/genesis/voice/bridge` endpoint. Any new health field the edge
+  starts reporting surfaces automatically under "Other."
+
+- **Voice dashboard Device tab: live Voice PE hardware vitals.** Temperature, WiFi signal,
+  uptime, reset reason, free heap, loop time, and voice-pipeline status, polled from Home
+  Assistant on demand (`GET /api/genesis/voice/device`; set `HA_VOICE_PE_PREFIX`). *(Shipped
+  earlier in #876; the changelog entry was missed at the time.)*
+
 ### Fixed
 
 - **A false "deferred work backlog" health warning no longer fires every few minutes.** The
