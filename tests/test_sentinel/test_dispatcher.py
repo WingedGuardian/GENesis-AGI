@@ -23,10 +23,20 @@ from genesis.sentinel.state import SentinelState, SentinelStateData
 
 @pytest.fixture(autouse=True)
 def _isolate_state(monkeypatch):
-    """Ensure load_state returns fresh state, not the live system's state file."""
+    """Isolate every test from the live system's state file.
+
+    load_state returns fresh state and save_state is a no-op — without the
+    latter, any dispatcher call site not individually wrapped in a
+    patch() would atomically overwrite ~/.genesis/sentinel_state.json on
+    the machine running the tests.
+    """
     monkeypatch.setattr(
         "genesis.sentinel.dispatcher.load_state",
         lambda: SentinelStateData(),
+    )
+    monkeypatch.setattr(
+        "genesis.sentinel.dispatcher.save_state",
+        lambda *args, **kwargs: None,
     )
 
 
@@ -115,8 +125,7 @@ class TestDispatch:
         d._state.started_at = "2020-01-01T00:00:00+00:00"
 
         # Mock observation creation
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             result = await d.dispatch(SentinelRequest(
@@ -141,8 +150,7 @@ class TestDispatch:
         mock_output.text = '{"diagnosis": "cannot fix", "actions_taken": [], "resolved": false}'
         d._invoker.run = AsyncMock(return_value=mock_output)
 
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             result = await d.dispatch(SentinelRequest(
@@ -159,8 +167,7 @@ class TestDispatch:
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
 
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             await d.dispatch(SentinelRequest(
@@ -181,10 +188,9 @@ class TestAutoReset:
         d._state.escalated_count = 0
         d._state.started_at = "2020-01-01T00:00:00+00:00"
 
-        with patch("genesis.sentinel.dispatcher.save_state"):
-            result = await d.dispatch(SentinelRequest(
-                trigger_source="test", trigger_reason="after reset",
-            ))
+        result = await d.dispatch(SentinelRequest(
+            trigger_source="test", trigger_reason="after reset",
+        ))
 
         # The dispatch auto-resets from ESCALATED first (incrementing count),
         # then dispatches CC which resolves successfully (resetting count to 0)
@@ -199,8 +205,7 @@ class TestEscalateDirect:
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
 
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             result = await d.escalate_direct(
@@ -348,8 +353,7 @@ class TestPatternResetOnResolve:
         d._pattern_attempts["infra:container_memory_high"] = [time.monotonic() - (20 * 60)]
 
         alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             result = await d.dispatch(SentinelRequest(
@@ -375,8 +379,7 @@ class TestPatternResetOnResolve:
         d._invoker.run = AsyncMock(return_value=mock_output)
 
         alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             await d.dispatch(SentinelRequest(
@@ -401,8 +404,7 @@ class TestResolvedCooldown:
         d._state.started_at = "2020-01-01T00:00:00+00:00"
         alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
 
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             # First dispatch: resolves
@@ -416,8 +418,7 @@ class TestResolvedCooldown:
         # Cooldown recorded
         assert "infra:container_memory_high" in d._resolved_cooldowns
 
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             # Second dispatch: same pattern, should be blocked by cooldown
@@ -470,8 +471,7 @@ class TestEscalation:
         ]
 
         alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.append_log"):
+        with patch("genesis.sentinel.dispatcher.append_log"):
             result = await d.dispatch(SentinelRequest(
                 trigger_source="fire_alarm",
                 trigger_reason="Tier 2 alarm",
@@ -503,8 +503,7 @@ class TestEscalation:
         ]
 
         alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.append_log"):
+        with patch("genesis.sentinel.dispatcher.append_log"):
             await d.dispatch(SentinelRequest(
                 trigger_source="fire_alarm",
                 trigger_reason="Tier 2 alarm",
@@ -536,8 +535,7 @@ class TestEscalation:
         ]
 
         alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.append_log"):
+        with patch("genesis.sentinel.dispatcher.append_log"):
             result = await d.dispatch(SentinelRequest(
                 trigger_source="fire_alarm",
                 trigger_reason="Tier 2 alarm",
@@ -556,8 +554,7 @@ class TestEscalation:
         d._escalated_patterns["infra:container_memory_high"] = "2026-04-09T23:00:00+00:00"
 
         alarm = FireAlarm(tier=2, alert_id="infra:container_memory_high", severity="CRITICAL", message="mem")
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.append_log"):
+        with patch("genesis.sentinel.dispatcher.append_log"):
             result = await d.dispatch(SentinelRequest(
                 trigger_source="fire_alarm",
                 trigger_reason="Tier 2 alarm",
@@ -585,8 +582,7 @@ class TestLockStarvationGuard:
 
         await d._lock.acquire()  # simulate an in-flight remediation holding the lock
         try:
-            with patch("genesis.mcp.health_mcp._impl_health_alerts", new=AsyncMock(return_value=alerts)), \
-                 patch("genesis.sentinel.dispatcher.save_state"):
+            with patch("genesis.mcp.health_mcp._impl_health_alerts", new=AsyncMock(return_value=alerts)):
                 # Two consecutive confirmed ticks would normally dispatch on the
                 # second — while the lock is held, neither does (and neither blocks).
                 r1 = await d.check_fire_alarms()
@@ -608,7 +604,6 @@ class TestLockStarvationGuard:
         alerts = [{"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"}]
 
         with patch("genesis.mcp.health_mcp._impl_health_alerts", new=AsyncMock(return_value=alerts)), \
-             patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"):
@@ -644,7 +639,6 @@ class TestRingBufferDebounce:
 
         alerts = [{"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"}]
         with patch("genesis.mcp.health_mcp._impl_health_alerts", new=AsyncMock(return_value=alerts)), \
-             patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"):
@@ -669,7 +663,6 @@ class TestRingBufferDebounce:
         _alerts_side_effect.calls = [alerts_on, alerts_off, alerts_on]
 
         with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts_side_effect), \
-             patch("genesis.sentinel.dispatcher.save_state"), \
              patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"):
@@ -722,8 +715,7 @@ class TestRejectionWindow:
         expiry = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
         d._state.rejected_patterns["infra:container_memory_high"] = expiry
 
-        with patch("genesis.sentinel.dispatcher.save_state"):
-            ready, _ = d._backoff_ready("infra:container_memory_high")
+        ready, _ = d._backoff_ready("infra:container_memory_high")
 
         assert ready is True
         assert "infra:container_memory_high" not in d._state.rejected_patterns
@@ -759,8 +751,7 @@ class TestRejectionWindow:
         d._state.pending_policy_id = "sentinel_dispatch"
         d._state.pending_pattern = "infra:container_memory_high"
 
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.append_log"):
+        with patch("genesis.sentinel.dispatcher.append_log"):
             result = await d.handle_approval_resolution("req-123", "rejected")
 
         assert result is not None
@@ -838,8 +829,7 @@ class TestSentinelActionStalenessGuard:
         mock_execute = AsyncMock(return_value=[])
         with patch.object(d, "_re_verify_alarms", new_callable=AsyncMock, return_value=True), \
              patch.object(d, "_execute_approved_actions", mock_execute), \
-             patch.object(d, "_finalize_dispatch", new_callable=AsyncMock, return_value=SentinelResult(dispatched=True)), \
-             patch("genesis.sentinel.dispatcher.save_state"):
+             patch.object(d, "_finalize_dispatch", new_callable=AsyncMock, return_value=SentinelResult(dispatched=True)):
             result = await d.resume_from_approval("req-action-1", "approved")
 
         assert result is not None
@@ -853,8 +843,7 @@ class TestSentinelActionStalenessGuard:
         _setup_pending_action(d)
 
         with patch.object(d, "_re_verify_alarms", new_callable=AsyncMock, return_value=False), \
-             patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, return_value=[]), \
-             patch("genesis.sentinel.dispatcher.save_state"):
+             patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, return_value=[]):
             result = await d.resume_from_approval("req-action-1", "approved")
 
         assert result is not None
@@ -871,8 +860,7 @@ class TestSentinelActionStalenessGuard:
         new_alerts = [{"alert_id": "different:alarm", "tier": 1}]
 
         with patch.object(d, "_re_verify_alarms", new_callable=AsyncMock, return_value=False), \
-             patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, return_value=new_alerts), \
-             patch("genesis.sentinel.dispatcher.save_state"):
+             patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, return_value=new_alerts):
             result = await d.resume_from_approval("req-action-1", "approved")
 
         assert result is not None
@@ -890,8 +878,7 @@ class TestSentinelActionStalenessGuard:
         with patch.object(d, "_re_verify_alarms", new_callable=AsyncMock, return_value=False), \
              patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, side_effect=Exception("health unavailable")), \
              patch.object(d, "_execute_approved_actions", mock_execute), \
-             patch.object(d, "_finalize_dispatch", new_callable=AsyncMock, return_value=SentinelResult(dispatched=True)), \
-             patch("genesis.sentinel.dispatcher.save_state"):
+             patch.object(d, "_finalize_dispatch", new_callable=AsyncMock, return_value=SentinelResult(dispatched=True)):
             result = await d.resume_from_approval("req-action-1", "approved")
 
         assert result is not None
@@ -903,8 +890,7 @@ class TestSentinelActionStalenessGuard:
         d = _make_dispatcher()
         _setup_pending_action(d, request_id="req-action-1")
 
-        with patch("genesis.sentinel.dispatcher.save_state"):
-            result = await d.resume_from_approval("req-wrong-id", "approved")
+        result = await d.resume_from_approval("req-wrong-id", "approved")
 
         assert result is None
 
@@ -936,8 +922,7 @@ class TestConvergePendingApproval:
         gate.get_request = AsyncMock(return_value={"id": "req-123", "status": "rejected"})
         d = self._parked(gate)
 
-        with patch("genesis.sentinel.dispatcher.save_state"):
-            await d.converge_pending_approval()
+        await d.converge_pending_approval()
 
         assert d._state.state == SentinelState.HEALTHY
         assert d._state.pending_request_id == ""
@@ -951,8 +936,7 @@ class TestConvergePendingApproval:
         gate.get_request = AsyncMock(return_value=row)
         d = self._parked(gate)
 
-        with patch("genesis.sentinel.dispatcher.save_state"):
-            await d.converge_pending_approval()
+        await d.converge_pending_approval()
 
         assert d._state.state == SentinelState.HEALTHY
         assert d._state.pending_request_id == ""
@@ -965,8 +949,7 @@ class TestConvergePendingApproval:
         gate.get_request = AsyncMock(return_value={"id": "req-123", "status": "pending"})
         d = self._parked(gate)
 
-        with patch("genesis.sentinel.dispatcher.save_state"):
-            await d.converge_pending_approval()
+        await d.converge_pending_approval()
 
         assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
         assert d._state.pending_request_id == "req-123"
@@ -979,8 +962,7 @@ class TestConvergePendingApproval:
         d = self._parked(gate)
         d.resume_from_approval = AsyncMock(return_value=None)
 
-        with patch("genesis.sentinel.dispatcher.save_state"):
-            await d.converge_pending_approval()
+        await d.converge_pending_approval()
 
         gate.mark_consumed.assert_awaited_once_with("req-123")
         d.resume_from_approval.assert_awaited_once_with("req-123", "approved")
@@ -993,8 +975,7 @@ class TestConvergePendingApproval:
         d = self._parked(gate)
         d.resume_from_approval = AsyncMock(return_value=None)
 
-        with patch("genesis.sentinel.dispatcher.save_state"):
-            await d.converge_pending_approval()
+        await d.converge_pending_approval()
 
         d.resume_from_approval.assert_not_awaited()
         assert d._state.state == SentinelState.HEALTHY
@@ -1025,8 +1006,7 @@ class TestConvergePendingApproval:
         )
         d._state.pending_request_id = ""
 
-        with patch("genesis.sentinel.dispatcher.save_state"):
-            await d.converge_pending_approval()
+        await d.converge_pending_approval()
 
         gate.get_request.assert_not_awaited()
         gate.mark_consumed.assert_not_awaited()
@@ -1063,8 +1043,7 @@ class TestOperationalBrief:
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
 
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"):
             await d.dispatch(SentinelRequest(
@@ -1162,8 +1141,7 @@ class TestShadowClassification:
         d._invoker.run = AsyncMock(return_value=_proposed_actions_output())
 
         mock_execute = AsyncMock(return_value=[])
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log") as mock_log, \
              patch.object(d, "_execute_approved_actions", mock_execute):
@@ -1192,8 +1170,7 @@ class TestShadowClassification:
         d._invoker.run = AsyncMock(return_value=_proposed_actions_output())
 
         mock_execute = AsyncMock(return_value=[])
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log") as mock_log, \
              patch.object(d, "_execute_approved_actions", mock_execute):
@@ -1215,8 +1192,7 @@ class TestShadowClassification:
         d._invoker.run = AsyncMock(return_value=_proposed_actions_output())
 
         mock_execute = AsyncMock(return_value=[])
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log"), \
              patch(
@@ -1238,8 +1214,7 @@ class TestShadowClassification:
         d = _make_dispatcher()  # default invoker output proposes no actions
         d._state.started_at = "2020-01-01T00:00:00+00:00"
 
-        with patch("genesis.sentinel.dispatcher.save_state"), \
-             patch("genesis.sentinel.dispatcher.write_last_run"), \
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
              patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
              patch("genesis.sentinel.dispatcher.append_log") as mock_log:
             result = await d.dispatch(SentinelRequest(
