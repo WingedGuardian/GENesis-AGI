@@ -6,6 +6,17 @@ Usage:
     python -m genesis.guardian --check-only  # one-shot health check (no recovery)
     python -m genesis.guardian --test-approval  # E2E test the keyword-reply gate
     python -m genesis.guardian --disk-status  # print storage-pool JSON (read-only)
+    python -m genesis.guardian --provision-status              # host capacity (read-only)
+    python -m genesis.guardian --provision-grow-disk <disk> <GiB>  # EXECUTE (pre-approved)
+    python -m genesis.guardian --provision-grow-memory <MiB>       # EXECUTE (pre-approved)
+    python -m genesis.guardian --storage-expand               # absorb a grown disk
+
+The provisioning grow/expand verbs are EXECUTE-ONLY: they run the shared
+execute-core (fresh due-diligence re-check + rate cap + one attempt + ledger),
+with NO Telegram approval gate. Approval is the CALLER's responsibility — the
+container obtains it via its own bot before invoking the gateway verb. The
+guardian's own getUpdates approval path (Genesis-DOWN) lives in check.py's
+autonomous pool-crit hook, never here.
 """
 
 from __future__ import annotations
@@ -35,6 +46,18 @@ def main() -> None:
     if "--disk-status" in sys.argv:
         asyncio.run(_disk_status())
         return
+
+    if "--provision-status" in sys.argv:
+        sys.exit(asyncio.run(_provision_status()))
+
+    if "--provision-grow-disk" in sys.argv:
+        sys.exit(asyncio.run(_provision_grow_disk(sys.argv)))
+
+    if "--provision-grow-memory" in sys.argv:
+        sys.exit(asyncio.run(_provision_grow_memory(sys.argv)))
+
+    if "--storage-expand" in sys.argv:
+        sys.exit(asyncio.run(_storage_expand()))
 
     asyncio.run(run_check())
 
@@ -142,6 +165,122 @@ async def _disk_status() -> None:
         "tier": tier,
         "snapshots": snapshots,
     }))
+
+
+def _emit(obj: dict) -> int:
+    """Print a JSON result line and return a shell exit code (0 iff ok)."""
+    import json
+    print(json.dumps(obj))
+    return 0 if obj.get("ok") else 1
+
+
+def _args_after(argv: list[str], flag: str, n: int) -> list[str] | None:
+    """Return the n positional args following ``flag``, or None if absent."""
+    try:
+        i = argv.index(flag)
+    except ValueError:
+        return None
+    tail = argv[i + 1 : i + 1 + n]
+    return tail if len(tail) == n else None
+
+
+async def _provision_status() -> int:
+    """Read-only host capacity via the audit token. Genesis's provisioning
+    window: VM cores/RAM, per-disk sizes, storage + node-RAM headroom."""
+    import dataclasses
+
+    from genesis.guardian.check import _build_provisioning_adapter
+    from genesis.guardian.config import load_config
+
+    adapter = _build_provisioning_adapter(load_config())
+    if adapter is None:
+        return _emit({"ok": False, "action": "provision-status",
+                      "error": "provisioning disabled or unconfigured"})
+    cap = await adapter.get_capacity()
+    return _emit({"ok": cap.detected, "action": "provision-status",
+                  "capacity": dataclasses.asdict(cap)})
+
+
+async def _provision_grow_disk(argv: list[str]) -> int:
+    """EXECUTE (pre-approved) a VM disk grow + absorb into the thin pool."""
+    import re
+
+    from genesis.guardian.check import _build_dispatcher, _build_provisioning_adapter
+    from genesis.guardian.config import load_config
+    from genesis.guardian.provisioning.flow import (
+        ProvisionRequest,
+        execute_provisioning_action,
+    )
+    from genesis.guardian.provisioning.ledger import ProvisioningLedger
+
+    args = _args_after(argv, "--provision-grow-disk", 2)
+    if not args:
+        return _emit({"ok": False, "action": "provision-grow-disk",
+                      "error": "usage: --provision-grow-disk <disk> <GiB>"})
+    disk, gib_s = args
+    if not re.fullmatch(r"(scsi|virtio|sata)[0-9]{1,2}", disk):
+        return _emit({"ok": False, "action": "provision-grow-disk",
+                      "error": f"invalid disk {disk!r}"})
+    if not re.fullmatch(r"[1-9][0-9]{0,2}", gib_s):
+        return _emit({"ok": False, "action": "provision-grow-disk",
+                      "error": f"invalid GiB {gib_s!r} (1-999)"})
+
+    config = load_config()
+    adapter = _build_provisioning_adapter(config)
+    if adapter is None:
+        return _emit({"ok": False, "action": "provision-grow-disk",
+                      "error": "provisioning disabled or unconfigured"})
+    request = ProvisionRequest(kind="disk", disk=disk, add_gib=int(gib_s),
+                               absorb_after=True, origin="container (approved)")
+    result = await execute_provisioning_action(
+        config, request, adapter, _build_dispatcher(config),
+        ProvisioningLedger(config.state_dir),
+    )
+    return _emit(result)
+
+
+async def _provision_grow_memory(argv: list[str]) -> int:
+    """EXECUTE (pre-approved) a VM memory grow (requires a later VM reboot)."""
+    import re
+
+    from genesis.guardian.check import _build_dispatcher, _build_provisioning_adapter
+    from genesis.guardian.config import load_config
+    from genesis.guardian.provisioning.flow import (
+        ProvisionRequest,
+        execute_provisioning_action,
+    )
+    from genesis.guardian.provisioning.ledger import ProvisioningLedger
+
+    args = _args_after(argv, "--provision-grow-memory", 1)
+    if not args or not re.fullmatch(r"[1-9][0-9]{2,5}", args[0]):
+        return _emit({"ok": False, "action": "provision-grow-memory",
+                      "error": "usage: --provision-grow-memory <MiB> (100-999999)"})
+
+    config = load_config()
+    adapter = _build_provisioning_adapter(config)
+    if adapter is None:
+        return _emit({"ok": False, "action": "provision-grow-memory",
+                      "error": "provisioning disabled or unconfigured"})
+    request = ProvisionRequest(kind="memory", new_mib=int(args[0]),
+                               origin="container (approved)")
+    result = await execute_provisioning_action(
+        config, request, adapter, _build_dispatcher(config),
+        ProvisioningLedger(config.state_dir),
+    )
+    return _emit(result)
+
+
+async def _storage_expand() -> int:
+    """Absorb an already-grown virtual disk into the LVM-thin pool (host-side).
+
+    Strictly additive LVM ops (pvresize → autoextend profile → verify). Used
+    standalone to retry the absorb after a disk grow already landed."""
+    from genesis.guardian.config import load_config
+    from genesis.guardian.provisioning.expand import expand_storage
+
+    result = await expand_storage(load_config())
+    result.setdefault("action", "storage-expand")
+    return _emit(result)
 
 
 async def _check_only() -> None:

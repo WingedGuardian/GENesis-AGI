@@ -309,6 +309,27 @@ class TestRemediationMap:
         monkeypatch.setattr(rm, "TOOLS", broken)
         assert "qdrant.local" not in rm.available_tools()
 
+    def test_host_resource_alloc_opts_in_via_flag(self, monkeypatch, tmp_path):
+        """host.resource_alloc is available only when guardian_remote.yaml sets
+        provisioning: true — absent file / missing flag / malformed ⇒ off."""
+        import genesis.sentinel.remediation_map as rm
+
+        home = tmp_path / "home"
+        (home / ".genesis").mkdir(parents=True)
+        monkeypatch.setattr("pathlib.Path.home", lambda: home)
+        cfg = home / ".genesis" / "guardian_remote.yaml"
+
+        assert rm._host_resource_alloc() is False  # file absent
+
+        cfg.write_text("host_ip: 10.0.0.1\nhost_user: guardian\n")
+        assert rm._host_resource_alloc() is False  # flag missing
+
+        cfg.write_text("host_ip: 10.0.0.1\nprovisioning: true\n")
+        assert rm._host_resource_alloc() is True   # opted in
+
+        cfg.write_text(": : not yaml : :\n")
+        assert rm._host_resource_alloc() is False  # malformed ⇒ fail-closed
+
     def test_is_remediable_requires_available_tool(self):
         assert is_remediable("infra:disk_low", frozenset({"container.disk_reclaim"}))
         assert not is_remediable("infra:disk_low", frozenset({"container.db_local"}))

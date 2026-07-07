@@ -165,6 +165,51 @@ class StoragePoolConfig:
 
 
 @dataclass
+class ProvisioningConfig:
+    """Hypervisor provisioning (rung 5 of the escalation ladder).
+
+    Lets the Guardian grow the VM's virtual disk / RAM from the hypervisor
+    (Proxmox) so a thin-pool with zero VG free extents can finally be extended —
+    the structural fix the 2026-07 outage proved was missing. Disabled by
+    default; every mutation passes a fresh per-action Telegram APPROVE/DENY gate.
+    Machine specifics (host/node/vmid/disk/storage) live here in config, never
+    hardcoded; only the two API token strings cross the credential bridge.
+
+    Safety invariants encoded as config, not code constants:
+    - grows are bounded per action (max_*_step_*) AND per week (max_actions_per_week)
+    - a fresh capacity+due-diligence re-check runs AFTER approval, before mutating
+    - node_memory_margin_mib / storage_margin_gib are headroom the grow must leave
+    """
+
+    enabled: bool = False
+    provider: str = "proxmox"  # only "proxmox" implemented; ABC allows others
+    api_host: str = ""         # PVE host, e.g. 192.168.1.10 — empty = unconfigured
+    api_port: int = 8006
+    verify_tls: bool = True     # self-signed PVE → set false per-install (documented)
+    node: str = ""             # PVE node name, e.g. "pve"
+    vmid: int = 0              # this container's host VM id, e.g. 100; 0 = unconfigured
+    target_disk: str = "scsi1"  # the disk backing the LVM-thin PV
+    storage: str = "local-lvm"  # PVE storage the disk lives on
+    # Per-action grow caps (a single approval can never exceed these).
+    max_disk_step_gib: int = 32
+    max_memory_step_mib: int = 4096
+    # Headroom the grow must leave on the hypervisor (refuse if it would dip below).
+    storage_margin_gib: int = 64
+    node_memory_margin_mib: int = 8192
+    # Rate cap: executed mutations allowed per rolling 7-day window.
+    max_actions_per_week: int = 2
+    # A recent successful backup is a precondition for an irreversible grow.
+    require_recent_backup: bool = True
+    backup_max_age_days: int = 14
+    # Bounded wait for the Telegram APPROVE/DENY reply (guardian is oneshot).
+    approval_timeout_s: int = 1800
+    # Damper: don't re-propose the same autonomous pool-grow more than this often.
+    min_repropose_hours: int = 24
+    # Autonomous path: on pool TIER_CRIT, PROPOSE a disk grow (never execute).
+    propose_on_pool_crit: bool = True
+
+
+@dataclass
 class GuardianConfig:
     """Top-level Guardian configuration."""
 
@@ -189,6 +234,7 @@ class GuardianConfig:
     snapshots: SnapshotConfig = field(default_factory=SnapshotConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     storage_pool: StoragePoolConfig = field(default_factory=StoragePoolConfig)
+    provisioning: ProvisioningConfig = field(default_factory=ProvisioningConfig)
 
     @property
     def health_url(self) -> str:
@@ -310,6 +356,12 @@ def _env_override(config: GuardianConfig) -> GuardianConfig:
         if val is not None:
             setattr(config.cc, attr, typ(val))
 
+    # Provisioning kill-switch — env can force-disable a config-enabled adapter
+    # (an operator escape hatch) or enable one for a live test.
+    prov_enabled = os.environ.get("GUARDIAN_PROVISIONING_ENABLED")
+    if prov_enabled is not None:
+        config.provisioning.enabled = prov_enabled.lower() in ("1", "true", "yes")
+
     return config
 
 
@@ -355,6 +407,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         snapshots=_build_sub(SnapshotConfig, raw, "snapshots"),
         recovery=_build_sub(RecoveryConfig, raw, "recovery"),
         storage_pool=_build_sub(StoragePoolConfig, raw, "storage_pool"),
+        provisioning=_build_sub(ProvisioningConfig, raw, "provisioning"),
     )
 
     return _env_override(config)

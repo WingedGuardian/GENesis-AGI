@@ -254,3 +254,73 @@ class TestAddressFamilyPin:
                            key_path="/tmp/test_key")
         args = await self._spawn_args(r)
         assert "AddressFamily=inet" not in args
+
+
+class TestProvisioningExecutors:
+    """EXECUTE-only executors: client-side validation + exact command + per-call
+    timeout override + JSON parsing. Approval is NOT done here."""
+
+    @pytest.mark.asyncio
+    async def test_provision_status_reads(self, remote):
+        with patch.object(remote, "_ssh_command",
+                          AsyncMock(return_value=(True, '{"ok": true, "capacity": {}}'))) as m:
+            res = await remote.provision_status()
+        assert res["ok"] is True
+        cmd, kw = m.call_args.args[0], m.call_args.kwargs
+        assert cmd == "provision-status"
+        assert kw["timeout"] == 70.0
+
+    @pytest.mark.asyncio
+    async def test_grow_disk_valid_sends_exact_command(self, remote):
+        with patch.object(remote, "_ssh_command",
+                          AsyncMock(return_value=(True, '{"ok": true, "stage": "executed"}'))) as m:
+            res = await remote.request_grow_disk("scsi1", 32)
+        assert res["ok"] is True
+        assert m.call_args.args[0] == "provision-grow-disk scsi1 32"
+        assert m.call_args.kwargs["timeout"] == 660.0
+
+    @pytest.mark.asyncio
+    async def test_grow_disk_bad_disk_never_dials(self, remote):
+        with patch.object(remote, "_ssh_command", AsyncMock()) as m:
+            res = await remote.request_grow_disk("sda1", 32)
+        assert res["ok"] is False and "invalid disk" in res["error"]
+        m.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_grow_disk_bad_gib_never_dials(self, remote):
+        with patch.object(remote, "_ssh_command", AsyncMock()) as m:
+            assert (await remote.request_grow_disk("scsi1", 0))["ok"] is False
+            assert (await remote.request_grow_disk("scsi1", 1000))["ok"] is False
+        m.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_grow_memory_validates_range(self, remote):
+        with patch.object(remote, "_ssh_command",
+                          AsyncMock(return_value=(True, '{"ok": true}'))) as m:
+            assert (await remote.request_grow_memory(99))["ok"] is False   # too small
+            m.assert_not_called()
+            await remote.request_grow_memory(24576)
+            assert m.call_args.args[0] == "provision-grow-memory 24576"
+            assert m.call_args.kwargs["timeout"] == 180.0
+
+    @pytest.mark.asyncio
+    async def test_storage_expand_command(self, remote):
+        with patch.object(remote, "_ssh_command",
+                          AsyncMock(return_value=(True, '{"ok": true}'))) as m:
+            await remote.storage_expand()
+        assert m.call_args.args[0] == "storage-expand"
+        assert m.call_args.kwargs["timeout"] == 660.0
+
+    @pytest.mark.asyncio
+    async def test_non_json_response_is_error(self, remote):
+        with patch.object(remote, "_ssh_command",
+                          AsyncMock(return_value=(True, "not json"))):
+            res = await remote.provision_status()
+        assert res["ok"] is False and res["error"] == "non-JSON response"
+
+    @pytest.mark.asyncio
+    async def test_ssh_failure_surfaces_as_error(self, remote):
+        with patch.object(remote, "_ssh_command",
+                          AsyncMock(return_value=(False, "timeout"))):
+            res = await remote.request_grow_disk("scsi1", 32)
+        assert res["ok"] is False and "timeout" in res["error"]

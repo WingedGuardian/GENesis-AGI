@@ -16,6 +16,11 @@
 #   test-approval   — E2E test the keyword-reply approval gate (no recovery)
 #   disk-status     — read-only storage-pool + snapshot JSON (Genesis's window
 #                     into host capacity: lvs data%/metadata%, VG free, snapshots)
+#   provision-status          — read-only Proxmox host capacity (audit token)
+#   provision-grow-disk <disk> <GiB> — EXECUTE a pre-approved VM disk grow +
+#                     absorb (execute-only: NO Telegram gate; caller approves)
+#   provision-grow-memory <MiB>      — EXECUTE a pre-approved VM memory grow
+#   storage-expand            — absorb an already-grown disk into the thin pool
 #   reharden-key    — rewrite the guardian authorized_keys line to the canonical
 #                     hardened options with a self-proving from= (dead-man's-
 #                     switch restores the previous file unless a fresh
@@ -563,6 +568,83 @@ PYEOF
         PYTHONPATH="$INSTALL_DIR/src" \
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
             timeout 30 "$VENV_PY" -m genesis.guardian --disk-status
+        ;;
+    provision-status)
+        # Read-only host capacity via the Proxmox AUDIT token (VM cores/RAM,
+        # per-disk sizes, storage + node-RAM headroom). No mutation, no sudo.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "provision-status", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+        GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
+            timeout 60 "$VENV_PY" -m genesis.guardian --provision-status
+        ;;
+    provision-grow-disk\ *)
+        # EXECUTE-ONLY (approval is the CALLER's job — the container approves via
+        # its own bot BEFORE calling this). Runs the execute-core: fresh
+        # due-diligence re-check + rate cap + ONE resize attempt + verify +
+        # ledger + storage-expand. Whole-string bash regex (NOT grep — grep is
+        # line-oriented; SSH_ORIGINAL_COMMAND is untrusted) rejects anything but
+        # exactly "<disk> <GiB>".
+        ARGS="${SSH_ORIGINAL_COMMAND#provision-grow-disk }"
+        PROV_DISK_RE='^(scsi|virtio|sata)[0-9]{1,2} [1-9][0-9]{0,2}$'
+        if [[ ! "$ARGS" =~ $PROV_DISK_RE ]]; then
+            echo '{"ok": false, "action": "provision-grow-disk", "error": "invalid args (expected <disk> <GiB 1-999>)"}' >&2
+            exit 1
+        fi
+        DISK="${ARGS%% *}"
+        GIB="${ARGS##* }"
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "provision-grow-disk", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+        GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
+            timeout 600 "$VENV_PY" -m genesis.guardian --provision-grow-disk "$DISK" "$GIB"
+        ;;
+    provision-grow-memory\ *)
+        # EXECUTE-ONLY (see provision-grow-disk). Grows configured VM memory;
+        # takes effect only after a VM reboot (scheduled downtime).
+        MIB="${SSH_ORIGINAL_COMMAND#provision-grow-memory }"
+        if [[ ! "$MIB" =~ ^[1-9][0-9]{2,5}$ ]]; then
+            echo '{"ok": false, "action": "provision-grow-memory", "error": "invalid MiB (100-999999)"}' >&2
+            exit 1
+        fi
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "provision-grow-memory", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+        GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
+            timeout 120 "$VENV_PY" -m genesis.guardian --provision-grow-memory "$MIB"
+        ;;
+    storage-expand)
+        # Absorb an already-grown virtual disk into the LVM-thin pool
+        # (pvresize → autoextend profile → verify). Strictly additive LVM ops
+        # (they use sudo -n internally), so guard passwordless sudo up front.
+        if ! sudo -n true 2>/dev/null; then
+            echo '{"ok": false, "action": "storage-expand", "error": "passwordless sudo unavailable"}' >&2
+            exit 1
+        fi
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "storage-expand", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+            timeout 600 "$VENV_PY" -m genesis.guardian --storage-expand
         ;;
     sync-gateway)
         # Recovery: redeploy the gateway script from the (already-pulled) install

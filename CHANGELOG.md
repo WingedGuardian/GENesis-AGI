@@ -11,6 +11,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis can now grow this VM's disk or RAM from the hypervisor — with your
+  approval — to fix the one storage failure nothing else could.** When the
+  container's storage pool has no room left to auto-expand into (the structural
+  cause of a full-pool outage), the only real fix is to add space at the
+  Proxmox layer. Genesis can now propose that grow, ask you to APPROVE or DENY,
+  and on approval grow the virtual disk and absorb it into the pool — or, if
+  Genesis itself is down in the outage, the host-side guardian can do it as part
+  of recovery. It is **off by default**, every change is approval-gated and
+  rate-capped, grows are one-attempt/never-auto-retried, and only two
+  read/write-split Proxmox tokens are ever stored. Setup and the full safety
+  model: `docs/reference/proxmox-provisioning.md`.
+
 - **Ambient bridge memory-leak regression alert.** If the edge bridge's RSS ever climbs past the
   healthy plateau again (total > 1000 MB or diarization child > 450 MB), ambient health flips to
   degraded and you get a one-time Telegram alert naming the breach — no nagging, and normal

@@ -84,12 +84,20 @@ def _guardian_configured() -> bool:
 def _host_resource_alloc() -> bool:
     """Host-level resource allocation (grow disk/RAM from the hypervisor).
 
-    No tool is wired for this yet — this is the integration slot for a
-    future Proxmox/AWS/host MCP. When one lands, its detector goes here and
-    ``infra:disk_low`` / ``infra:container_memory_high`` proposals gain the
-    host-allocation option (with capacity numbers and user approval).
+    Available when the container's ``guardian_remote.yaml`` opts in with
+    ``provisioning: true`` — the install-local flag that the approval-gated
+    Proxmox provisioning path (guardian gateway provision-* verbs +
+    ``provision_grow`` MCP tool) is wired on THIS install. A file-flag, not a
+    live gateway probe: cheap per awareness tick and stable through hypervisor
+    blips, so the tool doesn't vanish exactly when the pool is filling.
     """
-    return False
+    path = Path.home() / ".genesis" / "guardian_remote.yaml"
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text()) or {}
+    except Exception:  # noqa: BLE001 — missing/unreadable/malformed ⇒ unavailable
+        return False
+    return bool(data.get("provisioning"))
 
 
 TOOLS: tuple[RemediationTool, ...] = (
@@ -125,7 +133,8 @@ TOOLS: tuple[RemediationTool, ...] = (
     ),
     RemediationTool(
         "host.resource_alloc",
-        "Allocate additional disk/RAM from the host (future Proxmox/AWS MCP)",
+        "Grow this VM's disk/RAM from the hypervisor (approval-gated Proxmox "
+        "provisioning; propose the grow to the user)",
         _host_resource_alloc,
     ),
 )
