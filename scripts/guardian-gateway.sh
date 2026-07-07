@@ -22,6 +22,8 @@
 #   provision-grow-memory <MiB>      — EXECUTE a pre-approved VM memory grow
 #   storage-expand            — absorb an already-grown disk into the storage
 #                     pool (LVM-thin: pvresize; btrfs-on-LVM: + lvextend/resize)
+#   configure-provisioning <k=v ...> — land host provisioning config as a
+#                     state-dir override (survives redeploys; no secrets)
 #   reharden-key    — rewrite the guardian authorized_keys line to the canonical
 #                     hardened options with a self-proving from= (dead-man's-
 #                     switch restores the previous file unless a fresh
@@ -646,6 +648,36 @@ PYEOF
         PYTHONPATH="$INSTALL_DIR/src" \
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
             timeout 600 "$VENV_PY" -m genesis.guardian --storage-expand
+        ;;
+    configure-provisioning\ *)
+        # Land/refresh host provisioning config as a state-dir override
+        # (provisioning.local.yaml — survives redeploys, never edits the tracked
+        # guardian.yaml). key=value args only; strict charset guards the untrusted
+        # SSH_ORIGINAL_COMMAND (no shell metacharacters). NO secrets here — the two
+        # Proxmox tokens cross the credential bridge, not this verb.
+        ARGS="${SSH_ORIGINAL_COMMAND#configure-provisioning }"
+        # Require EVERY token to be key=value — a bare flag-shaped token (e.g.
+        # "--storage-expand") would otherwise word-split into argv and hijack
+        # main()'s `if "--x" in sys.argv` dispatch to a different guardian verb.
+        # key = lowercase field name; value = [-A-Za-z0-9_.] (covers IPs,
+        # local-lvm, scsiN, true/false, ints). No leading "-" token can match.
+        PROV_KV_RE='^[a-z_][a-z0-9_]*=[-A-Za-z0-9_.]*( [a-z_][a-z0-9_]*=[-A-Za-z0-9_.]*)*$'
+        if [[ ! "$ARGS" =~ $PROV_KV_RE ]]; then
+            echo '{"ok": false, "action": "configure-provisioning", "error": "invalid args (expected key=value tokens; key [a-z_], value [-A-Za-z0-9_.])"}' >&2
+            exit 1
+        fi
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "configure-provisioning", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        # ARGS is charset-validated above; intentional word-split into argv tokens.
+        # shellcheck disable=SC2086
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+        GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
+            timeout 30 "$VENV_PY" -m genesis.guardian --configure-provisioning $ARGS
         ;;
     sync-gateway)
         # Recovery: redeploy the gateway script from the (already-pulled) install

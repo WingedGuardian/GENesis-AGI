@@ -380,6 +380,89 @@ def _build_sub(cls: type, raw: dict, key: str) -> object:
     return cls(**{k: v for k, v in section.items() if k in valid_fields})
 
 
+# Provisioning override lives in the guardian STATE dir (not the git checkout),
+# so `configure-provisioning` can land host-specific provisioning config that
+# survives `update.sh` guardian redeploys without editing (or skip-worktree-ing)
+# the tracked guardian.yaml.
+_PROVISIONING_OVERRIDE_FILE = "provisioning.local.yaml"
+
+
+def _coerce_provisioning_value(default: object, value: object) -> object:
+    """Coerce a raw override value to the ProvisioningConfig field's type.
+
+    bool is checked before int (bool is an int subclass). Accepts real YAML
+    types (already correct) or strings (from the ``key=value`` CLI path).
+    """
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(default, int):
+        return int(value)
+    return str(value)
+
+
+def write_provisioning_override(state_dir: str, params: dict) -> Path:
+    """Write/replace the provisioning override file; return its path.
+
+    Only keys valid on ProvisioningConfig are accepted — an unknown key raises
+    ValueError so a typo can't silently no-op. No secrets belong here (the two
+    Proxmox tokens cross the credential bridge, never this file).
+    """
+    defaults = {f.name: f.default for f in dataclasses.fields(ProvisioningConfig)}
+    coerced: dict = {}
+    for k, v in params.items():
+        if k not in defaults:
+            raise ValueError(f"unknown provisioning field: {k!r}")
+        coerced[k] = _coerce_provisioning_value(defaults[k], v)
+    state_path = Path(state_dir).expanduser()
+    state_path.mkdir(parents=True, exist_ok=True)
+    dest = state_path / _PROVISIONING_OVERRIDE_FILE
+    # Atomic write: a mid-write kill must never leave a truncated override
+    # (it would be ignored and fall back to defaults, but a clean swap is free).
+    tmp = dest.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        yaml.safe_dump({"provisioning": coerced}, f, default_flow_style=False, sort_keys=True)
+    os.replace(tmp, dest)
+    return dest
+
+
+def _apply_provisioning_override(config: GuardianConfig) -> None:
+    """Merge the state-dir provisioning override onto the loaded config.
+
+    An absent or unreadable file is a silent no-op — a broken override must
+    never crash a guardian check cycle. Only fields valid on ProvisioningConfig
+    are applied; env overrides (incl. the GUARDIAN_PROVISIONING_ENABLED kill
+    switch) run AFTER this, so they always win.
+    """
+    override = config.state_path / _PROVISIONING_OVERRIDE_FILE
+    try:
+        if not override.exists():
+            return
+        with open(override) as f:
+            raw = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("Ignoring unreadable provisioning override %s: %s", override, exc)
+        return
+    section = raw.get("provisioning") if isinstance(raw, dict) and "provisioning" in raw else raw
+    if not isinstance(section, dict):
+        return
+    valid = {f.name for f in dataclasses.fields(ProvisioningConfig)}
+    applied = False
+    for k, v in section.items():
+        if k in valid:
+            setattr(config.provisioning, k, v)
+            applied = True
+    if applied:
+        logger.info("Applied provisioning override from %s", override)
+
+
+def _finalize(config: GuardianConfig) -> GuardianConfig:
+    """Apply the provisioning override then env overrides (env wins)."""
+    _apply_provisioning_override(config)
+    return _env_override(config)
+
+
 def load_config(path: Path | None = None) -> GuardianConfig:
     """Load Guardian config from YAML with env var overrides.
 
@@ -389,7 +472,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
 
     if not config_path.exists():
         logger.info("Guardian config not found at %s, using defaults", config_path)
-        return _env_override(GuardianConfig())
+        return _finalize(GuardianConfig())
 
     with open(config_path) as f:
         raw = yaml.safe_load(f) or {}
@@ -416,7 +499,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         provisioning=_build_sub(ProvisioningConfig, raw, "provisioning"),
     )
 
-    return _env_override(config)
+    return _finalize(config)
 
 
 def load_secrets(path: Path | None = None) -> dict[str, str]:

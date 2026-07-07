@@ -172,9 +172,18 @@ curl -sk -X PUT -H "Authorization: $AUD" "$H/nodes/<NODE>/qemu/<VMID>/config" -d
 2. **Credential bridge** — the awareness tick propagates just those two keys to
    `<state_dir>/shared/guardian/proxmox_creds.env` (0600) for the host guardian
    to read. Host/node/vmid are non-secret config, not bridged.
-3. **guardian.yaml** — fill the `provisioning:` block (`enabled: true`,
-   `api_host`, `node`, `vmid`, `verify_tls`). See the commented template in
-   `config/guardian.yaml`.
+3. **provisioning config** — land the `provisioning` fields (`enabled: true`,
+   `api_host`, `node`, `vmid`, `target_disk`, `storage`, `verify_tls`,
+   `require_recent_backup`). Preferred: the audited, repeatable gateway verb
+   ```
+   configure-provisioning enabled=true api_host=<PVE> node=<node> vmid=<id> \
+       target_disk=scsi1 storage=local-lvm verify_tls=false require_recent_backup=false
+   ```
+   which writes a `provisioning.local.yaml` **override in the guardian state_dir**
+   (outside the git checkout, so `update.sh` redeploys never clobber it) that the
+   config loader merges over `guardian.yaml`. `GUARDIAN_PROVISIONING_ENABLED=0`
+   still force-disables it. (Alternatively, edit the `provisioning:` block in
+   `guardian.yaml` directly — see the commented template in `config/guardian.yaml`.)
 4. **guardian_remote.yaml** (container) — add `provisioning: true` so the
    sentinel offers the `host.resource_alloc` remediation for disk/RAM alarms.
 
