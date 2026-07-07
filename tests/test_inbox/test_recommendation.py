@@ -322,6 +322,25 @@ verdict_reason: "No Proxmox cluster exists for Genesis to manage"
 ```
 """
 
+NEEDS_DISCUSSION_VERDICT = """\
+## 1. Hypothetical capability
+
+**Classification:** Genesis-relevant (capability-build directive)
+
+### Recommendation
+
+```yaml
+action: BUILD
+next_step: "Discuss shape before building"
+effort: Small
+scope: V4
+confidence: low
+architecture_impact: challenges
+verdict: needs_discussion
+verdict_reason: "Ambiguous interface - needs a design decision before the executor can proceed"
+```
+"""
+
 BAD_VERDICT_VALUE = """\
 ## 1. Something
 
@@ -400,6 +419,13 @@ class TestParseRecommendations:
         assert r.verdict_reason == "No Proxmox cluster exists for Genesis to manage"
         assert r.build_spec is None
         assert r.is_actionable is False
+
+    def test_needs_discussion_verdict_parses(self):
+        r = parse_recommendations(NEEDS_DISCUSSION_VERDICT)[0]
+        assert r.verdict == "needs_discussion"
+        assert r.verdict_reason is not None
+        assert r.build_spec is None
+        assert r.is_actionable is False  # BUILD is in _SKIP_ACTIONS
 
     def test_invalid_verdict_and_non_mapping_spec_degrade_to_none(self):
         # Shadow-safe: bad LLM output degrades to "no verdict", never invents one.
