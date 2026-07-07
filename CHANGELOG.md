@@ -7,14 +7,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
-## [Unreleased]
+## [v3.0b17] - 2026-07-06
 
 ### Added
-
-- **Ambient bridge memory-leak regression alert.** If the edge bridge's RSS ever climbs past the
-  healthy plateau again (total > 1000 MB or diarization child > 450 MB), ambient health flips to
-  degraded and you get a one-time Telegram alert naming the breach — no nagging, and normal
-  workload bursts never trigger it. Requires an ambient edge reporting the `rss_*` health keys.
 
 - **The voice dashboard's Bridge tab is now a full cockpit.** Instead of a bare status line, it
   shows the ambient edge bridge's complete live health, grouped for scanning: memory leak-watch
@@ -29,109 +24,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Assistant on demand (`GET /api/genesis/voice/device`; set `HA_VOICE_PE_PREFIX`). *(Shipped
   earlier in #876; the changelog entry was missed at the time.)*
 
-### Changed
-
-- **The idle-time code auditor now hunts the failure modes AI-generated code actually has.** Its
-  briefing gained a research-backed taxonomy — swallowed async errors, orphan state without
-  teardown, race surfaces, phantom guards, near-duplicate helpers, cosmetic abstractions, pattern
-  abandonment, and constraints quietly removed during refinement cycles — so audit findings target
-  the defect classes iterative LLM development is known to produce instead of only generic lint
-  categories. Development guidance gained the matching discipline: iterate with scoped explicit
-  prompts (never "improve this"), and diff refinements for what they *removed*.
-
-### Fixed
-
-- **A false "deferred work backlog" health warning no longer fires every few minutes.** The
-  weekly memory dream-cycle parks a large synthesis worklist that drains a little each day by
-  design; the health check was counting that scheduled batch against the "postponed due to
-  degradation" queue alarm, so it tripped a WARNING on every awareness tick. The alarm now
-  watches only genuine recovery backlog (a stalled worklist still surfaces after a full drain
-  cycle), and the dashboard shows the batch worklist separately from recovery work.
-
-- **Automatic Qdrant restart works again.** The self-heal action that restarts a downed Qdrant
-  targeted the wrong systemd manager and failed with "Access denied," leaving the vector store
-  without automatic recovery. It now restarts the correct user-scoped service.
-
-- **The emergency responder can't stall its own monitoring anymore.** If a Sentinel remediation
-  session was running when a health tick fired, the tick could block behind it long enough to
-  trip the very "monitoring is overdue" alarm the Sentinel exists to prevent. The tick now skips
-  cleanly when a remediation is already in flight.
-
-- **Background code-intelligence indexing can no longer freeze your machine.** Creating a git
-  worktree (or running install/bootstrap) could fire several full-repo indexing jobs at once —
-  uncapped, each building its own multi-gigabyte code graph — saturating the container's disk-write
-  limit until SSH and the dashboard stopped responding. All background indexing now goes through a
-  single entrypoint that skips worktrees entirely (the live LSP covers those sessions with no index
-  needed), runs at most one index per repo at a time, and caps the indexer's memory/IO/CPU so even
-  a single job can't starve the system. A repo-wide test blocks any future code path from spawning
-  a raw indexer again. Set `CODE_INTEL_INDEX_DISABLE=1` to opt out of background indexing entirely.
-
-- **`update.sh` was silently skipping the host-VM sync (guardian redeploy + host Node/Claude Code
-  pin healing).** A recent refactor re-indented the two inline Python snippets that read
-  `guardian_remote.yaml`; the resulting parse error was suppressed, the host address resolved
-  empty, and the entire host-side block quietly skipped on every update — guardian code stopped
-  reaching the host and host pin drift went unhealed, while update history still reported the host
-  as healthy. The snippets are now single-line (immune to the indentation class), an unusable
-  guardian config now prints a loud warning and is recorded as a degraded subsystem, and a
-  repo-wide test guards against any shell script reintroducing the indented-snippet shape.
-
-- **The host Guardian no longer gets stranded on an old commit.** `update.sh` decided whether to
-  redeploy the Guardian by looking only at what the *current* update pulled in — so on a run that
-  pulled nothing, a host that was already behind stayed behind indefinitely (and it could fall
-  behind whenever it had last been deployed from a commit that was later rebased away). The
-  redeploy now compares the host's actually-deployed commit against the current code and reconciles
-  the difference: it redeploys when Guardian-relevant code differs, converges a host on an
-  unrecognized/orphaned commit back onto current, and only falls back to the old behavior when the
-  host can't be reached — so a lagging host heals itself on the next update instead of drifting. If your
-  machine ever accumulated a second Claude Code install (an old nvm-tree copy, a native-installer
-  leftover, or an install in a directory only interactive shells can see), it could silently shadow
-  the version Genesis pins — you'd see a months-old Claude Code in your terminal while Genesis
-  believed everything was current, or updates would pointlessly reinstall on every run. The
-  install/update scripts now enforce a single canonical copy: provable duplicates are removed (with
-  clear logging), ambiguous files are only warned about, and shell aliases that shadow the real
-  binary are flagged. Set `CC_SHADOW_SCAN=0` if you deliberately run multiple copies.
-
-- **The codebase-memory code-intelligence server can no longer eat all your RAM.** The third-party
-  `codebase-memory-mcp` binary has a known upstream memory leak (grows without bound over hours of
-  use — several gigabytes per Claude Code session, enough to freeze the whole container when a few
-  sessions run at once). Every instance now starts inside a hard 2 GB memory cap: when the leak hits
-  the cap, only that server is killed and the session keeps working (reconnect it with `/mcp`).
-  Existing installs pick the cap up automatically on their next update — the setup script now also
-  detects and re-points a stale registration that would have bypassed the capped launcher. Override
-  with `CODEBASE_MEMORY_MCP_MEMORY_MAX` if your machine has RAM to spare.
-
-### Security
-
-- **The contribution sanitizer now blocks Tailscale addresses before they can reach the public
-  repo.** When you prepare a community contribution, the pre-push privacy scan now catches Tailscale
-  CGNAT and Tailscale IPv6 addresses, and flags the full private `10.176` subnet range (not just two
-  hard-coded addresses) — closing a gap where these install-specific addresses could otherwise slip
-  into a public PR. The commit-message guard gained the same IPv6 coverage.
-
-- **The HTTP client Genesis uses for outbound requests is upgraded to clear 11 security advisories.**
-  `aiohttp` — the library behind health checks, provider pings, and market/price-data fetches — now
-  requires 3.14.1 or newer, which fixes 11 published CVEs (including a cookie-leak-on-redirect issue
-  and several denial-of-service vectors). Genesis uses it only as a client for outbound calls, so
-  real-world exposure was limited, but the newer version removes the advisories outright.
-
-- **The autonomy gate now honors each action category's context ceiling before auto-dispatching a
-  background action.** When deciding whether a background action may run, the gate compared the
-  required level against the raw *earned* level — so a category that had earned a high level could
-  clear a bar it shouldn't in a more restricted context, most notably letting a financial action pass
-  its level check. It now uses the ceiling-clamped effective level, so background auto-dispatch of
-  higher-risk categories (e.g. financial) is refused regardless of earned level. Your explicit
-  approval was, and still is, required for these actions — this closes a defense-in-depth gap behind
-  that approval.
-
-- **The Genesis→host control SSH key is now bound to the container's source address and denied an
-  interactive terminal.** The key that lets the container drive recovery on the host is installed with
-  a `from=` source-IP restriction and `no-pty`, so a copied key can't be used from another machine on
-  your LAN and can't request a shell. Re-running the Guardian installer upgrades an existing key in
-  place; if the source address can't be confirmed it keeps the terminal restriction and safely skips
-  the address lock (verified by the installer's own connectivity test) rather than risk locking
-  Guardian out.
-
-### Added
+- **The Genesis Voice add-on's attention surface now shows the judge's reasoning — and lets you review it.**
+  For the optional passive-listening add-on, the buried "Attention" tab is now a top-level **Genesis Voice →
+  Judgment** review. Each moment the attention gate noticed is scored by a lightweight LLM judge that says
+  whether it was real speech, whether it was worth attention, and — new — a one-word category and a short
+  reason. You review the judge (worth noticing / not worth it / skip) and can jot your own *why*; your notes
+  inform the judge's prompt, not any hidden weights. It stays offline observability — nothing here speaks or
+  acts, and it's hidden entirely when the voice add-on isn't installed.
 
 - **Attention events now record which device they came from, and the Judgment tab can filter by it.**
   Every "perk-up" event the passive-listening engine emits now carries the source device (the home
@@ -140,6 +39,142 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   isolation. The engine also stops penalizing text-only sources: an utterance with no audio capture
   (no loudness to measure) is scored on its text signals instead of being docked 25% clarity or
   dropped as near-silence junk, which is what OMI wearable transcripts will need.
+
+- **The dashboard's container-health badge now tells the truth about CPU and memory pressure.**
+  Previously the badge ignored CPU entirely (it was hardwired to "healthy") and judged memory only by a
+  raw usage figure that's inflated by reclaimable cache — so a busy or memory-throttling box could still
+  read all-green. It now factors in actual CPU utilization and PSI (pressure-stall) readings: it stays
+  green when the box is merely holding reclaimable cache, and only turns amber/red when CPU or memory is
+  genuinely stalling work, with a reason that says which.
+
+- **The dashboard now shows the memory each Claude Code session is using, and warns you if one balloons.**
+  Each concurrent session normally uses well under a gigabyte; the Container card now lists per-session RSS, and
+  if a single session climbs past a high ceiling — a sign it may be leaking — Genesis raises a health alert
+  (reaching Telegram at the critical level) so you can restart just that session instead of finding out the hard way.
+
+- **Ambient bridge memory-leak regression alert.** If the edge bridge's RSS ever climbs past the
+  healthy plateau again (total > 1000 MB or diarization child > 450 MB), ambient health flips to
+  degraded and you get a one-time Telegram alert naming the breach — no nagging, and normal
+  workload bursts never trigger it. Requires an ambient edge reporting the `rss_*` health keys.
+
+- **The dashboard now has a Campaigns tab where you can see and control your autonomous campaigns.**
+  Each campaign shows its status, schedule (with next fire time), model/effort, today's spend
+  against its daily cap, completed runs vs. attempts, and whether a session is currently in
+  flight — plus recent run history and live state. You can pause/resume a campaign, run one
+  immediately, and edit its cadence, model, effort, daily cost cap, and a new optional
+  schedule "jitter" (randomized fire times so ticks aren't perfectly periodic). Until now the
+  only way to see or steer a campaign was through Genesis directly.
+
+- **Genesis now stewards its own open-source pull requests instead of filing-and-forgetting.**
+  A new background campaign checks the upstream PRs Genesis has authored (e.g. to litellm,
+  Qwen-Agent) every couple of days, and acts on what changed: it nudges a stalled PR once,
+  pings you when a maintainer responds or merges, and closes PRs that have gone unanswered
+  past a grace window — so contributions don't quietly die of inactivity. It runs in a new
+  locked-down session profile whose shell is restricted to the `gh` CLI only; any code
+  changes a reviewer asks for are escalated to you rather than pushed automatically.
+
+- **You can now run Genesis on Claude Fable 5, and pick the full thinking-effort range on Sonnet and Fable.**
+  Fable 5 (Anthropic's new top-tier model) is now a selectable model everywhere you choose one — the ego,
+  campaigns, the inbox monitor, the Telegram default, the `/model` command (terminal and Telegram), and the
+  dashboard dropdowns. Sonnet (now Sonnet 5) and Fable also accept the full `low`–`max` effort range,
+  including `xhigh` and `max`; previously Sonnet was capped at `high`. Nothing switches automatically — your
+  existing defaults are unchanged; this only makes the new options available when you want them.
+
+- **You can now start an interactive Claude Code session on a different model with one command.**
+  `gmodel <name>` launches `claude` on the model you pick: a Claude tier (`gmodel opus`) runs on
+  your normal Max subscription, while a roster peer (`gmodel glm-5.2`) runs on that provider's
+  native endpoint and its own API key. Plain `claude` is untouched. `gmodel` on its own lists the
+  models and which have keys configured; `gmodel --print-env <name>` shows what it would do without
+  launching. Your Anthropic subscription is protected — the launcher never lets a stray API key
+  quietly switch you to per-token billing, and never sends your Anthropic key to a third-party
+  endpoint. (Switch models by relaunching; each session is pinned to one model.)
+
+- **You can now put a model through a "gauntlet" to prove it can actually drive Claude Code
+  before you rely on it.** `genesis eval gauntlet --model <name>` has the model (native Claude,
+  or a routed roster peer like GLM) fix real broken Python projects inside a live Claude Code
+  session, then scores it objectively by running the project's tests — and catches cheating
+  (editing the tests or pytest config to fake a pass). Results are recorded so quality can be
+  tracked over time. An optional weekly run (off by default, opt-in via the roster's
+  `gauntlet.scheduled`) re-checks each roster model and, if one that used to pass starts
+  failing, alerts you and files a proposal for your review — it never silently drops a model
+  from failover on its own.
+
+- **Your morning report now shows Genesis's weekly cognitive-quality grades.** Each week
+  Genesis grades its own subsystems (memory, ego, procedural, awareness, reflection) A–F;
+  the morning report now surfaces them, so cognitive health is visible at a glance instead
+  of buried in a dashboard. Healthy grades compress to a single "nominal" line — it only
+  elaborates on a subsystem that's low.
+
+- **Genesis now tells you when its own cognitive quality regresses — and proposes a fix.**
+  When a subsystem's weekly grade drops to F or falls sharply from the week before, Genesis
+  sends you an alert and files a dashboard proposal to investigate (for example, running an
+  experiment on the affected subsystem). Nothing changes automatically — it's a heads-up plus
+  a recommendation you approve or dismiss.
+
+- **Genesis can now propose improvements to how it reflects — and apply them only with your approval.**
+  The Evo loop measures variations of the deep-reflection prompt against a golden set
+  (with held-out re-validation), and when one is a confirmed improvement it files a
+  proposal on the dashboard. Approving it updates the live reflection prompt; the change
+  is fully reversible (one click rolls it back). Nothing is ever applied automatically —
+  Genesis recommends, you decide.
+
+- **Three session skills now ship with the repo: `/shelve`, `/unshelve`, and `genesis-voice`.** `/shelve`
+  bookmarks the current session with tags and a context note; `/unshelve` finds bookmarked sessions later by
+  keyword and gives you the resume command. `genesis-voice` is the style guide Genesis applies when it writes
+  as itself (outreach, community posts, DMs) — first person, prove-don't-claim, with a mandatory anti-slop
+  pass anchored to the voice-master audit. Previously these existed only as untracked files on the
+  development install.
+
+- **Genesis now measures how often its automatic memory surfacing repeats itself within a session.**
+  Each prompt's surfaced memories are tracked per session, and the health snapshot's proactive-memory
+  section gains an `overlap_7d` rollup — the share of surfaced memories over the last 7 days that had
+  already been shown earlier in the same session. Measurement only: what gets surfaced is unchanged.
+  This data decides whether a planned improvement ships (skipping re-injection of memories already in
+  context to free slots for novel ones).
+
+- **Genesis can now shelve "someday/maybe" ideas separately from its actionable to-do list.**
+  Until now, every deferred item a session or the ego created landed in the actionable follow-up
+  queue — even low-value "might be worth doing someday" ideas — so the queue filled with things
+  nobody intended to act on. Genesis can now file those into a separate "tabled" lane instead
+  (the dashboard Follow-ups tab already supported this; now Genesis's own sessions and ego can too,
+  and can move an existing item between the two lanes). Tabled items are tracked but never surfaced
+  as work or auto-actioned, keeping the actionable list focused on real commitments.
+
+- **Genesis now catches scheduled jobs that silently stop working — running on schedule but never
+  succeeding.** Some background jobs (like the weekly self-assessment and quality calibration) could
+  fail week after week without ever showing up as "failed," because the failure counter is reset
+  every time the server restarts. Genesis now watches the gap between a job's last run and its last
+  success: if a job has been running-but-not-succeeding for more than about a week, it raises a health
+  alert that reaches your daily report and the dashboard, and the job-health view now shows a
+  `days_since_success` figure and a `stale` flag for every job.
+
+- **Genesis now notices when its Claude Code subscription hits its usage cap — instead of quietly going dark.**
+  A capped Anthropic subscription makes `claude -p` return *empty* output with no error, which Genesis used to
+  record as a successful (but blank) run — so its background thinking (ego cycles, reflections, weekly reviews)
+  could silently produce nothing for days without anyone noticing. Genesis now watches for a run of empty
+  results on calls that should have produced output and, when it sees one, sends a single critical alert
+  ("CC subscription likely capped — degraded until the limit resets") so you know to check. It's detection only:
+  it never changes how a call runs, and it stays quiet during normal idle periods.
+
+- **Off-site backups now self-prune on a grandfather-father-son schedule instead of growing forever.**
+  When you back up to an off-site target (NAS/SMB or a mounted path), each run now prunes old dated
+  snapshots — keeping the last 7 daily, 4 weekly, and 6 monthly — so remote storage stays bounded. It
+  never deletes the most recent complete snapshot (the one a restore uses), never touches an
+  in-progress snapshot, and never affects your local keep-forever transcript archive.
+
+- **Daily disk hygiene now prunes stale scratch and old attention snapshots.** Housekeeping now
+  age-prunes leftover files in `~/tmp` (older than 7 days) and garbage-collects attention-engine
+  snapshots older than 60 days — but never one behind a moment you've labeled for review, so your
+  labeled history stays revealable. Keeps disk usage from creeping up between the reactive cleanups
+  that previously only fired when the disk was nearly full.
+
+- **Genesis now keeps its own disk clean automatically, so it won't quietly fill up and stall.**
+  A daily hygiene job reaps git worktrees whose branches have already merged (moving them to a
+  7-day recovery trash bin, never deleting work in progress) and clears regenerable caches that
+  otherwise creep up over time. If the disk still climbs toward full, Genesis clears the heavier
+  reindexable caches automatically at 90% — before the disk hits 100% and disrupts the server,
+  its write-ahead log, or backups. Previously the worktree cleanup existed but was never
+  scheduled, so it never actually ran.
 
 - **The Sentinel now learns which infrastructure fixes would be safe to run itself — observe-only.**
   Every fix the Sentinel proposes still requires your approval, exactly as before. What's new: each
@@ -177,115 +212,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   re-run, not just fresh ones). Previously an unclean host reboot could leave the container stopped
   indefinitely, taking Genesis and its network access down until someone noticed.
 
-- **Three session skills now ship with the repo: `/shelve`, `/unshelve`, and `genesis-voice`.** `/shelve`
-  bookmarks the current session with tags and a context note; `/unshelve` finds bookmarked sessions later by
-  keyword and gives you the resume command. `genesis-voice` is the style guide Genesis applies when it writes
-  as itself (outreach, community posts, DMs) — first person, prove-don't-claim, with a mandatory anti-slop
-  pass anchored to the voice-master audit. Previously these existed only as untracked files on the
-  development install.
-
-- **Genesis now measures how often its automatic memory surfacing repeats itself within a session.**
-  Each prompt's surfaced memories are tracked per session, and the health snapshot's proactive-memory
-  section gains an `overlap_7d` rollup — the share of surfaced memories over the last 7 days that had
-  already been shown earlier in the same session. Measurement only: what gets surfaced is unchanged.
-  This data decides whether a planned improvement ships (skipping re-injection of memories already in
-  context to free slots for novel ones).
-
-- **Off-site backups now self-prune on a grandfather-father-son schedule instead of growing forever.**
-  When you back up to an off-site target (NAS/SMB or a mounted path), each run now prunes old dated
-  snapshots — keeping the last 7 daily, 4 weekly, and 6 monthly — so remote storage stays bounded. It
-  never deletes the most recent complete snapshot (the one a restore uses), never touches an
-  in-progress snapshot, and never affects your local keep-forever transcript archive.
-
-- **You can now run Genesis on Claude Fable 5, and pick the full thinking-effort range on Sonnet and Fable.**
-  Fable 5 (Anthropic's new top-tier model) is now a selectable model everywhere you choose one — the ego,
-  campaigns, the inbox monitor, the Telegram default, the `/model` command (terminal and Telegram), and the
-  dashboard dropdowns. Sonnet (now Sonnet 5) and Fable also accept the full `low`–`max` effort range,
-  including `xhigh` and `max`; previously Sonnet was capped at `high`. Nothing switches automatically — your
-  existing defaults are unchanged; this only makes the new options available when you want them.
-
-- **Daily disk hygiene now prunes stale scratch and old attention snapshots.** Housekeeping now
-  age-prunes leftover files in `~/tmp` (older than 7 days) and garbage-collects attention-engine
-  snapshots older than 60 days — but never one behind a moment you've labeled for review, so your
-  labeled history stays revealable. Keeps disk usage from creeping up between the reactive cleanups
-  that previously only fired when the disk was nearly full.
-
-- **Genesis now notices when its Claude Code subscription hits its usage cap — instead of quietly going dark.**
-  A capped Anthropic subscription makes `claude -p` return *empty* output with no error, which Genesis used to
-  record as a successful (but blank) run — so its background thinking (ego cycles, reflections, weekly reviews)
-  could silently produce nothing for days without anyone noticing. Genesis now watches for a run of empty
-  results on calls that should have produced output and, when it sees one, sends a single critical alert
-  ("CC subscription likely capped — degraded until the limit resets") so you know to check. It's detection only:
-  it never changes how a call runs, and it stays quiet during normal idle periods.
-
-- **The Genesis Voice add-on's attention surface now shows the judge's reasoning — and lets you review it.**
-  For the optional passive-listening add-on, the buried "Attention" tab is now a top-level **Genesis Voice →
-  Judgment** review. Each moment the attention gate noticed is scored by a lightweight LLM judge that says
-  whether it was real speech, whether it was worth attention, and — new — a one-word category and a short
-  reason. You review the judge (worth noticing / not worth it / skip) and can jot your own *why*; your notes
-  inform the judge's prompt, not any hidden weights. It stays offline observability — nothing here speaks or
-  acts, and it's hidden entirely when the voice add-on isn't installed.
-
-- **The dashboard's container-health badge now tells the truth about CPU and memory pressure.**
-  Previously the badge ignored CPU entirely (it was hardwired to "healthy") and judged memory only by a
-  raw usage figure that's inflated by reclaimable cache — so a busy or memory-throttling box could still
-  read all-green. It now factors in actual CPU utilization and PSI (pressure-stall) readings: it stays
-  green when the box is merely holding reclaimable cache, and only turns amber/red when CPU or memory is
-  genuinely stalling work, with a reason that says which.
-
-- **The dashboard now shows the memory each Claude Code session is using, and warns you if one balloons.**
-  Each concurrent session normally uses well under a gigabyte; the Container card now lists per-session RSS, and
-  if a single session climbs past a high ceiling — a sign it may be leaking — Genesis raises a health alert
-  (reaching Telegram at the critical level) so you can restart just that session instead of finding out the hard way.
-
-- **Genesis can now shelve "someday/maybe" ideas separately from its actionable to-do list.**
-  Until now, every deferred item a session or the ego created landed in the actionable follow-up
-  queue — even low-value "might be worth doing someday" ideas — so the queue filled with things
-  nobody intended to act on. Genesis can now file those into a separate "tabled" lane instead
-  (the dashboard Follow-ups tab already supported this; now Genesis's own sessions and ego can too,
-  and can move an existing item between the two lanes). Tabled items are tracked but never surfaced
-  as work or auto-actioned, keeping the actionable list focused on real commitments.
-
-- **Genesis now catches scheduled jobs that silently stop working — running on schedule but never
-  succeeding.** Some background jobs (like the weekly self-assessment and quality calibration) could
-  fail week after week without ever showing up as "failed," because the failure counter is reset
-  every time the server restarts. Genesis now watches the gap between a job's last run and its last
-  success: if a job has been running-but-not-succeeding for more than about a week, it raises a health
-  alert that reaches your daily report and the dashboard, and the job-health view now shows a
-  `days_since_success` figure and a `stale` flag for every job.
-- **You can now start an interactive Claude Code session on a different model with one command.**
-  `gmodel <name>` launches `claude` on the model you pick: a Claude tier (`gmodel opus`) runs on
-  your normal Max subscription, while a roster peer (`gmodel glm-5.2`) runs on that provider's
-  native endpoint and its own API key. Plain `claude` is untouched. `gmodel` on its own lists the
-  models and which have keys configured; `gmodel --print-env <name>` shows what it would do without
-  launching. Your Anthropic subscription is protected — the launcher never lets a stray API key
-  quietly switch you to per-token billing, and never sends your Anthropic key to a third-party
-  endpoint. (Switch models by relaunching; each session is pinned to one model.)
-- **You can now put a model through a "gauntlet" to prove it can actually drive Claude Code
-  before you rely on it.** `genesis eval gauntlet --model <name>` has the model (native Claude,
-  or a routed roster peer like GLM) fix real broken Python projects inside a live Claude Code
-  session, then scores it objectively by running the project's tests — and catches cheating
-  (editing the tests or pytest config to fake a pass). Results are recorded so quality can be
-  tracked over time. An optional weekly run (off by default, opt-in via the roster's
-  `gauntlet.scheduled`) re-checks each roster model and, if one that used to pass starts
-  failing, alerts you and files a proposal for your review — it never silently drops a model
-  from failover on its own.
-- **Genesis now keeps its own disk clean automatically, so it won't quietly fill up and stall.**
-  A daily hygiene job reaps git worktrees whose branches have already merged (moving them to a
-  7-day recovery trash bin, never deleting work in progress) and clears regenerable caches that
-  otherwise creep up over time. If the disk still climbs toward full, Genesis clears the heavier
-  reindexable caches automatically at 90% — before the disk hits 100% and disrupts the server,
-  its write-ahead log, or backups. Previously the worktree cleanup existed but was never
-  scheduled, so it never actually ran.
-- **The dashboard now has a Campaigns tab where you can see and control your autonomous campaigns.**
-  Each campaign shows its status, schedule (with next fire time), model/effort, today's spend
-  against its daily cap, completed runs vs. attempts, and whether a session is currently in
-  flight — plus recent run history and live state. You can pause/resume a campaign, run one
-  immediately, and edit its cadence, model, effort, daily cost cap, and a new optional
-  schedule "jitter" (randomized fire times so ticks aren't perfectly periodic). Until now the
-  only way to see or steer a campaign was through Genesis directly.
-
 ### Changed
+
+- **The idle-time code auditor now hunts the failure modes AI-generated code actually has.** Its
+  briefing gained a research-backed taxonomy — swallowed async errors, orphan state without
+  teardown, race surfaces, phantom guards, near-duplicate helpers, cosmetic abstractions, pattern
+  abandonment, and constraints quietly removed during refinement cycles — so audit findings target
+  the defect classes iterative LLM development is known to produce instead of only generic lint
+  categories. Development guidance gained the matching discipline: iterate with scoped explicit
+  prompts (never "improve this"), and diff refinements for what they *removed*.
 
 - **The Sentinel (Genesis's internal emergency responder) now only wakes for problems it can
   actually fix.** Previously any CRITICAL health alert woke it — including things it has no way to
@@ -318,6 +253,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   without color, and ages render in one format everywhere ("just now" / 5m / 3h / 2d)
   instead of mixed styles.
 
+- **The dashboard Infrastructure card now labels the ambient-capture bridge as "Voice Bridge"** —
+  a clearer, user-facing name. It still only appears when a voice/ambient edge is configured.
+
 - **The procedures Genesis learns are now concrete, replayable playbooks instead of vague
   summaries.** Previously every learned procedure was written as a "what this teaches: …"
   summary, and the learner only saw a heavily-truncated view of what happened (each tool's
@@ -334,7 +272,38 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   essentially the same one — even if it would be filed under a different name — and skips the
   duplicate. Together these keep the procedure store both more complete and less cluttered.
 
+- **Genesis surfaces its learned procedures by relevance — now including unproven
+  drafts, carefully.** A procedure Genesis has learned but not yet validated can be
+  surfaced when it's a strong match for what you're doing, but only on a higher
+  relevance bar than proven procedures and clearly flagged as an *unproven draft —
+  suggestion, not authoritative*. This lets a genuinely useful draft help (and earn
+  its way to proven status through use) instead of sitting unused forever, without
+  ever presenting it as settled guidance. Blind session-start injection still stays
+  limited to the most-proven, always-on procedures. Genesis also now repairs
+  procedures that were missing their embedding, so they stop being silently
+  invisible to this relevance matching. Genesis also now counts each time a
+  procedure is surfaced into context this way, so its own self-learning health
+  check reports learned procedures honestly as *reaching* its attention rather
+  than falsely flagging them as lost — and this surfacing count is kept strictly
+  separate from the signals that promote a procedure, so merely showing a draft
+  can never inflate its standing.
+
+- **Procedures you actually use now earn their keep.** How often a learned
+  procedure is recalled ("reads") now counts as a dampened usefulness signal:
+  frequently-recalled procedures rank higher when surfaced, and can be promoted
+  to higher activation tiers (reads alone can reach passive surfacing; the
+  proactive advisory tier still requires a real success). A procedure also now
+  graduates from speculative to validated on its first real success — previously
+  nothing ever cleared that flag.
+
 ### Fixed
+
+- **A false "deferred work backlog" health warning no longer fires every few minutes.** The
+  weekly memory dream-cycle parks a large synthesis worklist that drains a little each day by
+  design; the health check was counting that scheduled batch against the "postponed due to
+  degradation" queue alarm, so it tripped a WARNING on every awareness tick. The alarm now
+  watches only genuine recovery backlog (a stalled worklist still surfaces after a full drain
+  cycle), and the dashboard shows the batch worklist separately from recovery work.
 
 - **The dashboard's Infrastructure card is clearer at a glance: failed probes sort to the top, and a
   stray raw row is gone.** Probes now order worst-first (down/error, then degraded, then healthy) so
@@ -344,6 +313,41 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   healthy↔unhealthy line (e.g. Qdrant goes down, then recovers), that transition is now recorded in
   the Activity feed — with startup-grace and flap dampening so a restart blip or a rapidly-bouncing
   probe won't spam it.
+
+- **The dashboard's per-session memory row is clearer: "Claude Code Sessions", green when healthy.** The
+  cryptic "CC" row that listed sessions as gray "cc-1 …" chips is now labeled **Claude Code Sessions**,
+  renders each healthy session in green (amber ≥ 4 GB, red ≥ 6 GB), and shows a hover tooltip explaining
+  it's per-session memory for leak detection — so "gray" no longer reads as inactive/unknown.
+
+- **The dashboard's system-health view stays responsive under load and no longer errors out when a single
+  check hiccups.** Building the health snapshot used to run its systemd service checks (several `systemctl`
+  calls) and a couple of file scans directly on the main event loop, so gathering health could briefly stall
+  other work; and if any one sub-check raised an unexpected error, the entire health request failed. Those
+  checks now run off the main loop, and a failure in one section degrades just that section to an error state
+  while the rest of the health view loads normally. Overlapping health requests now also share a single
+  computation instead of each recomputing from scratch.
+
+- **The dead-letter-queue alert no longer cries wolf on self-healing bursts.** A short burst of low-value
+  retry items (e.g. memory-relevance grades, which are discarded within an hour by design) could push the queue
+  past its alert threshold and fire a *critical* notification for something that clears itself minutes later.
+  The alert now counts only items that are genuinely stuck — pending past their designed self-heal window — so a
+  transient burst stays quiet while a real, un-draining backlog still alerts. The dashboard still shows the full
+  raw count.
+
+- **The dashboard now reports each ego's cycle health separately.** Genesis runs two egos (a user-facing
+  one and its own), and both recorded their proactive-cycle health under a single shared key — so on the
+  health surface one ego's last run kept overwriting the other's, making it impossible to tell whether
+  either was actually cycling. Each ego now tracks its own health row, so a stalled or failing ego is
+  visible instead of masked.
+
+- **Automatic Qdrant restart works again.** The self-heal action that restarts a downed Qdrant
+  targeted the wrong systemd manager and failed with "Access denied," leaving the vector store
+  without automatic recovery. It now restarts the correct user-scoped service.
+
+- **The emergency responder can't stall its own monitoring anymore.** If a Sentinel remediation
+  session was running when a health tick fired, the tick could block behind it long enough to
+  trip the very "monitoring is overdue" alarm the Sentinel exists to prevent. The tick now skips
+  cleanly when a remediation is already in flight.
 
 - **The watchdog's memory-reclaim cooldown now survives its own restarts, so it can't trigger an
   I/O storm under sustained memory pressure.** When container memory runs high, the watchdog reclaims
@@ -373,6 +377,91 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   guardian-created snapshots exist, they are deleted (they capture the already-broken state) and the
   restore is retried once.
 
+- **Guardian's automated recovery now acts on the right service.** Guardian's self-healing (restart,
+  journal-freshness, and crash-loop probes) and its diagnostic briefing pointed at a deprecated,
+  usually-inactive background unit instead of the main Genesis service. As a result a "restart" could
+  report success while healing nothing, and a genuine crash loop of the main service went undetected.
+  Recovery, health probes, and diagnosis now target the main service, and a guardrail test keeps them
+  from drifting back.
+
+- **`update.sh` was silently skipping the host-VM sync (guardian redeploy + host Node/Claude Code
+  pin healing).** A recent refactor re-indented the two inline Python snippets that read
+  `guardian_remote.yaml`; the resulting parse error was suppressed, the host address resolved
+  empty, and the entire host-side block quietly skipped on every update — guardian code stopped
+  reaching the host and host pin drift went unhealed, while update history still reported the host
+  as healthy. The snippets are now single-line (immune to the indentation class), an unusable
+  guardian config now prints a loud warning and is recorded as a degraded subsystem, and a
+  repo-wide test guards against any shell script reintroducing the indented-snippet shape.
+
+- **The host Guardian no longer gets stranded on an old commit.** `update.sh` decided whether to
+  redeploy the Guardian by looking only at what the *current* update pulled in — so on a run that
+  pulled nothing, a host that was already behind stayed behind indefinitely (and it could fall
+  behind whenever it had last been deployed from a commit that was later rebased away). The
+  redeploy now compares the host's actually-deployed commit against the current code and reconciles
+  the difference: it redeploys when Guardian-relevant code differs, converges a host on an
+  unrecognized/orphaned commit back onto current, and only falls back to the old behavior when the
+  host can't be reached — so a lagging host heals itself on the next update instead of drifting. If your
+  machine ever accumulated a second Claude Code install (an old nvm-tree copy, a native-installer
+  leftover, or an install in a directory only interactive shells can see), it could silently shadow
+  the version Genesis pins — you'd see a months-old Claude Code in your terminal while Genesis
+  believed everything was current, or updates would pointlessly reinstall on every run. The
+  install/update scripts now enforce a single canonical copy: provable duplicates are removed (with
+  clear logging), ambiguous files are only warned about, and shell aliases that shadow the real
+  binary are flagged. Set `CC_SHADOW_SCAN=0` if you deliberately run multiple copies.
+
+- **`update.sh` no longer hangs if the health watchdog restarts the server mid-update.**
+  During an update Genesis stops its server to swap in new code and migrate the database. The
+  background health watchdog could see it "down" and restart it right then — and the revived
+  server's database lock deadlocked the update's procedure-seeding step, leaving the whole update
+  stuck for as long as ~30 minutes with no error. The watchdog now defers restarts while an update
+  is in progress, and the seeding step is time-bounded so a contended database fails fast instead of
+  hanging silently.
+
+- **Genesis now keeps your Claude Code CLI at the version it's tested against — automatically.**
+  Previously the installer only put Claude Code in place when it was *missing*, so if you already
+  had an older Claude Code, bumping the pinned version never actually upgraded you — you'd silently
+  keep running the old one. Now `install.sh`, `bootstrap.sh`, and `update.sh` all install *or* align
+  Claude Code to the pinned version on every run (matching it exactly, so an intentional rollback
+  also applies), with no manual step. It's non-fatal: if the update can't run (e.g. no permissions),
+  your update still completes and Claude Code is left as-is.
+
+- **Updates no longer abort when a schema migration actually succeeded** — if the
+  database was busy during an update (for example a background task writing at the same
+  time), a migration could commit successfully yet still surface a transient "database
+  is locked" error, which made the update roll the code back while the database had
+  already moved forward. Updates now confirm whether the migration was truly applied
+  before treating it as a failure, and give migrations more room to wait out a busy
+  database.
+
+- **Background code-intelligence indexing can no longer freeze your machine.** Creating a git
+  worktree (or running install/bootstrap) could fire several full-repo indexing jobs at once —
+  uncapped, each building its own multi-gigabyte code graph — saturating the container's disk-write
+  limit until SSH and the dashboard stopped responding. All background indexing now goes through a
+  single entrypoint that skips worktrees entirely (the live LSP covers those sessions with no index
+  needed), runs at most one index per repo at a time, and caps the indexer's memory/IO/CPU so even
+  a single job can't starve the system. A repo-wide test blocks any future code path from spawning
+  a raw indexer again. Set `CODE_INTEL_INDEX_DISABLE=1` to opt out of background indexing entirely.
+
+- **The codebase-memory code-intelligence server can no longer eat all your RAM.** The third-party
+  `codebase-memory-mcp` binary has a known upstream memory leak (grows without bound over hours of
+  use — several gigabytes per Claude Code session, enough to freeze the whole container when a few
+  sessions run at once). Every instance now starts inside a hard 2 GB memory cap: when the leak hits
+  the cap, only that server is killed and the session keeps working (reconnect it with `/mcp`).
+  Existing installs pick the cap up automatically on their next update — the setup script now also
+  detects and re-points a stale registration that would have bypassed the capped launcher. Override
+  with `CODEBASE_MEMORY_MCP_MEMORY_MAX` if your machine has RAM to spare.
+
+- **Skill suggestions now actually fire — and nested skill packs show up in the catalog.** The
+  prompt-time skill nudge scored matches against the length of your prompt, so on any wordy prompt a
+  genuine match was diluted below the firing threshold and suggestions near-never appeared; a single
+  clear name-or-keyword match is now enough. Suggestions also no longer get crowded out by the process
+  (TDD/brainstorming) nudges — each kind keeps its own slots — and library-skill suggestions now tell
+  you exactly what to do (`Read <path>/SKILL.md`) instead of pointing at a command that can't load
+  them. The catalog builder now looks inside container directories (skill packs like `gitnexus/` or
+  plugin repos in the skill library), indexing the real skills inside instead of one useless entry for
+  the folder. And a stale catalog can no longer cut the nudge off entirely: regeneration now runs in
+  the background while the current prompt uses the existing catalog.
+
 - **Reflection summaries are no longer degraded to raw JSON dumps when the model wraps its output in a
   code fence.** Light and strategic reflections store a searchable summary of what they found. When the
   model wrapped its answer in a markdown ```json fence — which it often does — the summary step failed to
@@ -389,17 +478,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   The Light reflection prompt also regains its hard output caps and "signals are the only valid
   evidence" verification rule, which were stranded in a prompt file the loader never used.
 
-- **Skill suggestions now actually fire — and nested skill packs show up in the catalog.** The
-  prompt-time skill nudge scored matches against the length of your prompt, so on any wordy prompt a
-  genuine match was diluted below the firing threshold and suggestions near-never appeared; a single
-  clear name-or-keyword match is now enough. Suggestions also no longer get crowded out by the process
-  (TDD/brainstorming) nudges — each kind keeps its own slots — and library-skill suggestions now tell
-  you exactly what to do (`Read <path>/SKILL.md`) instead of pointing at a command that can't load
-  them. The catalog builder now looks inside container directories (skill packs like `gitnexus/` or
-  plugin repos in the skill library), indexing the real skills inside instead of one useless entry for
-  the folder. And a stale catalog can no longer cut the nudge off entirely: regeneration now runs in
-  the background while the current prompt uses the existing catalog.
-
 - **Reactive ego events no longer force the expensive Opus model, critical escalations always think at
   full effort, and a missing ego prompt file fails loudly instead of silently running a placeholder.**
   Reactive events (deadline alerts, breaker trips) used to override every ego onto Opus at high effort
@@ -412,6 +490,36 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   report (the dedicated morning-report pipeline is the sole source — its daily-briefing cycle now
   focuses on what you need today), and the pending-proposal guidance matches the real threshold.
 
+- **Genesis's COO (self-maintenance ego) no longer burns cognitive cycles reacting to model-provider
+  outages it can't fix.** When a provider chain runs out of options (e.g. a temporary DeepSeek outage),
+  the "all providers exhausted" alerts no longer wake the ego into a full high-effort reasoning cycle that
+  can only conclude "nothing I can do" — these were the large majority of its zero-outcome reactive cycles.
+  The outage still reaches the ego through its normal system-health context, so nothing is hidden; it just
+  stops paying to react to it. Relatedly, the cross-type procedure-dedup check now skips its judgment call
+  outright when that chain is down, instead of firing a doomed request that would raise yet another alert.
+
+- **Genesis's background egos now keep their thinking rhythm across a restart instead of going quiet.**
+  The two egos run proactive cycles on an adaptive schedule that stretches out when things are idle. That
+  schedule was re-armed from scratch on every restart, so an install that restarts often (deploys, recovery)
+  could keep pushing the next cycle further out — in the worst case starving an ego for up to its full
+  backed-off interval. Each ego now anchors its first post-restart cycle to when it last actually ran: an
+  overdue ego runs shortly after startup, while an up-to-date one simply keeps its cadence.
+
+- **The Internals "composite" self-improvement score is no longer dragged down by draft
+  procedures** — Genesis extracts candidate procedures from its own sessions; these start
+  unvalidated (near-zero confidence) until they prove useful. The weekly composite score was
+  averaging *every* procedure's confidence, so a burst of new drafts made the score crater
+  even though nothing had actually regressed. The score now reflects only validated
+  procedures. Genesis also caps how many drafts a single session can create, so the
+  procedure store stops accumulating dead weight.
+
+- **Genesis stops cluttering its procedure store with general working-style rules.** When it
+  learns a "procedure" from a work session, it now tells a reusable *task procedure* (how a
+  specific tool or system works) apart from a *behavioral directive* (a general habit like
+  "double-check before acting" — which belongs in its standing instructions, not the procedure
+  store). Directives are no longer stored, removing the most common source of near-duplicate
+  procedures. The check errs toward keeping, so genuine procedures are never dropped.
+
 - **Background research findings reach your knowledge base again — instead of piling up as unreadable
   JSON blobs.** Genesis's idle-time research (brainstorms, gap clustering, code and wing audits) sends its
   findings through an intake step that splits them into individual knowledge entries. That step couldn't
@@ -422,50 +530,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   (dry-run by default) re-parses the previously mangled entries into proper knowledge units and removes
   the junk ones.
 
-- **Fresh installs and repairs now get scheduled housekeeping running without a manual step.** The
-  bootstrap script rendered Genesis's systemd timer units (watchdog health check, daily disk hygiene)
-  but never enabled them, so on a new machine — or after a repair re-render — the timers sat installed
-  yet dead until something else switched them on. Bootstrap now enables and starts the housekeeping
-  timers idempotently, right after the render pass; environments without systemd are unaffected. The
-  backup timer is deliberately left for you to enable after configuring backups (passphrase + verify
-  run), so it is not auto-started here.
-
-- **The dashboard's per-session memory row is clearer: "Claude Code Sessions", green when healthy.** The
-  cryptic "CC" row that listed sessions as gray "cc-1 …" chips is now labeled **Claude Code Sessions**,
-  renders each healthy session in green (amber ≥ 4 GB, red ≥ 6 GB), and shows a hover tooltip explaining
-  it's per-session memory for leak detection — so "gray" no longer reads as inactive/unknown.
-
-- **Genesis's COO (self-maintenance ego) no longer burns cognitive cycles reacting to model-provider
-  outages it can't fix.** When a provider chain runs out of options (e.g. a temporary DeepSeek outage),
-  the "all providers exhausted" alerts no longer wake the ego into a full high-effort reasoning cycle that
-  can only conclude "nothing I can do" — these were the large majority of its zero-outcome reactive cycles.
-  The outage still reaches the ego through its normal system-health context, so nothing is hidden; it just
-  stops paying to react to it. Relatedly, the cross-type procedure-dedup check now skips its judgment call
-  outright when that chain is down, instead of firing a doomed request that would raise yet another alert.
-
-- **The dashboard's system-health view stays responsive under load and no longer errors out when a single
-  check hiccups.** Building the health snapshot used to run its systemd service checks (several `systemctl`
-  calls) and a couple of file scans directly on the main event loop, so gathering health could briefly stall
-  other work; and if any one sub-check raised an unexpected error, the entire health request failed. Those
-  checks now run off the main loop, and a failure in one section degrades just that section to an error state
-  while the rest of the health view loads normally. Overlapping health requests now also share a single
-  computation instead of each recomputing from scratch.
-
-- **Genesis's background egos now keep their thinking rhythm across a restart instead of going quiet.**
-  The two egos run proactive cycles on an adaptive schedule that stretches out when things are idle. That
-  schedule was re-armed from scratch on every restart, so an install that restarts often (deploys, recovery)
-  could keep pushing the next cycle further out — in the worst case starving an ego for up to its full
-  backed-off interval. Each ego now anchors its first post-restart cycle to when it last actually ran: an
-  overdue ego runs shortly after startup, while an up-to-date one simply keeps its cadence.
-
-- **Uploading a large or malformed PDF to the Knowledge tab no longer freezes — or crashes — Genesis.**
-  PDF text extraction used to run directly on the main event loop, so a big document could stall the whole
-  server for seconds (health checks, background thinking, other requests all waited), and a corrupt or
-  hostile PDF could take the process down entirely. Extraction now runs in an isolated worker process with a
-  time limit: a large PDF no longer blocks anything else, and a PDF that crashes or hangs the parser fails
-  just that one ingest — the rest of Genesis keeps running. Uploads that hit a transient database hiccup are
-  now marked "failed" (and can be retried) instead of getting stuck showing "processing" forever.
-
 - **Re-ingesting a knowledge source with changed content now refreshes it instead of serving the stale
   version.** Previously, once a file or URL was ingested, re-ingesting the same source was skipped on source
   identity alone — so if the underlying content changed, the knowledge base kept serving the old distilled
@@ -473,31 +537,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   actually changed (unchanged content is still skipped, and a now-unreachable source falls back to its
   previously cached version).
 
-- **The dead-letter-queue alert no longer cries wolf on self-healing bursts.** A short burst of low-value
-  retry items (e.g. memory-relevance grades, which are discarded within an hour by design) could push the queue
-  past its alert threshold and fire a *critical* notification for something that clears itself minutes later.
-  The alert now counts only items that are genuinely stuck — pending past their designed self-heal window — so a
-  transient burst stays quiet while a real, un-draining backlog still alerts. The dashboard still shows the full
-  raw count.
-
-- **The dashboard now reports each ego's cycle health separately.** Genesis runs two egos (a user-facing
-  one and its own), and both recorded their proactive-cycle health under a single shared key — so on the
-  health surface one ego's last run kept overwriting the other's, making it impossible to tell whether
-  either was actually cycling. Each ego now tracks its own health row, so a stalled or failing ego is
-  visible instead of masked.
-
 - **Memory extraction now runs reliably after a restart.** The job that turns recent conversations into
   long-term memories was scheduled on a fixed 2-hour interval measured from server start — and that timer
   reset on every restart, so a box that restarted more often than every two hours could keep deferring
   extraction indefinitely. It now also runs shortly after each start, so extraction can't be starved by
   frequent restarts.
-
-- **Guardian's automated recovery now acts on the right service.** Guardian's self-healing (restart,
-  journal-freshness, and crash-loop probes) and its diagnostic briefing pointed at a deprecated,
-  usually-inactive background unit instead of the main Genesis service. As a result a "restart" could
-  report success while healing nothing, and a genuine crash loop of the main service went undetected.
-  Recovery, health probes, and diagnosis now target the main service, and a guardrail test keeps them
-  from drifting back.
 
 - **Superseded and expired memories no longer resurface in Genesis's automatic recall.** Before every
   prompt, Genesis injects the most relevant memories into its working context. That fast-path recall
@@ -508,18 +552,26 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   its sources, matching the main retriever. Memories that are current (no expiry, not superseded) are
   never affected, so nothing live is ever dropped.
 
-- **Completed background-task history no longer grows without bound.** Genesis's idle-time "surplus"
-  task queue kept every finished task row forever — only never-started tasks were ever cleaned up — so
-  the table crept upward over months of background work. Finished tasks (completed, failed, or
-  cancelled) are now aged out after 30 days, while any task still referenced by an open follow-up is
-  kept until that follow-up resolves.
-
 - **Deleting a knowledge item from the dashboard now works end to end.** Previously the delete
   button returned a server error, and behind the scenes the item was only half-removed — dropped
   from search but with its stored embedding left behind and its source still marked as already
   ingested, so re-adding that same file or URL was silently skipped and nothing came back. Deletes
   now complete cleanly (search entry and embedding both removed), and once a source's last item is
   deleted, re-ingesting that file or URL works again.
+
+- **Fresh installs and repairs now get scheduled housekeeping running without a manual step.** The
+  bootstrap script rendered Genesis's systemd timer units (watchdog health check, daily disk hygiene)
+  but never enabled them, so on a new machine — or after a repair re-render — the timers sat installed
+  yet dead until something else switched them on. Bootstrap now enables and starts the housekeeping
+  timers idempotently, right after the render pass; environments without systemd are unaffected. The
+  backup timer is deliberately left for you to enable after configuring backups (passphrase + verify
+  run), so it is not auto-started here.
+
+- **Completed background-task history no longer grows without bound.** Genesis's idle-time "surplus"
+  task queue kept every finished task row forever — only never-started tasks were ever cleaned up — so
+  the table crept upward over months of background work. Finished tasks (completed, failed, or
+  cancelled) are now aged out after 30 days, while any task still referenced by an open follow-up is
+  kept until that follow-up resolves.
 
 - **The weekly self-assessment and quality-calibration jobs now recover on their own instead of
   going dark for weeks.** Previously each ran only once a week, so if that one run failed — for
@@ -529,20 +581,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   rest of the week once one run succeeds), so a failed day is simply retried the next day until it
   succeeds. Side effect: the successful run now normally lands early in the week rather than on Sunday.
 
-- **`update.sh` no longer hangs if the health watchdog restarts the server mid-update.**
-  During an update Genesis stops its server to swap in new code and migrate the database. The
-  background health watchdog could see it "down" and restart it right then — and the revived
-  server's database lock deadlocked the update's procedure-seeding step, leaving the whole update
-  stuck for as long as ~30 minutes with no error. The watchdog now defers restarts while an update
-  is in progress, and the seeding step is time-bounded so a contended database fails fast instead of
-  hanging silently.
-- **Genesis now keeps your Claude Code CLI at the version it's tested against — automatically.**
-  Previously the installer only put Claude Code in place when it was *missing*, so if you already
-  had an older Claude Code, bumping the pinned version never actually upgraded you — you'd silently
-  keep running the old one. Now `install.sh`, `bootstrap.sh`, and `update.sh` all install *or* align
-  Claude Code to the pinned version on every run (matching it exactly, so an intentional rollback
-  also applies), with no manual step. It's non-fatal: if the update can't run (e.g. no permissions),
-  your update still completes and Claude Code is left as-is.
+- **Campaign results no longer sit uncaptured until the next scheduled tick.** Previously a
+  campaign that ran every couple of days would finish its background session but not record
+  the outcome (or cost, or notify you) until the *following* tick — so a finished run could
+  stay invisible for days, and its spend went uncounted. A new reaper now captures finished
+  sessions within minutes and cleans up runs orphaned by past crashes, so campaign status and
+  cost stay accurate in near-real-time.
+
+- **Uploading a large or malformed PDF to the Knowledge tab no longer freezes — or crashes — Genesis.**
+  PDF text extraction used to run directly on the main event loop, so a big document could stall the whole
+  server for seconds (health checks, background thinking, other requests all waited), and a corrupt or
+  hostile PDF could take the process down entirely. Extraction now runs in an isolated worker process with a
+  time limit: a large PDF no longer blocks anything else, and a PDF that crashes or hangs the parser fails
+  just that one ingest — the rest of Genesis keeps running. Uploads that hit a transient database hiccup are
+  now marked "failed" (and can be retried) instead of getting stuck showing "processing" forever.
+
 - **A casual message can no longer be mistaken for a permanent "hard rule" — and your
   steering-rules file keeps its structure.** Genesis auto-adds a steering rule only when you
   actually give it a terse directive ("stop doing X", "never do Y"); an ordinary status update
@@ -574,6 +627,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   repeatedly cancel and recreate that approval. Genesis now recognizes there's no new content and
   marks the note current in a single scan, so it settles instead of churning.
 
+- **Two pending inbox approvals could cancel each other forever, re-pinging you every 30 minutes for
+  nothing.** When new content arrived while one link approval was still pending, the refresh step
+  invalidated every row parked on it — including an unrelated file's — but only re-queued the
+  newly-detected file. That other file's rows reappeared as "new" on the very next scan, which
+  cancelled the fresh approval in turn: two files could leapfrog cancel-and-recreate every
+  30-minute scan with zero actual change on disk. Invalidated files are now folded into the same
+  refresh batch, so one merged approval covers everything in a single cycle instead of chasing itself.
+
 - **Links that fail partway through an evaluation now retry themselves.** When only some of the
   links in a note evaluate successfully and the rest fail (for example, a few get rate-limited),
   the failed links used to sit untouched until you edited the note again. Genesis now
@@ -596,84 +657,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   write a duplicate `…-N.genesis.md` file. Genesis now claims each evaluation the moment it
   starts, so an interrupted one is recovered and retried rather than run a second time.
 
-- **Campaign results no longer sit uncaptured until the next scheduled tick.** Previously a
-  campaign that ran every couple of days would finish its background session but not record
-  the outcome (or cost, or notify you) until the *following* tick — so a finished run could
-  stay invisible for days, and its spend went uncounted. A new reaper now captures finished
-  sessions within minutes and cleans up runs orphaned by past crashes, so campaign status and
-  cost stay accurate in near-real-time.
-
-- **Genesis now stewards its own open-source pull requests instead of filing-and-forgetting.**
-  A new background campaign checks the upstream PRs Genesis has authored (e.g. to litellm,
-  Qwen-Agent) every couple of days, and acts on what changed: it nudges a stalled PR once,
-  pings you when a maintainer responds or merges, and closes PRs that have gone unanswered
-  past a grace window — so contributions don't quietly die of inactivity. It runs in a new
-  locked-down session profile whose shell is restricted to the `gh` CLI only; any code
-  changes a reviewer asks for are escalated to you rather than pushed automatically.
-
-- **Your morning report now shows Genesis's weekly cognitive-quality grades.** Each week
-  Genesis grades its own subsystems (memory, ego, procedural, awareness, reflection) A–F;
-  the morning report now surfaces them, so cognitive health is visible at a glance instead
-  of buried in a dashboard. Healthy grades compress to a single "nominal" line — it only
-  elaborates on a subsystem that's low.
-
-- **Genesis now tells you when its own cognitive quality regresses — and proposes a fix.**
-  When a subsystem's weekly grade drops to F or falls sharply from the week before, Genesis
-  sends you an alert and files a dashboard proposal to investigate (for example, running an
-  experiment on the affected subsystem). Nothing changes automatically — it's a heads-up plus
-  a recommendation you approve or dismiss.
-
-- **Genesis can now propose improvements to how it reflects — and apply them only with your approval.**
-  The Evo loop measures variations of the deep-reflection prompt against a golden set
-  (with held-out re-validation), and when one is a confirmed improvement it files a
-  proposal on the dashboard. Approving it updates the live reflection prompt; the change
-  is fully reversible (one click rolls it back). Nothing is ever applied automatically —
-  Genesis recommends, you decide.
-
-- **Genesis stops cluttering its procedure store with general working-style rules.** When it
-  learns a "procedure" from a work session, it now tells a reusable *task procedure* (how a
-  specific tool or system works) apart from a *behavioral directive* (a general habit like
-  "double-check before acting" — which belongs in its standing instructions, not the procedure
-  store). Directives are no longer stored, removing the most common source of near-duplicate
-  procedures. The check errs toward keeping, so genuine procedures are never dropped.
-
-### Changed
-
-- **Genesis surfaces its learned procedures by relevance — now including unproven
-  drafts, carefully.** A procedure Genesis has learned but not yet validated can be
-  surfaced when it's a strong match for what you're doing, but only on a higher
-  relevance bar than proven procedures and clearly flagged as an *unproven draft —
-  suggestion, not authoritative*. This lets a genuinely useful draft help (and earn
-  its way to proven status through use) instead of sitting unused forever, without
-  ever presenting it as settled guidance. Blind session-start injection still stays
-  limited to the most-proven, always-on procedures. Genesis also now repairs
-  procedures that were missing their embedding, so they stop being silently
-  invisible to this relevance matching. Genesis also now counts each time a
-  procedure is surfaced into context this way, so its own self-learning health
-  check reports learned procedures honestly as *reaching* its attention rather
-  than falsely flagging them as lost — and this surfacing count is kept strictly
-  separate from the signals that promote a procedure, so merely showing a draft
-  can never inflate its standing.
-
-- **Procedures you actually use now earn their keep.** How often a learned
-  procedure is recalled ("reads") now counts as a dampened usefulness signal:
-  frequently-recalled procedures rank higher when surfaced, and can be promoted
-  to higher activation tiers (reads alone can reach passive surfacing; the
-  proactive advisory tier still requires a real success). A procedure also now
-  graduates from speculative to validated on its first real success — previously
-  nothing ever cleared that flag.
-- **The dashboard Infrastructure card now labels the ambient-capture bridge as "Voice Bridge"** —
-  a clearer, user-facing name. It still only appears when a voice/ambient edge is configured.
-
-### Fixed
-
-- **The Internals "composite" self-improvement score is no longer dragged down by draft
-  procedures** — Genesis extracts candidate procedures from its own sessions; these start
-  unvalidated (near-zero confidence) until they prove useful. The weekly composite score was
-  averaging *every* procedure's confidence, so a burst of new drafts made the score crater
-  even though nothing had actually regressed. The score now reflects only validated
-  procedures. Genesis also caps how many drafts a single session can create, so the
-  procedure store stops accumulating dead weight.
 - **Genesis no longer floods its own approvals with follow-up emails addressed to itself.**
   A follow-up drafted in a background session could lose its thread (and therefore its
   recipient) on the way to the outreach queue, then fall back to Genesis's own email address.
@@ -682,13 +665,37 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   thread recipient with the queued message, never sends an email to its own address, and
   treats a held or undeliverable message as resolved instead of retrying it forever. A
   message that can never be delivered is now dropped after a day rather than looping.
-- **Updates no longer abort when a schema migration actually succeeded** — if the
-  database was busy during an update (for example a background task writing at the same
-  time), a migration could commit successfully yet still surface a transient "database
-  is locked" error, which made the update roll the code back while the database had
-  already moved forward. Updates now confirm whether the migration was truly applied
-  before treating it as a failure, and give migrations more room to wait out a busy
-  database.
+
+### Security
+
+- **The contribution sanitizer now blocks Tailscale addresses before they can reach the public
+  repo.** When you prepare a community contribution, the pre-push privacy scan now catches Tailscale
+  CGNAT and Tailscale IPv6 addresses, and flags the full private `10.176` subnet range (not just two
+  hard-coded addresses) — closing a gap where these install-specific addresses could otherwise slip
+  into a public PR. The commit-message guard gained the same IPv6 coverage.
+
+- **The HTTP client Genesis uses for outbound requests is upgraded to clear 11 security advisories.**
+  `aiohttp` — the library behind health checks, provider pings, and market/price-data fetches — now
+  requires 3.14.1 or newer, which fixes 11 published CVEs (including a cookie-leak-on-redirect issue
+  and several denial-of-service vectors). Genesis uses it only as a client for outbound calls, so
+  real-world exposure was limited, but the newer version removes the advisories outright.
+
+- **The autonomy gate now honors each action category's context ceiling before auto-dispatching a
+  background action.** When deciding whether a background action may run, the gate compared the
+  required level against the raw *earned* level — so a category that had earned a high level could
+  clear a bar it shouldn't in a more restricted context, most notably letting a financial action pass
+  its level check. It now uses the ceiling-clamped effective level, so background auto-dispatch of
+  higher-risk categories (e.g. financial) is refused regardless of earned level. Your explicit
+  approval was, and still is, required for these actions — this closes a defense-in-depth gap behind
+  that approval.
+
+- **The Genesis→host control SSH key is now bound to the container's source address and denied an
+  interactive terminal.** The key that lets the container drive recovery on the host is installed with
+  a `from=` source-IP restriction and `no-pty`, so a copied key can't be used from another machine on
+  your LAN and can't request a shell. Re-running the Guardian installer upgrades an existing key in
+  place; if the source address can't be confirmed it keeps the terminal restriction and safely skips
+  the address lock (verified by the installer's own connectivity test) rather than risk locking
+  Guardian out.
 
 ## [v3.0b16] - 2026-06-21
 
