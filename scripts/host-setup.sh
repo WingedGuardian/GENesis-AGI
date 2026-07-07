@@ -854,10 +854,19 @@ LAN_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' 
 HOST_IPV4="${TS_IPV4:-$LAN_IPV4}"
 HOST_IPV6="${TS_IPV6:-$LAN_IPV6}"
 
-# Container IPs
-CONTAINER_IPV4=$(incus exec "$CONTAINER_NAME" -- hostname -I 2>/dev/null | awk '{print $1}' || echo "")
-CONTAINER_IPV6=$(incus exec "$CONTAINER_NAME" -- ip -6 addr show scope global 2>/dev/null \
-    | grep -oP 'inet6 \K[^ /]+' | head -1 || echo "")
+# Container IPs — exclude tailscale interfaces, same rule as
+# detect_container_lan_ip/_ipv6 in scripts/lib/claude_md_blocks.sh (the
+# detection runs INSIDE the container via incus, where the host-side
+# sourced lib isn't available, so the rule is inlined; keep in sync).
+# hostname -I fallback preserved: it picks the tailscale0 address first
+# when present, but an address beats no address.
+CONTAINER_IPV4=$(incus exec "$CONTAINER_NAME" -- sh -c \
+    "ip -4 -o addr show scope global 2>/dev/null | awk '\$2 !~ /^tailscale/ {print \$4}' | cut -d/ -f1 | head -1" \
+    2>/dev/null || echo "")
+[ -z "$CONTAINER_IPV4" ] && CONTAINER_IPV4=$(incus exec "$CONTAINER_NAME" -- hostname -I 2>/dev/null | awk '{print $1}' || echo "")
+CONTAINER_IPV6=$(incus exec "$CONTAINER_NAME" -- sh -c \
+    "ip -6 -o addr show scope global 2>/dev/null | awk '\$2 !~ /^tailscale/ {print \$4}' | cut -d/ -f1 | head -1" \
+    2>/dev/null || echo "")
 
 # Build dashboard URL for final report
 DASHBOARD_URL=""
@@ -991,20 +1000,13 @@ fi
 # instructions, not tracked in the repo). Idempotent via sentinel blocks.
 echo ""
 echo "  Writing network identity into ~/.claude/CLAUDE.md..."
-# Build the network block on the host side where all variables are available
-_NET_LINES="## Network Identity"
-_NET_LINES="${_NET_LINES}
-"
-_NET_LINES="${_NET_LINES}
-- **Container IP**: ${CONTAINER_IPV4}"
-[ -n "$CONTAINER_IPV6" ] && _NET_LINES="${_NET_LINES} (v6: ${CONTAINER_IPV6})"
-_NET_LINES="${_NET_LINES}
-- **Host VM IP**: ${HOST_IPV4}"
-[ -n "$HOST_IPV6" ] && _NET_LINES="${_NET_LINES} (v6: ${HOST_IPV6})"
-[ -n "$TS_IPV4" ] && _NET_LINES="${_NET_LINES}
-- **Tailscale**: ${TS_IPV4}"
-_NET_LINES="${_NET_LINES}
-- **Dashboard**: http://${HOST_IPV4:-localhost}:5000 (via proxy device)"
+# Build the network block on the host side where all variables are
+# available, using the shared builder so the format can't drift from
+# update.sh's in-container refresh (which rewrites this block every run).
+# shellcheck source=lib/claude_md_blocks.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/claude_md_blocks.sh"
+_NET_LINES="$(build_network_identity_block \
+    "$CONTAINER_IPV4" "$CONTAINER_IPV6" "$HOST_IPV4" "$HOST_IPV6" "$TS_IPV4")"
 
 # Write into container via incus exec, piping the block through stdin.
 # Target: ~/.claude/CLAUDE.md (user-level, not tracked in repo).
