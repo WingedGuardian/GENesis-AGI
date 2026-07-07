@@ -394,8 +394,17 @@ if [[ ! -d "$VENV_DIR" ]] || [[ ! -x "$VENV_DIR/bin/python" ]] || [[ ! -x "$VENV
     "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 echo "  Syncing dependencies..."
-"$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet 2>&1 | tail -1 || true
-if ! "$VENV_DIR/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/dev/null; then
+# Worktree guard + editable install + import verification — shared with
+# install.sh so the guard can't drift between the two entry points.
+# shellcheck source=lib/venv_setup.sh
+. "$SCRIPT_DIR/lib/venv_setup.sh"
+_ei_rc=0
+editable_install_guarded "$GENESIS_ROOT" "$VENV_DIR" || _ei_rc=$?
+if [ "$_ei_rc" -eq 1 ]; then
+    # Blocked: bootstrap from a worktree would poison the system-wide
+    # editable install — abort instead of continuing half-configured.
+    exit 1
+elif [ "$_ei_rc" -ne 0 ]; then
     echo "  FAIL: pip install completed but Genesis is not importable."
     echo "  Re-run: $VENV_DIR/bin/pip install -e $GENESIS_ROOT --verbose"
     exit 1
