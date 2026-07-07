@@ -132,6 +132,39 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   server restarts more frequently than the interval, the job never
   fires. Use `CronTrigger` for anything longer than a few hours.
   Bit us with `user_model_evolution` (48h interval, daily restarts).
+- **Modules are NEVER subsystems.** A capability *module*
+  (`src/genesis/modules/**`, an external pluggable capability — "hands,
+  not brain", see `modules/base.py`) is not an internal Genesis
+  *subsystem* (memory, reflection, ego, triage, autonomy, sentinel).
+  Module memory writes must **never** set a `source_subsystem` value —
+  that tag means "internal decisional output, exclude from default
+  recall", which is wrong for module output. This is enforced
+  mechanically: any `.store()` under `modules/**` passing
+  `source_subsystem` is a hard CI failure in
+  `tests/test_memory/test_store_subsystem_coverage.py`, which also forces
+  every new memory-writer to either tag itself or be explicitly
+  classified as user-context. `_KNOWN_SUBSYSTEMS`
+  (`memory/retrieval.py`) is the authoritative subsystem list; adding a
+  module name to it is a category error.
+- **Destructive data migrations must reconcile cross-store mirror fields.**
+  When a cleanup/backfill deletes data in one store (e.g. Qdrant vectors) but
+  another store mirrors that data's existence (e.g.
+  `memory_metadata.embedding_status`), the delete MUST also fix the mirror
+  field. A deleted vector left as `embedding_status='embedded'` is a field
+  that *lies*, and that lie is not cosmetic if any code path *reads* it —
+  `MemoryStore._mark_superseded` gates an `update_payload` on
+  `embedding_status != 'fts5_only'` and would fire a doomed write on the
+  now-deleted point. Before assuming a stale field is harmless, grep for its
+  *reads*, not just its writes. (Bit us in the source_subsystem purge, #918;
+  fixed by #921 Step 2c — reconcile tagged rows to `fts5_only`.)
+- **`immutable=1` reads miss WAL-resident writes.** A read-only `sqlite3`
+  connection opened with `file:...?immutable=1` reads only the main db file
+  and ignores the `-wal`, so a change you JUST committed (still
+  un-checkpointed) is *invisible* — you get a false-negative "the write
+  didn't land." To verify a live write, use `?mode=ro` (WAL-aware) or query
+  through the server/CRUD path; reserve `immutable=1` for historical
+  read-only sampling where a little staleness is fine. (A reconcile UPDATE
+  read clean under `mode=ro` but appeared unchanged under `immutable=1`.)
 
 ### Iterative-Refinement Discipline
 
