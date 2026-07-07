@@ -127,6 +127,31 @@ async def test_worktree_cap_and_overflow(empty_db, empty_dirs, monkeypatch):
     assert "(+4 more)" in block  # 12 - 8 cap
 
 
+async def test_worktrees_ordered_by_git_activity(empty_db, empty_dirs, tmp_path, monkeypatch):
+    import os
+
+    repo, plans = empty_dirs
+
+    def make_wt(name, index_mtime, branch):
+        # A fake linked worktree: .git file points at a private gitdir whose
+        # index mtime is the activity signal we sort on.
+        wt = tmp_path / name
+        wt.mkdir()
+        gitdir = tmp_path / "gd" / name
+        gitdir.mkdir(parents=True)
+        (gitdir / "index").write_text("x")
+        os.utime(gitdir / "index", (index_mtime, index_mtime))
+        (wt / ".git").write_text(f"gitdir: {gitdir}\n")
+        return {"path": str(wt), "head": "0" * 40, "branch": branch}
+
+    old = make_wt("oldwt", 1_000.0, "feat/old")
+    new = make_wt("newwt", 9_000_000_000.0, "feat/new")
+    # Return in old-first order so a working sort must reorder them.
+    monkeypatch.setattr(open_loops, "_list_worktrees", lambda root: [old, new])
+    block = await build_inflight_block(empty_db, repo_root=repo, plans_dir=plans)
+    assert block.index("feat/new") < block.index("feat/old")  # newer git activity first
+
+
 async def test_one_section_raises_others_still_render(empty_db, empty_dirs, monkeypatch):
     repo, plans = empty_dirs
     await _insert_task(empty_db, "task0001", "survivor task")

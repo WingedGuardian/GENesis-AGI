@@ -67,6 +67,30 @@ def _safe_mtime(path: str) -> float:
         return 0.0
 
 
+def _worktree_activity(path: str) -> float:
+    """Best-effort recency for a linked worktree.
+
+    The worktree *directory* mtime alone is a poor activity signal — it only
+    changes when entries are added/removed directly in the worktree root, not
+    when files are edited/committed under ``src/``, ``tests/``, etc. Instead use
+    the newest mtime among the worktree's git metadata (``index``/``HEAD``/
+    ``ORIG_HEAD`` in its private gitdir, which update on checkout/commit/stage),
+    falling back to the directory mtime. A few cheap stats per worktree.
+    """
+    best = _safe_mtime(path)
+    try:
+        with open(os.path.join(path, ".git"), encoding="utf-8") as fh:
+            content = fh.read(4096).strip()
+    except OSError:
+        return best
+    # Linked worktree: .git is a file "gitdir: <abs path to private gitdir>".
+    if content.startswith("gitdir:"):
+        gitdir = content[len("gitdir:"):].strip()
+        for name in ("index", "HEAD", "ORIG_HEAD"):
+            best = max(best, _safe_mtime(os.path.join(gitdir, name)))
+    return best
+
+
 def _list_worktrees(repo_root: Path) -> list[dict]:
     """Parse ``git worktree list --porcelain`` into structured data.
 
@@ -133,9 +157,9 @@ async def _task_lines(db) -> list[str]:
 
 
 def _worktree_lines(repo_root: Path) -> list[str]:
-    """Live git worktrees (main tree excluded), most-recently-touched first."""
+    """Live git worktrees (main tree excluded), by recent git activity first."""
     wts = _list_worktrees(repo_root)
-    wts.sort(key=lambda w: _safe_mtime(w.get("path", "")), reverse=True)
+    wts.sort(key=lambda w: _worktree_activity(w.get("path", "")), reverse=True)
     lines: list[str] = []
     for w in wts[:_MAX_WORKTREES]:
         branch = w.get("branch") or Path(w.get("path", "")).name or "detached"

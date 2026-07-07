@@ -245,13 +245,11 @@ def main() -> None:
         # the non-genesis-session branch). Writer: genesis.memory.open_loops.
         try:
             _inflight = _load_inflight_block()
+            for _chunk in _inflight_emission_chunks(
+                _inflight, ek_emitted=_ek_emitted, first=first
+            ):
+                _emit(_chunk)
             if _inflight:
-                if _ek_emitted:
-                    _emit("\n\n" + _inflight)  # ride under EK, no divider
-                else:
-                    if not first:
-                        _emit("\n\n---\n\n")
-                    _emit(_inflight)
                 first = False
         except Exception:
             pass  # In-flight state is advisory — never block session start
@@ -598,6 +596,28 @@ async def _load_cognitive_state(last_session_data: dict | None = None) -> str | 
         return await cognitive_state.render(db, activity_tier=tier)
     finally:
         await db.close()
+
+
+def _inflight_emission_chunks(
+    inflight: str, *, ek_emitted: bool, first: bool
+) -> list[str]:
+    """Emission chunks for the in-flight block (pure — drives the foreground branch).
+
+    Folds directly under Essential Knowledge with NO "---" divider when EK was
+    already emitted (so it reads as one continuous context block); otherwise it
+    stands alone, preceded by the standard divider only when it is not the first
+    block. Returns [] for an empty block (nothing to emit). Extracted so the
+    fold/divider logic is unit-testable without a full subprocess run.
+    """
+    if not inflight:
+        return []
+    if ek_emitted:
+        return ["\n\n" + inflight]  # fold under EK, no divider
+    chunks: list[str] = []
+    if not first:
+        chunks.append("\n\n---\n\n")
+    chunks.append(inflight)
+    return chunks
 
 
 def _load_inflight_block() -> str:
