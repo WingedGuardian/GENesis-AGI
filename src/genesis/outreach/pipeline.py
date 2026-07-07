@@ -216,8 +216,11 @@ class OutreachPipeline:
             # Machine-factual notification (e.g. task status): deliver the
             # context EXACTLY, with no LLM in the path, so it can never be
             # creatively rewritten or invent detail. Governance already ran
-            # above; this only removes the drafter.
-            formatted = self._formatter.format(request.context, format_target)
+            # above; this only removes the drafter. Fall back to topic if a
+            # caller ever leaves context empty — never deliver an empty string.
+            formatted = self._formatter.format(
+                request.context or request.topic, format_target,
+            )
         else:
             is_urgent = request.category in _URGENT_CATEGORIES
             draft = await self._drafter.draft(DraftRequest(

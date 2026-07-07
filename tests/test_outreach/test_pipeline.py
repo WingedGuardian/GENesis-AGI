@@ -630,6 +630,35 @@ async def test_submit_verbatim_skips_drafter(config, db, mock_drafter, mock_chan
 
 
 @pytest.mark.asyncio
+async def test_submit_verbatim_empty_context_falls_back_to_topic(
+    config, db, mock_drafter, mock_channel,
+):
+    """Verbatim with an empty context must never deliver an empty string —
+    it falls back to the topic (defensive; addresses the reviewer footgun)."""
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=_echo_formatter(),
+        channels={"telegram": mock_channel},
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.ALERT,
+        topic="Task abc123",
+        context="",
+        salience_score=0.9,
+        signal_type="task_alert",
+        verbatim=True,
+    )
+    result = await pipeline.submit(req)
+    mock_drafter.draft.assert_not_called()
+    assert result.message_content == "Task abc123"
+
+
+@pytest.mark.asyncio
 async def test_submit_non_verbatim_still_drafts(config, db, mock_drafter, mock_channel):
     """Regression guard: without verbatim, the drafter is still used (other
     outreach paths are unchanged)."""

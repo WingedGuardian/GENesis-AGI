@@ -68,7 +68,9 @@ class OutreachRequest:
     # `context` verbatim (still governed, deduped, formatted). Use for
     # machine-generated FACTUAL notifications (task status, health) that must
     # be conveyed exactly and must never be creatively rewritten. Governance
-    # runs before the drafter, so this only removes the LLM step.
+    # runs before the drafter, so this only removes the LLM step. Invariant:
+    # `context` should carry the message when verbatim=True; if it is empty,
+    # submit() falls back to `topic` so an empty string is never delivered.
     verbatim: bool = False
     # When set, the voice (spoken-aloud) fan-out speaks THIS text instead of the
     # delivered `formatted.text`. Lets a notification carry a short, factual
