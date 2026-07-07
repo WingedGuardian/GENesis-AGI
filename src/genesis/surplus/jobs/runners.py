@@ -1,9 +1,12 @@
 """Direct-run jobs — scheduled work delegating to wired components.
 
-Bodies extracted verbatim from ``SurplusScheduler``; the scheduler keeps every
-original method name as a thin delegate. Function-scope imports are
-intentional — they are both the tests' patch-target seam and the import-cycle
-breaker; do not hoist them to module top.
+Bodies extracted from ``SurplusScheduler``; the scheduler keeps every
+original method name as a thin delegate. Job-health recording goes through
+the swallow-safe ``_guard`` helpers; each job's pause check, not-wired
+guard, and event emissions stay in its body (they vary per job — see
+``_guard.py``). Function-scope imports are intentional — they are both the
+tests' patch-target seam and the import-cycle breaker; do not hoist them to
+module top.
 """
 
 from __future__ import annotations

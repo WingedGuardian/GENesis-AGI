@@ -1,11 +1,14 @@
 """Enqueue-gate jobs — cooldown-gated surplus task enqueues.
 
-Bodies extracted verbatim from ``SurplusScheduler``; the scheduler keeps every
-original method name as a thin delegate. Function-scope imports are
-intentional — they are both the tests' patch-target seam and the import-cycle
-breaker; do not hoist them to module top. Bodies call back through the
-scheduler instance (``sched._recently_completed`` / ``sched.schedule_pipeline``)
-so instance-level patching in tests keeps working.
+Bodies extracted from ``SurplusScheduler``; the scheduler keeps every original
+method name as a thin delegate. The nine uniform gate jobs carry their
+try/except + job-health protocol via ``@job_guard`` (see ``_guard.py``);
+``brainstorm_check`` keeps its pause check and failure event in the body.
+Function-scope imports are intentional — they are both the tests'
+patch-target seam and the import-cycle breaker; do not hoist them to module
+top. Bodies call back through the scheduler instance
+(``sched._recently_completed`` / ``sched.schedule_pipeline``) so
+instance-level patching in tests keeps working.
 """
 
 from __future__ import annotations
