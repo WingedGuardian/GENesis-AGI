@@ -8,6 +8,7 @@ that records (method, path, params, token) so we can assert token discipline
 from __future__ import annotations
 
 import re
+import urllib.parse
 
 import pytest
 
@@ -63,11 +64,25 @@ class FakePVE:
         self.put_config_status = 200
         self.apply_writes = True  # False → PUT returns 200 but config unchanged
         self.transport_dead = False  # True → every call is a -1 transport error
+        # Async-task (UPID) knobs — default None keeps the old synchronous shape.
+        self.resize_upid = None  # str → resize PUT returns this UPID in `data`
+        self.task_exitstatus = "OK"  # exitstatus once the task reports 'stopped'
+        self.task_running_polls = 0  # 'running' responses before 'stopped'
+        self.task_never_stops = False  # True → always 'running' (poll timeout)
+        self.task_status_code = 200  # non-200 → task-status read failure
+        self._task_polls = 0
 
     def __call__(self, method, path, params=None, token=""):
         self.calls.append((method, path, params, token))
         if self.transport_dead:
             return -1, None, "connection refused"
+        if method == "GET" and "/tasks/" in path and path.endswith("/status"):
+            if self.task_status_code != 200:
+                return self.task_status_code, None, f"HTTP {self.task_status_code}: nope"
+            self._task_polls += 1
+            if self.task_never_stops or self._task_polls <= self.task_running_polls:
+                return 200, {"status": "running"}, ""
+            return 200, {"status": "stopped", "exitstatus": self.task_exitstatus}, ""
         if method == "GET" and path.endswith("/status"):
             return 200, self.status, ""
         if method == "GET" and path.endswith("/storage"):
@@ -86,7 +101,7 @@ class FakePVE:
                 m = re.search(r"size=(\d+)G", cur)
                 new = int(m.group(1)) + add
                 self.config[disk] = re.sub(r"size=\d+G", f"size={new}G", cur)
-            return 200, None, ""
+            return 200, self.resize_upid, ""
         if method == "PUT" and path.endswith("/config"):
             if self.put_config_status != 200:
                 return self.put_config_status, None, f"HTTP {self.put_config_status}: denied"
@@ -201,7 +216,79 @@ async def test_grow_disk_403_structured_failure():
     assert res.ok is False and "403" in res.error
 
 
+# ── grow disk: async task (UPID) polling ─────────────────────────────────
+_UPID = "UPID:proxmox:001234AB:0056789A:66AABBCC:resize:100:root@pam:"
+
+
+async def test_grow_disk_awaits_task_ok_then_verifies():
+    """Resize returns a UPID; task runs then stops OK → verified grow."""
+    fake = FakePVE()
+    fake.resize_upid = _UPID
+    fake.task_running_polls = 2  # two 'running' polls, then 'stopped'/OK
+    res = await _adapter(fake).grow_vm_disk("scsi1", 32)
+    assert res.ok is True and res.verified is True
+    assert res.after == "64.0G"
+    # exactly one mutating PUT despite the multi-poll wait
+    assert len([c for c in fake.calls if c[0] == "PUT"]) == 1
+    # the task-status GET url-encodes the UPID's colons (%3A)
+    task_gets = [p for (m, p, _pa, _t) in fake.calls if m == "GET" and "/tasks/" in p]
+    assert task_gets, "expected a task-status poll"
+    assert "%3A" in task_gets[0]
+    assert urllib.parse.quote(_UPID, safe="") in task_gets[0]
+    # task status polled with the audit token
+    assert all(t == "AUDIT" for (m, p, _pa, t) in fake.calls if "/tasks/" in p)
+
+
+async def test_grow_disk_task_failed_reports_exitstatus_one_put():
+    """Resize PUT 200 but the worker task FAILS → ok=False, exitstatus surfaced,
+    exactly one PUT, and no confusion with a slow/unverified success."""
+    fake = FakePVE()
+    fake.resize_upid = _UPID
+    fake.apply_writes = False  # a failed resize does not change the disk
+    fake.task_exitstatus = "403 Permission check failed (/storage/local-lvm, Datastore.AllocateSpace)"
+    res = await _adapter(fake).grow_vm_disk("scsi1", 32)
+    assert res.ok is False and res.verified is False
+    assert "resize task failed" in res.error
+    assert "Datastore.AllocateSpace" in res.error  # the real exitstatus surfaced
+    assert res.target_bytes == 64 * _GIB  # diagnostic target preserved
+    assert len([c for c in fake.calls if c[0] == "PUT"]) == 1
+    # early return on task failure → no config re-read after the task poll
+    task_idx = max(i for i, c in enumerate(fake.calls) if "/tasks/" in c[1])
+    assert not [c for c in fake.calls[task_idx + 1 :] if c[1].endswith("/config")]
+
+
+async def test_grow_disk_task_poll_timeout_unverified():
+    """Task never reaches 'stopped' → bounded poll gives up, unverified, one PUT."""
+    fake = FakePVE()
+    fake.resize_upid = _UPID
+    fake.task_never_stops = True
+    res = await _adapter(fake).grow_vm_disk("scsi1", 32)
+    assert res.ok is False and res.verified is False
+    assert "timed out" in res.error
+    assert len([c for c in fake.calls if c[0] == "PUT"]) == 1
+
+
+async def test_await_task_status_read_failure_unverified():
+    """Persistent non-200 on the status endpoint → unverified, surfaced reason."""
+    fake = FakePVE()
+    fake.resize_upid = _UPID
+    fake.task_status_code = 500
+    res = await _adapter(fake).grow_vm_disk("scsi1", 32)
+    assert res.ok is False and res.verified is False
+    assert "timed out" in res.error and "500" in res.error
+
+
 # ── grow memory ──────────────────────────────────────────────────────────
+async def test_grow_memory_no_task_poll_when_synchronous():
+    """Config PUT returns data=null (synchronous) → no /tasks/ poll, still verifies."""
+    fake = FakePVE()
+    fake.pending = [{"key": "memory", "value": "21500", "pending": "24576"}]
+    res = await _adapter(fake).grow_vm_memory(24576)
+    assert res.ok is True and res.verified is True
+    assert not [c for c in fake.calls if "/tasks/" in c[1]]
+
+
+
 async def test_grow_memory_grow_only_guard_no_put():
     fake = FakePVE()
     res = await _adapter(fake).grow_vm_memory(21500)  # == current

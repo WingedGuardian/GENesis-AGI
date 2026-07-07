@@ -20,8 +20,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Genesis itself is down in the outage, the host-side guardian can do it as part
   of recovery. It is **off by default**, every change is approval-gated and
   rate-capped, grows are one-attempt/never-auto-retried, and only two
-  read/write-split Proxmox tokens are ever stored. Setup and the full safety
-  model: `docs/reference/proxmox-provisioning.md`.
+  read/write-split Proxmox tokens are ever stored. A grow that Proxmox accepts
+  but then fails to carry out in the background (e.g. a storage-permission gap)
+  is now reported as a clear failure rather than a vague "couldn't confirm."
+  Setup and the full safety model: `docs/reference/proxmox-provisioning.md`.
 
 - **Ambient bridge memory-leak regression alert.** If the edge bridge's RSS ever climbs past the
   healthy plateau again (total > 1000 MB or diarization child > 450 MB), ambient health flips to

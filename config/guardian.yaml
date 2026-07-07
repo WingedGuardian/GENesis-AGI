@@ -114,6 +114,11 @@ provisioning:
   node_memory_margin_mib: 8192  # required node-RAM headroom (keys on available)
   max_actions_per_week: 2     # rate cap (counts EXECUTED mutations)
   require_recent_backup: true # refuse a grow without a recent backup
+  # NOTE: the Proxmox backup-age query is not yet implemented
+  # (newest_backup_age_days() returns None → treated as unknown → REFUSE). So
+  # leaving this `true` refuses EVERY grow. Set false to enable grows until the
+  # backup-age check lands (a grow is additive/grow-only). See
+  # docs/reference/proxmox-provisioning.md.
   backup_max_age_days: 14
   approval_timeout_s: 1800    # bounded wait for APPROVE/DENY
   min_repropose_hours: 24     # damper on autonomous pool-crit re-proposals

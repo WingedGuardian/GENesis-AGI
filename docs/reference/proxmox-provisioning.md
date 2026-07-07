@@ -51,14 +51,18 @@ getUpdates gate lives only in the guardian's Genesis-DOWN path.
 
 ## Host setup (generalized — substitute your own values)
 
-Replace `<NODE>` (PVE node name), `<VMID>` (this container's VM id), and choose
-your own token secrets. Run on the PVE host:
+Replace `<NODE>` (PVE node name), `<VMID>` (this container's VM id), `<STORAGE>`
+(the storage the VM's disks live on, e.g. `local-lvm`), and choose your own token
+secrets. Run on the PVE host:
 
 ```sh
 # 1. A dedicated user + two roles (least privilege)
 pveum user add genesis@pve
 pveum role add GenesisAudit    -privs "Sys.Audit Datastore.Audit VM.Audit"
-pveum role add GenesisProvision -privs "VM.Config.Disk VM.Config.Memory"
+# A disk grow ALLOCATES space on the datastore → Datastore.AllocateSpace is
+# REQUIRED alongside VM.Config.Disk (without it the resize task 403s in the
+# worker even though the PUT returns 200 — see "The ACL gotcha" below).
+pveum role add GenesisProvision -privs "VM.Config.Disk VM.Config.Memory Datastore.AllocateSpace"
 
 # 2. Audit role at / (read the node/storage/VM config)
 pveum acl modify /                 -user genesis@pve -role GenesisAudit
@@ -66,7 +70,10 @@ pveum acl modify /                 -user genesis@pve -role GenesisAudit
 # 3. Provision role scoped to THIS VM only
 pveum acl modify /vms/<VMID>       -user genesis@pve -role GenesisProvision
 
-# 4. Two privilege-separated tokens (privsep=1). Save the printed secrets.
+# 4. Provision role ALSO on the storage (disk grow allocates space there)
+pveum acl modify /storage/<STORAGE> -user genesis@pve -role GenesisProvision
+
+# 5. Two privilege-separated tokens (privsep=1). Save the printed secrets.
 pveum user token add genesis@pve ro       --privsep 1
 pveum user token add genesis@pve provision --privsep 1
 ```
@@ -85,6 +92,31 @@ pveum acl modify /vms/<VMID> -token 'genesis@pve!ro'        -role GenesisAudit
 pveum acl modify /vms/<VMID> -token 'genesis@pve!provision' -role GenesisProvision
 ```
 
+The **same replacement rule bites again at the storage path**, in *both*
+directions:
+
+- The **provision token** needs `Datastore.AllocateSpace` at
+  `/storage/<STORAGE>` (the role privilege from step 1 only takes effect where
+  the ACL is granted). Without it, the resize PUT returns 200 but the async
+  worker task fails `403 Permission check failed (/storage/<STORAGE>,
+  Datastore.AllocateSpace)`.
+- The moment you add ANY ACL at `/storage/<STORAGE>`, that path stops
+  inheriting the `GenesisAudit` you granted at `/` — so the **audit token's
+  storage read silently breaks** (avail flips to 0 / access denied) until you
+  RE-grant `GenesisAudit` there too. Grant all three:
+
+```sh
+pveum acl modify /storage/<STORAGE> -token 'genesis@pve!provision' -role GenesisProvision
+pveum acl modify /storage/<STORAGE> -user  genesis@pve             -role GenesisAudit
+pveum acl modify /storage/<STORAGE> -token 'genesis@pve!ro'        -role GenesisAudit
+```
+
+Verify the provision token actually carries the privilege at the storage path:
+
+```sh
+pveum user token permissions genesis@pve provision /storage/<STORAGE> | grep -i AllocateSpace
+```
+
 ### Validate (audit reads succeed, writes 403)
 
 ```sh
@@ -92,8 +124,11 @@ AUD='PVEAPIToken=genesis@pve!ro=<AUDIT_SECRET>'
 PRV='PVEAPIToken=genesis@pve!provision=<PROVISION_SECRET>'
 H=https://<PVE_HOST>:8006/api2/json
 
-curl -sk -H "Authorization: $AUD" "$H/nodes/<NODE>/status"            | jq .data.memory
+curl -sk -H "Authorization: $AUD" "$H/nodes/<NODE>/status"             | jq .data.memory
 curl -sk -H "Authorization: $AUD" "$H/nodes/<NODE>/qemu/<VMID>/config" | jq '{cores,memory,scsi1}'
+# Storage read MUST still return a non-zero avail after the /storage ACLs above
+# (proves the GenesisAudit re-grant at /storage/<STORAGE> worked).
+curl -sk -H "Authorization: $AUD" "$H/nodes/<NODE>/storage"           | jq '.data[] | select(.storage=="<STORAGE>") | .avail'
 # Negative: the audit token must be REFUSED a write (expect 403)
 curl -sk -X PUT -H "Authorization: $AUD" "$H/nodes/<NODE>/qemu/<VMID>/config" -d 'memory=99999'
 ```
@@ -101,6 +136,14 @@ curl -sk -X PUT -H "Authorization: $AUD" "$H/nodes/<NODE>/qemu/<VMID>/config" -d
 > RAM headroom keys on `/nodes/<NODE>/status` → **`.memory.available`**, not
 > `.memory.free`. On a busy host `free` is near-zero (Linux uses RAM as cache);
 > gating on it would spuriously refuse every grow.
+
+> **A resize is asynchronous.** `PUT .../qemu/<VMID>/resize` returns HTTP 200
+> with a `UPID:` task string in `data`; the real work runs as a background task
+> that can FAIL *after* the 200 (the missing-`Datastore.AllocateSpace` case
+> above surfaces exactly this way). The adapter therefore polls
+> `/nodes/<NODE>/tasks/<UPID>/status` until `status=stopped` and only reports
+> success on `exitstatus=OK` — a failed task is reported as a failure, never as
+> an unverified "slow" success.
 
 ## Wiring on this install
 
@@ -135,6 +178,12 @@ curl -sk -X PUT -H "Authorization: $AUD" "$H/nodes/<NODE>/qemu/<VMID>/config" -d
   `<state_dir>/provisioning/ledger.json`; the gate refuses once
   `max_actions_per_week` is reached. Autonomous pool-crit re-proposals are
   damped by `min_repropose_hours` (`proposal_state.json`).
+- **`require_recent_backup`:** the backup-age check is not yet implemented for
+  Proxmox (`newest_backup_age_days()` returns `None`), and the gate treats an
+  unknown age as a refusal. So **setting `require_recent_backup: true` today
+  refuses every grow.** Leave it `false` until the backup-age query lands; a
+  grow is additive/grow-only and the container keeps a ≤24h healthy incus
+  snapshot lifeline, so a corrupting rollback risk from the grow itself is nil.
 
 ## `verify_tls: false`
 

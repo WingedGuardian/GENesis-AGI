@@ -143,6 +143,49 @@ class ProxmoxAdapter(ProvisioningAdapter):
             None, self._request_sync, method, path, params, token,
         )
 
+    async def _await_task(
+        self, upid: str, timeout: float = 120.0, interval: float = 2.0,
+    ) -> tuple[bool, str]:
+        """Poll a PVE task UPID to completion. Returns (ok, exitstatus).
+
+        A resize (and many PVE mutations) return HTTP 200 with a ``UPID:`` task
+        string in ``data``; the actual work runs as a background worker that can
+        FAIL *after* the 200 (e.g. a Datastore.AllocateSpace permission error
+        surfaces only in the worker). We poll
+        ``GET /nodes/N/tasks/{upid}/status`` (audit token — it has Sys.Audit)
+        until ``status == "stopped"``, then map ``exitstatus == "OK"`` → ok.
+
+        Never raises. On poll timeout or a persistent read failure we return
+        ``(False, <reason>)`` so the caller treats the mutation as UNVERIFIED
+        (and never auto-retries) rather than as a silent success. The ~``timeout``
+        bound is a raw external poll with no other watchdog: a resize completes
+        in seconds, so it only guards a pathologically slow/hung task worker or
+        status endpoint from blocking the (already bounded) provisioning flow.
+        Bounded two ways — a wall-clock deadline (honours the bound even when a
+        connected-but-hung endpoint makes each read block up to the per-request
+        timeout) AND a poll-count cap (deterministic when reads return fast).
+        """
+        cfg = self._config
+        encoded = urllib.parse.quote(upid, safe="")
+        path = f"/nodes/{cfg.node}/tasks/{encoded}/status"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        max_polls = max(1, int(timeout / interval))
+        last_err = "task did not reach 'stopped'"
+        for _ in range(max_polls):
+            st, data, err = await self._request("GET", path, token=self._audit)
+            if st == 200 and isinstance(data, dict):
+                if data.get("status") == "stopped":
+                    exitstatus = str(data.get("exitstatus") or "").strip()
+                    return exitstatus == "OK", exitstatus or "no exitstatus reported"
+                # still running — keep polling
+            else:
+                last_err = err or f"task status read failed: {st}"
+            if loop.time() >= deadline:
+                break
+            await asyncio.sleep(interval)
+        return False, f"task poll timed out after ~{timeout:.0f}s ({last_err})"
+
     # ── parsing helpers ──────────────────────────────────────────────────
     @staticmethod
     def _disk_entries(cfg: dict[str, Any]) -> dict[str, int]:
@@ -255,7 +298,7 @@ class ProxmoxAdapter(ProvisioningAdapter):
             )
         expected = before + add_gib * _GIB
         # The one mutating PUT — provision token.
-        stp, _data, ep = await self._request(
+        stp, put_data, ep = await self._request(
             "PUT", f"/nodes/{cfg.node}/qemu/{cfg.vmid}/resize",
             params={"disk": disk, "size": f"+{add_gib}G"}, token=self._provision,
         )
@@ -265,6 +308,19 @@ class ProxmoxAdapter(ProvisioningAdapter):
                 before=_human(before), target_bytes=expected,
                 error=f"resize PUT failed: {ep or stp}",
             )
+        # The resize runs as an async PVE task: the 200 above only means
+        # "accepted". When data is a UPID string, await the task so a resize
+        # that FAILS in the worker (e.g. a storage permission error) is
+        # reported as a failure — not misread as a slow-but-pending success by
+        # the config re-read below.
+        if isinstance(put_data, str) and put_data.startswith("UPID:"):
+            task_ok, exitstatus = await self._await_task(put_data)
+            if not task_ok:
+                return ProvisionResult(
+                    ok=False, action=action, requested=requested,
+                    before=_human(before), target_bytes=expected, verified=False,
+                    error=f"resize task failed: {exitstatus}",
+                )
         # Verify by re-read ONLY — never re-issue the PUT.
         after: int | None = None
         for _ in range(3):
@@ -315,7 +371,7 @@ class ProxmoxAdapter(ProvisioningAdapter):
                 before=f"{current}MiB",
                 error=f"grow-only: requested {new_mib} <= current {current} MiB",
             )
-        stp, _data, ep = await self._request(
+        stp, put_data, ep = await self._request(
             "PUT", f"/nodes/{cfg.node}/qemu/{cfg.vmid}/config",
             params={"memory": new_mib}, token=self._provision,
         )
@@ -325,6 +381,16 @@ class ProxmoxAdapter(ProvisioningAdapter):
                 before=f"{current}MiB",
                 error=f"config PUT failed: {ep or stp}",
             )
+        # A config PUT is normally synchronous (data=null), but await defensively
+        # if PVE ever returns a task UPID so a failed worker isn't misread as ok.
+        if isinstance(put_data, str) and put_data.startswith("UPID:"):
+            task_ok, exitstatus = await self._await_task(put_data)
+            if not task_ok:
+                return ProvisionResult(
+                    ok=False, action=action, requested=requested,
+                    before=f"{current}MiB", verified=False,
+                    error=f"config task failed: {exitstatus}",
+                )
         # Confirm the config accepted the new value; the running VM needs a
         # reboot to actually use it (hotplug is off on this install → default
         # requires_reboot True unless /pending proves it took effect live).
