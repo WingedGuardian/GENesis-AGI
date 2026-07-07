@@ -476,11 +476,12 @@ class GuardianWatchdog:
         except Exception:
             return None
 
-    async def _expected_gateway_sha(self, code_version: str) -> str | None:
-        """sha256 of the gateway script at the host's install-dir commit.
+    async def _expected_gateway_sha(self, commit_ref: str) -> str | None:
+        """sha256 of the gateway script at the given commit ref.
 
-        Returns None if the container's git can't resolve that commit (e.g. the
-        host is ahead of the container) — the caller then skips, never
+        Callers pass the host's ``deployed_commit`` (what the last redeploy
+        shipped). Returns None if the container's git can't resolve that commit
+        (e.g. the host is ahead of the container) — the caller then skips, never
         false-alarms. Split out so tests can stub the expected value.
         """
         import asyncio
@@ -489,7 +490,7 @@ class GuardianWatchdog:
         show = await asyncio.to_thread(
             subprocess.run,
             ["git", "-C", str(Path.home() / "genesis"),
-             "show", f"{code_version}:scripts/guardian-gateway.sh"],
+             "show", f"{commit_ref}:scripts/guardian-gateway.sh"],
             capture_output=True, timeout=5,
         )
         if show.returncode != 0 or not show.stdout:
@@ -499,22 +500,31 @@ class GuardianWatchdog:
     async def _check_gateway_staleness(self, version_info: dict) -> None:
         """Detect (and self-heal) a stale DEPLOYED gateway script.
 
-        The `update` self-update can fail while the git pull succeeds, leaving
-        ``~/.local/bin/guardian-gateway.sh`` frozen while the install dir
-        advances — the bug that froze the host gateway ~2 months. We compare the
+        A guardian redeploy can fail to swap ``~/.local/bin/guardian-gateway.sh``
+        (the atomic self-``cp``) while still advancing the install dir and
+        recording the new ``deployed_commit`` — leaving the deployed gateway
+        frozen (the bug that froze the host gateway ~2 months). We compare the
         host's reported ``gateway_sha`` against the sha of the gateway script at
-        the host's install-dir commit. On a confirmed mismatch we attempt ONE
+        the host's ``deployed_commit`` — the authoritative record of what the
+        last redeploy shipped. We deliberately do NOT key off ``code_version``
+        (the install-dir git HEAD): the tar-based redeploy never runs ``git`` in
+        the install dir, so HEAD systematically LAGS the deployed gateway, and
+        keying off it inverts the check (false-alarm on every healthy redeploy,
+        and the self-heal would then ``cp`` the STALE install-dir gateway back).
+        This matches the sibling ``_check_code_drift_inner``, which also measures
+        against ``deployed_commit``. On a confirmed mismatch we attempt ONE
         guarded ``sync-gateway`` self-heal per episode, then escalate if still
         unresolved. Best-effort (invoked under _check_code_drift's suppress).
         """
         host_gw_sha = version_info.get("gateway_sha", "unknown")
-        host_code_ver = version_info.get("code_version", "unknown")
+        host_deploy_commit = version_info.get("deployed_commit", "unknown")
         if not isinstance(host_gw_sha, str) or host_gw_sha in ("", "unknown"):
             return  # host gateway predates gateway_sha, or unreadable
-        if not isinstance(host_code_ver, str) or host_code_ver in ("", "unknown"):
-            return
+        if not isinstance(host_deploy_commit, str) or \
+                host_deploy_commit in ("", "unknown"):
+            return  # host hasn't recorded a deploy yet — skip, never false-alarm
 
-        expected = await self._expected_gateway_sha(host_code_ver)
+        expected = await self._expected_gateway_sha(host_deploy_commit)
         if expected is None:
             return  # can't determine expected sha — don't false-alarm
 
@@ -538,7 +548,7 @@ class GuardianWatchdog:
             logger.warning(
                 "Guardian deployed gateway stale (deployed=%s expected=%s @ %s) "
                 "— auto-running sync-gateway",
-                host_gw_sha[:12], expected[:12], host_code_ver,
+                host_gw_sha[:12], expected[:12], host_deploy_commit,
             )
             try:
                 res = await self._remote.sync_gateway()
@@ -552,7 +562,7 @@ class GuardianWatchdog:
                     Subsystem.GUARDIAN, Severity.WARNING,
                     "guardian.gateway_resync",
                     f"Deployed gateway was stale (sha {host_gw_sha[:12]} vs "
-                    f"{expected[:12]} @ {host_code_ver}); auto sync-gateway "
+                    f"{expected[:12]} @ {host_deploy_commit}); auto sync-gateway "
                     f"ok={ok}. Re-verifying next tick.",
                 )
             return
@@ -564,7 +574,7 @@ class GuardianWatchdog:
             logger.error(
                 "Guardian deployed gateway STILL stale after auto sync-gateway "
                 "(deployed=%s expected=%s @ %s)",
-                host_gw_sha[:12], expected[:12], host_code_ver,
+                host_gw_sha[:12], expected[:12], host_deploy_commit,
             )
             if self._event_bus:
                 from genesis.observability.types import Severity, Subsystem
@@ -573,14 +583,14 @@ class GuardianWatchdog:
                     "guardian.gateway_stale",
                     f"Deployed gateway still stale after auto-resync (sha "
                     f"{host_gw_sha[:12]} vs expected {expected[:12]} @ "
-                    f"{host_code_ver}). Manual check needed.",
+                    f"{host_deploy_commit}). Manual check needed.",
                 )
             await self._alert_user(
                 topic="Guardian gateway stale",
                 context=(
                     f"Guardian deployed gateway is STILL stale after auto-resync "
                     f"(sha {host_gw_sha[:12]} vs expected {expected[:12]} @ "
-                    f"{host_code_ver}). Manual intervention needed."
+                    f"{host_deploy_commit}). Manual intervention needed."
                 ),
                 source_id="guardian:gateway_stale",
             )

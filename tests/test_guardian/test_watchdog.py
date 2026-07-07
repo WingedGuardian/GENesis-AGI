@@ -268,7 +268,7 @@ class TestGatewayStaleness:
     async def test_match_no_action(self):
         wd, r, eb, outreach = _gw_watchdog()
         await wd._check_gateway_staleness(
-            {"gateway_sha": _EXPECTED_GW_SHA, "code_version": "abc1234"})
+            {"gateway_sha": _EXPECTED_GW_SHA, "deployed_commit": "abc1234"})
         r.sync_gateway.assert_not_called()
         eb.emit.assert_not_called()
         assert wd._gateway_drift_count == 0
@@ -278,7 +278,7 @@ class TestGatewayStaleness:
         """Host gateway too old to report gateway_sha → never alarm."""
         wd, r, _, _ = _gw_watchdog()
         await wd._check_gateway_staleness(
-            {"gateway_sha": "unknown", "code_version": "abc1234"})
+            {"gateway_sha": "unknown", "deployed_commit": "abc1234"})
         r.sync_gateway.assert_not_called()
         assert wd._gateway_drift_count == 0
 
@@ -288,14 +288,14 @@ class TestGatewayStaleness:
         wd, r, _, _ = _gw_watchdog()
         wd._expected_gateway_sha = AsyncMock(return_value=None)
         await wd._check_gateway_staleness(
-            {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"})
+            {"gateway_sha": _STALE_GW_SHA, "deployed_commit": "abc1234"})
         r.sync_gateway.assert_not_called()
         assert wd._gateway_drift_count == 0
 
     @pytest.mark.asyncio
     async def test_stale_below_threshold_no_resync(self):
         wd, r, _, _ = _gw_watchdog()
-        vi = {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"}
+        vi = {"gateway_sha": _STALE_GW_SHA, "deployed_commit": "abc1234"}
         for _ in range(_THRESHOLD - 1):
             await wd._check_gateway_staleness(vi)
         r.sync_gateway.assert_not_called()
@@ -304,7 +304,7 @@ class TestGatewayStaleness:
     @pytest.mark.asyncio
     async def test_threshold_triggers_single_resync(self):
         wd, r, eb, outreach = _gw_watchdog()
-        vi = {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"}
+        vi = {"gateway_sha": _STALE_GW_SHA, "deployed_commit": "abc1234"}
         for _ in range(_THRESHOLD):
             await wd._check_gateway_staleness(vi)
         r.sync_gateway.assert_called_once()
@@ -314,7 +314,7 @@ class TestGatewayStaleness:
     @pytest.mark.asyncio
     async def test_still_stale_after_resync_escalates_once(self):
         wd, r, eb, outreach = _gw_watchdog()
-        vi = {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"}
+        vi = {"gateway_sha": _STALE_GW_SHA, "deployed_commit": "abc1234"}
         for _ in range(_THRESHOLD):
             await wd._check_gateway_staleness(vi)   # → one resync
         await wd._check_gateway_staleness(vi)        # still stale → escalate
@@ -329,13 +329,13 @@ class TestGatewayStaleness:
     @pytest.mark.asyncio
     async def test_resolved_after_resync_resets_state(self):
         wd, r, _, _ = _gw_watchdog()
-        vi_stale = {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"}
+        vi_stale = {"gateway_sha": _STALE_GW_SHA, "deployed_commit": "abc1234"}
         for _ in range(_THRESHOLD):
             await wd._check_gateway_staleness(vi_stale)
         r.sync_gateway.assert_called_once()
         # Next tick: sync worked → deployed sha now matches expected.
         await wd._check_gateway_staleness(
-            {"gateway_sha": _EXPECTED_GW_SHA, "code_version": "abc1234"})
+            {"gateway_sha": _EXPECTED_GW_SHA, "deployed_commit": "abc1234"})
         assert wd._gateway_drift_count == 0
         assert wd._gateway_resync_attempted is False
         assert wd._gateway_escalated is False
@@ -345,8 +345,8 @@ class TestGatewayStaleness:
         """After a resolved episode, a fresh staleness episode must self-heal
         again (the most safety-critical transition — no 'quiet forever')."""
         wd, r, _, _ = _gw_watchdog()
-        vi_stale = {"gateway_sha": _STALE_GW_SHA, "code_version": "abc1234"}
-        vi_ok = {"gateway_sha": _EXPECTED_GW_SHA, "code_version": "abc1234"}
+        vi_stale = {"gateway_sha": _STALE_GW_SHA, "deployed_commit": "abc1234"}
+        vi_ok = {"gateway_sha": _EXPECTED_GW_SHA, "deployed_commit": "abc1234"}
         for _ in range(_THRESHOLD):
             await wd._check_gateway_staleness(vi_stale)   # episode 1 → resync
         await wd._check_gateway_staleness(vi_ok)           # resolved → reset
@@ -354,6 +354,33 @@ class TestGatewayStaleness:
         for _ in range(_THRESHOLD):
             await wd._check_gateway_staleness(vi_stale)   # episode 2 → re-armed
         assert r.sync_gateway.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_uses_deployed_commit_not_code_version(self):
+        """The staleness check keys the expected sha off ``deployed_commit`` (the
+        authoritative deploy record), NOT ``code_version`` (the install-dir git
+        HEAD, which the tar-based guardian redeploy leaves stale). A healthy
+        redeploy must NOT false-alarm just because the install-dir HEAD lags."""
+        wd, r, eb, _ = _gw_watchdog()
+        await wd._check_gateway_staleness({
+            "gateway_sha": _EXPECTED_GW_SHA,
+            "deployed_commit": "deadbee",
+            "code_version": "0ldc0de",  # stale/lagging — must be IGNORED
+        })
+        wd._expected_gateway_sha.assert_awaited_once_with("deadbee")
+        r.sync_gateway.assert_not_called()
+        eb.emit.assert_not_called()
+        assert wd._gateway_drift_count == 0
+
+    @pytest.mark.asyncio
+    async def test_unknown_deployed_commit_skips(self):
+        """Host hasn't recorded a deployed_commit yet → skip, never false-alarm
+        (mirrors the unknown-gateway_sha skip)."""
+        wd, r, _, _ = _gw_watchdog()
+        await wd._check_gateway_staleness(
+            {"gateway_sha": _STALE_GW_SHA, "deployed_commit": "unknown"})
+        r.sync_gateway.assert_not_called()
+        assert wd._gateway_drift_count == 0
 
 
 class TestExpectedGatewaySha:
