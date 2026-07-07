@@ -57,17 +57,31 @@ def _make_db(path: pathlib.Path) -> None:
     conn = sqlite3.connect(path)
     conn.execute(
         "CREATE TABLE memory_metadata (memory_id TEXT PRIMARY KEY, "
-        "source_subsystem TEXT, collection TEXT, invalid_at TEXT)"
+        "source_subsystem TEXT, collection TEXT, invalid_at TEXT, "
+        "embedding_status TEXT)"
     )
     conn.execute("CREATE TABLE memory_fts (memory_id TEXT, tags TEXT)")
     conn.execute("CREATE TABLE observations (id TEXT PRIMARY KEY, expires_at TEXT)")
-    # One tagged row (matched) -> Step 2 deletes its point.
+    # One tagged row (matched) -> Step 2 deletes its point. Its
+    # embedding_status is the stale 'embedded' the purge must reconcile to
+    # 'fts5_only' (Step 2c).
     conn.execute(
-        "INSERT INTO memory_metadata VALUES ('refl-1', 'reflection', "
-        "'episodic_memory', NULL)"
+        "INSERT INTO memory_metadata "
+        "(memory_id, source_subsystem, collection, invalid_at, embedding_status) "
+        "VALUES ('refl-1', 'reflection', 'episodic_memory', NULL, 'embedded')"
     )
     conn.commit()
     conn.close()
+
+
+def _embedding_status(path: pathlib.Path, memory_id: str) -> str | None:
+    conn = sqlite3.connect(path)
+    row = conn.execute(
+        "SELECT embedding_status FROM memory_metadata WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 @pytest.fixture
@@ -103,6 +117,34 @@ def test_dry_run_deletes_nothing(scenario):
     assert stub.deleted == []
 
 
+def test_apply_reconciles_stale_embedding_status(tmp_path, monkeypatch):
+    """The purge deletes the Qdrant vector, so a subsystem row that was
+    'embedded' must be reconciled to 'fts5_only' (Step 2c) — otherwise the
+    field lies about vector presence and mark_superseded would issue a doomed
+    update_payload on the deleted point."""
+    db = tmp_path / "genesis.db"
+    _make_db(db)  # refl-1 tagged 'reflection', embedding_status='embedded'
+    stub = _StubQdrant([_Point("refl-1", "reflection")])
+    module = _load_script()
+    import genesis.env as genv
+
+    monkeypatch.setattr(genv, "genesis_db_path", lambda: db)
+    monkeypatch.setattr(genv, "qdrant_url", lambda: "http://stub")
+    monkeypatch.setattr("qdrant_client.QdrantClient", lambda **_kw: stub)
+
+    # Dry-run: status untouched.
+    asyncio.run(module.main(apply=False))
+    assert _embedding_status(db, "refl-1") == "embedded"
+
+    # Apply: reconciled to fts5_only.
+    asyncio.run(module.main(apply=True))
+    assert _embedding_status(db, "refl-1") == "fts5_only"
+
+    # Idempotent: second apply leaves it fts5_only.
+    asyncio.run(module.main(apply=True))
+    assert _embedding_status(db, "refl-1") == "fts5_only"
+
+
 def test_orphan_sweep_runs_with_no_tagged_rows(tmp_path, monkeypatch):
     """Regression: the sweep must run even when memory_metadata has no tagged
     rows (pure-orphan install), i.e. the early return must not skip Step 2b."""
@@ -110,7 +152,8 @@ def test_orphan_sweep_runs_with_no_tagged_rows(tmp_path, monkeypatch):
     conn = sqlite3.connect(db)
     conn.execute(
         "CREATE TABLE memory_metadata (memory_id TEXT PRIMARY KEY, "
-        "source_subsystem TEXT, collection TEXT, invalid_at TEXT)"
+        "source_subsystem TEXT, collection TEXT, invalid_at TEXT, "
+        "embedding_status TEXT)"
     )
     conn.execute("CREATE TABLE memory_fts (memory_id TEXT, tags TEXT)")
     conn.execute("CREATE TABLE observations (id TEXT PRIMARY KEY, expires_at TEXT)")
