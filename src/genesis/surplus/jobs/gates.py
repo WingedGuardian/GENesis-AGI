@@ -17,7 +17,12 @@ from typing import TYPE_CHECKING
 
 from genesis.db.crud import surplus as surplus_crud
 from genesis.observability.types import Severity, Subsystem
-from genesis.surplus.jobs._guard import SKIP, job_guard
+from genesis.surplus.jobs._guard import (
+    SKIP,
+    job_guard,
+    record_failure,
+    record_success,
+)
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -39,18 +44,10 @@ async def brainstorm_check(sched: SchedulerContext) -> None:
         return
     try:
         await sched._brainstorm_runner.schedule_daily_brainstorms()
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_success("surplus_brainstorm")
-        except Exception:
-            pass
+        record_success("surplus_brainstorm")
     except Exception as exc:
         logger.exception("Brainstorm check failed")
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure("surplus_brainstorm", str(exc))
-        except Exception:
-            pass
+        record_failure("surplus_brainstorm", str(exc))
         if sched._event_bus:
             await sched._event_bus.emit(
                 Subsystem.SURPLUS, Severity.ERROR,

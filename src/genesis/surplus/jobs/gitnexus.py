@@ -15,6 +15,8 @@ import logging
 import re
 from pathlib import Path
 
+from genesis.surplus.jobs._guard import record_failure, record_success
+
 logger = logging.getLogger(__name__)
 
 
@@ -170,14 +172,10 @@ async def run_gitnexus_strip() -> None:
     intentionally keeps the block (read by cross-tool agents). Idempotent no-op
     when the block is absent.
     """
-    from genesis.runtime import GenesisRuntime
-
     try:
         if _strip_gitnexus_block(Path.home() / "genesis" / "CLAUDE.md"):
             logger.info("Stripped GitNexus block from CLAUDE.md (kept in AGENTS.md)")
-        with contextlib.suppress(Exception):
-            GenesisRuntime.instance().record_job_success("gitnexus_strip")
+        record_success("gitnexus_strip")
     except Exception as exc:
         logger.warning("GitNexus strip failed", exc_info=True)
-        with contextlib.suppress(Exception):
-            GenesisRuntime.instance().record_job_failure("gitnexus_strip", str(exc))
+        record_failure("gitnexus_strip", str(exc))

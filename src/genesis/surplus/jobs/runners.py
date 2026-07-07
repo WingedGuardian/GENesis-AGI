@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from genesis.observability.types import Severity, Subsystem
+from genesis.surplus.jobs._guard import record_failure, record_success
 
 if TYPE_CHECKING:
     from genesis.surplus.jobs.context import SchedulerContext
@@ -33,11 +34,7 @@ async def dispatch_follow_ups(sched: SchedulerContext) -> None:
         pass
     try:
         summary = await sched._follow_up_dispatcher.run_cycle()
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_success("follow_up_dispatch")
-        except Exception:
-            pass
+        record_success("follow_up_dispatch")
         if summary.get("failures_detected", 0) > 0:
             logger.warning(
                 "Follow-up dispatch detected %d failure(s)",
@@ -45,21 +42,13 @@ async def dispatch_follow_ups(sched: SchedulerContext) -> None:
             )
     except Exception as exc:
         logger.exception("Follow-up dispatch failed")
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure("follow_up_dispatch", str(exc))
-        except Exception:
-            pass
+        record_failure("follow_up_dispatch", str(exc))
 
 
 async def run_recon_gather(sched: SchedulerContext) -> None:
     """Check watchlist projects for new GitHub releases and star counts."""
     if sched._recon_gatherer is None:
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure("recon_gather", "gatherer not wired")
-        except Exception:
-            pass
+        record_failure("recon_gather", "gatherer not wired")
         return
     try:
         result = await sched._recon_gatherer.gather_releases()
@@ -82,11 +71,7 @@ async def run_recon_gather(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.DEBUG,
                 "heartbeat", "recon_gather completed",
             )
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_success("recon_gather")
-        except Exception:
-            pass
+        record_success("recon_gather")
     except Exception as exc:
         logger.exception("Recon gather failed")
         if sched._event_bus:
@@ -95,23 +80,13 @@ async def run_recon_gather(sched: SchedulerContext) -> None:
                 "recon_gather.failed",
                 "Recon gather failed with exception",
             )
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure("recon_gather", str(exc))
-        except Exception:
-            pass
+        record_failure("recon_gather", str(exc))
 
 
 async def run_model_intelligence(sched: SchedulerContext) -> None:
     """Run model intelligence scan (weekly)."""
     if sched._model_intelligence_job is None:
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure(
-                "model_intelligence", "job not wired",
-            )
-        except Exception:
-            pass
+        record_failure("model_intelligence", "job not wired")
         return
     try:
         result = await sched._model_intelligence_job.run()
@@ -122,11 +97,7 @@ async def run_model_intelligence(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.DEBUG,
                 "heartbeat", "model_intelligence completed",
             )
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_success("model_intelligence")
-        except Exception:
-            pass
+        record_success("model_intelligence")
     except Exception as exc:
         logger.exception("Model intelligence scan failed")
         if sched._event_bus:
@@ -135,23 +106,13 @@ async def run_model_intelligence(sched: SchedulerContext) -> None:
                 "model_intelligence.failed",
                 "Model intelligence scan failed",
             )
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure("model_intelligence", str(exc))
-        except Exception:
-            pass
+        record_failure("model_intelligence", str(exc))
 
 
 async def run_skill_security_scan(sched: SchedulerContext) -> None:
     """Run the weekly skill-security scan (SkillSpector → recon findings)."""
     if sched._skill_security_scan_job is None:
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure(
-                "skill_security_scan", "job not wired",
-            )
-        except Exception:
-            pass
+        record_failure("skill_security_scan", "job not wired")
         return
     try:
         result = await sched._skill_security_scan_job.run()
@@ -162,11 +123,7 @@ async def run_skill_security_scan(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.DEBUG,
                 "heartbeat", "skill_security_scan completed",
             )
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_success("skill_security_scan")
-        except Exception:
-            pass
+        record_success("skill_security_scan")
     except Exception as exc:
         logger.exception("Skill-security scan failed")
         if sched._event_bus:
@@ -175,11 +132,7 @@ async def run_skill_security_scan(sched: SchedulerContext) -> None:
                 "skill_security_scan.failed",
                 "Skill-security scan failed",
             )
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure("skill_security_scan", str(exc))
-        except Exception:
-            pass
+        record_failure("skill_security_scan", str(exc))
 
 
 async def run_github_discovery(sched: SchedulerContext) -> None:
@@ -192,13 +145,7 @@ async def run_github_discovery(sched: SchedulerContext) -> None:
     except Exception:
         pass
     if sched._github_discovery_job is None:
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure(
-                "github_discovery", "job not wired",
-            )
-        except Exception:
-            pass
+        record_failure("github_discovery", "job not wired")
         return
     try:
         result = await sched._github_discovery_job.run()
@@ -209,11 +156,7 @@ async def run_github_discovery(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.DEBUG,
                 "heartbeat", "github_discovery completed",
             )
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_success("github_discovery")
-        except Exception:
-            pass
+        record_success("github_discovery")
     except Exception as exc:
         logger.exception("GitHub Discovery failed")
         if sched._event_bus:
@@ -222,11 +165,7 @@ async def run_github_discovery(sched: SchedulerContext) -> None:
                 "github_discovery.failed",
                 "GitHub Discovery failed",
             )
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure("github_discovery", str(exc))
-        except Exception:
-            pass
+        record_failure("github_discovery", str(exc))
 
 
 async def run_models_md_synthesis(sched: SchedulerContext) -> None:
@@ -244,13 +183,7 @@ async def run_models_md_synthesis(sched: SchedulerContext) -> None:
     except Exception:
         pass
     if sched._models_md_synthesis_job is None:
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure(
-                "models_md_synthesis", "job not wired",
-            )
-        except Exception:
-            pass
+        record_failure("models_md_synthesis", "job not wired")
         return
     try:
         result = await sched._models_md_synthesis_job.run()
@@ -268,11 +201,7 @@ async def run_models_md_synthesis(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.DEBUG,
                 "heartbeat", "models_md_synthesis dispatched",
             )
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_success("models_md_synthesis")
-        except Exception:
-            pass
+        record_success("models_md_synthesis")
     except Exception as exc:
         logger.exception("Models.md synthesis failed")
         if sched._event_bus:
@@ -281,11 +210,7 @@ async def run_models_md_synthesis(sched: SchedulerContext) -> None:
                 "models_md_synthesis.failed",
                 "Models.md synthesis failed",
             )
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure("models_md_synthesis", str(exc))
-        except Exception:
-            pass
+        record_failure("models_md_synthesis", str(exc))
 
 
 async def run_db_integrity_check(sched: SchedulerContext) -> None:
@@ -310,18 +235,10 @@ async def run_db_integrity_check(sched: SchedulerContext) -> None:
         else:
             logger.error("DB integrity check FAILED: %s", status[:500])
             await sched._alarm_db_integrity(status)
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_success("db_integrity_check")
-        except Exception:
-            pass
+        record_success("db_integrity_check")
     except Exception as exc:
         logger.exception("DB integrity check job failed")
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure("db_integrity_check", str(exc))
-        except Exception:
-            pass
+        record_failure("db_integrity_check", str(exc))
 
 
 async def alarm_db_integrity(sched: SchedulerContext, detail: str) -> None:
@@ -368,13 +285,7 @@ async def run_memory_extraction(sched: SchedulerContext) -> None:
         logger.warning("Pause check failed — skipping extraction as precaution", exc_info=True)
         return
     if sched._extraction_store is None or sched._extraction_router is None:
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure(
-                "memory_extraction", "extraction deps not wired",
-            )
-        except Exception:
-            pass
+        record_failure("memory_extraction", "extraction deps not wired")
         return
     try:
         from genesis.memory.extraction_job import run_extraction_cycle
@@ -398,11 +309,7 @@ async def run_memory_extraction(sched: SchedulerContext) -> None:
                 Subsystem.SURPLUS, Severity.DEBUG,
                 "heartbeat", "memory_extraction completed",
             )
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_success("memory_extraction")
-        except Exception:
-            pass
+        record_success("memory_extraction")
     except Exception as exc:
         logger.exception("Memory extraction failed")
         if sched._event_bus:
@@ -411,8 +318,4 @@ async def run_memory_extraction(sched: SchedulerContext) -> None:
                 "memory_extraction.failed",
                 "Memory extraction failed with exception",
             )
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_failure("memory_extraction", str(exc))
-        except Exception:
-            pass
+        record_failure("memory_extraction", str(exc))
