@@ -185,11 +185,14 @@ def create_app(
             new_max_end = batch_max_end
         else:
             new_max_end = max(prev[1], batch_max_end)
-        state.set_anchor(uid, epoch0, new_max_end, now=recv_ts)
-        # 4. normalize + write + record.
+        # 4. normalize + write + record, THEN persist the advanced anchor LAST. If
+        # the day-db write raises, the anchor must not have moved for data that never
+        # landed — the next batch re-anchors cleanly off the unchanged prior anchor.
+        # All advisory: worst case is ~2s ts jitter on one batch, never lost/dup speech.
         rows = normalize_segments(unseen, uid=uid, epoch0=epoch0)
         written = write_rows(rows, recv_ts)
         state.record_segment_ids([r.segment_id for r in rows], now=recv_ts)
+        state.set_anchor(uid, epoch0, new_max_end, now=recv_ts)
         hb["accepted_total"] += written
         _write_heartbeat()
         return written

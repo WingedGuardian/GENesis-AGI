@@ -51,6 +51,10 @@ class OmiState:
                 segment_id TEXT PRIMARY KEY,
                 seen_at    REAL NOT NULL
             );
+            -- Anchor decision reads ONLY epoch0; max_end (monotonic within a kept
+            -- anchor, reset on re-anchor) and updated_at are DIAGNOSTIC — a record
+            -- of how far the current conversation got, not inputs to decide_anchor
+            -- (which uses each batch's own max-end). Kept for debugging the anchor.
             CREATE TABLE IF NOT EXISTS anchor (
                 uid        TEXT PRIMARY KEY,
                 epoch0     REAL NOT NULL,
