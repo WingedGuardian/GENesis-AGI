@@ -7,7 +7,14 @@ programmatically.
 
 Two vocabularies:
 - Genesis-relevant: ADOPT | ADAPT | WATCH | IGNORE
+  (+ BUILD, emitted only for capability-build notepad items — consumed by the
+  build lane, never by follow-up creation)
 - User-relevant:    adopt | explore | bookmark | potential_skip
+
+Capability-build extension: items evaluated under a capability-build bracket
+directive additionally carry ``verdict`` (build | dont_build | needs_discussion),
+``verdict_reason``, and a structured ``build_spec`` mapping. These parse into
+optional fields; evaluations without them are unchanged.
 """
 
 from __future__ import annotations
@@ -21,10 +28,22 @@ import yaml
 logger = logging.getLogger(__name__)
 
 # Actions that should NOT produce follow-ups.
+# BUILD is skipped by design: capability-build verdicts are consumed by the
+# build lane (greenlight card -> task executor), never queued as follow-ups.
 _SKIP_ACTIONS: frozenset[str] = frozenset({
     "ignore",
     "potential_skip",
     "potential skip",
+    "build",
+})
+
+# Valid values for the capability-build verdict field. An unrecognized value
+# parses as None (shadow-safe: bad LLM output degrades to "no verdict", it
+# never invents one).
+VALID_VERDICTS: frozenset[str] = frozenset({
+    "build",
+    "dont_build",
+    "needs_discussion",
 })
 
 # ---------------------------------------------------------------------------
@@ -51,6 +70,11 @@ class Recommendation:
     tool_momentum: str | None = None
     tool_activity: str | None = None
     tool_maturity: str | None = None
+    # Capability-build verdict (only for capability-notepad drops; the build
+    # lane consumes these — follow-up creation ignores them)
+    verdict: str | None = None
+    verdict_reason: str | None = None
+    build_spec: dict | None = None
     # Context
     item_title: str = ""
     classification: str = ""  # "genesis" or "user"
@@ -177,12 +201,37 @@ def parse_recommendations(evaluation_text: str) -> list[Recommendation]:
                 str(data["tool_maturity"]).strip()
                 if "tool_maturity" in data else None
             ),
+            verdict=_parse_verdict(data),
+            verdict_reason=(
+                str(data["verdict_reason"]).strip()
+                if data.get("verdict_reason") else None
+            ),
+            build_spec=(
+                data["build_spec"]
+                if isinstance(data.get("build_spec"), dict) else None
+            ),
             item_title=title,
             classification=classification,
         )
         results.append(rec)
 
     return results
+
+
+def _parse_verdict(data: dict) -> str | None:
+    """Normalize and validate the optional ``verdict`` field.
+
+    Unrecognized values degrade to None with a warning — a malformed verdict
+    must never masquerade as a real one downstream.
+    """
+    raw = data.get("verdict")
+    if not raw:
+        return None
+    verdict = str(raw).strip().lower().replace(" ", "_")
+    if verdict not in VALID_VERDICTS:
+        logger.warning("Unrecognized verdict value %r — treating as absent", raw)
+        return None
+    return verdict
 
 
 def _extract_item_title(section_text: str) -> str:
