@@ -16,6 +16,18 @@ from typing import TYPE_CHECKING
 
 from genesis.db.crud import ego as ego_crud
 from genesis.ego.types import ProposalStatus
+from genesis.util.approval_words import (
+    APPROVE_PHRASES as _SHARED_BARE_APPROVE,
+)
+from genesis.util.approval_words import (
+    APPROVE_TOKENS as _SHARED_APPROVE_TOKENS,
+)
+from genesis.util.approval_words import (
+    REJECT_PHRASES as _SHARED_BARE_REJECT,
+)
+from genesis.util.approval_words import (
+    REJECT_TOKENS as _SHARED_REJECT_TOKENS,
+)
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -746,32 +758,25 @@ class ProposalWorkflow:
 # Reply parser — converts user Telegram text into proposal decisions
 # ---------------------------------------------------------------------------
 
-_APPROVE_WORDS = {"approve", "approved", "yes", "accept", "go", "ok", "okay"}
-_REJECT_WORDS = {"reject", "rejected", "no", "deny", "denied", "skip", "nope"}
+# Token + phrase vocabulary is CANONICAL in genesis.util.approval_words
+# (imported at the top of this module) — shared with the CLI approval gate
+# and the Telegram bare-text path so the three decision surfaces can never
+# drift again. Only the cancel verbs are proposal-specific (grace-period
+# revoke has no equivalent elsewhere).
+_APPROVE_WORDS = _SHARED_APPROVE_TOKENS
+_REJECT_WORDS = _SHARED_REJECT_TOKENS
 _CANCEL_WORDS = {"cancel", "cancelled", "revoke", "revoked", "stop", "undo"}
 
-# Bare affirmative / negative — matches standalone short replies in
-# the ego_proposals topic.  Checked AFTER cross-batch and cancel
-# patterns, BEFORE the numbered regex.
-_BARE_APPROVE = frozenset({
-    # Short affirmatives — caught AFTER the explicit "X all" checks above,
-    # so entries like "approve all" belong there, not here.
-    "ok", "okay", "ok.", "okay.",
-    "yes", "yes.", "yep", "yep.", "yeah", "ya",
-    "sure", "sure.", "absolutely",
-    "go for it", "do it", "let's go", "lets go",
-    "proceed", "sounds good", "lgtm",
-    "approved", "approve", "accept",
-    "ship it", "send it",
-    "go", "alright", "aight",
-    "\U0001f44d", "\u2705",
+# Bare affirmative / negative — standalone short replies in the
+# ego_proposals topic. The shared phrase sets are punctuation-free (the
+# shared normalize() strips trailing punctuation before matching, but this
+# parser's caller only lowercases/strips), so the historical dotted
+# variants are added back locally for byte-compatible matching.
+_BARE_APPROVE = _SHARED_BARE_APPROVE | frozenset({
+    "ok.", "okay.", "yes.", "yep.", "sure.",
 })
-_BARE_REJECT = frozenset({
-    "no", "no.", "nope", "nah",
-    "reject", "rejected", "deny",
-    "skip", "pass",
-    "don't", "dont", "not now", "hold off",
-    "\U0001f44e", "\u274c",
+_BARE_REJECT = _SHARED_BARE_REJECT | frozenset({
+    "no.",
 })
 
 # Pattern: "1 approve" or "approve 1" or "1 yes" or "reject 2: reason"

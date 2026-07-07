@@ -478,6 +478,9 @@ def handlers_with_waiter(mock_loop, mock_adapter, dedupe):
     """Handlers with a mock reply_waiter injected."""
     waiter = MagicMock()
     waiter.resolve = MagicMock(return_value=True)
+    # Scoped standalone resolution defaults to "nothing pending here" so
+    # unrelated messages continue to normal CC flow.
+    waiter.resolve_scoped_pending = MagicMock(return_value=False)
     return make_handlers_v2(
         mock_loop,
         allowed_users={123},
@@ -519,6 +522,26 @@ async def test_outreach_reply_unresolved_continues_to_cc(handlers_with_waiter, m
 
     waiter.resolve.assert_called_once()
     mock_loop.handle_message_streaming.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_standalone_message_resolves_scoped_waiter(
+    handlers_with_waiter, mock_loop,
+):
+    """A NON-quote-reply message that resolves a chat+topic-scoped waiter is
+    consumed (no CC invocation) — the scoped replacement for the disabled
+    resolve_any_pending."""
+    handlers, waiter = handlers_with_waiter
+    waiter.resolve_scoped_pending = MagicMock(return_value=True)
+    update = _make_update(text="ok", message_id=201)
+    update.message.reply_to_message = None
+    ctx = _make_context()
+
+    await handlers["text"](update, ctx)
+
+    waiter.resolve_scoped_pending.assert_called_once()
+    assert waiter.resolve_scoped_pending.call_args.kwargs["thread_key"]
+    mock_loop.handle_message_streaming.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -17,14 +17,16 @@ from typing import Any
 from genesis.autonomy.cli_policy import load_autonomous_cli_policy
 from genesis.cc.types import CCInvocation
 
-logger = logging.getLogger(__name__)
+# Canonical vocabulary — shared with the Telegram bare-text path and the
+# ego proposal parser so the three surfaces can never drift again.
+from genesis.util.approval_words import (
+    APPROVE_TOKENS as _APPROVE_WORDS,
+)
+from genesis.util.approval_words import (
+    REJECT_TOKENS as _REJECT_WORDS,
+)
 
-_APPROVE_WORDS = frozenset({
-    "approve", "approved", "ok", "yes", "go", "lgtm",
-})
-_REJECT_WORDS = frozenset({
-    "reject", "rejected", "deny", "denied", "no", "nope",
-})
+logger = logging.getLogger(__name__)
 
 
 def _json_loads(raw: str | None) -> dict[str, Any]:

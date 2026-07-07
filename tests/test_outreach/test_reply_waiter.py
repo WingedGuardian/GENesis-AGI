@@ -79,3 +79,76 @@ async def test_wait_for_reply_success():
 async def test_cancel_nonexistent_is_safe():
     waiter = ReplyWaiter()
     waiter.cancel("does-not-exist")  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# Scoped standalone-text resolution (chat+topic bound)
+# ---------------------------------------------------------------------------
+
+
+async def test_scoped_resolution_matches_same_thread():
+    w = ReplyWaiter()
+    fut = w.register("d1")
+    w.set_context("d1", "123:45")
+    assert w.resolve_scoped_pending("ok", thread_key="123:45") is True
+    assert fut.result() == "ok"
+
+
+async def test_scoped_resolution_ignores_other_thread():
+    """The cross-chat conflation bug: a DM must never resolve a waiter
+    whose prompt was delivered to a forum topic."""
+    w = ReplyWaiter()
+    w.register("d1")
+    w.set_context("d1", "123:45")
+    assert w.resolve_scoped_pending("ok", thread_key="999:dm") is False
+    assert w.pending_count == 1
+
+
+async def test_scoped_resolution_skips_contextless_waiters():
+    w = ReplyWaiter()
+    w.register("d1")  # no context recorded
+    assert w.resolve_scoped_pending("ok", thread_key="123:45") is False
+
+
+async def test_scoped_resolution_ambiguous_does_nothing():
+    w = ReplyWaiter()
+    w.register("d1")
+    w.register("d2")
+    w.set_context("d1", "123:45")
+    w.set_context("d2", "123:45")
+    assert w.resolve_scoped_pending("ok", thread_key="123:45") is False
+    assert w.pending_count == 2
+
+
+async def test_scoped_resolution_alias_counts_once():
+    """A waiter with a callback-data alias is ONE waiter, not two —
+    aliasing must not make the single-pending check ambiguous."""
+    w = ReplyWaiter()
+    fut = w.register("uuid-key")
+    w.set_context("uuid-key", "123:45")
+    w.add_alias("msg-77", "uuid-key")
+    assert w.resolve_scoped_pending("go", thread_key="123:45") is True
+    assert fut.result() == "go"
+    # Both keys are gone — no stale entries.
+    assert w.pending_count == 0
+    assert w.resolve("msg-77", "late") is False
+
+
+async def test_alias_inherits_context():
+    w = ReplyWaiter()
+    w.register("uuid-key")
+    w.set_context("uuid-key", "123:45")
+    w.add_alias("msg-77", "uuid-key")
+    assert w._contexts.get("msg-77") == "123:45"
+
+
+async def test_context_cleared_on_resolve_and_cancel():
+    w = ReplyWaiter()
+    w.register("d1")
+    w.set_context("d1", "123:45")
+    w.resolve("d1", "ok")
+    assert "d1" not in w._contexts
+    w.register("d2")
+    w.set_context("d2", "123:45")
+    w.cancel("d2")
+    assert "d2" not in w._contexts
