@@ -6,9 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
-import re
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -23,6 +21,14 @@ from genesis.surplus.brainstorm import BrainstormRunner
 from genesis.surplus.compute_availability import ComputeAvailability
 from genesis.surplus.executor import StubExecutor
 from genesis.surplus.idle_detector import IdleDetector
+from genesis.surplus.jobs import dream as dream_jobs
+from genesis.surplus.jobs import gates as gate_jobs
+from genesis.surplus.jobs import gitnexus as gitnexus_jobs
+from genesis.surplus.jobs import runners as runner_jobs
+
+# Re-export: tests/test_surplus/test_gitnexus_strip.py imports the strip
+# helper from its historical home here.
+from genesis.surplus.jobs.gitnexus import _strip_gitnexus_block  # noqa: F401
 from genesis.surplus.queue import SurplusQueue
 from genesis.surplus.types import (
     INSIGHT_PRODUCING_TASK_TYPES,
@@ -36,31 +42,6 @@ if TYPE_CHECKING:
     from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
-
-
-# `gitnexus analyze` injects a `<!-- gitnexus:start --> … <!-- gitnexus:end -->`
-# block into BOTH CLAUDE.md and AGENTS.md, with no per-file flag. We keep it in
-# AGENTS.md (read by cross-tool agents — Codex/Cursor/etc.) but strip it from
-# CLAUDE.md so Claude Code's instructions file stays clean.
-_GITNEXUS_BLOCK_RE = re.compile(
-    r"\n*<!-- gitnexus:start -->.*?<!-- gitnexus:end -->[^\n]*\n?",
-    re.DOTALL,
-)
-
-
-def _strip_gitnexus_block(path: Path) -> bool:
-    """Remove GitNexus's auto-injected block from a file. Returns True if removed."""
-    try:
-        text = path.read_text()
-    except OSError:
-        return False
-    stripped = _GITNEXUS_BLOCK_RE.sub("", text)
-    if stripped == text:
-        return False
-    if stripped and not stripped.endswith("\n"):
-        stripped += "\n"
-    path.write_text(stripped)
-    return True
 
 
 def _restart_safe_hourly(hours: int, *, minute: int = 0):
@@ -641,1151 +622,114 @@ class SurplusScheduler:
         except Exception:
             logger.warning("Failed to emit scheduler error event", exc_info=True)
 
+    # ── Job delegates ────────────────────────────────────────────────────
+    # Bodies live in genesis.surplus.jobs.*; each method here keeps the
+    # original name so APScheduler job callables, runtime wiring
+    # (_core.py JobRetryRegistry, init/surplus.py memory-extraction coro),
+    # and tests keep working unchanged. Full docstrings live on the job
+    # functions.
+
     async def brainstorm_check(self) -> None:
         """Ensure today's brainstorm sessions are queued."""
-        try:
-            from genesis.runtime import GenesisRuntime
-            if GenesisRuntime.instance().paused:
-                logger.debug("Brainstorm check skipped (Genesis paused)")
-                return
-        except Exception:
-            logger.warning("Pause check failed — skipping brainstorm as precaution", exc_info=True)
-            return
-        try:
-            await self._brainstorm_runner.schedule_daily_brainstorms()
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("surplus_brainstorm")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Brainstorm check failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("surplus_brainstorm", str(exc))
-            except Exception:
-                pass
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.SURPLUS, Severity.ERROR,
-                    "brainstorm.failed",
-                    "Brainstorm check failed with exception",
-                )
+        await gate_jobs.brainstorm_check(self)
 
     async def _recently_completed(
         self, task_type, cooldown_hours: int | float,
     ) -> bool:
-        """Return ``True`` if *task_type* completed within *cooldown_hours*.
-
-        Used on startup to avoid re-enqueuing tasks that already ran
-        recently — prevents Telegram flooding after server restarts.
-        """
-        last = await self._queue.last_completed_at(task_type)
-        if last is None:
-            return False
-        try:
-            completed = datetime.fromisoformat(last)
-            if completed.tzinfo is None:
-                completed = completed.replace(tzinfo=UTC)
-            age_s = (self._clock() - completed).total_seconds()
-            return age_s < cooldown_hours * 3600
-        except (ValueError, TypeError):
-            return False
+        """Return ``True`` if *task_type* completed within *cooldown_hours*."""
+        return await gate_jobs.recently_completed(self, task_type, cooldown_hours)
 
     async def schedule_code_audit(self) -> None:
         """Enqueue a code audit task if none pending/running."""
-        if not self._enable_code_audits:
-            return
-        try:
-            from genesis.surplus.types import ComputeTier, TaskType
-
-            active = await self._queue.active_by_type(TaskType.CODE_AUDIT)
-            if active == 0 and not await self._recently_completed(
-                TaskType.CODE_AUDIT, self._code_audit_hours,
-            ):
-                await self._queue.enqueue(
-                    TaskType.CODE_AUDIT, ComputeTier.FREE_API, 0.5, "competence"
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("schedule_code_audit")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Code audit scheduling failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("schedule_code_audit", str(exc))
-            except Exception:
-                pass
+        await gate_jobs.schedule_code_audit(self)
 
     async def schedule_code_index(self) -> None:
         """Enqueue a code index task if none pending/running."""
-        try:
-            from genesis.surplus.types import ComputeTier, TaskType
-
-            active = await self._queue.active_by_type(TaskType.CODE_INDEX)
-            if active == 0 and not await self._recently_completed(
-                TaskType.CODE_INDEX, self._code_index_hours,
-            ):
-                await self._queue.enqueue(
-                    TaskType.CODE_INDEX, ComputeTier.FREE_API, 0.6, "competence"
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("schedule_code_index")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Code index scheduling failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("schedule_code_index", str(exc))
-            except Exception:
-                pass
+        await gate_jobs.schedule_code_index(self)
 
     async def schedule_j9_eval_batch(self) -> None:
         """Enqueue a J9 eval batch task if none pending/running."""
-        try:
-            from genesis.surplus.types import ComputeTier, TaskType
-
-            active = await self._queue.active_by_type(TaskType.J9_EVAL_BATCH)
-            if active == 0 and not await self._recently_completed(
-                TaskType.J9_EVAL_BATCH, self._j9_eval_batch_hours,
-            ):
-                await self._queue.enqueue(
-                    TaskType.J9_EVAL_BATCH, ComputeTier.FREE_API, 0.3, "competence"
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("schedule_j9_eval_batch")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("J9 eval batch scheduling failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("schedule_j9_eval_batch", str(exc))
-            except Exception:
-                pass
+        await gate_jobs.schedule_j9_eval_batch(self)
 
     async def _schedule_fresh_session_test(self) -> None:
         """Enqueue a FRESH_SESSION_TEST task if none pending/running."""
-        try:
-            from genesis.surplus.types import ComputeTier, TaskType
-
-            active = await self._queue.active_by_type(TaskType.FRESH_SESSION_TEST)
-            if active == 0:
-                await self._queue.enqueue(
-                    TaskType.FRESH_SESSION_TEST, ComputeTier.FREE_API, 0.2, "competence"
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("schedule_fresh_session_test")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Fresh session test scheduling failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("schedule_fresh_session_test", str(exc))
-            except Exception:
-                pass
+        await gate_jobs.schedule_fresh_session_test(self)
 
     async def schedule_model_eval(self) -> None:
         """Enqueue a MODEL_EVAL task if none pending/running."""
-        try:
-            import json
-
-            from genesis.surplus.types import ComputeTier, TaskType
-
-            active = await self._queue.active_by_type(TaskType.MODEL_EVAL)
-            if active == 0 and not await self._recently_completed(
-                TaskType.MODEL_EVAL, self._model_eval_hours,
-            ):
-                payload = json.dumps({"model_id": "groq-free"})
-                await self._queue.enqueue(
-                    TaskType.MODEL_EVAL, ComputeTier.FREE_API, 0.4, "competence",
-                    payload=payload,
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("schedule_model_eval")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Model eval scheduling failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("schedule_model_eval", str(exc))
-            except Exception:
-                pass
+        await gate_jobs.schedule_model_eval(self)
 
     async def schedule_maintenance(self) -> None:
         """Enqueue mechanical infrastructure maintenance tasks if none active."""
-        try:
-            from genesis.surplus.types import ComputeTier, TaskType
-
-            # Mechanical tasks only — no LLM needed, run every maintenance_hours
-            maintenance_tasks = [
-                (TaskType.DISK_CLEANUP, 0.4, "preservation"),
-                (TaskType.BACKUP_VERIFICATION, 0.7, "preservation"),
-                (TaskType.DEAD_LETTER_REPLAY, 0.5, "cooperation"),
-                (TaskType.DB_MAINTENANCE, 0.3, "competence"),
-            ]
-            for task_type, priority, drive in maintenance_tasks:
-                active = await self._queue.active_by_type(task_type)
-                if active == 0 and not await self._recently_completed(
-                    task_type, self._maintenance_hours,
-                ):
-                    await self._queue.enqueue(
-                        task_type, ComputeTier.FREE_API, priority, drive,
-                    )
-
-            # ── GC operations ──────────────────────────────────────────
-            # Each wrapped individually so one failure doesn't skip the rest.
-            from genesis.runtime import GenesisRuntime
-            rt = GenesisRuntime.instance()
-            if rt.db is not None:
-                # Purge expired surplus insights (TTL enforcement)
-                try:
-                    purged = await surplus_crud.purge_expired(rt.db)
-                    if purged:
-                        logger.info("Purged %d expired surplus insights", purged)
-                except Exception:
-                    logger.warning("GC: surplus insights purge failed", exc_info=True)
-
-                # GC: remove completed/failed pending_embeddings older than 30 days
-                try:
-                    from genesis.db.crud import pending_embeddings as pe_crud
-                    pe_purged = await pe_crud.purge_completed(rt.db, older_than_days=30)
-                    if pe_purged:
-                        logger.info("Purged %d completed pending_embeddings", pe_purged)
-                except Exception:
-                    logger.warning("GC: pending_embeddings purge failed", exc_info=True)
-
-                # GC: rotate heartbeat events older than 7 days
-                try:
-                    from genesis.db.crud import events as events_crud
-                    hb_cutoff = (datetime.now(UTC) - timedelta(days=7)).isoformat()
-                    hb_purged = await events_crud.prune(
-                        rt.db, older_than=hb_cutoff, event_type="heartbeat",
-                    )
-                    if hb_purged:
-                        logger.info("Pruned %d heartbeat events older than 7d", hb_purged)
-                except Exception:
-                    logger.warning("GC: heartbeat event rotation failed", exc_info=True)
-
-                # GC: prune weak memory links (strength <= 0.3, older than 30d)
-                try:
-                    from genesis.db.crud import memory_links as links_crud
-                    links_pruned = await links_crud.prune_weak(
-                        rt.db, max_strength=0.3, min_age_days=30,
-                    )
-                    if links_pruned:
-                        logger.info("Pruned %d weak memory links", links_pruned)
-                except Exception:
-                    logger.warning("GC: weak link pruning failed", exc_info=True)
-
-                # GC: archive old transcript files (gzip .jsonl > 90 days)
-                try:
-                    from genesis.surplus.maintenance import archive_old_transcripts
-                    transcripts_archived = await archive_old_transcripts(
-                        Path.home() / ".genesis" / "background-sessions",
-                        older_than_days=90,
-                    )
-                    if transcripts_archived:
-                        logger.info(
-                            "Archived %d old transcript files", transcripts_archived,
-                        )
-                except Exception:
-                    logger.warning("GC: transcript archival failed", exc_info=True)
-
-            with contextlib.suppress(Exception):
-                GenesisRuntime.instance().record_job_success("schedule_maintenance")
-        except Exception as exc:
-            logger.exception("Maintenance scheduling failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("schedule_maintenance", str(exc))
-            except Exception:
-                pass
+        await gate_jobs.schedule_maintenance(self)
 
     async def schedule_analytical(self) -> None:
-        """Enqueue LLM-based analytical tasks if none active.
-
-        These run on a separate (longer) cadence than mechanical maintenance
-        because their inputs change slowly and their free-tier model output
-        needs time to be consumed by deep reflection.
-        """
-        try:
-            from genesis.surplus.types import ComputeTier, TaskType
-
-            analytical_tasks = [
-                (TaskType.GAP_CLUSTERING, 0.4, "competence"),
-                # anticipatory_research returns as a pipeline — see pipelines.py.
-            ]
-            for task_type, priority, drive in analytical_tasks:
-                active = await self._queue.active_by_type(task_type)
-                if active == 0 and not await self._recently_completed(
-                    task_type, self._analytical_hours,
-                ):
-                    await self._queue.enqueue(
-                        task_type, ComputeTier.FREE_API, priority, drive,
-                    )
-            # prompt_effectiveness runs as a 3-step pipeline.
-            await self.schedule_pipeline("prompt_effectiveness")
-            await self.schedule_pipeline("anticipatory_research")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("schedule_analytical")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Analytical scheduling failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("schedule_analytical", str(exc))
-            except Exception:
-                pass
+        """Enqueue LLM-based analytical tasks if none active."""
+        await gate_jobs.schedule_analytical(self)
 
     async def schedule_wing_audit(self) -> None:
         """Enqueue a wing audit task if none pending/running."""
-        try:
-            from genesis.surplus.types import ComputeTier, TaskType
-
-            active = await self._queue.active_by_type(TaskType.WING_AUDIT)
-            if active == 0:
-                await self._queue.enqueue(
-                    TaskType.WING_AUDIT, ComputeTier.FREE_API, 0.4, "competence"
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("schedule_wing_audit")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Wing audit scheduling failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("schedule_wing_audit", str(exc))
-            except Exception:
-                pass
+        await gate_jobs.schedule_wing_audit(self)
 
     async def run_db_integrity_check(self) -> None:
-        """Weekly full PRAGMA integrity_check with an alarm on corruption.
-
-        Deterministic counterpart to the DbMaintenanceExecutor's fast
-        quick_check — guaranteed cadence plus a real alarm (observation +
-        ERROR event) so DB corruption can't go silent.
-        """
-        try:
-            from genesis.runtime import GenesisRuntime
-            if GenesisRuntime.instance().paused:
-                logger.debug("DB integrity check skipped (Genesis paused)")
-                return
-        except Exception:
-            pass
-        try:
-            from genesis.surplus.maintenance import check_db_integrity
-            status = await check_db_integrity(self._db)
-            if status == "ok":
-                logger.info("Weekly DB integrity check passed")
-            else:
-                logger.error("DB integrity check FAILED: %s", status[:500])
-                await self._alarm_db_integrity(status)
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("db_integrity_check")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("DB integrity check job failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("db_integrity_check", str(exc))
-            except Exception:
-                pass
+        """Weekly full PRAGMA integrity_check with an alarm on corruption."""
+        await runner_jobs.run_db_integrity_check(self)
 
     async def _alarm_db_integrity(self, detail: str) -> None:
         """Persist + broadcast a DB-corruption alarm (observation + ERROR event)."""
-        import uuid
-
-        # Observation — surfaces in the morning report / health views.
-        # skip_if_duplicate so a persistent corruption doesn't re-alarm weekly.
-        try:
-            from genesis.db.crud import observations
-            await observations.create(
-                self._db,
-                id=uuid.uuid4().hex,
-                source="surplus_scheduler",
-                type="db_integrity_failure",
-                content=f"PRAGMA integrity_check failed: {detail[:1000]}",
-                priority="critical",
-                created_at=datetime.now(UTC).isoformat(),
-                skip_if_duplicate=True,
-            )
-        except Exception:
-            logger.warning("Failed to write db_integrity_failure observation", exc_info=True)
-
-        # Event bus — dashboard / Sentinel alerting path.
-        if self._event_bus:
-            try:
-                await self._event_bus.emit(
-                    Subsystem.SURPLUS, Severity.ERROR,
-                    "db.integrity_failed",
-                    f"SQLite integrity_check failed: {detail[:300]}",
-                )
-            except Exception:
-                logger.warning("Failed to emit db integrity event", exc_info=True)
+        await runner_jobs.alarm_db_integrity(self, detail)
 
     async def schedule_cc_memory_staleness(self) -> None:
         """Enqueue a CC memory staleness scan if none pending/running."""
-        try:
-            from genesis.surplus.types import ComputeTier, TaskType
-
-            active = await self._queue.active_by_type(TaskType.CC_MEMORY_STALENESS)
-            if active == 0:
-                await self._queue.enqueue(
-                    TaskType.CC_MEMORY_STALENESS, ComputeTier.FREE_API, 0.3, "competence"
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("schedule_cc_memory_staleness")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("CC memory staleness scheduling failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("schedule_cc_memory_staleness", str(exc))
-            except Exception:
-                pass
+        await gate_jobs.schedule_cc_memory_staleness(self)
 
     async def schedule_pipeline(self, pipeline_name: str) -> str | None:
-        """Enqueue step 1 of a named pipeline if not already running.
-
-        Returns the task ID of the enqueued step, or None if skipped
-        (pipeline unknown, or step 1 task type already pending).
-        """
-        from genesis.surplus.pipelines import build_initial_payload, get_pipeline
-
-        defn = get_pipeline(pipeline_name)
-        if defn is None:
-            logger.warning("Unknown pipeline: %s", pipeline_name)
-            return None
-
-        step1 = defn.steps[0]
-        # Prevent re-enqueue if step 1's task type is already pending or
-        # running.  Checks RUNNING too — otherwise a slow pipeline step
-        # could allow a duplicate enqueue on the next scheduled cycle.
-        if await self._queue.active_by_type(step1.task_type) > 0:
-            return None
-
-        # Cooldown: skip if the pipeline's final step completed recently.
-        # Uses the last step because that's when the full pipeline finished.
-        last_step = defn.steps[-1]
-        if await self._recently_completed(
-            last_step.task_type, self._analytical_hours,
-        ):
-            return None
-
-        payload = build_initial_payload(pipeline_name, len(defn.steps))
-        task_id = await self._queue.enqueue(
-            step1.task_type,
-            step1.compute_tier,
-            step1.priority,
-            defn.drive_alignment,
-            payload=payload,
-        )
-        logger.info("Pipeline %s: enqueued step 1 (task=%s)", pipeline_name, task_id[:8])
-        return task_id
+        """Enqueue step 1 of a named pipeline if not already running."""
+        return await gate_jobs.schedule_pipeline(self, pipeline_name)
 
     async def dispatch_follow_ups(self) -> None:
         """Run the follow-up dispatcher cycle (always-on, not idle-gated)."""
-        if self._follow_up_dispatcher is None:
-            return
-        try:
-            from genesis.runtime import GenesisRuntime
-            if GenesisRuntime.instance().paused:
-                logger.debug("Follow-up dispatch skipped (Genesis paused)")
-                return
-        except Exception:
-            pass
-        try:
-            summary = await self._follow_up_dispatcher.run_cycle()
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("follow_up_dispatch")
-            except Exception:
-                pass
-            if summary.get("failures_detected", 0) > 0:
-                logger.warning(
-                    "Follow-up dispatch detected %d failure(s)",
-                    summary["failures_detected"],
-                )
-        except Exception as exc:
-            logger.exception("Follow-up dispatch failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("follow_up_dispatch", str(exc))
-            except Exception:
-                pass
+        await runner_jobs.dispatch_follow_ups(self)
 
     async def run_recon_gather(self) -> None:
         """Check watchlist projects for new GitHub releases and star counts."""
-        if self._recon_gatherer is None:
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("recon_gather", "gatherer not wired")
-            except Exception:
-                pass
-            return
-        try:
-            result = await self._recon_gatherer.gather_releases()
-            if result.new_findings > 0:
-                logger.info(
-                    "Recon gather found %d new release(s): %s",
-                    result.new_findings, "; ".join(result.details),
-                )
-            try:
-                star_result = await self._recon_gatherer.gather_stars()
-                if star_result.new_findings > 0:
-                    logger.info(
-                        "Star gather found %d change(s): %s",
-                        star_result.new_findings, "; ".join(star_result.details),
-                    )
-            except Exception:
-                logger.exception("Star gather failed (releases unaffected)")
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.RECON, Severity.DEBUG,
-                    "heartbeat", "recon_gather completed",
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("recon_gather")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Recon gather failed")
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.RECON, Severity.ERROR,
-                    "recon_gather.failed",
-                    "Recon gather failed with exception",
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("recon_gather", str(exc))
-            except Exception:
-                pass
+        await runner_jobs.run_recon_gather(self)
 
     async def run_model_intelligence(self) -> None:
         """Run model intelligence scan (weekly)."""
-        if self._model_intelligence_job is None:
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure(
-                    "model_intelligence", "job not wired",
-                )
-            except Exception:
-                pass
-            return
-        try:
-            result = await self._model_intelligence_job.run()
-            total = result.get("total_findings", 0)
-            logger.info("Model intelligence scan: %d findings", total)
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.RECON, Severity.DEBUG,
-                    "heartbeat", "model_intelligence completed",
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("model_intelligence")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Model intelligence scan failed")
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.RECON, Severity.ERROR,
-                    "model_intelligence.failed",
-                    "Model intelligence scan failed",
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("model_intelligence", str(exc))
-            except Exception:
-                pass
+        await runner_jobs.run_model_intelligence(self)
 
     async def run_skill_security_scan(self) -> None:
         """Run the weekly skill-security scan (SkillSpector → recon findings)."""
-        if self._skill_security_scan_job is None:
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure(
-                    "skill_security_scan", "job not wired",
-                )
-            except Exception:
-                pass
-            return
-        try:
-            result = await self._skill_security_scan_job.run()
-            total = result.get("total_findings", 0)
-            logger.info("Skill-security scan: %d untrusted findings", total)
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.RECON, Severity.DEBUG,
-                    "heartbeat", "skill_security_scan completed",
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("skill_security_scan")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Skill-security scan failed")
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.RECON, Severity.ERROR,
-                    "skill_security_scan.failed",
-                    "Skill-security scan failed",
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("skill_security_scan", str(exc))
-            except Exception:
-                pass
+        await runner_jobs.run_skill_security_scan(self)
 
     async def run_github_discovery(self) -> None:
         """Run weekly curated GitHub Discovery (new repos → recon triage queue)."""
-        try:
-            from genesis.runtime import GenesisRuntime
-            if GenesisRuntime.instance().paused:
-                logger.debug("GitHub Discovery skipped (Genesis paused)")
-                return
-        except Exception:
-            pass
-        if self._github_discovery_job is None:
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure(
-                    "github_discovery", "job not wired",
-                )
-            except Exception:
-                pass
-            return
-        try:
-            result = await self._github_discovery_job.run()
-            filed = result.get("filed", 0)
-            logger.info("GitHub Discovery: %d new repo(s) filed for triage", filed)
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.RECON, Severity.DEBUG,
-                    "heartbeat", "github_discovery completed",
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("github_discovery")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("GitHub Discovery failed")
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.RECON, Severity.ERROR,
-                    "github_discovery.failed",
-                    "GitHub Discovery failed",
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("github_discovery", str(exc))
-            except Exception:
-                pass
+        await runner_jobs.run_github_discovery(self)
 
     async def run_models_md_synthesis(self) -> None:
-        """Run weekly models.md synthesis (Sunday 8am UTC).
-
-        Dispatches a CC background session to update docs/reference/models.md
-        from recent model intelligence findings.  Fire-and-forget: job health
-        records the dispatch outcome, not the session completion.
-        """
-        try:
-            from genesis.runtime import GenesisRuntime
-            if GenesisRuntime.instance().paused:
-                logger.debug("Models.md synthesis skipped (Genesis paused)")
-                return
-        except Exception:
-            pass
-        if self._models_md_synthesis_job is None:
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure(
-                    "models_md_synthesis", "job not wired",
-                )
-            except Exception:
-                pass
-            return
-        try:
-            result = await self._models_md_synthesis_job.run()
-            skipped = result.get("skipped", False)
-            if skipped:
-                logger.info("Models.md synthesis skipped: %s", result.get("reason"))
-            else:
-                logger.info(
-                    "Models.md synthesis dispatched: %d findings (session=%s)",
-                    result.get("findings_count", 0),
-                    result.get("session_id", "?"),
-                )
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.RECON, Severity.DEBUG,
-                    "heartbeat", "models_md_synthesis dispatched",
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("models_md_synthesis")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Models.md synthesis failed")
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.RECON, Severity.ERROR,
-                    "models_md_synthesis.failed",
-                    "Models.md synthesis failed",
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("models_md_synthesis", str(exc))
-            except Exception:
-                pass
+        """Run weekly models.md synthesis (Sunday 8am UTC)."""
+        await runner_jobs.run_models_md_synthesis(self)
 
     async def run_dream_cycle(self) -> None:
-        """Run the WEEKLY dream-cycle clustering pass (Sunday 4am).
-
-        Scans + clusters episodic memory, runs the additive link/centrality
-        layer, and persists the value-ranked synthesis worklist that
-        ``run_dream_synthesis_drain`` consumes daily. Destructive phases
-        (entity resolution, link repair) are dry-run by default — set the
-        ``GENESIS_DREAM_CYCLE_LIVE=1`` environment variable (there is NO
-        config-file key for this) after reviewing dry-run reports.
-        """
-        try:
-            from genesis.runtime import GenesisRuntime
-            if GenesisRuntime.instance().paused:
-                logger.debug("Dream cycle skipped (Genesis paused)")
-                return
-        except Exception:
-            logger.warning("Pause check failed — skipping dream cycle", exc_info=True)
-            return
-
-        # Record start so crashes mid-execution are visible in job_health.
-        # The June 1 crash left last_run at May 17 because neither
-        # record_job_success nor record_job_failure was reached.
-        try:
-            from genesis.runtime import GenesisRuntime
-            GenesisRuntime.instance().record_job_start("dream_cycle")
-        except Exception:
-            pass  # Don't let health tracking prevent the actual job
-
-        try:
-            from genesis.memory import dream_cycle
-            from genesis.runtime import GenesisRuntime
-
-            rt = GenesisRuntime.instance()
-            store = rt.memory_store
-            if rt.db is None or store is None or rt.router is None:
-                logger.warning("Dream cycle skipped — missing runtime dependencies")
-                return
-
-            # MemoryStore always holds the QdrantClient it was constructed with.
-            qdrant = store.qdrant_client
-            if qdrant is None:
-                logger.warning("Dream cycle skipped — MemoryStore has no Qdrant client")
-                return
-
-            # Signal heavy workload so Sentinel and watchdog defer restarts.
-            rt._heavy_workload = "dream_cycle"
-            rt._heavy_workload_since = datetime.now(UTC)
-
-            # Default dry-run until user enables live mode.
-            # Set GENESIS_DREAM_CYCLE_LIVE=1 to enable actual merges.
-            import os
-            dry_run = os.environ.get("GENESIS_DREAM_CYCLE_LIVE", "") not in ("1", "true")
-
-            report = await dream_cycle.run(
-                qdrant=qdrant,
-                db=rt.db,
-                router=rt.router,
-                store=store,
-                dry_run=dry_run,
-            )
-
-            # Write observation with the report
-            try:
-                import uuid as _uuid  # noqa: PLC0415
-
-                from genesis.db.crud import observations as obs_crud
-                await obs_crud.create(
-                    rt.db,
-                    id=str(_uuid.uuid4()),
-                    source="dream_cycle",
-                    type="dream_cycle_report",
-                    content=(
-                        f"Dream cycle {'DRY RUN' if dry_run else 'LIVE'} "
-                        f"(weekly clustering): "
-                        f"{report.get('clusters_found', 0)} clusters found, "
-                        f"{report.get('worklist_enqueued', 0)} enqueued for "
-                        f"daily drain, "
-                        f"{report.get('oversize_flagged', 0)} oversize flagged, "
-                        f"{len(report.get('errors', []))} errors"
-                    ),
-                    priority="low",
-                    created_at=datetime.now(UTC).isoformat(),
-                )
-            except Exception:
-                pass
-
-            logger.info("Dream cycle complete: %s", report)
-            with contextlib.suppress(Exception):
-                GenesisRuntime.instance().record_job_success("dream_cycle")
-        except Exception as exc:
-            logger.exception("Dream cycle failed: %s", exc)
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure(
-                    "dream_cycle", str(exc)[:500],
-                )
-            except Exception as rec_err:
-                logger.error(
-                    "Failed to record dream_cycle failure: %s "
-                    "(original error: %s)",
-                    rec_err, exc,
-                )
-        finally:
-            # Always clear heavy workload flag, even on failure — but ONLY if
-            # this job set it: an early return above fires before the flag is
-            # set, and an unconditional clear would clobber a flag held by the
-            # daily synthesis drain (the two dream jobs share the flag).
-            # Use the captured `rt` reference from the try block above —
-            # re-looking up GenesisRuntime.instance() here introduces a
-            # second failure mode during shutdown races.  If `rt` is
-            # unbound (import/lookup failed), NameError is caught below.
-            try:
-                if rt._heavy_workload == "dream_cycle":
-                    rt._heavy_workload = None
-                    rt._heavy_workload_since = None
-            except Exception:
-                pass
+        """Run the WEEKLY dream-cycle clustering pass (Sunday 4am)."""
+        await dream_jobs.run_dream_cycle()
 
     async def run_dream_synthesis_drain(self) -> None:
-        """Drain a bounded, value-ranked slice of the dream-cycle synthesis
-        worklist (DAILY 8am — the weekly clustering job persists the worklist).
-
-        SHADOW mode: exercises the full queue + rehydration lifecycle but makes
-        no LLM calls and no memory mutations, reporting what it WOULD merge.
-        The live flip (honoring ``GENESIS_DREAM_CYCLE_LIVE``) is a separate,
-        user-gated change (T2-D PR2).
-        """
-        try:
-            from genesis.runtime import GenesisRuntime
-            rt = GenesisRuntime.instance()
-            if rt.paused:
-                logger.debug("Dream synthesis drain skipped (Genesis paused)")
-                return
-            if rt.heavy_workload:
-                # Weekly clustering (or another batch job) still running —
-                # don't overlap; today's slice re-surfaces tomorrow.
-                logger.info(
-                    "Dream synthesis drain skipped — heavy workload active (%s)",
-                    rt.heavy_workload,
-                )
-                return
-            # Dependency checks BEFORE record_job_start — a skip on a
-            # misconfigured deploy must not leave the job perpetually
-            # "started" in job_health (masks real stuck-job detection).
-            store = rt.memory_store
-            if rt.db is None or store is None or rt.router is None:
-                logger.warning(
-                    "Dream synthesis drain skipped — missing runtime dependencies"
-                )
-                return
-            qdrant = store.qdrant_client
-            if qdrant is None:
-                logger.warning(
-                    "Dream synthesis drain skipped — MemoryStore has no Qdrant client"
-                )
-                return
-        except Exception:
-            logger.warning(
-                "Pause check failed — skipping dream synthesis drain",
-                exc_info=True,
-            )
-            return
-
-        with contextlib.suppress(Exception):
-            GenesisRuntime.instance().record_job_start("dream_synthesis_drain")
-
-        try:
-            from genesis.memory import dream_cycle
-
-            rt._heavy_workload = "dream_synthesis_drain"
-            rt._heavy_workload_since = datetime.now(UTC)
-
-            # SHADOW hardwired: the live flip is a separate user-gated change.
-            report = await dream_cycle.run_synthesis_drain(
-                qdrant=qdrant, db=rt.db, router=rt.router, store=store,
-                dry_run=True,
-            )
-
-            try:
-                import uuid as _uuid  # noqa: PLC0415
-
-                from genesis.db.crud import observations as obs_crud
-                await obs_crud.create(
-                    rt.db,
-                    id=str(_uuid.uuid4()),
-                    source="dream_cycle",
-                    type="dream_synthesis_drain_report",
-                    content=(
-                        f"Dream synthesis drain "
-                        f"{'SHADOW' if report.get('dry_run') else 'LIVE'}: "
-                        f"{report.get('drained', 0)} drained, "
-                        f"{report.get('would_merge', 0)} would merge, "
-                        f"{report.get('stale_skipped', 0)} stale, "
-                        f"{len(report.get('errors', []))} errors"
-                    ),
-                    priority="low",
-                    created_at=datetime.now(UTC).isoformat(),
-                )
-            except Exception:
-                pass
-
-            logger.info("Dream synthesis drain complete: %s", report)
-            with contextlib.suppress(Exception):
-                GenesisRuntime.instance().record_job_success("dream_synthesis_drain")
-        except Exception as exc:
-            logger.exception("Dream synthesis drain failed: %s", exc)
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure(
-                    "dream_synthesis_drain", str(exc)[:500],
-                )
-            except Exception as rec_err:
-                logger.error(
-                    "Failed to record dream_synthesis_drain failure: %s "
-                    "(original error: %s)",
-                    rec_err, exc,
-                )
-        finally:
-            # Clear only if this job set the flag (see run_dream_cycle note).
-            try:
-                if rt._heavy_workload == "dream_synthesis_drain":
-                    rt._heavy_workload = None
-                    rt._heavy_workload_since = None
-            except Exception:
-                pass
+        """Drain a bounded slice of the dream-cycle synthesis worklist (daily 8am)."""
+        await dream_jobs.run_dream_synthesis_drain()
 
     async def run_gitnexus_reindex(self) -> None:
-        """Reindex the GitNexus code graph (Mon & Thu 5am UTC).
-
-        Runs the GitNexus reindex as a subprocess via the locked index
-        entrypoint. CPU-only AST parsing, no ONNX/GPU (embeddings off by
-        default). Incremental since GitNexus 1.6.5 — fast on unchanged repos.
-        """
-        import asyncio
-        import shutil
-
-        try:
-            from genesis.runtime import GenesisRuntime
-            if GenesisRuntime.instance().paused:
-                logger.debug("GitNexus reindex skipped (Genesis paused)")
-                return
-        except Exception:
-            logger.warning("Pause check failed — skipping GitNexus reindex", exc_info=True)
-            return
-
-        gitnexus = shutil.which("gitnexus")
-        if not gitnexus:
-            logger.warning("GitNexus reindex skipped — gitnexus not found on PATH")
-            return
-
-        try:
-            repo_root = str(Path.home() / "genesis")
-            # Route through the single locked+capped index entrypoint.
-            # max_instances=1 only dedups within THIS process; the
-            # post-commit hook and bootstrap spawn indexers out-of-process,
-            # so the entrypoint's flock is the cross-process single-flight
-            # guard (and its systemd scope caps memory/IO/CPU). No bare
-            # binary fallback — raw indexer spawns are banned (guardrail
-            # test), and the entrypoint ships with the repo.
-            entrypoint = Path(repo_root) / "scripts" / "lib" / "code_intel_index.sh"
-            if not entrypoint.is_file():
-                logger.warning(
-                    "GitNexus reindex skipped — index entrypoint missing at %s",
-                    entrypoint,
-                )
-                return
-            proc = await asyncio.create_subprocess_exec(
-                "bash", str(entrypoint), repo_root, "gitnexus",
-                cwd=repo_root,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                # Own process group: proc is a bash wrapper — the actual
-                # indexer is its (grand)child, so a timeout kill must hit
-                # the whole group or it orphans the indexer (which keeps
-                # running AND holds the stdout pipe, blocking communicate()
-                # forever and wedging the max_instances=1 slot for good).
-                start_new_session=True,
-            )
-            try:
-                # 2-hour cap: gitnexus analyze is AST-only (no ONNX), but a
-                # cold full-repo pass can take minutes. Hanging indefinitely
-                # blocks the job slot (max_instances=1) forever.
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=7200
-                )
-            except TimeoutError:
-                import os
-                import signal
-                # pgid > 1 guard: killpg(1) == kill ALL user processes
-                # (and mocked procs default to pid 1 in tests).
-                if isinstance(proc.pid, int) and proc.pid > 1:
-                    with contextlib.suppress(ProcessLookupError, PermissionError):
-                        os.killpg(proc.pid, signal.SIGKILL)
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                # Bounded drain: after a group SIGKILL this returns at once;
-                # the bound only guards against a pipe-holder that escaped
-                # the group (e.g. via its own setsid) re-wedging the slot.
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(proc.communicate(), timeout=30)
-                logger.error("GitNexus reindex timed out after 2h — killed")
-                with contextlib.suppress(Exception):
-                    GenesisRuntime.instance().record_job_failure(
-                        "gitnexus_reindex", "timed out after 2h",
-                    )
-                return
-            out_text = (stdout or b"").decode(errors="replace")
-            if proc.returncode == 0 and (
-                "skip:" in out_text or "disabled via" in out_text
-            ):
-                # Entrypoint no-op (lock held by a concurrent index, or
-                # indexing disabled) — do NOT claim a reindex happened.
-                logger.info(
-                    "GitNexus reindex skipped by entrypoint: %s",
-                    out_text.strip()[:200],
-                )
-                with contextlib.suppress(Exception):
-                    GenesisRuntime.instance().record_job_success("gitnexus_reindex")
-                return
-            if proc.returncode == 0:
-                logger.info("GitNexus reindex complete")
-                # Keep the gitnexus block in AGENTS.md (cross-tool agents) but
-                # strip it from CLAUDE.md — analyze injects both with no per-file flag.
-                with contextlib.suppress(Exception):
-                    if _strip_gitnexus_block(Path(repo_root) / "CLAUDE.md"):
-                        logger.info("Stripped GitNexus block from CLAUDE.md (kept in AGENTS.md)")
-                with contextlib.suppress(Exception):
-                    GenesisRuntime.instance().record_job_success("gitnexus_reindex")
-            else:
-                err_msg = (stderr or stdout or b"unknown error").decode()[:200]
-                logger.error("GitNexus reindex failed (rc=%d): %s", proc.returncode, err_msg)
-                with contextlib.suppress(Exception):
-                    GenesisRuntime.instance().record_job_failure(
-                        "gitnexus_reindex", err_msg,
-                    )
-        except Exception as exc:
-            logger.exception("GitNexus reindex failed")
-            with contextlib.suppress(Exception):
-                GenesisRuntime.instance().record_job_failure(
-                    "gitnexus_reindex", str(exc),
-                )
+        """Reindex the GitNexus code graph (Mon & Thu 5am UTC)."""
+        await gitnexus_jobs.run_gitnexus_reindex()
 
     async def run_gitnexus_strip(self) -> None:
-        """Strip GitNexus's auto-injected block from CLAUDE.md (hourly + on startup).
-
-        ``gitnexus analyze`` re-injects the block into CLAUDE.md on EVERY reindex,
-        including the out-of-band staleness reindex run by GitNexus's own MCP
-        server — which never triggers ``run_gitnexus_reindex``'s post-strip. This
-        decoupled job keeps CLAUDE.md clean regardless of what reindexed; AGENTS.md
-        intentionally keeps the block (read by cross-tool agents). Idempotent no-op
-        when the block is absent.
-        """
-        from genesis.runtime import GenesisRuntime
-
-        try:
-            if _strip_gitnexus_block(Path.home() / "genesis" / "CLAUDE.md"):
-                logger.info("Stripped GitNexus block from CLAUDE.md (kept in AGENTS.md)")
-            with contextlib.suppress(Exception):
-                GenesisRuntime.instance().record_job_success("gitnexus_strip")
-        except Exception as exc:
-            logger.warning("GitNexus strip failed", exc_info=True)
-            with contextlib.suppress(Exception):
-                GenesisRuntime.instance().record_job_failure("gitnexus_strip", str(exc))
+        """Strip GitNexus's auto-injected block from CLAUDE.md (hourly + on startup)."""
+        await gitnexus_jobs.run_gitnexus_strip()
 
     async def run_memory_extraction(self) -> None:
         """Run periodic memory extraction from session transcripts."""
-        try:
-            from genesis.runtime import GenesisRuntime
-            if GenesisRuntime.instance().paused:
-                logger.debug("Memory extraction skipped (Genesis paused)")
-                return
-        except Exception:
-            logger.warning("Pause check failed — skipping extraction as precaution", exc_info=True)
-            return
-        if self._extraction_store is None or self._extraction_router is None:
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure(
-                    "memory_extraction", "extraction deps not wired",
-                )
-            except Exception:
-                pass
-            return
-        try:
-            from genesis.memory.extraction_job import run_extraction_cycle
-
-            # Get linker from store for typed link creation
-            linker = self._extraction_store.linker
-            summary = await run_extraction_cycle(
-                db=self._db,
-                store=self._extraction_store,
-                router=self._extraction_router,
-                linker=linker,
-            )
-            logger.info(
-                "Memory extraction completed: %d sessions, %d entities, %d errors",
-                summary["sessions_processed"],
-                summary["entities_extracted"],
-                summary["errors"],
-            )
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.SURPLUS, Severity.DEBUG,
-                    "heartbeat", "memory_extraction completed",
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("memory_extraction")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Memory extraction failed")
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.SURPLUS, Severity.ERROR,
-                    "memory_extraction.failed",
-                    "Memory extraction failed with exception",
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("memory_extraction", str(exc))
-            except Exception:
-                pass
+        await runner_jobs.run_memory_extraction(self)
 
     async def dispatch_once(self) -> bool:
         """Single dispatch cycle. Returns True if a task was processed."""
