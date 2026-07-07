@@ -134,6 +134,84 @@ async def _check_wal_health(db) -> None:
         logger.debug("Failed to create WAL health alert observation", exc_info=True)
 
 
+# nodatacow (chattr +C) drift detection: on btrfs, a CoW SQLite DB suffers WAL
+# write-amplification + chronic fragmentation. The install sets +C on data/;
+# this catches regressions (a restore/recreate that dropped the flag). Static
+# condition → probe on the slow WAL cadence, alert at most once per day.
+_NOCOW_ALERT_COOLDOWN_S = 24 * 3600
+# None = "never alerted" (same monotonic-since-boot caveat as the WAL alert).
+_last_nocow_alert_at: float | None = None
+_FS_IOC_GETFLAGS = 0x80086601
+_FS_NOCOW_FL = 0x00800000
+
+
+def _fs_type_for(path) -> str | None:
+    """Filesystem type of the mount containing ``path`` (longest-prefix match
+    over /proc/mounts). None if it can't be determined."""
+    try:
+        target = str(path)
+        best, fstype = "", None
+        with open("/proc/mounts") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt, typ = parts[1], parts[2]
+                if (target == mnt or target.startswith(mnt.rstrip("/") + "/")) and len(mnt) > len(best):
+                    best, fstype = mnt, typ
+        return fstype
+    except OSError:
+        return None
+
+
+async def _check_db_nodatacow(db) -> None:
+    """Create a 'high' observation (morning-report tier) when the SQLite DB
+    sits on btrfs WITHOUT the nodatacow attribute. Non-btrfs filesystems are
+    exempt (the flag is meaningless there). Best-effort; never raises into the
+    tick, and never alerts on a probe failure."""
+    global _last_nocow_alert_at
+    try:
+        import fcntl
+        import struct
+
+        from genesis.env import genesis_db_path
+        db_path = genesis_db_path()
+        if not db_path.exists() or _fs_type_for(db_path) != "btrfs":
+            return
+        with open(db_path, "rb") as fh:
+            raw = fcntl.ioctl(fh.fileno(), _FS_IOC_GETFLAGS, struct.pack("l", 0))
+        if struct.unpack("l", raw)[0] & _FS_NOCOW_FL:
+            return  # +C set — healthy
+    except Exception:
+        return  # can't determine — nothing to alert on
+
+    if db is None:
+        return
+    now = time.monotonic()
+    if _last_nocow_alert_at is not None and now - _last_nocow_alert_at < _NOCOW_ALERT_COOLDOWN_S:
+        return
+    _last_nocow_alert_at = now
+    try:
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="nodatacow_monitor",
+            type="infrastructure_alert",
+            content=(
+                "genesis.db is on btrfs WITHOUT nodatacow (+C): CoW + SQLite WAL "
+                "means write-amplification and chronic fragmentation. Restore the "
+                "attribute: stop the server, `chattr +C` the data/ directory, "
+                "recreate the DB files inside it (cp, not mv — the flag only "
+                "applies to freshly-created files), verify with lsattr, restart."
+            ),
+            priority="high",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        logger.warning("nodatacow drift alert: genesis.db is CoW on btrfs")
+    except Exception:
+        logger.debug("Failed to create nodatacow alert observation", exc_info=True)
+
+
 # Per-CC-slot RSS alerting. Same monotonic-since-boot caveat as WAL above: use a
 # key-existence check (a missing key means "never alerted"), NEVER a default of
 # 0.0 — on a host booted <cooldown ago, `now - 0.0` is small and would wrongly
@@ -937,6 +1015,9 @@ class AwarenessLoop:
                 # WAL-size check alerts if a stuck reader is pinning the checkpoint.
                 if self._tick_count % _WAL_TRUNCATE_EVERY_N_TICKS == 0:
                     await _sqlite_wal_truncate(self._db)
+                    # nodatacow drift check (btrfs-only, daily alert cooldown) —
+                    # static condition, so the slow hourly cadence is plenty.
+                    await _check_db_nodatacow(self._db)
                 await _check_wal_health(self._db)
 
             # Status file writes are handled by a dedicated loop in

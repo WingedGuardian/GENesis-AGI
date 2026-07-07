@@ -1,11 +1,28 @@
 # Proxmox provisioning — grow this VM's disk/RAM from the hypervisor
 
 The last rung of Genesis's storage/RAM escalation ladder. When the container's
-LVM-thin pool has no VG free extents (`vg_free=0`), autoextend can never fire and
-no in-container action can fix it — the only cure is to grow the VM's virtual
+storage pool is exhausted at a layer no in-container action can fix — an
+LVM-thin pool with no VG free extents (`vg_free=0`), or a btrfs pool whose
+backing LV has consumed its VG — the only cure is to grow the VM's virtual
 disk at the hypervisor and absorb it into the pool. This subsystem lets Genesis
 (or the guardian, offline) do that **from the host side, approval-gated, one
 attempt at a time**.
+
+## Supported pool substrates
+
+`storage-expand` forks on the incus pool driver and absorbs accordingly:
+
+| Substrate | Guest chain | Absorb steps |
+|---|---|---|
+| **LVM-thin** (driver `lvm`) | PVE disk → guest PV → VG → thin pool | rescan → `pvresize` → autoextend profile + dmeventd → verify `vg_free>0` (the data LV is NEVER extended — free extents ARE the autoextend headroom) |
+| **btrfs-on-LVM** (driver `btrfs`, source a regular LV) | PVE disk → guest PV → VG → linear LV → btrfs | rescan → `pvresize` → `lvextend` the backing LV by an **explicit byte count** (clamped to `vg_free`) → `btrfs filesystem resize max <mount>` (online) → verify the fs grew |
+
+The btrfs backing LV is resolved live from the pool's own mountpath
+(`findmnt` → `lvs`), never from config — the absorb can only ever touch that
+one LV, not siblings in the VG. Prefer a **whole-disk PV** as the grow target
+(e.g. a dedicated `scsi1`): a partition-backed PV (`sda3`-style) needs a
+partition grow before `pvresize` sees anything, which this flow does not do.
+Any other driver (e.g. `dir`) is refused without touching anything.
 
 > **Disabled by default.** Everything here is off unless you deliberately opt in
 > (`provisioning.enabled: true` in `guardian.yaml` + the two API tokens in
@@ -168,8 +185,10 @@ curl -sk -X PUT -H "Authorization: $AUD" "$H/nodes/<NODE>/qemu/<VMID>/config" -d
   prints host capacity JSON.
 - **Grow disk (online):** the `provision_grow` MCP tool (`kind="disk"`) — asks
   you to APPROVE, then grows the disk and runs `storage-expand` to absorb it
-  (pvresize → autoextend profile threshold 80 / percent 20 → verify
-  `vg_free>0` + dmeventd monitoring). This is the structural `vg_free=0` fix.
+  per substrate (LVM-thin: pvresize → autoextend profile threshold 80 /
+  percent 20 → verify `vg_free>0` + dmeventd monitoring; btrfs-on-LVM:
+  pvresize → lvextend by the approved amount → `btrfs filesystem resize max` →
+  verify the fs grew). This is the structural pool-exhaustion fix.
 - **Grow memory:** `provision_grow` (`kind="memory"`) grows *configured* RAM;
   it **takes effect only after a VM reboot** (hotplug is off on this install).
   The provision token deliberately lacks `VM.PowerMgmt` — power stays

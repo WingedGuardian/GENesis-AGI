@@ -20,7 +20,8 @@
 #   provision-grow-disk <disk> <GiB> — EXECUTE a pre-approved VM disk grow +
 #                     absorb (execute-only: NO Telegram gate; caller approves)
 #   provision-grow-memory <MiB>      — EXECUTE a pre-approved VM memory grow
-#   storage-expand            — absorb an already-grown disk into the thin pool
+#   storage-expand            — absorb an already-grown disk into the storage
+#                     pool (LVM-thin: pvresize; btrfs-on-LVM: + lvextend/resize)
 #   reharden-key    — rewrite the guardian authorized_keys line to the canonical
 #                     hardened options with a self-proving from= (dead-man's-
 #                     switch restores the previous file unless a fresh

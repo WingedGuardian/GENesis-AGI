@@ -593,6 +593,14 @@ echo "--- Initializing runtime state ---"
 mkdir -p "$HOME/.genesis"
 touch "$HOME/.genesis/setup-complete"
 
+# SQLite data dir — set nodatacow (chattr +C) at creation. On btrfs, CoW +
+# SQLite WAL means write-amplification and chronic fragmentation; the flag only
+# takes effect on files created AFTER it is set on the directory, so it must be
+# applied before the first DB write. Best-effort: non-btrfs filesystems refuse
+# it harmlessly (the awareness tick's nodatacow drift check backstops btrfs).
+mkdir -p "$GENESIS_ROOT/data"
+chattr +C "$GENESIS_ROOT/data" 2>/dev/null || true
+
 # CC temp directory (keeps /tmp clean — CC uses TMPDIR)
 CC_TMP_DIR="$HOME/.genesis/cc-tmp"
 mkdir -p "$CC_TMP_DIR"

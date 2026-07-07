@@ -44,6 +44,31 @@ class TestWorstTier:
     def test_none_percents_are_ok(self):
         assert worst_tier(_status(None, None), self.cfg) == TIER_OK
 
+    def test_pool_used_is_the_fallback_signal(self):
+        # Non-LVM backend (btrfs): only pool_used_pct carries signal — it must
+        # tier, else a btrfs pool filling to 100% stays OK forever.
+        def _btrfs(used):
+            return StoragePoolStatus(detected=True, pool_used_pct=used)
+
+        assert worst_tier(_btrfs(50.0), self.cfg) == TIER_OK
+        assert worst_tier(_btrfs(76.0), self.cfg) == TIER_WARN
+        assert worst_tier(_btrfs(86.0), self.cfg) == TIER_HIGH
+        assert worst_tier(_btrfs(93.0), self.cfg) == TIER_CRIT
+
+    def test_pool_used_ignored_when_lvm_percents_present(self):
+        # LVM-thin: data%/metadata% stay the sole authority — incus's used%
+        # is also populated there and must NOT change long-standing behavior.
+        s = StoragePoolStatus(
+            detected=True, data_pct=50.0, metadata_pct=40.0, pool_used_pct=95.0,
+        )
+        assert worst_tier(s, self.cfg) == TIER_OK
+
+    def test_pool_used_applies_when_only_one_lvm_percent_missing_is_not_fallback(self):
+        # Even ONE present LVM percent keeps the LVM authority (partial lvs
+        # output) — fallback engages only when BOTH are absent.
+        s = StoragePoolStatus(detected=True, data_pct=50.0, pool_used_pct=95.0)
+        assert worst_tier(s, self.cfg) == TIER_OK
+
 
 class TestParseLvs:
     def test_parses_data_and_metadata(self):

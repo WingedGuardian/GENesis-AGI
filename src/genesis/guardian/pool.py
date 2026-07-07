@@ -72,7 +72,21 @@ def _tier_for(pct: float | None, warn: float, high: float, crit: float) -> str:
 
 
 def worst_tier(status: StoragePoolStatus, cfg: StoragePoolConfig) -> str:
-    """Highest tier across data% and metadata% (metadata alerts earlier)."""
+    """Highest tier across data%, metadata% and backend-agnostic pool-used%.
+
+    ``pool_used_pct`` is a FALLBACK signal: it only tiers when the LVM percents
+    are absent (non-LVM backend, e.g. btrfs). Without it, a btrfs pool could
+    fill to 100% while this function forever reported OK (data/metadata are None
+    there), so neither alerting nor the autonomous pool-crit propose path could
+    ever fire. On LVM-thin pools data%/metadata% remain the sole authority —
+    incus's space.used/total is ALSO populated there and tiering it would change
+    long-standing alert behavior on healthy LVM installs.
+    """
+    if status.data_pct is None and status.metadata_pct is None:
+        return _tier_for(
+            status.pool_used_pct,
+            cfg.pool_used_warn_pct, cfg.pool_used_high_pct, cfg.pool_used_crit_pct,
+        )
     data = _tier_for(
         status.data_pct, cfg.data_warn_pct, cfg.data_high_pct, cfg.data_crit_pct,
     )
@@ -140,6 +154,11 @@ def decide_alert(
     return AlertDecision(False, current_tier, "no change")
 
 
+def pool_mount_path(pool_name: str) -> str:
+    """Filesystem mountpath of an incus storage pool on the host."""
+    return f"/var/lib/incus/storage-pools/{pool_name}"
+
+
 async def _detect_pool_name(config: GuardianConfig) -> str | None:
     rc, out, _ = await _run_subprocess(
         "incus", "config", "device", "get", config.container_name, "root", "pool",
@@ -148,14 +167,14 @@ async def _detect_pool_name(config: GuardianConfig) -> str | None:
     return out.strip() if rc == 0 and out.strip() else None
 
 
-async def _lvm_source(pool_name: str) -> str | None:
-    """Return the LVM ``vg/thinpool`` backing an incus pool, or None if not LVM."""
+async def _pool_driver_and_source(pool_name: str) -> tuple[str | None, str | None]:
+    """Parse ``incus storage show``: (driver, source), (None, None) on failure."""
     rc, out, _ = await _run_subprocess(
         "incus", "storage", "show", pool_name, timeout=10.0,
     )
     if rc != 0:
-        return None
-    # incus storage show emits YAML; the driver + source lines identify LVM.
+        return None, None
+    # incus storage show emits YAML; driver + source identify the backend.
     driver = None
     source = None
     for line in out.splitlines():
@@ -164,6 +183,18 @@ async def _lvm_source(pool_name: str) -> str | None:
             driver = s.split(":", 1)[1].strip()
         elif s.startswith("source:"):
             source = s.split(":", 1)[1].strip()
+    return driver, source
+
+
+async def _detect_pool_driver(pool_name: str) -> str | None:
+    """Backend driver of an incus pool ("lvm", "btrfs", "dir", …), None on failure."""
+    driver, _ = await _pool_driver_and_source(pool_name)
+    return driver
+
+
+async def _lvm_source(pool_name: str) -> str | None:
+    """Return the LVM VG backing an incus pool, or None if not LVM."""
+    driver, source = await _pool_driver_and_source(pool_name)
     if driver != "lvm" or not source:
         return None
     # ``source`` is the VG name. NOTE: the backing thin-pool LV name is NOT

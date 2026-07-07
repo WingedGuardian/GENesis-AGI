@@ -560,8 +560,9 @@ async def _check_storage_pool_and_alert(
             parts.append(f"pool used {status.pool_used_pct:.0f}%")
         body = f"{decision.reason}. " + ", ".join(parts)
         if tier == TIER_CRIT:
+            pool_kind = "Thin pool" if status.data_pct is not None else "Storage pool"
             body += (
-                "\nThin pool near exhaustion — add VG space or free allocation "
+                f"\n{pool_kind} near exhaustion — add space or free allocation "
                 "before it forces the container read-only."
             )
         try:

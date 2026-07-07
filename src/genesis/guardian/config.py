@@ -159,6 +159,12 @@ class StoragePoolConfig:
     metadata_warn_pct: float = 60.0
     metadata_high_pct: float = 70.0
     metadata_crit_pct: float = 80.0
+    # Backend-agnostic pool-used% tiers (incus space.used/total) — the FALLBACK
+    # signal for non-LVM backends (btrfs), where data%/metadata% don't exist.
+    # Only consulted when both LVM percents are absent (see pool.worst_tier).
+    pool_used_warn_pct: float = 75.0
+    pool_used_high_pct: float = 85.0
+    pool_used_crit_pct: float = 92.0
     # Re-alert cadence while a tier is sustained (avoids per-tick spam but keeps
     # a live problem visible). Tier *increases* always alert immediately.
     realert_hours: float = 6.0
@@ -188,7 +194,7 @@ class ProvisioningConfig:
     verify_tls: bool = True     # self-signed PVE → set false per-install (documented)
     node: str = ""             # PVE node name, e.g. "pve"
     vmid: int = 0              # this container's host VM id, e.g. 100; 0 = unconfigured
-    target_disk: str = "scsi1"  # the disk backing the LVM-thin PV
+    target_disk: str = "scsi1"  # the disk backing the pool's PV (prefer whole-disk PV)
     storage: str = "local-lvm"  # PVE storage the disk lives on
     # Per-action grow caps (a single approval can never exceed these).
     max_disk_step_gib: int = 32
