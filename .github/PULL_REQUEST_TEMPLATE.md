@@ -13,3 +13,4 @@
 - [ ] `ruff check .` passes
 - [ ] `pytest -v` passes
 - [ ] Tested end-to-end (describe how)
+- [ ] `docs/architecture/CURRENT.md` updated (entry prose + `verified:` stamp) if subsystem capabilities changed
