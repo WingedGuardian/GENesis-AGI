@@ -166,6 +166,7 @@ class TaskDispatcher:
             outputs=str(resolved_path),
             session_id=None,
             intake_token=intake_token,
+            source=source,
             created_at=now,
         )
 

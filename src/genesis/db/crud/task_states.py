@@ -19,16 +19,17 @@ async def create(
     outputs: str | None = None,
     session_id: str | None = None,
     intake_token: str | None = None,
+    source: str = "user",
     created_at: str | None = None,
 ) -> str:
     await db.execute(
         """INSERT INTO task_states
            (task_id, description, current_phase, decisions, blockers,
-            outputs, session_id, intake_token, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')),
+            outputs, session_id, intake_token, source, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')),
                    COALESCE(?, datetime('now')))""",
         (task_id, description, current_phase, decisions, blockers,
-         outputs, session_id, intake_token, created_at, created_at),
+         outputs, session_id, intake_token, source, created_at, created_at),
     )
     await db.commit()
     return task_id

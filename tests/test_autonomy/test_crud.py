@@ -117,6 +117,16 @@ class TestTaskStates:
         row = await task_states.get_by_id(db, "task-1")
         assert row is not None
         assert row["current_phase"] == "planning"
+        assert row["source"] == "user"  # default provenance
+
+    async def test_create_persists_source(self, db):
+        token = await create_intake_token(db)
+        await task_states.create(
+            db, task_id="task-bl", description="build",
+            intake_token=token, source="build_lane",
+        )
+        row = await task_states.get_by_id(db, "task-bl")
+        assert row["source"] == "build_lane"
 
     async def test_update(self, db):
         token = await create_intake_token(db)
