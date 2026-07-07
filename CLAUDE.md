@@ -53,6 +53,9 @@ systemctl --user list-units 'genesis-*' --all    # All units
 ```
 
 Other units: `genesis-bridge.service` (Telegram relay, on-demand),
+`genesis-omi-ingest.service` (off-prem OMI wearable transcript receiver,
+on-demand — installed but inactive until `~/.genesis/omi_config.yaml` +
+`OMI_INGEST_SECRET_TOKEN` are set),
 `genesis-tmp-watchgod.service` (/tmp protection), `genesis-watchdog.timer`
 (health check), `genesis-backup.timer` (6h encrypted backup via
 `scripts/backup.sh`), `genesis-disk-hygiene.timer` (daily worktree reaping, cache reclaim, `~/tmp`

@@ -329,7 +329,7 @@ verified: 9037d45b 2026-07-07
   collectors). Tick → depth classification (MICRO/LIGHT/DEEP/STRATEGIC) →
   reflection dispatch. Also per-tick `_check_*` housekeeping: CC-slot RSS leak
   watch, subscription-cap detection, SQLite WAL hygiene, resilience-axis folds,
-  liveness heartbeat. It does NOT drive the ego cadence (ego has its own
+  liveness heartbeat, OMI-ingest unit liveness. It does NOT drive the ego cadence (ego has its own
   scheduler). Trap: PEP 562 lazy `__init__` — don't eager-import `loop.py`.
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
   a CC bridge) run in-process via the router; DEEP/STRATEGIC go to the CC
@@ -345,7 +345,12 @@ verified: 9037d45b 2026-07-07
   `sampler.py` (L1.5 judge) is the only LLM caller, outside the core.
   **Firewall: transcript text is never persisted** — only refs + derived
   features reach `attention_events`. Config is versioned DATA
-  (`~/.genesis/config/attention_config.json`).
+  (`~/.genesis/config/attention_config.json`). A separate **OMI off-prem
+  connector** (`omi_ingest.py` — a standalone sandboxed Flask receiver, NO
+  runtime import — plus pure `omi_normalize` and I/O `omi_state`/`omi_daydb`)
+  feeds wearable transcripts into the SAME shadow tier by writing byte-compatible
+  `omi_YYYYMMDD.db` snapshots the unchanged `SnapshotSource`/GC consume. It is
+  buffers-only (the L1.5 judge stays manual) and is NOT part of the pure core.
 
 ## 10. Learning & evaluation
 

@@ -11,6 +11,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis can now listen in on your off-prem conversations through an OMI
+  wearable — with the same passive "is this worth paying attention to?" judgment
+  it already applies to the home mic.** A new opt-in receiver takes the OMI app's
+  real-time transcript webhook and feeds it into the attention engine's
+  passive-listening tier, so conversations away from home get the same treatment
+  as ambient audio at home. It's **buffers-only**: transcripts are stored for the
+  shadow "perk up?" pass, and the deeper judgment step (which sends household text
+  to the cloud) stays manual and asks first, exactly as today — nothing is sent
+  anywhere automatically. It runs as its own locked-down service reachable only
+  over your private Tailscale Funnel behind a secret URL token, and stays inactive
+  until you configure it. Setup: `config/omi_config.yaml.example` +
+  `OMI_INGEST_SECRET_TOKEN` in `secrets.env`.
+
 - **Genesis can now grow this VM's disk or RAM from the hypervisor — with your
   approval — to fix the one storage failure nothing else could.** When the
   container's storage pool has no room left to auto-expand into (the structural

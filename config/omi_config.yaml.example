@@ -1,0 +1,33 @@
+# OMI ingest config — EXAMPLE. Copy to ~/.genesis/omi_config.yaml at deploy and edit.
+#
+# This file configures the genesis-omi-ingest service, which receives off-prem
+# wearable conversation transcripts from the OMI app's real-time webhook and buffers
+# them into the attention engine's passive-listening tier (same as home ambient).
+#
+# The SECRET path-token is NOT here — it lives in secrets.env as
+# OMI_INGEST_SECRET_TOKEN (see secrets.env.example). This file holds only
+# non-secret operational settings.
+#
+# The service reads this at startup; it exits 2 ("unconfigured", no restart-loop)
+# if this file is absent or `enabled: false`.
+
+# Master switch. false (or an absent file) = the service exits and stays inactive.
+enabled: true
+
+# Loopback port the Flask app binds (127.0.0.1). The Tailscale Funnel maps public
+# 443 -> localhost:<port>. 8799 is the verified-free default.
+port: 8799
+
+# Allowlist of OMI account uids permitted to POST (the `?uid=` query param, which
+# OMI also echoes as the body's session_id). A correct path-token but an
+# unallowlisted uid is rejected (403) — a misconfig SHOULD surface loudly.
+# Get your uid from the OMI app. Add each account that should feed this install.
+uid_allowlist:
+  - "REPLACE_WITH_YOUR_OMI_UID"
+
+# Re-anchor tolerance (seconds). OMI timestamps are conversation-relative and reset
+# at each new conversation; the receiver re-anchors a uid's clock when a batch's
+# predicted wall-clock drifts more than this from the actual receive time. 60s
+# absorbs normal in-conversation skew (incl. retries) while still catching a
+# conversation rollover (which jumps by >=~120s of silence).
+anchor_tolerance_s: 60
