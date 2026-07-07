@@ -130,3 +130,20 @@ class TestQueries:
         )
         assert (await build_candidates.get_by_approval_request(db, "ar-9"))["id"] == "c1"
         assert (await build_candidates.get_by_task(db, "t-9"))["id"] == "c1"
+
+    async def test_create_persists_approval_request_id(self, db):
+        await _make(db, id="c1", approval_request_id="ar-42")
+        row = await build_candidates.get_by_id(db, "c1")
+        assert row["approval_request_id"] == "ar-42"
+
+    async def test_get_any_by_item_key_finds_decided(self, db):
+        # Permanent dedup: a DECIDED row (not "open") is still found by
+        # get_any_by_item_key so a rescan never re-cards a built item.
+        await _make(db, id="c1", item_key="k1")
+        await build_candidates.record_user_decision(
+            db, "c1", user_decision="approved"
+        )
+        assert await build_candidates.get_open_by_item_key(db, "k1") is None
+        found = await build_candidates.get_any_by_item_key(db, "k1")
+        assert found is not None and found["id"] == "c1"
+        assert await build_candidates.get_any_by_item_key(db, "nope") is None

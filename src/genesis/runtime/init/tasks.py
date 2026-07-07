@@ -131,6 +131,65 @@ async def init(rt: GenesisRuntime) -> None:
             _dispatch_poll_loop(), name="task-dispatch-poll",
         )
 
+        # Capability-build lane: consumes inbox `build` verdicts into one-tap
+        # greenlight cards and drives approved builds to draft PRs via the
+        # dispatcher. Ships dark (build_lane.enabled default OFF). Always
+        # constructed so the monitor hook is a clean no-op when disabled; the
+        # poll loop is spawned ONLY when enabled (no idle churn while dark).
+        try:
+            from genesis.autonomy.build_lane import BuildLane
+            from genesis.env import build_lane_enabled
+
+            gate = getattr(rt, "_autonomous_cli_approval_gate", None)
+            bl_enabled = build_lane_enabled()
+            if bl_enabled and gate is None:
+                logger.warning(
+                    "build_lane.enabled=true but the approval gate is "
+                    "unavailable — lane forced OFF (greenlight cards require "
+                    "the gate)",
+                )
+                bl_enabled = False
+
+            build_lane = BuildLane(
+                db=rt._db,
+                dispatcher=dispatcher,
+                approval_gate=gate,
+                enabled=bl_enabled,
+            )
+            rt._build_lane = build_lane
+
+            # Late-wire the monitor hook (inbox init ran before tasks init).
+            if rt._inbox_monitor is not None and hasattr(
+                rt._inbox_monitor, "set_build_lane",
+            ):
+                rt._inbox_monitor.set_build_lane(build_lane)
+
+            if bl_enabled:
+                async def _build_lane_poll_loop() -> None:
+                    while True:
+                        try:
+                            await asyncio.sleep(90)
+                            await build_lane.poll_pending()
+                            rt.record_job_success("build_lane_poll")
+                        except asyncio.CancelledError:
+                            break
+                        except Exception as exc:
+                            rt.record_job_failure("build_lane_poll", str(exc))
+                            logger.error(
+                                "Build-lane polling failed", exc_info=True,
+                            )
+
+                rt._build_lane_poll = tracked_task(
+                    _build_lane_poll_loop(), name="build-lane-poll",
+                )
+                logger.info("Capability-build lane ENABLED (poll loop active)")
+            else:
+                logger.info("Capability-build lane constructed (dark — disabled)")
+        except ImportError:
+            logger.warning("Build lane modules not available")
+        except Exception:
+            logger.exception("Failed to initialize build lane")
+
         logger.info("Task executor subsystem initialized")
 
     except ImportError:

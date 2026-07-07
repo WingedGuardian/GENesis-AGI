@@ -124,6 +124,17 @@ async def test_empty_folder(monitor):
     assert result.errors == []
 
 
+def test_build_lane_defaults_none(monitor):
+    # Hook is inert until the build lane is late-wired.
+    assert monitor._build_lane is None
+
+
+def test_set_build_lane_wires_hook(monitor):
+    sentinel = object()
+    monitor.set_build_lane(sentinel)
+    assert monitor._build_lane is sentinel
+
+
 @pytest.mark.asyncio
 async def test_new_files_dispatched(monitor, inbox_dir, mock_invoker):
     (inbox_dir / "links.md").write_text("https://example.com")

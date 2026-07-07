@@ -172,6 +172,37 @@ def _voice_gate(mgr):
     return AutonomousCliApprovalGate(runtime=MagicMock(), approval_manager=mgr)
 
 
+def test_build_greenlight_is_voice_gated():
+    from genesis.autonomy.approval_gate import AutonomousCliApprovalGate
+
+    assert "build_greenlight" in AutonomousCliApprovalGate._VOICE_GATED_TYPES
+
+
+def test_format_message_build_greenlight_card():
+    from genesis.autonomy.approval_gate import AutonomousCliApprovalGate
+
+    msg = AutonomousCliApprovalGate._format_message(
+        request_id="req-1",
+        action_label="Build: Widget Skill [abc12345]",
+        invocation=None,
+        api_error=None,
+        action_type="build_greenlight",
+        extra_context={
+            "title": "Widget Skill",
+            "steps_count": 3,
+            "intended_paths": ["src/genesis/skills/widget/"],
+            "plan_path": "/home/u/.genesis/plans/build-abc12345-2026-07-07.md",
+        },
+    )
+    assert "Build Greenlight" in msg
+    assert "Widget Skill" in msg
+    assert "draft PR" in msg
+    assert "3 step(s)" in msg
+    assert "src/genesis/skills/widget/" in msg
+    # Must NOT fall through to the misleading generic CLI-fallback copy.
+    assert "autonomous Claude Code fallback" not in msg
+
+
 @pytest.mark.asyncio
 async def test_resolve_pending_voice_single(db):
     mgr = ApprovalManager(db=db)

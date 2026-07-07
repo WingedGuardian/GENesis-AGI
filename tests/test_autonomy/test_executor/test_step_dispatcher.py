@@ -252,3 +252,43 @@ class TestNoAutonomousDispatcher:
 
         assert result.status == "failed"
         assert "session crashed" in result.result
+
+
+@pytest.mark.asyncio
+class TestModelOverride:
+    """model_override upgrades CODE/VERIFICATION steps only."""
+
+    def _invoker(self):
+        invoker = AsyncMock()
+        invoker.run = AsyncMock(return_value=MagicMock(
+            is_error=False,
+            text='{"status": "completed", "result": "done"}',
+            cost_usd=0.01, session_id="s", model_used="opus",
+        ))
+        return invoker
+
+    async def _model_used(self, step_type, model_override):
+        invoker = self._invoker()
+        sd = StepDispatcher(db=AsyncMock(), invoker=invoker, autonomous_dispatcher=None)
+        await sd.dispatch_step(
+            "t-1", _make_step(step_type=step_type), [],
+            model_override=model_override,
+        )
+        return invoker.run.call_args[0][0].model
+
+    async def test_code_step_uses_override(self) -> None:
+        from genesis.cc.types import CCModel
+        assert await self._model_used("code", CCModel.OPUS) == CCModel.OPUS
+
+    async def test_verification_step_uses_override(self) -> None:
+        from genesis.cc.types import CCModel
+        assert await self._model_used("verification", CCModel.OPUS) == CCModel.OPUS
+
+    async def test_research_step_ignores_override(self) -> None:
+        from genesis.cc.types import CCModel
+        # Non-code steps stay on Sonnet even under a build-lane override.
+        assert await self._model_used("research", CCModel.OPUS) == CCModel.SONNET
+
+    async def test_code_step_defaults_sonnet_without_override(self) -> None:
+        from genesis.cc.types import CCModel
+        assert await self._model_used("code", None) == CCModel.SONNET

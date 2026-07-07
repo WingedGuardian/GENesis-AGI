@@ -202,6 +202,11 @@ class InboxMonitor:
         self._check_lock = asyncio.Lock()
         self._triage_pipeline = triage_pipeline
         self._autonomous_dispatcher = None
+        self._build_lane = None
+
+    def set_build_lane(self, build_lane: object) -> None:
+        """Wire the capability-build lane (late-bound after autonomy+tasks init)."""
+        self._build_lane = build_lane
 
     @property
     def config(self) -> InboxConfig:
@@ -1495,6 +1500,23 @@ class InboxMonitor:
                     "Follow-up creation from inbox eval failed (non-fatal)",
                     exc_info=True,
                 )
+
+            # Capability-build lane (non-fatal, no-op unless enabled + wired):
+            # consumes `build` verdicts into greenlight cards. Independent of
+            # follow-up creation — BUILD verdicts never become follow-ups.
+            if self._build_lane is not None:
+                try:
+                    await self._build_lane.handle_eval(
+                        evaluation_text=output_text,
+                        batch_id=batch_id,
+                        item=item,
+                        response_path=response_path,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Build-lane eval handling failed (non-fatal)",
+                        exc_info=True,
+                    )
 
         # URL-fetch give-up -> mark failed (retry); do NOT baseline these lines.
         if _has_url_failures(output_text, item.content):

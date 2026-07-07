@@ -89,6 +89,11 @@ class TestGetTimeout:
         c = self._make_classifier()
         assert c.get_timeout("sentinel_dispatch") is None
 
+    def test_build_greenlight_timeout_none(self) -> None:
+        # Greenlight cards wait indefinitely for a human tap.
+        c = self._make_classifier()
+        assert c.get_timeout("build_greenlight") is None
+
     def test_sentinel_action_timeout(self) -> None:
         c = self._make_classifier()
         assert c.get_timeout("sentinel_action") is None
