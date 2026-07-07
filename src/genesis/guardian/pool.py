@@ -166,7 +166,9 @@ async def _lvm_source(pool_name: str) -> str | None:
             source = s.split(":", 1)[1].strip()
     if driver != "lvm" or not source:
         return None
-    # source is the VG name; the thin pool LV is conventionally the pool name.
+    # ``source`` is the VG name. NOTE: the backing thin-pool LV name is NOT
+    # necessarily the incus pool name (default layout: pool "default" / LV
+    # "IncusThinPool") — resolve it via lvm.thinpool_name, not by assumption.
     return source
 
 
