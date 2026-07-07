@@ -184,5 +184,22 @@ class TestClassifyDomain:
     def test_existing_code_change_self_modify(self) -> None:
         assert classify_domain("code_change") is ActionDomain.SELF_MODIFY
 
+    def test_autonomous_build_maps_to_autonomous_build(self) -> None:
+        """Build-lane dispatches classify as AUTONOMOUS_BUILD (min level 2,
+        high-risk under a degraded gate) — NOT SELF_MODIFY (hard-blocked) and
+        NOT the EXTERNAL_READ fallback (always allowed)."""
+        assert (
+            classify_domain("autonomous_build")
+            is ActionDomain.AUTONOMOUS_BUILD
+        )
+
+    def test_self_modify_still_hard_blocked(self) -> None:
+        """Adding AUTONOMOUS_BUILD must not soften SELF_MODIFY: its minimum
+        level stays None (blocked from background dispatch entirely)."""
+        from genesis.autonomy.types import ACTION_DOMAIN_MIN_LEVEL
+
+        assert ACTION_DOMAIN_MIN_LEVEL[ActionDomain.SELF_MODIFY] is None
+        assert ACTION_DOMAIN_MIN_LEVEL[ActionDomain.AUTONOMOUS_BUILD] == 2
+
     def test_unknown_action_type_falls_to_external_read(self) -> None:
         assert classify_domain("totally_unknown_xyz") is ActionDomain.EXTERNAL_READ

@@ -288,6 +288,10 @@ ACTION_TYPE_DOMAIN_MAP: dict[str, ActionDomain] = {
     "payment": ActionDomain.FINANCIAL,
     "code_change": ActionDomain.SELF_MODIFY,
     "refactor": ActionDomain.SELF_MODIFY,
+    # Build-lane capability builds land on a scope-gated branch as a draft PR
+    # (never merged autonomously) — gated at level 2, not hard-blocked like
+    # SELF_MODIFY, which changes running code/config in place.
+    "autonomous_build": ActionDomain.AUTONOMOUS_BUILD,
     # Evo promotion rewrites Genesis's own deep-reflection prompt — a change to
     # its cognition. SELF_MODIFY is hard-blocked from background dispatch
     # (ACTION_DOMAIN_MIN_LEVEL = None), so an approved promotion can never be

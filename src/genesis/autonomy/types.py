@@ -98,6 +98,10 @@ class ActionDomain(StrEnum):
     REPRESENT_USER = "represent_user"      # Acts in user's name to external parties
     FINANCIAL = "financial"                # Involves money
     SELF_MODIFY = "self_modify"            # Changes Genesis's own code/config/identity
+    AUTONOMOUS_BUILD = "autonomous_build"  # Builds capability code on a branch only
+                                           # (scope-gated diff, draft PR, human merge).
+                                           # Distinct from SELF_MODIFY, which changes
+                                           # running code/config/identity in place.
 
 
 # Minimum autonomy level required per domain (background context).
@@ -111,6 +115,7 @@ ACTION_DOMAIN_MIN_LEVEL: dict[ActionDomain, int | None] = {
     ActionDomain.REPRESENT_USER: 3,
     ActionDomain.FINANCIAL: 4,
     ActionDomain.SELF_MODIFY: None,         # Blocked from background (V5 deferred)
+    ActionDomain.AUTONOMOUS_BUILD: 2,       # Branch-only builds; delivery cannot merge
 }
 
 
