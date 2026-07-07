@@ -81,6 +81,37 @@ async def _seg_monitored(vg: str, thinpool: str, run) -> bool:
     return rc == 0 and "monitored" in out.lower() and "not monitored" not in out.lower()
 
 
+async def _resolve_thinpool_lv(pool_name: str, vg: str, run) -> str:
+    """Resolve the thin-pool LV name backing an incus LVM pool.
+
+    The incus pool name and its backing thin-pool LV are NOT the same in the
+    default incus LVM layout: the pool is ``default`` but its LV is
+    ``IncusThinPool``. Assuming ``thinpool == pool_name`` made the autoextend
+    profile + monitoring target a nonexistent ``vg/<pool_name>`` LV. Resolve it
+    honestly, most-authoritative first:
+
+    1. incus's own ``lvm.thinpool_name`` config (exactly which LV incus uses),
+    2. the single thin-pool LV present in the VG (``lvs -S segtype=thin-pool``),
+    3. last resort: the pool name (correct only where the naming happens to
+       coincide) — never worse than the old behaviour.
+    """
+    rc, out, _ = await run(
+        "incus", "storage", "get", pool_name, "lvm.thinpool_name", timeout=10.0,
+    )
+    name = out.strip() if rc == 0 else ""
+    if name:
+        return name
+    rc, out, _ = await run(
+        "sudo", "-n", "lvs", "--noheadings", "-o", "lv_name",
+        "-S", "segtype=thin-pool", vg, timeout=15.0,
+    )
+    if rc == 0:
+        names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        if len(names) == 1:  # unambiguous → use it
+            return names[0]
+    return pool_name
+
+
 async def expand_storage(config: GuardianConfig, *, run=None) -> dict:
     """Absorb a grown disk into the thin pool. Returns a JSON-able result dict."""
     run = run or run_subprocess
@@ -100,7 +131,7 @@ async def expand_storage(config: GuardianConfig, *, run=None) -> dict:
             "ok": False, "steps": steps,
             "error": f"pool {pool_name} is not LVM-thin — nothing to expand",
         }
-    thinpool = pool_name  # thin-pool LV is conventionally the incus pool name
+    thinpool = await _resolve_thinpool_lv(pool_name, vg, run)
 
     # 1. Discover PVs in the VG.
     rc, out, err = await _run(
