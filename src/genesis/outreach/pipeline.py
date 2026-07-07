@@ -212,17 +212,23 @@ class OutreachPipeline:
         channel = request.channel or self._select_channel(request.category)
         format_target = _CHANNEL_FORMAT.get(channel, FormatTarget.GENERIC)
 
-        is_urgent = request.category in _URGENT_CATEGORIES
-        draft = await self._drafter.draft(DraftRequest(
-            topic=request.topic,
-            context=request.context,
-            target=format_target,
-            tone="urgent" if is_urgent else "conversational",
-            max_length=None,
-            system_prompt=self._load_alert_prompt() if is_urgent else None,
-        ))
-
-        formatted = self._formatter.format(draft.content.text, format_target)
+        if request.verbatim:
+            # Machine-factual notification (e.g. task status): deliver the
+            # context EXACTLY, with no LLM in the path, so it can never be
+            # creatively rewritten or invent detail. Governance already ran
+            # above; this only removes the drafter.
+            formatted = self._formatter.format(request.context, format_target)
+        else:
+            is_urgent = request.category in _URGENT_CATEGORIES
+            draft = await self._drafter.draft(DraftRequest(
+                topic=request.topic,
+                context=request.context,
+                target=format_target,
+                tone="urgent" if is_urgent else "conversational",
+                max_length=None,
+                system_prompt=self._load_alert_prompt() if is_urgent else None,
+            ))
+            formatted = self._formatter.format(draft.content.text, format_target)
 
         return await self._deliver(outreach_id, channel, formatted, request, gov)
 
@@ -641,13 +647,17 @@ class OutreachPipeline:
             except Exception:
                 logger.warning("Email thread registration failed", exc_info=True)
 
-        # Voice secondary delivery — non-blocking (must not delay primary path)
+        # Voice secondary delivery — non-blocking (must not delay primary path).
+        # A request may carry a short, factual `voice_text` TL;DR for the ear
+        # (no file paths / tokens / commands read aloud); when absent, speak the
+        # full delivered text (unchanged for every existing caller).
         if channel != "voice" and self._should_voice(request):
             voice = self._channels.get("voice")
             if voice:
                 from genesis.util.tasks import tracked_task
+                spoken = request.voice_text or formatted.text
                 tracked_task(
-                    voice.send_message("", formatted.text),
+                    voice.send_message("", spoken),
                     name=f"voice-chime-{outreach_id[:8]}",
                 )
                 logger.info("Voice chime queued for %s", outreach_id)
@@ -710,8 +720,9 @@ class OutreachPipeline:
           ``provider:credit_exhaustion`` match ``…:<provider>``; keep
           entries specific to avoid unintended prefix hits.
         - ``signal_type`` matching is how non-health signals opt in
-          (e.g. ``sentinel_escalation``; ``task_notification`` is set in
-          ``autonomy/executor/engine.py`` ``_notify``).
+          (e.g. ``sentinel_escalation``; ``task_complete`` / ``task_alert`` are
+          set by ``autonomy/executor/engine.py`` ``_notify`` for attention-worthy
+          task notifications — routine ``task_progress`` is deliberately absent).
         """
         if not self._channels.get("voice"):
             return False

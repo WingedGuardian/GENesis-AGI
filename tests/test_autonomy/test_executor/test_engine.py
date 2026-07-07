@@ -1089,3 +1089,59 @@ class TestTaskNotepad:
         # Notepad promotion is internal-subsystem output: tagged so it routes
         # FTS5-only and stays out of default semantic recall.
         assert mock_store.store.call_args.kwargs["source_subsystem"] == "autonomy"
+
+
+# ---------------------------------------------------------------------------
+# Notification kinds: verbatim delivery + per-kind voice signal / voice_text
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestNotifyKinds:
+    async def _capture(self, db, kind, **kw):
+        captured = {}
+
+        async def grab(request):
+            captured["req"] = request
+
+        outreach = AsyncMock()
+        outreach.submit = AsyncMock(side_effect=grab)
+        engine = _make_engine(
+            db, AsyncMock(), AsyncMock(), AsyncMock(),
+            outreach_pipeline=outreach,
+        )
+        await engine._notify("t-abc123", "Some message", kind, **kw)
+        return captured.get("req")
+
+    async def test_all_task_notifications_are_verbatim(self, db):
+        """Every task notification is delivered verbatim — the LLM drafter is
+        never in the path, so it cannot rewrite or fabricate a task status."""
+        for kind in ("progress", "success", "alert", "blocked"):
+            req = await self._capture(db, kind)
+            assert req.verbatim is True, kind
+            assert req.context == "Some message", kind
+
+    async def test_progress_is_silent_and_carries_no_voice_text(self, db):
+        from genesis.outreach.types import OutreachCategory
+
+        req = await self._capture(db, "progress")
+        assert req.signal_type == "task_progress"   # not on voice allowlist
+        assert req.voice_text is None
+        assert req.category == OutreachCategory.ALERT
+
+    async def test_success_and_alert_carry_voice_text(self, db):
+        req = await self._capture(db, "success", voice_text="Done.")
+        assert req.signal_type == "task_complete"
+        assert req.voice_text == "Done."
+
+        req2 = await self._capture(db, "alert", voice_text="Problem.")
+        assert req2.signal_type == "task_alert"
+        assert req2.voice_text == "Problem."
+
+    async def test_blocked_keeps_blocker_category_and_salience(self, db):
+        from genesis.outreach.types import OutreachCategory
+
+        req = await self._capture(db, "blocked", voice_text="Blocked.")
+        assert req.category == OutreachCategory.BLOCKER
+        assert req.salience_score == 0.9
+        assert req.signal_type == "task_alert"

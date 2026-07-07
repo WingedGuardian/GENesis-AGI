@@ -81,8 +81,8 @@ health_alerts:
 # Everything still goes to Telegram regardless — this only controls what
 # interrupts the user out loud during `hours`. This block is authoritative;
 # editing it changes behavior on next server restart. Keep entries specific
-# (prefix match) and keep `task_notification` in sync with the signal_type
-# set in src/genesis/autonomy/executor/engine.py _notify.
+# (prefix match) and keep the `task_*` entries in sync with the signal_type
+# values set in src/genesis/autonomy/executor/engine.py _notify.
 voice:
   alert_ids:
     # Memory-system + resource emergencies (matched via source_id)
@@ -95,6 +95,9 @@ voice:
     - "sentinel_escalation"
     - "sentinel_approval"
     - "sentinel_action_approval"
-    # Autonomous task hit a blocker/alert
-    - "task_notification"
+    # Autonomous task reached an attention-worthy state (complete / alert).
+    # `task_progress` is intentionally omitted — routine progress pings go to
+    # Telegram only and never interrupt by voice.
+    - "task_complete"
+    - "task_alert"
   hours: [9, 2]   # 9am-2am local (wraps midnight); end hour exclusive

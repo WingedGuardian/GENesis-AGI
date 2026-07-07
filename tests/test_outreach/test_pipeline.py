@@ -1,5 +1,6 @@
 """Tests for the outreach pipeline orchestrator."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import aiosqlite
@@ -581,3 +582,152 @@ async def test_self_send_skipped_on_gate_cleared_resume(
 
     assert result.status == OutreachStatus.IGNORED
     adapter.send_message.assert_not_called()
+
+
+# ── verbatim (factual notifications skip the LLM drafter) ──────────────────
+
+
+def _echo_formatter():
+    """A formatter that returns its input verbatim, so tests can assert the
+    delivered text equals the source (the stock mock_formatter returns a
+    constant)."""
+    f = MagicMock()
+    f.format.side_effect = lambda text, target: FormattedContent(
+        text=text, target=target, truncated=False, original_length=len(text),
+    )
+    return f
+
+
+@pytest.mark.asyncio
+async def test_submit_verbatim_skips_drafter(config, db, mock_drafter, mock_channel):
+    """A verbatim request must NOT touch the LLM drafter and must deliver the
+    context byte-for-byte. This is the structural guarantee that a factual
+    notification can never be creatively rewritten or fabricated."""
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=_echo_formatter(),
+        channels={"telegram": mock_channel},
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.ALERT,
+        topic="Task abc123",
+        context="Proceeding with task: build a thing (5 steps)",
+        salience_score=0.9,
+        signal_type="task_progress",
+        source_id="task:abc123",
+        verbatim=True,
+    )
+    result = await pipeline.submit(req)
+
+    assert result.status == OutreachStatus.DELIVERED
+    mock_drafter.draft.assert_not_called()          # the load-bearing assertion
+    assert result.message_content == req.context    # delivered exactly
+
+
+@pytest.mark.asyncio
+async def test_submit_non_verbatim_still_drafts(config, db, mock_drafter, mock_channel):
+    """Regression guard: without verbatim, the drafter is still used (other
+    outreach paths are unchanged)."""
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=_echo_formatter(),
+        channels={"telegram": mock_channel},
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.ALERT,
+        topic="Health",
+        context="disk at 92%",
+        salience_score=0.9,
+        signal_type="health_alert",
+    )
+    await pipeline.submit(req)
+    mock_drafter.draft.assert_called_once()
+
+
+# ── voice_text (short spoken TL;DR instead of the full text) ───────────────
+
+
+def _voice_pipeline(config, db, mock_drafter):
+    """Pipeline with a voice channel and task_alert on the voice allowlist."""
+    import dataclasses
+
+    voice_cfg = dataclasses.replace(
+        config, voice_alert_ids=("task_alert", "task_complete"),
+    )
+    voice_channel = AsyncMock()
+    voice_channel.send_message.return_value = "voice-1"
+    telegram = AsyncMock()
+    telegram.send_message.return_value = "tg-1"
+    pipeline = OutreachPipeline(
+        governance=GovernanceGate(voice_cfg, db),
+        drafter=mock_drafter,
+        formatter=_echo_formatter(),
+        channels={"telegram": telegram, "voice": voice_channel},
+        db=db,
+        config=voice_cfg,
+        recipients={"telegram": "12345"},
+    )
+    return pipeline, voice_channel
+
+
+@pytest.mark.asyncio
+async def test_voice_speaks_voice_text_not_full_message(config, db, mock_drafter):
+    """When voice_text is set, the spoken string is the short TL;DR — NOT the
+    full delivered text (which may carry paths / tokens the user shouldn't hear
+    read aloud)."""
+    from unittest.mock import patch
+
+    pipeline, voice_channel = _voice_pipeline(config, db, mock_drafter)
+    req = OutreachRequest(
+        category=OutreachCategory.ALERT,
+        topic="Task abc123",
+        context="Build parked by scope gate: reason. Blocked paths: src/genesis/x.py",
+        salience_score=0.9,
+        signal_type="task_alert",
+        source_id="task:abc123",
+        verbatim=True,
+        voice_text="A build was parked by the safety gate.",
+    )
+    with patch.object(pipeline, "_in_voice_hours", return_value=True):
+        result = await pipeline.submit(req)
+    await asyncio.sleep(0)  # let the fire-and-forget voice task record its call
+
+    assert result.message_content == req.context  # Telegram keeps full detail
+    voice_channel.send_message.assert_called_once()
+    spoken = voice_channel.send_message.call_args.args[1]
+    assert spoken == "A build was parked by the safety gate."
+    assert "src/genesis" not in spoken  # no path read aloud
+
+
+@pytest.mark.asyncio
+async def test_voice_falls_back_to_full_text_without_voice_text(config, db, mock_drafter):
+    """Callers that set no voice_text (e.g. health alerts) keep speaking their
+    full text — unchanged behavior."""
+    from unittest.mock import patch
+
+    pipeline, voice_channel = _voice_pipeline(config, db, mock_drafter)
+    req = OutreachRequest(
+        category=OutreachCategory.ALERT,
+        topic="Task abc123",
+        context="Task completed: build a thing",
+        salience_score=0.9,
+        signal_type="task_complete",
+        source_id="task:abc123",
+        verbatim=True,
+    )
+    with patch.object(pipeline, "_in_voice_hours", return_value=True):
+        await pipeline.submit(req)
+    await asyncio.sleep(0)
+
+    voice_channel.send_message.assert_called_once()
+    assert voice_channel.send_message.call_args.args[1] == "Task completed: build a thing"

@@ -385,7 +385,7 @@ class CCSessionExecutor:
                     task_id,
                     f"Proceeding with task: {description} "
                     f"({len(steps)} steps)",
-                    "alert",
+                    "progress",
                 )
 
                 step_results = []
@@ -676,7 +676,8 @@ class CCSessionExecutor:
                 f"Task completed. {len(step_results)} steps executed.",
             )
             await self._notify(
-                task_id, f"Task completed: {description}", "alert",
+                task_id, f"Task completed: {description}", "success",
+                voice_text="Task completed successfully.",
             )
             return True
 
@@ -747,7 +748,10 @@ class CCSessionExecutor:
         await task_states.update(
             self._db, task_id, blockers=reason,
         )
-        await self._notify(task_id, f"Task failed: {reason}", "alert")
+        await self._notify(
+            task_id, f"Task failed: {reason}", "alert",
+            voice_text="A task failed — details are in Telegram.",
+        )
 
     # =================================================================
     # Exit gate + challenge recording
@@ -957,7 +961,10 @@ class CCSessionExecutor:
             await self._transition(task_id, TaskPhase.BLOCKED)
 
         # 3. THEN notify
-        await self._notify(task_id, f"Blocked: {description}", "blocker")
+        await self._notify(
+            task_id, f"Blocked: {description}", "blocked",
+            voice_text="A task is blocked and needs your input.",
+        )
 
     # =================================================================
     # Checkpoint (Amendment #13: global pause)
@@ -1188,30 +1195,60 @@ class CCSessionExecutor:
         self,
         task_id: str,
         message: str,
-        category: str,
+        kind: str,
+        *,
+        voice_text: str | None = None,
     ) -> None:
-        """Send notification via outreach pipeline."""
+        """Send a task notification via the outreach pipeline.
+
+        Task notifications are machine-generated FACTS, so they are delivered
+        ``verbatim`` — the LLM drafter is never in the path and cannot rewrite
+        or fabricate them. ``kind`` selects the outreach category and the voice
+        signal_type:
+
+        - ``progress`` — routine progress; Telegram only, never spoken.
+        - ``success``  — completion / result; spoken (attention-worthy).
+        - ``alert``    — a problem needing attention; spoken.
+        - ``blocked``  — highest-priority block; spoken (BLOCKER category).
+
+        ``voice_text`` is a short, factual TL;DR spoken aloud in place of the
+        full ``message`` (so file paths, branch names, and commands are never
+        read out). Pass None for notifications that must stay silent.
+        """
         if not self._outreach:
             logger.debug("No outreach pipeline, skipping: %s", message)
             return
 
         from genesis.outreach.types import OutreachCategory, OutreachRequest
 
-        cat = {
-            "blocker": OutreachCategory.BLOCKER,
-            "alert": OutreachCategory.ALERT,
-        }.get(category, OutreachCategory.ALERT)
+        # kind -> (category-is-blocker, voice signal_type, salience). category
+        # is preserved from the pre-refactor mapping (blocker vs alert) so
+        # governance/threshold/routing behavior is unchanged; the new levers
+        # (verbatim + signal_type + voice_text) are orthogonal to it.
+        kinds = {
+            "progress": (False, "task_progress", 0.5),
+            "success": (False, "task_complete", 0.5),
+            "alert": (False, "task_alert", 0.5),
+            "blocked": (True, "task_alert", 0.9),
+        }
+        is_blocker, signal_type, salience = kinds.get(kind, kinds["alert"])
+        cat = OutreachCategory.BLOCKER if is_blocker else OutreachCategory.ALERT
 
         request = OutreachRequest(
             category=cat,
             topic=f"Task {task_id[:8]}",
             context=message,
-            salience_score=0.9 if cat == OutreachCategory.BLOCKER else 0.5,
-            # signal_type makes task notifications a toggleable voice menu
-            # item (voice_alert_ids -> OutreachPipeline._should_voice matches
-            # this). source_id identifies the task in outreach history.
-            signal_type="task_notification",
+            salience_score=salience,
+            # Machine fact: deliver exactly, never LLM-drafted.
+            verbatim=True,
+            # signal_type is the voice-menu key (voice_alert_ids ->
+            # OutreachPipeline._should_voice). Only task_complete / task_alert
+            # are on the allowlist; task_progress is Telegram-only. source_id
+            # identifies the task in outreach history.
+            signal_type=signal_type,
             source_id=f"task:{task_id}",
+            # Short spoken TL;DR (no tokens/paths aloud); None → not spoken.
+            voice_text=voice_text,
         )
 
         try:
@@ -1351,7 +1388,8 @@ class CCSessionExecutor:
                 task_id,
                 f"Build delivered: draft PR {result.pr_url} (branch {branch}). "
                 "Review and merge when ready.",
-                "alert",
+                "success",
+                voice_text="Build finished — a draft pull request is ready for review.",
             )
         else:
             await self._set_output(
@@ -1362,6 +1400,7 @@ class CCSessionExecutor:
                 f"Build branch {branch} pushed, but draft PR creation failed: "
                 f"{result.error or 'unknown'}. Open the PR manually.",
                 "alert",
+                voice_text="A build finished, but the pull request didn't open automatically.",
             )
 
     async def _task_source(self, task_id: str) -> str:
@@ -1479,6 +1518,7 @@ class CCSessionExecutor:
                     "Nothing was pushed — widening build scope is a human decision."
                 ),
                 "alert",
+                voice_text="A build was parked by the safety gate.",
             )
         return result
 
@@ -1510,6 +1550,7 @@ class CCSessionExecutor:
                 "Deliverable task finished, but no rendered file was found — "
                 "check the task output.",
                 "alert",
+                voice_text="A deliverable task finished but produced no file.",
             )
             return
 
@@ -1527,7 +1568,8 @@ class CCSessionExecutor:
             task_id,
             f"Deliverable ready and Gate-2 verified:\n{primary}{others}{qa_line}\n"
             "Review it and reply if you want changes.",
-            "alert",
+            "success",
+            voice_text="A deliverable is ready for review.",
         )
 
     # =================================================================

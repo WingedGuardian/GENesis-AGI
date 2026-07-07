@@ -63,9 +63,12 @@ class OutreachConfig:
         "sentinel_escalation",
         "sentinel_approval",
         "sentinel_action_approval",
-        # Autonomous task hit a blocker/alert — signal_type set in
-        # autonomy/executor/engine.py _notify (keep these two in sync).
-        "task_notification",
+        # Autonomous task reached an attention-worthy state — signal_type set
+        # in autonomy/executor/engine.py _notify (keep in sync with the yaml
+        # mirror below). `task_progress` is deliberately NOT here: routine
+        # progress pings go to Telegram only, never interrupt by voice.
+        "task_complete",
+        "task_alert",
     )
     voice_hours: tuple[int, int] = (9, 2)  # 9am–2am local (wraps midnight)
     # Delivery routing: per-category target — "supergroup", "dm", or "both".

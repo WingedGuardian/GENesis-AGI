@@ -64,6 +64,18 @@ class OutreachRequest:
     # _deliver so the WS-8 autonomy gate can classify reply-vs-cold for the
     # capability matrix. None for non-thread / cold sends.
     thread_id: str | None = None
+    # When True, `submit()` skips the LLM ContentDrafter and delivers
+    # `context` verbatim (still governed, deduped, formatted). Use for
+    # machine-generated FACTUAL notifications (task status, health) that must
+    # be conveyed exactly and must never be creatively rewritten. Governance
+    # runs before the drafter, so this only removes the LLM step.
+    verbatim: bool = False
+    # When set, the voice (spoken-aloud) fan-out speaks THIS text instead of the
+    # delivered `formatted.text`. Lets a notification carry a short, factual
+    # TL;DR for the ear (no file paths / tokens / commands read aloud) while
+    # the text channel keeps full detail. None → voice speaks the full text
+    # (unchanged behavior for every existing caller).
+    voice_text: str | None = None
 
 
 @dataclass(frozen=True)

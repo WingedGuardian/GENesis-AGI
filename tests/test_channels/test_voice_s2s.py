@@ -802,18 +802,25 @@ class TestVoiceHours:
         with patch.object(pipe, "_in_voice_hours", return_value=True):
             assert pipe._should_voice(req)
 
-    def test_should_voice_task_notification(self):
-        """task_notification signal_type is on the default allowlist."""
+    def test_should_voice_task_notifications_by_kind(self):
+        """Attention-worthy task notifications (task_complete / task_alert) are
+        on the default allowlist and voice; routine task_progress is NOT on the
+        allowlist and stays silent (Telegram only)."""
         from genesis.outreach.types import OutreachCategory, OutreachRequest
 
         pipe = self._make_pipeline()
-        req = OutreachRequest(
-            category=OutreachCategory.BLOCKER,
-            topic="t", context="t", salience_score=1.0,
-            signal_type="task_notification", source_id="task:abc123",
-        )
-        with patch.object(pipe, "_in_voice_hours", return_value=True):
-            assert pipe._should_voice(req)
+        for signal, expected in (
+            ("task_complete", True),
+            ("task_alert", True),
+            ("task_progress", False),
+        ):
+            req = OutreachRequest(
+                category=OutreachCategory.ALERT,
+                topic="t", context="t", salience_score=1.0,
+                signal_type=signal, source_id="task:abc123",
+            )
+            with patch.object(pipe, "_in_voice_hours", return_value=True):
+                assert pipe._should_voice(req) is expected, f"signal={signal}"
 
     def test_should_voice_critical_observation_silent(self):
         """Critical observations (obs UUIDs, not allowlisted) stay silent."""
