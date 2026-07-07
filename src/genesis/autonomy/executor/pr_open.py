@@ -33,6 +33,8 @@ _GH_TIMEOUT_S = 300
 
 @dataclass(frozen=True)
 class PrOpenResult:
+    """Outcome of a draft-PR open attempt (url on success, error otherwise)."""
+
     ok: bool
     pr_url: str = ""
     error: str = ""
@@ -52,6 +54,7 @@ async def _run(
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except TimeoutError:
         proc.kill()
+        await proc.wait()
         return 124, "", f"timed out after {timeout_s}s"
     return (
         proc.returncode or 0,
