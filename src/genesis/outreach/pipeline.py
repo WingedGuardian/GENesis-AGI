@@ -21,7 +21,7 @@ from genesis.db.crud import outreach as outreach_crud
 from genesis.outreach.config import OutreachConfig
 from genesis.outreach.fresh_eyes import FreshEyesReview
 from genesis.outreach.governance import GovernanceGate
-from genesis.outreach.reply_waiter import ReplyWaiter
+from genesis.outreach.reply_waiter import DEFAULT_REPLY_TIMEOUT_S, ReplyWaiter
 from genesis.outreach.types import (
     GovernanceVerdict,
     OutreachCategory,
@@ -282,7 +282,7 @@ class OutreachPipeline:
         self,
         request: OutreachRequest,
         *,
-        timeout_s: float = 300.0,
+        timeout_s: float = DEFAULT_REPLY_TIMEOUT_S,
     ) -> tuple[OutreachResult, str | None]:
         """Submit outreach and wait for user reply. Returns (result, reply_text)."""
         if not self._reply_waiter:
@@ -294,17 +294,31 @@ class OutreachPipeline:
         if result.status != OutreachStatus.DELIVERED or not result.delivery_id:
             return result, None
 
+        self._attach_waiter_context(result, result.delivery_id)
         reply = await self._reply_waiter.wait_for_reply(
             result.delivery_id, timeout_s=timeout_s,
         )
         return result, reply
+
+    def _attach_waiter_context(self, result: OutreachResult, *keys: str) -> None:
+        """Record the delivered chat+topic on waiter *keys* so standalone
+        text in that same topic can resolve them (scoped, never cross-chat).
+        """
+        if not self._reply_waiter or not result.chat_id:
+            return
+        thread_key = f"{result.chat_id}:{result.thread_id if result.thread_id is not None else 'dm'}"
+        for key in keys:
+            try:
+                self._reply_waiter.set_context(key, thread_key)
+            except Exception:
+                logger.debug("set_context failed for %s", key, exc_info=True)
 
     async def submit_raw_and_wait(
         self,
         text: str,
         request: OutreachRequest,
         *,
-        timeout_s: float = 300.0,
+        timeout_s: float = DEFAULT_REPLY_TIMEOUT_S,
         reply_markup: object | None = None,
         waiter_key: str | None = None,
     ) -> tuple[OutreachResult, str | None]:
@@ -334,6 +348,7 @@ class OutreachPipeline:
         actual_key = waiter_key or result.delivery_id
         if waiter_key and result.delivery_id != waiter_key:
             self._reply_waiter.add_alias(result.delivery_id, waiter_key)
+        self._attach_waiter_context(result, actual_key, result.delivery_id)
 
         try:
             reply = await self._reply_waiter.wait_for_reply(
@@ -645,6 +660,8 @@ class OutreachPipeline:
             message_content=formatted.text,
             delivery_id=str(delivery_id),
             governance_result=gov,
+            chat_id=str(delivery_recipient) if channel == "telegram" else None,
+            thread_id=thread_id if channel == "telegram" else None,
         )
 
     async def deliver_approved(

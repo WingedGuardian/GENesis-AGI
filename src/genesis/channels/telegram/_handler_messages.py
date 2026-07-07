@@ -22,6 +22,7 @@ from genesis.channels.telegram._handler_helpers import (
 )
 from genesis.channels.telegram.transport.streaming import DraftStreamer, generate_draft_id
 from genesis.channels.telegram.transport.update_dedupe import message_key
+from genesis.util.approval_words import scoped_decision
 
 if TYPE_CHECKING:
     from genesis.channels.telegram._handler_context import HandlerContext
@@ -726,28 +727,19 @@ async def _handle_media_inner(
             log.warning("Failed to clean up temp media file %s", file_path, exc_info=True)
 
 
-_BARE_APPROVE_WORDS = frozenset({"approve", "approved", "ok", "yes", "lgtm"})
-_BARE_REJECT_WORDS = frozenset({"reject", "rejected", "deny", "denied", "no"})
-
-
 def _bare_decision(text: str) -> str | None:
-    """Return 'approved'/'rejected' iff the entire message is a single
-    bare approve/reject word.  Rejects anything that's not an exact
-    single-token match so general conversation never triggers."""
-    stripped = (text or "").strip().lower()
-    if not stripped:
-        return None
-    # Allow optional trailing punctuation on a single token.
-    import re
+    """Return 'approved'/'rejected' for a message typed in the Approvals
+    topic (the caller enforces that scoping).
 
-    cleaned = re.sub(r"[^\w]", "", stripped) if " " not in stripped else stripped
-    if " " in cleaned:
-        return None
-    if cleaned in _BARE_APPROVE_WORDS:
-        return "approved"
-    if cleaned in _BARE_REJECT_WORDS:
-        return "rejected"
-    return None
+    Uses the CANONICAL shared vocabulary (genesis.util.approval_words) —
+    the same words a quote-reply resolves with — via two matchers:
+    exact standalone phrases ("sounds good", "go for it", a thumbs-up)
+    and leading-token decisions ("Ok sounds good, ship it" → approved,
+    matching the gate's own quote-reply semantics). Safe ONLY because the
+    Approvals topic is a decision-scoped surface; never run this over
+    general conversation.
+    """
+    return scoped_decision(text)
 
 
 async def _try_bare_approval_resolution(
@@ -767,6 +759,13 @@ async def _try_bare_approval_resolution(
     topic, a bare 'approve' resolves the most recent pending request.
     """
     if ctx.autonomous_cli_gate is None:
+        return False
+    # Quote-replies NEVER take this path: the user pointed at a specific
+    # message, so the reply-specific resolution (which resolves the QUOTED
+    # request) must handle it. Without this guard, the widened matcher
+    # would intercept "Ok sounds good" quoted onto an OLDER approval and
+    # resolve the most recent one instead.
+    if getattr(msg, "reply_to_message", None) is not None:
         return False
     decision = _bare_decision(msg.text)
     if decision is None:
@@ -1287,9 +1286,24 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
             log.info("Outreach reply resolved for delivery %s", reply_to_id)
             return
 
-    # resolve_any_pending DISABLED — it conflates messages across chats/topics.
-    # A DM message resolved an alert-topic approval request. Use quote-reply
-    # or inline keyboard buttons instead. See plan: fluttering-humming-bentley.md
+    # Standalone (non-quote-reply) waiter resolution — SCOPED to the message's
+    # own chat+topic. The old unscoped resolve_any_pending stayed disabled for
+    # months because a DM once resolved an alert-topic approval; the scoped
+    # variant only matches a waiter whose prompt was DELIVERED to this exact
+    # chat+thread, so cross-chat conflation is structurally impossible. A
+    # waiter without recorded delivery context is never eligible.
+    if ctx.reply_waiter and msg.text:
+        thread_key = f"{msg.chat.id}:{getattr(msg, 'message_thread_id', None) or 'dm'}"
+        try:
+            if ctx.reply_waiter.resolve_scoped_pending(
+                msg.text, thread_key=thread_key,
+            ):
+                log.info(
+                    "Standalone message resolved scoped waiter in %s", thread_key,
+                )
+                return
+        except Exception:
+            log.warning("Scoped waiter resolution failed", exc_info=True)
 
     # Record implicit engagement: user is active after receiving outreach
     if ctx.engagement_tracker and ctx.db:
@@ -1487,11 +1501,12 @@ async def handle_callback_query(
             except Exception:
                 log.warning("Failed to edit message after callback resolution", exc_info=True)
         else:
-            # Waiter expired or already processed — still show user feedback
-            # so button presses aren't silently swallowed.
+            # Waiter expired or already processed — feedback must NOT read
+            # as if the decision was recorded ("Approved (expired)" implied
+            # exactly that). Say plainly that nothing happened.
             decision_label = "Approved" if action == "approve" else "Rejected"
             log.info(
-                "Callback for expired/processed waiter %s: %s (user %s)",
+                "Callback for expired/processed waiter %s: %s NOT recorded (user %s)",
                 key,
                 decision_label,
                 user.id,
@@ -1499,7 +1514,11 @@ async def handle_callback_query(
             try:
                 original = query.message.text_html or query.message.text or ""
                 await query.edit_message_text(
-                    text=f"{original}\n\n<b>{decision_label}</b> <i>(expired)</i>",
+                    text=(
+                        f"{original}\n\n<b>⏰ Prompt expired</b> — your "
+                        f"“{decision_label.lower()}” was <b>not</b> recorded. "
+                        "Genesis will re-ask if this still needs a decision."
+                    ),
                     parse_mode="HTML",
                 )
             except Exception:

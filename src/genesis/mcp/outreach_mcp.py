@@ -334,9 +334,15 @@ async def outreach_send_and_wait(
     message: str,
     category: str = "blocker",
     channel: str = "telegram",
-    timeout_seconds: int = 300,
+    timeout_seconds: int = 1800,
 ) -> str:
-    """Send a message and wait for user reply. Returns JSON with reply or timeout."""
+    """Send a message and wait for user reply. Returns JSON with reply or timeout.
+
+    Default wait is 30 minutes (was 300s — the demonstrated "button pressed
+    after the waiter died" failure mode). Waiting on a human, not a machine;
+    pass a smaller timeout_seconds explicitly if the caller genuinely can't
+    block.
+    """
     if not _pipeline:
         return "Error: outreach pipeline not initialized"
     from genesis.outreach.types import OutreachCategory, OutreachRequest

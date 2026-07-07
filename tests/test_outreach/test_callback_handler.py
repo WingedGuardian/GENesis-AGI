@@ -242,9 +242,12 @@ async def test_cli_approve_unauthorized_user():
 # ---------------------------------------------------------------------------
 
 
-def test_bare_decision_exact_word_match_only():
-    """_bare_decision should only match single-token approve/reject
-    words — general conversation must not trigger."""
+def test_bare_decision_scoped_vocabulary():
+    """_bare_decision matches the shared decision vocabulary: standalone
+    phrases and LEADING-token decisions ("Ok sounds good" resolves — the
+    2026-07 'Ok did nothing' bug). Non-decision openers must never match:
+    this only runs inside the Approvals topic, but conversation there
+    still must not accidentally resolve."""
     from genesis.channels.telegram._handler_messages import _bare_decision
 
     assert _bare_decision("approve") == "approved"
@@ -259,13 +262,50 @@ def test_bare_decision_exact_word_match_only():
     assert _bare_decision("no") == "rejected"
     assert _bare_decision("denied") == "rejected"
 
-    # Not a bare word — must NOT match
+    # Leading-token decisions — the fix: quote-reply semantics now apply
+    # to bare text in the Approvals topic too.
+    assert _bare_decision("Ok sounds good") == "approved"
+    assert _bare_decision("approve this please") == "approved"
+    assert _bare_decision("yes, let's go") == "approved"
+    assert _bare_decision("no, hold off for now") == "rejected"
+
+    # Shared standalone phrases now work here too (parity with proposals).
+    assert _bare_decision("sounds good") == "approved"
+    assert _bare_decision("go for it") == "approved"
+    assert _bare_decision("ship it") == "approved"
+    assert _bare_decision("not now") == "rejected"
+
+    # Non-decision openers — must NOT match.
     assert _bare_decision("") is None
-    assert _bare_decision("approve this please") is None
     assert _bare_decision("please approve it") is None
     assert _bare_decision("I think we should approve") is None
-    assert _bare_decision("yes, let's go") is None
     assert _bare_decision("random text") is None
+    assert _bare_decision("what does this request do?") is None
+
     # Extra punctuation on a bare token still matches (user is informal)
     assert _bare_decision("approve!") == "approved"
     assert _bare_decision("reject.") == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_bare_approval_skips_quote_replies():
+    """A quote-reply must NEVER take the bare-text path: the user pointed
+    at a specific approval message, and the reply-specific resolution owns
+    it. Without the guard, the widened matcher would intercept 'Ok sounds
+    good' quoted onto an OLDER approval and resolve the most recent one."""
+    from genesis.channels.telegram._handler_messages import (
+        _try_bare_approval_resolution,
+    )
+
+    ctx = MagicMock()
+    ctx.autonomous_cli_gate = MagicMock()
+    ctx.autonomous_cli_gate.resolve_most_recent_pending = AsyncMock()
+    msg = MagicMock()
+    msg.text = "Ok sounds good"
+    msg.reply_to_message = MagicMock()  # it's a quote-reply
+    msg.message_thread_id = 42
+
+    consumed = await _try_bare_approval_resolution(ctx, msg, MagicMock())
+
+    assert consumed is False
+    ctx.autonomous_cli_gate.resolve_most_recent_pending.assert_not_awaited()

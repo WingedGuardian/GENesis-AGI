@@ -83,6 +83,10 @@ class OutreachResult:
     delivery_id: str | None = None
     governance_result: GovernanceResult | None = None
     error: str | None = None
+    # Destination of the delivered message (Telegram): lets send-and-wait
+    # scope standalone-text resolution to the prompt's own chat+topic.
+    chat_id: str | None = None
+    thread_id: int | None = None
 
 
 @dataclass(frozen=True)
