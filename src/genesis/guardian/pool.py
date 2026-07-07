@@ -15,7 +15,6 @@ Design:
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -203,30 +202,46 @@ async def _lvm_source(pool_name: str) -> str | None:
     return source
 
 
+async def _pool_used_pct_via_df(mount: str) -> float | None:
+    """Filesystem used% of a pool mount via ``df`` (statvfs).
+
+    The tiering signal for non-LVM pools, where there is no thin-pool
+    data%/metadata%. Returns None on any error (missing mount, unparsable
+    output, zero size) so a probe failure is never a false alarm.
+    """
+    rc, out, _ = await _run_subprocess(
+        "df", "-B1", "--output=used,size", mount, timeout=10.0,
+    )
+    if rc != 0:
+        return None
+    lines = out.strip().splitlines()
+    if len(lines) < 2:  # header + at least one data row
+        return None
+    try:
+        used, size = (int(x) for x in lines[-1].split()[:2])
+    except (ValueError, IndexError):
+        return None
+    if size <= 0:
+        return None
+    return 100.0 * used / size
+
+
 async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
     """Measure the host storage pool. Defensive: failure → detected=False."""
     pool_name = await _detect_pool_name(config)
     if not pool_name:
         return StoragePoolStatus(detected=False, detail="pool name undetected")
 
-    # Backend-agnostic used% via incus storage info (best-effort).
     pool_used_pct: float | None = None
-    rc, out, _ = await _run_subprocess(
-        "incus", "storage", "info", pool_name, "--format", "json", timeout=10.0,
-    )
-    if rc == 0:
-        try:
-            info = json.loads(out)
-            space = info.get("space") or info.get("resources", {}).get("space", {})
-            used, total = space.get("used"), space.get("total")
-            if isinstance(used, (int, float)) and total:
-                pool_used_pct = 100.0 * used / total
-        except (json.JSONDecodeError, TypeError, AttributeError, ZeroDivisionError):
-            pass
 
     vg = await _lvm_source(pool_name)
     if not vg:
-        # Non-LVM backend — pool_used_pct (if any) is the only signal.
+        # Non-LVM backend (btrfs/dir): the pool mount's filesystem used% is the
+        # only tiering signal (there is no thin-pool data%/metadata%). incus
+        # storage info exposes no machine-readable space for an uncapped
+        # btrfs-on-LV pool, so read the mount directly — the same source
+        # snapshots.py uses for this pool.
+        pool_used_pct = await _pool_used_pct_via_df(pool_mount_path(pool_name))
         return StoragePoolStatus(
             detected=pool_used_pct is not None,
             pool_used_pct=pool_used_pct,
