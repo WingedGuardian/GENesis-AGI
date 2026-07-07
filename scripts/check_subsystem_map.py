@@ -151,7 +151,9 @@ def _git(args: list[str]) -> str | None:
         proc = subprocess.run(
             ["git", *args], capture_output=True, text=True, timeout=60, check=False,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
+        # incl. TimeoutExpired — staleness is warning-only; a hung git call
+        # must degrade to a skip, never crash the guard into a hard failure
         return None
     if proc.returncode != 0:
         return None

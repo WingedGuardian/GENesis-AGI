@@ -172,7 +172,30 @@ def test_unused_allowlist_entry_is_a_warning(tmp_path):
     assert problems.unused_allowlist == {"long_gone"}
 
 
+def test_parse_map_multiline_flow_list():
+    text = (
+        "```yaml subsystem-map\n"
+        "entry: platform\n"
+        "modules: [db, util,\n"
+        "          env.py]\n"
+        "verified: 9037d45b 2026-07-07\n"
+        "```\n"
+    )
+    entries, errors = csm.parse_map(text)
+    assert errors == []
+    assert entries[0].modules == ["db", "util", "env.py"]
+
+
 # --- staleness (git stubbed; warning-only by contract) ---
+
+
+def test_git_returns_none_on_timeout(monkeypatch):
+    # _git must never raise — a hung git call degrades to a staleness skip.
+    def hang(*args, **kwargs):
+        raise csm.subprocess.TimeoutExpired(cmd="git", timeout=60)
+
+    monkeypatch.setattr(csm.subprocess, "run", hang)
+    assert csm._git(["rev-parse", "--is-shallow-repository"]) is None
 
 
 def test_staleness_warns_past_threshold(monkeypatch):
