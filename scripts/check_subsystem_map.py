@@ -115,12 +115,16 @@ def parse_map(text: str) -> tuple[list[Entry], list[str]]:
 
 
 def live_modules(src_root: Path) -> set[str]:
-    """Top-level packages (dirs with __init__.py) + loose .py modules."""
+    """Top-level dirs (packaged or not — e.g. skills/ has no __init__.py) + loose .py modules."""
     live: set[str] = set()
     for child in src_root.iterdir():
-        is_package = child.is_dir() and (child / "__init__.py").is_file()
+        is_subsystem_dir = (
+            child.is_dir()
+            and child.name != "__pycache__"
+            and not child.name.startswith(".")
+        )
         is_loose_module = child.suffix == ".py" and child.name not in _SKIP_TOP_LEVEL
-        if is_package or is_loose_module:
+        if is_subsystem_dir or is_loose_module:
             live.add(child.name)
     return live
 

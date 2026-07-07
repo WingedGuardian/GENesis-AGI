@@ -116,6 +116,16 @@ def test_live_modules_lists_packages_and_loose_modules(tmp_path):
     assert csm.live_modules(src) == {"memory", "db", "env.py"}
 
 
+def test_live_modules_includes_non_package_dirs(tmp_path):
+    # src/genesis/skills has no __init__.py (SKILL.md tree) but is still a
+    # top-level subsystem directory the map must claim.
+    src = _write_src(tmp_path, ["memory"], [])
+    (src / "skills").mkdir()
+    (src / "skills" / "SKILL.md").write_text("")
+    (src / ".hidden").mkdir()
+    assert csm.live_modules(src) == {"memory", "skills"}
+
+
 # --- coverage diff ---
 
 

@@ -87,7 +87,10 @@ src/genesis/cc/profile_overlay.py
 
 # Docs are private by default — opt-in for public.
 # Only directories listed with ! are tracked.
-docs/
+# NOTE: must be docs/* (not docs/) — excluding the parent dir itself makes
+# the ! re-inclusions below dead (git never descends into an excluded dir),
+# which silently forced `git add -f` for every new file in the opt-in dirs.
+docs/*
 !docs/architecture/
 !docs/decisions/
 !docs/case-studies/
