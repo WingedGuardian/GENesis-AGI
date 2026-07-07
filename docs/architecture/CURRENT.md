@@ -1,0 +1,509 @@
+# Genesis — Current Architecture (the Subsystem Map)
+
+This is the **canonical judgment-layer map** of Genesis: what each subsystem is
+FOR, the mechanisms auditors keep forgetting exist, what is LIVE vs shadow vs
+dark, and the do-not-touch edges. It answers "does Genesis have X?" — consult
+it FIRST (via the `subsystem-map` skill) before any capability claim, audit, or
+competitive comparison. The package-level structural companion is
+`.claude/skills/genesis-development/references/codebase-map.md`; the
+philosophical "why" is `docs/architecture/genesis-v3-vision.md`.
+
+**How this file stays honest.** Every entry claims its top-level
+`src/genesis` modules in a fenced `yaml subsystem-map` block and carries a
+`verified: <short-sha> <date>` stamp. CI (`subsystem-map-check`, backed by
+`scripts/check_subsystem_map.py`) fails the build if a module is unmapped,
+claimed twice, or vanished; stale stamps only warn. After changing a
+subsystem's capabilities, update its entry and bump its stamp (PR-template
+checkbox).
+
+**Naming trap.** The `capability_map` DB table and `ego/capability_aggregator.py`
+are the ego's per-domain *self-confidence model* — completely unrelated to this
+document. Everything here is "subsystem map".
+
+Maturity vocabulary: **LIVE** = wired into the runtime path and running;
+**shadow** = running but observe/log-only; **dark** = built, no live caller
+(usually `# GROUNDWORK(id)` — intentional, never delete as dead code);
+**gated** = present but off until an env var / config / user grant enables it.
+
+---
+
+## 1. Memory — retrieval, consolidation, vector store
+
+Persistent hybrid memory: FTS5 + Qdrant episodic/knowledge retrieval on the
+read side, extraction and dream-cycle consolidation on the write/maintenance
+side.
+
+```yaml subsystem-map
+entry: memory
+modules: [memory, qdrant]
+verified: 9037d45b 2026-07-07
+```
+
+**Retrieval is TIERED — the hottest auto-fired paths carry the thinnest
+stack.** Deep path: `memory/retrieval.py` `HybridRetriever.recall` (bitemporal
+`invalid_at` filter, entrenchment, activation/decay, graph boost, diversity
+penalty). Easy-to-forget mechanisms:
+
+- **CRAG** lives in the MCP-wrapper only (`memory/corrective.py`
+  `maybe_correct_recall`; `top_score >= 0.75` skips grading) — not in
+  `retrieval.py`.
+- **VoyageReranker** (`memory/reranker.py`, rerank-2.5) exists and is
+  API_KEY_VOYAGE-gated; the `rerank=` param is off by default at the retriever
+  and applied by callers.
+- **`drift_recall`** (`memory/drift.py`) is the degraded-mode fallback; its
+  FTS drilldown is hardcoded to `episodic_memory` (known MEM-006).
+- The proactive per-prompt path is `scripts/proactive_memory_hook.py` — an
+  **independent reimplementation** (own FTS5→Qdrant→RRF pipeline), not a
+  `HybridRetriever` caller. The `memory_proactive` MCP tool is registered but
+  has zero internal callers — the hook is the live path.
+- `procedure_recall` deliberately uses Jaccard tag-overlap
+  (`learning/procedural/matcher.py find_relevant`), not hybrid retrieval.
+- External-world recall results are provenance-wrapped (`wrap_external_recall`)
+  — first-party memory vs knowledge-base is a load-bearing distinction.
+
+**Consolidation (dream cycle)** — `memory/dream_cycle.py` (~1480 LOC):
+weekly clustering (Sun 4am) persists a value-ranked worklist to
+`deferred_work_queue` (`work_type="dream_synthesis_slice"`); a daily drain
+(8am) processes a budgeted top-value slice. Destructive merges are gated on
+`GENESIS_DREAM_CYCLE_LIVE` (env var, NOT a config key) and the drain is
+**shadow-hardwired** (`dry_run=True`) — the live flip is a separate user-gated
+change (#892). `_CapacityBreaker` aborts on consecutive provider exhaustion.
+`_cross_wing_scan` writes `memory_links` even under dry_run — intentional
+additive layer, not a leak.
+
+**Do not touch:** the drain's shadow hardwiring; the dry_run-independent link
+write. **Trap:** with no embedding provider registered, memory silently
+degrades to FTS5-only (see routing-providers entry).
+
+## 2. Execution — CC sessions (DirectSession)
+
+Spawning, tracking, and recovering Claude Code sessions — Genesis's hands for
+any task bigger than an LLM call.
+
+```yaml subsystem-map
+entry: execution-cc
+modules: [cc]
+verified: 9037d45b 2026-07-07
+```
+
+- `cc/direct_session.py` + `cc/conversation.py` (both >1000 LOC; split
+  candidates). Profile machinery: `PROFILES`, `_PROFILE_ADDENDA`,
+  `_PROFILE_SKILLS`, `_PROFILE_TO_MCP` (direct_session.py) +
+  `session_config._MCP_PROFILES` (profile → MCP-server allowlist).
+- **Spawn autonomy circuit breaker** (direct_session.py ~:600-635):
+  `bayesian_posterior < 0.15 and total_corrections > 3` blocks non-foreground
+  dispatch — flagged for review as a visible lever (Design Principle 3).
+- Recovery: `recover_stale_claims` on boot; `reap_stale` runs as the
+  `session_reaper` job on the **learning** scheduler (CronTrigger every 6h).
+  `SessionManager.cleanup_stale` is built but UNWIRED.
+- **Perimeter-session hardening:** `_NO_WEB_TOOLS` / `_NO_OUTREACH_EXTRAS`
+  blocklists strip risky tools from perimeter profiles — a security edge, not
+  configuration convenience.
+- `cc/context_injector.py` (memory→session injection) lives HERE, not in
+  memory. GROUNDWORK: `reflection_bridge/_bridge.py` (v4-executor),
+  `session_config.py` (hook-inheritance).
+
+## 3. Autonomy & egress gating
+
+Every autonomous action on the outside world funnels through deterministic
+in-code gates. Owner-facing delivery (Telegram/voice/email-to-owner) is NEVER
+gated — that contract is one-directional.
+
+```yaml subsystem-map
+entry: autonomy-egress
+modules: [autonomy, outreach, distribution, content, campaigns]
+verified: 9037d45b 2026-07-07
+```
+
+- **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
+  converge there. `EmailAutonomyGate` (`autonomy/email_gate.py`, WS-8
+  capability cells) sits below the LLM tool layer, unbypassable: HOLD writes
+  the `approval_requests` row FIRST, then `pending_email_sends`; the
+  `email_gate_watcher` job (every 5 min, learning scheduler) drains approved
+  sends.
+- **Discord is shadow-gated** (`autonomy/shadow_gate.py`): three doors —
+  `pipeline._deliver`, `outreach_poll` webhook, discord-bot `send_reply` —
+  observe-only into `capability_shadow`, best-effort so it can NEVER break the
+  real send. Enforcement (hold-for-approval) is the designed next stage. CI
+  backstop: `scripts/check_external_io.py` fails on new ungated egress
+  endpoints.
+- **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
+  PII scan for EXTERNAL channels and `content`-category drafts only. Never
+  applied to owner channels — don't add them.
+- `_NEVER_DISPATCH_ACTION_TYPES` lives in `ego/session.py`, not here.
+- **`DistributionManager` is not dead code** — instantiated by
+  `modules/content_pipeline`, but its autonomous publish path is
+  GROUNDWORK(autonomous-distribution) dark; the live Medium path is the
+  `content-publish` CC skill (browser automation).
+- **campaigns/** ships infrastructure only — a hard public/private contract:
+  campaign names/prompts/targets are USER DATA (DB + private backups), never
+  tracked source; zero shipped defaults. `CampaignRunner` cron-ticks
+  programmatic prechecks then dispatches DirectSessions; a 120s reaper
+  reconciles finished sessions.
+- GROUNDWORK across the entry: cross-vendor-review, per-step-verify,
+  trace-verify, task-verify (built, dark), outreach-voice,
+  autonomous-distribution.
+
+## 4. Scheduling & background work
+
+Genesis's system jobs, surplus-compute usage, and deferred-work accountability.
+Note: the *learning* package hosts the other big scheduler (see entry 10).
+
+```yaml subsystem-map
+entry: scheduling-background
+modules: [surplus, scheduler, follow_ups]
+verified: 9037d45b 2026-07-07
+```
+
+- `surplus/scheduler.py` (~2170 LOC) is the system-job hub (dream cycle, recon,
+  pipeline cycles, maintenance, code index/audit, model evals…).
+  `dispatch_once()` is **idle-gated** — surplus tasks only run when idle;
+  follow-up dispatch is deliberately NOT idle-gated.
+- **Durability model:** no persistent jobstore — jobs are re-registered at
+  every boot + CronTrigger + `misfire_grace_time`, backed by three durable DB
+  queues (`surplus_tasks`, `dead_letter`, `deferred_work_queue`).
+  **IntervalTrigger resets on restart** — anything >1h must be a CronTrigger
+  (documented bug class).
+- **`surplus/intake.py`** (intelligence intake: atomize → score → route)
+  auto-ingests curated sources into the knowledge base with NO manifest gate —
+  an INTENTIONAL bypass of the conversational confirm-first path; don't "fix"
+  it.
+- **`scheduler/` (top-level package) is the UserJobScheduler** — user-authored
+  cron jobs (via MCP) that dispatch background DirectSessions. Distinct from
+  `surplus/scheduler.py`.
+- `follow_ups/` = accountability ledger + dispatcher (every 5 min) that turns
+  follow-ups into surplus tasks; retention sweep on the learning scheduler.
+- GROUNDWORK: v4-parallel-dispatch, v4-surplus-tasks, v4-rate-tracking.
+
+## 5. Information intake & research
+
+Everything that pulls outside information IN: knowledge ingestion, the inbox
+drop folder, web search/fetch, recon jobs, and the research pipeline.
+
+```yaml subsystem-map
+entry: intake-research
+modules: [knowledge, inbox, research, recon, web, pipeline]
+verified: 9037d45b 2026-07-07
+```
+
+- **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
+  (`has_unchanged_source`) makes re-ingest of changed sources re-distill;
+  `remove_unit` tombstones a source when its last unit is deleted (invariant:
+  only that method may tombstone). The conversational path
+  (`knowledge_ingest_source` MCP) requires explicit user confirmation —
+  contrast the intake bypass in entry 4.
+- **inbox/**: file-drop monitor with approval-gated dispatch; phase order
+  resume → detect → create → dispatch; `approval_key_stable=True` (ONE
+  site-level approval key). The refresh path folds parked files into the
+  batch so approvals fire once (#914). Coherence + URL-failure heuristics gate
+  dispatch.
+- **recon/**: scheduled intelligence jobs (release watch, model intelligence
+  Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
+  via external NVIDIA SkillSpector). Emits findings for triage
+  (`recon_findings`/`recon_triage`) — intelligence-only, never auto-acts.
+- **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
+  (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
+  research, recon, pipeline), not runtime init.
+- **research/**: `ResearchOrchestrator` over the provider registry — read-only
+  capability, no egress gate needed.
+- **pipeline/**: tiered research collection → triage → elevation feeding
+  capability modules (crypto/prediction); pause-guarded. It is research
+  plumbing, NOT the cognitive pipeline.
+- GROUNDWORK: vision-ocr (image processor).
+
+## 6. Channels & interfaces
+
+Every surface a human (or host process) talks to Genesis through.
+
+```yaml subsystem-map
+entry: channels-interfaces
+modules: [channels, dashboard, mcp, hosting, browser, mail]
+verified: 9037d45b 2026-07-07
+```
+
+- **channels/**: adapter framework. Telegram (`bridge.py` =
+  `genesis-bridge.service`, boots a full headless runtime); voice (HA,
+  OUTBOUND-only — inbound voice arrives via `dashboard/routes/voice_api.py`;
+  uses `media_player.play_media`, never `assist_satellite.announce` which
+  reopens the mic); Discord webhook; email SMTP. All env-gated. "OpenClaw" here
+  is only the MIT origin of the Telegram transport code.
+- **dashboard/**: Flask blueprint at `/genesis` (~45 route modules);
+  `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
+  thread detects degraded-but-alive Flask; web terminal.
+- **mcp/**: 5 Genesis MCP servers (health, memory, outreach, recon,
+  discord-bot) + external codebase-memory; profile→server allowlist lives in
+  `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
+  modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
+  live runtime (stale-but-functional).
+- **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
+  default (`python -m genesis serve`; also hosts the OpenClaw
+  `/v1/chat/completions` endpoint); Agent Zero adapter optional.
+- **browser/**: profile/state layer only (persistent
+  `~/.genesis/browser-profile`, `BrowserLayer` enum, pgrep patterns as the
+  single source of process detection). The automation TOOLS live in
+  `mcp/health/browser.py`.
+- **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
+  CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
+  restricted `mail`-profile sessions. Sending is NOT here — all sends go
+  through the outreach gate (entry 3). Trap: never default a recipient to the
+  agent's own address (self-send loop).
+- GROUNDWORK: unified-bridge, outreach-pipeline (channels/base.py),
+  guardian-dialogue (dashboard health route).
+
+## 7. Ego & self-model
+
+The two autonomous decision-making egos and the identity documents that shape
+them.
+
+```yaml subsystem-map
+entry: ego-self-model
+modules: [ego, identity, deliberation]
+verified: 9037d45b 2026-07-07
+```
+
+- **Two egos, both LIVE**: user ego (CEO, Opus, MCP profile `user_reflection`)
+  and Genesis ego (COO, Sonnet, profile `reflection`), sharing `EgoSession`
+  (~108K). `EgoCadenceManager`: adaptive proactive cycles, morning-report cron,
+  30-min mechanical sweep, goal-staleness scans. Review cadence + budget
+  controls before adding call sites.
+- **`capability_aggregator.py` → `capability_map` table** = per-domain
+  self-confidence from up to 6 sources (inverse-confidence weighted; the
+  Outcome-Bus feed is flag-gated OFF). This is the naming-trap twin of this
+  document — unrelated to the subsystem map.
+- Proposal pipeline (`proposals.py`): batch WHAT/WHY/HOW digests to Telegram,
+  content firewall via `validate_batch()`, 6h digest rate-limit GROUNDWORK;
+  `_NEVER_DISPATCH_ACTION_TYPES` blocklist lives in `session.py`. Dispatches
+  record `follow_ups` rows for accountability. `integrity.py` chain-verify is
+  GROUNDWORK, explicitly NOT wired.
+- **identity/**: SOUL/USER/VOICE/STEERING CAPS-markdown + `IdentityLoader`
+  (wired via perception). `cc/session_config` reads SOUL+VOICE directly, not
+  via the loader. **USER.md auto-synthesis is PERMANENTLY DISABLED** — the
+  evolver writes system-owned `USER_KNOWLEDGE.md` instead, ledger-tracked.
+- **deliberation/**: `deliberate()` multi-model panel with explicit dissent —
+  reachable ONLY via the `deliberate` MCP tool, recursion-blocked,
+  never-raises. On-demand, not a default judgment path.
+
+## 8. Guardian & sentinel — infrastructure self-healing
+
+Two complementary watchdogs: the host-VM Guardian (outside the container blast
+radius) and the container-side Sentinel (CC-driven diagnosis/repair).
+
+```yaml subsystem-map
+entry: guardian-sentinel
+modules: [guardian, sentinel]
+verified: 9037d45b 2026-07-07
+```
+
+- **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
+  systemd timer; `check.py` runs 5 parallel probes → 6-state machine → act;
+  Proxmox disk/RAM provisioning verbs) and container side (`watchdog.py`
+  monitors the host Guardian every awareness tick, incl. git-SHA code-drift
+  detection). Config `~/.genesis/guardian_remote.yaml`; missing → silently
+  disabled.
+- **Merged ≠ deployed**: guardian code reaches the host ONLY via
+  `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
+  skill). Known wart: the watchdog's stale-alert wording inverts when the
+  deployed script is NEWER than the host checkout.
+- Provisioning verbs are EXECUTE-ONLY — approval is the CALLER's
+  responsibility (container obtains it via Telegram before invoking).
+- **sentinel/** is LIVE-wired but **shadow-only autonomy**: config mode
+  `"live"` is NOT implemented (dispatcher warns + downgrades); every proposed
+  action requires human approval. `InfrastructureMonitor` (call site 37, free
+  models) observes each awareness tick and wakes the dispatcher; state persists
+  to `~/.genesis/sentinel_state.json`.
+- GROUNDWORK: guardian-cgroup, guardian-bidirectional, sentinel-live-autonomy.
+
+## 9. Ambient cognition — heartbeat, reflection, attention
+
+The loops that make Genesis think between conversations.
+
+```yaml subsystem-map
+entry: ambient-cognition
+modules: [awareness, perception, reflection, attention]
+verified: 9037d45b 2026-07-07
+```
+
+- **awareness/**: the 5-min heartbeat. ~23 signal collectors (the richer
+  `learning/signals/*` set REPLACES the bootstrap placeholders in
+  `signals.py` — those stubs are GROUNDWORK(signal-bootstrap), not the live
+  collectors). Tick → depth classification (MICRO/LIGHT/DEEP/STRATEGIC) →
+  reflection dispatch. Also per-tick `_check_*` housekeeping: CC-slot RSS leak
+  watch, subscription-cap detection, SQLite WAL hygiene, resilience-axis folds,
+  liveness heartbeat. It does NOT drive the ego cadence (ego has its own
+  scheduler). Trap: PEP 562 lazy `__init__` — don't eager-import `loop.py`.
+- **perception/**: the real-time reflection engine — MICRO (and LIGHT without
+  a CC bridge) run in-process via the router; DEEP/STRATEGIC go to the CC
+  reflection bridge. GROUNDWORK: user-model-synthesis, pre-execution-gate
+  (template exists, gate not live).
+- **reflection/**: the deep/scheduled path (self-assessment, quality
+  calibration, learning-stability). **Cadence trap:** jobs FIRE DAILY but an
+  idempotency gate holds each to ≤1 SUCCESS per week — a failed day retries
+  tomorrow, not next week.
+- **attention/**: Track-1 ambient attention — SHADOW, not in runtime init;
+  runs via offline CLI over pulled snapshots. The 6-module core is pure and
+  edge-portable (no wall clock, no I/O, no genesis deps — test-enforced);
+  `sampler.py` (L1.5 judge) is the only LLM caller, outside the core.
+  **Firewall: transcript text is never persisted** — only refs + derived
+  features reach `attention_events`. Config is versioned DATA
+  (`~/.genesis/config/attention_config.json`).
+
+## 10. Learning & evaluation
+
+Self-improvement loops and the instrumentation that keeps them honest.
+
+```yaml subsystem-map
+entry: learning-evaluation
+modules: [learning, eval, experimentation, feedback, calibration]
+verified: 9037d45b 2026-07-07
+```
+
+- **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
+  ~20+ jobs well beyond learning (recovery orchestrator, reapers, email-gate
+  drain, retention sweeps, plus the eval/feedback jobs below). CronTrigger
+  discipline is load-bearing here. Loops that actually run: triage pipeline,
+  procedural extraction (extract → judge → promote hourly, novelty +
+  contradiction gates), weekly skill evolution, daily triage calibration.
+  `tool_discovery.py` static maps are deprecated (GROUNDWORK
+  provider-migration) — use ProviderRegistry.
+- **eval/**: J9 = fire-and-forget emit hooks on live cognitive paths (the
+  "cannot break production" contract — hooks must never raise) + weekly Sunday
+  aggregation (hard 7-day window) + an on-demand batch judge as a surplus
+  task. The model gauntlet is weekly but OFF by default (paid inference) and
+  NEVER auto-mutates the roster.
+- **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
+  only; **recommend-only is the safety invariant** (no autonomous promotion,
+  no live-cognition writes; Bonferroni + held-out re-validation).
+- **feedback/**: the Outcome Bus (`outcome_events`) — **write-path LIVE
+  (harvest 8:45/20:45), read-path DARK** (nothing consumes the ledger yet).
+  Tier taxonomy is load-bearing: Tier-1 ground truth outranks user approval.
+  `record_outcome` must never raise. Deliberately "observation, not
+  reinforcement" — don't rename toward RL.
+- **calibration/**: Bayesian prediction-calibration primitives, currently
+  wired via outreach (engagement reconciliation). **Four distinct
+  "calibration" surfaces exist** (this package, `learning/triage/calibration`,
+  `feedback/calibration` ego-ECE, `eval/calibration` golden-set loader) —
+  don't conflate.
+
+## 11. Routing & providers
+
+How every LLM call picks a provider, and the registry for non-LLM tools.
+
+```yaml subsystem-map
+entry: routing-providers
+modules: [routing, providers]
+verified: 9037d45b 2026-07-07
+```
+
+- **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
+  each a free-first → paid-last chain; `never_pays` sites are filtered to
+  free-only. Per-provider circuit breaker (3 failures, exponential backoff
+  capped 30 min — 4h for QUOTA_EXHAUSTED; 429 = backpressure, NOT a breaker
+  failure; state persisted cross-process to
+  `~/.genesis/circuit_breaker_state.json`). Degradation levels are
+  hand-curated: L2 sheds nice-to-haves; **L3 keeps ONLY micro-reflection,
+  embeddings, tagging** — changing those sets changes what survives an outage.
+  Some call sites alias another site's chain — don't assume 1:1.
+- **providers/**: the `ToolProvider` registry for NON-LLM tools (search,
+  embeddings, STT/TTS, crawl, probes). Adapters register GATED ON ENV KEYS —
+  silent non-registration is by design (absence ≠ bug). LLM breaker/health
+  logic lives in routing, not here. No embedding provider registered → memory
+  silently degrades to FTS5-only.
+- GROUNDWORK: gpt-oss-120b provider defined but unwired into any chain.
+
+## 12. Platform & data
+
+The load-bearing floor: database, runtime bootstrap, resilience, observability,
+config resolution, and hygiene utilities.
+
+```yaml subsystem-map
+entry: platform-data
+modules: [db, runtime, resilience, observability, security, codebase,
+          restore, util, env.py, _config_overlay.py]
+verified: 9037d45b 2026-07-07
+```
+
+- **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
+  without it interleaved commits pin `in_transaction` until restart). Two
+  schema paths coexist: base DDL (~113 CREATE TABLE; docs still say "60+")
+  plus versioned migrations 0001..0046 run ONCE at startup before any other
+  init step touches data; a failed migration ABORTS bootstrap. Migration
+  atomicity is hand-rolled (BEGIN IMMEDIATE + a proxy that blocks stray
+  commits/DDL autocommit) with a post-commit reconcile and SQLITE_LOCKED
+  retry (2026-06-25 incident guard). No TABLES-vs-sqlite_master parity test
+  exists.
+- **runtime/**: sequential bootstrap (secrets → db → … → sentinel, ~27 steps);
+  each step records ok/degraded/failed in the manifest — only db aborts.
+  `~/.genesis/capabilities.json` + `bootstrap_manifest.json` are projected at
+  bootstrap tail; readonly probes must never clobber the primary's state.
+  New capabilities need `_CAPABILITY_DESCRIPTIONS` registration. Autonomy init
+  installs a fail-closed `DenyHighRiskSentinel` FIRST so ctor failures degrade
+  to blocking. GROUNDWORK: task-verify (constructed, `.verify()` never called
+  — dark), web-dd.
+- **resilience/**: RecoveryOrchestrator on a 30-min interval (3 confirmation
+  probes before draining); `DeferredWorkQueue` priorities + staleness policies;
+  dead-letter replay. The `dream_synthesis_slice` worklist is deliberately
+  excluded from the backlog alarm (drift-guard test pins it).
+- **observability/**: event bus dispatches inline AND logs every event;
+  persist-queue overflow drops events but emits a rate-limited "dropped"
+  meta-event (WS-17). Two health layers (async probes vs systemd shell-out);
+  `/health` is a dashboard route, not an MCP tool; `job_health` state machine
+  is runtime-owned.
+- **security/**: prompt-injection defense + outbound scanning — sanitizer is
+  LOG-ONLY for internal sources (perimeter EMAIL/INBOX can block);
+  `output_scanner` = deterministic outbound secrets/IP scan; `skill_scan`
+  shells to external NVIDIA SkillSpector. NOT auth or secrets storage (that's
+  `runtime/init/secrets.py` + `env.py`).
+- **codebase/**: AST indexer (surplus task, set-difference deletes with
+  CASCADE) behind the `codebase_navigate` MCP tool.
+- **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
+  encrypted `scripts/backup.sh` timer).
+- **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
+  `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
+  tmp discipline (`~/tmp` for large temp — never override TMPDIR).
+- **env.py**: 3-tier resolution (env var → `~/.genesis/config/genesis.yaml` →
+  default). **`update_in_progress()` is load-bearing**: the watchdog defers
+  restarts during deploys (mid-deploy revival deadlocks bootstrap); fails open
+  to "no deploy". `secrets_path()` is repo-relative unless SECRETS_PATH set.
+- **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
+  dicts merge, lists REPLACE wholesale); dependency-free by design to stay
+  import-cycle-safe.
+
+## 13. Modules, skills & self-extension
+
+The pluggable edges: capability modules, the skill library, and the pipeline
+for contributing code upstream.
+
+```yaml subsystem-map
+entry: modules-skills
+modules: [modules, skills, contribution, bookmark, workflows]
+verified: 9037d45b 2026-07-07
+```
+
+- **modules/**: capability modules are "hands, not brain" — a module may
+  observe Genesis but never participates in cognition, and MUST NOT set
+  `source_subsystem` on memory writes (test-enforced). Two-phase load
+  (config/modules/*.yaml + auto-discovery; YAML wins), enabled-state persisted
+  in DB. Shipped: content-pipeline (enabled, ALL auto-features OFF),
+  crypto-ops, prediction-markets. GROUNDWORK: autonomous-distribution.
+- **skills/**: skills are directories with SKILL.md — registration is catalog
+  generation (`scripts/generate_skill_catalog.py` scans `.claude/skills/`,
+  `src/genesis/skills/`, `~/.genesis/skill-library/` →
+  `~/.genesis/skill_catalog.json`, self-heals hourly), consumed by the
+  injection hook and by autonomous-session resources. Skill refinement is a
+  tracked cognitive-file modification (`learning/skills/applicator.py`).
+  Voice-master exemplars are on the contribution FORBIDDEN list.
+- **contribution/**: `python -m genesis contribute <sha>` — sanitize-then-PR
+  upstream, pseudonymous. `sanitize.scan_diff()` is FAIL-CLOSED (8 scanners;
+  any finding stops). Its forbidden-globs floor duplicates
+  `config/protected_paths.yaml` — keep in sync.
+- **bookmark/**: two-tier session bookmarks stored as episodic memories +
+  a lookup table; enrichment runs on surplus compute.
+- **workflows/**: YAML DAG executor — GROUNDWORK(workflow-engine), built with
+  NO runtime caller. Not live; do not treat as a capability.
+
+---
+
+*Maintenance: run `python scripts/check_subsystem_map.py` from the repo root;
+CI runs it on every PR. Entry stamps mark the commit each entry was last
+verified against — bump them when you re-verify, not when you merely edit
+prose.*
