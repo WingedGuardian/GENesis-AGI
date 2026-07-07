@@ -24,7 +24,11 @@ from genesis.surplus.compute_availability import ComputeAvailability
 from genesis.surplus.executor import StubExecutor
 from genesis.surplus.idle_detector import IdleDetector
 from genesis.surplus.queue import SurplusQueue
-from genesis.surplus.types import INSIGHT_PRODUCING_TASK_TYPES, SurplusExecutor
+from genesis.surplus.types import (
+    INSIGHT_PRODUCING_TASK_TYPES,
+    SurplusExecutor,
+    TaskType,
+)
 
 if TYPE_CHECKING:
     from genesis.memory.store import MemoryStore
@@ -133,17 +137,9 @@ class SurplusScheduler:
         self._j9_eval_batch_hours = j9_eval_batch_hours
         self._model_eval_hours = model_eval_hours
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._code_audit_executor: SurplusExecutor | None = None
-        self._code_index_executor: SurplusExecutor | None = None
-        self._bookmark_enrichment_executor: SurplusExecutor | None = None
-        self._model_eval_executor: SurplusExecutor | None = None
-        self._j9_eval_batch_executor: SurplusExecutor | None = None
-        self._fresh_session_test_executor: SurplusExecutor | None = None
-        self._disk_cleanup_executor: SurplusExecutor | None = None
-        self._backup_verification_executor: SurplusExecutor | None = None
-        self._dead_letter_replay_executor: SurplusExecutor | None = None
-        self._db_maintenance_executor: SurplusExecutor | None = None
-        self._cc_memory_staleness_executor: SurplusExecutor | None = None
+        # Dedicated per-task-type executors. dispatch_once falls back to
+        # self._executor for any type without a registered entry.
+        self._executors: dict[TaskType, SurplusExecutor] = {}
         self._recon_gatherer: ReconGatherer | None = None
         self._model_intelligence_job = None  # Set via set_model_intelligence_job()
         self._models_md_synthesis_job = None  # Set via set_models_md_synthesis_job()
@@ -176,27 +172,27 @@ class SurplusScheduler:
 
     def set_code_audit_executor(self, executor) -> None:
         """Set a dedicated executor for CODE_AUDIT tasks."""
-        self._code_audit_executor = executor
+        self._executors[TaskType.CODE_AUDIT] = executor
 
     def set_code_index_executor(self, executor: SurplusExecutor) -> None:
         """Set a dedicated executor for CODE_INDEX tasks (no LLM, pure AST)."""
-        self._code_index_executor = executor
+        self._executors[TaskType.CODE_INDEX] = executor
 
     def set_bookmark_enrichment_executor(self, executor: SurplusExecutor) -> None:
         """Set a dedicated executor for BOOKMARK_ENRICHMENT tasks."""
-        self._bookmark_enrichment_executor = executor
+        self._executors[TaskType.BOOKMARK_ENRICHMENT] = executor
 
     def set_model_eval_executor(self, executor: SurplusExecutor) -> None:
         """Set a dedicated executor for MODEL_EVAL tasks."""
-        self._model_eval_executor = executor
+        self._executors[TaskType.MODEL_EVAL] = executor
 
     def set_j9_eval_batch_executor(self, executor: SurplusExecutor) -> None:
         """Set executor for J9_EVAL_BATCH tasks (daily memory relevance scoring)."""
-        self._j9_eval_batch_executor = executor
+        self._executors[TaskType.J9_EVAL_BATCH] = executor
 
     def set_fresh_session_test_executor(self, executor: SurplusExecutor) -> None:
         """Set executor for FRESH_SESSION_TEST tasks (weekly documentation quality diagnostic)."""
-        self._fresh_session_test_executor = executor
+        self._executors[TaskType.FRESH_SESSION_TEST] = executor
         # Late-registration: if scheduler already started, add the job now
         if self._scheduler.running and not self._scheduler.get_job("schedule_fresh_session_test"):
             from apscheduler.triggers.cron import CronTrigger
@@ -218,17 +214,17 @@ class SurplusScheduler:
     ) -> None:
         """Set dedicated executors for infrastructure maintenance tasks."""
         if disk_cleanup:
-            self._disk_cleanup_executor = disk_cleanup
+            self._executors[TaskType.DISK_CLEANUP] = disk_cleanup
         if backup_verification:
-            self._backup_verification_executor = backup_verification
+            self._executors[TaskType.BACKUP_VERIFICATION] = backup_verification
         if dead_letter_replay:
-            self._dead_letter_replay_executor = dead_letter_replay
+            self._executors[TaskType.DEAD_LETTER_REPLAY] = dead_letter_replay
         if db_maintenance:
-            self._db_maintenance_executor = db_maintenance
+            self._executors[TaskType.DB_MAINTENANCE] = db_maintenance
 
     def set_cc_memory_staleness_executor(self, executor: SurplusExecutor) -> None:
         """Set a dedicated executor for CC_MEMORY_STALENESS tasks."""
-        self._cc_memory_staleness_executor = executor
+        self._executors[TaskType.CC_MEMORY_STALENESS] = executor
 
     def set_recon_gatherer(self, gatherer: ReconGatherer) -> None:
         """Set the recon gatherer for scheduled release checking."""
@@ -493,7 +489,7 @@ class SurplusScheduler:
             )
         # Fresh session test: weekly Saturday 9 AM local.
         # Moved off Sunday to avoid dream cycle congestion.
-        if self._fresh_session_test_executor is not None:
+        if self._executors.get(TaskType.FRESH_SESSION_TEST) is not None:
             self._scheduler.add_job(
                 self._schedule_fresh_session_test,
                 CronTrigger(day_of_week="sat", hour=9, timezone=user_timezone()),
@@ -1821,29 +1817,12 @@ class SurplusScheduler:
 
         from genesis.surplus.types import TaskType as _TT
 
-        executor = self._executor
-        if task.task_type == _TT.CODE_AUDIT and self._code_audit_executor is not None:
-            executor = self._code_audit_executor
-        elif task.task_type == _TT.CODE_INDEX and self._code_index_executor is not None:
-            executor = self._code_index_executor
-        elif task.task_type == _TT.BOOKMARK_ENRICHMENT and self._bookmark_enrichment_executor is not None:
-            executor = self._bookmark_enrichment_executor
-        elif task.task_type == _TT.MODEL_EVAL and self._model_eval_executor is not None:
-            executor = self._model_eval_executor
-        elif task.task_type == _TT.DISK_CLEANUP and self._disk_cleanup_executor is not None:
-            executor = self._disk_cleanup_executor
-        elif task.task_type == _TT.BACKUP_VERIFICATION and self._backup_verification_executor is not None:
-            executor = self._backup_verification_executor
-        elif task.task_type == _TT.DEAD_LETTER_REPLAY and self._dead_letter_replay_executor is not None:
-            executor = self._dead_letter_replay_executor
-        elif task.task_type == _TT.DB_MAINTENANCE and self._db_maintenance_executor is not None:
-            executor = self._db_maintenance_executor
-        elif task.task_type == _TT.J9_EVAL_BATCH and self._j9_eval_batch_executor is not None:
-            executor = self._j9_eval_batch_executor
-        elif task.task_type == _TT.CC_MEMORY_STALENESS and self._cc_memory_staleness_executor is not None:
-            executor = self._cc_memory_staleness_executor
-        elif task.task_type == _TT.FRESH_SESSION_TEST and self._fresh_session_test_executor is not None:
-            executor = self._fresh_session_test_executor
+        # Dedicated executor for this task type if registered; the default
+        # executor otherwise (a registered-but-None entry also falls back,
+        # matching the old per-slot `is not None` checks).
+        executor = self._executors.get(task.task_type)
+        if executor is None:
+            executor = self._executor
 
         try:
             result = await executor.execute(task)
