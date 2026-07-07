@@ -27,6 +27,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The Guardian no longer false-alarms that the host gateway is "stale" after a
+  healthy update — and can no longer roll it back.** A guardian redeploy advances
+  the host's deployed code without moving its install-dir git checkout, so the
+  staleness check (which compared against that lagging checkout) fired a spurious
+  "gateway stale" alert after every clean update, and its self-heal could copy the
+  *older* checked-out gateway over the current one. The check now measures against
+  the commit that was actually deployed, so a healthy update stays quiet while a
+  genuinely frozen gateway is still detected and repaired.
+
 - **Memory recall no longer surfaces Genesis's own internal noise.** Machine-generated
   decisional output — background reflections, autonomy task retrospectives, and ego-dispatch
   records — was leaking into normal recall because several writers didn't mark themselves as

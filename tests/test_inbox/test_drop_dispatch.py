@@ -270,6 +270,85 @@ async def test_retry_respects_url_failure_storm_guard(
 
 
 @pytest.mark.asyncio
+async def test_modified_path_respects_url_failure_storm_guard(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """A file detected as MODIFIED (genuinely-new content) that persistently
+    fails URL fetches (>= max_retries partial_url_failure in 48h) must NOT be
+    re-dropped every scan — the modified path needs the same storm guard the
+    new-file and retry paths already have. Instead of dropping, it writes a
+    completing row to advance the known hash (stopping re-detection)."""
+    from genesis.inbox.scanner import compute_hash
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=3)
+    max_r = mon._config.max_retries
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(3))
+    new_h = compute_hash(fp)
+    recent = datetime.now(UTC).isoformat()  # count_url_failures windows on REAL now
+    # >= max_retries partial_url_failures pin the file as a storm. retry_count at
+    # the cap makes them NON-retriable (so the file is NOT a retry candidate) yet
+    # still counted by count_url_failures — and get_all_known keeps them (failed
+    # at cap) at an OLD hash, so the NEW disk content is detected as MODIFIED.
+    for i in range(max_r):
+        await inbox_items.create(
+            db, id=f"puf{i}", file_path=str(fp), content_hash="oldhash",
+            status="pending", created_at=recent,
+        )
+        await inbox_items.update_status(
+            db, f"puf{i}", status="failed",
+            error_message="partial_url_failure", retry_count=max_r,
+        )
+
+    r = await mon.check_once()
+
+    assert r.items_modified == 1, "file must be detected as modified, not retry"
+    assert r.items_retried == 0, "rows at the retry cap are not retry candidates"
+    assert r.batches_dispatched == 0, "storm guard must NOT dispatch a modified drop"
+    assert mock_invoker.run.call_count == 0
+    # The guard advanced the known hash via a completing row (stops re-detection).
+    completed_new = await (await db.execute(
+        "SELECT id FROM inbox_items WHERE file_path=? AND status='completed' "
+        "AND content_hash=?", (str(fp), new_h))).fetchall()
+    assert len(completed_new) == 1, "a completing row at the new hash must be written"
+    # No drop was queued.
+    pending = await (await db.execute(
+        "SELECT id FROM inbox_items WHERE file_path=? AND status IN "
+        "('pending','processing')", (str(fp),))).fetchall()
+    assert pending == [], "storm guard must not leave a pending/processing drop"
+
+
+@pytest.mark.asyncio
+async def test_modified_under_cap_still_queues(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """The modified-path storm guard is BOUNDED: an under-cap URL-failure count
+    (< max_retries) must NOT suppress a genuine modification — it still drops
+    and dispatches. Guards against the >= comparison over-suppressing."""
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=3)
+    max_r = mon._config.max_retries
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(3))
+    recent = datetime.now(UTC).isoformat()
+    # One under-cap failure (non-retriable at the cap so the file is modified,
+    # not a retry candidate); count 1 < max_retries -> guard must NOT fire.
+    await inbox_items.create(
+        db, id="puf0", file_path=str(fp), content_hash="oldhash",
+        status="pending", created_at=recent,
+    )
+    await inbox_items.update_status(
+        db, "puf0", status="failed",
+        error_message="partial_url_failure", retry_count=max_r,
+    )
+
+    r = await mon.check_once()
+
+    assert r.items_modified == 1
+    assert r.batches_dispatched >= 1, "an under-cap modification must still drop"
+    assert mock_invoker.run.call_count >= 1
+
+
+@pytest.mark.asyncio
 async def test_retry_candidate_vanished_file_is_abandoned(
     db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
 ):
