@@ -212,6 +212,40 @@ async def main(apply: bool = False) -> None:
                     len(orphan_ids),
                 )
 
+        # --- Step 2c: reconcile embedding_status on purged rows ------------
+        # Steps 2/2b delete the Qdrant vector but leave the metadata row's
+        # embedding_status untouched — so a subsystem row that was 'embedded'
+        # now claims a vector that no longer exists. That lie has a real
+        # consequence: mark_superseded (store.py) reads
+        # ``embedding_status != 'fts5_only'`` to decide whether to update the
+        # Qdrant payload, and would issue a doomed update_payload on the
+        # deleted point. Every source_subsystem-tagged row is FTS5-only by
+        # invariant (store.py forces it on subsystem writes), and post-purge
+        # none of them has a vector, so normalise them all to 'fts5_only'.
+        # Idempotent (gated on != 'fts5_only'); matches the forward-write path.
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM memory_metadata "
+            "WHERE source_subsystem IS NOT NULL "
+            "AND embedding_status IS NOT 'fts5_only'"
+        )
+        stale_status = (await cursor.fetchone())[0]
+        if apply:
+            await db.execute(
+                "UPDATE memory_metadata SET embedding_status = 'fts5_only' "
+                "WHERE source_subsystem IS NOT NULL "
+                "AND embedding_status IS NOT 'fts5_only'"
+            )
+            await db.commit()
+            logger.info(
+                "embedding_status reconcile: set %d subsystem row(s) to "
+                "'fts5_only'", stale_status,
+            )
+        else:
+            logger.info(
+                "DRY-RUN: would set embedding_status='fts5_only' on %d "
+                "subsystem row(s)", stale_status,
+            )
+
         # --- Step 3: invalid_at backfill via obs:<uuid> tag JOIN -----------
         # Find subsystem rows that still have NULL invalid_at, parse the
         # obs:<uuid> tag from memory_fts.tags, JOIN observations.expires_at,
