@@ -132,6 +132,20 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   server restarts more frequently than the interval, the job never
   fires. Use `CronTrigger` for anything longer than a few hours.
   Bit us with `user_model_evolution` (48h interval, daily restarts).
+- **Modules are NEVER subsystems.** A capability *module*
+  (`src/genesis/modules/**`, an external pluggable capability — "hands,
+  not brain", see `modules/base.py`) is not an internal Genesis
+  *subsystem* (memory, reflection, ego, triage, autonomy, sentinel).
+  Module memory writes must **never** set a `source_subsystem` value —
+  that tag means "internal decisional output, exclude from default
+  recall", which is wrong for module output. This is enforced
+  mechanically: any `.store()` under `modules/**` passing
+  `source_subsystem` is a hard CI failure in
+  `tests/test_memory/test_store_subsystem_coverage.py`, which also forces
+  every new memory-writer to either tag itself or be explicitly
+  classified as user-context. `_KNOWN_SUBSYSTEMS`
+  (`memory/retrieval.py`) is the authoritative subsystem list; adding a
+  module name to it is a category error.
 
 ### Iterative-Refinement Discipline
 
