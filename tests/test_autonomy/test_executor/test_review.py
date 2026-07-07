@@ -624,3 +624,48 @@ class TestPreMortem:
 
         assert result is not None
         assert result.confidence == 75
+
+
+# ---------------------------------------------------------------------------
+# Fresh-eyes (text-only) reviewer scoping — must not judge file existence
+# ---------------------------------------------------------------------------
+
+
+class TestFreshEyesPromptScoping:
+    """The text-only fresh-eyes reviewer has no filesystem access, so its
+    prompt must forbid existence/location/execution judgments (which caused
+    false 'artifacts not in main tree' failures on worktree-built code)."""
+
+    def test_text_only_prompt_disclaims_fs_access(self) -> None:
+        from genesis.autonomy.executor.review import (
+            _CALL_SITE_EXECUTOR_REVIEW,
+            TaskReviewer,
+        )
+
+        prompt = TaskReviewer._build_verify_prompt(
+            _CALL_SITE_EXECUTOR_REVIEW,
+            deliverable="Created src/genesis/skills/dad_joke/__init__.py in the worktree.",
+            requirements="A dad_joke skill exists with a test.",
+        )
+        low = prompt.lower()
+        # Must disclose no-fs access and forbid existence/location vetoes.
+        assert "text-only" in low
+        assert "no filesystem" in low
+        assert "worktree" in low
+        assert "main tree" in low
+        # Must tell it not to fail on unverifiable existence.
+        assert "do not fail" in low or "never" in low
+        # Still carries the deliverable + requirements.
+        assert "dad_joke" in prompt
+        assert "## Requirements" in prompt
+
+    def test_tool_capable_prompt_still_uses_tools(self) -> None:
+        # The tool-capable verifier is unchanged — it SHOULD check reality.
+        from genesis.autonomy.executor.review import TaskReviewer
+
+        prompt = TaskReviewer._build_active_verify_prompt(
+            deliverable="Made a file.", requirements="A file exists.",
+        )
+        low = prompt.lower()
+        assert "read the file" in low
+        assert "run the tests" in low

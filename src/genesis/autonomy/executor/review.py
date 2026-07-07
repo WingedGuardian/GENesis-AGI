@@ -674,9 +674,34 @@ class TaskReviewer:
             else "Try hard to find flaws, gaps, edge cases, and "
                  "potential failures. Be thorough and skeptical."
         )
+        # This reviewer is TEXT-ONLY (routed to an API model with no tools):
+        # it sees only the reported deliverable below and has no filesystem,
+        # shell, or tool access. A separate tool-capable verifier independently
+        # confirms that files exist, tests pass, and URLs are live. Without
+        # this scoping the model fabricates existence failures — e.g. blocking
+        # a task because worktree-built files are "not in the main tree".
+        scope = (
+            "## Your access is limited — read this first\n"
+            "You are a TEXT-ONLY reviewer with NO filesystem, shell, or tool "
+            "access. You see only the reported deliverable below. A separate "
+            "tool-capable verifier independently checks reality (that files "
+            "exist, tests actually pass, URLs are live).\n"
+            "- Assume the reported deliverable is factually accurate for this "
+            "review. Do NOT fail it because you personally cannot confirm an "
+            "artifact exists or that a step ran.\n"
+            "- Do NOT judge WHERE artifacts live. Code is built in an isolated "
+            "git worktree and delivered afterward; files being absent from the "
+            "main tree / working tree is EXPECTED and is never a defect.\n"
+            "- Judge only what the text supports: does the described work, if "
+            "accurately reported, satisfy the requirements? Is the approach "
+            "sound, complete, and internally correct? Flag genuine design, "
+            "completeness, or correctness gaps — never unverifiable existence "
+            "or execution claims.\n\n"
+        )
         return (
             f"You are {role}. Evaluate whether the deliverable "
             "meets the requirements.\n\n"
+            f"{scope}"
             "## Requirements\n"
             f"{requirements}\n\n"
             "## Deliverable\n"
