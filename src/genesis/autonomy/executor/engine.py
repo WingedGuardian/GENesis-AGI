@@ -22,7 +22,7 @@ import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from genesis.autonomy.decomposer import has_deliverable_frame
 from genesis.autonomy.executor import dispatch as _dispatch
@@ -36,6 +36,11 @@ from genesis.autonomy.executor.types import (
     TaskPhase,
     validate_transition,
 )
+
+if TYPE_CHECKING:
+    # Runtime import stays lazy inside _run_scope_gate (executor/__init__ ->
+    # engine -> decomposer would cycle at import time).
+    from genesis.autonomy.executor.scope_gate import ScopeGateResult
 
 logger = logging.getLogger(__name__)
 
@@ -1234,6 +1239,14 @@ class CCSessionExecutor:
         wt_path = self._worktree_paths.get(task_id)
 
         if has_code and wt_path:
+            # Build-lane tasks pass the diff allowlist gate before anything
+            # leaves the worktree. Blocked (or any git failure computing the
+            # diff) => parked: no push, no PR. User tasks are untouched.
+            if await self._task_source(task_id) == "build_lane":
+                gate_result = await self._run_scope_gate(task_id, wt_path)
+                if not gate_result.allowed:
+                    return
+
             branch = f"task/{task_id[:8]}"
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -1255,6 +1268,124 @@ class CCSessionExecutor:
                 logger.error(
                     "Delivery failed for task %s", task_id, exc_info=True,
                 )
+
+    async def _task_source(self, task_id: str) -> str:
+        """Dispatch provenance of a task ('user' when unknown/absent).
+
+        Tolerates DBs without the ``source`` column (pre-0048): missing
+        column or row degrades to 'user', which keeps delivery behavior
+        byte-identical for everything except explicit build-lane rows.
+        """
+        from genesis.db.crud import task_states
+
+        try:
+            task = await task_states.get_by_id(self._db, task_id)
+        except Exception:
+            logger.error(
+                "Could not read task %s for source check — treating as 'user'",
+                task_id, exc_info=True,
+            )
+            return "user"
+        if not task:
+            return "user"
+        return str(task.get("source") or "user")
+
+    async def _run_scope_gate(self, task_id: str, wt_path: Path) -> ScopeGateResult:
+        """Run the build-lane diff allowlist gate. Fail-closed throughout.
+
+        Blocked outcomes record ``scope_gate`` (verdict JSON) and
+        ``scope_blocked`` outputs on the task and notify the user; the
+        caller must then STOP delivery (no push, no PR).
+        """
+        from genesis.autonomy.executor.scope_gate import (
+            ScopeGateResult,
+            evaluate_raw_diff,
+        )
+
+        async def _git(*args: str) -> tuple[int, str]:
+            proc = await asyncio.create_subprocess_exec(
+                "git", *args,
+                cwd=str(wt_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            # A stuck git lock (aborted prior op, corrupted index) would
+            # otherwise wedge the delivery path — and its semaphore —
+            # permanently, with no external watchdog. 60s is generous for
+            # local status/merge-base/diff; timeout degrades to a gate
+            # failure (fail-closed), never a wedge.
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return 128, f"git {args[0]} timed out after 60s"
+            return proc.returncode or 0, (out or err).decode(errors="replace")
+
+        try:
+            # 1. Dirty tree = a step forgot to commit; the diff below would
+            #    silently exclude that work, so treat it as a gate failure.
+            rc, status_out = await _git("status", "--porcelain")
+            if rc != 0:
+                result = ScopeGateResult(
+                    allowed=False, reason=f"git status failed: {status_out[:200]}",
+                )
+            elif status_out.strip():
+                result = ScopeGateResult(
+                    allowed=False,
+                    reason="dirty worktree — uncommitted changes at delivery",
+                    blocked_paths=status_out.strip().splitlines()[:20],
+                )
+            else:
+                # 2. Committed diff vs the branch point.
+                rc, base = await _git("merge-base", "HEAD", "main")
+                if rc != 0:
+                    result = ScopeGateResult(
+                        allowed=False, reason=f"merge-base failed: {base[:200]}",
+                    )
+                else:
+                    # --raw (not --name-only): exposes destination file modes
+                    # so symlink additions are visible and blockable.
+                    rc, raw = await _git(
+                        "diff", "--raw", base.strip(), "HEAD",
+                    )
+                    if rc != 0:
+                        result = ScopeGateResult(
+                            allowed=False, reason=f"git diff failed: {raw[:200]}",
+                        )
+                    else:
+                        result = evaluate_raw_diff(raw.splitlines())
+        except Exception as exc:
+            logger.error(
+                "Scope gate errored for task %s — failing closed",
+                task_id, exc_info=True,
+            )
+            result = ScopeGateResult(
+                allowed=False, reason=f"scope gate error: {type(exc).__name__}",
+            )
+
+        await self._set_output(task_id, "scope_gate", result.to_json())
+        if result.allowed:
+            logger.info(
+                "Scope gate PASSED for task %s (%d paths)",
+                task_id, result.checked_paths,
+            )
+        else:
+            await self._set_output(task_id, "scope_blocked", result.reason)
+            logger.warning(
+                "Scope gate BLOCKED task %s: %s — %s",
+                task_id, result.reason, result.blocked_paths[:10],
+            )
+            await self._notify(
+                task_id,
+                (
+                    f"Build parked by scope gate: {result.reason}. "
+                    f"Blocked paths: {', '.join(result.blocked_paths[:5]) or 'n/a'}. "
+                    "Nothing was pushed — widening build scope is a human decision."
+                ),
+                "alert",
+            )
+        return result
 
     async def _deliver_artifact(
         self, task_id: str, step_results: list[StepResult]
