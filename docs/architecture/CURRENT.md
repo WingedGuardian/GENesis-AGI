@@ -152,13 +152,14 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: 15a3c86e 2026-07-07
+verified: a7aa076b 2026-07-07
 ```
 
-- `surplus/scheduler.py` (~1040 LOC) is the system-job hub (dream cycle, recon,
+- `surplus/scheduler.py` (~790 LOC) is the system-job hub (dream cycle, recon,
   pipeline cycles, maintenance, code index/audit, model evals…); job bodies
-  live in `surplus/jobs/` (gates/runners/dream/gitnexus) with the scheduler
-  keeping every method name as a thin delegate.
+  live in `surplus/jobs/` (gates/runners/dream/gitnexus) and the dispatch
+  pipeline in `surplus/dispatch.py`, with the scheduler keeping every method
+  name as a thin delegate/facade.
   `dispatch_once()` is **idle-gated** — surplus tasks only run when idle;
   follow-up dispatch is deliberately NOT idle-gated.
 - **Durability model:** no persistent jobstore — jobs are re-registered at
