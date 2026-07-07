@@ -237,6 +237,55 @@ class TestDecompose:
         assert steps[0]["type"] == "code"
         assert "command" not in steps[0]
 
+    async def test_shell_syntax_commands_fall_back_to_code(self) -> None:
+        """Exec-only runner can't run shell constructs — downgrade upfront.
+
+        Exactly the V0-canary failure shapes: 'source venv && pytest' and
+        'git add X && git commit' died at runtime and burned CC recovery
+        cycles; validation now catches them at decompose time.
+        """
+        steps_json = json.dumps([
+            {"idx": 0, "type": "test", "description": "t",
+             "command": "source /home/u/.venv/bin/activate && pytest tests/x.py"},
+            {"idx": 1, "type": "git", "description": "g",
+             "command": 'git add a.py b.py && git commit -m "feat: x"'},
+            {"idx": 2, "type": "bash", "description": "b",
+             "command": "pytest tests/x.py | tail -5"},
+            {"idx": 3, "type": "bash", "description": "e",
+             "command": "FOO=bar pytest tests/x.py"},
+            {"idx": 4, "type": "bash", "description": "i",
+             "command": "python -c 'print(1)'"},
+            {"idx": 5, "type": "bash", "description": "cd",
+             "command": "cd /somewhere"},
+        ])
+        router = _make_router(steps_json)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose("plan", "Task")
+
+        for step in steps[:6]:
+            assert step["type"] == "code", step
+            assert "command" not in step, step
+
+    async def test_clean_exec_commands_stay_deterministic(self) -> None:
+        """Plain single-program commands are untouched by the shell check."""
+        steps_json = json.dumps([
+            {"idx": 0, "type": "test", "description": "t",
+             "command": "pytest tests/test_foo.py -v"},
+            {"idx": 1, "type": "bash", "description": "r",
+             "command": "ruff check src/"},
+            {"idx": 2, "type": "git", "description": "g",
+             "command": 'git commit -m "feat: wire A && B"'},
+        ])
+        router = _make_router(steps_json)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose("plan", "Task")
+
+        assert steps[0]["type"] == "test"
+        assert steps[1]["type"] == "bash"
+        # NOTE: '&&' inside a quoted commit message still trips the substring
+        # check — acceptable false positive (downgrades to code, never breaks).
+        assert steps[2]["type"] == "code"
+
     async def test_git_step_type_valid(self) -> None:
         """Git step type is accepted."""
         steps_json = json.dumps([

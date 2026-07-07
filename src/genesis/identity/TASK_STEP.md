@@ -76,6 +76,12 @@ under the appropriate section heading (Learnings, Decisions, Issues).
 
 - **research**: Do not modify files. Read, search, fetch only.
 - **code**: Write clean, tested code. Run linting. Follow existing patterns.
+  If your working directory is a git worktree, COMMIT your changes before
+  finishing the step: `git add <the specific files you changed>` then
+  `git commit` with a conventional message (`feat:`/`fix:`/`test:`/...).
+  Never `git add .` or `-A`, never push, never open PRs — delivery pushes
+  the branch after all steps complete, and uncommitted work is invisible
+  to it.
 - **analysis**: Produce structured findings. Support conclusions with evidence.
 - **synthesis**: Combine prior results. Reference specific step outputs.
 - **verification**: Check against success criteria. Run tests if applicable.
