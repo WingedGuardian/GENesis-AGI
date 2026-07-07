@@ -150,6 +150,26 @@ async def list_recent(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def list_by_outcome(
+    db: aiosqlite.Connection, outcome: str
+) -> list[dict]:
+    """All candidates in a given *outcome*, oldest first.
+
+    Uses ``idx_build_candidates_outcome``. Unlike a recency-bounded scan,
+    this never drops an in-flight candidate out of the window as unrelated
+    calibration rows accumulate — the reconcile loop must see EVERY
+    ``submitted`` row until its task reaches a terminal phase.
+    """
+    if outcome not in OUTCOMES:
+        raise ValueError(f"invalid outcome: {outcome!r}")
+    cursor = await db.execute(
+        "SELECT * FROM build_candidates WHERE outcome = ? "
+        "ORDER BY created_at ASC",
+        (outcome,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def record_user_decision(
     db: aiosqlite.Connection,
     id: str,

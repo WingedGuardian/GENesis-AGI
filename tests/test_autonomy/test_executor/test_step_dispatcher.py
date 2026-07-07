@@ -292,3 +292,46 @@ class TestModelOverride:
     async def test_code_step_defaults_sonnet_without_override(self) -> None:
         from genesis.cc.types import CCModel
         assert await self._model_used("code", None) == CCModel.SONNET
+
+    async def test_try_workaround_preserves_override(self, monkeypatch) -> None:
+        from genesis.cc.types import CCModel
+        monkeypatch.setattr(
+            "genesis.db.crud.task_steps.update_step", AsyncMock(),
+        )
+        invoker = self._invoker()
+        workaround = AsyncMock()
+        workaround.search = AsyncMock(return_value=MagicMock(
+            found=True, approach="do it differently",
+        ))
+        sd = StepDispatcher(
+            db=AsyncMock(), invoker=invoker,
+            autonomous_dispatcher=None, workaround_searcher=workaround,
+        )
+        await sd.try_workaround(
+            "t-1", _make_step(step_type="code"),
+            MagicMock(result="failed"), [],
+            model_override=CCModel.OPUS,
+        )
+        # The recovery retry must NOT silently drop to Sonnet.
+        assert invoker.run.call_args[0][0].model == CCModel.OPUS
+
+    async def test_try_research_preserves_override(self, monkeypatch) -> None:
+        from genesis.cc.types import CCModel
+        monkeypatch.setattr(
+            "genesis.db.crud.task_steps.update_step", AsyncMock(),
+        )
+        invoker = self._invoker()
+        research = AsyncMock()
+        research.research = AsyncMock(return_value=MagicMock(
+            found=True, approach="research-derived approach",
+        ))
+        sd = StepDispatcher(
+            db=AsyncMock(), invoker=invoker,
+            autonomous_dispatcher=None, research_searcher=research,
+        )
+        await sd.try_research(
+            "t-1", _make_step(step_type="verification"),
+            MagicMock(result="failed"), [],
+            model_override=CCModel.OPUS,
+        )
+        assert invoker.run.call_args[0][0].model == CCModel.OPUS

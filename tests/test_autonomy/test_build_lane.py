@@ -477,3 +477,19 @@ class TestReconcile:
         await lane.poll_pending()
         row = await build_candidates.get_by_id(db, cid)
         assert row["outcome"] == "submitted"
+
+    async def test_reconcile_survives_calibration_flood(self, db, monkeypatch, tmp_path):
+        """A submitted candidate must reconcile even when >100 newer calibration
+        rows exist — the reconcile query is outcome-filtered, not recency-bounded."""
+        lane, cid, tid = await _submitted_candidate(db, monkeypatch, tmp_path)
+        # Flood with 120 unrelated dont_build calibration rows created AFTER it.
+        for i in range(120):
+            await build_candidates.create(
+                db, id=f"flood-{i}", item_key=f"flood-key-{i}",
+                item_title=f"noise {i}", source_file="x.md", verdict="dont_build",
+            )
+        await _set_task(db, tid, phase="completed",
+                        outputs={"branch": "task/abc", "pr_url": "https://x/pr/9"})
+        await lane.poll_pending()
+        row = await build_candidates.get_by_id(db, cid)
+        assert row["outcome"] == "pr_opened"

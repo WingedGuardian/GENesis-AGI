@@ -30,7 +30,6 @@ import hashlib
 import json
 import logging
 import uuid
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -245,9 +244,12 @@ class BuildLane:
             return None
         intended_paths = _as_list(build_spec.get("intended_paths"))
 
-        date = datetime.now(UTC).strftime("%Y-%m-%d")
+        # Deterministic filename (no date): permanent item_key dedup means a
+        # key is materialized at most once, so the date added no uniqueness —
+        # only a crash-retry idempotency gap (the path is folded into the
+        # greenlight approval_key). The row's created_at carries the timestamp.
         _PLANS_DIR.mkdir(parents=True, exist_ok=True)
-        path = _PLANS_DIR / f"build-{item_key[:8]}-{date}.md"
+        path = _PLANS_DIR / f"build-{item_key[:8]}.md"
 
         lines: list[str] = [
             f"# Build: {title}",
@@ -364,8 +366,11 @@ class BuildLane:
                 logger.info("build_lane: candidate %s rejected", cand["id"])
 
     async def _reconcile_submitted(self) -> None:
-        for cand in await build_candidates.list_recent(self._db, limit=100):
-            if cand.get("outcome") != "submitted" or not cand.get("task_id"):
+        # Query submitted rows directly (indexed) — a recency-bounded scan
+        # would drop an in-flight candidate out of the window as unrelated
+        # calibration rows pile up, stranding it at 'submitted' forever.
+        for cand in await build_candidates.list_by_outcome(self._db, "submitted"):
+            if not cand.get("task_id"):
                 continue
             task = await task_states.get_by_id(self._db, cand["task_id"])
             if not task:

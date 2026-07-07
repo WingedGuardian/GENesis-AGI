@@ -439,6 +439,7 @@ class CCSessionExecutor:
                     recovered = await self._step_dispatcher.try_workaround(
                         task_id, step, result, step_results,
                         worktree_path=wt_path,
+                        model_override=model_override,
                     )
                     if recovered is not None:
                         step_results[-1] = recovered
@@ -477,6 +478,7 @@ class CCSessionExecutor:
                             task_id, step, result, step_results,
                             due_diligence_results=dd_context,
                             worktree_path=wt_path,
+                            model_override=model_override,
                         )
                     )
                     if researched is not None:

@@ -344,6 +344,7 @@ class StepDispatcher:
         step_results: list[StepResult],
         *,
         worktree_path: Path | None = None,
+        model_override: Any = None,
     ) -> StepResult | None:
         """Attempt workaround for a failed step. Returns new result or None."""
         if not self._workaround:
@@ -363,11 +364,12 @@ class StepDispatcher:
         if wa_result is None or not wa_result.found or not wa_result.approach:
             return None
 
-        # Retry with workaround context
+        # Retry with workaround context (preserve any build-lane model upgrade)
         retry = await self.execute_step(
             task_id, step, step_results,
             workaround=wa_result.approach,
             worktree_path=worktree_path,
+            model_override=model_override,
         )
         return retry if retry.status == "completed" else None
 
@@ -400,6 +402,7 @@ class StepDispatcher:
         due_diligence_results: str | None = None,
         *,
         worktree_path: Path | None = None,
+        model_override: Any = None,
     ) -> tuple[StepResult | None, ResearchResult | None]:
         """Dispatch research session. Returns (retry_result, research_result).
 
@@ -424,11 +427,12 @@ class StepDispatcher:
         if research_result is None or not research_result.found:
             return None, research_result
 
-        # Retry with research-derived approach
+        # Retry with research-derived approach (preserve build-lane model upgrade)
         retry = await self.execute_step(
             task_id, step, step_results,
             workaround=research_result.approach,
             worktree_path=worktree_path,
+            model_override=model_override,
         )
         if retry.status == "completed":
             return retry, research_result

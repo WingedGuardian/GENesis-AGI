@@ -123,6 +123,20 @@ class TestQueries:
         rows = await build_candidates.list_recent(db, limit=2)
         assert len(rows) == 2
 
+    async def test_list_by_outcome(self, db):
+        await _make(db, id="c1", item_key="k1")  # outcome defaults to 'pending'
+        await _make(db, id="c2", item_key="k2")
+        await build_candidates.update(db, "c2", outcome="submitted")
+        await _make(db, id="c3", item_key="k3")
+        await build_candidates.update(db, "c3", outcome="submitted")
+        submitted = await build_candidates.list_by_outcome(db, "submitted")
+        assert {r["id"] for r in submitted} == {"c2", "c3"}
+        assert [r["id"] for r in submitted] == ["c2", "c3"]  # oldest first
+
+    async def test_list_by_outcome_rejects_bad_value(self, db):
+        with pytest.raises(ValueError):
+            await build_candidates.list_by_outcome(db, "shipped")
+
     async def test_get_by_approval_request_and_task(self, db):
         await _make(db, id="c1")
         await build_candidates.update(
