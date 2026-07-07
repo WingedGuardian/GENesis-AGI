@@ -884,6 +884,29 @@ class InboxMonitor:
                     created_at=now_iso,
                 )
                 continue
+            # Storm guard: a file whose evaluations keep failing on dead URLs
+            # must not re-queue a drop every scan. Mirror the new-file and retry
+            # paths (which already gate here) — the modified path was the one
+            # site missing it. Instead of dropping, write a completing row to
+            # ADVANCE the known hash (stopping re-detection), exactly like the
+            # empty-delta branch above.
+            url_fail_count = await inbox_items.count_url_failures(
+                self._db, str(f), since_hours=48,
+            )
+            if url_fail_count >= self._config.max_retries:
+                logger.warning(
+                    "Retry storm: %s has %d URL failures in 48h, "
+                    "skipping modification", f, url_fail_count,
+                )
+                await inbox_items.create(
+                    self._db,
+                    id=item_id,
+                    file_path=str(f),
+                    content_hash=h,
+                    status="completed",
+                    created_at=now_iso,
+                )
+                continue
             # Genuinely new content -> segment the delta into per-batch rows.
             await self._queue_drop(
                 str(f), eval_content, h, now_iso, pending_items,
