@@ -223,6 +223,7 @@ def main() -> None:
         # Replaces cognitive state — shows what Genesis knows, not system health.
         # Critical alerts only surface if genuinely user-blocking.
         _ek_file = Path.home() / ".genesis" / "essential_knowledge.md"
+        _ek_emitted = False
         if _ek_file.exists():
             try:
                 ek_content = _ek_file.read_text(encoding="utf-8").strip()
@@ -231,8 +232,27 @@ def main() -> None:
                         _emit("\n\n---\n\n")
                     _emit(ek_content)
                     first = False
+                    _ek_emitted = True
             except OSError:
                 pass  # Essential knowledge is advisory — silent failure is correct
+
+        # In-flight working state (advisory): active autonomy tasks, live
+        # worktrees, and recently-touched plan files — computed fresh here
+        # because they change far faster than the L1 essential-knowledge
+        # regeneration cadence. Folds directly UNDER Essential Knowledge with
+        # NO "---" divider so it reads as session context for recollection, not
+        # a standalone report to recite at the user. Foreground-only (this is
+        # the non-genesis-session branch). Writer: genesis.memory.open_loops.
+        try:
+            _inflight = _load_inflight_block()
+            for _chunk in _inflight_emission_chunks(
+                _inflight, ek_emitted=_ek_emitted, first=first
+            ):
+                _emit(_chunk)
+            if _inflight:
+                first = False
+        except Exception:
+            pass  # In-flight state is advisory — never block session start
 
         # Critical-only alert: surface genuinely user-blocking issues (DB down, etc.)
         _status_file = Path.home() / ".genesis" / "status.json"
@@ -576,6 +596,58 @@ async def _load_cognitive_state(last_session_data: dict | None = None) -> str | 
         return await cognitive_state.render(db, activity_tier=tier)
     finally:
         await db.close()
+
+
+def _inflight_emission_chunks(
+    inflight: str, *, ek_emitted: bool, first: bool
+) -> list[str]:
+    """Emission chunks for the in-flight block (pure — drives the foreground branch).
+
+    Folds directly under Essential Knowledge with NO "---" divider when EK was
+    already emitted (so it reads as one continuous context block); otherwise it
+    stands alone, preceded by the standard divider only when it is not the first
+    block. Returns [] for an empty block (nothing to emit). Extracted so the
+    fold/divider logic is unit-testable without a full subprocess run.
+    """
+    if not inflight:
+        return []
+    if ek_emitted:
+        return ["\n\n" + inflight]  # fold under EK, no divider
+    chunks: list[str] = []
+    if not first:
+        chunks.append("\n\n---\n\n")
+    chunks.append(inflight)
+    return chunks
+
+
+def _load_inflight_block() -> str:
+    """Fresh in-flight working-state block for the foreground session context.
+
+    Opens its own short-timeout connection (mirroring the "2.6 Codebase L0"
+    block above — isolated, never touches the shared runtime connection) and
+    delegates assembly to genesis.memory.open_loops.build_inflight_block.
+    Fail-open: any error returns "" so session start is never blocked.
+    """
+    try:
+        import aiosqlite
+
+        db_path = Path.home() / "genesis" / "data" / "genesis.db"
+        if not db_path.exists():
+            return ""
+        repo_root = Path.home() / "genesis"
+        plans_dir = Path.home() / ".claude" / "plans"
+
+        async def _run() -> str:
+            from genesis.memory.open_loops import build_inflight_block
+            async with aiosqlite.connect(str(db_path), timeout=2) as db:
+                db.row_factory = aiosqlite.Row
+                return await build_inflight_block(
+                    db, repo_root=repo_root, plans_dir=plans_dir
+                )
+
+        return asyncio.run(_run())
+    except Exception:
+        return ""  # Advisory — never block session start
 
 
 if __name__ == "__main__":
