@@ -20,6 +20,7 @@ SKILLS_INVENTORY: dict[str, dict] = {
     "strategic-reflection": {"consumer": "cc_background_reflection", "phase": 7, "description": "Strategic reflection — weekly self-assessment, quality calibration, learning stability monitoring"},
     "self-assessment": {"consumer": "cc_background_reflection", "phase": 7, "description": "Weekly self-assessment — evaluate reflection quality, procedure effectiveness, learning velocity, blind spots"},
     "skill-evolution": {"consumer": "cc_background_reflection", "phase": 7, "description": "Skill effectiveness analysis and refinement — analyze skill-tagged session outcomes, propose and apply improvements to SKILL.md files based on evidence"},
+    "aws-fde-delivery": {"consumer": "cc_background_task", "phase": 7, "description": "AWS FDE deliverable contract — build-first AI/ML work on AWS with mandatory IaC, grounded cost estimate, and Well-Architected review"},
     # Setup skills
     "onboarding": {"consumer": "cc_foreground", "phase": "setup", "description": "First-run onboarding — guides new users through Genesis configuration and verification"},
     # Content skills
