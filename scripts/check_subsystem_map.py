@@ -60,6 +60,8 @@ _SKIP_TOP_LEVEL = {"__init__.py", "__main__.py"}
 
 @dataclass
 class Entry:
+    """Parsed representation of one ``yaml subsystem-map`` block in CURRENT.md."""
+
     name: str
     modules: list[str]
     verified_sha: str
@@ -68,10 +70,12 @@ class Entry:
 
 @dataclass
 class Coverage:
-    unmapped: set[str] = field(default_factory=set)
-    vanished: set[str] = field(default_factory=set)
-    duplicates: set[str] = field(default_factory=set)
-    unused_allowlist: set[str] = field(default_factory=set)
+    """Result of diffing claimed modules against the live src/genesis tree."""
+
+    unmapped: set[str] = field(default_factory=set)  # live, claimed by no entry
+    vanished: set[str] = field(default_factory=set)  # claimed, gone from disk
+    duplicates: set[str] = field(default_factory=set)  # claimed by 2+ entries
+    unused_allowlist: set[str] = field(default_factory=set)  # allowlisted, no longer needed
 
 
 def parse_map(text: str) -> tuple[list[Entry], list[str]]:
@@ -132,6 +136,11 @@ def live_modules(src_root: Path) -> set[str]:
 def check_coverage(
     entries: list[Entry], live: set[str], allowlist: dict[str, str]
 ) -> Coverage:
+    """Diff claimed vs live modules both directions.
+
+    An allowlist entry is "unused" when its module is no longer a live-but-
+    unclaimed straggler (it vanished from disk, or an entry now claims it).
+    """
     cov = Coverage()
     claimed: set[str] = set()
     for entry in entries:
