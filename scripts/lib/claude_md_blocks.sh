@@ -10,9 +10,9 @@
 detect_container_lan_ip() {
     local lan_ip
     lan_ip=$(ip -4 -o addr show scope global 2>/dev/null \
-        | awk '$2 !~ /^tailscale/ {print $4}' | cut -d/ -f1 | head -1)
+        | awk '$2 !~ /^tailscale/ {print $4}' | cut -d/ -f1 | head -1 || true)
     if [ -z "$lan_ip" ]; then
-        lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
     fi
     printf '%s' "$lan_ip"
 }
@@ -21,7 +21,7 @@ detect_container_lan_ip() {
 # interface (Tailscale's fd7a::/48 ULA shows up as scope global too).
 detect_container_lan_ipv6() {
     ip -6 -o addr show scope global 2>/dev/null \
-        | awk '$2 !~ /^tailscale/ {print $4}' | cut -d/ -f1 | head -1
+        | awk '$2 !~ /^tailscale/ {print $4}' | cut -d/ -f1 | head -1 || true
     return 0
 }
 

@@ -854,10 +854,19 @@ LAN_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' 
 HOST_IPV4="${TS_IPV4:-$LAN_IPV4}"
 HOST_IPV6="${TS_IPV6:-$LAN_IPV6}"
 
-# Container IPs
-CONTAINER_IPV4=$(incus exec "$CONTAINER_NAME" -- hostname -I 2>/dev/null | awk '{print $1}' || echo "")
-CONTAINER_IPV6=$(incus exec "$CONTAINER_NAME" -- ip -6 addr show scope global 2>/dev/null \
-    | grep -oP 'inet6 \K[^ /]+' | head -1 || echo "")
+# Container IPs — exclude tailscale interfaces, same rule as
+# detect_container_lan_ip/_ipv6 in scripts/lib/claude_md_blocks.sh (the
+# detection runs INSIDE the container via incus, where the host-side
+# sourced lib isn't available, so the rule is inlined; keep in sync).
+# hostname -I fallback preserved: it picks the tailscale0 address first
+# when present, but an address beats no address.
+CONTAINER_IPV4=$(incus exec "$CONTAINER_NAME" -- sh -c \
+    "ip -4 -o addr show scope global 2>/dev/null | awk '\$2 !~ /^tailscale/ {print \$4}' | cut -d/ -f1 | head -1" \
+    2>/dev/null || echo "")
+[ -z "$CONTAINER_IPV4" ] && CONTAINER_IPV4=$(incus exec "$CONTAINER_NAME" -- hostname -I 2>/dev/null | awk '{print $1}' || echo "")
+CONTAINER_IPV6=$(incus exec "$CONTAINER_NAME" -- sh -c \
+    "ip -6 -o addr show scope global 2>/dev/null | awk '\$2 !~ /^tailscale/ {print \$4}' | cut -d/ -f1 | head -1" \
+    2>/dev/null || echo "")
 
 # Build dashboard URL for final report
 DASHBOARD_URL=""
