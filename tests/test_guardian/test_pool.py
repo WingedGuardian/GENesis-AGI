@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
+from genesis.guardian import pool as pool_mod
 from genesis.guardian.config import StoragePoolConfig
 from genesis.guardian.pool import (
     TIER_CRIT,
@@ -12,6 +15,7 @@ from genesis.guardian.pool import (
     TIER_WARN,
     StoragePoolStatus,
     decide_alert,
+    measure_storage_pool,
     parse_lvs_data_metadata,
     worst_tier,
 )
@@ -56,8 +60,8 @@ class TestWorstTier:
         assert worst_tier(_btrfs(93.0), self.cfg) == TIER_CRIT
 
     def test_pool_used_ignored_when_lvm_percents_present(self):
-        # LVM-thin: data%/metadata% stay the sole authority — incus's used%
-        # is also populated there and must NOT change long-standing behavior.
+        # LVM-thin: data%/metadata% stay the sole authority. Even if a used%
+        # were present, it must NOT change long-standing behavior.
         s = StoragePoolStatus(
             detected=True, data_pct=50.0, metadata_pct=40.0, pool_used_pct=95.0,
         )
@@ -118,3 +122,102 @@ class TestDecideAlert:
     def test_sustained_with_no_prior_time_alerts(self):
         # Defensive: missing last_alert_at shouldn't suppress a live problem.
         assert decide_alert(TIER_WARN, TIER_WARN, None, self.now, 6.0).should_alert
+
+
+def _df(used: int, size: int) -> str:
+    # `df -B1 --output=used,size` form: header row + one data row.
+    return f"       Used    1B-blocks\n{used} {size}\n"
+
+
+class TestPoolUsedViaDf:
+    """The non-LVM used% signal. `incus storage info` has no machine-readable
+    space for an uncapped btrfs-on-LV pool (its `--format json` flag doesn't
+    even exist), so the mount is read via df."""
+
+    @pytest.mark.asyncio
+    async def test_computes_used_pct(self, monkeypatch):
+        async def _run(*a, **k):
+            return 0, _df(48_318_382_080, 322_122_547_200), ""
+
+        monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
+        pct = await pool_mod._pool_used_pct_via_df("/mnt/pool")
+        assert pct == pytest.approx(15.0, abs=0.1)
+
+    @pytest.mark.asyncio
+    async def test_rc_nonzero_is_none(self, monkeypatch):
+        async def _run(*a, **k):
+            return 1, "", "df: no such file or directory"
+
+        monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
+        assert await pool_mod._pool_used_pct_via_df("/nope") is None
+
+    @pytest.mark.asyncio
+    async def test_single_line_output_is_none(self, monkeypatch):
+        async def _run(*a, **k):
+            return 0, "only a header\n", ""
+
+        monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
+        assert await pool_mod._pool_used_pct_via_df("/mnt/pool") is None
+
+    @pytest.mark.asyncio
+    async def test_nonnumeric_row_is_none(self, monkeypatch):
+        async def _run(*a, **k):
+            return 0, "Used 1B-blocks\nfoo bar\n", ""
+
+        monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
+        assert await pool_mod._pool_used_pct_via_df("/mnt/pool") is None
+
+    @pytest.mark.asyncio
+    async def test_zero_size_is_none(self, monkeypatch):
+        # Never divide by zero — a 0-size mount yields no signal, not a crash.
+        async def _run(*a, **k):
+            return 0, _df(0, 0), ""
+
+        monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
+        assert await pool_mod._pool_used_pct_via_df("/mnt/pool") is None
+
+
+class TestMeasureNonLvmPool:
+    """End-to-end of the non-LVM branch of measure_storage_pool: a btrfs pool
+    must surface a real pool_used_pct (from df) so worst_tier can tier it."""
+
+    @pytest.mark.asyncio
+    async def test_btrfs_pool_populates_used_pct(self, monkeypatch):
+        async def _detect(_config):
+            return "genesis-btrfs"
+
+        async def _lvm(_name):
+            return None  # non-LVM backend
+
+        async def _run(*a, **k):
+            return 0, _df(48_318_382_080, 322_122_547_200), ""
+
+        monkeypatch.setattr(pool_mod, "_detect_pool_name", _detect)
+        monkeypatch.setattr(pool_mod, "_lvm_source", _lvm)
+        monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
+
+        status = await measure_storage_pool(object())
+        assert status.detected is True
+        assert status.data_pct is None and status.metadata_pct is None
+        assert status.pool_used_pct == pytest.approx(15.0, abs=0.1)
+        # The whole point: a measured btrfs pool now tiers.
+        assert worst_tier(status, StoragePoolConfig()) == TIER_OK
+
+    @pytest.mark.asyncio
+    async def test_btrfs_df_failure_is_not_detected(self, monkeypatch):
+        async def _detect(_config):
+            return "genesis-btrfs"
+
+        async def _lvm(_name):
+            return None
+
+        async def _run(*a, **k):
+            return 1, "", "df failed"
+
+        monkeypatch.setattr(pool_mod, "_detect_pool_name", _detect)
+        monkeypatch.setattr(pool_mod, "_lvm_source", _lvm)
+        monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
+
+        status = await measure_storage_pool(object())
+        assert status.detected is False
+        assert status.pool_used_pct is None
