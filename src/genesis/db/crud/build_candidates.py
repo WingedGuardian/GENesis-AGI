@@ -59,6 +59,7 @@ async def create(
 
 
 async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
+    """Fetch one candidate row by primary key."""
     cursor = await db.execute(
         "SELECT * FROM build_candidates WHERE id = ?", (id,)
     )
@@ -82,6 +83,8 @@ async def get_open_by_item_key(
 async def get_by_approval_request(
     db: aiosqlite.Connection, approval_request_id: str
 ) -> dict | None:
+    """Fetch the candidate whose greenlight card is *approval_request_id*
+    (``approval_requests.id``) — the tap-resolution lookup."""
     cursor = await db.execute(
         "SELECT * FROM build_candidates WHERE approval_request_id = ?",
         (approval_request_id,),
@@ -91,6 +94,8 @@ async def get_by_approval_request(
 
 
 async def get_by_task(db: aiosqlite.Connection, task_id: str) -> dict | None:
+    """Fetch the candidate tied to a submitted executor task
+    (``task_states.task_id``) — the outcome-tracking lookup."""
     cursor = await db.execute(
         "SELECT * FROM build_candidates WHERE task_id = ?", (task_id,)
     )
@@ -110,6 +115,7 @@ async def list_open(db: aiosqlite.Connection) -> list[dict]:
 async def list_recent(
     db: aiosqlite.Connection, *, limit: int = 50
 ) -> list[dict]:
+    """Most recent candidates regardless of decision state, newest first."""
     cursor = await db.execute(
         "SELECT * FROM build_candidates ORDER BY created_at DESC LIMIT ?",
         (limit,),
