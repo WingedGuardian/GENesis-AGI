@@ -1026,8 +1026,14 @@ reminders here.)
 UCLSEED
 fi
 echo "--- Refreshing Network Identity in ~/.claude/CLAUDE.md ---"
-_c_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-_c_ipv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' | head -1 || true)
+# Block format + detection helpers are shared with host-setup.sh via the
+# lib — the two writers previously drifted (Tailscale line lost, container
+# IP mis-detected as the tailscale0 address).
+# shellcheck source=lib/claude_md_blocks.sh
+. "$SCRIPT_DIR/lib/claude_md_blocks.sh"
+_c_ip=$(detect_container_lan_ip)
+_c_ipv6=$(detect_container_lan_ipv6)
+_ts_ip=$(detect_tailscale_ip)
 _host_ip=$("$VENV_DIR/bin/python" -c "
 import yaml, pathlib
 p = pathlib.Path.home() / '.genesis' / 'guardian_remote.yaml'
@@ -1037,18 +1043,8 @@ if p.exists():
 " 2>/dev/null || true)
 [ -z "$_host_ip" ] && _host_ip=$(ip route | grep default | awk '{print $3}' || true)
 
-sed -i '/<!-- begin:network-identity -->/,/<!-- end:network-identity -->/d' "$_user_claude"
-{
-    echo "<!-- begin:network-identity -->"
-    echo "## Network Identity"
-    echo ""
-    printf -- "- **Container IP**: %s" "${_c_ip:-localhost}"
-    [ -n "$_c_ipv6" ] && printf " (v6: %s)" "$_c_ipv6"
-    echo ""
-    printf -- "- **Host VM IP**: %s\n" "${_host_ip:-localhost}"
-    printf -- "- **Dashboard**: http://%s:5000 (via proxy device)\n" "${_host_ip:-localhost}"
-    echo "<!-- end:network-identity -->"
-} >> "$_user_claude"
+build_network_identity_block "$_c_ip" "$_c_ipv6" "$_host_ip" "" "$_ts_ip" \
+    | write_sentinel_block "$_user_claude" "network-identity"
 echo "  Network identity updated in ~/.claude/CLAUDE.md"
 echo ""
 

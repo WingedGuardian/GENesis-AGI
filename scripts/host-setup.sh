@@ -991,20 +991,13 @@ fi
 # instructions, not tracked in the repo). Idempotent via sentinel blocks.
 echo ""
 echo "  Writing network identity into ~/.claude/CLAUDE.md..."
-# Build the network block on the host side where all variables are available
-_NET_LINES="## Network Identity"
-_NET_LINES="${_NET_LINES}
-"
-_NET_LINES="${_NET_LINES}
-- **Container IP**: ${CONTAINER_IPV4}"
-[ -n "$CONTAINER_IPV6" ] && _NET_LINES="${_NET_LINES} (v6: ${CONTAINER_IPV6})"
-_NET_LINES="${_NET_LINES}
-- **Host VM IP**: ${HOST_IPV4}"
-[ -n "$HOST_IPV6" ] && _NET_LINES="${_NET_LINES} (v6: ${HOST_IPV6})"
-[ -n "$TS_IPV4" ] && _NET_LINES="${_NET_LINES}
-- **Tailscale**: ${TS_IPV4}"
-_NET_LINES="${_NET_LINES}
-- **Dashboard**: http://${HOST_IPV4:-localhost}:5000 (via proxy device)"
+# Build the network block on the host side where all variables are
+# available, using the shared builder so the format can't drift from
+# update.sh's in-container refresh (which rewrites this block every run).
+# shellcheck source=lib/claude_md_blocks.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/claude_md_blocks.sh"
+_NET_LINES="$(build_network_identity_block \
+    "$CONTAINER_IPV4" "$CONTAINER_IPV6" "$HOST_IPV4" "$HOST_IPV6" "$TS_IPV4")"
 
 # Write into container via incus exec, piping the block through stdin.
 # Target: ~/.claude/CLAUDE.md (user-level, not tracked in repo).
