@@ -137,6 +137,35 @@ class TestQueries:
         with pytest.raises(ValueError):
             await build_candidates.list_by_outcome(db, "shipped")
 
+    async def test_list_by_verdict(self, db):
+        await _make(db, id="c1", item_key="k1", verdict="build")
+        await _make(db, id="c2", item_key="k2", verdict="dont_build",
+                    verdict_reason="duplicates existing capability")
+        await _make(db, id="c3", item_key="k3", verdict="dont_build",
+                    verdict_reason="brain-not-body scope")
+        rows = await build_candidates.list_by_verdict(db, "dont_build")
+        assert {r["id"] for r in rows} == {"c2", "c3"}
+        assert all(r["verdict"] == "dont_build" for r in rows)
+
+    async def test_list_by_verdict_limit_and_bad_value(self, db):
+        for i in range(3):
+            await _make(db, id=f"c{i}", item_key=f"k{i}", verdict="build")
+        assert len(await build_candidates.list_by_verdict(db, "build", limit=2)) == 2
+        with pytest.raises(ValueError):
+            await build_candidates.list_by_verdict(db, "ship_it")
+
+    async def test_verdict_decision_counts(self, db):
+        # build: 1 approved, 1 open; dont_build: 1 (never decided)
+        await _make(db, id="c1", item_key="k1", verdict="build")
+        await build_candidates.record_user_decision(db, "c1", user_decision="approved")
+        await _make(db, id="c2", item_key="k2", verdict="build")  # open
+        await _make(db, id="c3", item_key="k3", verdict="dont_build")
+        counts = await build_candidates.verdict_decision_counts(db)
+        as_set = {(r["verdict"], r["user_decision"], r["count"]) for r in counts}
+        assert ("build", "approved", 1) in as_set
+        assert ("build", None, 1) in as_set
+        assert ("dont_build", None, 1) in as_set
+
     async def test_get_by_approval_request_and_task(self, db):
         await _make(db, id="c1")
         await build_candidates.update(
