@@ -290,6 +290,102 @@ async def _check_cc_cap_detection(db) -> None:
         logger.debug("cc_cap detection failed — skipping this tick", exc_info=True)
 
 
+# OMI ingest liveness. Off-prem wearable transcripts stop SILENTLY if the
+# dedicated genesis-omi-ingest unit dies (the phone keeps POSTing to a dead
+# endpoint until OMI's own 100-failure budget disables the webhook, ~minutes).
+# Config-gated: only alerts once the user has an enabled ~/.genesis/omi_config.yaml,
+# so installs without OMI never fire. Same monotonic-since-boot caveat: None =
+# "never alerted", never 0.0.
+_OMI_ALERT_COOLDOWN_S = 3600  # one alert per hour max
+_last_omi_alert_at: float | None = None
+
+
+async def _systemd_unit_active(unit: str) -> bool | None:
+    """``systemctl --user is-active <unit>`` -> True / False / None.
+
+    True = "active"; False = a definitive not-active state (inactive/failed/…);
+    None = the probe itself could not run (systemctl missing, dbus hiccup, timeout)
+    so the caller must NOT guess. The 10s timeout guards a hung dbus call — a real
+    ``is-active`` returns in milliseconds — with no legitimate work to interrupt."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl", "--user", "is-active", unit,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        return out.decode().strip() == "active"
+    except Exception:
+        return None
+
+
+async def _check_omi_ingest(db) -> None:
+    """Alert when OMI ingest is configured+enabled but its systemd unit is down.
+
+    Best-effort; never raises into the tick. NOTE (documented residual): an
+    OMI-side auto-disable is undetectable here — a healthy-but-idle service and a
+    disabled webhook look identical (no posts arrive), so this watches the UNIT's
+    liveness, not the transcript flow. A stale heartbeat alone can't distinguish
+    "unit down" from "user not wearing the device"."""
+    global _last_omi_alert_at
+    if db is None:
+        return
+    try:
+        from genesis.attention import omi_ingest
+
+        try:
+            config = omi_ingest.load_omi_config()
+        except Exception:
+            # A malformed config is a separate concern — do NOT read it as "down".
+            logger.debug("omi_ingest: config unreadable — skipping liveness check", exc_info=True)
+            return
+
+        async def _resolve(note: str) -> None:
+            global _last_omi_alert_at
+            resolved = await observations.resolve_by_source_and_type(
+                db, source="omi_ingest_monitor", type="infrastructure_alert",
+                resolved_at=datetime.now(UTC).isoformat(), resolution_notes=note,
+            )
+            if resolved:
+                _last_omi_alert_at = None
+
+        if config is None:
+            await _resolve("OMI ingest not configured/enabled")
+            return
+
+        active = await _systemd_unit_active("genesis-omi-ingest.service")
+        if active is True:
+            await _resolve("genesis-omi-ingest unit active")
+            return
+        if active is None:
+            return  # indeterminate — neither alert nor resolve
+
+        now = time.monotonic()
+        if _last_omi_alert_at is not None and now - _last_omi_alert_at < _OMI_ALERT_COOLDOWN_S:
+            return
+        _last_omi_alert_at = now  # set BEFORE the write so a failed create still suppresses
+        created = await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="omi_ingest_monitor",
+            type="infrastructure_alert",
+            content=(
+                "OMI ingest is enabled (~/.genesis/omi_config.yaml) but the "
+                "genesis-omi-ingest unit is not active. Off-prem wearable transcripts "
+                "are being dropped until it restarts; OMI will auto-disable the webhook "
+                "once its own failure budget is spent."
+            ),
+            priority="high",
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=hashlib.sha256(b"omi_ingest_unit_down").hexdigest(),
+            skip_if_duplicate=True,
+        )
+        if created is None:
+            return  # an unresolved alert already exists — don't duplicate
+        logger.warning("OMI ingest unit down while enabled — alert raised")
+    except Exception:
+        logger.debug("omi_ingest check failed — skipping this tick", exc_info=True)
+
+
 # Micro ticks are silent by default (counted for cascade, no LLM call).
 # LLM fires only when these critical operational signals are active.
 _MICRO_CRITICAL_SIGNALS = frozenset({"software_error_spike", "critical_failure"})
@@ -927,6 +1023,11 @@ class AwarenessLoop:
             # completions (recorded by the invoker) and alerts on a run. Guarded
             # on db internally; a query failure no-ops (never breaks the tick).
             await _check_cc_cap_detection(self._db)
+
+            # OMI ingest liveness — alert if the off-prem transcript webhook's unit
+            # died while enabled (transcripts drop silently otherwise). Config-gated
+            # + best-effort; a no-op on installs without OMI configured.
+            await _check_omi_ingest(self._db)
 
             # SQLite WAL checkpoint — prevent unbounded WAL growth from
             # external scripts or concurrent writers. PASSIVE is non-blocking.
