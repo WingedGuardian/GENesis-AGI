@@ -157,15 +157,19 @@ class ProxmoxAdapter(ProvisioningAdapter):
 
         Never raises. On poll timeout or a persistent read failure we return
         ``(False, <reason>)`` so the caller treats the mutation as UNVERIFIED
-        (and never auto-retries) rather than as a silent success. The ~120s
-        bound (poll count × interval) is a raw external poll with no other
-        watchdog: a resize completes in seconds, so it only guards a
-        pathologically slow/hung task worker or status endpoint from blocking
-        the (already bounded) provisioning flow.
+        (and never auto-retries) rather than as a silent success. The ~``timeout``
+        bound is a raw external poll with no other watchdog: a resize completes
+        in seconds, so it only guards a pathologically slow/hung task worker or
+        status endpoint from blocking the (already bounded) provisioning flow.
+        Bounded two ways — a wall-clock deadline (honours the bound even when a
+        connected-but-hung endpoint makes each read block up to the per-request
+        timeout) AND a poll-count cap (deterministic when reads return fast).
         """
         cfg = self._config
         encoded = urllib.parse.quote(upid, safe="")
         path = f"/nodes/{cfg.node}/tasks/{encoded}/status"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         max_polls = max(1, int(timeout / interval))
         last_err = "task did not reach 'stopped'"
         for _ in range(max_polls):
@@ -177,6 +181,8 @@ class ProxmoxAdapter(ProvisioningAdapter):
                 # still running — keep polling
             else:
                 last_err = err or f"task status read failed: {st}"
+            if loop.time() >= deadline:
+                break
             await asyncio.sleep(interval)
         return False, f"task poll timed out after ~{timeout:.0f}s ({last_err})"
 
