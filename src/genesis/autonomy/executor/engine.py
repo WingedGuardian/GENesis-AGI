@@ -1242,12 +1242,14 @@ class CCSessionExecutor:
             # Build-lane tasks pass the diff allowlist gate before anything
             # leaves the worktree. Blocked (or any git failure computing the
             # diff) => parked: no push, no PR. User tasks are untouched.
-            if await self._task_source(task_id) == "build_lane":
+            is_build_lane = await self._task_source(task_id) == "build_lane"
+            if is_build_lane:
                 gate_result = await self._run_scope_gate(task_id, wt_path)
                 if not gate_result.allowed:
                     return
 
             branch = f"task/{task_id[:8]}"
+            pushed = False
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "git", "push", "-u", "origin", branch,
@@ -1264,10 +1266,88 @@ class CCSessionExecutor:
                 else:
                     logger.info("Pushed branch %s for task %s", branch, task_id)
                     await self._set_output(task_id, "branch", branch)
+                    pushed = True
             except Exception:
                 logger.error(
                     "Delivery failed for task %s", task_id, exc_info=True,
                 )
+
+            if is_build_lane and pushed:
+                await self._open_build_pr(task_id, wt_path, branch)
+
+    async def _open_build_pr(
+        self, task_id: str, wt_path: Path, branch: str
+    ) -> None:
+        """Open the draft PR for a pushed build-lane branch.
+
+        Non-fatal on failure: the branch is already delivered, so an error
+        degrades to "open the PR manually" — recorded on the task and
+        surfaced in the notification either way.
+        """
+        from genesis.autonomy.executor.pr_open import (
+            build_pr_body,
+            build_pr_title,
+            open_draft_pr,
+        )
+        from genesis.db.crud import task_states
+
+        description = ""
+        plan_path = ""
+        scope_gate_json = ""
+        try:
+            task = await task_states.get_by_id(self._db, task_id)
+            if task:
+                description = task.get("description") or ""
+                raw = task.get("outputs") or ""
+                try:
+                    outputs = json.loads(raw)
+                    if isinstance(outputs, dict):
+                        plan_path = str(outputs.get("plan_path", ""))
+                        scope_gate_json = str(outputs.get("scope_gate", ""))
+                except (json.JSONDecodeError, ValueError):
+                    plan_path = raw
+        except Exception:
+            logger.error(
+                "Could not load task %s context for PR body", task_id,
+                exc_info=True,
+            )
+
+        try:
+            result = await open_draft_pr(
+                worktree_path=wt_path,
+                branch=branch,
+                title=build_pr_title(description or f"build task {task_id}"),
+                body=build_pr_body(
+                    task_id=task_id,
+                    plan_path=plan_path,
+                    scope_gate_json=scope_gate_json,
+                ),
+            )
+        except Exception:
+            logger.error(
+                "Draft PR open crashed for task %s", task_id, exc_info=True,
+            )
+            await self._set_output(task_id, "pr_error", "pr_open crashed (see logs)")
+            return
+
+        if result.ok and result.pr_url:
+            await self._set_output(task_id, "pr_url", result.pr_url)
+            await self._notify(
+                task_id,
+                f"Build delivered: draft PR {result.pr_url} (branch {branch}). "
+                "Review and merge when ready.",
+                "alert",
+            )
+        else:
+            await self._set_output(
+                task_id, "pr_error", result.error or "unknown pr_open failure",
+            )
+            await self._notify(
+                task_id,
+                f"Build branch {branch} pushed, but draft PR creation failed: "
+                f"{result.error or 'unknown'}. Open the PR manually.",
+                "alert",
+            )
 
     async def _task_source(self, task_id: str) -> str:
         """Dispatch provenance of a task ('user' when unknown/absent).

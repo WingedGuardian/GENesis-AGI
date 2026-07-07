@@ -237,6 +237,7 @@ class TestDeliverScopeGate:
         await _seed(db)
         engine = _engine(db)
         engine._worktree_paths["t-sg1"] = tmp_path
+        engine._open_build_pr = AsyncMock()  # PR-open path covered in test_pr_open
         monkeypatch.setattr(
             engine, "_task_source", AsyncMock(return_value="build_lane"),
         )
