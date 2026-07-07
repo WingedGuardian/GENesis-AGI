@@ -72,7 +72,7 @@ def propagate_telegram_credentials(
     # Read source secrets
     source_secrets = _read_dotenv(src)
     if not source_secrets:
-        logger.debug("No secrets file at %s — skipping credential propagation", src)
+        logger.debug("No secrets file for telegram propagation — skipping")
         return None
 
     # Extract and map Telegram keys
@@ -83,7 +83,7 @@ def propagate_telegram_credentials(
             creds[dst_key] = value
 
     if not creds.get("TELEGRAM_BOT_TOKEN"):
-        logger.debug("No TELEGRAM_BOT_TOKEN in %s — skipping", src)
+        logger.debug("No TELEGRAM_BOT_TOKEN present — skipping telegram propagation")
         return None
 
     out_path = _write_creds_atomic(out_dir, _CREDS_FILENAME, creds)
@@ -129,7 +129,7 @@ def propagate_provisioning_credentials(
 
     source_secrets = _read_dotenv(src)
     if not source_secrets:
-        logger.debug("No secrets file at %s — skipping provisioning propagation", src)
+        logger.debug("No secrets file for provisioning propagation — skipping")
         return None
 
     creds: dict[str, str] = {}
@@ -139,7 +139,7 @@ def propagate_provisioning_credentials(
             creds[dst_key] = value
 
     if not creds.get("PROXMOX_AUDIT_TOKEN"):
-        logger.debug("No PROXMOX_AUDIT_TOKEN in %s — skipping provisioning creds", src)
+        logger.debug("No PROXMOX_AUDIT_TOKEN present — skipping provisioning creds")
         return None
 
     out_path = _write_creds_atomic(out_dir, _PROVISIONING_FILENAME, creds)
