@@ -56,6 +56,97 @@ _STALE_OBS_SECONDS = 3 * 86400
 _STALE_PRIORITY_DEMOTION = {"critical": "high", "high": "medium", "medium": "medium"}
 
 
+# ── Capability-build lane report helpers ──────────────────────────────────
+
+_BUILD_PR_CI_TIMEOUT_S = 20  # per-PR gh call; PRs are checked concurrently
+_MAX_BUILD_PR_CHECKS = 10    # cap concurrent gh calls (rate-limit safety)
+
+
+async def _pr_ci_status(pr_url: str) -> str | None:
+    """One-shot CI rollup for a draft build PR via
+    ``gh pr view <url> --json statusCheckRollup``. Returns a compact word
+    ('passing'/'failing'/'pending'/'no checks'), or None on error/timeout.
+
+    Uses the shared ``run_gh`` helper, which kills+reaps the child process on
+    timeout (the process-kill sequence is easy to get subtly wrong, so it is
+    not re-implemented here).
+    """
+    import json
+
+    from genesis.recon.gh_cli import run_gh
+
+    if not pr_url:
+        return None
+    raw = await run_gh(
+        "gh", "pr", "view", pr_url, "--json", "statusCheckRollup",
+        timeout=_BUILD_PR_CI_TIMEOUT_S,
+    )
+    if not raw:
+        return None
+    try:
+        checks = json.loads(raw).get("statusCheckRollup") or []
+    except (ValueError, TypeError):
+        return None
+    return _summarize_ci_rollup(checks)
+
+
+def _summarize_ci_rollup(checks: list) -> str:
+    """Collapse a heterogeneous statusCheckRollup (CheckRun + StatusContext)
+    into one word: failing > pending > passing."""
+    if not checks:
+        return "no checks"
+    _FAIL = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED",
+             "STARTUP_FAILURE", "ERROR"}
+    _OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+    saw_fail = saw_pending = False
+    for c in checks:
+        conclusion = (c.get("conclusion") or "").upper()
+        state = (c.get("state") or "").upper()  # StatusContext form
+        if conclusion in _FAIL or state in {"FAILURE", "ERROR"}:
+            saw_fail = True
+        elif conclusion in _OK or state == "SUCCESS":
+            continue
+        else:
+            # COMPLETED-without-conclusion, QUEUED, IN_PROGRESS, PENDING, ...
+            saw_pending = True
+    if saw_fail:
+        return "failing"
+    if saw_pending:
+        return "pending"
+    return "passing"
+
+
+def _format_build_calibration(counts: list[dict]) -> list[str]:
+    """Per-verdict agreement lines from verdict×user_decision counts.
+    dont_build is reported as 'uncontested' (never carded), never as agreement.
+    """
+    agg: dict[str, dict[str, int]] = {}
+    for row in counts:
+        verdict = row.get("verdict") or "?"
+        decision = row.get("user_decision") or "pending"
+        agg.setdefault(verdict, {})[decision] = row.get("count", 0)
+    lines: list[str] = []
+    if "build" in agg:
+        b = agg["build"]
+        approved = b.get("approved", 0)
+        rejected = b.get("rejected", 0)
+        pending = b.get("pending", 0)
+        decided = approved + rejected
+        rate = f"{approved}/{decided} approved" if decided else "none decided yet"
+        extra = f", {pending} pending your tap" if pending else ""
+        lines.append(f"- build verdicts: {rate}{extra}")
+    if "dont_build" in agg:
+        total = sum(agg["dont_build"].values())
+        lines.append(
+            f"- dont_build verdicts: {total} "
+            "(uncontested — reported, never carded)"
+        )
+    if "needs_discussion" in agg:
+        total = sum(agg["needs_discussion"].values())
+        lines.append(f"- needs_discussion verdicts: {total}")
+    return lines
+
+
 class MorningReportGenerator:
     """Synthesizes system state into a daily morning report."""
 
@@ -188,6 +279,15 @@ class MorningReportGenerator:
                 sections.append(f"## Inbox Follow-ups (Ego-resolved)\n{inbox_resolved}")
         except Exception:
             logger.warning("Morning report: inbox resolved digest unavailable", exc_info=True)
+
+        # 5c. Capability-build lane (open draft build PRs + calibration)
+        try:
+            build_lane = await self._get_build_lane_section()
+            if build_lane:
+                sections.append(f"## Capability Build Lane\n{build_lane}")
+        except Exception:
+            logger.warning("Morning report: build lane section unavailable", exc_info=True)
+            await self._emit_warning("build_lane", "Capability build lane section unavailable")
 
         # 6. Outreach summary (just total count, no self-analysis)
         try:
@@ -404,6 +504,64 @@ class MorningReportGenerator:
             score = g.get("score")
             score_txt = f" ({score:.0f})" if isinstance(score, (int, float)) else ""
             lines.append(f"- {sub}: {grade}{score_txt}")
+        return "\n".join(lines)
+
+    async def _get_build_lane_section(self) -> str | None:
+        """Capability-build lane readout: open draft build PRs (+ one-shot CI),
+        the wouldn't-build reasons, and per-verdict calibration vs the user's
+        actual decisions. Returns None when the lane has no candidates yet
+        (cold start) so the section is skipped entirely."""
+        import asyncio
+
+        from genesis.db.crud import build_candidates as bc
+
+        open_prs = await bc.list_by_outcome(self._db, "pr_opened")
+        dont_build = await bc.list_by_verdict(self._db, "dont_build", limit=10)
+        counts = await bc.verdict_decision_counts(self._db)
+
+        if not open_prs and not dont_build and not counts:
+            return None
+
+        lines: list[str] = [
+            "Autonomous capability-build lane. State facts only. 'Uncontested' "
+            "means an item was never carded for a decision, NOT that the user "
+            "agreed. Surface open build PRs under Open Items / Next Steps.",
+        ]
+
+        if open_prs:
+            checked = open_prs[:_MAX_BUILD_PR_CHECKS]
+            ci_states = await asyncio.gather(
+                *[_pr_ci_status(r.get("pr_url") or "") for r in checked]
+            )
+            lines.append("")
+            lines.append("Open build PRs (draft, awaiting your review/merge):")
+            for row, ci in zip(checked, ci_states, strict=True):
+                title = row.get("item_title") or "(untitled)"
+                pr_url = row.get("pr_url") or "(no url)"
+                ci_txt = f" — CI {ci}" if ci else ""
+                lines.append(f"- {title}: {pr_url}{ci_txt}")
+            if len(open_prs) > _MAX_BUILD_PR_CHECKS:
+                lines.append(
+                    f"- (+{len(open_prs) - _MAX_BUILD_PR_CHECKS} more open build "
+                    "PRs; CI not checked)"
+                )
+
+        if dont_build:
+            lines.append("")
+            lines.append(
+                "Wouldn't-build (Genesis declined; reported, never queued):"
+            )
+            for row in dont_build:
+                title = row.get("item_title") or "(untitled)"
+                reason = row.get("verdict_reason") or "no reason recorded"
+                lines.append(f"- {title}: {reason}")
+
+        calibration = _format_build_calibration(counts)
+        if calibration:
+            lines.append("")
+            lines.append("Calibration (Genesis verdict vs your decision):")
+            lines.extend(calibration)
+
         return "\n".join(lines)
 
     async def _get_pending_items(self) -> str:

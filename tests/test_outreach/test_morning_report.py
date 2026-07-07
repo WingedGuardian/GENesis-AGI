@@ -7,6 +7,7 @@ import pytest
 
 from genesis.content.types import DraftResult, FormatTarget, FormattedContent
 from genesis.db.schema import create_all_tables
+from genesis.outreach import morning_report as _mr_mod
 from genesis.outreach.morning_report import MorningReportGenerator
 from genesis.outreach.types import OutreachCategory
 
@@ -363,3 +364,83 @@ async def test_eval_quality_section_appears_in_assembled_context(db, mock_health
 
     assert "## Cognitive Subsystem Grades" in context
     assert "memory: B (82)" in context
+
+
+# ── Capability-build lane section ─────────────────────────────────────────
+
+
+def test_summarize_ci_rollup():
+    assert _mr_mod._summarize_ci_rollup([]) == "no checks"
+    assert _mr_mod._summarize_ci_rollup(
+        [{"conclusion": "SUCCESS"}, {"state": "SUCCESS"}]) == "passing"
+    assert _mr_mod._summarize_ci_rollup(
+        [{"conclusion": "SUCCESS"}, {"status": "IN_PROGRESS"}]) == "pending"
+    assert _mr_mod._summarize_ci_rollup(
+        [{"conclusion": "SUCCESS"}, {"conclusion": "FAILURE"}]) == "failing"
+
+
+def test_format_build_calibration():
+    counts = [
+        {"verdict": "build", "user_decision": "approved", "count": 2},
+        {"verdict": "build", "user_decision": None, "count": 1},
+        {"verdict": "dont_build", "user_decision": None, "count": 3},
+    ]
+    joined = "\n".join(_mr_mod._format_build_calibration(counts))
+    assert "build verdicts: 2/2 approved, 1 pending" in joined
+    assert "dont_build verdicts: 3 (uncontested" in joined
+
+
+@pytest.mark.asyncio
+async def test_build_lane_section_none_when_empty(db, mock_health, mock_drafter):
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    assert await gen._get_build_lane_section() is None
+
+
+@pytest.mark.asyncio
+async def test_build_lane_section_renders(db, mock_health, mock_drafter, monkeypatch):
+    from genesis.db.crud import build_candidates as bc
+
+    await bc.create(db, id="c1", item_key="k1", item_title="Dad-joke skill",
+                    source_file="New Genesis Capabilities.md", verdict="build")
+    await bc.update(db, "c1", outcome="pr_opened",
+                    pr_url="https://github.com/o/r/pull/42", branch="task/c1")
+    await bc.record_user_decision(db, "c1", user_decision="approved")
+    await bc.create(db, id="c2", item_key="k2", item_title="Rewrite the kernel",
+                    source_file="New Genesis Capabilities.md",
+                    verdict="dont_build", verdict_reason="brain-not-body scope")
+
+    async def fake_ci(url):
+        return "passing"
+
+    monkeypatch.setattr(_mr_mod, "_pr_ci_status", fake_ci)
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = await gen._get_build_lane_section()
+    assert section is not None
+    assert "https://github.com/o/r/pull/42" in section
+    assert "CI passing" in section
+    assert "brain-not-body scope" in section
+    assert "Calibration" in section
+
+
+@pytest.mark.asyncio
+async def test_pr_ci_status_parses_run_gh(monkeypatch):
+    import genesis.recon.gh_cli as gh_cli
+
+    async def fake_run_gh(*args, timeout=None):
+        return '{"statusCheckRollup": [{"conclusion": "SUCCESS"}]}'
+
+    monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
+    assert await _mr_mod._pr_ci_status("https://x/pull/1") == "passing"
+
+
+@pytest.mark.asyncio
+async def test_pr_ci_status_none_on_empty_or_no_url(monkeypatch):
+    import genesis.recon.gh_cli as gh_cli
+
+    async def fake_run_gh(*args, timeout=None):
+        return ""  # run_gh collapses failure/timeout to ""
+
+    monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
+    assert await _mr_mod._pr_ci_status("https://x/pull/1") is None
+    assert await _mr_mod._pr_ci_status("") is None

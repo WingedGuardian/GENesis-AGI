@@ -170,6 +170,42 @@ async def list_by_outcome(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def list_by_verdict(
+    db: aiosqlite.Connection, verdict: str, *, limit: int = 50
+) -> list[dict]:
+    """All candidates with a given *verdict*, newest first.
+
+    Used by the report's "wouldn't-build" section (verdict='dont_build') —
+    ``list_by_outcome`` can't serve this because dont_build rows never leave
+    ``outcome='pending'`` (they are closed via ``user_decision``, not outcome).
+    """
+    if verdict not in VERDICTS:
+        raise ValueError(f"invalid verdict: {verdict!r}")
+    cursor = await db.execute(
+        "SELECT * FROM build_candidates WHERE verdict = ? "
+        "ORDER BY created_at DESC LIMIT ?",
+        (verdict, limit),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def verdict_decision_counts(db: aiosqlite.Connection) -> list[dict]:
+    """Calibration aggregate: count of candidates grouped by (verdict,
+    user_decision). ``user_decision`` is NULL for still-open candidates.
+
+    Returns rows like ``{"verdict": "build", "user_decision": "approved",
+    "count": 3}`` — the raw material for the report's per-verdict agreement
+    lines (how often the user's decision matched Genesis's verdict).
+    """
+    cursor = await db.execute(
+        "SELECT verdict, user_decision, COUNT(*) AS count "
+        "FROM build_candidates "
+        "GROUP BY verdict, user_decision "
+        "ORDER BY verdict, user_decision"
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def record_user_decision(
     db: aiosqlite.Connection,
     id: str,

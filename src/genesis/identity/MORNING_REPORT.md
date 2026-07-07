@@ -134,7 +134,9 @@ Use these sections in order. Skip any that are empty/normal:
 3. **Overnight** — brainstorm highlights, background findings worth
    noting. Only include genuinely useful insights.
 4. **System Health** — one line if normal. Detail only if something broke.
-5. **Open Items** — pending items requiring user input (inbox, approvals)
+5. **Open Items** — pending items requiring user input (inbox, approvals, and
+   any open capability-build draft PRs awaiting your review/merge — name the
+   PR and its CI state)
 6. **Next Steps & Blockers** — the few highest-leverage actions for today and
    anything blocking progress. Each bullet is one concrete item drawn from the
    data above: a blocked/failed follow-up, a pending approval, or an observation
