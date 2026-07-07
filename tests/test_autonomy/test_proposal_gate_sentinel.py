@@ -25,6 +25,7 @@ _HIGH_RISK_ACTION_TYPES = [
     "purchase", "payment",                 # FINANCIAL
     "code_change", "refactor",             # SELF_MODIFY
     "cognitive_variant_promotion",         # SELF_MODIFY
+    "autonomous_build",                    # AUTONOMOUS_BUILD
 ]
 _BENIGN_ACTION_TYPES = [
     "investigate", "research", "analyze",  # EXTERNAL_READ
@@ -40,8 +41,24 @@ def test_high_risk_domains_is_the_external_and_self_modify_set():
         ActionDomain.REPRESENT_USER,
         ActionDomain.FINANCIAL,
         ActionDomain.SELF_MODIFY,
+        ActionDomain.AUTONOMOUS_BUILD,
     }
     assert set(HIGH_RISK_DOMAINS) == expected
+
+
+def test_high_risk_matches_min_level_contract():
+    """HIGH_RISK_DOMAINS must be exactly the domains whose
+    ACTION_DOMAIN_MIN_LEVEL is >= 2 or None (the KEEP IN SYNC rule stated
+    at its definition). A new ActionDomain that raises the bar but is not
+    added to HIGH_RISK_DOMAINS would be ALLOWED under a degraded gate."""
+    from genesis.autonomy.types import ACTION_DOMAIN_MIN_LEVEL
+
+    derived = {
+        domain
+        for domain, level in ACTION_DOMAIN_MIN_LEVEL.items()
+        if level is None or level >= 2
+    }
+    assert set(HIGH_RISK_DOMAINS) == derived
 
 
 @pytest.mark.parametrize("domain", sorted(HIGH_RISK_DOMAINS, key=str))

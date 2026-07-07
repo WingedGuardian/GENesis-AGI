@@ -186,6 +186,7 @@ HIGH_RISK_DOMAINS: frozenset[ActionDomain] = frozenset({
     ActionDomain.REPRESENT_USER,
     ActionDomain.FINANCIAL,
     ActionDomain.SELF_MODIFY,
+    ActionDomain.AUTONOMOUS_BUILD,
 })
 
 
