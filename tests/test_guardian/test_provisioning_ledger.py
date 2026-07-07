@@ -56,3 +56,49 @@ def test_proposal_damper(tmp_path):
     led.mark_proposed()
     hrs = led.hours_since_last_proposal()
     assert hrs is not None and hrs < 0.1
+
+
+_GIB = 1024**3
+
+
+def test_latest_unverified_disk_none_when_empty(tmp_path):
+    led = ProvisioningLedger(tmp_path)
+    assert led.latest_unverified_disk("scsi1") is None
+
+
+def test_latest_unverified_disk_returns_unverified_entry(tmp_path):
+    led = ProvisioningLedger(tmp_path)
+    led.record_action("grow_vm_disk", "scsi1 +32G", ok=False, verified=False,
+                      target_bytes=64 * _GIB)
+    pend = led.latest_unverified_disk("scsi1")
+    assert pend is not None and pend["target_bytes"] == 64 * _GIB
+
+
+def test_latest_unverified_disk_none_when_verified(tmp_path):
+    led = ProvisioningLedger(tmp_path)
+    led.record_action("grow_vm_disk", "scsi1 +32G", ok=True, verified=True,
+                      target_bytes=64 * _GIB)
+    assert led.latest_unverified_disk("scsi1") is None
+
+
+def test_latest_unverified_disk_is_per_disk_and_latest(tmp_path):
+    led = ProvisioningLedger(tmp_path)
+    led.record_action("grow_vm_disk", "scsi1 +32G", ok=False, verified=False,
+                      target_bytes=64 * _GIB)          # scsi1 unverified
+    led.record_action("grow_vm_disk", "virtio0 +8G", ok=True, verified=True,
+                      target_bytes=40 * _GIB)          # different disk, verified
+    # scsi1 substring must not false-match "scsi10"
+    led.record_action("grow_vm_disk", "scsi10 +8G", ok=False, verified=False,
+                      target_bytes=8 * _GIB)
+    assert led.latest_unverified_disk("scsi1")["target_bytes"] == 64 * _GIB
+    assert led.latest_unverified_disk("virtio0") is None
+
+
+def test_mark_latest_disk_verified_clears_latch(tmp_path):
+    led = ProvisioningLedger(tmp_path)
+    led.record_action("grow_vm_disk", "scsi1 +32G", ok=False, verified=False,
+                      target_bytes=64 * _GIB)
+    led.mark_latest_disk_verified("scsi1")
+    assert led.latest_unverified_disk("scsi1") is None
+    # does NOT add a new mutation (rate cap unchanged)
+    assert led.actions_in_window() == 1

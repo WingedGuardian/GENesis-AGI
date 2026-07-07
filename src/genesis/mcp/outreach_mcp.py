@@ -394,12 +394,18 @@ async def provision_grow(
         return {"ok": False, "error": "guardian remote not configured (no guardian_remote.yaml)"}
 
     async def _ask(text: str) -> str | None:
+        # submit_RAW_and_wait: deliver the proposal VERBATIM (skip the LLM
+        # drafter). The proposal ends in an exact "reply APPROVE / DENY"
+        # instruction that the coordinator matches literally — the drafter
+        # could paraphrase that instruction away and break the match.
         from genesis.outreach.types import OutreachCategory, OutreachRequest
         req = OutreachRequest(
             category=OutreachCategory("blocker"), topic=text[:100], context=text,
-            salience_score=1.0, signal_type="blocker", channel="telegram",
+            salience_score=1.0, signal_type="provision_approval", channel="telegram",
         )
-        _result, reply = await _pipeline.submit_and_wait(req, timeout_s=float(timeout_seconds))
+        _result, reply = await _pipeline.submit_raw_and_wait(
+            text, req, timeout_s=float(timeout_seconds),
+        )
         return reply
 
     if kind == "disk":

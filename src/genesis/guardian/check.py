@@ -306,6 +306,16 @@ async def run_check(config: GuardianConfig | None = None) -> None:
             is_healthy=sm.current_state == GuardianState.HEALTHY,
             snapshot_size_history=sm.state.snapshot_size_history,
         )
+        # Heartbeat means "Guardian process is alive and watching" —
+        # NOT "Genesis container is healthy". Any successful check cycle
+        # (regardless of resulting state) should refresh liveness. A
+        # crashed _check_cycle raises out before reaching here, which
+        # correctly withholds the heartbeat — that is a real Guardian
+        # failure that Genesis-side monitoring should see. Written BEFORE the
+        # pool check because the autonomous provisioning propose below can
+        # block on an APPROVE for up to approval_timeout_s — liveness must not
+        # hinge on that optional, bounded wait completing.
+        await _write_guardian_heartbeat(config)
         # Storage-pool monitoring runs every cycle regardless of state — a
         # filling thin pool is the exact silent failure that caused the outage.
         # genesis_down gates the autonomous provisioning propose: only when
@@ -315,13 +325,6 @@ async def run_check(config: GuardianConfig | None = None) -> None:
             config, dispatcher,
             genesis_down=(sm.current_state == GuardianState.CONFIRMED_DEAD),
         )
-        # Heartbeat means "Guardian process is alive and watching" —
-        # NOT "Genesis container is healthy". Any successful check cycle
-        # (regardless of resulting state) should refresh liveness. A
-        # crashed _check_cycle raises out before reaching here, which
-        # correctly withholds the heartbeat — that is a real Guardian
-        # failure that Genesis-side monitoring should see.
-        await _write_guardian_heartbeat(config)
     finally:
         # Always save state, even on error
         sm.save_state(state_path)

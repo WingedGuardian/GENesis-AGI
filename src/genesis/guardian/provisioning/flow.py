@@ -190,9 +190,33 @@ async def execute_provisioning_action(
         return {"ok": False, "stage": "recheck_failed", "requested": report.requested,
                 "checks": report.as_lines()}
 
+    # 1b. Anti-stack guard (disk only): a RELATIVE disk grow is non-idempotent.
+    # If a prior grow of this disk was recorded unverified but the live size has
+    # since reached that grow's target, it DID land — issuing another +NG would
+    # stack a second grow. Detect it, clear the latch, and refuse to stack.
+    # (Memory grows are absolute + grow-only, so they need no such guard.)
+    if request.kind == "disk":
+        current = cap.disks.get(request.disk)
+        pending = ledger.latest_unverified_disk(request.disk)
+        target = pending.get("target_bytes") if pending else None
+        if target and current is not None and current >= target:
+            ledger.mark_latest_disk_verified(request.disk)
+            await dispatcher.send(Alert(
+                severity=AlertSeverity.INFO,
+                title=f"Prior disk grow already landed: {request.disk}",
+                body=(f"{request.disk} is already {current / 1024**3:.0f}G — a "
+                      "previously-unverified grow did land. Not stacking another "
+                      "grow. Re-request only if you truly want MORE space."),
+            ))
+            return {"ok": True, "stage": "already_landed", "action": "grow_vm_disk",
+                    "requested": f"{request.disk} +{request.add_gib}G", "verified": True}
+
     # 2. Execute once + ledger (even if unverified — it may have landed).
     result = await _execute(request, adapter)
-    ledger.record_action(result.action, result.requested, result.ok, result.verified)
+    ledger.record_action(
+        result.action, result.requested, result.ok, result.verified,
+        target_bytes=result.target_bytes,
+    )
 
     expand_result = None
     if request.kind == "disk" and request.absorb_after and result.ok and result.verified:

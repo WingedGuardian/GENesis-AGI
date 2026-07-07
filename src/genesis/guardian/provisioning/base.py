@@ -55,6 +55,10 @@ class ProvisionResult:
     verified: bool = False
     requires_reboot: bool = False
     error: str = ""
+    # Absolute target the mutation aims for, in the resource's native unit
+    # (disk: bytes). Lets the flow detect an unverified-but-landed grow and
+    # avoid stacking a second RELATIVE disk grow. None when not applicable.
+    target_bytes: int | None = None
 
 
 class ProvisioningAdapter(ABC):

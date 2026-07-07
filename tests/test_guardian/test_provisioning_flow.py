@@ -264,6 +264,44 @@ async def test_execute_core_unverified_criticals_and_ledgers(tmp_path):
     assert "critical" in _sev(disp.alerts)
 
 
+# ── anti-stack guard: unverified-but-landed disk grow must not double-grow ──
+async def test_execute_core_skips_when_prior_unverified_grow_landed(tmp_path):
+    """A prior grow recorded unverified whose target the live size now meets
+    must NOT stack a second +NG — it is detected as landed and refused."""
+    led = ProvisioningLedger(tmp_path)
+    led.record_action("grow_vm_disk", "scsi1 +32G", ok=False, verified=False,
+                      target_bytes=64 * _GIB)
+    # Fresh capacity shows scsi1 already at 64G (the prior grow DID land).
+    landed_cap = HostCapacity(
+        detected=True, vm_memory_mib=21500, cores=5,
+        disks={"scsi1": 64 * _GIB}, storage_free_bytes=574 * _GIB,
+        node_mem_total_bytes=141 * _GIB, node_mem_available_bytes=65 * _GIB, detail="ok",
+    )
+    adapter = FakeAdapter(landed_cap,
+                          disk_result=ProvisionResult(ok=True, action="grow_vm_disk", verified=True))
+    res = await execute_provisioning_action(_cfg(), _disk_req(), adapter,
+                                            FakeDispatcher(None), led)
+    assert res["stage"] == "already_landed" and res["ok"] is True
+    assert adapter.grow_disk_calls == 0            # no second grow issued
+    assert led.latest_unverified_disk("scsi1") is None  # latch cleared
+
+
+async def test_execute_core_proceeds_when_prior_grow_did_not_land(tmp_path):
+    """If the prior unverified grow did NOT land (size still old), retrying to
+    the same target is safe and proceeds."""
+    led = ProvisioningLedger(tmp_path)
+    led.record_action("grow_vm_disk", "scsi1 +32G", ok=False, verified=False,
+                      target_bytes=64 * _GIB)
+    # scsi1 still at 32G — the prior grow truly did not land.
+    adapter = FakeAdapter(_good_cap(),
+                          disk_result=ProvisionResult(ok=True, action="grow_vm_disk",
+                                                      verified=True, target_bytes=64 * _GIB))
+    res = await execute_provisioning_action(_cfg(), _disk_req(), adapter,
+                                            FakeDispatcher(None), led)
+    assert res["stage"] == "executed"
+    assert adapter.grow_disk_calls == 1            # retry proceeds
+
+
 # ── autonomous propose damper ──────────────────────────────────────────────
 async def test_propose_damped_when_recent(tmp_path):
     led = ProvisioningLedger(tmp_path)

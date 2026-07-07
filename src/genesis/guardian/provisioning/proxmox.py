@@ -253,6 +253,7 @@ class ProxmoxAdapter(ProvisioningAdapter):
                 ok=False, action=action, requested=requested,
                 error=f"disk {disk} not found on VM {cfg.vmid}",
             )
+        expected = before + add_gib * _GIB
         # The one mutating PUT — provision token.
         stp, _data, ep = await self._request(
             "PUT", f"/nodes/{cfg.node}/qemu/{cfg.vmid}/resize",
@@ -261,11 +262,10 @@ class ProxmoxAdapter(ProvisioningAdapter):
         if stp != 200:
             return ProvisionResult(
                 ok=False, action=action, requested=requested,
-                before=_human(before),
+                before=_human(before), target_bytes=expected,
                 error=f"resize PUT failed: {ep or stp}",
             )
         # Verify by re-read ONLY — never re-issue the PUT.
-        expected = before + add_gib * _GIB
         after: int | None = None
         for _ in range(3):
             await asyncio.sleep(3)
@@ -280,7 +280,7 @@ class ProxmoxAdapter(ProvisioningAdapter):
         return ProvisionResult(
             ok=verified, action=action, requested=requested,
             before=_human(before), after=_human(after),
-            verified=verified,
+            verified=verified, target_bytes=expected,
             error="" if verified else "resize issued but re-read did not confirm the new size",
         )
 

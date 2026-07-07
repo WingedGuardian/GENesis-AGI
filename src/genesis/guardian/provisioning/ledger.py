@@ -49,8 +49,14 @@ class ProvisioningLedger:
     # ── mutations ledger ──────────────────────────────────────────────────
     def record_action(
         self, action: str, requested: str, ok: bool, verified: bool,
+        target_bytes: int | None = None,
     ) -> None:
-        """Append an executed mutation. Called only after a PUT was issued."""
+        """Append an executed mutation. Called only after a PUT was issued.
+
+        ``target_bytes`` records the absolute size the mutation aimed for (disk
+        grows only) so an unverified-but-landed grow can be detected later and
+        not stacked with a second relative grow.
+        """
         entries = self._read_json(self._ledger, [])
         if not isinstance(entries, list):
             entries = []
@@ -60,8 +66,45 @@ class ProvisioningLedger:
             "requested": requested,
             "ok": ok,
             "verified": verified,
+            "target_bytes": target_bytes,
         })
         self._atomic_write(self._ledger, entries)
+
+    def latest_unverified_disk(self, disk: str) -> dict | None:
+        """The most recent disk-grow entry for ``disk`` IF it is unverified.
+
+        Returns None when the latest grow for that disk is verified (or there is
+        none) — i.e. no stacking risk. Used to detect a prior grow that may have
+        landed after its verify re-read timed out, before issuing another.
+        """
+        entries = self._read_json(self._ledger, [])
+        if not isinstance(entries, list):
+            return None
+        prefix = f"{disk} "
+        for e in reversed(entries):
+            if (e.get("action") == "grow_vm_disk"
+                    and str(e.get("requested", "")).startswith(prefix)):
+                return None if e.get("verified") else e
+        return None
+
+    def mark_latest_disk_verified(self, disk: str) -> None:
+        """Flip the latest unverified disk-grow entry for ``disk`` to verified.
+
+        Clears the stacking latch once we confirm (by a live size re-read) that
+        a previously-unverified grow actually landed. Records NO new mutation,
+        so it never counts against the rate cap.
+        """
+        entries = self._read_json(self._ledger, [])
+        if not isinstance(entries, list):
+            return
+        prefix = f"{disk} "
+        for e in reversed(entries):
+            if (e.get("action") == "grow_vm_disk"
+                    and str(e.get("requested", "")).startswith(prefix)):
+                if not e.get("verified"):
+                    e["verified"] = True
+                    self._atomic_write(self._ledger, entries)
+                return
 
     def actions_in_window(self, days: int = 7) -> int:
         """Count executed mutations within the rolling window."""
