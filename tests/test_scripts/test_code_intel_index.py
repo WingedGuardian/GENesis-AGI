@@ -394,6 +394,6 @@ def test_all_wired_call_sites_reference_entrypoint():
         "scripts/hooks/post-commit",
         "scripts/install.sh",
         "scripts/bootstrap.sh",
-        "src/genesis/surplus/scheduler.py",
+        "src/genesis/surplus/jobs/gitnexus.py",
     ):
         assert "code_intel_index.sh" in (_REPO_ROOT / rel).read_text(), rel
