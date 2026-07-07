@@ -20,7 +20,11 @@ class CapabilityModule(Protocol):
     A module may *observe* Genesis's state, but it does not *think with* it:
     no memory writes, no reflection contribution, no ego role. Components that
     participate in Genesis's cognitive operations belong elsewhere (memory,
-    reflection, ego, sentinel) — not in modules.
+    reflection, ego, sentinel) — not in modules. In particular, a module is
+    NEVER a Genesis *subsystem*: module code must never set a
+    ``source_subsystem`` on a memory write (that tag is reserved for internal
+    subsystems and excludes the write from recall). This is enforced
+    mechanically by ``tests/test_memory/test_store_subsystem_coverage.py``.
 
     ## Implementing a Native Module
 

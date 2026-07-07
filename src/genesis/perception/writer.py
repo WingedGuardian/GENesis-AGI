@@ -186,6 +186,7 @@ class ResultWriter:
                 tags=output.tags,
                 confidence=output.salience,
                 source_pipeline="reflection",
+                source_subsystem="reflection",
             )
         return True
 
@@ -326,6 +327,7 @@ class ResultWriter:
                 tags=output.patterns if output.patterns else [],
                 confidence=output.confidence,
                 source_pipeline="reflection",
+                source_subsystem="reflection",
             )
 
         # Store surplus candidates directly in surplus_insights table.

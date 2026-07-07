@@ -120,6 +120,7 @@ class ExecutionTracer:
                 memory_type="episodic",
                 tags=tags,
                 confidence=0.7,
+                source_subsystem="autonomy",
             )
             logger.info(
                 "Stored execution trace for task %s as memory %s",
@@ -538,6 +539,7 @@ class ExecutionTracer:
             memory_type="episodic",
             tags=["skill_update_candidate", skill_name],
             confidence=0.5,
+            source_subsystem="autonomy",
         )
         logger.info("Recorded skill observation for '%s'", skill_name)
 
@@ -565,6 +567,7 @@ class ExecutionTracer:
             memory_type="episodic",
             tags=["learning:calibration", f"task:{task_id[:8]}"],
             confidence=0.5,
+            source_subsystem="autonomy",
         )
         logger.debug("Recorded calibration for task %s", task_id[:8])
 
@@ -588,6 +591,7 @@ class ExecutionTracer:
             memory_type="episodic",
             tags=["learning:workflow", f"task:{task_id[:8]}"],
             confidence=0.5,
+            source_subsystem="autonomy",
         )
         logger.debug("Recorded workflow optimization for task %s", task_id[:8])
 
@@ -615,6 +619,7 @@ class ExecutionTracer:
             memory_type="episodic",
             tags=["learning:drift", f"task:{task_id[:8]}"],
             confidence=0.5,
+            source_subsystem="autonomy",
         )
         logger.debug("Recorded context drift for task %s", task_id[:8])
 

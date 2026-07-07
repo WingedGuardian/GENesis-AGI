@@ -78,6 +78,9 @@ class TestExecutionTracer:
         call_kwargs = memory_store.store.call_args
         assert call_kwargs.kwargs["source"] == "task_executor"
         assert call_kwargs.kwargs["memory_type"] == "episodic"
+        # Executor retrospectives are internal-subsystem output: tagged so they
+        # route FTS5-only and stay out of default semantic recall.
+        assert call_kwargs.kwargs["source_subsystem"] == "autonomy"
         assert trace.retrospective_id == "mem-abc123"
 
     async def test_finalize_no_memory_store(self) -> None:

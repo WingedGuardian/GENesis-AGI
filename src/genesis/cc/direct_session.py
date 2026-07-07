@@ -881,6 +881,7 @@ class DirectSessionRunner:
                                 memory_type="episodic",
                                 wing="autonomy",
                                 room="ego",
+                                source_subsystem="ego",
                             )
                     except Exception:
                         logger.debug(
@@ -910,6 +911,7 @@ class DirectSessionRunner:
                             memory_type="episodic",
                             wing="autonomy",
                             room="ego",
+                            source_subsystem="ego",
                         )
                 except Exception:
                     logger.debug("Failed to store failure observation", exc_info=True)

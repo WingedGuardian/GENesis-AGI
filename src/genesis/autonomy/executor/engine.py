@@ -1139,6 +1139,7 @@ class CCSessionExecutor:
                 tags=["task_notepad", "synthesis"],
                 wing="autonomy",
                 room="tasks",
+                source_subsystem="autonomy",
             )
             logger.info(
                 "Task %s notepad promoted to memory (%d chars)",

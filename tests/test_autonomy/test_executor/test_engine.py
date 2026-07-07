@@ -1086,3 +1086,6 @@ class TestTaskNotepad:
         mock_store.store.assert_called_once()
         stored_content = mock_store.store.call_args.kwargs["content"]
         assert "cursor-based pagination" in stored_content
+        # Notepad promotion is internal-subsystem output: tagged so it routes
+        # FTS5-only and stays out of default semantic recall.
+        assert mock_store.store.call_args.kwargs["source_subsystem"] == "autonomy"

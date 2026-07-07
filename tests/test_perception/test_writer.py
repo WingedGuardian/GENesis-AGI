@@ -136,6 +136,7 @@ async def test_write_micro_with_memory_store(db):
         tags=["idle", "resource_normal"],
         confidence=0.6,
         source_pipeline="reflection",
+        source_subsystem="reflection",
     )
 
 
@@ -163,6 +164,7 @@ async def test_write_light_with_memory_store(db):
         tags=["declining_activity"],
         confidence=0.7,
         source_pipeline="reflection",
+        source_subsystem="reflection",
     )
 
 
