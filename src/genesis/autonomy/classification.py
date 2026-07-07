@@ -50,6 +50,7 @@ _DEFAULT_APPROVAL_TIMEOUTS: dict[str, int | None] = {
     "autonomous_cli_fallback": None,
     "sentinel_dispatch": None,
     "sentinel_action": None,
+    "build_greenlight": None,
     "irreversible": None,
 }
 

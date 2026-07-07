@@ -55,11 +55,15 @@ class StepDispatcher:
         *,
         workaround: str | None = None,
         worktree_path: Path | None = None,
+        model_override: Any = None,
     ) -> StepResult:
         """Execute and record a single step via CC session.
 
         Wraps ``dispatch_step`` with DB recording (started_at,
         status, result_json, cost, session_id, model_used).
+
+        ``model_override`` (a ``CCModel``) upgrades CODE/VERIFICATION steps
+        only — used by the build lane to run those steps on Opus.
         """
         from genesis.db.crud import task_steps
 
@@ -78,6 +82,7 @@ class StepDispatcher:
                 task_id, step, prior_results,
                 workaround=workaround,
                 worktree_path=worktree_path,
+                model_override=model_override,
             )
         except Exception as exc:
             duration = time.monotonic() - start
@@ -118,6 +123,7 @@ class StepDispatcher:
         *,
         workaround: str | None = None,
         worktree_path: Path | None = None,
+        model_override: Any = None,
     ) -> StepResult:
         """Dispatch step to a CC session or deterministic executor.
 
@@ -169,16 +175,23 @@ class StepDispatcher:
             working_dir = background_session_dir()
 
         # Effort: HIGH for code/verification, MEDIUM otherwise
-        effort = (
-            EffortLevel.HIGH
-            if step_type in (StepType.CODE, StepType.VERIFICATION)
-            else EffortLevel.MEDIUM
+        is_code_or_verify = step_type in (StepType.CODE, StepType.VERIFICATION)
+        effort = EffortLevel.HIGH if is_code_or_verify else EffortLevel.MEDIUM
+
+        # Model: SONNET by default; a build-lane task upgrades its CODE and
+        # VERIFICATION steps to the override model (Opus). Research/analysis/
+        # synthesis stay on SONNET regardless — quality-over-cost applies to
+        # the steps that write and check code.
+        model = (
+            model_override
+            if (model_override is not None and is_code_or_verify)
+            else CCModel.SONNET
         )
 
         invocation = CCInvocation(
             prompt=prompt,
             expect_output=True,  # silent-cap detection (step needs a result)
-            model=CCModel.SONNET,
+            model=model,
             effort=effort,
             timeout_s=step_type.default_timeout_s,
             skip_permissions=True,
@@ -331,6 +344,7 @@ class StepDispatcher:
         step_results: list[StepResult],
         *,
         worktree_path: Path | None = None,
+        model_override: Any = None,
     ) -> StepResult | None:
         """Attempt workaround for a failed step. Returns new result or None."""
         if not self._workaround:
@@ -350,11 +364,12 @@ class StepDispatcher:
         if wa_result is None or not wa_result.found or not wa_result.approach:
             return None
 
-        # Retry with workaround context
+        # Retry with workaround context (preserve any build-lane model upgrade)
         retry = await self.execute_step(
             task_id, step, step_results,
             workaround=wa_result.approach,
             worktree_path=worktree_path,
+            model_override=model_override,
         )
         return retry if retry.status == "completed" else None
 
@@ -387,6 +402,7 @@ class StepDispatcher:
         due_diligence_results: str | None = None,
         *,
         worktree_path: Path | None = None,
+        model_override: Any = None,
     ) -> tuple[StepResult | None, ResearchResult | None]:
         """Dispatch research session. Returns (retry_result, research_result).
 
@@ -411,11 +427,12 @@ class StepDispatcher:
         if research_result is None or not research_result.found:
             return None, research_result
 
-        # Retry with research-derived approach
+        # Retry with research-derived approach (preserve build-lane model upgrade)
         retry = await self.execute_step(
             task_id, step, step_results,
             workaround=research_result.approach,
             worktree_path=worktree_path,
+            model_override=model_override,
         )
         if retry.status == "completed":
             return retry, research_result

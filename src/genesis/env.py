@@ -283,6 +283,26 @@ def ollama_enabled() -> bool:
     return False
 
 
+def build_lane_enabled() -> bool:
+    """Check if the autonomous capability-build lane is active.
+
+    Defaults to False — the lane ships dark. When enabled, a ``build``
+    verdict on a capability-notepad drop produces a one-tap greenlight
+    card whose approval dispatches an autonomous build to a draft PR
+    (never a merge). Set GENESIS_BUILD_LANE_ENABLED=true in secrets.env
+    or build_lane.enabled in ~/.genesis/config/genesis.yaml. A flag flip
+    requires a server restart to take effect (the poll loop is only
+    spawned when enabled).
+    """
+    env_val = os.environ.get("GENESIS_BUILD_LANE_ENABLED")
+    if env_val is not None:
+        return env_val.strip().lower() not in {"0", "false", "no", "off"}
+    local_val = _local_config().get("build_lane", {}).get("enabled")
+    if local_val is not None:
+        return bool(local_val)
+    return False
+
+
 def user_timezone() -> str:
     """User's local timezone (IANA format).
 

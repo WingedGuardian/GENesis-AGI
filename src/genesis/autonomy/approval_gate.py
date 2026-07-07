@@ -124,6 +124,7 @@ class AutonomousCliApprovalGate:
         "autonomous_cli_fallback",
         "sentinel_dispatch",
         "sentinel_action",
+        "build_greenlight",
     })
 
     def __init__(
@@ -867,6 +868,35 @@ class AutonomousCliApprovalGate:
                 "",
                 f"Request ID: <code>{request_id}</code>",
             ]
+        elif action_type == "build_greenlight":
+            title = extra.get("title") or action_label
+            summary = extra.get("summary", "")
+            steps_count = extra.get("steps_count")
+            paths = extra.get("intended_paths") or []
+            plan_path = extra.get("plan_path", "")
+            lines = [
+                "<b>🔨 Build Greenlight</b>",
+                "",
+                "Genesis wants to autonomously build this capability and open "
+                "a <b>draft PR</b> (human review + merge always required):",
+                "",
+                f"<b>{title}</b>",
+            ]
+            if summary:
+                lines.append(summary)
+            scope_bits = []
+            if steps_count:
+                scope_bits.append(f"{steps_count} step(s)")
+            if paths:
+                shown = ", ".join(str(p) for p in paths[:4])
+                if len(paths) > 4:
+                    shown += f" (+{len(paths) - 4} more)"
+                scope_bits.append(f"touches {shown}")
+            if scope_bits:
+                lines.extend(["", f"<b>Scope:</b> {' · '.join(scope_bits)}"])
+            if plan_path:
+                lines.append(f"<b>Plan:</b> <code>{plan_path}</code>")
+            lines.append(f"Request ID: <code>{request_id}</code>")
         else:
             lines = [
                 "<b>Approval Needed</b>",

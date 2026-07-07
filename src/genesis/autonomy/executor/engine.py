@@ -146,6 +146,15 @@ class CCSessionExecutor:
 
         description = task.get("description", "")
 
+        # Build-lane tasks upgrade their CODE/VERIFICATION steps to Opus
+        # (quality-over-cost for autonomous builds); every other source, and
+        # all non-code step types, stay on Sonnet. Resolved once per run from
+        # the already-loaded task row (no extra read).
+        model_override = None
+        if task.get("source") == "build_lane":
+            from genesis.cc.types import CCModel
+            model_override = CCModel.OPUS
+
         # Deliverable-frame tasks route delivery differently (hand the user the
         # rendered file, not a git branch). Keyed on plan_content so it survives
         # resume, where reconstructed step dicts have no `skills` key.
@@ -398,6 +407,7 @@ class CCSessionExecutor:
                 result = await self._step_dispatcher.execute_step(
                     task_id, step, step_results,
                     worktree_path=self._worktree_paths.get(task_id),
+                    model_override=model_override,
                 )
                 step_results.append(result)
 
@@ -429,6 +439,7 @@ class CCSessionExecutor:
                     recovered = await self._step_dispatcher.try_workaround(
                         task_id, step, result, step_results,
                         worktree_path=wt_path,
+                        model_override=model_override,
                     )
                     if recovered is not None:
                         step_results[-1] = recovered
@@ -445,6 +456,7 @@ class CCSessionExecutor:
                             task_id, step, step_results,
                             workaround=dd_context,
                             worktree_path=wt_path,
+                            model_override=model_override,
                         )
                         if dd_retry.status == "completed":
                             step_results[-1] = dd_retry
@@ -466,6 +478,7 @@ class CCSessionExecutor:
                             task_id, step, result, step_results,
                             due_diligence_results=dd_context,
                             worktree_path=wt_path,
+                            model_override=model_override,
                         )
                     )
                     if researched is not None:
@@ -492,6 +505,7 @@ class CCSessionExecutor:
                                 task_id, step, step_results,
                                 workaround=suggested,
                                 worktree_path=wt_path,
+                                model_override=model_override,
                             )
                             if retry.status == "completed":
                                 step_results[-1] = retry
@@ -566,6 +580,7 @@ class CCSessionExecutor:
                     fixup_result = await self._step_dispatcher.execute_step(
                         task_id, fixup, step_results,
                         worktree_path=self._worktree_paths.get(task_id),
+                        model_override=model_override,
                     )
                     step_results.append(fixup_result)
                     deliverable = _dispatch.synthesize_deliverable(step_results)

@@ -54,7 +54,7 @@ _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "modules": "Capability module registry — domain-specific add-on modules (prediction markets, crypto ops)",
     "pipeline": "Pipeline orchestrator — signal collection, triage, and module dispatch cycles",
     "memory_extraction": "Periodic cross-session memory extraction — entities, decisions, relationships from conversation transcripts",
-    "tasks": "Task executor — autonomous multi-step task execution with adversarial review, pause/resume/cancel",
+    "tasks": "Task executor — autonomous multi-step task execution with adversarial review, pause/resume/cancel; hosts the capability-build lane (inbox build verdicts → greenlight card → scope-gated draft PR)",
     "guardian": "External host VM guardian — container health monitoring, diagnosis, and recovery",
     "guardian_monitoring": "Guardian bidirectional monitoring — detects stale Guardian heartbeat and auto-restarts via SSH",
     "sentinel": "Container-side guardian — autonomous CC call site for infrastructure diagnosis and remediation, counterpart to external Guardian",

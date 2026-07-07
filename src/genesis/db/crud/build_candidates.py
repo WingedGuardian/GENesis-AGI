@@ -35,9 +35,15 @@ async def create(
     confidence: str | None = None,
     build_spec: str | None = None,
     plan_path: str | None = None,
+    approval_request_id: str | None = None,
     created_at: str | None = None,
 ) -> str:
     """Insert a new candidate row (outcome starts at 'pending').
+
+    ``approval_request_id`` is set at insert time for ``build`` candidates
+    (the greenlight card is sent first, then the row records its request id)
+    so a crash between card and row simply re-cards idempotently on the next
+    eval rather than stranding a carded-but-unrecorded item.
 
     Raises ``aiosqlite.IntegrityError`` if an OPEN candidate for the same
     ``item_key`` already exists (partial unique index) — callers treat that
@@ -47,12 +53,12 @@ async def create(
         """INSERT INTO build_candidates
            (id, item_key, item_title, source_file, batch_id, eval_path,
             verdict, verdict_reason, confidence, build_spec, plan_path,
-            created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            approval_request_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    COALESCE(?, datetime('now')), COALESCE(?, datetime('now')))""",
         (id, item_key, item_title, source_file, batch_id, eval_path,
          verdict, verdict_reason, confidence, build_spec, plan_path,
-         created_at, created_at),
+         approval_request_id, created_at, created_at),
     )
     await db.commit()
     return id
@@ -74,6 +80,27 @@ async def get_open_by_item_key(
     cursor = await db.execute(
         "SELECT * FROM build_candidates "
         "WHERE item_key = ? AND user_decision IS NULL",
+        (item_key,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def get_any_by_item_key(
+    db: aiosqlite.Connection, item_key: str
+) -> dict | None:
+    """Return the most recent candidate for *item_key*, ANY decision state.
+
+    The partial unique index only guards OPEN (undecided) rows, so it does
+    not stop a *decided* item from being re-inserted. A capability-notepad
+    item stays in the file after it is built and is re-evaluated on every
+    rescan — this is the permanent dedup axis that prevents re-carding an
+    already-adjudicated item. A genuine title/URL edit changes the item_key
+    and legitimately produces a fresh candidate.
+    """
+    cursor = await db.execute(
+        "SELECT * FROM build_candidates "
+        "WHERE item_key = ? ORDER BY created_at DESC LIMIT 1",
         (item_key,),
     )
     row = await cursor.fetchone()
@@ -119,6 +146,26 @@ async def list_recent(
     cursor = await db.execute(
         "SELECT * FROM build_candidates ORDER BY created_at DESC LIMIT ?",
         (limit,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def list_by_outcome(
+    db: aiosqlite.Connection, outcome: str
+) -> list[dict]:
+    """All candidates in a given *outcome*, oldest first.
+
+    Uses ``idx_build_candidates_outcome``. Unlike a recency-bounded scan,
+    this never drops an in-flight candidate out of the window as unrelated
+    calibration rows accumulate — the reconcile loop must see EVERY
+    ``submitted`` row until its task reaches a terminal phase.
+    """
+    if outcome not in OUTCOMES:
+        raise ValueError(f"invalid outcome: {outcome!r}")
+    cursor = await db.execute(
+        "SELECT * FROM build_candidates WHERE outcome = ? "
+        "ORDER BY created_at ASC",
+        (outcome,),
     )
     return [dict(r) for r in await cursor.fetchall()]
 

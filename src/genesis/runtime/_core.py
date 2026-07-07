@@ -234,6 +234,8 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._task_executor: object | None = None
         self._task_dispatcher: object | None = None
         self._task_dispatch_poll: asyncio.Task | None = None
+        self._build_lane: object | None = None
+        self._build_lane_poll: asyncio.Task | None = None
         self._direct_session_runner: object | None = None
         self._direct_session_poll: asyncio.Task | None = None
         self._ego_session: object | None = None  # User ego (primary)

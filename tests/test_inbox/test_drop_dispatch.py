@@ -971,3 +971,67 @@ async def test_folded_file_reevaluates_only_unprocessed_delta(
     assert "https://example.com/a3" in prompts
     assert "https://example.com/b0" in prompts
     assert "https://example.com/a0" not in prompts, "re-evaluated processed URL"
+
+
+# ── Build-lane hook end-to-end (real monitor -> handle_eval -> greenlight) ──
+
+
+def _build_eval_text() -> str:
+    """An evaluation whose single item carries a `build` verdict + build_spec."""
+    import json as _json
+    spec = {
+        "requirements": ["Add widget"],
+        "steps": [{"type": "code", "description": "write widget.py"}],
+        "success_criteria": ["widget imports"],
+        "risks": ["none material"],
+        "intended_paths": ["src/genesis/skills/widget/"],
+    }
+    return (
+        "# Inbox Evaluation\n\n"
+        "## 1. Widget Skill\n\n"
+        "### Recommendation\n\n"
+        "```yaml\n"
+        "action: BUILD\n"
+        'next_step: "Build the widget skill"\n'
+        "scope: V4\n"
+        "confidence: high\n"
+        "verdict: build\n"
+        'verdict_reason: "clear fit"\n'
+        f"build_spec: {_json.dumps(spec)}\n"
+        "```\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_verdict_flows_through_monitor_to_greenlight(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, monkeypatch,
+):
+    """A `build` verdict in a real eval batch must reach BuildLane.handle_eval
+    via the monitor hook and produce a carded build_candidate — the wiring the
+    unit tests can't prove (they call handle_eval directly)."""
+    from unittest.mock import AsyncMock
+
+    from genesis.autonomy.build_lane import BuildLane
+    from genesis.db.crud import build_candidates
+
+    monkeypatch.setattr("genesis.autonomy.build_lane._PLANS_DIR", tmp_path / "plans")
+
+    gate = AsyncMock()
+    gate.ensure_approval = AsyncMock(return_value=("pending", "req-1", "pending"))
+    dispatcher = AsyncMock()
+    lane = BuildLane(db=db, dispatcher=dispatcher, approval_gate=gate, enabled=True)
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=1)
+    mon.set_build_lane(lane)
+    mock_invoker.run.return_value = _ok(text=_build_eval_text())
+
+    (inbox_dir / "Capabilities.md").write_text("https://example.com/widget")
+    await mon.check_once()
+
+    key = BuildLane.item_key("Widget Skill")
+    row = await build_candidates.get_open_by_item_key(db, key)
+    assert row is not None, "build verdict did not reach the lane via the monitor hook"
+    assert row["verdict"] == "build"
+    assert row["approval_request_id"] == "req-1"
+    gate.ensure_approval.assert_awaited_once()
+    assert gate.ensure_approval.await_args.kwargs["action_type"] == "build_greenlight"
