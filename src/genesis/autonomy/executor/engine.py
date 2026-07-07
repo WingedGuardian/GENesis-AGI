@@ -22,7 +22,7 @@ import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from genesis.autonomy.decomposer import has_deliverable_frame
 from genesis.autonomy.executor import dispatch as _dispatch
@@ -36,6 +36,11 @@ from genesis.autonomy.executor.types import (
     TaskPhase,
     validate_transition,
 )
+
+if TYPE_CHECKING:
+    # Runtime import stays lazy inside _run_scope_gate (executor/__init__ ->
+    # engine -> decomposer would cycle at import time).
+    from genesis.autonomy.executor.scope_gate import ScopeGateResult
 
 logger = logging.getLogger(__name__)
 
@@ -1285,7 +1290,7 @@ class CCSessionExecutor:
             return "user"
         return str(task.get("source") or "user")
 
-    async def _run_scope_gate(self, task_id: str, wt_path: Path):
+    async def _run_scope_gate(self, task_id: str, wt_path: Path) -> ScopeGateResult:
         """Run the build-lane diff allowlist gate. Fail-closed throughout.
 
         Blocked outcomes record ``scope_gate`` (verdict JSON) and
@@ -1304,7 +1309,17 @@ class CCSessionExecutor:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            out, err = await proc.communicate()
+            # A stuck git lock (aborted prior op, corrupted index) would
+            # otherwise wedge the delivery path — and its semaphore —
+            # permanently, with no external watchdog. 60s is generous for
+            # local status/merge-base/diff; timeout degrades to a gate
+            # failure (fail-closed), never a wedge.
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return 128, f"git {args[0]} timed out after 60s"
             return proc.returncode or 0, (out or err).decode(errors="replace")
 
         try:
