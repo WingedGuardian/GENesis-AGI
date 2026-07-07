@@ -173,6 +173,42 @@ async def test_duplicate_denied(config, db):
 
 
 @pytest.mark.asyncio
+async def test_task_lifecycle_notifications_never_deduped(config, db):
+    """Task lifecycle notifications (task_progress/complete/alert) have a
+    dedup window of 0 — they must never be suppressed. A 'Task completed' ping
+    must still deliver even though a sibling task_complete ping for the SAME
+    topic+category was just delivered (which would otherwise collide on the
+    (signal_type, topic, category) dedup key)."""
+    gate = GovernanceGate(config, db)
+    now = datetime.now(UTC).isoformat()
+    await outreach_crud.create(
+        db,
+        id="prior-task-1",
+        signal_type="task_complete",
+        topic="Task abcd1234",
+        category="alert",
+        salience_score=0.5,
+        channel="telegram",
+        message_content="Deliverable ready and Gate-2 verified: ...",
+        created_at=now,
+    )
+    await outreach_crud.record_delivery(db, "prior-task-1", delivered_at=now)
+
+    req = OutreachRequest(
+        category=OutreachCategory.ALERT,
+        topic="Task abcd1234",  # same topic as the prior ping
+        context="Task completed: build a thing",
+        salience_score=0.5,
+        signal_type="task_complete",
+        verbatim=True,
+    )
+    result = await gate.check(req)
+    # ALERT bypasses governance once dedup passes; the key point is NOT DENY.
+    assert result.verdict != GovernanceVerdict.DENY
+    assert "dedup" not in result.checks_failed
+
+
+@pytest.mark.asyncio
 async def test_rate_limit_exceeded(config, db):
     gate = GovernanceGate(config, db)
     now = datetime.now(UTC).isoformat()

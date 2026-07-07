@@ -32,10 +32,12 @@ class ContentDrafter:
         *,
         call_site_id: str = "35_content_draft",
     ) -> DraftResult:
-        """Draft content. Falls back to topic as content if no router."""
+        """Draft content. Falls back to the real context (then topic) if no
+        router is configured — never the opaque topic alone."""
         if self._router is None:
-            formatted = self._formatter.format(request.topic, request.target)
-            return DraftResult(content=formatted, raw_draft=request.topic)
+            fallback = request.context or request.topic
+            formatted = self._formatter.format(fallback, request.target)
+            return DraftResult(content=formatted, raw_draft=fallback)
 
         prompt = self._build_prompt(request)
         messages: list[dict] = []
@@ -49,10 +51,12 @@ class ContentDrafter:
                 call_site_id=call_site_id,
                 messages=messages,
             )
-            raw = result.content or request.topic
+            raw = result.content or request.context or request.topic
         except Exception:
-            logger.warning("LLM draft failed, using topic as fallback", exc_info=True)
-            raw = request.topic
+            logger.warning(
+                "LLM draft failed, using context as fallback", exc_info=True,
+            )
+            raw = request.context or request.topic
 
         formatted = self._formatter.format(raw, request.target)
         return DraftResult(

@@ -15,6 +15,17 @@ def test_default_config():
     assert config.surplus_daily == 1
 
 
+def test_default_voice_alert_ids_task_signals():
+    """The voice allowlist speaks attention-worthy task notifications
+    (task_complete / task_alert) but not routine progress; the old catch-all
+    task_notification signal is gone."""
+    config = load_outreach_config(Path("/nonexistent"))
+    assert "task_complete" in config.voice_alert_ids
+    assert "task_alert" in config.voice_alert_ids
+    assert "task_progress" not in config.voice_alert_ids
+    assert "task_notification" not in config.voice_alert_ids
+
+
 def test_load_from_yaml():
     yaml_content = """
 quiet_hours:
