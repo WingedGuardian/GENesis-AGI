@@ -59,6 +59,9 @@ def main() -> None:
     if "--storage-expand" in sys.argv:
         sys.exit(asyncio.run(_storage_expand()))
 
+    if "--configure-provisioning" in sys.argv:
+        sys.exit(_configure_provisioning(sys.argv))
+
     asyncio.run(run_check())
 
 
@@ -182,6 +185,44 @@ def _args_after(argv: list[str], flag: str, n: int) -> list[str] | None:
         return None
     tail = argv[i + 1 : i + 1 + n]
     return tail if len(tail) == n else None
+
+
+def _configure_provisioning(argv: list[str]) -> int:
+    """Land/refresh the host provisioning config as a state-dir override.
+
+    Takes ``key=value`` args (only ProvisioningConfig fields). Writes
+    ``<state_dir>/provisioning.local.yaml`` — outside the git checkout, so it
+    survives guardian redeploys — then re-loads to confirm it parses and echoes
+    the merged result. No secrets here (the Proxmox tokens cross the bridge).
+    """
+    from genesis.guardian.config import load_config, write_provisioning_override
+
+    i = argv.index("--configure-provisioning")
+    kvs = argv[i + 1:]
+    if not kvs:
+        return _emit({"ok": False, "action": "configure-provisioning",
+                      "error": "usage: --configure-provisioning key=value [key=value ...]"})
+    params: dict[str, str] = {}
+    for tok in kvs:
+        if "=" not in tok:
+            return _emit({"ok": False, "action": "configure-provisioning",
+                          "error": f"bad arg {tok!r} (expected key=value)"})
+        k, _, v = tok.partition("=")
+        params[k.strip()] = v.strip()
+
+    try:
+        config = load_config()
+        dest = write_provisioning_override(config.state_dir, params)
+    except (ValueError, OSError) as exc:
+        return _emit({"ok": False, "action": "configure-provisioning", "error": str(exc)})
+
+    p = load_config().provisioning  # re-read to reflect the merged result
+    return _emit({"ok": True, "action": "configure-provisioning", "path": str(dest),
+                  "provisioning": {"enabled": p.enabled, "api_host": p.api_host,
+                                   "api_port": p.api_port, "node": p.node, "vmid": p.vmid,
+                                   "target_disk": p.target_disk, "storage": p.storage,
+                                   "verify_tls": p.verify_tls,
+                                   "require_recent_backup": p.require_recent_backup}})
 
 
 async def _provision_status() -> int:
