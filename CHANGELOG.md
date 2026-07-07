@@ -25,6 +25,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   is now reported as a clear failure rather than a vague "couldn't confirm."
   Setup and the full safety model: `docs/reference/proxmox-provisioning.md`.
 
+- **A fresh session now recalls what's already in flight.** When you start an
+  interactive session, its opening context now includes a terse snapshot of the
+  current working state — active autonomy tasks, live git worktrees, and
+  recently-touched plan files — so it can pick up in-progress threads instead of
+  starting cold. It's framed as the session's own recollection, not a report to
+  read back to you.
+
 ### Fixed
 
 - **Memory recall no longer surfaces Genesis's own internal noise.** Machine-generated
