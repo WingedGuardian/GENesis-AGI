@@ -749,8 +749,41 @@ TABLES = {
             outputs          TEXT,
             session_id       TEXT,
             intake_token     TEXT,
+            source           TEXT NOT NULL DEFAULT 'user',
             created_at       TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """,
+    "build_candidates": """
+        CREATE TABLE IF NOT EXISTS build_candidates (
+            id                  TEXT PRIMARY KEY,
+            item_key            TEXT NOT NULL,
+            item_title          TEXT NOT NULL,
+            source_file         TEXT NOT NULL,
+            batch_id            TEXT,
+            eval_path           TEXT,
+            verdict             TEXT NOT NULL CHECK (
+                verdict IN ('build', 'dont_build', 'needs_discussion')
+            ),
+            verdict_reason      TEXT,
+            confidence          TEXT,
+            build_spec          TEXT,
+            plan_path           TEXT,
+            approval_request_id TEXT,
+            user_decision       TEXT CHECK (
+                user_decision IN ('approved', 'rejected', 'discussed')
+            ),
+            decided_at          TEXT,
+            task_id             TEXT,
+            branch              TEXT,
+            pr_url              TEXT,
+            outcome             TEXT NOT NULL DEFAULT 'pending' CHECK (
+                outcome IN ('pending', 'submitted', 'built', 'pr_opened',
+                            'scope_blocked', 'build_failed', 'abandoned')
+            ),
+            scope_gate_result   TEXT,
+            created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """,
     "intake_tokens": """
@@ -1694,6 +1727,12 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_task_states_phase ON task_states(current_phase)",
     # task steps (task executor)
     "CREATE INDEX IF NOT EXISTS idx_task_steps_status ON task_steps(status)",
+    # build candidates (capability-build lane) — partial unique index is the
+    # rescan guard: at most one OPEN (undecided) candidate per item_key
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_build_candidates_open_item "
+    "ON build_candidates(item_key) WHERE user_decision IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_build_candidates_outcome ON build_candidates(outcome)",
+    "CREATE INDEX IF NOT EXISTS idx_build_candidates_created ON build_candidates(created_at)",
     # cc_sessions: thread-aware lookup (Phase 9)
     "CREATE INDEX IF NOT EXISTS idx_cc_sess_user_ch_thread ON cc_sessions(user_id, channel, thread_id)",
     # telegram messages

@@ -125,6 +125,29 @@ class TestSubmit:
         assert task_id.startswith("t-")
         assert task_id in dispatcher._dispatched
         mock_create.assert_awaited_once()
+        assert mock_create.await_args.kwargs["source"] == "user"
+
+    async def test_submit_persists_internal_source(
+        self, dispatcher: TaskDispatcher, tmp_path: Path,
+    ) -> None:
+        """Non-user sources self-generate a token and are persisted verbatim —
+        the build lane depends on this to gate delivery on source."""
+        plan = tmp_path / "plan.md"
+        plan.write_text(VALID_PLAN)
+
+        with (
+            patch("genesis.autonomy.dispatcher._ALLOWED_PLAN_DIRS", [tmp_path]),
+            patch("genesis.db.crud.task_states.create", new_callable=AsyncMock) as mock_create,
+            patch("genesis.util.tasks.tracked_task"),
+            patch.object(
+                dispatcher, "_generate_intake_token",
+                new=AsyncMock(return_value="auto-tok"),
+            ),
+        ):
+            await dispatcher.submit(str(plan), "Build task", source="build_lane")
+
+        assert mock_create.await_args.kwargs["source"] == "build_lane"
+        assert mock_create.await_args.kwargs["intake_token"] == "auto-tok"
 
     async def test_submit_without_token_rejected(
         self, dispatcher: TaskDispatcher, tmp_path: Path,

@@ -60,6 +60,7 @@ EXPECTED_TABLES = [
     "pending_email_sends",  # WS-8 PR-C: email autonomy gate hold store
     "autonomous_email_sends",  # WS-8 PR-D: autonomous-send ledger (visibility + flag + rate-limit)
     "capability_shadow_events",  # WS5 Stage 2: Discord capability shadow-gate observations
+    "build_candidates",  # capability-build lane: verdicts + calibration + build outcomes
 ]
 
 
@@ -286,6 +287,70 @@ async def test_follow_ups_rejects_invalid_domain(db):
             "INSERT INTO follow_ups (id, source, content, strategy, created_at, domain) "
             "VALUES ('t', 's', 'c', 'ego_judgment', '2026-01-01T00:00:00', 'INVALID')"
         )
+
+
+async def test_build_candidates_rejects_invalid_verdict(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO build_candidates (id, item_key, item_title, source_file, verdict) "
+            "VALUES ('t', 'k', 'title', 'notepad.md', 'INVALID')"
+        )
+
+
+async def test_build_candidates_rejects_invalid_outcome(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO build_candidates (id, item_key, item_title, source_file, verdict, outcome) "
+            "VALUES ('t', 'k', 'title', 'notepad.md', 'build', 'INVALID')"
+        )
+
+
+async def test_build_candidates_rejects_invalid_user_decision(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO build_candidates "
+            "(id, item_key, item_title, source_file, verdict, user_decision) "
+            "VALUES ('t', 'k', 'title', 'notepad.md', 'build', 'INVALID')"
+        )
+
+
+async def test_build_candidates_one_open_per_item_key(db):
+    """Partial unique index: a second OPEN candidate for the same item_key is
+    rejected (rescan guard), but a DECIDED row plus a new open row coexist."""
+    await db.execute(
+        "INSERT INTO build_candidates (id, item_key, item_title, source_file, verdict) "
+        "VALUES ('c1', 'k1', 'title', 'notepad.md', 'build')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO build_candidates (id, item_key, item_title, source_file, verdict) "
+            "VALUES ('c2', 'k1', 'title', 'notepad.md', 'build')"
+        )
+    # Close c1 with a decision — a fresh open candidate is then allowed.
+    await db.execute(
+        "UPDATE build_candidates SET user_decision = 'rejected' WHERE id = 'c1'"
+    )
+    await db.execute(
+        "INSERT INTO build_candidates (id, item_key, item_title, source_file, verdict) "
+        "VALUES ('c3', 'k1', 'title', 'notepad.md', 'build')"
+    )
+
+
+async def test_task_states_source_defaults_to_user(db):
+    # Satisfy the enforce_intake_token trigger with a fresh, unconsumed token.
+    await db.execute(
+        "INSERT INTO intake_tokens (token, created_at, expires_at) "
+        "VALUES ('tok-src', datetime('now'), datetime('now', '+1 hour'))"
+    )
+    await db.execute(
+        "INSERT INTO task_states (task_id, description, intake_token) "
+        "VALUES ('t-x', 'd', 'tok-src')"
+    )
+    cursor = await db.execute(
+        "SELECT source FROM task_states WHERE task_id = 't-x'"
+    )
+    row = await cursor.fetchone()
+    assert row[0] == "user"
 
 
 # ─── NOT NULL constraints ────────────────────────────────────────────────────
