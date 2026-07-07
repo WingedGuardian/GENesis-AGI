@@ -67,6 +67,30 @@ A standalone `python -c "import genesis; print(genesis.__file__)"` DOES honor
 `PYTHONPATH`/the editable install, so it can misleadingly show main's path while
 pytest is using the worktree's. Trust the stash check, not the env var.
 
+## Shell discipline across checkouts (cwd drift)
+
+The conftest guard only helps when pytest runs FROM the worktree. The Bash
+tool's working directory persists across calls, and any command chain
+containing `cd` — even a side-errand like `cd ~/genesis && git fetch` —
+silently re-roots EVERY later relative path. In a multi-checkout session this
+mutates the WRONG tree: on 2026-07-06 a `cat >> tests/…` appended new tests to
+MAIN's tree and a bare `pytest tests/…` then ran them against main's src —
+false RED/GREEN signals (the tests exercised code without the feature under
+test) plus a stray uncommitted edit in main for concurrent sessions to trip
+over.
+
+- **Mutating commands use ABSOLUTE paths, always**: `cat >>`, `sed -i`, `cp`,
+  `mv`, and `git` staging/committing (or `git -C <worktree> …`).
+- **Test runs are self-rooting**: `cd <worktree> && pytest …` as ONE compound
+  command, every time — never a bare `pytest` relying on remembered cwd.
+- After running any command chain that contains a `cd`, treat the cwd as
+  unknown until re-established.
+- Diagnostic tell: a should-be-RED test "passes for the wrong reason," or a
+  feature test fails on the feature's own symbols being missing — check `pwd`
+  and the imported `module.__file__` before debugging the code itself.
+- Recovery: `git status` the polluted tree; if the diff is exactly the stray
+  edit, `git checkout -- <file>` and redo via absolute paths.
+
 ## Push/Merge Enforcement
 
 `git_push_guard.py` (PreToolUse hook) blocks:
