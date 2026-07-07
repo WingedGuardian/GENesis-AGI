@@ -146,6 +146,25 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   classified as user-context. `_KNOWN_SUBSYSTEMS`
   (`memory/retrieval.py`) is the authoritative subsystem list; adding a
   module name to it is a category error.
+- **Destructive data migrations must reconcile cross-store mirror fields.**
+  When a cleanup/backfill deletes data in one store (e.g. Qdrant vectors) but
+  another store mirrors that data's existence (e.g.
+  `memory_metadata.embedding_status`), the delete MUST also fix the mirror
+  field. A deleted vector left as `embedding_status='embedded'` is a field
+  that *lies*, and that lie is not cosmetic if any code path *reads* it —
+  `MemoryStore._mark_superseded` gates an `update_payload` on
+  `embedding_status != 'fts5_only'` and would fire a doomed write on the
+  now-deleted point. Before assuming a stale field is harmless, grep for its
+  *reads*, not just its writes. (Bit us in the source_subsystem purge, #918;
+  fixed by #921 Step 2c — reconcile tagged rows to `fts5_only`.)
+- **`immutable=1` reads miss WAL-resident writes.** A read-only `sqlite3`
+  connection opened with `file:...?immutable=1` reads only the main db file
+  and ignores the `-wal`, so a change you JUST committed (still
+  un-checkpointed) is *invisible* — you get a false-negative "the write
+  didn't land." To verify a live write, use `?mode=ro` (WAL-aware) or query
+  through the server/CRUD path; reserve `immutable=1` for historical
+  read-only sampling where a little staleness is fine. (A reconcile UPDATE
+  read clean under `mode=ro` but appeared unchanged under `immutable=1`.)
 
 ### Iterative-Refinement Discipline
 
