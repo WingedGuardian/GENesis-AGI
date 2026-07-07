@@ -56,7 +56,8 @@ TABLES = {
             acceptance_note   TEXT,                        -- reviewer's optional one-line WHY (PR3d); their reasoning, not the judge's
             snapshot_id       TEXT,
             config_version    TEXT,
-            created_at        TEXT NOT NULL
+            created_at        TEXT NOT NULL,
+            source            TEXT                         -- device provenance of the trigger utterance (e.g. omi / edge id)
             -- SHADOW/OFFLINE-ONLY firewall table: attention DECISIONS + REFERENCES only,
             -- NEVER ambient transcript text (that lives+dies in ambient.db on the edge).
             -- Not read by any cognition job (dream/ego/memory-synthesis).

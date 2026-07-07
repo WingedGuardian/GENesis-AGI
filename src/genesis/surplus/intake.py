@@ -77,15 +77,17 @@ _TASK_TYPE_TO_SOURCE: dict[str, IntakeSource] = {
     "memory_audit": IntakeSource.ANTICIPATORY_RESEARCH,
     "procedure_audit": IntakeSource.ANTICIPATORY_RESEARCH,
     "prompt_effectiveness_review": IntakeSource.ANTICIPATORY_RESEARCH,
+    "wing_audit": IntakeSource.ANTICIPATORY_RESEARCH,
 }
 
 # Task types that typically produce multiple findings and should be atomized.
-_MULTI_FINDING_TASK_TYPES = frozenset({
+MULTI_FINDING_TASK_TYPES = frozenset({
     "anticipatory_research",
     "code_audit",
     "gap_clustering",
     "brainstorm_user",
     "brainstorm_self",
+    "wing_audit",
 })
 
 
@@ -124,7 +126,7 @@ class IntakeStats:
     """Observability counters for a single intake run."""
 
     source: str = ""
-    atomization_path: str = ""  # "json_findings", "json_single", "markdown_split", "single_item"
+    atomization_path: str = ""  # atomize() path — see its docstring for values
     findings_count: int = 0
     routed_knowledge: int = 0
     routed_observation: int = 0
@@ -137,48 +139,107 @@ class IntakeStats:
 # ── Atomization ──────────────────────────────────────────────────────────
 
 
+# Matches ONLY a whole-message ```json fence (case-insensitive tag). `$` without
+# re.MULTILINE anchors to end-of-string, so combined with re.DOTALL the match
+# spans the entire message — inline fences (mid-text) and other-language blocks
+# (```python, bare ```) are deliberately NOT matched and pass through untouched.
+# Single source of truth for the surplus package (executor.py imports it too).
+FENCE_RE = re.compile(r"^\s*```(?i:json)\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL)
+
+
+def _finding_from_item(item: object, index: int, default_title: str) -> AtomicFinding | None:
+    """Build a finding from one entry of a findings array.
+
+    Handles both the ``{"findings": [...]}`` envelope item shape
+    (title/content/sources/relevance) and bare-array shapes from task-specific
+    prompts (e.g. code_audit's ``{"file", "severity", "description", ...}``) —
+    unknown dict shapes keep a title from their identity keys and the full
+    item as pretty-printed JSON content. Scalars other than str are unusable.
+    """
+    if isinstance(item, dict):
+        title = str(item.get("title") or item.get("file") or item.get("name") or "").strip()
+        if not title:
+            title = f"{default_title} finding {index + 1}"
+        raw_content = item.get("content", "")
+        content = str(raw_content) if raw_content else json.dumps(item, indent=2)
+        # Model output is untrusted: sources may be null, a bare string, or a
+        # list of mixed types; relevance may be null. None of these may abort
+        # the parse (a raised TypeError here would degrade the WHOLE payload
+        # back to a raw single_item unit).
+        raw_sources = item.get("sources")
+        if isinstance(raw_sources, str):
+            raw_sources = [raw_sources]
+        elif not isinstance(raw_sources, list):
+            raw_sources = []
+        return AtomicFinding(
+            title=title[:200],
+            content=content,
+            sources=[str(s) for s in raw_sources if isinstance(s, str)],
+            relevance=str(item.get("relevance") or ""),
+        )
+    if isinstance(item, str):
+        return AtomicFinding(title=item[:200], content=item)
+    return None
+
+
 def atomize(content: str, source_task_type: str) -> tuple[list[AtomicFinding], str]:
     """Split content into atomic findings.
 
     Returns (findings, atomization_path) where path is one of:
-    - "json_findings": parsed JSON with findings array
-    - "json_single": valid JSON but no findings key
+    - "json_findings": parsed JSON findings — envelope or bare top-level array
+    - "json_single": valid JSON object but no findings key
+    - "empty_findings": findings envelope/array with nothing usable — store nothing
     - "markdown_split": split on markdown headings/numbered items
     - "single_item": treated as one finding (fallback or single-output type)
+    - "empty": blank input
     """
     if not content or not content.strip():
         return [], "empty"
 
     # Single-output task types skip atomization entirely.
-    if source_task_type not in _MULTI_FINDING_TASK_TYPES:
+    if source_task_type not in MULTI_FINDING_TASK_TYPES:
         return [AtomicFinding(
             title=source_task_type.replace("_", " ").title(),
             content=content.strip(),
         )], "single_item"
 
-    # Attempt 1: Parse as JSON with findings array.
+    # Attempt 1: Parse as JSON with findings array. Models routinely wrap the
+    # payload in a ```json fence despite instructions — unwrap a whole-message
+    # fence first so the parse attempt sees bare JSON.
+    json_text = content
+    fence_match = FENCE_RE.match(content)
+    if fence_match:
+        json_text = fence_match.group(1)
     try:
-        data = json.loads(content)
-        if isinstance(data, dict) and "findings" in data:
-            findings_raw = data["findings"]
-            if isinstance(findings_raw, list) and findings_raw:
-                findings = []
-                for item in findings_raw:
-                    if isinstance(item, dict):
-                        findings.append(AtomicFinding(
-                            title=str(item.get("title", ""))[:200],
-                            content=str(item.get("content", "")),
-                            sources=[str(s) for s in item.get("sources", [])
-                                     if isinstance(s, str)],
-                            relevance=str(item.get("relevance", "")),
-                        ))
-                    elif isinstance(item, str):
-                        findings.append(AtomicFinding(
-                            title=item[:200],
-                            content=item,
-                        ))
-                if findings:
-                    return findings, "json_findings"
+        data = json.loads(json_text)
+        items: list | None = None
+        if isinstance(data, dict) and isinstance(data.get("findings"), list):
+            items = data["findings"]
+        elif isinstance(data, list):
+            # Some task prompts (e.g. code_audit) request a bare top-level
+            # array of finding objects rather than a findings envelope.
+            items = data
+        if items is not None:
+            default_title = source_task_type.replace("_", " ").title()
+            # Flatten one level of accidental nesting ([[{...}, {...}]]) —
+            # otherwise list entries are unusable and the payload is dropped.
+            flat_items: list = []
+            for entry in items:
+                if isinstance(entry, list):
+                    flat_items.extend(entry)
+                else:
+                    flat_items.append(entry)
+            findings = []
+            for i, item in enumerate(flat_items):
+                finding = _finding_from_item(item, i, default_title)
+                if finding is not None:
+                    findings.append(finding)
+            if findings:
+                return findings, "json_findings"
+            # A findings envelope/array with nothing usable ([] or only
+            # unusable entry shapes) is a no-op result — never store the
+            # raw envelope as a single unit.
+            return [], "empty_findings"
         # Valid JSON but no findings key — treat as single item.
         if isinstance(data, dict):
             return [AtomicFinding(
@@ -512,6 +573,21 @@ async def run_intake(
     return stats
 
 
+def kb_content_for_finding(finding: AtomicFinding) -> str:
+    """Render a finding as the knowledge-base body text.
+
+    Shared by the runtime routing path and the offline cleanup script
+    (scripts/cleanup_fenced_knowledge_units.py) so the stored unit shape
+    stays single-sourced.
+    """
+    text = f"{finding.title}\n\n{finding.content}"
+    if finding.sources:
+        text += "\n\nSources: " + ", ".join(finding.sources)
+    if finding.relevance:
+        text += f"\n\nRelevance: {finding.relevance}"
+    return text
+
+
 async def _route_to_knowledge(
     scored: ScoredFinding,
     *,
@@ -546,17 +622,7 @@ async def _route_to_knowledge(
     # Determine domain from source.
     domain = _domain_for_source(scored.source, scored.source_task_type)
 
-    sources_str = ""
-    if scored.finding.sources:
-        sources_str = "\n\nSources: " + ", ".join(scored.finding.sources)
-
-    content_for_kb = (
-        f"{scored.finding.title}\n\n"
-        f"{scored.finding.content}"
-        f"{sources_str}"
-    )
-    if scored.finding.relevance:
-        content_for_kb += f"\n\nRelevance: {scored.finding.relevance}"
+    content_for_kb = kb_content_for_finding(scored.finding)
 
     await ingest_knowledge_unit(
         store=store,

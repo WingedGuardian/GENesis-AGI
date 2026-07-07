@@ -270,6 +270,225 @@ def _update_and_format_trail(
     return f"[Session trail] {prefix}{' → '.join(labels)}"
 
 
+# ---------------------------------------------------------------------------
+# Working set — per-session record of already-injected memories (H-1 PR1)
+# ---------------------------------------------------------------------------
+# Record-only measurement layer: tracks which memory/KB/code IDs this hook
+# has already injected into the session (surfaced_memories.json) and appends
+# per-prompt overlap stats to injection_log.jsonl. The 7-day rollup
+# (observability/snapshots/proactive_memory.py) is the data gate for the
+# PR2 novelty-gate decision. Nothing here may affect injection output.
+
+_WS_VERSION = 1
+_WS_FILENAME = "surfaced_memories.json"
+_WS_LOG_FILENAME = "injection_log.jsonl"
+_WS_MAX_ENTRIES = 300  # Evict oldest-surfaced beyond this (bounds file size)
+_WS_MAX_RESETS = 20  # resets[] is written by the PR2 reset path; capped here
+
+
+def _ws_path(session_id: str) -> Path | None:
+    """Path to the working-set file, or None for unusable session IDs.
+
+    Session IDs arrive via hook stdin — refuse anything that could
+    escape the sessions dir (mirrors _load_recent_files).
+    """
+    if not session_id or "/" in session_id or ".." in session_id:
+        return None
+    return _TRAIL_DIR / session_id / _WS_FILENAME
+
+
+def _empty_working_set(session_id: str) -> dict:
+    return {
+        "version": _WS_VERSION,
+        "session_id": session_id,
+        "turn": 0,
+        "entries": {},
+        "procedures": {},
+        "resets": [],
+    }
+
+
+def _load_working_set(session_id: str) -> dict:
+    """Load the session working set. Empty structure if missing/corrupt."""
+    path = _ws_path(session_id)
+    if path is None:
+        return _empty_working_set(session_id)
+    try:
+        if path.exists():
+            data = json.loads(path.read_text())
+            if (
+                isinstance(data, dict)
+                and isinstance(data.get("entries"), dict)
+                and isinstance(data.get("procedures"), dict)
+            ):
+                data.setdefault("version", _WS_VERSION)
+                data.setdefault("session_id", session_id)
+                data.setdefault("turn", 0)
+                data.setdefault("resets", [])
+                return data
+    except Exception:
+        pass
+    return _empty_working_set(session_id)
+
+
+def _save_working_set(session_id: str, ws: dict) -> None:
+    """Atomic write of the working set (mirrors _save_trail). Never raises."""
+    path = _ws_path(session_id)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            os.write(fd, json.dumps(ws).encode())
+        finally:
+            os.close(fd)
+        os.replace(tmp, str(path))
+    except Exception:
+        pass  # Never block
+
+
+def _ws_kind(result: dict) -> str:
+    """Classify a fused result for working-set bookkeeping."""
+    if result.get("memory_id", "").startswith("code:"):
+        return "code"
+    if result.get("collection") == "knowledge_base":
+        return "kb"
+    return "memory"
+
+
+def _ws_overlap(ws: dict, injected_ids: list[str]) -> tuple[list[str], float]:
+    """Repeat IDs (already in the working set) + overlap percentage.
+
+    Must run on the PRE-update snapshot — call before _ws_record.
+    """
+    entries = ws.get("entries", {})
+    repeats = [mid for mid in injected_ids if mid in entries]
+    pct = round(100.0 * len(repeats) / len(injected_ids), 1) if injected_ids else 0.0
+    return repeats, pct
+
+
+def _ws_record(
+    ws: dict,
+    injected: list[tuple[str, str]],
+    proc_id: str | None,
+    now_iso: str,
+) -> None:
+    """Record injected (memory_id, kind) pairs + surfaced procedure in place."""
+    ws["turn"] = ws.get("turn", 0) + 1
+    turn = ws["turn"]
+    entries = ws.setdefault("entries", {})
+    for mid, kind in injected:
+        entry = entries.get(mid)
+        if entry is None:
+            entries[mid] = {
+                "first_ts": now_iso,
+                "last_ts": now_iso,
+                "count": 1,
+                "first_turn": turn,
+                "last_turn": turn,
+                "kind": kind,
+            }
+        else:
+            entry["last_ts"] = now_iso
+            entry["count"] = entry.get("count", 0) + 1
+            entry["last_turn"] = turn
+    if proc_id:
+        procedures = ws.setdefault("procedures", {})
+        proc = procedures.get(proc_id)
+        if proc is None:
+            procedures[proc_id] = {"last_ts": now_iso, "count": 1}
+        else:
+            proc["last_ts"] = now_iso
+            proc["count"] = proc.get("count", 0) + 1
+    # Bound file size: evict the oldest-surfaced entries beyond the cap
+    if len(entries) > _WS_MAX_ENTRIES:
+        by_age = sorted(entries.items(), key=lambda kv: kv[1].get("last_ts", ""))
+        for mid, _ in by_age[: len(entries) - _WS_MAX_ENTRIES]:
+            del entries[mid]
+    resets = ws.get("resets", [])
+    if len(resets) > _WS_MAX_RESETS:
+        ws["resets"] = resets[-_WS_MAX_RESETS:]
+
+
+def _append_injection_log(session_id: str, record: dict) -> None:
+    """Append one per-prompt overlap record. Best-effort, never raises."""
+    path = _ws_path(session_id)
+    if path is None:
+        return
+    try:
+        log_path = path.parent / _WS_LOG_FILENAME
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass  # Never block
+
+
+def _ws_measure(
+    fused: list[dict],
+    session_id: str,
+    surfaced_proc_id: str | None,
+    now_iso: str,
+) -> dict:
+    """The whole working-set measurement step for one prompt.
+
+    Computes overlap vs the PRE-update working set, records this prompt's
+    injection, and appends the injection-log line. Contract: NEVER prints
+    (hook stdout is context injected into the conversation) and NEVER
+    raises — any internal failure returns the stats gathered so far with
+    safe defaults for the rest.
+    """
+    stats: dict = {
+        "injected_ids": [],
+        "repeat_count": 0,
+        "overlap_pct": None,
+        "working_set_size": None,
+        "zero_retrieved_injected": 0,
+        "procedure_repeat": False,
+    }
+    try:
+        stats["injected_ids"] = [r["memory_id"] for r in fused if r.get("memory_id")]
+        # Baseline for the PR2 serendipity boost: how often does today's
+        # ranking already surface never-retrieved episodic memories?
+        # FTS-only entries lack _retrieved_count → excluded (unknown ≠ 0).
+        stats["zero_retrieved_injected"] = sum(
+            1
+            for r in fused
+            if r.get("collection") != "knowledge_base"
+            and r.get("_retrieved_count", -1) == 0
+        )
+        if session_id and (stats["injected_ids"] or surfaced_proc_id):
+            ws = _load_working_set(session_id)
+            repeats, overlap_pct = _ws_overlap(ws, stats["injected_ids"])
+            stats["repeat_count"] = len(repeats)
+            stats["overlap_pct"] = overlap_pct
+            stats["procedure_repeat"] = bool(
+                surfaced_proc_id and surfaced_proc_id in ws.get("procedures", {})
+            )
+            _ws_record(
+                ws,
+                [(r["memory_id"], _ws_kind(r)) for r in fused if r.get("memory_id")],
+                surfaced_proc_id,
+                now_iso,
+            )
+            _save_working_set(session_id, ws)
+            stats["working_set_size"] = len(ws.get("entries", {}))
+            _append_injection_log(session_id, {
+                "ts": now_iso,
+                "turn": ws.get("turn", 0),
+                "injected": len(stats["injected_ids"]),
+                "repeats": stats["repeat_count"],
+                "overlap_pct": stats["overlap_pct"],
+                "ws_size": stats["working_set_size"],
+                "proc": bool(surfaced_proc_id),
+                "proc_repeat": stats["procedure_repeat"],
+            })
+    except Exception:
+        pass  # Measurement must never block the prompt
+    return stats
+
+
 def _is_garbage(content: str) -> bool:
     """Filter out content that should never surface as proactive memory."""
     # NOTE (PR2): we deliberately no longer drop content merely for containing
@@ -1055,8 +1274,19 @@ def _record_detail(
     total_latency_ms: float,
     fts_only_fallback: bool,
     heartbeat_ms: float = 0.0,
+    injected_ids: list[str] | None = None,
+    repeat_count: int = 0,
+    overlap_pct: float | None = None,
+    working_set_size: int | None = None,
+    zero_retrieved_injected: int = 0,
+    procedure_repeat: bool = False,
 ) -> None:
-    """Atomic JSON write — latest invocation detail for health dashboard."""
+    """Atomic JSON write — latest invocation detail for health dashboard.
+
+    The working-set fields (H-1 PR1) describe this prompt's injection vs
+    the session's already-surfaced set; ``overlap_pct``/``working_set_size``
+    are None when no injection happened or no session ID was available.
+    """
     data = {
         "timestamp": datetime.now(UTC).isoformat(),
         "fts_results": fts_count,
@@ -1067,6 +1297,12 @@ def _record_detail(
         "fts_only_fallback": fts_only_fallback,
         "heartbeat_ms": round(heartbeat_ms, 1),
         "budget_exceeded": total_latency_ms > 2000,
+        "injected_ids": injected_ids or [],
+        "repeat_count": repeat_count,
+        "overlap_pct": overlap_pct,
+        "working_set_size": working_set_size,
+        "zero_retrieved_injected": zero_retrieved_injected,
+        "procedure_repeat": procedure_repeat,
     }
     try:
         _METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1415,6 +1651,12 @@ async def _run(prompt: str, session_id: str = "") -> None:
     if fused:
         await _increment_retrieved(fused)
 
+    # ── Working-set measurement (H-1 PR1, record-only) ─────────────
+    # Overlap stats feed the PR2 novelty-gate decision. Runs after all
+    # stdout is flushed — never touches injection output. Placed inside
+    # the total_ms window so budget_exceeded watches its file I/O too.
+    ws_stats = _ws_measure(fused, session_id, _surfaced_proc_id, now_iso)
+
     total_ms = (time.monotonic() - start) * 1000
 
     had_results = fused_count > 0
@@ -1431,6 +1673,12 @@ async def _run(prompt: str, session_id: str = "") -> None:
         total_latency_ms=total_ms,
         fts_only_fallback=fts_only_fallback,
         heartbeat_ms=heartbeat_ms,
+        injected_ids=ws_stats["injected_ids"],
+        repeat_count=ws_stats["repeat_count"],
+        overlap_pct=ws_stats["overlap_pct"],
+        working_set_size=ws_stats["working_set_size"],
+        zero_retrieved_injected=ws_stats["zero_retrieved_injected"],
+        procedure_repeat=ws_stats["procedure_repeat"],
     )
 
 

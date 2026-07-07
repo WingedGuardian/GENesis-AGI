@@ -4,8 +4,10 @@ Parses the CC transcript (.jsonl) to extract file paths touched by Write/Edit
 tool calls, cross-references against ProtectedPathRegistry, and feeds
 success/correction signals back to the AutonomyManager.
 
-All audit data is tagged with source_subsystem="autonomy" so it never
-surfaces to the ego via memory recall (contamination prevention).
+This module feeds success/correction signals to the AutonomyManager; it does
+NOT write to memory itself, so no ``source_subsystem`` tagging happens here.
+The tagged autonomy retrospective memories are written by the executor
+(see ``autonomy/executor/trace.py``, which sets ``source_subsystem="autonomy"``).
 """
 
 from __future__ import annotations

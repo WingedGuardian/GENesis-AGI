@@ -646,6 +646,59 @@ async def test_store_reflection_output_light_skips_primary(db):
 
 
 @pytest.mark.asyncio
+async def test_store_reflection_summary_parses_fenced_output(db):
+    """A ```json-fenced light output still yields a structured summary.
+
+    Before the fix, _store_reflection_summary json.loads'd the raw text while
+    its sibling parse sites fence-stripped first — so fenced output fell to
+    the raw-text fallback and the summary stored the fence dump instead of
+    the assessment."""
+    from genesis.cc.reflection_bridge._output import store_reflection_output
+
+    tick = TickResult(
+        tick_id="tick-fenced-1",
+        timestamp="2026-05-30T14:00:00",
+        source="scheduled",
+        signals=[],
+        scores=[],
+        classified_depth=Depth.LIGHT,
+        trigger_reason="test",
+    )
+    payload = json.dumps({
+        "assessment": "Fenced output parsed correctly.",
+        "patterns": [],
+        "recommendations": [],
+        "confidence": 0.8,
+        "focus_area": "situation",
+        "escalate_to_deep": False,
+        "escalation_reason": "",
+        "user_model_updates": [],
+        "surplus_candidates": [],
+    })
+    output = CCOutput(
+        session_id="refl-fenced-1",
+        text=f"```json\n{payload}\n```",
+        model_used="haiku",
+        cost_usd=0.001,
+        input_tokens=100,
+        output_tokens=50,
+        duration_ms=1000,
+        exit_code=0,
+    )
+
+    await store_reflection_output(Depth.LIGHT, tick, output, db=db)
+
+    rows = await db.execute_fetchall(
+        "SELECT content FROM observations WHERE source = 'cc_reflection_light' "
+        "AND type = 'reflection_summary'"
+    )
+    assert len(rows) == 1, "Fenced light output should still create a reflection_summary"
+    content = rows[0]["content"]
+    assert "Fenced output parsed correctly." in content
+    assert "```" not in content, "Summary must contain the parsed assessment, not the raw fence dump"
+
+
+@pytest.mark.asyncio
 async def test_store_reflection_output_strategic_keeps_primary(db):
     """Strategic depth should still create reflection_output observation."""
     from genesis.cc.reflection_bridge._output import store_reflection_output
@@ -681,6 +734,54 @@ async def test_store_reflection_output_strategic_keeps_primary(db):
         "AND type = 'reflection_output'"
     )
     assert len(rows) == 1, "Strategic should still create reflection_output"
+
+
+@pytest.mark.asyncio
+async def test_strategic_fenced_output_extracts_focus_and_summary(db):
+    """A ```json-fenced STRATEGIC output still yields focus_next_week and a
+    structured summary — pins the fence handling on the strategic path
+    (_extract_strategic_focus), not just LIGHT."""
+    from genesis.cc.reflection_bridge._output import store_reflection_output
+
+    tick = TickResult(
+        tick_id="tick-strat-fenced-1",
+        timestamp="2026-05-30T15:00:00",
+        source="scheduled",
+        signals=[],
+        scores=[],
+        classified_depth=Depth.STRATEGIC,
+        trigger_reason="test",
+    )
+    payload = json.dumps({
+        "assessment": "Strategic fenced output parsed correctly.",
+        "observations": [],
+        "focus_next_week": "Consolidate the intake pipeline fixes.",
+    })
+    output = CCOutput(
+        session_id="refl-strat-fenced-1",
+        text=f"```json\n{payload}\n```",
+        model_used="opus",
+        cost_usd=0.10,
+        input_tokens=2000,
+        output_tokens=1000,
+        duration_ms=30000,
+        exit_code=0,
+    )
+
+    await store_reflection_output(Depth.STRATEGIC, tick, output, db=db)
+
+    focus_rows = await db.execute_fetchall(
+        "SELECT content FROM cognitive_state WHERE section = 'pending_actions'"
+    )
+    assert len(focus_rows) == 1, "Fenced strategic output should store focus_next_week"
+    assert "Consolidate the intake pipeline fixes." in focus_rows[0]["content"]
+
+    summary_rows = await db.execute_fetchall(
+        "SELECT content FROM observations WHERE source = 'cc_reflection_strategic' "
+        "AND type = 'reflection_summary'"
+    )
+    assert len(summary_rows) == 1
+    assert "```" not in summary_rows[0]["content"]
 
 
 # ── build_light_prompt_enriched: prior context injection ────────────

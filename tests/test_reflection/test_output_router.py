@@ -84,8 +84,33 @@ class TestParseDeepReflectionOutput:
         out = parse_deep_reflection_output(raw)
         assert out.observations == ["only this"]
         assert out.cognitive_state_update is None
-        assert out.confidence == 0.7
+        assert out.confidence == 0.5
         assert out.memory_operations == []
+
+    def test_absent_confidence_gets_sentinel_and_flag(self):
+        """Missing 'confidence' → 0.5 sentinel + confidence_defaulted=True.
+
+        The prompt forbids 0.7-as-default, so an absent value must never be
+        stored as a plausible genuine one."""
+        out = parse_deep_reflection_output(json.dumps({"observations": ["x"]}))
+        assert out.confidence == 0.5
+        assert out.confidence_defaulted is True
+
+    def test_reported_confidence_not_flagged(self):
+        """A genuinely reported 0.5 is distinguishable from the sentinel."""
+        out = parse_deep_reflection_output(
+            json.dumps({"observations": ["x"], "confidence": 0.5})
+        )
+        assert out.confidence == 0.5
+        assert out.confidence_defaulted is False
+
+    def test_null_confidence_treated_as_absent(self):
+        """Explicit JSON null confidence takes the sentinel path (no crash)."""
+        out = parse_deep_reflection_output(
+            json.dumps({"observations": ["x"], "confidence": None})
+        )
+        assert out.confidence == 0.5
+        assert out.confidence_defaulted is True
 
 
 class TestParseWeeklyAssessmentOutput:
@@ -209,6 +234,23 @@ class TestRouteDeepReflection:
         summary = await router.route(output, db)
         assert summary.get("parse_failed") is True
         assert summary["observations_written"] == 0
+
+    @pytest.mark.asyncio
+    async def test_confidence_defaulted_flag_in_summary(self, db, router):
+        """route() surfaces confidence_defaulted in the routing summary (which
+        is returned to the bridge and persisted with the completed event)."""
+        output = DeepReflectionOutput(
+            observations=["obs1"], confidence=0.5, confidence_defaulted=True,
+        )
+        summary = await router.route(output, db)
+        assert summary.get("confidence_defaulted") is True
+
+    @pytest.mark.asyncio
+    async def test_reported_confidence_no_flag_in_summary(self, db, router):
+        """A reported confidence leaves no defaulted flag in the summary."""
+        output = DeepReflectionOutput(observations=["obs1"], confidence=0.5)
+        summary = await router.route(output, db)
+        assert "confidence_defaulted" not in summary
 
 
 class TestRouteAssessment:

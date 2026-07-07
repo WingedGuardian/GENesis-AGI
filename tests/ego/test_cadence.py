@@ -823,8 +823,9 @@ class TestReactiveSignals:
         assert sig.signal_type == "event"
         assert sig.focus_category == "reactive"
         assert "Provider X" in sig.summary
-        assert sig.metadata["model_override"] == "opus"
-        assert sig.metadata["effort_override"] == "high"
+        # No forced overrides — each ego's base config rules.
+        assert "model_override" not in sig.metadata
+        assert "effort_override" not in sig.metadata
         assert sig.metadata["event_type"] == "breaker.tripped"
         assert sig.metadata["source"] == "routing"
 
@@ -854,13 +855,13 @@ class TestReactiveSignals:
         cadence.push_reactive_event({"type": "test", "summary": "x"})
         assert cadence._signal_queue.empty()
 
-    def test_push_reactive_model_override_is_opus(self, cadence):
-        """Reactive signals carry opus/high model/effort overrides."""
+    def test_push_reactive_has_no_model_or_effort_override(self, cadence):
+        """Reactive signals carry NO overrides — each ego's base config rules."""
         cadence._running = True
         cadence.push_reactive_event({"type": "test", "summary": "alert"})
         signals = cadence._signal_queue.drain()
-        assert signals[0].metadata["model_override"] == "opus"
-        assert signals[0].metadata["effort_override"] == "high"
+        assert "model_override" not in signals[0].metadata
+        assert "effort_override" not in signals[0].metadata
 
     async def test_reactive_flows_through_unified_cycle(
         self, cadence, mock_session,
@@ -878,8 +879,9 @@ class TestReactiveSignals:
         signals = call_args[0][0]
         assert len(signals) == 1
         assert signals[0].focus_category == "reactive"
-        assert call_args[1]["model_override"] == "opus"
-        assert call_args[1]["effort_override"] == "high"
+        # No overrides forwarded — the ego runs on its base config.
+        assert call_args[1]["model_override"] is None
+        assert call_args[1]["effort_override"] is None
 
     async def test_reactive_rate_limit_at_consumer(
         self, cadence, mock_session,
@@ -985,8 +987,10 @@ class TestEscalationSignals:
         assert sig.signal_type == "event"
         assert sig.focus_category == "escalation"
         assert sig.priority == "critical"
-        assert sig.metadata["model_override"] == "sonnet"
-        assert sig.metadata["effort_override"] == "medium"
+        # No model override (base config rules); effort forced to high —
+        # never think less about a CRITICAL escalation than a routine tick.
+        assert "model_override" not in sig.metadata
+        assert sig.metadata["effort_override"] == "high"
 
     async def test_escalation_not_rate_limited(
         self, cadence, mock_session,
@@ -1052,8 +1056,8 @@ class TestEscalationSignals:
         await cadence._process_signals()
         mock_session.run_unified_cycle.assert_called_once()
         call_args = mock_session.run_unified_cycle.call_args
-        assert call_args[1]["model_override"] == "sonnet"
-        assert call_args[1]["effort_override"] == "medium"
+        assert call_args[1]["model_override"] is None
+        assert call_args[1]["effort_override"] == "high"
 
 
 # ---------------------------------------------------------------------------

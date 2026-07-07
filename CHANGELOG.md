@@ -23,7 +23,44 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   read/write-split Proxmox tokens are ever stored. Setup and the full safety
   model: `docs/reference/proxmox-provisioning.md`.
 
+- **Ambient bridge memory-leak regression alert.** If the edge bridge's RSS ever climbs past the
+  healthy plateau again (total > 1000 MB or diarization child > 450 MB), ambient health flips to
+  degraded and you get a one-time Telegram alert naming the breach — no nagging, and normal
+  workload bursts never trigger it. Requires an ambient edge reporting the `rss_*` health keys.
+
+- **The voice dashboard's Bridge tab is now a full cockpit.** Instead of a bare status line, it
+  shows the ambient edge bridge's complete live health, grouped for scanning: memory leak-watch
+  (parent / diarization-child / total RSS, ORT-arena state, pool recycles), capture activity
+  (utterances, rows per hour, last-utterance age), diarization worker state, connection
+  stability (connects, dark events, gap durations), and speaker-ID status — read on demand from
+  the edge via the new `GET /api/genesis/voice/bridge` endpoint. Any new health field the edge
+  starts reporting surfaces automatically under "Other."
+
+- **Voice dashboard Device tab: live Voice PE hardware vitals.** Temperature, WiFi signal,
+  uptime, reset reason, free heap, loop time, and voice-pipeline status, polled from Home
+  Assistant on demand (`GET /api/genesis/voice/device`; set `HA_VOICE_PE_PREFIX`). *(Shipped
+  earlier in #876; the changelog entry was missed at the time.)*
+
+### Changed
+
+- **The idle-time code auditor now hunts the failure modes AI-generated code actually has.** Its
+  briefing gained a research-backed taxonomy — swallowed async errors, orphan state without
+  teardown, race surfaces, phantom guards, near-duplicate helpers, cosmetic abstractions, pattern
+  abandonment, and constraints quietly removed during refinement cycles — so audit findings target
+  the defect classes iterative LLM development is known to produce instead of only generic lint
+  categories. Development guidance gained the matching discipline: iterate with scoped explicit
+  prompts (never "improve this"), and diff refinements for what they *removed*.
+
 ### Fixed
+
+- **Memory recall no longer surfaces Genesis's own internal noise.** Machine-generated
+  decisional output — background reflections, autonomy task retrospectives, and ego-dispatch
+  records — was leaking into normal recall because several writers didn't mark themselves as
+  internal-subsystem writes. Those writers are now tagged, so the content stays available to the
+  subsystem that produced it but no longer pollutes user-facing recall (which measurably improves
+  results on reflection-adjacent queries). Existing installs can purge already-embedded legacy
+  noise with the new `scripts/backfill_source_subsystem.py`, then
+  `scripts/cleanup_subsystem_qdrant.py` — both dry-run by default; add `--apply` to commit.
 
 - **A false "deferred work backlog" health warning no longer fires every few minutes.** The
   weekly memory dream-cycle parks a large synthesis worklist that drains a little each day by
@@ -117,6 +154,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Attention events now record which device they came from, and the Judgment tab can filter by it.**
+  Every "perk-up" event the passive-listening engine emits now carries the source device (the home
+  edge connection, or `omi` once the wearable connector lands), and the dashboard's Judgment review
+  gains a device dropdown plus a per-event source pill — so you can review one device's moments in
+  isolation. The engine also stops penalizing text-only sources: an utterance with no audio capture
+  (no loudness to measure) is scored on its text signals instead of being docked 25% clarity or
+  dropped as near-silence junk, which is what OMI wearable transcripts will need.
+
 - **The Sentinel now learns which infrastructure fixes would be safe to run itself — observe-only.**
   Every fix the Sentinel proposes still requires your approval, exactly as before. What's new: each
   proposed action is additionally classified as "would run autonomously" (reversible, programmatic,
@@ -159,6 +204,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   as itself (outreach, community posts, DMs) — first person, prove-don't-claim, with a mandatory anti-slop
   pass anchored to the voice-master audit. Previously these existed only as untracked files on the
   development install.
+
+- **Genesis now measures how often its automatic memory surfacing repeats itself within a session.**
+  Each prompt's surfaced memories are tracked per session, and the health snapshot's proactive-memory
+  section gains an `overlap_7d` rollup — the share of surfaced memories over the last 7 days that had
+  already been shown earlier in the same session. Measurement only: what gets surfaced is unchanged.
+  This data decides whether a planned improvement ships (skipping re-injection of memories already in
+  context to free slots for novel ones).
 
 - **Off-site backups now self-prune on a grandfather-father-son schedule instead of growing forever.**
   When you back up to an off-site target (NAS/SMB or a mounted path), each run now prunes old dated
@@ -342,6 +394,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   guardian-created snapshots exist, they are deleted (they capture the already-broken state) and the
   restore is retried once.
 
+- **Reflection summaries are no longer degraded to raw JSON dumps when the model wraps its output in a
+  code fence.** Light and strategic reflections store a searchable summary of what they found. When the
+  model wrapped its answer in a markdown ```json fence — which it often does — the summary step failed to
+  parse it and stored a truncated raw dump (fence markers included) instead of the assessment and focus,
+  degrading later recall. A ```json-tagged fence now parses the same as bare JSON (other fence types
+  are left untouched), matching how the rest of the reflection pipeline already reads it.
+
+- **Reflections that omit a confidence score are now recorded honestly instead of masquerading as
+  "0.7 confident".** The reflection prompt explicitly forbids defaulting to 0.7, but when a reflection
+  came back without a confidence value the system silently filled in 0.7 — indistinguishable from the
+  model genuinely reporting it. An absent confidence is now stored as 0.5: deep reflections carry a
+  `confidence_defaulted` marker in the cycle's routing record, and light reflections log the sentinel,
+  so you can tell reported confidence from a filled-in default.
+  The Light reflection prompt also regains its hard output caps and "signals are the only valid
+  evidence" verification rule, which were stranded in a prompt file the loader never used.
+
 - **Skill suggestions now actually fire — and nested skill packs show up in the catalog.** The
   prompt-time skill nudge scored matches against the length of your prompt, so on any wordy prompt a
   genuine match was diluted below the firing threshold and suggestions near-never appeared; a single
@@ -352,6 +420,36 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   plugin repos in the skill library), indexing the real skills inside instead of one useless entry for
   the folder. And a stale catalog can no longer cut the nudge off entirely: regeneration now runs in
   the background while the current prompt uses the existing catalog.
+
+- **Reactive ego events no longer force the expensive Opus model, critical escalations always think at
+  full effort, and a missing ego prompt file fails loudly instead of silently running a placeholder.**
+  Reactive events (deadline alerts, breaker trips) used to override every ego onto Opus at high effort
+  regardless of your configured model — now each ego handles them on its own base configuration.
+  Critical escalations previously ran at *medium* effort (less thinking than a routine tick); they now
+  always run at high effort. And if a per-ego identity prompt file is missing, the ego refuses to start
+  with a clear error naming the file, instead of quietly substituting a generic placeholder identity
+  (the obsolete legacy `EGO_SESSION.md` prompt is removed). The ego prompts themselves also got
+  corrections: the user ego no longer lists a health tool it doesn't have, no longer writes the morning
+  report (the dedicated morning-report pipeline is the sole source — its daily-briefing cycle now
+  focuses on what you need today), and the pending-proposal guidance matches the real threshold.
+
+- **Background research findings reach your knowledge base again — instead of piling up as unreadable
+  JSON blobs.** Genesis's idle-time research (brainstorms, gap clustering, code and wing audits) sends its
+  findings through an intake step that splits them into individual knowledge entries. That step couldn't
+  read the output format models actually produce (code-fenced JSON, and the bare-array shape code audits
+  emit), so months of findings were stored as single raw JSON dumps — useless to search and recall. Intake
+  now parses these formats, skips empty result envelopes outright, and wing-audit results are split into
+  individual findings like the other research types. A new `scripts/cleanup_fenced_knowledge_units.py`
+  (dry-run by default) re-parses the previously mangled entries into proper knowledge units and removes
+  the junk ones.
+
+- **Fresh installs and repairs now get scheduled housekeeping running without a manual step.** The
+  bootstrap script rendered Genesis's systemd timer units (watchdog health check, daily disk hygiene)
+  but never enabled them, so on a new machine — or after a repair re-render — the timers sat installed
+  yet dead until something else switched them on. Bootstrap now enables and starts the housekeeping
+  timers idempotently, right after the render pass; environments without systemd are unaffected. The
+  backup timer is deliberately left for you to enable after configuring backups (passphrase + verify
+  run), so it is not auto-started here.
 
 - **The dashboard's per-session memory row is clearer: "Claude Code Sessions", green when healthy.** The
   cryptic "CC" row that listed sessions as gray "cc-1 …" chips is now labeled **Claude Code Sessions**,

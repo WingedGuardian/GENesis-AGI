@@ -654,6 +654,25 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         systemctl --user daemon-reload 2>/dev/null || true
         echo "  systemd daemon reloaded"
     fi
+
+    # Enable + start every rendered timer (idempotent), EXCEPT timers that are a
+    # deliberate setup step. Without this a fresh install/repair leaves the
+    # housekeeping timers (watchdog, disk-hygiene) rendered but dead. The backup
+    # timer is intentionally skipped: it needs a passphrase + a verify run before
+    # it should fire (see the "Backups are NOT auto-enabled" note below and
+    # SETUP.md "Backups") — auto-enabling a 6h schedule here gives a false sense
+    # of safety while data is still local-only.
+    for template in "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
+        [[ -f "$template" ]] || continue
+        timer_name=$(basename "$template" .template)
+        case "$timer_name" in
+            genesis-backup.timer) continue ;;  # deliberate setup step — see note below
+        esac
+        if [ -f "$SYSTEMD_USER_DIR/$timer_name" ]; then
+            systemctl --user enable --now "$timer_name" 2>/dev/null && \
+                echo "  + $timer_name enabled + started" || true
+        fi
+    done
 else
     echo "  Template directory $SYSTEMD_TEMPLATE_DIR not found — skipping"
 fi

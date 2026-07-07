@@ -41,23 +41,34 @@ def _clamp01(x: float) -> float:
     return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
 
 
-def is_blip(rms: float, duration_s: float, n_tokens: int) -> bool:
+def is_blip(rms: float, duration_s: float, n_tokens: int, *, has_audio: bool = True) -> bool:
     """True for a near-silence throwaway (the ASR emitting a word or two from almost
     no audio): ``rms`` below the near-silence floor AND sparse (sub-second OR <=2
     tokens). Conservative physics gate — flags ~1.8% of the live corpus, the
-    unambiguous junk tail only. Needs no accuracy/relevance judgement, just loudness."""
+    unambiguous junk tail only. Needs no accuracy/relevance judgement, just loudness.
+
+    ``has_audio=False`` (a text-only source, e.g. OMI — no rms to judge): the physics
+    gate is inapplicable, so only a token-less row is junk."""
+    if not has_audio:
+        return n_tokens <= 0
     return rms < RMS_FLOOR and (duration_s < 1.0 or n_tokens <= 2)
 
 
 def capture_clarity(
-    rms: float, duration_s: float, frac_lt_1: float, n_tokens: int,
+    rms: float, duration_s: float, frac_lt_1: float, n_tokens: int, *, has_audio: bool = True,
 ) -> float:
     """Heuristic 0..1 capture-clarity score — equal-weight mean of four bounded
     sub-scores (ASR confidence ``1-frac_lt_1``, loudness, length, token-richness).
     Near-silence blips land near 0; loud/long/confident passages near 1. Edge-portable
-    plain arithmetic; NaN-safe (corrupt meta -> conservative low clarity)."""
+    plain arithmetic; NaN-safe (corrupt meta -> conservative low clarity).
+
+    ``has_audio=False`` (a text-only source, e.g. OMI): loudness is unknowable, not
+    quiet — drop that sub-score and average the three text-derived ones instead of
+    pinning every text-only utterance to a 25% clarity penalty."""
     confidence = 1.0 - _clamp01(frac_lt_1)
-    loudness = _clamp01((rms - RMS_FLOOR) / (RMS_REF - RMS_FLOOR))
     length = _clamp01(duration_s / DUR_REF)
     richness = _clamp01(n_tokens / NTOK_REF)
+    if not has_audio:
+        return (confidence + length + richness) / 3.0
+    loudness = _clamp01((rms - RMS_FLOOR) / (RMS_REF - RMS_FLOOR))
     return (confidence + loudness + length + richness) / 4.0

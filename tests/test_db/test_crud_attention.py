@@ -32,6 +32,7 @@ def _row(
     snapshot_id="20260701T013412Z",
     utt_ids=(1, 2, 3),
     config_version="0.1.0-default",
+    source="",
 ):
     """A full attention_events tuple in COLUMNS order."""
     triggers_json = json.dumps([{"name": nm, "kind": k, "contribution": c} for nm, k, c in triggers])
@@ -42,7 +43,7 @@ def _row(
     return (
         f"id-{n}", ts, session_id, activation, score, triggers_json,
         json.dumps(list(suppressors)), window_ref, "unknown", 0.9, None,
-        acceptance, snapshot_id, config_version, "2026-07-01T00:00:00+00:00",
+        acceptance, snapshot_id, config_version, "2026-07-01T00:00:00+00:00", source,
     )
 
 
@@ -200,6 +201,29 @@ async def test_config_versions_is_distinct_sorted_unfiltered(tmp_path):
         _row(3, config_version="0.2.0-taxonomy"),
     ])
     assert await crud.config_versions(db) == ["0.1.0-default", "0.2.0-taxonomy"]
+    await db.close()
+
+
+# ── device provenance: source filter + sources dropdown (PR-4) ─────────────────────
+
+@pytest.mark.asyncio
+async def test_list_events_filters_by_source(tmp_path):
+    db = await _db(tmp_path / "g.db")
+    await crud.bulk_upsert_events(db, [_row(1, source="omi"), _row(2, source="ambient-edge")])
+    assert [e["id"] for e in await crud.list_events(db, source="omi")] == ["id-1"]
+    got = await crud.list_events(db)                        # no filter -> both
+    assert {e["source"] for e in got} == {"omi", "ambient-edge"}
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_sources_is_distinct_sorted_nonempty(tmp_path):
+    # mirrors config_versions(): populates the device-filter dropdown; blank/NULL excluded
+    db = await _db(tmp_path / "g.db")
+    await crud.bulk_upsert_events(db, [
+        _row(1, source="omi"), _row(2, source="omi"), _row(3, source="ambient-edge"), _row(4),
+    ])
+    assert await crud.sources(db) == ["ambient-edge", "omi"]
     await db.close()
 
 

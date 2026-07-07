@@ -66,6 +66,7 @@ def _event_summary(row: dict) -> dict:
         "snapshot_id": row.get("snapshot_id"),
         "config_version": row.get("config_version"),
         "created_at": row.get("created_at"),
+        "source": row.get("source"),
     }
 
 
@@ -87,13 +88,15 @@ async def attention_list():
     is_user = request.args.get("is_user", "").lower() == "true"
     unlabeled = request.args.get("unlabeled", "").lower() == "true"
     config_version = request.args.get("config_version") or None
+    source = request.args.get("source") or None
     limit = max(1, min(request.args.get("limit", 200, type=int), 500))
     offset = max(0, request.args.get("offset", 0, type=int))
 
     try:
         rows = await attention_crud.list_events(
             rt.db, activation=activation, trigger=trigger, is_user=is_user,
-            unlabeled=unlabeled, config_version=config_version, limit=limit, offset=offset,
+            unlabeled=unlabeled, config_version=config_version, source=source,
+            limit=limit, offset=offset,
         )
         events = [_event_summary(r) for r in rows]
         return jsonify({"events": events, "count": len(events)})
@@ -127,6 +130,7 @@ async def attention_stats():
             "by_trigger": await attention_crud.trigger_stats(rt.db, config_version),
             "by_suppressor": await attention_crud.suppressor_stats(rt.db, config_version),
             "config_versions": await attention_crud.config_versions(rt.db),
+            "sources": await attention_crud.sources(rt.db),
         })
     except Exception:
         logger.exception("Attention stats failed")

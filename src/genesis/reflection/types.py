@@ -147,6 +147,10 @@ class DeepReflectionOutput:
     user_question: UserQuestion | None = None
     focus_next: str = ""
     confidence: float = 0.7
+    # True when the model omitted "confidence" and the parser substituted the
+    # 0.5 sentinel — keeps an absent value distinguishable from a reported one
+    # (the prompt explicitly forbids 0.7-as-default).
+    confidence_defaulted: bool = False
     separability: float | None = None
     alternative_assessment: str | None = None
     parse_failed: bool = False

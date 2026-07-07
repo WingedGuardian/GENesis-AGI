@@ -40,6 +40,12 @@ _SOURCE_TO_COLLECTIONS: dict[str, list[str]] = {
 # doesn't pollute user-facing answers. Surplus is intentionally absent —
 # its direct-session profile blocks memory writes entirely.
 # Autonomy: audit/gate data must never surface to ego context (opacity).
+#
+# A "subsystem" here is an INTERNAL Genesis cognitive component (ego, triage,
+# reflection, autonomy). A ``module`` (``src/genesis/modules/**`` — an
+# external, pluggable capability: "hands, not brain", see modules/base.py) is
+# NEVER a subsystem: module memory writes MUST NOT set ``source_subsystem``.
+# That invariant is enforced by tests/test_memory/test_store_subsystem_coverage.py.
 _KNOWN_SUBSYSTEMS: tuple[str, ...] = ("ego", "triage", "reflection", "autonomy")
 
 # ---------------------------------------------------------------------------
@@ -50,6 +56,22 @@ _ADJACENCY_BOOST = 1.05         # 5% bump for cluster-coherent results
 _ADJACENCY_MIN_INLINKS = 2      # need ≥2 top-K peers linking to you
 _ADJACENCY_TOP_K = 20           # adjacency check on top-K after backlink boost
 _FLOOR_RATIO = 0.85             # skip boosts for results below 85% of top score
+
+
+def _validate_subsystem_names(names: list[str], param: str) -> None:
+    """Raise ``ValueError`` if any name is not a known subsystem.
+
+    Guards against a silent empty result from a typo (e.g.
+    ``only_subsystem='automation'``): an unknown name matches no rows and
+    would return nothing, hiding the caller's mistake. Loud > silent.
+    """
+    unknown = [n for n in names if n not in _KNOWN_SUBSYSTEMS]
+    if unknown:
+        msg = (
+            f"{param} contains unknown subsystem(s) {unknown!r}; "
+            f"valid subsystems are {list(_KNOWN_SUBSYSTEMS)}"
+        )
+        raise ValueError(msg)
 
 
 def _resolve_subsystem_filter(
@@ -97,6 +119,7 @@ def _resolve_subsystem_filter(
             if not names:
                 msg = "only_subsystem must be a non-empty string or list"
                 raise ValueError(msg)
+        _validate_subsystem_names(names, "only_subsystem")
         return (None, names)
 
     if include_subsystem is True:
@@ -112,6 +135,7 @@ def _resolve_subsystem_filter(
             "pass False (default) to exclude all subsystems"
         )
         raise ValueError(msg)
+    _validate_subsystem_names(include_subsystem, "include_subsystem")
     keep = set(include_subsystem)
     exclude = [s for s in _KNOWN_SUBSYSTEMS if s not in keep]
     return (exclude, None)

@@ -25,12 +25,13 @@ def make_config(**over) -> AttentionConfig:
 
 
 def make_utt(id, ts, text="", *, is_user=None, speaker_total=None, rms=0.2,
-             duration_s=5.0, frac_lt_1=0.0, n_tokens=20, mode_state="unknown") -> AmbientUtterance:
+             duration_s=5.0, frac_lt_1=0.0, n_tokens=20, mode_state="unknown",
+             has_audio=True) -> AmbientUtterance:
     # defaults = clean / high-clarity so tests isolate the trigger + threshold logic.
     return AmbientUtterance(
         id=id, ts=ts, text=text, duration_s=duration_s, is_user=is_user,
         speaker_total=speaker_total, n_tokens=n_tokens, frac_lt_1=frac_lt_1, rms=rms,
-        mode_state=mode_state, source="test",
+        mode_state=mode_state, source="test", has_audio=has_audio,
     )
 
 
@@ -105,6 +106,18 @@ def test_blip_ignored_and_not_windowed():
     assert len(state.window) == 0     # never added to the window
 
 
+def test_text_only_short_utterance_not_blipped():
+    # a text-only (has_audio=False) source has no rms — a short utt must be EVALUATED,
+    # not dropped as a near-silence physics blip (rms=0 + duration<1 blips audio rows).
+    cfg = make_config()
+    state = EngineState()
+    utt = make_utt(1, 100.0, "hey genesis look at this", rms=0.0, duration_s=0.5,
+                   n_tokens=5, has_audio=False)
+    state, ev = evaluate(utt, state, cfg)
+    assert ev is not None and ev.activation == Activation.HARD
+    assert len(state.window) == 1
+
+
 def test_new_session_on_gap_clears_window():
     cfg = make_config()  # session_gap_s = 30
     state = EngineState()
@@ -137,6 +150,12 @@ def test_cooldown_raises_threshold():
     assert e2 is None                                          # cooldown bar .7; .5 + topic_continuation .15 = .65 < .7
     state, e3 = evaluate(make_utt(3, 140.0, "q?"), state, cfg)
     assert e3 is not None and e3.activation == Activation.SOFT  # 40s > cooldown -> fires again
+
+
+def test_event_carries_source_of_trigger_utterance():
+    # device provenance must reach the event (else the store can't tell OMI from home edge)
+    ev = run([make_utt(7, 100.0, "hey genesis check this")], make_config())[0]
+    assert ev.source == "test"   # make_utt's source, threaded onto the event
 
 
 def test_event_carries_refs_not_text():

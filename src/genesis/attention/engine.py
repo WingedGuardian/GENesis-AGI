@@ -41,10 +41,12 @@ def evaluate(
 ) -> tuple[EngineState, AttentionEvent | None]:
     """One fold step. Mutates ``state`` in place and returns ``(state, event | None)``."""
     sm = config.state_modifiers
-    clarity = capture_clarity(utt.rms, utt.duration_s, utt.frac_lt_1, utt.n_tokens)
+    clarity = capture_clarity(
+        utt.rms, utt.duration_s, utt.frac_lt_1, utt.n_tokens, has_audio=utt.has_audio,
+    )
 
     # near-silence junk: ignore entirely (never pollutes windows or timing).
-    if is_blip(utt.rms, utt.duration_s, utt.n_tokens):
+    if is_blip(utt.rms, utt.duration_s, utt.n_tokens, has_audio=utt.has_audio):
         return state, None
 
     # ── sessionize (gap-based, a pure fold over ts) ──
@@ -119,5 +121,6 @@ def evaluate(
         ts=utt.ts,
         mode_state=utt.mode_state,
         clarity=round(clarity, 4),
+        source=utt.source,
     )
     return state, event

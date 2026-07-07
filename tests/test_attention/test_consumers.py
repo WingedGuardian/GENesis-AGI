@@ -86,6 +86,24 @@ async def test_firewall_no_transcript_text_persisted(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_persist_writes_source_column(tmp_path):
+    # device provenance round-trips: utterance.source -> event.source -> the source column
+    db = tmp_path / "g.db"
+    _make_db(db)
+    cfg = AttentionConfig.from_dict(default_config_dict())
+    evs = _run_events([_utt(1, 100.0, "what do you think about it?", source="omi")], cfg)
+    assert evs
+    c = ShadowStoreConsumer(db, snapshot_id="s", config_version=cfg.version)
+    for ev in evs:
+        c.add(ev)
+    await c.flush()
+    conn = sqlite3.connect(db)
+    vals = [r[0] for r in conn.execute("SELECT source FROM attention_events")]
+    conn.close()
+    assert vals and all(v == "omi" for v in vals)
+
+
+@pytest.mark.asyncio
 async def test_idempotent_reflush_same_snapshot_and_config(tmp_path):
     db = tmp_path / "g.db"
     _make_db(db)
