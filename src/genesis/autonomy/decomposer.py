@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import re
+import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -67,6 +68,49 @@ _DELIVERABLE_STEP_DESC = (
     "authenticity_target / audience / acceptance, and its '## Requirements' + "
     "'## Success Criteria' for the substance to produce."
 )
+
+
+# Shell constructs an exec-only runner cannot execute. Operators/expansions
+# are substring-matched; builtins and env prefixes are matched on the first
+# token. Interpreter prefixes (bash/sh/python/...) are pulled from the
+# runner's own blocklist (lazy import — executor package imports back into
+# this module via engine.py, so a top-level import would cycle).
+_SHELL_OPERATORS: tuple[str, ...] = (
+    "&&", "||", ";", "|", ">", "<", "$(", "`", "\n",
+)
+_SHELL_BUILTINS: frozenset[str] = frozenset({
+    "source", ".", "cd", "export", "set", "unset", "alias", "eval", "exec",
+})
+
+
+def _shell_incompatible(command: str) -> str | None:
+    """Return why *command* cannot run under the exec-only deterministic
+    runner, or None if it can.
+
+    The runner uses ``create_subprocess_exec`` + ``shlex.split`` — no shell.
+    Shell operators, builtins (``source``), ``VAR=x`` env prefixes, and
+    interpreter invocations (which the runner blocks at execution time
+    anyway) all need a CC session instead.
+    """
+    from genesis.autonomy.executor.deterministic import _INTERPRETER_PREFIXES
+
+    for op in _SHELL_OPERATORS:
+        if op in command:
+            return f"shell operator {op!r}"
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return "unparseable quoting"
+    if not tokens:
+        return "empty command"
+    head = tokens[0]
+    if head in _SHELL_BUILTINS:
+        return f"shell builtin {head!r}"
+    if "=" in head:
+        return f"env-var prefix {head!r}"
+    if head.rsplit("/", 1)[-1] in _INTERPRETER_PREFIXES:
+        return f"interpreter {head!r} (blocked by the runner)"
+    return None
 
 
 def has_deliverable_frame(plan_content: str) -> bool:
@@ -311,6 +355,23 @@ class TaskDecomposer:
                     i, step_type,
                 )
                 step_type = "code"
+
+            # The deterministic runner is exec-only (create_subprocess_exec,
+            # no shell): shell operators, builtins, env prefixes, and
+            # interpreter invocations are guaranteed to fail at runtime and
+            # burn a recovery cycle (V0 canary: 'source venv && pytest' and
+            # 'git add X && git commit' both died instantly and were rerouted
+            # to paid CC sessions). Downgrade them to 'code' upfront.
+            if step_type in _DETERMINISTIC_TYPES and command:
+                reason = _shell_incompatible(str(command))
+                if reason is not None:
+                    logger.warning(
+                        "Step %d command needs a shell (%s) — the "
+                        "deterministic runner is exec-only; falling back "
+                        "to 'code': %r",
+                        i, reason, command,
+                    )
+                    step_type = "code"
 
             complexity = str(step.get("complexity", "medium")).lower()
             if complexity not in _VALID_COMPLEXITIES:

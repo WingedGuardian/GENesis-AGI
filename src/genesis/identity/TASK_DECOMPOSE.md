@@ -59,6 +59,30 @@ no LLM reasoning.  Use ``code`` when the LLM needs to decide what to
 write or how to approach a problem.  Example: ``pytest tests/test_foo.py``
 is deterministic; "fix the failing test" is a code step.
 
+**Deterministic commands are EXEC-ONLY — there is no shell.** The runner
+executes ONE program with its arguments (``create_subprocess_exec``).
+Commands violating any of these are downgraded to ``code`` steps and lose
+their zero-cost execution:
+
+- NO shell operators: ``&&``, ``||``, ``;``, ``|``, ``>``, ``<``, ``$(...)``,
+  backticks.  One command per step — chain via separate steps with
+  ``dependencies`` instead of ``&&``.
+- NO shell builtins: ``source``, ``cd``, ``export``, ``eval``.  The venv is
+  already on PATH (``pytest``, ``ruff``, ``python`` resolve to it) — never
+  emit ``source .venv/bin/activate``.  The working directory is already set
+  by the executor — never emit ``cd``.
+- NO ``VAR=value`` env prefixes and NO interpreter invocations (``bash -c``,
+  ``python -c``, ...) — the runner blocks interpreters as an injection
+  guard.  If a step genuinely needs any of these, make it a ``code`` step.
+
+Right: ``{"type": "test", "command": "pytest tests/test_foo.py -v"}`` plus a
+separate ``{"type": "bash", "command": "ruff check src/"}`` step.
+Wrong: ``{"type": "test", "command": "source .venv/bin/activate && pytest tests/test_foo.py && ruff check src/"}``.
+
+For git commits, ``git add`` and ``git commit`` are TWO separate ``git``
+steps (``git add <specific files>`` then ``git commit -m "..."``), or fold
+the commit into the ``code`` step that produced the changes.
+
 ## Rules
 
 1. **Max 8 steps.** If the task needs more, consolidate related work.
