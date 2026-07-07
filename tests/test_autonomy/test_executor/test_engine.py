@@ -1145,3 +1145,59 @@ class TestNotifyKinds:
         assert req.category == OutreachCategory.BLOCKER
         assert req.salience_score == 0.9
         assert req.signal_type == "task_alert"
+
+
+@pytest.mark.asyncio
+async def test_notify_e2e_verbatim_telegram_and_tokenfree_voice(db):
+    """E2E across the real seam: engine._notify -> real OutreachPipeline ->
+    Telegram receives the EXACT detailed text (tokens/paths intact) while voice
+    speaks ONLY the short token-free TL;DR. The LLM drafter is never called."""
+    from unittest.mock import patch
+
+    from genesis.content.types import FormattedContent
+    from genesis.outreach.config import OutreachConfig, QuietHours
+    from genesis.outreach.governance import GovernanceGate
+    from genesis.outreach.pipeline import OutreachPipeline
+
+    cfg = OutreachConfig(
+        quiet_hours=QuietHours(start="22:00", end="07:00"),
+        channel_preferences={"default": "telegram"},
+        thresholds={"blocker": 0.0, "alert": 0.0, "surplus": 0.7, "digest": 0.0},
+        max_daily=50, surplus_daily=1, content_daily=3, notification_daily=50,
+        morning_report_time="07:00", engagement_timeout_hours=24,
+        engagement_poll_minutes=60,
+        voice_alert_ids=("task_alert", "task_complete"),
+    )
+    echo = MagicMock()
+    echo.format.side_effect = lambda text, target: FormattedContent(
+        text=text, target=target, truncated=False, original_length=len(text),
+    )
+    telegram = AsyncMock()
+    telegram.send_message.return_value = "tg-1"
+    voice = AsyncMock()
+    voice.send_message.return_value = "v-1"
+    drafter = AsyncMock()  # must NEVER be invoked for a task notification
+    pipeline = OutreachPipeline(
+        governance=GovernanceGate(cfg, db), drafter=drafter, formatter=echo,
+        channels={"telegram": telegram, "voice": voice}, db=db, config=cfg,
+        recipients={"telegram": "12345"},
+    )
+    engine = _make_engine(
+        db, AsyncMock(), AsyncMock(), AsyncMock(), outreach_pipeline=pipeline,
+    )
+    detailed = (
+        "Build parked by scope gate: bad path. "
+        "Blocked paths: src/genesis/autonomy/x.py"
+    )
+    with patch.object(pipeline, "_in_voice_hours", return_value=True):
+        await engine._notify(
+            "t-e2e-9f8a", detailed, "alert",
+            voice_text="A build was parked by the safety gate.",
+        )
+    await asyncio.sleep(0)  # let the fire-and-forget voice task record its call
+
+    drafter.draft.assert_not_called()
+    assert telegram.send_message.call_args.args[1] == detailed  # tokens intact
+    spoken = voice.send_message.call_args.args[1]
+    assert spoken == "A build was parked by the safety gate."
+    assert "src/genesis" not in spoken  # no path read aloud

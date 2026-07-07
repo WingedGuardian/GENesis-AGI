@@ -43,6 +43,14 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "content_review": 1,  # Short window — distinct content pieces may share topics
     "cli_approval": 0,  # Never dedup — every approval request must be delivered
     "ambient_health": 0,  # Never dedup — the monitor's state machine gates re-alerts/recovery
+    # Task lifecycle notifications — never dedup. Each is a distinct status
+    # event for one task (topic = "Task <id>"), and every _notify call site
+    # fires at most once per path. Without this they fell through to the 24h
+    # default and collided on (signal_type, topic, category): a "Task completed"
+    # ping was suppressed for 24h by the earlier "Proceeding" / a sibling ping.
+    "task_progress": 0,
+    "task_complete": 0,
+    "task_alert": 0,
     "ego_notification": 12,  # Ego notifications — don't repeat same topic within 12h
     "mail_reply": 1,  # Email replies — short window to allow ack + full response
     "mail_follow_up": 24,  # Follow-up emails — one per day max per topic
