@@ -1294,7 +1294,7 @@ class CCSessionExecutor:
         """
         from genesis.autonomy.executor.scope_gate import (
             ScopeGateResult,
-            evaluate_scope,
+            evaluate_raw_diff,
         )
 
         async def _git(*args: str) -> tuple[int, str]:
@@ -1329,15 +1329,17 @@ class CCSessionExecutor:
                         allowed=False, reason=f"merge-base failed: {base[:200]}",
                     )
                 else:
-                    rc, names = await _git(
-                        "diff", "--name-only", base.strip(), "HEAD",
+                    # --raw (not --name-only): exposes destination file modes
+                    # so symlink additions are visible and blockable.
+                    rc, raw = await _git(
+                        "diff", "--raw", base.strip(), "HEAD",
                     )
                     if rc != 0:
                         result = ScopeGateResult(
-                            allowed=False, reason=f"git diff failed: {names[:200]}",
+                            allowed=False, reason=f"git diff failed: {raw[:200]}",
                         )
                     else:
-                        result = evaluate_scope(names.splitlines())
+                        result = evaluate_raw_diff(raw.splitlines())
         except Exception as exc:
             logger.error(
                 "Scope gate errored for task %s — failing closed",

@@ -10,10 +10,16 @@ import pytest
 from genesis.autonomy.executor.engine import CCSessionExecutor
 from genesis.autonomy.executor.scope_gate import (
     ScopeGateResult,
+    evaluate_raw_diff,
     evaluate_scope,
 )
 from genesis.db.crud import task_states
 from genesis.db.crud.task_states import create_intake_token
+
+
+def _raw(path: str, new_mode: str = "100644") -> str:
+    """One `git diff --raw` line for *path* (added file by default)."""
+    return f":000000 {new_mode} 0000000 1111111 A\t{path}"
 
 # ---------------------------------------------------------------------------
 # Pure-function matrix
@@ -66,10 +72,30 @@ class TestEvaluateScope:
         "tests/test_autonomy/test_approval.py",          # approval surface, even tests
         "docs/journey/2026-07-07.md",
         "docs/reflections/on-building.md",
+        # Admin/cognitive-control MCP surface — whole subtree denied.
+        "src/genesis/mcp/health/settings.py",
+        "src/genesis/mcp/health/session_control.py",
+        "src/genesis/mcp/health/ego_tools.py",
+        # Case variants — fnmatch is case-sensitive on POSIX; the gate
+        # must not be (review finding, 2026-07-07).
+        "src/genesis/modules/foo/SECRETS.ENV",
+        "src/genesis/modules/foo/Prod.ENV",
+        "src/genesis/modules/foo/Settings.JSON",
+        "src/genesis/modules/foo/genesis.SERVICE",
+        "SRC/GENESIS/MODULES/foo/secrets.yaml",          # denied either way
+        # Dotenv family — *.env alone missed these (review finding).
+        "src/genesis/modules/foo/.env.local",
+        "src/genesis/modules/foo/.env.production",
+        "src/genesis/modules/foo/config.env.example",
+        "src/genesis/modules/foo/client_secret.json",
     ])
     def test_deny_overrides_inside_allowed_trees(self, path):
         result = evaluate_scope([path])
         assert not result.allowed, path
+
+    def test_new_mcp_module_outside_health_is_allowed(self):
+        # The health/ denial must not wall off the whole mcp/ tree.
+        assert evaluate_scope(["src/genesis/mcp/star_velocity_tools.py"]).allowed
 
     @pytest.mark.parametrize("path", [
         "/etc/passwd",
@@ -108,6 +134,47 @@ class TestEvaluateScope:
         assert data["allowed"] is False
         assert data["checked_paths"] == 1
         assert data["blocked_paths"]
+
+
+class TestEvaluateRawDiff:
+    def test_allowed_regular_files(self):
+        result = evaluate_raw_diff([
+            _raw("src/genesis/skills/foo/SKILL.md"),
+            _raw("tests/test_learning/test_foo.py", "100755"),
+        ])
+        assert result.allowed
+        assert result.checked_paths == 2
+
+    def test_symlink_blocked_even_in_allowed_tree(self):
+        result = evaluate_raw_diff([
+            _raw("src/genesis/modules/foo/link.py", "120000"),
+        ])
+        assert not result.allowed
+        assert "symlink" in result.reason
+        assert "link.py" in result.blocked_paths[0]
+
+    def test_symlink_plus_out_of_scope_reports_both(self):
+        result = evaluate_raw_diff([
+            _raw("src/genesis/modules/foo/link.py", "120000"),
+            _raw("src/genesis/autonomy/types.py"),
+        ])
+        assert not result.allowed
+        joined = " ".join(result.blocked_paths)
+        assert "symlink" in joined and "types.py" in joined
+
+    def test_malformed_raw_line_blocks(self):
+        # A line without the tab separator can't be trusted — it becomes an
+        # unparseable "path" that the allowlist rejects.
+        result = evaluate_raw_diff([":100644 100644 abc def M"])
+        assert not result.allowed
+
+    def test_non_colon_line_treated_as_path(self):
+        # Unexpected shapes are judged as paths, never silently skipped.
+        assert not evaluate_raw_diff(["some noise"]).allowed
+        assert evaluate_raw_diff(["docs/reference/x.md"]).allowed
+
+    def test_empty_raw_diff_blocked(self):
+        assert not evaluate_raw_diff([]).allowed
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +243,7 @@ class TestDeliverScopeGate:
         calls = _subprocess_script(monkeypatch, [
             _FakeProc(0, b""),                                  # status --porcelain
             _FakeProc(0, b"abc123\n"),                          # merge-base
-            _FakeProc(0, b"src/genesis/skills/foo/SKILL.md\n"),  # diff --name-only
+            _FakeProc(0, _raw("src/genesis/skills/foo/SKILL.md").encode() + b"\n"),
             _FakeProc(0),                                        # push
         ])
 
@@ -198,7 +265,7 @@ class TestDeliverScopeGate:
         calls = _subprocess_script(monkeypatch, [
             _FakeProc(0, b""),
             _FakeProc(0, b"abc123\n"),
-            _FakeProc(0, b"src/genesis/autonomy/approval_gate.py\n"),
+            _FakeProc(0, _raw("src/genesis/autonomy/approval_gate.py").encode() + b"\n"),
         ])
 
         await engine._deliver("t-sg1", "d", _CODE_STEPS, [])
@@ -256,7 +323,7 @@ class TestDeliverScopeGate:
         _subprocess_script(monkeypatch, [
             _FakeProc(0, b""),
             _FakeProc(0, b"abc\n"),
-            _FakeProc(0, b"scripts/update.sh\n"),
+            _FakeProc(0, _raw("scripts/update.sh").encode() + b"\n"),
         ])
 
         await engine._deliver("t-sg1", "d", _CODE_STEPS, [])

@@ -43,19 +43,29 @@ ALLOWED_TREES: tuple[str, ...] = (
     "docs/",
 )
 
-# Documentation subtrees that remain human territory (narrative/history);
-# builds document capabilities under docs/reference, docs/architecture, etc.
-DENIED_DOC_TREES: tuple[str, ...] = (
+# Subtrees denied even though a broader allowed tree contains them.
+# docs narrative/history dirs are human territory; src/genesis/mcp/health/
+# is the ADMIN/cognitive-control tool surface (settings_update's readonly
+# registry, session_control, ego tools, follow-up tools, ...) — a build may
+# add new MCP modules under src/genesis/mcp/, but never modify the admin
+# server's toolset. Widening is a human PR on Stage-1 evidence.
+DENIED_SUBTREES: tuple[str, ...] = (
     "docs/journey/",
     "docs/reflections/",
     "docs/case-studies/",
     "docs/superpowers/",
+    "src/genesis/mcp/health/",
 )
 
 # Basename glob patterns denied EVERYWHERE, even inside allowed trees.
+# Matched against the LOWERCASED basename — fnmatch is case-sensitive on
+# POSIX, and `SECRETS.ENV` must not slip past a lowercase-only pattern.
 DENIED_BASENAME_GLOBS: tuple[str, ...] = (
     "*.env",
+    "*.env.*",     # .env.local / .env.production / config.env.example
+    ".env*",
     "secrets*",
+    "*secret*",
     "*.service",
     "*.timer",
     "settings*.json",
@@ -98,7 +108,9 @@ def _deny_reason(path: str) -> str | None:
         return "malformed path"
     if path in DENIED_EXACT_PATHS:
         return "task submission surface"
-    basename = path.rsplit("/", 1)[-1]
+    # Case-insensitive throughout: fnmatch does NOT fold case on POSIX, and
+    # `SECRETS.ENV` / `Settings.JSON` must hit the same walls as lowercase.
+    basename = path.rsplit("/", 1)[-1].lower()
     for pattern in DENIED_BASENAME_GLOBS:
         if fnmatch(basename, pattern):
             return f"denied filename pattern {pattern!r}"
@@ -106,9 +118,9 @@ def _deny_reason(path: str) -> str | None:
     for token in DENIED_PATH_SUBSTRINGS:
         if token in lowered:
             return f"denied path token {token!r}"
-    for tree in DENIED_DOC_TREES:
-        if path.startswith(tree):
-            return f"denied docs subtree {tree!r}"
+    for tree in DENIED_SUBTREES:
+        if lowered.startswith(tree):
+            return f"denied subtree {tree!r}"
     return None
 
 
@@ -150,3 +162,47 @@ def evaluate_scope(changed_paths: list[str]) -> ScopeGateResult:
         reason="all changed paths within allowed capability trees",
         checked_paths=len(paths),
     )
+
+
+_SYMLINK_MODE = "120000"
+
+
+def evaluate_raw_diff(raw_lines: list[str]) -> ScopeGateResult:
+    """Judge ``git diff --raw <base> HEAD`` output.
+
+    Path-only gating can't see FILE CONTENT, so a symlink added inside an
+    allowed tree could point anywhere on the host. ``--raw`` exposes the
+    destination file mode; any entry whose new mode is 120000 (symlink) is
+    blocked outright, then the remaining paths go through the normal
+    allowlist. Unparseable raw lines are treated as paths (which blocks
+    them) — never silently skipped.
+    """
+    paths: list[str] = []
+    symlinks: list[str] = []
+    for raw in raw_lines:
+        line = raw.rstrip("\n")
+        if not line.strip():
+            continue
+        if not line.startswith(":"):
+            paths.append(line)  # unexpected shape — let the allowlist judge it
+            continue
+        meta, sep, path = line.partition("\t")
+        if not sep or not path.strip():
+            paths.append(line)  # malformed — blocks as an unparseable path
+            continue
+        fields = meta.split()
+        new_mode = fields[1] if len(fields) >= 2 else ""
+        paths.append(path)
+        if new_mode == _SYMLINK_MODE:
+            symlinks.append(path)
+
+    result = evaluate_scope(paths)
+    if symlinks:
+        blocked = [f"{p} (symlink — content-level escape)" for p in symlinks]
+        return ScopeGateResult(
+            allowed=False,
+            reason=f"{len(symlinks)} symlink(s) in diff — blocked regardless of path",
+            blocked_paths=blocked + result.blocked_paths,
+            checked_paths=result.checked_paths,
+        )
+    return result
