@@ -2692,7 +2692,7 @@
           }
         },
 
-        async resolveApproval(requestId, decision) {
+        async resolveApproval(requestId, decision, outreachMsgId = null) {
           const current = this.approvalActions[requestId] || {};
           this.approvalActions = {
             ...this.approvalActions,
@@ -2711,6 +2711,25 @@
                 [requestId]: { saving: false, error: null },
               };
               this.finishFetch("approvals");
+              // Post-resolve follow-ups must not flip the error state — the
+              // approval itself already resolved successfully.
+              try {
+                if (outreachMsgId) {
+                  const outcome = decision === "approved" ? "useful" : "not_useful";
+                  await fetchApi(`/api/genesis/outreach/${encodeURIComponent(outreachMsgId)}/engage`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ outcome, response: decision === "approved" ? "approve" : "deny" }),
+                  });
+                }
+                await Promise.all([
+                  this.fetchOutreachMessages(),
+                  this.fetchApprovals(),
+                  this.fetchComms(),
+                ]);
+              } catch (e) {
+                console.error("post-resolve refresh failed", e);
+              }
             } else {
               const error = await this.readApiError(resp, "Approval update failed");
               this.approvalActions = {
@@ -3835,28 +3854,6 @@
             if (a.description && msg.topic && a.description.includes(msg.topic.slice(0, 30))) return a;
           }
           return null;
-        },
-
-        async resolveApproval(approvalId, decision, outreachMsgId) {
-          try {
-            await fetchApi("/api/genesis/approvals/" + approvalId + "/resolve", {
-              method: "POST", headers: {"Content-Type": "application/json"},
-              body: JSON.stringify({decision})
-            });
-            if (outreachMsgId) {
-              const outcome = decision === 'approved' ? 'useful' : 'not_useful';
-              await fetchApi("/api/genesis/outreach/" + outreachMsgId + "/engage", {
-                method: "POST", headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({outcome, response: decision === 'approved' ? 'approve' : 'deny'})
-              });
-            }
-            // Refresh all approval-related stores for immediate UI update
-            await Promise.all([
-              this.fetchOutreachMessages(),
-              this.fetchApprovals(),
-              this.fetchComms(),
-            ]);
-          } catch (e) { console.error("resolve failed", e); }
         },
 
         async approveAllPending() {
