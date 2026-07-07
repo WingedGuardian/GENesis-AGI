@@ -266,6 +266,100 @@ confidence: low
 """
 
 
+BUILD_VERDICT = """\
+## 1. Warpchart — star-velocity tracker
+
+**Classification:** Genesis-relevant (capability-build directive)
+
+### Recommendation
+
+```yaml
+action: BUILD
+next_step: "Build a star-velocity module fed by gather_stars history"
+effort: Small
+scope: V4
+confidence: high
+architecture_impact: extends
+verdict: build
+verdict_reason: "Clear capability gap, fits module tree"
+build_spec:
+  requirements:
+    - "Compute +N/day velocity from existing star history"
+  steps:
+    - type: code
+      description: "Add velocity computation"
+    - type: verification
+      description: "Verify against recorded history"
+  success_criteria:
+    - "Velocity matches hand-computed value for fixture data"
+  risks:
+    - "Sparse history yields noisy velocity - require 3+ samples"
+  intended_paths:
+    - "src/genesis/modules/star_velocity/"
+```
+
+### Lens 1
+
+Analysis.
+"""
+
+DONT_BUILD_VERDICT = """\
+## 1. Proxmox VM provisioning MCP
+
+**Classification:** Genesis-relevant (capability-build directive)
+
+### Recommendation
+
+```yaml
+action: BUILD
+next_step: "Report the veto"
+effort: Trivial
+scope: Never
+confidence: high
+architecture_impact: irrelevant
+verdict: dont_build
+verdict_reason: "No Proxmox cluster exists for Genesis to manage"
+```
+"""
+
+NEEDS_DISCUSSION_VERDICT = """\
+## 1. Hypothetical capability
+
+**Classification:** Genesis-relevant (capability-build directive)
+
+### Recommendation
+
+```yaml
+action: BUILD
+next_step: "Discuss shape before building"
+effort: Small
+scope: V4
+confidence: low
+architecture_impact: challenges
+verdict: needs_discussion
+verdict_reason: "Ambiguous interface - needs a design decision before the executor can proceed"
+```
+"""
+
+BAD_VERDICT_VALUE = """\
+## 1. Something
+
+**Classification:** Genesis-relevant
+
+### Recommendation
+
+```yaml
+action: BUILD
+next_step: "n"
+effort: Small
+scope: V4
+confidence: low
+verdict: maybe_later
+build_spec: "not a mapping"
+```
+"""
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -300,6 +394,51 @@ class TestParseRecommendations:
         assert r.tool_momentum is None
         assert r.tool_activity is None
         assert r.tool_maturity is None
+
+    def test_build_verdict_parses_full_spec(self):
+        recs = parse_recommendations(BUILD_VERDICT)
+        assert len(recs) == 1
+        r = recs[0]
+        assert r.action == "BUILD"
+        assert r.verdict == "build"
+        assert r.verdict_reason == "Clear capability gap, fits module tree"
+        assert isinstance(r.build_spec, dict)
+        assert r.build_spec["requirements"] == [
+            "Compute +N/day velocity from existing star history"
+        ]
+        assert r.build_spec["steps"][0]["type"] == "code"
+        assert r.build_spec["intended_paths"] == [
+            "src/genesis/modules/star_velocity/"
+        ]
+        # BUILD never produces a follow-up — the build lane owns it.
+        assert r.is_actionable is False
+
+    def test_dont_build_verdict_without_spec(self):
+        r = parse_recommendations(DONT_BUILD_VERDICT)[0]
+        assert r.verdict == "dont_build"
+        assert r.verdict_reason == "No Proxmox cluster exists for Genesis to manage"
+        assert r.build_spec is None
+        assert r.is_actionable is False
+
+    def test_needs_discussion_verdict_parses(self):
+        r = parse_recommendations(NEEDS_DISCUSSION_VERDICT)[0]
+        assert r.verdict == "needs_discussion"
+        assert r.verdict_reason is not None
+        assert r.build_spec is None
+        assert r.is_actionable is False  # BUILD is in _SKIP_ACTIONS
+
+    def test_invalid_verdict_and_non_mapping_spec_degrade_to_none(self):
+        # Shadow-safe: bad LLM output degrades to "no verdict", never invents one.
+        r = parse_recommendations(BAD_VERDICT_VALUE)[0]
+        assert r.verdict is None
+        assert r.build_spec is None
+
+    def test_verdict_fields_default_none_for_ordinary_evals(self):
+        # Backward compatible: every pre-existing eval has no verdict fields.
+        r = parse_recommendations(GENESIS_SINGLE)[0]
+        assert r.verdict is None
+        assert r.verdict_reason is None
+        assert r.build_spec is None
 
     def test_user_single(self):
         recs = parse_recommendations(USER_SINGLE)

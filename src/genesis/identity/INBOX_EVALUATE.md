@@ -228,6 +228,38 @@ all** — e.g., a note containing only the bracket itself with nothing
 else, which is pure meta-context and should be classified as
 **Acknowledged** (no response file) instead.
 
+### Capability-build directives (a Rule 1 sub-case)
+
+Some Genesis-directed brackets go further than classification: they express
+BUILD INTENT — e.g. "capabilities/tools I'd like Genesis to be able to use",
+"if it's in here, I believe we need it", "default to getting it done unless
+there's a technical reason we shouldn't", or close variants. When the bracket
+expresses build intent:
+
+1. Every item is Genesis-relevant per Rule 1, evaluated with the Genesis
+   framework as usual.
+2. Each item ADDITIONALLY receives a **build verdict** in its Recommendation
+   YAML (`verdict`, `verdict_reason`, and — for `verdict: build` — a
+   `build_spec`). See Step 5 for the exact format.
+3. The verdict carries a **strong prior toward `build`**: the user has
+   already declared they believe the capability is needed. You are NOT
+   running a second from-scratch evaluation of whether it's worthwhile.
+   `dont_build` is a VETO, and a veto requires articulable technical
+   grounds stated in `verdict_reason` — one of: Genesis already has this
+   capability (cite the component), it doesn't fit the architecture,
+   it is technically unsound, or it is brain-not-body scope (it modifies
+   Genesis's cognitive core — memory, reflection, triage, routing, ego —
+   which this lane never builds autonomously; the veto report tells the
+   user to raise it as an architecture conversation instead). Do NOT use
+   `needs_discussion` for brain-scope items — that verdict is for
+   genuinely unpinnable BODY builds, not for scope refusals.
+   "Not obviously valuable" is not a veto ground under a build directive.
+4. Use `needs_discussion` when you genuinely cannot pin the right shape —
+   an unmade design decision, missing access, or ambiguity about what the
+   user actually wants built. Say precisely what needs deciding.
+5. Emit the verdict fields ONLY under a build-intent bracket. Ordinary
+   Genesis notepads and unbracketed files never carry them.
+
 ### Classification Categories
 
 With Rule 1 resolved (or no bracket present), classification is judgment,
@@ -522,6 +554,48 @@ tool_momentum: high        # high | medium | low — growth/adoption trend
 tool_activity: high        # high | medium | low — maintenance/recency
 tool_maturity: medium      # high | medium | low — proven/stable/age
 ```
+
+For items under a **capability-build directive** (Step 2, "Capability-build
+directives"), use `action: BUILD` and extend the Genesis block with the
+verdict fields:
+
+```yaml
+action: BUILD              # capability-build items ONLY (never elsewhere)
+next_step: "One concrete sentence — what the build produces"
+effort: Small              # Trivial | Small | Medium | Large
+scope: V4                  # V4 | V5 | Future | Never
+confidence: high           # low | medium | high
+architecture_impact: extends
+verdict: build             # build | dont_build | needs_discussion
+verdict_reason: "Why this verdict — MANDATORY for dont_build (the veto grounds)"
+build_spec:                # REQUIRED for verdict: build — omit otherwise
+  requirements:            # specific, verifiable requirements
+    - "..."
+  steps:                   # executor-perspective steps, each typed
+    - type: code           # code | test | verification
+      description: "..."
+  success_criteria:        # testable by the executor in a headless container
+    - "..."
+  risks:                   # specific failure modes, not vague worries
+    - "..."
+  intended_paths:          # repo paths the build is expected to touch
+    - "src/genesis/skills/..."
+```
+
+**Capability-build rules:**
+- Strong prior toward `verdict: build` — the user pre-declared need by
+  dropping the item. `dont_build` is a veto and MUST argue articulable
+  technical grounds in `verdict_reason` (existing capability / architecture
+  misfit / technically unsound / brain-not-body scope).
+- `verdict: build` with an empty or missing `build_spec` (or any empty
+  required list inside it) is malformed — the build lane will park it as
+  needs_discussion. Fill every list or change the verdict.
+- `intended_paths` should stay within capability trees (modules, skills,
+  MCP tools, tests, docs). A build that needs core-subsystem changes is
+  `needs_discussion`, not `build`.
+- BUILD items never create follow-ups — the build lane owns their lifecycle.
+- `dont_build` and `needs_discussion` items still get the full evaluation
+  sections; the verdict fields ride on top, they don't replace analysis.
 
 For **User-relevant** items, use this YAML block:
 
