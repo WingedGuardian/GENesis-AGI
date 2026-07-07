@@ -22,6 +22,7 @@ from genesis.channels.telegram._handler_helpers import (
 )
 from genesis.channels.telegram.transport.streaming import DraftStreamer, generate_draft_id
 from genesis.channels.telegram.transport.update_dedupe import message_key
+from genesis.util.approval_words import scoped_decision
 
 if TYPE_CHECKING:
     from genesis.channels.telegram._handler_context import HandlerContext
@@ -738,8 +739,6 @@ def _bare_decision(text: str) -> str | None:
     Approvals topic is a decision-scoped surface; never run this over
     general conversation.
     """
-    from genesis.util.approval_words import scoped_decision
-
     return scoped_decision(text)
 
 
