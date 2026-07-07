@@ -144,7 +144,10 @@ async def test_timeout_no_mutation(tmp_path):
 
 # ── approve happy path ─────────────────────────────────────────────────────
 async def test_approve_executes_ledgers_and_expands(tmp_path, monkeypatch):
-    async def _fake_expand(config):
+    captured = {}
+
+    async def _fake_expand(config, add_gib=None):
+        captured["add_gib"] = add_gib
         return {"ok": True, "vg_free_bytes": 32 * _GIB}
     monkeypatch.setattr(flow_mod, "expand_storage", _fake_expand)
 
@@ -160,6 +163,7 @@ async def test_approve_executes_ledgers_and_expands(tmp_path, monkeypatch):
     assert adapter.grow_disk_calls == 1  # exactly once
     assert led.actions_in_window() == 1
     assert res["expand"]["ok"] is True
+    assert captured["add_gib"] == 32  # absorb bounded to the approved grow amount
     assert "critical" not in _sev(disp.alerts)
 
 

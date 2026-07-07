@@ -70,7 +70,8 @@ snapshots:
   # safety net). Empty string disables. NOT applied to manual snapshots.
   expiry: "2w"
 
-# Host storage-pool monitoring (LVM-thin data% + metadata% + VG headroom).
+# Host storage-pool monitoring (LVM-thin data% + metadata% + VG headroom;
+# non-LVM backends like btrfs tier on the backend-agnostic pool-used% fallback).
 # Tiered guardian alerts with hysteresis; metadata alerts earlier than data
 # (metadata-full forces an offline thin_check/repair). This is the warning that
 # was missing when the thin pool silently filled to 100%.
@@ -82,6 +83,11 @@ storage_pool:
   metadata_warn_pct: 60
   metadata_high_pct: 70
   metadata_crit_pct: 80
+  # Fallback tiers for non-LVM pools (btrfs/dir): incus space.used/total.
+  # Only consulted when the LVM data/metadata percents are unavailable.
+  pool_used_warn_pct: 75
+  pool_used_high_pct: 85
+  pool_used_crit_pct: 92
   realert_hours: 6
 
 recovery:
@@ -106,7 +112,7 @@ provisioning:
   verify_tls: true        # self-signed PVE → set false per-install (documented)
   node: ""                # PVE node name, e.g. "pve"
   vmid: 0                 # this container's host VM id, e.g. 300
-  target_disk: scsi1      # the disk backing the LVM-thin PV
+  target_disk: scsi1      # the disk backing the pool's PV (prefer a whole-disk PV)
   storage: local-lvm      # PVE storage the disk lives on
   max_disk_step_gib: 32       # hard cap per single disk grow
   max_memory_step_mib: 4096   # hard cap per single memory grow

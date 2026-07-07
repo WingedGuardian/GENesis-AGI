@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.config import GuardianConfig
-from genesis.guardian.pool import measure_storage_pool
+from genesis.guardian.pool import measure_storage_pool, pool_mount_path
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ class SnapshotManager:
             logger.warning("Failed to detect storage pool — assuming full")
             return 100.0
 
-        pool_path = f"/var/lib/incus/storage-pools/{pool_name.strip()}"
+        pool_path = pool_mount_path(pool_name.strip())
         rc, stdout, stderr = await _run_subprocess(
             "df", "--output=pcent", pool_path,
             timeout=10.0,
@@ -98,7 +98,7 @@ class SnapshotManager:
         if rc != 0 or not pool_name.strip():
             return None
 
-        pool_path = f"/var/lib/incus/storage-pools/{pool_name.strip()}"
+        pool_path = pool_mount_path(pool_name.strip())
         rc, stdout, stderr = await _run_subprocess(
             "df", "--output=size,avail", "--block-size=1", pool_path,
             timeout=10.0,

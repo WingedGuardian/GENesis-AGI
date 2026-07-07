@@ -220,7 +220,9 @@ async def execute_provisioning_action(
 
     expand_result = None
     if request.kind == "disk" and request.absorb_after and result.ok and result.verified:
-        expand_result = await expand_storage(config)
+        # Bound the absorb to exactly the approved grow amount (btrfs substrate
+        # extends its backing LV by this; LVM-thin ignores it — pvresize only).
+        expand_result = await expand_storage(config, add_gib=request.add_gib or None)
 
     # 3. Result alert.
     if result.ok and result.verified:
@@ -228,8 +230,12 @@ async def execute_provisioning_action(
         if result.requires_reboot:
             extra = "\n⚠️ Takes effect after a VM reboot (schedule a downtime window)."
         if expand_result is not None:
+            if expand_result.get("driver") == "btrfs":
+                detail = f"fs_size={expand_result.get('fs_size_bytes')}"
+            else:
+                detail = f"vg_free={expand_result.get('vg_free_bytes')}"
             extra += (f"\nstorage-expand: {'ok' if expand_result['ok'] else 'FAILED'} "
-                      f"(vg_free={expand_result.get('vg_free_bytes')})")
+                      f"({detail})")
         await dispatcher.send(Alert(
             severity=AlertSeverity.INFO,
             title=f"Provisioning done: {result.requested}",
