@@ -237,6 +237,26 @@ jobs:
       - name: External-I/O egress guard
         run: python scripts/check_external_io.py
 
+  subsystem-map-check:
+    # Judgment-layer map guard: docs/architecture/CURRENT.md must claim every
+    # top-level src/genesis module (an unmapped or vanished module = the map
+    # lies to audits → error). Stale 'verified:' stamps only warn. The stamp
+    # check counts commits since each entry's stamp, so this job alone checks
+    # out full history (fetch-depth: 0); the checker degrades gracefully on
+    # shallow clones. See scripts/check_subsystem_map.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install checker dependency
+        run: pip install pyyaml
+      - name: Subsystem-map drift guard
+        run: python scripts/check_subsystem_map.py
+
   cc-node-lockstep:
     # Enforce the CC↔Node pin lockstep: NODE_MAJOR in scripts/lib/cc_version.sh
     # must satisfy the pinned Claude Code's engines.node floor. Prevents the

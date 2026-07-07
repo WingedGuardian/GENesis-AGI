@@ -236,8 +236,9 @@ stack**, and a negative from a positive search is not evidence of absence:
 A 2026-06-30 competitive audit wrongly claimed Genesis lacked CRAG,
 scope-before-rank, and a live reranker — all three had already shipped. Full
 protocol: procedure `codebase_audit` / CC memory `audit-enumerate-not-spotcheck`.
-For "does Genesis already have X", consult the capability map
-(`references/codebase-map.md`) FIRST.
+For "does Genesis already have X", consult the subsystem map
+(`docs/architecture/CURRENT.md`, via the `subsystem-map` skill) FIRST;
+`references/codebase-map.md` stays the package-level structural companion.
 
 ## Adaptive Review Protocol
 
@@ -346,6 +347,7 @@ references on every trigger.
 
 | When you need... | Read... |
 |---|---|
+| Subsystem purpose/maturity/do-not-touch (judgment layer) | `docs/architecture/CURRENT.md` |
 | Codebase structure, package map, gotchas, debugging | `references/codebase-map.md` |
 | Package/module/symbol navigation (progressive drill) | `codebase_navigate` MCP tool (L0→L1→L2) |
 | venv, DB paths, Qdrant, Ollama, network, commands | `references/environment.md` |
@@ -360,6 +362,9 @@ references on every trigger.
 **Freshness rule:** On first read of `codebase-map.md` in a session,
 verify structural claims against current code. If a package status or
 gotcha has changed, flag to user before acting on stale assumptions.
+`docs/architecture/CURRENT.md` carries per-entry `verified:` stamps
+enforced by `scripts/check_subsystem_map.py` (CI `subsystem-map-check`) —
+after changing a subsystem's capabilities, update its entry and stamp.
 
 ## Public Repo & Release Workflow
 

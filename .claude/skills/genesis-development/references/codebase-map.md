@@ -3,6 +3,11 @@
 Quick reference for how Genesis is structurally organized, where to find
 things, and what trips developers up repeatedly.
 
+> For the judgment layer — what each subsystem is FOR, its easy-to-forget
+> mechanisms, maturity, and do-not-touch edges — read
+> `docs/architecture/CURRENT.md` (stamped + CI-enforced via
+> `scripts/check_subsystem_map.py`). This file stays package-level.
+
 ## Package Map (`src/genesis/`)
 
 | Package | Purpose | Status |
