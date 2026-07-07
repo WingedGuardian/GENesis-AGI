@@ -9,6 +9,7 @@ import pytest
 
 from genesis.guardian.check import (
     _build_dispatcher,
+    _build_provisioning_adapter,
     _check_storage_pool_and_alert,
     _execute_recovery_with_approval,
     _handle_cc_resolved,
@@ -203,6 +204,103 @@ class TestStoragePoolAlert:
         with patch("genesis.guardian.check.measure_storage_pool", called):
             await _check_storage_pool_and_alert(config, dispatcher)
         called.assert_not_called()
+
+
+def _prov_cfg(config: GuardianConfig) -> GuardianConfig:
+    config.provisioning.enabled = True
+    config.provisioning.api_host = "10.0.0.9"
+    config.provisioning.node = "pve"
+    config.provisioning.vmid = 100
+    return config
+
+
+class TestBuildProvisioningAdapter:
+
+    def test_disabled_returns_none(self, config: GuardianConfig) -> None:
+        assert _build_provisioning_adapter(config) is None
+
+    def test_enabled_but_unconfigured_returns_none(self, config: GuardianConfig) -> None:
+        config.provisioning.enabled = True  # api_host/node/vmid still unset
+        assert _build_provisioning_adapter(config) is None
+
+    def test_env_tokens_build_adapter(
+        self, config: GuardianConfig, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _prov_cfg(config)
+        monkeypatch.setenv("PROXMOX_AUDIT_TOKEN", "aud-tok")
+        monkeypatch.setenv("PROXMOX_PROVISION_TOKEN", "prov-tok")
+        adapter = _build_provisioning_adapter(config)
+        assert adapter is not None
+        assert adapter._audit == "aud-tok"
+        assert adapter._provision == "prov-tok"
+
+    def test_audit_only_is_readonly_adapter(
+        self, config: GuardianConfig, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _prov_cfg(config)
+        monkeypatch.setenv("PROXMOX_AUDIT_TOKEN", "aud-tok")
+        monkeypatch.delenv("PROXMOX_PROVISION_TOKEN", raising=False)
+        # Isolate from a real host secrets.env that might carry a provision token.
+        with patch("genesis.guardian.check.load_secrets", return_value={}):
+            adapter = _build_provisioning_adapter(config)
+        assert adapter is not None
+        assert adapter._audit == "aud-tok"
+        assert adapter._provision == ""
+
+    def test_no_tokens_anywhere_returns_none(
+        self, config: GuardianConfig, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _prov_cfg(config)
+        monkeypatch.delenv("PROXMOX_AUDIT_TOKEN", raising=False)
+        monkeypatch.delenv("PROXMOX_PROVISION_TOKEN", raising=False)
+        with patch("genesis.guardian.check.load_secrets", return_value={}):
+            assert _build_provisioning_adapter(config) is None
+
+
+class TestProvisioningProposeHook:
+    """The autonomous propose only fires on a CRITICAL pool AND Genesis down."""
+
+    @pytest.mark.asyncio
+    async def test_crit_and_genesis_down_proposes(self, config: GuardianConfig) -> None:
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock(return_value=True)
+        status = StoragePoolStatus(detected=True, data_pct=95.0)
+        with (
+            patch("genesis.guardian.check.measure_storage_pool",
+                  AsyncMock(return_value=status)),
+            patch("genesis.guardian.check._maybe_propose_provisioning",
+                  AsyncMock()) as propose,
+        ):
+            await _check_storage_pool_and_alert(config, dispatcher, genesis_down=True)
+        propose.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_crit_but_genesis_up_does_not_propose(self, config: GuardianConfig) -> None:
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock(return_value=True)
+        status = StoragePoolStatus(detected=True, data_pct=95.0)
+        with (
+            patch("genesis.guardian.check.measure_storage_pool",
+                  AsyncMock(return_value=status)),
+            patch("genesis.guardian.check._maybe_propose_provisioning",
+                  AsyncMock()) as propose,
+        ):
+            await _check_storage_pool_and_alert(config, dispatcher, genesis_down=False)
+        propose.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_warn_tier_never_proposes_even_if_down(self, config: GuardianConfig) -> None:
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock(return_value=True)
+        status = StoragePoolStatus(detected=True, data_pct=80.0)  # warn, not crit
+        with (
+            patch("genesis.guardian.check.measure_storage_pool",
+                  AsyncMock(return_value=status)),
+            patch("genesis.guardian.check._maybe_propose_provisioning",
+                  AsyncMock()) as propose,
+        ):
+            await _check_storage_pool_and_alert(config, dispatcher, genesis_down=True)
+        propose.assert_not_called()
 
 
 class TestRunCheck:

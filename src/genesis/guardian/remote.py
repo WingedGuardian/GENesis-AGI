@@ -10,7 +10,8 @@ enforces this restriction, not our code.
 
 Gateway allowlist: restart-timer, pause, resume, status, reset-state, version,
 update, sync-gateway, redeploy, update-cc, update-node, test-approval,
-disk-status, reharden-key, ping.
+disk-status, reharden-key, ping, provision-status, provision-grow-disk,
+provision-grow-memory, storage-expand.
 """
 
 from __future__ import annotations
@@ -18,9 +19,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Client-side validation (defense in depth — the gateway re-validates too).
+_DISK_RE = re.compile(r"(scsi|virtio|sata)[0-9]{1,2}")
+
+# Per-verb SSH wait timeouts. The grow/expand verbs run long host-side (a disk
+# grow + LVM absorb), so the client waits slightly LONGER than the gateway's own
+# `timeout N` so the gateway's timeout fires first with a clean JSON error
+# rather than the client killing the connection mid-op.
+_STATUS_TIMEOUT = 70.0       # gateway: timeout 60
+_GROW_DISK_TIMEOUT = 660.0   # gateway: timeout 600 (PVE resize + storage-expand)
+_GROW_MEM_TIMEOUT = 180.0    # gateway: timeout 120 (config PUT + pending check)
+_EXPAND_TIMEOUT = 660.0      # gateway: timeout 600 (pvresize + autoextend profile)
 
 
 class GuardianRemote:
@@ -45,12 +59,20 @@ class GuardianRemote:
         self._key_path = str(Path(key_path).expanduser())
         self._timeout = timeout
 
-    async def _ssh_command(self, command: str) -> tuple[bool, str]:
+    async def _ssh_command(
+        self, command: str, timeout: float | None = None,
+    ) -> tuple[bool, str]:
         """Run a command via SSH to the guardian gateway.
 
         Returns (success, raw_stdout). The gateway returns JSON for all
         operations; failures return JSON on stderr with exit code 1.
+
+        ``timeout`` overrides the instance default for verbs that legitimately
+        run long (a disk grow + storage-expand can take minutes host-side).
+        The ConnectTimeout stays pinned to the short instance default — only
+        the post-connect wait is extended.
         """
+        wait_timeout = timeout if timeout is not None else self._timeout
         cmd = [
             "ssh",
             "-i", self._key_path,
@@ -75,7 +97,7 @@ class GuardianRemote:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=self._timeout + 5,
+                proc.communicate(), timeout=wait_timeout + 5,
             )
             output = stdout.decode().strip() or stderr.decode().strip()
             return proc.returncode == 0, output
@@ -88,7 +110,7 @@ class GuardianRemote:
                 pass
             logger.warning(
                 "SSH to %s@%s timed out after %.0fs",
-                self._host_user, self._host_ip, self._timeout,
+                self._host_user, self._host_ip, wait_timeout,
             )
             return False, "timeout"
         except OSError as exc:
@@ -229,3 +251,52 @@ class GuardianRemote:
                 "switch will restore the previous key", confirm_out[:200],
             )
         return result
+
+    # ── provisioning executors (EXECUTE-ONLY — approval is the caller's job) ──
+    # These invoke the host execute-core (fresh re-check + one attempt +
+    # ledger) with NO Telegram gate. The container obtains APPROVE via its own
+    # bot BEFORE calling these (see provisioning.container.coordinate_grow_*).
+
+    @staticmethod
+    def _as_json(ok: bool, output: str, action: str) -> dict:
+        if not ok:
+            return {"ok": False, "action": action, "error": output[:300]}
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError:
+            logger.warning("Guardian %s returned non-JSON: %s", action, output[:200])
+            return {"ok": False, "action": action,
+                    "error": "non-JSON response", "raw": output[:300]}
+
+    async def provision_status(self) -> dict:
+        """Read-only host capacity (audit token). No approval, no mutation."""
+        ok, out = await self._ssh_command("provision-status", timeout=_STATUS_TIMEOUT)
+        return self._as_json(ok, out, "provision-status")
+
+    async def request_grow_disk(self, disk: str, add_gib: int) -> dict:
+        """EXECUTE a pre-approved VM disk grow + absorb into the thin pool."""
+        if not _DISK_RE.fullmatch(disk):
+            return {"ok": False, "action": "provision-grow-disk",
+                    "error": f"invalid disk {disk!r}"}
+        if not 1 <= add_gib <= 999:
+            return {"ok": False, "action": "provision-grow-disk",
+                    "error": f"invalid GiB {add_gib} (1-999)"}
+        ok, out = await self._ssh_command(
+            f"provision-grow-disk {disk} {add_gib}", timeout=_GROW_DISK_TIMEOUT,
+        )
+        return self._as_json(ok, out, "provision-grow-disk")
+
+    async def request_grow_memory(self, new_mib: int) -> dict:
+        """EXECUTE a pre-approved VM memory grow (requires a later VM reboot)."""
+        if not 100 <= new_mib <= 999999:
+            return {"ok": False, "action": "provision-grow-memory",
+                    "error": f"invalid MiB {new_mib} (100-999999)"}
+        ok, out = await self._ssh_command(
+            f"provision-grow-memory {new_mib}", timeout=_GROW_MEM_TIMEOUT,
+        )
+        return self._as_json(ok, out, "provision-grow-memory")
+
+    async def storage_expand(self) -> dict:
+        """Absorb an already-grown virtual disk into the LVM-thin pool."""
+        ok, out = await self._ssh_command("storage-expand", timeout=_EXPAND_TIMEOUT)
+        return self._as_json(ok, out, "storage-expand")

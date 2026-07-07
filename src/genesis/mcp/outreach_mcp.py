@@ -364,6 +364,58 @@ async def outreach_send_and_wait(
 
 
 @mcp.tool()
+async def provision_grow(
+    kind: str = "disk",
+    disk: str = "scsi1",
+    gib: int = 0,
+    mib: int = 0,
+    timeout_seconds: int = 1800,
+) -> dict:
+    """Grow this VM's disk or RAM from the hypervisor — approval-gated.
+
+    The container-owned approval path (used while Genesis is up): sends an
+    APPROVE/DENY request to your own channel and, only on APPROVE, executes
+    host-side via the guardian gateway (which re-checks the due-diligence gate).
+    Disabled or unconfigured installs return a clean error and never mutate.
+
+    kind="disk" grows <disk> by <gib> GiB and absorbs it into the thin pool;
+    kind="memory" grows configured RAM to <mib> MiB (needs a later VM reboot).
+    """
+    if not _pipeline:
+        return {"ok": False, "error": "outreach pipeline not initialized"}
+    from genesis.guardian.provisioning.container import (
+        coordinate_grow_disk,
+        coordinate_grow_memory,
+    )
+    from genesis.observability.health import _load_guardian_remote_from_config
+
+    remote = _load_guardian_remote_from_config()
+    if remote is None:
+        return {"ok": False, "error": "guardian remote not configured (no guardian_remote.yaml)"}
+
+    async def _ask(text: str) -> str | None:
+        # submit_RAW_and_wait: deliver the proposal VERBATIM (skip the LLM
+        # drafter). The proposal ends in an exact "reply APPROVE / DENY"
+        # instruction that the coordinator matches literally — the drafter
+        # could paraphrase that instruction away and break the match.
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+        req = OutreachRequest(
+            category=OutreachCategory("blocker"), topic=text[:100], context=text,
+            salience_score=1.0, signal_type="provision_approval", channel="telegram",
+        )
+        _result, reply = await _pipeline.submit_raw_and_wait(
+            text, req, timeout_s=float(timeout_seconds),
+        )
+        return reply
+
+    if kind == "disk":
+        return await coordinate_grow_disk(remote, _ask, disk=disk, add_gib=gib)
+    if kind == "memory":
+        return await coordinate_grow_memory(remote, _ask, new_mib=mib)
+    return {"ok": False, "error": f"invalid kind {kind!r} (disk|memory)"}
+
+
+@mcp.tool()
 async def outreach_engagement(
     outreach_id: str,
     signal: str,

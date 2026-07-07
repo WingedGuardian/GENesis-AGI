@@ -235,3 +235,85 @@ class TestRoundTrip:
         assert result["TELEGRAM_THREAD_ID"] == "7"
         assert "API_KEY_GROQ" not in result
         assert "TELEGRAM_FORUM_CHAT_ID" not in result
+
+
+class TestProvisioningCredentials:
+    """Proxmox token propagation — only the two token keys ever cross."""
+
+    def test_writes_only_proxmox_tokens(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import (
+            load_provisioning_credentials,
+            propagate_provisioning_credentials,
+        )
+        secrets = tmp_path / "container" / "secrets.env"
+        secrets.parent.mkdir(parents=True)
+        secrets.write_text(
+            "ANTHROPIC_API_KEY=should-not-appear\n"
+            "PROXMOX_AUDIT_TOKEN=genesis@pve!ro=aaa\n"
+            "PROXMOX_PROVISION_TOKEN=genesis@pve!provision=bbb\n"
+            "TELEGRAM_BOT_TOKEN=should-not-appear-here\n"
+        )
+        shared = tmp_path / "state" / "shared"
+        out = propagate_provisioning_credentials(shared_dir=shared, secrets_path=secrets)
+        assert out is not None
+        assert stat.S_IMODE(os.stat(out).st_mode) == 0o600
+        result = load_provisioning_credentials(str(tmp_path / "state"))
+        assert result["PROXMOX_AUDIT_TOKEN"] == "genesis@pve!ro=aaa"
+        assert result["PROXMOX_PROVISION_TOKEN"] == "genesis@pve!provision=bbb"
+        assert "ANTHROPIC_API_KEY" not in result
+        assert "TELEGRAM_BOT_TOKEN" not in result
+
+    def test_requires_audit_token(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import propagate_provisioning_credentials
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("PROXMOX_PROVISION_TOKEN=only-provision\n")
+        assert propagate_provisioning_credentials(
+            shared_dir=tmp_path / "shared", secrets_path=secrets,
+        ) is None
+
+    def test_audit_only_still_propagates(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import (
+            load_provisioning_credentials,
+            propagate_provisioning_credentials,
+        )
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("PROXMOX_AUDIT_TOKEN=audit-only\n")
+        out = propagate_provisioning_credentials(
+            shared_dir=tmp_path / "state" / "shared", secrets_path=secrets,
+        )
+        assert out is not None
+        result = load_provisioning_credentials(str(tmp_path / "state"))
+        assert result == {"PROXMOX_AUDIT_TOKEN": "audit-only"}
+
+
+class TestCombinedBridge:
+    """propagate_guardian_credentials fans out to both, each guarded."""
+
+    def test_writes_both_when_present(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import propagate_guardian_credentials
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text(
+            "TELEGRAM_BOT_TOKEN=bot\nTELEGRAM_FORUM_CHAT_ID=chat\n"
+            "PROXMOX_AUDIT_TOKEN=audit\nPROXMOX_PROVISION_TOKEN=prov\n"
+        )
+        shared = tmp_path / "state" / "shared"
+        written = propagate_guardian_credentials(shared_dir=shared, secrets_path=secrets)
+        names = sorted(p.name for p in written)
+        assert names == ["proxmox_creds.env", "telegram_creds.env"]
+
+    def test_only_telegram_when_no_proxmox(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import propagate_guardian_credentials
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("TELEGRAM_BOT_TOKEN=bot\nTELEGRAM_CHAT_ID=chat\n")
+        written = propagate_guardian_credentials(
+            shared_dir=tmp_path / "state" / "shared", secrets_path=secrets,
+        )
+        assert [p.name for p in written] == ["telegram_creds.env"]
+
+    def test_never_raises_on_missing_secrets(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import propagate_guardian_credentials
+        # Nonexistent secrets file → empty list, no exception.
+        written = propagate_guardian_credentials(
+            shared_dir=tmp_path / "shared", secrets_path=tmp_path / "nope.env",
+        )
+        assert written == []
