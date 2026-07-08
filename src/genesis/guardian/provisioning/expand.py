@@ -161,16 +161,29 @@ async def _rescan_and_pvresize(vg: str, run, _record) -> tuple[bool, str]:
 async def _btrfs_backing(mount: str, run) -> tuple[str | None, str | None]:
     """Resolve the (vg, lv) backing a mounted btrfs from its mountpath.
 
-    ``findmnt`` yields the dm device (``/dev/mapper/vg-lv``, possibly with a
-    ``[/subvol]`` suffix to strip); ``lvs <dev>`` resolves it to VG/LV names.
+    ``findmnt`` yields the backing device, but it can be a ``/dev/disk/by-uuid``
+    symlink or a bare ``/dev/dm-N`` (with a possible ``[/subvol]`` suffix) —
+    ``lvs`` accepts neither (a by-uuid path is "Invalid path for Logical Volume";
+    a ``/dev/dm-N`` is misread as a VG name). Canonicalize to the kernel device
+    (``readlink -f``), resolve its device-mapper name (``lsblk``), then
+    ``lvs /dev/mapper/<name>`` — which only succeeds for a real LVM LV, so a
+    non-LVM btrfs (e.g. on a bare partition) correctly returns (None, None).
     """
     rc, out, _ = await run("findmnt", "-no", "SOURCE", mount, timeout=10.0)
     if rc != 0 or not out.strip():
         return None, None
     dev = out.strip().splitlines()[0].split("[", 1)[0].strip()
+    # by-uuid symlink / dm path → canonical kernel device (/dev/dm-N).
+    rc, out, _ = await run("readlink", "-f", dev, timeout=10.0)
+    real = out.strip().splitlines()[0].strip() if rc == 0 and out.strip() else dev
+    # Kernel device → device-mapper name (e.g. ubuntu--vg-genesis--btrfs--lv).
+    rc, out, _ = await run("lsblk", "-ndo", "NAME", real, timeout=10.0)
+    if rc != 0 or not out.strip():
+        return None, None
+    dmname = out.strip().splitlines()[0].strip()
     rc, out, _ = await run(
-        "sudo", "-n", "lvs", "--noheadings", "-o", "vg_name,lv_name", dev,
-        timeout=15.0,
+        "sudo", "-n", "lvs", "--noheadings", "-o", "vg_name,lv_name",
+        f"/dev/mapper/{dmname}", timeout=15.0,
     )
     if rc != 0 or not out.strip():
         return None, None

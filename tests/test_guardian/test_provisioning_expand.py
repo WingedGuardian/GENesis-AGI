@@ -26,8 +26,10 @@ class FakeRun:
         self.incus_thinpool_name = "IncusThinPool"  # incus lvm.thinpool_name; "" = unset
         self.lvs_lv_name = "IncusThinPool"  # `lvs -o lv_name -S segtype=thin-pool <vg>`
         # btrfs-on-LVM knobs
-        self.findmnt_out = "/dev/mapper/vg0-genesis--btrfs--lv"
-        self.lvs_backing_out = "  vg0 genesis-btrfs-lv"  # `lvs -o vg_name,lv_name <dev>`
+        self.findmnt_out = "/dev/disk/by-uuid/11111111-2222-3333-4444-555555555555"  # by-uuid symlink
+        self.readlink_out = "/dev/dm-3"  # readlink -f <findmnt SOURCE> → kernel dev
+        self.lsblk_name = "vg0-genesis--btrfs--lv"  # lsblk -ndo NAME <real> → dm name
+        self.lvs_backing_out = "  vg0 genesis-btrfs-lv"  # `lvs -o vg_name,lv_name /dev/mapper/<name>`
         self.lvextend_rc = 0
         self.btrfs_resize_rc = 0
         # df --output=size --block-size=1 answers, consumed in order (before/after);
@@ -37,8 +39,12 @@ class FakeRun:
     async def __call__(self, *argv, timeout=60.0, stdin_data=None):
         self.calls.append((argv, stdin_data))
         a = list(argv)
+        if a[:1] == ["readlink"]:
+            return 0, self.readlink_out, ""
         if a[:1] == ["lsblk"]:
-            return 0, self.lsblk_out, ""
+            if "NAME" in a:  # btrfs backing: dm-name of the canonical device
+                return (0, self.lsblk_name, "") if self.lsblk_name else (1, "", "")
+            return 0, self.lsblk_out, ""  # PKNAME: thin-pool PV parent
         if a[:1] == ["findmnt"]:
             return (0, self.findmnt_out, "") if self.findmnt_out else (1, "", "not found")
         if a[:1] == ["df"]:
@@ -253,6 +259,36 @@ async def test_btrfs_happy_path_order_and_ok(_btrfs):
     assert "thinpool.profile" not in joined
     assert "lvchange" not in joined
     assert "100%FREE" not in joined
+
+
+async def test_btrfs_backing_resolves_via_readlink_and_mapper(_btrfs):
+    """Regression (live 2026-07-07): findmnt yields a /dev/disk/by-uuid symlink,
+    which lvs rejects ("Invalid path for Logical Volume"). The backing must be
+    resolved through readlink -f → lsblk NAME → lvs /dev/mapper/<name>, and the
+    lvs call must NOT receive the raw by-uuid path."""
+    fake = FakeRun()  # findmnt_out is a by-uuid symlink by default
+    res = await expand_storage(GuardianConfig(), run=fake, add_gib=1)
+    assert res["ok"] is True
+    assert res["vg"] == "vg0" and res["lv"] == "genesis-btrfs-lv"
+    # findmnt → readlink (canonicalize) happened, in order
+    assert fake.cmd_index("readlink") >= 0
+    assert fake.cmd_index("findmnt") < fake.cmd_index("readlink")
+    # the backing lvs targets /dev/mapper/<dmname>, never the by-uuid symlink
+    backing_lvs = next(
+        argv for argv, _ in fake.calls
+        if "lvs" in argv and "vg_name,lv_name" in argv
+    )
+    assert "/dev/mapper/vg0-genesis--btrfs--lv" in backing_lvs
+    assert not any("by-uuid" in tok for tok in backing_lvs)
+
+
+async def test_btrfs_unresolvable_dmname_refuses(_btrfs):
+    """If lsblk can't yield a dm-name (non-LVM btrfs), refuse cleanly."""
+    fake = FakeRun()
+    fake.lsblk_name = ""  # lsblk NAME returns nothing
+    res = await expand_storage(GuardianConfig(), run=fake, add_gib=1)
+    assert res["ok"] is False
+    assert "resolve" in res["error"].lower()
 
 
 async def test_btrfs_standalone_absorbs_vg_free(_btrfs):
