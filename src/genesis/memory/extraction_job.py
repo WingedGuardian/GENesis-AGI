@@ -13,6 +13,7 @@ Extraction scope:
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING
 import aiosqlite
 
 from genesis.env import cc_project_dir
+from genesis.learning.procedural.judge import ProcedureBuilderUnavailable
 from genesis.memory.extraction import (
     RETRY_PROMPT,
     ExtractionResult,
@@ -48,6 +50,17 @@ _EXTRACTABLE_SOURCE_TAGS = {"foreground", "inbox"}
 
 # Transcript directory
 _TRANSCRIPT_DIR = Path.home() / ".claude" / "projects" / cc_project_dir()
+
+# Durable rebuild queue for procedure builds that died on provider exhaustion.
+# The extraction watermark advances BEFORE the whole-session procedure builder
+# runs, so once a build fails the session is never revisited by the normal cycle
+# (``if not messages: continue``) and the procedure is lost for good. On failure
+# the session is re-queued here and a later cycle rebuilds it from the full
+# transcript. Capped so a persistently-failing session (e.g. a rotated
+# transcript) can't retry forever — exhaustion is surfaced as an observation,
+# never silently dropped.
+_PROCEDURE_REBUILD_WORK = "procedure_rebuild"
+_MAX_PROCEDURE_REBUILD_ATTEMPTS = 8
 
 
 async def _check_claim_duplicate(
@@ -141,6 +154,27 @@ async def run_extraction_cycle(
     }
     # Collect newly stored memories for cross-session connection discovery
     _newly_stored: list[tuple[str, str, str]] = []
+
+    # Rebuild procedures whose build previously died on provider exhaustion.
+    # Their sessions' watermarks have advanced, so the loop below will skip them
+    # (``if not messages: continue``) — this drain is the only path that recovers
+    # them. Skipped for the history-mining / filtered invocations, which don't
+    # own production extraction state.
+    if (
+        not reference_only_mode
+        and start_line_override is None
+        and session_filter is None
+    ):
+        try:
+            await _drain_procedure_rebuilds(
+                db=db,
+                router=router,
+                transcript_dir=transcript_dir,
+                summary=summary,
+                max_procedures_per_session=max_procedures_per_session,
+            )
+        except Exception:
+            logger.error("Procedure rebuild drain failed", exc_info=True)
 
     # Find sessions with unextracted content (includes filesystem discovery)
     sessions = await _find_extractable_sessions(db, transcript_dir=transcript_dir)
@@ -487,16 +521,23 @@ async def run_extraction_cycle(
                         session_id, struggle_score, len(session_candidates),
                         len(stored_ids),
                     )
-            except TimeoutError:
-                # The build was cancelled mid-flight; discard any half-written
-                # store so a partial transaction can't block the shared connection.
-                # (Completed per-procedure stores already auto-committed.)
+            except (ProcedureBuilderUnavailable, TimeoutError) as exc:
+                # Transient: the provider chain was exhausted, or the build was
+                # cancelled mid-flight (timeout). Roll back any half-written store
+                # (completed per-procedure stores already auto-committed), then
+                # re-queue the session for a later rebuild — the watermark has
+                # already advanced past its lines above, so without this the
+                # session is never revisited and the procedure is lost.
                 with contextlib.suppress(Exception):
                     await db.rollback()
                 logger.warning(
-                    "Procedure builder timed out for session %s", session_id,
+                    "Procedure builder unavailable for session %s (%s) — "
+                    "re-queuing for rebuild", session_id, type(exc).__name__,
                 )
+                await _enqueue_procedure_rebuild(db, session_id, cc_session_id)
             except Exception:
+                # Deterministic failure (parse/logic) — NOT re-queued; retrying
+                # would burn every attempt identically.
                 with contextlib.suppress(Exception):
                     await db.rollback()
                 logger.warning(
@@ -522,6 +563,174 @@ async def run_extraction_cycle(
             logger.warning("Connection pass failed", exc_info=True)
 
     return summary
+
+
+async def _enqueue_procedure_rebuild(
+    db: aiosqlite.Connection, session_id: str, cc_session_id: str,
+) -> None:
+    """Re-queue a session whose procedure build died on provider exhaustion.
+
+    Durable (deferred_work_queue): a later extraction cycle drains it and rebuilds
+    the procedures from the full transcript. Best-effort — a failure to enqueue
+    must not break the extraction cycle. Rebuild idempotency is guaranteed by the
+    novelty/dedup gate in ``store_procedure_checked``.
+    """
+    from genesis.resilience.deferred_work import (
+        DRAIN,
+        MEMORY_OPS,
+        DeferredWorkQueue,
+    )
+
+    try:
+        queue = DeferredWorkQueue(db)
+        await queue.enqueue(
+            work_type=_PROCEDURE_REBUILD_WORK,
+            call_site_id="38_procedure_extraction",
+            priority=MEMORY_OPS,
+            payload=json.dumps(
+                {"session_id": session_id, "cc_session_id": cc_session_id}
+            ),
+            reason="procedure builder provider-exhausted; watermark already advanced",
+            staleness_policy=DRAIN,
+        )
+    except Exception:
+        logger.error(
+            "Failed to enqueue procedure rebuild for session %s",
+            session_id, exc_info=True,
+        )
+
+
+async def _drain_procedure_rebuilds(
+    *,
+    db: aiosqlite.Connection,
+    router: Router,
+    transcript_dir: Path,
+    summary: dict,
+    max_procedures_per_session: int,
+) -> None:
+    """Rebuild procedures for sessions whose build previously died.
+
+    Per queued item: rebuild spine+haystack from the full transcript and re-run
+    the whole-session builder. Success → mark completed (even with zero
+    procedures — the provider was available, nothing to rebuild). Still
+    provider-exhausted → reset to pending (retry next cycle). Transcript gone or
+    attempts exhausted → discard, surfacing an observation so the genuine loss is
+    visible, never silent.
+    """
+    import asyncio
+
+    from genesis.db.crud import deferred_work as dw_crud
+    from genesis.learning.procedural.judge import (
+        JUDGE_TIMEOUT_SECS,
+        judge_multi_procedure,
+    )
+    from genesis.learning.procedural.struggle_detector import (
+        build_spine_and_haystack,
+        score_struggle,
+    )
+    from genesis.resilience.deferred_work import DeferredWorkQueue
+
+    queue = DeferredWorkQueue(db)
+    items = await dw_crud.query_pending(
+        db, work_type=_PROCEDURE_REBUILD_WORK, limit=20,
+    )
+    for item in items:
+        item_id = item["id"]
+        attempts = item.get("attempts", 0)
+
+        if attempts >= _MAX_PROCEDURE_REBUILD_ATTEMPTS:
+            await _exhaust_procedure_rebuild(db, queue, item)
+            continue
+
+        try:
+            payload = json.loads(item.get("payload_json", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            await queue.mark_discarded(item_id, "unparseable payload")
+            continue
+
+        cc_session_id = payload.get("cc_session_id") or payload.get("session_id")
+        transcript_path = (
+            _find_transcript(transcript_dir, cc_session_id) if cc_session_id else None
+        )
+        if not transcript_path:
+            # Transcript rotated/gone — nothing to rebuild from.
+            await queue.mark_discarded(item_id, "transcript not found")
+            continue
+
+        await queue.mark_processing(item_id)  # increments attempts
+        try:
+            spine, haystack = build_spine_and_haystack(transcript_path)
+            score = score_struggle(spine)
+            stored_ids = await asyncio.wait_for(
+                judge_multi_procedure(
+                    db, spine, haystack, score, router,
+                    source_session_id=cc_session_id,
+                    max_new=max_procedures_per_session,
+                ),
+                timeout=JUDGE_TIMEOUT_SECS,
+            )
+            await queue.mark_completed(item_id)
+            summary["procedures_rebuilt"] = (
+                summary.get("procedures_rebuilt", 0) + len(stored_ids)
+            )
+            if stored_ids:
+                logger.info(
+                    "Rebuilt %d procedure(s) for session %s (attempt %d)",
+                    len(stored_ids), cc_session_id, attempts + 1,
+                )
+        except (ProcedureBuilderUnavailable, TimeoutError):
+            # Providers still down — keep it pending for a later cycle.
+            with contextlib.suppress(Exception):
+                await db.rollback()
+            await queue.reset_to_pending(item_id)
+        except Exception:
+            # Deterministic failure (bad transcript / parse) — don't loop forever.
+            with contextlib.suppress(Exception):
+                await db.rollback()
+            logger.warning(
+                "Procedure rebuild failed permanently for session %s",
+                cc_session_id, exc_info=True,
+            )
+            await queue.mark_discarded(item_id, "rebuild raised non-retryable error")
+
+
+async def _exhaust_procedure_rebuild(db: aiosqlite.Connection, queue, item: dict) -> None:
+    """Give up on a rebuild after the attempt cap and record the loss honestly."""
+    import uuid
+
+    from genesis.db.crud import observations as obs_crud
+
+    item_id = item["id"]
+    try:
+        payload = json.loads(item.get("payload_json", "{}"))
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    cc_session_id = payload.get("cc_session_id") or payload.get("session_id") or "?"
+
+    await queue.mark_discarded(
+        item_id,
+        f"procedure rebuild exhausted {_MAX_PROCEDURE_REBUILD_ATTEMPTS} attempts",
+    )
+    with contextlib.suppress(Exception):
+        await obs_crud.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="procedure_rebuild",
+            type="procedure_extraction_lost",
+            content=(
+                f"Procedure extraction permanently lost for session {cc_session_id}: "
+                f"the builder stayed provider-exhausted across "
+                f"{_MAX_PROCEDURE_REBUILD_ATTEMPTS} rebuild attempts. A reusable "
+                f"playbook that should have been learned was not."
+            ),
+            priority="medium",
+            created_at=datetime.now(UTC).isoformat(),
+            skip_if_duplicate=True,
+        )
+    logger.warning(
+        "Procedure rebuild EXHAUSTED for session %s after %d attempts",
+        cc_session_id, _MAX_PROCEDURE_REBUILD_ATTEMPTS,
+    )
 
 
 async def _find_extractable_sessions(

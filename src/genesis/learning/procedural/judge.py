@@ -31,6 +31,18 @@ logger = logging.getLogger(__name__)
 
 _CALL_SITE = "38_procedure_extraction"
 
+
+class ProcedureBuilderUnavailable(Exception):
+    """The builder LLM call could not complete (provider chain exhausted or the
+    transport raised) — as opposed to succeeding with zero procedures.
+
+    Raised by ``_call_and_parse_list`` so the caller can distinguish a *transient*
+    failure worth re-attempting later (the source session is re-queued for a
+    procedure rebuild) from a genuine "no procedures here". A persistently
+    unparseable response is NOT this — that is a deterministic model-quality issue
+    and still returns ``[]`` (retrying it forever is waste).
+    """
+
 # Outer guard for the whole-session builder (extraction_job caller). NOT a single
 # call: the builder makes up to ~15 sequential LLM calls (1 build + 1 retry, then
 # per stored procedure a scoping check + a cross-type dedup check). Realistic
@@ -322,18 +334,24 @@ async def _call_and_parse_list(router: object, prompt: str) -> list[dict]:
             result = await router.route_call(
                 call_site_id=_CALL_SITE,
                 messages=[{"role": "user", "content": prompt}],
+                # This builder path owns its own durable retry (the extraction
+                # job re-queues the source session on failure), so do NOT also
+                # dead-letter — the DLQ replay only re-issues the transport and
+                # discards the parsed procedures, doubling the LLM cost and
+                # inflating the queue for zero recovery.
+                suppress_dead_letter=True,
             )
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "Judge LLM call failed for multi-procedure (attempt %d)", attempt,
                 exc_info=True,
             )
-            return []
+            raise ProcedureBuilderUnavailable(str(exc)) from exc
         if not result.success:
             logger.warning(
                 "Judge LLM call unsuccessful (attempt %d): %s", attempt, result.error,
             )
-            return []
+            raise ProcedureBuilderUnavailable(result.error or "call unsuccessful")
         parsed = _parse_judge_response_list(result.content)
         if parsed is not None:
             return parsed
@@ -359,6 +377,11 @@ async def judge_multi_procedure(
     uncapped execution record used for grounding. Each built procedure is grounded
     (warning-only — never dropped), scoping-gated, novelty-checked, and stored.
     Returns the list of stored procedure IDs (capped at ``max_new`` when given).
+
+    Raises ``ProcedureBuilderUnavailable`` when the builder LLM call cannot
+    complete (provider chain exhausted / transport error) so the caller can
+    re-queue the source session for a later rebuild. A successful call that
+    yields no procedures returns ``[]`` (nothing to rebuild).
     """
     from genesis.learning.procedural.grounding import grounding_score
     from genesis.learning.procedural.struggle_detector import format_spine_for_judge
