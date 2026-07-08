@@ -35,9 +35,13 @@ def _reset_cooldown():
     # so each exercises the intended path, not leftover state.
     q._last_dead_letter_alert_at = 0.0
     q._last_dead_letter_band = ""
+    q._last_dlq_storm_alert_at = 0.0
+    q._last_dlq_storm_band = ""
     yield
     q._last_dead_letter_alert_at = 0.0
     q._last_dead_letter_band = ""
+    q._last_dlq_storm_alert_at = 0.0
+    q._last_dlq_storm_band = ""
 
 
 async def _unresolved_infra(db) -> int:
@@ -157,3 +161,102 @@ async def test_queues_high_pending_low_stuck_does_not_alert(db):
     result = await q.queues(db, None, _DLQ(200, stuck=0), None)
     assert await _unresolved_infra(db) == 0        # no cry-wolf
     assert result["dead_letters"] == 200           # raw total stays honest
+
+
+# ── Rate-based storm alert ───────────────────────────────────────────────────
+
+from datetime import UTC, datetime, timedelta  # noqa: E402
+
+
+async def _seed_dead_letters(db, n: int, op_type: str, *, minutes_ago: int = 1) -> None:
+    """Insert ``n`` dead_letter rows created ``minutes_ago`` in the past."""
+    created = (datetime.now(UTC) - timedelta(minutes=minutes_ago)).isoformat()
+    for i in range(n):
+        await db.execute(
+            "INSERT INTO dead_letter (id, operation_type, payload, target_provider, "
+            "failure_reason, created_at, status) VALUES (?,?,?,?,?,?, 'pending')",
+            (f"{op_type}:{minutes_ago}:{i}", op_type, "{}", "all",
+             "All providers exhausted", created),
+        )
+    await db.commit()
+
+
+async def _unresolved_storm(db) -> int:
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM observations WHERE source='dead_letter_storm' "
+        "AND type='infrastructure_alert' AND resolved=0"
+    )
+    return rows[0][0]
+
+
+@pytest.mark.asyncio
+async def test_storm_alerts_on_nonjudge_rate(db):
+    """A rate spike of non-judge dead-letters in the window pages once."""
+    await _seed_dead_letters(db, 45, "chain_exhausted:4_light_reflection")
+    await q.queues(db, None, _DLQ(0, stuck=0), None)  # depth path silent
+    assert await _unresolved_storm(db) == 1
+
+
+@pytest.mark.asyncio
+async def test_storm_excludes_judge_burst(db):
+    """A self-healing judge burst must NOT trip the storm alert (worthless-late)."""
+    await _seed_dead_letters(db, 200, "chain_exhausted:judge")
+    await q.queues(db, None, _DLQ(0, stuck=0), None)
+    assert await _unresolved_storm(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_storm_below_threshold_no_alert(db):
+    """Normal trickle (< threshold non-judge) does not page."""
+    await _seed_dead_letters(db, 30, "chain_exhausted:3_micro_reflection")
+    await q.queues(db, None, _DLQ(0, stuck=0), None)
+    assert await _unresolved_storm(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_storm_ignores_aged_rows(db):
+    """Rows older than the window don't count — only the *rate* matters."""
+    await _seed_dead_letters(db, 60, "chain_exhausted:dream_cycle_synthesis",
+                             minutes_ago=30)  # outside the 15m window
+    await q.queues(db, None, _DLQ(0, stuck=0), None)
+    assert await _unresolved_storm(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_storm_resolves_when_rate_drops(db):
+    """After a storm alerts, a subsequent tick with the rate back to normal
+    auto-resolves it (mirrors the accumulation resolve-on-drain)."""
+    await _seed_dead_letters(db, 50, "chain_exhausted:4_light_reflection")
+    await q.queues(db, None, _DLQ(0, stuck=0), None)
+    assert await _unresolved_storm(db) == 1
+    # Age the rows out of the window, then tick again.
+    await db.execute(
+        "UPDATE dead_letter SET created_at = ?",
+        ((datetime.now(UTC) - timedelta(hours=2)).isoformat(),),
+    )
+    await db.commit()
+    await q.queues(db, None, _DLQ(0, stuck=0), None)
+    assert await _unresolved_storm(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_storm_no_duplicate_rapid_same_band(db):
+    """Four rapid same-band storm alerts (the observed 4-in-30s dup bug) produce
+    exactly one unresolved row — band + cooldown + skip_if_duplicate hold."""
+    breakdown = [("chain_exhausted:4_light_reflection", 60)]
+    for _ in range(4):
+        await q._alert_dead_letter_storm(db, 60, breakdown)  # cooldown NOT reset
+    assert await _unresolved_storm(db) == 1
+
+
+@pytest.mark.asyncio
+async def test_storm_distinct_from_accumulation_alert(db):
+    """Storm and accumulation alerts use distinct sources: both can coexist, and
+    resolving one must not clobber the other."""
+    await q._alert_dead_letter_accumulation(db, 200)   # source=dead_letter_monitor
+    await q._alert_dead_letter_storm(db, 60, [("chain_exhausted:4_light_reflection", 60)])
+    assert await _unresolved_infra(db) == 1            # accumulation
+    assert await _unresolved_storm(db) == 1            # storm
+    await q._resolve_dead_letter_alerts(db, 0)         # resolve accumulation only
+    assert await _unresolved_infra(db) == 0
+    assert await _unresolved_storm(db) == 1            # storm untouched

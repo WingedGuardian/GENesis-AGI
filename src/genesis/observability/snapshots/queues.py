@@ -27,6 +27,23 @@ _last_dead_letter_alert_at: float = 0.0
 # cooldown; a band change is an escalation-worthy transition that bypasses it.
 _last_dead_letter_band: str = ""
 
+# Rate-based provider-exhaustion STORM alert. The accumulation alert above is
+# depth-based (get_stuck_count) and only counts an item once it ages past its
+# TTL — so a short-intense storm that self-heals or expires inside the TTL
+# window is invisible to it (the observed Apr/Jun storm shape). This catches the
+# storm at ENQUEUE RATE: N non-judge dead-letters within a rolling window.
+# chain_exhausted:judge (1h self-heal TTL, worthless-late) is excluded so a
+# judge burst never pages. Calibrated against real storms: normal operation
+# stays <40 non-judge enqueues per 15 min, every observed storm exceeded 45.
+# Distinct source so it never collides with the accumulation alert's dedup /
+# resolve. Safety-net for provider outages (e.g. a future Groq model EOL).
+_DLQ_STORM_WINDOW_S = 900
+_DLQ_STORM_THRESHOLD = 40
+_DLQ_STORM_COOLDOWN_S = 3600
+_DLQ_STORM_JUDGE_PREFIX = "chain_exhausted:judge"
+_last_dlq_storm_alert_at: float = 0.0
+_last_dlq_storm_band: str = ""
+
 
 def _dlq_band(count: int) -> str:
     """Bucket the dead-letter count into a stable band.
@@ -145,6 +162,114 @@ async def _resolve_dead_letter_alerts(db: aiosqlite.Connection | None, count: in
         logger.debug("Failed to resolve dead letter alert observations", exc_info=True)
 
 
+async def _alert_dead_letter_storm(
+    db: aiosqlite.Connection | None,
+    count: int,
+    breakdown: list[tuple[str, int]],
+) -> None:
+    """Create a critical observation when dead-letters enqueue at STORM rate.
+
+    Rate-based early warning, distinct from the depth-based accumulation alert:
+    fires on ``count`` non-judge dead-letters within the rolling window. Uses a
+    distinct ``source="dead_letter_storm"`` AND hash prefix so it never collides
+    with the accumulation alert's ``skip_if_duplicate`` dedup or its
+    ``resolve_by_source_and_type`` recovery. Same band + cooldown +
+    skip_if_duplicate throttle as the accumulation alert, so one storm surfaces
+    one alert (a band change bypasses the cooldown as an escalation).
+    """
+    global _last_dlq_storm_alert_at, _last_dlq_storm_band
+
+    now = time.monotonic()
+    band = _dlq_band(count)
+    if (
+        now - _last_dlq_storm_alert_at < _DLQ_STORM_COOLDOWN_S
+        and band == _last_dlq_storm_band
+    ):
+        return  # Cooldown active for the same band
+
+    if db is None:
+        return
+
+    try:
+        import uuid
+
+        from genesis.db.crud import observations as obs_crud
+
+        top = ", ".join(
+            f"{op.removeprefix('chain_exhausted:')} ×{c}"
+            for op, c in breakdown[:5]
+        )
+        window_min = _DLQ_STORM_WINDOW_S // 60
+        content_hash = hashlib.sha256(
+            f"dead_letter_storm:{band}".encode()
+        ).hexdigest()
+        created = await obs_crud.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="dead_letter_storm",
+            type="infrastructure_alert",
+            content=(
+                f"Provider-exhaustion STORM: {count} internal-cognition "
+                f"operations dead-lettered in the last {window_min}m (self-"
+                f"healing judge calls excluded). Genesis's background thinking "
+                f"is failing to run — check provider health and circuit-"
+                f"breaker state. Top: {top or 'n/a'}."
+            ),
+            priority="critical",
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+        if created is None:
+            return  # An unresolved storm alert for this band already exists.
+        _last_dlq_storm_alert_at = now
+        _last_dlq_storm_band = band
+        logger.warning(
+            "Dead letter STORM alert: %d non-judge ops in %ds "
+            "(critical observation created)",
+            count, _DLQ_STORM_WINDOW_S,
+        )
+    except Exception:
+        logger.debug(
+            "Failed to create dead letter storm alert observation", exc_info=True
+        )
+
+
+async def _resolve_dead_letter_storm(db: aiosqlite.Connection | None) -> None:
+    """Resolve outstanding storm alerts once the enqueue rate returns to normal.
+
+    Mirror of _resolve_dead_letter_alerts for the distinct storm source. Kept
+    unconditional (no in-memory guard) so it survives restart; the UPDATE is a
+    cheap no-op when nothing matches.
+    """
+    global _last_dlq_storm_alert_at, _last_dlq_storm_band
+
+    if db is None:
+        return
+
+    try:
+        from genesis.db.crud import observations as obs_crud
+
+        resolved = await obs_crud.resolve_by_source_and_type(
+            db,
+            source="dead_letter_storm",
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="auto-resolved: dead-letter enqueue rate back to normal",
+        )
+        if resolved:
+            _last_dlq_storm_alert_at = 0.0
+            _last_dlq_storm_band = ""
+            logger.info(
+                "Auto-resolved %d dead-letter storm alert observation(s) on rate drop",
+                resolved,
+            )
+    except Exception:
+        logger.debug(
+            "Failed to resolve dead letter storm alert observations", exc_info=True
+        )
+
+
 async def queues(
     db: aiosqlite.Connection | None,
     deferred_queue: DeferredWorkQueue | None,
@@ -190,6 +315,27 @@ async def queues(
                 await _alert_dead_letter_accumulation(db, stuck)
             else:
                 await _resolve_dead_letter_alerts(db, stuck)
+
+            # Rate-based storm early-warning (independent of depth). Catches a
+            # short-intense provider-exhaustion burst that the depth alert above
+            # misses because items self-heal / expire before aging past their
+            # TTL. Judge (self-healing) is excluded from the trigger count.
+            if db is not None:
+                from genesis.db.crud import dead_letter as _dl_crud
+
+                since = (
+                    datetime.now(UTC) - timedelta(seconds=_DLQ_STORM_WINDOW_S)
+                ).isoformat()
+                recent = await _dl_crud.count_recent(
+                    db, since=since, exclude_prefix=_DLQ_STORM_JUDGE_PREFIX,
+                )
+                if recent >= _DLQ_STORM_THRESHOLD:
+                    breakdown = await _dl_crud.recent_optype_counts(
+                        db, since=since, exclude_prefix=_DLQ_STORM_JUDGE_PREFIX,
+                    )
+                    await _alert_dead_letter_storm(db, recent, breakdown)
+                else:
+                    await _resolve_dead_letter_storm(db)
         except Exception:
             errors.append("dead_letters: query failed")
             logger.error("Failed to query dead letter queue", exc_info=True)

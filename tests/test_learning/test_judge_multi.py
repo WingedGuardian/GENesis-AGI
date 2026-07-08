@@ -76,6 +76,39 @@ async def test_builder_empty_response_returns_empty(db):
 
 
 @pytest.mark.asyncio
+async def test_builder_raises_on_provider_exhaustion(db):
+    """A failed builder call (providers exhausted) RAISES so the caller can
+    re-queue — distinct from a successful call that yields zero procedures."""
+    from genesis.learning.procedural.judge import ProcedureBuilderUnavailable
+
+    router = _router_seq(_Result(success=False, error="All providers exhausted"))
+    with pytest.raises(ProcedureBuilderUnavailable):
+        await judge_multi_procedure(db, _SPINE, "", 0.5, router)
+
+
+@pytest.mark.asyncio
+async def test_builder_raises_on_call_exception(db):
+    """A transport exception is also a rebuild-worthy failure, not a []-return."""
+    from genesis.learning.procedural.judge import ProcedureBuilderUnavailable
+
+    router = MagicMock()
+    router.route_call = AsyncMock(side_effect=RuntimeError("router down"))
+    with pytest.raises(ProcedureBuilderUnavailable):
+        await judge_multi_procedure(db, _SPINE, "", 0.5, router)
+
+
+@pytest.mark.asyncio
+async def test_builder_suppresses_dead_letter(db):
+    """The builder owns its own durable retry (the rebuild queue), so it must NOT
+    also dead-letter — that would re-issue the transport, discard the parsed
+    procedures, and double the cost for zero recovery."""
+    router = _router_seq(_Result(content=_builder_json([])))
+    await judge_multi_procedure(db, _SPINE, "", 0.5, router)
+    _, kwargs = router.route_call.call_args
+    assert kwargs.get("suppress_dead_letter") is True
+
+
+@pytest.mark.asyncio
 async def test_builder_stores_real_procedure_and_records_grounding(db):
     router = _router_seq(
         _Result(content=_builder_json([_proc()])),  # builder

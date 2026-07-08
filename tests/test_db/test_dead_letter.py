@@ -104,3 +104,35 @@ async def test_duplicate_id_raises(db):
     await dead_letter.create(db, id="dldup", **_COMMON)
     with pytest.raises(sqlite3.IntegrityError):
         await dead_letter.create(db, id="dldup", **_COMMON)
+
+
+async def _seed(db, id, op_type, created_at):
+    await dead_letter.create(
+        db, id=id, operation_type=op_type, payload="{}",
+        target_provider="all", failure_reason="All providers exhausted",
+        created_at=created_at,
+    )
+
+
+async def test_count_recent_window_and_exclude_prefix(db):
+    await _seed(db, "r1", "chain_exhausted:4_light_reflection", "2026-03-01T12:00:00")
+    await _seed(db, "r2", "chain_exhausted:4_light_reflection", "2026-03-01T12:05:00")
+    await _seed(db, "r3", "chain_exhausted:judge", "2026-03-01T12:06:00")
+    await _seed(db, "old", "chain_exhausted:3_micro_reflection", "2026-03-01T11:00:00")
+
+    since = "2026-03-01T11:50:00"
+    # All recent (3 in-window; the 11:00 one excluded by the since cutoff).
+    assert await dead_letter.count_recent(db, since=since) == 3
+    # Judge excluded → the two light-reflection rows only.
+    assert await dead_letter.count_recent(
+        db, since=since, exclude_prefix="chain_exhausted:judge",
+    ) == 2
+
+
+async def test_recent_optype_counts_grouped(db):
+    await _seed(db, "a1", "chain_exhausted:4_light_reflection", "2026-03-01T12:00:00")
+    await _seed(db, "a2", "chain_exhausted:4_light_reflection", "2026-03-01T12:01:00")
+    await _seed(db, "a3", "chain_exhausted:38_procedure_extraction", "2026-03-01T12:02:00")
+    rows = await dead_letter.recent_optype_counts(db, since="2026-03-01T11:00:00")
+    assert rows[0] == ("chain_exhausted:4_light_reflection", 2)
+    assert ("chain_exhausted:38_procedure_extraction", 1) in rows
