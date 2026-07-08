@@ -58,6 +58,16 @@ right now owns approval** — there is no second bot:
 | **UP** | the **container** | `provision_grow` MCP tool → `outreach` submit-and-wait (its own bot, zero contention) | host gateway execute verb |
 | **DOWN** | the **guardian** | `getUpdates` on the shared token (uncontended — main bot is dead) | in-process execute-core |
 
+The container (UP) path runs the approval-and-wait **in the genesis-server
+process**, where the pipeline and the single Telegram reply-waiter live. A
+standalone MCP subprocess (e.g. a Claude Code session) has no pipeline of its
+own, so `provision_grow` / `outreach_send_and_wait` POST to the server's
+localhost RPC routes (`/api/genesis/provision/grow`,
+`/api/genesis/outreach/send_and_wait`) rather than failing — the server does the
+ask and returns the result. Those routes are LAN-reachable via the dashboard
+proxy like the rest of `/api/*`; `provision/grow` stays safe because it is
+owner-APPROVE-gated before anything mutates.
+
 Genesis-DOWN is not an edge case: a full pool → rootfs read-only → Genesis down
 is the original outage, and the guardian growing the disk there **is** the
 offline recovery. If Genesis flaps mid-approval, whoever is alive tries; a

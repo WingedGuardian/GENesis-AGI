@@ -329,6 +329,32 @@ async def outreach_queue(
         return [{"error": f"Query failed: {exc}"}]
 
 
+async def _server_rpc(path: str, payload: dict, *, read_timeout_s: float) -> dict:
+    """Bridge a synchronous outreach op to genesis-server, which owns the live
+    pipeline this subprocess lacks. POSTs to the in-process dashboard route and
+    returns the parsed JSON dict — or a clean error dict if the server is
+    unreachable. Never raises (the caller is an MCP tool).
+
+    The read timeout must cover the full owner-reply wait (we block on a human);
+    the connect timeout stays short so a genuinely-down server fails fast.
+    """
+    host = os.environ.get("GENESIS_DASHBOARD_HOST", "127.0.0.1")
+    port = os.environ.get("GENESIS_DASHBOARD_PORT", "5000")
+    url = f"http://{host}:{port}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(read_timeout_s, connect=5.0)) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as exc:
+        body = exc.response.text[:200] if exc.response is not None else ""
+        return {"error": f"genesis-server RPC {path} returned {exc.response.status_code}: {body}"}
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        return {"error": f"genesis-server unreachable at {url} ({type(exc).__name__}); is it running?"}
+    except Exception as exc:  # noqa: BLE001 — an MCP tool must never crash
+        return {"error": f"genesis-server RPC {path} failed: {exc}"}
+
+
 @mcp.tool()
 async def outreach_send_and_wait(
     message: str,
@@ -344,29 +370,20 @@ async def outreach_send_and_wait(
     block.
     """
     if not _pipeline:
-        return "Error: outreach pipeline not initialized"
-    from genesis.outreach.types import OutreachCategory, OutreachRequest
+        # No in-process pipeline (standalone MCP subprocess) → bridge to the
+        # genesis-server, which owns the live pipeline + Telegram reply-waiter.
+        return json.dumps(await _server_rpc(
+            "/api/genesis/outreach/send_and_wait",
+            {"message": message, "category": category, "channel": channel,
+             "timeout_seconds": timeout_seconds},
+            read_timeout_s=float(timeout_seconds) + 30.0,
+        ))
+    from genesis.outreach.rpc import send_and_wait_via_pipeline
 
-    try:
-        cat = OutreachCategory(category)
-    except ValueError:
-        return f"Error: invalid category '{category}'"
-
-    req = OutreachRequest(
-        category=cat,
-        topic=message[:100],
-        context=message,
-        salience_score=1.0,
-        signal_type=category,
-        channel=channel,
-    )
-    result, reply = await _pipeline.submit_and_wait(req, timeout_s=float(timeout_seconds))
-    return json.dumps({
-        "outreach_id": result.outreach_id,
-        "status": result.status.value,
-        "reply": reply,
-        "timed_out": reply is None and result.status.value == "delivered",
-    })
+    return json.dumps(await send_and_wait_via_pipeline(
+        _pipeline, message=message, category=category, channel=channel,
+        timeout_s=float(timeout_seconds),
+    ))
 
 
 @mcp.tool()
@@ -388,37 +405,21 @@ async def provision_grow(
     kind="memory" grows configured RAM to <mib> MiB (needs a later VM reboot).
     """
     if not _pipeline:
-        return {"ok": False, "error": "outreach pipeline not initialized"}
-    from genesis.guardian.provisioning.container import (
-        coordinate_grow_disk,
-        coordinate_grow_memory,
+        # Standalone MCP subprocess → bridge to genesis-server (owner-approval is
+        # enforced there, on the live pipeline). Extra grace covers pickup + the
+        # post-approval host execute verb.
+        return await _server_rpc(
+            "/api/genesis/provision/grow",
+            {"kind": kind, "disk": disk, "gib": gib, "mib": mib,
+             "timeout_seconds": timeout_seconds},
+            read_timeout_s=float(timeout_seconds) + 180.0,
+        )
+    from genesis.outreach.rpc import grow_via_pipeline
+
+    return await grow_via_pipeline(
+        _pipeline, kind=kind, disk=disk, gib=gib, mib=mib,
+        timeout_s=float(timeout_seconds),
     )
-    from genesis.observability.health import _load_guardian_remote_from_config
-
-    remote = _load_guardian_remote_from_config()
-    if remote is None:
-        return {"ok": False, "error": "guardian remote not configured (no guardian_remote.yaml)"}
-
-    async def _ask(text: str) -> str | None:
-        # submit_RAW_and_wait: deliver the proposal VERBATIM (skip the LLM
-        # drafter). The proposal ends in an exact "reply APPROVE / DENY"
-        # instruction that the coordinator matches literally — the drafter
-        # could paraphrase that instruction away and break the match.
-        from genesis.outreach.types import OutreachCategory, OutreachRequest
-        req = OutreachRequest(
-            category=OutreachCategory("blocker"), topic=text[:100], context=text,
-            salience_score=1.0, signal_type="provision_approval", channel="telegram",
-        )
-        _result, reply = await _pipeline.submit_raw_and_wait(
-            text, req, timeout_s=float(timeout_seconds),
-        )
-        return reply
-
-    if kind == "disk":
-        return await coordinate_grow_disk(remote, _ask, disk=disk, add_gib=gib)
-    if kind == "memory":
-        return await coordinate_grow_memory(remote, _ask, new_mib=mib)
-    return {"ok": False, "error": f"invalid kind {kind!r} (disk|memory)"}
 
 
 @mcp.tool()

@@ -13,7 +13,7 @@ async def test_all_tools_registered():
     tools = await mcp.get_tools()
     for name in ["outreach_send", "outreach_poll", "outreach_queue",
                  "outreach_engagement", "outreach_preferences",
-                 "outreach_digest", "outreach_send_and_wait"]:
+                 "outreach_digest", "outreach_send_and_wait", "provision_grow"]:
         assert name in tools, f"Missing tool: {name}"
 
 
@@ -26,11 +26,61 @@ async def test_outreach_send_without_pipeline():
     assert "not initialized" in result.lower() or "error" in result.lower()
 
 
-async def test_send_and_wait_without_pipeline():
-    """Should return error when pipeline not initialized."""
-    tools = await mcp.get_tools()
-    result = await tools["outreach_send_and_wait"].fn(message="test")
-    assert "not initialized" in result.lower()
+async def test_send_and_wait_bridges_to_server_when_no_pipeline():
+    """Standalone (pipeline=None) → bridge to genesis-server via _server_rpc,
+    not the old 'not initialized' dead-end."""
+    old_pipeline = mcp_mod._pipeline
+    try:
+        mcp_mod._pipeline = None
+        with patch("genesis.mcp.outreach_mcp._server_rpc", new_callable=AsyncMock,
+                   return_value={"outreach_id": "o1", "status": "delivered",
+                                 "reply": "yep", "timed_out": False}) as rpc:
+            tools = await mcp.get_tools()
+            result = await tools["outreach_send_and_wait"].fn(
+                message="test", timeout_seconds=42,
+            )
+        assert json.loads(result)["reply"] == "yep"
+        path, payload = rpc.call_args.args
+        assert path == "/api/genesis/outreach/send_and_wait"
+        assert payload["message"] == "test"
+        # read timeout must cover the full owner-wait (timeout + buffer)
+        assert rpc.call_args.kwargs["read_timeout_s"] >= 42
+    finally:
+        mcp_mod._pipeline = old_pipeline
+
+
+async def test_provision_grow_bridges_to_server_when_no_pipeline():
+    """Standalone provision_grow → bridge to the server's provision route."""
+    old_pipeline = mcp_mod._pipeline
+    try:
+        mcp_mod._pipeline = None
+        with patch("genesis.mcp.outreach_mcp._server_rpc", new_callable=AsyncMock,
+                   return_value={"ok": True, "stage": "executed"}) as rpc:
+            tools = await mcp.get_tools()
+            result = await tools["provision_grow"].fn(
+                kind="disk", disk="scsi1", gib=1, timeout_seconds=60,
+            )
+        assert result == {"ok": True, "stage": "executed"}
+        path, payload = rpc.call_args.args
+        assert path == "/api/genesis/provision/grow"
+        assert payload == {"kind": "disk", "disk": "scsi1", "gib": 1, "mib": 0,
+                           "timeout_seconds": 60}
+        assert rpc.call_args.kwargs["read_timeout_s"] >= 60
+    finally:
+        mcp_mod._pipeline = old_pipeline
+
+
+async def test_server_rpc_connect_error_returns_clean_dict():
+    """A down server yields a clean error dict, never an exception."""
+    import httpx
+
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = httpx.ConnectError("refused")
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient", return_value=mock_client):
+        result = await mcp_mod._server_rpc("/api/genesis/x", {"a": 1}, read_timeout_s=5.0)
+    assert "unreachable" in result["error"].lower()
 
 
 @pytest.mark.asyncio
