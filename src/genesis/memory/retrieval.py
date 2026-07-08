@@ -686,79 +686,20 @@ class HybridRetriever:
             ranked_lists.append(event_memory_ids)
         fused = _rrf_fuse(ranked_lists)
 
-        # 7.5 Cross-encoder reranking (optional, off by default)
-        #
-        # Voyage scores live in a different range (0.0–1.0) than RRF scores
-        # (~0.01–0.05). To keep the score space uniform for graph boost and
-        # final sort, we replace the entire fused dict with positional scores
-        # derived from the reranker's ordering. Candidates the reranker
-        # didn't score are dropped — if they lacked content or fell below
-        # top_k, they weren't strong enough to keep.
-        if rerank and self._reranker and self._reranker.enabled and fused:
-            rerank_candidates = sorted(
-                fused, key=fused.get, reverse=True,  # type: ignore[arg-type]
-            )[:limit * 3]
-            rerank_docs: list[dict[str, str]] = []
-            for mid in rerank_candidates:
-                content = ""
-                qhit = qdrant_by_id.get(mid)
-                if qhit:
-                    content = qhit.get("payload", {}).get("content", "")
-                elif mid in fts_by_id:
-                    content = fts_by_id[mid].get("content", "")
-                if content:
-                    rerank_docs.append({"id": mid, "text": content})
-            if rerank_docs:
-                reranked = await self._reranker.rerank(
-                    query, rerank_docs, top_k=limit * 2,
-                )
-                if reranked:
-                    # Rebuild fused with only reranked candidates, using
-                    # positional scores so graph boost floor-gating works.
-                    fused = {
-                        item["id"]: 1.0 / (1 + rank)
-                        for rank, item in enumerate(reranked)
-                    }
+        # 7.5 Cross-encoder reranking (optional, off by default) — the ONLY
+        # post-fusion point where ``fused`` is reassigned rather than mutated.
+        fused = await self._maybe_rerank(
+            query=query,
+            fused=fused,
+            qdrant_by_id=qdrant_by_id,
+            fts_by_id=fts_by_id,
+            limit=limit,
+            rerank=rerank,
+        )
 
-        # 7b. Graph boost: backlink + adjacency (floor-gated)
-        graph_boost_applied = False
-        if fused:
-            top_fused = max(fused.values())
-            floor_score = top_fused * _FLOOR_RATIO
-
-            # 7b-i. Backlink boost: reward memories referenced by many others
-            for mid in fused:
-                if fused[mid] < floor_score:
-                    continue  # floor-gated: skip weak candidates
-                inbound = inbound_by_id.get(mid, 0)
-                if inbound > 0:
-                    fused[mid] *= 1 + _BACKLINK_BOOST_COEF * math.log(1 + inbound)
-                    graph_boost_applied = True
-
-            # 7b-ii. Adjacency boost: reward cluster coherence in top-K
-            # Recompute floor after backlink boost — the top score may
-            # have changed, and the adjacency gate should use the new top.
-            floor_score = max(fused.values()) * _FLOOR_RATIO
-            boosted_ranked = sorted(fused, key=fused.get, reverse=True)  # type: ignore[arg-type]
-            top_k = boosted_ranked[:_ADJACENCY_TOP_K]
-            if len(top_k) >= 3:
-                try:
-                    edges = await memory_links.inter_candidate_links(
-                        self._db, top_k,
-                    )
-                    intra_inbound: dict[str, int] = {}
-                    for src, tgt in edges:
-                        if src != tgt:
-                            intra_inbound[tgt] = intra_inbound.get(tgt, 0) + 1
-                    for mid, count in intra_inbound.items():
-                        if count >= _ADJACENCY_MIN_INLINKS and fused[mid] >= floor_score:
-                            fused[mid] *= _ADJACENCY_BOOST
-                            graph_boost_applied = True
-                except Exception:
-                    logger.warning(
-                        "Adjacency boost query failed, skipping",
-                        exc_info=True,
-                    )
+        # 7b. Graph boost: backlink + adjacency (floor-gated); mutates
+        # ``fused`` in place.
+        graph_boost_applied = await self._apply_graph_boost(fused, inbound_by_id)
 
         # 8. Filter by min_activation
         candidates = [
@@ -785,71 +726,9 @@ class HybridRetriever:
         # 10. Take top limit
         top = candidates[:limit]
 
-        # 11. Increment retrieved_count + stamp last_retrieved_at
-        for mid in top:
-            qdrant_hit = qdrant_by_id.get(mid)
-            if qdrant_hit:
-                coll = qdrant_hit.get("_collection", "episodic_memory")
-                old_count = qdrant_hit.get("payload", {}).get("retrieved_count", 0)
-                try:
-                    qdrant_ops.update_payload(
-                        self._qdrant,
-                        collection=coll,
-                        point_id=mid,
-                        payload={
-                            "retrieved_count": old_count + 1,
-                            "last_retrieved_at": now_str,
-                        },
-                    )
-                except Exception:
-                    logger.warning(
-                        "Failed to update retrieved_count for %s in %s",
-                        mid, coll, exc_info=True,
-                    )
-
-        # 11b. Sync observation retrieved_count in SQLite
-        #       Extract obs:<uuid> tags from Qdrant payloads to find linked observations
-        obs_ids: list[str] = []
-        for mid in top:
-            qdrant_hit = qdrant_by_id.get(mid)
-            if qdrant_hit:
-                tags = qdrant_hit.get("payload", {}).get("tags") or []
-                for tag in tags:
-                    if tag.startswith("obs:"):
-                        obs_ids.append(tag[4:])
-        if obs_ids:
-            try:
-                await observations.increment_retrieved_batch(self._db, obs_ids)
-            except Exception:
-                logger.warning(
-                    "Failed to sync observation retrieved_count for %d obs",
-                    len(obs_ids), exc_info=True,
-                )
-
-        # 11c. Sync knowledge_units retrieved_count in SQLite
-        #       Match via qdrant_id (Qdrant point ID == knowledge_units.qdrant_id)
-        ku_qdrant_ids: list[str] = []
-        for mid in top:
-            qdrant_hit = qdrant_by_id.get(mid)
-            if qdrant_hit:
-                if qdrant_hit.get("_collection") == "knowledge_base":
-                    ku_qdrant_ids.append(mid)
-            else:
-                # FTS5-only hit — check collection tag
-                fts_hit = fts_by_id.get(mid)
-                if fts_hit and fts_hit.get("collection") == "knowledge_base":
-                    ku_qdrant_ids.append(mid)
-        if ku_qdrant_ids:
-            try:
-                from genesis.db.crud import knowledge as knowledge_crud
-                await knowledge_crud.increment_retrieved_batch(
-                    self._db, ku_qdrant_ids,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to sync knowledge retrieved_count for %d units",
-                    len(ku_qdrant_ids), exc_info=True,
-                )
+        # 11/11b/11c. Retrieval write-backs (Qdrant counts, observation +
+        # knowledge_units sync) — each individually swallowed.
+        await self._record_retrievals(top, qdrant_by_id, fts_by_id, now_str)
 
         # 12. Build RetrievalResult objects
         results = _assemble_results(
@@ -1161,3 +1040,181 @@ class HybridRetriever:
             retrieved_count_by_id[mid] = retrieved_count
             created_at_by_id[mid] = created_at
         return activation_by_id, inbound_by_id, retrieved_count_by_id, created_at_by_id
+
+    # --- recall() stage helpers (mutators / side effects) ---
+
+    async def _maybe_rerank(
+        self,
+        *,
+        query: str,
+        fused: dict[str, float],
+        qdrant_by_id: dict[str, dict],
+        fts_by_id: dict[str, dict],
+        limit: int,
+        rerank: bool,
+    ) -> dict[str, float]:
+        """Stage 7.5: cross-encoder reranking (optional, off by default).
+
+        Voyage scores live in a different range (0.0–1.0) than RRF scores
+        (~0.01–0.05). To keep the score space uniform for graph boost and
+        final sort, we replace the entire fused dict with positional scores
+        derived from the reranker's ordering. Candidates the reranker
+        didn't score are dropped — if they lacked content or fell below
+        top_k, they weren't strong enough to keep.
+
+        Returns the SAME ``fused`` object when reranking is skipped, or a
+        replacement positional-score dict when it ran.
+        """
+        if rerank and self._reranker and self._reranker.enabled and fused:
+            rerank_candidates = sorted(
+                fused, key=fused.get, reverse=True,  # type: ignore[arg-type]
+            )[:limit * 3]
+            rerank_docs: list[dict[str, str]] = []
+            for mid in rerank_candidates:
+                content = ""
+                qhit = qdrant_by_id.get(mid)
+                if qhit:
+                    content = qhit.get("payload", {}).get("content", "")
+                elif mid in fts_by_id:
+                    content = fts_by_id[mid].get("content", "")
+                if content:
+                    rerank_docs.append({"id": mid, "text": content})
+            if rerank_docs:
+                reranked = await self._reranker.rerank(
+                    query, rerank_docs, top_k=limit * 2,
+                )
+                if reranked:
+                    # Rebuild fused with only reranked candidates, using
+                    # positional scores so graph boost floor-gating works.
+                    fused = {
+                        item["id"]: 1.0 / (1 + rank)
+                        for rank, item in enumerate(reranked)
+                    }
+        return fused
+
+    async def _apply_graph_boost(
+        self,
+        fused: dict[str, float],
+        inbound_by_id: dict[str, int],
+    ) -> bool:
+        """Stage 7b: graph boost — backlink + adjacency (floor-gated).
+
+        **Mutates ``fused`` in place** (multiplicative boosts); never
+        rebinds it. Returns whether any boost was applied.
+        """
+        graph_boost_applied = False
+        if fused:
+            top_fused = max(fused.values())
+            floor_score = top_fused * _FLOOR_RATIO
+
+            # 7b-i. Backlink boost: reward memories referenced by many others
+            for mid in fused:
+                if fused[mid] < floor_score:
+                    continue  # floor-gated: skip weak candidates
+                inbound = inbound_by_id.get(mid, 0)
+                if inbound > 0:
+                    fused[mid] *= 1 + _BACKLINK_BOOST_COEF * math.log(1 + inbound)
+                    graph_boost_applied = True
+
+            # 7b-ii. Adjacency boost: reward cluster coherence in top-K
+            # Recompute floor after backlink boost — the top score may
+            # have changed, and the adjacency gate should use the new top.
+            floor_score = max(fused.values()) * _FLOOR_RATIO
+            boosted_ranked = sorted(fused, key=fused.get, reverse=True)  # type: ignore[arg-type]
+            top_k = boosted_ranked[:_ADJACENCY_TOP_K]
+            if len(top_k) >= 3:
+                try:
+                    edges = await memory_links.inter_candidate_links(
+                        self._db, top_k,
+                    )
+                    intra_inbound: dict[str, int] = {}
+                    for src, tgt in edges:
+                        if src != tgt:
+                            intra_inbound[tgt] = intra_inbound.get(tgt, 0) + 1
+                    for mid, count in intra_inbound.items():
+                        if count >= _ADJACENCY_MIN_INLINKS and fused[mid] >= floor_score:
+                            fused[mid] *= _ADJACENCY_BOOST
+                            graph_boost_applied = True
+                except Exception:
+                    logger.warning(
+                        "Adjacency boost query failed, skipping",
+                        exc_info=True,
+                    )
+        return graph_boost_applied
+
+    async def _record_retrievals(
+        self,
+        top: list[str],
+        qdrant_by_id: dict[str, dict],
+        fts_by_id: dict[str, dict],
+        now_str: str,
+    ) -> None:
+        """Stages 11/11b/11c: retrieval write-backs for the returned
+        candidates. Every write is individually swallowed — a failed
+        write-back must never block returning results.
+        """
+        # 11. Increment retrieved_count + stamp last_retrieved_at
+        for mid in top:
+            qdrant_hit = qdrant_by_id.get(mid)
+            if qdrant_hit:
+                coll = qdrant_hit.get("_collection", "episodic_memory")
+                old_count = qdrant_hit.get("payload", {}).get("retrieved_count", 0)
+                try:
+                    qdrant_ops.update_payload(
+                        self._qdrant,
+                        collection=coll,
+                        point_id=mid,
+                        payload={
+                            "retrieved_count": old_count + 1,
+                            "last_retrieved_at": now_str,
+                        },
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to update retrieved_count for %s in %s",
+                        mid, coll, exc_info=True,
+                    )
+
+        # 11b. Sync observation retrieved_count in SQLite
+        #       Extract obs:<uuid> tags from Qdrant payloads to find linked observations
+        obs_ids: list[str] = []
+        for mid in top:
+            qdrant_hit = qdrant_by_id.get(mid)
+            if qdrant_hit:
+                tags = qdrant_hit.get("payload", {}).get("tags") or []
+                for tag in tags:
+                    if tag.startswith("obs:"):
+                        obs_ids.append(tag[4:])
+        if obs_ids:
+            try:
+                await observations.increment_retrieved_batch(self._db, obs_ids)
+            except Exception:
+                logger.warning(
+                    "Failed to sync observation retrieved_count for %d obs",
+                    len(obs_ids), exc_info=True,
+                )
+
+        # 11c. Sync knowledge_units retrieved_count in SQLite
+        #       Match via qdrant_id (Qdrant point ID == knowledge_units.qdrant_id)
+        ku_qdrant_ids: list[str] = []
+        for mid in top:
+            qdrant_hit = qdrant_by_id.get(mid)
+            if qdrant_hit:
+                if qdrant_hit.get("_collection") == "knowledge_base":
+                    ku_qdrant_ids.append(mid)
+            else:
+                # FTS5-only hit — check collection tag
+                fts_hit = fts_by_id.get(mid)
+                if fts_hit and fts_hit.get("collection") == "knowledge_base":
+                    ku_qdrant_ids.append(mid)
+        if ku_qdrant_ids:
+            try:
+                from genesis.db.crud import knowledge as knowledge_crud
+                await knowledge_crud.increment_retrieved_batch(
+                    self._db, ku_qdrant_ids,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to sync knowledge retrieved_count for %d units",
+                    len(ku_qdrant_ids), exc_info=True,
+                )
