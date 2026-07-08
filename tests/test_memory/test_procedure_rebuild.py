@@ -98,6 +98,19 @@ async def test_drain_still_exhausted_stays_pending(mdb, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_drain_never_rolls_back_shared_connection(mdb, monkeypatch):
+    """Regression: the drain must never call rollback() — ``db`` is the shared
+    SerializedConnection, so a rollback would discard other concurrent jobs'
+    pending writes, not just ours."""
+    await ej._enqueue_procedure_rebuild(mdb, "s1", "cc1")
+    _stub_builder(monkeypatch, result=jm.ProcedureBuilderUnavailable("down"))
+    rollback_spy = AsyncMock()
+    monkeypatch.setattr(mdb, "rollback", rollback_spy)
+    await _drain(mdb)
+    rollback_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_drain_transcript_gone_discards(mdb, monkeypatch):
     await ej._enqueue_procedure_rebuild(mdb, "s1", "cc1")
     monkeypatch.setattr(ej, "_find_transcript", lambda d, s: None)

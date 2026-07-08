@@ -523,13 +523,15 @@ async def run_extraction_cycle(
                     )
             except (ProcedureBuilderUnavailable, TimeoutError) as exc:
                 # Transient: the provider chain was exhausted, or the build was
-                # cancelled mid-flight (timeout). Roll back any half-written store
-                # (completed per-procedure stores already auto-committed), then
-                # re-queue the session for a later rebuild — the watermark has
-                # already advanced past its lines above, so without this the
-                # session is never revisited and the procedure is lost.
-                with contextlib.suppress(Exception):
-                    await db.rollback()
+                # cancelled mid-flight (timeout). Re-queue the session for a later
+                # rebuild — the watermark has already advanced past its lines
+                # above, so without this the session is never revisited and the
+                # procedure is lost. Do NOT db.rollback(): this ``db`` is the
+                # shared SerializedConnection and a rollback discards EVERY
+                # coroutine's pending write, not just ours (see connection.py).
+                # There is nothing of ours to undo anyway — procedure stores
+                # self-commit and the deferred memory_events was committed by the
+                # watermark update above.
                 logger.warning(
                     "Procedure builder unavailable for session %s (%s) — "
                     "re-queuing for rebuild", session_id, type(exc).__name__,
@@ -537,9 +539,8 @@ async def run_extraction_cycle(
                 await _enqueue_procedure_rebuild(db, session_id, cc_session_id)
             except Exception:
                 # Deterministic failure (parse/logic) — NOT re-queued; retrying
-                # would burn every attempt identically.
-                with contextlib.suppress(Exception):
-                    await db.rollback()
+                # would burn every attempt identically. No rollback (shared
+                # connection — see above).
                 logger.warning(
                     "Procedure builder failed for session %s",
                     session_id, exc_info=True,
@@ -679,14 +680,13 @@ async def _drain_procedure_rebuilds(
                     len(stored_ids), cc_session_id, attempts + 1,
                 )
         except (ProcedureBuilderUnavailable, TimeoutError):
-            # Providers still down — keep it pending for a later cycle.
-            with contextlib.suppress(Exception):
-                await db.rollback()
+            # Providers still down — keep it pending for a later cycle. No
+            # db.rollback(): shared SerializedConnection (a rollback would discard
+            # other coroutines' pending writes); procedure stores self-commit so
+            # there is nothing of ours to undo.
             await queue.reset_to_pending(item_id)
         except Exception:
             # Deterministic failure (bad transcript / parse) — don't loop forever.
-            with contextlib.suppress(Exception):
-                await db.rollback()
             logger.warning(
                 "Procedure rebuild failed permanently for session %s",
                 cc_session_id, exc_info=True,
