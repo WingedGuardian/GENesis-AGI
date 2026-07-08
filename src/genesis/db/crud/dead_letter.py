@@ -174,3 +174,47 @@ async def query_recent(
     db.row_factory = aiosqlite.Row
     cursor = await db.execute(sql, params)
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def count_recent(
+    db: aiosqlite.Connection,
+    *,
+    since: str,
+    exclude_prefix: str | None = None,
+) -> int:
+    """Count dead-letter rows enqueued at/after ``since`` (any status).
+
+    ``exclude_prefix`` drops operation_types starting with it — the rate-based
+    provider-exhaustion storm detector passes ``chain_exhausted:judge`` so a
+    self-healing 1h-TTL judge burst (worthless-late, drains itself) never counts
+    toward the storm trigger. Backed by ``idx_dead_letter_created``.
+    """
+    sql = "SELECT COUNT(*) FROM dead_letter WHERE created_at >= ?"
+    params: list = [since]
+    if exclude_prefix:
+        sql += " AND operation_type NOT LIKE ?"
+        params.append(exclude_prefix + "%")
+    cursor = await db.execute(sql, params)
+    row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def recent_optype_counts(
+    db: aiosqlite.Connection,
+    *,
+    since: str,
+    exclude_prefix: str | None = None,
+) -> list[tuple[str, int]]:
+    """Per-operation_type counts of dead-letters enqueued at/after ``since``.
+
+    Feeds the storm alert's breakdown line (``light-reflection ×N``). Ordered by
+    count descending. ``exclude_prefix`` behaves as in :func:`count_recent`.
+    """
+    sql = "SELECT operation_type, COUNT(*) AS c FROM dead_letter WHERE created_at >= ?"
+    params: list = [since]
+    if exclude_prefix:
+        sql += " AND operation_type NOT LIKE ?"
+        params.append(exclude_prefix + "%")
+    sql += " GROUP BY operation_type ORDER BY c DESC"
+    cursor = await db.execute(sql, params)
+    return [(str(r[0]), int(r[1])) for r in await cursor.fetchall()]

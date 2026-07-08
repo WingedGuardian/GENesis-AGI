@@ -1653,6 +1653,7 @@ INDEXES = [
     # dead letter
     "CREATE INDEX IF NOT EXISTS idx_dead_letter_status ON dead_letter(status)",
     "CREATE INDEX IF NOT EXISTS idx_dead_letter_provider ON dead_letter(target_provider)",
+    "CREATE INDEX IF NOT EXISTS idx_dead_letter_created ON dead_letter(created_at)",
     # cognitive state
     "CREATE INDEX IF NOT EXISTS idx_cognitive_state_section ON cognitive_state(section)",
     # message queue
