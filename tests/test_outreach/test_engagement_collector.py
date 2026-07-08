@@ -37,10 +37,29 @@ async def test_all_engaged_returns_high(db):
             message_content="Hi", created_at=now,
         )
         await outreach_crud.record_delivery(db, f"e-{i}", delivered_at=now)
-        await outreach_crud.record_engagement(db, f"e-{i}", engagement_outcome="engaged", engagement_signal="reply")
+        # 'useful' is the value a real reply writes — was 'engaged', a value
+        # never written, so this ratio used to be 0.0 no matter what.
+        await outreach_crud.record_engagement(db, f"e-{i}", engagement_outcome="useful", engagement_signal="user_reply")
 
     collector = OutreachEngagementCollector(db)
     reading = await collector.collect()
+    assert reading.value == 1.0
+
+
+@pytest.mark.asyncio
+async def test_positive_set_includes_behavioural(db):
+    """useful / acted_on / acknowledged all count as engaged (harvest's set)."""
+    now = datetime.now(UTC).isoformat()
+    for i, outcome in enumerate(["useful", "acted_on", "acknowledged"]):
+        await outreach_crud.create(
+            db, id=f"p-{i}", signal_type="surplus", topic=f"P{i}",
+            category="surplus", salience_score=0.8, channel="telegram",
+            message_content="Hi", created_at=now,
+        )
+        await outreach_crud.record_delivery(db, f"p-{i}", delivered_at=now)
+        await outreach_crud.record_engagement(db, f"p-{i}", engagement_outcome=outcome, engagement_signal="s")
+
+    reading = await OutreachEngagementCollector(db).collect()
     assert reading.value == 1.0
 
 
@@ -54,7 +73,7 @@ async def test_mixed_engagement(db):
             message_content="Hi", created_at=now,
         )
         await outreach_crud.record_delivery(db, f"eng-{i}", delivered_at=now)
-        await outreach_crud.record_engagement(db, f"eng-{i}", engagement_outcome="engaged", engagement_signal="reply")
+        await outreach_crud.record_engagement(db, f"eng-{i}", engagement_outcome="useful", engagement_signal="user_reply")
     for i in range(2):
         await outreach_crud.create(
             db, id=f"ign-{i}", signal_type="surplus", topic=f"I{i}",

@@ -35,7 +35,10 @@ class OutreachEngagementCollector:
                 baseline_note=note,
             )
         total = sum(r[1] for r in rows)
-        engaged = sum(r[1] for r in rows if r[0] == "engaged")
+        # Positive engagement set (mirrors feedback.harvest._OUTREACH_MAP). Was
+        # `r[0] == "engaged"`, a value never written to engagement_outcome, so
+        # this ratio was always 0.0 regardless of real engagement.
+        engaged = sum(r[1] for r in rows if r[0] in ("useful", "acted_on", "acknowledged"))
         value = engaged / total if total > 0 else 0.0
         return SignalReading(
             name=self.signal_name,

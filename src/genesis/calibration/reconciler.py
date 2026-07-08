@@ -23,7 +23,7 @@ class PredictionReconciler:
         for pred in unmatched:
             action_id = pred["action_id"]
             cursor = await self._db.execute(
-                "SELECT engagement_outcome FROM outreach_history "
+                "SELECT engagement_outcome, engagement_signal FROM outreach_history "
                 "WHERE id = ? AND engagement_outcome IS NOT NULL",
                 (action_id,),
             )
@@ -31,7 +31,19 @@ class PredictionReconciler:
             if not row:
                 continue
             outcome = row[0] if isinstance(row, tuple) else row["engagement_outcome"]
-            correct = outcome == "engaged"
+            signal = row[1] if isinstance(row, tuple) else row["engagement_signal"]
+            # No-reply (the 24h timeout) is not a graded outcome: silence is
+            # unresolved, not a wrong prediction (WS-0: "ignored" != no value).
+            # An explicit dismissal via the outreach_engagement tool carries a
+            # non-'timeout' signal and is still graded below.
+            if outcome == "ignored" and signal == "timeout":
+                continue
+            if outcome == "ambivalent":
+                continue  # neutral implicit-activity signal — not gradeable
+            # Positive engagement set (mirrors feedback.harvest._OUTREACH_MAP).
+            # Was `outcome == "engaged"`, a value never written to the column,
+            # so every outreach prediction was graded incorrect unconditionally.
+            correct = outcome in ("useful", "acted_on", "acknowledged")
             await pred_crud.record_outcome(
                 self._db, pred["id"], outcome=outcome, correct=correct,
             )

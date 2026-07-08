@@ -280,7 +280,7 @@ class OutcomeHarvester:
     async def _harvest_outreach(self, cutoff: str | None) -> int:
         """outreach_history → outreach_reply (T2) / outreach_implicit (T3)."""
         sql = (
-            "SELECT id, engagement_outcome, user_response, category, "
+            "SELECT id, engagement_outcome, engagement_signal, user_response, category, "
             "       prediction_error, delivered_at, created_at "
             "FROM outreach_history "
             "WHERE engagement_outcome IS NOT NULL AND trim(engagement_outcome) != ''"
@@ -297,7 +297,14 @@ class OutcomeHarvester:
         inserted = 0
         for raw in rows:
             r = dict(zip(cols, raw, strict=False))
-            mapping = _OUTREACH_MAP.get((r["engagement_outcome"] or "").strip())
+            outcome = (r["engagement_outcome"] or "").strip()
+            # No-reply (24h timeout) carries no value signal — silence is not a
+            # negative (WS-0: "ignored" != no value). An explicit dismissal via
+            # the outreach_engagement tool has a non-'timeout' signal and still
+            # maps through _OUTREACH_MAP below.
+            if outcome == "ignored" and (r.get("engagement_signal") or "").strip() == "timeout":
+                continue
+            mapping = _OUTREACH_MAP.get(outcome)
             if mapping is None:
                 continue  # empty / unknown engagement value — no real signal
             signal_type, polarity, value = mapping

@@ -62,18 +62,18 @@ async def _add_proposal(
 
 
 async def _add_outreach(
-    db, *, oid, engagement_outcome, user_response=None, category="notification",
-    prediction_error=None, delivered_at=None,
+    db, *, oid, engagement_outcome, engagement_signal=None, user_response=None,
+    category="notification", prediction_error=None, delivered_at=None,
 ):
     delivered_at = delivered_at or _recent(hours=1)
     await db.execute(
         "INSERT INTO outreach_history "
         "(id, signal_type, topic, category, salience_score, channel, "
-        " message_content, engagement_outcome, user_response, prediction_error, "
-        " delivered_at, created_at) "
-        "VALUES (?, 'sig', 'topic', ?, 0.5, 'telegram', 'msg', ?, ?, ?, ?, ?)",
-        (oid, category, engagement_outcome, user_response, prediction_error,
-         delivered_at, _recent(hours=2)),
+        " message_content, engagement_outcome, engagement_signal, user_response, "
+        " prediction_error, delivered_at, created_at) "
+        "VALUES (?, 'sig', 'topic', ?, 0.5, 'telegram', 'msg', ?, ?, ?, ?, ?, ?)",
+        (oid, category, engagement_outcome, engagement_signal, user_response,
+         prediction_error, delivered_at, _recent(hours=2)),
     )
     await db.commit()
 
@@ -242,6 +242,28 @@ class TestHarvestOutreach:
         await _add_outreach(db, oid="real", engagement_outcome="useful")
         await OutcomeHarvester(db).run_backfill()
         assert await oe.count(db) == 1  # only the real one
+
+    @pytest.mark.asyncio
+    async def test_noreply_timeout_is_skipped(self, db):
+        # A 24h no-reply (outcome='ignored', signal='timeout') carries no value
+        # signal — silence is not a negative (WS-0). It must NOT harvest a row.
+        await _add_outreach(
+            db, oid="nr", engagement_outcome="ignored", engagement_signal="timeout",
+        )
+        await _add_outreach(db, oid="real", engagement_outcome="useful")
+        await OutcomeHarvester(db).run_backfill()
+        assert await oe.count(db) == 1  # only the useful one
+
+    @pytest.mark.asyncio
+    async def test_explicit_ignored_nontimeout_stays_negative(self, db):
+        # An explicit dismissal (non-'timeout' signal) is still a real negative.
+        await _add_outreach(
+            db, oid="dis", engagement_outcome="ignored", engagement_signal="user_dismiss",
+        )
+        await OutcomeHarvester(db).run_backfill()
+        row = (await oe.recent(db, limit=1))[0]
+        assert row["signal_type"] == "outreach_implicit"
+        assert row["polarity"] == "negative"
 
 
 # --------------------------------------------------------------------------- #
