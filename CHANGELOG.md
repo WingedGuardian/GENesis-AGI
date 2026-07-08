@@ -34,6 +34,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Asking Genesis to grow a disk or wait on your reply now works from a Claude
+  Code session, not only from inside the running server.** The two tools that
+  block on your Telegram reply (`provision_grow`, `outreach_send_and_wait`) need
+  the live message pipeline, which runs in the Genesis server — not in the
+  separate helper process a CC session talks to. They used to fail there with
+  "pipeline not initialized"; they now hand the request to the server so an
+  approval-and-wait, or an approval-gated grow, can be driven from a session.
+
 - **The Guardian no longer false-alarms that the host gateway is "stale" after a
   healthy update — and can no longer roll it back.** A guardian redeploy advances
   the host's deployed code without moving its install-dir git checkout, so the
