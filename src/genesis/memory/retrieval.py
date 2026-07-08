@@ -12,7 +12,12 @@ from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links, observations
 from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
-from genesis.memory.intent import classify_intent, expand_query, rank_by_intent
+from genesis.memory.intent import (
+    QueryIntent,
+    classify_intent,
+    expand_query,
+    rank_by_intent,
+)
 from genesis.memory.reranker import VoyageReranker
 from genesis.memory.types import RetrievalResult
 from genesis.observability.call_site_recorder import record_last_run
@@ -282,6 +287,201 @@ def _apply_diversity_penalty(
     return [mid for mid in candidates if fused.get(mid, 0.0) > 0.0]
 
 
+def _build_intent_ranked(
+    intent: QueryIntent,
+    all_ids: set[str],
+    qdrant_by_id: dict[str, dict],
+    fts_by_id: dict[str, dict],
+) -> list[str]:
+    """Build the intent-biased ranked list for RRF (empty for GENERAL — no bias)."""
+    intent_ranked: list[str] = []
+    if intent.category != "GENERAL":
+        candidate_meta: dict[str, dict] = {}
+        for mid in all_ids:
+            qhit = qdrant_by_id.get(mid)
+            fhit = fts_by_id.get(mid)
+            if qhit:
+                p = qhit.get("payload", {})
+                candidate_meta[mid] = {
+                    "source": p.get("source", ""),
+                    "tags": p.get("tags") or [],
+                    "content": p.get("content", ""),
+                }
+            elif fhit:
+                candidate_meta[mid] = {
+                    "source": fhit.get("source_type", ""),
+                    "tags": [],
+                    "content": fhit.get("content", ""),
+                }
+        intent_ranked = rank_by_intent(intent, candidate_meta)
+    return intent_ranked
+
+
+def _filter_scope_fts_only(
+    candidates: list[str],
+    qdrant_by_id: dict[str, dict],
+    fts_by_id: dict[str, dict],
+    *,
+    wing: str | None,
+    room: str | None,
+    life_domain: str | None,
+) -> list[str]:
+    """Filter FTS5-only candidates by wing/room/life_domain (Qdrant results
+    are already filtered at query time; this catches FTS5-only candidates
+    that don't match the requested filters). No-op when no filter is set.
+    """
+    if wing or room or life_domain:
+        filtered: list[str] = []
+        for mid in candidates:
+            qhit = qdrant_by_id.get(mid)
+            if qhit:
+                # Qdrant already filtered — guaranteed match
+                filtered.append(mid)
+            elif life_domain and not wing and not room:
+                # FTS5-only + life_domain filter: check the tag string
+                fhit = fts_by_id.get(mid)
+                if fhit:
+                    tags_str = fhit.get("tags", "")
+                    if f"life_domain:{life_domain}" in tags_str:
+                        filtered.append(mid)
+            else:
+                # FTS5-only candidate with wing/room filter — no
+                # wing/room data in FTS5, exclude since we can't
+                # verify membership.
+                pass
+        candidates = filtered
+    return candidates
+
+
+def _assemble_results(
+    *,
+    top: list[str],
+    qdrant_by_id: dict[str, dict],
+    fts_by_id: dict[str, dict],
+    fused: dict[str, float],
+    activation_by_id: dict[str, float],
+    vector_ranked_dedup: list[str],
+    seen: set[str],
+    fts_ranked: list[str],
+    embedding_available: bool,
+    intent: QueryIntent,
+) -> list[RetrievalResult]:
+    """Build RetrievalResult objects for the top-ranked candidates.
+
+    Vector/FTS ranks are recomputed positionally against the stage-6 ranked
+    lists (``vector_ranked_dedup``/``seen``/``fts_ranked``) — that reach-back
+    is deliberate and explicit in the parameters.
+    """
+    results: list[RetrievalResult] = []
+    for mid in top:
+        qdrant_hit = qdrant_by_id.get(mid)
+        fts_hit = fts_by_id.get(mid)
+
+        # Determine content and metadata. ``_collection`` is the
+        # authoritative first-party/external discriminator (audit D12):
+        # the Qdrant collection on a vector hit (set at recall time, ~L367),
+        # or the FTS row's collection tag for an FTS5-only hit.
+        if qdrant_hit:
+            payload = qdrant_hit.get("payload", {})
+            content = payload.get("content", "")
+            src = payload.get("source", "")
+            mem_type = payload.get("memory_type", "")
+            _collection = qdrant_hit.get("_collection", "episodic_memory")
+        elif fts_hit:
+            content = fts_hit.get("content", "")
+            src = fts_hit.get("source_type", "")
+            mem_type = fts_hit.get("collection", "")
+            payload = fts_hit
+            _collection = fts_hit.get("collection", "episodic_memory")
+        else:
+            continue
+
+        # Determine ranks
+        if embedding_available:
+            v_rank = (
+                vector_ranked_dedup.index(mid) + 1
+                if mid in seen and mid in set(vector_ranked_dedup)
+                else None
+            )
+        else:
+            v_rank = None
+        f_rank = (
+            fts_ranked.index(mid) + 1
+            if mid in set(fts_ranked)
+            else None
+        )
+
+        # Extract provenance from Qdrant payload if available
+        _p = payload if qdrant_hit else {}
+        _line_range = _p.get("source_line_range")
+        results.append(
+            RetrievalResult(
+                memory_id=mid,
+                content=content,
+                source=src,
+                memory_type=mem_type,
+                score=fused[mid],
+                vector_rank=v_rank,
+                fts_rank=f_rank,
+                activation_score=activation_by_id.get(mid, 0.0),
+                payload=_p,
+                source_session_id=_p.get("source_session_id"),
+                transcript_path=_p.get("transcript_path"),
+                source_line_range=tuple(_line_range) if _line_range else None,
+                source_pipeline=_p.get("source_pipeline"),
+                memory_class=_p.get("memory_class", "fact"),
+                query_intent=intent.category,
+                intent_confidence=intent.confidence,
+                collection=_collection,
+            ),
+        )
+    return results
+
+
+def _entrenchment_metrics(
+    results: list[RetrievalResult],
+    _scores: list[float],
+    retrieved_count_by_id: dict[str, int],
+    created_at_by_id: dict[str, str],
+    now_str: str,
+) -> tuple[float | None, float | None, float | None]:
+    """MEM-005: entrenchment signal — does retrieval frequency predict final
+    ranking? A positive corr(retrieved_count, score) means the activation
+    loop is rewarding mere frequency in the ranking. Monitor-only (D7:
+    instrument, do NOT re-rank); a sustained strong-positive trend over
+    time flags entrenchment of stale-but-popular memories. Defensive — it
+    reads external payload data and must never break recall.
+
+    Returns ``(entrenchment_corr, mean_retrieved_count, mean_age_days)``.
+    """
+    _entrenchment = _mean_retrieved = _mean_age_days = None
+    try:
+        _ret_counts = [
+            float(retrieved_count_by_id.get(r.memory_id, 0)) for r in results
+        ]
+        if _ret_counts:
+            _entrenchment = _spearman_rank_corr(_ret_counts, _scores)
+            _mean_retrieved = round(sum(_ret_counts) / len(_ret_counts), 2)
+            _now_dt = datetime.fromisoformat(now_str.replace("Z", "+00:00"))
+            _ages: list[float] = []
+            for r in results:
+                _ca = created_at_by_id.get(r.memory_id)
+                if not _ca:
+                    continue
+                try:
+                    _ages.append(
+                        (_now_dt - datetime.fromisoformat(
+                            _ca.replace("Z", "+00:00"))).total_seconds() / 86400.0
+                    )
+                except (ValueError, AttributeError):
+                    continue
+            if _ages:
+                _mean_age_days = round(sum(_ages) / len(_ages), 1)
+    except Exception:
+        logger.debug("MEM-005 entrenchment metric failed", exc_info=True)
+    return _entrenchment, _mean_retrieved, _mean_age_days
+
+
 async def _expired_candidate_ids(
     db: aiosqlite.Connection,
     candidate_ids: set[str],
@@ -393,6 +593,223 @@ class HybridRetriever:
         candidate_limit = limit * 3
 
         # 1. Embed query (with fallback to FTS5-only)
+        vector, embedding_available = await self._embed_query(query)
+
+        # 2. Qdrant vector search across collections (skip if no embedding)
+        qdrant_results: list[dict] = []
+        qdrant_by_id: dict[str, dict] = {}
+        if embedding_available and vector is not None:
+            qdrant_results, qdrant_by_id = await self._gather_vector_candidates(
+                vector=vector,
+                collections=collections,
+                candidate_limit=candidate_limit,
+                wing=wing,
+                room=room,
+                life_domain=life_domain,
+                project_type=project_type,
+                exclude_subsystems=exclude_subsystems,
+                include_only_subsystems=include_only_subsystems,
+                include_deprecated=include_deprecated,
+            )
+
+        # 2b. Event-calendar search (temporal queries)
+        event_memory_ids = await self._gather_event_candidates(
+            query, intent, candidate_limit,
+        )
+
+        # 2c. Expand query via tag co-occurrence (opt-in, expensive index rebuild)
+        fts_query = await self._expand_fts_query(
+            query, collections, expand_query_terms=expand_query_terms,
+        )
+
+        # 3. FTS5 text search (using expanded query)
+        fts_results, fts_by_id = await self._gather_fts_candidates(
+            query=query,
+            fts_query=fts_query,
+            collections=collections,
+            candidate_limit=candidate_limit,
+            exclude_subsystems=exclude_subsystems,
+            include_only_subsystems=include_only_subsystems,
+            include_deprecated=include_deprecated,
+        )
+
+        # 4. Union of all candidate memory_ids
+        all_ids = set(qdrant_by_id) | set(fts_by_id) | set(event_memory_ids)
+        if not all_ids:
+            return []
+
+        # 4b. Phase 1.5e: drop candidates past their bitemporal invalid_at.
+        all_ids, event_memory_ids = await self._filter_expired_candidates(
+            all_ids, qdrant_by_id, fts_by_id, event_memory_ids,
+        )
+        if not all_ids:
+            return []
+
+        now_str = datetime.now(UTC).isoformat()
+
+        # 5/5b. Batch-fetch link counts + compute activation scores
+        (
+            activation_by_id,
+            inbound_by_id,
+            retrieved_count_by_id,
+            created_at_by_id,
+        ) = await self._compute_activations(all_ids, qdrant_by_id, now_str)
+
+        # 6. Build ranked lists for RRF (or FTS5-only if no embedding)
+        vector_ranked_dedup: list[str] = []
+        seen: set[str] = set()
+        if embedding_available:
+            vector_ranked = [h["id"] for h in qdrant_results if h["id"] in all_ids]
+            for mid in vector_ranked:
+                if mid not in seen:
+                    seen.add(mid)
+                    vector_ranked_dedup.append(mid)
+
+        # FTS5 rank is negative, lower = better; results already ordered by rank
+        fts_ranked = [r["memory_id"] for r in fts_results if r["memory_id"] in all_ids]
+
+        activation_ranked = sorted(all_ids, key=lambda m: activation_by_id[m], reverse=True)
+
+        # 6b. Build intent-biased ranked list (empty for GENERAL — no bias)
+        intent_ranked = _build_intent_ranked(
+            intent, all_ids, qdrant_by_id, fts_by_id,
+        )
+
+        # 7. Fusion: RRF if we have vector results, otherwise FTS5 + activation only
+        if embedding_available:
+            ranked_lists = [vector_ranked_dedup, fts_ranked, activation_ranked]
+        else:
+            ranked_lists = [fts_ranked, activation_ranked]
+        if intent_ranked:
+            ranked_lists.append(intent_ranked)
+        if event_memory_ids:
+            ranked_lists.append(event_memory_ids)
+        fused = _rrf_fuse(ranked_lists)
+
+        # 7.5 Cross-encoder reranking (optional, off by default) — the ONLY
+        # post-fusion point where ``fused`` is reassigned rather than mutated.
+        fused = await self._maybe_rerank(
+            query=query,
+            fused=fused,
+            qdrant_by_id=qdrant_by_id,
+            fts_by_id=fts_by_id,
+            limit=limit,
+            rerank=rerank,
+        )
+
+        # 7b. Graph boost: backlink + adjacency (floor-gated); mutates
+        # ``fused`` in place.
+        graph_boost_applied = await self._apply_graph_boost(fused, inbound_by_id)
+
+        # 8. Filter by min_activation
+        candidates = [
+            mid for mid in fused if activation_by_id.get(mid, 0.0) >= min_activation
+        ]
+
+        # 8b. Diversity penalty — collapse echo clusters
+        # If multiple candidates have near-identical content (Jaccard ≥ 0.80),
+        # penalize lower-ranked echoes to prevent sycophantic memory clusters
+        # from dominating retrieval results.
+        candidates = _apply_diversity_penalty(
+            candidates, fused, qdrant_by_id, fts_by_id,
+        )
+
+        # 9. Sort by fused score descending
+        candidates.sort(key=lambda m: fused[m], reverse=True)
+
+        # 9b. Filter FTS5-only candidates by wing/room/life_domain
+        candidates = _filter_scope_fts_only(
+            candidates, qdrant_by_id, fts_by_id,
+            wing=wing, room=room, life_domain=life_domain,
+        )
+
+        # 10. Take top limit
+        top = candidates[:limit]
+
+        # 11/11b/11c. Retrieval write-backs (Qdrant counts, observation +
+        # knowledge_units sync) — each individually swallowed.
+        await self._record_retrievals(top, qdrant_by_id, fts_by_id, now_str)
+
+        # 12. Build RetrievalResult objects
+        results = _assemble_results(
+            top=top,
+            qdrant_by_id=qdrant_by_id,
+            fts_by_id=fts_by_id,
+            fused=fused,
+            activation_by_id=activation_by_id,
+            vector_ranked_dedup=vector_ranked_dedup,
+            seen=seen,
+            fts_ranked=fts_ranked,
+            embedding_available=embedding_available,
+            intent=intent,
+        )
+
+        # J-9 eval: log recall event for memory retrieval quality measurement
+        from genesis.eval.j9_hooks import (
+            emit_recall_diagnostics,
+            emit_recall_fired,
+        )
+
+        _scores = [r.score for r in results]
+        # MEM-005: entrenchment signal (monitor-only) — see _entrenchment_metrics.
+        _entrenchment, _mean_retrieved, _mean_age_days = _entrenchment_metrics(
+            results, _scores, retrieved_count_by_id, created_at_by_id, now_str,
+        )
+
+        recall_event_id = await emit_recall_fired(
+            self._db,
+            query=query,
+            result_count=len(results),
+            top_scores=[r.score for r in results[:5]],
+            memory_ids=[r.memory_id for r in results[:10]],
+            latency_ms=(time.monotonic() - _t0) * 1000,
+            source=source,
+            intent_category=intent.category,
+            graph_boost_applied=graph_boost_applied,
+            mean_score=sum(_scores) / len(_scores) if _scores else None,
+            wing=wing,
+            entrenchment_corr=_entrenchment,
+            mean_retrieved_count=_mean_retrieved,
+            mean_age_days=_mean_age_days,
+        )
+
+        # MEM-003: hand the emitted event id back to an MCP caller so it can
+        # enrich THIS event (mode / pipeline_used / post-filter counts) instead
+        # of emitting a second recall_fired that double-counts in the J-9
+        # aggregator and batch judge.
+        if event_id_sink is not None and recall_event_id is not None:
+            event_id_sink.append(recall_event_id)
+
+        # Recall diagnostics: capture intermediate pipeline metrics
+        _overlap = len(set(qdrant_by_id) & set(fts_by_id))
+        await emit_recall_diagnostics(
+            self._db,
+            recall_event_id=recall_event_id,
+            qdrant_pool_size=len(qdrant_by_id),
+            fts_pool_size=len(fts_by_id),
+            event_pool_size=len(event_memory_ids),
+            total_candidates=len(all_ids),
+            overlap_count=_overlap,
+            score_spread=round(max(_scores) - min(_scores), 4) if _scores else None,
+            embedding_available=embedding_available,
+            intent_category=intent.category,
+            intent_confidence=intent.confidence,
+            query_expanded=fts_query != query,
+        )
+
+        return results
+
+    # --- recall() stage helpers (read-only gathers/computes) ---
+    # Bodies are verbatim moves out of recall(); the orchestration order,
+    # guards, and early returns live in recall() itself.
+
+    async def _embed_query(
+        self, query: str,
+    ) -> tuple[list[float] | None, bool]:
+        """Stage 1: embed the query, degrading to FTS5-only on failure.
+
+        Returns ``(vector, embedding_available)``.
+        """
         embedding_available = True
         vector = None
         try:
@@ -405,40 +822,64 @@ class HybridRetriever:
         except EmbeddingUnavailableError:
             embedding_available = False
             logger.warning("Embedding unavailable, falling back to FTS5-only retrieval")
+        return vector, embedding_available
 
-        # 2. Qdrant vector search across collections (skip if no embedding)
+    async def _gather_vector_candidates(
+        self,
+        *,
+        vector: list[float],
+        collections: list[str],
+        candidate_limit: int,
+        wing: str | None,
+        room: str | None,
+        life_domain: str | None,
+        project_type: str | None,
+        exclude_subsystems: list[str] | None,
+        include_only_subsystems: list[str] | None,
+        include_deprecated: bool,
+    ) -> tuple[list[dict], dict[str, dict]]:
+        """Stage 2: Qdrant vector search across collections.
+
+        Returns ``(qdrant_results, qdrant_by_id)`` — the score-sorted hit
+        list and a first-hit-wins dedup map.
+        """
         qdrant_results: list[dict] = []
         qdrant_by_id: dict[str, dict] = {}
-        if embedding_available and vector is not None:
-            for coll in collections:
-                with track_operation(self._embeddings.tracker, "qdrant.search"):
-                    hits = qdrant_ops.search(
-                        self._qdrant,
-                        collection=coll,
-                        query_vector=vector,
-                        limit=candidate_limit,
-                        wing=wing,
-                        room=room,
-                        life_domain=life_domain,
-                        project_type=project_type,
-                        exclude_subsystems=exclude_subsystems,
-                        include_only_subsystems=include_only_subsystems,
-                        include_deprecated=include_deprecated,
-                    )
-                for hit in hits:
-                    hit["_collection"] = coll
-                qdrant_results.extend(hits)
+        for coll in collections:
+            with track_operation(self._embeddings.tracker, "qdrant.search"):
+                hits = qdrant_ops.search(
+                    self._qdrant,
+                    collection=coll,
+                    query_vector=vector,
+                    limit=candidate_limit,
+                    wing=wing,
+                    room=room,
+                    life_domain=life_domain,
+                    project_type=project_type,
+                    exclude_subsystems=exclude_subsystems,
+                    include_only_subsystems=include_only_subsystems,
+                    include_deprecated=include_deprecated,
+                )
+            for hit in hits:
+                hit["_collection"] = coll
+            qdrant_results.extend(hits)
 
-            qdrant_results.sort(key=lambda h: h["score"], reverse=True)
+        qdrant_results.sort(key=lambda h: h["score"], reverse=True)
 
-            for hit in qdrant_results:
-                mid = hit["id"]
-                if mid not in qdrant_by_id:
-                    qdrant_by_id[mid] = hit
+        for hit in qdrant_results:
+            mid = hit["id"]
+            if mid not in qdrant_by_id:
+                qdrant_by_id[mid] = hit
+        return qdrant_results, qdrant_by_id
 
-        # 2b. Event-calendar search (temporal queries)
-        # (Intent classified at the top of recall(); reused below for
-        # RRF bias in step 7 and for the temporal-marker check here.)
+    async def _gather_event_candidates(
+        self, query: str, intent: QueryIntent, candidate_limit: int,
+    ) -> list[str]:
+        """Stage 2b: event-calendar search for temporal queries.
+
+        (Intent classified at the top of recall(); reused downstream for
+        RRF bias in step 7 and for the temporal-marker check here.)
+        """
         event_memory_ids: list[str] = []
         if intent.category == "WHEN" or _has_temporal_markers(query):
             try:
@@ -452,8 +893,13 @@ class HybridRetriever:
                     )
             except Exception:
                 logger.warning("Event-calendar search failed", exc_info=True)
+        return event_memory_ids
 
-        # 2c. Expand query via tag co-occurrence (opt-in, expensive index rebuild)
+    async def _expand_fts_query(
+        self, query: str, collections: list[str], *, expand_query_terms: bool,
+    ) -> str:
+        """Stage 2c: expand the FTS query via tag co-occurrence (degrades to
+        the original query on failure)."""
         fts_query = query
         if expand_query_terms:
             try:
@@ -462,14 +908,30 @@ class HybridRetriever:
                 )
             except Exception:
                 logger.warning("Query expansion failed, using original", exc_info=True)
+        return fts_query
 
-        # 3. FTS5 text search (using expanded query)
-        # FTS5 respects the caller's source choice — searching the wrong
-        # pool here is how knowledge_base entries flood episodic recall
-        # results purely by candidate volume. When source="both" we pass
-        # None so FTS5 sees every row; for a single-collection source we
-        # filter at the SQL level so the candidate set matches Qdrant's
-        # filtered search and RRF fuses comparable lists.
+    async def _gather_fts_candidates(
+        self,
+        *,
+        query: str,
+        fts_query: str,
+        collections: list[str],
+        candidate_limit: int,
+        exclude_subsystems: list[str] | None,
+        include_only_subsystems: list[str] | None,
+        include_deprecated: bool,
+    ) -> tuple[list[dict], dict[str, dict]]:
+        """Stage 3: FTS5 text search using the expanded query.
+
+        FTS5 respects the caller's source choice — searching the wrong
+        pool here is how knowledge_base entries flood episodic recall
+        results purely by candidate volume. When source="both" we pass
+        None so FTS5 sees every row; for a single-collection source we
+        filter at the SQL level so the candidate set matches Qdrant's
+        filtered search and RRF fuses comparable lists.
+
+        Returns ``(fts_results, fts_by_id)``.
+        """
         fts_is_boolean = fts_query != query  # expansion produced boolean syntax
         fts_collection = collections[0] if len(collections) == 1 else None
         fts_results = await memory_crud.search_ranked(
@@ -488,19 +950,28 @@ class HybridRetriever:
             mid = row["memory_id"]
             if mid not in fts_by_id:
                 fts_by_id[mid] = row
+        return fts_results, fts_by_id
 
-        # 4. Union of all candidate memory_ids
-        all_ids = set(qdrant_by_id) | set(fts_by_id) | set(event_memory_ids)
-        if not all_ids:
-            return []
+    async def _filter_expired_candidates(
+        self,
+        all_ids: set[str],
+        qdrant_by_id: dict[str, dict],
+        fts_by_id: dict[str, dict],
+        event_memory_ids: list[str],
+    ) -> tuple[set[str], list[str]]:
+        """Stage 4b (Phase 1.5e): drop candidates past their bitemporal
+        invalid_at.
 
-        # 4b. Phase 1.5e: drop candidates past their bitemporal invalid_at.
-        # FTS5 already filtered (search_ranked has SQL WHERE on invalid_at);
-        # Qdrant and the event calendar don't see invalid_at, so a batched
-        # lookup here catches their candidates before we waste activation/
-        # link computation on expired rows.
-        # Wrapped in try/except: a DB failure here should degrade to
-        # "no expiry filter applied" rather than crash the entire recall.
+        FTS5 already filtered (search_ranked has SQL WHERE on invalid_at);
+        Qdrant and the event calendar don't see invalid_at, so a batched
+        lookup here catches their candidates before we waste activation/
+        link computation on expired rows.
+        Wrapped in try/except: a DB failure here should degrade to
+        "no expiry filter applied" rather than crash the entire recall.
+
+        **Mutates ``qdrant_by_id``/``fts_by_id`` in place** (pops expired
+        ids); returns the shrunk ``(all_ids, event_memory_ids)``.
+        """
         try:
             expired = await _expired_candidate_ids(self._db, all_ids)
         except Exception:
@@ -515,18 +986,27 @@ class HybridRetriever:
                 qdrant_by_id.pop(mid, None)
                 fts_by_id.pop(mid, None)
             event_memory_ids = [m for m in event_memory_ids if m not in expired]
-            if not all_ids:
-                return []
+        return all_ids, event_memory_ids
 
-        # 5. Batch-fetch link counts for all candidates (replaces N+1 per-ID loop)
-        now_str = datetime.now(UTC).isoformat()
+    async def _compute_activations(
+        self,
+        all_ids: set[str],
+        qdrant_by_id: dict[str, dict],
+        now_str: str,
+    ) -> tuple[dict[str, float], dict[str, int], dict[str, int], dict[str, str]]:
+        """Stages 5/5b: batch-fetch link counts (replaces N+1 per-ID loop)
+        and compute activation scores using the batched link data.
+
+        Returns ``(activation_by_id, inbound_by_id, retrieved_count_by_id,
+        created_at_by_id)`` — inbound counts feed graph boost in step 7b;
+        the MEM-005 maps capture retrieval frequency + age per id to measure
+        (not act on) whether the activation loop entrenches frequently-
+        retrieved memories.
+        """
         link_counts = await memory_links.batch_link_counts(self._db, list(all_ids))
 
-        # 5b. Compute activation scores using batched link data
         activation_by_id: dict[str, float] = {}
         inbound_by_id: dict[str, int] = {}  # saved for graph boost in step 7b
-        # MEM-005: capture retrieval frequency + age per id to measure (not act
-        # on) whether the activation loop entrenches frequently-retrieved memories.
         retrieved_count_by_id: dict[str, int] = {}
         created_at_by_id: dict[str, str] = {}
         for mid in all_ids:
@@ -559,63 +1039,32 @@ class HybridRetriever:
             activation_by_id[mid] = act.final_score
             retrieved_count_by_id[mid] = retrieved_count
             created_at_by_id[mid] = created_at
+        return activation_by_id, inbound_by_id, retrieved_count_by_id, created_at_by_id
 
-        # 6. Build ranked lists for RRF (or FTS5-only if no embedding)
-        vector_ranked_dedup: list[str] = []
-        seen: set[str] = set()
-        if embedding_available:
-            vector_ranked = [h["id"] for h in qdrant_results if h["id"] in all_ids]
-            for mid in vector_ranked:
-                if mid not in seen:
-                    seen.add(mid)
-                    vector_ranked_dedup.append(mid)
+    # --- recall() stage helpers (mutators / side effects) ---
 
-        # FTS5 rank is negative, lower = better; results already ordered by rank
-        fts_ranked = [r["memory_id"] for r in fts_results if r["memory_id"] in all_ids]
+    async def _maybe_rerank(
+        self,
+        *,
+        query: str,
+        fused: dict[str, float],
+        qdrant_by_id: dict[str, dict],
+        fts_by_id: dict[str, dict],
+        limit: int,
+        rerank: bool,
+    ) -> dict[str, float]:
+        """Stage 7.5: cross-encoder reranking (optional, off by default).
 
-        activation_ranked = sorted(all_ids, key=lambda m: activation_by_id[m], reverse=True)
+        Voyage scores live in a different range (0.0–1.0) than RRF scores
+        (~0.01–0.05). To keep the score space uniform for graph boost and
+        final sort, we replace the entire fused dict with positional scores
+        derived from the reranker's ordering. Candidates the reranker
+        didn't score are dropped — if they lacked content or fell below
+        top_k, they weren't strong enough to keep.
 
-        # 6b. Build intent-biased ranked list (empty for GENERAL — no bias)
-        intent_ranked: list[str] = []
-        if intent.category != "GENERAL":
-            candidate_meta: dict[str, dict] = {}
-            for mid in all_ids:
-                qhit = qdrant_by_id.get(mid)
-                fhit = fts_by_id.get(mid)
-                if qhit:
-                    p = qhit.get("payload", {})
-                    candidate_meta[mid] = {
-                        "source": p.get("source", ""),
-                        "tags": p.get("tags") or [],
-                        "content": p.get("content", ""),
-                    }
-                elif fhit:
-                    candidate_meta[mid] = {
-                        "source": fhit.get("source_type", ""),
-                        "tags": [],
-                        "content": fhit.get("content", ""),
-                    }
-            intent_ranked = rank_by_intent(intent, candidate_meta)
-
-        # 7. Fusion: RRF if we have vector results, otherwise FTS5 + activation only
-        if embedding_available:
-            ranked_lists = [vector_ranked_dedup, fts_ranked, activation_ranked]
-        else:
-            ranked_lists = [fts_ranked, activation_ranked]
-        if intent_ranked:
-            ranked_lists.append(intent_ranked)
-        if event_memory_ids:
-            ranked_lists.append(event_memory_ids)
-        fused = _rrf_fuse(ranked_lists)
-
-        # 7.5 Cross-encoder reranking (optional, off by default)
-        #
-        # Voyage scores live in a different range (0.0–1.0) than RRF scores
-        # (~0.01–0.05). To keep the score space uniform for graph boost and
-        # final sort, we replace the entire fused dict with positional scores
-        # derived from the reranker's ordering. Candidates the reranker
-        # didn't score are dropped — if they lacked content or fell below
-        # top_k, they weren't strong enough to keep.
+        Returns the SAME ``fused`` object when reranking is skipped, or a
+        replacement positional-score dict when it ran.
+        """
         if rerank and self._reranker and self._reranker.enabled and fused:
             rerank_candidates = sorted(
                 fused, key=fused.get, reverse=True,  # type: ignore[arg-type]
@@ -641,8 +1090,18 @@ class HybridRetriever:
                         item["id"]: 1.0 / (1 + rank)
                         for rank, item in enumerate(reranked)
                     }
+        return fused
 
-        # 7b. Graph boost: backlink + adjacency (floor-gated)
+    async def _apply_graph_boost(
+        self,
+        fused: dict[str, float],
+        inbound_by_id: dict[str, int],
+    ) -> bool:
+        """Stage 7b: graph boost — backlink + adjacency (floor-gated).
+
+        **Mutates ``fused`` in place** (multiplicative boosts); never
+        rebinds it. Returns whether any boost was applied.
+        """
         graph_boost_applied = False
         if fused:
             top_fused = max(fused.values())
@@ -681,50 +1140,19 @@ class HybridRetriever:
                         "Adjacency boost query failed, skipping",
                         exc_info=True,
                     )
+        return graph_boost_applied
 
-        # 8. Filter by min_activation
-        candidates = [
-            mid for mid in fused if activation_by_id.get(mid, 0.0) >= min_activation
-        ]
-
-        # 8b. Diversity penalty — collapse echo clusters
-        # If multiple candidates have near-identical content (Jaccard ≥ 0.80),
-        # penalize lower-ranked echoes to prevent sycophantic memory clusters
-        # from dominating retrieval results.
-        candidates = _apply_diversity_penalty(
-            candidates, fused, qdrant_by_id, fts_by_id,
-        )
-
-        # 9. Sort by fused score descending
-        candidates.sort(key=lambda m: fused[m], reverse=True)
-
-        # 9b. Filter FTS5-only candidates by wing/room/life_domain (Qdrant
-        #     results are already filtered at query time; this catches
-        #     FTS5-only candidates that don't match the requested filters).
-        if wing or room or life_domain:
-            filtered: list[str] = []
-            for mid in candidates:
-                qhit = qdrant_by_id.get(mid)
-                if qhit:
-                    # Qdrant already filtered — guaranteed match
-                    filtered.append(mid)
-                elif life_domain and not wing and not room:
-                    # FTS5-only + life_domain filter: check the tag string
-                    fhit = fts_by_id.get(mid)
-                    if fhit:
-                        tags_str = fhit.get("tags", "")
-                        if f"life_domain:{life_domain}" in tags_str:
-                            filtered.append(mid)
-                else:
-                    # FTS5-only candidate with wing/room filter — no
-                    # wing/room data in FTS5, exclude since we can't
-                    # verify membership.
-                    pass
-            candidates = filtered
-
-        # 10. Take top limit
-        top = candidates[:limit]
-
+    async def _record_retrievals(
+        self,
+        top: list[str],
+        qdrant_by_id: dict[str, dict],
+        fts_by_id: dict[str, dict],
+        now_str: str,
+    ) -> None:
+        """Stages 11/11b/11c: retrieval write-backs for the returned
+        candidates. Every write is individually swallowed — a failed
+        write-back must never block returning results.
+        """
         # 11. Increment retrieved_count + stamp last_retrieved_at
         for mid in top:
             qdrant_hit = qdrant_by_id.get(mid)
@@ -790,150 +1218,3 @@ class HybridRetriever:
                     "Failed to sync knowledge retrieved_count for %d units",
                     len(ku_qdrant_ids), exc_info=True,
                 )
-
-        # 12. Build RetrievalResult objects
-        results: list[RetrievalResult] = []
-        for mid in top:
-            qdrant_hit = qdrant_by_id.get(mid)
-            fts_hit = fts_by_id.get(mid)
-
-            # Determine content and metadata. ``_collection`` is the
-            # authoritative first-party/external discriminator (audit D12):
-            # the Qdrant collection on a vector hit (set at recall time, ~L367),
-            # or the FTS row's collection tag for an FTS5-only hit.
-            if qdrant_hit:
-                payload = qdrant_hit.get("payload", {})
-                content = payload.get("content", "")
-                src = payload.get("source", "")
-                mem_type = payload.get("memory_type", "")
-                _collection = qdrant_hit.get("_collection", "episodic_memory")
-            elif fts_hit:
-                content = fts_hit.get("content", "")
-                src = fts_hit.get("source_type", "")
-                mem_type = fts_hit.get("collection", "")
-                payload = fts_hit
-                _collection = fts_hit.get("collection", "episodic_memory")
-            else:
-                continue
-
-            # Determine ranks
-            if embedding_available:
-                v_rank = (
-                    vector_ranked_dedup.index(mid) + 1
-                    if mid in seen and mid in set(vector_ranked_dedup)
-                    else None
-                )
-            else:
-                v_rank = None
-            f_rank = (
-                fts_ranked.index(mid) + 1
-                if mid in set(fts_ranked)
-                else None
-            )
-
-            # Extract provenance from Qdrant payload if available
-            _p = payload if qdrant_hit else {}
-            _line_range = _p.get("source_line_range")
-            results.append(
-                RetrievalResult(
-                    memory_id=mid,
-                    content=content,
-                    source=src,
-                    memory_type=mem_type,
-                    score=fused[mid],
-                    vector_rank=v_rank,
-                    fts_rank=f_rank,
-                    activation_score=activation_by_id.get(mid, 0.0),
-                    payload=_p,
-                    source_session_id=_p.get("source_session_id"),
-                    transcript_path=_p.get("transcript_path"),
-                    source_line_range=tuple(_line_range) if _line_range else None,
-                    source_pipeline=_p.get("source_pipeline"),
-                    memory_class=_p.get("memory_class", "fact"),
-                    query_intent=intent.category,
-                    intent_confidence=intent.confidence,
-                    collection=_collection,
-                ),
-            )
-
-        # J-9 eval: log recall event for memory retrieval quality measurement
-        from genesis.eval.j9_hooks import (
-            emit_recall_diagnostics,
-            emit_recall_fired,
-        )
-
-        _scores = [r.score for r in results]
-        # MEM-005: entrenchment signal — does retrieval frequency predict final
-        # ranking? A positive corr(retrieved_count, score) means the activation
-        # loop is rewarding mere frequency in the ranking. Monitor-only (D7:
-        # instrument, do NOT re-rank); a sustained strong-positive trend over
-        # time flags entrenchment of stale-but-popular memories. Defensive — it
-        # reads external payload data and must never break recall.
-        _entrenchment = _mean_retrieved = _mean_age_days = None
-        try:
-            _ret_counts = [
-                float(retrieved_count_by_id.get(r.memory_id, 0)) for r in results
-            ]
-            if _ret_counts:
-                _entrenchment = _spearman_rank_corr(_ret_counts, _scores)
-                _mean_retrieved = round(sum(_ret_counts) / len(_ret_counts), 2)
-                _now_dt = datetime.fromisoformat(now_str.replace("Z", "+00:00"))
-                _ages: list[float] = []
-                for r in results:
-                    _ca = created_at_by_id.get(r.memory_id)
-                    if not _ca:
-                        continue
-                    try:
-                        _ages.append(
-                            (_now_dt - datetime.fromisoformat(
-                                _ca.replace("Z", "+00:00"))).total_seconds() / 86400.0
-                        )
-                    except (ValueError, AttributeError):
-                        continue
-                if _ages:
-                    _mean_age_days = round(sum(_ages) / len(_ages), 1)
-        except Exception:
-            logger.debug("MEM-005 entrenchment metric failed", exc_info=True)
-
-        recall_event_id = await emit_recall_fired(
-            self._db,
-            query=query,
-            result_count=len(results),
-            top_scores=[r.score for r in results[:5]],
-            memory_ids=[r.memory_id for r in results[:10]],
-            latency_ms=(time.monotonic() - _t0) * 1000,
-            source=source,
-            intent_category=intent.category,
-            graph_boost_applied=graph_boost_applied,
-            mean_score=sum(_scores) / len(_scores) if _scores else None,
-            wing=wing,
-            entrenchment_corr=_entrenchment,
-            mean_retrieved_count=_mean_retrieved,
-            mean_age_days=_mean_age_days,
-        )
-
-        # MEM-003: hand the emitted event id back to an MCP caller so it can
-        # enrich THIS event (mode / pipeline_used / post-filter counts) instead
-        # of emitting a second recall_fired that double-counts in the J-9
-        # aggregator and batch judge.
-        if event_id_sink is not None and recall_event_id is not None:
-            event_id_sink.append(recall_event_id)
-
-        # Recall diagnostics: capture intermediate pipeline metrics
-        _overlap = len(set(qdrant_by_id) & set(fts_by_id))
-        await emit_recall_diagnostics(
-            self._db,
-            recall_event_id=recall_event_id,
-            qdrant_pool_size=len(qdrant_by_id),
-            fts_pool_size=len(fts_by_id),
-            event_pool_size=len(event_memory_ids),
-            total_candidates=len(all_ids),
-            overlap_count=_overlap,
-            score_spread=round(max(_scores) - min(_scores), 4) if _scores else None,
-            embedding_available=embedding_available,
-            intent_category=intent.category,
-            intent_confidence=intent.confidence,
-            query_expanded=fts_query != query,
-        )
-
-        return results
