@@ -60,8 +60,8 @@ def _make_repo(path: Path, origin: str) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
     subprocess.run(["git", "-C", str(path), "remote", "add", "origin", origin], check=True)
-    subprocess.run(["git", "-C", str(path), "config", "user.email", "t@t.io"], check=True)
-    subprocess.run(["git", "-C", str(path), "config", "user.name", "t"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "test"], check=True)
     return path
 
 

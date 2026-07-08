@@ -30,6 +30,11 @@ Known limits (accepted, documented):
   truncates arg collection, and space-separated global flags (``git --git-dir P
   commit``) are not value-skipped like ``-C``/``-c``. Agent-issued commands here
   use ``git -C`` / ``cd && git``, both handled and tested.
+
+Runtime requirement: PyYAML. It is always present in the Genesis venv (this hook
+runs via ``genesis-hook``, which invokes that venv's python). If ``yaml`` is
+unavailable the guard prints a visible NOTE to stderr and fails open (disables
+itself) rather than crashing.
 """
 
 from __future__ import annotations
@@ -310,6 +315,7 @@ def _classify(
 
 
 def main() -> int:
+    """Entry point: parse hook input, classify staged files, block or advise."""
     try:
         raw = os.environ.get("CLAUDE_TOOL_INPUT", "")
         if not raw:
