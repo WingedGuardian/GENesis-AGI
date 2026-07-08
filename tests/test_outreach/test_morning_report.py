@@ -444,3 +444,96 @@ async def test_pr_ci_status_none_on_empty_or_no_url(monkeypatch):
     monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
     assert await _mr_mod._pr_ci_status("https://x/pull/1") is None
     assert await _mr_mod._pr_ci_status("") is None
+
+
+# --- message_queue finding closure (confirm_delivery) ---
+
+
+async def _insert_finding(db, id_: str, content: str = "inbox batch finding"):
+    from genesis.db.crud import message_queue as mq_crud
+
+    await mq_crud.create(
+        db, id=id_, source="cc_background", target="cc_foreground",
+        message_type="finding", content=content,
+        created_at="2026-03-12T06:00:00+00:00", priority="low",
+    )
+
+
+async def _mq_row(db, id_: str):
+    cursor = await db.execute(
+        "SELECT response, responded_at FROM message_queue WHERE id = ?", (id_,)
+    )
+    return dict(await cursor.fetchone())
+
+
+@pytest.mark.asyncio
+async def test_mq_finding_closed_after_confirm_delivery(db, mock_health, mock_drafter):
+    await _insert_finding(db, "f1")
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    await gen.generate()
+    await gen.confirm_delivery()
+
+    row = await _mq_row(db, "f1")
+    assert row["response"] == "surfaced_in_morning_report"
+    assert row["responded_at"] is not None
+    assert gen._pending_mq_ids == []
+
+
+@pytest.mark.asyncio
+async def test_mq_finding_stays_pending_when_delivery_unconfirmed(
+    db, mock_health, mock_drafter
+):
+    # Delivery failed → confirm_delivery never called → finding re-appears
+    # in the next report instead of being silently closed.
+    await _insert_finding(db, "f2")
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    await gen.generate()
+
+    row = await _mq_row(db, "f2")
+    assert row["responded_at"] is None
+    assert gen._pending_mq_ids == ["f2"]
+
+
+@pytest.mark.asyncio
+async def test_untitled_mq_rows_not_rendered_and_not_closed(
+    db, mock_health, mock_drafter
+):
+    # "Untitled" rows are filtered from the report, so closing them would
+    # mark items responded that were never shown.
+    await _insert_finding(db, "f3", content="Untitled batch artifact")
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    await gen.generate()
+    await gen.confirm_delivery()
+
+    row = await _mq_row(db, "f3")
+    assert row["responded_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_mq_ids_replaced_not_accumulated_across_generates(
+    db, mock_health, mock_drafter
+):
+    await _insert_finding(db, "f4")
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    await gen.generate()
+    await gen.generate()  # retry after failed delivery must not duplicate
+    assert gen._pending_mq_ids == ["f4"]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_question_rows_never_closed(db, mock_health, mock_drafter):
+    # question/decision/error rows are the checkpoint flow's to answer
+    # (CheckpointManager.deliver_response); the report must not close them.
+    from genesis.db.crud import message_queue as mq_crud
+
+    await mq_crud.create(
+        db, id="q1", source="cc_background", target="user",
+        message_type="question", content="Need a decision on X",
+        created_at="2026-03-12T06:00:00+00:00",
+    )
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    await gen.generate()
+    await gen.confirm_delivery()
+
+    row = await _mq_row(db, "q1")
+    assert row["responded_at"] is None

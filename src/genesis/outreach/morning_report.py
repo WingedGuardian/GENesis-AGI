@@ -163,6 +163,7 @@ class MorningReportGenerator:
         self._drafter = drafter
         self._event_bus = event_bus
         self._pending_surface_ids: list[str] = []
+        self._pending_mq_ids: list[str] = []
 
     async def generate(self) -> OutreachRequest:
         context = await self._assemble_context()
@@ -193,23 +194,42 @@ class MorningReportGenerator:
         )
 
     async def confirm_delivery(self) -> None:
-        """Mark observations as surfaced after successful delivery.
+        """Mark surfaced items as consumed after successful delivery.
 
         Called by the scheduler after the pipeline confirms delivery.
-        Observations collected during generate() are only marked surfaced
-        here — if delivery fails, they re-appear in the next report.
+        Items collected during generate() are only closed here — if
+        delivery fails, they re-appear in the next report.
 
-        Only calls mark_surfaced — retrieved/influenced tracking is
-        handled by _get_activity_summary to avoid double-counting.
+        Observations: only calls mark_surfaced — retrieved/influenced
+        tracking is handled by _get_activity_summary to avoid
+        double-counting.
+
+        Message-queue rows rendered into the report are marked responded;
+        nothing else ever closes them (the 7-day expiry job is the only
+        other exit, which conflates "seen in a delivered report" with
+        "never seen at all").
         """
-        ids = self._pending_surface_ids
-        if not ids:
-            return
-        from genesis.db.crud.observations import mark_surfaced
-
         now = datetime.now(UTC).isoformat()
-        await mark_surfaced(self._db, ids, now)
-        self._pending_surface_ids = []
+
+        ids = self._pending_surface_ids
+        if ids:
+            from genesis.db.crud.observations import mark_surfaced
+
+            await mark_surfaced(self._db, ids, now)
+            self._pending_surface_ids = []
+
+        mq_ids = self._pending_mq_ids
+        if mq_ids:
+            from genesis.db.crud import message_queue as mq_crud
+
+            for mq_id in mq_ids:
+                await mq_crud.set_response(
+                    self._db,
+                    mq_id,
+                    response="surfaced_in_morning_report",
+                    responded_at=now,
+                )
+            self._pending_mq_ids = []
 
     @staticmethod
     def _load_system_prompt() -> str | None:
@@ -571,8 +591,12 @@ class MorningReportGenerator:
 
         lines: list[str] = []
 
-        # Message queue items
+        # Message queue items. Rendered rows are collected so
+        # confirm_delivery() can close them — without that they re-list
+        # every morning until the 7-day expiry job silently drops them
+        # (observed: 158 expired / 0 ever responded over 4 months).
         mq_rows = await mq_crud.query_pending(self._db)
+        self._pending_mq_ids = []
         for r in mq_rows:
             content = r.get("content", "")
             if "Untitled" in content:
@@ -583,6 +607,12 @@ class MorningReportGenerator:
                 f"from={r.get('source') or '?'}, "
                 f"created={r.get('created_at', '?')}: {content[:200]}"
             )
+            # Only fire-and-forget findings are closed on delivery.
+            # question/decision/error rows belong to the checkpoint flow
+            # (CheckpointManager.deliver_response) — closing them here
+            # would swallow a background session's pending question.
+            if r.get("id") and r.get("message_type") == "finding":
+                self._pending_mq_ids.append(r["id"])
 
         # Pending ego proposals (user needs to approve/reject on dashboard)
         try:
