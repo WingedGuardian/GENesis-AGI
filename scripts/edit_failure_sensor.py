@@ -1,27 +1,44 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: track Edit/Write success and failure rates.
+"""PostToolUse + PostToolUseFailure hook: track Edit/Write success and failure rates.
 
 Records every Edit and Write tool call outcome to the tool_call_outcomes
 table, enabling measurement of edit failure rates and identification of
 patterns in failed edits (file size, match complexity, etc.).
 
-Fires on Edit|Write completions. Reads stdin JSON per the PostToolUse
-contract (includes tool_result/tool_output).
+Registered for BOTH events (see .claude/settings.json):
+- PostToolUse fires only on SUCCESSFUL tool calls — it never sees a failed
+  Edit, so on this event the row is a success record (the marker scan below
+  is a belt-and-braces guard for soft-error text in nominally-successful
+  output).
+- PostToolUseFailure fires when the tool call FAILS (e.g. "old_string not
+  found") and carries the error in ``tool_error``. This is the only path
+  that can produce success=0 rows; without it the sensor is blind to
+  failures (observed: 12,737 rows / 0 failures over 7 weeks before this
+  event was registered).
 
-Zero tokens — pure shell/DB operation.
+Reads stdin JSON per the hook contract; ``hook_event_name`` distinguishes
+the two events. Zero tokens — pure shell/DB operation.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-_DB_PATH = Path.home() / "genesis" / "data" / "genesis.db"
+# GENESIS_DB_PATH override exists for tests/verification only; production
+# hooks rely on the default. Keep this script stdlib-only (no genesis imports).
+_DB_PATH = Path(
+    os.environ.get("GENESIS_DB_PATH", "")
+    or Path.home() / "genesis" / "data" / "genesis.db"
+)
 
-# Markers in tool_output that indicate an Edit failure
+# Markers in tool_output that indicate an Edit failure surfaced in a
+# nominally-successful call (defensive; hard failures arrive via
+# PostToolUseFailure instead).
 _FAILURE_MARKERS = [
     "old_string not found",
     "not unique in the file",
@@ -42,6 +59,23 @@ def main() -> None:
         return
 
 
+def _extract_error(data: dict) -> str:
+    """Best-effort error text from a PostToolUseFailure payload.
+
+    ``tool_error`` is the documented key; the fallbacks tolerate payload
+    drift across Claude Code versions rather than silently recording an
+    empty snippet.
+    """
+    for key in ("tool_error", "error", "tool_output", "tool_response"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    code = data.get("tool_error_code")
+    if code is not None:
+        return f"tool failed (error code {code}, no error text)"
+    return "tool failed (no error text in payload)"
+
+
 def _process(data: dict) -> None:
     tool_name = data.get("tool_name", "")
     if tool_name not in ("Edit", "Write"):
@@ -49,23 +83,25 @@ def _process(data: dict) -> None:
 
     session_id = data.get("session_id", "")
     tool_input = data.get("tool_input") or {}
-    tool_output = data.get("tool_output", "") or ""
 
     if not isinstance(tool_input, dict):
         return
 
     file_path = tool_input.get("file_path", "")
 
-    # Determine success/failure from tool_output
-    success = 1
-    error_snippet = None
-
-    output_lower = tool_output.lower()
-    for marker in _FAILURE_MARKERS:
-        if marker.lower() in output_lower:
-            success = 0
-            error_snippet = tool_output[:200]
-            break
+    if data.get("hook_event_name") == "PostToolUseFailure":
+        success = 0
+        error_snippet = _extract_error(data)[:200]
+    else:
+        tool_output = data.get("tool_output", "") or ""
+        success = 1
+        error_snippet = None
+        output_lower = str(tool_output).lower()
+        for marker in _FAILURE_MARKERS:
+            if marker.lower() in output_lower:
+                success = 0
+                error_snippet = str(tool_output)[:200]
+                break
 
     if not _DB_PATH.exists():
         return
