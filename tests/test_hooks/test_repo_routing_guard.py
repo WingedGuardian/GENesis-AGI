@@ -188,6 +188,84 @@ def test_strong_still_fires_under_allow_path(agi_repo, topology):
     assert r.returncode == 2
 
 
+# ── compound-command parsing (review findings 1-3) ──────────────────────
+
+def test_semicolon_in_commit_message_still_detects(agi_repo, topology):
+    # A ';' inside the -m message must NOT be treated as a command separator.
+    _write(agi_repo, "esphome/device.yaml", "esphome:\n")
+    subprocess.run(["git", "-C", str(agi_repo), "add", "esphome/device.yaml"], check=True)
+    r = _run('git commit -m "add esphome device; then wire it in"', agi_repo, topology)
+    assert r.returncode == 2
+
+
+def test_chained_adds_second_is_checked(agi_repo, topology):
+    _write(agi_repo, "README.md")
+    _write(agi_repo, "firmware/boot.py")
+    r = _run("git add README.md && git add firmware/boot.py", agi_repo, topology)
+    assert r.returncode == 2
+    assert "firmware/boot.py" in r.stderr
+
+
+def test_add_then_commit_all_chained(agi_repo, topology):
+    # `git add safe && git commit -am` — the commit stage must still be checked.
+    _write(agi_repo, "firmware/boot.py")
+    subprocess.run(["git", "-C", str(agi_repo), "add", "firmware/boot.py"], check=True)
+    _write(agi_repo, "notes.txt")
+    r = _run("git add notes.txt && git commit -m done", agi_repo, topology)
+    assert r.returncode == 2
+
+
+def test_newline_separated_cd_then_git(agi_repo, topology, tmp_path):
+    _write(agi_repo, "firmware/boot.py")
+    elsewhere = tmp_path / "nl"
+    elsewhere.mkdir()
+    r = _run(f"cd {agi_repo}\ngit add firmware/boot.py", elsewhere, topology)
+    assert r.returncode == 2
+
+
+# ── content-marker false positives (review finding 4) ───────────────────
+
+def test_ruleset_config_not_content_blocked(agi_repo, topology):
+    # A file literally named repo_topology.yaml (contains markers as data) must
+    # not self-block on content scan.
+    _write(agi_repo, "config/repo_topology.yaml",
+           'strong_content_markers: ["ESP32", "esphome:", "platformio"]\n')
+    r = _run("git add config/repo_topology.yaml", agi_repo, topology)
+    assert r.returncode == 0
+    assert r.stdout.strip() == ""
+
+
+def test_test_file_with_markers_not_content_blocked(agi_repo, topology):
+    _write(agi_repo, "tests/test_x.py", "# fixture mentions ESP32 and platformio\n")
+    r = _run("git add tests/test_x.py", agi_repo, topology)
+    assert r.returncode == 0
+
+
+def test_doc_with_markers_not_content_blocked(agi_repo, topology):
+    _write(agi_repo, "docs/hardware.md", "The ESP32 runs esphome: firmware.\n")
+    r = _run("git add docs/hardware.md", agi_repo, topology)
+    assert r.returncode == 0
+
+
+def test_code_file_with_markers_still_blocks(agi_repo, topology):
+    # Control: real code (not prose/tests/config) with a content marker still blocks.
+    _write(agi_repo, "src/genesis/hw/driver.py", "# ESP32 pinout\n")
+    r = _run("git add src/genesis/hw/driver.py", agi_repo, topology)
+    assert r.returncode == 2
+
+
+# ── deletions are never blocked (review finding 5) ──────────────────────
+
+def test_deleting_foreign_file_not_blocked(agi_repo, topology):
+    # Removing wrong-repo content (the incident cleanup) must never be blocked.
+    _write(agi_repo, "firmware/boot.py")
+    subprocess.run(["git", "-C", str(agi_repo), "add", "firmware/boot.py"], check=True)
+    subprocess.run(["git", "-C", str(agi_repo), "commit", "-q", "-m", "seed"], check=True)
+    subprocess.run(["git", "-C", str(agi_repo), "rm", "-q", "firmware/boot.py"], check=True)
+    r = _run("git commit -m 'remove firmware'", agi_repo, topology)
+    assert r.returncode == 0
+
+
 # ── override ────────────────────────────────────────────────────────────
 
 def test_override_bypasses(agi_repo, topology):

@@ -25,6 +25,11 @@ Known limits (accepted, documented):
 - ``git commit --amend`` sees only the staged delta, not the files already in
   the commit being amended.
 - Topology is matched by ``origin`` remote; a repo with no origin is not guarded.
+- Exotic command shapes degrade in the FAIL-SAFE direction (broader scan, never
+  a missed detection): a pathspec/message token literally equal to ``git``/``cd``
+  truncates arg collection, and space-separated global flags (``git --git-dir P
+  commit``) are not value-skipped like ``-C``/``-c``. Agent-issued commands here
+  use ``git -C`` / ``cd && git``, both handled and tested.
 """
 
 from __future__ import annotations
@@ -71,53 +76,64 @@ def _load_topology() -> dict | None:
         return None
 
 
-def _segments(cmd: str) -> list[str]:
-    """Split a compound command on top-level && and ; into trimmed segments."""
-    return [s.strip() for s in re.split(r"&&|;", cmd) if s.strip()]
+_SHELL_OPS = {"&&", "||", ";", "|", "&"}
 
 
-def _parse_git_invocation(cmd: str) -> tuple[str | None, list[str], str]:
-    """Find the git add|commit segment; return (subcommand, args, effective_dir).
+def _parse_git_invocations(cmd: str) -> list[tuple[str, list[str], str]]:
+    """Return every git add|commit in the command as (subcommand, args, dir).
 
-    Tracks a leading ``cd <dir>`` and ``git -C <dir>`` to infer the directory the
-    git command actually runs in. Best-effort — falls back to cwd. subcommand is
-    None if there is no add/commit.
+    Tokenizes the WHOLE command once with shlex (quote-aware, so a ``;`` inside a
+    ``-m`` message is not a separator, and newlines collapse to whitespace), then
+    walks the token stream: shell operators separate commands, ``cd <dir>`` and
+    ``git -C <dir>`` update the effective directory, and EVERY add/commit is
+    collected (not just the first). Best-effort — an unparseable command yields [].
     """
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        return []
+    out: list[tuple[str, list[str], str]] = []
     cur_dir = os.getcwd()
-    for seg in _segments(cmd):
-        try:
-            toks = shlex.split(seg)
-        except ValueError:
+    i, n = 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t in _SHELL_OPS:
+            i += 1
             continue
-        if not toks:
-            continue
-        if toks[0] == "cd" and len(toks) >= 2:
-            d = os.path.expanduser(toks[1])
+        if t == "cd" and i + 1 < n and toks[i + 1] not in _SHELL_OPS:
+            d = os.path.expanduser(toks[i + 1])
             cur_dir = d if os.path.isabs(d) else os.path.normpath(os.path.join(cur_dir, d))
+            i += 2
             continue
-        if "git" not in toks:
-            continue
-        rest = toks[toks.index("git") + 1:]
-        git_dir = cur_dir
-        i = 0
-        while i < len(rest):
-            t = rest[i]
-            if t == "-C" and i + 1 < len(rest):
-                d = os.path.expanduser(rest[i + 1])
-                git_dir = d if os.path.isabs(d) else os.path.normpath(os.path.join(cur_dir, d))
-                i += 2
-                continue
-            if t == "-c" and i + 1 < len(rest):
-                i += 2
-                continue
-            if t.startswith("-"):
+        if t == "git":
+            i += 1
+            git_dir = cur_dir
+            while i < n:
+                if toks[i] == "-C" and i + 1 < n:
+                    d = os.path.expanduser(toks[i + 1])
+                    git_dir = d if os.path.isabs(d) else os.path.normpath(os.path.join(cur_dir, d))
+                    i += 2
+                    continue
+                if toks[i] == "-c" and i + 1 < n:
+                    i += 2
+                    continue
+                if toks[i].startswith("-"):
+                    i += 1
+                    continue
+                break
+            sub = toks[i] if i < n else None
+            if sub is not None:
                 i += 1
-                continue
-            break
-        sub = rest[i] if i < len(rest) else None
-        if sub in ("add", "commit"):
-            return sub, rest[i + 1:], git_dir
-    return None, [], cur_dir
+            # Collect this git command's args until the next command boundary.
+            args: list[str] = []
+            while i < n and toks[i] not in _SHELL_OPS and toks[i] not in ("git", "cd"):
+                args.append(toks[i])
+                i += 1
+            if sub in ("add", "commit"):
+                out.append((sub, args, git_dir))
+            continue
+        i += 1
+    return out
 
 
 def _git(git_dir: str, args: list[str], timeout: int) -> str:
@@ -157,7 +173,11 @@ def _porcelain_files(
         if len(line) < 4:
             continue
         xy, path = line[:2], line[3:]
-        if " -> " in path:  # rename
+        # Deletions can never INTRODUCE wrong-repo content — skip so that
+        # removing a foreign file (the incident cleanup) is never blocked.
+        if "D" in xy:
+            continue
+        if " -> " in path:  # rename — classify the destination path
             path = path.split(" -> ", 1)[1]
         path = path.strip().strip('"')
         if not path:
@@ -178,16 +198,19 @@ def _commit_files(
         if len(parts) < 2:
             continue
         status, path = parts[0], parts[-1].strip().strip('"')
+        if status.startswith("D"):  # deletion — cannot introduce foreign content
+            continue
         files.add(path)
         if status.startswith("A"):
             new.add(path)
-    # `commit -a` / `-am` also stages tracked modifications
+    # `commit -a` / `-am` also stages tracked modifications (never new files).
     if any(a in ("-a", "--all") or (a.startswith("-") and not a.startswith("--") and "a" in a)
            for a in args):
-        for line in _git(git_dir, ["diff", "HEAD", "--name-only"], timeout).splitlines():
-            p = line.strip().strip('"')
-            if p:
-                files.add(p)
+        for line in _git(git_dir, ["diff", "HEAD", "--name-status"], timeout).splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2 or parts[0].startswith("D"):
+                continue
+            files.add(parts[-1].strip().strip('"'))
     return files, new
 
 
@@ -236,6 +259,15 @@ def _has_content_marker(git_dir: str, path: str, markers: list[str], max_bytes: 
     return any(m in blob for m in markers)
 
 
+_DEFAULT_CONTENT_EXCLUDE = [
+    "*.md", "**/*.md", "docs/**", "tests/**", "**/repo_topology.yaml",
+]
+
+
+def _path_excluded(path: str, globs: list[str]) -> bool:
+    return any(_glob_match(path, g) for g in globs)
+
+
 def _classify(
     files: set[str], new_files: set[str], git_dir: str,
     cur_allow: list[str], foreign: dict[str, dict], settings: dict,
@@ -244,6 +276,10 @@ def _classify(
     max_files = int(settings.get("max_files", 200))
     max_content = int(settings.get("max_content_files", 20))
     max_bytes = int(settings.get("max_content_bytes", 4096))
+    # Content markers scan CODE, not prose/tests/the ruleset itself — otherwise
+    # this guard's own topology + test files (which name the markers verbatim)
+    # would self-block on a fresh add (e.g. the public-repo distribution).
+    content_exclude = settings.get("content_scan_exclude") or _DEFAULT_CONTENT_EXCLUDE
     strong: list[tuple[str, str]] = []
     weak: list[tuple[str, str]] = []
     reads = 0
@@ -255,6 +291,7 @@ def _classify(
                 matched_strong = True
                 break
             if (path in new_files and reads < max_content
+                    and not _path_excluded(path, content_exclude)
                     and _has_content_marker(
                         git_dir, path, sig.get("strong_content_markers", []) or [], max_bytes)):
                 reads += 1
@@ -288,8 +325,8 @@ def main() -> int:
             print("NOTE: repo-routing-guard override acknowledged by session.", file=sys.stderr)
             return 0
 
-        sub, args, git_dir = _parse_git_invocation(cmd)
-        if sub is None:
+        invocations = _parse_git_invocations(cmd)
+        if not invocations:
             return 0
 
         topo = _load_topology()
@@ -299,37 +336,48 @@ def main() -> int:
         settings = topo.get("settings", {}) or {}
         timeout = int(settings.get("git_timeout_seconds", 2))
 
-        origin = _normalize_remote(
-            _git(git_dir, ["config", "--get", "remote.origin.url"], timeout).strip())
-        if not origin:
-            return 0
-        cur_key = next(
-            (k for k, v in repos.items()
-             if origin in {_normalize_remote(r) for r in (v.get("remotes") or [])}),
-            None,
-        )
-        if cur_key is None:
-            return 0  # unknown repo — don't guard
+        # Accumulate hits across EVERY git add/commit in the command (chained
+        # commands each get classified against their own effective repo).
+        strong: list[tuple[str, str]] = []
+        weak: list[tuple[str, str]] = []
+        cur_key = None
+        for sub, args, git_dir in invocations:
+            origin = _normalize_remote(
+                _git(git_dir, ["config", "--get", "remote.origin.url"], timeout).strip())
+            if not origin:
+                continue
+            key = next(
+                (k for k, v in repos.items()
+                 if origin in {_normalize_remote(r) for r in (v.get("remotes") or [])}),
+                None,
+            )
+            if key is None:
+                continue  # unknown repo — don't guard this invocation
+            foreign = {
+                k: v for k, v in repos.items()
+                if k != key and (
+                    v.get("strong_path_segments") or v.get("strong_path_globs")
+                    or v.get("strong_content_markers") or v.get("weak_path_segments"))
+            }
+            if not foreign:
+                continue
+            if sub == "commit":
+                files, new_files = _commit_files(git_dir, args, timeout)
+            else:
+                files, new_files = _add_files(git_dir, args, timeout)
+            if not files:
+                continue
+            cur_allow = repos.get(key, {}).get("allow_paths", []) or []
+            s, w = _classify(files, new_files, git_dir, cur_allow, foreign, settings)
+            strong.extend(s)
+            weak.extend(w)
+            cur_key = key
 
-        # Foreign = every OTHER repo that declares a signature.
-        foreign = {
-            k: v for k, v in repos.items()
-            if k != cur_key and (
-                v.get("strong_path_segments") or v.get("strong_path_globs")
-                or v.get("strong_content_markers") or v.get("weak_path_segments"))
-        }
-        if not foreign:
-            return 0
-
-        if sub == "commit":
-            files, new_files = _commit_files(git_dir, args, timeout)
-        else:
-            files, new_files = _add_files(git_dir, args, timeout)
-        if not files:
-            return 0
-
-        cur_allow = repos.get(cur_key, {}).get("allow_paths", []) or []
-        strong, weak = _classify(files, new_files, git_dir, cur_allow, foreign, settings)
+        # A file staged then committed in one command is hit twice — dedup,
+        # preserving order, and drop weak hits already flagged as strong.
+        strong = list(dict.fromkeys(strong))
+        strong_paths = {p for p, _ in strong}
+        weak = [h for h in dict.fromkeys(weak) if h[0] not in strong_paths]
 
         if strong:
             belongs = sorted({name for _, name in strong})

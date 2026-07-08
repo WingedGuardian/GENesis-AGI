@@ -47,3 +47,12 @@ settings:
   max_content_files: 20   # cap on NEW files whose content is read
   max_content_bytes: 4096 # bytes read per file for content markers
   git_timeout_seconds: 2  # per git subprocess call
+  # Content markers scan CODE, not prose/tests/the ruleset itself. Without this,
+  # this file (which names the markers verbatim) and the guard's tests would
+  # self-block on a fresh add. Path/glob STRONG checks still apply everywhere.
+  content_scan_exclude:
+    - "*.md"
+    - "**/*.md"
+    - "docs/**"
+    - "tests/**"
+    - "**/repo_topology.yaml"
