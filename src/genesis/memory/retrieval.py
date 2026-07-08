@@ -593,101 +593,45 @@ class HybridRetriever:
         candidate_limit = limit * 3
 
         # 1. Embed query (with fallback to FTS5-only)
-        embedding_available = True
-        vector = None
-        try:
-            vector = await self._embeddings.embed(query)
-            await record_last_run(
-                self._db, "21b_query_embedding",
-                provider="embedding", model_id="cloud-primary",
-                response_text=f"Query embed: {query[:60]}",
-            )
-        except EmbeddingUnavailableError:
-            embedding_available = False
-            logger.warning("Embedding unavailable, falling back to FTS5-only retrieval")
+        vector, embedding_available = await self._embed_query(query)
 
         # 2. Qdrant vector search across collections (skip if no embedding)
         qdrant_results: list[dict] = []
         qdrant_by_id: dict[str, dict] = {}
         if embedding_available and vector is not None:
-            for coll in collections:
-                with track_operation(self._embeddings.tracker, "qdrant.search"):
-                    hits = qdrant_ops.search(
-                        self._qdrant,
-                        collection=coll,
-                        query_vector=vector,
-                        limit=candidate_limit,
-                        wing=wing,
-                        room=room,
-                        life_domain=life_domain,
-                        project_type=project_type,
-                        exclude_subsystems=exclude_subsystems,
-                        include_only_subsystems=include_only_subsystems,
-                        include_deprecated=include_deprecated,
-                    )
-                for hit in hits:
-                    hit["_collection"] = coll
-                qdrant_results.extend(hits)
-
-            qdrant_results.sort(key=lambda h: h["score"], reverse=True)
-
-            for hit in qdrant_results:
-                mid = hit["id"]
-                if mid not in qdrant_by_id:
-                    qdrant_by_id[mid] = hit
+            qdrant_results, qdrant_by_id = await self._gather_vector_candidates(
+                vector=vector,
+                collections=collections,
+                candidate_limit=candidate_limit,
+                wing=wing,
+                room=room,
+                life_domain=life_domain,
+                project_type=project_type,
+                exclude_subsystems=exclude_subsystems,
+                include_only_subsystems=include_only_subsystems,
+                include_deprecated=include_deprecated,
+            )
 
         # 2b. Event-calendar search (temporal queries)
-        # (Intent classified at the top of recall(); reused below for
-        # RRF bias in step 7 and for the temporal-marker check here.)
-        event_memory_ids: list[str] = []
-        if intent.category == "WHEN" or _has_temporal_markers(query):
-            try:
-                from genesis.memory.temporal import parse_temporal_reference
-                time_range = parse_temporal_reference(query)
-                if time_range:
-                    from genesis.db.crud import memory_events
-                    event_memory_ids = await memory_events.get_memory_ids_in_range(
-                        self._db, time_range[0], time_range[1],
-                        limit=candidate_limit,
-                    )
-            except Exception:
-                logger.warning("Event-calendar search failed", exc_info=True)
+        event_memory_ids = await self._gather_event_candidates(
+            query, intent, candidate_limit,
+        )
 
         # 2c. Expand query via tag co-occurrence (opt-in, expensive index rebuild)
-        fts_query = query
-        if expand_query_terms:
-            try:
-                fts_query = await expand_query(
-                    query, self._qdrant, collections, max_expansions=5,
-                )
-            except Exception:
-                logger.warning("Query expansion failed, using original", exc_info=True)
+        fts_query = await self._expand_fts_query(
+            query, collections, expand_query_terms=expand_query_terms,
+        )
 
         # 3. FTS5 text search (using expanded query)
-        # FTS5 respects the caller's source choice — searching the wrong
-        # pool here is how knowledge_base entries flood episodic recall
-        # results purely by candidate volume. When source="both" we pass
-        # None so FTS5 sees every row; for a single-collection source we
-        # filter at the SQL level so the candidate set matches Qdrant's
-        # filtered search and RRF fuses comparable lists.
-        fts_is_boolean = fts_query != query  # expansion produced boolean syntax
-        fts_collection = collections[0] if len(collections) == 1 else None
-        fts_results = await memory_crud.search_ranked(
-            self._db,
-            query=fts_query,
-            collection=fts_collection,
-            limit=candidate_limit,
-            boolean=fts_is_boolean,
+        fts_results, fts_by_id = await self._gather_fts_candidates(
+            query=query,
+            fts_query=fts_query,
+            collections=collections,
+            candidate_limit=candidate_limit,
             exclude_subsystems=exclude_subsystems,
             include_only_subsystems=include_only_subsystems,
             include_deprecated=include_deprecated,
         )
-
-        fts_by_id: dict[str, dict] = {}
-        for row in fts_results:
-            mid = row["memory_id"]
-            if mid not in fts_by_id:
-                fts_by_id[mid] = row
 
         # 4. Union of all candidate memory_ids
         all_ids = set(qdrant_by_id) | set(fts_by_id) | set(event_memory_ids)
@@ -695,70 +639,21 @@ class HybridRetriever:
             return []
 
         # 4b. Phase 1.5e: drop candidates past their bitemporal invalid_at.
-        # FTS5 already filtered (search_ranked has SQL WHERE on invalid_at);
-        # Qdrant and the event calendar don't see invalid_at, so a batched
-        # lookup here catches their candidates before we waste activation/
-        # link computation on expired rows.
-        # Wrapped in try/except: a DB failure here should degrade to
-        # "no expiry filter applied" rather than crash the entire recall.
-        try:
-            expired = await _expired_candidate_ids(self._db, all_ids)
-        except Exception:
-            logger.warning(
-                "invalid_at filter failed, returning unfiltered candidates",
-                exc_info=True,
-            )
-            expired = set()
-        if expired:
-            all_ids -= expired
-            for mid in expired:
-                qdrant_by_id.pop(mid, None)
-                fts_by_id.pop(mid, None)
-            event_memory_ids = [m for m in event_memory_ids if m not in expired]
-            if not all_ids:
-                return []
+        all_ids, event_memory_ids = await self._filter_expired_candidates(
+            all_ids, qdrant_by_id, fts_by_id, event_memory_ids,
+        )
+        if not all_ids:
+            return []
 
-        # 5. Batch-fetch link counts for all candidates (replaces N+1 per-ID loop)
         now_str = datetime.now(UTC).isoformat()
-        link_counts = await memory_links.batch_link_counts(self._db, list(all_ids))
 
-        # 5b. Compute activation scores using batched link data
-        activation_by_id: dict[str, float] = {}
-        inbound_by_id: dict[str, int] = {}  # saved for graph boost in step 7b
-        # MEM-005: capture retrieval frequency + age per id to measure (not act
-        # on) whether the activation loop entrenches frequently-retrieved memories.
-        retrieved_count_by_id: dict[str, int] = {}
-        created_at_by_id: dict[str, str] = {}
-        for mid in all_ids:
-            total_links, inbound_links = link_counts.get(mid, (0, 0))
-            inbound_by_id[mid] = inbound_links
-
-            qdrant_hit = qdrant_by_id.get(mid)
-            if qdrant_hit:
-                payload = qdrant_hit.get("payload", {})
-                confidence = payload.get("confidence", 0.5)
-                created_at = payload.get("created_at", now_str)
-                retrieved_count = payload.get("retrieved_count", 0)
-            else:
-                confidence = 0.5
-                created_at = now_str
-                retrieved_count = 0
-
-            mem_class = payload.get("memory_class", "fact") if qdrant_hit else "fact"
-            act = compute_activation(
-                confidence=confidence,
-                created_at=created_at,
-                retrieved_count=retrieved_count,
-                link_count=total_links,
-                source=payload.get("source", "") if qdrant_hit else "",
-                tags=payload.get("tags") or [] if qdrant_hit else [],
-                now=now_str,
-                memory_class=mem_class,
-                last_retrieved_at=payload.get("last_retrieved_at") if qdrant_hit else None,
-            )
-            activation_by_id[mid] = act.final_score
-            retrieved_count_by_id[mid] = retrieved_count
-            created_at_by_id[mid] = created_at
+        # 5/5b. Batch-fetch link counts + compute activation scores
+        (
+            activation_by_id,
+            inbound_by_id,
+            retrieved_count_by_id,
+            created_at_by_id,
+        ) = await self._compute_activations(all_ids, qdrant_by_id, now_str)
 
         # 6. Build ranked lists for RRF (or FTS5-only if no embedding)
         vector_ranked_dedup: list[str] = []
@@ -1024,3 +919,245 @@ class HybridRetriever:
         )
 
         return results
+
+    # --- recall() stage helpers (read-only gathers/computes) ---
+    # Bodies are verbatim moves out of recall(); the orchestration order,
+    # guards, and early returns live in recall() itself.
+
+    async def _embed_query(
+        self, query: str,
+    ) -> tuple[list[float] | None, bool]:
+        """Stage 1: embed the query, degrading to FTS5-only on failure.
+
+        Returns ``(vector, embedding_available)``.
+        """
+        embedding_available = True
+        vector = None
+        try:
+            vector = await self._embeddings.embed(query)
+            await record_last_run(
+                self._db, "21b_query_embedding",
+                provider="embedding", model_id="cloud-primary",
+                response_text=f"Query embed: {query[:60]}",
+            )
+        except EmbeddingUnavailableError:
+            embedding_available = False
+            logger.warning("Embedding unavailable, falling back to FTS5-only retrieval")
+        return vector, embedding_available
+
+    async def _gather_vector_candidates(
+        self,
+        *,
+        vector: list[float],
+        collections: list[str],
+        candidate_limit: int,
+        wing: str | None,
+        room: str | None,
+        life_domain: str | None,
+        project_type: str | None,
+        exclude_subsystems: list[str] | None,
+        include_only_subsystems: list[str] | None,
+        include_deprecated: bool,
+    ) -> tuple[list[dict], dict[str, dict]]:
+        """Stage 2: Qdrant vector search across collections.
+
+        Returns ``(qdrant_results, qdrant_by_id)`` — the score-sorted hit
+        list and a first-hit-wins dedup map.
+        """
+        qdrant_results: list[dict] = []
+        qdrant_by_id: dict[str, dict] = {}
+        for coll in collections:
+            with track_operation(self._embeddings.tracker, "qdrant.search"):
+                hits = qdrant_ops.search(
+                    self._qdrant,
+                    collection=coll,
+                    query_vector=vector,
+                    limit=candidate_limit,
+                    wing=wing,
+                    room=room,
+                    life_domain=life_domain,
+                    project_type=project_type,
+                    exclude_subsystems=exclude_subsystems,
+                    include_only_subsystems=include_only_subsystems,
+                    include_deprecated=include_deprecated,
+                )
+            for hit in hits:
+                hit["_collection"] = coll
+            qdrant_results.extend(hits)
+
+        qdrant_results.sort(key=lambda h: h["score"], reverse=True)
+
+        for hit in qdrant_results:
+            mid = hit["id"]
+            if mid not in qdrant_by_id:
+                qdrant_by_id[mid] = hit
+        return qdrant_results, qdrant_by_id
+
+    async def _gather_event_candidates(
+        self, query: str, intent: QueryIntent, candidate_limit: int,
+    ) -> list[str]:
+        """Stage 2b: event-calendar search for temporal queries.
+
+        (Intent classified at the top of recall(); reused downstream for
+        RRF bias in step 7 and for the temporal-marker check here.)
+        """
+        event_memory_ids: list[str] = []
+        if intent.category == "WHEN" or _has_temporal_markers(query):
+            try:
+                from genesis.memory.temporal import parse_temporal_reference
+                time_range = parse_temporal_reference(query)
+                if time_range:
+                    from genesis.db.crud import memory_events
+                    event_memory_ids = await memory_events.get_memory_ids_in_range(
+                        self._db, time_range[0], time_range[1],
+                        limit=candidate_limit,
+                    )
+            except Exception:
+                logger.warning("Event-calendar search failed", exc_info=True)
+        return event_memory_ids
+
+    async def _expand_fts_query(
+        self, query: str, collections: list[str], *, expand_query_terms: bool,
+    ) -> str:
+        """Stage 2c: expand the FTS query via tag co-occurrence (degrades to
+        the original query on failure)."""
+        fts_query = query
+        if expand_query_terms:
+            try:
+                fts_query = await expand_query(
+                    query, self._qdrant, collections, max_expansions=5,
+                )
+            except Exception:
+                logger.warning("Query expansion failed, using original", exc_info=True)
+        return fts_query
+
+    async def _gather_fts_candidates(
+        self,
+        *,
+        query: str,
+        fts_query: str,
+        collections: list[str],
+        candidate_limit: int,
+        exclude_subsystems: list[str] | None,
+        include_only_subsystems: list[str] | None,
+        include_deprecated: bool,
+    ) -> tuple[list[dict], dict[str, dict]]:
+        """Stage 3: FTS5 text search using the expanded query.
+
+        FTS5 respects the caller's source choice — searching the wrong
+        pool here is how knowledge_base entries flood episodic recall
+        results purely by candidate volume. When source="both" we pass
+        None so FTS5 sees every row; for a single-collection source we
+        filter at the SQL level so the candidate set matches Qdrant's
+        filtered search and RRF fuses comparable lists.
+
+        Returns ``(fts_results, fts_by_id)``.
+        """
+        fts_is_boolean = fts_query != query  # expansion produced boolean syntax
+        fts_collection = collections[0] if len(collections) == 1 else None
+        fts_results = await memory_crud.search_ranked(
+            self._db,
+            query=fts_query,
+            collection=fts_collection,
+            limit=candidate_limit,
+            boolean=fts_is_boolean,
+            exclude_subsystems=exclude_subsystems,
+            include_only_subsystems=include_only_subsystems,
+            include_deprecated=include_deprecated,
+        )
+
+        fts_by_id: dict[str, dict] = {}
+        for row in fts_results:
+            mid = row["memory_id"]
+            if mid not in fts_by_id:
+                fts_by_id[mid] = row
+        return fts_results, fts_by_id
+
+    async def _filter_expired_candidates(
+        self,
+        all_ids: set[str],
+        qdrant_by_id: dict[str, dict],
+        fts_by_id: dict[str, dict],
+        event_memory_ids: list[str],
+    ) -> tuple[set[str], list[str]]:
+        """Stage 4b (Phase 1.5e): drop candidates past their bitemporal
+        invalid_at.
+
+        FTS5 already filtered (search_ranked has SQL WHERE on invalid_at);
+        Qdrant and the event calendar don't see invalid_at, so a batched
+        lookup here catches their candidates before we waste activation/
+        link computation on expired rows.
+        Wrapped in try/except: a DB failure here should degrade to
+        "no expiry filter applied" rather than crash the entire recall.
+
+        **Mutates ``qdrant_by_id``/``fts_by_id`` in place** (pops expired
+        ids); returns the shrunk ``(all_ids, event_memory_ids)``.
+        """
+        try:
+            expired = await _expired_candidate_ids(self._db, all_ids)
+        except Exception:
+            logger.warning(
+                "invalid_at filter failed, returning unfiltered candidates",
+                exc_info=True,
+            )
+            expired = set()
+        if expired:
+            all_ids -= expired
+            for mid in expired:
+                qdrant_by_id.pop(mid, None)
+                fts_by_id.pop(mid, None)
+            event_memory_ids = [m for m in event_memory_ids if m not in expired]
+        return all_ids, event_memory_ids
+
+    async def _compute_activations(
+        self,
+        all_ids: set[str],
+        qdrant_by_id: dict[str, dict],
+        now_str: str,
+    ) -> tuple[dict[str, float], dict[str, int], dict[str, int], dict[str, str]]:
+        """Stages 5/5b: batch-fetch link counts (replaces N+1 per-ID loop)
+        and compute activation scores using the batched link data.
+
+        Returns ``(activation_by_id, inbound_by_id, retrieved_count_by_id,
+        created_at_by_id)`` — inbound counts feed graph boost in step 7b;
+        the MEM-005 maps capture retrieval frequency + age per id to measure
+        (not act on) whether the activation loop entrenches frequently-
+        retrieved memories.
+        """
+        link_counts = await memory_links.batch_link_counts(self._db, list(all_ids))
+
+        activation_by_id: dict[str, float] = {}
+        inbound_by_id: dict[str, int] = {}  # saved for graph boost in step 7b
+        retrieved_count_by_id: dict[str, int] = {}
+        created_at_by_id: dict[str, str] = {}
+        for mid in all_ids:
+            total_links, inbound_links = link_counts.get(mid, (0, 0))
+            inbound_by_id[mid] = inbound_links
+
+            qdrant_hit = qdrant_by_id.get(mid)
+            if qdrant_hit:
+                payload = qdrant_hit.get("payload", {})
+                confidence = payload.get("confidence", 0.5)
+                created_at = payload.get("created_at", now_str)
+                retrieved_count = payload.get("retrieved_count", 0)
+            else:
+                confidence = 0.5
+                created_at = now_str
+                retrieved_count = 0
+
+            mem_class = payload.get("memory_class", "fact") if qdrant_hit else "fact"
+            act = compute_activation(
+                confidence=confidence,
+                created_at=created_at,
+                retrieved_count=retrieved_count,
+                link_count=total_links,
+                source=payload.get("source", "") if qdrant_hit else "",
+                tags=payload.get("tags") or [] if qdrant_hit else [],
+                now=now_str,
+                memory_class=mem_class,
+                last_retrieved_at=payload.get("last_retrieved_at") if qdrant_hit else None,
+            )
+            activation_by_id[mid] = act.final_score
+            retrieved_count_by_id[mid] = retrieved_count
+            created_at_by_id[mid] = created_at
+        return activation_by_id, inbound_by_id, retrieved_count_by_id, created_at_by_id
