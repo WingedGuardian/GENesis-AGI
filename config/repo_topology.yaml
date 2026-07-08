@@ -1,0 +1,49 @@
+# repo_topology.yaml — declares which code belongs to which repo so the
+# repo_routing_guard PreToolUse hook can catch "wrong-repo" git add/commit
+# (e.g. building edge-device firmware into the AGI codebase — the OMI incident,
+# 2026-07). This is the in-repo TEMPLATE / fallback.
+#
+# Resolution order (first found wins):
+#   1. $REPO_TOPOLOGY_PATH               (tests / explicit override)
+#   2. ~/.genesis/config/repo_topology.yaml  (user override)
+#   3. this file (config/repo_topology.yaml) (in-repo fallback)
+#
+# The guard identifies the CURRENT repo by its `origin` remote URL, then flags
+# staged/added files whose path or (for new files) content matches ANOTHER
+# repo's signature. STRONG match -> block (exit 2). WEAK match -> advisory only.
+version: 1
+
+repos:
+  GENesis-AGI:
+    remotes:
+      - WingedGuardian/GENesis-AGI
+    # Paths legitimately internal to AGI — silence WEAK markers here. (AGI keeps
+    # internal channel code; "voice"/"wyoming" are deliberately NOT markers.)
+    # Does NOT silence STRONG markers: a foreign component name (s2s_bridge,
+    # firmware, ...) landing under these paths is still the wrong-repo mistake.
+    allow_paths:
+      - dashboard/routes/voice_api.py
+      - src/genesis/channels/voice/
+      - src/genesis/attention/
+
+  GENesis-Voice:
+    remotes:
+      - WingedGuardian/GENesis-Voice
+    # STRONG — a match BLOCKS the commit. Path segments use exact segment
+    # equality (a path part == the marker), not substring, to avoid catching
+    # e.g. "device_registry".
+    strong_path_segments: [firmware, esphome, s2s_bridge, ambient_bridge, omi]
+    strong_path_globs:
+      - "config/voice-pe/**"
+      - "**/flash_*.sh"
+    # Content markers checked only in NEW files (added/untracked).
+    strong_content_markers: ["esphome:", "ESP32", "esp-idf", "platformio"]
+    # WEAK — advisory only (additionalContext), never blocks. Silenced by the
+    # current repo's allow_paths.
+    weak_path_segments: [voice-pe, voice_pe, satellite, edge]
+
+settings:
+  max_files: 200          # cap on files inspected per invocation
+  max_content_files: 20   # cap on NEW files whose content is read
+  max_content_bytes: 4096 # bytes read per file for content markers
+  git_timeout_seconds: 2  # per git subprocess call
