@@ -221,7 +221,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 9037d45b 2026-07-07
+verified: 8235a607 2026-07-08
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -229,7 +229,10 @@ verified: 9037d45b 2026-07-07
   OUTBOUND-only — inbound voice arrives via `dashboard/routes/voice_api.py`;
   uses `media_player.play_media`, never `assist_satellite.announce` which
   reopens the mic); Discord webhook; email SMTP. All env-gated. "OpenClaw" here
-  is only the MIT origin of the Telegram transport code.
+  is only the MIT origin of the Telegram transport code. Device/edge-side voice
+  software (firmware, esphome, S2S/ambient bridges, edge deploy) lives in the
+  separate `GENesis-Voice` repo — `channels/voice/` here is only the in-runtime
+  channel.
 - **dashboard/**: Flask blueprint at `/genesis` (~45 route modules);
   `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
   thread detects degraded-but-alive Flask; web terminal.

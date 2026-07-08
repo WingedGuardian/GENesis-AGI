@@ -1041,6 +1041,7 @@ section is safe to hand-edit; install scripts preserve it.
 - **Working Repo**: (set by installer)
 - **Backups Repo**: (set by installer)
 - **Public Distribution**: (set by installer)
+- **Voice/Edge Repo**: (set by installer)
 <!-- end:github-config -->
 
 ## Personal Notes

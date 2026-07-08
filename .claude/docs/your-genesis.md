@@ -7,7 +7,17 @@ organized as:
 
 Where Genesis development happens. Everyone clones this. PRs go here.
 Bugs get filed as issues here. This is the single source of truth for
-the codebase.
+the **cognitive core** codebase — voice and edge-device software lives in a
+separate repo (see below).
+
+## The voice / edge repo — `GENesis-Voice`
+
+Voice and edge-device software lives in its own repo, `GENesis-Voice`: OMI and
+Voice PE firmware, esphome device configs, the S2S / ambient audio bridges, and
+edge deployment. `GENesis-AGI` keeps only its **internal** channel code — the
+voice API route and channel adapters that run inside the core runtime. Rule of
+thumb: if a change is about flashing a device, an esphome config, or an
+edge/satellite bridge, it belongs in `GENesis-Voice`, not here.
 
 ## Your fork (private) — automatic
 
@@ -50,6 +60,7 @@ disk failure.
 |------|-------|-----|
 | Your customizations to code | Your fork, as git commits | Versioned, diffable, contributable upstream when desired |
 | Your memory / DB / secrets | Your backup repo, encrypted | Changes constantly; separating keeps code history clean |
+| Voice / edge-device software | The `GENesis-Voice` repo | Firmware, esphome, bridges, edge deploy — separate from the cognitive core |
 | Nothing | The public repo, from you directly | Public repo is shared; contribute via fork + PR |
 
 ## The contribution flow (decentralized bug fixing)
