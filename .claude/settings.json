@@ -372,6 +372,18 @@
                     }
                 ]
             }
+        ],
+        "PostToolUseFailure": [
+            {
+                "matcher": "Edit|Write",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook edit_failure_sensor.py",
+                        "timeout": 500
+                    }
+                ]
+            }
         ]
     },
     "worktree": {
