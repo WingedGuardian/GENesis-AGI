@@ -112,6 +112,26 @@ class TestParseDeepReflectionOutput:
         assert out.confidence == 0.5
         assert out.confidence_defaulted is True
 
+    def test_null_priority_defaults_and_request_kept(self):
+        """A surplus_task_request with priority=null must not crash; it defaults
+        to 0.5 and the request is retained (float(None) → TypeError otherwise)."""
+        out = parse_deep_reflection_output(json.dumps({
+            "surplus_task_requests": [
+                {"task_type": "investigate", "reason": "why", "priority": None},
+            ],
+        }))
+        assert len(out.surplus_task_requests) == 1
+        assert out.surplus_task_requests[0].priority == 0.5
+
+    def test_reported_priority_preserved(self):
+        """A genuine priority survives the safe-float path unchanged."""
+        out = parse_deep_reflection_output(json.dumps({
+            "surplus_task_requests": [
+                {"task_type": "investigate", "reason": "why", "priority": 0.9},
+            ],
+        }))
+        assert out.surplus_task_requests[0].priority == 0.9
+
 
 class TestParseWeeklyAssessmentOutput:
     def test_valid_output(self):
@@ -130,6 +150,98 @@ class TestParseWeeklyAssessmentOutput:
         out = parse_weekly_assessment_output("bad")
         assert isinstance(out, WeeklyAssessmentOutput)
         assert out.dimensions == []
+
+    def test_null_score_dimension_skipped(self):
+        """A dimension with score=null (data_available:false) is skipped, not
+        crashed on. float(None) raises TypeError, which the old parser missed.
+
+        A null score is a legitimate 'no data this window' signal — skip the
+        dimension entirely rather than coerce to 0.0 (a stored 0.0 would
+        false-fire the learning-regression alarm in stability.py)."""
+        raw = json.dumps({
+            "dimensions": [
+                {"dimension": "reflection_quality", "score": 0.8, "evidence": "ok"},
+                {"dimension": "memory_precision", "score": None,
+                 "data_available": False, "evidence": "no data this window"},
+            ],
+            "overall_score": 0.8,
+        })
+        out = parse_weekly_assessment_output(raw)
+        assert out.parse_failed is False
+        assert len(out.dimensions) == 1
+        assert out.dimensions[0].dimension == "reflection_quality"
+        assert all(d.score is not None for d in out.dimensions)
+
+    def test_all_null_scores_yields_empty_dimensions(self):
+        """Every dimension null → empty dims, still a successful parse."""
+        raw = json.dumps({
+            "dimensions": [
+                {"dimension": "memory_precision", "score": None,
+                 "data_available": False},
+            ],
+            "overall_score": 0.5,
+        })
+        out = parse_weekly_assessment_output(raw)
+        assert out.parse_failed is False
+        assert out.dimensions == []
+        assert out.overall_score == 0.5
+
+    def test_missing_score_key_skipped(self):
+        """A dimension dict with no 'score' key is skipped (get→None)."""
+        raw = json.dumps({
+            "dimensions": [{"dimension": "reflection_quality", "evidence": "x"}],
+            "overall_score": 0.6,
+        })
+        out = parse_weekly_assessment_output(raw)
+        assert out.parse_failed is False
+        assert out.dimensions == []
+
+    def test_null_overall_score_defaults_zero(self):
+        """overall_score=null must not crash; defaults to 0.0."""
+        raw = json.dumps({
+            "dimensions": [
+                {"dimension": "reflection_quality", "score": 0.8},
+            ],
+            "overall_score": None,
+        })
+        out = parse_weekly_assessment_output(raw)
+        assert out.parse_failed is False
+        assert out.overall_score == 0.0
+        assert len(out.dimensions) == 1
+
+    def test_garbage_score_defaults_zero_not_skipped(self):
+        """A non-null, non-numeric score is coerced to 0.0 (kept), not skipped —
+        only the explicit null 'no data' signal is dropped."""
+        raw = json.dumps({
+            "dimensions": [{"dimension": "reflection_quality", "score": "high"}],
+            "overall_score": 0.5,
+        })
+        out = parse_weekly_assessment_output(raw)
+        assert out.parse_failed is False
+        assert len(out.dimensions) == 1
+        assert out.dimensions[0].score == 0.0
+
+    def test_production_shaped_null_payload(self):
+        """The real failing shape: several dims, some null with data_available
+        false, a real overall_score. Parses without raising, keeps only
+        data-bearing dimensions."""
+        raw = json.dumps({
+            "dimensions": [
+                {"dimension": "reflection_quality", "score": 0.72, "data_available": True},
+                {"dimension": "memory_precision", "score": None, "data_available": False},
+                {"dimension": "procedure_effectiveness", "score": None, "data_available": False},
+                {"dimension": "goal_progress", "score": 0.65, "data_available": True},
+            ],
+            "overall_score": 0.685,
+            "observations": ["partial data window"],
+            "recommendations": ["keep collecting"],
+        })
+        out = parse_weekly_assessment_output(raw)
+        assert out.parse_failed is False
+        assert len(out.dimensions) == 2
+        assert {d.dimension for d in out.dimensions} == {
+            "reflection_quality", "goal_progress"}
+        assert out.overall_score == 0.685
 
 
 class TestParseQualityCalibrationOutput:

@@ -31,6 +31,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _safe_float(value: object, default: float) -> float:
+    """Coerce ``value`` to float, returning ``default`` for null/non-numeric.
+
+    The reflection LLM legitimately emits an explicit ``null`` (e.g. a score or
+    priority it cannot assign). ``float(None)`` raises ``TypeError`` — not
+    ``ValueError`` — so a plain ``float(...)`` inside an ``except ValueError``
+    guard still crashes the whole parse. Route every model-supplied numeric
+    through here.
+    """
+    if value is None:
+        return default
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
 def parse_deep_reflection_output(raw_json: str) -> DeepReflectionOutput:
     """Parse raw CC output JSON into a DeepReflectionOutput.
 
@@ -76,7 +93,7 @@ def parse_deep_reflection_output(raw_json: str) -> DeepReflectionOutput:
             task_requests.append(SurplusTaskRequest(
                 task_type=str(req.get("task_type", "")),
                 reason=str(req.get("reason", "")),
-                priority=float(req.get("priority", 0.5)),
+                priority=_safe_float(req.get("priority"), 0.5),
                 drive_alignment=str(req.get("drive_alignment", "competence")),
                 payload=req.get("payload"),
             ))
@@ -135,20 +152,30 @@ def parse_weekly_assessment_output(raw_json: str) -> WeeklyAssessmentOutput:
     dims = []
     for d in data.get("dimensions", []):
         if isinstance(d, dict):
+            # A null (or absent) score is the LLM's legitimate "no data this
+            # window" signal (paired with data_available:false). Skip the
+            # dimension rather than coerce it to 0.0 — a stored 0.0 would
+            # false-fire the learning-regression alarm in stability.py.
+            if d.get("score") is None:
+                logger.debug(
+                    "Skipping weekly-assessment dimension with null score: %s",
+                    d.get("dimension", "unknown"),
+                )
+                continue
             try:
                 dim_enum = d.get("dimension", "reflection_quality")
                 dims.append(DimensionScore(
                     dimension=dim_enum,
-                    score=float(d.get("score", 0.0)),
+                    score=_safe_float(d.get("score"), 0.0),
                     evidence=d.get("evidence", ""),
                     data_available=d.get("data_available", True),
                 ))
-            except (ValueError, KeyError):
+            except (ValueError, KeyError, TypeError):
                 continue
 
     return WeeklyAssessmentOutput(
         dimensions=dims,
-        overall_score=float(data.get("overall_score", 0.0)),
+        overall_score=_safe_float(data.get("overall_score"), 0.0),
         observations=data.get("observations", []),
         recommendations=data.get("recommendations", []),
     )
