@@ -782,3 +782,157 @@ class TestSpearmanRankCorr:
 
         v = _spearman_rank_corr([1, 5, 2, 8, 3], [2, 1, 4, 3, 9])
         assert -1.0 <= v <= 1.0
+
+
+# --- Characterization tests: degradation paths + reranker contract ---
+# Written BEFORE the recall() stage decomposition to pin current behavior.
+# Each failure-path test asserts the failing dependency was actually called,
+# so a refactor that silently skips the stage fails the test.
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_survives_event_calendar_failure(
+    mock_qdrant, mock_crud, mock_links, _mock_expand,
+):
+    """A raising event-calendar range query degrades to a warning, not a crash."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.95)]
+    mock_crud.search_ranked = AsyncMock(return_value=[_make_fts_row("mem-1", -5.0)])
+    _setup_link_mocks(mock_links)
+
+    with (
+        patch(
+            "genesis.memory.temporal.parse_temporal_reference",
+            return_value=("2026-07-01T00:00:00+00:00", "2026-07-02T00:00:00+00:00"),
+        ),
+        patch(
+            "genesis.db.crud.memory_events.get_memory_ids_in_range",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("event calendar down"),
+        ) as mock_events,
+    ):
+        results = await retriever.recall("when did that happen yesterday", limit=5)
+
+    mock_events.assert_called_once()
+    assert [r.memory_id for r in results] == ["mem-1"]
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock)
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_expansion_failure_uses_original_query(
+    mock_qdrant, mock_crud, mock_links, mock_expand,
+):
+    """expand_query raising falls back to the ORIGINAL query, boolean=False."""
+    retriever, _, _, _ = _build_retriever()
+    mock_expand.side_effect = RuntimeError("tag index rebuild failed")
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.95)]
+    mock_crud.search_ranked = AsyncMock(return_value=[_make_fts_row("mem-1", -5.0)])
+    _setup_link_mocks(mock_links)
+
+    results = await retriever.recall("original query text", limit=5)
+
+    mock_expand.assert_called_once()
+    kwargs = mock_crud.search_ranked.call_args.kwargs
+    assert kwargs["query"] == "original query text"
+    assert kwargs["boolean"] is False
+    assert len(results) == 1
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_expiry_filter_failure_returns_unfiltered(
+    mock_qdrant, mock_crud, mock_links, _mock_expand,
+):
+    """A raising invalid_at lookup degrades to 'no expiry filter applied'."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = [
+        _make_qdrant_hit("mem-1", 0.95),
+        _make_qdrant_hit("mem-2", 0.80),
+    ]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    _setup_link_mocks(mock_links)
+
+    with patch(
+        "genesis.memory.retrieval._expired_candidate_ids",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("db locked"),
+    ) as mock_expired:
+        results = await retriever.recall("test query", limit=5)
+
+    mock_expired.assert_called_once()
+    assert {r.memory_id for r in results} == {"mem-1", "mem-2"}
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_update_payload_failure_still_returns_results(
+    mock_qdrant, mock_crud, mock_links, _mock_expand,
+):
+    """A raising retrieved_count write-back never blocks returning results."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.95)]
+    mock_qdrant.update_payload.side_effect = RuntimeError("qdrant write failed")
+    mock_crud.search_ranked = AsyncMock(return_value=[_make_fts_row("mem-1", -5.0)])
+    _setup_link_mocks(mock_links)
+
+    results = await retriever.recall("test query", limit=5)
+
+    mock_qdrant.update_payload.assert_called_once()
+    assert [r.memory_id for r in results] == ["mem-1"]
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_reranker_replaces_fused_with_positional_scores(
+    mock_qdrant, mock_crud, mock_links, _mock_expand,
+):
+    """Reranker path: fused is REPLACED with 1/(1+rank) positional scores and
+    candidates the reranker didn't score are dropped entirely."""
+    embed_provider = MagicMock()
+    embed_provider.embed = AsyncMock(return_value=[0.1] * 1024)
+    reranker = MagicMock()
+    reranker.enabled = True
+    # Reranker inverts the RRF ordering and omits mem-3.
+    reranker.rerank = AsyncMock(return_value=[{"id": "mem-2"}, {"id": "mem-1"}])
+    retriever = HybridRetriever(
+        embedding_provider=embed_provider,
+        qdrant_client=MagicMock(),
+        db=MagicMock(spec_set=["execute", "commit"]),
+        reranker=reranker,
+    )
+
+    mock_qdrant.search.return_value = [
+        _make_qdrant_hit("mem-1", 0.95),
+        _make_qdrant_hit("mem-2", 0.80),
+    ]
+    mock_crud.search_ranked = AsyncMock(return_value=[_make_fts_row("mem-3", -5.0)])
+    _setup_link_mocks(mock_links)
+
+    results = await retriever.recall("test query", limit=5, rerank=True)
+
+    reranker.rerank.assert_called_once()
+    call_args = reranker.rerank.call_args
+    assert call_args.args[0] == "test query"
+    assert {d["id"] for d in call_args.args[1]} == {"mem-1", "mem-2", "mem-3"}
+    assert call_args.kwargs["top_k"] == 10  # limit * 2
+
+    # Positional scores from the reranker's ordering; mem-3 dropped.
+    assert [r.memory_id for r in results] == ["mem-2", "mem-1"]
+    assert results[0].score == pytest.approx(1.0)   # 1/(1+0)
+    assert results[1].score == pytest.approx(0.5)   # 1/(1+1)
