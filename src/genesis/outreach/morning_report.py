@@ -595,8 +595,9 @@ class MorningReportGenerator:
         # confirm_delivery() can close them — without that they re-list
         # every morning until the 7-day expiry job silently drops them
         # (observed: 158 expired / 0 ever responded over 4 months).
-        mq_rows = await mq_crud.query_pending(self._db)
         self._pending_mq_ids = []
+        mq_rows = await mq_crud.query_pending(self._db)
+        rendered_mq_ids: list[str] = []
         for r in mq_rows:
             content = r.get("content", "")
             if "Untitled" in content:
@@ -612,7 +613,8 @@ class MorningReportGenerator:
             # (CheckpointManager.deliver_response) — closing them here
             # would swallow a background session's pending question.
             if r.get("id") and r.get("message_type") == "finding":
-                self._pending_mq_ids.append(r["id"])
+                rendered_mq_ids.append(r["id"])
+        self._pending_mq_ids = rendered_mq_ids
 
         # Pending ego proposals (user needs to approve/reject on dashboard)
         try:
