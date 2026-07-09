@@ -400,6 +400,7 @@ class TestLoadCriticalPatterns:
         assert ".claude/settings.json" in _FALLBACK_CRITICAL
         assert "src/genesis/autonomy/protection.py" in _FALLBACK_CRITICAL
         assert "config/protected_paths.yaml" in _FALLBACK_CRITICAL
+        assert "scripts/systemd/*.template" in _FALLBACK_CRITICAL
 
     def test_fallback_returns_copy_not_reference(self, tmp_path):
         """Fallback list is a copy, not a reference to the module constant."""

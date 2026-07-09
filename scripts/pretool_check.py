@@ -29,6 +29,7 @@ _FALLBACK_CRITICAL = [
     ".claude/settings.json",
     "src/genesis/autonomy/protection.py",
     "config/protected_paths.yaml",
+    "scripts/systemd/*.template",
 ]
 
 
