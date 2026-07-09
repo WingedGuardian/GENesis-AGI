@@ -119,12 +119,13 @@ class TestSubprocessCriticalBlocked:
         result = _run_subprocess_json("config/genesis-bridge.service")
         assert result.returncode == 2
 
-    def test_watchdog_service(self):
-        result = _run_subprocess_json("config/genesis-watchdog.service")
+    def test_watchdog_service_template(self):
+        """Unit templates (source of live units) are blocked."""
+        result = _run_subprocess_json("scripts/systemd/genesis-watchdog.service.template")
         assert result.returncode == 2
 
-    def test_watchdog_timer(self):
-        result = _run_subprocess_json("config/genesis-watchdog.timer")
+    def test_watchdog_timer_template(self):
+        result = _run_subprocess_json("scripts/systemd/genesis-watchdog.timer.template")
         assert result.returncode == 2
 
     def test_any_service_file(self):
@@ -309,12 +310,17 @@ class TestMatchesFunction:
     def test_empty_path_no_match(self):
         assert _matches("", ["*.service"]) is None
 
-    def test_watchdog_glob_pattern(self):
-        """config/genesis-watchdog.* matches .service, .timer, etc."""
-        patterns = ["config/genesis-watchdog.*"]
-        assert _matches("config/genesis-watchdog.service", patterns) is not None
-        assert _matches("config/genesis-watchdog.timer", patterns) is not None
-        assert _matches("config/genesis-watchdog.conf", patterns) is not None
+    def test_systemd_template_glob_pattern(self):
+        """scripts/systemd/*.template matches every unit template — and the
+        generic *.service / *.timer patterns do NOT (the .template suffix
+        escapes them), which is why the dedicated pattern must exist."""
+        patterns = ["scripts/systemd/*.template"]
+        assert _matches("scripts/systemd/genesis-watchdog.service.template", patterns) is not None
+        assert _matches("scripts/systemd/genesis-watchdog.timer.template", patterns) is not None
+        assert _matches("scripts/systemd/genesis-server.service.template", patterns) is not None
+        assert _matches(
+            "scripts/systemd/genesis-watchdog.service.template", ["*.service", "*.timer"]
+        ) is None
 
 
 # ===================================================================
@@ -590,7 +596,7 @@ class TestConfigCompleteness:
         expected = [
             "src/genesis/channels/**",
             "config/genesis-bridge.service",
-            "config/genesis-watchdog.*",
+            "scripts/systemd/*.template",
             "src/genesis/autonomy/protection.py",
             "config/protected_paths.yaml",
             "config/autonomy.yaml",

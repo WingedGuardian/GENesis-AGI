@@ -43,12 +43,11 @@ Defaults remain compatible with the current private setup:
 
 ## Service Behavior Changes
 
-`config/genesis-bridge.service` and `config/genesis-watchdog.service` no longer
-hardcode `${HOME}/...`. They now use:
-
-- `%h/genesis` as the default repo location
-- `%h/genesis/.venv` as the default venv
-- shell-based startup so `GENESIS_REPO_ROOT` and `VENV_PATH` can be overridden
+Live systemd units are generated from `scripts/systemd/*.template` at install
+time (Step 7 of `scripts/install.sh` / `scripts/bootstrap.sh`), with `__HOME__`,
+`__REPO_DIR__`, and `__VENV__` substituted per machine — nothing hardcodes
+`${HOME}/...`. (The historical `config/genesis-watchdog.*` copies were stale
+duplicates of the templates and have been removed.)
 
 ## Migration Utilities
 

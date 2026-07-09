@@ -28,6 +28,8 @@ def rules() -> list[ProtectedPathRule]:
         ProtectedPathRule("config/protected_paths.yaml", ProtectionLevel.CRITICAL,
                           "Protection config"),
         ProtectedPathRule("*.service", ProtectionLevel.CRITICAL, "Systemd units"),
+        ProtectedPathRule("scripts/systemd/*.template", ProtectionLevel.CRITICAL,
+                          "Systemd unit templates"),
         ProtectedPathRule("/etc/netplan/**", ProtectionLevel.CRITICAL, "Networking"),
         ProtectedPathRule("src/genesis/runtime.py", ProtectionLevel.SENSITIVE,
                           "Runtime bootstrap"),
@@ -60,7 +62,13 @@ class TestClassify:
         assert registry.classify("config/genesis-bridge.service") is ProtectionLevel.CRITICAL
 
     def test_critical_wildcard_service(self, registry: ProtectedPathRegistry):
-        assert registry.classify("config/genesis-watchdog.service") is ProtectionLevel.CRITICAL
+        assert registry.classify("config/genesis-tmp-watchgod.service") is ProtectionLevel.CRITICAL
+
+    def test_critical_systemd_template(self, registry: ProtectedPathRegistry):
+        """Unit templates are the SOURCE of live units — protected like the units."""
+        assert registry.classify("scripts/systemd/genesis-watchdog.service.template") is ProtectionLevel.CRITICAL
+        assert registry.classify("scripts/systemd/genesis-server.service.template") is ProtectionLevel.CRITICAL
+        assert registry.classify("scripts/systemd/genesis-backup.timer.template") is ProtectionLevel.CRITICAL
 
     def test_critical_secrets(self, registry: ProtectedPathRegistry):
         assert registry.classify("~/genesis/secrets.env") is ProtectionLevel.CRITICAL
@@ -189,15 +197,15 @@ class TestEdgeCases:
         assert reg.classify("src/genesis/awareness/loop.py") is ProtectionLevel.SENSITIVE
 
     def test_rule_count(self, registry: ProtectedPathRegistry):
-        assert registry.rule_count == 12
+        assert registry.rule_count == 13
 
     def test_get_rules_all(self, registry: ProtectedPathRegistry):
-        assert len(registry.get_rules()) == 12
+        assert len(registry.get_rules()) == 13
 
     def test_get_rules_filtered(self, registry: ProtectedPathRegistry):
         critical = registry.get_rules(ProtectionLevel.CRITICAL)
         sensitive = registry.get_rules(ProtectionLevel.SENSITIVE)
-        assert len(critical) == 8
+        assert len(critical) == 9
         assert len(sensitive) == 4
 
 
@@ -215,6 +223,12 @@ class TestYamlLoading:
         assert reg.rule_count > 0
         # Self-protection: the protection module itself should be CRITICAL
         assert reg.classify("src/genesis/autonomy/protection.py") is ProtectionLevel.CRITICAL
+        # Unit templates render into live systemd units at install time —
+        # they must be CRITICAL in the shipped config (the ".template"
+        # suffix escapes the generic *.service / *.timer patterns).
+        assert reg.classify(
+            "scripts/systemd/genesis-watchdog.service.template"
+        ) is ProtectionLevel.CRITICAL
 
     def test_load_missing_file(self, tmp_path: Path):
         """Missing config → empty registry, all paths NORMAL."""
