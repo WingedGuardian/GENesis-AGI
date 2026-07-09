@@ -4,12 +4,15 @@ Runs on a weekly CronTrigger. Reads eval_events and existing DB tables
 to compute metrics for each dimension, stores results in eval_snapshots.
 
 Dimensions:
-1. Memory retrieval quality (precision@5, hit rate, MRR, usage rate)
+1. Memory retrieval quality (precision@5, precision@3, hit rate, MRR, usage rate)
 2. System improvement composite (session success, ego acceptance, etc.)
 3. Ego proposal quality (approval rate, confidence calibration)
 4. Cognitive loop value (recall vs no-recall session comparison)
 5. Procedural learning effectiveness (invocation rate, success rate)
 6. Cognitive drift (Phase 7, dark): dissent-rate + proposal-diversity
+7. Approvals (WS-1 A2): approval-gate resolution throughput
+8. Goals (WS-1 A2, scaffold): user_goals status ratios + completion rate
+9. Noise/passivity (WS-1 A2): loop-closure leaks + empty-ego-cycle rate
 """
 
 from __future__ import annotations
@@ -84,7 +87,7 @@ async def _compute_cognitive_drift(
 
 
 async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
-    """Compute and store weekly snapshots for all 5 eval dimensions + drift.
+    """Compute and store weekly snapshots for all eval dimensions.
 
     Returns dict of {dimension: metrics} for logging/inspection.
     """
@@ -101,6 +104,9 @@ async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
         ("cognitive", _compute_cognitive_loop),
         ("procedure", _compute_procedural_effectiveness),
         ("cognitive_drift", _compute_cognitive_drift),
+        ("approvals", _compute_approvals),
+        ("goals", _compute_goal_completion),
+        ("noise", _compute_noise_passivity),
     ]:
         try:
             metrics, sample_count = await fn(db, period_start, period_end)
@@ -247,7 +253,9 @@ async def _compute_memory_quality(
     relevance_events = _dedupe_by_pair(relevance_events)
 
     if not relevance_events:
-        return {"precision_at_5": None, "hit_rate": None, "mrr": None,
+        return {"precision_at_5": None, "precision_at_3": None,
+                "precision_at_3_recalls": 0, "judge_prompt_versions": [],
+                "hit_rate": None, "mrr": None,
                 "usage_rate": None, "total_recalls": 0, **entrenchment}, 0
 
     # Group by recall_event_id
@@ -260,6 +268,7 @@ async def _compute_memory_quality(
 
     # Compute per-recall metrics
     precisions = []
+    precisions_at_3 = []
     mrrs = []
     hits = 0
     total_recalls = len(by_recall)
@@ -270,8 +279,23 @@ async def _compute_memory_quality(
         # timestamp-DESC order, so list order is NOT the rank — without this sort
         # MRR is meaningless. Pre-fix historical events lack a rank → sort last.
         memories.sort(key=lambda m: m.get("rank", 1 << 30))
+        # Defensive top-5 cap: j9_batch judges memory_ids[:5], so post-dedup
+        # this is a no-op on well-formed data — but a malformed emitter must
+        # not inflate the "@5" denominator beyond 5.
+        memories = memories[:5]
         relevant_count = sum(1 for m in memories if m.get("relevance", 0) >= 0.5)
+        # Precision among judged (top-k of what was judged), NOT a hard-k
+        # denominator — preserves the historical precision_at_5 series.
         precisions.append(relevant_count / max(len(memories), 1))
+
+        # precision@3: only meaningful when every judged memory carries a real
+        # rank — for unranked pre-fix events the [:3] slice would be arbitrary.
+        # Denominator = min(3, judged); recalls skipped here are visible via
+        # precision_at_3_recalls vs total_recalls.
+        if all("rank" in m for m in memories):
+            top3 = memories[:3]
+            relevant_top3 = sum(1 for m in top3 if m.get("relevance", 0) >= 0.5)
+            precisions_at_3.append(relevant_top3 / max(len(top3), 1))
 
         # MRR: rank of first relevant result
         found_relevant = False
@@ -293,8 +317,22 @@ async def _compute_memory_quality(
     total_used = sum(1 for ev in used_events if ev.get("metrics", {}).get("used"))
     total_usage_checked = len(used_events)
 
+    # Judge-prompt versions seen in-window: a change here is a series break
+    # (precision@k is judge-rated; a reworded judge prompt shifts the series
+    # without any retrieval change). Pre-versioning events → "unversioned".
+    judge_prompt_versions = sorted({
+        (ev.get("metrics", {}) or {}).get("judge_prompt_version") or "unversioned"
+        for ev in relevance_events
+    })
+
     metrics = {
         "precision_at_5": round(sum(precisions) / len(precisions), 4) if precisions else None,
+        "precision_at_3": round(sum(precisions_at_3) / len(precisions_at_3), 4)
+        if precisions_at_3 else None,
+        # Coverage: recalls that qualified for the @3 metric (fully ranked)
+        # vs total_recalls — thin coverage must be visible, not hidden.
+        "precision_at_3_recalls": len(precisions_at_3),
+        "judge_prompt_versions": judge_prompt_versions,
         "hit_rate": round(hits / total_recalls, 4) if total_recalls else None,
         "mrr": round(sum(mrrs) / len(mrrs), 4) if mrrs else None,
         "usage_rate": round(total_used / total_usage_checked, 4) if total_usage_checked else None,
@@ -565,6 +603,260 @@ async def _compute_procedural_effectiveness(
         "confidence_calibration": calibration,
     }
     return metrics, invocation_count + outcome_total
+
+
+# ── Dimension 7: Approval-Gate Throughput (WS-1 A2) ──────────────────────────
+
+# The self-approval churn class: background sessions requesting CLI fallback
+# via the fail-closed gate (autonomy/approval_gate.py). 86% of all rows at
+# time of writing — excluded views are reported alongside, never alone.
+_CHURN_ACTION_TYPE = "autonomous_cli_fallback"
+
+
+async def _compute_approvals(
+    db: aiosqlite.Connection, since: str, until: str,
+) -> tuple[dict, int]:
+    """Approval-request resolution metrics over ``approval_requests``.
+
+    Measures GATE THROUGHPUT — how designed approval gates get resolved and
+    by whom — NOT corrective intervention: genuinely corrective user action
+    (mid-course correction via chat) never lands in this table, so no single
+    "intervention rate" headline is derived from it.
+
+    Honesty notes baked into the shape:
+    - resolver classes come from the ONE canonical ``classify_resolver``
+      (db/crud/approval_requests.py); unmatched values surface as
+      ``unknown_resolver_*`` keys so free-text drift is visible in the series.
+    - ``system_cancelled`` conflates never-delivered approval cards with
+      delivered-but-unanswered ones — there is no delivery-receipt column, so
+      no "user ignored rate" is synthesized.
+    - ``resolved_at`` carries two formats (space-separated from SQLite
+      ``datetime('now')`` bulk expiry; ISO-T+00:00 from Python isoformat) —
+      both UTC; ``datetime()`` normalizes them for windowing.
+
+    Snapshot-only dimension (writes no eval_events).
+    """
+    from genesis.db.crud.approval_requests import classify_resolver
+
+    cursor = await db.execute(
+        """SELECT action_type, status, resolved_by
+           FROM approval_requests
+           WHERE resolved_at IS NOT NULL
+             AND datetime(resolved_at) >= datetime(?)
+             AND datetime(resolved_at) < datetime(?)""",
+        (since, until),
+    )
+    resolved = [dict(r) for r in await cursor.fetchall()]
+
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM approval_requests "
+        "WHERE created_at >= ? AND created_at < ?",
+        (since, until),
+    )
+    total_created = (await cursor.fetchone())[0]
+
+    # Point-in-time gauge, not windowed: what is open right now.
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE status = 'pending'"
+    )
+    pending_open = (await cursor.fetchone())[0]
+
+    total_resolved = len(resolved)
+    classified = [(r, classify_resolver(r["resolved_by"])) for r in resolved]
+    user_resolved = sum(1 for _r, c in classified if c == "human")
+    auto_resolved = sum(1 for _r, c in classified if c == "system")
+    unknown_rows = [r for r, c in classified if c == "unknown"]
+
+    churn_total = sum(
+        1 for r in resolved if r["action_type"] == _CHURN_ACTION_TYPE
+    )
+    non_churn_total = total_resolved - churn_total
+    user_non_churn = sum(
+        1 for r, c in classified
+        if c == "human" and r["action_type"] != _CHURN_ACTION_TYPE
+    )
+
+    metrics = {
+        "total_created": total_created,
+        "total_resolved": total_resolved,
+        "churn_total": churn_total,
+        "churn_excluded_total": non_churn_total,
+        "user_resolved": user_resolved,
+        "user_resolved_rate": round(user_resolved / total_resolved, 4)
+        if total_resolved else None,
+        "user_resolved_rate_excl_churn": round(user_non_churn / non_churn_total, 4)
+        if non_churn_total else None,
+        "auto_resolved": auto_resolved,
+        "auto_expired": sum(1 for r in resolved if r["status"] == "expired"),
+        "system_cancelled": sum(
+            1 for r, c in classified
+            if r["status"] == "cancelled" and c == "system"
+        ),
+        "rejection_count": sum(1 for r in resolved if r["status"] == "rejected"),
+        # M12 scaffold: a human-resolved rejection = an explicit user denial.
+        # Zero observed instances to date — derivation is unvalidated against
+        # real deny data until a first real rejection occurs.
+        "user_denied_count": sum(
+            1 for r, c in classified
+            if r["status"] == "rejected" and c == "human"
+        ),
+        "unknown_resolver_count": len(unknown_rows),
+        "unknown_resolver_values": sorted(
+            {r["resolved_by"] for r in unknown_rows if r["resolved_by"]}
+        )[:10],
+        "pending_open": pending_open,
+    }
+    return metrics, total_resolved
+
+
+# ── Dimension 8: Goal Completion (WS-1 A2, scaffold) ─────────────────────────
+
+
+async def _compute_goal_completion(
+    db: aiosqlite.Connection, since: str, until: str,
+) -> tuple[dict, int]:
+    """``user_goals`` status ratios + completion rate.
+
+    SCAFFOLD: zero terminal goals exist to date, so ``completion_rate`` is
+    None (never 0.0 on 0/0). Rate = achieved / (achieved + abandoned);
+    achieved and abandoned are always reported separately — a lone ratio
+    would invite abandoning stale goals to juice it. Ex-ante success
+    criteria (a ``success_criteria`` column + population wiring) are
+    deliberately deferred; until then any non-null rate is unvalidated.
+
+    Snapshot-only dimension (writes no eval_events).
+    """
+    cursor = await db.execute(
+        "SELECT status, COUNT(*) FROM user_goals GROUP BY status"
+    )
+    by_status = {r[0]: r[1] for r in await cursor.fetchall()}
+    total_goals = sum(by_status.values())
+    achieved = by_status.get("achieved", 0)
+    abandoned = by_status.get("abandoned", 0)
+    terminal = achieved + abandoned
+
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM user_goals "
+        "WHERE achieved_at >= ? AND achieved_at < ?",
+        (since, until),
+    )
+    achieved_in_period = (await cursor.fetchone())[0]
+
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM user_goals "
+        "WHERE status = 'abandoned' AND updated_at >= ? AND updated_at < ?",
+        (since, until),
+    )
+    abandoned_in_period = (await cursor.fetchone())[0]
+
+    metrics = {
+        "total_goals": total_goals,
+        "by_status": {
+            s: by_status.get(s, 0)
+            for s in ("active", "paused", "achieved", "abandoned")
+        },
+        "terminal_count": terminal,
+        "achieved_count": achieved,
+        "abandoned_count": abandoned,
+        "completion_rate": round(achieved / terminal, 4) if terminal else None,
+        "achieved_in_period": achieved_in_period,
+        "abandoned_in_period": abandoned_in_period,
+    }
+    if terminal == 0:
+        metrics["note"] = "scaffold: no terminal goals yet — rate uncomputable"
+    return metrics, total_goals
+
+
+# ── Dimension 9: Noise / Passivity v1 (WS-1 A2) ──────────────────────────────
+
+# Mirrors _STALE_DAYS in mcp/health/loop_closure_status.py — a follow-up /
+# proposal still pending past this cutoff counts as a leak.
+_NOISE_STALE_DAYS = 14
+
+
+async def _compute_noise_passivity(
+    db: aiosqlite.Connection, since: str, until: str,
+) -> tuple[dict, int]:
+    """Noise/passivity v1: loop-closure leaks + windowed ego-cycle activity.
+
+    Two kinds of numbers, deliberately distinct:
+    - Funnel gauges (``stale_followups`` …) reuse db/crud/loop_closure.py and
+      are ALL-TIME LEVELS (stocks) snapshotted weekly — the *series* shows
+      drift, but week-over-week deltas are NOT flows.
+    - Windowed counts (``ego_cycles`` …) are true per-period flows.
+      ``empty_ego_cycle_pct`` has an opportunity denominator (cycles run in
+      the window) — an empty cycle on a quiet week isn't passivity, which is
+      why the denominator is cycles, not wall-clock.
+
+    Raw buckets only — no composite "suppression score": realist ``reject``
+    verdicts have zero observed rows, so any composite would be dominated by
+    unvalidated components.
+
+    Snapshot-only dimension (writes no eval_events).
+    """
+    from genesis.db.crud import loop_closure
+
+    stale_before = (
+        datetime.fromisoformat(until) - timedelta(days=_NOISE_STALE_DAYS)
+    ).isoformat()
+    fu = await loop_closure.followup_funnel(db, stale_before=stale_before)
+    obs = await loop_closure.observation_funnel(db, stale_before=stale_before)
+    prop = await loop_closure.proposal_funnel(db, stale_before=stale_before)
+
+    cursor = await db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(num_proposals = 0), 0) "
+        "FROM ego_cycle_outcomes WHERE created_at >= ? AND created_at < ?",
+        (since, until),
+    )
+    row = await cursor.fetchone()
+    ego_cycles, empty_ego_cycles = row[0], row[1]
+
+    cursor = await db.execute(
+        "SELECT status, COUNT(*) FROM ego_proposals "
+        "WHERE created_at >= ? AND created_at < ? GROUP BY status",
+        (since, until),
+    )
+    status_counts = {r[0]: r[1] for r in await cursor.fetchall()}
+    proposals_in_period = sum(status_counts.values())
+
+    cursor = await db.execute(
+        "SELECT action_type, COUNT(*) FROM ego_proposals "
+        "WHERE created_at >= ? AND created_at < ? AND status = 'rejected' "
+        "GROUP BY action_type",
+        (since, until),
+    )
+    rejected_by_action_type = {r[0]: r[1] for r in await cursor.fetchall()}
+
+    cursor = await db.execute(
+        "SELECT realist_verdict, COUNT(*) FROM ego_proposals "
+        "WHERE created_at >= ? AND created_at < ? "
+        "AND realist_verdict IS NOT NULL GROUP BY realist_verdict",
+        (since, until),
+    )
+    verdicts = {r[0]: r[1] for r in await cursor.fetchall()}
+
+    metrics = {
+        # Gauges (all-time stocks, see docstring)
+        "stale_followups": fu["leak_pending_stale"],
+        "followups_pending": fu["by_status"].get("pending", 0),
+        "observations_stale_unactuated": obs["leak_stale_unactuated"],
+        "proposals_pending_stale": prop["leak_pending_stale"],
+        "stale_cutoff_days": _NOISE_STALE_DAYS,
+        # Windowed flows
+        "ego_cycles": ego_cycles,
+        "empty_ego_cycles": empty_ego_cycles,
+        "empty_ego_cycle_pct": round(empty_ego_cycles / ego_cycles, 4)
+        if ego_cycles else None,
+        "proposals_in_period": proposals_in_period,
+        "rejected_count": status_counts.get("rejected", 0),
+        "withdrawn_count": status_counts.get("withdrawn", 0),
+        "tabled_count": status_counts.get("tabled", 0),
+        "rejected_by_action_type": rejected_by_action_type,
+        "realist_amend": verdicts.get("amend", 0),
+        "realist_reject": verdicts.get("reject", 0),
+        "realist_quality_hold": verdicts.get("quality_hold", 0),
+    }
+    return metrics, ego_cycles + proposals_in_period
 
 
 # ── Composite Trends ─────────────────────────────────────────────────────────
