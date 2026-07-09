@@ -936,7 +936,9 @@ async def test_compute_goal_completion_rate(db):
     assert metrics["abandoned_count"] == 1
     assert metrics["completion_rate"] == 0.5
     assert metrics["achieved_in_period"] == 1
-    assert metrics["abandoned_in_period"] == 1
+    # No abandoned_in_period: no abandonment timestamp exists (updated_at is
+    # refreshed by ANY edit) — the stock abandoned_count carries the signal.
+    assert "abandoned_in_period" not in metrics
     assert "note" not in metrics
 
 
@@ -963,14 +965,17 @@ async def test_compute_noise_passivity(db):
         "(id, source, type, content, priority, created_at, influenced_action, resolved, surfaced_count) "
         "VALUES ('o1','s','generic','c','medium',?,0,0,0)", (old,),
     )
-    # ego proposals: rejected + withdrawn + stale-pending, one realist amend
+    # ego proposals: rejected + withdrawn (decision buckets window on
+    # resolved_at, which the reject/table/withdraw transitions set) +
+    # stale-pending, one realist amend
     await db.execute(
-        "INSERT INTO ego_proposals (id, action_type, content, status, created_at, realist_verdict) "
-        "VALUES ('p1','investigate','c','rejected',?, 'amend')", (old,),
+        "INSERT INTO ego_proposals "
+        "(id, action_type, content, status, created_at, resolved_at, realist_verdict) "
+        "VALUES ('p1','investigate','c','rejected',?,?,'amend')", (old, old),
     )
     await db.execute(
-        "INSERT INTO ego_proposals (id, action_type, content, status, created_at) "
-        "VALUES ('p2','outreach','c','withdrawn',?)", (old,),
+        "INSERT INTO ego_proposals (id, action_type, content, status, created_at, resolved_at) "
+        "VALUES ('p2','outreach','c','withdrawn',?,?)", (old, old),
     )
     await db.execute(
         "INSERT INTO ego_proposals (id, action_type, content, status, created_at) "
@@ -1037,3 +1042,50 @@ async def test_run_weekly_aggregation_writes_new_dimensions(db):
     memory_snap = await j9_eval.get_latest_snapshot(db, dimension="memory")
     assert "precision_at_3" in memory_snap["metrics"]
     assert "judge_prompt_versions" in memory_snap["metrics"]
+
+
+async def test_noise_decision_buckets_window_on_resolved_at(db):
+    """A proposal created BEFORE the window but decided INSIDE it is this
+    week's decision — created_at windowing would undercount boundary-
+    straddling proposals (Codex P2 on PR #966)."""
+    from genesis.eval.j9_aggregator import _compute_noise_passivity
+
+    # created long before the window, rejected inside it
+    await db.execute(
+        "INSERT INTO ego_proposals (id, action_type, content, status, created_at, resolved_at) "
+        "VALUES ('pb1','investigate','c','rejected',"
+        "'1999-01-01T00:00:00+00:00','2050-06-01T00:00:00+00:00')",
+    )
+    # created AND resolved before the window — must NOT count
+    await db.execute(
+        "INSERT INTO ego_proposals (id, action_type, content, status, created_at, resolved_at) "
+        "VALUES ('pb2','outreach','c','withdrawn',"
+        "'1999-01-01T00:00:00+00:00','1999-06-01T00:00:00+00:00')",
+    )
+    await db.commit()
+
+    metrics, _ = await _compute_noise_passivity(
+        db, since="2000-01-01T00:00:00+00:00", until="2100-01-01T00:00:00+00:00",
+    )
+    assert metrics["rejected_count"] == 1       # pb1: decided in window
+    assert metrics["withdrawn_count"] == 0      # pb2: decided before window
+    assert metrics["proposals_in_period"] == 0  # neither was CREATED in window
+    assert metrics["rejected_by_action_type"] == {"investigate": 1}
+
+
+async def test_j9_eval_status_reports_new_snapshot_dimensions(db, monkeypatch):
+    """The MCP health endpoint must surface the three snapshot-only dims
+    (they have no eval_events, so only the snapshot loop shows them)."""
+    from types import SimpleNamespace
+
+    import genesis.mcp.health_mcp as health_mcp_mod
+    from genesis.eval.j9_aggregator import run_weekly_aggregation
+    from genesis.mcp.health.j9_eval import _impl_j9_eval_status
+
+    await run_weekly_aggregation(db)
+    monkeypatch.setattr(health_mcp_mod, "_service", SimpleNamespace(_db=db))
+
+    res = await _impl_j9_eval_status()
+    for dim in ("approvals", "goals", "noise"):
+        assert dim in res["latest_snapshots"], f"missing {dim}"
+        assert res["latest_snapshots"][dim] is not None

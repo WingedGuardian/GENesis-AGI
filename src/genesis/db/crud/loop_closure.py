@@ -23,6 +23,14 @@ import json
 
 import aiosqlite
 
+# Canonical staleness cutoff: a discovered item still un-actuated after this
+# long is counted as a leak ("work goes here to die"). Shared by the
+# loop_closure_status MCP tool and the J-9 noise dimension — callers derive
+# their ISO ``stale_before`` cutoff from it (the query layer itself stays
+# deterministic; no wall-clock in here). 14d mirrors the morning report's
+# follow-up staleness rule.
+STALE_DAYS = 14
+
 # Session statuses where a skill's outcome is DETERMINABLE at all (so a
 # success-rate is computable) — the full terminal set, not just failures.
 # 'active'/'checkpointed'/'expired' are not terminal-for-outcome. NB:

@@ -746,13 +746,11 @@ async def _compute_goal_completion(
     )
     achieved_in_period = (await cursor.fetchone())[0]
 
-    cursor = await db.execute(
-        "SELECT COUNT(*) FROM user_goals "
-        "WHERE status = 'abandoned' AND updated_at >= ? AND updated_at < ?",
-        (since, until),
-    )
-    abandoned_in_period = (await cursor.fetchone())[0]
-
+    # No abandoned_in_period: user_goals has no abandonment timestamp
+    # (mark_abandoned only touches updated_at, which ANY later edit also
+    # refreshes) — a windowed count would double-report edited-after-abandon
+    # goals. The all-time abandoned_count stock (weekly deltas in the series)
+    # carries the flow signal honestly.
     metrics = {
         "total_goals": total_goals,
         "by_status": {
@@ -764,7 +762,6 @@ async def _compute_goal_completion(
         "abandoned_count": abandoned,
         "completion_rate": round(achieved / terminal, 4) if terminal else None,
         "achieved_in_period": achieved_in_period,
-        "abandoned_in_period": abandoned_in_period,
     }
     if terminal == 0:
         metrics["note"] = "scaffold: no terminal goals yet — rate uncomputable"
@@ -772,10 +769,6 @@ async def _compute_goal_completion(
 
 
 # ── Dimension 9: Noise / Passivity v1 (WS-1 A2) ──────────────────────────────
-
-# Mirrors _STALE_DAYS in mcp/health/loop_closure_status.py — a follow-up /
-# proposal still pending past this cutoff counts as a leak.
-_NOISE_STALE_DAYS = 14
 
 
 async def _compute_noise_passivity(
@@ -801,7 +794,7 @@ async def _compute_noise_passivity(
     from genesis.db.crud import loop_closure
 
     stale_before = (
-        datetime.fromisoformat(until) - timedelta(days=_NOISE_STALE_DAYS)
+        datetime.fromisoformat(until) - timedelta(days=loop_closure.STALE_DAYS)
     ).isoformat()
     fu = await loop_closure.followup_funnel(db, stale_before=stale_before)
     obs = await loop_closure.observation_funnel(db, stale_before=stale_before)
@@ -816,16 +809,29 @@ async def _compute_noise_passivity(
     ego_cycles, empty_ego_cycles = row[0], row[1]
 
     cursor = await db.execute(
-        "SELECT status, COUNT(*) FROM ego_proposals "
-        "WHERE created_at >= ? AND created_at < ? GROUP BY status",
+        "SELECT COUNT(*) FROM ego_proposals "
+        "WHERE created_at >= ? AND created_at < ?",
         (since, until),
     )
-    status_counts = {r[0]: r[1] for r in await cursor.fetchall()}
-    proposals_in_period = sum(status_counts.values())
+    proposals_in_period = (await cursor.fetchone())[0]
+
+    # Decision buckets window on resolved_at (set by the reject/table/withdraw
+    # CRUD transitions), NOT created_at — a proposal created before the window
+    # but decided inside it IS this week's decision; created_at windowing
+    # would undercount decisions on boundary-straddling proposals.
+    cursor = await db.execute(
+        "SELECT status, COUNT(*) FROM ego_proposals "
+        "WHERE resolved_at IS NOT NULL "
+        "AND resolved_at >= ? AND resolved_at < ? "
+        "AND status IN ('rejected', 'withdrawn', 'tabled') GROUP BY status",
+        (since, until),
+    )
+    decision_counts = {r[0]: r[1] for r in await cursor.fetchall()}
 
     cursor = await db.execute(
         "SELECT action_type, COUNT(*) FROM ego_proposals "
-        "WHERE created_at >= ? AND created_at < ? AND status = 'rejected' "
+        "WHERE resolved_at IS NOT NULL "
+        "AND resolved_at >= ? AND resolved_at < ? AND status = 'rejected' "
         "GROUP BY action_type",
         (since, until),
     )
@@ -845,16 +851,17 @@ async def _compute_noise_passivity(
         "followups_pending": fu["by_status"].get("pending", 0),
         "observations_stale_unactuated": obs["leak_stale_unactuated"],
         "proposals_pending_stale": prop["leak_pending_stale"],
-        "stale_cutoff_days": _NOISE_STALE_DAYS,
+        "stale_cutoff_days": loop_closure.STALE_DAYS,
         # Windowed flows
         "ego_cycles": ego_cycles,
         "empty_ego_cycles": empty_ego_cycles,
         "empty_ego_cycle_pct": round(empty_ego_cycles / ego_cycles, 4)
         if ego_cycles else None,
         "proposals_in_period": proposals_in_period,
-        "rejected_count": status_counts.get("rejected", 0),
-        "withdrawn_count": status_counts.get("withdrawn", 0),
-        "tabled_count": status_counts.get("tabled", 0),
+        # Decisions RESOLVED in window (not created-in-window cohort)
+        "rejected_count": decision_counts.get("rejected", 0),
+        "withdrawn_count": decision_counts.get("withdrawn", 0),
+        "tabled_count": decision_counts.get("tabled", 0),
         "rejected_by_action_type": rejected_by_action_type,
         "realist_amend": verdicts.get("amend", 0),
         "realist_reject": verdicts.get("reject", 0),

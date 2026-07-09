@@ -21,14 +21,11 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime, timedelta
 
+# Canonical staleness cutoff lives beside the funnel queries it governs.
+from genesis.db.crud.loop_closure import STALE_DAYS as _STALE_DAYS
 from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
-
-# A discovered item still un-actuated after this long is counted as a leak
-# (the "work goes here to die" signal). 14d mirrors the morning report's
-# follow-up staleness rule.
-_STALE_DAYS = 14
 
 
 async def _impl_loop_closure_status() -> dict:
