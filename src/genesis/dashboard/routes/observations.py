@@ -61,7 +61,11 @@ async def observations_list():
         kwargs["priority"] = priority
     if obs_type:
         kwargs["type"] = obs_type
-    if source:
+    if source == "session:*":
+        # Sentinel from the filters endpoint: all session-sourced observations
+        # collapse into one dropdown option (raw values are per-session UUIDs).
+        kwargs["source_prefix"] = "session:"
+    elif source:
         kwargs["source"] = source
     if resolved is not None:
         kwargs["resolved"] = resolved
@@ -116,6 +120,7 @@ async def observations_summary():
 @_async_route
 async def observations_filters():
     """Return distinct types and sources for filter dropdowns."""
+    from genesis.db.crud import observations as obs_crud
     from genesis.db.crud.observations import INTERNAL_OBS_TYPES
     from genesis.runtime import GenesisRuntime
 
@@ -124,17 +129,16 @@ async def observations_filters():
         return jsonify({"types": [], "sources": []})
 
     # Only return types/sources that have unresolved observations
-    cursor = await rt.db.execute(
-        "SELECT DISTINCT type FROM observations WHERE resolved = 0 ORDER BY type"
-    )
-    all_types = [row[0] for row in await cursor.fetchall()]
+    all_types = await obs_crud.distinct_unresolved_types(rt.db)
     # Exclude internal types from the dropdown
     types = [t for t in all_types if t not in INTERNAL_OBS_TYPES]
 
-    cursor = await rt.db.execute(
-        "SELECT DISTINCT source FROM observations WHERE resolved = 0 ORDER BY source"
-    )
-    sources = [row[0] for row in await cursor.fetchall()]
+    # Collapse per-session UUID sources ("session:<uuid>") into one sentinel
+    # option; the list endpoint expands "session:*" to a prefix match.
+    all_sources = await obs_crud.distinct_unresolved_sources(rt.db)
+    sources = [s for s in all_sources if not s.startswith("session:")]
+    if len(sources) != len(all_sources):
+        sources.append("session:*")
 
     return jsonify({"types": types, "sources": sources})
 

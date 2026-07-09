@@ -40,6 +40,32 @@ async def test_query_by_source(db):
     assert all(r["source"] == "sensor" for r in rows)
 
 
+async def test_query_by_source_prefix(db):
+    await observations.create(db, id="sp1", **{**_COMMON, "source": "session:abc-123"})
+    await observations.create(db, id="sp2", **{**_COMMON, "source": "session:def-456"})
+    await observations.create(db, id="sp3", **_COMMON)
+    rows = await observations.query(db, source_prefix="session:")
+    assert {r["id"] for r in rows} == {"sp1", "sp2"}
+
+
+async def test_query_source_filters_mutually_exclusive(db):
+    with pytest.raises(ValueError):
+        await observations.query(db, source="a", source_prefix="b")
+    with pytest.raises(ValueError):
+        await observations.query(db, source_in=["a"], source_prefix="b")
+
+
+async def test_distinct_unresolved_types_and_sources(db):
+    await observations.create(db, id="du1", **_COMMON)
+    await observations.create(db, id="du2", **{**_COMMON, "source": "session:abc"})
+    await observations.create(db, id="du3", **{**_COMMON, "type": "anomaly"})
+    await observations.resolve(
+        db, "du3", resolved_at="2026-01-02T00:00:00", resolution_notes=""
+    )
+    assert await observations.distinct_unresolved_types(db) == ["metric"]
+    assert await observations.distinct_unresolved_sources(db) == ["sensor", "session:abc"]
+
+
 async def test_query_by_priority(db):
     await observations.create(db, id="o5", **{**_COMMON, "priority": "low"})
     rows = await observations.query(db, priority="low")

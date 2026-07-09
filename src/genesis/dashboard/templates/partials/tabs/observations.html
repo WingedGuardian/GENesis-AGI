@@ -59,7 +59,7 @@
                   @change="$store.genesisDashboard.observationsFilters.source = $event.target.value; $store.genesisDashboard.fetchObservations()">
             <option value="">All sources</option>
             <template x-for="s in $store.genesisDashboard.observationsAvailableFilters.sources" :key="s">
-              <option :value="s" x-text="s"></option>
+              <option :value="s" x-text="s === 'session:*' ? 'session (any)' : s"></option>
             </template>
           </select>
 

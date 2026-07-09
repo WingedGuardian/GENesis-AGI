@@ -314,6 +314,7 @@ async def query(
     person_id: str | None = None,
     source: str | None = None,
     source_in: list[str] | None = None,
+    source_prefix: str | None = None,
     type: str | None = None,
     priority: str | None = None,
     category: str | None = None,
@@ -321,8 +322,8 @@ async def query(
     exclude_types: tuple[str, ...] | frozenset[str] | None = None,
     limit: int = 50,
 ) -> list[dict]:
-    if source and source_in:
-        raise ValueError("Cannot specify both 'source' and 'source_in'")
+    if sum(map(bool, (source, source_in, source_prefix))) > 1:
+        raise ValueError("Specify at most one of 'source', 'source_in', 'source_prefix'")
     sql = "SELECT * FROM observations WHERE 1=1"
     params: list = []
     if person_id is not None:
@@ -335,6 +336,11 @@ async def query(
         placeholders = ",".join("?" for _ in source_in)
         sql += f" AND source IN ({placeholders})"
         params.extend(source_in)
+    if source_prefix:
+        # Callers pass fixed literals (e.g. "session:"), never user-supplied
+        # patterns, so no LIKE-wildcard escaping is needed.
+        sql += " AND source LIKE ? || '%'"
+        params.append(source_prefix)
     if type:
         sql += " AND type = ?"
         params.append(type)
@@ -355,6 +361,22 @@ async def query(
     params.append(limit)
     rows = await db.execute_fetchall(sql, params)
     return [dict(r) for r in rows]
+
+
+async def distinct_unresolved_types(db: aiosqlite.Connection) -> list[str]:
+    """Distinct ``type`` values among unresolved observations (dropdown feed)."""
+    rows = await db.execute_fetchall(
+        "SELECT DISTINCT type FROM observations WHERE resolved = 0 ORDER BY type"
+    )
+    return [row[0] for row in rows]
+
+
+async def distinct_unresolved_sources(db: aiosqlite.Connection) -> list[str]:
+    """Distinct ``source`` values among unresolved observations (dropdown feed)."""
+    rows = await db.execute_fetchall(
+        "SELECT DISTINCT source FROM observations WHERE resolved = 0 ORDER BY source"
+    )
+    return [row[0] for row in rows]
 
 
 async def resolve(
