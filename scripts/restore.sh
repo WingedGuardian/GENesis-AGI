@@ -127,6 +127,28 @@ _quiesce_genesis_server() {
 
 _BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
 
+# Circular-trap fallback: if the passphrase is not in the environment (e.g.
+# secrets.env was lost — the exact disaster this backup exists for), read it
+# from the host-side escrow the credential bridge writes. Without this, an
+# encrypted backup of a lost secrets.env would be undecryptable.
+if [ -z "$_BACKUP_PASSPHRASE" ]; then
+    for _escrow in \
+        "${GENESIS_PASSPHRASE_ESCROW:-}" \
+        "$HOME/.genesis/shared/guardian/backup_passphrase.env" \
+        "$HOME/.local/state/genesis-guardian/shared/guardian/backup_passphrase.env"; do
+        [ -n "$_escrow" ] && [ -f "$_escrow" ] || continue
+        # Bridge writes exactly `GENESIS_BACKUP_PASSPHRASE=<value>` (no quotes);
+        # tolerate an optional `export ` prefix. Do NOT strip quotes — the
+        # passphrase may legitimately contain them.
+        _escrowed="$(sed -n 's/^\(export \)\{0,1\}GENESIS_BACKUP_PASSPHRASE=//p' "$_escrow" | head -n1)"
+        if [ -n "$_escrowed" ]; then
+            _BACKUP_PASSPHRASE="$_escrowed"
+            log "Using escrowed backup passphrase from $_escrow (env passphrase absent)"
+            break
+        fi
+    done
+fi
+
 # decrypt_file <src.gpg> <dst>
 decrypt_file() {
     local src="$1" dst="$2"
@@ -301,6 +323,20 @@ _pull_from_offsite() {
             warn "off-site: failed to pull secrets.env.gpg from snapshot $latest — secrets will not be restored"
         fi
     fi
+    # creds — Tier-1 git normally carries these; a no-git box needs them from the
+    # snapshot too (restore §8 reads $BACKUP_DIR/creds). backend_list is
+    # single-level, so iterate creds/ and creds/ssh/ separately; the .gpg filter
+    # drops the `ssh` subdir entry so it is not mis-fetched as a flat file.
+    for _sub in creds creds/ssh; do
+        while read -r fname; do
+            mkdir -p "$BACKUP_DIR/$_sub"
+            if backend_get "$snap/$_sub/$fname" "$BACKUP_DIR/$_sub/$fname"; then
+                log "  off-site: pulled $_sub/$fname"
+            else
+                warn "off-site: failed to pull $_sub/$fname from snapshot $latest"
+            fi
+        done < <(backend_list "$snap/$_sub" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
+    done
 }
 _pull_from_offsite
 
@@ -585,6 +621,47 @@ if [ -f "$SECRETS_SRC" ]; then
     fi
 else
     log "Secrets: no backup payload at $SECRETS_SRC"
+fi
+
+# ── 8. Critical credential & wiring files → staging (non-destructive) ─
+# Decrypted to a staging dir, never auto-placed: clobbering a live ~/.ssh key or
+# credential file mid-restore is dangerous. On a fresh rebuild, move them into
+# place from the staging dir (paths logged below). These live in the Tier-1 git
+# clone, so no off-site pull is needed.
+log "--- Credential & wiring files ---"
+CREDS_SRC_DIR="$BACKUP_DIR/creds"
+if [ -d "$CREDS_SRC_DIR" ]; then
+    CREDS_STAGE="${GENESIS_CREDS_STAGE:-$HOME/.genesis/restore-creds}"
+    _CREDS_STAGED=0
+    # Private-by-creation: make the stage dir 0700 and set umask 077 BEFORE any
+    # plaintext is written, so decrypted SSH keys / credentials are never briefly
+    # world-readable on a multi-user host (no window between write and chmod).
+    if ! $DRY_RUN; then
+        mkdir -p "$CREDS_STAGE" && chmod 0700 "$CREDS_STAGE"
+    fi
+    _prev_umask="$(umask)"; umask 077
+    while IFS= read -r -d '' _gpg; do
+        _rel="${_gpg#"$CREDS_SRC_DIR"/}"       # e.g. ssh/id_ed25519.gpg
+        _out="$CREDS_STAGE/${_rel%.gpg}"        # strip trailing .gpg
+        if $DRY_RUN; then
+            log "Creds: would decrypt → $_out"
+            continue
+        fi
+        mkdir -p "$(dirname "$_out")"
+        if decrypt_file "$_gpg" "$_out"; then
+            chmod 0600 "$_out"
+            _CREDS_STAGED=$(( _CREDS_STAGED + 1 ))
+        else
+            warn "Creds: decrypt failed for $_rel"
+        fi
+    done < <(find "$CREDS_SRC_DIR" -type f -name '*.gpg' -print0)
+    umask "$_prev_umask"
+    if ! $DRY_RUN; then
+        log "Creds: $_CREDS_STAGED file(s) decrypted → $CREDS_STAGE (staged, NOT auto-placed)"
+        log "      Move into place manually (ssh/ → ~/.ssh/, gh_hosts.yml → ~/.config/gh/hosts.yml, etc.)."
+    fi
+else
+    log "Creds: no backup payload at $CREDS_SRC_DIR"
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────
