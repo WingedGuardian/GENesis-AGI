@@ -67,6 +67,19 @@ _MAX_RESULTS = 3
 _MIN_PROMPT_WORDS = 1  # Stop words already filter greetings to 0 keywords
 _METRICS_PATH = Path.home() / ".genesis" / "proactive_metrics.json"
 
+# Rank-2+ RRF floor and single-KB-slot cap for result selection. Module-level
+# so the H-1 PR2a shadow projection (_shadow_gate) shares the exact same values
+# as the real selection loop in _rrf_fusion.
+_MIN_RRF_SCORE_RANK2 = 0.015
+_MAX_KB_SLOTS = 1  # Prevent KB from flooding out episodic context
+
+# H-1 PR2a novelty-gate shadow: serendipity boost applied (in projection only)
+# to never-surfaced episodic memories, and the kill-switch flag that neutralizes
+# the suppression set without a deploy. PR2a is measurement-only — these affect
+# the shadow projection, never the injected output.
+_SERENDIPITY_BOOST = 1.3
+_WS_GATE_DISABLED_FLAG = Path.home() / ".genesis" / "ws_gate_disabled"
+
 # Common English stop words to filter from search queries
 _STOP_WORDS = frozenset({
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
@@ -425,11 +438,31 @@ def _append_injection_log(session_id: str, record: dict) -> None:
         pass  # Never block
 
 
+def _compute_suppress_ids(session_id: str) -> frozenset[str]:
+    """IDs already surfaced this session — the PR2b suppression set.
+
+    Empty when there's no session, or when the kill-switch flag
+    (``~/.genesis/ws_gate_disabled``) exists — a hot disable without a deploy.
+    In PR2a this feeds the shadow projection only; the real injection is
+    unaffected regardless.
+    """
+    if not session_id:
+        return frozenset()
+    try:
+        if _WS_GATE_DISABLED_FLAG.exists():
+            return frozenset()
+    except OSError:
+        pass
+    ws = _load_working_set(session_id)
+    return frozenset(ws.get("entries", {}).keys())
+
+
 def _ws_measure(
     fused: list[dict],
     session_id: str,
     surfaced_proc_id: str | None,
     now_iso: str,
+    shadow: dict | None = None,
 ) -> dict:
     """The whole working-set measurement step for one prompt.
 
@@ -438,6 +471,11 @@ def _ws_measure(
     (hook stdout is context injected into the conversation) and NEVER
     raises — any internal failure returns the stats gathered so far with
     safe defaults for the rest.
+
+    ``shadow`` (H-1 PR2a) is the ``_shadow_gate`` projection for this prompt;
+    when non-empty its ``projected_injected``/``suppressed``/``serendipity_boosted``
+    fields are merged into the injection-log record and returned stats. It never
+    changes the injected output — this step already runs after stdout is flushed.
     """
     stats: dict = {
         "injected_ids": [],
@@ -474,7 +512,7 @@ def _ws_measure(
             )
             _save_working_set(session_id, ws)
             stats["working_set_size"] = len(ws.get("entries", {}))
-            _append_injection_log(session_id, {
+            record = {
                 "ts": now_iso,
                 "turn": ws.get("turn", 0),
                 "injected": len(stats["injected_ids"]),
@@ -483,7 +521,12 @@ def _ws_measure(
                 "ws_size": stats["working_set_size"],
                 "proc": bool(surfaced_proc_id),
                 "proc_repeat": stats["procedure_repeat"],
-            })
+            }
+            if shadow:
+                for key in ("projected_injected", "suppressed", "serendipity_boosted"):
+                    record[key] = shadow.get(key)
+                    stats[key] = shadow.get(key)
+            _append_injection_log(session_id, record)
     except Exception:
         pass  # Measurement must never block the prompt
     return stats
@@ -957,6 +1000,8 @@ def _rrf_fusion(
     code_results: list[dict] | None = None,
     knowledge_results: list[dict] | None = None,
     k: int = 60,
+    suppress_ids: frozenset[str] = frozenset(),
+    shadow: dict | None = None,
 ) -> list[dict]:
     """Reciprocal Rank Fusion of FTS5, vector, wing-filtered, knowledge, and code results.
 
@@ -1024,12 +1069,10 @@ def _rrf_fusion(
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
     # Dynamic count: rank 0 always surfaces; rank 1-2 only if they meet
-    # a minimum RRF score threshold.  At k=60, single-source rank 0 scores
-    # ~0.016 so 0.015 filters code-index-only results (0.5x weight = 0.008)
-    # and very weak multi-source hits.  Tune upward to ~0.025 if rank 2-3
-    # results are still noisy in practice.
-    _MIN_RRF_SCORE_RANK2 = 0.015
-    _MAX_KB_SLOTS = 1  # Prevent KB from flooding out episodic context
+    # a minimum RRF score threshold (_MIN_RRF_SCORE_RANK2, module-level).  At
+    # k=60, single-source rank 0 scores ~0.016 so 0.015 filters code-index-only
+    # results (0.5x weight = 0.008) and very weak multi-source hits.  Tune
+    # upward to ~0.025 if rank 2-3 results are still noisy in practice.
     kb_count = 0
     results = []
     for i, (mid, score) in enumerate(ranked[:_MAX_RESULTS * 2]):  # scan extra to handle KB slot skips
@@ -1045,7 +1088,72 @@ def _rrf_fusion(
         results.append(entry)
         if len(results) >= _MAX_RESULTS:
             break
+
+    # H-1 PR2a (measurement-only): project what the novelty gate WOULD inject,
+    # without touching `results`. Skipped entirely when shadow is None (every
+    # existing caller), so the injected output is byte-identical.
+    if shadow is not None:
+        shadow.update(_shadow_gate(scores, content_map, suppress_ids))
+
     return results
+
+
+def _shadow_gate(
+    scores: dict[str, float],
+    content_map: dict[str, dict],
+    suppress_ids: frozenset[str],
+) -> dict:
+    """Project the PR2b novelty gate's injection set (H-1 PR2a, measurement-only).
+
+    Mirrors the real selection loop in ``_rrf_fusion`` but on COPIES: applies the
+    serendipity boost to never-surfaced episodic memories (``_retrieved_count==0``,
+    non-KB), then skips already-surfaced ``suppress_ids`` over a widened scan.
+    Never mutates its inputs — the real injection path above is untouched. PR2b
+    folds this logic into the real loop; here it only feeds measurement.
+
+    (Intentional near-duplicate of the loop above: keeping it separate is what
+    guarantees the measured path stays byte-identical during the shadow window.)
+    """
+    boosted = dict(scores)
+    serendipity_boosted = 0
+    for mid, entry in content_map.items():
+        if mid not in boosted:
+            continue
+        if (
+            entry.get("_retrieved_count", -1) == 0
+            and entry.get("collection") != "knowledge_base"
+        ):
+            boosted[mid] *= _SERENDIPITY_BOOST
+            serendipity_boosted += 1
+    ranked = sorted(boosted.items(), key=lambda x: x[1], reverse=True)
+
+    suppressed = 0
+    kb_count = 0
+    projected: list[str] = []
+    for i, (mid, score) in enumerate(ranked[:_MAX_RESULTS * 4]):
+        if mid not in content_map:
+            continue
+        if i > 0 and score < _MIN_RRF_SCORE_RANK2:
+            break
+        if mid in suppress_ids:
+            suppressed += 1
+            continue
+        entry = content_map[mid]
+        if entry.get("collection") == "knowledge_base":
+            kb_count += 1
+            if kb_count > _MAX_KB_SLOTS:
+                continue
+        if _is_garbage(entry.get("content", "")):
+            continue
+        projected.append(mid)
+        if len(projected) >= _MAX_RESULTS:
+            break
+    return {
+        "projected_ids": projected,
+        "projected_injected": len(projected),
+        "suppressed": suppressed,
+        "serendipity_boosted": serendipity_boosted,
+    }
 
 
 def _format_age(iso_str: str) -> str:
@@ -1280,12 +1388,17 @@ def _record_detail(
     working_set_size: int | None = None,
     zero_retrieved_injected: int = 0,
     procedure_repeat: bool = False,
+    projected_injected: int | None = None,
+    suppressed: int = 0,
+    serendipity_boosted: int = 0,
 ) -> None:
     """Atomic JSON write — latest invocation detail for health dashboard.
 
     The working-set fields (H-1 PR1) describe this prompt's injection vs
     the session's already-surfaced set; ``overlap_pct``/``working_set_size``
-    are None when no injection happened or no session ID was available.
+    are None when no injection happened or no session ID was available. The
+    shadow fields (H-1 PR2a) are the novelty-gate projection for this prompt —
+    ``projected_injected`` is None when no shadow ran.
     """
     data = {
         "timestamp": datetime.now(UTC).isoformat(),
@@ -1303,6 +1416,9 @@ def _record_detail(
         "working_set_size": working_set_size,
         "zero_retrieved_injected": zero_retrieved_injected,
         "procedure_repeat": procedure_repeat,
+        "projected_injected": projected_injected,
+        "suppressed": suppressed,
+        "serendipity_boosted": serendipity_boosted,
     }
     try:
         _METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1577,12 +1693,19 @@ async def _run(prompt: str, session_id: str = "") -> None:
     # Fuse results (with wing boost, code index, and knowledge base)
     fused: list[dict] = []
     fused_count = 0
+    # H-1 PR2a: shadow-project the novelty gate. suppress_ids feeds the shadow
+    # projection ONLY — the real selection loop ignores it, so injected output
+    # is unchanged. _shadow accumulates the projection for the injection log.
+    _suppress_ids = _compute_suppress_ids(session_id)
+    _shadow: dict = {}
     if fts_results or vector_results or wing_results or code_results or knowledge_results:
         fused = _rrf_fusion(
             fts_results, vector_results,
             wing_results=wing_results,
             code_results=code_results or None,
             knowledge_results=knowledge_results or None,
+            suppress_ids=_suppress_ids,
+            shadow=_shadow,
         )
         fused = [r for r in fused if not _is_garbage(r.get("content", ""))]
         fused_count = len(fused)
@@ -1651,11 +1774,12 @@ async def _run(prompt: str, session_id: str = "") -> None:
     if fused:
         await _increment_retrieved(fused)
 
-    # ── Working-set measurement (H-1 PR1, record-only) ─────────────
-    # Overlap stats feed the PR2 novelty-gate decision. Runs after all
-    # stdout is flushed — never touches injection output. Placed inside
-    # the total_ms window so budget_exceeded watches its file I/O too.
-    ws_stats = _ws_measure(fused, session_id, _surfaced_proc_id, now_iso)
+    # ── Working-set measurement (H-1 PR1 record-only + PR2a shadow) ─
+    # Overlap stats + the shadow novelty-gate projection feed the PR2b
+    # enforcement decision. Runs after all stdout is flushed — never touches
+    # injection output. Inside the total_ms window so budget_exceeded watches
+    # its file I/O too.
+    ws_stats = _ws_measure(fused, session_id, _surfaced_proc_id, now_iso, shadow=_shadow)
 
     total_ms = (time.monotonic() - start) * 1000
 
@@ -1679,6 +1803,9 @@ async def _run(prompt: str, session_id: str = "") -> None:
         working_set_size=ws_stats["working_set_size"],
         zero_retrieved_injected=ws_stats["zero_retrieved_injected"],
         procedure_repeat=ws_stats["procedure_repeat"],
+        projected_injected=ws_stats.get("projected_injected"),
+        suppressed=ws_stats.get("suppressed", 0),
+        serendipity_boosted=ws_stats.get("serendipity_boosted", 0),
     )
 
 
