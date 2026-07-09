@@ -5,16 +5,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from genesis.outreach.types import POSITIVE_ENGAGEMENT_OUTCOMES
+from genesis.outreach.types import POSITIVE_ENGAGEMENT_SQL_IN as _POSITIVE_IN
 
 if TYPE_CHECKING:
     import aiosqlite
 
 logger = logging.getLogger(__name__)
-
-# SQL IN-list of positive engagement values, sorted for deterministic queries.
-# Values are trusted module constants (no user input) — safe to inline.
-_POSITIVE_IN = ", ".join(f"'{o}'" for o in sorted(POSITIVE_ENGAGEMENT_OUTCOMES))
 
 
 async def outreach_stats(db: aiosqlite.Connection | None) -> dict:

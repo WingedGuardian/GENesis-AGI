@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import aiosqlite
 
-from genesis.outreach.types import POSITIVE_ENGAGEMENT_OUTCOMES
-
-# SQL IN-list of positive engagement values (trusted constants, safe to inline).
-_POSITIVE_IN = ", ".join(f"'{o}'" for o in sorted(POSITIVE_ENGAGEMENT_OUTCOMES))
+from genesis.outreach.types import POSITIVE_ENGAGEMENT_SQL_IN as _POSITIVE_IN
 
 
 async def create(

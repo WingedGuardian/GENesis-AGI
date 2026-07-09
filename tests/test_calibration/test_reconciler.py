@@ -157,6 +157,32 @@ async def test_reconcile_outreach_acted_on_is_correct(db):
 
 
 @pytest.mark.asyncio
+async def test_reconcile_outreach_ambivalent_is_skipped(db):
+    """An 'ambivalent' outcome (neutral implicit-activity signal) is not
+    gradeable — the reconciler skips it, leaving the prediction unmatched
+    rather than scoring it either way."""
+    now = datetime.now(UTC).isoformat()
+    await pred_crud.log_prediction(
+        db, id="pred-amb", action_id="outreach-amb",
+        prediction="user will engage", confidence=0.7,
+        confidence_bucket="0.7-0.8", domain="outreach", reasoning="t",
+    )
+    await outreach_crud.create(
+        db, id="outreach-amb", signal_type="surplus", topic="Amb",
+        category="surplus", salience_score=0.7, channel="telegram",
+        message_content="Hi", created_at=now,
+    )
+    await outreach_crud.record_delivery(db, "outreach-amb", delivered_at=now)
+    await outreach_crud.record_engagement(db, "outreach-amb", engagement_outcome="ambivalent", engagement_signal="implicit_activity")
+
+    count = await PredictionReconciler(db).reconcile_outreach()
+    assert count == 0  # ambivalent skipped, not graded
+
+    row = await pred_crud.get_by_id(db, "pred-amb")
+    assert row["outcome"] is None  # left unmatched
+
+
+@pytest.mark.asyncio
 async def test_reconcile_skips_already_matched(db):
     await pred_crud.log_prediction(
         db, id="pred-3", action_id="outreach-ghi",

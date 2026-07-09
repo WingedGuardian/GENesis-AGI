@@ -10,12 +10,14 @@ import pytest
 from genesis.db.crud import ego as ego_crud
 from genesis.db.crud import outcome_events as oe
 from genesis.feedback.harvest import (
+    _OUTREACH_MAP,
     BACKFILL_MARKER,
     BACKFILL_VERSION,
     OutcomeHarvester,
     _marker_version,
     _parse_execution_suffix,
 )
+from genesis.outreach.types import POSITIVE_ENGAGEMENT_OUTCOMES
 
 
 @pytest.fixture
@@ -527,3 +529,16 @@ class TestIdempotencyAndScheduling:
         # ...but backfill (all history) captures it.
         await OutcomeHarvester(db).run_backfill()
         assert await oe.count(db) == 1
+
+
+def test_outreach_map_covers_all_positive_outcomes():
+    """Forcing function: every positive engagement outcome must have an
+    _OUTREACH_MAP entry, or harvest silently drops it (mapping is None →
+    continue). This is the exact drift that caused the original bug — if a
+    value is added to POSITIVE_ENGAGEMENT_OUTCOMES without a matching harvest
+    mapping, this test fails instead of the signal vanishing in production."""
+    missing = POSITIVE_ENGAGEMENT_OUTCOMES - _OUTREACH_MAP.keys()
+    assert not missing, (
+        f"POSITIVE_ENGAGEMENT_OUTCOMES {sorted(missing)} have no _OUTREACH_MAP "
+        f"entry and would be silently dropped from harvest."
+    )

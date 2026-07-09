@@ -53,6 +53,13 @@ POSITIVE_ENGAGEMENT_OUTCOMES: frozenset[str] = frozenset(
     {"useful", "engaged", "acted_on", "acknowledged"}
 )
 
+# SQL IN-list rendering of the positive set, sorted for deterministic queries.
+# Values are trusted module constants (no user input) — safe to inline into a
+# query string. Every SQL consumer references this instead of re-deriving it.
+POSITIVE_ENGAGEMENT_SQL_IN: str = ", ".join(
+    f"'{o}'" for o in sorted(POSITIVE_ENGAGEMENT_OUTCOMES)
+)
+
 
 class GovernanceVerdict(StrEnum):
     ALLOW = "allow"
