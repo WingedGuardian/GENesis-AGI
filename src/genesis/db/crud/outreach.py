@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import aiosqlite
 
+from genesis.outreach.types import POSITIVE_ENGAGEMENT_OUTCOMES
+
+# SQL IN-list of positive engagement values (trusted constants, safe to inline).
+_POSITIVE_IN = ", ".join(f"'{o}'" for o in sorted(POSITIVE_ENGAGEMENT_OUTCOMES))
+
 
 async def create(
     db: aiosqlite.Connection,
@@ -154,9 +159,9 @@ async def get_engagement_stats(db: aiosqlite.Connection, *, days: int = 7) -> di
     Returns: {total, engaged, ignored, ambivalent, pending}
     """
     cursor = await db.execute(
-        """SELECT
+        f"""SELECT
             COUNT(*) AS total,
-            SUM(CASE WHEN engagement_outcome = 'useful' THEN 1 ELSE 0 END) AS engaged,
+            SUM(CASE WHEN engagement_outcome IN ({_POSITIVE_IN}) THEN 1 ELSE 0 END) AS engaged,
             SUM(CASE WHEN engagement_outcome = 'ignored' THEN 1 ELSE 0 END) AS ignored,
             SUM(CASE WHEN engagement_outcome = 'ambivalent' THEN 1 ELSE 0 END) AS ambivalent,
             SUM(CASE WHEN engagement_outcome IS NULL THEN 1 ELSE 0 END) AS pending

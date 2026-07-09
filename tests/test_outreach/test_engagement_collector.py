@@ -15,6 +15,10 @@ async def db():
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
     await create_all_tables(conn)
+    # engagement_outcome CHECK is a no-op and prod carries drifted values
+    # ('acted_on', 'acknowledged'); disable check enforcement for parity with
+    # real data (see tests/feedback/test_harvest.py).
+    await conn.execute("PRAGMA ignore_check_constraints = ON")
     yield conn
     await conn.close()
 
@@ -48,9 +52,10 @@ async def test_all_engaged_returns_high(db):
 
 @pytest.mark.asyncio
 async def test_positive_set_includes_behavioural(db):
-    """useful / acted_on / acknowledged all count as engaged (harvest's set)."""
+    """useful / engaged / acted_on / acknowledged all count as engaged
+    (the canonical POSITIVE_ENGAGEMENT_OUTCOMES set)."""
     now = datetime.now(UTC).isoformat()
-    for i, outcome in enumerate(["useful", "acted_on", "acknowledged"]):
+    for i, outcome in enumerate(["useful", "engaged", "acted_on", "acknowledged"]):
         await outreach_crud.create(
             db, id=f"p-{i}", signal_type="surplus", topic=f"P{i}",
             category="surplus", salience_score=0.8, channel="telegram",

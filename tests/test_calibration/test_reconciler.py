@@ -16,6 +16,12 @@ async def db():
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
     await create_all_tables(conn)
+    # The engagement_outcome CHECK is a no-op in practice (NULL in its IN-list
+    # defeats enforcement), and prod carries drifted values ('engaged',
+    # 'acted_on', 'acknowledged'). Match tests/feedback/test_harvest.py and
+    # disable check enforcement so the fixture reproduces real data regardless
+    # of whether the CHECK is ever repaired.
+    await conn.execute("PRAGMA ignore_check_constraints = ON")
     yield conn
     await conn.close()
 
@@ -100,6 +106,31 @@ async def test_reconcile_outreach_explicit_ignored_is_incorrect(db):
     row = await pred_crud.get_by_id(db, "pred-x")
     assert row["outcome"] == "ignored"
     assert row["correct"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_outreach_engaged_dashboard_is_correct(db):
+    """The dashboard /engage endpoint writes engagement_outcome='engaged' — a
+    real positive that must grade correct (the original code only ever matched
+    'engaged', which is precisely why replies were mis-graded)."""
+    now = datetime.now(UTC).isoformat()
+    await pred_crud.log_prediction(
+        db, id="pred-e", action_id="outreach-e",
+        prediction="user will engage", confidence=0.8,
+        confidence_bucket="0.8-0.9", domain="outreach", reasoning="t",
+    )
+    await outreach_crud.create(
+        db, id="outreach-e", signal_type="surplus", topic="E",
+        category="surplus", salience_score=0.8, channel="telegram",
+        message_content="Hi", created_at=now,
+    )
+    await outreach_crud.record_delivery(db, "outreach-e", delivered_at=now)
+    await outreach_crud.record_engagement(db, "outreach-e", engagement_outcome="engaged", engagement_signal="dashboard")
+
+    count = await PredictionReconciler(db).reconcile_outreach()
+    assert count == 1
+    row = await pred_crud.get_by_id(db, "pred-e")
+    assert row["correct"] == 1
 
 
 @pytest.mark.asyncio

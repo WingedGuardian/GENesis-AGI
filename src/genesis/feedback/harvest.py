@@ -74,8 +74,12 @@ _SUFFIX_MAP = (
 # signals) — a pre-existing outreach schema/data drift, tracked separately. We map
 # what actually exists; explicit > implicit-negative defaulting (which would
 # mislabel acted_on/acknowledged and the empty-string rows).
+# Positive keys must stay in sync with genesis.outreach.types
+# .POSITIVE_ENGAGEMENT_OUTCOMES ('engaged' is written by the dashboard /engage
+# endpoint and was previously dropped here, losing that positive signal).
 _OUTREACH_MAP: dict[str, tuple[str, str, float | None]] = {
     "useful":       ("outreach_reply", "positive", 1.0),
+    "engaged":      ("outreach_reply", "positive", 1.0),
     "acted_on":     ("outreach_reply", "positive", 1.0),
     "acknowledged": ("outreach_reply", "positive", 0.5),
     "not_useful":   ("outreach_reply", "negative", 0.0),

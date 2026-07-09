@@ -7,6 +7,8 @@ from functools import wraps
 
 from flask import Blueprint, jsonify, request
 
+from genesis.outreach.types import POSITIVE_ENGAGEMENT_OUTCOMES
+
 logger = logging.getLogger(__name__)
 
 outreach_api = Blueprint("outreach_api", __name__, url_prefix="/api/genesis/outreach")
@@ -68,11 +70,14 @@ async def get_engagement():
     rows = await cursor.fetchall()
     summary = {r[0]: r[1] for r in rows}
     total = sum(summary.values())
+    # Count every positive engagement value, not just the literal 'engaged'
+    # (see genesis.outreach.types.POSITIVE_ENGAGEMENT_OUTCOMES).
+    engaged = sum(summary.get(k, 0) for k in POSITIVE_ENGAGEMENT_OUTCOMES)
     return jsonify({
         "period": "7d",
         "total": total,
         "breakdown": summary,
-        "engagement_rate": summary.get("engaged", 0) / total if total else 0,
+        "engagement_rate": engaged / total if total else 0,
     })
 
 

@@ -221,6 +221,7 @@ class TestHarvestOutreach:
         "outcome, exp_type, exp_polarity",
         [
             ("useful", "outreach_reply", "positive"),
+            ("engaged", "outreach_reply", "positive"),        # dashboard /engage writer
             ("acted_on", "outreach_reply", "positive"),       # was mislabeled negative
             ("acknowledged", "outreach_reply", "positive"),   # was mislabeled negative
             ("not_useful", "outreach_reply", "negative"),

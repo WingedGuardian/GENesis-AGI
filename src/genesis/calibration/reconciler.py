@@ -7,6 +7,7 @@ import logging
 import aiosqlite
 
 from genesis.db.crud import predictions as pred_crud
+from genesis.outreach.types import POSITIVE_ENGAGEMENT_OUTCOMES
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +41,11 @@ class PredictionReconciler:
                 continue
             if outcome == "ambivalent":
                 continue  # neutral implicit-activity signal — not gradeable
-            # Positive engagement set (mirrors feedback.harvest._OUTREACH_MAP).
-            # Was `outcome == "engaged"`, a value never written to the column,
-            # so every outreach prediction was graded incorrect unconditionally.
-            correct = outcome in ("useful", "acted_on", "acknowledged")
+            # Was `outcome == "engaged"` alone. 'engaged' IS written (dashboard
+            # /engage endpoint) but a real reply writes 'useful' — so every
+            # reply-engaged prediction was graded incorrect. Use the canonical
+            # positive set so no real engagement value is missed.
+            correct = outcome in POSITIVE_ENGAGEMENT_OUTCOMES
             await pred_crud.record_outcome(
                 self._db, pred["id"], outcome=outcome, correct=correct,
             )
