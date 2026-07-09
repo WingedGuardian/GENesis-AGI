@@ -648,9 +648,13 @@ async def _compute_approvals(
     )
     resolved = [dict(r) for r in await cursor.fetchall()]
 
+    # datetime() here too: production always passes ISO-T created_at, but the
+    # CRUD's COALESCE(?, datetime('now')) fallback writes space-format — a
+    # future caller omitting created_at must not dodge the window.
     cursor = await db.execute(
         "SELECT COUNT(*) FROM approval_requests "
-        "WHERE created_at >= ? AND created_at < ?",
+        "WHERE datetime(created_at) >= datetime(?) "
+        "AND datetime(created_at) < datetime(?)",
         (since, until),
     )
     total_created = (await cursor.fetchone())[0]
