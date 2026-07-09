@@ -665,6 +665,30 @@ class DirectSessionRunner:
     def active_count(self) -> int:
         return len(self._active)
 
+    async def shutdown(self, *, grace_s: float = 10.0) -> int:
+        """Cancel in-flight session tasks and await their handlers.
+
+        Called by ``GenesisRuntime.shutdown()`` BEFORE the DB closes so the
+        CancelledError handler in ``_run_session`` can persist a terminal
+        'failed' status. Without this, a ``systemctl restart`` tears the
+        event loop down only after the DB is closed — the handler's writes
+        no-op and the rows linger 'active' until the stale reaper.
+
+        ``grace_s`` bounds the wait because shutdown runs under systemd's
+        TimeoutStopSec (~90s) hard deadline: an unbounded wait on a wedged
+        CC child would push the whole unit into SIGKILL, losing every later
+        cleanup step (including the DB close itself). 10s is ample for the
+        handler's few DB writes.
+
+        Returns the number of tasks that were still in flight.
+        """
+        tasks = [t for t in self._active.values() if not t.done()]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=grace_s)
+        return len(tasks)
+
     @staticmethod
     def _summarize_tools(tools_called: list[dict]) -> dict[str, int]:
         """Aggregate tool calls into {name: count} dict."""
@@ -796,24 +820,26 @@ class DirectSessionRunner:
         except asyncio.CancelledError:
             # T2-B: CancelledError is a BaseException — the Exception handler
             # below never sees it, so a cancelled session used to linger
-            # 'active' until the stale reaper swept it. A cancel (shutdown,
-            # task.cancel) is a KNOWN interruption: record it as failed.
-            # Best-effort — cancellation was already delivered at the await
-            # point above, so these writes normally complete; a second cancel
-            # or a closed DB just propagates after the log.
+            # 'active' until the stale reaper swept it. A cancel (runtime
+            # shutdown via self.shutdown(), task.cancel) is a KNOWN
+            # interruption: record it as failed. Best-effort — cancellation
+            # was already delivered at the await point above, so these writes
+            # normally complete; a closed DB is caught and logged, while a
+            # genuinely re-delivered second cancel propagates immediately
+            # (skipping the log — same terminal task state either way).
             elapsed = time.monotonic() - start
+            cancel_result = DirectSessionResult(
+                session_id=session_id,
+                success=False,
+                error="CancelledError: session cancelled",
+                duration_s=round(elapsed, 1),
+                tools_called=telemetry,
+            )
             try:
-                await self._store_result(
-                    session_id,
-                    request,
-                    DirectSessionResult(
-                        session_id=session_id,
-                        success=False,
-                        error="CancelledError: session cancelled",
-                        duration_s=round(elapsed, 1),
-                        tools_called=telemetry,
-                    ),
-                )
+                await self._store_result(session_id, request, cancel_result)
+                # Feed the outcome back to an ego proposal, matching the
+                # generic failure path below (review P3).
+                await self._record_proposal_outcome(request, cancel_result)
                 await self._session_manager.fail(
                     session_id, reason="cancelled",
                 )

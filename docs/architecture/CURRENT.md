@@ -102,9 +102,11 @@ verified: e01e0c49 2026-07-09
   + a boot-time kick) routes through `SessionManager.cleanup_stale` —
   stale non-foreground 'active' rows → `expired` (outcome unknown),
   end-hooks fired. Known interruptions record `failed`: `_run_session` has
-  an explicit `CancelledError` handler (T2-B 2026-07-09; the old crud
-  `reap_stale`, which relabeled orphans 'completed', is deleted). J-9
-  counts only `completed` as success.
+  an explicit `CancelledError` handler, and `GenesisRuntime.shutdown()`
+  cancel-and-awaits the runner's in-flight tasks (`DirectSessionRunner
+  .shutdown`, 10s grace) BEFORE closing the DB so that handler can persist
+  (T2-B 2026-07-09; the old crud `reap_stale`, which relabeled orphans
+  'completed', is deleted). J-9 counts only `completed` as success.
 - **Perimeter-session hardening:** `_NO_WEB_TOOLS` / `_NO_OUTREACH_EXTRAS`
   blocklists strip risky tools from perimeter profiles — a security edge, not
   configuration convenience.

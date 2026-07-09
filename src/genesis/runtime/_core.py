@@ -501,6 +501,20 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
                 await self._status_writer_task
             logger.info("Stopped status writer loop")
 
+        # Cancel-and-await in-flight direct sessions while the DB is still
+        # open, so _run_session's CancelledError handler can persist a
+        # terminal 'failed' status (T2-B review P2 — without this the rows
+        # linger 'active' across every systemctl restart).
+        if self._direct_session_runner is not None:
+            try:
+                stopped = await self._direct_session_runner.shutdown()
+                if stopped:
+                    logger.info(
+                        "Cancelled %d in-flight direct sessions", stopped,
+                    )
+            except Exception:
+                logger.exception("Failed to stop direct-session runner")
+
         for name, component in [
             ("user_ego_cadence", self._ego_cadence_manager),
             ("genesis_ego_cadence", self._genesis_ego_cadence_manager),
