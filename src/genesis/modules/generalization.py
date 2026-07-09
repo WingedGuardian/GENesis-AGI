@@ -95,6 +95,10 @@ class GeneralizationFilter:
     ) -> str | None:
         """Write a generalizable lesson to Genesis core memory.
 
+        This is the sanctioned module→core bridge: modules emit observations
+        through the observation writer, never via the memory store directly
+        (see the module contract in ``modules/base.py``).
+
         Promoted observations get:
         - source: "module:<name>" (traceable provenance)
         - category: "generalizable_lesson"
