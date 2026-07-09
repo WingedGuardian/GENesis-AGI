@@ -490,6 +490,24 @@ else
         fi
     fi
 
+    # Upload creds (encrypted credential + wiring files) so the COMPLETE snapshot
+    # genuinely includes them — a no-git fresh box pulls them from here (restore
+    # §8). One level of nesting: creds/*.gpg + creds/ssh/*.gpg; a failed upload of
+    # a present file flips _T2_OK, same contract as the payloads above.
+    if [ -d creds ]; then
+        backend_mkdir "${_T2_DIR}/creds"
+        [ -d creds/ssh ] && backend_mkdir "${_T2_DIR}/creds/ssh"
+        while IFS= read -r -d '' f; do
+            rel="${f#creds/}"
+            if backend_put "$f" "${_T2_DIR}/creds/${rel}"; then
+                log "  off-site: uploaded creds/${rel}"
+            else
+                log "WARNING: off-site upload failed for creds/${rel}"
+                _T2_OK=false
+            fi
+        done < <(find creds -type f -name '*.gpg' -print0 2>/dev/null)
+    fi
+
     # Mark the snapshot COMPLETE only when every upload succeeded, so restore never
     # picks a half-uploaded snapshot (it selects the latest COMPLETE one). If the
     # marker itself fails to upload, the snapshot is unusable for restore — treat

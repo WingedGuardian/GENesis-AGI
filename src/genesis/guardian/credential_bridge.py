@@ -54,6 +54,12 @@ _KEY_MAP_PROVISIONING = {
 # circle: a rebuilt/fresh container can decrypt the backup from the host copy.
 # The passphrase is as sensitive as everything it decrypts; the escrow file is
 # 0600 on the host mount (same trust level as the telegram/proxmox tokens here).
+# NOTE: backup.sh obtains the passphrase by `source`-ing secrets.env (full shell
+# parsing) while this escrow reads it via _read_dotenv (strip one quote layer).
+# For a passphrase containing unescaped shell metacharacters (``$``, backticks,
+# backslashes, unbalanced quotes) the two can diverge, so the escrowed value
+# would not match what encrypted the backup. The generated passphrase is a plain
+# token; keep any hand-set one shell-safe (alphanumeric / base64) to stay sound.
 _PASSPHRASE_FILENAME = "backup_passphrase.env"
 _KEY_MAP_PASSPHRASE = {
     "GENESIS_BACKUP_PASSPHRASE": "GENESIS_BACKUP_PASSPHRASE",
