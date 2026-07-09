@@ -134,9 +134,12 @@ def test_procedure_surfacing_subprocess(seeded_db, tmp_path: Path):
         iso_config_dir = tmp_path / ".genesis" / "config"
         iso_config_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy(real_config, iso_config_dir / "genesis.yaml")
-    # Qdrant URL — use the real one (needed for memory recall, but
-    # we're testing procedure surfacing which uses SQLite only)
-    env.setdefault("QDRANT_URL", "http://localhost:6333")
+    # Dead Qdrant on purpose: procedure surfacing uses SQLite only, and
+    # pointing the subprocess at the production vector store let the
+    # hook's _increment_retrieved bump REAL points' retrieved_count on
+    # every backend-enabled test run (found 2026-07-09 while building
+    # the session-awareness integration test).
+    env["QDRANT_URL"] = "http://127.0.0.1:1"
 
     # Build hook input
     hook_input = json.dumps({

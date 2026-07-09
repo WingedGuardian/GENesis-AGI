@@ -325,8 +325,8 @@ The loops that make Genesis think between conversations.
 
 ```yaml subsystem-map
 entry: ambient-cognition
-modules: [awareness, perception, reflection, attention]
-verified: 9037d45b 2026-07-07
+modules: [awareness, perception, reflection, attention, session_awareness]
+verified: 8dac642c 2026-07-09
 ```
 
 - **awareness/**: the 5-min heartbeat. ~23 signal collectors (the richer
@@ -352,6 +352,13 @@ verified: 9037d45b 2026-07-07
   **Firewall: transcript text is never persisted** — only refs + derived
   features reach `attention_events`. Config is versioned DATA
   (`~/.genesis/config/attention_config.json`).
+- **session_awareness/**: WS-C ambient session-theme layer — SHADOW,
+  record-only (PR1). The proactive memory hook folds each genuine user
+  prompt's embedding into a per-session EMA + entity ledger and records
+  drift-trigger fires in `~/.genesis/sessions/<id>/session_theme.json`;
+  the detached retrieval worker/arbiter lanes (PR2+) act on fires. Pure
+  functions, no clocks (callers pass time), zero DB writes, fail-open at
+  the hook boundary. Kill switch: `GENESIS_SESSION_AWARENESS_DISABLED=1`.
 
 ## 10. Learning & evaluation
 
