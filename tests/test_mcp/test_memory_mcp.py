@@ -1434,3 +1434,60 @@ async def test_memory_recall_drift_mode_emits_exactly_one_recall_fired(db):
         assert events[0]["metrics"]["pipeline_used"] == "drift"
     finally:
         mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_memory_recall_mcp_enrichment_uses_raw_scores(db):
+    """mem-007 (MCP layer): the MEM-003 in-place enrichment realigns the
+    retriever's recall_fired event with the final result set — it must
+    re-derive top_scores/mean_score from ``retrieval_score`` (pre-diversity-
+    penalty), NOT ``score``, or it clobbers the retriever's raw values with
+    the halved dedup artifact."""
+    import genesis.mcp.memory_mcp as mod
+    from genesis.db.crud import j9_eval
+    from genesis.eval.j9_hooks import emit_recall_fired
+    from genesis.memory.types import RetrievalResult
+
+    def _penalized(mid: str, score: float, raw: float):
+        return RetrievalResult(
+            memory_id=mid, content=f"c-{mid}", source="test",
+            memory_type="episodic", score=score, vector_rank=1, fts_rank=1,
+            activation_score=0.3, payload={}, source_pipeline="hybrid",
+            collection="episodic_memory", retrieval_score=raw,
+        )
+
+    # winner unpenalized (raw == final); echo halved (raw 1.0 → final 0.5)
+    results = [_penalized("win", 1.0, 1.0), _penalized("echo", 0.5, 1.0)]
+
+    async def fake_recall(*_a, event_id_sink=None, **_k):
+        eid = await emit_recall_fired(
+            db, query="q", result_count=len(results),
+            top_scores=[r.retrieval_score for r in results],
+            memory_ids=[r.memory_id for r in results],
+            latency_ms=1.0, source="both",
+        )
+        if event_id_sink is not None and eid is not None:
+            event_id_sink.append(eid)
+        return list(results)
+
+    mock_retriever = AsyncMock()
+    mock_retriever.recall = fake_recall
+    mock_retriever._embeddings = MagicMock()
+
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._retriever = mock_retriever
+        mod._qdrant = MagicMock()
+        tools = await _get_tools()
+        await tools["memory_recall"].fn(
+            query="q", source="both", limit=10, compact=True,
+        )
+        events = await j9_eval.get_events(db, event_type="recall_fired")
+        assert len(events) == 1
+        m = events[0]["metrics"]
+        # Raw scores survive the MCP realignment: both 1.0, not [1.0, 0.5]
+        assert m["top_scores"] == pytest.approx([1.0, 1.0])
+        assert m["mean_score"] == pytest.approx(1.0)
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old

@@ -415,6 +415,8 @@ async def drift_recall(
                 query_intent=intent.category,
                 intent_confidence=intent.confidence,
                 collection=row.get("collection", "episodic_memory"),
+                # mem-007: DRIFT applies no diversity penalty — raw == final.
+                retrieval_score=fused_scores[mid],
             )
         )
 

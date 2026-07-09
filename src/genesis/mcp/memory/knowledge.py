@@ -48,6 +48,11 @@ def _apply_authority_boost(merged: list[dict]) -> list[dict]:
                 boost = multiplier
                 break
         item["score"] = item.get("score", 0.0) * boost
+        # mem-007: the authority boost is a legitimate quality signal (like
+        # graph boost), so the pre-diversity-penalty score carries it too —
+        # only the echo-dedup penalty is excluded from J-9 quality metrics.
+        if "retrieval_score" in item:
+            item["retrieval_score"] = item["retrieval_score"] * boost
     merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     return merged
 
@@ -109,6 +114,10 @@ async def knowledge_recall(
             "source": r.source,
             "source_doc": r.source,
             "score": r.score,
+            # mem-007: pre-diversity-penalty score, for J-9 metrics only —
+            # ordering/floor stay on the penalized ``score``. Fallback for
+            # paths that don't populate it (0.0 == unset).
+            "retrieval_score": r.retrieval_score or r.score,
             "origin": "vector",
             "source_pipeline": r.source_pipeline,
         })
@@ -128,6 +137,9 @@ async def knowledge_recall(
                 "domain": fts_row.get("domain", ""),
                 "project_type": fts_row.get("project_type", ""),
                 "score": fts_score,
+                # mem-007: synthetic FTS score never saw the diversity
+                # penalty — raw == final.
+                "retrieval_score": fts_score,
                 "origin": "fts",
                 "source_pipeline": fts_row.get("source_pipeline"),
             })
@@ -151,7 +163,11 @@ async def knowledge_recall(
         recall_event_sink[0] if recall_event_sink else None
     )
     try:
-        _top_scores = [r.get("score", 0.0) for r in final[:5]]
+        # mem-007: J-9 metrics read the pre-diversity-penalty score
+        # (authority boost included); ordering/floor above used ``score``.
+        _top_scores = [
+            r.get("retrieval_score") or r.get("score", 0.0) for r in final[:5]
+        ]
         _memory_ids = [r.get("unit_id", "") for r in final[:10]]
         if recall_event_id is not None:
             from genesis.eval.j9_hooks import update_recall_metrics

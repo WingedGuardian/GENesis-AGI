@@ -278,9 +278,14 @@ async def memory_recall(
         recall_event_sink[0] if recall_event_sink else None
     )
     try:
-        _top_scores = [r.score for r in results[:5]]
+        # mem-007: J-9 quality metrics use the PRE-diversity-penalty score
+        # (retrieval_score); ``score`` is the final ordering value with the
+        # echo-cluster penalty applied — logging it understates penalized
+        # results. Fall back to ``score`` for paths that don't populate
+        # retrieval_score (0.0 == unset; real fused scores are always > 0).
+        _top_scores = [r.retrieval_score or r.score for r in results[:5]]
         _memory_ids = [r.memory_id for r in results[:10]]
-        _all_scores = [r.score for r in results]
+        _all_scores = [r.retrieval_score or r.score for r in results]
         _mean_score = (
             round(sum(_all_scores) / len(_all_scores), 4) if _all_scores else None
         )
