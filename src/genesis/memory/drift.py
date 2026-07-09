@@ -190,24 +190,30 @@ async def _local_drilldown(
     # Scoped FTS5 search (room filter via tag match if available)
     fts_query = query
     if wing:
-        # FTS5 can filter by tags field which contains wing info
-        fts_results = await memory_crud.search_ranked(
-            db, query=fts_query, collection="episodic_memory", limit=local_limit,
-            exclude_subsystems=exclude_subsystems,
-            include_only_subsystems=include_only_subsystems,
-        )
+        # MEM-006: mirror the vector arm below — search each source
+        # collection's FTS rows. Hardcoding ``episodic_memory`` here made
+        # knowledge recall vector-only in the wing-scoped phase (knowledge
+        # rows ARE FTS-indexed under collection='knowledge_base').
+        fts_ids: list[str] = []
+        for collection in source_collections:
+            fts_results = await memory_crud.search_ranked(
+                db, query=fts_query, collection=collection, limit=local_limit,
+                exclude_subsystems=exclude_subsystems,
+                include_only_subsystems=include_only_subsystems,
+            )
+            fts_ids.extend(r["memory_id"] for r in fts_results)
+        # Preserve rank order, drop cross-collection duplicates
+        fts_ids = list(dict.fromkeys(fts_ids))
         # Filter results by wing in post-processing (FTS5 doesn't support wing filter)
-        fts_ids = [r["memory_id"] for r in fts_results]
-        if wing:
+        if fts_ids:
             # Verify wing membership
             placeholders = ",".join("?" * len(fts_ids))
-            if fts_ids:
-                wing_query = f"""
-                    SELECT memory_id FROM memory_metadata
-                    WHERE memory_id IN ({placeholders}) AND wing = ?
-                """
-                async with db.execute(wing_query, [*fts_ids, wing]) as cursor:
-                    fts_ids = [row[0] async for row in cursor]
+            wing_query = f"""
+                SELECT memory_id FROM memory_metadata
+                WHERE memory_id IN ({placeholders}) AND wing = ?
+            """
+            async with db.execute(wing_query, [*fts_ids, wing]) as cursor:
+                fts_ids = [row[0] async for row in cursor]
         local_ids.extend(fts_ids)
 
     # Scoped vector search with wing filter

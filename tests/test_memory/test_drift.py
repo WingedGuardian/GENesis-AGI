@@ -10,6 +10,7 @@ from genesis.memory.drift import (
     _coalesce,
     _global_primer,
     _identify_clusters,
+    _local_drilldown,
     _rrf_fuse,
     drift_recall,
 )
@@ -256,3 +257,108 @@ class TestDriftRecallDefaultSource:
         assert call_kwargs["source_collections"] == ["episodic_memory"], (
             f"Expected ['episodic_memory'], got {call_kwargs['source_collections']!r}"
         )
+
+
+class TestLocalDrilldownCollections:
+    """MEM-006: the scoped FTS drill-down must honor source_collections.
+
+    The vector arm already loops over ``source_collections``; the FTS arm
+    hardcoded ``episodic_memory``, making knowledge recall vector-only in
+    the wing-scoped phase.
+    """
+
+    @staticmethod
+    def _wing_cursor(rows):
+        """Async context-manager cursor for the wing post-filter query."""
+
+        class _Cursor:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            def __aiter__(self):
+                async def gen():
+                    for r in rows:
+                        yield r
+
+                return gen()
+
+        return _Cursor()
+
+    def _db_with_wing_rows(self, rows):
+        db = MagicMock()
+        db.execute = MagicMock(return_value=self._wing_cursor(rows))
+        return db
+
+    @staticmethod
+    def _failing_embeddings():
+        embeddings = AsyncMock()
+        embeddings.embed = AsyncMock(side_effect=Exception("no embeddings"))
+        return embeddings
+
+    @pytest.mark.asyncio
+    async def test_fts_drilldown_searches_all_source_collections(self):
+        """With source='both'-style collections, FTS must hit each one."""
+        # Both ids pass the wing post-filter
+        db = self._db_with_wing_rows([("ep1",), ("kb1",)])
+        seen_collections: list[str | None] = []
+
+        async def fake_search_ranked(db_, *, query, limit,
+                                     collection=None, **kw):
+            seen_collections.append(collection)
+            if collection == "knowledge_base":
+                return [{"memory_id": "kb1", "content": "kb", "rank": -1.0}]
+            return [{"memory_id": "ep1", "content": "ep", "rank": -2.0}]
+
+        with patch(
+            "genesis.memory.drift.memory_crud.search_ranked",
+            new=AsyncMock(side_effect=fake_search_ranked),
+        ):
+            ids = await _local_drilldown(
+                "test query",
+                db=db,
+                qdrant_client=MagicMock(),
+                embedding_provider=self._failing_embeddings(),
+                source_collections=["episodic_memory", "knowledge_base"],
+                wing="memory",
+                room=None,
+                global_ids=[],
+            )
+
+        assert seen_collections == ["episodic_memory", "knowledge_base"], (
+            f"FTS drill-down searched {seen_collections!r}, expected one "
+            "search per source collection"
+        )
+        assert "kb1" in ids, "knowledge_base FTS hit must survive the drill-down"
+        assert "ep1" in ids
+
+    @pytest.mark.asyncio
+    async def test_fts_drilldown_episodic_only_unchanged(self):
+        """Default episodic source still searches exactly one collection."""
+        db = self._db_with_wing_rows([("ep1",)])
+        seen_collections: list[str | None] = []
+
+        async def fake_search_ranked(db_, *, query, limit,
+                                     collection=None, **kw):
+            seen_collections.append(collection)
+            return [{"memory_id": "ep1", "content": "ep", "rank": -2.0}]
+
+        with patch(
+            "genesis.memory.drift.memory_crud.search_ranked",
+            new=AsyncMock(side_effect=fake_search_ranked),
+        ):
+            ids = await _local_drilldown(
+                "test query",
+                db=db,
+                qdrant_client=MagicMock(),
+                embedding_provider=self._failing_embeddings(),
+                source_collections=["episodic_memory"],
+                wing="memory",
+                room=None,
+                global_ids=[],
+            )
+
+        assert seen_collections == ["episodic_memory"]
+        assert ids == ["ep1"]
