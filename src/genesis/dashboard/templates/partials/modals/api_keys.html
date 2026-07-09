@@ -43,6 +43,11 @@
                         :style="`color: ${$store.genesisDashboard.providerCbState(name) === 'closed' ? '#4caf50' : $store.genesisDashboard.providerCbState(name) === 'open' ? '#d9534f' : '#f0ad4e'}`"
                         x-text="'CB: ' + $store.genesisDashboard.providerCbState(name)"></span>
                 </template>
+                <template x-if="info.recent_failures > 0">
+                  <span style="font-size: 0.68rem; color: #f0ad4e; margin-left: 0.3rem;"
+                        title="Dead-lettered operations targeting this provider in the last 24h"
+                        x-text="info.recent_failures + ' failures (24h)' + (info.last_failure_at ? ' · last ' + $store.genesisDashboard.relativeTime(info.last_failure_at) : '')"></span>
+                </template>
               </div>
             </template>
             <!-- Provider → Call Site Usage -->

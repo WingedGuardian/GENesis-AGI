@@ -193,3 +193,50 @@ def test_api_key_health_critical_when_essential_uncovered(monkeypatch):
     assert orp["key_health"] == "red"
     assert orp["alert_severity"] == "critical"  # essential uncovered → critical
     assert any(a["severity"] == "critical" for a in out["alerts"])
+
+
+def test_api_key_health_recent_failures_enrichment(monkeypatch):
+    """Windowed dead-letter counts attach to matched providers only, and are
+    purely additive — no status/severity/color change."""
+    from genesis.observability.snapshots import api_keys as ak
+
+    monkeypatch.setenv("API_KEY_OPENROUTER", "sk-test")
+    monkeypatch.setenv("GOOGLE_API_KEY", "g-test")
+    ak._api_validation_cache.clear()
+
+    config = _routing_config()
+    baseline = ak.api_key_health(config, breakers=_registry(config))
+
+    out = ak.api_key_health(
+        config, breakers=_registry(config),
+        recent_failures={
+            "openrouter-x": {"count": 274, "last_at": "2026-07-09T18:00:00+00:00"},
+            "all": {"count": 9, "last_at": "2026-07-09T17:00:00+00:00"},  # sentinel: no match
+        },
+    )
+    orp = out["providers"]["openrouter-x"]
+    assert orp["recent_failures"] == 274
+    assert orp["last_failure_at"] == "2026-07-09T18:00:00+00:00"
+    # Unmatched provider untouched; sentinel didn't invent an entry.
+    assert "recent_failures" not in out["providers"]["gemini-free"]
+    assert "all" not in out["providers"]
+    # Additive only — same status/severity/color as without the map.
+    for field in ("status", "alert_severity", "key_health"):
+        assert orp[field] == baseline["providers"]["openrouter-x"][field]
+    assert out["alerts"] == baseline["alerts"]
+
+
+def test_api_key_health_recent_failures_none_safe(monkeypatch):
+    """Omitting or passing None/{} for recent_failures changes nothing."""
+    from genesis.observability.snapshots import api_keys as ak
+
+    monkeypatch.setenv("API_KEY_OPENROUTER", "sk-test")
+    monkeypatch.setenv("GOOGLE_API_KEY", "g-test")
+    ak._api_validation_cache.clear()
+
+    config = _routing_config()
+    out_default = ak.api_key_health(config, breakers=_registry(config))
+    out_none = ak.api_key_health(config, breakers=_registry(config), recent_failures=None)
+    out_empty = ak.api_key_health(config, breakers=_registry(config), recent_failures={})
+    assert out_default == out_none == out_empty
+    assert all("recent_failures" not in e for e in out_default["providers"].values())
