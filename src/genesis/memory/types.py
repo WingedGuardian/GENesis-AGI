@@ -52,9 +52,17 @@ class RetrievalResult:
     # retrieved from. ``knowledge_base`` == external-world knowledge; anything
     # else == first-party memory. Authoritative (always known at retrieval),
     # unlike the per-item ``source`` string. Defaults first-party so an unset
-    # value is never mislabeled external. Kept LAST for positional-construction
-    # safety. Use ``genesis.memory.provenance`` to turn it into a label.
+    # value is never mislabeled external. Defaulted fields are appended (never
+    # inserted) for positional-construction safety. Use
+    # ``genesis.memory.provenance`` to turn it into a label.
     collection: str = "episodic_memory"
+    # mem-007: the pre-diversity-penalty fused score (post-rerank, post-graph-
+    # boost). ``score`` is the FINAL ordering score — the echo-cluster penalty
+    # is applied to it so near-duplicate results rank lower. J-9 quality
+    # logging reads THIS field instead, so a dedup artifact (score * 0.5)
+    # never masquerades as retrieval quality. 0.0 == not populated (paths
+    # other than HybridRetriever.recall don't compute it).
+    retrieval_score: float = 0.0
 
 
 @dataclass(frozen=True)
