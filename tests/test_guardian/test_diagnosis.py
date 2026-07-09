@@ -16,6 +16,7 @@ from genesis.guardian.config import GuardianConfig
 from genesis.guardian.diagnosis import (
     DiagnosisEngine,
     RecoveryAction,
+    _ensure_work_dir,
 )
 
 
@@ -289,3 +290,31 @@ def test_prompt_includes_essential_knowledge(tmp_path, monkeypatch):
     prompt = _build_diagnosis_prompt(snap, "test signal", "genesis")
     assert "Essential Knowledge" in prompt
     assert "approval gate fix" in prompt
+
+
+# ── _ensure_work_dir — guardian brain survives an uncreatable work_dir ──────
+def test_ensure_work_dir_uses_configured_when_creatable(tmp_path):
+    configured = tmp_path / "guardian-snapshots" / "cc-sessions"
+    got = _ensure_work_dir(configured, fallback=tmp_path / "fb")
+    assert got == configured and configured.is_dir()
+
+
+def test_ensure_work_dir_falls_back_when_configured_uncreatable(tmp_path):
+    # A file where a parent dir is expected → mkdir(parents=True) raises OSError
+    # (NotADirectoryError). Mirrors a root-owned/misconfigured cc.work_dir.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file, not a dir")
+    configured = blocker / "cc-sessions"
+    fallback = tmp_path / "state" / "cc-sessions"
+    got = _ensure_work_dir(configured, fallback=fallback)
+    assert got == fallback and fallback.is_dir()
+    assert not configured.exists()  # configured was never created
+
+
+def test_ensure_work_dir_propagates_when_fallback_also_uncreatable(tmp_path):
+    # No writable dir anywhere → OSError propagates (alert-only is the honest
+    # degradation; we must NOT silently return an unusable path).
+    blocker = tmp_path / "blocker"
+    blocker.write_text("file")
+    with pytest.raises(OSError):
+        _ensure_work_dir(blocker / "wd", fallback=blocker / "fb")
