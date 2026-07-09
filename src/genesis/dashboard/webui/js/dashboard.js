@@ -491,7 +491,8 @@
               break;
             case "observations":
               if (first) { this.fetchObservations(); this.fetchObservationsSummary(); this.fetchObservationsFilters(); }
-              this._observationsInterval = setInterval(() => { this.fetchObservations(); this.fetchObservationsSummary(); }, 30000);
+              // Summary refresh lives on the global 15s poll (badge is chrome).
+              this._observationsInterval = setInterval(() => this.fetchObservations(), 30000);
               break;
             case "follow-ups":
               if (first) { this.fetchCockpit(); this.fetchCockpitFilters(); }
@@ -546,7 +547,8 @@
           // Check auth status (non-blocking, best-effort)
           this.checkAuth();
 
-          // Always fetch: health, errors, pause, update status, approvals (needed on all tabs)
+          // Always fetch: health, errors, pause, update status, approvals,
+          // observations summary (badge is chrome — needed on all tabs)
           await Promise.all([
             this.fetchHealth(),
             this.fetchErrorSummary(),
@@ -554,6 +556,7 @@
             this.fetchUpdateStatus(),
             this.fetchEgoStatus(),
             this.fetchApprovals(),
+            this.fetchObservationsSummary(),
           ]);
 
           // Initialize tab from URL hash and fetch tab-specific data
@@ -575,6 +578,7 @@
             this.fetchErrorSummary();
             this.fetchPauseState();
             this.fetchEgoStatus();
+            this.fetchObservationsSummary();
           }, 15000);
         },
 
