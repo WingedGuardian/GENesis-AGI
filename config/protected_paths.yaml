@@ -16,8 +16,8 @@ critical:
     reason: "Relay infrastructure — modifying via Telegram could break Telegram"
   - pattern: "config/genesis-bridge.service"
     reason: "Bridge systemd unit — misconfiguration kills remote access"
-  - pattern: "config/genesis-watchdog.*"
-    reason: "Watchdog infrastructure — self-healing must not break itself"
+  - pattern: "scripts/systemd/*.template"
+    reason: "Systemd unit templates — install/update render live units from these; a corrupted template becomes a corrupted service"
 
   # Autonomy protection module — Genesis cannot weaken its own guardrails via relay
   - pattern: "src/genesis/autonomy/protection.py"

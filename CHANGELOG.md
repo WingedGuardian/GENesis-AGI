@@ -59,6 +59,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Protected-path guarding now covers the real systemd unit sources.** The
+  critical-path rules protected a stale copy of the watchdog unit under
+  `config/` while leaving `scripts/systemd/*.template` — the files installs
+  actually render live units from — editable from relay channels. The rules
+  now protect all unit templates, and the unused `config/genesis-watchdog.*`
+  duplicates (stale 60s cadence, wrong dependencies) are removed.
+
 - **The Guardian's recovery brain no longer goes dark when its work directory is
   misconfigured.** On some installs the Guardian's configured CC work dir points
   at a path it can't create (e.g. a root-owned dir on an install that predates

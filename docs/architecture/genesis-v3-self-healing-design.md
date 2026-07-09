@@ -39,7 +39,7 @@ to the repository root.
 - State persisted in `~/.genesis/watchdog_state.json` (survives process restarts)
 - Also checks `systemctl --user is-active genesis-bridge.service` as a fast-path before staleness check
 
-`src/genesis/autonomy/watchdog_runner.py` — systemd oneshot entry point called by `genesis-watchdog.timer` every 60s.
+`src/genesis/autonomy/watchdog_runner.py` — systemd oneshot entry point called by `genesis-watchdog.timer` every 300s (60s after boot).
 
 ### 2.2 Memory Pressure Reclamation
 
@@ -127,7 +127,7 @@ to the repository root.
 
 - Manages the AZ Flask web server (port 5000) which hosts the Genesis dashboard
 - `Restart=on-failure`, `RestartSec=10`, `StartLimitBurst=4`
-- Watchdog checks `systemctl --user is-active agent-zero.service` every 60s
+- Watchdog checks `systemctl --user is-active agent-zero.service` each timer run (300s)
 - Separate backoff state in `~/.genesis/watchdog_az_state.json` (independent from bridge)
 - Max 3 restart attempts (conservative — AZ restart kills dashboard + all Genesis subsystems)
 - Dashboard provides manual restart button (`POST /api/genesis/restart/agent-zero`)
@@ -243,10 +243,10 @@ The registry does not replace existing infrastructure. It wraps and extends it.
 
 Two independent loops feed the remediation system:
 
-#### Loop A: Watchdog (runs outside the bridge, every 60s)
+#### Loop A: Watchdog (runs outside the bridge, every 300s)
 
 ```
-genesis-watchdog.timer (systemd, 60s)
+genesis-watchdog.timer (systemd, 300s)
   → watchdog_runner.main()
     → WatchdogChecker.check()
       → _check_memory_pressure()          # Existing: 80%/90% reclaim

@@ -1,6 +1,6 @@
 """Watchdog runner — systemd oneshot entry point.
 
-Called by genesis-watchdog.timer every 60s.
+Called by genesis-watchdog.timer every 300s (first run 60s after boot).
 Checks health, takes action, exits.
 """
 
