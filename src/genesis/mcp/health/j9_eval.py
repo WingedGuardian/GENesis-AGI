@@ -27,9 +27,11 @@ async def _impl_j9_eval_status() -> dict:
     for dim in dimensions:
         event_counts[dim] = await j9_eval.count_events(db, dimension=dim)
 
-    # Get latest snapshot per dimension
+    # Get latest snapshot per dimension. approvals/goals/noise are
+    # snapshot-only dimensions (no eval_events), so they appear here but
+    # not in event_counts above.
     latest_snapshots: dict[str, dict | None] = {}
-    for dim in [*dimensions, "composite"]:
+    for dim in [*dimensions, "composite", "approvals", "goals", "noise"]:
         snap = await j9_eval.get_latest_snapshot(db, dimension=dim)
         if snap:
             latest_snapshots[dim] = {
