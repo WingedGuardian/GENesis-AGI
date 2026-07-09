@@ -73,6 +73,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   incident and silently drop it to alert-only. It now falls back to a writable
   state dir so the self-healing path keeps working.
 
+- **Knowledge-base results no longer go missing from DRIFT memory recall's
+  keyword arm.** The wing-scoped keyword (FTS) search inside the DRIFT
+  fallback pipeline only ever looked at episodic memories, so a recall that
+  included knowledge sources could only surface knowledge via vector
+  similarity — exact-phrase and keyword matches on ingested docs were
+  silently dropped. It now searches every requested collection.
 - **Asking Genesis to grow a disk or wait on your reply now works from a Claude
   Code session, not only from inside the running server.** The two tools that
   block on your Telegram reply (`provision_grow`, `outreach_send_and_wait`) need
