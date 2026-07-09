@@ -131,26 +131,10 @@ async def query_stale(
     return [dict(r) for r in await cursor.fetchall()]
 
 
-async def reap_stale(
-    db: aiosqlite.Connection,
-    *,
-    older_than: str,
-) -> int:
-    """Mark stale active sessions as completed. Returns count reaped.
-
-    Foreground sessions are excluded — they should never be auto-expired
-    (the user might resume).  This matches the policy in
-    ``SessionManager.cleanup_stale()``.
-    """
-    cursor = await db.execute(
-        """UPDATE cc_sessions SET status = 'completed'
-           WHERE status = 'active'
-             AND session_type != 'foreground'
-             AND last_activity_at < ?""",
-        (older_than,),
-    )
-    await db.commit()
-    return cursor.rowcount
+# T2-B: reap_stale (bulk UPDATE → 'completed') was deleted. It relabeled
+# crashed/orphaned sessions as successes; the session reaper now routes
+# through ``SessionManager.cleanup_stale()`` (policy-aware, → 'expired',
+# fires end-hooks). See runtime/init/learning.py::_reap_stale_sessions.
 
 
 async def set_pid(db: aiosqlite.Connection, id: str, pid: int) -> bool:

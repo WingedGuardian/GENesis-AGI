@@ -286,3 +286,42 @@ async def test_run_session_isolates_and_cleans_sandbox(db, tmp_path, monkeypatch
     assert "bg-cc-sessions" in captured["path"]
     # finally cleanup removed the whole per-session tree
     assert not _bg_session_root(sess["id"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_run_session_cancelled_marks_failed(db):
+    """T2-B: a cancelled session must not linger 'active'.
+
+    CancelledError is a BaseException, so the ``except Exception`` failure
+    path never saw it — the row stayed 'active' until the stale reaper
+    swept it (historically relabeling it 'completed', i.e. a crash
+    masquerading as success in J-9's success rates).
+    """
+    from types import SimpleNamespace
+
+    from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    invoker = AsyncMock()
+    # Cancellation delivered at the await point inside _run_session's try
+    invoker.run_streaming = AsyncMock(side_effect=asyncio.CancelledError())
+    runner = DirectSessionRunner(
+        invoker=invoker,
+        session_manager=sm,
+        config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db),
+    )
+    runner._build_invocation = lambda _req, _sid: CCInvocation(prompt="x")
+    sess = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._run_session(DirectSessionRequest(prompt="t"), sess["id"])
+
+    row = await cc_sessions.get_by_id(db, sess["id"])
+    assert row["status"] == "failed", (
+        f"cancelled session left status={row['status']!r} — must be terminal"
+    )

@@ -282,8 +282,9 @@ class ConversationLoop:
             # session's sticky peer session (failover returns early, never here).
             await self._maybe_clear_fallback(session)
 
-            # Activity timestamp — non-critical, but reap_stale() uses it so
-            # persistent failures deserve monitoring (WARNING, not debug).
+            # Activity timestamp — non-critical, but the stale-session reaper
+            # (SessionManager.cleanup_stale) keys on it so persistent
+            # failures deserve monitoring (WARNING, not debug).
             try:
                 await self._session_mgr.update_activity(session["id"])
             except Exception:
@@ -583,8 +584,9 @@ class ConversationLoop:
             # session's sticky peer session (failover returns early, never here).
             await self._maybe_clear_fallback(session)
 
-            # Activity timestamp — non-critical, but reap_stale() uses it so
-            # persistent failures deserve monitoring (WARNING, not debug).
+            # Activity timestamp — non-critical, but the stale-session reaper
+            # (SessionManager.cleanup_stale) keys on it so persistent
+            # failures deserve monitoring (WARNING, not debug).
             try:
                 await self._session_mgr.update_activity(session["id"])
             except Exception:

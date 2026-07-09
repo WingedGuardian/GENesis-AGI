@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -719,15 +719,25 @@ async def init(rt: GenesisRuntime) -> None:
             if rt._db is None:
                 return
             try:
-                from genesis.db.crud.cc_sessions import reap_stale
-                from genesis.db.crud.session_heartbeats import cleanup_stale
+                from genesis.db.crud.session_heartbeats import (
+                    cleanup_stale as cleanup_stale_heartbeats,
+                )
 
-                cutoff = (datetime.now(UTC) - timedelta(hours=6)).isoformat()
-                reaped = await reap_stale(rt._db, older_than=cutoff)
-                cleaned = await cleanup_stale(rt._db)
+                # T2-B: policy-aware sweep via SessionManager — stale
+                # non-foreground 'active' rows → 'expired' (outcome UNKNOWN:
+                # the process is gone; it may have crashed or been killed),
+                # with session end-hooks fired. Replaces the old crud
+                # reap_stale, which relabeled these rows 'completed' and made
+                # crashes read as successes in J-9's success rates.
+                reaped = 0
+                if rt._session_manager is not None:
+                    reaped = await rt._session_manager.cleanup_stale(
+                        max_idle_minutes=360,
+                    )
+                cleaned = await cleanup_stale_heartbeats(rt._db)
                 rt.record_job_success("session_reaper")
                 if reaped:
-                    logger.info("Session reaper: marked %d stale sessions as completed", reaped)
+                    logger.info("Session reaper: expired %d stale sessions", reaped)
                 if cleaned:
                     logger.info("Session reaper: cleaned %d stale heartbeats", cleaned)
             except Exception as exc:
@@ -741,6 +751,11 @@ async def init(rt: GenesisRuntime) -> None:
             max_instances=1,
             misfire_grace_time=3600,
         )
+        # T2-B: boot-time sweep — 'active' rows orphaned by a crashed process
+        # shouldn't wait up to ~6h for the next cron tick. Init order runs
+        # cc_relay (which sets rt._session_manager) before learning, so the
+        # manager exists here; the None-guard above covers degraded init.
+        _tt(_reap_stale_sessions(), name="initial_session_reap")
 
         async def _refresh_capability_map() -> None:
             if rt._db is None:

@@ -146,30 +146,10 @@ async def test_query_stale_excludes_foreground(db, sess_fields):
     assert len(rows) == 0
 
 
-async def test_reap_stale_excludes_foreground(db, sess_fields):
-    """reap_stale must never mark foreground sessions as completed."""
-    await cc_sessions.create(
-        db,
-        **{**sess_fields, "session_type": "foreground",
-           "last_activity_at": "2026-03-07T06:00:00"},
-    )
-    reaped = await cc_sessions.reap_stale(db, older_than="2026-03-07T07:00:00")
-    assert reaped == 0
-    row = await cc_sessions.get_by_id(db, "sess-1")
-    assert row["status"] == "active"  # Still active, not reaped
-
-
-async def test_reap_stale_expires_background(db, sess_fields):
-    """reap_stale should expire stale background sessions."""
-    await cc_sessions.create(
-        db,
-        **{**sess_fields, "session_type": "background_task",
-           "last_activity_at": "2026-03-07T06:00:00"},
-    )
-    reaped = await cc_sessions.reap_stale(db, older_than="2026-03-07T07:00:00")
-    assert reaped == 1
-    row = await cc_sessions.get_by_id(db, "sess-1")
-    assert row["status"] == "completed"
+# T2-B: the reap_stale crud tests were removed with the function itself —
+# the stale-sweep policy (foreground preserved, background → 'expired',
+# end-hooks fired) is covered at the SessionManager.cleanup_stale level in
+# tests/test_cc/test_session_manager.py.
 
 
 async def test_delete(db, sess_fields):

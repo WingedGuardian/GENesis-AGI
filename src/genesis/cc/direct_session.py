@@ -793,6 +793,41 @@ class DirectSessionRunner:
             )
             return result
 
+        except asyncio.CancelledError:
+            # T2-B: CancelledError is a BaseException — the Exception handler
+            # below never sees it, so a cancelled session used to linger
+            # 'active' until the stale reaper swept it. A cancel (shutdown,
+            # task.cancel) is a KNOWN interruption: record it as failed.
+            # Best-effort — cancellation was already delivered at the await
+            # point above, so these writes normally complete; a second cancel
+            # or a closed DB just propagates after the log.
+            elapsed = time.monotonic() - start
+            try:
+                await self._store_result(
+                    session_id,
+                    request,
+                    DirectSessionResult(
+                        session_id=session_id,
+                        success=False,
+                        error="CancelledError: session cancelled",
+                        duration_s=round(elapsed, 1),
+                        tools_called=telemetry,
+                    ),
+                )
+                await self._session_manager.fail(
+                    session_id, reason="cancelled",
+                )
+            except Exception:
+                logger.error(
+                    "Failed to record session %s cancellation",
+                    session_id[:8], exc_info=True,
+                )
+            logger.warning(
+                "Direct session %s cancelled after %.1fs",
+                session_id[:8], elapsed,
+            )
+            raise
+
         except Exception as exc:
             elapsed = time.monotonic() - start
             error_result = DirectSessionResult(
