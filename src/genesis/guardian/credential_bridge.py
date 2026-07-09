@@ -22,8 +22,10 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "load_backup_passphrase",
     "load_provisioning_credentials",
     "load_telegram_credentials",
+    "propagate_backup_passphrase",
     "propagate_guardian_credentials",
     "propagate_provisioning_credentials",
     "propagate_telegram_credentials",
@@ -43,6 +45,18 @@ _PROVISIONING_FILENAME = "proxmox_creds.env"
 _KEY_MAP_PROVISIONING = {
     "PROXMOX_AUDIT_TOKEN": "PROXMOX_AUDIT_TOKEN",
     "PROXMOX_PROVISION_TOKEN": "PROXMOX_PROVISION_TOKEN",
+}
+
+# Backup-passphrase escrow. GENESIS_BACKUP_PASSPHRASE lives ONLY inside
+# secrets.env, which the backup encrypts WITH it — so a secrets.env loss makes
+# the encrypted backup undecryptable (a circular trap). Escrowing the passphrase
+# to the host-side shared mount (outside the container's blast radius) breaks the
+# circle: a rebuilt/fresh container can decrypt the backup from the host copy.
+# The passphrase is as sensitive as everything it decrypts; the escrow file is
+# 0600 on the host mount (same trust level as the telegram/proxmox tokens here).
+_PASSPHRASE_FILENAME = "backup_passphrase.env"
+_KEY_MAP_PASSPHRASE = {
+    "GENESIS_BACKUP_PASSPHRASE": "GENESIS_BACKUP_PASSPHRASE",
 }
 
 # Keys to extract from container secrets.env
@@ -168,17 +182,75 @@ def load_provisioning_credentials(
         return {}
 
 
+def propagate_backup_passphrase(
+    shared_dir: Path | None = None,
+    secrets_path: Path | None = None,
+) -> Path | None:
+    """Escrow GENESIS_BACKUP_PASSPHRASE → host shared mount (host reads on restore).
+
+    Breaks the circular trap where the only copy of the passphrase lives inside
+    the very secrets.env the backup encrypts with it. Returns the path written,
+    or None if the passphrase is absent.
+    """
+    src = secrets_path or _CONTAINER_SECRETS
+    out_dir = (shared_dir or _CONTAINER_SHARED_DIR) / _CREDS_SUBDIR
+
+    source_secrets = _read_dotenv(src)
+    if not source_secrets:
+        logger.debug("No secrets file for passphrase escrow — skipping")
+        return None
+
+    creds: dict[str, str] = {}
+    for src_key, dst_key in _KEY_MAP_PASSPHRASE.items():
+        value = source_secrets.get(src_key, "")
+        if value:
+            creds[dst_key] = value
+
+    if not creds.get("GENESIS_BACKUP_PASSPHRASE"):
+        logger.debug("No GENESIS_BACKUP_PASSPHRASE present — skipping escrow")
+        return None
+
+    out_path = _write_creds_atomic(out_dir, _PASSPHRASE_FILENAME, creds)
+    logger.debug("Backup passphrase escrowed to %s", out_path)
+    return out_path
+
+
+def load_backup_passphrase(
+    state_dir: str = "~/.local/state/genesis-guardian",
+) -> dict[str, str]:
+    """Read the escrowed backup passphrase from the shared mount (host side).
+
+    Returns {} when absent/unreadable — the caller falls back to secrets.env or
+    refuses to decrypt.
+    """
+    creds_path = (
+        Path(state_dir).expanduser() / "shared" / _CREDS_SUBDIR / _PASSPHRASE_FILENAME
+    )
+    if not creds_path.exists():
+        logger.debug("Escrowed backup passphrase not found at %s", creds_path)
+        return {}
+    try:
+        return _read_dotenv(creds_path)
+    except OSError as exc:
+        logger.warning("Failed to read escrowed backup passphrase: %s", exc)
+        return {}
+
+
 def propagate_guardian_credentials(
     shared_dir: Path | None = None,
     secrets_path: Path | None = None,
 ) -> list[Path]:
-    """Combined container-side bridge: telegram + provisioning, each guarded.
+    """Combined container-side bridge: telegram + provisioning + passphrase escrow.
 
     Wired to the awareness-loop tick (called zero-arg). A failure in one leg
     never blocks the other, and never raises into the loop.
     """
     written: list[Path] = []
-    for fn in (propagate_telegram_credentials, propagate_provisioning_credentials):
+    for fn in (
+        propagate_telegram_credentials,
+        propagate_provisioning_credentials,
+        propagate_backup_passphrase,
+    ):
         try:
             path = fn(shared_dir=shared_dir, secrets_path=secrets_path)
         except Exception as exc:  # noqa: BLE001 — must never break the tick

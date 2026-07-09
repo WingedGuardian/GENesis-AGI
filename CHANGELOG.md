@@ -32,6 +32,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   starting cold. It's framed as the session's own recollection, not a report to
   read back to you.
 
+### Added
+
+- **Backups now cover the credentials and wiring you'd need to actually rebuild —
+  and the backup passphrase is escrowed so a lost secrets file can't lock you out
+  of your own backup.** The encrypted backup set now includes your SSH keys, the
+  GitHub and Claude Code credentials, and the host/network wiring config (the
+  difference between "restore" and "reprovision from scratch"). Separately, the
+  backup passphrase — which previously lived *only* inside the very secrets file
+  the backup encrypts with it — is now escrowed to the host outside the container,
+  so a secrets-file loss no longer leaves the encrypted backup undecryptable.
+  Restore reads the escrowed passphrase automatically and stages recovered
+  credentials to a review directory rather than overwriting live ones.
+
 ### Fixed
 
 - **The Guardian's recovery brain no longer goes dark when its work directory is

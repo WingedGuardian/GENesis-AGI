@@ -327,6 +327,47 @@ else
     log "WARNING: secrets file not found at $SECRETS_FILE"
 fi
 
+# --- 8. Critical credential & wiring files (encrypted, Tier 1) ---
+# Small, high-value files whose loss means "reprovision from scratch" instead of
+# "restore": SSH keys (incl. the guardian control-plane key), the gh + Claude
+# Code credentials, and the host/network wiring config. Each is GPG-encrypted;
+# missing files are skipped (non-fatal). Refuses plaintext without a passphrase.
+log "Backing up critical credential & wiring files (encrypted)..."
+mkdir -p creds
+_CREDS_COUNT=0
+if $_ENCRYPT_READY; then
+    # Whole ~/.ssh (keys, config, known_hosts) — regular files only.
+    if [ -d "$HOME/.ssh" ]; then
+        mkdir -p creds/ssh
+        while IFS= read -r -d '' _f; do
+            _base="$(basename "$_f")"
+            if encrypt_file "$_f" "creds/ssh/${_base}.gpg"; then
+                _CREDS_COUNT=$(( _CREDS_COUNT + 1 ))
+            else
+                log "WARNING: failed to encrypt ssh/${_base}"
+            fi
+        done < <(find "$HOME/.ssh" -maxdepth 1 -type f -print0)
+    fi
+    # Named single files → creds/<flatname>.gpg
+    for _spec in \
+        "$HOME/.config/gh/hosts.yml:gh_hosts.yml" \
+        "$HOME/.claude/.credentials.json:claude_credentials.json" \
+        "$HOME/.claude.json:claude.json" \
+        "$HOME/.genesis/guardian_remote.yaml:guardian_remote.yaml" \
+        "$HOME/.genesis/config/genesis.yaml:genesis.yaml"; do
+        _srcf="${_spec%%:*}"; _dstn="${_spec##*:}"
+        [ -f "$_srcf" ] || continue
+        if encrypt_file "$_srcf" "creds/${_dstn}.gpg"; then
+            _CREDS_COUNT=$(( _CREDS_COUNT + 1 ))
+        else
+            log "WARNING: failed to encrypt ${_dstn}"
+        fi
+    done
+    log "Creds: $_CREDS_COUNT files (encrypted)"
+else
+    log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping creds backup (refusing plaintext)"
+fi
+
 # --- Tier 2: upload large files to the off-site backend (pluggable) ---
 # Destination is selectable (none/local/smb) via GENESIS_BACKUP_TIER2_BACKEND —
 # the public repo prescribes no provider. The dated snapshot tree

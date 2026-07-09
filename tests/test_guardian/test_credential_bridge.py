@@ -317,3 +317,53 @@ class TestCombinedBridge:
             shared_dir=tmp_path / "shared", secrets_path=tmp_path / "nope.env",
         )
         assert written == []
+
+
+class TestBackupPassphraseEscrow:
+    """GENESIS_BACKUP_PASSPHRASE escrow — breaks the circular backup trap."""
+
+    def test_escrows_only_the_passphrase(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import (
+            load_backup_passphrase,
+            propagate_backup_passphrase,
+        )
+        secrets = tmp_path / "container" / "secrets.env"
+        secrets.parent.mkdir(parents=True)
+        secrets.write_text(
+            "ANTHROPIC_API_KEY=should-not-appear\n"
+            "GENESIS_BACKUP_PASSPHRASE=s3cret-pass-phrase\n"
+            "TELEGRAM_BOT_TOKEN=should-not-appear\n"
+        )
+        shared = tmp_path / "state" / "shared"
+        out = propagate_backup_passphrase(shared_dir=shared, secrets_path=secrets)
+        assert out is not None
+        assert out.name == "backup_passphrase.env"
+        assert stat.S_IMODE(os.stat(out).st_mode) == 0o600
+        result = load_backup_passphrase(str(tmp_path / "state"))
+        assert result == {"GENESIS_BACKUP_PASSPHRASE": "s3cret-pass-phrase"}
+
+    def test_absent_passphrase_skips(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import propagate_backup_passphrase
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("TELEGRAM_BOT_TOKEN=bot\n")
+        assert propagate_backup_passphrase(
+            shared_dir=tmp_path / "shared", secrets_path=secrets,
+        ) is None
+
+    def test_load_missing_returns_empty(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import load_backup_passphrase
+        assert load_backup_passphrase(str(tmp_path / "nope")) == {}
+
+    def test_combined_bridge_includes_passphrase(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import propagate_guardian_credentials
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text(
+            "TELEGRAM_BOT_TOKEN=bot\nTELEGRAM_FORUM_CHAT_ID=chat\n"
+            "PROXMOX_AUDIT_TOKEN=audit\n"
+            "GENESIS_BACKUP_PASSPHRASE=pp\n"
+        )
+        written = propagate_guardian_credentials(
+            shared_dir=tmp_path / "state" / "shared", secrets_path=secrets,
+        )
+        names = sorted(p.name for p in written)
+        assert names == ["backup_passphrase.env", "proxmox_creds.env", "telegram_creds.env"]
