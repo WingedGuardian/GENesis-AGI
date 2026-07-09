@@ -18,13 +18,18 @@ class CapabilityModule(Protocol):
     The unifying property is "hands, not brain" — modules can be plugged in
     and unplugged without affecting Genesis identity, reflection, or learning.
     A module may *observe* Genesis's state, but it does not *think with* it:
-    no memory writes, no reflection contribution, no ego role. Components that
-    participate in Genesis's cognitive operations belong elsewhere (memory,
-    reflection, ego, sentinel) — not in modules. In particular, a module is
-    NEVER a Genesis *subsystem*: module code must never set a
-    ``source_subsystem`` on a memory write (that tag is reserved for internal
-    subsystems and excludes the write from recall). This is enforced
-    mechanically by ``tests/test_memory/test_store_subsystem_coverage.py``.
+    no reflection contribution, no ego role, and no read-then-write cognitive
+    loop with memory. The one sanctioned memory surface is the *observation
+    writer* (``learning/observation_writer.py``): a module may emit
+    observations to core memory through it — e.g. ``generalization.py``
+    promoting a generalizable lesson — but it never calls the memory store
+    directly as a cognitive participant. Components that participate in
+    Genesis's cognitive operations belong elsewhere (memory, reflection, ego,
+    sentinel) — not in modules. In particular, a module is NEVER a Genesis
+    *subsystem*: module code must never set a ``source_subsystem`` on a
+    memory write (that tag is reserved for internal subsystems and excludes
+    the write from recall). This is enforced mechanically by
+    ``tests/test_memory/test_store_subsystem_coverage.py``.
 
     ## Implementing a Native Module
 
