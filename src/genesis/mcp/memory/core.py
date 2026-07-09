@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import asdict
 from datetime import UTC, datetime
 
@@ -402,6 +403,49 @@ async def memory_recall(
     return enriched
 
 
+_UUID_LEN = 36
+# Hex (with optional dashes) 4–35 chars — a partial memory UUID. Anything
+# else (full UUIDs, non-hex ids) bypasses prefix resolution untouched.
+_ID_PREFIX_RE = re.compile(r"^[0-9a-f][0-9a-f-]{3,34}$")
+
+
+async def _resolve_id_prefixes(
+    db, memory_ids: list[str],
+) -> tuple[list[str], list[str]]:
+    """Resolve short hex handles to full memory UUIDs via memory_metadata.
+
+    The proactive memory hook surfaces memories as ``id:<8-char-prefix>``
+    handles and documents memory_expand as the expansion path, so those
+    handles must resolve here. Unknown prefixes pass through unchanged (they
+    surface in ``not_found``); ambiguous prefixes are never guessed; DB
+    errors fail open (identical behavior to no resolver).
+
+    Returns ``(resolved_ids, ambiguous_handles)``.
+    """
+    resolved: list[str] = []
+    ambiguous: list[str] = []
+    for raw in memory_ids:
+        mid = raw.strip().lower().removeprefix("id:")
+        if len(mid) >= _UUID_LEN or not _ID_PREFIX_RE.match(mid):
+            resolved.append(mid)
+            continue
+        try:
+            from genesis.db.crud.memory import match_id_prefix
+
+            matches = await match_id_prefix(db, mid, limit=2)
+        except Exception:
+            logger.debug("prefix resolution failed for %r", raw, exc_info=True)
+            resolved.append(mid)
+            continue
+        if len(matches) == 1:
+            resolved.append(matches[0])
+        elif matches:
+            ambiguous.append(raw)
+        else:
+            resolved.append(mid)
+    return resolved, ambiguous
+
+
 @mcp.tool()
 async def memory_expand(
     memory_ids: list[str],
@@ -409,11 +453,17 @@ async def memory_expand(
     """Fetch full content + graph neighbors for specific memory IDs.
 
     Use after a compact memory_recall to selectively expand interesting results.
-    Returns full RetrievalResult data with graph enrichment for each ID found.
+    Accepts full UUIDs or the proactive hook's short handles (``id:xxxxxxxx``
+    or bare 8-char hex prefixes). Returns full RetrievalResult data with graph
+    enrichment for each ID found; unresolved or ambiguous handles are reported
+    in a trailing ``{"not_found": [...], "ambiguous": [...]}`` entry instead
+    of being silently dropped.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._qdrant is not None and memory_mod._db is not None
+
+    memory_ids, ambiguous = await _resolve_id_prefixes(memory_mod._db, memory_ids)
 
     # Batch retrieve from all collections (episodic_memory + knowledge_base).
     # Track which collection each point came from — it's the authoritative
@@ -435,7 +485,10 @@ async def memory_expand(
             logger.warning("Qdrant retrieve from %s failed", coll, exc_info=True)
 
     if not points:
-        return []
+        trailer: dict = {"not_found": memory_ids}
+        if ambiguous:
+            trailer["ambiguous"] = ambiguous
+        return [trailer]
 
     found_ids = {str(p.id) for p in points}
     not_found = [mid for mid in memory_ids if mid not in found_ids]
@@ -508,8 +561,11 @@ async def memory_expand(
 
         results.append(d)
 
-    if not_found:
-        results.append({"not_found": not_found})
+    if not_found or ambiguous:
+        trailer = {"not_found": not_found}
+        if ambiguous:
+            trailer["ambiguous"] = ambiguous
+        results.append(trailer)
 
     return results
 

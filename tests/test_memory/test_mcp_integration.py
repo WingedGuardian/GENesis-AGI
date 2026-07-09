@@ -506,3 +506,126 @@ async def test_memory_recall_full_path_labels_post_crag(mock_deps, tools, monkey
     assert by_id["ep1"]["provenance"] == "first-party memory"
     assert by_id["kb_aug"]["collection"] == "knowledge_base"
     assert by_id["kb_aug"]["provenance"].startswith("external-world knowledge")
+
+
+# ─── PR0: prefix-handle resolution (proactive-hook `id:xxxxxxxx` contract) ───
+
+_FULL_ID = "9d36f039-3126-4721-8c71-027df1a94e2a"
+
+
+def _db_resolving(rows_by_prefix):
+    """MagicMock db whose execute_fetchall answers prefix lookups."""
+    db = MagicMock()
+
+    async def _fetchall(sql, params=None):
+        return rows_by_prefix.get(params[0], []) if params else []
+
+    db.execute_fetchall = MagicMock(side_effect=_fetchall)
+    return db
+
+
+@pytest.mark.asyncio
+async def test_memory_expand_resolves_prefix_handle(mock_deps, tools):
+    """An 8-char hex handle (the proactive hook's `id:xxxxxxxx` format) must
+    resolve to the full UUID via memory_metadata before hitting Qdrant."""
+    from types import SimpleNamespace
+
+    _init_with_mocks(mock_deps)
+    memory_mcp._db = _db_resolving({"9d36f039": [(_FULL_ID,)]})
+
+    seen_ids = []
+
+    def _retrieve(collection_name, ids, with_payload):
+        seen_ids.append(list(ids))
+        if collection_name == "episodic_memory":
+            return [SimpleNamespace(id=_FULL_ID, payload={"content": "fact"})]
+        return []
+
+    memory_mcp._qdrant.retrieve = MagicMock(side_effect=_retrieve)
+
+    results = await tools["memory_expand"].fn(memory_ids=["9d36f039"])
+    by_id = {r["memory_id"]: r for r in results if "memory_id" in r}
+    assert _FULL_ID in by_id
+    assert all(_FULL_ID in ids for ids in seen_ids)
+
+
+@pytest.mark.asyncio
+async def test_memory_expand_strips_id_colon_and_case(mock_deps, tools):
+    """A verbatim pasted `id:9D36F039` handle still resolves."""
+    from types import SimpleNamespace
+
+    _init_with_mocks(mock_deps)
+    memory_mcp._db = _db_resolving({"9d36f039": [(_FULL_ID,)]})
+    memory_mcp._qdrant.retrieve = MagicMock(
+        side_effect=lambda collection_name, ids, with_payload: (
+            [SimpleNamespace(id=_FULL_ID, payload={"content": "fact"})]
+            if collection_name == "episodic_memory" and _FULL_ID in ids else []
+        )
+    )
+
+    results = await tools["memory_expand"].fn(memory_ids=["ID:9D36F039"])
+    assert any(r.get("memory_id") == _FULL_ID for r in results)
+
+
+@pytest.mark.asyncio
+async def test_memory_expand_ambiguous_prefix_reported(mock_deps, tools):
+    """An ambiguous prefix must not guess — it is reported, never resolved."""
+    _init_with_mocks(mock_deps)
+    memory_mcp._db = _db_resolving(
+        {"abcd1234": [("abcd1234-aaaa",), ("abcd1234-bbbb",)]}
+    )
+    memory_mcp._qdrant.retrieve = MagicMock(return_value=[])
+
+    results = await tools["memory_expand"].fn(memory_ids=["abcd1234"])
+    assert results == [{"not_found": [], "ambiguous": ["abcd1234"]}]
+
+
+@pytest.mark.asyncio
+async def test_memory_expand_empty_result_reports_not_found(mock_deps, tools):
+    """When nothing resolves, the tool must say so — never a silent []."""
+    _init_with_mocks(mock_deps)
+    memory_mcp._db = _db_resolving({})
+    memory_mcp._qdrant.retrieve = MagicMock(return_value=[])
+
+    results = await tools["memory_expand"].fn(memory_ids=[_FULL_ID])
+    assert results == [{"not_found": [_FULL_ID]}]
+
+
+@pytest.mark.asyncio
+async def test_memory_expand_non_hex_short_ids_skip_resolution(mock_deps, tools):
+    """Short non-hex IDs (e.g. test fixtures like 'ep1') bypass the prefix
+    lookup entirely — no DB call, passed through to Qdrant unchanged."""
+    from types import SimpleNamespace
+
+    _init_with_mocks(mock_deps)
+    db = MagicMock()
+    db.execute_fetchall = MagicMock()
+    memory_mcp._db = db
+    memory_mcp._qdrant.retrieve = MagicMock(
+        side_effect=lambda collection_name, ids, with_payload: (
+            [SimpleNamespace(id="ep1", payload={"content": "x"})]
+            if collection_name == "episodic_memory" else []
+        )
+    )
+
+    results = await tools["memory_expand"].fn(memory_ids=["ep1"])
+    assert any(r.get("memory_id") == "ep1" for r in results)
+    db.execute_fetchall.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_memory_expand_db_error_fails_open(mock_deps, tools):
+    """A broken prefix lookup must not take the tool down — the raw handle
+    passes through and surfaces in not_found."""
+    _init_with_mocks(mock_deps)
+    db = MagicMock()
+
+    async def _boom(sql, params=None):
+        raise RuntimeError("db down")
+
+    db.execute_fetchall = MagicMock(side_effect=_boom)
+    memory_mcp._db = db
+    memory_mcp._qdrant.retrieve = MagicMock(return_value=[])
+
+    results = await tools["memory_expand"].fn(memory_ids=["9d36f039"])
+    assert results == [{"not_found": ["9d36f039"]}]
