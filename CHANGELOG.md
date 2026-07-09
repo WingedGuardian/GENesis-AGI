@@ -11,6 +11,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Three new honesty-first metric series on the dashboard's compounding
+  panel, plus retrieval precision@3.** The weekly eval now tracks how your
+  approval gates actually get resolved (by you vs. auto-expired vs.
+  fail-closed cancels — unknown resolver values are surfaced, never silently
+  bucketed), goal completion (reports "no data yet" instead of a fake 0%
+  until goals actually close), and a noise/passivity view (stale follow-ups,
+  empty ego cycles, rejected-proposal clusters). Memory retrieval gains a
+  precision@3 series alongside precision@5, with judge changes marked as
+  series breaks. Trend arrows are now honest too: the arrow shows which way a
+  metric moved, while its color shows whether that's an improvement — a
+  rising noise metric no longer glows green.
+
 - **Genesis can now grow this VM's disk or RAM from the hypervisor — with your
   approval — to fix the one storage failure nothing else could.** When the
   container's storage pool has no room left to auto-expand into (the structural
