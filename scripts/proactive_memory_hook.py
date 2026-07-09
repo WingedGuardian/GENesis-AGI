@@ -20,6 +20,7 @@ Reads hook input from stdin as JSON:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import json
 import os
@@ -539,6 +540,8 @@ def _is_garbage(content: str) -> bool:
     # boundary markers, but it also silently lost legitimate hits. `_format_results`
     # now strips any leaked markers and re-labels external-world hits (`KB·…`),
     # so surfacing-clean is safe. Do not re-add this drop as "protective".
+    if content is None:
+        return True  # NULL-content row (FTS content is nullable): filter, never crash
     stripped = content.lstrip()
     if stripped.startswith("{") and any(
         k in stripped[:100] for k in ('"drift_detected"', '"tags"', '"type":', '"operation"')
@@ -1091,9 +1094,13 @@ def _rrf_fusion(
 
     # H-1 PR2a (measurement-only): project what the novelty gate WOULD inject,
     # without touching `results`. Skipped entirely when shadow is None (every
-    # existing caller), so the injected output is byte-identical.
+    # existing caller). Wrapped fail-open: this runs inline BEFORE the caller
+    # prints `results`, so a shadow-projection failure must never suppress the
+    # real injection — the measurement is strictly subordinate to the output.
     if shadow is not None:
-        shadow.update(_shadow_gate(scores, content_map, suppress_ids))
+        # Shadow projection must never affect the real injection path.
+        with contextlib.suppress(Exception):
+            shadow.update(_shadow_gate(scores, content_map, suppress_ids))
 
     return results
 
@@ -1129,7 +1136,7 @@ def _shadow_gate(
 
     suppressed = 0
     kb_count = 0
-    projected: list[str] = []
+    selected: list[dict] = []
     for i, (mid, score) in enumerate(ranked[:_MAX_RESULTS * 4]):
         if mid not in content_map:
             continue
@@ -1143,11 +1150,19 @@ def _shadow_gate(
             kb_count += 1
             if kb_count > _MAX_KB_SLOTS:
                 continue
-        if _is_garbage(entry.get("content", "")):
-            continue
-        projected.append(mid)
-        if len(projected) >= _MAX_RESULTS:
+        selected.append(entry)
+        if len(selected) >= _MAX_RESULTS:
             break
+    # Mirror the real path exactly (see _run: `fused = [r for r in fused if not
+    # _is_garbage(...)]`): drop garbage from the SELECTED set with NO backfill,
+    # so projected vs actual differs ONLY by suppression + serendipity boost —
+    # the two mechanisms PR2a exists to measure. (The widened *4 scan above is
+    # for skipping suppressed IDs, not for backfilling garbage.)
+    projected = [
+        e.get("memory_id", "")
+        for e in selected
+        if not _is_garbage(e.get("content", ""))
+    ]
     return {
         "projected_ids": projected,
         "projected_injected": len(projected),

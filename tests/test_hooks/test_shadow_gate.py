@@ -166,6 +166,46 @@ class TestOutputInvariance:
         assert ids.count("k1") <= 1  # single KB slot honored
 
 
+class TestShadowFailOpen:
+    """A shadow-projection failure must NEVER suppress the real injection."""
+
+    def test_shadow_exception_does_not_break_real_results(self) -> None:
+        fts = [
+            {"memory_id": "m1", "content": "alpha", "collection": "episodic"},
+            {"memory_id": "m2", "content": "beta", "collection": "episodic"},
+        ]
+        vector = [{"memory_id": "m1", "content": "alpha", "collection": "episodic",
+                   "_retrieved_count": 3}]
+        base = _mod._rrf_fusion(fts, vector, shadow=None)
+        # _shadow_gate calls _is_garbage; make it explode.
+        def boom(_c):
+            raise RuntimeError("shadow blew up")
+        with patch.object(_mod, "_is_garbage", boom):
+            got = _mod._rrf_fusion(fts, vector, suppress_ids=frozenset(), shadow={})
+        assert [r["memory_id"] for r in got] == [r["memory_id"] for r in base]
+
+    def test_shadow_garbage_matches_real_no_backfill(self) -> None:
+        # A garbage item in the real top-3 → real path drops it with NO backfill
+        # (injected count falls below 3). The shadow must do the same, so the
+        # projected delta is attributable only to suppression/boost.
+        scores = {"g": 0.030, "b": 0.020, "c": 0.018, "d": 0.017}
+        cmap = {"g": _cm("g", content="JUNK"), "b": _cm("b"), "c": _cm("c"), "d": _cm("d")}
+        with patch.object(_mod, "_is_garbage", lambda x: x == "JUNK"):
+            out = _mod._shadow_gate(scores, cmap, frozenset())
+        assert out["projected_ids"] == ["b", "c"]  # g dropped, NO backfill of d
+        assert "d" not in out["projected_ids"]
+        assert out["projected_injected"] == 2
+
+
+class TestIsGarbageNoneSafe:
+    def test_none_content_is_filtered_not_crash(self) -> None:
+        assert _mod._is_garbage(None) is True  # was AttributeError
+
+    def test_empty_string_behavior_preserved(self) -> None:
+        assert _mod._is_garbage("") is False
+        assert _mod._is_garbage("a normal memory") is False
+
+
 class TestComputeSuppressIds:
     def test_returns_working_set_entry_ids(self, tmp_path: Path) -> None:
         sid = "sess-a"
