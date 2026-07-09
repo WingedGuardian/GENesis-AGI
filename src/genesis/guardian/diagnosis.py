@@ -57,6 +57,35 @@ def _host_mem_available_gib() -> float | None:
     return None
 
 
+_WORK_DIR_FALLBACK = "~/.local/state/genesis-guardian/cc-sessions"
+
+
+def _ensure_work_dir(configured: Path, fallback: Path | None = None) -> Path:
+    """Create the CC diagnosis work dir, returning the dir actually usable.
+
+    A vintage or misconfigured install may point ``cc.work_dir`` at a path this
+    process can't create (e.g. ``/var/lib/guardian-snapshots`` owned by root on
+    an install that predates the installer's mkdir/chown). A bare
+    ``work_dir.mkdir`` there raises mid-tick and drops the guardian to
+    alert-only — exactly the failure seen live during a freeze. Fall back to a
+    user-writable state dir so the diagnosis brain still runs.
+
+    If the fallback itself can't be created, the OSError propagates — with no
+    writable work dir anywhere, alert-only is the honest degradation.
+    """
+    fallback = fallback or Path(_WORK_DIR_FALLBACK).expanduser()
+    try:
+        configured.mkdir(parents=True, exist_ok=True)
+        return configured
+    except OSError as exc:
+        logger.warning(
+            "guardian cc.work_dir %s not creatable (%s) — falling back to %s",
+            configured, exc, fallback,
+        )
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
 class CCDiagnosisError(Exception):
     """CC diagnosis failed with a specific, capturable reason."""
 
@@ -378,8 +407,7 @@ class DiagnosisEngine:
             diagnostic, signal_summary, container_name, briefing_context,
         )
         cc_path = str(Path(self._config.cc.path).expanduser())
-        work_dir = Path(self._config.cc.work_dir).expanduser()
-        work_dir.mkdir(parents=True, exist_ok=True)
+        work_dir = _ensure_work_dir(Path(self._config.cc.work_dir).expanduser())
 
         # Pre-flight: check disk space before launching CC.
         # CC diagnosis generates significant I/O against the genesis pool.

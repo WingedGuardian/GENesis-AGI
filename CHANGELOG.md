@@ -34,6 +34,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The Guardian's recovery brain no longer goes dark when its work directory is
+  misconfigured.** On some installs the Guardian's configured CC work dir points
+  at a path it can't create (e.g. a root-owned dir on an install that predates
+  the setup script) — which used to make its intelligent diagnosis fail mid-
+  incident and silently drop it to alert-only. It now falls back to a writable
+  state dir so the self-healing path keeps working.
+
 - **Asking Genesis to grow a disk or wait on your reply now works from a Claude
   Code session, not only from inside the running server.** The two tools that
   block on your Telegram reply (`provision_grow`, `outreach_send_and_wait`) need
