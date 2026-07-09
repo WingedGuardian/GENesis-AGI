@@ -11,7 +11,7 @@
 
     <!-- Error banner -->
     <div class="error-banner" x-show="$store.genesisDashboard.error" x-transition>
-      <span class="material-symbols-outlined">warning</span>
+      <span class="material-symbols-outlined" aria-hidden="true">warning</span>
       <span x-text="$store.genesisDashboard.error"></span>
     </div>
 
@@ -34,7 +34,7 @@
 
     <!-- Header -->
     <h1>
-      <span class="material-symbols-outlined">neurology</span>
+      <span class="material-symbols-outlined" aria-hidden="true">neurology</span>
       Genesis Dashboard
       <span style="margin-left: auto; display: flex; gap: 0.5rem; align-items: center;">
         <button @click="$store.genesisDashboard.restartBridge()"
@@ -48,7 +48,7 @@
                   x-text="$store.genesisDashboard._restartingHF ? 'Restarting...' : 'Restart ' + ($store.genesisDashboard.health.services.host_framework.name || 'Host')"></button>
         </template>
         <a href="#" @click.prevent="$store.genesisDashboard.navigateTo('chat')" class="back-link">
-          <span class="material-symbols-outlined" style="font-size:1rem">terminal</span>
+          <span class="material-symbols-outlined" style="font-size:1rem" aria-hidden="true">terminal</span>
           Terminal
         </a>
         <template x-if="$store.genesisDashboard.authEnabled">
@@ -66,7 +66,7 @@
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'overview' }"
               @click="location.hash = 'overview'">Overview</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'chat' }"
-              @click="location.hash = 'chat'">Chat</button>
+              @click="location.hash = 'chat'">Comms</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'work' }"
               @click="location.hash = 'work'">Work</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'follow-ups' }"
