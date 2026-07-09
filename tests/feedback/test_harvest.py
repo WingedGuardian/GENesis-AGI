@@ -10,12 +10,14 @@ import pytest
 from genesis.db.crud import ego as ego_crud
 from genesis.db.crud import outcome_events as oe
 from genesis.feedback.harvest import (
+    _OUTREACH_MAP,
     BACKFILL_MARKER,
     BACKFILL_VERSION,
     OutcomeHarvester,
     _marker_version,
     _parse_execution_suffix,
 )
+from genesis.outreach.types import POSITIVE_ENGAGEMENT_OUTCOMES
 
 
 @pytest.fixture
@@ -62,18 +64,18 @@ async def _add_proposal(
 
 
 async def _add_outreach(
-    db, *, oid, engagement_outcome, user_response=None, category="notification",
-    prediction_error=None, delivered_at=None,
+    db, *, oid, engagement_outcome, engagement_signal=None, user_response=None,
+    category="notification", prediction_error=None, delivered_at=None,
 ):
     delivered_at = delivered_at or _recent(hours=1)
     await db.execute(
         "INSERT INTO outreach_history "
         "(id, signal_type, topic, category, salience_score, channel, "
-        " message_content, engagement_outcome, user_response, prediction_error, "
-        " delivered_at, created_at) "
-        "VALUES (?, 'sig', 'topic', ?, 0.5, 'telegram', 'msg', ?, ?, ?, ?, ?)",
-        (oid, category, engagement_outcome, user_response, prediction_error,
-         delivered_at, _recent(hours=2)),
+        " message_content, engagement_outcome, engagement_signal, user_response, "
+        " prediction_error, delivered_at, created_at) "
+        "VALUES (?, 'sig', 'topic', ?, 0.5, 'telegram', 'msg', ?, ?, ?, ?, ?, ?)",
+        (oid, category, engagement_outcome, engagement_signal, user_response,
+         prediction_error, delivered_at, _recent(hours=2)),
     )
     await db.commit()
 
@@ -221,6 +223,7 @@ class TestHarvestOutreach:
         "outcome, exp_type, exp_polarity",
         [
             ("useful", "outreach_reply", "positive"),
+            ("engaged", "outreach_reply", "positive"),        # dashboard /engage writer
             ("acted_on", "outreach_reply", "positive"),       # was mislabeled negative
             ("acknowledged", "outreach_reply", "positive"),   # was mislabeled negative
             ("not_useful", "outreach_reply", "negative"),
@@ -242,6 +245,28 @@ class TestHarvestOutreach:
         await _add_outreach(db, oid="real", engagement_outcome="useful")
         await OutcomeHarvester(db).run_backfill()
         assert await oe.count(db) == 1  # only the real one
+
+    @pytest.mark.asyncio
+    async def test_noreply_timeout_is_skipped(self, db):
+        # A 24h no-reply (outcome='ignored', signal='timeout') carries no value
+        # signal — silence is not a negative (WS-0). It must NOT harvest a row.
+        await _add_outreach(
+            db, oid="nr", engagement_outcome="ignored", engagement_signal="timeout",
+        )
+        await _add_outreach(db, oid="real", engagement_outcome="useful")
+        await OutcomeHarvester(db).run_backfill()
+        assert await oe.count(db) == 1  # only the useful one
+
+    @pytest.mark.asyncio
+    async def test_explicit_ignored_nontimeout_stays_negative(self, db):
+        # An explicit dismissal (non-'timeout' signal) is still a real negative.
+        await _add_outreach(
+            db, oid="dis", engagement_outcome="ignored", engagement_signal="user_dismiss",
+        )
+        await OutcomeHarvester(db).run_backfill()
+        row = (await oe.recent(db, limit=1))[0]
+        assert row["signal_type"] == "outreach_implicit"
+        assert row["polarity"] == "negative"
 
 
 # --------------------------------------------------------------------------- #
@@ -504,3 +529,16 @@ class TestIdempotencyAndScheduling:
         # ...but backfill (all history) captures it.
         await OutcomeHarvester(db).run_backfill()
         assert await oe.count(db) == 1
+
+
+def test_outreach_map_covers_all_positive_outcomes():
+    """Forcing function: every positive engagement outcome must have an
+    _OUTREACH_MAP entry, or harvest silently drops it (mapping is None →
+    continue). This is the exact drift that caused the original bug — if a
+    value is added to POSITIVE_ENGAGEMENT_OUTCOMES without a matching harvest
+    mapping, this test fails instead of the signal vanishing in production."""
+    missing = POSITIVE_ENGAGEMENT_OUTCOMES - _OUTREACH_MAP.keys()
+    assert not missing, (
+        f"POSITIVE_ENGAGEMENT_OUTCOMES {sorted(missing)} have no _OUTREACH_MAP "
+        f"entry and would be silently dropped from harvest."
+    )

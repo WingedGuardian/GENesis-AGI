@@ -39,6 +39,28 @@ class OutreachStatus(StrEnum):
     HELD = "held"
 
 
+# Canonical set of engagement_outcome values that count as genuine POSITIVE
+# engagement, for grading and metrics. Writers drifted this vocabulary over time:
+# a reply writes 'useful', the dashboard /engage endpoint writes 'engaged', and
+# behavioural signals write 'acted_on'/'acknowledged'. Every consumer that scores
+# "did the user engage" MUST reference this ONE set — hardcoding it per-consumer is
+# exactly what caused the drift (the reconciler and the awareness collector
+# compared only 'engaged' and so mis-graded every real reply; harvest omitted
+# 'engaged'; the dashboard snapshot omitted acted_on/acknowledged). This is
+# deliberately NOT the inverse of the outreach spam-throttle, which counts
+# 'ignored' (a 24h no-reply) and is governed separately.
+POSITIVE_ENGAGEMENT_OUTCOMES: frozenset[str] = frozenset(
+    {"useful", "engaged", "acted_on", "acknowledged"}
+)
+
+# SQL IN-list rendering of the positive set, sorted for deterministic queries.
+# Values are trusted module constants (no user input) — safe to inline into a
+# query string. Every SQL consumer references this instead of re-deriving it.
+POSITIVE_ENGAGEMENT_SQL_IN: str = ", ".join(
+    f"'{o}'" for o in sorted(POSITIVE_ENGAGEMENT_OUTCOMES)
+)
+
+
 class GovernanceVerdict(StrEnum):
     ALLOW = "allow"
     DENY = "deny"

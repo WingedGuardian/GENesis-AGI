@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from genesis.outreach.types import POSITIVE_ENGAGEMENT_SQL_IN as _POSITIVE_IN
+
 if TYPE_CHECKING:
     import aiosqlite
 
@@ -17,11 +19,11 @@ async def outreach_stats(db: aiosqlite.Connection | None) -> dict:
 
     try:
         cursor = await db.execute(
-            """SELECT
+            f"""SELECT
                 COUNT(*) as total,
                 COUNT(delivered_at) as delivered,
                 SUM(CASE WHEN engagement_signal = 'user_reply' THEN 1 ELSE 0 END) as responded,
-                SUM(CASE WHEN engagement_outcome IN ('useful', 'engaged') THEN 1 ELSE 0 END) as engaged
+                SUM(CASE WHEN engagement_outcome IN ({_POSITIVE_IN}) THEN 1 ELSE 0 END) as engaged
             FROM outreach_history
             WHERE created_at >= datetime('now', '-7 days')
               AND category != 'digest'"""

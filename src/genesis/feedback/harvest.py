@@ -74,8 +74,12 @@ _SUFFIX_MAP = (
 # signals) — a pre-existing outreach schema/data drift, tracked separately. We map
 # what actually exists; explicit > implicit-negative defaulting (which would
 # mislabel acted_on/acknowledged and the empty-string rows).
+# Positive keys must stay in sync with genesis.outreach.types
+# .POSITIVE_ENGAGEMENT_OUTCOMES ('engaged' is written by the dashboard /engage
+# endpoint and was previously dropped here, losing that positive signal).
 _OUTREACH_MAP: dict[str, tuple[str, str, float | None]] = {
     "useful":       ("outreach_reply", "positive", 1.0),
+    "engaged":      ("outreach_reply", "positive", 1.0),
     "acted_on":     ("outreach_reply", "positive", 1.0),
     "acknowledged": ("outreach_reply", "positive", 0.5),
     "not_useful":   ("outreach_reply", "negative", 0.0),
@@ -280,7 +284,7 @@ class OutcomeHarvester:
     async def _harvest_outreach(self, cutoff: str | None) -> int:
         """outreach_history → outreach_reply (T2) / outreach_implicit (T3)."""
         sql = (
-            "SELECT id, engagement_outcome, user_response, category, "
+            "SELECT id, engagement_outcome, engagement_signal, user_response, category, "
             "       prediction_error, delivered_at, created_at "
             "FROM outreach_history "
             "WHERE engagement_outcome IS NOT NULL AND trim(engagement_outcome) != ''"
@@ -297,7 +301,14 @@ class OutcomeHarvester:
         inserted = 0
         for raw in rows:
             r = dict(zip(cols, raw, strict=False))
-            mapping = _OUTREACH_MAP.get((r["engagement_outcome"] or "").strip())
+            outcome = (r["engagement_outcome"] or "").strip()
+            # No-reply (24h timeout) carries no value signal — silence is not a
+            # negative (WS-0: "ignored" != no value). An explicit dismissal via
+            # the outreach_engagement tool has a non-'timeout' signal and still
+            # maps through _OUTREACH_MAP below.
+            if outcome == "ignored" and (r.get("engagement_signal") or "").strip() == "timeout":
+                continue
+            mapping = _OUTREACH_MAP.get(outcome)
             if mapping is None:
                 continue  # empty / unknown engagement value — no real signal
             signal_type, polarity, value = mapping

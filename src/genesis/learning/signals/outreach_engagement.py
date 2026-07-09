@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import aiosqlite
 
 from genesis.awareness.types import SignalReading
+from genesis.outreach.types import POSITIVE_ENGAGEMENT_OUTCOMES
 
 
 class OutreachEngagementCollector:
@@ -35,7 +36,10 @@ class OutreachEngagementCollector:
                 baseline_note=note,
             )
         total = sum(r[1] for r in rows)
-        engaged = sum(r[1] for r in rows if r[0] == "engaged")
+        # Was `r[0] == "engaged"` alone, so a real reply ('useful') never counted
+        # and this ratio was ~0.0 regardless of true engagement. Use the canonical
+        # positive set (see genesis.outreach.types).
+        engaged = sum(r[1] for r in rows if r[0] in POSITIVE_ENGAGEMENT_OUTCOMES)
         value = engaged / total if total > 0 else 0.0
         return SignalReading(
             name=self.signal_name,
