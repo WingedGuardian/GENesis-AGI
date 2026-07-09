@@ -352,13 +352,20 @@ verified: 8dac642c 2026-07-09
   **Firewall: transcript text is never persisted** — only refs + derived
   features reach `attention_events`. Config is versioned DATA
   (`~/.genesis/config/attention_config.json`).
-- **session_awareness/**: WS-C ambient session-theme layer — SHADOW,
-  record-only (PR1). The proactive memory hook folds each genuine user
-  prompt's embedding into a per-session EMA + entity ledger and records
-  drift-trigger fires in `~/.genesis/sessions/<id>/session_theme.json`;
-  the detached retrieval worker/arbiter lanes (PR2+) act on fires. Pure
-  functions, no clocks (callers pass time), zero DB writes, fail-open at
-  the hook boundary. Kill switch: `GENESIS_SESSION_AWARENESS_DISABLED=1`.
+- **session_awareness/**: WS-C ambient session-theme layer — SHADOW.
+  The proactive memory hook folds each genuine user prompt's embedding
+  into a per-session EMA + entity ledger
+  (`~/.genesis/sessions/<id>/session_theme.json`); on a drift-trigger
+  fire it spawns the detached worker (2-slot flock semaphore), which
+  retrieves+ranks candidates over three lanes — vector, decisions
+  (`tags~decision`, the OMI-incident class), entity-keyword drift — all
+  Qdrant lanes EXACT search (filtered HNSW without payload indexes
+  drops valid results; found 2026-07-09). Verdicts →
+  `ambient_verdict.json`, tuning → size-capped shadow log. **Zero
+  DB/Qdrant writes — never bumps retrieved_count** (protects
+  MEM-005/H-1 baselines). Fail-open at the hook boundary. Kill switch:
+  `GENESIS_SESSION_AWARENESS_DISABLED=1`. Arbiter (PR3) + replay gate
+  (PR4) pending.
 
 ## 10. Learning & evaluation
 
