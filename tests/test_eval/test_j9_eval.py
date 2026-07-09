@@ -694,3 +694,398 @@ async def test_insert_run_persists_metadata_json_per_result(db):
     }
     assert rows["c1"] == detail  # judge result → JSON dual-write
     assert rows["c2"] is None  # non-judge result → NULL (not the plain string)
+
+
+# ── WS-1 A2: precision@3 + top-5 truncation ─────────────────────────────────
+
+
+async def test_memory_quality_precision_at_3(db):
+    """p@3 counts relevance in the top-3 by rank; p@5 stays precision-among-
+    judged. Ranks 1-5 with relevance (1,0,1,0,1): p@5 = 3/5, p@3 = 2/3."""
+    from genesis.eval.j9_aggregator import _compute_memory_quality
+
+    for rank, rel in enumerate((1.0, 0.0, 1.0, 0.0, 1.0), 1):
+        await j9_eval.insert_event(
+            db, dimension="memory", event_type="recall_relevance",
+            metrics={"recall_event_id": "r1", "memory_id": f"m{rank}",
+                     "relevance": rel, "rank": rank},
+        )
+
+    metrics, _ = await _compute_memory_quality(db, since="2000-01-01", until="2100-01-01")
+    assert metrics["precision_at_5"] == 0.6
+    assert metrics["precision_at_3"] == pytest.approx(2 / 3, abs=1e-3)
+    assert metrics["precision_at_3_recalls"] == 1
+
+
+async def test_memory_quality_precision_at_3_fewer_than_three(db):
+    """With fewer than 3 judged memories the p@3 denominator is the judged
+    count (min(3, judged)), not a hard 3."""
+    from genesis.eval.j9_aggregator import _compute_memory_quality
+
+    for rank, rel in ((1, 1.0), (2, 0.0)):
+        await j9_eval.insert_event(
+            db, dimension="memory", event_type="recall_relevance",
+            metrics={"recall_event_id": "r1", "memory_id": f"m{rank}",
+                     "relevance": rel, "rank": rank},
+        )
+
+    metrics, _ = await _compute_memory_quality(db, since="2000-01-01", until="2100-01-01")
+    assert metrics["precision_at_3"] == 0.5
+
+
+async def test_memory_quality_truncates_to_top5(db):
+    """A malformed emitter judging >5 memories per recall must not inflate the
+    @5 denominator: rank-6 (the only relevant one) is cut, p@5 = 0/5."""
+    from genesis.eval.j9_aggregator import _compute_memory_quality
+
+    for rank in range(1, 6):
+        await j9_eval.insert_event(
+            db, dimension="memory", event_type="recall_relevance",
+            metrics={"recall_event_id": "r1", "memory_id": f"m{rank}",
+                     "relevance": 0.0, "rank": rank},
+        )
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r1", "memory_id": "m6",
+                 "relevance": 1.0, "rank": 6},
+    )
+
+    metrics, _ = await _compute_memory_quality(db, since="2000-01-01", until="2100-01-01")
+    assert metrics["precision_at_5"] == 0.0
+    assert metrics["hit_rate"] == 0.0  # the relevant memory was beyond top-5
+
+
+async def test_precision_at_3_skips_unranked_recalls(db):
+    """Pre-fix events without rank sort arbitrarily — an unranked recall is
+    excluded from p@3 (None when no recall qualifies) while p@5 still computes."""
+    from genesis.eval.j9_aggregator import _compute_memory_quality
+
+    for i, rel in enumerate((1.0, 0.0, 1.0, 0.0), 1):
+        await j9_eval.insert_event(
+            db, dimension="memory", event_type="recall_relevance",
+            metrics={"recall_event_id": "r1", "memory_id": f"m{i}", "relevance": rel},
+        )
+
+    metrics, _ = await _compute_memory_quality(db, since="2000-01-01", until="2100-01-01")
+    assert metrics["precision_at_5"] == 0.5
+    assert metrics["precision_at_3"] is None
+    assert metrics["precision_at_3_recalls"] == 0
+
+
+async def test_memory_quality_reports_judge_prompt_versions(db):
+    """The set of judge-prompt versions seen in-window is reported so a judge
+    change reads as a series break; version-less events show as 'unversioned'."""
+    from genesis.eval.j9_aggregator import _compute_memory_quality
+
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r1", "memory_id": "m1", "relevance": 1.0,
+                 "rank": 1, "judge_prompt_version": "1"},
+    )
+    await j9_eval.insert_event(
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r2", "memory_id": "m2", "relevance": 0.0,
+                 "rank": 1},
+    )
+
+    metrics, _ = await _compute_memory_quality(db, since="2000-01-01", until="2100-01-01")
+    assert metrics["judge_prompt_versions"] == ["1", "unversioned"]
+
+
+# ── WS-1 A2: approvals dimension ─────────────────────────────────────────────
+
+
+async def _approval(db, aid, *, action_type="other", status=None,
+                    resolved_at=None, resolved_by=None):
+    from genesis.db.crud import approval_requests as ar
+
+    await ar.create(
+        db, id=aid, action_type=action_type, action_class="reversible",
+        description="d",
+    )
+    if status is not None:
+        assert await ar.resolve(
+            db, aid, status=status, resolved_at=resolved_at,
+            resolved_by=resolved_by,
+        )
+
+
+async def test_compute_approvals_buckets(db):
+    """Every bucket of the approvals dimension, incl. the M12 scaffold
+    (human-resolved rejection → user_denied_count) and unknown surfacing."""
+    from genesis.eval.j9_aggregator import _compute_approvals
+
+    ts = "2026-06-05T12:00:00+00:00"
+    # churn class: one human approve, one fail-closed system cancel
+    await _approval(db, "a1", action_type="autonomous_cli_fallback",
+                    status="approved", resolved_at=ts,
+                    resolved_by="telegram:button:1")
+    await _approval(db, "a2", action_type="autonomous_cli_fallback",
+                    status="cancelled", resolved_at=ts, resolved_by="system")
+    # non-churn: explicit human denial (M12), timeout expiry, unknown resolver
+    await _approval(db, "a3", status="rejected", resolved_at=ts,
+                    resolved_by="telegram:bare_text:1")
+    await _approval(db, "a4", status="expired", resolved_at=ts,
+                    resolved_by="timeout_auto_expire")
+    await _approval(db, "a5", status="approved", resolved_at=ts,
+                    resolved_by="manual_stale_cleanup")
+    # still pending — resolved-population excludes it; pending_open gauge sees it
+    await _approval(db, "a6")
+
+    metrics, sample = await _compute_approvals(
+        db, since="2000-01-01", until="2100-01-01",
+    )
+    assert sample == 5
+    assert metrics["total_created"] == 6
+    assert metrics["total_resolved"] == 5
+    assert metrics["churn_total"] == 2
+    assert metrics["churn_excluded_total"] == 3
+    assert metrics["user_resolved"] == 2          # a1 + a3
+    assert metrics["user_resolved_rate"] == 0.4
+    assert metrics["user_resolved_rate_excl_churn"] == pytest.approx(1 / 3, abs=1e-3)
+    assert metrics["auto_resolved"] == 2          # a2 + a4
+    assert metrics["auto_expired"] == 1
+    assert metrics["system_cancelled"] == 1
+    assert metrics["rejection_count"] == 1
+    assert metrics["user_denied_count"] == 1      # M12: human reject
+    assert metrics["unknown_resolver_count"] == 1
+    assert metrics["unknown_resolver_values"] == ["manual_stale_cleanup"]
+    assert metrics["pending_open"] == 1
+
+
+async def test_compute_approvals_empty_window_is_null(db):
+    """No resolved rows → rates are None, never 0.0."""
+    from genesis.eval.j9_aggregator import _compute_approvals
+
+    metrics, sample = await _compute_approvals(
+        db, since="2000-01-01", until="2100-01-01",
+    )
+    assert sample == 0
+    assert metrics["user_resolved_rate"] is None
+    assert metrics["user_resolved_rate_excl_churn"] is None
+
+
+async def test_compute_approvals_mixed_resolved_at_formats(db):
+    """resolved_at carries space-separated (SQLite datetime('now')) AND
+    ISO-T (+00:00) formats. Lexicographically ' ' < 'T', so a space-format
+    timestamp AFTER an ISO-T window bound would leak in — datetime()
+    normalization must window both formats correctly."""
+    from genesis.eval.j9_aggregator import _compute_approvals
+
+    # in-window, one of each format
+    await _approval(db, "b1", status="approved",
+                    resolved_at="2026-06-05 12:00:00",
+                    resolved_by="telegram:button:1")
+    await _approval(db, "b2", status="approved",
+                    resolved_at="2026-06-06T12:00:00+00:00",
+                    resolved_by="dashboard")
+    # space-format AFTER the until bound — lexicographic compare against
+    # '2026-06-30T00:00:00+00:00' would wrongly include it (' ' < 'T')
+    await _approval(db, "b3", status="approved",
+                    resolved_at="2026-06-30 12:00:00",
+                    resolved_by="dashboard")
+
+    metrics, _ = await _compute_approvals(
+        db, since="2026-06-01T00:00:00+00:00", until="2026-06-30T00:00:00+00:00",
+    )
+    assert metrics["total_resolved"] == 2  # b3 excluded
+    assert metrics["user_resolved"] == 2
+
+
+# ── WS-1 A2: goals dimension ─────────────────────────────────────────────────
+
+
+async def test_compute_goal_completion_zero_terminal_is_null(db):
+    """0 terminal goals → completion_rate is None (never 0.0 on 0/0), with the
+    scaffold note present."""
+    from genesis.db.crud import user_goals
+    from genesis.eval.j9_aggregator import _compute_goal_completion
+
+    await user_goals.create(db, title="g1", category="project")
+    await user_goals.create(db, title="g2", category="learning")
+
+    metrics, sample = await _compute_goal_completion(
+        db, since="2000-01-01", until="2100-01-01",
+    )
+    assert sample == 2
+    assert metrics["total_goals"] == 2
+    assert metrics["terminal_count"] == 0
+    assert metrics["completion_rate"] is None
+    assert "note" in metrics
+
+
+async def test_compute_goal_completion_rate(db):
+    """achieved / terminal with achieved and abandoned reported separately."""
+    from genesis.db.crud import user_goals
+    from genesis.eval.j9_aggregator import _compute_goal_completion
+
+    g1 = await user_goals.create(db, title="g1", category="project")
+    g2 = await user_goals.create(db, title="g2", category="project")
+    await user_goals.create(db, title="g3", category="project")
+    await user_goals.mark_achieved(db, g1)
+    await user_goals.mark_abandoned(db, g2)
+
+    metrics, _ = await _compute_goal_completion(
+        db, since="2000-01-01", until="2100-01-01",
+    )
+    assert metrics["by_status"] == {
+        "active": 1, "paused": 0, "achieved": 1, "abandoned": 1,
+    }
+    assert metrics["terminal_count"] == 2
+    assert metrics["achieved_count"] == 1
+    assert metrics["abandoned_count"] == 1
+    assert metrics["completion_rate"] == 0.5
+    assert metrics["achieved_in_period"] == 1
+    # No abandoned_in_period: no abandonment timestamp exists (updated_at is
+    # refreshed by ANY edit) — the stock abandoned_count carries the signal.
+    assert "abandoned_in_period" not in metrics
+    assert "note" not in metrics
+
+
+# ── WS-1 A2: noise/passivity dimension ───────────────────────────────────────
+
+
+async def test_compute_noise_passivity(db):
+    """Funnel gauges + windowed ego-cycle/proposal flows, raw buckets only."""
+    from genesis.eval.j9_aggregator import _compute_noise_passivity
+
+    old = "2020-01-01T00:00:00+00:00"
+    # follow-ups: one stale-pending (leak), one completed
+    await db.execute(
+        "INSERT INTO follow_ups (id, source, content, strategy, status, created_at) "
+        "VALUES ('f1','session_retro','x','ego_judgment','pending',?)", (old,),
+    )
+    await db.execute(
+        "INSERT INTO follow_ups (id, source, content, strategy, status, created_at) "
+        "VALUES ('f2','session_retro','y','ego_judgment','completed',?)", (old,),
+    )
+    # observation: unresolved, un-actuated, old → stale leak
+    await db.execute(
+        "INSERT INTO observations "
+        "(id, source, type, content, priority, created_at, influenced_action, resolved, surfaced_count) "
+        "VALUES ('o1','s','generic','c','medium',?,0,0,0)", (old,),
+    )
+    # ego proposals: rejected + withdrawn (decision buckets window on
+    # resolved_at, which the reject/table/withdraw transitions set) +
+    # stale-pending, one realist amend
+    await db.execute(
+        "INSERT INTO ego_proposals "
+        "(id, action_type, content, status, created_at, resolved_at, realist_verdict) "
+        "VALUES ('p1','investigate','c','rejected',?,?,'amend')", (old, old),
+    )
+    await db.execute(
+        "INSERT INTO ego_proposals (id, action_type, content, status, created_at, resolved_at) "
+        "VALUES ('p2','outreach','c','withdrawn',?,?)", (old, old),
+    )
+    await db.execute(
+        "INSERT INTO ego_proposals (id, action_type, content, status, created_at) "
+        "VALUES ('p3','maintenance','c','pending',?)", (old,),
+    )
+    # ego cycles: 2 empty, 1 productive
+    for cid, n in (("c1", 0), ("c2", 0), ("c3", 2)):
+        await db.execute(
+            "INSERT INTO ego_cycle_outcomes (cycle_id, focus_type, num_proposals, created_at) "
+            "VALUES (?, 'signal', ?, ?)", (cid, n, old),
+        )
+    await db.commit()
+
+    metrics, sample = await _compute_noise_passivity(
+        db, since="2000-01-01T00:00:00+00:00", until="2100-01-01T00:00:00+00:00",
+    )
+    assert metrics["stale_followups"] == 1
+    assert metrics["followups_pending"] == 1
+    assert metrics["observations_stale_unactuated"] == 1
+    assert metrics["proposals_pending_stale"] == 1
+    assert metrics["ego_cycles"] == 3
+    assert metrics["empty_ego_cycles"] == 2
+    assert metrics["empty_ego_cycle_pct"] == pytest.approx(2 / 3, abs=1e-3)
+    assert metrics["proposals_in_period"] == 3
+    assert metrics["rejected_count"] == 1
+    assert metrics["withdrawn_count"] == 1
+    assert metrics["rejected_by_action_type"] == {"investigate": 1}
+    assert metrics["realist_amend"] == 1
+    assert metrics["realist_reject"] == 0
+    assert sample == 6  # 3 cycles + 3 proposals
+
+
+async def test_compute_noise_passivity_zero_cycles_is_null(db):
+    """No ego cycles in window → empty_ego_cycle_pct is None, not 0.0."""
+    from genesis.eval.j9_aggregator import _compute_noise_passivity
+
+    metrics, _ = await _compute_noise_passivity(
+        db, since="2000-01-01T00:00:00+00:00", until="2100-01-01T00:00:00+00:00",
+    )
+    assert metrics["empty_ego_cycle_pct"] is None
+
+
+# ── WS-1 A2: registration / E2E guard ────────────────────────────────────────
+
+
+async def test_run_weekly_aggregation_writes_new_dimensions(db):
+    """run_weekly_aggregation swallows per-dimension exceptions (a broken
+    compute fn fails SILENTLY in production) — so this asserts every
+    registered dimension actually produced a snapshot on a fresh DB, and that
+    the memory snapshot carries the new precision_at_3 keys."""
+    from genesis.eval.j9_aggregator import run_weekly_aggregation
+
+    results = await run_weekly_aggregation(db)
+
+    expected = {"memory", "system", "ego", "cognitive", "procedure",
+                "cognitive_drift", "approvals", "goals", "noise"}
+    missing = expected - results.keys()
+    assert not missing, f"dimensions failed silently: {missing}"
+
+    for dim in ("approvals", "goals", "noise"):
+        snap = await j9_eval.get_latest_snapshot(db, dimension=dim)
+        assert snap is not None, f"no snapshot written for {dim}"
+
+    memory_snap = await j9_eval.get_latest_snapshot(db, dimension="memory")
+    assert "precision_at_3" in memory_snap["metrics"]
+    assert "judge_prompt_versions" in memory_snap["metrics"]
+
+
+async def test_noise_decision_buckets_window_on_resolved_at(db):
+    """A proposal created BEFORE the window but decided INSIDE it is this
+    week's decision — created_at windowing would undercount boundary-
+    straddling proposals (Codex P2 on PR #966)."""
+    from genesis.eval.j9_aggregator import _compute_noise_passivity
+
+    # created long before the window, rejected inside it
+    await db.execute(
+        "INSERT INTO ego_proposals (id, action_type, content, status, created_at, resolved_at) "
+        "VALUES ('pb1','investigate','c','rejected',"
+        "'1999-01-01T00:00:00+00:00','2050-06-01T00:00:00+00:00')",
+    )
+    # created AND resolved before the window — must NOT count
+    await db.execute(
+        "INSERT INTO ego_proposals (id, action_type, content, status, created_at, resolved_at) "
+        "VALUES ('pb2','outreach','c','withdrawn',"
+        "'1999-01-01T00:00:00+00:00','1999-06-01T00:00:00+00:00')",
+    )
+    await db.commit()
+
+    metrics, _ = await _compute_noise_passivity(
+        db, since="2000-01-01T00:00:00+00:00", until="2100-01-01T00:00:00+00:00",
+    )
+    assert metrics["rejected_count"] == 1       # pb1: decided in window
+    assert metrics["withdrawn_count"] == 0      # pb2: decided before window
+    assert metrics["proposals_in_period"] == 0  # neither was CREATED in window
+    assert metrics["rejected_by_action_type"] == {"investigate": 1}
+
+
+async def test_j9_eval_status_reports_new_snapshot_dimensions(db, monkeypatch):
+    """The MCP health endpoint must surface the three snapshot-only dims
+    (they have no eval_events, so only the snapshot loop shows them)."""
+    from types import SimpleNamespace
+
+    import genesis.mcp.health_mcp as health_mcp_mod
+    from genesis.eval.j9_aggregator import run_weekly_aggregation
+    from genesis.mcp.health.j9_eval import _impl_j9_eval_status
+
+    await run_weekly_aggregation(db)
+    monkeypatch.setattr(health_mcp_mod, "_service", SimpleNamespace(_db=db))
+
+    res = await _impl_j9_eval_status()
+    for dim in ("approvals", "goals", "noise"):
+        assert dim in res["latest_snapshots"], f"missing {dim}"
+        assert res["latest_snapshots"][dim] is not None

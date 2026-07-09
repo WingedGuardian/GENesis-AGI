@@ -149,3 +149,26 @@ async def test_deadline_defers_remaining(db, monkeypatch):
     assert "PARTIAL" in result.content
     assert router.calls == 0  # everything deferred to next run
     assert len(await _relevance_pairs(db)) == 0
+
+
+async def test_stored_events_carry_rank_and_judge_prompt_version(db):
+    """Each stored recall_relevance event must carry the retrieval rank AND
+    the judge-prompt version stamp — the aggregator's series-break marker
+    (judge_prompt_versions) reads this exact key; without it every event
+    reports as 'unversioned' and a judge change becomes invisible."""
+    from genesis.eval.j9_batch import _RELEVANCE_PROMPT_VERSION
+
+    eid = await _seed_recall(db, query="q", memory_ids=["m1", "m2"])
+    ex = J9EvalBatchExecutor(db=db, router=_FakeRouter())
+    result = await ex.execute(_task())
+    assert result.success
+
+    events = await j9_eval.get_events(
+        db, dimension="memory", event_type="recall_relevance", limit=10,
+    )
+    assert len(events) == 2
+    by_mid = {e["metrics"]["memory_id"]: e["metrics"] for e in events}
+    assert by_mid["m1"]["recall_event_id"] == eid
+    assert {by_mid["m1"]["rank"], by_mid["m2"]["rank"]} == {1, 2}
+    for m in by_mid.values():
+        assert m["judge_prompt_version"] == _RELEVANCE_PROMPT_VERSION

@@ -63,6 +63,13 @@ def _text_overlap(memory_text: str, reference_text: str, min_phrases: int = 2) -
     return matches >= min_phrases
 
 
+# Version of the relevance-judge prompt below, stamped into every
+# recall_relevance event so the aggregator can mark a judge change as a
+# series break (precision@k is judge-rated — a reworded prompt shifts the
+# series without any retrieval change). BUMP THIS whenever _RELEVANCE_PROMPT
+# changes materially. Events predating this stamp read as "unversioned".
+_RELEVANCE_PROMPT_VERSION = "1"
+
 _RELEVANCE_PROMPT = """\
 You are judging whether a recalled memory is relevant to a query.
 
@@ -182,6 +189,7 @@ class J9EvalBatchExecutor:
                             "relevance": relevance,
                             "judge_rationale": rationale,
                             "judge_model": model_used,
+                            "judge_prompt_version": _RELEVANCE_PROMPT_VERSION,
                         },
                     )
                     scored += 1

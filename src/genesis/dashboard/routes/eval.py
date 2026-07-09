@@ -10,7 +10,10 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 
 logger = logging.getLogger(__name__)
 
-_DIMENSIONS = ("memory", "system", "ego", "cognitive", "procedure")
+_DIMENSIONS = (
+    "memory", "system", "ego", "cognitive", "procedure",
+    "approvals", "goals", "noise",
+)
 
 # Which metric to extract as the "headline" value per dimension
 _HEADLINE_METRIC = {
@@ -19,7 +22,38 @@ _HEADLINE_METRIC = {
     "ego": "approval_rate",
     "cognitive": "delta",
     "procedure": "success_rate",
+    "approvals": "user_resolved_rate",
+    "goals": "completion_rate",
+    "noise": "empty_ego_cycle_pct",
 }
+
+# Valence of a RISING headline value per dimension: True = improving,
+# False = degrading, None = direction-ambiguous. Drives trend_good (the
+# display color) while `trend` stays the factual direction of the value —
+# a rising noise metric must never render as improvement.
+_HIGHER_IS_BETTER = {
+    "memory": True,
+    "system": True,
+    "ego": True,
+    "cognitive": True,
+    "procedure": True,
+    # more human touch on approval gates = more oversight, not better/worse
+    "approvals": None,
+    "goals": True,
+    "noise": False,
+}
+
+
+def _trend_good(dim: str, trend: str) -> bool | None:
+    """Map a factual trend direction to a valence for the given dimension.
+
+    Returns None (neutral display) when the dimension's valence is ambiguous
+    or the trend is flat/insufficient.
+    """
+    higher_is_better = _HIGHER_IS_BETTER.get(dim, True)
+    if higher_is_better is None or trend not in ("up", "down"):
+        return None
+    return (trend == "up") == higher_is_better
 
 
 @blueprint.route("/api/genesis/metrics/compounding")
@@ -79,6 +113,7 @@ async def metrics_compounding():
             )
         else:
             data["trend"] = "insufficient_data"
+        data["trend_good"] = _trend_good(_dim, data["trend"])
 
     return jsonify({"dimensions": dimensions})
 
