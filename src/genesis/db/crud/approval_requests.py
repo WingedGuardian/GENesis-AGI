@@ -4,6 +4,58 @@ from __future__ import annotations
 
 import aiosqlite
 
+# ── Resolver-origin classification ───────────────────────────────────────────
+# ``resolved_by`` is free text written by convention, not constraint. This is
+# the ONE canonical mapping from resolved_by values to a resolver class —
+# consumers (J-9 approvals metrics, dashboards) must use it rather than
+# re-deriving prefixes. When adding a new resolved_by writer, extend the
+# prefix tuples AND tests/test_db/test_approval_resolver_classes.py (which
+# pins every known writer literal and the live-DB value inventory).
+#
+# Known writers as of 2026-07-09:
+#   human:  telegram:batch:/button:/bare_text: (channels/telegram/
+#           _handler_messages.py), <channel>:reply (autonomy/approval_gate.py),
+#           dashboard / dashboard:batch (dashboard/routes/state.py),
+#           voice:s2s (channels/voice/genesis_bridge.py),
+#           manual:* (operator sessions), "user" (autonomy/approval.py default)
+#   system: "system" (approval.py cancel()), timeout_auto_expire
+#           (approval_gate.py), alarm_cleared (sentinel/dispatcher.py),
+#           cleanup:* (housekeeping jobs)
+#   blank/None → system: bulk expiry (expire_timed_out below) never writes
+#           resolved_by — no human acted on those rows.
+HUMAN_RESOLVER_PREFIXES: tuple[str, ...] = (
+    "telegram:",
+    "dashboard",
+    "voice:",
+    "manual:",
+    "user",
+)
+SYSTEM_RESOLVER_PREFIXES: tuple[str, ...] = (
+    "system",
+    "timeout_auto_expire",
+    "cleanup:",
+    "alarm_cleared",
+)
+
+
+def classify_resolver(resolved_by: str | None) -> str:
+    """Classify a ``resolved_by`` value as ``human`` | ``system`` | ``unknown``.
+
+    Unmatched non-blank values return ``unknown`` — never guessed: the live DB
+    carries values with no in-tree writer (one-off manual DB fixes such as
+    ``manual_stale_cleanup``), and misclassifying a novel human channel as
+    system would silently deflate the human-resolution metrics. Consumers
+    surface unknowns rather than bucketing them.
+    """
+    if resolved_by is None or not resolved_by.strip():
+        return "system"
+    value = resolved_by.strip()
+    if value.startswith(HUMAN_RESOLVER_PREFIXES):
+        return "human"
+    if value.startswith(SYSTEM_RESOLVER_PREFIXES):
+        return "system"
+    return "unknown"
+
 
 async def create(
     db: aiosqlite.Connection,
