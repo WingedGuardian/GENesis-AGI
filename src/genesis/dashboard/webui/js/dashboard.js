@@ -279,6 +279,13 @@
           jobHealth: { state: "idle", lastSuccess: null, error: null },
           autonomyConfig: { state: "idle", lastSuccess: null, error: null },
           autonomousCliPolicy: { state: "idle", lastSuccess: null, error: null },
+          // Tab-list panels: gate "No X found" empty states on first load
+          // (state === "loading") so a slow fetch doesn't flash a lie.
+          observations: { state: "idle", lastSuccess: null, error: null },
+          tasks: { state: "idle", lastSuccess: null, error: null },
+          workSessions: { state: "idle", lastSuccess: null, error: null },
+          cockpit: { state: "idle", lastSuccess: null, error: null },
+          comms: { state: "idle", lastSuccess: null, error: null },
         },
 
         // Polling interval IDs
@@ -503,7 +510,9 @@
               this._tracesInterval = setInterval(() => this.fetchSpansRecent(), 30000);
               break;
             case "autonomy":
-              if (first) { this.fetchAutonomyGrants(); this.fetchAutonomySends(); }
+              // refreshAutonomy (not the bare fetches) so autonomyLoading
+              // gates the empty states during the first load.
+              if (first) { this.refreshAutonomy(); }
               this._autonomyInterval = setInterval(() => { this.fetchAutonomyGrants(); this.fetchAutonomySends(); }, 30000);
               break;
             case "memory":
@@ -956,14 +965,21 @@
 
         // ── Tasks tab fetches ─────────────────────────────────────
         async fetchTasks() {
+          this.startFetch("tasks");
           try {
             const resp = await fetchApi("/api/genesis/tasks?include_completed=true&limit=50");
             if (resp && resp.ok) {
               const data = await resp.json();
               this.taskList = data.tasks || [];
               this.taskActive = data.active || {};
+              this.finishFetch("tasks");
+            } else {
+              this.failFetch("tasks", "Tasks endpoint returned an error");
             }
-          } catch (e) { console.warn("Tasks fetch failed:", e); }
+          } catch (e) {
+            console.warn("Tasks fetch failed:", e);
+            this.failFetch("tasks", "Failed to fetch tasks");
+          }
         },
         async fetchTaskDetail(taskId) {
           if (this.taskExpanded === taskId) { this.taskExpanded = null; this.taskDetail = null; this.taskDetailSteps = []; this.taskTimeline = []; this.taskLinkedFollowUps = []; return; }
@@ -998,17 +1014,25 @@
 
         // ── Work tab fetches ──────────────────────────────────────
         async fetchWorkSessions() {
+          this.startFetch("workSessions");
           try {
             const resp = await fetchApi(`/api/genesis/work?type=session&view=${this.sessionsView}&limit=50`);
             if (resp && resp.ok) {
               const data = await resp.json();
               this.sessionsList = data.items || [];
+              this.finishFetch("workSessions");
+            } else {
+              this.failFetch("workSessions", "Work endpoint returned an error");
             }
-          } catch (e) { console.warn("Work sessions fetch failed:", e); }
+          } catch (e) {
+            console.warn("Work sessions fetch failed:", e);
+            this.failFetch("workSessions", "Failed to fetch work sessions");
+          }
         },
 
         // ── Observations tab fetches ─────────────────────────────
         async fetchObservations() {
+          this.startFetch("observations");
           try {
             const f = this.observationsFilters;
             const params = new URLSearchParams();
@@ -1022,8 +1046,14 @@
               const data = await resp.json();
               this.observationsList = data.observations || [];
               this.observationsHasMore = data.has_more || false;
+              this.finishFetch("observations");
+            } else {
+              this.failFetch("observations", "Observations endpoint returned an error");
             }
-          } catch (e) { console.warn("Observations fetch failed:", e); }
+          } catch (e) {
+            console.warn("Observations fetch failed:", e);
+            this.failFetch("observations", "Failed to fetch observations");
+          }
         },
         async fetchObservationsSummary() {
           try {
@@ -1103,6 +1133,7 @@
 
         // ── Follow-ups cockpit tab ───────────────────────────────
         async fetchCockpit() {
+          this.startFetch("cockpit");
           try {
             const f = this.cockpitFilters;
             const params = new URLSearchParams();
@@ -1120,8 +1151,14 @@
               const data = await resp.json();
               this.cockpitList = data.items || [];
               this.cockpitTotal = data.total || 0;
+              this.finishFetch("cockpit");
+            } else {
+              this.failFetch("cockpit", "Cockpit endpoint returned an error");
             }
-          } catch (e) { console.warn("Cockpit fetch failed:", e); }
+          } catch (e) {
+            console.warn("Cockpit fetch failed:", e);
+            this.failFetch("cockpit", "Failed to fetch follow-ups");
+          }
         },
         async fetchCockpitFilters() {
           try {
@@ -1333,6 +1370,7 @@
 
         // ── Comms fetches (on Chat tab) ──────────────────────────
         async fetchComms() {
+          this.startFetch("comms");
           try {
             const resp = await fetchApi(`/api/genesis/comms?view=${this.commsView}&limit=30`);
             if (resp && resp.ok) {
@@ -1341,8 +1379,14 @@
               this.commsProposals = data.proposals || [];
               this.commsPendingApprovals = data.pending_approvals || [];
               this.commsCounts = data.counts || {};
+              this.finishFetch("comms");
+            } else {
+              this.failFetch("comms", "Comms endpoint returned an error");
             }
-          } catch (e) { console.warn("Comms fetch failed:", e); }
+          } catch (e) {
+            console.warn("Comms fetch failed:", e);
+            this.failFetch("comms", "Failed to fetch comms");
+          }
         },
         async resolveCommsProposal(proposalId, status, userResponse) {
           try {

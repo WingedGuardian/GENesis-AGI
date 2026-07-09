@@ -93,8 +93,13 @@
           </template>
         </div>
 
-        <!-- Empty state -->
-        <template x-if="$store.genesisDashboard.cockpitList.length === 0">
+        <!-- Empty state (gated on first load so a slow fetch doesn't flash it) -->
+        <template x-if="$store.genesisDashboard.panelState('cockpit') === 'loading'">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            Loading…
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.cockpitList.length === 0 && $store.genesisDashboard.panelState('cockpit') !== 'loading'">
           <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
             No follow-ups match these filters.
           </div>

@@ -20,8 +20,13 @@
         <!-- ── Standing autonomy ─────────────────────────────────── -->
         <div style="font-size:0.78rem; font-weight:600; margin-bottom:0.4rem;">Standing autonomy</div>
 
-        <!-- Empty state (calm / good given the all-ASK default) -->
-        <template x-if="$store.genesisDashboard.autonomyGrants.length === 0">
+        <!-- Empty state (calm / good given the all-ASK default; gated on first load) -->
+        <template x-if="$store.genesisDashboard.autonomyLoading">
+          <div style="padding:1.1rem; text-align:center; color:var(--color-text-secondary); font-size:0.74rem; margin-bottom:1.2rem;">
+            Loading…
+          </div>
+        </template>
+        <template x-if="!$store.genesisDashboard.autonomyLoading && $store.genesisDashboard.autonomyGrants.length === 0">
           <div style="padding:1.1rem; text-align:center; color:var(--color-text-secondary); font-size:0.74rem; margin-bottom:1.2rem;">
             No standing autonomy — every action holds for your approval.
           </div>
@@ -58,8 +63,8 @@
         <!-- ── Autonomous sends ──────────────────────────────────── -->
         <div style="font-size:0.78rem; font-weight:600; margin-bottom:0.4rem;">Autonomous sends</div>
 
-        <!-- Empty state -->
-        <template x-if="$store.genesisDashboard.autonomySends.length === 0">
+        <!-- Empty state (gated on first load) -->
+        <template x-if="!$store.genesisDashboard.autonomyLoading && $store.genesisDashboard.autonomySends.length === 0">
           <div style="padding:1.1rem; text-align:center; color:var(--color-text-secondary); font-size:0.74rem;">
             No autonomous sends yet.
           </div>
