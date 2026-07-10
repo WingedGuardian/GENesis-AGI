@@ -23,6 +23,14 @@ OUTLIER_COS = 0.05  # below this cosine vs EMA: skip fold, count it
 OUTLIER_ESCAPE_RUN = 3  # N consecutive outliers = a real theme change, not glitches
 RING_SIZE = 3  # EMA snapshots kept for the stability check
 
+FOLD_MIN_KEYWORDS = 3  # "continue"-class turns carry no thematic signal
+PIVOT_CONFIRM_COS = 0.5  # lexical pivot resets the ring only if semantics agree
+_NON_THEMATIC_PREFIXES = (
+    "This session is being continued",  # compaction walls fold topic soup
+    "[Request interrupted",  # harness interrupt markers, not user themes
+    "<bash-",  # `!` passthrough input/output, not a user theme
+)
+
 ENTITY_DECAY = 0.9  # per-turn multiplicative decay
 PROMPT_KW_WEIGHT = 1.0
 FILE_KW_WEIGHT = 0.3
@@ -47,6 +55,19 @@ def _unit(v: list[float]) -> list[float]:
     if norm == 0.0:
         return list(v)
     return [x / norm for x in v]
+
+
+def should_fold(prompt_text: str, prompt_keywords: list[str]) -> bool:
+    """Is this turn thematic signal worth folding into the EMA?
+
+    Replay-derived gates (2026-07-09, session 246fe52b): "continue"-class
+    turns converged the EMA into filler-space and fired on it; compaction
+    continuations are summaries of EVERYTHING, not a theme.
+    """
+    if len(prompt_keywords) < FOLD_MIN_KEYWORDS:
+        return False
+    stripped = prompt_text.lstrip()
+    return not stripped.startswith(_NON_THEMATIC_PREFIXES)
 
 
 def _normalize_keyword(kw: str) -> str:
@@ -115,9 +136,13 @@ def fold_turn(
                 state["ema_turns"] = 1
                 state["ring"] = [unit]
             else:
-                if pivoted or is_outlier:
-                    # Theme changed — stability must rebuild before the
-                    # trigger can fire again.
+                semantic_break = cosine(vector, ema) < PIVOT_CONFIRM_COS
+                if (pivoted and semantic_break) or is_outlier:
+                    # Theme genuinely changed (lexical pivot corroborated
+                    # by semantics, or an escaped outlier run) — stability
+                    # must rebuild. Uncorroborated Jaccard pivots fire on
+                    # ~40%% of real turns (replay-measured); resetting on
+                    # every one starves the trigger.
                     state["ring"] = []
                 folded = [
                     (1.0 - ALPHA) * e + ALPHA * u

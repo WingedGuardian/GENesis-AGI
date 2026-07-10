@@ -138,6 +138,7 @@ def search(
     include_deprecated: bool = False,
     tags_any: list[str] | None = None,
     exact: bool = False,
+    created_before: str | None = None,
 ) -> list[dict]:
     """Search by vector similarity with optional payload filters.
 
@@ -147,7 +148,8 @@ def search(
     Includes use ``must`` — only points whose key matches are returned.
 
     ``tags_any`` matches points whose ``tags`` array contains any of the
-    given values. ``exact=True`` forces brute-force scoring instead of
+    given values. ``created_before`` keeps only points whose RFC3339
+    ``created_at`` payload is <= the given instant (as-of replays). ``exact=True`` forces brute-force scoring instead of
     HNSW — use for offline/latency-tolerant lanes: filtered HNSW without
     payload indexes measurably drops valid results (found 2026-07-09;
     ~90-220ms exact at ~49K points).
@@ -203,6 +205,14 @@ def search(
     if tags_any:
         conditions.append(
             FieldCondition(key="tags", match=MatchAny(any=list(tags_any)))
+        )
+    if created_before:
+        from qdrant_client.models import DatetimeRange
+
+        conditions.append(
+            FieldCondition(
+                key="created_at", range=DatetimeRange(lte=created_before),
+            )
         )
     query_filter = Filter(
         must=conditions or None,
