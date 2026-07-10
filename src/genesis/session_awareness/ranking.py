@@ -14,6 +14,13 @@ memory):
 - **Drift lane** — the entity ledger's top keywords as a query string
   through ``drift_recall`` (it has no vector entry point; it re-embeds
   internally and only READS retrieval bookkeeping).
+- **Entity lane (E4, shadow-first)** — ledger keywords resolved to
+  entity nodes (ledger keys == norm_names by construction), expanded
+  ≤2 typed hops through ``entity_links``, then their ``entity_mentions``
+  become candidates. This is the categorical-inference lane: a single
+  "OMI" mention reaches the repo-split decision via
+  OMI →is_a→ voice-edge-device →constrained_by→ rule. Gated by
+  ``ENTITY_LANE_MODE`` (see below).
 
 Bitemporal parity with the main retrieval path via
 ``_expired_candidate_ids``. Rank mirrors the graph-boost shape from
@@ -52,6 +59,21 @@ BACKLINK_COEF = 0.05  # mirrors retrieval._BACKLINK_BOOST_COEF
 DEFAULT_CONFIDENCE = 0.5
 PREVIEW_CHARS = 200
 
+# ── Entity lane (E4) ─────────────────────────────────────────────────
+# "shadow": lane computed and reported via ``entity_shadow_out``, but
+# entity-only candidates never enter the returned set and existing
+# candidates' ``lanes`` stay untouched (the arbiter prompt renders
+# lanes — shadow must not perturb judgments; entity info rides in the
+# separate ``entity_path`` key the arbiter never reads).
+# "live": entity candidates rank normally with a reserved floor.
+# "off": lane skipped entirely.
+# The E4b flip is this ONE constant → "live", gated on the OMI replay.
+ENTITY_LANE_MODE = "shadow"
+ENTITY_RESERVED = 2  # entity-lane floor (live mode), mirrors DECISION_RESERVED
+ENTITY_DEPTH_DECAY = 0.7  # per-hop decay on top of edge confidences
+ENTITY_MENTIONS_PER_ENTITY = 10
+ENTITY_LANE_LIMIT = 15  # max entity-lane candidates considered
+
 
 def _preview(content: str) -> str:
     return content[:PREVIEW_CHARS]
@@ -66,11 +88,16 @@ async def rank_candidates(
     embedding_provider: EmbeddingProvider,
     top_n: int = TOP_N,
     created_before: str | None = None,
+    entity_lane: str | None = None,
+    entity_shadow_out: list | None = None,
 ) -> list[dict]:
-    """Gather both lanes, filter expired, rank, return the top *top_n*.
+    """Gather the lanes, filter expired, rank, return the top *top_n*.
 
     Each candidate: memory_id, score, cosine, confidence, memory_class,
-    inbound_links, lanes, preview.
+    inbound_links, lanes, preview (+ entity_path when the entity lane
+    reached it). *entity_lane* overrides ``ENTITY_LANE_MODE``; in shadow
+    mode entity-only candidates are appended to *entity_shadow_out*
+    (when given) instead of the returned set.
     """
     from genesis.db.crud.memory_links import batch_link_counts
     from genesis.memory.classification import CLASS_WEIGHTS
@@ -134,28 +161,117 @@ async def rank_candidates(
                 "lanes": ["drift"],
             }
 
+    # ── Entity lane (E4) ─────────────────────────────────────────────
+    # Ledger keywords ARE norm_names by construction (both normalize via
+    # entity_resolution.normalize_content) — resolution doubles as the
+    # noise filter: STT filler words resolve to nothing and drop out.
+    mode = entity_lane or ENTITY_LANE_MODE
+    if mode in ("shadow", "live"):
+        try:
+            from genesis.db.crud import entities as entities_crud
+            from genesis.db.crud.entities import PROVENANCE_WEIGHTS
+
+            weights: dict[str, float] = {}
+            for keyword in entity_query.split():
+                ent = await entities_crud.get_by_norm_name(
+                    db, norm_name=keyword,
+                )
+                if ent and ent.get("status") == "active":
+                    weights[ent["entity_id"]] = 1.0
+            if weights:
+                reached = await entities_crud.connected_entities(
+                    db, list(weights), max_depth=2, as_of=created_before,
+                )
+                for eid, info in reached.items():
+                    weights[eid] = info["path_confidence"] * (
+                        ENTITY_DEPTH_DECAY ** info["depth"]
+                    )
+                mentions = await entities_crud.memories_mentioning(
+                    db, list(weights),
+                    limit_per_entity=ENTITY_MENTIONS_PER_ENTITY,
+                )
+                entity_meta: dict[str, dict] = {}
+                for m in mentions:
+                    path_score = (
+                        weights[m["entity_id"]]
+                        * m["confidence"]
+                        * PROVENANCE_WEIGHTS.get(m["provenance"], 0.5)
+                    )
+                    prev = entity_meta.get(m["memory_id"])
+                    if prev is None or path_score > prev["path_score"]:
+                        entity_meta[m["memory_id"]] = {
+                            "path_score": path_score,
+                            "via_entity": m["entity_id"],
+                            "provenance": m["provenance"],
+                        }
+                ranked_hits = sorted(
+                    entity_meta.items(),
+                    key=lambda kv: kv[1]["path_score"],
+                    reverse=True,
+                )[:ENTITY_LANE_LIMIT]
+                for mid, meta in ranked_hits:
+                    if mid in by_id:
+                        by_id[mid]["entity_path"] = meta
+                        if mode == "live":
+                            by_id[mid]["lanes"].append("entity")
+                    else:
+                        by_id[mid] = {
+                            "memory_id": mid,
+                            "cosine": None,  # backfilled below
+                            "confidence": None,
+                            "memory_class": None,
+                            "preview": "",
+                            "lanes": ["entity"],
+                            "entity_path": meta,
+                            "_shadow_only": mode == "shadow",
+                        }
+        except Exception:
+            pass  # additive lane — never breaks the worker
+
     if not by_id:
         return []
 
-    # Drift-only candidates need their stored vector for cosine-vs-EMA.
+    # Drift/entity-only candidates need vector (cosine-vs-EMA) + payload.
     missing = [mid for mid, c in by_id.items() if c["cosine"] is None]
     if missing:
         try:
             points = qdrant_client.retrieve(
                 collection_name="episodic_memory",
                 ids=missing,
-                with_payload=False,
+                with_payload=True,
                 with_vectors=True,
             )
             for p in points:
+                cand = by_id.get(str(p.id))
+                if cand is None:
+                    continue
                 vec = p.vector if isinstance(p.vector, list) else None
                 if vec:
-                    by_id[str(p.id)]["cosine"] = cosine(ema, vec)
+                    cand["cosine"] = cosine(ema, vec)
+                payload = p.payload or {}
+                if not cand["preview"]:
+                    cand["preview"] = _preview(payload.get("content", ""))
+                if cand["confidence"] is None:
+                    cand["confidence"] = payload.get("confidence")
+                if cand["memory_class"] is None:
+                    cand["memory_class"] = payload.get("memory_class")
+                cand.setdefault("created_at", payload.get("created_at"))
         except Exception:
             pass  # cosine stays None → scored at 0 below, not dropped info
         for mid in missing:
             if by_id[mid]["cosine"] is None:
                 by_id[mid]["cosine"] = 0.0
+
+    # As-of parity for entity-only candidates: mentions don't carry the
+    # memory's created_at, so the cutoff applies via the payload fetched
+    # above (other lanes were already cutoff-filtered at search time).
+    if created_before:
+        for mid in [
+            m for m, c in by_id.items()
+            if c["lanes"] == ["entity"]
+            and str(c.get("created_at") or "") > created_before
+        ]:
+            by_id.pop(mid)
 
     # ── Bitemporal parity ────────────────────────────────────────────
     expired = await _expired_candidate_ids(db, set(by_id))
@@ -180,7 +296,12 @@ async def rank_candidates(
             * max(cand["cosine"] or 0.0, 0.0)
         )
 
-    ranked = sorted(by_id.values(), key=lambda c: c["score"], reverse=True)
+    # Shadow-only entity candidates never enter the live ranking; they
+    # are reported through entity_shadow_out for telemetry/replay.
+    shadow_only = [c for c in by_id.values() if c.pop("_shadow_only", False)]
+    live_pool = [c for c in by_id.values() if c not in shadow_only]
+
+    ranked = sorted(live_pool, key=lambda c: c["score"], reverse=True)
     picked = ranked[:top_n]
 
     # Stratified floor: guarantee decision-lane representation. Without
@@ -199,5 +320,45 @@ async def rank_candidates(
                 + extras
             )
             picked.sort(key=lambda c: c["score"], reverse=True)
+
+    # Entity floor (live mode only) — same crowd-out logic as decisions.
+    if mode == "live":
+        entity_in = sum(1 for c in picked if "entity" in c["lanes"])
+        if entity_in < ENTITY_RESERVED:
+            extras = [
+                c for c in ranked[top_n:]
+                if "entity" in c["lanes"] and c not in picked
+            ][: ENTITY_RESERVED - entity_in]
+            if extras:
+                protected = [
+                    c for c in picked
+                    if "entity" in c["lanes"] or "decision" in c["lanes"]
+                ]
+                fill = [c for c in picked if c not in protected]
+                picked = (
+                    protected
+                    + fill[: max(0, top_n - len(protected) - len(extras))]
+                    + extras
+                )
+                picked.sort(key=lambda c: c["score"], reverse=True)
+
+    # Shadow report: what the entity lane WOULD have contributed.
+    if entity_shadow_out is not None and mode == "shadow":
+        report = shadow_only + [
+            c for c in live_pool if "entity_path" in c
+        ]
+        report.sort(
+            key=lambda c: c["entity_path"]["path_score"], reverse=True,
+        )
+        entity_shadow_out.extend(
+            {
+                "memory_id": c["memory_id"],
+                "score": c["score"],
+                "entity_path": c["entity_path"],
+                "already_candidate": c not in shadow_only,
+                "preview": c["preview"],
+            }
+            for c in report
+        )
 
     return picked

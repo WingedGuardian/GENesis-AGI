@@ -383,15 +383,18 @@ verified: 8dac642c 2026-07-09
   into a per-session EMA + entity ledger
   (`~/.genesis/sessions/<id>/session_theme.json`); on a drift-trigger
   fire it spawns the detached worker (2-slot flock semaphore), which
-  retrieves+ranks candidates over three lanes — vector, decisions
-  (`tags~decision`, the OMI-incident class), entity-keyword drift — all
-  Qdrant lanes EXACT search (filtered HNSW without payload indexes
-  drops valid results; found 2026-07-09). Verdicts →
-  `ambient_verdict.json`, tuning → size-capped shadow log. **Zero
-  DB/Qdrant writes — never bumps retrieved_count** (protects
-  MEM-005/H-1 baselines). Fail-open at the hook boundary. Kill switch:
-  `GENESIS_SESSION_AWARENESS_DISABLED=1`. Arbiter (PR3) + replay gate
-  (PR4) pending.
+  retrieves+ranks candidates over four lanes — vector, decisions
+  (`tags~decision`, the OMI-incident class), entity-keyword drift, and
+  the **entity lane** (ledger keywords → entity nodes → ≤2 typed hops →
+  mentions; `ranking.ENTITY_LANE_MODE`, SHADOW — entity-only hits ride
+  `entity_shadow` telemetry, never candidates, until the OMI-replay-
+  gated flip) — all Qdrant lanes EXACT search (filtered HNSW without
+  payload indexes drops valid results; found 2026-07-09). Headless-
+  Haiku arbiter judges candidates per fire (fail-closed parse, group-
+  kill on timeout). Verdicts → `ambient_verdict.json`, tuning →
+  size-capped shadow log. **Zero DB/Qdrant writes — never bumps
+  retrieved_count** (protects MEM-005/H-1 baselines). Fail-open at the
+  hook boundary. Kill switch: `GENESIS_SESSION_AWARENESS_DISABLED=1`.
 
 ## 10. Learning & evaluation
 

@@ -113,12 +113,14 @@ async def run_worker(
             qdrant = QdrantClient(url=url, timeout=10)
             provider = EmbeddingProvider()
             entity_query = " ".join(top_entities(state, ENTITY_QUERY_TERMS))
+            entity_shadow: list[dict] = []
             candidates = await rank_candidates(
                 ema=state["ema"],
                 entity_query=entity_query,
                 db=db,
                 qdrant_client=qdrant,
                 embedding_provider=provider,
+                entity_shadow_out=entity_shadow,
             )
         finally:
             await db.close()
@@ -134,6 +136,9 @@ async def run_worker(
             "theme": theme_stats,
             "entity_query": entity_query,
             "candidates": candidates,
+            # E4 shadow telemetry: what the entity lane would have added
+            # (empty once the lane goes live — hits then ride candidates).
+            "entity_shadow": entity_shadow,
         }
         if not no_arbiter:
             # Deferred: --no-arbiter runs never load the subprocess
