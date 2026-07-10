@@ -191,6 +191,17 @@ class CCInvocation:
     # shell access to a single tool (gh) without granting an open shell.
     bash_allowlist: tuple[str, ...] = ()
     bare: bool = False
+    # --safe-mode: start with all customizations (CLAUDE.md, skills, plugins,
+    # hooks, MCP servers, custom commands/agents) disabled, with OAuth intact —
+    # unlike --bare, which refuses OAuth and requires ANTHROPIC_API_KEY. Used by
+    # the eval bench's "bare Claude" arm: safe-mode is the only OAuth-compatible
+    # way to suppress the user-level CLAUDE.md, which CC discovers via the
+    # passwd-resolved home directory regardless of $HOME/$CLAUDE_CONFIG_DIR
+    # (probe-verified 2026-07-09). Built-in tools remain available.
+    safe_mode: bool = False
+    # --strict-mcp-config: CC honors ONLY the servers in --mcp-config, ignoring
+    # user/project-scope MCP configs. Without it, mcp_config is additive.
+    strict_mcp_config: bool = False
     append_system_prompt: bool = False
     stream_idle_timeout_ms: int | None = None
     anthropic_base_url: str | None = None  # Proxy URL override (ANTHROPIC_BASE_URL)
@@ -223,6 +234,12 @@ class CCInvocation:
     # interrupt (e.g. Telegram /stop) targets THIS session's subprocess and not
     # a concurrent background one. None → keyed by pid (never cross-fired).
     session_key: str | None = None
+    # Applied LAST in CCInvoker._build_env, after every computed key — the
+    # per-invocation escape hatch for env the invoker doesn't model (e.g. the
+    # eval bench's CLAUDE_CONFIG_DIR cleanroom). Overrides win over inherited
+    # os.environ AND the invoker's own settings; use deliberately. repr=False:
+    # values may reference credential paths.
+    env_overrides: dict[str, str] | None = field(default=None, repr=False)
     on_spawn: Callable[[int], Awaitable[None]] | None = field(
         default=None, compare=False, repr=False,
     )

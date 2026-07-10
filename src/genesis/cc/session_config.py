@@ -28,6 +28,29 @@ _READONLY_DISALLOWED = [
 # disallowed_tools matches tool NAMES (e.g. "Bash"), not command substrings.
 # Hooks fire for ALL sessions including claude -p, so protection is global.
 
+def render_mcp_servers(
+    template_path, genesis_root: str, servers: set[str] | None = None,
+) -> dict:
+    """Render ``config/mcp.json.template`` into an MCP-config dict.
+
+    Pure function: no cache, no file writes — the single owner of the
+    ``{{GENESIS_ROOT}}`` substitution contract. ``build_mcp_config`` layers
+    its mtime cache on top; the eval bench calls this directly to inject
+    per-run ``env`` blocks (a shared ``.generated/`` cache is wrong for
+    per-run configs). ``servers=None`` keeps every server; otherwise filter
+    to the named subset.
+    """
+    import json
+
+    template_text = template_path.read_text(encoding="utf-8")
+    resolved = template_text.replace("{{GENESIS_ROOT}}", genesis_root)
+    full_config = json.loads(resolved)
+    all_servers = full_config.get("mcpServers", {})
+    if servers is not None:
+        all_servers = {k: v for k, v in all_servers.items() if k in servers}
+    return {"mcpServers": all_servers}
+
+
 # MCP server profiles — which servers each session type needs.
 # Module-level constant (immutable intent), consistent with _READONLY_DISALLOWED.
 _MCP_PROFILES: dict[str, list[str]] = {
@@ -155,20 +178,12 @@ class SessionConfigBuilder:
         ):
             return str(generated_path)
 
-        # Generate from template.
+        # Generate from template (shared substitution contract lives in
+        # render_mcp_servers; this method only adds the mtime cache).
         try:
-            genesis_root = str(config_dir.parent)
-            template_text = template_path.read_text(encoding="utf-8")
-            resolved = template_text.replace("{{GENESIS_ROOT}}", genesis_root)
-            full_config = json.loads(resolved)
-
-            filtered = {
-                "mcpServers": {
-                    k: v
-                    for k, v in full_config.get("mcpServers", {}).items()
-                    if k in servers
-                }
-            }
+            filtered = render_mcp_servers(
+                template_path, str(config_dir.parent), set(servers),
+            )
 
             os.makedirs(generated_dir, exist_ok=True)
             generated_path.write_text(

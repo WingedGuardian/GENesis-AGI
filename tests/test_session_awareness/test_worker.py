@@ -31,9 +31,11 @@ def _seed_theme(sessions_root: Path, *, ema=None) -> None:
     s["ema_turns"] = 4
     s["ring"] = [s["ema"]] * 3
     s["entities"] = {"genesis": 2.0, "voice": 1.1, "faint": 0.06}
-    # Dynamic: a frozen timestamp crosses statefiles.STALE_AFTER (24h)
-    # and load_state's _soften_stale clears the ring — a frozen value
-    # makes the test rot on the wall clock (bit us 2026-07-10).
+    # NOW-relative, never hardcoded: run_worker's load_state compares
+    # updated_at against the wall clock (STALE_AFTER softening shrinks the
+    # ring → stability 0.0). The original hardcoded 2026-07-09 stamp was a
+    # time bomb — green when written, red for every run after the staleness
+    # horizon passed (broke main CI on 2026-07-10).
     s["updated_at"] = datetime.now(UTC).isoformat()
     save_state(SID, s, base=sessions_root)
 

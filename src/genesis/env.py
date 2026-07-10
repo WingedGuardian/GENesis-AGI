@@ -101,6 +101,24 @@ def genesis_home() -> Path:
     return Path(value).expanduser() if value else Path.home() / ".genesis"
 
 
+def memory_writebacks_off() -> bool:
+    """True when retrieval write-backs (retrieved_count / last_retrieved_at
+    bumps on recall) must be suppressed.
+
+    Recall is read-mostly, not read-only: it mutates usage-tracking payloads in
+    Qdrant and SQLite on every hit. That's correct in production (activation
+    scoring reflects real usage) but wrong for evaluation harnesses reading a
+    frozen memory snapshot — the eval bench (``genesis eval bench``) sets
+    GENESIS_MEMORY_WRITEBACKS_OFF=1 in its MCP-server env so Genesis-arm
+    recalls neither pollute the production Qdrant payloads (GENESIS_DB_PATH
+    redirects only SQLite; Qdrant is shared) nor let earlier bench tasks
+    re-rank memories for later ones. Default off: production unaffected.
+    """
+    return os.environ.get("GENESIS_MEMORY_WRITEBACKS_OFF", "").strip() in (
+        "1", "true", "yes",
+    )
+
+
 # A real deploy completes in minutes (update.sh's health-check phase caps at
 # ~3 min). A state file whose start is older than this cutoff is a crashed or
 # abandoned deploy, not a live one — treating it as stale bounds the (rare)

@@ -18,87 +18,25 @@ import asyncio
 import logging
 from pathlib import Path
 
+# The standalone Router shim lives in experimentation.standalone_router
+# (LiteLLMDelegate-backed, provider-name selection, 429 retries). This script
+# previously carried its own inline copy — refactored onto the shared one
+# (the cleanup its docstring tracked). The bench harness uses the same shim.
+from genesis.experimentation.standalone_router import (
+    DEFAULT_JUDGE_PROVIDER,
+    StandaloneLiteLLMRouter,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_GOLDEN = Path.home() / ".genesis" / "output" / "reflection_quality_golden.jsonl"
-
-
-class _LiteLLMRouter:
-    """Minimal Router-compatible wrapper around litellm for standalone use.
-
-    The eval calibration pipeline expects a ``Router`` with a
-    ``route_call`` method. This provides a lightweight alternative when
-    the full Genesis runtime isn't running.
-    """
-
-    def __init__(self) -> None:
-        self._model = "openrouter/deepseek/deepseek-chat-v3-0324"
-
-    async def route_call(
-        self,
-        call_site_id: str,
-        messages: list[dict],
-        **kwargs,
-    ):
-        """Route a call through litellm directly."""
-        import litellm
-
-        from genesis.eval.reflection_golden_set import _ensure_secrets
-
-        _ensure_secrets()
-
-        try:
-            response = await litellm.acompletion(
-                model=self._model,
-                messages=messages,
-                temperature=kwargs.get("temperature", 0.0),
-            )
-            content = response.choices[0].message.content or ""
-            model_id = response.model or self._model
-
-            return _RoutingResult(
-                success=True,
-                content=content,
-                model_id=model_id,
-                provider_used=self._model.split("/")[0],
-                error=None,
-            )
-        except Exception as exc:
-            return _RoutingResult(
-                success=False,
-                content=None,
-                model_id=None,
-                provider_used=None,
-                error=str(exc),
-            )
-
-    async def close(self) -> None:
-        pass
-
-
-class _RoutingResult:
-    """Minimal RoutingResult for the lightweight router."""
-
-    def __init__(
-        self,
-        success: bool,
-        content: str | None,
-        model_id: str | None,
-        provider_used: str | None,
-        error: str | None,
-    ) -> None:
-        self.success = success
-        self.content = content
-        self.model_id = model_id
-        self.provider_used = provider_used
-        self.error = error
 
 
 async def run(golden_path: Path) -> None:
     """Run calibration and print results."""
     from genesis.eval.calibration import run_calibration
 
-    router = _LiteLLMRouter()
+    router = StandaloneLiteLLMRouter(DEFAULT_JUDGE_PROVIDER)
 
     try:
         result = await run_calibration(

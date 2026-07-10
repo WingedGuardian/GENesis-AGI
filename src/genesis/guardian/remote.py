@@ -32,6 +32,11 @@ _DISK_RE = re.compile(r"(scsi|virtio|sata)[0-9]{1,2}")
 # `timeout N` so the gateway's timeout fires first with a clean JSON error
 # rather than the client killing the connection mid-op.
 _STATUS_TIMEOUT = 70.0       # gateway: timeout 60
+# version now also runs `claude auth status` (node startup + a network round-trip,
+# bounded host-side by `timeout 15`) on top of claude/node/git version reads, so
+# the 10s instance default is too tight — a slow verb would return `unreachable`
+# and silently skip EVERY drift/authkey/cc-auth reconciler that reuses this call.
+_VERSION_TIMEOUT = 30.0      # gateway version verb: auth-status probe + version reads
 _GROW_DISK_TIMEOUT = 660.0   # gateway: timeout 600 (PVE resize + storage-expand)
 _GROW_MEM_TIMEOUT = 180.0    # gateway: timeout 120 (config PUT + pending check)
 _EXPAND_TIMEOUT = 660.0      # gateway: timeout 600 (pvresize + autoextend profile)
@@ -153,7 +158,7 @@ class GuardianRemote:
 
     async def version(self) -> dict:
         """Query Guardian version info (CC, Node, code) from the host."""
-        ok, output = await self._ssh_command("version")
+        ok, output = await self._ssh_command("version", timeout=_VERSION_TIMEOUT)
         if ok:
             try:
                 return json.loads(output)

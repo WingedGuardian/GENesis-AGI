@@ -11,6 +11,50 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The host Guardian now tells you before its AI recovery brain loses its
+  login — and can survive it without you touching the host.** The Guardian's
+  autonomous diagnosis runs on Claude Code authenticated by a one-time login at
+  install, which never refreshes; if it died, the brain silently went dark and
+  you'd only find out mid-incident. Genesis now watches that login's health and
+  alerts you (over Telegram) if it goes dead, and warns ~30 days before a
+  fallback token would expire. Optionally, mint a one-year token with `claude
+  setup-token` from any machine and pipe it to `scripts/store_cc_token.sh` —
+  Genesis syncs it to the host and uses it **only** as a fallback when the
+  host's own login is dead, never overriding a working login. The token is a
+  subscription token (not an API key), is stored 0600 and never logged, and the
+  health signal sends only status booleans — never the token or your account
+  details. You can set this up at install or just wait for the first alert.
+
+- **`genesis eval bench` — a Genesis-vs-bare-Claude A/B benchmark you can run
+  in one command.** Each task in a private task set runs through two arms: a
+  cognition-enabled Genesis session (identity + read-only recall from your
+  real memory) and a plain Claude Code session with zero Genesis context. An
+  LLM judge grades both against success criteria written before the run, and
+  the paired win-rate lands in the eval tables and a JSON report. Honesty is
+  built in: the judge is labeled uncalibrated until it's validated against
+  your own verdicts, small pilots print "insufficient data" instead of fake
+  significance, and every run proves it wrote nothing to production memory —
+  recall's own usage counters are suppressed for the run so benchmarking
+  never distorts what your live Genesis considers important.
+
+- **The API Keys panel now shows how often each provider is causing fallbacks.**
+  A provider that is misconfigured or failing — for example one whose key is
+  missing yet is still wired in as the preferred choice on many call sites — used
+  to read only "missing (fallback active)" with no sense of scale. Each provider
+  row now shows "in N fallbacks (24h) · last …" beside its key status, so an
+  ongoing fallback storm is visible at a glance instead of hiding in the logs.
+
+- **Your credentials now survive losing the whole container.** Genesis mirrors
+  its encrypted credential bundle (secrets, SSH keys including the guardian
+  control-plane key, and Claude/GitHub credentials — all GPG-encrypted) onto the
+  host, outside the container's blast radius, and the host guardian keeps a
+  second copy the container can't touch. If the container is ever destroyed, a
+  fresh one can be rebuilt with credentials intact from the host — no network and
+  no chicken-and-egg (previously the only backup copies lived *inside* the
+  container). The guardian also warns you if that mirror goes stale, so you find
+  out backups have stopped landing *before* you need them. See the
+  container-loss runbook in `docs/reference/recovery-and-portability-workflow.md`.
+
 - **Genesis now detects and repairs corrupted credential files on its own.**
   If a critical credential or wiring file (`secrets.env`, your Claude Code and
   GitHub credentials, SSH keys, `guardian_remote.yaml`, `genesis.yaml`) gets
