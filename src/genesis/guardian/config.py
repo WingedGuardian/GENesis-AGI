@@ -171,6 +171,29 @@ class StoragePoolConfig:
 
 
 @dataclass
+class CredIntegrityConfig:
+    """Guardian-side credential-file integrity watch (G.1 escalation ladder).
+
+    The container's own awareness tick is the FIRST responder (detect + self-heal
+    from the encrypted backup). The guardian is the backstop: it validates the
+    same files via read-only ``incus exec`` each tick, WARNs on first sight
+    (deferring to the container's self-heal), and only STEPS IN — executing the
+    restore inside the container — if the corruption survives ``grace_minutes``.
+    This exists for the exact window the container can't cover itself: a
+    degraded/dead genesis-server whose awareness loop isn't ticking.
+    """
+
+    enabled: bool = True
+    grace_minutes: int = 30          # container self-heal window before guardian steps in
+    realert_hours: float = 6.0       # re-alert cadence while corruption persists
+    max_restores_per_day: int = 3    # per-target guardian step-in cap
+    check_timeout_s: int = 30
+    restore_timeout_s: int = 60
+    backup_dir: str = ""             # container-side backup path; "" = module default
+    container_home: str = ""         # "" = the container's real home; set only for E2E
+
+
+@dataclass
 class ProvisioningConfig:
     """Hypervisor provisioning (rung 5 of the escalation ladder).
 
@@ -240,6 +263,7 @@ class GuardianConfig:
     snapshots: SnapshotConfig = field(default_factory=SnapshotConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     storage_pool: StoragePoolConfig = field(default_factory=StoragePoolConfig)
+    cred_integrity: CredIntegrityConfig = field(default_factory=CredIntegrityConfig)
     provisioning: ProvisioningConfig = field(default_factory=ProvisioningConfig)
 
     @property
@@ -496,6 +520,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         snapshots=_build_sub(SnapshotConfig, raw, "snapshots"),
         recovery=_build_sub(RecoveryConfig, raw, "recovery"),
         storage_pool=_build_sub(StoragePoolConfig, raw, "storage_pool"),
+        cred_integrity=_build_sub(CredIntegrityConfig, raw, "cred_integrity"),
         provisioning=_build_sub(ProvisioningConfig, raw, "provisioning"),
     )
 
