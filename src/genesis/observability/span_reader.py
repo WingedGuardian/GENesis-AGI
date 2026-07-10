@@ -52,7 +52,7 @@ async def list_recent_traces(db: aiosqlite.Connection, *, limit: int = 50) -> li
     trace_ids = [r["trace_id"] for r in roots]
     placeholders = ", ".join("?" * len(trace_ids))
     cur = await db.execute(
-        f"SELECT trace_id, COUNT(*) FROM otel_spans "
+        f"SELECT trace_id, COUNT(*) FROM otel_spans "  # noqa: S608 - literal SQL fragments; values bound as parameters
         f"WHERE trace_id IN ({placeholders}) GROUP BY trace_id",
         trace_ids,
     )

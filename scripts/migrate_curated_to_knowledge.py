@@ -108,7 +108,7 @@ def main() -> None:
 
     to_move = [p for p in epi_points if str(p["id"]) not in kb_ids]
     to_skip = [p for p in epi_points if str(p["id"]) in kb_ids]
-    print(f"  To move: {len(to_move)}, already in KB (skip upsert, still delete from episodic): {len(to_skip)}")
+    print(f"  To move: {len(to_move)}, already in KB (skip upsert, still delete from episodic): {len(to_skip)}")  # noqa: S608 - progress message, not SQL
 
     all_ids = [str(p["id"]) for p in epi_points]
 

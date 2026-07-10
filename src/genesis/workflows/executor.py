@@ -166,7 +166,7 @@ def execute_deterministic_step(
     if not step.command:
         return False, "No command specified"
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: S602 - user-authored workflow commands run behind the approval gate
             step.command,
             shell=True,  # noqa: S602 — trusted YAML source, see docstring
             capture_output=True,

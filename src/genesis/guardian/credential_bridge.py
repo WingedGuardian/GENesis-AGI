@@ -60,7 +60,7 @@ _KEY_MAP_PROVISIONING = {
 # backslashes, unbalanced quotes) the two can diverge, so the escrowed value
 # would not match what encrypted the backup. The generated passphrase is a plain
 # token; keep any hand-set one shell-safe (alphanumeric / base64) to stay sound.
-_PASSPHRASE_FILENAME = "backup_passphrase.env"
+_PASSPHRASE_FILENAME = "backup_passphrase.env"  # noqa: S105 - filename constant, not a passphrase
 _KEY_MAP_PASSPHRASE = {
     "GENESIS_BACKUP_PASSPHRASE": "GENESIS_BACKUP_PASSPHRASE",
 }

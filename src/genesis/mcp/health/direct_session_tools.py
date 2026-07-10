@@ -230,7 +230,7 @@ async def _impl_direct_session_list(
             WHERE source_tag = 'direct_session'
             {status_clause}
             ORDER BY started_at DESC
-            LIMIT ?""",
+            LIMIT ?""",  # noqa: S608 - literal SQL fragments; values bound as parameters
         (limit,),
     )
     rows = await cursor.fetchall()
