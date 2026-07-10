@@ -48,7 +48,7 @@ def _apply_authority_boost(merged: list[dict]) -> list[dict]:
                 boost = multiplier
                 break
         item["score"] = item.get("score", 0.0) * boost
-        # mem-007: the authority boost is a legitimate quality signal (like
+        # The authority boost is a legitimate quality signal (like
         # graph boost), so the pre-diversity-penalty score carries it too —
         # only the echo-dedup penalty is excluded from J-9 quality metrics.
         if "retrieval_score" in item:
@@ -114,7 +114,7 @@ async def knowledge_recall(
             "source": r.source,
             "source_doc": r.source,
             "score": r.score,
-            # mem-007: pre-diversity-penalty score, for J-9 metrics only —
+            # Pre-diversity-penalty score, for J-9 metrics only —
             # ordering/floor stay on the penalized ``score``. Fallback for
             # paths that don't populate it (0.0 == unset).
             "retrieval_score": r.retrieval_score or r.score,
@@ -137,7 +137,7 @@ async def knowledge_recall(
                 "domain": fts_row.get("domain", ""),
                 "project_type": fts_row.get("project_type", ""),
                 "score": fts_score,
-                # mem-007: synthetic FTS score never saw the diversity
+                # The synthetic FTS score never saw the diversity
                 # penalty — raw == final.
                 "retrieval_score": fts_score,
                 "origin": "fts",
@@ -163,7 +163,7 @@ async def knowledge_recall(
         recall_event_sink[0] if recall_event_sink else None
     )
     try:
-        # mem-007: J-9 metrics read the pre-diversity-penalty score
+        # J-9 metrics read the pre-diversity-penalty score
         # (authority boost included); ordering/floor above used ``score``.
         _top_scores = [
             r.get("retrieval_score") or r.get("score", 0.0) for r in final[:5]

@@ -362,3 +362,48 @@ class TestLocalDrilldownCollections:
 
         assert seen_collections == ["episodic_memory"]
         assert ids == ["ep1"]
+
+    @pytest.mark.asyncio
+    async def test_fts_drilldown_merges_by_rank_across_collections(self):
+        """A knowledge hit with a BETTER FTS rank must precede weaker
+        episodic hits in the returned order (Codex P2): local_ids feeds RRF
+        as a ranked list, so naive per-collection appending would rank every
+        hit of the first collection above the second's regardless of
+        relevance. Ranks are comparable — same memory_fts table, same query.
+        """
+        # Wing filter passes all three (single shared cursor is fine — the
+        # filter must also PRESERVE the rank-merged order, not rescramble it)
+        db = self._db_with_wing_rows([("ep1",), ("ep2",), ("kb1",)])
+        rows_by_collection = {
+            "episodic_memory": [
+                {"memory_id": "ep1", "content": "e1", "rank": -5.0},
+                {"memory_id": "ep2", "content": "e2", "rank": -3.0},
+            ],
+            # kb1 outranks both episodic hits (more negative = better)
+            "knowledge_base": [
+                {"memory_id": "kb1", "content": "k1", "rank": -9.0},
+            ],
+        }
+
+        async def fake_search_ranked(db_, *, query, limit,
+                                     collection=None, **kw):
+            return rows_by_collection[collection]
+
+        with patch(
+            "genesis.memory.drift.memory_crud.search_ranked",
+            new=AsyncMock(side_effect=fake_search_ranked),
+        ):
+            ids = await _local_drilldown(
+                "test query",
+                db=db,
+                qdrant_client=MagicMock(),
+                embedding_provider=self._failing_embeddings(),
+                source_collections=["episodic_memory", "knowledge_base"],
+                wing="memory",
+                room=None,
+                global_ids=[],
+            )
+
+        assert ids == ["kb1", "ep1", "ep2"], (
+            f"expected rank-merged order [kb1, ep1, ep2], got {ids!r}"
+        )

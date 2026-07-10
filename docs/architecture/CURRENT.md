@@ -44,7 +44,7 @@ stack.** Deep path: `memory/retrieval.py` `HybridRetriever.recall` (bitemporal
 `invalid_at` filter, entrenchment, activation/decay, graph boost, diversity
 penalty). The diversity penalty only shapes ORDERING —
 `RetrievalResult.retrieval_score` carries the pre-penalty score and is what
-J-9 quality logging reads (mem-007; the MCP MEM-003 enrichment reads it too).
+J-9 quality logging reads (the MCP MEM-003 enrichment reads it too).
 Easy-to-forget mechanisms:
 
 - **CRAG** lives in the MCP-wrapper only (`memory/corrective.py`
@@ -54,8 +54,8 @@ Easy-to-forget mechanisms:
   API_KEY_VOYAGE-gated; the `rerank=` param is off by default at the retriever
   and applied by callers.
 - **`drift_recall`** (`memory/drift.py`) is the degraded-mode fallback; its
-  FTS drilldown searches every collection in `source_collections`
-  (MEM-006 fixed 2026-07-09; was hardcoded to `episodic_memory`).
+  FTS drilldown searches every collection in `source_collections`,
+  rank-merged across collections.
 - The proactive per-prompt path is `scripts/proactive_memory_hook.py` — an
   **independent reimplementation** (own FTS5→Qdrant→RRF pipeline), not a
   `HybridRetriever` caller. The `memory_proactive` MCP tool is registered but

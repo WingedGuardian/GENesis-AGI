@@ -374,7 +374,7 @@ def _assemble_results(
     is deliberate and explicit in the parameters.
 
     ``fused`` carries the final (diversity-penalized) ordering scores;
-    ``raw_fused`` is the pre-penalty snapshot (mem-007) so J-9 logging can
+    ``raw_fused`` is the pre-penalty snapshot so J-9 logging can
     read genuine retrieval quality via ``RetrievalResult.retrieval_score``.
     """
     results: list[RetrievalResult] = []
@@ -438,7 +438,7 @@ def _assemble_results(
                 query_intent=intent.category,
                 intent_confidence=intent.confidence,
                 collection=_collection,
-                # mem-007: pre-penalty score; falls back to the final score
+                # Pre-penalty score; falls back to the final score
                 # for ids that predate the snapshot (defensive — every id in
                 # ``top`` is in the snapshot today).
                 retrieval_score=raw_fused.get(mid, fused[mid]),
@@ -719,7 +719,7 @@ class HybridRetriever:
         # If multiple candidates have near-identical content (Jaccard ≥ 0.80),
         # penalize lower-ranked echoes to prevent sycophantic memory clusters
         # from dominating retrieval results.
-        # mem-007: snapshot the pre-penalty scores first — the penalty mutates
+        # Snapshot the pre-penalty scores first — the penalty mutates
         # ``fused`` in place, and J-9 must log retrieval QUALITY, not the
         # halved dedup artifact. ``fused`` (penalized) still drives ordering.
         raw_fused = dict(fused)
@@ -764,7 +764,7 @@ class HybridRetriever:
             emit_recall_fired,
         )
 
-        # mem-007: J-9 logs the PRE-diversity-penalty scores. ``score`` is an
+        # J-9 logs the PRE-diversity-penalty scores. ``score`` is an
         # ordering value (echo penalty applied); logging it understated the
         # quality of penalized results in top_scores/mean_score/score_spread
         # and skewed the entrenchment correlation.

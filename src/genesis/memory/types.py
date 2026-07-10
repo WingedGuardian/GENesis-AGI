@@ -56,7 +56,7 @@ class RetrievalResult:
     # inserted) for positional-construction safety. Use
     # ``genesis.memory.provenance`` to turn it into a label.
     collection: str = "episodic_memory"
-    # mem-007: the pre-diversity-penalty fused score (post-rerank, post-graph-
+    # The pre-diversity-penalty fused score (post-rerank, post-graph-
     # boost). ``score`` is the FINAL ordering score — the echo-cluster penalty
     # is applied to it so near-duplicate results rank lower. J-9 quality
     # logging reads THIS field instead, so a dedup artifact (score * 0.5)

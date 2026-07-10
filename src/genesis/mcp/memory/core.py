@@ -278,7 +278,7 @@ async def memory_recall(
         recall_event_sink[0] if recall_event_sink else None
     )
     try:
-        # mem-007: J-9 quality metrics use the PRE-diversity-penalty score
+        # J-9 quality metrics use the PRE-diversity-penalty score
         # (retrieval_score); ``score`` is the final ordering value with the
         # echo-cluster penalty applied — logging it understates penalized
         # results. Fall back to ``score`` for paths that don't populate

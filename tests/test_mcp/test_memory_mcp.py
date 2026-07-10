@@ -1436,6 +1436,7 @@ async def test_memory_recall_drift_mode_emits_exactly_one_recall_fired(db):
         mod._store, mod._db, mod._retriever, mod._qdrant = old
 
 
+@pytest.mark.asyncio
 async def test_memory_recall_mcp_enrichment_uses_raw_scores(db):
     """mem-007 (MCP layer): the MEM-003 in-place enrichment realigns the
     retriever's recall_fired event with the final result set — it must
@@ -1489,5 +1490,82 @@ async def test_memory_recall_mcp_enrichment_uses_raw_scores(db):
         # Raw scores survive the MCP realignment: both 1.0, not [1.0, 0.5]
         assert m["top_scores"] == pytest.approx([1.0, 1.0])
         assert m["mean_score"] == pytest.approx(1.0)
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+def test_apply_authority_boost_propagates_to_retrieval_score():
+    """The authority boost is a quality signal and must scale BOTH the
+    ordering score and the raw (pre-diversity-penalty) score by the same
+    factor — and must not require the raw key to be present."""
+    from genesis.mcp.memory.knowledge import _apply_authority_boost
+
+    boosted = _apply_authority_boost([
+        {"unit_id": "a", "score": 0.6, "retrieval_score": 0.8,
+         "source_pipeline": "curated"},          # 1.5x tier
+        {"unit_id": "b", "score": 0.6, "source_pipeline": "curated"},
+    ])
+    by_id = {r["unit_id"]: r for r in boosted}
+    assert by_id["a"]["score"] == pytest.approx(0.9)
+    assert by_id["a"]["retrieval_score"] == pytest.approx(1.2)
+    assert by_id["b"]["score"] == pytest.approx(0.9)
+    assert "retrieval_score" not in by_id["b"]  # guarded, no KeyError
+
+
+async def test_knowledge_recall_enrichment_uses_raw_scores(db):
+    """knowledge_recall's J-9 enrichment must log pre-diversity-penalty
+    scores (with the authority boost applied), not the halved dedup
+    artifact carried by ``score``."""
+    import genesis.mcp.memory_mcp as mod
+    from genesis.db.crud import j9_eval
+    from genesis.eval.j9_hooks import emit_recall_fired
+    from genesis.memory.types import RetrievalResult
+
+    def _kb(mid: str, score: float, raw: float):
+        return RetrievalResult(
+            memory_id=mid, content=f"c-{mid}", source="test",
+            memory_type="knowledge", score=score, vector_rank=1,
+            fts_rank=None, activation_score=0.3, payload={},
+            source_pipeline="curated",  # 1.5x authority tier
+            collection="knowledge_base", retrieval_score=raw,
+        )
+
+    # echo penalized for ordering (0.6 -> 0.3) but raw stays 0.6;
+    # after the 1.5x curated boost: scores [0.9, 0.45], raws [0.9, 0.9]
+    results = [_kb("kb-win", 0.6, 0.6), _kb("kb-echo", 0.3, 0.6)]
+
+    async def fake_recall(*_a, event_id_sink=None, **_k):
+        eid = await emit_recall_fired(
+            db, query="q", result_count=len(results),
+            top_scores=[r.retrieval_score for r in results],
+            memory_ids=[r.memory_id for r in results],
+            latency_ms=1.0, source="knowledge",
+        )
+        if event_id_sink is not None and eid is not None:
+            event_id_sink.append(eid)
+        return list(results)
+
+    mock_retriever = AsyncMock()
+    mock_retriever.recall = fake_recall
+
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._retriever = mock_retriever
+        mod._qdrant = MagicMock()
+        tools = await _get_tools()
+        out = await tools["knowledge_recall"].fn(
+            query="q", limit=5, corrective=False,
+        )
+        # Ordering/return still keyed on the penalized+boosted score
+        assert [r["unit_id"] for r in out] == ["kb-win", "kb-echo"]
+        events = await j9_eval.get_events(db, event_type="recall_fired")
+        assert len(events) == 1  # enriched in place, no second emit
+        m = events[0]["metrics"]
+        assert m["top_scores"] == pytest.approx([0.9, 0.9]), (
+            "J-9 must see boosted RAW scores, not the penalized ordering "
+            f"values — got {m['top_scores']}"
+        )
     finally:
         mod._store, mod._db, mod._retriever, mod._qdrant = old
