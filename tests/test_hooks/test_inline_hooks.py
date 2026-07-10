@@ -290,6 +290,109 @@ class TestBashHookRmRf:
         result = run_hook(rm_rf_hook_command, {"command": "rm foo.txt"})
         assert result.returncode == 0
 
+    # -- Token-parse regressions: the 4 bypasses confirmed live by the
+    # -- 2026-07-10 P1 triage (single-token regex missed all of these),
+    # -- plus multi-operand and separator handling.
+
+    def test_rm_split_flags_blocked(self, rm_rf_hook_command: str) -> None:
+        """rm -r -f / -> BLOCKED (flags accumulate across tokens)."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -r -f /"})
+        assert result.returncode == 2
+
+    def test_rm_long_flags_blocked(self, rm_rf_hook_command: str) -> None:
+        """rm --recursive --force . -> BLOCKED."""
+        result = run_hook(
+            rm_rf_hook_command, {"command": "rm --recursive --force ."}
+        )
+        assert result.returncode == 2
+
+    def test_rm_capital_r_blocked(self, rm_rf_hook_command: str) -> None:
+        """rm -Rf ~ -> BLOCKED (-R is recursive too)."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -Rf ~"})
+        assert result.returncode == 2
+
+    def test_rm_double_dash_blocked(self, rm_rf_hook_command: str) -> None:
+        """rm -rf -- / -> BLOCKED ('--' ends flags, operands still checked)."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf -- /"})
+        assert result.returncode == 2
+
+    def test_rm_broad_second_operand_blocked(
+        self, rm_rf_hook_command: str
+    ) -> None:
+        """rm -rf deep/ok/nested/path / -> BLOCKED (each operand checked)."""
+        result = run_hook(
+            rm_rf_hook_command,
+            {"command": "rm -rf ./some/specific/deep/path /"},
+        )
+        assert result.returncode == 2
+
+    def test_rm_after_separator_blocked(self, rm_rf_hook_command: str) -> None:
+        """echo ok && rm -r -f ~ -> BLOCKED (rm found past separators)."""
+        result = run_hook(
+            rm_rf_hook_command, {"command": "echo ok && rm -r -f ~"}
+        )
+        assert result.returncode == 2
+
+    def test_rm_unparseable_falls_back_to_regex(
+        self, rm_rf_hook_command: str
+    ) -> None:
+        """Unclosed quote (shlex fails) + classic spelling -> legacy block."""
+        result = run_hook(
+            rm_rf_hook_command, {"command": "rm -rf / 'unclosed"}
+        )
+        assert result.returncode == 2
+
+    def test_rm_split_flags_deep_path_allowed(
+        self, rm_rf_hook_command: str
+    ) -> None:
+        """rm -r -f on a 4+-deep path -> allowed (parity with -rf)."""
+        result = run_hook(
+            rm_rf_hook_command,
+            {"command": "rm -r -f ./some/specific/deep/path"},
+        )
+        assert result.returncode == 0
+
+    # -- 2026-07-10 review findings: leading-'..' traversal + abbreviated
+    # -- GNU long flags were both live bypasses.
+
+    @pytest.mark.parametrize("target", [
+        "../../../etc",
+        "../../../../../../../../etc",  # bottoms out at /etc from root
+        "../foo/bar/baz/qux",           # depth 4 textually, still traverses up
+        "a/b/../../../../etc",          # interior '..' escapes past the base
+    ])
+    def test_rm_rf_upward_traversal_blocked(
+        self, rm_rf_hook_command: str, target: str
+    ) -> None:
+        """rm -rf on any path whose normalized form keeps a '..' -> BLOCKED.
+
+        A relative '..' cannot be depth-bounded without the real cwd, so
+        the guard refuses (`../../../etc` used to report depth 4 and pass
+        while resolving to /etc)."""
+        result = run_hook(
+            rm_rf_hook_command, {"command": f"rm -rf {target}"}
+        )
+        assert result.returncode == 2
+
+    def test_rm_rf_abbrev_long_flags_blocked(
+        self, rm_rf_hook_command: str
+    ) -> None:
+        """rm --rec --f / -> BLOCKED (GNU unambiguous prefix abbreviations)."""
+        result = run_hook(
+            rm_rf_hook_command, {"command": "rm --rec --f /"}
+        )
+        assert result.returncode == 2
+
+    def test_rm_non_destructive_long_flags_allowed(
+        self, rm_rf_hook_command: str
+    ) -> None:
+        """--dir/--verbose are not recursive+force -> deep path allowed."""
+        result = run_hook(
+            rm_rf_hook_command,
+            {"command": "rm --dir --verbose /a/b/c/d/e"},
+        )
+        assert result.returncode == 0
+
 
 # ---------------------------------------------------------------------------
 # Bash hook: git push --force / -f

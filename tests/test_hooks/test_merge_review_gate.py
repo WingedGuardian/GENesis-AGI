@@ -419,3 +419,60 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         # type=User AND not in the inline bot set → not an automated finding
         assert block is False
+
+
+class TestResolvePrNumber:
+    """Fail-closed PR resolution: no-arg `gh pr merge` used to skip
+    every merge gate (the gates only ran under `if pr_num:`)."""
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            ("gh pr merge 123 --squash", "123"),
+            ("gh pr merge #77 --admin", "77"),
+            ("gh pr merge https://github.com/o/r/pull/456 --squash", "456"),
+            ('gh pr merge --subject "fix 123 things" 55', "55"),
+        ],
+    )
+    def test_extract_variants(self, guard_module, cmd, expected):
+        assert guard_module._extract_pr_number(cmd) == expected
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            # Digits in a CHAINED command must not stand in for the target
+            # (`; echo 456` merges 123, not 456). 2026-07-10 review P1.
+            ("gh pr merge --admin 123; echo 456", "123"),
+            ("gh pr merge 123 && echo 999", "123"),
+            ("gh pr merge --admin xyz; echo 456", None),  # no number → fall back
+            ("gh pr merge 5 | tee 777", "5"),
+            ("gh pr merge --admin xyz\necho 456", None),  # newline chain
+            ("gh pr merge 123\necho 456", "123"),
+        ],
+    )
+    def test_stops_at_shell_separator(self, guard_module, cmd, expected):
+        assert guard_module._extract_pr_number(cmd) == expected
+
+    def test_quoted_digits_not_a_pr_number(self, guard_module):
+        # shlex keeps the quoted arg whole — '123' inside --subject must
+        # not resolve as the PR number.
+        cmd = 'gh pr merge --subject "fix 123"'
+        assert guard_module._extract_pr_number(cmd) is None
+
+    def test_resolves_current_branch_pr(self, guard_module):
+        with patch.object(
+            guard_module.subprocess, "run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="88\n", stderr="",
+            ),
+        ):
+            assert guard_module._resolve_pr_number("gh pr merge --squash") == "88"
+
+    def test_unresolvable_returns_none(self, guard_module):
+        with patch.object(
+            guard_module.subprocess, "run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="no pr",
+            ),
+        ):
+            assert guard_module._resolve_pr_number("gh pr merge --squash") is None

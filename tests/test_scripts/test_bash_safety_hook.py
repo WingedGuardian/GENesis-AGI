@@ -175,3 +175,95 @@ def test_worktree_serve_blocked(cmd, tmp_path):
 def test_non_worktree_serve_paths_allowed(cmd, tmp_path):
     """Server management and plain serve (outside a worktree) pass this guard."""
     assert _run_cwd(cmd, tmp_path).returncode == 0
+
+
+# --- gh pr merge: PR resolution fails CLOSED (2026-07-10 P1 triage) ---
+
+def _gh_stub(tmp_path: Path, script: str) -> dict[str, str]:
+    """Put a fake `gh` first on PATH so no test touches the network."""
+    stub = tmp_path / "gh"
+    stub.write_text(f"#!/usr/bin/env bash\n{script}\n")
+    stub.chmod(0o755)
+    return {"PATH": f"{tmp_path}:{os.environ['PATH']}"}
+
+
+def test_merge_no_arg_unresolvable_blocks(tmp_path):
+    """No number in the command AND no open PR for the branch -> exit 2."""
+    env = _gh_stub(tmp_path, "exit 1")
+    result = _run("gh pr merge --squash --admin", env_extra=env)
+    assert result.returncode == 2
+    assert "cannot resolve" in result.stderr
+
+
+def test_merge_no_arg_resolves_branch_pr(tmp_path):
+    """No number, but the branch has an open PR -> gates run against it."""
+    env = _gh_stub(
+        tmp_path,
+        'case "$*" in *"--json number"*) echo 42;; '
+        '*"--json mergeable"*) echo MERGEABLE;; esac',
+    )
+    result = _run("gh pr merge --squash", env_extra=env)
+    assert result.returncode == 0
+    assert "PR #42" in result.stderr
+
+
+def test_merge_numbered_conflicting_blocks(tmp_path):
+    env = _gh_stub(
+        tmp_path,
+        'case "$*" in *"--json mergeable"*) echo CONFLICTING;; esac',
+    )
+    result = _run("gh pr merge 123 --squash", env_extra=env)
+    assert result.returncode == 2
+    assert "merge conflicts" in result.stderr
+
+
+# --- gh pr merge: PR number after a FLAG must resolve correctly ---
+# (2026-07-10 review: an anchored "merge <digits>" match missed
+#  `gh pr merge --admin 123` and fell back to the WRONG branch PR.)
+
+@pytest.mark.parametrize("cmd", [
+    "gh pr merge --admin 123",
+    "gh pr merge 123 --admin",
+    "gh pr merge --squash 123 --admin",
+    "gh pr merge https://github.com/o/r/pull/123 --squash",
+])
+def test_merge_number_after_flag_resolves_correctly(tmp_path, cmd):
+    """The PR named in the command is checked, regardless of flag order.
+
+    The gh stub returns branch-PR #55; a correct parse must report #123,
+    not #55.
+    """
+    env = _gh_stub(
+        tmp_path,
+        'case "$*" in *"--json number"*) echo 55;; '
+        '*"--json mergeable"*) echo MERGEABLE;; esac',
+    )
+    result = _run(cmd, env_extra=env)
+    assert "PR #123" in result.stderr
+    assert "PR #55" not in result.stderr
+
+
+def test_merge_digits_in_quoted_subject_not_a_pr(tmp_path):
+    """Digits inside a quoted --subject must not be taken as the PR."""
+    env = _gh_stub(
+        tmp_path,
+        'case "$*" in *"--json number"*) echo 77;; '
+        '*"--json mergeable"*) echo MERGEABLE;; esac',
+    )
+    # Only digits present are inside the quoted subject -> fall back to
+    # the branch PR (#77), never "999".
+    result = _run('gh pr merge --subject "merge 999 now"', env_extra=env)
+    assert "PR #77" in result.stderr
+    assert "999" not in result.stderr
+
+
+def test_merge_chained_command_digits_ignored(tmp_path):
+    """`gh pr merge 123; echo 456` must check PR #123, not #456 (a chained
+    command's digits are not this merge's target). 2026-07-10 review."""
+    env = _gh_stub(
+        tmp_path,
+        'case "$*" in *"--json mergeable"*) echo MERGEABLE;; esac',
+    )
+    result = _run("gh pr merge 123 --admin; echo 456", env_extra=env)
+    assert "PR #123" in result.stderr
+    assert "456" not in result.stderr

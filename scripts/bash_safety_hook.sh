@@ -87,13 +87,13 @@ fi
 # below, because the generic "git push" warning (exit 0) would otherwise
 # short-circuit a force-push before this block could hard-block it.
 case "$CMD" in
-    *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*|*"rm -rf .."*)
+    *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*)  # "rm -rf ." also covers ".."
         echo "BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user." >&2
         exit 2;;
     *"git reset --hard"*)
         echo "BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user." >&2
         exit 2;;
-    *"git clean -f"*|*"git clean -fd"*)
+    *"git clean -f"*)  # substring also covers -fd
         echo "BLOCKED: git clean removes untracked files permanently. Ask the user first." >&2
         exit 2;;
 esac
@@ -120,23 +120,61 @@ if echo "$CMD" | grep -qE "^gh pr create|[;&|] *gh pr create"; then
     exit 0
 fi
 
-# gh pr merge — hard-block if GitHub hasn't confirmed the PR is conflict-free
+# gh pr merge — hard-block if GitHub hasn't confirmed the PR is conflict-free.
+# Fail CLOSED on an unresolvable PR: a no-arg `gh pr merge` from the PR branch
+# used to skip this check entirely (2026-07-10 P1 triage).
 if echo "$CMD" | grep -qE "^gh pr merge|[;&|] *gh pr merge"; then
-    _pr_num=$(echo "$CMD" | grep -oE '[0-9]+' | head -1)
-    _repo_flag=$(echo "$CMD" | grep -oP -- '--repo \S+' || true)
-    _mergeable=""
-    if [ -n "$_pr_num" ]; then
-        _mergeable=$(gh pr view "$_pr_num" $_repo_flag --json mergeable --jq '.mergeable' 2>/dev/null)
-        if [ "$_mergeable" = "UNKNOWN" ]; then
-            echo "BLOCKED: PR #$_pr_num mergeable status is UNKNOWN." >&2
-            echo "GitHub hasn't finished conflict analysis. Wait until mergeable status is known before retrying." >&2
-            exit 2
-        fi
-        if [ "$_mergeable" = "CONFLICTING" ]; then
-            echo "BLOCKED: PR #$_pr_num has merge conflicts. Resolve before merging." >&2
-            exit 2
-        fi
+    # PR number can appear AFTER a flag (`gh pr merge --admin 123` is valid
+    # gh syntax), so scan all args after 'merge', skipping flags — an
+    # anchored "merge <digits>" match would miss it and silently fall back
+    # to the current branch's PR, checking/merging the WRONG one
+    # (2026-07-10 review). Drop quoted substrings first so digits inside
+    # e.g. --subject "fix 123" can't false-match (mirrors the Python hook's
+    # shlex tokenizer).
+    _after="${CMD#*gh pr merge}"
+    _after=$(printf '%s' "$_after" | sed -E "s/'[^']*'//g; s/\"[^\"]*\"//g")
+    # Stop at the first shell separator — a chained `; echo 456` must not
+    # let its digits stand in for this merge's PR (2026-07-10 review).
+    # Quotes were dropped above, so any remaining separator is real. A
+    # newline ends the command too, so cut there first.
+    _after="${_after%%$'\n'*}"
+    _after="${_after%%[;&|]*}"
+    _pr_num=""
+    for _tok in $_after; do
+        case "$_tok" in
+            -*) continue ;;                       # flag — never the PR number
+            \#[0-9]*) _tok="${_tok#\#}" ;;        # #123 → 123
+            *pull/[0-9]*)
+                _tok=$(printf '%s' "$_tok" | grep -oE 'pull/[0-9]+' \
+                    | grep -oE '[0-9]+' | head -1) ;;
+        esac
+        case "$_tok" in
+            *[!0-9]*|'') continue ;;              # not a pure integer
+            *) _pr_num="$_tok"; break ;;
+        esac
+    done
+    _repo_args=()
+    _repo=$(echo "$CMD" | grep -oP -- '--repo \K\S+' || true)
+    [ -n "$_repo" ] && _repo_args=(--repo "$_repo")
+    if [ -z "$_pr_num" ]; then
+        # No number in the command — resolve the current branch's open PR
+        _pr_num=$(gh pr view --json number --jq '.number' 2>/dev/null || true)
     fi
-    echo "⚠️  STOP: gh pr merge detected (mergeable=$_mergeable). Have you received explicit user approval for this merge?" >&2
+    if [ -z "$_pr_num" ]; then
+        echo "BLOCKED: cannot resolve which PR this merges (no number in the command, no open PR for the current branch)." >&2
+        echo "Specify the PR number: gh pr merge <N> --squash --admin" >&2
+        exit 2
+    fi
+    _mergeable=$(gh pr view "$_pr_num" "${_repo_args[@]}" --json mergeable --jq '.mergeable' 2>/dev/null)
+    if [ "$_mergeable" = "UNKNOWN" ]; then
+        echo "BLOCKED: PR #$_pr_num mergeable status is UNKNOWN." >&2
+        echo "GitHub hasn't finished conflict analysis. Wait until mergeable status is known before retrying." >&2
+        exit 2
+    fi
+    if [ "$_mergeable" = "CONFLICTING" ]; then
+        echo "BLOCKED: PR #$_pr_num has merge conflicts. Resolve before merging." >&2
+        exit 2
+    fi
+    echo "⚠️  STOP: gh pr merge detected (PR #$_pr_num, mergeable=$_mergeable). Have you received explicit user approval for this merge?" >&2
     exit 0
 fi

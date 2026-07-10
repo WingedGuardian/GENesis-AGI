@@ -72,13 +72,12 @@ SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-backup]"
 
-# Source secrets for backup passphrase (cron doesn't inherit shell env)
-if [ -f "$SECRETS_FILE" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$SECRETS_FILE"
-    set +a
-fi
+# Load secrets for the backup passphrase (cron doesn't inherit shell
+# env) WITHOUT shell-evaluating the file — `source` would execute any
+# command substitution embedded in a value.
+# shellcheck source=scripts/lib/load_secrets.sh
+source "$_SCRIPT_DIR/lib/load_secrets.sh"
+load_secrets_file "$SECRETS_FILE"
 
 log() { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 

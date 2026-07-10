@@ -134,8 +134,12 @@ Genesis uses an environment-file approach for secrets:
   only).
 - The `genesis.env` module (`src/genesis/env.py`) resolves the secrets path
   at runtime, with support for `SECRETS_PATH` environment variable override.
-- A `detect-secrets` scan runs as part of the public release process to verify
-  no secrets leak into the distribution repo.
+- A `detect-secrets` scan and a blocking `gitleaks` scan (`.gitleaks.toml`
+  rules: API keys plus install-specific IP/hostname patterns) run in CI on
+  every PR to verify no secrets leak into the public repo.
+- Scripts read `secrets.env` as data (`scripts/lib/load_secrets.sh` or the
+  Python dotenv reader) — never `source` it; a sourced value containing
+  `$(...)` would execute.
 
 **Rules:**
 - Never commit API keys, tokens, or credentials to version control.

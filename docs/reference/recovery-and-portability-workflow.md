@@ -25,7 +25,8 @@ documentation.
 
 The public repo (`GENesis-AGI`) is the primary repo, so there is no separate
 "strip and stage" step. Leak protection is enforced on every PR by the
-`leak-detector` job in `.github/workflows/ci.yml` (detect-secrets + portability
+`leak-detector` job in `.github/workflows/ci.yml` (detect-secrets + gitleaks
+with the repo's `.gitleaks.toml` PII/infrastructure rules + portability
 + email scans). Releases are cut by tagging `vX.Y` on `main` and publishing a
 GitHub Release from the matching `CHANGELOG.md` section.
 
