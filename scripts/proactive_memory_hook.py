@@ -1681,6 +1681,59 @@ async def _run(prompt: str, session_id: str = "") -> None:
         procedure_repeat=ws_stats["procedure_repeat"],
     )
 
+    # ── Ambient session-awareness fold (WS-C PR1, record-only) ─────
+    # Folds the prompt embedding (already computed above) into a
+    # session-theme EMA and records drift-trigger fires in the
+    # session's session_theme.json. No spawn (PR2), no output. Runs
+    # after all stdout AND all existing metrics so it can never affect
+    # either; placed outside the total_ms window on purpose — new work
+    # must not skew the H-1 latency baselines.
+    _ambient_fold(vector, session_id, prompt, recent_files)
+
+
+def _turn_pivoted(session_id: str) -> bool:
+    """True if the intent trail recorded a pivot on the current turn."""
+    try:
+        trail = _load_trail(session_id)
+        pivots = trail.get("pivots", [])
+        return bool(pivots) and pivots[-1].get("at_msg") == trail.get("msg_count")
+    except Exception:
+        return False
+
+
+def _ambient_fold(
+    vector: list[float] | None,
+    session_id: str,
+    prompt: str,
+    recent_files: list[str],
+) -> None:
+    """Fail-open bridge into genesis.session_awareness (WS-C).
+
+    Skips harness envelopes (not genuine user turns) and embed-less
+    turns. GENESIS_SESSION_AWARENESS_DISABLED=1 is the ops kill switch;
+    dispatched sessions never get here (GENESIS_CC_SESSION guard at
+    import). Must never raise or print.
+    """
+    try:
+        if (
+            not vector
+            or not session_id
+            or os.environ.get("GENESIS_SESSION_AWARENESS_DISABLED") == "1"
+            or _is_harness_envelope(prompt)
+        ):
+            return
+        from genesis.session_awareness import hook_fold
+
+        hook_fold(
+            session_id=session_id,
+            vector=vector,
+            prompt_keywords=_extract_keywords(prompt),
+            file_keywords=_keywords_from_files(recent_files) if recent_files else [],
+            pivoted=_turn_pivoted(session_id),
+        )
+    except Exception:
+        pass  # Ambient layer must never affect the hook
+
 
 def main() -> None:
     """Hook entry point."""
