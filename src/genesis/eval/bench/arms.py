@@ -87,10 +87,24 @@ BENCH_MEMORY_DISALLOW: list[str] = [
 # Appended to the task prompt for BOTH arms identically (fairness: neither
 # arm gets extra output guidance the other lacks). CCOutput's text is the
 # session's final message — the judge grades exactly that.
+#
+# The out-of-bounds rule exists because the arms run on Genesis's own host:
+# in the 2026-07-10 pilot the BARE arm answered a recall task by running
+# `find / -iname "*CLAUDE.md"`, grepping ~/genesis, and reading a CC-memory
+# backup file — context contamination through the filesystem, caught only by
+# the judge-rationale audit. A prompt rule is the v1 mitigation (both arms,
+# identically); host-level sandboxing (e.g. bwrap) is the principled fix and
+# is tracked for the >=20-task scale-up. The synchronous-work rule exists
+# because both arms once returned "waiting for a workflow" placeholders as
+# their final message (background work outliving the session).
 TASK_ENVELOPE = (
     "\n\nDeliver your complete final answer in your final message — it is "
     "the only output that will be evaluated. Do not end with a question or "
-    "an offer to continue."
+    "an offer to continue. Work synchronously: do not launch background "
+    "tasks or workflows whose results would arrive after your final "
+    "message. Do not read or search files outside your own working "
+    "directory — the host machine's other files are out of bounds, and "
+    "answers looked up from them are disqualified."
 )
 
 #: Genesis-arm system-prompt addendum (styled after direct_session's profile
