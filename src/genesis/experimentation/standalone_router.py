@@ -76,7 +76,13 @@ class StandaloneLiteLLMRouter:
         *,
         config: RoutingConfig | None = None,
         delegate: LiteLLMDelegate | None = None,
+        fallback_providers: tuple[str, ...] = (),
     ) -> None:
+        """``fallback_providers``: tried IN ORDER when the primary fails
+        (one attempt each — a hanging provider must not eat retry budget;
+        observed 2026-07-09: nvidia-nim hard-timing out at 120s × every
+        retry stalled a bench judge for 13 minutes). Without fallbacks the
+        legacy same-provider retry behavior is unchanged."""
         # Load secrets.env into the environment so litellm finds provider API
         # keys (the same hook the offline calibration CLI uses). Idempotent.
         from genesis.eval.reflection_golden_set import _ensure_secrets
@@ -85,14 +91,21 @@ class StandaloneLiteLLMRouter:
 
         if config is None:
             config = load_config(_default_config_path())
-        provider_cfg = config.providers.get(provider_name)
-        if provider_cfg is None:
-            raise ValueError(
-                f"unknown provider {provider_name!r} — available: "
-                f"{', '.join(sorted(config.providers))}"
-            )
-        self._provider_name = provider_name
-        self._model_id = provider_cfg.model_id
+
+        def _resolve(name: str) -> tuple[str, str]:
+            cfg = config.providers.get(name)
+            if cfg is None:
+                raise ValueError(
+                    f"unknown provider {name!r} — available: "
+                    f"{', '.join(sorted(config.providers))}"
+                )
+            return name, cfg.model_id
+
+        self._provider_name, self._model_id = _resolve(provider_name)
+        self._chain: list[tuple[str, str]] = [
+            (self._provider_name, self._model_id),
+            *(_resolve(name) for name in fallback_providers),
+        ]
         self._delegate = delegate or LiteLLMDelegate(config)
 
     async def route_call(
@@ -101,6 +114,9 @@ class StandaloneLiteLLMRouter:
         messages: list[dict],
         **kwargs,
     ) -> StandaloneRoutingResult:
+        if len(self._chain) > 1:
+            return await self._route_call_chain(call_site_id, messages, **kwargs)
+
         result = None
         for attempt in range(_MAX_RETRIES + 1):
             result = await self._delegate.call(
@@ -133,6 +149,42 @@ class StandaloneLiteLLMRouter:
             content=result.content,
             model_id=self._model_id,
             provider_used=self._provider_name,
+            error=getattr(result, "error", None),
+        )
+
+    async def _route_call_chain(
+        self,
+        call_site_id: str,
+        messages: list[dict],
+        **kwargs,
+    ) -> StandaloneRoutingResult:
+        """Fallback-chain mode: ONE attempt per provider, advance on any
+        failure. A hung/down provider costs one timeout, not a retry budget."""
+        result = None
+        provider = model_id = ""
+        for provider, model_id in self._chain:
+            result = await self._delegate.call(
+                provider=provider,
+                model_id=model_id,
+                messages=messages,
+                **kwargs,
+            )
+            if result.success:
+                break
+            logger.info(
+                "standalone %s via %s failed (%s); advancing chain",
+                call_site_id, provider, result.error,
+            )
+        if not result.success:
+            logger.warning(
+                "standalone route_call failed on every chain provider "
+                "(%s; last=%s): %s", call_site_id, provider, result.error,
+            )
+        return StandaloneRoutingResult(
+            success=result.success,
+            content=result.content,
+            model_id=model_id,
+            provider_used=provider,
             error=getattr(result, "error", None),
         )
 

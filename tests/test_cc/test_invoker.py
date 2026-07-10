@@ -234,6 +234,33 @@ def test_build_env_no_overrides_is_noop(invoker):
     assert env["GENESIS_CC_SESSION"] == "1"
 
 
+def test_parse_result_dict_ignores_auxiliary_model_for_downgrade(invoker):
+    """modelUsage lists CC's auxiliary haiku calls (titles/topics) alongside
+    the main model, in arbitrary dict order. The main model = highest tier
+    present; an aux haiku listed FIRST must not read as a downgrade
+    (false-positived the bench fairness check, 2026-07-09)."""
+    result_data = {
+        "result": "ok", "session_id": "s", "usage": {},
+        "modelUsage": {"claude-haiku-4-5-20251001": {}, "claude-sonnet-5": {}},
+    }
+    out = invoker._parse_result_dict(
+        result_data, CCInvocation(prompt="x", model=CCModel.SONNET), 100,
+    )
+    assert out.downgraded is False
+    assert "sonnet" in out.model_used
+
+
+def test_parse_result_dict_detects_genuine_downgrade(invoker):
+    result_data = {
+        "result": "ok", "session_id": "s", "usage": {},
+        "modelUsage": {"claude-haiku-4-5-20251001": {}},
+    }
+    out = invoker._parse_result_dict(
+        result_data, CCInvocation(prompt="x", model=CCModel.SONNET), 100,
+    )
+    assert out.downgraded is True
+
+
 def test_build_env_sets_bash_allowlist(invoker):
     """Steward-style invocations export GENESIS_BASH_ALLOWLIST for the hook."""
     inv = CCInvocation(prompt="hello", bash_allowlist=("gh",))

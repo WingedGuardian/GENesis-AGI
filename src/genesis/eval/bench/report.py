@@ -102,7 +102,7 @@ def render_console(report: BenchReport) -> str:
     lines.append(_fmt_stat(report.pass_winrate))
     if report.prod_delta:
         clean = report.prod_delta.get("clean")
-        mark = "CLEAN" if clean else "!!! DELTA DETECTED !!!"
+        mark = "CLEAN" if clean else "DELTA — attribution required (live prod has ambient writes)"
         lines.append(f"prod isolation probe: {mark}")
         for d in report.prod_delta.get("deltas", []):
             lines.append(f"    {d}")

@@ -19,11 +19,13 @@ from genesis.eval.bench.runner import BenchBusyError, run_bench
 FIXTURES = pathlib.Path(__file__).parent / "bench_fixtures" / "synthetic_tasks.jsonl"
 
 
-def _cc_output(text: str) -> CCOutput:
+def _cc_output(text: str, downgraded: bool = False) -> CCOutput:
     return CCOutput(
-        session_id="s", text=text, model_used="sonnet",
+        session_id="s", text=text,
+        model_used="haiku" if downgraded else "sonnet",
         cost_usd=0.01, input_tokens=100, output_tokens=50,
         duration_ms=2000, exit_code=0,
+        model_requested="sonnet", downgraded=downgraded,
     )
 
 
@@ -207,10 +209,34 @@ class TestRunBench:
         assert all(p.skipped for p in report.pairs)
         assert any("no complete pairs" in n for n in report.notes)
 
+    async def test_model_downgrade_skips_pair(self, bench_env):
+        """A quota-downgraded arm breaks fairness — infra skip, not a score."""
+        async def behavior(inv, arm):
+            return _cc_output(f"{arm} answer", downgraded=(arm == "bare"))
+
+        report = await _run(
+            bench_env,
+            invoker=_FakeInvoker(behavior=behavior, snapshot_writer=_snapshot_writer),
+        )
+        assert all(p.bare.skipped for p in report.pairs)
+        assert all("model downgrade" in p.bare.skip_reason for p in report.pairs)
+
     async def test_arm_degraded_positive_control(self, bench_env):
         """Genesis arm 'runs' but nothing writes the snapshot → INVALID."""
         report = await _run(
             bench_env, invoker=_FakeInvoker(snapshot_writer=None),
+        )
+        assert any("INVALID RUN (arm_degraded)" in n for n in report.notes)
+
+    async def test_arm_degraded_not_masked_by_judge_failure(self, bench_env):
+        """Regression (shakedown 2026-07-09): a judge outage skipped every
+        pair AFTER the arms ran, which set genesis.skipped=True and silently
+        disarmed the positive control. The pre-judge ran-state must keep it
+        armed: judge dead + no snapshot writes → still INVALID."""
+        report = await _run(
+            bench_env,
+            invoker=_FakeInvoker(snapshot_writer=None),
+            router=_FakeRouter(fail=True),
         )
         assert any("INVALID RUN (arm_degraded)" in n for n in report.notes)
 

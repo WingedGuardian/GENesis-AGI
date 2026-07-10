@@ -992,7 +992,22 @@ class CCInvoker:
         """Build CCOutput from a parsed result dict."""
         usage = result_data.get("usage", {})
         model_usage = result_data.get("modelUsage", {})
-        model_name = next(iter(model_usage), str(inv.model))
+        # modelUsage lists EVERY model the session touched, including CC's
+        # auxiliary haiku calls (title/topic generation) — and dict order is
+        # not tier order. Taking the first key false-positived downgrade
+        # detection whenever an auxiliary call was listed before the main
+        # model (observed 2026-07-09: {haiku, sonnet-5} on a sonnet session).
+        # The MAIN conversation model is the highest tier present.
+        model_name = (
+            max(
+                model_usage,
+                key=lambda name: self._TIER_RANK.get(
+                    CCModel.from_full_name(name), -1,
+                ),
+            )
+            if model_usage
+            else str(inv.model)
+        )
         downgraded = self._detect_downgrade(inv.model, model_name)
         if downgraded:
             logger.warning(

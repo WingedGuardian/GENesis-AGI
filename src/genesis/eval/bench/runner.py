@@ -113,10 +113,23 @@ async def _run_arm(
             task_id=task.id, arm=arm, output_text="",
             skipped=True, skip_reason="infra: empty output",
         )
+    if getattr(output, "downgraded", False):
+        # Fairness violation: this arm ran a lower tier than requested (e.g.
+        # a quota downgrade). The pair can't be compared — infra skip.
+        return BenchArmOutcome(
+            task_id=task.id, arm=arm, output_text="",
+            model_used=output.model_used,
+            skipped=True,
+            skip_reason=(
+                f"infra: model downgrade ({output.model_requested} → "
+                f"{output.model_used}) — fairness requires identical models"
+            ),
+        )
     return BenchArmOutcome(
         task_id=task.id,
         arm=arm,
         output_text=output.text,
+        model_used=output.model_used,
         duration_s=output.duration_ms / 1000.0,
         cost_usd=output.cost_usd,
         input_tokens=output.input_tokens,
@@ -140,14 +153,14 @@ async def _judge_arm(scorer, task: BenchTask, outcome: BenchArmOutcome) -> Bench
     if detail_obj.get("error"):
         return BenchArmOutcome(
             task_id=outcome.task_id, arm=outcome.arm,
-            output_text=outcome.output_text,
+            output_text=outcome.output_text, model_used=outcome.model_used,
             duration_s=outcome.duration_s, cost_usd=outcome.cost_usd,
             input_tokens=outcome.input_tokens, output_tokens=outcome.output_tokens,
             skipped=True, skip_reason=f"judge: {detail_obj['error']}",
         )
     return BenchArmOutcome(
         task_id=outcome.task_id, arm=outcome.arm,
-        output_text=outcome.output_text,
+        output_text=outcome.output_text, model_used=outcome.model_used,
         duration_s=outcome.duration_s, cost_usd=outcome.cost_usd,
         input_tokens=outcome.input_tokens, output_tokens=outcome.output_tokens,
         judge_passed=passed, judge_score=score, judge_detail=detail,
@@ -297,9 +310,19 @@ async def run_bench(
                 StandaloneLiteLLMRouter,
             )
 
-            router = StandaloneLiteLLMRouter(DEFAULT_JUDGE_PROVIDER)
+            # Mirror the runtime `judge` call site's chain (free NIM first,
+            # then paid OpenRouter) — one attempt per provider, so a hanging
+            # provider costs one timeout, not the whole judge budget.
+            router = StandaloneLiteLLMRouter(
+                DEFAULT_JUDGE_PROVIDER,
+                fallback_providers=(
+                    "openrouter-deepseek-v4",
+                    "openrouter-deepseek-v4-flash",
+                ),
+            )
         scorer = LLMJudgeScorer(router=router)
 
+        genesis_ran = False  # pre-judge: did the Genesis ARM itself succeed?
         for i, task in enumerate(tasks, start=1):
             logger.info("bench: task %d/%d %s (%s)", i, len(tasks), task.id, task.category)
             bare_inv = build_bare_arm_invocation(
@@ -312,6 +335,9 @@ async def run_bench(
                 _run_arm(invoker, bare_inv, task, ARM_BARE),
                 _run_arm(invoker, genesis_inv, task, ARM_GENESIS),
             )
+            # Captured BEFORE judging — a judge failure must not mask the
+            # arm-degradation positive control below.
+            genesis_ran = genesis_ran or not genesis_out.skipped
             bare_out = await _judge_arm(scorer, task, bare_out)
             genesis_out = await _judge_arm(scorer, task, genesis_out)
             pair = BenchPair(task=task, bare=bare_out, genesis=genesis_out)
@@ -324,10 +350,9 @@ async def run_bench(
             report.pairs.append(pair)
 
         # Positive control — the Genesis arm must have exercised its memory
-        # server (recall emits J-9 events into the SNAPSHOT). Checked against
-        # tasks where the arm actually ran, so an all-infra-skip run doesn't
-        # false-alarm on top of its real problem.
-        genesis_ran = any(not p.genesis.skipped for p in report.pairs)
+        # server (recall emits J-9 events into the SNAPSHOT). Uses the
+        # PRE-judge ran state accumulated in the loop, so an all-infra-skip
+        # run doesn't false-alarm and a judge outage doesn't mask this.
         events_after = count_snapshot_eval_events(snapshot)
         if genesis_ran and events_after <= events_before:
             report.notes.append(
@@ -341,8 +366,18 @@ async def run_bench(
         if probe:
             report.prod_delta = probe.finish()
             if not report.prod_delta.get("clean", False):
+                # On a LIVE system the probe is evidence, not a verdict: the
+                # server's ambient activity (session extraction, concurrent
+                # recalls, observations) moves these counters on its own
+                # (measured 2026-07-09: +17 episodic points in a 13-min
+                # window with the bench making ZERO recalls). Attribute
+                # before acting: the dispositive bench-side checks are the
+                # snapshot positive control + the writebacks seam + tool
+                # policy. A delta during a genuinely quiet window IS a breach.
                 report.notes.append(
-                    "PROD DELTA DETECTED — isolation breached, see prod_delta."
+                    "PROD DELTA observed — requires attribution (live prod "
+                    "has ambient writes; see prod_delta and compare against "
+                    "concurrent server activity before calling it a breach)."
                 )
 
         complete = [p for p in report.pairs if not p.skipped]
