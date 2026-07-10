@@ -1,6 +1,7 @@
 """Process singleton guard using fcntl file locking."""
 
 import contextlib
+import errno
 import fcntl
 import logging
 import os
@@ -57,7 +58,16 @@ class ProcessLock:
             return False
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as exc:
+            if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                # I/O-level failure, not contention. Still report "locked":
+                # callers use this to avoid booting a duplicate runtime, and
+                # a dual runtime is worse than a skipped fallback start —
+                # but say so instead of silently conflating the two.
+                log.warning(
+                    "Lock probe for %s inconclusive (errno=%s) — "
+                    "treating as locked", name, exc.errno,
+                )
             return True
         else:
             fcntl.flock(fd, fcntl.LOCK_UN)

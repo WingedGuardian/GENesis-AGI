@@ -263,6 +263,12 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         ev_loop.add_signal_handler(sig, _signal_handler)
 
+    # Re-probe before polling starts: on a simultaneous co-start (e.g. a
+    # deploy restarting both units) the __main__ probe can pass before the
+    # server acquires its lock; by the end of our ~90s bootstrap a co-started
+    # server definitely holds it. Exiting here means we never poll.
+    await _late_yield_check(runtime)
+
     await adapter.start()
 
     # Create TopicManager after start() — needs adapter._app.bot
@@ -358,6 +364,24 @@ async def main():
     await adapter.stop()
     await runtime.shutdown()
     log.info("Bridge stopped.")
+
+
+async def _late_yield_check(runtime, pid_dir=None) -> None:
+    """Second yield probe, run after bootstrap and before adapter.start().
+
+    Closes the co-start race the __main__ probe can't see: if the server was
+    started in the window since that probe, shut the runtime down cleanly and
+    exit 200 BEFORE this process ever issues a getUpdates poll.
+    """
+    from genesis.util.process_lock import EXIT_ALREADY_RUNNING, ProcessLock
+
+    if ProcessLock.is_locked("genesis-server", pid_dir=pid_dir):
+        log.critical(
+            "genesis-server started during bridge bootstrap — yielding "
+            "before polling begins (exit 200)"
+        )
+        await runtime.shutdown()
+        sys.exit(EXIT_ALREADY_RUNNING)
 
 
 def _yield_to_server(pid_dir=None) -> None:

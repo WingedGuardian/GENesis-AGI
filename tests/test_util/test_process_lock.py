@@ -179,3 +179,21 @@ def test_is_locked_vanishing_file_is_free(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "open", _vanish)
     assert ProcessLock.is_locked("gone", pid_dir=tmp_path) is False
+
+
+def test_is_locked_io_error_reports_locked_with_warning(tmp_path, monkeypatch, caplog):
+    """Non-contention flock failures (EIO etc.) read as locked — refusing a
+    fallback start is safer than risking a dual runtime — but loudly."""
+    import errno as _errno
+    import fcntl
+    import logging
+
+    (tmp_path / "weird.lock").write_text("1")
+
+    def _eio(*a, **kw):
+        raise OSError(_errno.EIO, "io error")
+
+    monkeypatch.setattr(fcntl, "flock", _eio)
+    with caplog.at_level(logging.WARNING):
+        assert ProcessLock.is_locked("weird", pid_dir=tmp_path) is True
+    assert any("inconclusive" in r.message for r in caplog.records)

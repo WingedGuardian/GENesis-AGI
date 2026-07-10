@@ -113,3 +113,57 @@ class TestYieldToServer:
         from genesis.channels.bridge import _yield_to_server
 
         _yield_to_server(pid_dir=tmp_path)  # must not raise
+
+
+class TestLateYieldCheck:
+    """The pre-polling re-probe: a server that started during the bridge's
+    ~90s bootstrap is detected before the first getUpdates poll."""
+
+    async def test_shuts_down_and_exits_200_when_server_appeared(self, tmp_path):
+        import subprocess
+        import sys as _sys
+        import textwrap
+        import time
+        from unittest.mock import AsyncMock
+
+        import pytest
+
+        from genesis.channels.bridge import _late_yield_check
+        from genesis.util.process_lock import EXIT_ALREADY_RUNNING
+
+        holder = subprocess.Popen(
+            [
+                _sys.executable,
+                "-c",
+                textwrap.dedent(f"""\
+                    import time
+                    from pathlib import Path
+                    from genesis.util.process_lock import ProcessLock
+                    with ProcessLock("genesis-server", pid_dir=Path("{tmp_path}")):
+                        time.sleep(30)
+                """),
+            ],
+        )
+        try:
+            lock_path = tmp_path / "genesis-server.lock"
+            for _ in range(100):
+                if lock_path.exists() and lock_path.read_text().strip():
+                    break
+                time.sleep(0.1)
+            runtime = AsyncMock()
+            with pytest.raises(SystemExit) as exc:
+                await _late_yield_check(runtime, pid_dir=tmp_path)
+            assert exc.value.code == EXIT_ALREADY_RUNNING
+            runtime.shutdown.assert_awaited_once()
+        finally:
+            holder.terminate()
+            holder.wait(timeout=10)
+
+    async def test_noop_when_server_absent(self, tmp_path):
+        from unittest.mock import AsyncMock
+
+        from genesis.channels.bridge import _late_yield_check
+
+        runtime = AsyncMock()
+        await _late_yield_check(runtime, pid_dir=tmp_path)
+        runtime.shutdown.assert_not_awaited()
