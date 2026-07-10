@@ -30,7 +30,13 @@ logger = logging.getLogger(__name__)
 
 def _increment_retrieved(qdrant, results) -> None:
     """Increment retrieved_count for results not tracked by HybridRetriever."""
+    from genesis.env import memory_writebacks_off
     from genesis.qdrant import collections as qdrant_ops
+
+    # Eval-harness seam: frozen-snapshot bench recalls must not mutate the
+    # shared prod Qdrant's usage payloads. See env.memory_writebacks_off.
+    if memory_writebacks_off():
+        return
 
     for r in results:
         for coll in ("episodic_memory", "knowledge_base"):
@@ -729,8 +735,12 @@ async def memory_core_facts(
     scored.sort(key=lambda x: x[1], reverse=True)
     top = scored[:limit]
 
-    # Track retrieval so activation scores reflect actual usage
-    if top:
+    # Track retrieval so activation scores reflect actual usage.
+    # (Suppressed under the eval bench's frozen-snapshot mode — see
+    # env.memory_writebacks_off; shared prod Qdrant must stay unmutated.)
+    from genesis.env import memory_writebacks_off
+
+    if top and not memory_writebacks_off():
         try:
             for item, _ in top:
                 mid = item["memory_id"]

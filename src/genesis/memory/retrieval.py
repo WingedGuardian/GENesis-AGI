@@ -1171,6 +1171,14 @@ class HybridRetriever:
         candidates. Every write is individually swallowed — a failed
         write-back must never block returning results.
         """
+        # Eval-harness seam: a frozen-snapshot bench must not mutate usage
+        # tracking — neither prod Qdrant payloads (shared instance; only
+        # SQLite is redirected) nor its own snapshot (earlier tasks would
+        # re-rank memories for later ones). See env.memory_writebacks_off.
+        from genesis.env import memory_writebacks_off
+
+        if memory_writebacks_off():
+            return
         # 11. Increment retrieved_count + stamp last_retrieved_at
         for mid in top:
             qdrant_hit = qdrant_by_id.get(mid)
