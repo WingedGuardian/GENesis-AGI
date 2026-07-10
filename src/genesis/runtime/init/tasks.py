@@ -163,8 +163,8 @@ async def init(rt: GenesisRuntime) -> None:
             logger.warning("Task MCP tools not available")
 
         # Crash recovery
+        from genesis.db.crud import task_states as _task_states
         try:
-            from genesis.db.crud import task_states as _task_states
             # Reset stale 'dispatching' claims (a crash between the atomic claim
             # and the first phase) BEFORE recover_incomplete, so they return to
             # pending and re-dispatch cleanly instead of being refused.
@@ -178,7 +178,6 @@ async def init(rt: GenesisRuntime) -> None:
             logger.error("Task crash recovery failed", exc_info=True)
 
         # Background polling loop for observation-based dispatch
-        from genesis.db.crud import task_states as _task_states_poll
         from genesis.util.tasks import tracked_task
 
         async def _dispatch_poll_loop() -> None:
@@ -188,7 +187,7 @@ async def init(rt: GenesisRuntime) -> None:
                     # Reap stale 'dispatching' claims each cycle (own job key so
                     # a reaper failure is visible separately from the dispatch).
                     try:
-                        reaped = await _task_states_poll.recover_stale_dispatching(
+                        reaped = await _task_states.recover_stale_dispatching(
                             rt._db,
                         )
                         if reaped:
