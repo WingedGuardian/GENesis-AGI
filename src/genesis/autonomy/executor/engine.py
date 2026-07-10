@@ -129,10 +129,14 @@ class CCSessionExecutor:
         # the resume-vs-restart decision happen AFTER the plan read below, so a
         # task that fails its plan read is never claimed into 'dispatching'.
         db_phase_str = task.get("current_phase", "pending")
-        _RESUMABLE_PHASES = {"executing", "verifying", "blocked"}
-        # Pre-execution phases (no code run / nothing delivered yet) plus a
-        # paused task recovered at startup: safe to re-run fresh, never refuse.
-        _RESTARTABLE_PHASES = {"observing", "reviewing", "planning", "paused"}
+        # 'paused' resumes from persisted steps: PAUSED is only ever reached
+        # mid-EXECUTING (after >=1 step ran), so re-running it fresh would
+        # silently redo completed steps and re-spend cost. Resume + re-pause at
+        # the first checkpoint via _paused_tasks instead.
+        _RESUMABLE_PHASES = {"executing", "verifying", "blocked", "paused"}
+        # Pre-execution phases only (nothing decomposed / no code run yet):
+        # safe to re-run fresh, never refuse.
+        _RESTARTABLE_PHASES = {"observing", "reviewing", "planning"}
         if (
             db_phase_str != TaskPhase.PENDING.value
             and db_phase_str not in _RESUMABLE_PHASES
@@ -207,9 +211,8 @@ class CCSessionExecutor:
                 task_id, db_phase_str,
             )
         else:
-            # Restartable pre-execution phase (observing/reviewing/planning) or
-            # a paused task recovered at startup: re-run fresh from PENDING (a
-            # paused task re-pauses at the first checkpoint via _paused_tasks).
+            # Restartable pre-execution phase (observing/reviewing/planning):
+            # crashed before anything was decomposed/run, so re-run fresh.
             resuming = False
             self._active_tasks[task_id] = TaskPhase.PENDING
 
