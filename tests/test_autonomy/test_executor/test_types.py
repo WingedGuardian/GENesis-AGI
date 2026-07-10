@@ -118,3 +118,18 @@ class TestExecutionTrace:
         assert t.total_cost_usd == 0.0
         assert t.step_results == []
         assert t.retrospective_id is None
+
+
+class TestDispatchingPhase:
+    """WS-C: the transient DISPATCHING claim phase and its transitions."""
+
+    def test_pending_can_transition_to_dispatching(self) -> None:
+        assert TaskPhase.DISPATCHING in VALID_TRANSITIONS[TaskPhase.PENDING]
+
+    def test_dispatching_transitions_to_observing_and_pending(self) -> None:
+        # OBSERVING = won claim proceeds; PENDING = reaper reset
+        assert TaskPhase.OBSERVING in VALID_TRANSITIONS[TaskPhase.DISPATCHING]
+        assert TaskPhase.PENDING in VALID_TRANSITIONS[TaskPhase.DISPATCHING]
+
+    def test_dispatching_is_not_terminal(self) -> None:
+        assert VALID_TRANSITIONS[TaskPhase.DISPATCHING] != set()

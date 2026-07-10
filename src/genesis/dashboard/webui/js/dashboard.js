@@ -997,7 +997,7 @@
         },
         phaseColor(phase) {
           const colors = {
-            pending: '#616161', observing: '#78909c', reviewing: '#7e57c2',
+            pending: '#616161', dispatching: '#546e7a', observing: '#78909c', reviewing: '#7e57c2',
             planning: '#9e9e9e', executing: '#2196F3', verifying: '#ab47bc',
             synthesizing: '#26a69a', delivering: '#66bb6a', completed: '#66bb6a',
             failed: '#ef9a9a', cancelled: '#9e9e9e', blocked: '#ffa726', paused: '#ffa726',
