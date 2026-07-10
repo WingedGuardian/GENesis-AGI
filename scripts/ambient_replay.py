@@ -176,6 +176,7 @@ async def replay(args) -> dict:
     genuine = 0
     trace: list[dict] = []
     fires: list[dict] = []
+    t_mention: int | None = None  # first turn the target entity is in the ledger
     as_of_cutoff: str | None = None if args.as_of in (None, "auto") else args.as_of
 
     db = qdrant = None
@@ -239,6 +240,15 @@ async def replay(args) -> dict:
             }
             trace.append(row)
 
+            # Track first turn the target entity enters the ledger
+            # (t_mention anchors the E4 acceptance window).
+            if (
+                args.target_entity
+                and t_mention is None
+                and args.target_entity in state.get("entities", {})
+            ):
+                t_mention = genuine
+
             if fired:
                 record_fire(state, now_iso)
                 fire_rec: dict = {"turn": genuine, "ts": now_iso}
@@ -246,6 +256,7 @@ async def replay(args) -> dict:
                     from genesis.session_awareness.accumulator import top_entities
                     from genesis.session_awareness.ranking import rank_candidates
 
+                    entity_shadow: list[dict] = []
                     candidates = await rank_candidates(
                         ema=state["ema"],
                         entity_query=" ".join(top_entities(state, 8)),
@@ -253,16 +264,30 @@ async def replay(args) -> dict:
                         qdrant_client=qdrant,
                         embedding_provider=provider,
                         created_before=as_of_cutoff,
+                        entity_lane=args.entity_lane,
+                        entity_shadow_out=entity_shadow,
                     )
                     fire_rec["candidates"] = [
                         {
                             "memory_id": c["memory_id"],
                             "score": round(c["score"], 4),
                             "lanes": c["lanes"],
+                            "entity_path": c.get("entity_path"),
                             "preview": c["preview"][:60],
                         }
                         for c in candidates
                     ]
+                    if entity_shadow:
+                        fire_rec["entity_shadow"] = [
+                            {
+                                "memory_id": s["memory_id"],
+                                "path_score": round(
+                                    s["entity_path"]["path_score"], 4
+                                ),
+                                "already_candidate": s["already_candidate"],
+                            }
+                            for s in entity_shadow
+                        ]
                 fires.append(fire_rec)
     finally:
         if db is not None:
@@ -282,13 +307,51 @@ async def replay(args) -> dict:
         for f in fires:
             for c in f.get("candidates", []):
                 if c["memory_id"].startswith(args.target):
-                    hit = {"turn": f["turn"], "memory_id": c["memory_id"]}
+                    hit = {
+                        "turn": f["turn"],
+                        "memory_id": c["memory_id"],
+                        "lanes": c.get("lanes", []),
+                    }
                     break
             if hit:
                 break
         result["target"] = args.target
         result["target_hit"] = hit
-        result["PASS"] = bool(hit and hit["turn"] <= 10)
+        if args.target_entity:
+            # E4 criterion: a fire within [t_mention, t_mention+10]
+            # whose candidates include the target VIA the entity lane.
+            # (The mention window replaces the original fixed turn<=10 —
+            # mentions can arrive late in a session.) A miss with no
+            # fire in the window is a trigger-cadence failure, reported
+            # distinctly from a lane failure.
+            result["target_entity"] = args.target_entity
+            result["t_mention"] = t_mention
+            window_fires = [
+                f for f in fires
+                if t_mention is not None
+                and t_mention <= f["turn"] <= t_mention + 10
+            ]
+            entity_hit = None
+            for f in window_fires:
+                for c in f.get("candidates", []):
+                    if (
+                        c["memory_id"].startswith(args.target)
+                        and "entity" in c.get("lanes", [])
+                    ):
+                        entity_hit = {"turn": f["turn"], "memory_id": c["memory_id"]}
+                        break
+                if entity_hit:
+                    break
+            result["entity_hit"] = entity_hit
+            result["PASS"] = bool(entity_hit)
+            if not entity_hit:
+                result["fail_reason"] = (
+                    "no_mention" if t_mention is None
+                    else "no_fire_in_window" if not window_fires
+                    else "target_not_in_entity_lane"
+                )
+        else:
+            result["PASS"] = bool(hit and hit["turn"] <= 10)
     return result
 
 
@@ -297,6 +360,20 @@ def main() -> None:
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--transcript", default=None)
     parser.add_argument("--target", default=None, help="memory-id prefix to hunt")
+    parser.add_argument(
+        "--target-entity",
+        default=None,
+        help="normalized ledger keyword (e.g. 'omi'); switches PASS to the "
+             "E4 criterion: target reached VIA the entity lane within 10 "
+             "turns of the keyword first entering the ledger",
+    )
+    parser.add_argument(
+        "--entity-lane",
+        default=None,
+        choices=["off", "shadow", "live"],
+        help="override ranking.ENTITY_LANE_MODE for this replay (the "
+             "acceptance run uses 'live'; production stays shadow)",
+    )
     parser.add_argument("--max-genuine-turns", type=int, default=0)
     parser.add_argument("--no-retrieve", action="store_true")
     parser.add_argument(
@@ -329,6 +406,10 @@ def main() -> None:
     if args.target:
         print(f"TARGET {args.target}: hit={result['target_hit']} "
               f"PASS={result.get('PASS')}")
+        if args.target_entity:
+            print(f"  t_mention={result.get('t_mention')} "
+                  f"entity_hit={result.get('entity_hit')} "
+                  f"fail_reason={result.get('fail_reason')}")
 
 
 if __name__ == "__main__":
