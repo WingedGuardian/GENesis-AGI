@@ -268,3 +268,48 @@ async def test_decision_lane_dedup_with_vector_lane():
         )
     assert len(ranked) == 1
     assert ranked[0]["lanes"] == ["vector", "decision"]
+
+
+@pytest.mark.asyncio
+async def test_drift_overfetch_recovers_precutoff_rows_under_as_of():
+    """created_before replays post-filter drift rows; without over-fetch,
+    top rows that are all post-cutoff would silently starve the lane
+    (Codex P2, 2026-07-10). 4x fetch must refill to DRIFT_LANE_LIMIT."""
+    from genesis.session_awareness.ranking import DRIFT_LANE_LIMIT
+
+    cutoff = "2026-06-01T00:00:00+00:00"
+
+    def _dated(mid, created):
+        r = _rr(mid, confidence=1.0, mclass="fact")
+        r.payload["created_at"] = created
+        return r
+
+    # The top 5 drift hits post-date the cutoff; 12 valid older rows sit
+    # below them. Old behavior (limit=10, then filter) kept only 5.
+    rows = [_dated(f"new-{i}", "2026-07-01T00:00:00+00:00") for i in range(5)]
+    rows += [_dated(f"old-{i}", "2026-05-01T00:00:00+00:00") for i in range(12)]
+
+    qdrant = MagicMock()
+    qdrant.retrieve = MagicMock(return_value=[])
+    drift_mock = AsyncMock(return_value=rows)
+    with (
+        patch("genesis.qdrant.collections.search", side_effect=[[], []]),
+        patch("genesis.memory.drift.drift_recall", new=drift_mock),
+        patch(
+            "genesis.memory.retrieval._expired_candidate_ids",
+            new=AsyncMock(return_value=set()),
+        ),
+        patch(
+            "genesis.db.crud.memory_links.batch_link_counts",
+            new=AsyncMock(return_value={}),
+        ),
+    ):
+        ranked = await rank_candidates(
+            ema=EMA, entity_query="genesis voice", db=_db(),
+            qdrant_client=qdrant, embedding_provider=MagicMock(),
+            created_before=cutoff, entity_lane="off", top_n=30,
+        )
+    assert drift_mock.call_args.kwargs["limit"] == DRIFT_LANE_LIMIT * 4
+    drift_ids = [c["memory_id"] for c in ranked if "drift" in c["lanes"]]
+    assert len(drift_ids) == DRIFT_LANE_LIMIT  # lane refilled, not starved
+    assert all(mid.startswith("old-") for mid in drift_ids)
