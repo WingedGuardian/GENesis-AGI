@@ -30,6 +30,9 @@ EXPECTED_TABLES = [
     "message_queue",
     "cc_sessions",
     "memory_links",
+    "entities",
+    "entity_mentions",
+    "entity_links",
     "inbox_items",
     "deferred_work_queue",
     "pending_embeddings",
@@ -111,6 +114,7 @@ async def test_no_unexpected_tables(db):
         "ego_calibration_snapshots",  # measure-only ego calibration
         "otel_spans",  # tracing/spans backbone
         "cognitive_file_modifications",  # cognitive self-mod rollback ledger
+        "entities", "entity_mentions", "entity_links",  # entity layer (WS-H P2)
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"
