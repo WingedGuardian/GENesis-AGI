@@ -59,8 +59,8 @@ async def up(db: aiosqlite.Connection) -> None:
         await _ensure_column(db, "knowledge_units")
         placeholders = ",".join("?" * len(_FIRST_PARTY_KU_PIPELINES))
         await db.execute(
-            "UPDATE knowledge_units SET origin_class = CASE "
-            f"  WHEN source_pipeline IN ({placeholders}) THEN 'first_party' "  # noqa: S608 - placeholders for a fixed literal tuple
+            "UPDATE knowledge_units SET origin_class = CASE "  # noqa: S608 - literal SQL; the IN placeholders are bound params
+            f"  WHEN source_pipeline IN ({placeholders}) THEN 'first_party' "
             "  ELSE 'external_untrusted' END "
             "WHERE origin_class IS NULL",
             _FIRST_PARTY_KU_PIPELINES,

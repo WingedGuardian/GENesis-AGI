@@ -17,7 +17,7 @@ import importlib
 import aiosqlite
 import pytest
 
-M53 = importlib.import_module("genesis.db.migrations.0053_origin_class")
+M53 = importlib.import_module("genesis.db.migrations.0054_origin_class")
 
 # Current knowledge_units DDL from _tables.py WITHOUT origin_class.
 _LEGACY_KNOWLEDGE_UNITS = """
