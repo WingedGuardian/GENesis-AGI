@@ -275,7 +275,7 @@ class RecoveryEngine:
         # Clear /tmp (preserve essential sockets)
         rc, _, stderr = await _run_subprocess(
             "incus", "exec", container, "--",
-            "find", "/tmp", "-type", "f",
+            "find", "/tmp", "-type", "f",  # noqa: S108 - hygiene scan of host /tmp, not temp creation
             "-not", "-name", "*.sock",
             "-mmin", "+5", "-delete",
             timeout=30.0,

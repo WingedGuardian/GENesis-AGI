@@ -403,11 +403,21 @@ async def get_recently_resolved(
     source: str | None = None,
     days: int = 7,
     limit: int = 20,
+    include_tabled: bool = False,
 ) -> list[dict]:
-    """Get recently completed follow-ups, optionally filtered by source."""
+    """Get recently completed follow-ups, optionally filtered by source.
+
+    Tabled follow-ups are excluded unless include_tabled=True. A decayed inbox
+    attention marker is flipped to ``completed`` by the decay sweep, so without
+    this filter it would surface here as if the ego had actively resolved it —
+    misreporting a mechanical TTL as work done (e.g. in the morning report /
+    inbox digest). The two callers both want the exclusion.
+    """
     days = max(1, days)
     query = "SELECT * FROM follow_ups WHERE status = 'completed'"
     params: list[str | int] = []
+    if not include_tabled:
+        query += " AND kind = 'follow_up'"
     if source:
         query += " AND source = ?"
         params.append(source)
@@ -441,23 +451,73 @@ async def purge_completed(
     return cursor.rowcount
 
 
+async def decay_stale_inbox_markers(
+    db: aiosqlite.Connection,
+    *,
+    older_than_days: int = 60,
+) -> int:
+    """Soft-decay stale inbox attention markers (the WATCH/BOOKMARK tabled lane).
+
+    Inbox evaluation routes WATCH/BOOKMARK recommendations into the ``tabled``
+    lane as attention markers — tracked, never dispatched, and never resolved by
+    ego judgment (the ego has no authority to discard a user-curated marker). A
+    marker that is never promoted eventually goes stale; this sweep ages such
+    markers out by marking them ``completed`` with a decay note after
+    *older_than_days*.
+
+    This is a SOFT transition (a status flip, not a DELETE): the row is retained
+    and could be reactivated before the retention sweep (``purge_completed``)
+    eventually hard-deletes it. It targets every NON-TERMINAL tabled inbox
+    marker (``pending`` and — defensively — ``blocked``/``in_progress``/
+    ``scheduled`` a marker could be moved into via the cockpit/ego): terminal
+    ``completed``/``failed`` rows already carry a ``completed_at`` and are reaped
+    by ``purge_completed``, so excluding them here keeps the two sweeps'
+    responsibilities disjoint. Without this breadth a ``blocked`` tabled marker
+    would be immortal — decay (pending-only) and purge (completed/failed-only)
+    would both skip it. Non-inbox / non-tabled follow-ups are left untouched.
+
+    Returns the number of markers decayed.
+    """
+    older_than_days = max(1, older_than_days)
+    cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+    cursor = await db.execute(
+        "UPDATE follow_ups "
+        "SET status = 'completed', completed_at = ?, resolution_notes = ? "
+        "WHERE source = 'inbox_evaluation' "
+        "AND kind = 'tabled' "
+        "AND status NOT IN ('completed', 'failed') "
+        "AND created_at < ?",
+        (_now_iso(), f"decayed: not promoted within {older_than_days}d", cutoff),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def get_recently_completed(
     db: aiosqlite.Connection,
     *,
     hours: int = 24,
     limit: int = 5,
     domain: str | None = None,
+    include_tabled: bool = False,
 ) -> list[dict]:
     """Get follow-ups completed within the given time window.
 
     domain (exact match) scopes to that domain only and is applied in SQL
     BEFORE the LIMIT (so the cap samples within the scoped domain — a Python
     post-filter would be wrong here). None = all domains (no-op).
+
+    Tabled follow-ups are excluded unless include_tabled=True. A decayed inbox
+    attention marker is flipped to ``completed`` by the decay sweep, so without
+    this filter it would appear in the morning report's "Completed (24h)"
+    section as if the ego actively resolved it. The one caller wants exclusion.
     """
     dom_clause, dom_params = _domain_eq(domain)
+    kind_and = "" if include_tabled else "AND kind = 'follow_up' "
     cursor = await db.execute(
         "SELECT content, resolution_notes FROM follow_ups "
         "WHERE status = 'completed' "
+        f"{kind_and}"
         f"AND completed_at >= datetime('now', ? || ' hours'){dom_clause} "
         "ORDER BY completed_at DESC LIMIT ?",
         (f"-{hours}", *dom_params, limit),

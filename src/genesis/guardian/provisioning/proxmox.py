@@ -110,9 +110,9 @@ class ProxmoxAdapter(ProvisioningAdapter):
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         elif method == "GET" and params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
-        req = urllib.request.Request(url, data=body, method=method, headers=headers)
+        req = urllib.request.Request(url, data=body, method=method, headers=headers)  # noqa: S310 - stdlib-only guardian; https endpoint from config
         try:
-            with urllib.request.urlopen(
+            with urllib.request.urlopen(  # noqa: S310 - stdlib-only guardian; https endpoint from config
                 req, timeout=self._timeout, context=self._ctx,
             ) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")

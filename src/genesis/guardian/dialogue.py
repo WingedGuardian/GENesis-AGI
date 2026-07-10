@@ -142,7 +142,7 @@ async def send_dialogue(
         import urllib.error
         import urllib.request
 
-        req = urllib.request.Request(
+        req = urllib.request.Request(  # noqa: S310 - stdlib-only guardian; https endpoint from config
             url,
             data=payload,
             method="POST",
@@ -155,7 +155,7 @@ async def send_dialogue(
 
         def _do_post() -> tuple[int, str]:
             try:
-                with urllib.request.urlopen(req, timeout=15) as resp:
+                with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 - stdlib-only guardian; https endpoint from config
                     body = resp.read().decode("utf-8", errors="replace")
                     return resp.status, body
             except urllib.error.HTTPError as exc:

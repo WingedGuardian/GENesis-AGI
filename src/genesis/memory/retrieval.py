@@ -512,7 +512,7 @@ async def _expired_candidate_ids(
         as_of = datetime.now(UTC).isoformat()
     placeholders = ",".join("?" * len(candidate_ids))
     sql = (
-        f"SELECT memory_id FROM memory_metadata "
+        f"SELECT memory_id FROM memory_metadata "  # noqa: S608 - literal SQL fragments; values bound as parameters
         f"WHERE memory_id IN ({placeholders}) "
         f"AND invalid_at IS NOT NULL AND invalid_at <= ?"
     )

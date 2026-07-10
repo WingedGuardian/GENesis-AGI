@@ -252,7 +252,7 @@ class WyomingSTTServer:
         *,
         s2s_manager: S2SSessionManager | None = None,
         tts_server: WyomingTTSServer | None = None,
-        host: str = "0.0.0.0",
+        host: str = "0.0.0.0",  # noqa: S104 - Wyoming server must listen on LAN for the Voice PE device
         port: int | None = None,
     ) -> None:
         self._s2s_manager = s2s_manager

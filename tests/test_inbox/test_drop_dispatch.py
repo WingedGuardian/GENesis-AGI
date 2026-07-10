@@ -711,6 +711,60 @@ async def test_followup_integrity_error_does_not_abort_remaining_recs(
     assert created == 1, "first raised+caught, second created"
 
 
+def _rec(url: str, action: str, scope: str) -> str:
+    return (
+        f"## {url}\n\n"
+        "**Classification:** Genesis-relevant | **Decision:** Research\n\n"
+        "### Recommendation\n\n"
+        "```yaml\n"
+        f"action: {action}\n"
+        f'next_step: "step for {action}"\n'
+        f"effort: Small\nscope: {scope}\n"
+        "confidence: high\narchitecture_impact: extends\n"
+        "```\n"
+    )
+
+
+_FOUR_LANES = (
+    "# Inbox Evaluation — test\n\n"
+    + _rec("https://ex.com/adopt", "ADOPT", "V4")
+    + "\n" + _rec("https://ex.com/watch", "WATCH", "V4")
+    + "\n" + _rec("https://ex.com/explore", "EXPLORE", "V4")
+    + "\n" + _rec("https://ex.com/bookmark", "BOOKMARK", "V4")
+)
+
+
+@pytest.mark.asyncio
+async def test_watch_bookmark_route_to_tabled_lane(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """WATCH/BOOKMARK → tabled (never actionable); ADOPT/EXPLORE → follow_up."""
+    from genesis.db.crud import follow_ups
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    created = await mon._create_follow_ups_from_eval(
+        evaluation_text=_FOUR_LANES, batch_id="b1",
+        source_files=[str(inbox_dir / "Genesis.md")],
+    )
+    assert created == 4
+
+    rows = [dict(r) for r in await (await db.execute(
+        "SELECT content, kind FROM follow_ups WHERE source = 'inbox_evaluation'",
+    )).fetchall()]
+    by_action = {r["content"].split("]")[0].lstrip("["): r for r in rows}
+    assert by_action["ADOPT"]["kind"] == "follow_up"
+    assert by_action["EXPLORE"]["kind"] == "follow_up"
+    assert by_action["WATCH"]["kind"] == "tabled"
+    assert by_action["BOOKMARK"]["kind"] == "tabled"
+
+    # The ego/actionable feed must never see the markers.
+    actionable = " ".join(
+        r["content"] for r in await follow_ups.get_actionable(db)
+    )
+    assert "[ADOPT]" in actionable and "[EXPLORE]" in actionable
+    assert "[WATCH]" not in actionable and "[BOOKMARK]" not in actionable
+
+
 @pytest.mark.asyncio
 async def test_consume_approval_returns_bool(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path):
     mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
