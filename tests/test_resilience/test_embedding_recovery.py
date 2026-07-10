@@ -79,6 +79,54 @@ class TestDrainPending:
         assert len(pending) == 0  # None pending (one embedded, one failed)
 
     @pytest.mark.asyncio
+    async def test_recovery_restores_faceting_fields(self, db, worker):
+        """D3: a recovered point carries wing/room (from memory_metadata) and
+        life_domain (from the ``life_domain:`` tag) so it survives faceted
+        (wing=/room=/life_domain=) recall — a payload missing these keys is
+        silently excluded by Qdrant ``must`` filters.
+        """
+        from genesis.db.crud import memory as memory_crud
+
+        w, _, qdrant = worker
+        # create_metadata runs in the same store() that enqueues the pending
+        # row, so wing/room are guaranteed present at drain time.
+        await memory_crud.create_metadata(
+            db, memory_id="mem-facet", created_at="2026-03-11T12:00:00",
+            wing="infrastructure", room="watchdog",
+        )
+        await crud.create(
+            db, id="pe-facet", memory_id="mem-facet", content="facet item",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00",
+            tags="wing:infrastructure,life_domain:health,tag1",
+        )
+
+        assert await w.drain_pending() == 1
+        payload = qdrant.upsert.call_args.kwargs["points"][0].payload
+        assert payload["wing"] == "infrastructure"
+        assert payload["room"] == "watchdog"
+        assert payload["life_domain"] == "health"
+        # project_type is not recoverable on this path — must stay absent
+        assert "project_type" not in payload
+        # the stray memory_id key is dropped to match the normal write path
+        assert "memory_id" not in payload
+
+    @pytest.mark.asyncio
+    async def test_recovery_without_metadata_omits_facets(self, db, worker):
+        """A pending row whose metadata row is somehow absent (legacy) must
+        still drain — faceting fields are simply omitted, no crash."""
+        w, _, qdrant = worker
+        await crud.create(
+            db, id="pe-nofacet", memory_id="mem-nofacet", content="no facet",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00", tags="tag1",
+        )
+        assert await w.drain_pending() == 1
+        payload = qdrant.upsert.call_args.kwargs["points"][0].payload
+        assert "wing" not in payload
+        assert "life_domain" not in payload
+
+    @pytest.mark.asyncio
     async def test_count_pending(self, db, worker):
         w, _, _ = worker
         await crud.create(

@@ -69,3 +69,36 @@ async def test_search_ranked_with_collection(db):
     )
     results = await memory.search_ranked(db, query="ranked", collection="special")
     assert all(r["collection"] == "special" for r in results)
+
+
+async def test_get_taxonomy(db):
+    await memory.create_metadata(
+        db, memory_id="tx1", created_at="2020-01-01T00:00:00+00:00",
+        wing="infrastructure", room="watchdog",
+    )
+    assert await memory.get_taxonomy(db, "tx1") == {
+        "wing": "infrastructure", "room": "watchdog",
+    }
+    # room is optional — a wing-only row still resolves
+    await memory.create_metadata(
+        db, memory_id="tx2", created_at="2020-01-01T00:00:00+00:00", wing="memory",
+    )
+    assert await memory.get_taxonomy(db, "tx2") == {"wing": "memory", "room": None}
+    assert await memory.get_taxonomy(db, "missing") is None
+
+
+async def test_batch_created_at(db):
+    await memory.create_metadata(
+        db, memory_id="c1", created_at="2020-01-01T00:00:00+00:00",
+    )
+    await memory.create_metadata(
+        db, memory_id="c2", created_at="2021-02-02T00:00:00+00:00",
+    )
+    got = await memory.batch_created_at(db, ["c1", "c2", "missing"])
+    assert got == {
+        "c1": "2020-01-01T00:00:00+00:00",
+        "c2": "2021-02-02T00:00:00+00:00",
+    }
+    # missing ids are simply omitted; empty input short-circuits
+    assert "missing" not in got
+    assert await memory.batch_created_at(db, []) == {}
