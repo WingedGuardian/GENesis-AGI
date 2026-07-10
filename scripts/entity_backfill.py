@@ -133,6 +133,9 @@ async def main() -> None:
         print(f"seed-FTS pass: {seed['seed_mentions']} mentions")
         for name, count in sorted(seed["per_entity"].items(), key=lambda kv: -kv[1]):
             print(f"  {name}: {count}")
+        # The GENesis-Voice repo-split decision memory — the OMI-incident
+        # acceptance target (E4 replay gate); zero rows here just means
+        # the seed/backfill didn't reach it on this install.
         target = "9d36f039-3126-4721-8c71-027df1a94e2a"
         rows = await db.execute_fetchall(
             "SELECT entity_id, provenance, source FROM entity_mentions "
