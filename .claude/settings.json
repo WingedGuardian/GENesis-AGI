@@ -333,7 +333,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/subsystem_traps_hook.py",
-                        "timeout": 5
+                        "timeout": 10
                     }
                 ]
             },

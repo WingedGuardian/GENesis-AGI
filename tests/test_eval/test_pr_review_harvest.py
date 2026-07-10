@@ -63,9 +63,10 @@ def _comment(body: str, *, author: str = "codex-bot", path: str = "src/a.py") ->
     return {"body": body, "user": {"login": author}, "path": path}
 
 
-async def _one_pr_observation(db, number: int) -> dict:
+async def _one_pr_observation(db, number: int, repo: str = "acme/widget") -> dict:
     cursor = await db.execute(
-        "SELECT * FROM observations WHERE id = ?", (f"prrev-{number}",),
+        "SELECT * FROM observations WHERE id = ?",
+        (f"prrev-{repo.replace('/', '-')}-{number}",),
     )
     rows = await cursor.fetchall()
     assert len(rows) == 1
@@ -222,7 +223,7 @@ async def test_per_pr_failure_skips_but_harvest_continues(db):
     await _one_pr_observation(db, 101)
     await _one_pr_observation(db, 103)
     cursor = await db.execute(
-        "SELECT COUNT(*) FROM observations WHERE id = 'prrev-102'",
+        "SELECT COUNT(*) FROM observations WHERE id LIKE 'prrev-%-102'",
     )
     assert (await cursor.fetchone())[0] == 0
 

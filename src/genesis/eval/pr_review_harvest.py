@@ -156,10 +156,12 @@ async def _harvest_one_pr(
         "findings": findings,
     })
     # Deterministic id → the weekly re-harvest of a still-in-window PR
-    # updates its row in place instead of duplicating it.
+    # updates its row in place instead of duplicating it. Repo-scoped so a
+    # repo rename/switch can never silently upsert PR #N of one repo over
+    # PR #N of another.
     await obs_crud.upsert(
         db,
-        id=f"prrev-{number}",
+        id=f"prrev-{repo.replace('/', '-')}-{number}",
         source="recon",
         type="pr_review_findings",
         category="pr_review_findings",

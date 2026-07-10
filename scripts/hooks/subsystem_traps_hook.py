@@ -159,10 +159,14 @@ def _process(data: dict) -> None:
     if section is None:
         return
     session_id = str(data.get("session_id") or "")
-    if not session_id or _already_nudged(session_id, section["entry"]):
+    if not session_id:
         return
+    # Extract BEFORE marking the dedup: a section with no extractable traps
+    # must not consume the once-per-session slot without injecting anything.
     traps = _extract_traps(section["body"])
     if not traps:
+        return
+    if _already_nudged(session_id, section["entry"]):
         return
     lines = "\n".join(f"- {t}" for t in traps)
     context = (
