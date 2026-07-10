@@ -148,9 +148,90 @@ PYEOF
                 fi
             fi
         fi
-        printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s", "deployed_commit": "%s", "gateway_sha": "%s", "authkey_no_pty": %s, "authkey_has_from": %s, "authkey_from_matches": %s, "authkey_observed_src_hash": "%s", "authkey_opts_hash": "%s"}\n' \
+        # --- CC recovery-brain auth-health indicators (consumed by the
+        # container's _check_cc_auth reconciler). Least disclosure: emit ONLY
+        # loggedIn (tri-state), token presence, and age — NEVER token material,
+        # and NEVER the account email/orgId that `claude auth status` also prints.
+        # cc_logged_in is a JSON literal true/false/null (null = auth status
+        # unavailable/unparseable, so an old CC or a transient failure never
+        # false-alarms the reconciler).
+        #
+        # The loggedIn probe spawns `claude` (~1s, ~290MB transient RSS, no MCP),
+        # and `version` runs on EVERY 5-min awareness tick — so cache it host-side
+        # with a 1h TTL to keep that spawn off the hot path (host OOM history).
+        # loggedIn here is an early-warning SIGNAL, not an incident-time decision
+        # (the diagnosis path probes fresh, uncached), so ≤1h staleness is fine.
+        # Token presence/age are cheap stats → per-tick, uncached.
+        CC_NOW_EPOCH=$(date +%s)
+        CC_LOGGED_IN=null
+        CC_PROBE_CACHE="$STATE_DIR/cc_auth_probe.json"
+        CC_PROBE_TTL=3600
+        CC_PROBE_FRESH=false
+        if [ -f "$CC_PROBE_CACHE" ]; then
+            CC_CACHED=$(python3 -c '
+import sys, json
+try:
+    d = json.load(open(sys.argv[1]))
+    ts = int(d.get("checked_at", 0)); li = d.get("logged_in")
+    now = int(sys.argv[2]); ttl = int(sys.argv[3])
+    if 0 <= now - ts <= ttl and li in ("true", "false", "null"):
+        print(li)
+except Exception:
+    pass
+' "$CC_PROBE_CACHE" "$CC_NOW_EPOCH" "$CC_PROBE_TTL" 2>/dev/null || true)
+            if [ -n "$CC_CACHED" ]; then CC_LOGGED_IN="$CC_CACHED"; CC_PROBE_FRESH=true; fi
+        fi
+        if [ "$CC_PROBE_FRESH" = false ]; then
+            # timeout 15: node startup + a network round-trip, bounded so the
+            # version verb can't hang the awareness tick on a wedged claude.
+            CC_AUTH_JSON=$(timeout 15 claude auth status --json 2>/dev/null || true)
+            if [ -n "$CC_AUTH_JSON" ]; then
+                CC_LOGGED_IN=$(printf '%s' "$CC_AUTH_JSON" | python3 -c '
+import sys, json
+try:
+    v = json.load(sys.stdin).get("loggedIn")
+    print("true" if v is True else "false" if v is False else "null")
+except Exception:
+    print("null")
+' 2>/dev/null || echo null)
+            fi
+            [ -n "$CC_LOGGED_IN" ] || CC_LOGGED_IN=null
+            # Cache best-effort; a write failure just means we re-probe next tick.
+            mkdir -p "$STATE_DIR" 2>/dev/null || true
+            if printf '{"logged_in": "%s", "checked_at": %s}\n' "$CC_LOGGED_IN" "$CC_NOW_EPOCH" \
+                    > "$CC_PROBE_CACHE.tmp" 2>/dev/null; then
+                mv "$CC_PROBE_CACHE.tmp" "$CC_PROBE_CACHE" 2>/dev/null || true
+            fi
+        fi
+        # Synced setup-token fallback: presence + age (from the shared mount the
+        # credential-bridge writes to). Age drives a pre-expiry warning; -1 =
+        # unknown. Never read or emit the token value itself.
+        CC_TOKEN_FILE="$STATE_DIR/shared/guardian/cc_oauth_token.env"
+        CC_TOKEN_PRESENT=false
+        CC_TOKEN_AGE_DAYS=-1
+        if [ -f "$CC_TOKEN_FILE" ]; then
+            if grep -qE '^CLAUDE_CODE_OAUTH_TOKEN=.+' "$CC_TOKEN_FILE" 2>/dev/null; then
+                CC_TOKEN_PRESENT=true
+            fi
+            CC_TOKEN_CREATED=$(grep '^GENESIS_CC_TOKEN_CREATED_AT=' "$CC_TOKEN_FILE" 2>/dev/null \
+                | head -1 | cut -d= -f2- | tr -d '"' || true)
+            if printf '%s' "$CC_TOKEN_CREATED" | grep -qE '^[0-9]+$'; then
+                CC_TOKEN_AGE_DAYS=$(( (CC_NOW_EPOCH - CC_TOKEN_CREATED) / 86400 ))
+                # A future-dated created_at (clock skew / bad write) → clamp to 0,
+                # never a negative that the reconciler would misread as unknown.
+                if [ "$CC_TOKEN_AGE_DAYS" -lt 0 ]; then CC_TOKEN_AGE_DAYS=0; fi
+            else
+                CC_MTIME=$(stat -c %Y "$CC_TOKEN_FILE" 2>/dev/null || echo "")
+                if printf '%s' "$CC_MTIME" | grep -qE '^[0-9]+$'; then
+                    CC_TOKEN_AGE_DAYS=$(( (CC_NOW_EPOCH - CC_MTIME) / 86400 ))
+                    if [ "$CC_TOKEN_AGE_DAYS" -lt 0 ]; then CC_TOKEN_AGE_DAYS=0; fi
+                fi
+            fi
+        fi
+        printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s", "deployed_commit": "%s", "gateway_sha": "%s", "authkey_no_pty": %s, "authkey_has_from": %s, "authkey_from_matches": %s, "authkey_observed_src_hash": "%s", "authkey_opts_hash": "%s", "cc_logged_in": %s, "cc_token_present": %s, "cc_token_age_days": %s}\n' \
             "$CC_VER" "$NODE_VER" "$CODE_VER" "$CODE_DATE" "$DEPLOYED" "$GW_SHA" \
-            "$AK_NO_PTY" "$AK_HAS_FROM" "$AK_FROM_MATCHES" "$AK_SRC_HASH" "$AK_OPTS_HASH"
+            "$AK_NO_PTY" "$AK_HAS_FROM" "$AK_FROM_MATCHES" "$AK_SRC_HASH" "$AK_OPTS_HASH" \
+            "$CC_LOGGED_IN" "$CC_TOKEN_PRESENT" "$CC_TOKEN_AGE_DAYS"
         ;;
     update)
         INSTALL_DIR="${HOME}/.local/share/genesis-guardian"

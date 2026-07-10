@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -495,6 +496,7 @@ class DiagnosisEngine:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(work_dir),
+            env=await self._resolve_cc_env(cc_path),
         )
 
         try:
@@ -526,6 +528,77 @@ class DiagnosisEngine:
                 "No valid JSON diagnosis found in CC response"
             )
         return result
+
+    async def _resolve_cc_env(self, cc_path: str) -> dict[str, str] | None:
+        """Resolve the environment for the CC recovery-brain subprocess.
+
+        FALLBACK-ONLY setup-token injection. Returns ``None`` (inherit
+        ``os.environ`` — the ``create_subprocess_exec`` default, identical to
+        today's behavior) UNLESS a pre-flight ``claude auth status`` confirms the
+        host's own ``claude login`` is DEAD, in which case it injects the synced
+        ``CLAUDE_CODE_OAUTH_TOKEN`` so the brain can still authenticate.
+
+        The pre-flight runs with the SAME inherited env the real brain gets in
+        the no-token case, so ``loggedIn: true`` faithfully predicts the real
+        invocation. ``{**os.environ, ...}`` preserves every inherited key (the
+        brain relies on inherited provider keys — no env scrub), adding only the
+        token.
+
+        ⚠ Honest boundary: ``CLAUDE_CODE_OAUTH_TOKEN`` *overrides* a stored
+        login, so "never degrade a working login" rests on the pre-flight
+        reporting ``loggedIn`` correctly. On a FALSE ``loggedIn: false`` (login
+        actually fine) coinciding with a STALE synced token, we would inject and
+        the brain would fail onto the bad token — but that lands as the existing
+        ``CCDiagnosisError`` → ``cc_unavailable`` escalation (a clean fail-safe,
+        NOT silent brain death), only in that rare double-coincidence. We never
+        inject on ambiguity (unparseable / timeout / ``loggedIn`` unknown) nor
+        when no token exists. Never raises; never logs the token value.
+
+        Cost: one ~1-3s ``auth status`` call per diagnosis. Diagnosis fires only
+        when Genesis is DOWN (rare), so it is deliberately NOT cached — caching
+        would reintroduce the auth-staleness class this whole feature kills.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                cc_path, "auth", "status", "--json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                # 15s: node startup + a network round-trip, generous for a
+                # degraded host but bounded so a wedged probe can't hang the
+                # (already timeout-bounded) diagnosis. Never inherits the token.
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            except TimeoutError:
+                if proc.returncode is None:
+                    proc.kill()
+                    await proc.wait()
+                return None  # ambiguous → inherit; fail-safe covers a real outage
+            try:
+                logged_in = json.loads(
+                    stdout.decode("utf-8", errors="replace"),
+                ).get("loggedIn")
+            except (json.JSONDecodeError, ValueError):
+                return None  # unparseable → never inject on ambiguity
+            if logged_in is not False:
+                # True (login works) or None (unknown) → inherit, never inject.
+                return None
+            # Host login is dead → inject the synced fallback token if present.
+            from genesis.guardian.credential_bridge import load_cc_oauth_token
+
+            token = load_cc_oauth_token(self._config.state_dir).get(
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            )
+            if not token:
+                return None  # no fallback → inherit; cc_unavailable fail-safe fires
+            logger.warning(
+                "Host `claude login` reports logged-out — injecting the synced "
+                "setup-token as this diagnosis's fallback (token value not logged).",
+            )
+            return {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token}
+        except Exception:
+            logger.debug("CC auth pre-flight failed; inheriting env", exc_info=True)
+            return None
 
     def _parse_cc_response(self, raw: str) -> DiagnosisResult | None:
         """Parse the CC response into a DiagnosisResult.

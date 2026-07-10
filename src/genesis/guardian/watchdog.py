@@ -47,6 +47,8 @@ class GuardianWatchdog:
         "scripts/install_guardian.sh", "scripts/guardian-gateway.sh",
     ]
     DRIFT_ALERT_THRESHOLD = 3   # Consecutive drifted ticks before alerting
+    CC_TOKEN_WARN_AGE_DAYS = 335  # warn ~30d before a 1-year setup-token expires
+    _CC_TOKEN_MAX_AGE_DAYS = 365  # setup-token lifetime; older = expired/unusable
 
     def __init__(
         self,
@@ -77,6 +79,15 @@ class GuardianWatchdog:
         self._authkey_escalated: bool = False
         self._authkey_flap_escalated: bool = False
         self._authkey_last_src_hash: str | None = None
+        # CC recovery-brain auth health: alert when the host login is dead with
+        # no usable fallback token (dead-brain), and warn before the synced
+        # setup-token expires. Alert-only — no safe non-interactive remediation
+        # (claude login / setup-token both need a human; the token re-copy is the
+        # diagnosis fallback's + credential-bridge's job). The expiry-warning
+        # guard has its OWN token-refresh lifecycle, NOT the health reset.
+        self._cc_auth_drift_count: int = 0
+        self._cc_auth_escalated: bool = False
+        self._cc_token_expiry_warned: bool = False
 
     async def _alert_user(self, *, topic: str, context: str, source_id: str) -> None:
         """Deliver a user-facing (Telegram) alert about a Guardian degradation.
@@ -342,6 +353,11 @@ class GuardianWatchdog:
         # Own suppress so a failure here can't skip code-drift logic below.
         with contextlib.suppress(Exception):
             await self._check_authkey_hardening(version_info)
+
+        # CC recovery-brain auth-health reconciler reuses the same payload. Own
+        # suppress so a failure here can't skip code-drift logic below.
+        with contextlib.suppress(Exception):
+            await self._check_cc_auth(version_info)
 
         host_hash = version_info.get("deployed_commit", "unknown")
 
@@ -759,4 +775,142 @@ class GuardianWatchdog:
             topic="Guardian key source flapping",
             context=message,
             source_id="guardian:authkey_flap",
+        )
+
+    def _reset_cc_auth_state(self) -> None:
+        """Reset ONLY the dead-brain drift/escalation state (re-arm on health).
+
+        The expiry-warning guard (``_cc_token_expiry_warned``) is deliberately
+        NOT reset here — it has its own token-refresh lifecycle. Resetting it on
+        health would re-warn every tick a healthy login is up (spam); never
+        resetting it would one-shot forever and miss the NEXT token's expiry.
+        """
+        self._cc_auth_drift_count = 0
+        self._cc_auth_escalated = False
+
+    async def _check_cc_auth(self, version_info: dict) -> None:
+        """Alert when the host CC recovery brain cannot authenticate.
+
+        The host ``version`` verb reports ``cc_logged_in`` (tri-state True/
+        False/None), ``cc_token_present`` (bool), and ``cc_token_age_days``
+        (int, -1 unknown). Two independent concerns:
+
+        * **Pre-expiry WARNING** — the synced setup-token nears its ~1-year end.
+          Runs BEFORE the healthy early-return, so a token rotting while the
+          primary login is fine is still surfaced (its whole point is insurance
+          against a FUTURE login death).
+        * **Dead-brain ALERT** — the host ``claude login`` is dead AND no usable
+          fallback token exists. Needs ``DRIFT_ALERT_THRESHOLD`` ticks (mirrors
+          the authkey/staleness reconcilers) so a blip doesn't page.
+
+        Alert-only: unlike authkey (``reharden-key``) / gateway
+        (``sync-gateway``) there is NO safe non-interactive remediation —
+        ``claude login`` / ``setup-token`` both need a human, and the token
+        re-copy is already the diagnosis fallback's + credential-bridge's job.
+        Best-effort (invoked under _check_code_drift's suppress).
+        """
+        # Old gateway without the cc_* fields → nothing to reconcile.
+        if "cc_logged_in" not in version_info:
+            return
+        logged_in = version_info.get("cc_logged_in")  # True / False / None
+        token_present = version_info.get("cc_token_present") is True
+        age = version_info.get("cc_token_age_days")
+        age = age if isinstance(age, int) and not isinstance(age, bool) else -1
+
+        # 1. Pre-expiry warning — independent of login health, BEFORE the gate.
+        await self._check_cc_token_expiry(token_present, age)
+
+        # 2. Dead-brain gate. A usable fallback = present AND not past its 1-year
+        #    lifetime (age == -1 unknown → optimistically usable; the diagnosis
+        #    fail-safe still backstops a truly-expired unknown-age token).
+        token_usable = token_present and (
+            age == -1 or age < self._CC_TOKEN_MAX_AGE_DAYS
+        )
+        if logged_in is True or token_usable:
+            # Login works, or a usable fallback exists → brain can authenticate.
+            if self._cc_auth_drift_count > 0:
+                logger.info("Guardian CC recovery-brain auth recovered")
+            self._reset_cc_auth_state()
+            return
+        if logged_in is not False:
+            # logged_in is None (ambiguous / old CC / transient) AND no usable
+            # token → never false-alarm on ambiguity; the diagnosis fail-safe
+            # still catches a genuine outage at incident time.
+            return
+        # logged_in is False AND no usable fallback token → genuinely dead brain.
+        self._cc_auth_drift_count += 1
+        if self._cc_auth_drift_count < self.DRIFT_ALERT_THRESHOLD:
+            return
+        await self._escalate_cc_auth(token_present=token_present, age=age)
+
+    async def _check_cc_token_expiry(self, token_present: bool, age: int) -> None:
+        """One WARNING per episode as the synced fallback token nears expiry.
+
+        Re-arms on token refresh (age back below the warn threshold, or the
+        token going absent) — NOT on login health — so it neither spams a
+        healthy host nor one-shots forever and misses the next token's expiry.
+        """
+        if not token_present or age < 0:
+            # No token, or unknown age → nothing to warn about; re-arm.
+            self._cc_token_expiry_warned = False
+            return
+        if age < self.CC_TOKEN_WARN_AGE_DAYS:
+            self._cc_token_expiry_warned = False  # fresh / refreshed → re-arm
+            return
+        if self._cc_token_expiry_warned:
+            return
+        self._cc_token_expiry_warned = True
+        msg = (
+            f"Guardian's synced CC fallback setup-token is nearing expiry "
+            f"(age {age} d of a ~1-year lifetime). Re-run `claude setup-token` "
+            f"and pipe it to `scripts/store_cc_token.sh` to refresh it before "
+            f"the host login could ever need the fallback."
+        )
+        logger.warning(msg)
+        if self._event_bus:
+            from genesis.observability.types import Severity, Subsystem
+            await self._event_bus.emit(
+                Subsystem.GUARDIAN, Severity.WARNING,
+                "guardian.cc_token_expiring", msg,
+            )
+        await self._alert_user(
+            topic="Guardian CC token expiring",
+            context=msg,
+            source_id="guardian:cc_token_expiring",
+        )
+
+    async def _escalate_cc_auth(self, *, token_present: bool, age: int) -> None:
+        """One dead-brain ALERT per episode (re-armed by _reset_cc_auth_state)."""
+        if self._cc_auth_escalated:
+            return
+        self._cc_auth_escalated = True
+        if token_present:
+            remedy = (
+                f"the synced setup-token appears expired/invalid (age {age} d) — "
+                f"re-run `claude setup-token` → `scripts/store_cc_token.sh`, or "
+                f"`claude login` on the host."
+            )
+        else:
+            remedy = (
+                "run `claude setup-token` and pipe it to "
+                "`scripts/store_cc_token.sh` (preferred — no host access needed), "
+                "or `claude login` on the host."
+            )
+        msg = (
+            "Guardian's CC recovery brain cannot authenticate: the host `claude "
+            f"login` is dead and no usable fallback token is available — {remedy} "
+            "Host self-diagnosis is unavailable until then (other recovery paths "
+            "still work)."
+        )
+        logger.error(msg)
+        if self._event_bus:
+            from genesis.observability.types import Severity, Subsystem
+            await self._event_bus.emit(
+                Subsystem.GUARDIAN, Severity.ERROR,
+                "guardian.cc_auth_unhealthy", msg,
+            )
+        await self._alert_user(
+            topic="Guardian CC auth dead",
+            context=msg,
+            source_id="guardian:cc_auth_unhealthy",
         )
