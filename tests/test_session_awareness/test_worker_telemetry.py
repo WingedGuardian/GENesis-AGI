@@ -1,61 +1,41 @@
 """Arbiter neural-monitor telemetry — call_site_last_run recording.
 
-The worker records one ``ambient_arbiter`` row per real arbiter run
-(judged verdicts only, and only when candidates existed — an empty set
+The worker records one ``ambient_arbiter`` row per arbiter ATTEMPT
+(judged verdicts with a non-empty candidate set — an empty set
 short-circuits judge_candidates without spawning CC). The write goes
-through its own short-lived RW connection; the retrieval connection
-stays read-only, and telemetry failure must never affect the verdict.
+through ``record_last_run_detached`` (own short-lived RW connection);
+the retrieval connection stays read-only, telemetry failure must never
+affect the verdict, and ``telemetry_recorded`` must be True only when
+the row demonstrably landed.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import aiosqlite
 import pytest
 
+from genesis.db.schema import create_all_tables
 from genesis.session_awareness import worker as worker_mod
 from genesis.session_awareness.arbiter import ARBITER_MODEL
-from genesis.session_awareness.statefiles import empty_state, save_state
 from genesis.session_awareness.worker import run_worker
 
-DIM = 8
+from .conftest import seed_theme
+
 SID = "worker-telemetry-1"
 
-_TABLE_DDL = """
-    CREATE TABLE call_site_last_run (
-        call_site_id TEXT PRIMARY KEY,
-        last_run_at TEXT NOT NULL,
-        provider_used TEXT,
-        model_id TEXT,
-        response_text TEXT,
-        input_tokens INTEGER,
-        output_tokens INTEGER,
-        success INTEGER NOT NULL DEFAULT 1,
-        updated_at TEXT NOT NULL
-    )
-"""
 
-
-def _seed_theme(sessions_root: Path) -> None:
-    s = empty_state(SID)
-    s["ema"] = [1.0] + [0.0] * (DIM - 1)
-    s["ema_turns"] = 4
-    s["ring"] = [s["ema"]] * 3
-    s["entities"] = {"genesis": 2.0}
-    s["updated_at"] = datetime.now(UTC).isoformat()
-    save_state(SID, s, base=sessions_root)
-
-
-def _tmp_db(tmp_path: Path) -> Path:
-    db = tmp_path / "g.db"
-    con = sqlite3.connect(str(db))
-    con.execute(_TABLE_DDL)
-    con.commit()
-    con.close()
-    return db
+async def _real_schema_db(tmp_path: Path) -> Path:
+    """Temp file DB with the REAL schema — no hand-copied DDL to drift."""
+    db_path = tmp_path / "g.db"
+    conn = await aiosqlite.connect(str(db_path))
+    await create_all_tables(conn)
+    await conn.commit()
+    await conn.close()
+    return db_path
 
 
 def _last_run_row(db: Path) -> sqlite3.Row | None:
@@ -70,7 +50,7 @@ def _last_run_row(db: Path) -> sqlite3.Row | None:
 
 async def _run(tmp_path, *, db: Path, arbiter_verdict: dict, candidates: list):
     sessions, state = tmp_path / "s", tmp_path / "sa"
-    _seed_theme(sessions)
+    seed_theme(sessions, SID)
     with (
         patch.object(
             worker_mod, "rank_candidates", new=AsyncMock(return_value=candidates),
@@ -88,7 +68,7 @@ async def _run(tmp_path, *, db: Path, arbiter_verdict: dict, candidates: list):
 
 @pytest.mark.asyncio
 async def test_judged_run_records_last_run_row(tmp_path):
-    db = _tmp_db(tmp_path)
+    db = await _real_schema_db(tmp_path)
     result = await _run(
         tmp_path, db=db,
         arbiter_verdict={"arbiter": "ok", "picks": [1], "prompt_version": "v1"},
@@ -110,7 +90,7 @@ async def test_judged_run_records_last_run_row(tmp_path):
 
 @pytest.mark.asyncio
 async def test_arbiter_failure_records_red_row(tmp_path):
-    db = _tmp_db(tmp_path)
+    db = await _real_schema_db(tmp_path)
     result = await _run(
         tmp_path, db=db,
         arbiter_verdict={
@@ -126,7 +106,7 @@ async def test_arbiter_failure_records_red_row(tmp_path):
 
 @pytest.mark.asyncio
 async def test_no_run_paths_do_not_record(tmp_path):
-    db = _tmp_db(tmp_path)
+    db = await _real_schema_db(tmp_path)
 
     # no_theme: no arbiter, no row
     sessions, state = tmp_path / "s0", tmp_path / "sa0"
@@ -136,7 +116,7 @@ async def test_no_run_paths_do_not_record(tmp_path):
 
     # --no-arbiter: candidates ranked but arbiter never invoked
     sessions, state = tmp_path / "s1", tmp_path / "sa1"
-    _seed_theme(sessions)
+    seed_theme(sessions, SID)
     with patch.object(
         worker_mod, "rank_candidates",
         new=AsyncMock(return_value=[{"memory_id": "m1", "score": 0.9}]),
@@ -164,7 +144,7 @@ async def test_no_run_paths_do_not_record(tmp_path):
 async def test_telemetry_failure_never_breaks_verdict(tmp_path):
     """A dead telemetry path degrades to telemetry_recorded=False —
     the verdict still writes and the shadow log still appends."""
-    db = _tmp_db(tmp_path)
+    db = await _real_schema_db(tmp_path)
     with patch(
         "genesis.db.connection.get_raw_db",
         side_effect=RuntimeError("db exploded"),
@@ -185,15 +165,33 @@ async def test_telemetry_failure_never_breaks_verdict(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_swallowed_insert_failure_reports_false(tmp_path):
+    """record_last_run swallows INSERT errors internally — the flag must
+    still come back False, not a false-positive True. A schemaless DB
+    (missing call_site_last_run, e.g. migration-lagged install) is the
+    concrete reachable case."""
+    db_path = tmp_path / "empty.db"
+    sqlite3.connect(str(db_path)).close()  # no tables at all
+    result = await _run(
+        tmp_path, db=db_path,
+        arbiter_verdict={"arbiter": "ok", "picks": [], "prompt_version": "v1"},
+        candidates=[{"memory_id": "m1", "score": 0.9, "lanes": ["vector"]}],
+    )
+    assert result["status"] == "judged"
+    assert result["telemetry_recorded"] is False
+
+
+@pytest.mark.asyncio
 async def test_retrieval_rows_untouched_by_telemetry(tmp_path):
-    """The RW telemetry connection writes ONLY call_site_last_run — the
-    zero-write invariant on memory rows (retrieved_count) holds."""
-    db = _tmp_db(tmp_path)
+    """The RW telemetry connection writes ONLY call_site_last_run — rows
+    carrying retrieved_count (real schema: observations) stay untouched."""
+    db = await _real_schema_db(tmp_path)
     con = sqlite3.connect(str(db))
     con.execute(
-        "CREATE TABLE memory_metadata (id TEXT PRIMARY KEY, retrieved_count INTEGER)"
+        "INSERT INTO observations (id, source, type, content, priority,"
+        " retrieved_count, created_at)"
+        " VALUES ('o1', 'test', 'note', 'x', 'low', 7, '2026-07-10T00:00:00Z')"
     )
-    con.execute("INSERT INTO memory_metadata VALUES ('m1', 7)")
     con.commit()
     con.close()
 
@@ -204,7 +202,7 @@ async def test_retrieval_rows_untouched_by_telemetry(tmp_path):
     )
     con = sqlite3.connect(str(db))
     count = con.execute(
-        "SELECT retrieved_count FROM memory_metadata WHERE id='m1'"
+        "SELECT retrieved_count FROM observations WHERE id='o1'"
     ).fetchone()[0]
     con.close()
     assert count == 7

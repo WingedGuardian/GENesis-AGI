@@ -1998,13 +1998,16 @@ function updateSubsystemGrid(data) {
                     const ps = c.probe_status;
                     return ps ? ps === 'reachable' : c.state !== 'open';
                 }).length;
-                let chainSummary = apiUp + '/' + apiChain.length + ' API';
+                // CC-only sites (empty API chain, e.g. ambient_arbiter) skip
+                // the API fraction — '0/0 API' reads as a broken chain.
+                const summaryParts = [];
+                if (apiChain.length > 0) summaryParts.push(apiUp + '/' + apiChain.length + ' API');
                 if (ccChain.length > 0) {
                     const ccPs = ccChain[0].probe_status;
                     const ccOk = ccPs ? ccPs !== 'unreachable' : ccChain[0].state !== 'open';
-                    chainSummary += ', CC ' + (ccOk ? 'up' : 'down');
+                    summaryParts.push('CC ' + (ccOk ? 'up' : 'down'));
                 }
-                tipRows.push({ text: chainSummary });
+                if (summaryParts.length > 0) tipRows.push({ text: summaryParts.join(', ') });
             }
             dot.dataset.tip = JSON.stringify(tipRows);
             dot.addEventListener('mouseenter', () => showTip(dot));

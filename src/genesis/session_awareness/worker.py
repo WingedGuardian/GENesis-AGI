@@ -10,7 +10,9 @@ Writes three places:
 - ``~/.genesis/session_awareness/shadow_log.jsonl`` — append-only tuning
   record (size-capped; skips are counted in the verdict, never silent)
 - ``call_site_last_run`` row ``ambient_arbiter`` — neural-monitor
-  telemetry, ONLY when the arbiter subprocess actually ran. This uses a
+  telemetry, one row per arbiter ATTEMPT (including pre-spawn failures,
+  which record success=0 with the reason; empty candidate sets record
+  nothing — judge_candidates short-circuits without spawning CC). Uses a
   separate short-lived RW connection; the retrieval connection stays
   ``mode=ro`` so the zero-write invariant on memory rows holds.
 
@@ -60,14 +62,14 @@ async def _record_arbiter_telemetry(
 ) -> bool:
     """Best-effort ``call_site_last_run`` row for the neural monitor.
 
-    Mirrors ``contribution.version_gate._record_to_monitor``: own
-    short-lived RW connection (``get_raw_db`` — WAL + busy_timeout), never
-    raises. Returns False when the write could not be attempted, so the
-    verdict/shadow log stays honest about missing telemetry.
+    Never raises; True only when the row demonstrably landed (a swallowed
+    INSERT failure reports False), so the verdict/shadow log stays honest
+    about missing telemetry.
     """
     try:
-        from genesis.db.connection import get_raw_db
-        from genesis.observability.call_site_recorder import record_last_run
+        from genesis.observability.call_site_recorder import (
+            record_last_run_detached,
+        )
 
         from .arbiter import ARBITER_MODEL
 
@@ -80,16 +82,14 @@ async def _record_arbiter_telemetry(
         ]
         if verdict.get("reason"):
             parts.append(str(verdict["reason"])[:80])
-        async with get_raw_db(str(db_path)) as db:
-            await record_last_run(
-                db,
-                "ambient_arbiter",
-                provider="cc",
-                model_id=ARBITER_MODEL,
-                response_text="|".join(parts),
-                success=arbiter == "ok",
-            )
-        return True
+        return await record_last_run_detached(
+            str(db_path),
+            "ambient_arbiter",
+            provider="cc",
+            model_id=ARBITER_MODEL,
+            response_text="|".join(parts),
+            success=arbiter == "ok",
+        )
     except Exception:
         return False
 
@@ -126,11 +126,9 @@ async def run_worker(
     def finish(verdict: dict) -> dict:
         verdict.setdefault("session_id", session_id)
         verdict.setdefault("generated_at", now_iso)
-        _atomic_write_json(verdict_path, verdict)
-        logged = _append_shadow_log(verdict, state_root)
-        if not logged:
+        if not _append_shadow_log(verdict, state_root):
             verdict["shadow_log_skipped"] = True
-            _atomic_write_json(verdict_path, verdict)
+        _atomic_write_json(verdict_path, verdict)
         return verdict
 
     state = load_state(session_id, base=sessions_root)
