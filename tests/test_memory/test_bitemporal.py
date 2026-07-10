@@ -93,7 +93,8 @@ class TestCreateMetadata:
             ("m1",),
         )
         row = await cursor.fetchone()
-        assert row["valid_at"] == "2026-05-08T12:00:00Z"
+        # Fallback to created_at is canonicalized at the write gate (E1).
+        assert row["valid_at"] == "2026-05-08T12:00:00+00:00"
         assert row["invalid_at"] is None
 
     @pytest.mark.asyncio
@@ -146,10 +147,71 @@ class TestInvalidateMemory:
             ("m1",),
         )
         row = await cursor.fetchone()
-        assert row["invalid_at"] == "2026-05-08T15:00:00Z"
+        # Z-suffix canonicalized at the write gate (E1) — Z sorts after
+        # '+' in the always-on TEXT comparison.
+        assert row["invalid_at"] == "2026-05-08T15:00:00+00:00"
 
     @pytest.mark.asyncio
     async def test_invalidate_nonexistent_returns_false(self, meta_db):
         from genesis.db.crud.memory import invalidate_memory
         result = await invalidate_memory(meta_db, "nonexistent", "2026-05-08")
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_invalidate_garbage_timestamp_raises(self, meta_db):
+        from genesis.db.crud.memory import create_metadata, invalidate_memory
+        await create_metadata(
+            meta_db, memory_id="m1", created_at="2026-05-08T12:00:00+00:00",
+        )
+        with pytest.raises(ValueError, match="unparseable"):
+            await invalidate_memory(meta_db, "m1", "next Friday")
+
+
+class TestWriteGateCanonicalization:
+    """E1 write gate: non-canonical inputs never reach the table."""
+
+    @pytest.mark.asyncio
+    async def test_garbage_valid_at_falls_back_to_created_at(self, meta_db):
+        from genesis.db.crud.memory import create_metadata
+        await create_metadata(
+            meta_db,
+            memory_id="g1",
+            created_at="2026-05-08T12:00:00+00:00",
+            valid_at="Friday",  # LLM temporal string
+        )
+        cursor = await meta_db.execute(
+            "SELECT valid_at FROM memory_metadata WHERE memory_id = ?", ("g1",),
+        )
+        row = await cursor.fetchone()
+        assert row["valid_at"] == "2026-05-08T12:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_garbage_invalid_at_dropped_to_null(self, meta_db):
+        from genesis.db.crud.memory import create_metadata
+        await create_metadata(
+            meta_db,
+            memory_id="g2",
+            created_at="2026-05-08T12:00:00+00:00",
+            invalid_at="soon",
+        )
+        cursor = await meta_db.execute(
+            "SELECT invalid_at FROM memory_metadata WHERE memory_id = ?",
+            ("g2",),
+        )
+        row = await cursor.fetchone()
+        assert row["invalid_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_naive_valid_at_canonicalized(self, meta_db):
+        from genesis.db.crud.memory import create_metadata
+        await create_metadata(
+            meta_db,
+            memory_id="g3",
+            created_at="2026-05-08T12:00:00+00:00",
+            valid_at="2026-05-03T17:30:26",
+        )
+        cursor = await meta_db.execute(
+            "SELECT valid_at FROM memory_metadata WHERE memory_id = ?", ("g3",),
+        )
+        row = await cursor.fetchone()
+        assert row["valid_at"] == "2026-05-03T17:30:26+00:00"
