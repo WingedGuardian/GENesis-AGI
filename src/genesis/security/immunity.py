@@ -43,7 +43,11 @@ from typing import Any
 
 import yaml
 
-from genesis._config_overlay import _user_config_dir, merge_local_overlay
+from genesis._config_overlay import (
+    _resolve_overlay_path,
+    _user_config_dir,
+    merge_local_overlay,
+)
 from genesis.env import repo_root
 from genesis.memory.provenance import (
     ORIGIN_CLASSES,
@@ -172,9 +176,14 @@ def record_demotion(gate: str, reason: str) -> None:
         raise ValueError(f"unknown immunity gate {gate!r}; expected one of {GATES}")
     path = _overlay_path()
     overlay: dict[str, Any] = {}
+    # Read from the SAME overlay the reader resolves (user-dir first, then
+    # the repo-sibling back-compat location) so a legacy repo-sibling
+    # overlay's keys are carried into the canonical user-dir file we write —
+    # otherwise creating the user-dir overlay would silently shadow them.
+    read_path = _resolve_overlay_path(_base_path())
     try:
-        if path.is_file():
-            loaded = yaml.safe_load(path.read_text()) or {}
+        if read_path.is_file():
+            loaded = yaml.safe_load(read_path.read_text()) or {}
             if isinstance(loaded, dict):
                 overlay = loaded
     except Exception:

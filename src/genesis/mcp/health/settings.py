@@ -717,7 +717,9 @@ def _validate_ws3_immunity(changes: dict) -> list[str]:
                     errors.append("'auto_demote.enabled' must be a boolean")
                 for int_key in ("window_minutes", "would_block_threshold"):
                     if int_key in value and (
-                        not isinstance(value[int_key], int) or value[int_key] <= 0
+                        not isinstance(value[int_key], int)
+                        or isinstance(value[int_key], bool)  # bool ⊂ int
+                        or value[int_key] <= 0
                     ):
                         errors.append(f"'auto_demote.{int_key}' must be a positive int")
         # auto_demote_state: written by immunity.record_demotion via this

@@ -180,3 +180,22 @@ def test_hand_edited_unquoted_off_is_honored(config_dirs):
     base.write_text("enabled: true\nprocedure:\n  mode: off\nidentity:\n  mode: on\n")
     assert immunity.gate_mode("procedure") == "off"
     assert immunity.gate_mode("identity") == "shadow"
+
+
+def test_record_demotion_carries_repo_sibling_overlay_keys(config_dirs):
+    """A legacy repo-sibling .local.yaml (the back-compat location the
+    reader honors) must have its keys carried into the canonical user-dir
+    overlay record_demotion writes — otherwise creating the user-dir file
+    would silently shadow them."""
+    base, user_overlay = config_dirs
+    assert not user_overlay.exists()
+    sibling = base.with_suffix(".local.yaml")
+    _write(sibling, {"procedure": {"mode": "enforce"}})
+    assert immunity.gate_mode("procedure") == "enforce"
+
+    immunity.record_demotion("identity", "spike")
+
+    written = yaml.safe_load(user_overlay.read_text())
+    assert written["procedure"]["mode"] == "enforce"  # carried over
+    assert written["identity"]["mode"] == "shadow"
+    assert immunity.gate_mode("procedure") == "enforce"  # still applies

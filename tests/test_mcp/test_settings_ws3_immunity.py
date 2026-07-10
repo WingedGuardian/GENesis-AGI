@@ -77,3 +77,10 @@ def test_validate_accepts_valid_auto_demote():
         {"auto_demote": {"enabled": True, "window_minutes": 30,
                          "would_block_threshold": 3}}
     ) == []
+
+
+def test_validate_rejects_bool_for_auto_demote_ints():
+    # bool is an int subclass in Python — {"window_minutes": true} would
+    # otherwise validate and write `window_minutes: true` to the overlay.
+    errors = _validate_ws3_immunity({"auto_demote": {"window_minutes": True}})
+    assert errors and "positive int" in errors[0]
