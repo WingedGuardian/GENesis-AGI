@@ -570,7 +570,10 @@ function formatAge(seconds) {
     if (seconds == null) return '';
     if (seconds < 120) return Math.round(seconds) + 's';
     if (seconds < 7200) return Math.round(seconds / 60) + 'm';
-    return (seconds / 3600).toFixed(1) + 'h';
+    // Roll to days past 48h (matches relativeTime in dashboard.js) —
+    // "67d" reads as stale at a glance where "1613.5h" does not.
+    if (seconds < 172800) return (seconds / 3600).toFixed(1) + 'h';
+    return Math.round(seconds / 86400) + 'd';
 }
 
 function sectionRow(label, value, valueStyle) {
@@ -2069,7 +2072,7 @@ function updateSubsystemGrid(data) {
                 const age = ek.age_hours;
                 const c = age > 24 ? 'color:#ef4444' : age > 6 ? 'color:#ffe600' : 'color:#4ade80';
                 const size = ek.size_bytes ? ' \u00B7 ' + (ek.size_bytes / 1024).toFixed(1) + 'KB' : '';
-                enrichment.appendChild(sectionRow('L1 EK', age.toFixed(1) + 'h ago' + size, c));
+                enrichment.appendChild(sectionRow('L1 EK', formatAge(age * 3600) + ' ago' + size, c));
                 hasEnrichment = true;
             }
 

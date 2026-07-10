@@ -7,6 +7,11 @@ Three capabilities:
 4. **Audit logging** — every resolution action logged for post-hoc review
 
 Used by the dream cycle entity resolution phase and the store pipeline.
+
+NAMING NOTE: "entity" here means a near-duplicate MEMORY PAIR, not a
+typed entity node — those live in the entity layer (``entity_registry``
+/ ``db/crud/entities.py``, WS-H Pillar 2), which uses only
+``normalize_content`` from this module.
 """
 
 from __future__ import annotations

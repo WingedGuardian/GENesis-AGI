@@ -113,7 +113,13 @@
                       x-text="cat ? cat.charAt(0).toUpperCase() + cat.slice(1) : 'All'"></button>
             </template>
           </div>
-          <template x-if="$store.genesisDashboard.commsOutreach.filter(m => m.signal_type !== 'cli_approval').length === 0">
+          <template x-if="$store.genesisDashboard.panelState('comms') === 'loading'">
+            <div style="color:var(--color-text-secondary); text-align:center; padding:2rem; font-size:0.75rem;">Loading…</div>
+          </template>
+          <template x-if="$store.genesisDashboard.panelState('comms') === 'error'">
+            <div style="color:#f0ad4e; text-align:center; padding:2rem; font-size:0.75rem;">Couldn't load comms — will keep retrying.</div>
+          </template>
+          <template x-if="!['loading','error'].includes($store.genesisDashboard.panelState('comms')) && $store.genesisDashboard.commsOutreach.filter(m => m.signal_type !== 'cli_approval').length === 0">
             <div style="color:var(--color-text-secondary); text-align:center; padding:2rem; font-size:0.75rem;">No outreach messages found.</div>
           </template>
           <template x-for="msg in $store.genesisDashboard.commsOutreach.filter(m => m.signal_type !== 'cli_approval').filter(m => !$store.genesisDashboard.commsCategoryFilter || m.category === $store.genesisDashboard.commsCategoryFilter)" :key="msg.id">
@@ -174,7 +180,13 @@
                       x-text="label"></button>
             </template>
           </div>
-          <template x-if="$store.genesisDashboard.commsProposals.length === 0">
+          <template x-if="$store.genesisDashboard.panelState('comms') === 'loading'">
+            <div style="color:var(--color-text-secondary); text-align:center; padding:2rem; font-size:0.75rem;">Loading…</div>
+          </template>
+          <template x-if="$store.genesisDashboard.panelState('comms') === 'error'">
+            <div style="color:#f0ad4e; text-align:center; padding:2rem; font-size:0.75rem;">Couldn't load comms — will keep retrying.</div>
+          </template>
+          <template x-if="!['loading','error'].includes($store.genesisDashboard.panelState('comms')) && $store.genesisDashboard.commsProposals.length === 0">
             <div style="color:var(--color-text-secondary); text-align:center; padding:2rem; font-size:0.75rem;">No proposals. The ego hasn't produced any proposals yet.</div>
           </template>
           <template x-for="p in $store.genesisDashboard.commsProposals.filter(p => !$store.genesisDashboard.commsProposalFilter || p.status === $store.genesisDashboard.commsProposalFilter)" :key="p.id">
@@ -279,7 +291,13 @@
 
         <!-- ── Approvals ────────────────────────────────── -->
         <div x-show="$store.genesisDashboard.commsTab === 'approvals'">
-          <template x-if="$store.genesisDashboard.approvals.length === 0">
+          <template x-if="$store.genesisDashboard.panelState('approvals') === 'loading'">
+            <div style="color:var(--color-text-secondary); text-align:center; padding:2rem; font-size:0.75rem;">Loading…</div>
+          </template>
+          <template x-if="$store.genesisDashboard.panelState('approvals') === 'error'">
+            <div style="color:#f0ad4e; text-align:center; padding:2rem; font-size:0.75rem;">Couldn't load approvals — revisit this tab to retry.</div>
+          </template>
+          <template x-if="!['loading','error'].includes($store.genesisDashboard.panelState('approvals')) && $store.genesisDashboard.approvals.length === 0">
             <div style="color:var(--color-text-secondary); text-align:center; padding:2rem; font-size:0.75rem;">No pending approvals.</div>
           </template>
           <template x-if="$store.genesisDashboard.approvals.length > 0">

@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .accumulator import fold_turn
+from .accumulator import fold_turn, should_fold
 from .statefiles import load_state, save_state
 from .trigger import check_fire, record_fire, stability
 
@@ -24,10 +24,17 @@ def hook_fold(
     prompt_keywords: list[str],
     file_keywords: list[str] | None = None,
     pivoted: bool = False,
+    prompt_text: str = "",
     base_dir: Path | None = None,
     now: datetime | None = None,
 ) -> dict | None:
     """Fold one turn; check the drift trigger; record any fire.
+
+    ``prompt_text``, when provided, runs the ``should_fold`` gate first:
+    non-thematic turns (continuations, interrupts, bash passthrough,
+    sub-minimum keyword count) return ``{"fired": False, "reason":
+    "low_signal"}`` without folding. Empty ``prompt_text`` (legacy
+    callers) skips the gate and folds unconditionally.
 
     Returns a small summary dict (for tests and the PR4 replay harness)
     or None on any failure — by contract this function cannot raise.
@@ -35,6 +42,8 @@ def hook_fold(
     try:
         if not session_id or not vector:
             return None
+        if prompt_text and not should_fold(prompt_text, prompt_keywords):
+            return {"fired": False, "reason": "low_signal"}
         now = now or datetime.now(UTC)
         now_iso = now.isoformat()
 

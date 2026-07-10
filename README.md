@@ -42,7 +42,7 @@ We have the most capable AI models ever created, and we're using them like searc
 
 Every other AI agent puts you in the driver's seat—and keeps you there. YOU figure out what you need. YOU debug the failures. YOU manage the infrastructure. YOU supervise every step.
 
-But now? **Personal AGI is here.**
+But now? **This is my run at personal AGI—the most complete open-source cognitive architecture for a persistent personal agent.**
 
 Not the sci-fi version. The real one: a system that remembers everything, learns from every interaction, thinks while you sleep, earns autonomy through demonstrated competence, and gets fundamentally better every day it runs. Clone it, run it; tell me I'm wrong!
 

@@ -10,6 +10,8 @@ import re
 
 import aiosqlite
 
+from genesis.db.timeutil import canonical_iso
+
 
 def _prepare_fts5(query: str, *, boolean: bool = False) -> str | None:
     """Prepare a query string for FTS5 MATCH.
@@ -263,15 +265,22 @@ async def create_metadata(
     triage, reflection) so foreground recall can default-filter them.
     NULL = user-sourced.
     """
-    resolved_valid_at = valid_at or created_at
+    # Bitemporal columns are raw TEXT-compared everywhere — canonicalize
+    # at the write gate. Unparseable valid_at (LLM temporal strings like
+    # "Friday" or date ranges) falls back to created_at; unparseable
+    # invalid_at is dropped (NULL = valid forever) rather than stored as
+    # a string that breaks the always-on filter.
+    resolved_valid_at = (
+        canonical_iso(valid_at) or canonical_iso(created_at) or created_at
+    )
     await db.execute(
         "INSERT OR IGNORE INTO memory_metadata "
         "(memory_id, created_at, collection, confidence, embedding_status, "
         "memory_class, wing, room, valid_at, invalid_at, source_subsystem) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (memory_id, created_at, collection, confidence, embedding_status,
-         memory_class, wing, room, resolved_valid_at, invalid_at,
-         source_subsystem),
+         memory_class, wing, room, resolved_valid_at,
+         canonical_iso(invalid_at), source_subsystem),
     )
     await db.commit()
     return memory_id
@@ -284,11 +293,18 @@ async def invalidate_memory(
 ) -> bool:
     """Mark a memory as no longer valid (bi-temporal invalidation).
 
-    Returns True if the memory was found and updated.
+    Returns True if the memory was found and updated. Raises
+    ``ValueError`` on an unparseable timestamp — an explicit
+    invalidation with a garbage cutoff is a programming error, and a
+    non-canonical string would silently break the always-on TEXT
+    comparison in ``search_ranked``.
     """
+    canonical = canonical_iso(invalid_at)
+    if canonical is None:
+        raise ValueError(f"invalidate_memory: unparseable invalid_at {invalid_at!r}")
     cursor = await db.execute(
         "UPDATE memory_metadata SET invalid_at = ? WHERE memory_id = ?",
-        (invalid_at, memory_id),
+        (canonical, memory_id),
     )
     await db.commit()
     return cursor.rowcount > 0

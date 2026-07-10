@@ -65,6 +65,7 @@ async def rank_candidates(
     qdrant_client: QdrantClient,
     embedding_provider: EmbeddingProvider,
     top_n: int = TOP_N,
+    created_before: str | None = None,
 ) -> list[dict]:
     """Gather both lanes, filter expired, rank, return the top *top_n*.
 
@@ -90,6 +91,7 @@ async def rank_candidates(
             limit=limit,
             tags_any=tags,
             exact=True,
+            created_before=created_before,
         ):
             mid = str(hit["id"])
             if mid in by_id:
@@ -119,6 +121,10 @@ async def rank_candidates(
                 by_id[r.memory_id]["lanes"].append("drift")
                 continue
             payload = r.payload or {}
+            # drift_recall has no as-of entry point — post-filter (the
+            # replay's fidelity concern; live runs pass no cutoff)
+            if created_before and str(payload.get("created_at") or "") > created_before:
+                continue
             by_id[r.memory_id] = {
                 "memory_id": r.memory_id,
                 "cosine": None,  # backfilled below from the stored vector

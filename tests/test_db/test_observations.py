@@ -40,6 +40,66 @@ async def test_query_by_source(db):
     assert all(r["source"] == "sensor" for r in rows)
 
 
+async def test_query_by_source_prefix(db):
+    await observations.create(db, id="sp1", **{**_COMMON, "source": "session:abc-123"})
+    await observations.create(db, id="sp2", **{**_COMMON, "source": "session:def-456"})
+    await observations.create(db, id="sp3", **_COMMON)
+    rows = await observations.query(db, source_prefix="session:")
+    assert {r["id"] for r in rows} == {"sp1", "sp2"}
+
+
+async def test_query_source_filters_mutually_exclusive(db):
+    with pytest.raises(ValueError):
+        await observations.query(db, source="a", source_prefix="b")
+    with pytest.raises(ValueError):
+        await observations.query(db, source_in=["a"], source_prefix="b")
+
+
+async def test_distinct_unresolved_types_and_sources(db):
+    await observations.create(db, id="du1", **_COMMON)
+    await observations.create(db, id="du2", **{**_COMMON, "source": "session:abc"})
+    await observations.create(db, id="du3", **{**_COMMON, "type": "anomaly"})
+    await observations.resolve(
+        db, "du3", resolved_at="2026-01-02T00:00:00", resolution_notes=""
+    )
+    assert await observations.distinct_unresolved_types(db) == ["metric"]
+    assert await observations.distinct_unresolved_sources(db) == ["sensor", "session:abc"]
+
+
+async def test_count_unsurfaced_mirrors_get_unsurfaced(db):
+    await observations.create(db, id="cu1", **_COMMON)                                # counted
+    await observations.create(db, id="cu2", **{**_COMMON, "priority": "low"})         # excluded by priority
+    await observations.create(db, id="cu3", **{**_COMMON, "type": "internal_thing"})  # excluded by type
+    await observations.create(db, id="cu4", **_COMMON)
+    await observations.mark_surfaced(db, ["cu4"], "2026-01-02T00:00:00")              # surfaced
+    await observations.create(db, id="cu5", **_COMMON)
+    await observations.resolve(db, "cu5", resolved_at="2026-01-02T00:00:00", resolution_notes="")
+
+    count = await observations.count_unsurfaced(
+        db, priority_filter=("critical", "high", "medium"),
+        exclude_types=("internal_thing",),
+    )
+    assert count == 1
+    rows = await observations.get_unsurfaced(
+        db, priority_filter=("critical", "high", "medium"),
+        exclude_types=("internal_thing",), limit=100,
+    )
+    assert count == len(rows)
+    assert await observations.count_unsurfaced(db, priority_filter=()) == 0
+
+
+async def test_distinct_unresolved_sources_excludes_types(db):
+    """A source whose unresolved rows are ALL excluded types must not appear."""
+    await observations.create(db, id="dx1", **_COMMON)
+    await observations.create(
+        db, id="dx2", **{**_COMMON, "source": "session:abc", "type": "conversation_pivot"}
+    )
+    sources = await observations.distinct_unresolved_sources(
+        db, exclude_types=("conversation_pivot",)
+    )
+    assert sources == ["sensor"]
+
+
 async def test_query_by_priority(db):
     await observations.create(db, id="o5", **{**_COMMON, "priority": "low"})
     rows = await observations.query(db, priority="low")

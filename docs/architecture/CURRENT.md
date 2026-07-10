@@ -64,6 +64,15 @@ Easy-to-forget mechanisms:
   (`learning/procedural/matcher.py find_relevant`), not hybrid retrieval.
 - External-world recall results are provenance-wrapped (`wrap_external_recall`)
   — first-party memory vs knowledge-base is a load-bearing distinction.
+- **Entity layer (WS-H Pillar 2)** — typed entity nodes with identity:
+  `entities`/`entity_mentions`/`entity_links` tables (migration 0051),
+  `db/crud/entities.py` (recursive-CTE traversal, bi-temporal edge validity,
+  EXTRACTED/INFERRED/AMBIGUOUS provenance), `memory/entity_registry.py`
+  (string→ID resolution tiering; fuzzy matches queue `entity_adjudication`),
+  `memory/entity_seed.py` (curated spine incl. the repo-split rule).
+  Distinct from `memory/entity_resolution.py`, which is near-duplicate
+  memory-PAIR dedup. Bitemporal timestamps are canonicalized at the write
+  gate (`db/timeutil.canonical_iso`, migration 0050).
 
 **Consolidation (dream cycle)** — `memory/dream_cycle.py` (~1480 LOC):
 weekly clustering (Sun 4am) persists a value-ranked worklist to

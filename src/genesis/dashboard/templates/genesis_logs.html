@@ -32,8 +32,10 @@
         loadingMore: false,
 
         // Filters
+        // INFO+ by default: the 60s DEBUG heartbeat would otherwise dominate
+        // the feed. Keep in sync with resetFilters().
         filters: {
-          severities: "debug",
+          severities: "info",
           subsystem: "",
           eventType: "",
           search: "",
@@ -111,7 +113,7 @@
         },
 
         resetFilters() {
-          this.filters = { severities: "info", subsystem: "", eventType: "", search: "", timeRange: "1h" };
+          this.filters = { severities: "info", subsystem: "", eventType: "", search: "", timeRange: "24h" };
           this.applyFilters();
         },
 

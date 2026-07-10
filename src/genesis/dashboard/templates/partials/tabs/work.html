@@ -24,8 +24,18 @@
                   :style="$store.genesisDashboard.tasksView === 'completed' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
                   @click="$store.genesisDashboard.tasksView = 'completed'">Completed</button>
         </div>
-        <!-- Task list -->
-        <template x-if="$store.genesisDashboard.taskList.filter(t => {
+        <!-- Task list (first-load / failure / empty states) -->
+        <template x-if="$store.genesisDashboard.panelState('tasks') === 'loading'">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            Loading…
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.panelState('tasks') === 'error'">
+          <div style="padding:1.5rem; text-align:center; color:#f0ad4e; font-size:0.75rem;">
+            Couldn't load tasks — will keep retrying.
+          </div>
+        </template>
+        <template x-if="!['loading','error'].includes($store.genesisDashboard.panelState('tasks')) && $store.genesisDashboard.taskList.filter(t => {
           const phase = (t.current_phase || '').toLowerCase();
           const active = ['executing','paused','blocked','pending'].includes(phase);
           return $store.genesisDashboard.tasksView === 'active' ? active : !active;
@@ -219,7 +229,17 @@
                   :style="$store.genesisDashboard.sessionsView === 'history' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
                   @click="$store.genesisDashboard.sessionsView = 'history'; $store.genesisDashboard.fetchWorkSessions()">History</button>
         </div>
-        <template x-if="$store.genesisDashboard.sessionsList.length === 0">
+        <template x-if="$store.genesisDashboard.panelState('workSessions') === 'loading'">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            Loading…
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.panelState('workSessions') === 'error'">
+          <div style="padding:1.5rem; text-align:center; color:#f0ad4e; font-size:0.75rem;">
+            Couldn't load sessions — will keep retrying.
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.sessionsList.length === 0 && !['loading','error'].includes($store.genesisDashboard.panelState('workSessions'))">
           <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
             No background sessions found.
           </div>

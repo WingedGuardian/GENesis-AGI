@@ -352,7 +352,7 @@ async def test_source_in_filters_by_multiple_sources(db):
 
 
 async def test_source_and_source_in_mutual_exclusion(db):
-    with pytest.raises(ValueError, match="Cannot specify both"):
+    with pytest.raises(ValueError, match="at most one"):
         await observations.query(db, source="x", source_in=["y"])
 
 
