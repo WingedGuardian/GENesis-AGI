@@ -57,6 +57,12 @@ def _sessions_dir() -> Path:
     return Path.home() / ".genesis" / "sessions"
 
 
+def _split_modules(raw: str) -> list[str]:
+    """Parse a (possibly multi-line-joined) ``[a, b, c]`` module list."""
+    raw = raw.strip().strip("[]")
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+
 def _parse_sections(text: str) -> list[dict]:
     """Split CURRENT.md into ## sections carrying entry/modules + body."""
     sections = []
@@ -67,6 +73,8 @@ def _parse_sections(text: str) -> list[dict]:
         lines = body.splitlines()
         entry, modules = None, []
         in_block = False
+        collecting = False  # accumulating a multi-line `modules: [ ... ]`
+        mod_buf = ""
         for line in lines:
             if _BLOCK_RE.match(line):
                 in_block = True
@@ -74,12 +82,24 @@ def _parse_sections(text: str) -> list[dict]:
             if in_block:
                 if line.startswith("```"):
                     in_block = False
+                    collecting = False
+                    continue
+                if collecting:
+                    mod_buf += " " + line
+                    if "]" in line:
+                        modules = _split_modules(mod_buf)
+                        collecting = False
                     continue
                 if line.startswith("entry:"):
                     entry = line.split(":", 1)[1].strip()
                 elif line.startswith("modules:"):
-                    raw = line.split(":", 1)[1].strip().strip("[]")
-                    modules = [m.strip() for m in raw.split(",") if m.strip()]
+                    # The list may wrap onto continuation lines (e.g. the
+                    # platform-data entry) — keep reading until the ']'.
+                    mod_buf = line.split(":", 1)[1]
+                    if "]" in mod_buf:
+                        modules = _split_modules(mod_buf)
+                    else:
+                        collecting = True
         if entry:
             sections.append(
                 {"title": lines[0].lstrip("# ").strip(), "entry": entry,
@@ -112,8 +132,11 @@ def _top_module(file_path: str) -> str | None:
     # .../src/genesis/<top>/... or .../src/genesis/<top>.py
     if idx == 0 or parts[idx - 1] != "src" or idx + 1 >= len(parts):
         return None
-    top = parts[idx + 1]
-    return top[:-3] if top.endswith(".py") else top
+    # Return the segment VERBATIM: CURRENT.md names package dirs bare
+    # (`memory`) but loose top-level modules WITH the suffix (`env.py`,
+    # `_config_overlay.py`), matching scripts/check_subsystem_map.py's
+    # live_modules(). Stripping `.py` would make loose-module edits miss.
+    return parts[idx + 1]
 
 
 def _already_nudged(session_id: str, entry: str) -> bool:

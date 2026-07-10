@@ -132,6 +132,49 @@ def test_traversal_session_id_silent(tmp_path):
     assert proc.returncode == 0 and proc.stdout.strip() == ""
 
 
+# The real platform-data entry: modules wrap onto a continuation line, and
+# loose top-level modules are named WITH `.py` (matching check_subsystem_map).
+_WRAPPED_MD = """# Map
+
+## 12. Platform & data
+
+```yaml subsystem-map
+entry: platform-data
+modules: [db, runtime, resilience, observability, security, codebase,
+          restore, util, env.py, _config_overlay.py]
+verified: abc123 2026-07-10
+```
+
+- **Do not touch:** the migration runner's transaction proxy.
+"""
+
+
+def test_multiline_modules_continuation_dir_module(tmp_path):
+    """A dir module on the wrapped continuation line still matches (parser
+    reads until ']', not just the first modules: line)."""
+    for module in ("util", "restore"):
+        proc = _run(
+            _edit(f"/r/src/genesis/{module}/x.py", session_id=module),
+            tmp_path, md_text=_WRAPPED_MD,
+        )
+        ctx = _context(proc)
+        assert ctx is not None, module
+        assert "Platform & data" in ctx
+
+
+def test_loose_top_level_py_module_matches_with_suffix(tmp_path):
+    """A loose top-level module edited as src/genesis/env.py matches the
+    map's `env.py` entry — the segment is kept verbatim, not .py-stripped."""
+    for i, module in enumerate(("env.py", "_config_overlay.py")):
+        proc = _run(
+            _edit(f"/r/src/genesis/{module}", session_id=f"loose-{i}"),
+            tmp_path, md_text=_WRAPPED_MD,
+        )
+        ctx = _context(proc)
+        assert ctx is not None, module
+        assert "Platform & data" in ctx
+
+
 def test_malformed_stdin_fails_open(tmp_path):
     md = tmp_path / "CURRENT.md"
     md.write_text(FIXTURE_MD)

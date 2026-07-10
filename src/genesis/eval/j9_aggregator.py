@@ -907,8 +907,17 @@ async def _compute_dev_quality(
       PR merged). ``harvest_prs_seen`` counts ALL rows regardless of window
       so thin harvest coverage is visible, not hidden.
     - observations source='recon' category='code_audit', unresolved — an
-      all-time backlog gauge (stock, not flow). ``code_audit_by_category``
-      stays sparse until the audit taxonomy prompt ships (see ``note``).
+      all-time backlog gauge (stock, not flow). This reads the SAME source
+      the existing dashboard surplus panel reads (`routes/surplus.py`), so
+      the two agree — but note that source is currently under-populated: the
+      live surplus code-audit pipeline routes findings through
+      `FindingsBridge` into intake/knowledge or the `surplus_insights`
+      staging table, NOT back into `observations`. So this gauge reflects
+      only the observations-published subset (today, stale/expired rows),
+      not total audit output. Reconciling the code-audit finding store
+      across the bridge, the dashboard panel, and this metric is a tracked
+      follow-up. ``code_audit_by_category`` additionally stays sparse until
+      the audit-taxonomy prompt ships (see ``note``).
     - tool_call_outcomes windowed on timestamp (Edit/Write rows written by
       scripts/edit_failure_sensor.py). datetime() normalization mirrors the
       approvals dimension: both formats seen in the wild must window.
@@ -1006,7 +1015,10 @@ async def _compute_dev_quality(
         if edit_calls_total else None,
         # Coverage honesty: all harvested PR rows, windowed or not.
         "harvest_prs_seen": harvest_prs_seen,
-        "note": "scaffold: code_audit_by_category sparse until the audit "
+        "note": "scaffold: code_audit_* reflects only the observations-"
+                "published subset (bridge routes findings to intake/"
+                "surplus_insights, not observations — reconciliation "
+                "tracked); code_audit_by_category sparse until the audit "
                 "taxonomy prompt ships",
     }
     return metrics, prs_merged + edit_calls_total
