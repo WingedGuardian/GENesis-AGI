@@ -154,20 +154,17 @@ fi
 # encrypted creds/secrets payloads (e.g. a freshly rebuilt container whose backup
 # clone has not been re-cloned yet), fall back to the host-side mirror on the
 # shared mount — or, for a host-side restore, the guardian's host-only archive.
-# Same two-path (+archive) probe discipline as the escrow above. Sections 7/8
-# consult $_MIRROR_ROOT only when the primary clone payload is absent.
-_MIRROR_ROOT=""
-for _m in \
-    "${GENESIS_CREDS_MIRROR:-}" \
-    "$HOME/.genesis/shared/guardian/creds-mirror" \
-    "$HOME/.local/state/genesis-guardian/shared/guardian/creds-mirror" \
-    "$HOME/.local/state/genesis-guardian/creds-archive"; do
-    [ -n "$_m" ] && [ -d "$_m" ] || continue
-    if [ -f "$_m/secrets/secrets.env.gpg" ] || [ -d "$_m/creds" ]; then
-        _MIRROR_ROOT="$_m"
-        break
-    fi
-done
+# Ordered candidate roots (shared mount preferred, then the host-only archive).
+# Sections 7/8 resolve the secrets source and the creds source INDEPENDENTLY,
+# each picking the first candidate that carries ITS OWN payload — so a partial
+# mirror (e.g. creds present but secrets lost) never masks a complete archive.
+_cred_fallback_sources() {
+    printf '%s\n' \
+        "${GENESIS_CREDS_MIRROR:-}" \
+        "$HOME/.genesis/shared/guardian/creds-mirror" \
+        "$HOME/.local/state/genesis-guardian/shared/guardian/creds-mirror" \
+        "$HOME/.local/state/genesis-guardian/creds-archive"
+}
 
 # decrypt_file <src.gpg> <dst>
 decrypt_file() {
@@ -620,9 +617,13 @@ fi
 # ── 7. Secrets ───────────────────────────────────────────────────────
 log "--- Secrets ---"
 SECRETS_SRC="$BACKUP_DIR/secrets/secrets.env.gpg"
-if [ ! -f "$SECRETS_SRC" ] && [ -n "$_MIRROR_ROOT" ] && [ -f "$_MIRROR_ROOT/secrets/secrets.env.gpg" ]; then
-    SECRETS_SRC="$_MIRROR_ROOT/secrets/secrets.env.gpg"
-    log "Secrets: Tier-1 clone payload absent — using host-side mirror $SECRETS_SRC"
+if [ ! -f "$SECRETS_SRC" ]; then
+    while IFS= read -r _d; do
+        [ -n "$_d" ] && [ -f "$_d/secrets/secrets.env.gpg" ] || continue
+        SECRETS_SRC="$_d/secrets/secrets.env.gpg"
+        log "Secrets: Tier-1 clone payload absent — using host-side mirror $SECRETS_SRC"
+        break
+    done < <(_cred_fallback_sources)
 fi
 if [ -f "$SECRETS_SRC" ]; then
     if [ -f "$SECRETS_FILE" ] && ! $FORCE; then
@@ -656,15 +657,17 @@ log "--- Credential & wiring files ---"
 CREDS_SRC_DIR="$BACKUP_DIR/creds"
 # Key the fallback on actual .gpg PAYLOAD presence, not directory existence:
 # backup.sh skips creds when the passphrase was unset (§8), which can leave an
-# empty/placeholder creds/ dir that would otherwise mask a good host mirror.
-# Symmetric with the secrets file test above; set -e-safe (checks live in `if`).
-_creds_has_payload=false
-if [ -d "$CREDS_SRC_DIR" ] && find "$CREDS_SRC_DIR" -name '*.gpg' -print -quit 2>/dev/null | grep -q .; then
-    _creds_has_payload=true
-fi
-if ! $_creds_has_payload && [ -n "$_MIRROR_ROOT" ] && [ -d "$_MIRROR_ROOT/creds" ]; then
-    CREDS_SRC_DIR="$_MIRROR_ROOT/creds"
-    log "Creds: Tier-1 clone payload absent — using host-side mirror $CREDS_SRC_DIR"
+# empty/placeholder creds/ dir; and a partial mirror may have creds/ without the
+# .gpg files. Pick the first candidate that actually carries creds payload, so a
+# hollow mirror never masks a complete archive. set -e-safe (checks in `if`).
+_creds_has_payload() { find "$1" -name '*.gpg' -print -quit 2>/dev/null | grep -q .; }
+if ! { [ -d "$CREDS_SRC_DIR" ] && _creds_has_payload "$CREDS_SRC_DIR"; }; then
+    while IFS= read -r _d; do
+        [ -n "$_d" ] && [ -d "$_d/creds" ] && _creds_has_payload "$_d/creds" || continue
+        CREDS_SRC_DIR="$_d/creds"
+        log "Creds: Tier-1 clone payload absent — using host-side mirror $CREDS_SRC_DIR"
+        break
+    done < <(_cred_fallback_sources)
 fi
 if [ -d "$CREDS_SRC_DIR" ]; then
     CREDS_STAGE="${GENESIS_CREDS_STAGE:-$HOME/.genesis/restore-creds}"
