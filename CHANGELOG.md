@@ -11,6 +11,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The host Guardian now tells you before its AI recovery brain loses its
+  login — and can survive it without you touching the host.** The Guardian's
+  autonomous diagnosis runs on Claude Code authenticated by a one-time login at
+  install, which never refreshes; if it died, the brain silently went dark and
+  you'd only find out mid-incident. Genesis now watches that login's health and
+  alerts you (over Telegram) if it goes dead, and warns ~30 days before a
+  fallback token would expire. Optionally, mint a one-year token with `claude
+  setup-token` from any machine and pipe it to `scripts/store_cc_token.sh` —
+  Genesis syncs it to the host and uses it **only** as a fallback when the
+  host's own login is dead, never overriding a working login. The token is a
+  subscription token (not an API key), is stored 0600 and never logged, and the
+  health signal sends only status booleans — never the token or your account
+  details. You can set this up at install or just wait for the first alert.
+
 - **`genesis eval bench` — a Genesis-vs-bare-Claude A/B benchmark you can run
   in one command.** Each task in a private task set runs through two arms: a
   cognition-enabled Genesis session (identity + read-only recall from your

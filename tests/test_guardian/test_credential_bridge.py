@@ -486,3 +486,86 @@ class TestMirrorCredentialBackup:
         shared = tmp_path / "shared"
         shared.mkdir()
         assert mirror_credential_backup(shared_dir=shared, backup_dir=clone) is None
+
+
+class TestCCOAuthTokenSync:
+    """CC setup-token sync — dedicated source file, never secrets.env."""
+
+    def test_syncs_token_and_created_at(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import (
+            load_cc_oauth_token,
+            propagate_cc_oauth_token,
+        )
+        src = tmp_path / "container" / "cc_oauth_token.env"
+        src.parent.mkdir(parents=True)
+        src.write_text(
+            "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-SYNTHETIC\n"
+            "GENESIS_CC_TOKEN_CREATED_AT=1700000000\n",
+        )
+        shared = tmp_path / "state" / "shared"
+        out = propagate_cc_oauth_token(shared_dir=shared, source_path=src)
+        assert out is not None
+        assert out.name == "cc_oauth_token.env"
+        assert stat.S_IMODE(os.stat(out).st_mode) == 0o600
+        result = load_cc_oauth_token(str(tmp_path / "state"))
+        assert result == {
+            "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-SYNTHETIC",
+            "GENESIS_CC_TOKEN_CREATED_AT": "1700000000",
+        }
+
+    def test_backfills_created_at_from_mtime(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import (
+            _read_dotenv,
+            propagate_cc_oauth_token,
+        )
+        src = tmp_path / "cc_oauth_token.env"
+        src.write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-X\n")
+        out = propagate_cc_oauth_token(shared_dir=tmp_path / "shared", source_path=src)
+        assert out is not None
+        back = _read_dotenv(out)
+        assert back["GENESIS_CC_TOKEN_CREATED_AT"].isdigit()
+
+    def test_absent_source_skips(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import propagate_cc_oauth_token
+        assert propagate_cc_oauth_token(
+            shared_dir=tmp_path / "shared", source_path=tmp_path / "nope.env",
+        ) is None
+
+    def test_no_token_key_skips(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import propagate_cc_oauth_token
+        src = tmp_path / "cc_oauth_token.env"
+        src.write_text("GENESIS_CC_TOKEN_CREATED_AT=123\n")  # created_at, no token
+        assert propagate_cc_oauth_token(
+            shared_dir=tmp_path / "shared", source_path=src,
+        ) is None
+
+    def test_load_missing_returns_empty(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import load_cc_oauth_token
+        assert load_cc_oauth_token(str(tmp_path / "nope")) == {}
+
+    def test_combined_bridge_includes_cc_token(self, tmp_path: Path, monkeypatch) -> None:
+        # The composite calls the leg without source_path (module default), so
+        # point _CC_TOKEN_SOURCE at a tmp file for this test.
+        from genesis.guardian import credential_bridge as cb
+        src = tmp_path / "cc_oauth_token.env"
+        src.write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-X\n")
+        monkeypatch.setattr(cb, "_CC_TOKEN_SOURCE", src)
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("TELEGRAM_BOT_TOKEN=bot\nTELEGRAM_CHAT_ID=chat\n")
+        written = cb.propagate_guardian_credentials(
+            shared_dir=tmp_path / "state" / "shared", secrets_path=secrets,
+        )
+        assert "cc_oauth_token.env" in [p.name for p in written]
+
+    def test_never_reads_from_secrets_env(self, tmp_path: Path) -> None:
+        # A token in secrets.env must NOT be picked up — the leg reads only its
+        # dedicated file (guards the load_dotenv override hazard by construction).
+        from genesis.guardian.credential_bridge import propagate_cc_oauth_token
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-FROM-SECRETS\n")
+        out = propagate_cc_oauth_token(
+            shared_dir=tmp_path / "shared",
+            source_path=tmp_path / "absent.env",
+            secrets_path=secrets,
+        )
+        assert out is None  # secrets_path is ignored for this leg

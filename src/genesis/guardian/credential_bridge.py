@@ -14,6 +14,7 @@ host reads from $STATE_DIR/shared/guardian/telegram_creds.env.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
@@ -24,10 +25,12 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "load_backup_passphrase",
+    "load_cc_oauth_token",
     "load_provisioning_credentials",
     "load_telegram_credentials",
     "mirror_credential_backup",
     "propagate_backup_passphrase",
+    "propagate_cc_oauth_token",
     "propagate_guardian_credentials",
     "propagate_provisioning_credentials",
     "propagate_telegram_credentials",
@@ -79,6 +82,26 @@ _KEY_MAP_PASSPHRASE = {
 _MIRROR_SUBDIR = "creds-mirror"      # under <shared>/guardian/
 _MIRROR_STAMP = "MIRROR_STAMP"       # completeness marker, written LAST
 _MIRROR_SRC_SUBDIRS = ("creds", "secrets")  # subtrees of the Tier-1 clone to mirror
+
+# CC recovery-brain OAuth setup-token sync. The host Guardian's `claude -p`
+# recovery brain authenticates via a one-time manual `claude login` (no refresh),
+# so if that login dies the brain silently goes dark. A `claude setup-token`
+# 1-year OAuth token (used via CLAUDE_CODE_OAUTH_TOKEN — NOT an ANTHROPIC_API_KEY)
+# minted anywhere and dropped in the dedicated container file below is synced to
+# the host shared mount; the host-side diagnosis path injects it ONLY as a
+# FALLBACK when its own login is dead (never degrades a working login). Two keys
+# cross: the token + its creation epoch (which drives the pre-expiry warning).
+# ⚠ The token lives in a DEDICATED file, NOT secrets.env: runtime/init/secrets.py
+# does load_dotenv(secrets.env, override=True), which would inject
+# CLAUDE_CODE_OAUTH_TOKEN into every CONTAINER-side `claude` subprocess and
+# hijack the container's own CC auth. Keeping it out of secrets.env is
+# load-bearing, not tidiness.
+_CC_TOKEN_FILENAME = "cc_oauth_token.env"
+_CC_TOKEN_SOURCE = Path("~/.genesis/cc_oauth_token.env").expanduser()
+_KEY_MAP_CC_TOKEN = {
+    "CLAUDE_CODE_OAUTH_TOKEN": "CLAUDE_CODE_OAUTH_TOKEN",
+    "GENESIS_CC_TOKEN_CREATED_AT": "GENESIS_CC_TOKEN_CREATED_AT",
+}
 
 # Keys to extract from container secrets.env
 # Maps source key name → output key name
@@ -320,12 +343,79 @@ def mirror_credential_backup(
     return dest_root
 
 
+def propagate_cc_oauth_token(
+    shared_dir: Path | None = None,
+    source_path: Path | None = None,
+    secrets_path: Path | None = None,
+) -> Path | None:
+    """Sync the CC setup-token (+ creation epoch) → host shared mount.
+
+    Reads the DEDICATED container file (``~/.genesis/cc_oauth_token.env``,
+    written by ``scripts/store_cc_token.sh``), NEVER secrets.env — see the
+    module note: secrets.env is ``load_dotenv``'d with ``override=True`` and a
+    token there would hijack the container's own CC auth. The host injects this
+    token ONLY as a fallback when its own ``claude login`` is dead. Opt-in /
+    lazy: absent file or no token → returns None (nothing propagated).
+
+    ``secrets_path`` is accepted (and ignored) so the combined bridge can call
+    every leg with a uniform signature; the token has its own source file.
+    """
+    src = source_path or _CC_TOKEN_SOURCE
+    out_dir = (shared_dir or _CONTAINER_SHARED_DIR) / _CREDS_SUBDIR
+
+    source_creds = _read_dotenv(src)
+    if not source_creds:
+        logger.debug("No CC token file at %s — skipping cc-token propagation", src)
+        return None
+
+    creds: dict[str, str] = {}
+    for src_key, dst_key in _KEY_MAP_CC_TOKEN.items():
+        value = source_creds.get(src_key, "")
+        if value:
+            creds[dst_key] = value
+
+    if not creds.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        logger.debug("No CLAUDE_CODE_OAUTH_TOKEN present — skipping cc-token propagation")
+        return None
+
+    # Backfill the creation epoch from the source file's mtime if the intake
+    # script didn't stamp one — age drives the host's pre-expiry warning.
+    if not creds.get("GENESIS_CC_TOKEN_CREATED_AT"):
+        with contextlib.suppress(OSError):
+            creds["GENESIS_CC_TOKEN_CREATED_AT"] = str(int(src.stat().st_mtime))
+
+    out_path = _write_creds_atomic(out_dir, _CC_TOKEN_FILENAME, creds)
+    logger.debug("CC OAuth token propagated to %s", out_path)  # never logs the value
+    return out_path
+
+
+def load_cc_oauth_token(
+    state_dir: str = "~/.local/state/genesis-guardian",
+) -> dict[str, str]:
+    """Read the synced CC OAuth token from the shared mount (host side).
+
+    Returns {} when absent/unreadable — the host then relies on its own
+    ``claude login`` (the token is injected only when that login is dead).
+    """
+    creds_path = (
+        Path(state_dir).expanduser() / "shared" / _CREDS_SUBDIR / _CC_TOKEN_FILENAME
+    )
+    if not creds_path.exists():
+        logger.debug("Synced CC OAuth token not found at %s", creds_path)
+        return {}
+    try:
+        return _read_dotenv(creds_path)
+    except OSError as exc:
+        logger.warning("Failed to read synced CC OAuth token: %s", exc)
+        return {}
+
+
 def propagate_guardian_credentials(
     shared_dir: Path | None = None,
     secrets_path: Path | None = None,
 ) -> list[Path]:
     """Combined container-side bridge: telegram + provisioning + passphrase escrow
-    + encrypted-backup mirror.
+    + cc-token + encrypted-backup mirror.
 
     Wired to the awareness-loop tick (called zero-arg). A failure in one leg
     never blocks the others, and never raises into the loop.
@@ -335,6 +425,7 @@ def propagate_guardian_credentials(
         propagate_telegram_credentials,
         propagate_provisioning_credentials,
         propagate_backup_passphrase,
+        propagate_cc_oauth_token,
     ):
         try:
             path = fn(shared_dir=shared_dir, secrets_path=secrets_path)
