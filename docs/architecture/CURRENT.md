@@ -364,7 +364,7 @@ The loops that make Genesis think between conversations.
 ```yaml subsystem-map
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness]
-verified: 8dac642c 2026-07-09
+verified: 780cc8de 2026-07-10
 ```
 
 - **awareness/**: the 5-min heartbeat. ~23 signal collectors (the richer
@@ -404,9 +404,13 @@ verified: 8dac642c 2026-07-09
   payload indexes drops valid results; found 2026-07-09). Headless-
   Haiku arbiter judges candidates per fire (fail-closed parse, group-
   kill on timeout). Verdicts → `ambient_verdict.json`, tuning →
-  size-capped shadow log. **Zero DB/Qdrant writes — never bumps
-  retrieved_count** (protects MEM-005/H-1 baselines). Fail-open at the
-  hook boundary. Kill switch: `GENESIS_SESSION_AWARENESS_DISABLED=1`.
+  size-capped shadow log; each arbiter attempt (incl. pre-spawn
+  failures, success=0 with reason) also records a `call_site_last_run`
+  row (`ambient_arbiter`, neural monitor) via its own short-lived RW
+  connection. **Zero memory-row writes — never bumps
+  retrieved_count** (retrieval connection is mode=ro; protects
+  MEM-005/H-1 baselines). Fail-open at the hook boundary. Kill switch:
+  `GENESIS_SESSION_AWARENESS_DISABLED=1`.
 
 ## 10. Learning & evaluation
 

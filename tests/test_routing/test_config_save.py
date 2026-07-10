@@ -30,6 +30,14 @@ def config_file(tmp_path):
                 "default_paid": True,
                 "never_pays": False,
             },
+            # Empty-chain cli site (the ambient_arbiter class): the loader
+            # keeps it, so the save path must round-trip it too.
+            "ambient_arbiter": {
+                "chain": [],
+                "dispatch": "cli",
+                "cc_model": "Haiku",
+                "never_pays": True,
+            },
         },
     }
     path = tmp_path / "model_routing.yaml"
@@ -97,6 +105,33 @@ def test_reject_never_pays_without_free(config_file):
             chain=["openrouter_sonnet"],  # not free
             never_pays=True,
         )
+
+
+def test_empty_chain_cli_site_round_trips(config_file):
+    """The editor always sends the chain; [] must be accepted for a cli
+    site (mirrors the loader's exemption) or the site is un-editable."""
+    new_config = update_call_site_in_yaml(
+        config_file, "ambient_arbiter", chain=[], cc_model="Sonnet",
+    )
+    cs = new_config.call_sites["ambient_arbiter"]
+    assert cs.chain == []
+    assert cs.dispatch == "cli"
+
+
+def test_never_pays_vacuous_on_empty_chain_cli(config_file):
+    """The never_pays free-provider check must not block a chainless cli
+    site (nothing to pay for) — any edit would 400 forever otherwise."""
+    new_config = update_call_site_in_yaml(
+        config_file, "ambient_arbiter", never_pays=True,
+    )
+    assert new_config.call_sites["ambient_arbiter"].never_pays is True
+
+
+def test_empty_chain_still_rejected_for_api_sites(config_file):
+    """The cli exemption must not leak: a dual/api site keeps the
+    non-empty-chain requirement (2_triage has no dispatch -> dual)."""
+    with pytest.raises(ValueError, match="at least one provider"):
+        update_call_site_in_yaml(config_file, "2_triage", chain=[])
 
 
 def test_update_default_paid(config_file):

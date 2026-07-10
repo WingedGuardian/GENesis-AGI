@@ -350,21 +350,21 @@ async def _call_llm(prompt: str, model: str) -> str:
 async def _record_to_monitor(model: str, response_text: str | None, *, success: bool) -> None:
     """Best-effort recording to neural monitor. Never raises."""
     try:
-        from genesis.db.connection import get_raw_db
         from genesis.env import genesis_db_path
-        from genesis.observability.call_site_recorder import record_last_run
+        from genesis.observability.call_site_recorder import (
+            record_last_run_detached,
+        )
 
         # Extract provider prefix from litellm model string (e.g. "anthropic/..." → "anthropic")
         provider = model.split("/", 1)[0] if "/" in model else model
         model_id = model.split("/", 1)[1] if "/" in model else model
 
-        async with get_raw_db(str(genesis_db_path())) as db:
-            await record_last_run(
-                db, _CALL_SITE_ID,
-                provider=provider, model_id=model_id,
-                response_text=(response_text or "")[:200],
-                success=success,
-            )
+        await record_last_run_detached(
+            str(genesis_db_path()), _CALL_SITE_ID,
+            provider=provider, model_id=model_id,
+            response_text=(response_text or "")[:200],
+            success=success,
+        )
     except Exception:
         logger.debug("Failed to record contribution_gate to neural monitor", exc_info=True)
 
