@@ -147,3 +147,32 @@ def test_entry_script_subprocess(tmp_path):
     assert proc.returncode == 0, proc.stderr
     verdict_path = tmp_path / ".genesis" / "sessions" / SID / "ambient_verdict.json"
     assert json.loads(verdict_path.read_text())["status"] == "no_theme"
+
+
+@pytest.mark.asyncio
+async def test_arbiter_path_records_picks(tmp_path):
+    """Default (arbiter) path: verdict carries picks + resolved memory ids."""
+    sessions, state = tmp_path / "s", tmp_path / "sa"
+    _seed_theme(sessions)
+    fake = [
+        {"memory_id": "m1", "score": 0.9, "lanes": ["vector"]},
+        {"memory_id": "m2", "score": 0.7, "lanes": ["decision"]},
+    ]
+    fake_verdict = {"arbiter": "ok", "picks": [2], "prompt_version": "v1"}
+    with (
+        patch.object(worker_mod, "rank_candidates", new=AsyncMock(return_value=fake)),
+        patch(
+            "genesis.session_awareness.arbiter.judge_candidates",
+            new=AsyncMock(return_value=fake_verdict),
+        ) as judge,
+    ):
+        result = await run_worker(
+            SID, sessions_root=sessions, state_root=state,
+            db_path=_tmp_db(tmp_path), qdrant_url="http://127.0.0.1:1",
+        )
+    assert result["status"] == "judged"
+    assert result["arbiter"] == "ok"
+    assert result["picked_memory_ids"] == ["m2"]
+    judge.assert_awaited_once()
+    v = _verdict(sessions)
+    assert v["picked_memory_ids"] == ["m2"]
