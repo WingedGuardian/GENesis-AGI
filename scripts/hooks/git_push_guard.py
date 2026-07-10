@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -76,9 +77,50 @@ def _get_push_remote_and_branch(cmd: str) -> tuple[str | None, str | None]:
 
 
 def _extract_pr_number(cmd: str) -> str | None:
-    """Extract PR number from a gh pr merge command."""
-    match = re.search(r"gh pr merge\s+(\d+)", cmd)
-    return match.group(1) if match else None
+    """PR number from a gh pr merge command (bare number, #N, or URL)."""
+    match = re.search(r"\bgh pr merge\b(.*)$", cmd, re.DOTALL)
+    if not match:
+        return None
+    try:
+        # shlex keeps quoted args whole so digits inside a --subject
+        # string are never mistaken for the PR number.
+        tokens = shlex.split(match.group(1))
+    except ValueError:
+        tokens = match.group(1).split()
+    for tok in tokens:
+        if tok.isdigit():
+            return tok
+        if tok.startswith("#") and tok[1:].isdigit():
+            return tok[1:]
+        url = re.match(r"\S*/pull/(\d+)\b", tok)
+        if url:
+            return url.group(1)
+    return None
+
+
+def _resolve_pr_number(cmd: str) -> str | None:
+    """Command PR number, else the current branch's open PR.
+
+    No-arg `gh pr merge` from a PR branch is valid gh usage, but it
+    used to skip EVERY merge gate here (the gates only ran under
+    `if pr_num:`) — the 2026-07-10 audit points at this as a mechanism
+    behind findings-ignored merges. Resolution failure is the caller's
+    signal to fail CLOSED for merge commands.
+    """
+    pr_num = _extract_pr_number(cmd)
+    if pr_num:
+        return pr_num
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", "--json", "number", "--jq", ".number"],
+            capture_output=True, text=True, timeout=10,
+        )
+        resolved = result.stdout.strip()
+        if result.returncode == 0 and resolved.isdigit():
+            return resolved
+    except Exception:
+        pass
+    return None
 
 
 def _check_mergeable(pr_num: str) -> str | None:
@@ -364,8 +406,22 @@ def main() -> int:
                 )
                 return 2
 
-            # Check mergeable status before allowing merge
-            pr_num = _extract_pr_number(cmd)
+            # Check mergeable status before allowing merge. Merge is
+            # the one command that fails CLOSED: if we can't tell which
+            # PR this is, we can't run the gates, so we don't merge.
+            pr_num = _resolve_pr_number(cmd)
+            if pr_num is None:
+                print(
+                    "BLOCKED: cannot resolve which PR this merges "
+                    "(no number in the command and no open PR for the "
+                    "current branch).",
+                    file=sys.stderr,
+                )
+                print(
+                    "Specify the PR number: gh pr merge <N> --squash --admin",
+                    file=sys.stderr,
+                )
+                return 2
             if pr_num:
                 mergeable = _check_mergeable(pr_num)
                 if mergeable == "UNKNOWN":
