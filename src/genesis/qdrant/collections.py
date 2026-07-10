@@ -86,6 +86,8 @@ def search(
     exclude_subsystems: list[str] | None = None,
     include_only_subsystems: list[str] | None = None,
     include_deprecated: bool = False,
+    tags_any: list[str] | None = None,
+    exact: bool = False,
 ) -> list[dict]:
     """Search by vector similarity with optional payload filters.
 
@@ -93,6 +95,12 @@ def search(
     the ``source_subsystem`` payload key. Excludes use ``must_not`` —
     points missing the key (legacy data without the tag) are preserved.
     Includes use ``must`` — only points whose key matches are returned.
+
+    ``tags_any`` matches points whose ``tags`` array contains any of the
+    given values. ``exact=True`` forces brute-force scoring instead of
+    HNSW — use for offline/latency-tolerant lanes: filtered HNSW without
+    payload indexes measurably drops valid results (found 2026-07-09;
+    ~90-220ms exact at ~49K points).
     """
     from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
@@ -142,15 +150,25 @@ def search(
                 match=MatchAny(any=list(exclude_subsystems)),
             )
         )
+    if tags_any:
+        conditions.append(
+            FieldCondition(key="tags", match=MatchAny(any=list(tags_any)))
+        )
     query_filter = Filter(
         must=conditions or None,
         must_not=must_not_conditions or None,
     )
+    search_params = None
+    if exact:
+        from qdrant_client.models import SearchParams
+
+        search_params = SearchParams(exact=True)
     results = client.query_points(
         collection_name=collection,
         query=query_vector,
         limit=limit,
         query_filter=query_filter,
+        search_params=search_params,
     )
     return [
         {"id": str(hit.id), "score": hit.score, "payload": hit.payload}

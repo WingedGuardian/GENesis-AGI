@@ -25,6 +25,7 @@ import importlib
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -1842,13 +1843,13 @@ async def _run(prompt: str, session_id: str = "") -> None:
         serendipity_boosted=ws_stats.get("serendipity_boosted", 0),
     )
 
-    # ── Ambient session-awareness fold (WS-C PR1, record-only) ─────
+    # ── Ambient session-awareness fold (WS-C) ──────────────────────
     # Folds the prompt embedding (already computed above) into a
-    # session-theme EMA and records drift-trigger fires in the
-    # session's session_theme.json. No spawn (PR2), no output. Runs
-    # after all stdout AND all existing metrics so it can never affect
-    # either; placed outside the total_ms window on purpose — new work
-    # must not skew the H-1 latency baselines.
+    # session-theme EMA; on a drift-trigger fire, spawns the detached
+    # ambient worker (shadow mode: retrieve+rank only, no injection).
+    # No output. Runs after all stdout AND all existing metrics so it
+    # can never affect either; placed outside the total_ms window on
+    # purpose — new work must not skew the H-1 latency baselines.
     _ambient_fold(vector, session_id, prompt, recent_files)
 
 
@@ -1885,15 +1886,50 @@ def _ambient_fold(
             return
         from genesis.session_awareness import hook_fold
 
-        hook_fold(
+        result = hook_fold(
             session_id=session_id,
             vector=vector,
             prompt_keywords=_extract_keywords(prompt),
             file_keywords=_keywords_from_files(recent_files) if recent_files else [],
             pivoted=_turn_pivoted(session_id),
         )
+        if result and result.get("fired"):
+            _spawn_ambient_worker(session_id)
     except Exception:
         pass  # Ambient layer must never affect the hook
+
+
+def _spawn_ambient_worker(session_id: str) -> None:
+    """Detached worker spawn (WS-C PR2) — the genesis_session_end idiom.
+
+    start_new_session=True: the worker outlives this hook process.
+    stdout is discarded; stderr goes to a shared error log (the worker
+    records outcomes in ambient_verdict.json / shadow_log.jsonl, so
+    stderr only matters for crashes-before-logging). --no-arbiter until
+    PR3 lands the judgment stage.
+    """
+    try:
+        script = Path(__file__).resolve().parent / "ambient_awareness_worker.py"
+        err_dir = Path.home() / ".genesis" / "session_awareness"
+        err_dir.mkdir(parents=True, exist_ok=True)
+        with (
+            (err_dir / "worker_err.log").open("ab") as log_fh,
+            contextlib.suppress(OSError),
+        ):
+            subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(script),
+                        "--session-id",
+                        session_id,
+                        "--no-arbiter",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=log_fh,
+                    start_new_session=True,
+                )
+    except Exception:
+        pass  # Spawn failure must never affect the hook
 
 
 def main() -> None:
