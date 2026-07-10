@@ -1778,10 +1778,15 @@
         backupHeadline() {
           const bs = this.backupStatus;
           const lb = bs && bs.last_backup;
-          const enabled = bs && bs.schedule && bs.schedule.enabled;
+          const sch = bs && bs.schedule;
+          const enabled = sch && sch.enabled;
+          const active = sch && sch.active;
           if (!lb) return { text: 'No backups yet', color: '#ffb74d' };
           if (!lb.success) return { text: 'Failing', color: '#ef9a9a' };
           if (!enabled) return { text: 'On demand only (not scheduled)', color: '#ffb74d' };
+          // enabled but not loaded/running (e.g. stopped out-of-band, or failed to
+          // start) — the timer won't fire, so "Active" would misreport. Say so.
+          if (!active) return { text: 'Scheduled, but the timer is not running', color: '#ffb74d' };
           return { text: 'Active', color: '#81c784' };
         },
         // "every 6 hours · last 12:10 PM ✓ · next 6:10 PM" — the at-a-glance line.
