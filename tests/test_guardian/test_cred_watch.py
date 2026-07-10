@@ -164,6 +164,31 @@ async def test_step_in_success_with_unreachable_recheck_is_not_failed(cfg, monke
     assert not any("FAILED" in a.title for a in disp.alerts)
 
 
+async def test_unreadable_past_grace_alerts_but_never_restores(cfg, monkeypatch):
+    """An 'unreadable' verdict is ambiguous (not RESTORABLE) — past grace the
+    guardian must ALERT but NOT call run_container_restore."""
+    old = (datetime.now(UTC) - timedelta(minutes=40)).isoformat()
+    (cfg.state_path).mkdir(parents=True, exist_ok=True)
+    _seed_state(cfg, {"secrets_env": {
+        "first_seen": old, "warned_at": old, "stepped_in_at": None,
+        "last_alert_at": old, "restore_attempts": [],
+    }})
+    monkeypatch.setattr(cred_watch, "run_container_check",
+                        _async(_report(secrets_env="unreadable")))
+    called = {"restore": 0}
+
+    async def fake_restore(config, name):
+        called["restore"] += 1
+        return {"ok": True, "action": "restored"}
+
+    monkeypatch.setattr(cred_watch, "run_container_restore", fake_restore)
+    disp = _Dispatcher()
+    await check_credential_integrity_and_alert(cfg, disp)
+    assert called["restore"] == 0
+    assert any(a.severity == AlertSeverity.CRITICAL and "unreadable" in a.title.lower()
+               for a in disp.alerts)
+
+
 async def test_run_container_restore_rejects_unknown_target(cfg):
     result = await cred_watch.run_container_restore(cfg, "totally_bogus_target")
     assert result is None

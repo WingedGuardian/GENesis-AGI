@@ -38,8 +38,14 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+# This module is piped into the container's *system* python3, whose version is
+# unknown (an install may leave python3 at 3.10 while provisioning 3.12
+# elsewhere). Stay portable to 3.9+: use timezone.utc, not datetime.UTC (3.11+).
+# (UP017 would "modernize" this to datetime.UTC — exactly what breaks 3.10.)
+_UTC = timezone.utc  # noqa: UP017
 
 try:
     import yaml  # PyYAML — present in the venv and in the container's system python3
@@ -302,7 +308,7 @@ def restore_file(
         os.chmod(tmp, target.file_mode)
 
         if target_path.exists():
-            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            stamp = datetime.now(_UTC).strftime("%Y%m%dT%H%M%SZ")
             aside = target_path.with_name(f"{target_path.name}.corrupt-{stamp}")
             os.replace(target_path, aside)
             with contextlib.suppress(OSError):
@@ -320,7 +326,7 @@ def restore_file(
         )
 
     placed = validate_file(target, home, backup_dir)
-    mtime = datetime.fromtimestamp(src.stat().st_mtime, UTC).isoformat()
+    mtime = datetime.fromtimestamp(src.stat().st_mtime, _UTC).isoformat()
     if not placed.ok:
         return RestoreResult(
             False, "restore_verify_failed",

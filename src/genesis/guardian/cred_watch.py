@@ -26,7 +26,7 @@ from pathlib import Path
 
 from genesis.guardian import cred_integrity
 from genesis.guardian.alert.base import Alert, AlertSeverity
-from genesis.guardian.cred_integrity import allowed_restore
+from genesis.guardian.cred_integrity import RESTORABLE_STATUSES, allowed_restore
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +212,14 @@ async def check_credential_integrity_and_alert(config, dispatcher) -> None:
         for name, r in results.items()
         if not r.get("ok", True) and r.get("status") != "absent"
     }
+    # Raw status per corrupt target — the guardian only auto-restores RESTORABLE
+    # statuses. "unreadable" (permission/IO) is ambiguous, not proven corruption,
+    # so it alerts but is never stepped-in on (mirrors the container self-heal).
+    corrupt_status: dict[str, str] = {
+        name: r.get("status", "")
+        for name, r in results.items()
+        if not r.get("ok", True) and r.get("status") != "absent"
+    }
 
     for name in set(list(corrupt) + list(episodes)):
         is_corrupt = name in corrupt
@@ -257,6 +265,17 @@ async def check_credential_integrity_and_alert(config, dispatcher) -> None:
             episode["last_status"] = corrupt[name]
             episode["stepped_in_at"] = now_iso
             episode["last_alert_at"] = now_iso
+            # Only auto-restore proven-corrupt (restorable) statuses. An
+            # "unreadable" verdict is ambiguous — alert for manual action, never
+            # overwrite a file that was not proven corrupt.
+            if corrupt_status.get(name) not in RESTORABLE_STATUSES:
+                await _send(dispatcher, AlertSeverity.CRITICAL,
+                            f"Credential unreadable: {name}",
+                            f"{name} is {corrupt[name]} and the container did not "
+                            f"resolve it in {cfg.grace_minutes} min. This is not a "
+                            "proven-corrupt state (permission/IO?), so the guardian "
+                            "will NOT auto-restore — manual intervention needed.")
+                continue
             if not allowed_restore(attempts, now, cfg.max_restores_per_day):
                 episode["restore_attempts"] = attempts
                 await _send(dispatcher, AlertSeverity.CRITICAL,
