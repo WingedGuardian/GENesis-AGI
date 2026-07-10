@@ -50,10 +50,11 @@ def _authed():
 # ── _strip_url_creds ──────────────────────────────────────────────────
 def test_strip_url_creds_removes_token():
     from genesis.dashboard.routes.backup import _strip_url_creds
-    assert _strip_url_creds("https://user:ghp_tok@github.com/u/r.git") == \
-        "https://github.com/u/r.git"
-    assert _strip_url_creds("https://github.com/u/r.git") == \
-        "https://github.com/u/r.git"
+
+    assert (
+        _strip_url_creds("https://user:ghp_tok@github.com/u/r.git") == "https://github.com/u/r.git"
+    )
+    assert _strip_url_creds("https://github.com/u/r.git") == "https://github.com/u/r.git"
     assert _strip_url_creds("git@github.com:u/r.git") == "git@github.com:u/r.git"
     assert _strip_url_creds("") == ""
     assert _strip_url_creds(None) is None
@@ -62,15 +63,12 @@ def test_strip_url_creds_removes_token():
 # ── _interval_from_calendar (pure) ────────────────────────────────────
 def test_interval_from_calendar_maps_presets():
     from genesis.dashboard.routes.backup import _interval_from_calendar
-    assert _interval_from_calendar(
-        "{ OnCalendar=*-*-* 00/6:10:00 ; next_elapse=... }") == "6h"
-    assert _interval_from_calendar(
-        "{ OnCalendar=*-*-* 00/3:10:00 ; next_elapse=(null) }") == "3h"
-    assert _interval_from_calendar(
-        "{ OnCalendar=*-*-* 04:10:00 ; next_elapse=... }") == "daily"
+
+    assert _interval_from_calendar("{ OnCalendar=*-*-* 00/6:10:00 ; next_elapse=... }") == "6h"
+    assert _interval_from_calendar("{ OnCalendar=*-*-* 00/3:10:00 ; next_elapse=(null) }") == "3h"
+    assert _interval_from_calendar("{ OnCalendar=*-*-* 04:10:00 ; next_elapse=... }") == "daily"
     # Unrecognised OnCalendar → "custom"; absent → None.
-    assert _interval_from_calendar(
-        "{ OnCalendar=*-*-* 09:00:00 ; next_elapse=... }") == "custom"
+    assert _interval_from_calendar("{ OnCalendar=*-*-* 09:00:00 ; next_elapse=... }") == "custom"
     assert _interval_from_calendar("") is None
     assert _interval_from_calendar(None) is None
 
@@ -129,17 +127,23 @@ def test_timer_state_disabled_inactive():
 
 def test_timer_state_survives_systemctl_failure():
     from genesis.dashboard.routes.backup import _timer_state
+
     with patch(f"{_BK}.subprocess.run", side_effect=OSError("no systemctl")):
         st = _timer_state()
     assert st == {
-        "mechanism": "systemd-timer", "enabled": False, "active": False,
-        "next_run": None, "last_trigger": None, "interval": None,
+        "mechanism": "systemd-timer",
+        "enabled": False,
+        "active": False,
+        "next_run": None,
+        "last_trigger": None,
+        "interval": None,
     }
 
 
 # ── _set_timer_schedule (writes reset drop-in) ────────────────────────
 def test_set_timer_schedule_writes_reset_dropin(tmp_path):
     from genesis.dashboard.routes import backup as bk
+
     dropin = tmp_path / "genesis-backup.timer.d" / "schedule.conf"
     with (
         patch.object(bk, "_TIMER_DROPIN", dropin),
@@ -151,12 +155,15 @@ def test_set_timer_schedule_writes_reset_dropin(tmp_path):
     # additive base so the template's 6h schedule does not also fire.
     assert content == "[Timer]\nOnCalendar=\nOnCalendar=00/12:10\n"
     # daemon-reload issued after the write.
-    assert any(c.args[0][:4] == ["systemctl", "--user", "daemon-reload"]
-               or c.args[0][3] == "daemon-reload" for c in run.call_args_list)
+    assert any(
+        c.args[0][:4] == ["systemctl", "--user", "daemon-reload"] or c.args[0][3] == "daemon-reload"
+        for c in run.call_args_list
+    )
 
 
 def test_set_timer_schedule_rejects_unknown_interval(tmp_path):
     from genesis.dashboard.routes import backup as bk
+
     dropin = tmp_path / "schedule.conf"
     with (
         patch.object(bk, "_TIMER_DROPIN", dropin),
@@ -170,6 +177,7 @@ def test_set_timer_schedule_rejects_unknown_interval(tmp_path):
 # ── _set_timer_enabled ────────────────────────────────────────────────
 def test_set_timer_enabled_true_enables_now():
     from genesis.dashboard.routes import backup as bk
+
     with patch(f"{_BK}.subprocess.run", return_value=_proc("")) as run:
         assert bk._set_timer_enabled(True) is True
     argv = run.call_args.args[0]
@@ -179,6 +187,7 @@ def test_set_timer_enabled_true_enables_now():
 
 def test_set_timer_enabled_false_disables_now():
     from genesis.dashboard.routes import backup as bk
+
     with patch(f"{_BK}.subprocess.run", return_value=_proc("")) as run:
         assert bk._set_timer_enabled(False) is True
     argv = run.call_args.args[0]
@@ -186,23 +195,30 @@ def test_set_timer_enabled_false_disables_now():
 
 
 # ── M5: the two calendar maps stay in lockstep ────────────────────────
-@pytest.mark.skipif(shutil.which("systemd-analyze") is None,
-                    reason="systemd-analyze not available")
+@pytest.mark.skipif(shutil.which("systemd-analyze") is None, reason="systemd-analyze not available")
 def test_calendar_maps_are_consistent():
     """Every short OnCalendar we WRITE must normalise (per systemd) to exactly
     the long form we READ back — guards the two hand-maintained maps drifting."""
     from genesis.dashboard.routes.backup import _CALENDAR_TO_INTERVAL, _INTERVAL_TO_CALENDAR
+
     # Both maps describe the same 4 presets.
     assert set(_INTERVAL_TO_CALENDAR) == set(_CALENDAR_TO_INTERVAL.values())
     for key, short in _INTERVAL_TO_CALENDAR.items():
-        out = subprocess.run(["systemd-analyze", "calendar", short],
-                             capture_output=True, text=True, timeout=10)
-        norm = next((ln.split(":", 1)[1].strip()
-                     for ln in out.stdout.splitlines()
-                     if "Normalized form" in ln), None)
+        out = subprocess.run(
+            ["systemd-analyze", "calendar", short], capture_output=True, text=True, timeout=10
+        )
+        norm = next(
+            (
+                ln.split(":", 1)[1].strip()
+                for ln in out.stdout.splitlines()
+                if "Normalized form" in ln
+            ),
+            None,
+        )
         assert norm is not None, f"no normalized form for {short}"
         assert _CALENDAR_TO_INTERVAL.get(norm) == key, (
-            f"{short} normalises to {norm!r}; reverse-map disagrees")
+            f"{short} normalises to {norm!r}; reverse-map disagrees"
+        )
 
 
 # ── POST auth gate ────────────────────────────────────────────────────
@@ -213,8 +229,7 @@ def test_set_requires_auth(client):
         patch(f"{_BK}._set_timer_enabled") as en,
         patch(f"{_BK}._set_timer_schedule") as sch,
     ):
-        resp = client.post("/api/genesis/backup/config",
-                           json={"tier2_backend": "none"})
+        resp = client.post("/api/genesis/backup/config", json={"tier2_backend": "none"})
     assert resp.status_code == 401
     wr.assert_not_called()
     en.assert_not_called()
@@ -224,16 +239,14 @@ def test_set_requires_auth(client):
 # ── POST validation ───────────────────────────────────────────────────
 def test_set_rejects_bad_backend(client):
     with patch(f"{_SEC}._key_value", return_value=""):
-        resp = client.post("/api/genesis/backup/config",
-                           json={"tier2_backend": "ftp"})
+        resp = client.post("/api/genesis/backup/config", json={"tier2_backend": "ftp"})
     assert resp.status_code == 422
     assert any("tier2_backend" in e for e in resp.get_json()["details"])
 
 
 def test_set_smb_requires_nas(client):
     with patch(f"{_SEC}._key_value", return_value=""):
-        resp = client.post("/api/genesis/backup/config",
-                           json={"tier2_backend": "smb"})
+        resp = client.post("/api/genesis/backup/config", json={"tier2_backend": "smb"})
     assert resp.status_code == 422
     assert any("NAS" in e for e in resp.get_json()["details"])
 
@@ -243,8 +256,9 @@ def test_set_rejects_bad_interval(client):
         patch(f"{_SEC}._key_value", return_value=""),
         patch(f"{_BK}._set_timer_enabled") as en,
     ):
-        resp = client.post("/api/genesis/backup/config", json={
-            "schedule_enabled": True, "schedule_interval": "7h"})
+        resp = client.post(
+            "/api/genesis/backup/config", json={"schedule_enabled": True, "schedule_interval": "7h"}
+        )
     assert resp.status_code == 422
     assert any("schedule_interval" in e for e in resp.get_json()["details"])
     en.assert_not_called()
@@ -252,8 +266,7 @@ def test_set_rejects_bad_interval(client):
 
 def test_set_rejects_bad_repo(client):
     with patch(f"{_SEC}._key_value", return_value=""):
-        resp = client.post("/api/genesis/backup/config",
-                           json={"repo": "ftp://nope"})
+        resp = client.post("/api/genesis/backup/config", json={"repo": "ftp://nope"})
     assert resp.status_code == 422
 
 
@@ -266,11 +279,16 @@ def test_set_writes_env_and_enables_timer(client):
         patch(f"{_BK}._set_timer_enabled", return_value=True) as en,
         patch.dict("os.environ", {}, clear=False),
     ):
-        resp = client.post("/api/genesis/backup/config", json={
-            "repo": "https://github.com/u/backups.git",
-            "tier2_backend": "local", "local_path": "/mnt/bk",
-            "schedule_interval": "12h", "schedule_enabled": True,
-        })
+        resp = client.post(
+            "/api/genesis/backup/config",
+            json={
+                "repo": "https://github.com/u/backups.git",
+                "tier2_backend": "local",
+                "local_path": "/mnt/bk",
+                "schedule_interval": "12h",
+                "schedule_enabled": True,
+            },
+        )
     assert resp.status_code == 200
     written = wr.call_args.args[0]
     assert written["GENESIS_BACKUP_REPO"] == "https://github.com/u/backups.git"
@@ -290,8 +308,10 @@ def test_set_schedule_disabled_skips_interval_and_disables(client):
         patch(f"{_BK}._set_timer_enabled", return_value=True) as en,
         patch.dict("os.environ", {}, clear=False),
     ):
-        resp = client.post("/api/genesis/backup/config", json={
-            "schedule_enabled": False, "schedule_interval": "7h"})  # bad interval ignored
+        resp = client.post(
+            "/api/genesis/backup/config",
+            json={"schedule_enabled": False, "schedule_interval": "7h"},
+        )  # bad interval ignored
     assert resp.status_code == 200
     sch.assert_not_called()
     en.assert_called_once_with(False)
@@ -305,8 +325,9 @@ def test_set_secrets_only_written_when_provided(client):
         patch(f"{_BK}._set_timer_enabled", return_value=True),
         patch.dict("os.environ", {}, clear=False),
     ):
-        client.post("/api/genesis/backup/config", json={
-            "passphrase": "s3cret", "schedule_enabled": False})
+        client.post(
+            "/api/genesis/backup/config", json={"passphrase": "s3cret", "schedule_enabled": False}
+        )
     written = wr.call_args.args[0]
     assert written.get("GENESIS_BACKUP_PASSPHRASE") == "s3cret"
     assert "GENESIS_BACKUP_NAS_PASS" not in written
@@ -315,14 +336,16 @@ def test_set_secrets_only_written_when_provided(client):
 def test_set_warns_on_passphrase_rotation(client):
     def keyval(k):
         return "old-pass" if k == "GENESIS_BACKUP_PASSPHRASE" else ""
+
     with (
         patch(f"{_SEC}._key_value", side_effect=keyval),
         patch(f"{_SEC}._update_secrets_file"),
         patch(f"{_BK}._set_timer_enabled", return_value=True),
         patch.dict("os.environ", {}, clear=False),
     ):
-        resp = client.post("/api/genesis/backup/config",
-                           json={"passphrase": "new-pass", "schedule_enabled": False})
+        resp = client.post(
+            "/api/genesis/backup/config", json={"passphrase": "new-pass", "schedule_enabled": False}
+        )
     assert any("re-encrypt" in w for w in resp.get_json()["warnings"])
 
 
@@ -334,8 +357,9 @@ def test_set_timer_enable_failure_returns_500(client):
         patch(f"{_BK}._set_timer_enabled", return_value=False),
         patch.dict("os.environ", {}, clear=False),
     ):
-        resp = client.post("/api/genesis/backup/config",
-                           json={"schedule_interval": "6h", "schedule_enabled": True})
+        resp = client.post(
+            "/api/genesis/backup/config", json={"schedule_interval": "6h", "schedule_enabled": True}
+        )
     assert resp.status_code == 500
 
 
@@ -352,9 +376,17 @@ def test_get_config_strips_creds_and_gates_nas(client):
     }
     with (
         patch(f"{_SEC}._key_value", side_effect=lambda k: values.get(k, "")),
-        patch(f"{_BK}._timer_state", return_value={
-            "mechanism": "systemd-timer", "enabled": True, "active": True,
-            "next_run": None, "last_trigger": None, "interval": "6h"}),
+        patch(
+            f"{_BK}._timer_state",
+            return_value={
+                "mechanism": "systemd-timer",
+                "enabled": True,
+                "active": True,
+                "next_run": None,
+                "last_trigger": None,
+                "interval": "6h",
+            },
+        ),
         patch(f"{_BK}.is_authenticated", return_value=False),
     ):
         resp = client.get("/api/genesis/backup/config")
@@ -369,14 +401,23 @@ def test_get_config_strips_creds_and_gates_nas(client):
 
 def test_get_config_returns_nas_when_authenticated(client):
     values = {
-        "GENESIS_BACKUP_NAS": "//host/share", "GENESIS_BACKUP_NAS_USER": "bk",
+        "GENESIS_BACKUP_NAS": "//host/share",
+        "GENESIS_BACKUP_NAS_USER": "bk",
         "GENESIS_BACKUP_LOCAL_PATH": "/mnt/bk",
     }
     with (
         patch(f"{_SEC}._key_value", side_effect=lambda k: values.get(k, "")),
-        patch(f"{_BK}._timer_state", return_value={
-            "mechanism": "systemd-timer", "enabled": False, "active": False,
-            "next_run": None, "last_trigger": None, "interval": None}),
+        patch(
+            f"{_BK}._timer_state",
+            return_value={
+                "mechanism": "systemd-timer",
+                "enabled": False,
+                "active": False,
+                "next_run": None,
+                "last_trigger": None,
+                "interval": None,
+            },
+        ),
         patch(f"{_BK}.is_authenticated", return_value=True),
     ):
         resp = client.get("/api/genesis/backup/config")
@@ -389,33 +430,61 @@ def test_get_config_returns_nas_when_authenticated(client):
 def _status_env(tmp_path, status: dict, authed=True):
     """Patch the status route's filesystem deps to a controlled fixture."""
     from genesis.dashboard.routes import backup as bk
+
     sf = tmp_path / "backup_status.json"
     import json
+
     sf.write_text(json.dumps(status))
     return (
         patch.object(bk, "_STATUS_FILE", sf),
         patch.object(bk, "_BACKUP_SCRIPT", tmp_path / "backup.sh"),
         patch.object(bk, "_BACKUP_DIR", tmp_path / "nope"),  # not a dir → repo None
-        patch(f"{_BK}._timer_state", return_value={
-            "mechanism": "systemd-timer", "enabled": True, "active": True,
-            "next_run": "x", "last_trigger": "y", "interval": "6h"}),
+        patch(
+            f"{_BK}._timer_state",
+            return_value={
+                "mechanism": "systemd-timer",
+                "enabled": True,
+                "active": True,
+                "next_run": "x",
+                "last_trigger": "y",
+                "interval": "6h",
+            },
+        ),
         patch(f"{_BK}.is_authenticated", return_value=authed),
     )
 
 
 def test_status_builds_destinations_and_schedule(client, tmp_path):
     status = {
-        "timestamp": "2026-07-10T16:05:26Z", "success": True, "duration_s": 325,
-        "sqlite_lines": 599261, "qdrant_collections": 2, "transcript_files": 859,
-        "memory_files": 409, "secrets_encrypted": True, "failure_reason": "",
-        "tier2_status": "ok", "offsite_confirmed": True, "tier2_backend": "smb",
-        "snapshot_id": "20260710T160526Z", "snapshot_count": 17,
-        "pruned_count": 1, "tier1_pushed": True,
+        "timestamp": "2026-07-10T16:05:26Z",
+        "success": True,
+        "duration_s": 325,
+        "sqlite_lines": 599261,
+        "qdrant_collections": 2,
+        "transcript_files": 859,
+        "memory_files": 409,
+        "secrets_encrypted": True,
+        "failure_reason": "",
+        "tier2_status": "ok",
+        "offsite_confirmed": True,
+        "tier2_backend": "smb",
+        "snapshot_id": "20260710T160526Z",
+        "snapshot_count": 17,
+        "pruned_count": 1,
+        "tier1_pushed": True,
     }
     patches = _status_env(tmp_path, status, authed=True)
-    with patches[0], patches[1], patches[2], patches[3], patches[4], \
-            patch(f"{_SEC}._key_value", side_effect=lambda k:
-                  "//host/share" if k == "GENESIS_BACKUP_NAS" else ""):
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patch(
+            f"{_SEC}._key_value",
+            side_effect=lambda k: "//host/share" if k == "GENESIS_BACKUP_NAS" else "",
+        ),
+    ):
         resp = client.get("/api/genesis/backup/status")
     data = resp.get_json()
     assert "cron_schedule" not in data
@@ -429,13 +498,28 @@ def test_status_builds_destinations_and_schedule(client, tmp_path):
 
 
 def test_status_hides_nas_target_when_unauthenticated(client, tmp_path):
-    status = {"timestamp": "t", "success": True, "tier2_status": "ok",
-              "offsite_confirmed": True, "tier2_backend": "smb",
-              "snapshot_id": "s", "snapshot_count": 3, "tier1_pushed": True}
+    status = {
+        "timestamp": "t",
+        "success": True,
+        "tier2_status": "ok",
+        "offsite_confirmed": True,
+        "tier2_backend": "smb",
+        "snapshot_id": "s",
+        "snapshot_count": 3,
+        "tier1_pushed": True,
+    }
     patches = _status_env(tmp_path, status, authed=False)
-    with patches[0], patches[1], patches[2], patches[3], patches[4], \
-            patch(f"{_SEC}._key_value", side_effect=lambda k:
-                  "//secret-host/share" if k == "GENESIS_BACKUP_NAS" else ""):
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patch(
+            f"{_SEC}._key_value",
+            side_effect=lambda k: "//secret-host/share" if k == "GENESIS_BACKUP_NAS" else "",
+        ),
+    ):
         resp = client.get("/api/genesis/backup/status")
     data = resp.get_json()
     assert "target" not in data["destinations"]["tier2"]
@@ -446,12 +530,23 @@ def test_status_hides_nas_target_when_unauthenticated(client, tmp_path):
 def test_status_allowlists_last_backup_fields(client, tmp_path):
     """M6: a future/unknown field in the status file must NOT auto-leak through
     the unauthenticated /status route — last_backup is projected to a known set."""
-    status = {"timestamp": "t", "success": True, "duration_s": 1,
-              "tier2_status": "ok", "offsite_confirmed": True,
-              "_leaked_nas_path": "//private-nas/secret-share"}
+    status = {
+        "timestamp": "t",
+        "success": True,
+        "duration_s": 1,
+        "tier2_status": "ok",
+        "offsite_confirmed": True,
+        "_leaked_nas_path": "//private-nas/secret-share",
+    }
     patches = _status_env(tmp_path, status, authed=False)
-    with patches[0], patches[1], patches[2], patches[3], patches[4], \
-            patch(f"{_SEC}._key_value", return_value=""):
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patch(f"{_SEC}._key_value", return_value=""),
+    ):
         resp = client.get("/api/genesis/backup/status")
     data = resp.get_json()
     assert "_leaked_nas_path" not in data["last_backup"]
@@ -461,6 +556,7 @@ def test_status_allowlists_last_backup_fields(client, tmp_path):
 # ── /trigger uses the service (non-blocking) ──────────────────────────
 def test_trigger_starts_service_no_block(client, tmp_path):
     from genesis.dashboard.routes import backup as bk
+
     script = tmp_path / "backup.sh"
     script.write_text("#!/bin/bash\n")
     with (
@@ -478,14 +574,85 @@ def test_trigger_starts_service_no_block(client, tmp_path):
 
 def test_trigger_missing_script_404(client, tmp_path):
     from genesis.dashboard.routes import backup as bk
+
     with patch.object(bk, "_BACKUP_SCRIPT", tmp_path / "absent.sh"):
         resp = client.post("/api/genesis/backup/trigger")
     assert resp.status_code == 404
 
 
+# ── Tier-2 backend resolution (backward-compat) ───────────────────────
+def test_resolved_backend_backward_compat():
+    """Mirrors backup_backends.sh:_backend_resolve — explicit selector wins;
+    NAS-only (no selector) → smb; nothing → none."""
+    from genesis.dashboard.routes import backup as bk
+
+    with patch(
+        f"{_SEC}._key_value",
+        side_effect=lambda k: "local" if k == "GENESIS_BACKUP_TIER2_BACKEND" else "",
+    ):
+        assert bk._resolved_backend() == "local"
+    with patch(
+        f"{_SEC}._key_value",
+        side_effect=lambda k: "//host/share" if k == "GENESIS_BACKUP_NAS" else "",
+    ):
+        assert bk._resolved_backend() == "smb"
+    with patch(f"{_SEC}._key_value", return_value=""):
+        assert bk._resolved_backend() == "none"
+
+
+def test_get_config_backend_backward_compat(client):
+    """A NAS-only install (no explicit selector) must report backend 'smb', not
+    'none' — otherwise the form misleads and a save could write TIER2_BACKEND=none
+    and silently disable off-site backups."""
+    values = {"GENESIS_BACKUP_NAS": "//host/share"}
+    with (
+        patch(f"{_SEC}._key_value", side_effect=lambda k: values.get(k, "")),
+        patch(
+            f"{_BK}._timer_state",
+            return_value={
+                "mechanism": "systemd-timer",
+                "enabled": True,
+                "active": True,
+                "next_run": None,
+                "last_trigger": None,
+                "interval": "6h",
+            },
+        ),
+        patch(f"{_BK}.is_authenticated", return_value=True),
+    ):
+        resp = client.get("/api/genesis/backup/config")
+    assert resp.get_json()["tier2_backend"] == "smb"
+
+
+def test_status_destinations_backend_backward_compat(client, tmp_path):
+    """When the status file predates tier2_backend, destinations still resolves
+    the backend via backward-compat (NAS set → smb), not 'none'."""
+    status = {
+        "timestamp": "t",
+        "success": True,
+        "tier2_status": "ok",
+        "offsite_confirmed": True,
+    }  # no tier2_backend field (old script)
+    patches = _status_env(tmp_path, status, authed=False)
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patch(
+            f"{_SEC}._key_value",
+            side_effect=lambda k: "//host/share" if k == "GENESIS_BACKUP_NAS" else "",
+        ),
+    ):
+        resp = client.get("/api/genesis/backup/status")
+    assert resp.get_json()["destinations"]["tier2"]["backend"] == "smb"
+
+
 # ── Secrets-UI masking (unchanged secrets.py guard) ───────────────────
 def test_sensitive_re_masks_backup_nas_pass():
     from genesis.dashboard.routes.secrets import _SENSITIVE_RE
+
     assert _SENSITIVE_RE.search("GENESIS_BACKUP_NAS_PASS")
     assert _SENSITIVE_RE.search("GENESIS_BACKUP_PASSPHRASE")
     assert not _SENSITIVE_RE.search("GENESIS_BACKUP_NAS_SHARE")

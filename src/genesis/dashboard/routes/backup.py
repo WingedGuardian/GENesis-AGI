@@ -42,10 +42,7 @@ _BACKUP_DIR = _HOME / "backups" / "genesis-backups"
 # Systemd user units (source of truth for the backup schedule).
 _TIMER_UNIT = "genesis-backup.timer"
 _SERVICE_UNIT = "genesis-backup.service"
-_TIMER_DROPIN = (
-    _HOME / ".config" / "systemd" / "user"
-    / "genesis-backup.timer.d" / "schedule.conf"
-)
+_TIMER_DROPIN = _HOME / ".config" / "systemd" / "user" / "genesis-backup.timer.d" / "schedule.conf"
 
 # Preset schedules exposed by the dashboard. The value is the SHORT OnCalendar
 # spec we write into the drop-in; systemd normalises it on load to the long form
@@ -69,12 +66,26 @@ _CALENDAR_TO_INTERVAL = {
 # it through this allowlist so a future field added to backup.sh's status line
 # (e.g. an infra path) can never auto-leak. The raw off-site TARGET is
 # deliberately NOT here — it comes from /config's auth-gated _key_value instead.
-_STATUS_SAFE_FIELDS = frozenset({
-    "timestamp", "success", "sqlite_lines", "qdrant_collections",
-    "transcript_files", "memory_files", "secrets_encrypted", "duration_s",
-    "failure_reason", "tier2_status", "offsite_confirmed", "tier2_backend",
-    "snapshot_id", "snapshot_count", "pruned_count", "tier1_pushed",
-})
+_STATUS_SAFE_FIELDS = frozenset(
+    {
+        "timestamp",
+        "success",
+        "sqlite_lines",
+        "qdrant_collections",
+        "transcript_files",
+        "memory_files",
+        "secrets_encrypted",
+        "duration_s",
+        "failure_reason",
+        "tier2_status",
+        "offsite_confirmed",
+        "tier2_backend",
+        "snapshot_id",
+        "snapshot_count",
+        "pruned_count",
+        "tier1_pushed",
+    }
+)
 
 _BACKENDS = {"none", "local", "smb"}
 _NAS_RE = re.compile(r"^//[^/\s]+/[^\s]+$")
@@ -83,6 +94,7 @@ _ONCALENDAR_RE = re.compile(r"OnCalendar=(.+?)\s*;")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
+
 
 def _strip_url_creds(url: str | None) -> str | None:
     """Remove any embedded ``user:token@`` from an http(s) URL.
@@ -112,7 +124,10 @@ def _systemctl(*args: str, timeout: int = 5):
     try:
         return subprocess.run(
             ["systemctl", "--user", *args],
-            capture_output=True, text=True, timeout=timeout, env=systemctl_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=systemctl_env(),
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -150,8 +165,12 @@ def _timer_state() -> dict:
     than raising — the status route must never 500 on a schedule probe.
     """
     state = {
-        "mechanism": "systemd-timer", "enabled": False, "active": False,
-        "next_run": None, "last_trigger": None, "interval": None,
+        "mechanism": "systemd-timer",
+        "enabled": False,
+        "active": False,
+        "next_run": None,
+        "last_trigger": None,
+        "interval": None,
     }
     r = _systemctl("is-enabled", _TIMER_UNIT)
     if r is not None:
@@ -159,10 +178,16 @@ def _timer_state() -> dict:
     r = _systemctl("is-active", _TIMER_UNIT)
     if r is not None:
         state["active"] = r.stdout.strip() == "active"
-    r = _systemctl("show", _TIMER_UNIT,
-                   "-p", "NextElapseUSecRealtime",
-                   "-p", "LastTriggerUSec",
-                   "-p", "TimersCalendar")
+    r = _systemctl(
+        "show",
+        _TIMER_UNIT,
+        "-p",
+        "NextElapseUSecRealtime",
+        "-p",
+        "LastTriggerUSec",
+        "-p",
+        "TimersCalendar",
+    )
     if r is not None and r.returncode == 0:
         props = _parse_show(r.stdout)
         state["next_run"] = props.get("NextElapseUSecRealtime") or None
@@ -185,9 +210,7 @@ def _set_timer_schedule(interval_key: str) -> bool:
         return False
     try:
         _TIMER_DROPIN.parent.mkdir(parents=True, exist_ok=True)
-        _TIMER_DROPIN.write_text(
-            f"[Timer]\nOnCalendar=\nOnCalendar={calendar}\n"
-        )
+        _TIMER_DROPIN.write_text(f"[Timer]\nOnCalendar=\nOnCalendar={calendar}\n")
     except OSError:
         logger.error("Failed to write backup timer drop-in", exc_info=True)
         return False
@@ -212,11 +235,33 @@ def _backup_repo_url() -> str | None:
     try:
         remote = subprocess.run(
             ["git", "-C", str(_BACKUP_DIR), "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
     return _strip_url_creds(remote.stdout.strip()) if remote.returncode == 0 else None
+
+
+def _resolved_backend() -> str:
+    """The active Tier-2 backend, replicating ``backup_backends.sh`` resolution.
+
+    An explicit ``GENESIS_BACKUP_TIER2_BACKEND`` wins; otherwise a configured
+    ``GENESIS_BACKUP_NAS`` with no selector means ``smb`` (the documented
+    backward-compat, ``scripts/lib/backup_backends.sh:_backend_resolve``); else
+    ``none``. Without this, a NAS-only install (the common legacy setup) reads as
+    ``none`` in the UI even while off-site backups succeed — and a config save
+    would then write ``TIER2_BACKEND=none`` and silently disable them.
+    """
+    from genesis.dashboard.routes.secrets import _key_value
+
+    b = (_key_value("GENESIS_BACKUP_TIER2_BACKEND") or "").strip()
+    if b:
+        return b
+    if (_key_value("GENESIS_BACKUP_NAS") or "").strip():
+        return "smb"
+    return "none"
 
 
 def _destinations(status: dict | None, repo: str | None) -> dict:
@@ -236,8 +281,7 @@ def _destinations(status: dict | None, repo: str | None) -> dict:
         "pushed": status.get("tier1_pushed"),
         "last": status.get("timestamp"),
     }
-    backend = (status.get("tier2_backend")
-               or _key_value("GENESIS_BACKUP_TIER2_BACKEND") or "none")
+    backend = status.get("tier2_backend") or _resolved_backend()
     tier2 = {
         "backend": backend,
         "status": status.get("tier2_status"),
@@ -247,14 +291,14 @@ def _destinations(status: dict | None, repo: str | None) -> dict:
     }
     if is_authenticated():
         if backend == "smb":
-            tier2["target"] = _strip_url_creds(
-                _key_value("GENESIS_BACKUP_NAS")) or None
+            tier2["target"] = _strip_url_creds(_key_value("GENESIS_BACKUP_NAS")) or None
         elif backend == "local":
             tier2["target"] = _key_value("GENESIS_BACKUP_LOCAL_PATH") or None
     return {"tier1": tier1, "tier2": tier2}
 
 
 # ── Routes ────────────────────────────────────────────────────────────
+
 
 @blueprint.route("/api/genesis/backup/status")
 def backup_status():
@@ -275,8 +319,7 @@ def backup_status():
             if isinstance(raw, dict):
                 # Allowlist projection — a future field in backup.sh's status
                 # line cannot auto-leak through this unauthenticated route.
-                last_backup = {k: v for k, v in raw.items()
-                               if k in _STATUS_SAFE_FIELDS}
+                last_backup = {k: v for k, v in raw.items() if k in _STATUS_SAFE_FIELDS}
         except (json.JSONDecodeError, OSError):
             last_backup = None
     result["last_backup"] = last_backup
@@ -302,7 +345,7 @@ def backup_config_get():
     timer = _timer_state()
     result = {
         "repo": _strip_url_creds(_key_value("GENESIS_BACKUP_REPO")),
-        "tier2_backend": _key_value("GENESIS_BACKUP_TIER2_BACKEND") or "none",
+        "tier2_backend": _resolved_backend(),
         "schedule_enabled": timer["enabled"],
         # Preset key ("6h"/…), "custom" for a hand-edited OnCalendar, or None.
         "schedule_interval": timer["interval"],
@@ -392,9 +435,7 @@ def backup_config_set():
     # Cross-field: a selected backend needs its destination (new or already set).
     if backend == "smb" and not (nas or _key_value("GENESIS_BACKUP_NAS")):
         errors.append("smb backend requires a NAS share (//host/share)")
-    if backend == "local" and not (
-        local_path or _key_value("GENESIS_BACKUP_LOCAL_PATH")
-    ):
+    if backend == "local" and not (local_path or _key_value("GENESIS_BACKUP_LOCAL_PATH")):
         errors.append("local backend requires a local_path")
 
     # Secrets — only written when a non-empty value is supplied, so leaving the
@@ -430,10 +471,7 @@ def backup_config_set():
         if data.get("schedule_enabled", True):
             interval = (data.get("schedule_interval") or "").strip()
             if interval and interval not in _INTERVAL_TO_CALENDAR:
-                errors.append(
-                    "schedule_interval must be one of "
-                    f"{sorted(_INTERVAL_TO_CALENDAR)}"
-                )
+                errors.append(f"schedule_interval must be one of {sorted(_INTERVAL_TO_CALENDAR)}")
             else:
                 schedule_action = ("enable", interval or None)
         else:
@@ -458,29 +496,35 @@ def backup_config_set():
             # Write the schedule (if the user picked one) BEFORE enabling, so the
             # daemon-reload's recompute is already in place when the timer starts.
             if interval and not _set_timer_schedule(interval):
-                return jsonify(
-                    {"error": "Failed to write backup schedule (drop-in)"}), 500
+                return jsonify({"error": "Failed to write backup schedule (drop-in)"}), 500
             if not _set_timer_enabled(True):
                 return jsonify(
-                    {"error": "Schedule written but failed to enable the backup "
-                              "timer — retry, or check `systemctl --user status "
-                              "genesis-backup.timer`"}), 500
+                    {
+                        "error": "Schedule written but failed to enable the backup "
+                        "timer — retry, or check `systemctl --user status "
+                        "genesis-backup.timer`"
+                    }
+                ), 500
             schedule_result = "enabled"
         else:
             if not _set_timer_enabled(False):
                 return jsonify({"error": "Failed to disable the backup timer"}), 500
             schedule_result = "disabled"
 
-    logger.info("Backup config updated: keys=%s schedule=%s",
-                sorted(env_updates.keys()),
-                schedule_action[0] if schedule_action else None)
-    return jsonify({
-        "status": "ok",
-        "updated": sorted(env_updates.keys()),
-        "schedule": schedule_result,
-        "warnings": warnings,
-        "needs_restart": False,
-    })
+    logger.info(
+        "Backup config updated: keys=%s schedule=%s",
+        sorted(env_updates.keys()),
+        schedule_action[0] if schedule_action else None,
+    )
+    return jsonify(
+        {
+            "status": "ok",
+            "updated": sorted(env_updates.keys()),
+            "schedule": schedule_result,
+            "warnings": warnings,
+            "needs_restart": False,
+        }
+    )
 
 
 @blueprint.route("/api/genesis/backup/trigger", methods=["POST"])
@@ -499,7 +543,7 @@ def backup_trigger():
 
     r = _systemctl("start", "--no-block", _SERVICE_UNIT, timeout=10)
     if r is None or r.returncode != 0:
-        err = (r.stderr.strip() if r is not None else "systemctl unavailable")
+        err = r.stderr.strip() if r is not None else "systemctl unavailable"
         logger.error("Failed to start %s: %s", _SERVICE_UNIT, err)
         return jsonify({"error": err or "Failed to start backup service"}), 500
     logger.info("Manual backup triggered via %s", _SERVICE_UNIT)
