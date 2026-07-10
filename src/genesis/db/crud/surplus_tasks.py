@@ -169,10 +169,13 @@ async def recover_stuck_with_retries(
         )
         failed = cursor.rowcount
     else:
+        # NULL started_at is unreachable via mark_running but the boot
+        # contract is "every running row is orphaned" — match it exactly.
         cursor = await db.execute(
             "UPDATE surplus_tasks SET status = 'pending', "
             "started_at = NULL, failure_reason = NULL "
-            "WHERE status = 'running' AND started_at < ?",
+            "WHERE status = 'running' "
+            "AND (started_at < ? OR started_at IS NULL)",
             (cutoff,),
         )
         requeued = cursor.rowcount
