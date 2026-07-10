@@ -16,8 +16,10 @@ passphrase is resolved container-side, so the guardian never handles a secret.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import shlex
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -88,7 +90,15 @@ async def _incus_exec_stdin(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    out, err = await asyncio.wait_for(proc.communicate(input=stdin_data), timeout=timeout)
+    try:
+        out, err = await asyncio.wait_for(
+            proc.communicate(input=stdin_data), timeout=timeout,
+        )
+    except TimeoutError:
+        # wait_for cancels communicate() but leaves the incus exec child running.
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        raise
     if proc.returncode != 0:
         logger.debug(
             "cred_watch incus exec rc=%s: %s",
@@ -112,7 +122,6 @@ def _extract_json(stdout: str) -> dict | None:
 
 
 def _build_cmd(subcmd_args: str, cfg) -> str:
-    import shlex
     cmd = f"python3 - {subcmd_args}"
     if cfg.container_home:
         cmd += f" --home {shlex.quote(cfg.container_home)}"
@@ -141,8 +150,14 @@ async def run_container_check(config) -> dict | None:
 
 async def run_container_restore(config, target_name: str) -> dict | None:
     cfg = config.cred_integrity
+    # target_name originates from the container's own verdict / episode keys, but
+    # validate it against the known target set before it enters an incus `su -c`
+    # string — defense in depth, matching the shlex-quoting of the other args.
+    if target_name not in {t.name for t in cred_integrity.DEFAULT_TARGETS}:
+        logger.warning("cred_watch: refusing restore of unknown target %r", target_name)
+        return None
     src = Path(cred_integrity.__file__).read_bytes()
-    cmd = _build_cmd(f"restore --target {target_name} --json", cfg)
+    cmd = _build_cmd(f"restore --target {shlex.quote(target_name)} --json", cfg)
     try:
         rc, out = await _incus_exec_stdin(
             config.container_name, cmd, src, cfg.restore_timeout_s,
@@ -255,10 +270,14 @@ async def check_credential_integrity_and_alert(config, dispatcher) -> None:
             episode["restore_attempts"] = attempts
             result = await run_container_restore(config, name)
             recheck = await run_container_check(config)
-            now_ok = bool(
-                recheck and recheck.get("results", {}).get(name, {}).get("ok")
+            # A restore that reported ok is trusted unless a REACHABLE recheck
+            # contradicts it. If the recheck itself is unreachable (None), treat it
+            # as inconclusive — don't flip a real success into a false "FAILED".
+            recheck_ok = (
+                True if recheck is None
+                else bool(recheck.get("results", {}).get(name, {}).get("ok"))
             )
-            if result and result.get("ok") and now_ok:
+            if result and result.get("ok") and recheck_ok:
                 await _send(dispatcher, AlertSeverity.CRITICAL,
                             f"Guardian restored credential: {name}",
                             f"Container did not self-heal in {cfg.grace_minutes} min; "

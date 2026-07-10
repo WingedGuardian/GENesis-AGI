@@ -141,6 +141,34 @@ async def test_step_in_restores_and_criticals(cfg, monkeypatch):
                for a in disp.alerts)
 
 
+async def test_step_in_success_with_unreachable_recheck_is_not_failed(cfg, monkeypatch):
+    """Restore reports ok but the post-restore recheck is unreachable (None) →
+    must NOT be reported as FAILED (recheck-unreachable = inconclusive)."""
+    old = (datetime.now(UTC) - timedelta(minutes=40)).isoformat()
+    (cfg.state_path).mkdir(parents=True, exist_ok=True)
+    _seed_state(cfg, {"secrets_env": {
+        "first_seen": old, "warned_at": old, "stepped_in_at": None,
+        "last_alert_at": old, "restore_attempts": [],
+    }})
+    checks = iter([_report(secrets_env="nul_bytes"), None])  # 2nd check unreachable
+    monkeypatch.setattr(cred_watch, "run_container_check", lambda config: _next(checks))
+
+    async def fake_restore(config, name):
+        return {"ok": True, "action": "restored", "backup_mtime": "2026-07-09T18:00:00+00:00"}
+
+    monkeypatch.setattr(cred_watch, "run_container_restore", fake_restore)
+    disp = _Dispatcher()
+    await check_credential_integrity_and_alert(cfg, disp)
+    assert any(a.severity == AlertSeverity.CRITICAL and "restored" in a.title.lower()
+               for a in disp.alerts)
+    assert not any("FAILED" in a.title for a in disp.alerts)
+
+
+async def test_run_container_restore_rejects_unknown_target(cfg):
+    result = await cred_watch.run_container_restore(cfg, "totally_bogus_target")
+    assert result is None
+
+
 async def test_exec_failure_no_alert_no_state_change(cfg, monkeypatch):
     monkeypatch.setattr(cred_watch, "run_container_check", _async(None))
     disp = _Dispatcher()

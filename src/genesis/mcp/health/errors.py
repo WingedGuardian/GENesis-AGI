@@ -753,9 +753,16 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         try:
             cred_data = json.loads(cred_status_file.read_text())
             targets = cred_data.get("targets", {})
+            if not isinstance(targets, dict):
+                targets = {}
+            targets = {n: t for n, t in targets.items() if isinstance(t, dict)}
+            # corrupt_pending is deliberately EXCLUDED: it is the 2-tick debounce
+            # window (a writer possibly caught mid-rewrite). It self-clears or
+            # escalates to a terminal status (restored / restore_failed) next
+            # tick, so alerting on it would defeat the debounce's whole purpose.
             corrupt = {
                 n: t for n, t in targets.items()
-                if t.get("status") in ("corrupt", "corrupt_pending", "restore_failed")
+                if t.get("status") in ("corrupt", "restore_failed")
             }
             restored = {
                 n: t for n, t in targets.items() if t.get("status") == "restored"

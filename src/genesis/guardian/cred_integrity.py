@@ -64,15 +64,17 @@ class CredTarget:
     file_mode: int = 0o600
 
 
-# secrets.env deliberately carries NO required_keys: requiring a specific key
-# (e.g. ANTHROPIC_API_KEY) would false-positive a *destructive* restore on an
-# install that legitimately omits it, violating the strict-corruption rule. The
-# structural signals (empty / NUL-zeroed — the outage signature — / <min_keys)
-# catch the real threat without that risk. .credentials.json keeps its one
-# stable structural key (claudeAiOauth) — CC always writes it.
+# secrets.env deliberately carries NO required_keys and min_keys=1: requiring a
+# specific key (e.g. ANTHROPIC_API_KEY) or a key-count floor would false-positive
+# a *destructive* restore on an install that legitimately omits a key or ships a
+# small secrets.env, violating the strict-corruption rule. min_keys=1 means only
+# a file that parses to ZERO valid keys (garbage / all-comments) is corrupt; the
+# real outage signatures (empty, NUL-zeroed) are caught by the pre-checks above.
+# .credentials.json keeps its one stable structural key (claudeAiOauth) — CC
+# always writes it, and missing_keys is debounced 2 ticks before any restore.
 DEFAULT_TARGETS: tuple[CredTarget, ...] = (
     CredTarget("secrets_env", "genesis/secrets.env", "secrets/secrets.env.gpg",
-               "dotenv", min_keys=5),
+               "dotenv", min_keys=1),
     CredTarget("claude_credentials", ".claude/.credentials.json",
                "creds/claude_credentials.json.gpg", "json",
                required_keys=("claudeAiOauth",)),
@@ -233,6 +235,13 @@ class _DecryptError(Exception):
     pass
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte — os.write may short-write; a truncated secret is unsafe."""
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
 def _gpg_decrypt(src: Path, passphrase: str) -> bytes:
     """Symmetric-decrypt a backup .gpg to bytes. Matches scripts/restore.sh:
     ``gpg --batch --yes --passphrase-fd 0 -d <src>`` (passphrase on stdin)."""
@@ -278,20 +287,20 @@ def restore_file(
         )
 
     target_path = home / target.path
+    tmp = target_path.with_name(f".{target_path.name}.restore-tmp-{os.getpid()}")
+    aside: Path | None = None
     try:
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if target.kind == "ssh_key":
             os.chmod(target_path.parent, 0o700)
 
-        tmp = target_path.with_name(f".{target_path.name}.restore-tmp-{os.getpid()}")
         fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
-            os.write(fd, data)
+            _write_all(fd, data)
         finally:
             os.close(fd)
         os.chmod(tmp, target.file_mode)
 
-        aside: Path | None = None
         if target_path.exists():
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
             aside = target_path.with_name(f"{target_path.name}.corrupt-{stamp}")
@@ -301,7 +310,14 @@ def restore_file(
 
         os.replace(tmp, target_path)
     except OSError as exc:
-        return RestoreResult(False, "error", detail=f"placement failed: {exc}")
+        # Never leave a plaintext temp of the decrypted secret behind.
+        with contextlib.suppress(OSError):
+            if tmp.exists():
+                tmp.unlink()
+        return RestoreResult(
+            False, "error", aside_path=str(aside) if aside else None,
+            detail=f"placement failed: {exc}",
+        )
 
     placed = validate_file(target, home, backup_dir)
     mtime = datetime.fromtimestamp(src.stat().st_mtime, UTC).isoformat()

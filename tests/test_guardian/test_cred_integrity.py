@@ -283,6 +283,43 @@ def test_pipe_mode_parity_and_no_genesis_imports(tmp_path):
     assert piped["claude_credentials"]["status"] == in_proc["claude_credentials"].status
 
 
+def test_secrets_env_small_but_valid_is_ok():
+    """min_keys=1: a legitimate small secrets.env (few keys) must NOT be flagged
+    corrupt — only a file that parses to ZERO keys is."""
+    t = DEFAULT_TARGETS[0]
+    assert t.min_keys == 1
+    assert validate_bytes(t.kind, b"A=1\nB=2\n", t.required_keys, t.min_keys).ok
+    # Garbage with no key=value lines → 0 keys → parse_error (restorable).
+    assert validate_bytes(t.kind, b"just some prose\nno equals here\n",
+                          t.required_keys, t.min_keys).status == "parse_error"
+
+
+@pytest.mark.skipif(not _HAS_GPG, reason="gpg not available")
+def test_restore_placement_failure_leaves_no_plaintext_temp(tmp_path, monkeypatch):
+    """If placement fails after the decrypted temp is written, the plaintext temp
+    must be cleaned up (no secret left on disk)."""
+    home = tmp_path / "home"
+    backup = tmp_path / "backup"
+    _encrypt(b"A=1\nB=2\nC=3\n", backup / "secrets" / "secrets.env.gpg", _PASS)
+    target_path = home / "genesis" / "secrets.env"
+    target_path.parent.mkdir(parents=True)
+    target_path.write_bytes(b"\x00" * 8)
+
+    real_replace = os.replace
+
+    def failing_replace(src, dst):
+        # Fail only the final tmp→target placement, not the aside move.
+        if str(src).endswith(".restore-tmp-" + str(os.getpid())):
+            raise OSError("simulated placement failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    r = restore_file(DEFAULT_TARGETS[0], home=home, backup_dir=backup, passphrase=_PASS)
+    assert not r.ok and r.action == "error"
+    leftovers = [p.name for p in target_path.parent.iterdir()]
+    assert not any(".restore-tmp-" in n for n in leftovers), leftovers
+
+
 def test_default_targets_match_backup_paths():
     """Guard: every target's backup_rel matches scripts/backup.sh §8 naming."""
     by_name = {t.name: t for t in DEFAULT_TARGETS}

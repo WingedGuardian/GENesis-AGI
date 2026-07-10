@@ -763,6 +763,37 @@ async def test_creds_corrupt_and_restored_alerts(monkeypatch, tmp_path):
         health_mcp_mod._alert_history = old_history
 
 
+async def test_corrupt_pending_does_not_alert(monkeypatch, tmp_path):
+    """corrupt_pending is the 2-tick debounce window — it must NOT fire an alert
+    (else the debounce fails to suppress the false alarm it exists to prevent).
+    Malformed-but-valid-JSON status must also not crash the alert pass."""
+    import json
+    from pathlib import Path
+
+    fake_home = tmp_path / "home"
+    (fake_home / ".genesis").mkdir(parents=True)
+    (fake_home / ".genesis" / "cred_integrity_status.json").write_text(json.dumps({
+        "version": 1,
+        "targets": {
+            "claude_json": {"status": "corrupt_pending", "detail": "parse_error"},
+            "bogus": "not-a-dict",  # must be tolerated, not crash
+        },
+    }))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+
+    mock_svc = AsyncMock()
+    mock_svc.snapshot.return_value = _mock_snapshot()
+    old, old_history = health_mcp_mod._service, health_mcp_mod._alert_history.copy()
+    try:
+        health_mcp_mod._service = mock_svc
+        health_mcp_mod._alert_history = {}
+        alerts = await _impl_health_alerts()
+        assert not [a for a in alerts if a["id"].startswith("creds:")]
+    finally:
+        health_mcp_mod._service = old
+        health_mcp_mod._alert_history = old_history
+
+
 async def test_no_creds_alert_when_all_ok(monkeypatch, tmp_path):
     import json
     from pathlib import Path
