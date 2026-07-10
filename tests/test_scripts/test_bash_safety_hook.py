@@ -255,3 +255,15 @@ def test_merge_digits_in_quoted_subject_not_a_pr(tmp_path):
     result = _run('gh pr merge --subject "merge 999 now"', env_extra=env)
     assert "PR #77" in result.stderr
     assert "999" not in result.stderr
+
+
+def test_merge_chained_command_digits_ignored(tmp_path):
+    """`gh pr merge 123; echo 456` must check PR #123, not #456 (a chained
+    command's digits are not this merge's target). 2026-07-10 review."""
+    env = _gh_stub(
+        tmp_path,
+        'case "$*" in *"--json mergeable"*) echo MERGEABLE;; esac',
+    )
+    result = _run("gh pr merge 123 --admin; echo 456", env_extra=env)
+    assert "PR #123" in result.stderr
+    assert "456" not in result.stderr

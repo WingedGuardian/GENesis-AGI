@@ -13,8 +13,10 @@
 #   - an optional leading "export " is accepted
 #   - KEY must match [A-Za-z_][A-Za-z0-9_]* — other lines are skipped
 #   - value = everything after the first '='
-#   - a value fully wrapped in matching single or double quotes is
-#     unwrapped one layer, contents verbatim (no escape processing)
+#   - a value that STARTS with a single or double quote is the content up
+#     to the matching closing quote; anything after it (e.g. an inline
+#     comment) is discarded — matches `source` and the Python
+#     _read_dotenv reader (contents verbatim, no escape processing)
 #   - unquoted values drop a trailing inline comment (whitespace + '#'
 #     onward) and trailing whitespace — matching what `source` yielded
 #     for such lines, so the switch is behavior-identical
@@ -43,13 +45,19 @@ load_secrets_file() {
             '' | [0-9]* | *[!A-Za-z0-9_]*) continue ;;
         esac
         case "$value" in
-            \"*\")
+            \"*)
+                # Value is up to the FIRST closing quote; drop everything
+                # after it (a trailing inline comment). `%%\"*` removes the
+                # longest suffix starting at the leftmost '"', leaving the
+                # quoted content. Without this, `KEY="a b" # c` kept the
+                # quotes and diverged from source → wrong backup passphrase
+                # (2026-07-10 review).
                 value="${value#\"}"
-                value="${value%\"}"
+                value="${value%%\"*}"
                 ;;
-            \'*\')
+            \'*)
                 value="${value#\'}"
-                value="${value%\'}"
+                value="${value%%\'*}"
                 ;;
             *)
                 # sed keeps leftmost-match semantics: 'x #a #b' → 'x',

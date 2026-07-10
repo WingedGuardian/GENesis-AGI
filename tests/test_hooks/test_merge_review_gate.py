@@ -437,6 +437,20 @@ class TestResolvePrNumber:
     def test_extract_variants(self, guard_module, cmd, expected):
         assert guard_module._extract_pr_number(cmd) == expected
 
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            # Digits in a CHAINED command must not stand in for the target
+            # (`; echo 456` merges 123, not 456). 2026-07-10 review P1.
+            ("gh pr merge --admin 123; echo 456", "123"),
+            ("gh pr merge 123 && echo 999", "123"),
+            ("gh pr merge --admin xyz; echo 456", None),  # no number → fall back
+            ("gh pr merge 5 | tee 777", "5"),
+        ],
+    )
+    def test_stops_at_shell_separator(self, guard_module, cmd, expected):
+        assert guard_module._extract_pr_number(cmd) == expected
+
     def test_quoted_digits_not_a_pr_number(self, guard_module):
         # shlex keeps the quoted arg whole — '123' inside --subject must
         # not resolve as the PR number.

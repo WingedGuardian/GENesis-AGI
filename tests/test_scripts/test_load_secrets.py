@@ -94,6 +94,18 @@ class TestLoadSecrets:
         assert sourced.returncode == 0, sourced.stderr
         assert loader_vals == sourced.stdout.split("\0")[:-1]
 
+    def test_quoted_value_with_inline_comment(self, tmp_path):
+        """`KEY="a b" # c` -> `a b` (quotes AND comment stripped), matching
+        `source`. Leaving the quotes would corrupt the backup passphrase
+        (2026-07-10 review P2)."""
+        content = (
+            'PP="abc def" # backup\n'
+            "SQ='x y' # note\n"
+            'DQEMBED="a#b" # c\n'
+        )
+        vals = _load_and_dump(tmp_path, content, ["PP", "SQ", "DQEMBED"])
+        assert vals == ["abc def", "x y", "a#b"]
+
     def test_missing_file_is_noop(self, tmp_path):
         proc = subprocess.run(
             ["bash", "-c",
