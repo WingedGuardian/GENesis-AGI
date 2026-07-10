@@ -936,3 +936,83 @@ async def test_recall_reranker_replaces_fused_with_positional_scores(
     assert [r.memory_id for r in results] == ["mem-2", "mem-1"]
     assert results[0].score == pytest.approx(1.0)   # 1/(1+0)
     assert results[1].score == pytest.approx(0.5)   # 1/(1+1)
+
+
+# --- mem-007: diversity penalty must not contaminate J9-logged scores ---
+
+
+def _make_echo_hit(mid: str, score: float, content: str) -> dict:
+    hit = _make_qdrant_hit(mid, score)
+    hit["payload"]["content"] = content
+    return hit
+
+
+@pytest.mark.asyncio
+@patch("genesis.eval.j9_hooks.emit_recall_fired", new_callable=AsyncMock, return_value=None)
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_diversity_penalty_preserves_raw_score_for_j9(
+    mock_qdrant, mock_crud, mock_links, _expand, mock_emit,
+):
+    """An echo-penalized result keeps its pre-penalty score in
+    ``retrieval_score``, and the J-9 recall event logs THAT — not the
+    halved dedup artifact. ``score`` (final ordering) stays penalized."""
+    retriever, _, _, _ = _build_retriever()
+
+    echo = "alpha beta gamma delta epsilon zeta identical content"
+    mock_qdrant.search.return_value = [
+        _make_echo_hit("echo-hi", 0.95, echo),
+        _make_echo_hit("echo-lo", 0.90, echo),
+    ]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    _setup_link_mocks(mock_links)
+
+    results = await retriever.recall("test", limit=5)
+
+    by_id = {r.memory_id: r for r in results}
+    assert {"echo-hi", "echo-lo"} <= set(by_id), (
+        "both echo-cluster members should survive (2 <= max_per_cluster)"
+    )
+    hi, lo = by_id["echo-hi"], by_id["echo-lo"]
+
+    # The winner is unpenalized: final == raw
+    assert hi.score == pytest.approx(hi.retrieval_score)
+    # The echo is halved for ORDERING, but its raw score is preserved
+    assert lo.score == pytest.approx(lo.retrieval_score * 0.5), (
+        f"echo final score {lo.score} should be raw {lo.retrieval_score} * 0.5"
+    )
+    assert lo.retrieval_score > lo.score > 0.0
+
+    # J-9 logging reads the RAW scores, not the penalized ones
+    emit_kwargs = mock_emit.call_args.kwargs
+    assert emit_kwargs["top_scores"] == pytest.approx(
+        [r.retrieval_score for r in results[:5]]
+    ), "J-9 top_scores must be pre-penalty retrieval scores"
+    expected_mean = sum(r.retrieval_score for r in results) / len(results)
+    assert emit_kwargs["mean_score"] == pytest.approx(expected_mean)
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_no_penalty_retrieval_score_equals_score(
+    mock_qdrant, mock_crud, mock_links, _expand,
+):
+    """With no echo clusters, retrieval_score == score for every result."""
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = [
+        _make_echo_hit("m1", 0.95, "completely unique first content"),
+        _make_echo_hit("m2", 0.90, "utterly different second thing"),
+    ]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    _setup_link_mocks(mock_links)
+
+    results = await retriever.recall("test", limit=5)
+    assert len(results) == 2
+    for r in results:
+        assert r.score == pytest.approx(r.retrieval_score)

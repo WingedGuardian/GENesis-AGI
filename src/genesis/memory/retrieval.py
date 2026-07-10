@@ -359,6 +359,7 @@ def _assemble_results(
     qdrant_by_id: dict[str, dict],
     fts_by_id: dict[str, dict],
     fused: dict[str, float],
+    raw_fused: dict[str, float],
     activation_by_id: dict[str, float],
     vector_ranked_dedup: list[str],
     seen: set[str],
@@ -371,6 +372,10 @@ def _assemble_results(
     Vector/FTS ranks are recomputed positionally against the stage-6 ranked
     lists (``vector_ranked_dedup``/``seen``/``fts_ranked``) — that reach-back
     is deliberate and explicit in the parameters.
+
+    ``fused`` carries the final (diversity-penalized) ordering scores;
+    ``raw_fused`` is the pre-penalty snapshot so J-9 logging can
+    read genuine retrieval quality via ``RetrievalResult.retrieval_score``.
     """
     results: list[RetrievalResult] = []
     for mid in top:
@@ -433,6 +438,10 @@ def _assemble_results(
                 query_intent=intent.category,
                 intent_confidence=intent.confidence,
                 collection=_collection,
+                # Pre-penalty score; falls back to the final score
+                # for ids that predate the snapshot (defensive — every id in
+                # ``top`` is in the snapshot today).
+                retrieval_score=raw_fused.get(mid, fused[mid]),
             ),
         )
     return results
@@ -710,6 +719,10 @@ class HybridRetriever:
         # If multiple candidates have near-identical content (Jaccard ≥ 0.80),
         # penalize lower-ranked echoes to prevent sycophantic memory clusters
         # from dominating retrieval results.
+        # Snapshot the pre-penalty scores first — the penalty mutates
+        # ``fused`` in place, and J-9 must log retrieval QUALITY, not the
+        # halved dedup artifact. ``fused`` (penalized) still drives ordering.
+        raw_fused = dict(fused)
         candidates = _apply_diversity_penalty(
             candidates, fused, qdrant_by_id, fts_by_id,
         )
@@ -736,6 +749,7 @@ class HybridRetriever:
             qdrant_by_id=qdrant_by_id,
             fts_by_id=fts_by_id,
             fused=fused,
+            raw_fused=raw_fused,
             activation_by_id=activation_by_id,
             vector_ranked_dedup=vector_ranked_dedup,
             seen=seen,
@@ -750,7 +764,11 @@ class HybridRetriever:
             emit_recall_fired,
         )
 
-        _scores = [r.score for r in results]
+        # J-9 logs the PRE-diversity-penalty scores. ``score`` is an
+        # ordering value (echo penalty applied); logging it understated the
+        # quality of penalized results in top_scores/mean_score/score_spread
+        # and skewed the entrenchment correlation.
+        _scores = [r.retrieval_score for r in results]
         # MEM-005: entrenchment signal (monitor-only) — see _entrenchment_metrics.
         _entrenchment, _mean_retrieved, _mean_age_days = _entrenchment_metrics(
             results, _scores, retrieved_count_by_id, created_at_by_id, now_str,
@@ -760,7 +778,7 @@ class HybridRetriever:
             self._db,
             query=query,
             result_count=len(results),
-            top_scores=[r.score for r in results[:5]],
+            top_scores=[r.retrieval_score for r in results[:5]],
             memory_ids=[r.memory_id for r in results[:10]],
             latency_ms=(time.monotonic() - _t0) * 1000,
             source=source,

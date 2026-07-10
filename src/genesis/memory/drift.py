@@ -190,24 +190,39 @@ async def _local_drilldown(
     # Scoped FTS5 search (room filter via tag match if available)
     fts_query = query
     if wing:
-        # FTS5 can filter by tags field which contains wing info
-        fts_results = await memory_crud.search_ranked(
-            db, query=fts_query, collection="episodic_memory", limit=local_limit,
-            exclude_subsystems=exclude_subsystems,
-            include_only_subsystems=include_only_subsystems,
-        )
+        # Mirror the vector arm below — search each source collection's FTS
+        # rows (hardcoding ``episodic_memory`` here made knowledge recall
+        # vector-only in the wing-scoped phase; knowledge rows ARE
+        # FTS-indexed under collection='knowledge_base'). Merge across
+        # collections by FTS rank — bm25, lower = more relevant, and ranks
+        # are comparable because every collection lives in the same
+        # ``memory_fts`` table under the same query. Appending
+        # per-collection pages instead would rank every hit of the first
+        # collection above the second's regardless of relevance, and this
+        # order matters: ``local_ids`` feeds RRF as a ranked list.
+        fts_rows: list[dict] = []
+        for collection in source_collections:
+            fts_rows.extend(await memory_crud.search_ranked(
+                db, query=fts_query, collection=collection, limit=local_limit,
+                exclude_subsystems=exclude_subsystems,
+                include_only_subsystems=include_only_subsystems,
+            ))
+        fts_rows.sort(key=lambda r: r["rank"])
+        # Rank order preserved; drop cross-collection duplicates
+        fts_ids = list(dict.fromkeys(r["memory_id"] for r in fts_rows))
         # Filter results by wing in post-processing (FTS5 doesn't support wing filter)
-        fts_ids = [r["memory_id"] for r in fts_results]
-        if wing:
-            # Verify wing membership
+        if fts_ids:
+            # Verify wing membership. Filter as a SET and keep the ranked
+            # order — the IN-clause SELECT returns rows in table-scan
+            # order, which would rescramble the rank merge above.
             placeholders = ",".join("?" * len(fts_ids))
-            if fts_ids:
-                wing_query = f"""
-                    SELECT memory_id FROM memory_metadata
-                    WHERE memory_id IN ({placeholders}) AND wing = ?
-                """
-                async with db.execute(wing_query, [*fts_ids, wing]) as cursor:
-                    fts_ids = [row[0] async for row in cursor]
+            wing_query = f"""
+                SELECT memory_id FROM memory_metadata
+                WHERE memory_id IN ({placeholders}) AND wing = ?
+            """
+            async with db.execute(wing_query, [*fts_ids, wing]) as cursor:
+                wing_members = {row[0] async for row in cursor}
+            fts_ids = [mid for mid in fts_ids if mid in wing_members]
         local_ids.extend(fts_ids)
 
     # Scoped vector search with wing filter
@@ -409,6 +424,8 @@ async def drift_recall(
                 query_intent=intent.category,
                 intent_confidence=intent.confidence,
                 collection=row.get("collection", "episodic_memory"),
+                # DRIFT applies no diversity penalty — raw == final.
+                retrieval_score=fused_scores[mid],
             )
         )
 

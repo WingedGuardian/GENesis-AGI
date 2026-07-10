@@ -36,13 +36,16 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 9037d45b 2026-07-07
+verified: d3d48d94 2026-07-09
 ```
 
 **Retrieval is TIERED — the hottest auto-fired paths carry the thinnest
 stack.** Deep path: `memory/retrieval.py` `HybridRetriever.recall` (bitemporal
 `invalid_at` filter, entrenchment, activation/decay, graph boost, diversity
-penalty). Easy-to-forget mechanisms:
+penalty). The diversity penalty only shapes ORDERING —
+`RetrievalResult.retrieval_score` carries the pre-penalty score and is what
+J-9 quality logging reads (the MCP MEM-003 enrichment reads it too).
+Easy-to-forget mechanisms:
 
 - **CRAG** lives in the MCP-wrapper only (`memory/corrective.py`
   `maybe_correct_recall`; `top_score >= 0.75` skips grading) — not in
@@ -51,7 +54,8 @@ penalty). Easy-to-forget mechanisms:
   API_KEY_VOYAGE-gated; the `rerank=` param is off by default at the retriever
   and applied by callers.
 - **`drift_recall`** (`memory/drift.py`) is the degraded-mode fallback; its
-  FTS drilldown is hardcoded to `episodic_memory` (known MEM-006).
+  FTS drilldown searches every collection in `source_collections`,
+  rank-merged across collections.
 - The proactive per-prompt path is `scripts/proactive_memory_hook.py` — an
   **independent reimplementation** (own FTS5→Qdrant→RRF pipeline), not a
   `HybridRetriever` caller. The `memory_proactive` MCP tool is registered but
