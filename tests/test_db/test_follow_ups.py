@@ -380,3 +380,139 @@ async def test_query_page_status_sort_ranks_by_actionability(db):
     # Alphabetical 'completed' < 'in_progress' would invert this — the rank CASE
     # must put in_progress first.
     assert order.index(active) < order.index(done)
+
+
+# ─── Inbox attention-marker decay (WATCH/BOOKMARK tabled lane) ────────────────
+
+
+async def _make_marker(db, *, age_days: int, kind="tabled",
+                       source="inbox_evaluation", content="[WATCH] x",
+                       status="pending"):
+    """Create a follow-up, backdate created_at by *age_days*, set *status*."""
+    fid = await follow_ups.create(
+        db, source=source, content=content, reason="r",
+        strategy="ego_judgment", priority="low", kind=kind,
+    )
+    from datetime import UTC, datetime, timedelta
+
+    old = (datetime.now(UTC) - timedelta(days=age_days)).isoformat()
+    await db.execute(
+        "UPDATE follow_ups SET created_at = ?, status = ? WHERE id = ?",
+        (old, status, fid),
+    )
+    await db.commit()
+    return fid
+
+
+async def test_decay_stale_inbox_markers_ages_out_old(db):
+    """A tabled inbox marker older than the threshold is completed with a note."""
+    fid = await _make_marker(db, age_days=61)
+
+    count = await follow_ups.decay_stale_inbox_markers(db, older_than_days=60)
+    assert count == 1
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "completed"
+    assert row["completed_at"] is not None
+    assert "decayed" in (row["resolution_notes"] or "")
+
+
+async def test_decay_ages_out_blocked_marker(db):
+    """Regression: a BLOCKED tabled marker must decay too, else it is immortal.
+
+    purge_completed only reaps completed/failed (which carry completed_at); a
+    blocked tabled row has no completed_at, so if decay skipped it (pending-only)
+    nothing would ever reap it.
+    """
+    fid = await _make_marker(db, age_days=61, status="blocked")
+
+    count = await follow_ups.decay_stale_inbox_markers(db, older_than_days=60)
+    assert count == 1
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "completed"
+    assert "decayed" in (row["resolution_notes"] or "")
+
+
+async def test_decay_skips_terminal_markers(db):
+    """Already completed/failed tabled markers are left to purge_completed."""
+    done = await _make_marker(db, age_days=200, status="completed")
+    failed = await _make_marker(db, age_days=200, status="failed")
+
+    count = await follow_ups.decay_stale_inbox_markers(db, older_than_days=60)
+    assert count == 0
+    assert (await follow_ups.get_by_id(db, done))["status"] == "completed"
+    assert (await follow_ups.get_by_id(db, failed))["status"] == "failed"
+
+
+async def test_decay_keeps_recent_marker(db):
+    """A tabled inbox marker younger than the threshold is untouched."""
+    fid = await _make_marker(db, age_days=30)
+
+    count = await follow_ups.decay_stale_inbox_markers(db, older_than_days=60)
+    assert count == 0
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "pending"
+
+
+async def test_decay_ignores_actionable_follow_up_lane(db):
+    """An old ADOPT/ADAPT/EXPLORE follow_up (not tabled) is never decayed."""
+    fid = await _make_marker(
+        db, age_days=200, kind="follow_up", content="[ADAPT] x",
+    )
+
+    count = await follow_ups.decay_stale_inbox_markers(db, older_than_days=60)
+    assert count == 0
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "pending"
+
+
+async def test_decay_ignores_non_inbox_tabled(db):
+    """A tabled marker from another source (e.g. a tracked bug) is never decayed."""
+    fid = await _make_marker(db, age_days=200, source="manual_bug_tracker")
+
+    count = await follow_ups.decay_stale_inbox_markers(db, older_than_days=60)
+    assert count == 0
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "pending"
+
+
+async def test_get_recently_resolved_excludes_tabled(db):
+    """Decayed (completed) tabled markers must not read as ego-resolved work."""
+    fu = await follow_ups.create(db, **_BASE)
+    await follow_ups.update_status(db, fu, status="completed")
+    marker = await follow_ups.create(db, **_BASE, kind="tabled")
+    await follow_ups.update_status(db, marker, status="completed")
+
+    ids = {r["id"] for r in await follow_ups.get_recently_resolved(db)}
+    assert fu in ids
+    assert marker not in ids
+
+    ids_all = {
+        r["id"]
+        for r in await follow_ups.get_recently_resolved(db, include_tabled=True)
+    }
+    assert marker in ids_all
+
+
+async def test_get_recently_completed_excludes_tabled(db):
+    """The daily morning-report 'Completed (24h)' path also drops tabled.
+
+    get_recently_completed selects content/resolution_notes (not id), so assert
+    on the content of a decayed marker vs a genuinely-completed follow-up.
+    """
+    await follow_ups.create(db, **{**_BASE, "content": "real work done"})
+    fu = (await follow_ups.get_pending(db))[0]["id"]
+    await follow_ups.update_status(db, fu, status="completed")
+    marker = await follow_ups.create(
+        db, **{**_BASE, "content": "[BOOKMARK] decayed"}, kind="tabled",
+    )
+    await follow_ups.update_status(db, marker, status="completed")
+
+    contents = {r["content"] for r in await follow_ups.get_recently_completed(db)}
+    assert "real work done" in contents
+    assert "[BOOKMARK] decayed" not in contents
+
+    contents_all = {
+        r["content"]
+        for r in await follow_ups.get_recently_completed(db, include_tabled=True)
+    }
+    assert "[BOOKMARK] decayed" in contents_all

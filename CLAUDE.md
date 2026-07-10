@@ -325,7 +325,13 @@ When a user shares a file path or URL in conversation:
   derail this session — or the user directs it as separate. Otherwise do it
   now, even if unrelated/unasked; "already noted in a PR/comment" is not a
   reason to also create a row. Valid ones: create via `follow_up_create` MCP,
-  never leave as just text. (Genuine someday/maybe → `tabled`, not a follow-up.)
+  never leave as just text. **Two lanes** (`kind` on a follow-up): `follow_up`
+  = committed work, actionable, dispatched/surfaced (the FIX-NOW-or-valid-defer
+  cases above); `tabled` = an awareness record — "tracked, keep a record, not
+  acting near-term" — bug-tracker semantics, never dispatched or surfaced as
+  action. Genuine someday/maybe and deferred known bugs go to `tabled`, not a
+  `follow_up` row. (Inbox WATCH/BOOKMARK markers auto-route to `tabled` and
+  soft-decay after 60d.)
 - **No laziness.** Find root causes. No temporary fixes. No shortcuts.
   Don't EVER mute the symptom — fix the problem.
 - **Read before writing.** Never modify code you haven't fully read.
@@ -334,7 +340,9 @@ When a user shares a file path or URL in conversation:
   mistakes, not just document them.
 - **NEVER hide broken things — FIX THEM.** Fix the root cause, not the
   symptom. This is a thinking rule, not just a code rule.
-- **Bugs you see get fixed or tracked — never ignored.**
+- **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a
+  bug you consciously defer becomes a `tabled` record (bug-tracker lane above),
+  never a silent drop.
 - **Telegram reminders**: use `outreach_send` with `preferred_timing`,
   NOT the `/schedule` skill (that's Claude Code's remote scheduler).
 - **Cognitive co-pilot, not order taker.** On every task, ask: "what else

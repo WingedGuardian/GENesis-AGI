@@ -1722,13 +1722,21 @@ class InboxMonitor:
     # Follow-up creation from evaluation Recommendation blocks
     # ------------------------------------------------------------------
 
-    # Classification → (strategy, priority, pinned)
-    _ACTION_MAP: dict[str, tuple[str, str, bool]] = {
-        "adopt":  ("user_input_needed", "high",   True),
-        "adapt":  ("user_input_needed", "medium", True),
-        "watch":  ("ego_judgment",      "low",    False),
-        "explore": ("user_input_needed", "medium", True),
-        "bookmark": ("ego_judgment",     "low",    False),
+    # Classification → (strategy, priority, pinned, kind)
+    #
+    # WATCH/BOOKMARK are attention markers, not tasks: they route to the
+    # ``tabled`` lane (tracked, never dispatched or surfaced as action). The ego
+    # therefore never sees them (get_actionable excludes tabled) and has no
+    # authority to discard a user-curated marker — their honest fates are DECAY
+    # (soft age-out via decay_stale_inbox_markers) and ACTIVATION (surfaced when
+    # relevant). ADOPT/ADAPT/EXPLORE are intent-to-act → the actionable
+    # ``follow_up`` lane, pinned and user-owned.
+    _ACTION_MAP: dict[str, tuple[str, str, bool, str]] = {
+        "adopt":  ("user_input_needed", "high",   True,  "follow_up"),
+        "adapt":  ("user_input_needed", "medium", True,  "follow_up"),
+        "watch":  ("ego_judgment",      "low",    False, "tabled"),
+        "explore": ("user_input_needed", "medium", True, "follow_up"),
+        "bookmark": ("ego_judgment",     "low",    False, "tabled"),
     }
 
     async def _create_follow_ups_from_eval(
@@ -1763,7 +1771,7 @@ class InboxMonitor:
                 )
                 continue
 
-            strategy, priority, pinned = mapping
+            strategy, priority, pinned, kind = mapping
 
             title = rec.item_title or "Untitled"
             content = f"[{rec.action.upper()}] {title}: {rec.next_step}"
@@ -1798,6 +1806,7 @@ class InboxMonitor:
                     strategy=strategy,
                     priority=priority,
                     pinned=pinned,
+                    kind=kind,
                     # The evaluator judges each item genesis-vs-user; reuse it.
                     domain=(
                         "internal" if rec.classification == "genesis"
