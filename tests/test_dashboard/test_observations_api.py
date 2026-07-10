@@ -48,11 +48,15 @@ class TestObservationsFilters:
                 "genesis.db.crud.observations.distinct_unresolved_sources",
                 new_callable=AsyncMock,
                 return_value=["routing", "session:aaa-111", "session:bbb-222"],
-            ),
+            ) as mock_sources,
         ):
             MockRT.instance.return_value = _mock_rt()
             data = client.get("/api/genesis/observations/filters").get_json()
             assert data["sources"] == ["routing", "session:*"]
+            # Internal types must be excluded from the sources feed, so the
+            # dropdown never offers a source the default list would show 0 rows
+            # for (e.g. session sources whose rows are all conversation_pivot).
+            assert mock_sources.call_args.kwargs["exclude_types"]
 
     def test_no_session_sources_no_sentinel(self, client):
         with (

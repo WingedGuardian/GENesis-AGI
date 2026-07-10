@@ -134,8 +134,12 @@ async def observations_filters():
     types = [t for t in all_types if t not in INTERNAL_OBS_TYPES]
 
     # Collapse per-session UUID sources ("session:<uuid>") into one sentinel
-    # option; the list endpoint expands "session:*" to a prefix match.
-    all_sources = await obs_crud.distinct_unresolved_sources(rt.db)
+    # option; the list endpoint expands "session:*" to a prefix match. Internal
+    # types are excluded here for the same reason they are excluded from the
+    # list by default — a source with only internal rows would filter to zero.
+    all_sources = await obs_crud.distinct_unresolved_sources(
+        rt.db, exclude_types=tuple(INTERNAL_OBS_TYPES)
+    )
     sources = [s for s in all_sources if not s.startswith("session:")]
     if len(sources) != len(all_sources):
         sources.append("session:*")

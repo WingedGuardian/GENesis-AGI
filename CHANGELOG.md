@@ -77,11 +77,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   UUIDs into a single "session (any)" option. And high-traffic tabs show
   "Loading…" during their first fetch instead of flashing a false "No X found".
 
-- **The API Keys card now connects a bad key to the failures it causes.** Each
-  provider with dead-lettered operations in the last 24h shows "N failures ·
-  last X ago" next to its key status, so "missing (fallback active)" and the
-  error-log storm it produces finally read as one story.
-
 - **The Guardian's recovery brain no longer goes dark when its work directory is
   misconfigured.** On some installs the Guardian's configured CC work dir points
   at a path it can't create (e.g. a root-owned dir on an install that predates

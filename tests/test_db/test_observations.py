@@ -66,6 +66,18 @@ async def test_distinct_unresolved_types_and_sources(db):
     assert await observations.distinct_unresolved_sources(db) == ["sensor", "session:abc"]
 
 
+async def test_distinct_unresolved_sources_excludes_types(db):
+    """A source whose unresolved rows are ALL excluded types must not appear."""
+    await observations.create(db, id="dx1", **_COMMON)
+    await observations.create(
+        db, id="dx2", **{**_COMMON, "source": "session:abc", "type": "conversation_pivot"}
+    )
+    sources = await observations.distinct_unresolved_sources(
+        db, exclude_types=("conversation_pivot",)
+    )
+    assert sources == ["sensor"]
+
+
 async def test_query_by_priority(db):
     await observations.create(db, id="o5", **{**_COMMON, "priority": "low"})
     rows = await observations.query(db, priority="low")

@@ -371,11 +371,26 @@ async def distinct_unresolved_types(db: aiosqlite.Connection) -> list[str]:
     return [row[0] for row in rows]
 
 
-async def distinct_unresolved_sources(db: aiosqlite.Connection) -> list[str]:
-    """Distinct ``source`` values among unresolved observations (dropdown feed)."""
-    rows = await db.execute_fetchall(
-        "SELECT DISTINCT source FROM observations WHERE resolved = 0 ORDER BY source"
-    )
+async def distinct_unresolved_sources(
+    db: aiosqlite.Connection,
+    *,
+    exclude_types: tuple[str, ...] | frozenset[str] | None = None,
+) -> list[str]:
+    """Distinct ``source`` values among unresolved observations (dropdown feed).
+
+    ``exclude_types`` drops observations of those types before deriving sources,
+    so a source whose unresolved rows are ALL internal types (e.g. a
+    ``session:<uuid>`` source with only ``conversation_pivot`` rows) never
+    appears as a filter option the list endpoint would then show zero rows for.
+    """
+    sql = "SELECT DISTINCT source FROM observations WHERE resolved = 0"
+    params: list = []
+    if exclude_types:
+        placeholders = ",".join("?" for _ in exclude_types)
+        sql += f" AND type NOT IN ({placeholders})"
+        params.extend(exclude_types)
+    sql += " ORDER BY source"
+    rows = await db.execute_fetchall(sql, params)
     return [row[0] for row in rows]
 
 
