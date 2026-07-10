@@ -321,3 +321,101 @@ class TestMergeGateIntegration:
         result = _run_guard("git config --get user.name")
         assert result.returncode == 0
         assert result.stderr.strip() == ""
+
+
+# ── _check_inline_review_findings tests ──────────────────────────────
+
+_P1_BODY = (
+    "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-red)"
+    "</sub></sub>  Make queue claim atomic across concurrent pollers**"
+    "\n\nDetails here."
+)
+_P2_BODY = (
+    "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow)"
+    "</sub></sub>  Preserve multi-word ledger keys for entity lookup**"
+    "\n\nDetails here."
+)
+
+
+class TestCheckInlineReviewFindings:
+    """Inline (pulls/N/comments) findings: P1 blocks, P2 warns.
+
+    Codex posts findings ONLY on this endpoint; the review body is
+    boilerplate — 173 findings passed the gate unseen before this
+    (2026-07-10 audit)."""
+
+    def _mock(self, guard_module, comments, rc=0):
+        # gh api --paginate with a per-element jq filter emits one
+        # compact JSON object per line across ALL result pages.
+        return patch.object(
+            guard_module.subprocess, "run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=rc,
+                stdout="\n".join(json.dumps(c) for c in comments),
+                stderr="",
+            ),
+        )
+
+    def _codex(self, cid, body, reply_to=None):
+        return {
+            "id": cid, "reply_to": reply_to,
+            "login": "chatgpt-codex-connector[bot]", "type": "Bot",
+            "body": body,
+        }
+
+    def test_inline_p1_blocks_with_title(self, guard_module):
+        with self._mock(guard_module, [self._codex(1, _P1_BODY)]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "Make queue claim atomic" in msg
+
+    def test_inline_p2_warns_but_allows(self, guard_module, capsys):
+        with self._mock(guard_module, [self._codex(1, _P2_BODY)]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert not block
+        err = capsys.readouterr().err
+        assert "[P2] Preserve multi-word ledger keys" in err
+
+    def test_replied_p1_is_acknowledged(self, guard_module):
+        comments = [
+            self._codex(1, _P1_BODY),
+            {"id": 2, "reply_to": 1, "login": "WingedGuardian",
+             "type": "User", "body": "Fixed in abc123."},
+        ]
+        with self._mock(guard_module, comments):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_force_override_allows(self, guard_module):
+        block, _ = guard_module._check_inline_review_findings(
+            "100", force=True,
+        )
+        assert not block
+
+    def test_api_error_fails_open(self, guard_module):
+        with self._mock(guard_module, [], rc=1):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_gh_call_paginates(self, guard_module):
+        # Findings beyond REST page 1 (30 comments) must still gate —
+        # the very first PR through this gate (#996) drew a P1 for it.
+        with self._mock(guard_module, []) as run_mock:
+            guard_module._check_inline_review_findings("100")
+        assert "--paginate" in run_mock.call_args[0][0]
+
+    def test_p1_beyond_first_page_blocks(self, guard_module):
+        filler = [self._codex(i, "note") for i in range(1, 32)]
+        with self._mock(guard_module, [*filler, self._codex(99, _P1_BODY)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_human_inline_comments_ignored(self, guard_module):
+        comments = [{
+            "id": 1, "reply_to": None, "login": "WingedGuardian",
+            "type": "User", "body": _P1_BODY,
+        }]
+        with self._mock(guard_module, comments):
+            block, _ = guard_module._check_inline_review_findings("100")
+        # type=User AND not in the inline bot set → not an automated finding
+        assert block is False

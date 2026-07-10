@@ -218,3 +218,51 @@ class TestStoreSeamFailOpen:
                 source="test",
             )
         assert memory_id  # anchor failure never breaks the store
+
+
+class TestCodexRemediationE3:
+    """Regression tests for the 2026-07-10 Codex P2 findings (E3 side)."""
+
+    def test_digit_only_ids_are_not_commit_anchors(self):
+        # Plain numeric IDs (tickets/builds/counters) polluted the live
+        # table with 559 fake commit entities pre-fix.
+        for text in ("build 1234567890 done", "counter 000000001 rolled"):
+            anchors = extract_anchors(text)
+            assert not [a for a in anchors if a[1] == "commit"], text
+        # Real SHAs (digit + hex letter) still match.
+        anchors = dict(extract_anchors("squash d343a626 landed"))
+        assert anchors.get("d343a626") == "commit"
+
+    @pytest.mark.asyncio
+    async def test_mechanical_resolution_ignores_aliases(self, db):
+        # An alias like "cc" → "claude code" must never rewrite literal
+        # identifiers (paths/symbols/PR#s/SHAs).
+        from genesis.memory.entity_registry import resolve_entity
+
+        eid, provenance = await resolve_entity(
+            db, name="src/genesis/cc/direct_session.py",
+            entity_type="code_file",
+            aliases={"cc": "claude code"},
+        )
+        assert provenance == "EXTRACTED"
+        rows = await db.execute_fetchall(
+            "SELECT norm_name FROM entities WHERE entity_id = ?", (eid,),
+        )
+        assert rows[0][0] == "src/genesis/cc/direct_session.py"
+
+    @pytest.mark.asyncio
+    async def test_relationship_confidence_clamped(self, db):
+        extraction = FakeExtraction(
+            entities=["OMI"],
+            relationships=[
+                {"from": "OMI", "to": "left", "type": "is_a",
+                 "confidence": 1.7},
+                {"from": "OMI", "to": "right", "type": "part_of",
+                 "confidence": -0.4},
+            ],
+        )
+        await record_extraction(db, "mem-1", extraction, aliases={})
+        rows = await db.execute_fetchall(
+            "SELECT link_type, confidence FROM entity_links ORDER BY link_type",
+        )
+        assert [(r[0], r[1]) for r in rows] == [("is_a", 1.0), ("part_of", 0.0)]
