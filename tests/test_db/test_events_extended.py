@@ -264,3 +264,84 @@ class TestQueryGroupedErrors:
         groups = await crud.query_grouped_errors(db, subsystem="memory")
         assert len(groups) == 1
         assert groups[0]["subsystem"] == "memory"
+
+
+# ── recent_provider_fallback_counts ──────────────────────────────────────
+
+
+class TestRecentProviderFallbackCounts:
+    @pytest.mark.asyncio
+    async def test_counts_and_unnests_failed_providers(self, db):
+        # Two fallbacks blame nvidia; the second also blames gemini (2-elem array)
+        await crud.insert(
+            db, subsystem="routing", severity="warning",
+            event_type="provider.fallback", message="fb1",
+            details={"call_site": "9_fact_extraction", "provider": "groq-free",
+                     "failed_providers": ["nvidia-nim-deepseek"]},
+            timestamp="2026-03-14T10:00:00",
+        )
+        await crud.insert(
+            db, subsystem="routing", severity="warning",
+            event_type="provider.fallback", message="fb2",
+            details={"call_site": "judge", "provider": "openrouter-free",
+                     "failed_providers": ["nvidia-nim-deepseek", "gemini-free"]},
+            timestamp="2026-03-14T11:00:00",
+        )
+        # A breaker.tripped event names nvidia too — must NOT be counted here
+        # (this crud is fallback-only; the CB state carries breaker signal).
+        await crud.insert(
+            db, subsystem="routing", severity="warning",
+            event_type="breaker.tripped", message="trip",
+            details={"provider": "nvidia-nim-deepseek", "call_site": "x"},
+            timestamp="2026-03-14T12:00:00",
+        )
+
+        out = await crud.recent_provider_fallback_counts(
+            db, since="2026-03-14T00:00:00",
+        )
+        # nvidia appears in both fallbacks → 2 (NOT 3 — breaker.tripped ignored)
+        assert out["nvidia-nim-deepseek"]["count"] == 2
+        assert out["gemini-free"]["count"] == 1
+        # last_at = MAX(timestamp) across the two nvidia fallback rows
+        assert out["nvidia-nim-deepseek"]["last_at"] == "2026-03-14T11:00:00"
+
+    @pytest.mark.asyncio
+    async def test_since_window_excludes_old(self, db):
+        await crud.insert(
+            db, subsystem="routing", severity="warning",
+            event_type="provider.fallback", message="old",
+            details={"failed_providers": ["groq-free"]},
+            timestamp="2026-03-10T00:00:00",
+        )
+        await crud.insert(
+            db, subsystem="routing", severity="warning",
+            event_type="provider.fallback", message="new",
+            details={"failed_providers": ["groq-free"]},
+            timestamp="2026-03-14T00:00:00",
+        )
+        out = await crud.recent_provider_fallback_counts(
+            db, since="2026-03-12T00:00:00",
+        )
+        assert out["groq-free"]["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_failed_providers_key_contributes_nothing(self, db):
+        # A provider.fallback event lacking failed_providers: json_extract → NULL,
+        # json_each(NULL) → 0 rows, so it contributes nothing (no crash).
+        await crud.insert(
+            db, subsystem="routing", severity="warning",
+            event_type="provider.fallback", message="nokey",
+            details={"call_site": "x", "provider": "groq-free"},
+            timestamp="2026-03-14T00:00:00",
+        )
+        out = await crud.recent_provider_fallback_counts(
+            db, since="2026-03-14T00:00:00",
+        )
+        assert out == {}
+
+    @pytest.mark.asyncio
+    async def test_empty_returns_empty_dict(self, db):
+        out = await crud.recent_provider_fallback_counts(
+            db, since="2026-01-01T00:00:00",
+        )
+        assert out == {}

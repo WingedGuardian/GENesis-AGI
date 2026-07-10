@@ -324,3 +324,28 @@ class TestProvisioningExecutors:
                           AsyncMock(return_value=(False, "timeout"))):
             res = await remote.request_grow_disk("scsi1", 32)
         assert res["ok"] is False and "timeout" in res["error"]
+
+
+class TestVersionTimeout:
+    """version() must pass a longer wait than the instance default — it now
+    also runs `claude auth status` host-side, which can exceed 10s and would
+    make version() return `unreachable`, skipping EVERY reconciler."""
+
+    @pytest.mark.asyncio
+    async def test_version_uses_extended_timeout(self, remote):
+        from genesis.guardian.remote import _VERSION_TIMEOUT
+        mock_ssh = AsyncMock(return_value=(True, "{}"))
+        with patch.object(remote, "_ssh_command", new=mock_ssh):
+            await remote.version()
+        mock_ssh.assert_awaited_once_with("version", timeout=_VERSION_TIMEOUT)
+        assert remote._timeout < _VERSION_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_version_passes_through_new_fields(self, remote):
+        payload = {"cc_version": "1.2.3", "cc_logged_in": True,
+                   "cc_token_present": False, "cc_token_age_days": -1}
+        with patch.object(remote, "_ssh_command",
+                          new=AsyncMock(return_value=(True, json.dumps(payload)))):
+            got = await remote.version()
+        assert got["cc_logged_in"] is True
+        assert got["cc_token_age_days"] == -1

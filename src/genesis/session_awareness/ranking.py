@@ -90,6 +90,7 @@ async def rank_candidates(
     created_before: str | None = None,
     entity_lane: str | None = None,
     entity_shadow_out: list | None = None,
+    entity_terms: list[str] | None = None,
 ) -> list[dict]:
     """Gather the lanes, filter expired, rank, return the top *top_n*.
 
@@ -98,6 +99,11 @@ async def rank_candidates(
     reached it). *entity_lane* overrides ``ENTITY_LANE_MODE``; in shadow
     mode entity-only candidates are appended to *entity_shadow_out*
     (when given) instead of the returned set.
+
+    *entity_terms* are the ledger keys VERBATIM for the entity lane —
+    alias normalization produces multi-word keys ("cc" → "claude code")
+    that must not be whitespace-split or they can never resolve to their
+    norm_name. Falls back to splitting *entity_query* when omitted.
     """
     from genesis.db.crud.memory_links import batch_link_counts
     from genesis.memory.classification import CLASS_WEIGHTS
@@ -136,22 +142,30 @@ async def rank_candidates(
 
     # ── Drift lane ───────────────────────────────────────────────────
     if entity_query.strip():
+        # drift_recall has no as-of entry point, so replays post-filter
+        # by created_at. Over-fetch under a cutoff: if the top rows are
+        # all post-cutoff, valid older hits below the cap would silently
+        # vanish and the as-of replay undercounts the lane.
+        drift_limit = DRIFT_LANE_LIMIT * (4 if created_before else 1)
+        drift_kept = 0
         for r in await drift_recall(
             entity_query,
             db=db,
             qdrant_client=qdrant_client,
             embedding_provider=embedding_provider,
             source="episodic",
-            limit=DRIFT_LANE_LIMIT,
+            limit=drift_limit,
         ):
+            if drift_kept >= DRIFT_LANE_LIMIT:
+                break
             if r.memory_id in by_id:
                 by_id[r.memory_id]["lanes"].append("drift")
+                drift_kept += 1
                 continue
             payload = r.payload or {}
-            # drift_recall has no as-of entry point — post-filter (the
-            # replay's fidelity concern; live runs pass no cutoff)
             if created_before and str(payload.get("created_at") or "") > created_before:
                 continue
+            drift_kept += 1
             by_id[r.memory_id] = {
                 "memory_id": r.memory_id,
                 "cosine": None,  # backfilled below from the stored vector
@@ -172,7 +186,11 @@ async def rank_candidates(
             from genesis.db.crud.entities import PROVENANCE_WEIGHTS
 
             weights: dict[str, float] = {}
-            for keyword in entity_query.split():
+            terms = (
+                entity_terms if entity_terms is not None
+                else entity_query.split()
+            )
+            for keyword in terms:
                 ent = await entities_crud.get_by_norm_name(
                     db, norm_name=keyword,
                 )
@@ -233,6 +251,8 @@ async def rank_candidates(
 
     # Drift/entity-only candidates need vector (cosine-vs-EMA) + payload.
     missing = [mid for mid, c in by_id.items() if c["cosine"] is None]
+    retrieved: set[str] = set()
+    retrieve_failed = False
     if missing:
         try:
             points = qdrant_client.retrieve(
@@ -245,6 +265,7 @@ async def rank_candidates(
                 cand = by_id.get(str(p.id))
                 if cand is None:
                     continue
+                retrieved.add(str(p.id))
                 vec = p.vector if isinstance(p.vector, list) else None
                 if vec:
                     cand["cosine"] = cosine(ema, vec)
@@ -257,10 +278,23 @@ async def rank_candidates(
                     cand["memory_class"] = payload.get("memory_class")
                 cand.setdefault("created_at", payload.get("created_at"))
         except Exception:
-            pass  # cosine stays None → scored at 0 below, not dropped info
+            retrieve_failed = True  # infra blip ≠ evidence of absence
         for mid in missing:
             if by_id[mid]["cosine"] is None:
                 by_id[mid]["cosine"] = 0.0
+
+    # Entity mentions cover every write path (knowledge base, FTS5-only,
+    # pending embeds) but this lane retrieves from episodic_memory only:
+    # an entity-only candidate with no episodic point has an empty
+    # preview and score 0, yet the live floor could still force it into
+    # the arbiter prompt. Drop those — unless retrieve itself failed,
+    # where dropping would misread an infra blip as absence.
+    if not retrieve_failed:
+        for mid in [
+            m for m, c in by_id.items()
+            if c["lanes"] == ["entity"] and m in set(missing) - retrieved
+        ]:
+            by_id.pop(mid)
 
     # As-of parity for entity-only candidates: mentions don't carry the
     # memory's created_at, so the cutoff applies via the payload fetched

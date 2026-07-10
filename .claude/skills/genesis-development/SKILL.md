@@ -355,6 +355,16 @@ outlives its incident is a bug.
    `.comments` scan misses. Check BOTH `gh pr view N --json reviews,comments`
    and `gh api repos/<owner>/<repo>/pulls/N/comments`, and address each soft
    warning or consciously accept it. Never merge past an unread warning.
+7. **Codex findings are INLINE review comments — invisible to `gh pr view`.**
+   Codex's review *body* is boilerplate ("Here are some automated review
+   suggestions"); its actual `[P1]`/`[P2]` findings live only at
+   `gh api repos/<slug>/pulls/N/comments`. Derive `<slug>` live —
+   `gh repo view --json nameWithOwner --jq .nameWithOwner` — NEVER hardcode
+   it (configs name several repos; the working repo is not the org default).
+   A **404 from that endpoint means WRONG SLUG or PR number, never "no
+   findings"** — a clean PR returns `[]`. The merge-gate hook only blocks
+   ERROR/[P1]/HARD BLOCK, so unread P2s pass silently (2026-07-10: 8 real
+   P2s on the entity-layer PRs were merged past this exact way).
 
 ## Reference Router
 
