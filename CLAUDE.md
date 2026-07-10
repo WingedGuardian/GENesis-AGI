@@ -52,7 +52,10 @@ journalctl --user -u genesis-server -n 50        # Logs
 systemctl --user list-units 'genesis-*' --all    # All units
 ```
 
-Other units: `genesis-bridge.service` (Telegram relay, on-demand),
+Other units: `genesis-bridge.service` (LEGACY fallback — full stack incl.
+Telegram, only when genesis-server is DOWN; it yields/exits 200 if the server
+lock is held, and must never run alongside the server — dual getUpdates
+pollers split updates and break approval buttons),
 `genesis-tmp-watchgod.service` (/tmp protection), `genesis-watchdog.timer`
 (health check), `genesis-backup.timer` (6h encrypted backup via
 `scripts/backup.sh`), `genesis-disk-hygiene.timer` (daily worktree reaping, cache reclaim, `~/tmp`
