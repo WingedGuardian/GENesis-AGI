@@ -125,9 +125,27 @@ class TestRegistration:
         assert len(reg.actions) == len(DEFAULT_REMEDIATIONS)
         names = {a.name for a in reg.actions}
         assert "qdrant_restart" in names
-        assert "awareness_restart" in names
+        assert "scheduler_heartbeat_alert" in names
         assert "ollama_alert" in names
         assert "disk_cleanup" in names
+        # The dead awareness_restart (unregistered probe; restarted the
+        # legacy bridge → dual-poller) must never come back.
+        assert "awareness_restart" not in names
+
+    def test_scheduler_heartbeat_alert_is_alert_only(self):
+        alert = [
+            a for a in DEFAULT_REMEDIATIONS
+            if a.name == "scheduler_heartbeat_alert"
+        ][0]
+        assert alert.governance_level == 4   # alert-only — restart is the
+        assert alert.command == []           # external watchdog's job
+        assert alert.probe_name == "scheduler_heartbeats"
+
+    def test_no_action_targets_genesis_bridge(self):
+        """Remediation must never (re)start the legacy bridge alongside the
+        server — that is the dual-getUpdates incident class."""
+        for action in DEFAULT_REMEDIATIONS:
+            assert "genesis-bridge.service" not in action.command, action.name
 
     def test_default_timeout_s(self):
         # New per-action timeout defaults to 30s (no behavior change for others).

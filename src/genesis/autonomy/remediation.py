@@ -388,15 +388,24 @@ DEFAULT_REMEDIATIONS: list[RemediationAction] = [
         cooldown_s=300,
         max_attempts=3,
     ),
+    # The RESTART response to a stale scheduler heartbeat lives in the
+    # external watchdog (autonomy/watchdog.py zombie-scheduler path), which
+    # runs out-of-process every ~5 min with heavy-workload / boot-stabilization
+    # / deploy-window / backoff guards. In-loop we only ALERT: an action
+    # evaluated inside the awareness tick cannot restart a hung awareness
+    # loop anyway (its predecessor, awareness_restart, was doubly dead — its
+    # probe was never registered, and it restarted genesis-bridge, a stale
+    # mapping from when the awareness loop lived in the bridge; starting the
+    # bridge alongside the server causes a getUpdates dual-poller conflict).
     RemediationAction(
-        name="awareness_restart",
-        probe_name="awareness_tick",
-        condition="Awareness loop heartbeat stale >15min",
-        command=["systemctl", "--user", "restart", "genesis-bridge.service"],
-        governance_level=2,
+        name="scheduler_heartbeat_alert",
+        probe_name="scheduler_heartbeats",
+        condition="A scheduler heartbeat (awareness/surplus) stale >15min",
+        command=[],  # Alert-only, no command
+        governance_level=4,
         reversible=True,
-        cooldown_s=300,
-        max_attempts=3,
+        cooldown_s=3600,
+        max_attempts=1,
     ),
     RemediationAction(
         name="ollama_alert",
