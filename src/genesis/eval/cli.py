@@ -43,7 +43,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     # -- eval benchmark --
     bench_cmd = eval_sub.add_parser(
         "benchmark",
-        help="Run all enabled providers across all datasets (comparison table)",
+        help="Run all enabled providers across all datasets (comparison table; "
+             "for the Genesis-vs-bare A/B see `bench`)",
     )
     bench_cmd.add_argument(
         "--include-paid", action="store_true",
@@ -118,6 +119,54 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Also run the advisory PASS->FAIL regression check (files a proposal)",
     )
 
+    # -- eval bench (A/B) --
+    ab_cmd = eval_sub.add_parser(
+        "bench",
+        help="Genesis-vs-bare-Claude A/B bench on real tasks (WS-1 A3)",
+        description=(
+            "Run the paired task bench: a cognition-enabled Genesis arm "
+            "(identity + read-only memory recall against a DB snapshot) vs a "
+            "bare Claude Code arm (no Genesis context), judged per-arm against "
+            "each task's ex-ante criteria. NOT `benchmark` — that is the "
+            "cross-provider dataset comparison table."
+        ),
+    )
+    ab_cmd.add_argument(
+        "--tasks", default=None,
+        help="Task JSONL path (default: ~/.genesis/eval/bench_tasks_v1.jsonl; "
+             "must live OUTSIDE the repo)",
+    )
+    ab_cmd.add_argument(
+        "--model", "-m", default="sonnet",
+        help="CC model for BOTH arms (default: sonnet)",
+    )
+    ab_cmd.add_argument(
+        "--effort", default="medium",
+        help="CC effort for BOTH arms (default: medium)",
+    )
+    ab_cmd.add_argument(
+        "--limit", type=int, default=None, help="Run only the first N tasks",
+    )
+    ab_cmd.add_argument(
+        "--task-id", default=None, help="Run a single task by id (shakedowns)",
+    )
+    ab_cmd.add_argument(
+        "--epsilon", type=float, default=0.05,
+        help="Score-difference tie band for the win-rate (default: 0.05)",
+    )
+    ab_cmd.add_argument(
+        "--no-db", action="store_true",
+        help="Skip persisting paired eval_runs rows",
+    )
+    ab_cmd.add_argument(
+        "--keep-workdir", action="store_true",
+        help="Keep ~/tmp/bench/<run_id> (snapshot, arm workdirs, transcripts)",
+    )
+    ab_cmd.add_argument(
+        "--no-verify-prod", action="store_true",
+        help="Skip the prod-delta isolation probe (NOT recommended)",
+    )
+
     eval_cmd.set_defaults(func=_run_eval_cli)
 
 
@@ -155,9 +204,11 @@ def _run_eval_cli(args: argparse.Namespace) -> int:
         return _cmd_datasets()
     elif args.eval_command == "gauntlet":
         return asyncio.run(_cmd_gauntlet(args))
+    elif args.eval_command == "bench":
+        return asyncio.run(_cmd_bench(args))
     else:
         print(
-            "usage: genesis eval {run|benchmark|results|compare|export|datasets|gauntlet}",
+            "usage: genesis eval {run|benchmark|results|compare|export|datasets|gauntlet|bench}",
             file=sys.stderr,
         )
         return 1
@@ -245,6 +296,55 @@ async def _cmd_gauntlet(args: argparse.Namespace) -> int:
             await db.close()
     # Non-zero exit only on a GENUINE failure (skips are infra, not failures).
     return 1 if summary is not None and summary.failed_cases > 0 else 0
+
+
+async def _cmd_bench(args: argparse.Namespace) -> int:
+    from genesis.cc.types import CCModel, EffortLevel
+    from genesis.eval.bench.report import render_console
+    from genesis.eval.bench.runner import BenchBusyError, run_bench
+    from genesis.eval.bench.tasks import TaskFileError
+
+    try:
+        model = CCModel(args.model)
+        effort = EffortLevel(args.effort)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    db = None
+    if not args.no_db:
+        try:
+            import aiosqlite  # noqa: I001
+
+            from genesis.env import genesis_db_path
+            db = await aiosqlite.connect(str(genesis_db_path()))
+            await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        except Exception as e:
+            print(f"warning: could not open DB ({e}), results won't be stored")
+
+    try:
+        report = await run_bench(
+            tasks_path=args.tasks,
+            model=model,
+            effort=effort,
+            limit=args.limit,
+            task_id=args.task_id,
+            epsilon=args.epsilon,
+            db=db,
+            keep_workdir=args.keep_workdir,
+            verify_prod=not args.no_verify_prod,
+        )
+        print(render_console(report))
+    except TaskFileError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except BenchBusyError as e:
+        print(f"busy: {e}", file=sys.stderr)
+        return 3
+    finally:
+        if db is not None:
+            await db.close()
+    return 0
 
 
 async def _cmd_benchmark(args: argparse.Namespace) -> int:

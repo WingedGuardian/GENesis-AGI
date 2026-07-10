@@ -276,3 +276,38 @@ class TestRunBench:
         assert "judge_calibrated: false" in text
         assert "insufficient_data" in text
         assert "PILOT" in text
+
+
+class TestCli:
+    def _parse(self, argv):
+        import argparse
+
+        from genesis.eval.cli import add_parser
+
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        add_parser(sub)
+        return parser.parse_args(argv)
+
+    def test_bench_subcommand_registered(self):
+        args = self._parse(["eval", "bench", "--model", "opus", "--limit", "2"])
+        assert args.eval_command == "bench"
+        assert args.model == "opus"
+        assert args.limit == 2
+        assert args.no_db is False
+
+    def test_benchmark_subcommand_untouched(self):
+        args = self._parse(["eval", "benchmark", "--include-paid"])
+        assert args.eval_command == "benchmark"
+
+    async def test_cmd_bench_rejects_bad_model(self, capsys):
+        import argparse
+
+        from genesis.eval.cli import _cmd_bench
+
+        args = argparse.Namespace(
+            model="gpt-99", effort="medium", tasks=None, limit=None,
+            task_id=None, epsilon=0.05, no_db=True, keep_workdir=False,
+            no_verify_prod=True,
+        )
+        assert await _cmd_bench(args) == 2
