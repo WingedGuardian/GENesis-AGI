@@ -61,6 +61,19 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # read live per-invocation by genesis.cc.roster
     ),
+    "ws3_immunity": SettingsDomain(
+        name="ws3_immunity",
+        description=(
+            "WS-3 immunity kill switch — master `enabled` + per-gate "
+            "off/shadow/enforce for procedure/identity/autonomy/injection. "
+            "Read live per-call by genesis.security.immunity (no restart); "
+            "owner/first-party content is never blocked in any mode."
+        ),
+        config_filename="ws3_immunity.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per-call by genesis.security.immunity
+        hidden_fields=frozenset({"auto_demote_state"}),
+    ),
     "resilience": SettingsDomain(
         name="resilience",
         description="Resilience thresholds (flapping detection, recovery, CC rate limits)",
@@ -674,8 +687,47 @@ def _validate_cc_roster(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_ws3_immunity(changes: dict) -> list[str]:
+    """Validate ws3_immunity kill-switch changes (see genesis.security.immunity)."""
+    from genesis.security.immunity import GATES, MODES
+
+    errors: list[str] = []
+    valid_top_keys = {"enabled", "auto_demote", "auto_demote_state", *GATES}
+    for key, value in changes.items():
+        if key not in valid_top_keys:
+            errors.append(
+                f"Unknown key '{key}'. Valid: {', '.join(sorted(valid_top_keys))}"
+            )
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key in GATES:
+            if not isinstance(value, dict):
+                errors.append(f"'{key}' must be a mapping like {{mode: shadow}}")
+            elif value.get("mode") not in MODES:
+                errors.append(
+                    f"'{key}.mode' must be one of {', '.join(MODES)}; "
+                    f"got {value.get('mode')!r}"
+                )
+        elif key == "auto_demote":
+            if not isinstance(value, dict):
+                errors.append("'auto_demote' must be a mapping")
+            else:
+                if "enabled" in value and not isinstance(value["enabled"], bool):
+                    errors.append("'auto_demote.enabled' must be a boolean")
+                for int_key in ("window_minutes", "would_block_threshold"):
+                    if int_key in value and (
+                        not isinstance(value[int_key], int) or value[int_key] <= 0
+                    ):
+                        errors.append(f"'auto_demote.{int_key}' must be a positive int")
+        # auto_demote_state: written by immunity.record_demotion via this
+        # same overlay; accepted opaquely (hidden from the UI).
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "tts": _validate_tts,
+    "ws3_immunity": _validate_ws3_immunity,
     "cc_roster": _validate_cc_roster,
     "resilience": _validate_resilience,
     "inbox_monitor": _validate_inbox_monitor,
