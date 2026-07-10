@@ -11,6 +11,28 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Code quality is now a measured series, not a feeling.** A new
+  `dev_quality` dimension in the weekly eval snapshots tracks review
+  findings per merged PR (by severity, harvested from the PR bots' inline
+  comments every Sunday), open code-audit findings, and the edit-failure
+  rate — so "the codebase is getting better" is a falsifiable trend on the
+  dashboard, honest about small numbers (rates go null, not zero, when
+  there's no data).
+
+- **Editing a file now surfaces that subsystem's traps.** The first time a
+  session touches each subsystem, its do-not-touch edges and easy-to-forget
+  mechanisms from the architecture map are injected right at the edit — the
+  invariants arrive while the code is being written instead of at review
+  time.
+
+- **The idle-time code auditor got a sharper brief.** Its instructions now
+  use a four-class failure taxonomy tuned to AI-generated code (structural,
+  async/state, error-handling, tests), it picks targets from real
+  import-graph data (highest fan-in modules first), and findings carry a
+  category. Also fixes a long-standing bug where the auditor could never
+  report a critical-severity finding — its output schema simply didn't
+  include the word.
+
 - **`genesis eval bench` — a Genesis-vs-bare-Claude A/B benchmark you can run
   in one command.** Each task in a private task set runs through two arms: a
   cognition-enabled Genesis session (identity + read-only recall from your

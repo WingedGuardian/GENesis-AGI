@@ -415,7 +415,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration]
-verified: 3c6cf249 2026-07-09
+verified: fe5d0945 2026-07-10
 ```
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
@@ -430,10 +430,16 @@ verified: 3c6cf249 2026-07-09
   "cannot break production" contract — hooks must never raise) + weekly Sunday
   aggregation (hard 7-day window) + an on-demand batch judge as a surplus
   task. The model gauntlet is weekly but OFF by default (paid inference) and
-  NEVER auto-mutates the roster. Nine snapshot dimensions: the original five
+  NEVER auto-mutates the roster. Ten snapshot dimensions: the original five
   (memory/system/ego/cognitive/procedure) + cognitive_drift + three
   snapshot-only WS-1 A2 series (approvals gate-throughput, goals scaffold,
-  noise/passivity). `run_weekly_aggregation` swallows per-dimension failures
+  noise/passivity) + `dev_quality` (findings-per-PR by severity, code-audit
+  gauge, edit-failure flow; fed by the `pr_review_harvest` job — Sun 06:45
+  user-tz, 45 min BEFORE the 07:30 aggregation, deliberately a separate job
+  so a gh outage degrades to stale rows instead of silently nulling the
+  dimension; the harvester reads INLINE PR comments via
+  `gh api pulls/N/comments` — `gh pr view --json reviews,comments` misses
+  bot findings). `run_weekly_aggregation` swallows per-dimension failures
   silently — the registration test in `tests/test_eval/test_j9_eval.py` is
   the guard; keep it in sync when adding a dimension. Resolver-origin
   classification for the approvals series is canonical in
