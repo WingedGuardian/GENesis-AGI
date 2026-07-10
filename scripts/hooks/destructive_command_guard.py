@@ -43,22 +43,24 @@ _ALWAYS_BLOCK = {".", "..", "/", "~", "*"}
 _SEPARATORS = {"|", "||", "&&", ";", "&", "\n"}
 
 
-def _path_depth(path: str) -> int:
-    """Count meaningful path components after expansion."""
-    expanded = os.path.expanduser(path)
-    expanded = os.path.normpath(expanded)
-    parts = [p for p in expanded.split("/") if p]
-    return len(parts)
-
-
 def _check_target(target: str) -> str | None:
     """Reason string if *target* is too broad to rm recursively."""
     clean = target.strip("'\"")
     if clean in _ALWAYS_BLOCK:
         return f"rm -rf on '{clean}' is not allowed."
-    depth = _path_depth(clean)
-    if depth < 4:
-        return f"rm -rf on '{clean}' (depth {depth}) is too broad."
+    expanded = os.path.normpath(os.path.expanduser(clean))
+    parts = [p for p in expanded.split("/") if p]
+    # A surviving '..' means the path traverses upward from a base the
+    # hook cannot know (its cwd need not match the Bash invocation's).
+    # normpath collapses interior '..' only against an absolute/~-anchored
+    # path; a leading '..' on a RELATIVE path survives and is counted as
+    # depth — so `rm -rf ../../../etc` reports depth 4 yet resolves to
+    # /etc from filesystem root. Refuse rather than guess. (2026-07-10
+    # review: this was a live bypass.)
+    if ".." in parts:
+        return f"rm -rf on '{clean}' traverses upward ('..') — refusing."
+    if len(parts) < 4:
+        return f"rm -rf on '{clean}' (depth {len(parts)}) is too broad."
     return None
 
 
@@ -90,9 +92,14 @@ def _rm_violations(cmd: str) -> list[str] | None:
                 flags_done = True
                 continue
             if not flags_done and arg.startswith("--"):
-                if arg == "--recursive":
+                # GNU getopt_long accepts unambiguous prefix abbreviations,
+                # so `--rec`/`--f` are valid spellings of --recursive/
+                # --force. Match by prefix (len>=3 skips the bare '--').
+                # Over-matching only over-blocks, which is safe here.
+                # (2026-07-10 review: `rm --rec --f /` was a live bypass.)
+                if len(arg) >= 3 and "--recursive".startswith(arg):
                     recursive = True
-                elif arg == "--force":
+                elif len(arg) >= 3 and "--force".startswith(arg):
                     force = True
                 continue  # other long flags carry no target
             if not flags_done and arg.startswith("-") and len(arg) > 1:

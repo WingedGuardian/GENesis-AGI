@@ -124,7 +124,29 @@ fi
 # Fail CLOSED on an unresolvable PR: a no-arg `gh pr merge` from the PR branch
 # used to skip this check entirely (2026-07-10 P1 triage).
 if echo "$CMD" | grep -qE "^gh pr merge|[;&|] *gh pr merge"; then
-    _pr_num=$(echo "$CMD" | grep -oE 'merge +#?[0-9]+' | grep -oE '[0-9]+' | head -1)
+    # PR number can appear AFTER a flag (`gh pr merge --admin 123` is valid
+    # gh syntax), so scan all args after 'merge', skipping flags — an
+    # anchored "merge <digits>" match would miss it and silently fall back
+    # to the current branch's PR, checking/merging the WRONG one
+    # (2026-07-10 review). Drop quoted substrings first so digits inside
+    # e.g. --subject "fix 123" can't false-match (mirrors the Python hook's
+    # shlex tokenizer).
+    _after="${CMD#*gh pr merge}"
+    _after=$(printf '%s' "$_after" | sed -E "s/'[^']*'//g; s/\"[^\"]*\"//g")
+    _pr_num=""
+    for _tok in $_after; do
+        case "$_tok" in
+            -*) continue ;;                       # flag — never the PR number
+            \#[0-9]*) _tok="${_tok#\#}" ;;        # #123 → 123
+            *pull/[0-9]*)
+                _tok=$(printf '%s' "$_tok" | grep -oE 'pull/[0-9]+' \
+                    | grep -oE '[0-9]+' | head -1) ;;
+        esac
+        case "$_tok" in
+            *[!0-9]*|'') continue ;;              # not a pure integer
+            *) _pr_num="$_tok"; break ;;
+        esac
+    done
     _repo_args=()
     _repo=$(echo "$CMD" | grep -oP -- '--repo \K\S+' || true)
     [ -n "$_repo" ] && _repo_args=(--repo "$_repo")

@@ -215,3 +215,43 @@ def test_merge_numbered_conflicting_blocks(tmp_path):
     result = _run("gh pr merge 123 --squash", env_extra=env)
     assert result.returncode == 2
     assert "merge conflicts" in result.stderr
+
+
+# --- gh pr merge: PR number after a FLAG must resolve correctly ---
+# (2026-07-10 review: an anchored "merge <digits>" match missed
+#  `gh pr merge --admin 123` and fell back to the WRONG branch PR.)
+
+@pytest.mark.parametrize("cmd", [
+    "gh pr merge --admin 123",
+    "gh pr merge 123 --admin",
+    "gh pr merge --squash 123 --admin",
+    "gh pr merge https://github.com/o/r/pull/123 --squash",
+])
+def test_merge_number_after_flag_resolves_correctly(tmp_path, cmd):
+    """The PR named in the command is checked, regardless of flag order.
+
+    The gh stub returns branch-PR #55; a correct parse must report #123,
+    not #55.
+    """
+    env = _gh_stub(
+        tmp_path,
+        'case "$*" in *"--json number"*) echo 55;; '
+        '*"--json mergeable"*) echo MERGEABLE;; esac',
+    )
+    result = _run(cmd, env_extra=env)
+    assert "PR #123" in result.stderr
+    assert "PR #55" not in result.stderr
+
+
+def test_merge_digits_in_quoted_subject_not_a_pr(tmp_path):
+    """Digits inside a quoted --subject must not be taken as the PR."""
+    env = _gh_stub(
+        tmp_path,
+        'case "$*" in *"--json number"*) echo 77;; '
+        '*"--json mergeable"*) echo MERGEABLE;; esac',
+    )
+    # Only digits present are inside the quoted subject -> fall back to
+    # the branch PR (#77), never "999".
+    result = _run('gh pr merge --subject "merge 999 now"', env_extra=env)
+    assert "PR #77" in result.stderr
+    assert "999" not in result.stderr

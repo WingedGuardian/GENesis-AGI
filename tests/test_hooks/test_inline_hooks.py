@@ -352,6 +352,47 @@ class TestBashHookRmRf:
         )
         assert result.returncode == 0
 
+    # -- 2026-07-10 review findings: leading-'..' traversal + abbreviated
+    # -- GNU long flags were both live bypasses.
+
+    @pytest.mark.parametrize("target", [
+        "../../../etc",
+        "../../../../../../../../etc",  # bottoms out at /etc from root
+        "../foo/bar/baz/qux",           # depth 4 textually, still traverses up
+        "a/b/../../../../etc",          # interior '..' escapes past the base
+    ])
+    def test_rm_rf_upward_traversal_blocked(
+        self, rm_rf_hook_command: str, target: str
+    ) -> None:
+        """rm -rf on any path whose normalized form keeps a '..' -> BLOCKED.
+
+        A relative '..' cannot be depth-bounded without the real cwd, so
+        the guard refuses (`../../../etc` used to report depth 4 and pass
+        while resolving to /etc)."""
+        result = run_hook(
+            rm_rf_hook_command, {"command": f"rm -rf {target}"}
+        )
+        assert result.returncode == 2
+
+    def test_rm_rf_abbrev_long_flags_blocked(
+        self, rm_rf_hook_command: str
+    ) -> None:
+        """rm --rec --f / -> BLOCKED (GNU unambiguous prefix abbreviations)."""
+        result = run_hook(
+            rm_rf_hook_command, {"command": "rm --rec --f /"}
+        )
+        assert result.returncode == 2
+
+    def test_rm_non_destructive_long_flags_allowed(
+        self, rm_rf_hook_command: str
+    ) -> None:
+        """--dir/--verbose are not recursive+force -> deep path allowed."""
+        result = run_hook(
+            rm_rf_hook_command,
+            {"command": "rm --dir --verbose /a/b/c/d/e"},
+        )
+        assert result.returncode == 0
+
 
 # ---------------------------------------------------------------------------
 # Bash hook: git push --force / -f
