@@ -1,4 +1,4 @@
-"""Migration 0050 — drop the stale schedule_code_audit job_health row.
+"""Migration 0052 — drop the stale schedule_code_audit job_health row.
 
 Verifies the row is deleted on the existing-DB upgrade path, sibling rows
 survive, the delete is idempotent, and a missing table is a safe no-op
@@ -12,8 +12,8 @@ import importlib
 import aiosqlite
 import pytest
 
-M50 = importlib.import_module(
-    "genesis.db.migrations.0050_drop_stale_code_audit_job_health"
+M52 = importlib.import_module(
+    "genesis.db.migrations.0052_drop_stale_code_audit_job_health"
 )
 
 _DDL = """
@@ -40,7 +40,7 @@ async def test_up_deletes_stale_row_keeps_siblings(tmp_path):
             "INSERT INTO job_health (job_name) VALUES "
             "('schedule_code_audit'), ('surplus_dispatch')"
         )
-        await M50.up(db)
+        await M52.up(db)
         assert await _names(db) == {"surplus_dispatch"}
 
 
@@ -48,12 +48,12 @@ async def test_up_deletes_stale_row_keeps_siblings(tmp_path):
 async def test_up_is_idempotent(tmp_path):
     async with aiosqlite.connect(str(tmp_path / "t.db")) as db:
         await db.execute(_DDL)
-        await M50.up(db)
-        await M50.up(db)  # second run must not raise
+        await M52.up(db)
+        await M52.up(db)  # second run must not raise
         assert await _names(db) == set()
 
 
 @pytest.mark.asyncio
 async def test_up_noop_when_table_absent(tmp_path):
     async with aiosqlite.connect(str(tmp_path / "t.db")) as db:
-        await M50.up(db)  # no job_health table — safe no-op
+        await M52.up(db)  # no job_health table — safe no-op
