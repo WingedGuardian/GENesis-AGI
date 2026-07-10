@@ -136,6 +136,8 @@ async def run_worker(
             "candidates": candidates,
         }
         if not no_arbiter:
+            # Deferred: --no-arbiter runs never load the subprocess
+            # machinery (and its genesis.security/env imports).
             from .arbiter import judge_candidates
 
             verdict.update(

@@ -59,6 +59,8 @@ CANDIDATES:
 
 def build_prompt(theme: dict, entity_query: str, candidates: list[dict]) -> str:
     """Render the arbiter prompt. Previews are sanitized, numbered DATA."""
+    # Deferred: keeps this module import-light for callers that only
+    # need parse_verdict/build_argv (tests, replay tooling).
     from genesis.security.sanitizer import strip_boundary_markers
 
     lines = []
@@ -86,6 +88,7 @@ def build_argv(claude_path: str = "claude", no_mcp_config: str | None = None) ->
     the repo's no_mcp.json keep MCP servers out of the subprocess.
     """
     if no_mcp_config is None:
+        # Deferred: only resolved when the caller didn't pin a config.
         from genesis.env import repo_root
 
         no_mcp_config = str(repo_root() / "config" / "no_mcp.json")
