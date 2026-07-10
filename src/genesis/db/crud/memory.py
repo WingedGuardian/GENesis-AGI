@@ -339,6 +339,26 @@ async def get_metadata(
     }
 
 
+async def match_id_prefix(
+    db: aiosqlite.Connection,
+    prefix: str,
+    *,
+    limit: int = 2,
+) -> list[str]:
+    """Memory IDs starting with *prefix* (e.g. an 8-char ``id:`` handle).
+
+    ``limit=2`` lets callers distinguish unique from ambiguous without
+    counting every match. Parameterized LIKE; callers are expected to
+    pre-validate the prefix shape (hex/dash).
+    """
+    rows = await db.execute_fetchall(
+        "SELECT memory_id FROM memory_metadata"
+        " WHERE memory_id LIKE ? || '%' LIMIT ?",
+        (prefix, limit),
+    )
+    return [str(r[0]) for r in rows]
+
+
 async def delete_metadata(db: aiosqlite.Connection, *, memory_id: str) -> bool:
     """Delete a memory_metadata row. Returns True if deleted."""
     cursor = await db.execute(
