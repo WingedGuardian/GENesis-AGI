@@ -30,9 +30,10 @@ import sys
 from pathlib import Path
 
 # Per-invocation cap, not a policy timeout: ruff on a single file is
-# ~50-300ms; the hook itself is killed by settings.json at 6s. This cap just
-# keeps one wedged invocation from eating the whole budget so the later
-# calls (and the advisory) still run. Fail-open on expiry.
+# ~50-300ms; the settings.json hook timeout (10, in SECONDS per the CC hooks
+# docs) is the outer kill. This cap just keeps one wedged invocation from
+# eating the whole budget so the later calls (and the advisory) still run.
+# Fail-open on expiry.
 _RUFF_TIMEOUT_S = 1.5
 
 # Advisory payload cap — enough to act on, small enough not to flood context.

@@ -44,6 +44,10 @@ test = [
     "pytest-asyncio",
     "pytest-timeout",
     "aioresponses>=0.7.7",
+    # tests/test_hooks/test_edit_verify_advisory.py executes the real hook,
+    # which shells out to the venv's ruff — CI's test job installs only this
+    # extra, so ruff must be here (the lint job installs its own copy).
+    "ruff>=0.5",
 ]
 browser = [
     "playwright>=1.40",

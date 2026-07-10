@@ -11,9 +11,11 @@ grounds scope calls below.
 
 ## Step 0 — Prior-Learnings Pass
 
-Before reading the diff, call `procedure_recall` (task_type `code_review`,
-context_tags = the touched subsystems per `docs/architecture/CURRENT.md`) and
-scan the returned procedures for repeat offenses to check this diff against.
+Before reading the diff, call `procedure_recall` with a `task_description`
+describing this review (rows stored under task_type `code_review` will match)
+and `context_tags` = the touched subsystems per `docs/architecture/CURRENT.md`,
+then scan the returned procedures for repeat offenses to check this diff
+against.
 At the END of the review, if you found a genuinely durable NEW lesson (a
 mistake class likely to recur, not a one-off), store it via `procedure_store`
 with task_type `code_review`. If the memory MCP tools are not available in
