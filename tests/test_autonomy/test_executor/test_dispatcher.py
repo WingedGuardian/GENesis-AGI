@@ -320,3 +320,43 @@ class TestRecoverIncomplete:
             count = await dispatcher.recover_incomplete()
 
         assert count == 0
+
+
+@pytest.mark.asyncio
+class TestWSCDispatchGuards:
+    """WS-C: Bug B in-flight guard (Path 1b) + non-resumable tail-phase skip."""
+
+    async def test_path1b_skips_task_already_executing(
+        self, dispatcher: TaskDispatcher, mock_executor: AsyncMock,
+    ) -> None:
+        """A blocked+approved task already live in the executor is NOT re-fired
+        (without the guard it re-dispatches every 120s cycle)."""
+        mock_executor._active_tasks = {"t-blk": "blocked"}
+        with (
+            patch("genesis.db.crud.task_states.list_active", new_callable=AsyncMock,
+                  return_value=[{"task_id": "t-blk", "current_phase": "blocked"}]),
+            patch("genesis.db.crud.observations.query", new_callable=AsyncMock,
+                  return_value=[]),
+            patch("genesis.util.tasks.tracked_task") as mock_tt,
+        ):
+            count = await dispatcher.dispatch_cycle()
+
+        assert count == 0
+        mock_tt.assert_not_called()
+
+    async def test_recover_skips_tail_phase(
+        self, dispatcher: TaskDispatcher, mock_executor: AsyncMock,
+    ) -> None:
+        """A task crashed mid-synthesizing is left for review, not re-dispatched
+        into a guaranteed refusal."""
+        mock_executor._active_tasks = {}
+        with (
+            patch("genesis.db.crud.task_states.list_active", new_callable=AsyncMock,
+                  return_value=[{"task_id": "t-synth", "current_phase": "synthesizing"}]),
+            patch("genesis.util.tasks.tracked_task") as mock_tt,
+        ):
+            count = await dispatcher.recover_incomplete()
+
+        assert count == 1  # counted as known/recovered
+        assert "t-synth" in dispatcher._dispatched
+        mock_tt.assert_not_called()  # but NOT re-dispatched

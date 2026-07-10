@@ -121,6 +121,40 @@ class CCSessionExecutor:
             logger.error("Task %s not found in DB", task_id)
             return False
 
+        # --- Dispatch claim + refuse-taxonomy (WS-C / F2) ------------------
+        # Decide fresh-vs-resume-vs-refuse BEFORE any side-effecting work, so a
+        # duplicate or stale dispatch returns without re-running the task.
+        db_phase_str = task.get("current_phase", "pending")
+        _RESUMABLE_PHASES = {"executing", "verifying", "blocked"}
+        if db_phase_str == TaskPhase.PENDING.value:
+            # Atomically flip pending -> dispatching. Losing the claim means
+            # another dispatch already took it: refuse with no side effects.
+            if not await task_states.claim_for_dispatch(self._db, task_id):
+                logger.info(
+                    "Task %s: lost dispatch claim (already claimed/advanced), "
+                    "skipping", task_id,
+                )
+                await self._emit_claim_lost(task_id, db_phase_str)
+                return False
+            resuming = False
+            self._active_tasks[task_id] = TaskPhase.DISPATCHING
+        elif db_phase_str in _RESUMABLE_PHASES:
+            resuming = True
+            self._active_tasks[task_id] = TaskPhase(db_phase_str)
+            logger.info(
+                "Task %s: resuming from %s phase (skipping observe/review/plan)",
+                task_id, db_phase_str,
+            )
+        else:
+            # Terminal, transient 'dispatching', or a non-resumable tail phase
+            # (synthesizing/delivering/retrospective). Never re-run — refuse.
+            logger.warning(
+                "Task %s: refusing execute() in non-dispatchable phase %s",
+                task_id, db_phase_str,
+            )
+            await self._emit_claim_lost(task_id, db_phase_str)
+            return False
+
         # Resolve plan path from outputs (may be plain string or JSON)
         raw_outputs = task.get("outputs") or ""
         plan_path = raw_outputs
@@ -159,21 +193,6 @@ class CCSessionExecutor:
         # rendered file, not a git branch). Keyed on plan_content so it survives
         # resume, where reconstructed step dicts have no `skills` key.
         is_deliverable = has_deliverable_frame(plan_content)
-
-        # Determine recovery phase from DB
-        db_phase_str = task.get("current_phase", "pending")
-        _RESUMABLE_PHASES = {"executing", "verifying", "blocked"}
-        resuming = db_phase_str in _RESUMABLE_PHASES
-
-        # Register task at current phase (recovery) or PENDING (fresh)
-        if resuming:
-            self._active_tasks[task_id] = TaskPhase(db_phase_str)
-            logger.info(
-                "Task %s: resuming from %s phase (skipping observe/review/plan)",
-                task_id, db_phase_str,
-            )
-        else:
-            self._active_tasks[task_id] = TaskPhase.PENDING
 
         cancel_event = asyncio.Event()
         self._cancel_events[task_id] = cancel_event
@@ -709,6 +728,22 @@ class CCSessionExecutor:
     # State machine (Amendment #10)
     # =================================================================
 
+    async def _emit_claim_lost(self, task_id: str, phase: str) -> None:
+        """Emit an observability event when a dispatch is refused (lost claim
+        or non-dispatchable phase). Should be rare; a spike signals races."""
+        if not self._event_bus:
+            return
+        from genesis.observability.types import Severity, Subsystem
+        with contextlib.suppress(Exception):
+            await self._event_bus.emit(
+                Subsystem.AUTONOMY,
+                Severity.INFO,
+                "task.dispatch_claim_lost",
+                f"Task {task_id[:8]}: dispatch refused in phase {phase}",
+                task_id=task_id,
+                phase=phase,
+            )
+
     async def _transition(self, task_id: str, to_phase: TaskPhase) -> None:
         """Validate and apply a state transition. Emits event."""
         from genesis.db.crud import task_states
@@ -719,6 +754,7 @@ class CCSessionExecutor:
         self._active_tasks[task_id] = to_phase
         await task_states.update(
             self._db, task_id, current_phase=to_phase.value,
+            updated_at=datetime.now(UTC).isoformat(),
         )
 
         if self._event_bus:

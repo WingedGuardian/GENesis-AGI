@@ -19,6 +19,7 @@ class TaskPhase(StrEnum):
     """Lifecycle phases for a background task."""
 
     PENDING = "pending"
+    DISPATCHING = "dispatching"  # transient: atomically claimed, not yet started
     OBSERVING = "observing"
     REVIEWING = "reviewing"
     PLANNING = "planning"
@@ -39,7 +40,18 @@ class TaskPhase(StrEnum):
 # ---------------------------------------------------------------------------
 
 VALID_TRANSITIONS: dict[TaskPhase, set[TaskPhase]] = {
-    TaskPhase.PENDING: {TaskPhase.OBSERVING, TaskPhase.FAILED, TaskPhase.CANCELLED},
+    TaskPhase.PENDING: {
+        TaskPhase.DISPATCHING,  # won the atomic dispatch claim
+        TaskPhase.OBSERVING,  # pre-planning-blocker re-run resets to PENDING then observes
+        TaskPhase.FAILED,
+        TaskPhase.CANCELLED,
+    },
+    TaskPhase.DISPATCHING: {
+        TaskPhase.OBSERVING,  # claim won -> first real phase
+        TaskPhase.PENDING,  # reaper reset of a stale claim
+        TaskPhase.FAILED,
+        TaskPhase.CANCELLED,
+    },
     TaskPhase.OBSERVING: {
         TaskPhase.REVIEWING,  # annotation-only, always proceeds
         TaskPhase.FAILED,

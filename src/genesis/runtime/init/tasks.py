@@ -164,6 +164,13 @@ async def init(rt: GenesisRuntime) -> None:
 
         # Crash recovery
         try:
+            from genesis.db.crud import task_states as _task_states
+            # Reset stale 'dispatching' claims (a crash between the atomic claim
+            # and the first phase) BEFORE recover_incomplete, so they return to
+            # pending and re-dispatch cleanly instead of being refused.
+            reaped = await _task_states.recover_stale_dispatching(rt._db)
+            if reaped:
+                logger.info("Reset %d stale dispatching claims", reaped)
             recovered = await dispatcher.recover_incomplete()
             if recovered:
                 logger.info("Recovered %d incomplete tasks", recovered)
@@ -171,12 +178,25 @@ async def init(rt: GenesisRuntime) -> None:
             logger.error("Task crash recovery failed", exc_info=True)
 
         # Background polling loop for observation-based dispatch
+        from genesis.db.crud import task_states as _task_states_poll
         from genesis.util.tasks import tracked_task
 
         async def _dispatch_poll_loop() -> None:
             while True:
                 try:
                     await asyncio.sleep(120)  # 2-minute interval
+                    # Reap stale 'dispatching' claims each cycle (own job key so
+                    # a reaper failure is visible separately from the dispatch).
+                    try:
+                        reaped = await _task_states_poll.recover_stale_dispatching(
+                            rt._db,
+                        )
+                        if reaped:
+                            logger.info("Reaped %d stale dispatching claims", reaped)
+                        rt.record_job_success("task_dispatch_reaper")
+                    except Exception as exc:
+                        rt.record_job_failure("task_dispatch_reaper", str(exc))
+                        logger.error("Dispatch reaper failed", exc_info=True)
                     count = await dispatcher.dispatch_cycle()
                     if count:
                         logger.info("Dispatch cycle: %d tasks dispatched", count)

@@ -93,6 +93,55 @@ async def update(
     return cursor.rowcount > 0
 
 
+async def claim_for_dispatch(db: aiosqlite.Connection, task_id: str) -> bool:
+    """Atomically claim a PENDING task for dispatch (at-most-once).
+
+    Transitions ``current_phase`` from ``pending`` to ``dispatching`` in one
+    guarded UPDATE, but ONLY for a row still in ``pending``. Returns True iff
+    this call won the claim (``rowcount == 1``). A row already claimed
+    (``dispatching``), running, or terminal does not match and returns False,
+    so the caller must refuse it — this is the dedup gate that stops two
+    overlapping dispatches from both executing the same task.
+
+    Stamps ``updated_at`` (ISO) so :func:`recover_stale_dispatching` can reap a
+    claim stranded by a crash between the claim and the first real phase.
+    """
+    now = datetime.now(UTC).isoformat()
+    cursor = await db.execute(
+        """UPDATE task_states
+           SET current_phase = 'dispatching', updated_at = ?
+           WHERE task_id = ? AND current_phase = 'pending'""",
+        (now, task_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def recover_stale_dispatching(
+    db: aiosqlite.Connection, max_age_s: int = 120,
+) -> int:
+    """Reset ``dispatching`` claims older than ``max_age_s`` back to ``pending``.
+
+    A task sits in ``dispatching`` only between the atomic claim and the first
+    real phase transition. If the executor crashes in that window the row would
+    stay stuck (and be refused on the next pickup), so this reaper — run at
+    startup and on the dispatch poll — returns it to ``pending`` for a clean
+    re-dispatch. Mirrors ``direct_session_queue.recover_stale_claims``. All
+    ``dispatching`` rows carry an ISO ``updated_at`` (written by
+    :func:`claim_for_dispatch`), so the ``<`` compare is well-ordered.
+    """
+    cutoff_iso = (datetime.now(UTC) - timedelta(seconds=max_age_s)).isoformat()
+    now = datetime.now(UTC).isoformat()
+    cursor = await db.execute(
+        """UPDATE task_states
+           SET current_phase = 'pending', updated_at = ?
+           WHERE current_phase = 'dispatching' AND updated_at < ?""",
+        (now, cutoff_iso),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def delete(db: aiosqlite.Connection, task_id: str) -> bool:
     cursor = await db.execute(
         "DELETE FROM task_states WHERE task_id = ?", (task_id,)

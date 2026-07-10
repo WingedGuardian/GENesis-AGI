@@ -44,6 +44,15 @@ _TERMINAL_PHASES = frozenset({
     TaskPhase.CANCELLED.value,
 })
 
+# Non-resumable tail phases: a task that crashed here cannot be safely re-run
+# from scratch (execute() refuses them), so crash recovery leaves them for
+# review instead of spawning a guaranteed-refusal dispatch.
+_NON_RESUMABLE_TAIL = frozenset({
+    TaskPhase.SYNTHESIZING.value,
+    TaskPhase.DELIVERING.value,
+    TaskPhase.RETROSPECTIVE.value,
+})
+
 
 def _validate_plan_path(path_str: str) -> Path:
     """Validate that a plan path is under allowed directories.
@@ -276,6 +285,12 @@ class TaskDispatcher:
             if phase != TaskPhase.BLOCKED.value:
                 continue
 
+            # Bug B guard: if this task is already executing in-process, don't
+            # stack another dispatch. Without this a blocked+approved task
+            # re-fires every cycle until execute() consumes the approval.
+            if task_id in self._executor._active_tasks:
+                continue
+
             # Check if there's an approved-but-unconsumed approval for this task
             try:
                 cursor = await self._db.execute(
@@ -439,6 +454,18 @@ class TaskDispatcher:
                     logger.info("Found blocked task %s, re-notifying", task_id)
                     self._dispatched.add(task_id)
                     recovered += 1
+                continue
+
+            # Non-resumable tail phase (crashed mid synth/deliver/retro):
+            # execute() would refuse a fresh re-run, so leave it for review
+            # instead of spawning a guaranteed-refusal dispatch.
+            if phase in _NON_RESUMABLE_TAIL:
+                logger.info(
+                    "Found task %s stuck in tail phase %s, leaving for review",
+                    task_id, phase,
+                )
+                self._dispatched.add(task_id)
+                recovered += 1
                 continue
 
             # Re-dispatch executing/reviewing/planning/etc tasks

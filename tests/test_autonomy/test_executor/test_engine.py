@@ -1201,3 +1201,132 @@ async def test_notify_e2e_verbatim_telegram_and_tokenfree_voice(db):
     spoken = voice.send_message.call_args.args[1]
     assert spoken == "A build was parked by the safety gate."
     assert "src/genesis" not in spoken  # no path read aloud
+
+
+# ---------------------------------------------------------------------------
+# WS-C: atomic dispatch claim + refuse-taxonomy (F2 — duplicate execution)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDispatchClaim:
+    """Atomic PENDING claim + explicit refuse-taxonomy in execute().
+
+    Proves the F2 fix: a task may only be run once. Overlapping dispatches
+    lose the atomic claim, and a task already in a terminal / tail /
+    transient phase is refused instead of silently re-run from scratch.
+    """
+
+    async def test_completed_task_is_refused_not_rerun(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """A 'completed' task must be refused, never re-run fresh (the harm)."""
+        await _seed_task(db, plan_path=plan_file, phase="completed")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        result = await engine.execute("t-001")
+
+        assert result is False
+        mock_decomposer.decompose.assert_not_called()
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "completed"
+
+    async def test_tail_phase_task_is_refused(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """A task stuck in a non-resumable tail phase (synthesizing) is refused."""
+        await _seed_task(db, plan_path=plan_file, phase="synthesizing")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        result = await engine.execute("t-001")
+
+        assert result is False
+        mock_decomposer.decompose.assert_not_called()
+
+    async def test_dispatching_phase_is_refused(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """The transient 'dispatching' claim phase is refused by execute()
+        (only the reaper resets it to pending)."""
+        await _seed_task(db, plan_path=plan_file, phase="dispatching")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        result = await engine.execute("t-001")
+
+        assert result is False
+        mock_decomposer.decompose.assert_not_called()
+
+    async def test_concurrent_execute_runs_once(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """Two overlapping execute() calls for one pending task → exactly one runs."""
+        await _seed_task(db, plan_path=plan_file, phase="pending")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        results = await asyncio.gather(
+            engine.execute("t-001"), engine.execute("t-001"),
+        )
+
+        assert sum(1 for r in results if r is True) == 1
+        assert mock_decomposer.decompose.call_count == 1
+
+    async def test_claim_for_dispatch_is_atomic(self, db):
+        """First claim wins (pending -> dispatching); a second claim loses."""
+        await _seed_task(db, phase="pending")
+
+        won_first = await task_states.claim_for_dispatch(db, "t-001")
+        won_second = await task_states.claim_for_dispatch(db, "t-001")
+
+        assert won_first is True
+        assert won_second is False
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "dispatching"
+
+    async def test_claim_for_dispatch_stamps_updated_at(self, db):
+        """A winning claim refreshes updated_at (reaper staleness relies on it)."""
+        await _seed_task(db, phase="pending")
+        await task_states.update(
+            db, "t-001", updated_at="2020-01-01T00:00:00+00:00",
+        )
+
+        assert await task_states.claim_for_dispatch(db, "t-001") is True
+
+        after = (await task_states.get_by_id(db, "t-001"))["updated_at"]
+        assert after != "2020-01-01T00:00:00+00:00"
+
+    async def test_claim_for_dispatch_rejects_non_pending(self, db):
+        """Only a 'pending' row is claimable; a 'blocked' row is not."""
+        await _seed_task(db, phase="blocked")
+        assert await task_states.claim_for_dispatch(db, "t-001") is False
+
+    async def test_recover_stale_dispatching_resets_old(self, db):
+        """A 'dispatching' row older than max_age is reset to pending."""
+        await _seed_task(db, phase="pending")
+        await task_states.update(
+            db, "t-001", current_phase="dispatching",
+            updated_at="2020-01-01T00:00:00+00:00",
+        )
+
+        n = await task_states.recover_stale_dispatching(db, max_age_s=120)
+
+        assert n == 1
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "pending"
+
+    async def test_recover_stale_dispatching_spares_fresh(self, db):
+        """A freshly-claimed 'dispatching' row is NOT reaped."""
+        await _seed_task(db, phase="pending")
+        fresh = datetime.now(UTC).isoformat()
+        await task_states.update(
+            db, "t-001", current_phase="dispatching", updated_at=fresh,
+        )
+
+        n = await task_states.recover_stale_dispatching(db, max_age_s=120)
+
+        assert n == 0
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "dispatching"
