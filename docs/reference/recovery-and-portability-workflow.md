@@ -79,3 +79,39 @@ The guardian also emits a WARNING if the mirror goes stale (its newest
 credential older than `cred_integrity.mirror_stale_hours`, default 48h) — an
 early signal that backups have stopped landing and a container loss would not be
 recoverable from the host.
+
+## Host CC Authentication (Guardian Recovery Brain)
+
+The host Guardian's autonomous diagnosis uses `claude -p` (the "recovery
+brain"), authenticated at install by a one-time `claude login`. That login has
+no refresh, so if it dies the brain silently goes dark — discovered only
+mid-incident.
+
+Two mechanisms make this observable and survivable without host access:
+
+1. **Auth-health signal.** The gateway `version` verb reports `cc_logged_in`
+   (a 1h-cached `claude auth status` probe), `cc_token_present`, and
+   `cc_token_age_days`. The container-side `GuardianWatchdog._check_cc_auth`
+   reconciler alerts (Telegram) when the login is dead with no usable fallback
+   (after a 3-tick threshold), and warns ~30 days before a synced fallback
+   token expires. No token material or account identity ever crosses the wire —
+   only booleans and an age.
+
+2. **Fallback setup-token (optional, lazy).** Mint a 1-year token from ANY
+   machine with `claude setup-token` and pipe it to `scripts/store_cc_token.sh`
+   in the container (stdin only — never an argument). The credential-bridge
+   awareness tick syncs it to the host shared mount
+   (`~/.local/state/genesis-guardian/shared/guardian/cc_oauth_token.env`), and
+   `diagnosis.py` injects it via `CLAUDE_CODE_OAUTH_TOKEN` **only** when a
+   pre-flight `claude auth status` confirms the host's own login is dead — a
+   working login is never overridden. Remove it with
+   `scripts/store_cc_token.sh --remove`.
+
+   The token lives in a **dedicated** file, never `secrets.env` (which is
+   `load_dotenv`'d with `override=True` and would hijack the *container's* own
+   CC auth). It is a subscription-OAuth token, **not** an `ANTHROPIC_API_KEY` —
+   the no-API-key posture is unchanged.
+
+You can mint the token proactively at install, or defer it entirely: the first
+auth-health alert is the cue, and the response becomes "mint + store from
+anywhere" instead of "SSH to the host and re-run `claude login`."

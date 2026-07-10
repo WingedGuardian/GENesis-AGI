@@ -318,3 +318,65 @@ def test_ensure_work_dir_propagates_when_fallback_also_uncreatable(tmp_path):
     blocker.write_text("file")
     with pytest.raises(OSError):
         _ensure_work_dir(blocker / "wd", fallback=blocker / "fb")
+
+
+def _stub_claude(tmp_path, body: str):
+    """A stub `claude` that prints ``body`` for `auth status --json`."""
+    stub = tmp_path / "claude"
+    stub.write_text(f"#!/bin/sh\ncat <<'STUBEOF'\n{body}\nSTUBEOF\n")
+    stub.chmod(0o755)
+    return str(stub)
+
+
+def _engine_with_token(tmp_path, *, token: bool) -> DiagnosisEngine:
+    cfg = GuardianConfig()
+    cfg.state_dir = str(tmp_path / "state")
+    if token:
+        d = tmp_path / "state" / "shared" / "guardian"
+        d.mkdir(parents=True)
+        (d / "cc_oauth_token.env").write_text(
+            "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-SYNTHETIC\n"
+            "GENESIS_CC_TOKEN_CREATED_AT=1700000000\n",
+        )
+    return DiagnosisEngine(cfg)
+
+
+class TestResolveCCEnv:
+    """FALLBACK-ONLY setup-token injection for the CC recovery brain."""
+
+    @pytest.mark.asyncio
+    async def test_logged_in_true_never_injects(self, tmp_path):
+        # Working login present → inherit env (None), even WITH a token synced.
+        cc = _stub_claude(tmp_path, '{"loggedIn": true}')
+        engine = _engine_with_token(tmp_path, token=True)
+        assert await engine._resolve_cc_env(cc) is None
+
+    @pytest.mark.asyncio
+    async def test_dead_login_with_token_injects_and_preserves_env(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("CANARY_ENV", "keepme")
+        cc = _stub_claude(tmp_path, '{"loggedIn": false}')
+        engine = _engine_with_token(tmp_path, token=True)
+        env = await engine._resolve_cc_env(cc)
+        assert isinstance(env, dict)
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-SYNTHETIC"
+        assert env["CANARY_ENV"] == "keepme"  # inherited env preserved
+
+    @pytest.mark.asyncio
+    async def test_dead_login_no_token_inherits(self, tmp_path):
+        cc = _stub_claude(tmp_path, '{"loggedIn": false}')
+        engine = _engine_with_token(tmp_path, token=False)
+        assert await engine._resolve_cc_env(cc) is None
+
+    @pytest.mark.asyncio
+    async def test_unparseable_status_never_injects(self, tmp_path):
+        # Ambiguous auth status + token present → still inherit (never inject).
+        cc = _stub_claude(tmp_path, "not json at all")
+        engine = _engine_with_token(tmp_path, token=True)
+        assert await engine._resolve_cc_env(cc) is None
+
+    @pytest.mark.asyncio
+    async def test_missing_binary_never_raises(self, tmp_path):
+        engine = _engine_with_token(tmp_path, token=True)
+        assert await engine._resolve_cc_env(str(tmp_path / "nonexistent")) is None
