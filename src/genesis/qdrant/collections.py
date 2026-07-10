@@ -31,8 +31,29 @@ def get_client(url: str | None = None) -> QdrantClient:
     return QdrantClient(url=url)
 
 
+# Payload fields used in search filters. Without payload indexes,
+# filtered HNSW search measurably DROPS valid results (verified
+# 2026-07-09: exact-vs-approx same-query comparisons on episodic_memory
+# at ~49K points returned different result sets) — and every production
+# search is filtered (the unconditional `deprecated` must_not). Indexed
+# fields make filtered HNSW use the filterable index instead of
+# guessing.
+INDEXED_PAYLOAD_FIELDS: dict[str, str] = {
+    "deprecated": "bool",
+    "tags": "keyword",
+    "wing": "keyword",
+    "room": "keyword",
+    "life_domain": "keyword",
+    "project_type": "keyword",
+    "source_subsystem": "keyword",
+    "source_type": "keyword",
+    "source_pipeline": "keyword",
+    "memory_class": "keyword",
+}
+
+
 def ensure_collections(client: QdrantClient) -> None:
-    """Create all Genesis collections if they don't exist."""
+    """Create all Genesis collections and their payload indexes."""
     existing = {c.name for c in client.get_collections().collections}
     for name in COLLECTIONS:
         if name not in existing:
@@ -40,6 +61,35 @@ def ensure_collections(client: QdrantClient) -> None:
                 collection_name=name,
                 vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE),
             )
+    ensure_payload_indexes(client)
+
+
+def ensure_payload_indexes(client: QdrantClient) -> None:
+    """Idempotently create payload indexes on all Genesis collections.
+
+    Runs at server init (via ensure_collections). Creating an index that
+    already exists is a no-op server-side; each field is still wrapped
+    so one failure can't block init or the remaining fields.
+    """
+    from qdrant_client.models import PayloadSchemaType
+
+    schema_types = {
+        "bool": PayloadSchemaType.BOOL,
+        "keyword": PayloadSchemaType.KEYWORD,
+    }
+    for collection in COLLECTIONS:
+        for field, kind in INDEXED_PAYLOAD_FIELDS.items():
+            try:
+                client.create_payload_index(
+                    collection_name=collection,
+                    field_name=field,
+                    field_schema=schema_types[kind],
+                )
+            except Exception:
+                logger.warning(
+                    "payload index %s.%s not created", collection, field,
+                    exc_info=True,
+                )
 
 
 def upsert_point(

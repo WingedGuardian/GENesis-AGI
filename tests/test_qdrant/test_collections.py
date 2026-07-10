@@ -198,3 +198,57 @@ def test_ensure_collections(qdrant):
     assert "knowledge_base" in existing
     # NOTE: Do NOT delete production collections here. ensure_collections is
     # idempotent — leaving them is safe. Deleting them nukes production data.
+
+
+class TestPayloadIndexes:
+    """ensure_payload_indexes: coverage + idempotency (mock client —
+    creation against the real instance is the apply script's job)."""
+
+    def test_creates_every_field_on_every_collection(self):
+        from unittest.mock import MagicMock
+
+        from genesis.qdrant.collections import (
+            COLLECTIONS,
+            INDEXED_PAYLOAD_FIELDS,
+            ensure_payload_indexes,
+        )
+
+        client = MagicMock()
+        ensure_payload_indexes(client)
+        calls = client.create_payload_index.call_args_list
+        assert len(calls) == len(COLLECTIONS) * len(INDEXED_PAYLOAD_FIELDS)
+        seen = {
+            (c.kwargs["collection_name"], c.kwargs["field_name"]) for c in calls
+        }
+        for coll in COLLECTIONS:
+            for field in INDEXED_PAYLOAD_FIELDS:
+                assert (coll, field) in seen
+
+    def test_one_failure_does_not_block_the_rest(self):
+        from unittest.mock import MagicMock
+
+        from genesis.qdrant.collections import (
+            COLLECTIONS,
+            INDEXED_PAYLOAD_FIELDS,
+            ensure_payload_indexes,
+        )
+
+        client = MagicMock()
+        client.create_payload_index.side_effect = [RuntimeError("boom")] + [
+            None
+        ] * (len(COLLECTIONS) * len(INDEXED_PAYLOAD_FIELDS) - 1)
+        ensure_payload_indexes(client)  # must not raise
+        assert client.create_payload_index.call_count == (
+            len(COLLECTIONS) * len(INDEXED_PAYLOAD_FIELDS)
+        )
+
+    def test_ensure_collections_wires_indexes(self):
+        from unittest.mock import MagicMock, patch
+
+        from genesis.qdrant import collections as mod
+
+        client = MagicMock()
+        client.get_collections.return_value.collections = []
+        with patch.object(mod, "ensure_payload_indexes") as epi:
+            mod.ensure_collections(client)
+        epi.assert_called_once_with(client)
