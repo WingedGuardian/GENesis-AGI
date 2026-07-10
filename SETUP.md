@@ -142,6 +142,20 @@ systemctl --user start genesis-backup.service   # fire one run now
 cat ~/.genesis/backup_status.json               # expect "success":true
 ```
 
+Or manage it from the dashboard **Backup** tab (Settings → Backup): the schedule
+toggle + interval (every 3h / 6h / 12h / daily), a **Run Now** button, and both
+destinations (GitHub Tier-1 and the off-site Tier-2) with live health. The tab
+drives the same `genesis-backup.timer` unit over `systemctl --user` — it does not
+use crontab.
+
+> **Migrating from an old crontab-based schedule?** Earlier installs scheduled
+> backups with a `crontab` line (`… /scripts/backup.sh …`). The systemd timer and
+> a leftover cron line will BOTH fire, running two backups that race on the same
+> repo. When you enable the timer, remove any legacy line:
+> ```bash
+> crontab -l | grep -v 'scripts/backup.sh' | crontab -
+> ```
+
 ## Verify Installation
 
 ```bash
