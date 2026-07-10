@@ -744,6 +744,52 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         })
         current_ids.add(alert_id)
 
+    # Credential-file integrity — the container self-heal writes this status;
+    # corruption (or a failed/rate-capped restore) is CRITICAL, and a completed
+    # auto-restore is also CRITICAL (the user must know creds were replaced, and
+    # rotate any that may have changed since the backup).
+    cred_status_file = Path.home() / ".genesis" / "cred_integrity_status.json"
+    if cred_status_file.is_file():
+        try:
+            cred_data = json.loads(cred_status_file.read_text())
+            targets = cred_data.get("targets", {})
+            corrupt = {
+                n: t for n, t in targets.items()
+                if t.get("status") in ("corrupt", "corrupt_pending", "restore_failed")
+            }
+            restored = {
+                n: t for n, t in targets.items() if t.get("status") == "restored"
+            }
+            if corrupt:
+                detail = "; ".join(
+                    f"{n} ({t.get('detail', t.get('status'))})"
+                    for n, t in sorted(corrupt.items())
+                )
+                alert_id = "creds:corrupt"
+                alerts.append({
+                    "id": alert_id,
+                    "severity": "CRITICAL",
+                    "message": f"Credential file corruption: {detail}",
+                })
+                current_ids.add(alert_id)
+            if restored:
+                detail = "; ".join(
+                    f"{n} (from backup {t.get('backup_mtime', '?')})"
+                    for n, t in sorted(restored.items())
+                )
+                alert_id = "creds:restored"
+                alerts.append({
+                    "id": alert_id,
+                    "severity": "CRITICAL",
+                    "message": (
+                        f"Credential files auto-restored: {detail} — "
+                        "rotate any that changed since the backup"
+                    ),
+                })
+                current_ids.add(alert_id)
+        except (json.JSONDecodeError, OSError):
+            pass
+
     now = datetime.now(UTC).isoformat()
     for old_id in list(_alert_history.keys()):
         if old_id in current_ids:
