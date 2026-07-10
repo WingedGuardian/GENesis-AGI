@@ -197,6 +197,12 @@ except Exception:
             fi
             [ -n "$CC_LOGGED_IN" ] || CC_LOGGED_IN=null
             # Cache best-effort; a write failure just means we re-probe next tick.
+            # We DELIBERATELY cache `null` too: the cache exists to bound the
+            # ~290MB claude spawn on this OOM-history host, and a broken/hung
+            # claude returns null every time — caching it keeps that at 1/hr
+            # instead of 1/tick. The cost is ≤1h latency to notice a recovered
+            # login (an early-warning signal only; the diagnosis path always
+            # probes fresh at incident time), which is an acceptable trade.
             mkdir -p "$STATE_DIR" 2>/dev/null || true
             if printf '{"logged_in": "%s", "checked_at": %s}\n' "$CC_LOGGED_IN" "$CC_NOW_EPOCH" \
                     > "$CC_PROBE_CACHE.tmp" 2>/dev/null; then
@@ -216,14 +222,16 @@ except Exception:
             CC_TOKEN_CREATED=$(grep '^GENESIS_CC_TOKEN_CREATED_AT=' "$CC_TOKEN_FILE" 2>/dev/null \
                 | head -1 | cut -d= -f2- | tr -d '"' || true)
             if printf '%s' "$CC_TOKEN_CREATED" | grep -qE '^[0-9]+$'; then
-                CC_TOKEN_AGE_DAYS=$(( (CC_NOW_EPOCH - CC_TOKEN_CREATED) / 86400 ))
+                # 10# forces base-10: a corrupt leading-zero created_at (e.g.
+                # 08…) would otherwise be read as octal → arithmetic error.
+                CC_TOKEN_AGE_DAYS=$(( (CC_NOW_EPOCH - 10#$CC_TOKEN_CREATED) / 86400 ))
                 # A future-dated created_at (clock skew / bad write) → clamp to 0,
                 # never a negative that the reconciler would misread as unknown.
                 if [ "$CC_TOKEN_AGE_DAYS" -lt 0 ]; then CC_TOKEN_AGE_DAYS=0; fi
             else
                 CC_MTIME=$(stat -c %Y "$CC_TOKEN_FILE" 2>/dev/null || echo "")
                 if printf '%s' "$CC_MTIME" | grep -qE '^[0-9]+$'; then
-                    CC_TOKEN_AGE_DAYS=$(( (CC_NOW_EPOCH - CC_MTIME) / 86400 ))
+                    CC_TOKEN_AGE_DAYS=$(( (CC_NOW_EPOCH - 10#$CC_MTIME) / 86400 ))
                     if [ "$CC_TOKEN_AGE_DAYS" -lt 0 ]; then CC_TOKEN_AGE_DAYS=0; fi
                 fi
             fi

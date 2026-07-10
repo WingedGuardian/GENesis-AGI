@@ -380,3 +380,11 @@ class TestResolveCCEnv:
     async def test_missing_binary_never_raises(self, tmp_path):
         engine = _engine_with_token(tmp_path, token=True)
         assert await engine._resolve_cc_env(str(tmp_path / "nonexistent")) is None
+
+    @pytest.mark.asyncio
+    async def test_non_object_json_never_injects(self, tmp_path):
+        # Valid JSON but not an object (null) → .get would raise; must be caught
+        # as ambiguity → inherit env, even with a token present.
+        cc = _stub_claude(tmp_path, "null")
+        engine = _engine_with_token(tmp_path, token=True)
+        assert await engine._resolve_cc_env(cc) is None

@@ -835,7 +835,14 @@ class GuardianWatchdog:
         if logged_in is not False:
             # logged_in is None (ambiguous / old CC / transient) AND no usable
             # token → never false-alarm on ambiguity; the diagnosis fail-safe
-            # still catches a genuine outage at incident time.
+            # still catches a genuine outage at incident time. We deliberately
+            # neither increment NOR reset the drift streak here: an ambiguous
+            # tick must not CLEAR a real dead signal (so a host that reports
+            # False/None/False, never True, still accumulates toward the alert),
+            # but it also isn't itself evidence of a dead brain. So this
+            # reconciler's threshold counts "ticks that never confirmed
+            # auth-able," which is intentionally looser than the strictly-
+            # consecutive semantics of the sibling reconcilers.
             return
         # logged_in is False AND no usable fallback token → genuinely dead brain.
         self._cc_auth_drift_count += 1

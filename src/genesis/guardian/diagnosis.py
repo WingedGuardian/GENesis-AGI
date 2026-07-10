@@ -578,8 +578,10 @@ class DiagnosisEngine:
                 logged_in = json.loads(
                     stdout.decode("utf-8", errors="replace"),
                 ).get("loggedIn")
-            except (json.JSONDecodeError, ValueError):
-                return None  # unparseable → never inject on ambiguity
+            except (json.JSONDecodeError, ValueError, AttributeError, TypeError):
+                # Unparseable, or valid-but-non-object JSON (null/true/[] → no
+                # .get) → treat as ambiguity, never inject.
+                return None
             if logged_in is not False:
                 # True (login works) or None (unknown) → inherit, never inject.
                 return None

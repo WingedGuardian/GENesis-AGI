@@ -169,3 +169,16 @@ def test_corrupt_cache_reprobes(sandbox):
     (sandbox["state"] / "cc_auth_probe.json").write_text("{not json")
     # Garbage cache must not crash the verb; it re-probes.
     assert _version(sandbox, logged_in="true")["cc_logged_in"] is True
+
+
+@_needs_bash
+def test_corrupt_leading_zero_created_at_no_crash(sandbox):
+    # A leading-zero created_at must not be read as octal (would error under
+    # set -e); the verb still emits valid JSON with a base-10 age.
+    sandbox["token_file"].write_text(
+        "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-X\n"
+        "GENESIS_CC_TOKEN_CREATED_AT=0899999999\n",
+    )
+    v = _version(sandbox)  # _version asserts returncode 0 + json.loads
+    assert v["cc_token_present"] is True
+    assert isinstance(v["cc_token_age_days"], int)
