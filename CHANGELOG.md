@@ -11,6 +11,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Every memory now carries a provenance class — and immunity gets its kill
+  switch before it gets its gates.** Everything Genesis stores is stamped
+  `owner`, `first_party`, or `external_untrusted` at write time (your words /
+  Genesis's own observations / content pulled off the world, including
+  ingested documents), with all existing memories backfilled. This is the
+  foundation for the WS-3 immunity gates: crafted external content becomes
+  blockable from turning into procedures, identity edits, or autonomy
+  evidence by *origin*, not content guessing. The control surface ships
+  first: a live-editable `ws3_immunity` settings domain (master switch +
+  per-gate off/shadow/enforce) that takes effect instantly with no restart —
+  and owner/first-party content can never be blocked in any mode, by
+  construction. No gates are active yet; they arrive in the next phase, in
+  observe-only shadow mode.
+
 - **`genesis eval bench` — a Genesis-vs-bare-Claude A/B benchmark you can run
   in one command.** Each task in a private task set runs through two arms: a
   cognition-enabled Genesis session (identity + read-only recall from your
