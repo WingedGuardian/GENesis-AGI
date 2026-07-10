@@ -30,6 +30,12 @@ def hook_fold(
 ) -> dict | None:
     """Fold one turn; check the drift trigger; record any fire.
 
+    ``prompt_text``, when provided, runs the ``should_fold`` gate first:
+    non-thematic turns (continuations, interrupts, bash passthrough,
+    sub-minimum keyword count) return ``{"fired": False, "reason":
+    "low_signal"}`` without folding. Empty ``prompt_text`` (legacy
+    callers) skips the gate and folds unconditionally.
+
     Returns a small summary dict (for tests and the PR4 replay harness)
     or None on any failure — by contract this function cannot raise.
     """

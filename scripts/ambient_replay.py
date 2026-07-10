@@ -40,7 +40,14 @@ SRC_DIR = REPO_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-_TRANSCRIPT_DIR = Path.home() / ".claude" / "projects" / "-home-ubuntu-genesis"
+from genesis.env import repo_root  # noqa: E402  (needs the sys.path insert)
+
+# CC keys a project's transcript dir by the project path with '/' → '-';
+# derive from the resolved repo root (GENESIS_REPO_ROOT-aware) so the
+# default works on any install. --transcript overrides.
+_TRANSCRIPT_DIR = (
+    Path.home() / ".claude" / "projects" / str(repo_root()).replace("/", "-")
+)
 _CACHE_PATH = (
     Path.home() / ".genesis" / "session_awareness" / "replay_embed_cache.json"
 )
