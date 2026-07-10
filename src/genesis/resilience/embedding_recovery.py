@@ -7,6 +7,7 @@ import logging
 
 import aiosqlite
 
+from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import pending_embeddings as crud
 
 logger = logging.getLogger(__name__)
@@ -59,8 +60,25 @@ class EmbeddingRecoveryWorker:
                 tag_list = [t.strip() for t in raw_tags.split(",") if t.strip()] if raw_tags else []
                 collection = item.get("collection", "episodic_memory")
 
+                # Restore faceting fields so the recovered point survives
+                # wing=/room=/life_domain= filtered recall — Qdrant `must`
+                # filters exclude a point that LACKS the key, so a payload
+                # missing these silently drops out of scoped recall (the
+                # normal write path sets all of them, see memory/store.py).
+                # wing/room live in memory_metadata (written by create_metadata
+                # in the same store() that enqueued this pending row, so the
+                # row is present at drain time); life_domain is not a metadata
+                # column — recover it from the `life_domain:` tag store.py
+                # appends. project_type is not persisted on this path (absent
+                # from metadata, pending_embeddings, and tags) → stays unset.
+                taxo = await memory_crud.get_taxonomy(self._db, item["memory_id"])
+                life_domain = next(
+                    (t.split(":", 1)[1] for t in tag_list
+                     if t.startswith("life_domain:")),
+                    None,
+                )
+
                 payload = {
-                    "memory_id": item["memory_id"],
                     "memory_type": item["memory_type"],
                     "content": item["content"],
                     "source": item.get("source") or "embedding_recovery",
@@ -71,6 +89,13 @@ class EmbeddingRecoveryWorker:
                     "retrieved_count": 0,
                     "scope": "external" if collection == "knowledge_base" else "user",
                 }
+                if taxo:
+                    if taxo.get("wing"):
+                        payload["wing"] = taxo["wing"]
+                    if taxo.get("room"):
+                        payload["room"] = taxo["room"]
+                if life_domain:
+                    payload["life_domain"] = life_domain
                 # Restore provenance fields if queued with them
                 for prov_key in (
                     "source_session_id", "transcript_path",

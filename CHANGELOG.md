@@ -59,6 +59,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Memories recovered after an embedding outage keep their wing/room/life_domain
+  filters, and keyword-only results are no longer ranked as artificially fresh.**
+  When the embedding provider was down, memories were stored keyword-only and
+  re-embedded on recovery — but the rebuilt vector dropped its wing/room/life_domain
+  tags, so it silently vanished from any domain-scoped ("wing=…") recall. Recovery
+  now restores those fields. Separately, keyword-only memories were being scored as
+  if created just now (maximum freshness), letting old notes outrank genuinely recent
+  ones; they now use their real creation time.
+
 - **Protected-path guarding now covers the real systemd unit sources.** The
   critical-path rules protected a stale copy of the watchdog unit under
   `config/` while leaving `scripts/systemd/*.template` — the files installs

@@ -355,6 +355,63 @@ async def get_metadata(
     }
 
 
+async def get_taxonomy(
+    db: aiosqlite.Connection,
+    memory_id: str,
+) -> dict[str, str | None] | None:
+    """Return ``{"wing", "room"}`` for a memory_id, or None if no row.
+
+    The embedding-recovery worker uses this to restore the faceting
+    fields onto the reconstructed Qdrant payload (see
+    ``resilience/embedding_recovery``) so a recovered point is not
+    silently dropped from ``wing=``/``room=`` filtered recall. Only
+    ``wing`` and ``room`` are metadata columns; ``life_domain`` is
+    recovered from the ``life_domain:`` tag and ``project_type`` is not
+    persisted on this path.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT wing, room FROM memory_metadata WHERE memory_id = ?",
+        (memory_id,),
+    )
+    row = rows[0] if rows else None
+    if not row:
+        return None
+    return {"wing": row[0], "room": row[1]}
+
+
+async def batch_created_at(
+    db: aiosqlite.Connection,
+    memory_ids: list[str],
+) -> dict[str, str]:
+    """Batch-fetch ``created_at`` from memory_metadata for *memory_ids*.
+
+    Mirrors ``memory_links.batch_link_counts``: one chunked IN-clause
+    query instead of N lookups. ``HybridRetriever._compute_activations``
+    uses it to give FTS-only rows (no Qdrant hit) their real creation
+    time instead of the ``now_str`` fallback — that fallback yields an
+    unearned ``recency = exp(0) = 1.0`` and a phantom age of 0 in the
+    MEM-005 entrenchment metric. Ids with no metadata row are omitted;
+    the caller falls back to ``now_str`` for those.
+    """
+    if not memory_ids:
+        return {}
+
+    _CHUNK = 900  # single-column query, stays under SQLite's 999 limit
+    out: dict[str, str] = {}
+    for offset in range(0, len(memory_ids), _CHUNK):
+        chunk = memory_ids[offset : offset + _CHUNK]
+        ph = ",".join("?" * len(chunk))
+        rows = await db.execute_fetchall(
+            f"SELECT memory_id, created_at FROM memory_metadata"
+            f" WHERE memory_id IN ({ph})",
+            chunk,
+        )
+        for row in rows:
+            if row[1]:
+                out[row[0]] = row[1]
+    return out
+
+
 async def match_id_prefix(
     db: aiosqlite.Connection,
     prefix: str,
