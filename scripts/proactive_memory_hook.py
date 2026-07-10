@@ -1892,6 +1892,7 @@ def _ambient_fold(
             prompt_keywords=_extract_keywords(prompt),
             file_keywords=_keywords_from_files(recent_files) if recent_files else [],
             pivoted=_turn_pivoted(session_id),
+            prompt_text=prompt,
         )
         if result and result.get("fired"):
             _spawn_ambient_worker(session_id)

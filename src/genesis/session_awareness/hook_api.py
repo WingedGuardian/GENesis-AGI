@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .accumulator import fold_turn
+from .accumulator import fold_turn, should_fold
 from .statefiles import load_state, save_state
 from .trigger import check_fire, record_fire, stability
 
@@ -24,6 +24,7 @@ def hook_fold(
     prompt_keywords: list[str],
     file_keywords: list[str] | None = None,
     pivoted: bool = False,
+    prompt_text: str = "",
     base_dir: Path | None = None,
     now: datetime | None = None,
 ) -> dict | None:
@@ -35,6 +36,8 @@ def hook_fold(
     try:
         if not session_id or not vector:
             return None
+        if prompt_text and not should_fold(prompt_text, prompt_keywords):
+            return {"fired": False, "reason": "low_signal"}
         now = now or datetime.now(UTC)
         now_iso = now.isoformat()
 

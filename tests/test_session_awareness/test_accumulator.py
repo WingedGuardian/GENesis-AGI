@@ -86,14 +86,45 @@ def test_near_theme_vector_folds_normally():
     assert cosine(s["ema"], expected_dir) > 0.999
 
 
-def test_pivot_resets_ring_but_keeps_ema():
+def test_uncorroborated_pivot_does_not_reset_ring():
+    """A Jaccard pivot with NO semantic shift (cos >= PIVOT_CONFIRM_COS)
+    keeps the ring — lexical pivots fire on ~40% of real turns and
+    resetting on every one starves the trigger (replay-measured)."""
     s = empty_state("s1")
     for _ in range(3):
         fold_turn(s, unit(0), [], now_iso=NOW)
     assert len(s["ring"]) == 3
     fold_turn(s, blend(unit(0), unit(1), 0.2), [], pivoted=True, now_iso=NOW)
+    assert len(s["ring"]) == 3  # same theme: ring survives
+    assert s["ema_turns"] == 4
+
+
+def test_corroborated_pivot_resets_ring():
+    """Pivot + genuine semantic shift (cos < PIVOT_CONFIRM_COS) resets."""
+    s = empty_state("s1")
+    for _ in range(3):
+        fold_turn(s, unit(0), [], now_iso=NOW)
+    shifted = blend(unit(0), unit(1), 0.9)  # cos vs EMA ~0.11 < 0.5
+    fold_turn(s, shifted, [], pivoted=True, now_iso=NOW)
     assert len(s["ring"]) == 1  # cleared, then this fold appended
     assert s["ema_turns"] == 4
+
+
+def test_should_fold_gates_low_signal_turns():
+    from genesis.session_awareness.accumulator import should_fold
+
+    assert should_fold("plan the memory retrieval ranking", ["plan", "memory", "retrieval", "ranking"])
+    assert not should_fold("continue", ["continue"])
+    assert not should_fold("ok credits now", ["credits", "now"])
+    assert not should_fold(
+        "This session is being continued from a previous conversation..."
+        " lots of summary soup",
+        ["session", "continued", "previous", "conversation", "summary"],
+    )
+    assert not should_fold(
+        "[Request interrupted by user for tool use]",
+        ["request", "interrupted", "user", "tool"],
+    )
 
 
 def test_entities_decay_weights_and_file_discount():
