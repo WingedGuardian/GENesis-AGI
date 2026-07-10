@@ -351,6 +351,11 @@ if [ "$CC_ENABLED" = "true" ] && [ "$CC_AUTHENTICATED" = "false" ] && [ "$NON_IN
     echo "  Claude Code, but autonomous diagnosis — where Guardian"
     echo "  uses AI to investigate and fix problems — requires it."
     echo ""
+    echo "  Fallback (no re-SSH if this login ever dies): mint a 1-year token"
+    echo "  with 'claude setup-token' from ANY machine and pipe it to"
+    echo "  'scripts/store_cc_token.sh' in the container. Genesis syncs it here"
+    echo "  and uses it only as a fallback when this login is dead."
+    echo ""
     if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
         echo "  Since you're on a headless machine:"
         echo "    1. It will print a URL — open it in YOUR browser"
@@ -367,10 +372,12 @@ if [ "$CC_ENABLED" = "true" ] && [ "$CC_AUTHENTICATED" = "false" ] && [ "$NON_IN
             echo "  + Claude Code authenticated"
         else
             echo "  WARNING: Login failed or was skipped"
-            echo "  To log in later: claude login (from this host)"
+            echo "  To log in later: claude login (from this host), or mint a"
+            echo "  setup-token from anywhere (see scripts/store_cc_token.sh)"
         fi
     else
-        echo "  Skipped. To log in later: claude login (from this host)"
+        echo "  Skipped. To log in later: claude login (from this host), or mint"
+        echo "  a setup-token from anywhere (see scripts/store_cc_token.sh)"
     fi
 fi
 

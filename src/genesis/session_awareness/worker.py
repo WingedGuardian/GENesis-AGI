@@ -28,6 +28,11 @@ from .trigger import stability
 
 SHADOW_LOG_MAX_BYTES = 50 * 1024 * 1024  # cap, counted when hit
 ENTITY_QUERY_TERMS = 8
+# The entity lane resolves ledger keys with one indexed lookup each, so
+# it takes far more than the 8-term drift text query: a resolvable
+# entity at ledger rank 10 must not fall to a text-query cap. The ledger
+# is already bounded (accumulator MAX_ENTITIES); defensive ceiling only.
+ENTITY_RESOLVE_TERMS = 32
 VERDICT_FILENAME = "ambient_verdict.json"
 
 
@@ -121,6 +126,9 @@ async def run_worker(
                 qdrant_client=qdrant,
                 embedding_provider=provider,
                 entity_shadow_out=entity_shadow,
+                # Keys verbatim — alias-normalized ledger keys can be
+                # multi-word ("claude code") and must not be re-split.
+                entity_terms=top_entities(state, ENTITY_RESOLVE_TERMS),
             )
         finally:
             await db.close()

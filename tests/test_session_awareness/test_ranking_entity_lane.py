@@ -181,3 +181,57 @@ async def test_created_before_drops_future_entity_candidates(db):
             created_before="2026-06-01T00:00:00+00:00",  # before memory created
         )
     assert shadow == []  # post-cutoff memory filtered even from shadow
+
+
+@pytest.mark.asyncio
+async def test_multiword_entity_terms_resolve_verbatim(db):
+    """Alias-normalized ledger keys ("cc" → "claude code") are multi-word;
+    entity_terms must reach resolution unsplit or those entities are
+    permanently unreachable (Codex P2, 2026-07-10)."""
+    ent = await entities_crud.create_entity(
+        db, name="Claude Code", norm_name="claude code", entity_type="product",
+    )
+    await entities_crud.upsert_mention(
+        db, memory_id=TARGET, entity_id=ent, provenance="EXTRACTED",
+        confidence=0.95, source="seed",
+    )
+    qdrant, patches = _lane_patches([_hit("other-mem", 0.9)], [_point(TARGET)])
+    shadow: list[dict] = []
+    with patches[0], patches[1], patches[2], patches[3]:
+        await rank_candidates(
+            ema=EMA, entity_query="claude code", db=db,
+            qdrant_client=qdrant, embedding_provider=MagicMock(),
+            entity_lane="shadow", entity_shadow_out=shadow,
+            entity_terms=["claude code"],
+        )
+    assert shadow and shadow[0]["memory_id"] == TARGET
+
+    # The legacy split path documents WHY the param exists: the same
+    # string via entity_query alone shatters and resolves nothing.
+    qdrant2, patches2 = _lane_patches([_hit("other-mem", 0.9)], [_point(TARGET)])
+    shadow2: list[dict] = []
+    with patches2[0], patches2[1], patches2[2], patches2[3]:
+        await rank_candidates(
+            ema=EMA, entity_query="claude code", db=db,
+            qdrant_client=qdrant2, embedding_provider=MagicMock(),
+            entity_lane="shadow", entity_shadow_out=shadow2,
+        )
+    assert shadow2 == []
+
+
+@pytest.mark.asyncio
+async def test_live_drops_entity_candidates_without_episodic_point(db):
+    """Mentions cover every write path (KB, FTS5-only) but the lane
+    retrieves episodic only — a mention with no episodic point must not
+    be floor-forced into the arbiter as an empty score-0 candidate."""
+    await _seed_spine(db)
+    # retrieve returns NOTHING for the target
+    qdrant, patches = _lane_patches([_hit("m1", 0.9)], [])
+    with patches[0], patches[1], patches[2], patches[3]:
+        picked = await rank_candidates(
+            ema=EMA, entity_query="omi", db=db,
+            qdrant_client=qdrant, embedding_provider=MagicMock(),
+            entity_lane="live",
+        )
+    assert TARGET not in [c["memory_id"] for c in picked]
+    assert [c["memory_id"] for c in picked] == ["m1"]

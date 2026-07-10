@@ -6,6 +6,8 @@ import os
 import stat
 from pathlib import Path
 
+import pytest
+
 from genesis.guardian.credential_bridge import (
     load_telegram_credentials,
     propagate_telegram_credentials,
@@ -289,6 +291,13 @@ class TestProvisioningCredentials:
 class TestCombinedBridge:
     """propagate_guardian_credentials fans out to both, each guarded."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_home(self, tmp_path: Path, monkeypatch):
+        # The mirror leg defaults its source to ~/backups/genesis-backups. Isolate
+        # HOME to a clone-free sandbox so these telegram/proxmox assertions stay
+        # deterministic regardless of the host having a real backup clone.
+        monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
+
     def test_writes_both_when_present(self, tmp_path: Path) -> None:
         from genesis.guardian.credential_bridge import propagate_guardian_credentials
         secrets = tmp_path / "secrets.env"
@@ -354,8 +363,13 @@ class TestBackupPassphraseEscrow:
         from genesis.guardian.credential_bridge import load_backup_passphrase
         assert load_backup_passphrase(str(tmp_path / "nope")) == {}
 
-    def test_combined_bridge_includes_passphrase(self, tmp_path: Path) -> None:
+    def test_combined_bridge_includes_passphrase(self, tmp_path: Path, monkeypatch) -> None:
         from genesis.guardian.credential_bridge import propagate_guardian_credentials
+        # Isolate HOME so the mirror leg (which defaults its source to
+        # ~/backups/genesis-backups) is a deterministic no-op here — no clone in
+        # the sandbox home means no "creds-mirror" entry. Mirror is covered by
+        # TestMirrorCredentialBackup below.
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
         secrets = tmp_path / "secrets.env"
         secrets.write_text(
             "TELEGRAM_BOT_TOKEN=bot\nTELEGRAM_FORUM_CHAT_ID=chat\n"
@@ -367,3 +381,191 @@ class TestBackupPassphraseEscrow:
         )
         names = sorted(p.name for p in written)
         assert names == ["backup_passphrase.env", "proxmox_creds.env", "telegram_creds.env"]
+
+    def test_combined_bridge_includes_mirror_when_clone_present(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """With a backup clone present, the combined bridge also mirrors it."""
+        from genesis.guardian.credential_bridge import propagate_guardian_credentials
+        home = tmp_path / "home"
+        clone = home / "backups" / "genesis-backups"
+        (clone / "secrets").mkdir(parents=True)
+        (clone / "secrets" / "secrets.env.gpg").write_bytes(b"ENC")
+        monkeypatch.setenv("HOME", str(home))
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("GENESIS_BACKUP_PASSPHRASE=pp\n")
+        written = propagate_guardian_credentials(
+            shared_dir=tmp_path / "state" / "shared", secrets_path=secrets,
+        )
+        names = sorted(p.name for p in written)
+        assert "creds-mirror" in names
+        assert "backup_passphrase.env" in names
+
+
+class TestMirrorCredentialBackup:
+    """G.4 container-side encrypted-backup mirror to the shared mount."""
+
+    def _clone(self, root: Path, rels=("creds/claude.json.gpg",
+                                       "creds/ssh/id_ed25519.gpg",
+                                       "secrets/secrets.env.gpg")) -> Path:
+        clone = root / "clone"
+        for rel in rels:
+            p = clone / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"ENCRYPTED-" + rel.encode())
+        return clone
+
+    def test_mirrors_encrypted_files_0600_with_stamp(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import mirror_credential_backup
+        clone = self._clone(tmp_path)
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        dest = mirror_credential_backup(shared_dir=shared, backup_dir=clone)
+        assert dest is not None
+        assert (dest / "creds" / "claude.json.gpg").read_bytes().startswith(b"ENCRYPTED-")
+        assert (dest / "creds" / "ssh" / "id_ed25519.gpg").exists()
+        assert (dest / "secrets" / "secrets.env.gpg").exists()
+        assert (dest / "MIRROR_STAMP").exists()
+        mode = stat.S_IMODE(os.stat(dest / "creds" / "claude.json.gpg").st_mode)
+        assert mode == 0o600
+
+    def test_skips_unchanged_on_second_run(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import mirror_credential_backup
+        clone = self._clone(tmp_path)
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        dest = mirror_credential_backup(shared_dir=shared, backup_dir=clone)
+        f = dest / "secrets" / "secrets.env.gpg"
+        ino1 = os.stat(f).st_ino
+        mirror_credential_backup(shared_dir=shared, backup_dir=clone)
+        # Unchanged source ⇒ no rewrite ⇒ same inode (os.replace would swap it).
+        assert os.stat(f).st_ino == ino1
+
+    def test_prunes_vanished_source(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import mirror_credential_backup
+        clone = self._clone(tmp_path)
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        dest = mirror_credential_backup(shared_dir=shared, backup_dir=clone)
+        assert (dest / "creds" / "claude.json.gpg").exists()
+        (clone / "creds" / "claude.json.gpg").unlink()
+        mirror_credential_backup(shared_dir=shared, backup_dir=clone)
+        assert not (dest / "creds" / "claude.json.gpg").exists()
+        assert (dest / "secrets" / "secrets.env.gpg").exists()  # survivor kept
+
+    def test_prune_containment_leaves_siblings(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import mirror_credential_backup
+        clone = self._clone(tmp_path)
+        shared = tmp_path / "shared"
+        (shared / "guardian").mkdir(parents=True)
+        sibling = shared / "guardian" / "telegram_creds.env"  # sibling of creds-mirror
+        sibling.write_text("TELEGRAM_BOT_TOKEN=keepme\n")
+        mirror_credential_backup(shared_dir=shared, backup_dir=clone)
+        assert sibling.read_text() == "TELEGRAM_BOT_TOKEN=keepme\n"
+
+    def test_absent_shared_mount_returns_none(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import mirror_credential_backup
+        clone = self._clone(tmp_path)
+        assert mirror_credential_backup(
+            shared_dir=tmp_path / "nonexistent", backup_dir=clone,
+        ) is None
+
+    def test_absent_clone_returns_none(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import mirror_credential_backup
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        assert mirror_credential_backup(
+            shared_dir=shared, backup_dir=tmp_path / "no-clone",
+        ) is None
+
+    def test_clone_without_gpg_returns_none(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import mirror_credential_backup
+        clone = tmp_path / "clone"
+        (clone / "creds").mkdir(parents=True)
+        (clone / "creds" / "readme.txt").write_text("not encrypted")
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        assert mirror_credential_backup(shared_dir=shared, backup_dir=clone) is None
+
+
+class TestCCOAuthTokenSync:
+    """CC setup-token sync — dedicated source file, never secrets.env."""
+
+    def test_syncs_token_and_created_at(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import (
+            load_cc_oauth_token,
+            propagate_cc_oauth_token,
+        )
+        src = tmp_path / "container" / "cc_oauth_token.env"
+        src.parent.mkdir(parents=True)
+        src.write_text(
+            "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-SYNTHETIC\n"
+            "GENESIS_CC_TOKEN_CREATED_AT=1700000000\n",
+        )
+        shared = tmp_path / "state" / "shared"
+        out = propagate_cc_oauth_token(shared_dir=shared, source_path=src)
+        assert out is not None
+        assert out.name == "cc_oauth_token.env"
+        assert stat.S_IMODE(os.stat(out).st_mode) == 0o600
+        result = load_cc_oauth_token(str(tmp_path / "state"))
+        assert result == {
+            "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-SYNTHETIC",
+            "GENESIS_CC_TOKEN_CREATED_AT": "1700000000",
+        }
+
+    def test_backfills_created_at_from_mtime(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import (
+            _read_dotenv,
+            propagate_cc_oauth_token,
+        )
+        src = tmp_path / "cc_oauth_token.env"
+        src.write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-X\n")
+        out = propagate_cc_oauth_token(shared_dir=tmp_path / "shared", source_path=src)
+        assert out is not None
+        back = _read_dotenv(out)
+        assert back["GENESIS_CC_TOKEN_CREATED_AT"].isdigit()
+
+    def test_absent_source_skips(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import propagate_cc_oauth_token
+        assert propagate_cc_oauth_token(
+            shared_dir=tmp_path / "shared", source_path=tmp_path / "nope.env",
+        ) is None
+
+    def test_no_token_key_skips(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import propagate_cc_oauth_token
+        src = tmp_path / "cc_oauth_token.env"
+        src.write_text("GENESIS_CC_TOKEN_CREATED_AT=123\n")  # created_at, no token
+        assert propagate_cc_oauth_token(
+            shared_dir=tmp_path / "shared", source_path=src,
+        ) is None
+
+    def test_load_missing_returns_empty(self, tmp_path: Path) -> None:
+        from genesis.guardian.credential_bridge import load_cc_oauth_token
+        assert load_cc_oauth_token(str(tmp_path / "nope")) == {}
+
+    def test_combined_bridge_includes_cc_token(self, tmp_path: Path, monkeypatch) -> None:
+        # The composite calls the leg without source_path (module default), so
+        # point _CC_TOKEN_SOURCE at a tmp file for this test.
+        from genesis.guardian import credential_bridge as cb
+        src = tmp_path / "cc_oauth_token.env"
+        src.write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-X\n")
+        monkeypatch.setattr(cb, "_CC_TOKEN_SOURCE", src)
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("TELEGRAM_BOT_TOKEN=bot\nTELEGRAM_CHAT_ID=chat\n")
+        written = cb.propagate_guardian_credentials(
+            shared_dir=tmp_path / "state" / "shared", secrets_path=secrets,
+        )
+        assert "cc_oauth_token.env" in [p.name for p in written]
+
+    def test_never_reads_from_secrets_env(self, tmp_path: Path) -> None:
+        # A token in secrets.env must NOT be picked up — the leg reads only its
+        # dedicated file (guards the load_dotenv override hazard by construction).
+        from genesis.guardian.credential_bridge import propagate_cc_oauth_token
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-FROM-SECRETS\n")
+        out = propagate_cc_oauth_token(
+            shared_dir=tmp_path / "shared",
+            source_path=tmp_path / "absent.env",
+            secrets_path=secrets,
+        )
+        assert out is None  # secrets_path is ignored for this leg

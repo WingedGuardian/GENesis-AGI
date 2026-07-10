@@ -61,17 +61,23 @@ async def resolve_entity(
     for confident identity and AMBIGUOUS when a fuzzy near-match was
     detected (adjudication queued).
     """
-    norm_name = norm(name, aliases)
-    if not norm_name:
-        raise ValueError(f"unresolvable empty entity name {name!r}")
-
-    # Tier 1 — mechanical: exact identity by construction.
+    # Tier 1 — mechanical: exact identity by construction. Literal
+    # identifiers must NEVER pass through alias expansion (an alias like
+    # "cc" → "claude code" would rewrite path components); lowercase-only,
+    # matching what record_anchors has always written.
     if entity_type in MECHANICAL_TYPES:
+        norm_name = name.strip().lower()
+        if not norm_name:
+            raise ValueError(f"unresolvable empty entity name {name!r}")
         entity_id = await entities_crud.create_entity(
             db, name=name, norm_name=norm_name, entity_type=entity_type,
             source=source, _commit=_commit,
         )
         return entity_id, "EXTRACTED"
+
+    norm_name = norm(name, aliases)
+    if not norm_name:
+        raise ValueError(f"unresolvable empty entity name {name!r}")
 
     # Tier 2 — named exact (same type, then concept-cluster cross-type).
     existing = await entities_crud.get_by_norm_name(
@@ -180,6 +186,9 @@ async def record_extraction(
             confidence = float(rel.get("confidence", extraction.confidence))
         except (TypeError, ValueError):
             confidence = extraction.confidence
+        # LLM output despite the prompt's [0,1] instruction: clamp, or
+        # path-confidence products go >1 / negative downstream.
+        confidence = min(1.0, max(0.0, confidence))
         await entities_crud.upsert_link(
             db,
             source_id=source[0],

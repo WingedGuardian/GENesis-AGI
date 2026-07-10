@@ -193,3 +193,72 @@ def test_api_key_health_critical_when_essential_uncovered(monkeypatch):
     assert orp["key_health"] == "red"
     assert orp["alert_severity"] == "critical"  # essential uncovered → critical
     assert any(a["severity"] == "critical" for a in out["alerts"])
+
+
+# --- recent_fallbacks: additive display context, keyed by provider config name ---
+
+
+def _env(monkeypatch):
+    from genesis.observability.snapshots import api_keys as ak
+
+    monkeypatch.setenv("API_KEY_OPENROUTER", "sk-test")
+    monkeypatch.setenv("GOOGLE_API_KEY", "g-test")
+    ak._api_validation_cache.clear()
+    return ak
+
+
+def test_recent_fallbacks_attached_by_config_name(monkeypatch):
+    ak = _env(monkeypatch)
+    config = _routing_config()
+    reg = _registry(config)
+
+    out = ak.api_key_health(config, breakers=reg, recent_fallbacks={
+        "openrouter-x": {"count": 42, "last_at": "2026-03-14T11:00:00"},
+    })
+    orp = out["providers"]["openrouter-x"]
+    assert orp["recent_fallbacks"] == 42
+    assert orp["last_fallback_at"] == "2026-03-14T11:00:00"
+    # A provider absent from the map gets no attach (selective by name).
+    assert "recent_fallbacks" not in out["providers"]["gemini-free"]
+
+
+def test_recent_fallbacks_none_safe(monkeypatch):
+    ak = _env(monkeypatch)
+    config = _routing_config()
+    reg = _registry(config)
+
+    out = ak.api_key_health(config, breakers=reg)  # no kwarg
+    for entry in out["providers"].values():
+        assert "recent_fallbacks" not in entry
+        assert "last_fallback_at" not in entry
+
+
+def test_recent_fallbacks_zero_count_not_attached(monkeypatch):
+    ak = _env(monkeypatch)
+    config = _routing_config()
+    reg = _registry(config)
+
+    out = ak.api_key_health(config, breakers=reg, recent_fallbacks={
+        "openrouter-x": {"count": 0, "last_at": None},
+    })
+    assert "recent_fallbacks" not in out["providers"]["openrouter-x"]
+
+
+def test_recent_fallbacks_does_not_change_severity_or_color(monkeypatch):
+    from genesis.routing.types import ErrorCategory
+
+    ak = _env(monkeypatch)
+    config = _routing_config()
+    reg = _registry(config)
+    for _ in range(3):
+        reg.get("openrouter-x").record_failure(ErrorCategory.QUOTA_EXHAUSTED)
+
+    without = ak.api_key_health(config, breakers=reg)
+    with_fb = ak.api_key_health(config, breakers=reg, recent_fallbacks={
+        "openrouter-x": {"count": 99, "last_at": "2026-03-14T11:00:00"},
+    })
+    for name in without["providers"]:
+        w, f = without["providers"][name], with_fb["providers"][name]
+        assert w["key_health"] == f["key_health"]
+        assert w.get("alert_severity") == f.get("alert_severity")
+    assert without["alerts"] == with_fb["alerts"]
