@@ -529,6 +529,19 @@ class SurplusScheduler:
         except Exception:
             logger.debug("Dream cycle integrity check skipped", exc_info=True)
 
+        # Reclaim tasks orphaned by the previous process. Dispatch is
+        # single-worker, so any 'running' row at boot is dead — reset it now
+        # (no age gate) instead of waiting for the 2h-gated per-cycle sweep,
+        # and don't count the restart toward the task's retry budget.
+        try:
+            requeued, _ = await self._queue.recover_stuck(
+                older_than_hours=0, bump_attempt=False,
+            )
+            if requeued:
+                logger.info("Boot sweep: reclaimed %d orphaned running task(s)", requeued)
+        except Exception:
+            logger.warning("Boot orphan sweep failed", exc_info=True)
+
         # Run brainstorm check immediately on startup
         await self.brainstorm_check()
         # Run remaining jobs immediately on startup —

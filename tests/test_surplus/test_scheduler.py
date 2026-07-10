@@ -620,3 +620,26 @@ async def test_drain_wrapper_finally_is_owner_guarded(db):
         rt_cls.instance.return_value = rt
         await sched.run_dream_synthesis_drain()
     assert rt._heavy_workload == "dream_cycle"  # not clobbered
+
+
+async def test_start_reclaims_orphaned_running_tasks_immediately(db):
+    """Boot sweep (D1): a 'running' row left by the previous process is reset
+    to 'pending' at start() regardless of age, without burning attempt_count.
+    (Single-worker: nothing can legitimately be running before start().)"""
+    recent = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    await surplus_tasks.create(
+        db, id="st-orphan", task_type="brainstorm", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-03-04T00:00:00Z",
+    )
+    await surplus_tasks.mark_running(db, "st-orphan", started_at=recent)
+
+    sched, compute = _make_scheduler(db, idle=True)
+    with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False), \
+         patch.object(sched, "run_gitnexus_strip", new_callable=AsyncMock):
+        await sched.start()
+    try:
+        row = await surplus_tasks.get_by_id(db, "st-orphan")
+        assert row["status"] == "pending"
+        assert row["attempt_count"] == 0
+    finally:
+        await sched.stop()
