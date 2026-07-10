@@ -317,3 +317,54 @@ async def test_consecutive_failures(db):
     # Different task type should return 0
     count = await surplus_tasks.consecutive_failures(db, "brainstorm")
     assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_recover_stuck_bumps_attempts_by_default(db):
+    """Per-cycle recovery counts each reclaim toward max_retries."""
+    await surplus_tasks.create(
+        db, id="st-stuck", task_type="brainstorm", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-03-04T00:00:00Z",
+    )
+    await surplus_tasks.mark_running(db, "st-stuck", started_at="2026-03-04T00:01:00Z")
+
+    requeued, failed = await surplus_tasks.recover_stuck_with_retries(db)
+    assert (requeued, failed) == (1, 0)
+    row = await surplus_tasks.get_by_id(db, "st-stuck")
+    assert row["status"] == "pending"
+    assert row["attempt_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_stuck_no_bump_reclaims_all_running(db):
+    """Boot sweep: a restart is not a task failure — reclaim every 'running'
+    row immediately (older_than_hours=0) without burning attempt_count, and
+    never permanently fail a row that only 'ran' across a restart."""
+    from datetime import UTC, datetime, timedelta
+
+    recent = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    await surplus_tasks.create(
+        db, id="st-fresh", task_type="brainstorm", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-03-04T00:00:00Z",
+    )
+    await surplus_tasks.mark_running(db, "st-fresh", started_at=recent)
+
+    # A row already at max_retries: boot sweep must requeue, not fail it.
+    await surplus_tasks.create(
+        db, id="st-maxed", task_type="brainstorm", compute_tier="slm",
+        priority=0.5, drive_alignment="curiosity", created_at="2026-03-04T00:00:00Z",
+    )
+    await surplus_tasks.mark_running(db, "st-maxed", started_at=recent)
+    await db.execute(
+        "UPDATE surplus_tasks SET attempt_count = 3 WHERE id = 'st-maxed'"
+    )
+    await db.commit()
+
+    requeued, failed = await surplus_tasks.recover_stuck_with_retries(
+        db, older_than_hours=0, bump_attempt=False,
+    )
+    assert (requeued, failed) == (2, 0)
+    fresh = await surplus_tasks.get_by_id(db, "st-fresh")
+    maxed = await surplus_tasks.get_by_id(db, "st-maxed")
+    assert fresh["status"] == "pending" and fresh["attempt_count"] == 0
+    assert maxed["status"] == "pending" and maxed["attempt_count"] == 3

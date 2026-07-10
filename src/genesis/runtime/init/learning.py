@@ -500,6 +500,11 @@ async def init(rt: GenesisRuntime) -> None:
         )
         from genesis.util.tasks import tracked_task as _tt
         _tt(_validate_keys(), name="initial_api_key_validation")
+        # Boot kick: run recovery housekeeping (dead-letter replay, stuck-
+        # processing expiry, pending embeddings) immediately instead of
+        # waiting up to 30 min for the first interval fire. The expiry's own
+        # 2h age gate still applies to each row.
+        _tt(_run_recovery(), name="initial_recovery")
 
         async def _expire_dead_letters() -> None:
             if rt._dead_letter_queue is not None:

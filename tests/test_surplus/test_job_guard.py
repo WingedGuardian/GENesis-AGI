@@ -127,25 +127,3 @@ def test_record_helpers_swallow_instance_lookup_failure():
         mock_cls.instance.side_effect = RuntimeError("no runtime")
         record_success("job_a")  # must not raise
         record_failure("job_b", "bad")  # must not raise
-
-
-# ── integration: the one disabled-by-config path in gates.py ────────
-
-async def test_schedule_code_audit_disabled_records_nothing():
-    # The _enable_code_audits early-out predates the decorator and never
-    # recorded job health (its job_health row is stale-by-design while
-    # audits are off). SKIP must preserve that exactly.
-    import types
-
-    from genesis.surplus.jobs import gates
-
-    sched = types.SimpleNamespace(_enable_code_audits=False)
-
-    patcher, mock_rt = _mock_runtime()
-    try:
-        await gates.schedule_code_audit(sched)
-    finally:
-        patcher.stop()
-
-    mock_rt.record_job_success.assert_not_called()
-    mock_rt.record_job_failure.assert_not_called()

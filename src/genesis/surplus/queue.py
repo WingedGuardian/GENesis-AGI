@@ -112,10 +112,24 @@ class SurplusQueue:
         cutoff = self._clock() - timedelta(days=older_than_days)
         return await surplus_tasks.delete_terminal_before(self._db, before=cutoff.isoformat())
 
-    async def recover_stuck(self, *, older_than_hours: int = 2, max_retries: int = 3) -> tuple[int, int]:
-        """Recover tasks stuck in 'running' state."""
+    async def recover_stuck(
+        self,
+        *,
+        older_than_hours: int = 2,
+        max_retries: int = 3,
+        bump_attempt: bool = True,
+    ) -> tuple[int, int]:
+        """Recover tasks stuck in 'running' state.
+
+        Default (per-cycle sweep): age-gated, counts each reclaim toward
+        max_retries and permanently fails exhausted rows. With
+        ``bump_attempt=False`` (boot sweep): requeues every matching row
+        without touching attempt_count and never permanently fails —
+        a process restart is not a task failure.
+        """
         return await surplus_tasks.recover_stuck_with_retries(
             self._db, older_than_hours=older_than_hours, max_retries=max_retries,
+            bump_attempt=bump_attempt,
         )
 
     async def pending_count(self) -> int:

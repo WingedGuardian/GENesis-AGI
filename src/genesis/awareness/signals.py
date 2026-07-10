@@ -452,7 +452,7 @@ class SchedulerLivenessCollector:
             jh = self._runtime.job_health
             surplus_jobs = [
                 "surplus_dispatch", "surplus_brainstorm",
-                "schedule_code_audit", "schedule_code_index",
+                "schedule_code_index",
             ]
             latest_run: datetime | None = None
             for job_name in surplus_jobs:

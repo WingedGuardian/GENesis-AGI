@@ -26,7 +26,6 @@ def _make_scheduler(db, *, maintenance_hours=24, analytical_hours=12,
     return SurplusScheduler(
         db=db, queue=SurplusQueue(db), idle_detector=idle_detector,
         compute_availability=compute, executor=StubExecutor(),
-        enable_code_audits=False,
         maintenance_hours=maintenance_hours,
         analytical_hours=analytical_hours,
         code_index_hours=code_index_hours,

@@ -76,7 +76,6 @@ class SurplusScheduler:
         brainstorm_check_hours: int = 12,
         task_expiry_hours: int = 72,
         terminal_retention_days: int = 30,
-        code_audit_hours: int = 12,
         code_index_hours: int = 4,
         recon_gather_hours: int = 84,
         maintenance_hours: int = 6,
@@ -87,11 +86,9 @@ class SurplusScheduler:
         model_eval_hours: int = 24,
         clock=None,
         event_bus: GenesisEventBus | None = None,
-        enable_code_audits: bool = True,
     ):
         self._db = db
         self._event_bus = event_bus
-        self._enable_code_audits = enable_code_audits
         self._queue = queue
         self._idle_detector = idle_detector
         self._compute = compute_availability
@@ -103,7 +100,6 @@ class SurplusScheduler:
         self._brainstorm_interval = brainstorm_check_hours
         self._task_expiry_hours = task_expiry_hours
         self._terminal_retention_days = terminal_retention_days
-        self._code_audit_hours = code_audit_hours
         self._code_index_hours = code_index_hours
         self._recon_gather_hours = recon_gather_hours
         self._maintenance_hours = maintenance_hours
@@ -279,20 +275,6 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=60,
         )
-        if self._enable_code_audits:
-            # CronTrigger not IntervalTrigger — same >1h restart-reset trap as
-            # maintenance/code_index (code_audit_hours=12 by default). _code_audit_hours
-            # stays the _recently_completed cooldown; the boot run is covered by the
-            # immediate await in start() below.
-            self._scheduler.add_job(
-                self.schedule_code_audit,
-                _restart_safe_hourly(self._code_audit_hours, minute=5),
-                id="schedule_code_audit",
-                max_instances=1,
-                misfire_grace_time=300,
-            )
-        else:
-            logger.info("Code audits disabled — skipping job registration")
         # CronTrigger not IntervalTrigger — a >1h IntervalTrigger resets on every
         # restart (CLAUDE.md trap), so code indexing starves if the server restarts
         # more often than code_index_hours. _code_index_hours stays the
@@ -529,12 +511,23 @@ class SurplusScheduler:
         except Exception:
             logger.debug("Dream cycle integrity check skipped", exc_info=True)
 
+        # Reclaim tasks orphaned by the previous process. Dispatch is
+        # single-worker, so any 'running' row at boot is dead — reset it now
+        # (no age gate) instead of waiting for the 2h-gated per-cycle sweep,
+        # and don't count the restart toward the task's retry budget.
+        try:
+            requeued, _ = await self._queue.recover_stuck(
+                older_than_hours=0, bump_attempt=False,
+            )
+            if requeued:
+                logger.info("Boot sweep: reclaimed %d orphaned running task(s)", requeued)
+        except Exception:
+            logger.warning("Boot orphan sweep failed", exc_info=True)
+
         # Run brainstorm check immediately on startup
         await self.brainstorm_check()
         # Run remaining jobs immediately on startup —
         # otherwise they only fire at their next scheduled time.
-        if self._enable_code_audits:
-            await self.schedule_code_audit()
         await self.schedule_code_index()
         await self.run_recon_gather()
         await self.schedule_maintenance()
@@ -633,10 +626,6 @@ class SurplusScheduler:
     ) -> bool:
         """Return ``True`` if *task_type* completed within *cooldown_hours*."""
         return await gate_jobs.recently_completed(self, task_type, cooldown_hours)
-
-    async def schedule_code_audit(self) -> None:
-        """Enqueue a code audit task if none pending/running."""
-        await gate_jobs.schedule_code_audit(self)
 
     async def schedule_code_index(self) -> None:
         """Enqueue a code index task if none pending/running."""

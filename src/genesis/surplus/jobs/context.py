@@ -33,8 +33,6 @@ class SchedulerContext(Protocol):
     _queue: SurplusQueue
     _brainstorm_runner: BrainstormRunner
     _clock: Callable[[], datetime]
-    _enable_code_audits: bool
-    _code_audit_hours: int
     _code_index_hours: int
     _j9_eval_batch_hours: int
     _model_eval_hours: int

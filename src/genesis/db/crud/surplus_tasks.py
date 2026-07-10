@@ -127,25 +127,23 @@ async def consecutive_failures(
     return count
 
 
-async def recover_stuck(
-    db: aiosqlite.Connection,
-    *,
-    older_than_hours: int = 2,
-) -> tuple[int, int]:
-    """Recover tasks stuck in 'running' state beyond the timeout threshold."""
-    return await recover_stuck_with_retries(db, older_than_hours=older_than_hours, max_retries=3)
-
-
 async def recover_stuck_with_retries(
     db: aiosqlite.Connection,
     *,
     older_than_hours: int = 2,
     max_retries: int = 3,
+    bump_attempt: bool = True,
 ) -> tuple[int, int]:
     """Recover tasks stuck in 'running' state.
 
     Re-queues retryable tasks and permanently fails exhausted tasks.
     Returns (requeued_count, failed_count).
+
+    With ``bump_attempt=False`` (boot sweep) every 'running' row is requeued
+    without counting toward max_retries and nothing is permanently failed:
+    a process restart is not a task failure. Only valid while dispatch is
+    single-worker — any boot-time 'running' row is by definition orphaned.
+    Re-gate on worker ownership if parallel dispatch ever ships.
     """
     import logging
     from datetime import UTC, datetime, timedelta
@@ -153,22 +151,35 @@ async def recover_stuck_with_retries(
     logger = logging.getLogger(__name__)
     cutoff = (datetime.now(UTC) - timedelta(hours=older_than_hours)).isoformat()
 
-    cursor = await db.execute(
-        "UPDATE surplus_tasks SET status = 'pending', "
-        "started_at = NULL, failure_reason = NULL, "
-        "attempt_count = attempt_count + 1 "
-        "WHERE status = 'running' AND started_at < ? AND attempt_count < ?",
-        (cutoff, max_retries),
-    )
-    requeued = cursor.rowcount
+    if bump_attempt:
+        cursor = await db.execute(
+            "UPDATE surplus_tasks SET status = 'pending', "
+            "started_at = NULL, failure_reason = NULL, "
+            "attempt_count = attempt_count + 1 "
+            "WHERE status = 'running' AND started_at < ? AND attempt_count < ?",
+            (cutoff, max_retries),
+        )
+        requeued = cursor.rowcount
 
-    cursor = await db.execute(
-        "UPDATE surplus_tasks SET status = 'failed', "
-        "failure_reason = 'stuck: exceeded running timeout (max retries exhausted)' "
-        "WHERE status = 'running' AND started_at < ? AND attempt_count >= ?",
-        (cutoff, max_retries),
-    )
-    failed = cursor.rowcount
+        cursor = await db.execute(
+            "UPDATE surplus_tasks SET status = 'failed', "
+            "failure_reason = 'stuck: exceeded running timeout (max retries exhausted)' "
+            "WHERE status = 'running' AND started_at < ? AND attempt_count >= ?",
+            (cutoff, max_retries),
+        )
+        failed = cursor.rowcount
+    else:
+        # NULL started_at is unreachable via mark_running but the boot
+        # contract is "every running row is orphaned" — match it exactly.
+        cursor = await db.execute(
+            "UPDATE surplus_tasks SET status = 'pending', "
+            "started_at = NULL, failure_reason = NULL "
+            "WHERE status = 'running' "
+            "AND (started_at < ? OR started_at IS NULL)",
+            (cutoff,),
+        )
+        requeued = cursor.rowcount
+        failed = 0
     await db.commit()
 
     if requeued > 0:
