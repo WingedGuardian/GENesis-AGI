@@ -1106,13 +1106,16 @@ def _rrf_fusion(
     if shadow is not None:
         # Shadow projection must never affect the real injection path.
         with contextlib.suppress(Exception):
-            # Vector rows carry the true _retrieved_count; content_map may hold
-            # the FTS duplicate (which lacks it), so pass an authoritative map.
-            rc_map = {
-                r["memory_id"]: r["_retrieved_count"]
-                for r in vector_results
-                if r.get("memory_id") and "_retrieved_count" in r
-            }
+            # content_map may hold a duplicate's FTS row (no _retrieved_count).
+            # Build an authoritative count map from EVERY Qdrant-backed source
+            # that carries the payload (vector + wing-filtered + KB + code), so a
+            # never-surfaced hit is recognized regardless of which search found it.
+            rc_map: dict[str, int] = {}
+            for _src in (vector_results, wing_results, knowledge_results, code_results):
+                for r in _src or []:
+                    mid = r.get("memory_id")
+                    if mid and "_retrieved_count" in r:
+                        rc_map[mid] = r["_retrieved_count"]
             shadow.update(_shadow_gate(scores, content_map, suppress_ids, rc_map))
 
     return results

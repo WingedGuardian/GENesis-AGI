@@ -114,6 +114,21 @@ class TestShadowGateSerendipity:
             _mod._rrf_fusion(fts, vector, shadow=shadow)
         assert shadow["serendipity_boosted"] >= 1
 
+    def test_serendipity_uses_wing_retrieved_count(self) -> None:
+        # m1 found by FTS + the wing-filtered Qdrant search (retrieved_count=0) but
+        # NOT the unfiltered vector top-N. The authoritative count map must include
+        # wing rows too, else wing-scoped prompts lose the serendipity signal (Codex P2).
+        fts = [
+            {"memory_id": "m1", "content": "alpha", "collection": "episodic"},
+            {"memory_id": "m2", "content": "beta", "collection": "episodic"},
+        ]
+        wing = [{"memory_id": "m1", "content": "alpha", "collection": "episodic",
+                 "_retrieved_count": 0}]
+        shadow: dict = {}
+        with patch.object(_mod, "_is_garbage", lambda c: False):
+            _mod._rrf_fusion(fts, [], wing_results=wing, shadow=shadow)
+        assert shadow["serendipity_boosted"] >= 1
+
     def test_unknown_retrieved_count_not_boosted(self) -> None:
         scores = {"a": 0.020, "b": 0.016}
         cmap = {"a": _cm("a", retrieved=5), "b": _cm("b", retrieved=-1)}  # FTS-only, unknown
