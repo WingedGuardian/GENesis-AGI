@@ -283,6 +283,8 @@ class CCInvoker:
             args += ["--resume", inv.resume_session_id]
         if inv.mcp_config:
             args += ["--mcp-config", inv.mcp_config]
+        if inv.strict_mcp_config:
+            args.append("--strict-mcp-config")
         # Register the span-capture PostToolUse hook for this dispatched session.
         # Dispatched sessions run with a cwd outside any git repo, so CC never
         # loads the repo's .claude/settings.json; --settings injects just this
@@ -299,6 +301,8 @@ class CCInvoker:
             args += ["--disallowedTools", ",".join(inv.disallowed_tools)]
         if inv.bare:
             args.append("--bare")
+        if inv.safe_mode:
+            args.append("--safe-mode")
         # Prompt is passed via stdin (see run/run_streaming), not as a CLI
         # argument.  This avoids argument-parsing edge cases (the "--"
         # separator broke -p prompt detection) and handles arbitrarily long
@@ -371,6 +375,12 @@ class CCInvoker:
             env["GENESIS_BASH_ALLOWLIST"] = ",".join(inv.bash_allowlist)
         else:
             env.pop("GENESIS_BASH_ALLOWLIST", None)
+        # Per-invocation overrides win over EVERYTHING above (inherited environ,
+        # roster routing, sandbox tmpdir) — the deliberate escape hatch for env
+        # the invoker doesn't model (e.g. the eval bench's CLAUDE_CONFIG_DIR
+        # cleanroom). Applied last by contract; see CCInvocation.env_overrides.
+        if inv and inv.env_overrides:
+            env.update(inv.env_overrides)
         return env
 
     def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:
@@ -982,7 +992,22 @@ class CCInvoker:
         """Build CCOutput from a parsed result dict."""
         usage = result_data.get("usage", {})
         model_usage = result_data.get("modelUsage", {})
-        model_name = next(iter(model_usage), str(inv.model))
+        # modelUsage lists EVERY model the session touched, including CC's
+        # auxiliary haiku calls (title/topic generation) — and dict order is
+        # not tier order. Taking the first key false-positived downgrade
+        # detection whenever an auxiliary call was listed before the main
+        # model (observed 2026-07-09: {haiku, sonnet-5} on a sonnet session).
+        # The MAIN conversation model is the highest tier present.
+        model_name = (
+            max(
+                model_usage,
+                key=lambda name: self._TIER_RANK.get(
+                    CCModel.from_full_name(name), -1,
+                ),
+            )
+            if model_usage
+            else str(inv.model)
+        )
         downgraded = self._detect_downgrade(inv.model, model_name)
         if downgraded:
             logger.warning(

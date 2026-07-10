@@ -11,6 +11,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **`genesis eval bench` — a Genesis-vs-bare-Claude A/B benchmark you can run
+  in one command.** Each task in a private task set runs through two arms: a
+  cognition-enabled Genesis session (identity + read-only recall from your
+  real memory) and a plain Claude Code session with zero Genesis context. An
+  LLM judge grades both against success criteria written before the run, and
+  the paired win-rate lands in the eval tables and a JSON report. Honesty is
+  built in: the judge is labeled uncalibrated until it's validated against
+  your own verdicts, small pilots print "insufficient data" instead of fake
+  significance, and every run proves it wrote nothing to production memory —
+  recall's own usage counters are suppressed for the run so benchmarking
+  never distorts what your live Genesis considers important.
+
 - **Genesis now detects and repairs corrupted credential files on its own.**
   If a critical credential or wiring file (`secrets.env`, your Claude Code and
   GitHub credentials, SSH keys, `guardian_remote.yaml`, `genesis.yaml`) gets

@@ -36,7 +36,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: d3d48d94 2026-07-09
+verified: 3c6cf249 2026-07-09
 ```
 
 **Retrieval is TIERED — the hottest auto-fired paths carry the thinnest
@@ -50,6 +50,12 @@ Easy-to-forget mechanisms:
 - **CRAG** lives in the MCP-wrapper only (`memory/corrective.py`
   `maybe_correct_recall`; `top_score >= 0.75` skips grading) — not in
   `retrieval.py`.
+- **Recall is read-MOSTLY, not read-only**: every hit bumps
+  `retrieved_count`/`last_retrieved_at` in Qdrant + SQLite (retrieval stage
+  11, the MCP drift fallback, `memory_core_facts`). Eval harnesses reading a
+  frozen snapshot suppress this via `GENESIS_MEMORY_WRITEBACKS_OFF`
+  (`env.memory_writebacks_off()`); any NEW write inside a read path must
+  honor the same seam.
 - **VoyageReranker** (`memory/reranker.py`, rerank-2.5) exists and is
   API_KEY_VOYAGE-gated; the `rerank=` param is off by default at the retriever
   and applied by callers.
@@ -409,7 +415,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration]
-verified: b2fde2bb 2026-07-09
+verified: 3c6cf249 2026-07-09
 ```
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
@@ -433,9 +439,26 @@ verified: b2fde2bb 2026-07-09
   classification for the approvals series is canonical in
   `db/crud/approval_requests.py classify_resolver` (free-text convention —
   a new `resolved_by` writer must extend the prefix tuples + drift test).
+- **eval/bench/** (`genesis eval bench`, WS-1 A3): Genesis-vs-bare-Claude
+  paired A/B on real tasks. FOUR A/B-ish surfaces now exist — don't conflate:
+  `eval bench` (CC-arm task A/B), `eval benchmark` (provider×dataset table),
+  the gauntlet (roster agentic fix-loop), Crucible/Evo (in-process prompt
+  A/B). Bench isolation contract: Genesis arm = fresh no-callback CCInvoker +
+  genesis-memory MCP env-redirected to a WAL-safe DB snapshot
+  (`GENESIS_DB_PATH` + `GENESIS_MEMORY_WRITEBACKS_OFF` — recall is
+  read-MOSTLY: without the seam it bumps retrieved_count in shared prod
+  Qdrant); bare arm = `--safe-mode` (the only OAuth-compatible CLAUDE.md
+  suppression; `--bare` refuses OAuth) + cleanroom CLAUDE_CONFIG_DIR.
+  Task set is PRIVATE (`~/.genesis/eval/bench_tasks_v1.jsonl`; loader
+  refuses in-repo paths). Judge = `bench_task_success` rubric, UNCALIBRATED
+  v1 (every surface stamps `judge_calibrated: false`). Every new
+  genesis-memory tool must be classified in `eval/bench/arms.py`
+  (static-AST forcing test). Don't run across Sun 07:30 (J-9 aggregation).
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
+  `standalone_router.StandaloneLiteLLMRouter` is the ONE offline Router shim
+  (calibration + bench both use it — don't add inline copies).
 - **feedback/**: the Outcome Bus (`outcome_events`) — **write-path LIVE
   (harvest 8:45/20:45), read-path DARK** (nothing consumes the ledger yet).
   Tier taxonomy is load-bearing: Tier-1 ground truth outranks user approval.

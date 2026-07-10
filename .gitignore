@@ -73,6 +73,10 @@ data/genesis.sql
 # repo — every install needs them to calibrate rubrics. Allow .jsonl
 # files under tests/eval/golden/ explicitly.
 !tests/eval/golden/*.jsonl
+# Synthetic bench fixtures (obviously-fake exemplar tasks) MUST be in the
+# repo — the bench test suite loads them. The REAL task set stays private
+# under ~/.genesis/eval/ and is refused by the loader if found in-repo.
+!tests/test_eval/bench_fixtures/*.jsonl
 .config/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock

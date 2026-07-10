@@ -10,9 +10,14 @@ GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MCP_SCRIPT="$GENESIS_ROOT/scripts/genesis_mcp_server.py"
 
 # Find the Python venv. In a worktree, .venv lives in the main repo, not here.
+# NOTE: resolved via git-common-dir, NOT `git worktree list | head -1` — under
+# `set -o pipefail`, head closing the pipe SIGPIPEs git and kills this script
+# with exit 141 (the exact bug that silently disabled genesis-hook in
+# worktrees; bit the eval bench's worktree E2E the same way on 2026-07-09).
 PYTHON="$GENESIS_ROOT/.venv/bin/python"
 if [[ ! -x "$PYTHON" ]]; then
-    MAIN_ROOT="$(cd "$GENESIS_ROOT" && git worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')"
+    COMMON_DIR="$(git -C "$GENESIS_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    MAIN_ROOT="${COMMON_DIR%/.git}"
     if [[ -n "$MAIN_ROOT" && -x "$MAIN_ROOT/.venv/bin/python" ]]; then
         PYTHON="$MAIN_ROOT/.venv/bin/python"
     else
