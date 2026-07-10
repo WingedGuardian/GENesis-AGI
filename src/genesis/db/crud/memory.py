@@ -255,6 +255,7 @@ async def create_metadata(
     valid_at: str | None = None,
     invalid_at: str | None = None,
     source_subsystem: str | None = None,
+    origin_class: str | None = None,
 ) -> str:
     """Insert a row into memory_metadata. Returns memory_id.
 
@@ -264,6 +265,10 @@ async def create_metadata(
     ``source_subsystem`` tags writes from automated subsystems (ego,
     triage, reflection) so foreground recall can default-filter them.
     NULL = user-sourced.
+    ``origin_class`` is the WS-3 provenance taxonomy
+    (owner/first_party/external_untrusted), derived in
+    ``MemoryStore.store()``; NULL = legacy/unclassified (gates treat it
+    fail-closed at gate time).
     """
     # Bitemporal columns are raw TEXT-compared everywhere — canonicalize
     # at the write gate. Unparseable valid_at (LLM temporal strings like
@@ -276,11 +281,12 @@ async def create_metadata(
     await db.execute(
         "INSERT OR IGNORE INTO memory_metadata "
         "(memory_id, created_at, collection, confidence, embedding_status, "
-        "memory_class, wing, room, valid_at, invalid_at, source_subsystem) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "memory_class, wing, room, valid_at, invalid_at, source_subsystem, "
+        "origin_class) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (memory_id, created_at, collection, confidence, embedding_status,
          memory_class, wing, room, resolved_valid_at,
-         canonical_iso(invalid_at), source_subsystem),
+         canonical_iso(invalid_at), source_subsystem, origin_class),
     )
     await db.commit()
     return memory_id

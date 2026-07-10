@@ -123,6 +123,7 @@ class MemoryStore:
         life_domain: str | None = None,
         project_type: str | None = None,
         supersedes: str | None = None,
+        origin_class: str | None = None,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
 
@@ -136,6 +137,13 @@ class MemoryStore:
                 it for user-sourced content, nor for ``modules/**`` writers — a
                 module is an external capability, never a subsystem (see
                 modules/base.py; enforced by test_store_subsystem_coverage).
+            origin_class: WS-3 provenance taxonomy
+                (owner/first_party/external_untrusted). Explicit value wins
+                and is validated; when omitted it is DERIVED from
+                source_pipeline/source_subsystem/collection via
+                ``provenance.derive_origin_class`` and stamped into the
+                Qdrant payload, memory_metadata, and (for KB ingest paths)
+                knowledge_units.
         """
         # Validate life_domain if explicitly provided
         if life_domain is not None:
@@ -194,6 +202,16 @@ class MemoryStore:
         now_iso = datetime.now(UTC).isoformat()
         resolved_tags = tags or []
         resolved_collection = collection or _COLLECTION_MAP.get(memory_type, "episodic_memory")
+        # WS-3 origin classification — deferred import matches this
+        # function's cycle-avoidance style; validates an explicit override.
+        from genesis.memory.provenance import derive_origin_class
+
+        resolved_origin = derive_origin_class(
+            origin_class=origin_class,
+            source_pipeline=source_pipeline,
+            source_subsystem=source_subsystem,
+            collection=resolved_collection,
+        )
         resolved_class = memory_class or classify_memory(
             content, source=source, source_pipeline=source_pipeline or "",
         )
@@ -257,6 +275,9 @@ class MemoryStore:
                         "wing": wing,
                         "room": room,
                         "life_domain": life_domain,
+                        # Always non-None by construction (derived above) —
+                        # lives in the base dict, not the conditional block.
+                        "origin_class": resolved_origin,
                     }
                     # Provenance fields — trace memory back to source conversation
                     if source_session_id:
@@ -334,6 +355,7 @@ class MemoryStore:
             valid_at=valid_at,
             invalid_at=invalid_at,
             source_subsystem=source_subsystem,
+            origin_class=resolved_origin,
         )
 
         # Mechanical code anchors (entity layer) — regex-only, every write
