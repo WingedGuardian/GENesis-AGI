@@ -74,16 +74,19 @@ async def test_search_ranked_with_collection(db):
 async def test_get_taxonomy(db):
     await memory.create_metadata(
         db, memory_id="tx1", created_at="2020-01-01T00:00:00+00:00",
-        wing="infrastructure", room="watchdog",
+        wing="infrastructure", room="watchdog", origin_class="first_party",
     )
     assert await memory.get_taxonomy(db, "tx1") == {
         "wing": "infrastructure", "room": "watchdog",
+        "origin_class": "first_party",
     }
-    # room is optional — a wing-only row still resolves
+    # room/origin_class optional — a wing-only row still resolves
     await memory.create_metadata(
         db, memory_id="tx2", created_at="2020-01-01T00:00:00+00:00", wing="memory",
     )
-    assert await memory.get_taxonomy(db, "tx2") == {"wing": "memory", "room": None}
+    assert await memory.get_taxonomy(db, "tx2") == {
+        "wing": "memory", "room": None, "origin_class": None,
+    }
     assert await memory.get_taxonomy(db, "missing") is None
 
 

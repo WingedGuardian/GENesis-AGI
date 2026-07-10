@@ -365,24 +365,25 @@ async def get_taxonomy(
     db: aiosqlite.Connection,
     memory_id: str,
 ) -> dict[str, str | None] | None:
-    """Return ``{"wing", "room"}`` for a memory_id, or None if no row.
+    """Return ``{"wing", "room", "origin_class"}`` for a memory_id, or None.
 
-    The embedding-recovery worker uses this to restore the faceting
-    fields onto the reconstructed Qdrant payload (see
-    ``resilience/embedding_recovery``) so a recovered point is not
-    silently dropped from ``wing=``/``room=`` filtered recall. Only
-    ``wing`` and ``room`` are metadata columns; ``life_domain`` is
-    recovered from the ``life_domain:`` tag and ``project_type`` is not
-    persisted on this path.
+    The embedding-recovery worker uses this to restore metadata fields onto
+    the reconstructed Qdrant payload (see ``resilience/embedding_recovery``)
+    so a recovered point is not silently dropped from ``wing=``/``room=``
+    filtered recall — nor (WS-3) from ``origin_class=`` filtered gates.
+    ``origin_class`` is read from ``memory_metadata`` (always written at
+    store time, even on the FTS5-only/pending path) rather than the pending
+    row, keeping ONE source of truth. ``life_domain`` is recovered from the
+    ``life_domain:`` tag and ``project_type`` is not persisted on this path.
     """
     rows = await db.execute_fetchall(
-        "SELECT wing, room FROM memory_metadata WHERE memory_id = ?",
+        "SELECT wing, room, origin_class FROM memory_metadata WHERE memory_id = ?",
         (memory_id,),
     )
     row = rows[0] if rows else None
     if not row:
         return None
-    return {"wing": row[0], "room": row[1]}
+    return {"wing": row[0], "room": row[1], "origin_class": row[2]}
 
 
 async def batch_created_at(
