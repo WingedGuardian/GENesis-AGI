@@ -45,6 +45,9 @@ class OutreachConfig:
         # channel for real backup failures on installs where backups
         # are enabled. Prefix — matches backup:last_failed / backup:overdue.
         "backup:",
+        # Credential-file corruption / auto-restore — losing auth blinds
+        # Genesis (and the guardian brain). Prefix — creds:corrupt / creds:restored.
+        "creds:",
     )
     # Voice proactive chiming — the spoken-aloud allowlist. This IS the menu:
     # a request is spoken only if its signal_type or a source_id part matches
@@ -102,6 +105,7 @@ _DEFAULTS = OutreachConfig(
         "awareness:tick_overdue",
         "service:health_data_uninitialized",
         "backup:",  # Prefix — push channel now that backups are out of Sentinel scope
+        "creds:",   # Prefix — credential corruption / auto-restore (creds:corrupt/restored)
     ),
     delivery_routing={"default": "supergroup"},
 )

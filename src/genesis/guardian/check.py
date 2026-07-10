@@ -325,6 +325,10 @@ async def run_check(config: GuardianConfig | None = None) -> None:
             config, dispatcher,
             genesis_down=(sm.current_state == GuardianState.CONFIRMED_DEAD),
         )
+        # Credential-file integrity backstop. The container self-heals first; the
+        # guardian WARNs on first sight and steps in only after the grace window —
+        # covering the window a degraded/dead server's awareness loop can't.
+        await _check_credential_integrity_and_alert(config, dispatcher)
     finally:
         # Always save state, even on error
         sm.save_state(state_path)
@@ -498,6 +502,20 @@ _POOL_TIER_SEVERITY = {
     "high": AlertSeverity.WARNING,
     "crit": AlertSeverity.CRITICAL,
 }
+
+
+async def _check_credential_integrity_and_alert(
+    config: GuardianConfig, dispatcher: AlertDispatcher,
+) -> None:
+    """Guardian-side credential-integrity backstop (delegates to cred_watch).
+
+    Never raises into the tick — a check exec failure is 'no signal', not an
+    alert (container-down is the state machine's job)."""
+    try:
+        from genesis.guardian.cred_watch import check_credential_integrity_and_alert
+        await check_credential_integrity_and_alert(config, dispatcher)
+    except Exception:
+        logger.warning("credential-integrity watch failed", exc_info=True)
 
 
 async def _check_storage_pool_and_alert(

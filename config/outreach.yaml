@@ -74,6 +74,11 @@ health_alerts:
     - "provider:embedding_failing"
     - "provider:qdrant_unreachable"
     - "awareness:tick_overdue"
+    # Prefixes. This list REPLACES the code default when present, so anything the
+    # default escalates must be repeated here. backup: was missing (backup-failure
+    # alerts were silently non-escalating); creds: is new for G.1.
+    - "backup:"
+    - "creds:"
 
 # Voice proactive chiming — the spoken-aloud allowlist (THE menu).
 # A request is spoken through the Voice PE only if its signal_type or a

@@ -343,6 +343,12 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         _full = mode == "full"
         logger.info("GenesisRuntime bootstrap starting (mode=%s)", mode)
 
+        # Validate + restore corrupt credential files BEFORE loading secrets,
+        # so a zeroed/corrupt secrets.env is healed before load_dotenv reads it.
+        self._run_init_step(
+            "cred_integrity_startup", self._selfheal_credentials_startup,
+        )
+
         self._run_init_step("secrets", self._load_secrets)
         self._restore_pause_state()
 
@@ -368,6 +374,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         if _full:
             await self._run_init_step_async("awareness", self._init_awareness)
+
+        if _full:
+            self._run_init_step("cred_integrity", self._init_cred_integrity)
 
         self._run_init_step("router", self._init_router)
 

@@ -254,3 +254,25 @@ async def test_dedup_does_not_suppress_old_delivery(db, bridge):
         result = await bridge.check_and_generate()
 
     assert len(result) == 1
+
+
+# ── creds: escalation (G.1) ──────────────────────────────────────────────
+
+
+async def test_creds_alerts_escalate_via_production_config(db):
+    """creds:corrupt / creds:restored must pass the escalation filter using the
+    REAL production whitelist (prefix match), so credential alerts reach Telegram."""
+    from genesis.outreach.config import _DEFAULTS
+
+    bridge = HealthOutreachBridge(
+        db, escalation_ids=frozenset(_DEFAULTS.immediate_escalation_alerts)
+    )
+    alerts = [
+        {"id": "creds:corrupt", "severity": "CRITICAL", "message": "secrets_env nul_bytes"},
+        {"id": "creds:restored", "severity": "CRITICAL", "message": "gh_hosts restored"},
+    ]
+    with _patch_alerts(alerts):
+        result = await bridge.check_and_generate()
+    ids = {r.source_id for r in result}
+    assert ids == {"creds:corrupt", "creds:restored"}
+    assert all(r.category == OutreachCategory.BLOCKER for r in result)

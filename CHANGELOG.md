@@ -11,6 +11,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now detects and repairs corrupted credential files on its own.**
+  If a critical credential or wiring file (`secrets.env`, your Claude Code and
+  GitHub credentials, SSH keys, `guardian_remote.yaml`, `genesis.yaml`) gets
+  zeroed, truncated, or otherwise corrupted — the exact kind of damage a storage
+  outage can cause mid-write — Genesis notices on its next cycle, restores the
+  file from your encrypted backup with the corrupt copy set aside for
+  inspection, and alerts you (telling you to rotate anything that may have
+  changed since the backup). It only ever acts on *proven* corruption, never on
+  a file that is simply different, and it validates the decrypted backup before
+  touching the original, so a bad backup can never make things worse. The
+  host-side guardian is the backstop: it watches the same files and steps in to
+  restore them if Genesis is too degraded to heal itself. Restores are
+  rate-capped, and installs without backups configured still get the detection
+  and alert. Requires the backup passphrase escrow shipped in the previous
+  release. (Backup-failure alerts also reach Telegram now — they were being
+  silently dropped on installs using the shipped `outreach.yaml`.)
+
 - **Three new honesty-first metric series on the dashboard's compounding
   panel, plus retrieval precision@3.** The weekly eval now tracks how your
   approval gates actually get resolved (by you vs. auto-expired vs.
