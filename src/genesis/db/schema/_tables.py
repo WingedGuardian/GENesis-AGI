@@ -1566,6 +1566,62 @@ TABLES = {
             created_at      TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """,
+    # Entity layer (WS-H Pillar 2, Graphiti blueprint on SQLite+Qdrant).
+    # NOTE: distinct from memory-pair dedup ("entity resolution" in
+    # memory/entity_resolution.py) — these are typed entity NODES.
+    "entities": """
+        CREATE TABLE IF NOT EXISTS entities (
+            entity_id   TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            norm_name   TEXT NOT NULL,
+            entity_type TEXT NOT NULL CHECK (entity_type IN (
+                'code_file','code_symbol','pr','commit',
+                'product','device','repo','subsystem','person','org','concept'
+            )),
+            summary     TEXT,
+            source      TEXT NOT NULL DEFAULT 'extracted',
+            status      TEXT NOT NULL DEFAULT 'active'
+                            CHECK (status IN ('active','merged','gone')),
+            merged_into TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL,
+            UNIQUE (norm_name, entity_type)
+        )
+    """,
+    "entity_mentions": """
+        CREATE TABLE IF NOT EXISTS entity_mentions (
+            memory_id  TEXT NOT NULL,
+            entity_id  TEXT NOT NULL,
+            provenance TEXT NOT NULL CHECK (
+                provenance IN ('EXTRACTED','INFERRED','AMBIGUOUS')
+            ),
+            confidence REAL NOT NULL DEFAULT 0.7,
+            source     TEXT,
+            created_at TEXT NOT NULL,
+            -- No validity columns: "M mentions E" is an event-time fact;
+            -- memory-level validity lives in memory_metadata.
+            PRIMARY KEY (memory_id, entity_id)
+        )
+    """,
+    "entity_links": """
+        CREATE TABLE IF NOT EXISTS entity_links (
+            source_id          TEXT NOT NULL,
+            target_id          TEXT NOT NULL,
+            -- Free-form slug by design (LLM-first open vocabulary);
+            -- deliberately NOT the memory_links CHECK registry.
+            link_type          TEXT NOT NULL,
+            provenance         TEXT NOT NULL CHECK (
+                provenance IN ('EXTRACTED','INFERRED','AMBIGUOUS')
+            ),
+            confidence         REAL NOT NULL DEFAULT 0.7,
+            evidence_memory_id TEXT,
+            valid_at           TEXT,
+            invalid_at         TEXT,
+            invalidated_by     TEXT,
+            created_at         TEXT NOT NULL,
+            PRIMARY KEY (source_id, target_id, link_type)
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1685,6 +1741,9 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_deferred_work_status ON deferred_work_queue(status)",
     "CREATE INDEX IF NOT EXISTS idx_deferred_work_priority ON deferred_work_queue(priority)",
     "CREATE INDEX IF NOT EXISTS idx_deferred_work_type ON deferred_work_queue(work_type)",
+    "CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_links_target ON entity_links(target_id)",
     # pending embeddings
     "CREATE INDEX IF NOT EXISTS idx_pending_embeddings_status ON pending_embeddings(status)",
     "CREATE INDEX IF NOT EXISTS idx_pending_embeddings_memory ON pending_embeddings(memory_id)",
