@@ -110,6 +110,93 @@ async def resolve_entity(
     return entity_id, "EXTRACTED"
 
 
+async def record_extraction(
+    db: aiosqlite.Connection,
+    memory_id: str,
+    extraction,
+    *,
+    aliases: dict[str, str] | None = None,
+) -> dict:
+    """Give an extraction's entities/relationships identity (E3 wiring).
+
+    Runs after ``linker.create_typed_links`` in the extraction cycle —
+    the memory_links path stays intact in parallel; zero new LLM calls.
+    Named entities resolve as type ``concept``; concept-cluster
+    cross-type reuse folds them onto seeded/typed entities (extraction
+    calling OMI a concept still lands on the seeded device). Mechanical
+    anchors are NOT handled here — the ``MemoryStore.store()`` seam
+    covers every write path including this one.
+
+    Returns counts. Commits once at the end (the surrounding
+    ``store.store()`` already committed the memory row itself).
+    """
+    from genesis.db.crud import entities as entities_crud
+
+    if aliases is None:
+        aliases = load_aliases()
+    counts = {"mentions": 0, "links": 0, "ambiguous": 0}
+    cache: dict[str, tuple[str, str] | None] = {}
+
+    async def _resolve(name: str) -> tuple[str, str] | None:
+        if name not in cache:
+            try:
+                cache[name] = await resolve_entity(
+                    db, name=name, entity_type="concept",
+                    source="extracted", aliases=aliases, _commit=False,
+                )
+            except ValueError:
+                cache[name] = None
+        return cache[name]
+
+    for name in extraction.entities or []:
+        pair = await _resolve(name)
+        if pair is None:
+            continue
+        entity_id, provenance = pair
+        if provenance == "AMBIGUOUS":
+            counts["ambiguous"] += 1
+        await entities_crud.upsert_mention(
+            db, memory_id=memory_id, entity_id=entity_id,
+            provenance=provenance, confidence=extraction.confidence,
+            source="llm_extraction", _commit=False,
+        )
+        counts["mentions"] += 1
+
+    for rel in extraction.relationships or []:
+        from_name, to_name = rel.get("from", ""), rel.get("to", "")
+        link_type = rel.get("type", "")
+        if not from_name or not to_name or not link_type:
+            continue
+        source = await _resolve(from_name)
+        target = await _resolve(to_name)
+        if source is None or target is None or source[0] == target[0]:
+            continue
+        provenance = (
+            "AMBIGUOUS"
+            if rel.get("ambiguous") or "AMBIGUOUS" in (source[1], target[1])
+            else "EXTRACTED"
+        )
+        try:
+            confidence = float(rel.get("confidence", extraction.confidence))
+        except (TypeError, ValueError):
+            confidence = extraction.confidence
+        await entities_crud.upsert_link(
+            db,
+            source_id=source[0],
+            target_id=target[0],
+            link_type=link_type,
+            provenance=provenance,
+            confidence=confidence,
+            evidence_memory_id=memory_id,
+            valid_at=extraction.temporal,
+            _commit=False,
+        )
+        counts["links"] += 1
+
+    await db.commit()
+    return counts
+
+
 def _closest(
     norm_name: str, candidates: list[tuple[str, str, str]]
 ) -> str | None:

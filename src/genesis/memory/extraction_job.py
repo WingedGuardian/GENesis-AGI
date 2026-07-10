@@ -417,6 +417,29 @@ async def run_extraction_cycle(
                                 memory_id, exc_info=True,
                             )
 
+                    # Entity layer (E3): give extracted entities and
+                    # relationships IDENTITY (entities/entity_mentions/
+                    # entity_links). Parallel to memory_links, never a
+                    # replacement; fail-open per memory.
+                    if extraction.entities or extraction.relationships:
+                        try:
+                            from genesis.memory.entity_registry import (
+                                record_extraction,
+                            )
+
+                            entity_counts = await record_extraction(
+                                db, memory_id, extraction,
+                            )
+                            summary.setdefault("entity_mentions", 0)
+                            summary.setdefault("entity_links", 0)
+                            summary["entity_mentions"] += entity_counts["mentions"]
+                            summary["entity_links"] += entity_counts["links"]
+                        except Exception:
+                            logger.warning(
+                                "Entity-layer recording failed for %s",
+                                memory_id, exc_info=True,
+                            )
+
                     # Goal signal detection — DISABLED: keyword matcher
                     # produced ~95% false positives (277 garbage goals from
                     # conversation snippets). Replaced by explicit goal

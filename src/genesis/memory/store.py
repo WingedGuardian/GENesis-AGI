@@ -336,6 +336,19 @@ class MemoryStore:
             source_subsystem=source_subsystem,
         )
 
+        # Mechanical code anchors (entity layer) — regex-only, every write
+        # path. Failure-isolated: a broken anchor write must never break
+        # the store itself.
+        try:
+            from genesis.memory.entity_anchors import record_anchors
+
+            await record_anchors(self._db, memory_id, content)
+        except Exception:
+            logger.debug(
+                "entity anchor extraction failed for %s",
+                memory_id, exc_info=True,
+            )
+
         if not embedding_ok and not is_subsystem_write:
             # Queue for later embedding — preserve provenance so the recovery
             # worker can reconstruct the full Qdrant payload.

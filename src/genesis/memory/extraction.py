@@ -32,8 +32,13 @@ For each extraction, provide:
 - confidence: 0.0 to 1.0 (how certain are you this is correctly extracted?)
 - entities: Named entities mentioned (tools, projects, people, organizations)
 - relationships: Typed connections between entities
-  - type: One of: discussed_in, evaluated_for, decided, action_item_for,
-    categorized_as, related_to, succeeded_by, preceded_by
+  - type: Preferred vocabulary: is_a, part_of, constrained_by, depends_on,
+    supersedes, alternative_to, discussed_in, evaluated_for, decided,
+    action_item_for, categorized_as, related_to, succeeded_by, preceded_by.
+    Prefer is_a for category membership ("X is a voice device") and
+    constrained_by for rules/decisions that govern an entity.
+  - optionally add "confidence" (0.0-1.0) and "ambiguous": true when you
+    are unsure the two names refer to distinct known things
 - temporal: Date or time reference if mentioned (ISO format preferred)
 
 For each extraction that has a temporal reference AND describes a concrete
@@ -277,15 +282,24 @@ def parse_extraction_response_full(text: str) -> ParsedResponse:
         relationships = item.get("relationships", [])
         if not isinstance(relationships, list):
             relationships = []
-        # Validate relationship structure
+        # Validate relationship structure. The optional per-relationship
+        # confidence/ambiguous fields the prompt solicits must survive
+        # parsing — record_extraction consumes them for entity_links
+        # provenance (dropping them silently forces every link to
+        # EXTRACTED at extraction-level confidence).
         valid_rels: list[dict] = []
         for rel in relationships:
             if isinstance(rel, dict) and "from" in rel and "to" in rel and "type" in rel:
-                valid_rels.append({
+                entry = {
                     "from": str(rel["from"]),
                     "to": str(rel["to"]),
                     "type": str(rel["type"]),
-                })
+                }
+                if "confidence" in rel:
+                    entry["confidence"] = rel["confidence"]
+                if "ambiguous" in rel:
+                    entry["ambiguous"] = bool(rel["ambiguous"])
+                valid_rels.append(entry)
 
         temporal = item.get("temporal")
         if temporal is not None:
