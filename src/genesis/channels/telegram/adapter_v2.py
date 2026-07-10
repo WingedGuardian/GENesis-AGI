@@ -30,7 +30,10 @@ from telegram.ext import (
 from genesis.channels.base import ChannelAdapter
 from genesis.channels.telegram.handlers_v2 import make_handlers_v2
 from genesis.channels.telegram.transport.offset_store import read_offset, write_offset
-from genesis.channels.telegram.transport.polling import PollingWatchdog
+from genesis.channels.telegram.transport.polling import (
+    LivenessHTTPXRequest,
+    PollingWatchdog,
+)
 from genesis.channels.telegram.transport.send import (
     safe_send_document,
     safe_send_message,
@@ -148,6 +151,18 @@ class TelegramAdapterV2(ChannelAdapter):
             .connect_timeout(10.0)
             .concurrent_updates(4)  # Bounded concurrency — prevents callback TTL stalls
             # while limiting race exposure on shared HandlerContext state
+            # Dedicated getUpdates pool (pool_size=1 mirrors PTB's default for
+            # it) that records poll liveness on every successful round trip —
+            # empty polls included — so idle chat ≠ stalled poller.
+            # self._watchdog is created below, before polling starts.
+            .get_updates_request(LivenessHTTPXRequest(
+                connection_pool_size=1,
+                on_success=lambda: (
+                    w.record_activity()
+                    if (w := getattr(self, "_watchdog", None)) is not None
+                    else None
+                ),
+            ))
             .build()
         )
 
@@ -181,8 +196,10 @@ class TelegramAdapterV2(ChannelAdapter):
         if "callback_query" in handlers:
             self._app.add_handler(CallbackQueryHandler(handlers["callback_query"]))
 
-        # Watchdog activity tracker — fires on ALL updates (not just user messages)
-        # so idle periods don't trigger false stall alarms
+        # Stall watchdog. Liveness is recorded from two directions: the
+        # LivenessHTTPXRequest above on every successful getUpdates round
+        # trip (idle chat ≠ stall), and the TypeHandler below on every
+        # processed update (belt — also persists the offset).
         self._watchdog = PollingWatchdog(on_stall=self._handle_polling_stall)
 
         async def _record_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -17,6 +17,8 @@ import contextlib
 import logging
 import time
 
+from telegram.request import HTTPXRequest
+
 from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
@@ -24,6 +26,38 @@ logger = logging.getLogger(__name__)
 STALL_THRESHOLD_S = 300.0  # 5 min — low-traffic bot; 90s was triggering on normal idle
 CHECK_INTERVAL_S = 60.0
 _MAX_STALL_THRESHOLD_S = 900.0  # 15 minutes — cap for backoff
+
+
+class LivenessHTTPXRequest(HTTPXRequest):
+    """getUpdates request pool that reports every successful poll round-trip.
+
+    PTB only surfaces updates that ARRIVE (handlers, incl. TypeHandler), so
+    an idle chat is indistinguishable from a hung poller to the stall
+    watchdog — which then restarts the updater every threshold window
+    (observed as all-day false-stall churn). This class is passed to
+    ``ApplicationBuilder.get_updates_request`` (a pool used exclusively by
+    getUpdates), and fires ``on_success`` on each HTTP-200 round trip,
+    empty result or not. Errors and exceptions deliberately do NOT report,
+    so genuine network hangs and persistent API failures still starve the
+    watchdog and trip the stall restart. Bots are slotted/locked in PTB, so
+    the request object is the supported seam for this.
+    """
+
+    __slots__ = ("_on_success",)
+
+    def __init__(self, *args, on_success=None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._on_success = on_success
+
+    async def do_request(self, *args, **kwargs):
+        result = await super().do_request(*args, **kwargs)
+        code = result[0] if isinstance(result, tuple) else result
+        if code == 200 and self._on_success is not None:
+            try:
+                self._on_success()
+            except Exception:
+                logger.warning("poll-liveness callback failed", exc_info=True)
+        return result
 
 
 class PollingWatchdog:
