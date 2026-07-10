@@ -459,6 +459,24 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             except Exception:
                 logger.warning("Failed to expire cognitive state entries", exc_info=True)
 
+        # Boot-time stale-session sweep — 'active' rows orphaned by a crashed
+        # process shouldn't wait up to ~6h for the session_reaper cron.
+        # Deliberately HERE, after ALL init steps: session end-hooks (e.g. the
+        # ego dispatch-outcome tracker, registered in ego init) must exist
+        # before orphans are expired, and ego init runs after learning init
+        # (where the job itself is registered).
+        if self._learning_scheduler is not None:
+            try:
+                _reaper_job = self._learning_scheduler.get_job("session_reaper")
+                if _reaper_job is not None:
+                    from genesis.util.tasks import tracked_task
+
+                    tracked_task(
+                        _reaper_job.func(), name="initial_session_reap",
+                    )
+            except Exception:
+                logger.warning("Boot session-reap kick failed", exc_info=True)
+
         self._wire_job_retry_registry()
 
         critical_ok = all(
@@ -503,8 +521,8 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         # Cancel-and-await in-flight direct sessions while the DB is still
         # open, so _run_session's CancelledError handler can persist a
-        # terminal 'failed' status (T2-B review P2 — without this the rows
-        # linger 'active' across every systemctl restart).
+        # terminal 'failed' status (without this the rows linger 'active'
+        # across every systemctl restart).
         if self._direct_session_runner is not None:
             try:
                 stopped = await self._direct_session_runner.shutdown()

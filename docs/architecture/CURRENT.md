@@ -105,7 +105,7 @@ verified: e01e0c49 2026-07-09
   an explicit `CancelledError` handler, and `GenesisRuntime.shutdown()`
   cancel-and-awaits the runner's in-flight tasks (`DirectSessionRunner
   .shutdown`, 10s grace) BEFORE closing the DB so that handler can persist
-  (T2-B 2026-07-09; the old crud `reap_stale`, which relabeled orphans
+  (2026-07-09; the old crud `reap_stale`, which relabeled orphans
   'completed', is deleted). J-9 counts only `completed` as success.
 - **Perimeter-session hardening:** `_NO_WEB_TOOLS` / `_NO_OUTREACH_EXTRAS`
   blocklists strip risky tools from perimeter profiles — a security edge, not

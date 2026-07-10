@@ -146,7 +146,7 @@ async def test_query_stale_excludes_foreground(db, sess_fields):
     assert len(rows) == 0
 
 
-# T2-B: the reap_stale crud tests were removed with the function itself —
+# The reap_stale crud tests were removed with the function itself —
 # the stale-sweep policy (foreground preserved, background → 'expired',
 # end-hooks fired) is covered at the SessionManager.cleanup_stale level in
 # tests/test_cc/test_session_manager.py.

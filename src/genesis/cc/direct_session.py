@@ -818,7 +818,7 @@ class DirectSessionRunner:
             return result
 
         except asyncio.CancelledError:
-            # T2-B: CancelledError is a BaseException — the Exception handler
+            # CancelledError is a BaseException — the Exception handler
             # below never sees it, so a cancelled session used to linger
             # 'active' until the stale reaper swept it. A cancel (runtime
             # shutdown via self.shutdown(), task.cancel) is a KNOWN
@@ -838,7 +838,7 @@ class DirectSessionRunner:
             try:
                 await self._store_result(session_id, request, cancel_result)
                 # Feed the outcome back to an ego proposal, matching the
-                # generic failure path below (review P3).
+                # generic failure path below.
                 await self._record_proposal_outcome(request, cancel_result)
                 await self._session_manager.fail(
                     session_id, reason="cancelled",

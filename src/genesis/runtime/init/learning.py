@@ -723,7 +723,7 @@ async def init(rt: GenesisRuntime) -> None:
                     cleanup_stale as cleanup_stale_heartbeats,
                 )
 
-                # T2-B: policy-aware sweep via SessionManager — stale
+                # Policy-aware sweep via SessionManager — stale
                 # non-foreground 'active' rows → 'expired' (outcome UNKNOWN:
                 # the process is gone; it may have crashed or been killed),
                 # with session end-hooks fired. Replaces the old crud
@@ -751,11 +751,11 @@ async def init(rt: GenesisRuntime) -> None:
             max_instances=1,
             misfire_grace_time=3600,
         )
-        # T2-B: boot-time sweep — 'active' rows orphaned by a crashed process
-        # shouldn't wait up to ~6h for the next cron tick. Init order runs
-        # cc_relay (which sets rt._session_manager) before learning, so the
-        # manager exists here; the None-guard above covers degraded init.
-        _tt(_reap_stale_sessions(), name="initial_session_reap")
+        # The boot-time sweep kick for this job lives at the END of
+        # GenesisRuntime.bootstrap() (not here) — session end-hooks (e.g. the
+        # ego's dispatch-outcome tracker) register during LATER init steps,
+        # and a sweep fired from learning init would expire orphaned rows
+        # before those hooks exist.
 
         async def _refresh_capability_map() -> None:
             if rt._db is None:

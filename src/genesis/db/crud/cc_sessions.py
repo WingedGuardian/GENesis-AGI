@@ -131,7 +131,7 @@ async def query_stale(
     return [dict(r) for r in await cursor.fetchall()]
 
 
-# T2-B: reap_stale (bulk UPDATE → 'completed') was deleted. It relabeled
+# reap_stale (bulk UPDATE → 'completed') was deleted. It relabeled
 # crashed/orphaned sessions as successes; the session reaper now routes
 # through ``SessionManager.cleanup_stale()`` (policy-aware, → 'expired',
 # fires end-hooks). See runtime/init/learning.py::_reap_stale_sessions.
