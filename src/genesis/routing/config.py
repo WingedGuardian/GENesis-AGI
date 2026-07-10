@@ -354,8 +354,18 @@ def update_call_site_in_yaml(
     base_cs = base_raw["call_sites"][call_site_id]
     effective_cs = _deep_merge(base_cs, local_cs)
 
+    # The dispatch this update will leave in effect. Mirrors the loader's
+    # empty-chain exemption (_parse: an empty chain is valid ONLY for cli
+    # sites, which spawn CC directly). Without it the first empty-chain
+    # cli site (ambient_arbiter) is un-editable — the dashboard editor
+    # round-trips the chain, and [] was rejected unconditionally here.
+    intended_dispatch = _normalize_dispatch(
+        dispatch if dispatch is not None else effective_cs.get("dispatch"),
+        call_site_name=call_site_id,
+    )
+
     if chain is not None:
-        if not chain:
+        if not chain and intended_dispatch != "cli":
             msg = "Chain must have at least one provider"
             raise ValueError(msg)
         if len(chain) != len(set(chain)):
@@ -406,9 +416,14 @@ def update_call_site_in_yaml(
             local_cs.pop("cc_model", None)
             local_cs.pop("cc_position", None)
 
-    # Validate: never_pays sites must have at least one free provider
+    # Validate: never_pays sites must have at least one free provider.
+    # Vacuous for an empty-chain cli site (nothing to pay for — the same
+    # class the loader exempts), so skip it there or the site can never
+    # revalidate through this path.
     effective_chain = effective_cs.get("chain", base_cs.get("chain", []))
-    if effective_cs.get("never_pays"):
+    if effective_cs.get("never_pays") and not (
+        intended_dispatch == "cli" and not effective_chain
+    ):
         free_in_chain = [p for p in effective_chain if providers.get(p, {}).get("free")]
         if not free_in_chain:
             msg = f"never_pays site '{call_site_id}' must have at least one free provider"

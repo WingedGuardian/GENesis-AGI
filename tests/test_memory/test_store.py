@@ -218,6 +218,73 @@ async def test_store_scope_tag_external_for_knowledge_base(store):
     assert payload["scope"] == "external"
 
 
+# ─── WS-3 origin_class stamping ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio()
+async def test_store_stamps_first_party_origin_by_default(store):
+    """A normal store carries origin_class='first_party' in BOTH the Qdrant
+    payload and the memory_metadata row."""
+    with patch("genesis.memory.store.upsert_point") as mock_upsert, \
+         patch("genesis.memory.store.memory_crud") as mock_mem:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        await store.store("test content", "src")
+
+    payload = mock_upsert.call_args.kwargs["payload"]
+    assert payload["origin_class"] == "first_party"
+    meta_kwargs = mock_mem.create_metadata.call_args.kwargs
+    assert meta_kwargs["origin_class"] == "first_party"
+
+
+@pytest.mark.asyncio()
+async def test_store_explicit_owner_origin_end_to_end(store):
+    """An explicit origin_class='owner' override reaches both stores."""
+    with patch("genesis.memory.store.upsert_point") as mock_upsert, \
+         patch("genesis.memory.store.memory_crud") as mock_mem:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        await store.store("owner note", "src", origin_class="owner")
+
+    assert mock_upsert.call_args.kwargs["payload"]["origin_class"] == "owner"
+    assert mock_mem.create_metadata.call_args.kwargs["origin_class"] == "owner"
+
+
+@pytest.mark.asyncio()
+async def test_store_subsystem_write_stamps_first_party_metadata(store):
+    """Subsystem writes are FTS5-only (no Qdrant) but memory_metadata still
+    gets origin_class='first_party'."""
+    with patch("genesis.memory.store.upsert_point") as mock_upsert, \
+         patch("genesis.memory.store.memory_crud") as mock_mem:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        await store.store("triage signal", "src", source_subsystem="triage")
+
+    mock_upsert.assert_not_called()  # FTS5-only path, no Qdrant point
+    meta_kwargs = mock_mem.create_metadata.call_args.kwargs
+    assert meta_kwargs["origin_class"] == "first_party"
+    assert meta_kwargs["source_subsystem"] == "triage"
+
+
+@pytest.mark.asyncio()
+async def test_store_recon_pipeline_stamps_external_untrusted(store):
+    """source_pipeline='recon' derives external_untrusted in both stores."""
+    with patch("genesis.memory.store.upsert_point") as mock_upsert, \
+         patch("genesis.memory.store.memory_crud") as mock_mem:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        await store.store("web finding", "recon", source_pipeline="recon")
+
+    payload = mock_upsert.call_args.kwargs["payload"]
+    assert payload["origin_class"] == "external_untrusted"
+    meta_kwargs = mock_mem.create_metadata.call_args.kwargs
+    assert meta_kwargs["origin_class"] == "external_untrusted"
+
+
 @pytest.mark.asyncio()
 async def test_store_falls_back_on_qdrant_connection_error(store):
     """When Qdrant upsert raises a connection error, store should fall back to FTS5."""

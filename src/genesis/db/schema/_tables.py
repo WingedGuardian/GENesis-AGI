@@ -833,6 +833,7 @@ TABLES = {
             source_pipeline  TEXT,
             purpose          TEXT,
             ingestion_source TEXT,
+            origin_class     TEXT,
             UNIQUE(project_type, domain, concept)
         )
     """,
@@ -1125,7 +1126,8 @@ TABLES = {
             invalid_at       TEXT,
             source_subsystem TEXT,
             deprecated       INTEGER NOT NULL DEFAULT 0,
-            dream_cycle_run_id TEXT
+            dream_cycle_run_id TEXT,
+            origin_class     TEXT
         )
     """,
     "code_modules": """

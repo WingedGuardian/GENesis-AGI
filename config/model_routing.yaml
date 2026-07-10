@@ -699,6 +699,19 @@ call_sites:
       deepseek-v4-pro (100% clean, different vendor) fallback; both free, so never_pays
       keeps a valid chain. NON-Groq deliberately \u2014 Groq's 8B is EOL 2026-08-16 and its
       gpt-oss-20b replacement breaks strict JSON.
+  ambient_arbiter:
+    chain: []
+    dispatch: cli
+    cc_model: Haiku
+    never_pays: true
+    description: >-
+      Ambient session-awareness arbiter: judges which drift-fire candidate
+      memories deserve surfacing (headless CC, model PINNED in
+      session_awareness/arbiter.py). The chain is empty BY DESIGN: no API
+      fallback exists (a failed call records an empty verdict, never a guess)
+      and the router never dispatches this site. The detached ambient worker
+      spawns CC directly and reports each run via record_last_run; registered
+      here for neural-monitor visibility and central declaration.
 retry:
   # max_total_s: aggregate wall-clock ceiling (seconds) across a single
   # route_call's retries x chain length. A safety net against pathological

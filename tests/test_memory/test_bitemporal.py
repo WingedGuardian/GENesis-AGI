@@ -69,7 +69,8 @@ async def meta_db():
             room             TEXT,
             valid_at         TEXT,
             invalid_at       TEXT,
-            source_subsystem TEXT
+            source_subsystem TEXT,
+            origin_class     TEXT
         )
     """)
     await db.commit()

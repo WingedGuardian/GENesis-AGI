@@ -417,6 +417,13 @@ class KnowledgeOrchestrator:
                 old_qdrant_id = existing.get("qdrant_id") if existing else None
 
                 # Store to Qdrant via MemoryStore (non-transactional, immediate)
+                # WS-3: curated ingest is external_untrusted (authority tier,
+                # not authorship); derived once, mirrored to both stores.
+                from genesis.memory.provenance import derive_origin_class
+
+                resolved_origin = derive_origin_class(
+                    source_pipeline="curated", collection="knowledge_base",
+                )
                 qdrant_id = await memory_mod._store.store(
                     unit.body,
                     f"knowledge:{project_type}/{unit.domain}",
@@ -426,6 +433,7 @@ class KnowledgeOrchestrator:
                     confidence=unit.confidence,
                     auto_link=False,
                     source_pipeline="curated",
+                    origin_class=resolved_origin,
                 )
                 qdrant_ids.append(qdrant_id)
 
@@ -464,6 +472,7 @@ class KnowledgeOrchestrator:
                     source_pipeline="curated",
                     purpose=purpose_json,
                     ingestion_source=source,
+                    origin_class=resolved_origin,
                     _commit=False,
                 )
 

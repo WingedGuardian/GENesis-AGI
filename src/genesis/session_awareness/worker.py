@@ -3,11 +3,18 @@
 Spawned by the proactive hook (``start_new_session=True``) when a
 session theme settles. Opens its OWN read-only DB connection, Qdrant
 client, and embedding provider — it must never touch server state.
-Writes exactly two places, both under ``~/.genesis``:
+Writes three places:
 
-- ``sessions/<id>/ambient_verdict.json`` — the latest outcome (atomic)
-- ``session_awareness/shadow_log.jsonl`` — append-only tuning record
-  (size-capped; skips are counted in the verdict, never silent)
+- ``~/.genesis/sessions/<id>/ambient_verdict.json`` — the latest outcome
+  (atomic)
+- ``~/.genesis/session_awareness/shadow_log.jsonl`` — append-only tuning
+  record (size-capped; skips are counted in the verdict, never silent)
+- ``call_site_last_run`` row ``ambient_arbiter`` — neural-monitor
+  telemetry, one row per arbiter ATTEMPT (including pre-spawn failures,
+  which record success=0 with the reason; empty candidate sets record
+  nothing — judge_candidates short-circuits without spawning CC). Uses a
+  separate short-lived RW connection; the retrieval connection stays
+  ``mode=ro`` so the zero-write invariant on memory rows holds.
 
 PR2 runs ``--no-arbiter`` only; PR3 adds the arbiter judgment stage.
 """
@@ -17,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -54,6 +62,43 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     os.replace(tmp, str(path))
 
 
+async def _record_arbiter_telemetry(
+    db_path: Path | str, verdict: dict, n_candidates: int,
+) -> bool:
+    """Best-effort ``call_site_last_run`` row for the neural monitor.
+
+    Never raises; True only when the row demonstrably landed (a swallowed
+    INSERT failure reports False), so the verdict/shadow log stays honest
+    about missing telemetry.
+    """
+    try:
+        from genesis.observability.call_site_recorder import (
+            record_last_run_detached,
+        )
+
+        from .arbiter import ARBITER_MODEL
+
+        arbiter = verdict.get("arbiter", "unknown")
+        parts = [
+            f"arbiter={arbiter}",
+            f"picks={len(verdict.get('picks') or [])}",
+            f"candidates={n_candidates}",
+            f"lat_ms={verdict.get('arbiter_latency_ms', 0)}",
+        ]
+        if verdict.get("reason"):
+            parts.append(str(verdict["reason"])[:80])
+        return await record_last_run_detached(
+            str(db_path),
+            "ambient_arbiter",
+            provider="cc",
+            model_id=ARBITER_MODEL,
+            response_text="|".join(parts),
+            success=arbiter == "ok",
+        )
+    except Exception:
+        return False
+
+
 def _append_shadow_log(record: dict, state_root: Path) -> bool:
     """Append to shadow_log.jsonl. False (and no write) once capped."""
     log_path = state_root / "shadow_log.jsonl"
@@ -86,11 +131,9 @@ async def run_worker(
     def finish(verdict: dict) -> dict:
         verdict.setdefault("session_id", session_id)
         verdict.setdefault("generated_at", now_iso)
-        _atomic_write_json(verdict_path, verdict)
-        logged = _append_shadow_log(verdict, state_root)
-        if not logged:
+        if not _append_shadow_log(verdict, state_root):
             verdict["shadow_log_skipped"] = True
-            _atomic_write_json(verdict_path, verdict)
+        _atomic_write_json(verdict_path, verdict)
         return verdict
 
     state = load_state(session_id, base=sessions_root)
@@ -153,8 +196,12 @@ async def run_worker(
             # machinery (and its genesis.security/env imports).
             from .arbiter import judge_candidates
 
+            arbiter_t0 = time.monotonic()
             verdict.update(
                 await judge_candidates(theme_stats, entity_query, candidates)
+            )
+            verdict["arbiter_latency_ms"] = int(
+                (time.monotonic() - arbiter_t0) * 1000
             )
             picks = verdict.get("picks") or []
             verdict["picked_memory_ids"] = [
@@ -162,6 +209,12 @@ async def run_worker(
                 for n in picks
                 if 1 <= n <= len(candidates)
             ]
+            if candidates:
+                # Empty candidate sets short-circuit judge_candidates without
+                # spawning CC — no run happened, so nothing to record.
+                verdict["telemetry_recorded"] = await _record_arbiter_telemetry(
+                    resolved_db, verdict, len(candidates)
+                )
         return finish(verdict)
     except Exception as exc:  # recorded, never raised — detached process
         return finish({"status": "error", "error": f"{type(exc).__name__}: {exc}"})

@@ -49,6 +49,8 @@ INDEXED_PAYLOAD_FIELDS: dict[str, str] = {
     "source_type": "keyword",
     "source_pipeline": "keyword",
     "memory_class": "keyword",
+    # WS-3 provenance taxonomy — B1 immunity gates filter on it.
+    "origin_class": "keyword",
 }
 
 

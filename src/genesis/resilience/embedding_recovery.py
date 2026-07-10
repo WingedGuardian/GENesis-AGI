@@ -94,6 +94,12 @@ class EmbeddingRecoveryWorker:
                         payload["wing"] = taxo["wing"]
                     if taxo.get("room"):
                         payload["room"] = taxo["room"]
+                    # WS-3: restore origin_class from the authoritative
+                    # metadata row so an outage-recovered point carries the
+                    # indexed provenance key B1 gates filter on. Missing
+                    # (legacy row) → key omitted; gates fail closed on it.
+                    if taxo.get("origin_class"):
+                        payload["origin_class"] = taxo["origin_class"]
                 if life_domain:
                     payload["life_domain"] = life_domain
                 # Restore provenance fields if queued with them

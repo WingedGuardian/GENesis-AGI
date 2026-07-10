@@ -36,7 +36,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 3c6cf249 2026-07-09
+verified: 36563f95 2026-07-10
 ```
 
 **Retrieval is TIERED — the hottest auto-fired paths carry the thinnest
@@ -93,6 +93,17 @@ additive layer, not a leak.
 **Do not touch:** the drain's shadow hardwiring; the dry_run-independent link
 write. **Trap:** with no embedding provider registered, memory silently
 degrades to FTS5-only (see routing-providers entry).
+
+**origin_class (WS-3 B0):** every store stamps
+`owner | first_party | external_untrusted` into the Qdrant payload,
+`memory_metadata`, and (KB paths) `knowledge_units` — derived in
+`provenance.derive_origin_class` (explicit kwarg wins; external pipelines
+outrank `source_subsystem`; `curated` is external BY DECISION — authority
+tier, not authorship). Store-time derivation is conservative-first-party for
+unknown internal writers; the fail-closed unknown→external rule lives only
+at gate time (`security/immunity.py`). Migration 0053 backfilled history
+(no owner heuristics); `scripts/backfill_origin_class_qdrant.py` mirrors the
+payloads idempotently.
 
 ## 2. Execution — CC sessions (DirectSession)
 
@@ -364,7 +375,7 @@ The loops that make Genesis think between conversations.
 ```yaml subsystem-map
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness]
-verified: 8dac642c 2026-07-09
+verified: 780cc8de 2026-07-10
 ```
 
 - **awareness/**: the 5-min heartbeat. ~23 signal collectors (the richer
@@ -404,9 +415,13 @@ verified: 8dac642c 2026-07-09
   payload indexes drops valid results; found 2026-07-09). Headless-
   Haiku arbiter judges candidates per fire (fail-closed parse, group-
   kill on timeout). Verdicts → `ambient_verdict.json`, tuning →
-  size-capped shadow log. **Zero DB/Qdrant writes — never bumps
-  retrieved_count** (protects MEM-005/H-1 baselines). Fail-open at the
-  hook boundary. Kill switch: `GENESIS_SESSION_AWARENESS_DISABLED=1`.
+  size-capped shadow log; each arbiter attempt (incl. pre-spawn
+  failures, success=0 with reason) also records a `call_site_last_run`
+  row (`ambient_arbiter`, neural monitor) via its own short-lived RW
+  connection. **Zero memory-row writes — never bumps
+  retrieved_count** (retrieval connection is mode=ro; protects
+  MEM-005/H-1 baselines). Fail-open at the hook boundary. Kill switch:
+  `GENESIS_SESSION_AWARENESS_DISABLED=1`.
 
 ## 10. Learning & evaluation
 
@@ -505,7 +520,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, env.py, _config_overlay.py]
-verified: 9037d45b 2026-07-07
+verified: 36563f95 2026-07-10
 ```
 
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
@@ -538,7 +553,16 @@ verified: 9037d45b 2026-07-07
   LOG-ONLY for internal sources (perimeter EMAIL/INBOX can block);
   `output_scanner` = deterministic outbound secrets/IP scan; `skill_scan`
   shells to external NVIDIA SkillSpector. NOT auth or secrets storage (that's
-  `runtime/init/secrets.py` + `env.py`).
+  `runtime/init/secrets.py` + `env.py`). **`immunity.py` = the WS-3 kill
+  switch (control surface LIVE, gates NOT built — B1)**: `gate_mode()`
+  re-reads `config/ws3_immunity.yaml` + its `.local.yaml` overlay per call
+  (no cache, no restart — the `ws3_immunity` settings domain is writable);
+  master `enabled: false` short-circuits every gate; `is_blockable()` is the
+  never-block-owner/first-party invariant every B1 gate must route through;
+  the gate-time fail-closed unknown→external rule lives ONLY in
+  `effective_origin_class()` (store-time derivation never fail-closes).
+  Auto-demote state is written INTO the overlay so state and behavior share
+  one file.
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h

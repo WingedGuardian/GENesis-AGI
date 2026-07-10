@@ -568,4 +568,15 @@ _CALL_SITE_META: dict[str, dict] = {
         "model_tier": "frontier",
         "wired": True,
     },
+    "ambient_arbiter": {
+        # Manual cost_policy on purpose: the chain is empty by design (no API
+        # fallback), so auto-derivation would mislabel it "Not configured".
+        "description": "Ambient session-awareness arbiter: judges which drift-fire candidate memories deserve surfacing. Headless CC (pinned Haiku) spawned by the detached ambient worker; the router never dispatches it.",
+        "category": "memory",
+        "frequency": "Per drift-trigger fire (max 8/session)",
+        "cost_policy": "CC subscription (Haiku)",
+        "dispatch": "cli",
+        "cc_model": "Haiku",
+        "model_tier": "cc",
+    },
 }
