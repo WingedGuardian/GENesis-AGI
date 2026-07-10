@@ -116,6 +116,11 @@ ignore = [
 # stays live outside these data-access layers.
 "src/genesis/db/crud/*" = ["S608"]
 "src/genesis/dashboard/routes/*" = ["S608"]
+# Schema/data migrations assemble literal SQL fragments (often from module-level
+# constants); they run at deploy against the schema and NEVER take runtime user
+# input, so S608 is a false positive here — same data-access-layer rationale as
+# db/crud/*. (0053's f-string UPDATE uses a trusted literal _WHERE constant.)
+"src/genesis/db/migrations/*" = ["S608"]
 # Type-narrowing asserts in MCP handlers (follow-up: convert to explicit raises).
 "src/genesis/mcp/memory/*" = ["S101"]
 
