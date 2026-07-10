@@ -98,6 +98,22 @@ class TestShadowGateSerendipity:
         assert out["serendipity_boosted"] == 0
         assert out["projected_ids"][0] == "a"  # order unchanged
 
+    def test_duplicate_hit_uses_vector_retrieved_count(self) -> None:
+        # m1 is returned by BOTH FTS and vector; _rrf_fusion keeps the FTS row
+        # (no _retrieved_count) in content_map. The shadow must still see the
+        # vector payload's retrieved_count==0 and count it as serendipity-eligible
+        # (Codex P2 — otherwise duplicate strong hits are never boosted).
+        fts = [
+            {"memory_id": "m1", "content": "alpha", "collection": "episodic"},
+            {"memory_id": "m2", "content": "beta", "collection": "episodic"},
+        ]
+        vector = [{"memory_id": "m1", "content": "alpha", "collection": "episodic",
+                   "_retrieved_count": 0}]
+        shadow: dict = {}
+        with patch.object(_mod, "_is_garbage", lambda c: False):
+            _mod._rrf_fusion(fts, vector, shadow=shadow)
+        assert shadow["serendipity_boosted"] >= 1
+
     def test_unknown_retrieved_count_not_boosted(self) -> None:
         scores = {"a": 0.020, "b": 0.016}
         cmap = {"a": _cm("a", retrieved=5), "b": _cm("b", retrieved=-1)}  # FTS-only, unknown

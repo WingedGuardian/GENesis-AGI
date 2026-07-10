@@ -1014,6 +1014,12 @@ def _rrf_fusion(
     (curated ~0.95 competes at rank 2+; recon ~0.65 rarely surfaces). Max 1 KB
     slot prevents KB from flooding out episodic context.
     Code index results get a 0.5x weight (supplementary, not primary).
+
+    ``suppress_ids`` and ``shadow`` drive the H-1 PR2a novelty-gate MEASUREMENT
+    only — they never affect the returned results. When ``shadow`` is a dict, the
+    projected gate (suppress ``suppress_ids`` + serendipity boost) is computed on
+    copies and written into it fail-open; when ``shadow`` is None (all existing
+    callers) nothing extra runs.
     """
     scores: dict[str, float] = {}
     content_map: dict[str, dict] = {}
@@ -1100,7 +1106,14 @@ def _rrf_fusion(
     if shadow is not None:
         # Shadow projection must never affect the real injection path.
         with contextlib.suppress(Exception):
-            shadow.update(_shadow_gate(scores, content_map, suppress_ids))
+            # Vector rows carry the true _retrieved_count; content_map may hold
+            # the FTS duplicate (which lacks it), so pass an authoritative map.
+            rc_map = {
+                r["memory_id"]: r["_retrieved_count"]
+                for r in vector_results
+                if r.get("memory_id") and "_retrieved_count" in r
+            }
+            shadow.update(_shadow_gate(scores, content_map, suppress_ids, rc_map))
 
     return results
 
@@ -1109,6 +1122,7 @@ def _shadow_gate(
     scores: dict[str, float],
     content_map: dict[str, dict],
     suppress_ids: frozenset[str],
+    retrieved_counts: dict[str, int] | None = None,
 ) -> dict:
     """Project the PR2b novelty gate's injection set (H-1 PR2a, measurement-only).
 
@@ -1121,15 +1135,17 @@ def _shadow_gate(
     (Intentional near-duplicate of the loop above: keeping it separate is what
     guarantees the measured path stays byte-identical during the shadow window.)
     """
+    # A memory hit by both FTS and vector keeps its FTS row in content_map (no
+    # _retrieved_count); retrieved_counts carries the vector payload's value so a
+    # never-surfaced duplicate hit is still recognized as serendipity-eligible.
+    retrieved_counts = retrieved_counts or {}
     boosted = dict(scores)
     serendipity_boosted = 0
     for mid, entry in content_map.items():
         if mid not in boosted:
             continue
-        if (
-            entry.get("_retrieved_count", -1) == 0
-            and entry.get("collection") != "knowledge_base"
-        ):
+        rc = retrieved_counts.get(mid, entry.get("_retrieved_count", -1))
+        if rc == 0 and entry.get("collection") != "knowledge_base":
             boosted[mid] *= _SERENDIPITY_BOOST
             serendipity_boosted += 1
     ranked = sorted(boosted.items(), key=lambda x: x[1], reverse=True)
