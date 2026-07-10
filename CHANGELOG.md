@@ -11,6 +11,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Lint feedback now reaches the session instead of disappearing.** The
+  edit-time ruff hook used to auto-fix what it could and silently swallow the
+  rest; now anything it can't fix comes back to the working session as a
+  short advisory note (capped, explicitly non-blocking) so problems surface
+  the moment they're written instead of at commit time. Security linting
+  (the full bandit ruleset via ruff's `S` family) is enabled repo-wide with
+  every suppression individually justified in-line — `shell=True` misuse now
+  fails lint everywhere, including CI.
+
+- **Code reviews follow a written protocol instead of convention.** The
+  architect reviewer now opens with a scope-drift check (did the change do
+  what was asked — nothing more, nothing less), grades findings on an
+  explicit BLOCKER / SHOULD-FIX / NOTE ladder, must quote the exact line
+  motivating each finding or have the finding's confidence capped, consults
+  prior review learnings before starting, and closes with an explicit
+  completion status. Adapted from the gstack review framework.
+
 - **`genesis eval bench` — a Genesis-vs-bare-Claude A/B benchmark you can run
   in one command.** Each task in a private task set runs through two arms: a
   cognition-enabled Genesis session (identity + read-only recall from your
