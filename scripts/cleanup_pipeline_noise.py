@@ -74,7 +74,7 @@ async def main(dry_run: bool = False) -> None:
             # Delete from memory_metadata
             placeholders = ",".join("?" * len(noise_ids))
             cursor = await db.execute(
-                f"DELETE FROM memory_metadata WHERE memory_id IN ({placeholders})",
+                f"DELETE FROM memory_metadata WHERE memory_id IN ({placeholders})",  # noqa: S608 - literal SQL fragments; values bound as parameters
                 noise_ids,
             )
             meta_deleted = cursor.rowcount

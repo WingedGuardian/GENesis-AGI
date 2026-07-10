@@ -313,7 +313,7 @@ async def _collect_cpu(config: GuardianConfig) -> CPUInfo:
 async def _collect_disk(config: GuardianConfig) -> list[DiskInfo]:
     """Collect disk usage for key mount points."""
     disks = []
-    for mount in ["/", "/tmp", "/home"]:
+    for mount in ["/", "/tmp", "/home"]:  # noqa: S108 - monitoring host mounts, not creating temp files
         try:
             rc, out = await _incus_exec(
                 config.container_name,

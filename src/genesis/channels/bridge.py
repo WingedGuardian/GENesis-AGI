@@ -60,7 +60,7 @@ def _load_bridge_config() -> dict | None:
                 secrets[key.strip()] = value.strip().strip('"')
 
     token = secrets.get("TELEGRAM_BOT_TOKEN", "")
-    if not token or token == "PLACEHOLDER":
+    if not token or token == "PLACEHOLDER":  # noqa: S105 - sentinel placeholder, not a credential
         log.info("TELEGRAM_BOT_TOKEN not set — Telegram adapter will not start")
         return None
 

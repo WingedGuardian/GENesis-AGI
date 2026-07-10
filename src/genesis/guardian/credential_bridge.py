@@ -65,7 +65,7 @@ _KEY_MAP_PROVISIONING = {
 # backslashes, unbalanced quotes) the two can diverge, so the escrowed value
 # would not match what encrypted the backup. The generated passphrase is a plain
 # token; keep any hand-set one shell-safe (alphanumeric / base64) to stay sound.
-_PASSPHRASE_FILENAME = "backup_passphrase.env"
+_PASSPHRASE_FILENAME = "backup_passphrase.env"  # noqa: S105 - filename constant, not a passphrase
 _KEY_MAP_PASSPHRASE = {
     "GENESIS_BACKUP_PASSPHRASE": "GENESIS_BACKUP_PASSPHRASE",
 }
@@ -96,7 +96,7 @@ _MIRROR_SRC_SUBDIRS = ("creds", "secrets")  # subtrees of the Tier-1 clone to mi
 # CLAUDE_CODE_OAUTH_TOKEN into every CONTAINER-side `claude` subprocess and
 # hijack the container's own CC auth. Keeping it out of secrets.env is
 # load-bearing, not tidiness.
-_CC_TOKEN_FILENAME = "cc_oauth_token.env"
+_CC_TOKEN_FILENAME = "cc_oauth_token.env"  # noqa: S105 - filename constant, not a token
 _CC_TOKEN_SOURCE = Path("~/.genesis/cc_oauth_token.env").expanduser()
 _KEY_MAP_CC_TOKEN = {
     "CLAUDE_CODE_OAUTH_TOKEN": "CLAUDE_CODE_OAUTH_TOKEN",

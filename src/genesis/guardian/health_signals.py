@@ -126,9 +126,9 @@ def parse_psi_content(content: str) -> dict[str, float]:
 
 def _http_get(url: str, timeout: float = 10.0) -> tuple[int, str]:
     """Synchronous HTTP GET via stdlib. Returns (status_code, body)."""
-    req = urllib.request.Request(url, method="GET")
+    req = urllib.request.Request(url, method="GET")  # noqa: S310 - stdlib-only guardian; https endpoint from config
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - stdlib-only guardian; https endpoint from config
             body = resp.read().decode("utf-8", errors="replace")
             return resp.status, body
     except urllib.error.HTTPError as exc:
@@ -410,7 +410,7 @@ async def check_tick_regularity(config: GuardianConfig) -> SuspiciousResult:
         rc, stdout, stderr = await _run_subprocess(
             "incus", "exec", config.container_name, "--",
             "su", "-", "ubuntu", "-c",
-            f"sqlite3 ~/genesis/data/genesis.db "
+            f"sqlite3 ~/genesis/data/genesis.db "  # noqa: S608 - config int into remote sqlite3 CLI; no binding over incus exec
             f"'SELECT created_at FROM awareness_ticks "
             f"ORDER BY created_at DESC LIMIT {count}'",
             timeout=config.probes.probe_timeout_s,
@@ -522,7 +522,7 @@ async def check_tmp_usage(config: GuardianConfig) -> SuspiciousResult:
     try:
         rc, stdout, stderr = await _run_subprocess(
             "incus", "exec", config.container_name, "--",
-            "df", "--output=pcent", "/tmp",
+            "df", "--output=pcent", "/tmp",  # noqa: S108 - monitoring host /tmp usage, not creating temp files
             timeout=config.probes.probe_timeout_s,
         )
         if rc != 0:

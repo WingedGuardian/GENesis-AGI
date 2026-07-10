@@ -69,9 +69,16 @@ async def unified_work():
     if type_filter in (None, "follow_up"):
         try:
             if view == "active":
-                fups = await follow_ups.get_by_status(rt.db, "pending")
-                fups += await follow_ups.get_by_status(rt.db, "in_progress")
-                fups += await follow_ups.get_by_status(rt.db, "blocked")
+                # Exclude tabled markers (e.g. inbox WATCH/BOOKMARK attention
+                # markers) from the ACTIVE work ledger — they are tracked, not
+                # actionable. They remain browsable in the recent view below
+                # (get_recent defaults include_tabled=True).
+                fups = await follow_ups.get_by_status(
+                    rt.db, "pending", include_tabled=False)
+                fups += await follow_ups.get_by_status(
+                    rt.db, "in_progress", include_tabled=False)
+                fups += await follow_ups.get_by_status(
+                    rt.db, "blocked", include_tabled=False)
             else:
                 fups = await follow_ups.get_recent(rt.db, limit=limit)
             for f in fups:
@@ -90,7 +97,10 @@ async def unified_work():
                     "blocked_reason": f.get("blocked_reason", ""),
                     "raw": f,
                 })
-            fu_counts = await follow_ups.get_summary_counts(rt.db)
+            # Active view's badge must agree with its list (actionable lane
+            # only); the recent view counts every kind, matching get_recent.
+            fu_counts = await follow_ups.get_summary_counts(
+                rt.db, include_tabled=(view != "active"))
             counts["follow_ups"] = fu_counts
         except Exception:
             logger.error("Failed to fetch follow-ups for work view", exc_info=True)

@@ -285,7 +285,7 @@ class GenesisEgoContextBuilder:
             # not in _USER_WORLD_CATEGORIES that isn't :user tagged.
             exclude_placeholders = ",".join("?" for _ in _USER_WORLD_CATEGORIES)
             cursor = await self._db.execute(
-                f"SELECT id, source, type, category, content, priority, created_at "
+                f"SELECT id, source, type, category, content, priority, created_at "  # noqa: S608 - literal SQL fragments; values bound as parameters
                 f"FROM observations "
                 f"WHERE resolved = 0 "
                 f"AND created_at >= datetime('now', '-48 hours') "

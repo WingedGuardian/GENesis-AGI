@@ -388,8 +388,8 @@ class KnowledgeOrchestrator:
         import genesis.mcp.memory_mcp as memory_mod
 
         memory_mod._require_init()
-        assert memory_mod._store is not None
-        assert memory_mod._db is not None
+        assert memory_mod._store is not None  # noqa: S101 - type-narrowing invariant
+        assert memory_mod._db is not None  # noqa: S101 - type-narrowing invariant
 
         import uuid
         from datetime import UTC, datetime

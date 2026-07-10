@@ -135,7 +135,7 @@ async def get_runs(
     params.append(limit)
 
     cursor = await db.execute(
-        f"SELECT * FROM eval_runs {where} ORDER BY created_at DESC LIMIT ?",
+        f"SELECT * FROM eval_runs {where} ORDER BY created_at DESC LIMIT ?",  # noqa: S608 - literal SQL fragments; values bound as parameters
         params,
     )
     cols = [d[0] for d in cursor.description]

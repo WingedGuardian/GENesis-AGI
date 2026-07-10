@@ -252,7 +252,7 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
     placeholders = ",".join("?" * len(_EXCLUDED_TYPES))
     try:
         cursor = await db.execute(
-            "SELECT content FROM observations "
+            "SELECT content FROM observations "  # noqa: S608 - literal SQL fragments; values bound as parameters
             f"WHERE type NOT IN ({placeholders}) "
             "AND resolved = 0 "
             "AND created_at > datetime('now', ?) "
