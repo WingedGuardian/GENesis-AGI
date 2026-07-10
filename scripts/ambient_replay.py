@@ -266,6 +266,9 @@ async def replay(args) -> dict:
                         created_before=as_of_cutoff,
                         entity_lane=args.entity_lane,
                         entity_shadow_out=entity_shadow,
+                        # Verbatim keys — mirrors the worker (multi-word
+                        # alias-normalized keys must not be re-split).
+                        entity_terms=top_entities(state, 32),
                     )
                     fire_rec["candidates"] = [
                         {

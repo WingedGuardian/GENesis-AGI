@@ -173,7 +173,11 @@ async def upsert_link(
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(source_id, target_id, link_type) DO UPDATE SET "
         "provenance = excluded.provenance, confidence = excluded.confidence, "
-        "evidence_memory_id = excluded.evidence_memory_id "
+        "evidence_memory_id = excluded.evidence_memory_id, "
+        # A stronger undated claim must not erase a known valid_at; a
+        # stronger dated claim must replace NULL (as_of treats NULL as
+        # always-valid, which silently widens the validity interval).
+        "valid_at = COALESCE(excluded.valid_at, entity_links.valid_at) "
         "WHERE excluded.confidence > entity_links.confidence",
         (
             source_id, target_id, slugify_link_type(link_type), provenance,
@@ -302,13 +306,25 @@ async def merge_entity(
     survivor_id: str,
     _commit: bool = True,
 ) -> None:
-    """Adjudicated merge: rewrite loser's mentions/links to the survivor."""
+    """Adjudicated merge: rewrite loser's mentions/links to the survivor.
+
+    Keep-stronger discipline mirrors ``upsert_mention``/``upsert_link``:
+    when the survivor already holds the same mention/relation, the
+    higher-confidence row wins — a merge must never discard the
+    strongest evidence (the loser is often the better-attested record).
+    """
     now = datetime.now(UTC).isoformat()
     await db.execute(
-        "INSERT OR IGNORE INTO entity_mentions "
+        "INSERT INTO entity_mentions "
         "(memory_id, entity_id, provenance, confidence, source, created_at) "
         "SELECT memory_id, ?, provenance, confidence, source, created_at "
-        "FROM entity_mentions WHERE entity_id = ?",
+        # The SELECT's own WHERE disambiguates the upsert-from-SELECT
+        # parse (SQLite needs one before ON CONFLICT).
+        "FROM entity_mentions WHERE entity_id = ? "
+        "ON CONFLICT(memory_id, entity_id) DO UPDATE SET "
+        "provenance = excluded.provenance, confidence = excluded.confidence, "
+        "source = excluded.source "
+        "WHERE excluded.confidence > entity_mentions.confidence",
         (survivor_id, loser_id),
     )
     await db.execute(
@@ -318,12 +334,18 @@ async def merge_entity(
         # dst != survivor guard: a pre-existing loser↔survivor link
         # (e.g. an LLM-emitted supersedes) must not become a self-loop.
         await db.execute(
-            f"INSERT OR IGNORE INTO entity_links "  # noqa: S608
+            f"INSERT INTO entity_links "  # noqa: S608
             f"({src_col}, {dst_col}, link_type, provenance, confidence, "
             f"evidence_memory_id, valid_at, invalid_at, invalidated_by, created_at) "
             f"SELECT ?, {dst_col}, link_type, provenance, confidence, "
             f"evidence_memory_id, valid_at, invalid_at, invalidated_by, created_at "
-            f"FROM entity_links WHERE {src_col} = ? AND {dst_col} != ?",
+            f"FROM entity_links WHERE {src_col} = ? AND {dst_col} != ? "
+            f"ON CONFLICT(source_id, target_id, link_type) DO UPDATE SET "
+            f"provenance = excluded.provenance, "
+            f"confidence = excluded.confidence, "
+            f"evidence_memory_id = excluded.evidence_memory_id, "
+            f"valid_at = COALESCE(excluded.valid_at, entity_links.valid_at) "
+            f"WHERE excluded.confidence > entity_links.confidence",
             (survivor_id, loser_id, survivor_id),
         )
         await db.execute(
