@@ -115,6 +115,11 @@ def gate_mode(gate: str) -> str:
         return "off"
     gate_cfg = cfg.get(gate)
     mode = gate_cfg.get("mode") if isinstance(gate_cfg, dict) else None
+    if mode is False:
+        # A hand-edited unquoted `mode: off` parses as YAML-1.1 boolean
+        # False. That intent is unambiguous — honor it. (True is NOT
+        # mapped: `on` is not a mode, so it degrades to shadow below.)
+        mode = "off"
     if mode not in MODES:
         logger.warning(
             "ws3_immunity gate %s has invalid mode %r — degrading to shadow",

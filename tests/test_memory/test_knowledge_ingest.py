@@ -74,3 +74,46 @@ async def test_ingest_unit_scan_failure_is_fail_open():
         unit_id = await _run("anything")
 
     assert unit_id == "unit-1"
+
+
+# ─── WS-3 origin_class: one derivation, both stores ─────────────────────────
+
+
+async def _run_capture(provenance: dict | None = None):
+    """Invoke ingest_knowledge_unit; return (store_mock, upsert_mock)."""
+    store = _mock_store()
+    with patch(
+        "genesis.memory.knowledge_ingest.knowledge_crud.find_by_unique_key",
+        new_callable=AsyncMock, return_value=None,
+    ), patch(
+        "genesis.memory.knowledge_ingest.knowledge_crud.upsert",
+        new_callable=AsyncMock, return_value=("unit-1", True),
+    ) as upsert_mock:
+        await ingest_knowledge_unit(
+            store=store,
+            db=MagicMock(),
+            content="some knowledge body",
+            project="proj",
+            domain="dom",
+            provenance=provenance,
+        )
+    return store, upsert_mock
+
+
+async def test_ingest_unit_default_origin_is_external_untrusted():
+    """Default provenance → source_pipeline='knowledge_ingest' → external,
+    and the SAME resolved value reaches store.store AND knowledge upsert."""
+    store, upsert_mock = await _run_capture()
+
+    assert store.store.call_args.kwargs["origin_class"] == "external_untrusted"
+    assert upsert_mock.call_args.kwargs["origin_class"] == "external_untrusted"
+
+
+async def test_ingest_unit_surplus_pipeline_is_first_party():
+    """Genesis-authored surplus insights stay first_party in both stores."""
+    store, upsert_mock = await _run_capture(
+        provenance={"source_pipeline": "surplus"},
+    )
+
+    assert store.store.call_args.kwargs["origin_class"] == "first_party"
+    assert upsert_mock.call_args.kwargs["origin_class"] == "first_party"

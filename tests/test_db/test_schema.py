@@ -575,6 +575,11 @@ async def test_migration_on_stripped_db():
         col_names = {row[1] for row in await cursor.fetchall()}
         assert "deprecated" in col_names, "migration didn't add 'deprecated' column"
         assert "dream_cycle_run_id" in col_names, "migration didn't add 'dream_cycle_run_id'"
+        assert "origin_class" in col_names, "memory_metadata missing 'origin_class'"
+
+        cursor = await conn.execute("PRAGMA table_info(knowledge_units)")
+        ku_col_names = {row[1] for row in await cursor.fetchall()}
+        assert "origin_class" in ku_col_names, "knowledge_units missing 'origin_class'"
 
         # Create all indexes
         for idx_ddl in INDEXES:
