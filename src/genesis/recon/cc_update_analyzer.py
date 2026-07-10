@@ -383,11 +383,15 @@ class CCUpdateAnalyzer:
             )
 
             from genesis.db.crud import knowledge as knowledge_crud
+            from genesis.memory.provenance import derive_origin_class
 
             # Use upsert so re-analysis of the same CC release version
             # replaces the stale row instead of failing on the
             # UNIQUE(project_type, domain, concept) constraint.  The concept
             # is derived from summary[:200] which is stable per-version.
+            # WS-3: mirror the store() call's provenance — the ON CONFLICT
+            # SET would otherwise regress a backfilled origin_class to NULL
+            # on re-analysis.
             _uid, inserted = await knowledge_crud.upsert(
                 self._db,
                 project_type="genesis-infra",
@@ -400,6 +404,10 @@ class CCUpdateAnalyzer:
                 qdrant_id=qdrant_id,
                 embedding_model=getattr(
                     self._memory_store._embeddings, "model_name", None,
+                ),
+                source_pipeline="recon",
+                origin_class=derive_origin_class(
+                    source_pipeline="recon", collection="knowledge_base",
                 ),
             )
             logger.info(

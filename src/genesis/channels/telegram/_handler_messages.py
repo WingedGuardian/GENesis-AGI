@@ -1198,6 +1198,9 @@ async def _try_ego_correction_store(ctx: HandlerContext, msg) -> bool:
                 memory_type="episodic",
                 wing="autonomy",
                 room="ego",
+                # WS-3: the content IS the owner's own message text — the
+                # one store() call site where "owner" is directly traceable.
+                origin_class="owner",
             )
             log.info("Stored ego user correction (%d chars)", len(msg.text))
             try:

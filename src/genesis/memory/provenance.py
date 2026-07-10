@@ -59,6 +59,100 @@ _PIPELINE_SHORT: dict[str, str] = {
 # Placeholder ``source_doc`` values that carry no real provenance.
 _PLACEHOLDER_DOCS = {"", "manual"}
 
+# ── WS-3 origin_class taxonomy ────────────────────────────────────────────
+# Persisted at STORE time (memory_metadata / knowledge_units / Qdrant
+# payload), unlike the recall-time labels above which re-derive from the
+# collection on every read. Future immunity gates key on
+# external_untrusted vs not; owner and first_party are never blockable.
+
+ORIGIN_OWNER = "owner"
+ORIGIN_FIRST_PARTY = "first_party"
+ORIGIN_EXTERNAL_UNTRUSTED = "external_untrusted"
+ORIGIN_CLASSES = frozenset(
+    {ORIGIN_OWNER, ORIGIN_FIRST_PARTY, ORIGIN_EXTERNAL_UNTRUSTED}
+)
+
+# Pipelines whose CONTENT is text pulled off the world. ``curated`` is here
+# deliberately: "curated" is an authority tier, not authorship — URL/file
+# ingests land as curated and the body is third-party text even when the
+# owner initiated the ingest (user-decided 2026-07-10; if B1 shadow logs
+# show legitimate owner workflows would-block via curated units, split
+# curated_upload/first_party vs curated_url/external — ingest_source
+# already knows source_type). ``email``/``inbox``/``web_search``/
+# ``web_fetch`` have no store() writers today; reserving them means a
+# future writer is external BY DEFAULT rather than silently first-party.
+_EXTERNAL_PIPELINES = frozenset({
+    "crag_web",
+    "recon",
+    "knowledge_ingest",
+    "knowledge_ingest_source",
+    "curated",
+    "email",
+    "inbox",
+    "web_search",
+    "web_fetch",
+})
+
+# Pipelines that write Genesis's own observations/derivations or the
+# owner's conversational content.
+_FIRST_PARTY_PIPELINES = frozenset({
+    "conversation",
+    "session_observer",
+    "harvest",
+    "synthesis",
+    "event_calendar",
+    "dream_cycle",
+    "reflection",
+    "drift",
+    "extraction_job",
+    "surplus",
+    "reference_store",
+})
+
+
+def derive_origin_class(
+    *,
+    origin_class: str | None = None,
+    source_pipeline: str | None = None,
+    source_subsystem: str | None = None,
+    collection: str | None = None,
+) -> str:
+    """Deterministic store-time origin classification.
+
+    Precedence (each rule short-circuits):
+      1. explicit ``origin_class`` override — validated, wins outright
+      2. pipeline in the external set → external_untrusted (outranks
+         source_subsystem: e.g. the recon pipeline stores web-collected
+         signals WITH ``source_subsystem='triage'`` — content is external)
+      3. pipeline in the first-party set → first_party
+      4. any ``source_subsystem`` → first_party (internal subsystem writer)
+      5. ``collection == 'knowledge_base'`` → external_untrusted (the same
+         already-litigated discriminator :func:`is_external` uses)
+      6. default → first_party
+
+    This is the CONSERVATIVE store-time mapping (unknown internal writers
+    stay first-party, matching :func:`is_external`'s documented stance).
+    Fail-closed normalization of unknown/missing values to
+    external_untrusted happens only at GATE time, in
+    ``genesis.security.immunity.effective_origin_class`` — never here.
+    """
+    if origin_class is not None:
+        if origin_class not in ORIGIN_CLASSES:
+            raise ValueError(
+                f"invalid origin_class {origin_class!r}; "
+                f"expected one of {sorted(ORIGIN_CLASSES)}"
+            )
+        return origin_class
+    if source_pipeline in _EXTERNAL_PIPELINES:
+        return ORIGIN_EXTERNAL_UNTRUSTED
+    if source_pipeline in _FIRST_PARTY_PIPELINES:
+        return ORIGIN_FIRST_PARTY
+    if source_subsystem:
+        return ORIGIN_FIRST_PARTY
+    if collection == KNOWLEDGE_COLLECTION:
+        return ORIGIN_EXTERNAL_UNTRUSTED
+    return ORIGIN_FIRST_PARTY
+
 
 def is_external(collection: str | None) -> bool:
     """True when the memory came from the external-world knowledge base.

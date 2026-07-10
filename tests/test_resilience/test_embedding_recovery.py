@@ -92,7 +92,7 @@ class TestDrainPending:
         # row, so wing/room are guaranteed present at drain time.
         await memory_crud.create_metadata(
             db, memory_id="mem-facet", created_at="2026-03-11T12:00:00",
-            wing="infrastructure", room="watchdog",
+            wing="infrastructure", room="watchdog", origin_class="first_party",
         )
         await crud.create(
             db, id="pe-facet", memory_id="mem-facet", content="facet item",
@@ -106,6 +106,9 @@ class TestDrainPending:
         assert payload["wing"] == "infrastructure"
         assert payload["room"] == "watchdog"
         assert payload["life_domain"] == "health"
+        # WS-3: origin_class restored from the authoritative metadata row so
+        # an outage-recovered point carries the indexed provenance key.
+        assert payload["origin_class"] == "first_party"
         # project_type is not recoverable on this path — must stay absent
         assert "project_type" not in payload
         # the stray memory_id key is dropped to match the normal write path

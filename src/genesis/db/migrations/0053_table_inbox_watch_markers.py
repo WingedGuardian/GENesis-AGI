@@ -31,7 +31,7 @@ _WHERE = (
 
 async def up(db: aiosqlite.Connection) -> None:
     await db.execute(
-        f"UPDATE follow_ups SET kind = 'tabled' "
+        f"UPDATE follow_ups SET kind = 'tabled' "  # noqa: S608 - _WHERE is a literal constant, no user input
         f"WHERE {_WHERE} AND kind = 'follow_up'"
     )
 
