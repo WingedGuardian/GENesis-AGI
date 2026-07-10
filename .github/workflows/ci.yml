@@ -101,6 +101,23 @@ jobs:
           fi
           echo "Secret scan: CLEAN (0 findings)"
 
+      - name: Leak scan (gitleaks)
+        # Blocking. Covers the whole tree (incl. docs/) with the repo's
+        # .gitleaks.toml PII/infrastructure rules — the scans above only
+        # cover src/config/scripts/.github. Version+checksum pinned;
+        # --redact is MANDATORY: these logs are public, a found secret
+        # must never be echoed into them.
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION=8.22.1
+          GITLEAKS_SHA256=2f92ab3b8e08319ac30836c32b90818e01519c3a4982771e4f45a7f5607872f7
+          curl -sSfL -o /tmp/gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          /tmp/gitleaks detect --no-git --redact -c .gitleaks.toml --source .
+          echo "Leak scan (gitleaks): CLEAN"
+
       - name: Portability scan (user-specific content)
         run: |
           set -euo pipefail

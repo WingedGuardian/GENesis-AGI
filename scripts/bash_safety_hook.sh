@@ -87,13 +87,13 @@ fi
 # below, because the generic "git push" warning (exit 0) would otherwise
 # short-circuit a force-push before this block could hard-block it.
 case "$CMD" in
-    *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*|*"rm -rf .."*)
+    *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*)  # "rm -rf ." also covers ".."
         echo "BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user." >&2
         exit 2;;
     *"git reset --hard"*)
         echo "BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user." >&2
         exit 2;;
-    *"git clean -f"*|*"git clean -fd"*)
+    *"git clean -f"*)  # substring also covers -fd
         echo "BLOCKED: git clean removes untracked files permanently. Ask the user first." >&2
         exit 2;;
 esac
@@ -125,7 +125,9 @@ fi
 # used to skip this check entirely (2026-07-10 P1 triage).
 if echo "$CMD" | grep -qE "^gh pr merge|[;&|] *gh pr merge"; then
     _pr_num=$(echo "$CMD" | grep -oE 'merge +#?[0-9]+' | grep -oE '[0-9]+' | head -1)
-    _repo_flag=$(echo "$CMD" | grep -oP -- '--repo \S+' || true)
+    _repo_args=()
+    _repo=$(echo "$CMD" | grep -oP -- '--repo \K\S+' || true)
+    [ -n "$_repo" ] && _repo_args=(--repo "$_repo")
     if [ -z "$_pr_num" ]; then
         # No number in the command — resolve the current branch's open PR
         _pr_num=$(gh pr view --json number --jq '.number' 2>/dev/null || true)
@@ -135,7 +137,7 @@ if echo "$CMD" | grep -qE "^gh pr merge|[;&|] *gh pr merge"; then
         echo "Specify the PR number: gh pr merge <N> --squash --admin" >&2
         exit 2
     fi
-    _mergeable=$(gh pr view "$_pr_num" $_repo_flag --json mergeable --jq '.mergeable' 2>/dev/null)
+    _mergeable=$(gh pr view "$_pr_num" "${_repo_args[@]}" --json mergeable --jq '.mergeable' 2>/dev/null)
     if [ "$_mergeable" = "UNKNOWN" ]; then
         echo "BLOCKED: PR #$_pr_num mergeable status is UNKNOWN." >&2
         echo "GitHub hasn't finished conflict analysis. Wait until mergeable status is known before retrying." >&2

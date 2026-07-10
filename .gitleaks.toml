@@ -53,4 +53,17 @@ paths = [
     '''src/genesis/contribution/sanitize\.py''',
     '''scripts/hooks/commit-msg''',
     '''\.gitleaks\.toml''',
+    '''secrets\.env\.example''',
+]
+# Match allowlist regexes against the whole LINE (default is the captured
+# secret, which never includes the /10 and /48 suffixes that mark these
+# as range notation rather than host addresses).
+regexTarget = "line"
+regexes = [
+    # RFC 6598 CGNAT range notation in security docs — a range, not an
+    # address of anything.
+    '''100\.64\.0\.0/10''',
+    # Tailscale ULA prefix notation in code comments — the prefix
+    # itself, not a host address.
+    '''fd7a::/48''',
 ]

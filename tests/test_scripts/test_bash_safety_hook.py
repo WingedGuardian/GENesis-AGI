@@ -175,3 +175,43 @@ def test_worktree_serve_blocked(cmd, tmp_path):
 def test_non_worktree_serve_paths_allowed(cmd, tmp_path):
     """Server management and plain serve (outside a worktree) pass this guard."""
     assert _run_cwd(cmd, tmp_path).returncode == 0
+
+
+# --- gh pr merge: PR resolution fails CLOSED (2026-07-10 P1 triage) ---
+
+def _gh_stub(tmp_path: Path, script: str) -> dict[str, str]:
+    """Put a fake `gh` first on PATH so no test touches the network."""
+    stub = tmp_path / "gh"
+    stub.write_text(f"#!/usr/bin/env bash\n{script}\n")
+    stub.chmod(0o755)
+    return {"PATH": f"{tmp_path}:{os.environ['PATH']}"}
+
+
+def test_merge_no_arg_unresolvable_blocks(tmp_path):
+    """No number in the command AND no open PR for the branch -> exit 2."""
+    env = _gh_stub(tmp_path, "exit 1")
+    result = _run("gh pr merge --squash --admin", env_extra=env)
+    assert result.returncode == 2
+    assert "cannot resolve" in result.stderr
+
+
+def test_merge_no_arg_resolves_branch_pr(tmp_path):
+    """No number, but the branch has an open PR -> gates run against it."""
+    env = _gh_stub(
+        tmp_path,
+        'case "$*" in *"--json number"*) echo 42;; '
+        '*"--json mergeable"*) echo MERGEABLE;; esac',
+    )
+    result = _run("gh pr merge --squash", env_extra=env)
+    assert result.returncode == 0
+    assert "PR #42" in result.stderr
+
+
+def test_merge_numbered_conflicting_blocks(tmp_path):
+    env = _gh_stub(
+        tmp_path,
+        'case "$*" in *"--json mergeable"*) echo CONFLICTING;; esac',
+    )
+    result = _run("gh pr merge 123 --squash", env_extra=env)
+    assert result.returncode == 2
+    assert "merge conflicts" in result.stderr
