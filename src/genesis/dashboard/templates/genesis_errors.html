@@ -198,11 +198,6 @@
           return map[sev] || "#f0ad4e";
         },
 
-        formatTime(isoStr) {
-          if (!isoStr) return "-";
-          try { return new Date(isoStr).toLocaleTimeString("en-US", { hour12: false }); } catch { return isoStr; }
-        },
-
         formatDateTime(isoStr) {
           if (!isoStr) return "-";
           try {
@@ -210,6 +205,21 @@
             return d.toLocaleDateString("en-US", { month: "short", day: "numeric" })
               + " " + d.toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit" });
           } catch { return isoStr; }
+        },
+
+        // Range end: bare time only when it's the same calendar day as the
+        // start — a cross-day range must show the date on both ends.
+        formatRangeEnd(firstIso, lastIso) {
+          if (!lastIso) return "-";
+          try {
+            const a = new Date(firstIso), b = new Date(lastIso);
+            const sameDay = a.getFullYear() === b.getFullYear()
+              && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+            if (sameDay) {
+              return b.toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit" });
+            }
+            return this.formatDateTime(lastIso);
+          } catch { return lastIso; }
         },
 
         get sortedGroups() {
@@ -718,7 +728,7 @@
                   x-text="group.message_prefix"></span>
             <span class="group-count" x-text="group.count"></span>
             <span class="group-times"
-                  x-text="$store.genesisErrors.formatDateTime(group.first_seen) + ' \u2192 ' + $store.genesisErrors.formatTime(group.last_seen)"></span>
+                  x-text="$store.genesisErrors.formatDateTime(group.first_seen) + ' \u2192 ' + $store.genesisErrors.formatRangeEnd(group.first_seen, group.last_seen)"></span>
             <span class="group-expand">
               <span class="material-symbols-outlined"
                     :style="$store.genesisErrors.expandedGroupKey === group.key ? 'transform:rotate(180deg)' : ''"

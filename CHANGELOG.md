@@ -66,6 +66,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   now protect all unit templates, and the unused `config/genesis-watchdog.*`
   duplicates (stale 60s cadence, wrong dependencies) are removed.
 
+- **The dashboard stops lying about monitoring state — six correctness fixes.**
+  The Observations badge no longer reads 0 on a fresh page load while unsurfaced
+  observations are waiting (its count now loads with the page and refreshes on
+  the standard poll). The Event Log defaults to INFO+ so the once-a-minute
+  heartbeat no longer drowns the feed (DEBUG stays one click away). The Neural
+  Monitor shows long-stale runs as days ("67d") instead of raw hours
+  ("1613.5h"). The Error Log's time-range column shows the date on both ends
+  when a group spans days. The observation source filter folds per-session
+  UUIDs into a single "session (any)" option. And high-traffic tabs show
+  "Loading…" during their first fetch instead of flashing a false "No X found".
+
 - **The Guardian's recovery brain no longer goes dark when its work directory is
   misconfigured.** On some installs the Guardian's configured CC work dir points
   at a path it can't create (e.g. a root-owned dir on an install that predates

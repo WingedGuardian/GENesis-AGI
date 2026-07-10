@@ -93,8 +93,18 @@
           </template>
         </div>
 
-        <!-- Empty state -->
-        <template x-if="$store.genesisDashboard.cockpitList.length === 0">
+        <!-- First-load / failure / empty: never flash a false "No X found" -->
+        <template x-if="$store.genesisDashboard.panelState('cockpit') === 'loading'">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            Loading…
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.panelState('cockpit') === 'error'">
+          <div style="padding:1.5rem; text-align:center; color:#f0ad4e; font-size:0.75rem;">
+            Couldn't load follow-ups — will keep retrying.
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.cockpitList.length === 0 && !['loading','error'].includes($store.genesisDashboard.panelState('cockpit'))">
           <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
             No follow-ups match these filters.
           </div>
