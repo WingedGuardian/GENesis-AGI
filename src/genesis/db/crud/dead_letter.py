@@ -218,26 +218,3 @@ async def recent_optype_counts(
     sql += " GROUP BY operation_type ORDER BY c DESC"
     cursor = await db.execute(sql, params)
     return [(str(r[0]), int(r[1])) for r in await cursor.fetchall()]
-
-
-async def recent_provider_counts(
-    db: aiosqlite.Connection,
-    *,
-    since: str,
-) -> list[tuple[str, int, str]]:
-    """Per-target_provider ``(provider, count, last_created_at)`` of dead-letters
-    enqueued at/after ``since``, any status.
-
-    Any-status on purpose: a replayed/expired storm is still a failure signal
-    worth linking to its provider on the API-keys card. The reserved ``'all'``
-    sentinel (chain-exhausted items) passes through unfiltered — it never
-    matches a real provider name at merge time. Backed by
-    ``idx_dead_letter_created``. Ordered by count descending.
-    """
-    cursor = await db.execute(
-        "SELECT target_provider, COUNT(*) AS c, MAX(created_at) "
-        "FROM dead_letter WHERE created_at >= ? "
-        "GROUP BY target_provider ORDER BY c DESC",
-        (since,),
-    )
-    return [(str(r[0]), int(r[1]), str(r[2])) for r in await cursor.fetchall()]

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -181,16 +181,6 @@ class HealthDataService:
 
         now = datetime.now(UTC).isoformat()
 
-        async def _recent_provider_failures() -> list:
-            # 24h per-provider dead-letter counts feed the API-keys card's
-            # provider→failure linkage. Pre-bootstrap (no DB) → no counts.
-            if self._db is None:
-                return []
-            from genesis.db.crud import dead_letter as dead_letter_crud
-
-            since = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
-            return await dead_letter_crud.recent_provider_counts(self._db, since=since)
-
         # Probe providers if cache is stale (probes are free — /v1/models endpoints)
         probe_results = None
         if self._provider_health:
@@ -234,7 +224,6 @@ class HealthDataService:
             services_async(),
             asyncio.to_thread(conversation_activity),
             asyncio.to_thread(proactive_memory_metrics),
-            _recent_provider_failures(),
             return_exceptions=True,
         )
         # Isolate any failed section uniformly: one raising sub-snapshot degrades
@@ -244,17 +233,8 @@ class HealthDataService:
             r_call_sites, r_cc_sessions, r_infrastructure, r_queues, r_surplus,
             r_cost, r_awareness, r_outreach, r_mcp, r_provider_activity,
             r_memory_health, r_eval_staleness, r_vcr,
-            r_services, r_conversation, r_proactive, r_dl_providers,
+            r_services, r_conversation, r_proactive,
         ) = results
-
-        # A failed dead-letter query degrades to "no counts" — _or_error turns
-        # it into a dict, which must never poison the api_keys section.
-        recent_failures: dict[str, dict] = {}
-        if isinstance(r_dl_providers, list):
-            recent_failures = {
-                name: {"count": count, "last_at": last_at}
-                for name, count, last_at in r_dl_providers
-            }
 
         # Surface infra probe healthy<->unhealthy transitions to the activity
         # feed. Best-effort: a bad emit must never poison the shared snapshot.
@@ -275,10 +255,7 @@ class HealthDataService:
             "awareness": r_awareness,
             "outreach_stats": r_outreach,
             "services": r_services,
-            "api_keys": api_key_health(
-                self._routing_config, breakers=self._breakers,
-                recent_failures=recent_failures,
-            ),
+            "api_keys": api_key_health(self._routing_config, breakers=self._breakers),
             "mcp_servers": r_mcp,
             "conversation": r_conversation,
             "provider_activity": r_provider_activity,

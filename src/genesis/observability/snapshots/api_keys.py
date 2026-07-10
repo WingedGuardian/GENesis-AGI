@@ -48,7 +48,6 @@ def has_api_key(provider_cfg) -> bool:
 def api_key_health(
     routing_config: RoutingConfig | None,
     breakers: object | None = None,
-    recent_failures: dict[str, dict] | None = None,
 ) -> dict:
     """Provider API key health with chain-aware criticality and CB state.
 
@@ -57,12 +56,6 @@ def api_key_health(
     Each provider entry includes the original fields (status, provider_type)
     plus chain_count, criticality, is_free, cb_state, cb_reason, and
     alert_severity — derived from the routing config and circuit breakers.
-
-    ``recent_failures`` maps provider name → ``{"count": int, "last_at": iso}``
-    (windowed dead-letter counts, supplied by health_data). Matched providers
-    gain ``recent_failures``/``last_failure_at`` fields so the API-keys card
-    can link a missing/broken key to the failures it is causing. Purely
-    additive — no effect on status, severity, or color.
 
     The ``alerts`` list contains pre-computed attention-strip items for
     critical/warning conditions (credit exhaustion, missing critical keys).
@@ -203,17 +196,6 @@ def api_key_health(
                 "alert_severity": None,
                 "key_health": "gray",
             }
-
-    # Link providers to the failures they're causing (windowed dead-letter
-    # counts). Applied uniformly — enabled AND disabled entries — for every
-    # provider present in the map, whatever its key status: a CB-open provider
-    # with a valid key benefits as much as a missing-key one.
-    if recent_failures:
-        for name, entry in results.items():
-            rf = recent_failures.get(name)
-            if rf:
-                entry["recent_failures"] = int(rf.get("count", 0))
-                entry["last_failure_at"] = rf.get("last_at")
 
     # Build attention-strip alerts
     alerts = _build_alerts(results)
