@@ -127,15 +127,6 @@ async def consecutive_failures(
     return count
 
 
-async def recover_stuck(
-    db: aiosqlite.Connection,
-    *,
-    older_than_hours: int = 2,
-) -> tuple[int, int]:
-    """Recover tasks stuck in 'running' state beyond the timeout threshold."""
-    return await recover_stuck_with_retries(db, older_than_hours=older_than_hours, max_retries=3)
-
-
 async def recover_stuck_with_retries(
     db: aiosqlite.Connection,
     *,
