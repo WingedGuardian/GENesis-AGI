@@ -198,11 +198,6 @@
           return map[sev] || "#f0ad4e";
         },
 
-        formatTime(isoStr) {
-          if (!isoStr) return "-";
-          try { return new Date(isoStr).toLocaleTimeString("en-US", { hour12: false }); } catch { return isoStr; }
-        },
-
         formatDateTime(isoStr) {
           if (!isoStr) return "-";
           try {

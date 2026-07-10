@@ -66,6 +66,28 @@ async def test_distinct_unresolved_types_and_sources(db):
     assert await observations.distinct_unresolved_sources(db) == ["sensor", "session:abc"]
 
 
+async def test_count_unsurfaced_mirrors_get_unsurfaced(db):
+    await observations.create(db, id="cu1", **_COMMON)                                # counted
+    await observations.create(db, id="cu2", **{**_COMMON, "priority": "low"})         # excluded by priority
+    await observations.create(db, id="cu3", **{**_COMMON, "type": "internal_thing"})  # excluded by type
+    await observations.create(db, id="cu4", **_COMMON)
+    await observations.mark_surfaced(db, ["cu4"], "2026-01-02T00:00:00")              # surfaced
+    await observations.create(db, id="cu5", **_COMMON)
+    await observations.resolve(db, "cu5", resolved_at="2026-01-02T00:00:00", resolution_notes="")
+
+    count = await observations.count_unsurfaced(
+        db, priority_filter=("critical", "high", "medium"),
+        exclude_types=("internal_thing",),
+    )
+    assert count == 1
+    rows = await observations.get_unsurfaced(
+        db, priority_filter=("critical", "high", "medium"),
+        exclude_types=("internal_thing",), limit=100,
+    )
+    assert count == len(rows)
+    assert await observations.count_unsurfaced(db, priority_filter=()) == 0
+
+
 async def test_distinct_unresolved_sources_excludes_types(db):
     """A source whose unresolved rows are ALL excluded types must not appear."""
     await observations.create(db, id="dx1", **_COMMON)

@@ -97,14 +97,13 @@ async def observations_summary():
         return jsonify({"counts": {}, "total_unsurfaced": 0, "total_unresolved": 0})
 
     counts = await obs_crud.unsurfaced_counts_by_priority(rt.db)
-    # Filter out internal types from the counts shown to user
-    unsurfaced_user = await obs_crud.get_unsurfaced(
+    # Filter out internal types from the counts shown to user. COUNT query —
+    # this endpoint is polled every 15s by every open dashboard for the badge.
+    total_unsurfaced = await obs_crud.count_unsurfaced(
         rt.db,
         priority_filter=("critical", "high", "medium", "low"),
         exclude_types=tuple(INTERNAL_OBS_TYPES),
-        limit=1000,
     )
-    total_unsurfaced = len(unsurfaced_user)
     total_unresolved = await obs_crud.count_unresolved(
         rt.db, exclude_types=INTERNAL_OBS_TYPES
     )

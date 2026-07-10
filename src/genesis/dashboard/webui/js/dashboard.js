@@ -286,6 +286,8 @@
           workSessions: { state: "idle", lastSuccess: null, error: null },
           cockpit: { state: "idle", lastSuccess: null, error: null },
           comms: { state: "idle", lastSuccess: null, error: null },
+          autonomyGrants: { state: "idle", lastSuccess: null, error: null },
+          autonomySends: { state: "idle", lastSuccess: null, error: null },
         },
 
         // Polling interval IDs
@@ -497,7 +499,7 @@
               this._workSessionsInterval = setInterval(() => this.fetchWorkSessions(), 10000);
               break;
             case "observations":
-              if (first) { this.fetchObservations(); this.fetchObservationsSummary(); this.fetchObservationsFilters(); }
+              if (first) { this.fetchObservations(); this.fetchObservationsFilters(); }
               // Summary refresh lives on the global 15s poll (badge is chrome).
               this._observationsInterval = setInterval(() => this.fetchObservations(), 30000);
               break;
@@ -510,8 +512,6 @@
               this._tracesInterval = setInterval(() => this.fetchSpansRecent(), 30000);
               break;
             case "autonomy":
-              // refreshAutonomy (not the bare fetches) so autonomyLoading
-              // gates the empty states during the first load.
               if (first) { this.refreshAutonomy(); }
               this._autonomyInterval = setInterval(() => { this.fetchAutonomyGrants(); this.fetchAutonomySends(); }, 30000);
               break;
@@ -1329,22 +1329,36 @@
 
         // ── Autonomy tab fetches ──────────────────────────────────
         async fetchAutonomyGrants() {
+          this.startFetch("autonomyGrants");
           try {
             const resp = await fetchApi("/api/genesis/autonomy/grants");
             if (resp && resp.ok) {
               const data = await resp.json();
               this.autonomyGrants = data.grants || [];
+              this.finishFetch("autonomyGrants");
+            } else {
+              this.failFetch("autonomyGrants", "Grants endpoint returned an error");
             }
-          } catch (e) { console.warn("Autonomy grants fetch failed:", e); }
+          } catch (e) {
+            console.warn("Autonomy grants fetch failed:", e);
+            this.failFetch("autonomyGrants", "Failed to fetch autonomy grants");
+          }
         },
         async fetchAutonomySends() {
+          this.startFetch("autonomySends");
           try {
             const resp = await fetchApi("/api/genesis/autonomy/sends?limit=100");
             if (resp && resp.ok) {
               const data = await resp.json();
               this.autonomySends = data.sends || [];
+              this.finishFetch("autonomySends");
+            } else {
+              this.failFetch("autonomySends", "Sends endpoint returned an error");
             }
-          } catch (e) { console.warn("Autonomy sends fetch failed:", e); }
+          } catch (e) {
+            console.warn("Autonomy sends fetch failed:", e);
+            this.failFetch("autonomySends", "Failed to fetch autonomy sends");
+          }
         },
         async refreshAutonomy() {
           this.autonomyLoading = true;

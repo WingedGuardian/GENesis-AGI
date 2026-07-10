@@ -78,13 +78,18 @@
           </template>
         </div>
 
-        <!-- Empty state (gated on first load so a slow fetch doesn't flash it) -->
+        <!-- First-load / failure / empty: never flash a false "No X found" -->
         <template x-if="$store.genesisDashboard.panelState('observations') === 'loading'">
           <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
             Loading…
           </div>
         </template>
-        <template x-if="$store.genesisDashboard.observationsList.length === 0 && $store.genesisDashboard.panelState('observations') !== 'loading'">
+        <template x-if="$store.genesisDashboard.panelState('observations') === 'error'">
+          <div style="padding:1.5rem; text-align:center; color:#f0ad4e; font-size:0.75rem;">
+            Couldn't load observations — will keep retrying.
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.observationsList.length === 0 && !['loading','error'].includes($store.genesisDashboard.panelState('observations'))">
           <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
             No observations found.
           </div>

@@ -655,6 +655,34 @@ async def get_unsurfaced(
         return [dict(zip(cols, r, strict=False)) for r in rows]
 
 
+async def count_unsurfaced(
+    db: aiosqlite.Connection,
+    *,
+    priority_filter: tuple[str, ...] = ("critical", "high", "medium"),
+    exclude_types: tuple[str, ...] | frozenset[str] = (),
+) -> int:
+    """COUNT mirror of :func:`get_unsurfaced` (same WHERE, no rows fetched).
+
+    The dashboard badge polls this every 15s — a COUNT keeps that O(1) rows
+    instead of pulling up to ``limit`` full rows (with content) to ``len()``
+    them, and doesn't silently cap at the fetch limit.
+    """
+    if not priority_filter:
+        return 0
+    prio_placeholders = ",".join("?" for _ in priority_filter)
+    sql = (
+        "SELECT COUNT(*) FROM observations "
+        f"WHERE surfaced_at IS NULL AND resolved = 0 AND priority IN ({prio_placeholders})"
+    )
+    params: list = list(priority_filter)
+    if exclude_types:
+        type_placeholders = ",".join("?" for _ in exclude_types)
+        sql += f" AND type NOT IN ({type_placeholders})"
+        params.extend(exclude_types)
+    rows = await db.execute_fetchall(sql, params)
+    return int(rows[0][0]) if rows else 0
+
+
 async def mark_surfaced(
     db: aiosqlite.Connection,
     ids: list[str],

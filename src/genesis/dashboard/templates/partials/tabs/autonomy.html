@@ -20,13 +20,19 @@
         <!-- ── Standing autonomy ─────────────────────────────────── -->
         <div style="font-size:0.78rem; font-weight:600; margin-bottom:0.4rem;">Standing autonomy</div>
 
-        <!-- Empty state (calm / good given the all-ASK default; gated on first load) -->
-        <template x-if="$store.genesisDashboard.autonomyLoading">
+        <!-- First-load / failure / empty. The calm "no standing autonomy" line is
+             security-relevant, so it must never render on a failed fetch. -->
+        <template x-if="$store.genesisDashboard.panelState('autonomyGrants') === 'loading'">
           <div style="padding:1.1rem; text-align:center; color:var(--color-text-secondary); font-size:0.74rem; margin-bottom:1.2rem;">
             Loading…
           </div>
         </template>
-        <template x-if="!$store.genesisDashboard.autonomyLoading && $store.genesisDashboard.autonomyGrants.length === 0">
+        <template x-if="$store.genesisDashboard.panelState('autonomyGrants') === 'error'">
+          <div style="padding:1.1rem; text-align:center; color:#f0ad4e; font-size:0.74rem; margin-bottom:1.2rem;">
+            Couldn't load grants — will keep retrying.
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.autonomyGrants.length === 0 && !['loading','error'].includes($store.genesisDashboard.panelState('autonomyGrants'))">
           <div style="padding:1.1rem; text-align:center; color:var(--color-text-secondary); font-size:0.74rem; margin-bottom:1.2rem;">
             No standing autonomy — every action holds for your approval.
           </div>
@@ -63,8 +69,18 @@
         <!-- ── Autonomous sends ──────────────────────────────────── -->
         <div style="font-size:0.78rem; font-weight:600; margin-bottom:0.4rem;">Autonomous sends</div>
 
-        <!-- Empty state (gated on first load) -->
-        <template x-if="!$store.genesisDashboard.autonomyLoading && $store.genesisDashboard.autonomySends.length === 0">
+        <!-- First-load / failure / empty -->
+        <template x-if="$store.genesisDashboard.panelState('autonomySends') === 'loading'">
+          <div style="padding:1.1rem; text-align:center; color:var(--color-text-secondary); font-size:0.74rem;">
+            Loading…
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.panelState('autonomySends') === 'error'">
+          <div style="padding:1.1rem; text-align:center; color:#f0ad4e; font-size:0.74rem;">
+            Couldn't load sends — will keep retrying.
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.autonomySends.length === 0 && !['loading','error'].includes($store.genesisDashboard.panelState('autonomySends'))">
           <div style="padding:1.1rem; text-align:center; color:var(--color-text-secondary); font-size:0.74rem;">
             No autonomous sends yet.
           </div>
