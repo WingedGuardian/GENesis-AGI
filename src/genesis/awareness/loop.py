@@ -712,6 +712,7 @@ class AwarenessLoop:
         self._remediation_registry = None
         self._sentinel = None
         self._credential_bridge_fn = None
+        self._cred_integrity_fn = None
         self._autonomous_cli_policy_export_fn = None
         self._briefing_writer_fn = None
         self._findings_ingest_fn = None
@@ -1056,6 +1057,14 @@ class AwarenessLoop:
                     self._credential_bridge_fn()
                 except Exception:
                     logger.error("Credential bridge write failed", exc_info=True)
+
+            # Credential-file integrity: detect corruption + self-heal from backup
+            # (first responder; the host guardian steps in only if this doesn't).
+            if self._cred_integrity_fn:
+                try:
+                    self._cred_integrity_fn()
+                except Exception:
+                    logger.error("Credential integrity self-heal failed", exc_info=True)
 
             if self._autonomous_cli_policy_export_fn:
                 try:
@@ -1618,6 +1627,10 @@ class AwarenessLoop:
     def set_credential_bridge(self, fn) -> None:
         """Inject credential bridge for Telegram credential propagation."""
         self._credential_bridge_fn = fn
+
+    def set_cred_integrity_fn(self, fn) -> None:
+        """Inject the credential-file integrity check + self-heal (per tick)."""
+        self._cred_integrity_fn = fn
 
     def set_autonomous_cli_policy_exporter(self, fn) -> None:
         """Inject shared-mount exporter for effective autonomous CLI policy."""

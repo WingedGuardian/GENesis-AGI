@@ -1023,6 +1023,18 @@ class HybridRetriever:
         """
         link_counts = await memory_links.batch_link_counts(self._db, list(all_ids))
 
+        # FTS-only rows (no Qdrant hit) otherwise fall back to now_str for
+        # created_at, giving them an unearned recency = exp(0) = 1.0 and a
+        # phantom age of 0 in the MEM-005 entrenchment metric. Fetch their
+        # real created_at from memory_metadata (NOT NULL there); legacy FTS
+        # ghosts with no metadata row keep the now_str fallback below.
+        fts_only_ids = [mid for mid in all_ids if mid not in qdrant_by_id]
+        meta_created_at = (
+            await memory_crud.batch_created_at(self._db, fts_only_ids)
+            if fts_only_ids
+            else {}
+        )
+
         activation_by_id: dict[str, float] = {}
         inbound_by_id: dict[str, int] = {}  # saved for graph boost in step 7b
         retrieved_count_by_id: dict[str, int] = {}
@@ -1039,7 +1051,7 @@ class HybridRetriever:
                 retrieved_count = payload.get("retrieved_count", 0)
             else:
                 confidence = 0.5
-                created_at = now_str
+                created_at = meta_created_at.get(mid, now_str)
                 retrieved_count = 0
 
             mem_class = payload.get("memory_class", "fact") if qdrant_hit else "fact"

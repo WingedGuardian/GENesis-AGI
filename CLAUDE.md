@@ -142,7 +142,7 @@ Genesis to research, summarize, write content, or do non-Genesis tasks).
 
 Your Genesis install is one operational system: the public `GENesis-AGI`
 codebase (the cognitive core), the public `GENesis-Voice` repo for
-voice/edge-device software (OMI + Voice PE firmware, esphome configs, S2S/
+voice/edge-device software (HAOS Voice PE device firmware, esphome configs, S2S/
 ambient audio bridges, edge deploy — `GENesis-AGI` keeps only its internal
 channel code), your private fork for customizations, and your private
 `genesis-backups` repo for encrypted data. Full model:

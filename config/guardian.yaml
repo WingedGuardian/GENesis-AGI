@@ -90,6 +90,22 @@ storage_pool:
   pool_used_crit_pct: 92
   realert_hours: 6
 
+# Credential-file integrity backstop (G.1). The container self-heals corrupt
+# credential files first (its awareness tick); the guardian validates the same
+# files via read-only `incus exec`, WARNs on first sight, and STEPS IN (restores
+# inside the container) only if the corruption survives grace_minutes — covering
+# the window a degraded/dead server's awareness loop can't. Machine specifics
+# stay empty (real container home + default backup path).
+cred_integrity:
+  enabled: true
+  grace_minutes: 30        # container self-heal window before the guardian steps in
+  realert_hours: 6
+  max_restores_per_day: 3  # per-target guardian step-in cap
+  check_timeout_s: 30
+  restore_timeout_s: 60
+  # backup_dir: ""         # container-side backup path; empty = module default
+  # container_home: ""     # empty = container's real home; set only for E2E
+
 recovery:
   verification_delay_s: 30
   max_escalations: 3

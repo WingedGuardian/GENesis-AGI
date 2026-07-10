@@ -23,6 +23,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   recall's own usage counters are suppressed for the run so benchmarking
   never distorts what your live Genesis considers important.
 
+- **Genesis now detects and repairs corrupted credential files on its own.**
+  If a critical credential or wiring file (`secrets.env`, your Claude Code and
+  GitHub credentials, SSH keys, `guardian_remote.yaml`, `genesis.yaml`) gets
+  zeroed, truncated, or otherwise corrupted — the exact kind of damage a storage
+  outage can cause mid-write — Genesis notices on its next cycle, restores the
+  file from your encrypted backup with the corrupt copy set aside for
+  inspection, and alerts you (telling you to rotate anything that may have
+  changed since the backup). It only ever acts on *proven* corruption, never on
+  a file that is simply different, and it validates the decrypted backup before
+  touching the original, so a bad backup can never make things worse. The
+  host-side guardian is the backstop: it watches the same files and steps in to
+  restore them if Genesis is too degraded to heal itself. Restores are
+  rate-capped, and installs without backups configured still get the detection
+  and alert. Requires the backup passphrase escrow shipped in the previous
+  release. (Backup-failure alerts also reach Telegram now — they were being
+  silently dropped on installs using the shipped `outreach.yaml`.)
+
 - **Three new honesty-first metric series on the dashboard's compounding
   panel, plus retrieval precision@3.** The weekly eval now tracks how your
   approval gates actually get resolved (by you vs. auto-expired vs.
@@ -71,12 +88,32 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Memories recovered after an embedding outage keep their wing/room/life_domain
+  filters, and keyword-only results are no longer ranked as artificially fresh.**
+  When the embedding provider was down, memories were stored keyword-only and
+  re-embedded on recovery — but the rebuilt vector dropped its wing/room/life_domain
+  tags, so it silently vanished from any domain-scoped ("wing=…") recall. Recovery
+  now restores those fields. Separately, keyword-only memories were being scored as
+  if created just now (maximum freshness), letting old notes outrank genuinely recent
+  ones; they now use their real creation time.
+
 - **Protected-path guarding now covers the real systemd unit sources.** The
   critical-path rules protected a stale copy of the watchdog unit under
   `config/` while leaving `scripts/systemd/*.template` — the files installs
   actually render live units from — editable from relay channels. The rules
   now protect all unit templates, and the unused `config/genesis-watchdog.*`
   duplicates (stale 60s cadence, wrong dependencies) are removed.
+
+- **The dashboard stops lying about monitoring state — six correctness fixes.**
+  The Observations badge no longer reads 0 on a fresh page load while unsurfaced
+  observations are waiting (its count now loads with the page and refreshes on
+  the standard poll). The Event Log defaults to INFO+ so the once-a-minute
+  heartbeat no longer drowns the feed (DEBUG stays one click away). The Neural
+  Monitor shows long-stale runs as days ("67d") instead of raw hours
+  ("1613.5h"). The Error Log's time-range column shows the date on both ends
+  when a group spans days. The observation source filter folds per-session
+  UUIDs into a single "session (any)" option. And high-traffic tabs show
+  "Loading…" during their first fetch instead of flashing a false "No X found".
 
 - **The Guardian's recovery brain no longer goes dark when its work directory is
   misconfigured.** On some installs the Guardian's configured CC work dir points

@@ -16,9 +16,11 @@ from .accumulator import RING_SIZE, cosine
 
 EMA_MIN_TURNS = 3  # don't judge a theme before it exists
 STABILITY_MIN = 0.90  # min pairwise cosine across the ring
-FIRED_DIST_MIN = 0.35  # cosine distance from every prior fired region
+FIRED_DIST_MIN = 0.15  # cosine distance from every prior fired region
+# (0.35 starved on replay: ALL topics in a real dev session sit within
+# ~0.3 of each other — the arbiter, not the region gate, filters noise)
 TURNS_BETWEEN_FIRES = 3
-MAX_FIRES = 3  # per session
+MAX_FIRES = 8  # per session (multi-day resumed sessions starve at 3)
 CLAIM_STALE_S = 120.0  # pending-worker claim override
 
 

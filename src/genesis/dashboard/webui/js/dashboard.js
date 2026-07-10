@@ -279,6 +279,15 @@
           jobHealth: { state: "idle", lastSuccess: null, error: null },
           autonomyConfig: { state: "idle", lastSuccess: null, error: null },
           autonomousCliPolicy: { state: "idle", lastSuccess: null, error: null },
+          // Tab-list panels: gate "No X found" empty states on first load
+          // (state === "loading") so a slow fetch doesn't flash a lie.
+          observations: { state: "idle", lastSuccess: null, error: null },
+          tasks: { state: "idle", lastSuccess: null, error: null },
+          workSessions: { state: "idle", lastSuccess: null, error: null },
+          cockpit: { state: "idle", lastSuccess: null, error: null },
+          comms: { state: "idle", lastSuccess: null, error: null },
+          autonomyGrants: { state: "idle", lastSuccess: null, error: null },
+          autonomySends: { state: "idle", lastSuccess: null, error: null },
         },
 
         // Polling interval IDs
@@ -490,8 +499,9 @@
               this._workSessionsInterval = setInterval(() => this.fetchWorkSessions(), 10000);
               break;
             case "observations":
-              if (first) { this.fetchObservations(); this.fetchObservationsSummary(); this.fetchObservationsFilters(); }
-              this._observationsInterval = setInterval(() => { this.fetchObservations(); this.fetchObservationsSummary(); }, 30000);
+              if (first) { this.fetchObservations(); this.fetchObservationsFilters(); }
+              // Summary refresh lives on the global 15s poll (badge is chrome).
+              this._observationsInterval = setInterval(() => this.fetchObservations(), 30000);
               break;
             case "follow-ups":
               if (first) { this.fetchCockpit(); this.fetchCockpitFilters(); }
@@ -502,7 +512,7 @@
               this._tracesInterval = setInterval(() => this.fetchSpansRecent(), 30000);
               break;
             case "autonomy":
-              if (first) { this.fetchAutonomyGrants(); this.fetchAutonomySends(); }
+              if (first) { this.refreshAutonomy(); }
               this._autonomyInterval = setInterval(() => { this.fetchAutonomyGrants(); this.fetchAutonomySends(); }, 30000);
               break;
             case "memory":
@@ -546,7 +556,8 @@
           // Check auth status (non-blocking, best-effort)
           this.checkAuth();
 
-          // Always fetch: health, errors, pause, update status, approvals (needed on all tabs)
+          // Always fetch: health, errors, pause, update status, approvals,
+          // observations summary (badge is chrome — needed on all tabs)
           await Promise.all([
             this.fetchHealth(),
             this.fetchErrorSummary(),
@@ -554,6 +565,7 @@
             this.fetchUpdateStatus(),
             this.fetchEgoStatus(),
             this.fetchApprovals(),
+            this.fetchObservationsSummary(),
           ]);
 
           // Initialize tab from URL hash and fetch tab-specific data
@@ -575,6 +587,7 @@
             this.fetchErrorSummary();
             this.fetchPauseState();
             this.fetchEgoStatus();
+            this.fetchObservationsSummary();
           }, 15000);
         },
 
@@ -952,14 +965,21 @@
 
         // ── Tasks tab fetches ─────────────────────────────────────
         async fetchTasks() {
+          this.startFetch("tasks");
           try {
             const resp = await fetchApi("/api/genesis/tasks?include_completed=true&limit=50");
             if (resp && resp.ok) {
               const data = await resp.json();
               this.taskList = data.tasks || [];
               this.taskActive = data.active || {};
+              this.finishFetch("tasks");
+            } else {
+              this.failFetch("tasks", "Tasks endpoint returned an error");
             }
-          } catch (e) { console.warn("Tasks fetch failed:", e); }
+          } catch (e) {
+            console.warn("Tasks fetch failed:", e);
+            this.failFetch("tasks", "Failed to fetch tasks");
+          }
         },
         async fetchTaskDetail(taskId) {
           if (this.taskExpanded === taskId) { this.taskExpanded = null; this.taskDetail = null; this.taskDetailSteps = []; this.taskTimeline = []; this.taskLinkedFollowUps = []; return; }
@@ -977,7 +997,7 @@
         },
         phaseColor(phase) {
           const colors = {
-            pending: '#616161', observing: '#78909c', reviewing: '#7e57c2',
+            pending: '#616161', dispatching: '#546e7a', observing: '#78909c', reviewing: '#7e57c2',
             planning: '#9e9e9e', executing: '#2196F3', verifying: '#ab47bc',
             synthesizing: '#26a69a', delivering: '#66bb6a', completed: '#66bb6a',
             failed: '#ef9a9a', cancelled: '#9e9e9e', blocked: '#ffa726', paused: '#ffa726',
@@ -994,17 +1014,25 @@
 
         // ── Work tab fetches ──────────────────────────────────────
         async fetchWorkSessions() {
+          this.startFetch("workSessions");
           try {
             const resp = await fetchApi(`/api/genesis/work?type=session&view=${this.sessionsView}&limit=50`);
             if (resp && resp.ok) {
               const data = await resp.json();
               this.sessionsList = data.items || [];
+              this.finishFetch("workSessions");
+            } else {
+              this.failFetch("workSessions", "Work endpoint returned an error");
             }
-          } catch (e) { console.warn("Work sessions fetch failed:", e); }
+          } catch (e) {
+            console.warn("Work sessions fetch failed:", e);
+            this.failFetch("workSessions", "Failed to fetch work sessions");
+          }
         },
 
         // ── Observations tab fetches ─────────────────────────────
         async fetchObservations() {
+          this.startFetch("observations");
           try {
             const f = this.observationsFilters;
             const params = new URLSearchParams();
@@ -1018,8 +1046,14 @@
               const data = await resp.json();
               this.observationsList = data.observations || [];
               this.observationsHasMore = data.has_more || false;
+              this.finishFetch("observations");
+            } else {
+              this.failFetch("observations", "Observations endpoint returned an error");
             }
-          } catch (e) { console.warn("Observations fetch failed:", e); }
+          } catch (e) {
+            console.warn("Observations fetch failed:", e);
+            this.failFetch("observations", "Failed to fetch observations");
+          }
         },
         async fetchObservationsSummary() {
           try {
@@ -1099,6 +1133,7 @@
 
         // ── Follow-ups cockpit tab ───────────────────────────────
         async fetchCockpit() {
+          this.startFetch("cockpit");
           try {
             const f = this.cockpitFilters;
             const params = new URLSearchParams();
@@ -1116,8 +1151,14 @@
               const data = await resp.json();
               this.cockpitList = data.items || [];
               this.cockpitTotal = data.total || 0;
+              this.finishFetch("cockpit");
+            } else {
+              this.failFetch("cockpit", "Cockpit endpoint returned an error");
             }
-          } catch (e) { console.warn("Cockpit fetch failed:", e); }
+          } catch (e) {
+            console.warn("Cockpit fetch failed:", e);
+            this.failFetch("cockpit", "Failed to fetch follow-ups");
+          }
         },
         async fetchCockpitFilters() {
           try {
@@ -1288,22 +1329,36 @@
 
         // ── Autonomy tab fetches ──────────────────────────────────
         async fetchAutonomyGrants() {
+          this.startFetch("autonomyGrants");
           try {
             const resp = await fetchApi("/api/genesis/autonomy/grants");
             if (resp && resp.ok) {
               const data = await resp.json();
               this.autonomyGrants = data.grants || [];
+              this.finishFetch("autonomyGrants");
+            } else {
+              this.failFetch("autonomyGrants", "Grants endpoint returned an error");
             }
-          } catch (e) { console.warn("Autonomy grants fetch failed:", e); }
+          } catch (e) {
+            console.warn("Autonomy grants fetch failed:", e);
+            this.failFetch("autonomyGrants", "Failed to fetch autonomy grants");
+          }
         },
         async fetchAutonomySends() {
+          this.startFetch("autonomySends");
           try {
             const resp = await fetchApi("/api/genesis/autonomy/sends?limit=100");
             if (resp && resp.ok) {
               const data = await resp.json();
               this.autonomySends = data.sends || [];
+              this.finishFetch("autonomySends");
+            } else {
+              this.failFetch("autonomySends", "Sends endpoint returned an error");
             }
-          } catch (e) { console.warn("Autonomy sends fetch failed:", e); }
+          } catch (e) {
+            console.warn("Autonomy sends fetch failed:", e);
+            this.failFetch("autonomySends", "Failed to fetch autonomy sends");
+          }
         },
         async refreshAutonomy() {
           this.autonomyLoading = true;
@@ -1329,6 +1384,7 @@
 
         // ── Comms fetches (on Chat tab) ──────────────────────────
         async fetchComms() {
+          this.startFetch("comms");
           try {
             const resp = await fetchApi(`/api/genesis/comms?view=${this.commsView}&limit=30`);
             if (resp && resp.ok) {
@@ -1337,8 +1393,14 @@
               this.commsProposals = data.proposals || [];
               this.commsPendingApprovals = data.pending_approvals || [];
               this.commsCounts = data.counts || {};
+              this.finishFetch("comms");
+            } else {
+              this.failFetch("comms", "Comms endpoint returned an error");
             }
-          } catch (e) { console.warn("Comms fetch failed:", e); }
+          } catch (e) {
+            console.warn("Comms fetch failed:", e);
+            this.failFetch("comms", "Failed to fetch comms");
+          }
         },
         async resolveCommsProposal(proposalId, status, userResponse) {
           try {
@@ -2133,7 +2195,7 @@
           interval_minutes: 'Dispatch Interval (min)', task_expiry_hours: 'Task Expiry (hours)',
           max_iterations_per_cycle: 'Max Iterations/Cycle',
           brainstorm_check_hours: 'Brainstorm Check (hours)',
-          code_audit_hours: 'Code Audit (hours)', code_index_hours: 'Code Index (hours)',
+          code_index_hours: 'Code Index (hours)',
           recon_gather_hours: 'Recon Gather (hours)', maintenance_hours: 'Maintenance (hours)',
           analytical_hours: 'Analytical (hours)', follow_up_dispatch_minutes: 'Follow-up Dispatch (min)',
           memory_extraction_hours: 'Memory Extraction (hours)',
@@ -2212,7 +2274,6 @@
           task_expiry_hours: 'Pending tasks older than this are discarded',
           max_iterations_per_cycle: 'Maximum tasks dispatched per surplus cycle',
           brainstorm_check_hours: 'Hours between brainstorm surplus runs',
-          code_audit_hours: 'Hours between code audit runs',
           code_index_hours: 'Hours between code indexing runs',
           recon_gather_hours: 'Hours between recon gathering runs',
           maintenance_hours: 'Hours between maintenance task runs',

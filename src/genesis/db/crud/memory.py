@@ -10,6 +10,8 @@ import re
 
 import aiosqlite
 
+from genesis.db.timeutil import canonical_iso
+
 
 def _prepare_fts5(query: str, *, boolean: bool = False) -> str | None:
     """Prepare a query string for FTS5 MATCH.
@@ -263,15 +265,22 @@ async def create_metadata(
     triage, reflection) so foreground recall can default-filter them.
     NULL = user-sourced.
     """
-    resolved_valid_at = valid_at or created_at
+    # Bitemporal columns are raw TEXT-compared everywhere — canonicalize
+    # at the write gate. Unparseable valid_at (LLM temporal strings like
+    # "Friday" or date ranges) falls back to created_at; unparseable
+    # invalid_at is dropped (NULL = valid forever) rather than stored as
+    # a string that breaks the always-on filter.
+    resolved_valid_at = (
+        canonical_iso(valid_at) or canonical_iso(created_at) or created_at
+    )
     await db.execute(
         "INSERT OR IGNORE INTO memory_metadata "
         "(memory_id, created_at, collection, confidence, embedding_status, "
         "memory_class, wing, room, valid_at, invalid_at, source_subsystem) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (memory_id, created_at, collection, confidence, embedding_status,
-         memory_class, wing, room, resolved_valid_at, invalid_at,
-         source_subsystem),
+         memory_class, wing, room, resolved_valid_at,
+         canonical_iso(invalid_at), source_subsystem),
     )
     await db.commit()
     return memory_id
@@ -284,11 +293,18 @@ async def invalidate_memory(
 ) -> bool:
     """Mark a memory as no longer valid (bi-temporal invalidation).
 
-    Returns True if the memory was found and updated.
+    Returns True if the memory was found and updated. Raises
+    ``ValueError`` on an unparseable timestamp — an explicit
+    invalidation with a garbage cutoff is a programming error, and a
+    non-canonical string would silently break the always-on TEXT
+    comparison in ``search_ranked``.
     """
+    canonical = canonical_iso(invalid_at)
+    if canonical is None:
+        raise ValueError(f"invalidate_memory: unparseable invalid_at {invalid_at!r}")
     cursor = await db.execute(
         "UPDATE memory_metadata SET invalid_at = ? WHERE memory_id = ?",
-        (invalid_at, memory_id),
+        (canonical, memory_id),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -337,6 +353,63 @@ async def get_metadata(
         "superseded_by": row[4],
         "superseded_at": row[5],
     }
+
+
+async def get_taxonomy(
+    db: aiosqlite.Connection,
+    memory_id: str,
+) -> dict[str, str | None] | None:
+    """Return ``{"wing", "room"}`` for a memory_id, or None if no row.
+
+    The embedding-recovery worker uses this to restore the faceting
+    fields onto the reconstructed Qdrant payload (see
+    ``resilience/embedding_recovery``) so a recovered point is not
+    silently dropped from ``wing=``/``room=`` filtered recall. Only
+    ``wing`` and ``room`` are metadata columns; ``life_domain`` is
+    recovered from the ``life_domain:`` tag and ``project_type`` is not
+    persisted on this path.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT wing, room FROM memory_metadata WHERE memory_id = ?",
+        (memory_id,),
+    )
+    row = rows[0] if rows else None
+    if not row:
+        return None
+    return {"wing": row[0], "room": row[1]}
+
+
+async def batch_created_at(
+    db: aiosqlite.Connection,
+    memory_ids: list[str],
+) -> dict[str, str]:
+    """Batch-fetch ``created_at`` from memory_metadata for *memory_ids*.
+
+    Mirrors ``memory_links.batch_link_counts``: one chunked IN-clause
+    query instead of N lookups. ``HybridRetriever._compute_activations``
+    uses it to give FTS-only rows (no Qdrant hit) their real creation
+    time instead of the ``now_str`` fallback — that fallback yields an
+    unearned ``recency = exp(0) = 1.0`` and a phantom age of 0 in the
+    MEM-005 entrenchment metric. Ids with no metadata row are omitted;
+    the caller falls back to ``now_str`` for those.
+    """
+    if not memory_ids:
+        return {}
+
+    _CHUNK = 900  # single-column query, stays under SQLite's 999 limit
+    out: dict[str, str] = {}
+    for offset in range(0, len(memory_ids), _CHUNK):
+        chunk = memory_ids[offset : offset + _CHUNK]
+        ph = ",".join("?" * len(chunk))
+        rows = await db.execute_fetchall(
+            f"SELECT memory_id, created_at FROM memory_metadata"
+            f" WHERE memory_id IN ({ph})",
+            chunk,
+        )
+        for row in rows:
+            if row[1]:
+                out[row[0]] = row[1]
+    return out
 
 
 async def match_id_prefix(

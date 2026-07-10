@@ -121,6 +121,34 @@ class CCSessionExecutor:
             logger.error("Task %s not found in DB", task_id)
             return False
 
+        # --- Refuse non-restartable phases up front (WS-C / F2) -----------
+        # A duplicate or stale dispatch that lands on a task which already ran
+        # (completed), is past a safe restart point (synthesizing/delivering/
+        # retrospective), is a transient claim (dispatching), or is terminal
+        # must never re-run it. Refuse before any work. The atomic claim and
+        # the resume-vs-restart decision happen AFTER the plan read below, so a
+        # task that fails its plan read is never claimed into 'dispatching'.
+        db_phase_str = task.get("current_phase", "pending")
+        # 'paused' resumes from persisted steps: PAUSED is only ever reached
+        # mid-EXECUTING (after >=1 step ran), so re-running it fresh would
+        # silently redo completed steps and re-spend cost. Resume + re-pause at
+        # the first checkpoint via _paused_tasks instead.
+        _RESUMABLE_PHASES = {"executing", "verifying", "blocked", "paused"}
+        # Pre-execution phases only (nothing decomposed / no code run yet):
+        # safe to re-run fresh, never refuse.
+        _RESTARTABLE_PHASES = {"observing", "reviewing", "planning"}
+        if (
+            db_phase_str != TaskPhase.PENDING.value
+            and db_phase_str not in _RESUMABLE_PHASES
+            and db_phase_str not in _RESTARTABLE_PHASES
+        ):
+            logger.warning(
+                "Task %s: refusing execute() in non-restartable phase %s",
+                task_id, db_phase_str,
+            )
+            await self._emit_claim_lost(task_id, db_phase_str)
+            return False
+
         # Resolve plan path from outputs (may be plain string or JSON)
         raw_outputs = task.get("outputs") or ""
         plan_path = raw_outputs
@@ -160,19 +188,32 @@ class CCSessionExecutor:
         # resume, where reconstructed step dicts have no `skills` key.
         is_deliverable = has_deliverable_frame(plan_content)
 
-        # Determine recovery phase from DB
-        db_phase_str = task.get("current_phase", "pending")
-        _RESUMABLE_PHASES = {"executing", "verifying", "blocked"}
-        resuming = db_phase_str in _RESUMABLE_PHASES
-
-        # Register task at current phase (recovery) or PENDING (fresh)
-        if resuming:
+        # --- Claim / resume / restart (WS-C / F2) -------------------------
+        # Done after the plan read so a task that fails its plan read is never
+        # claimed into the transient 'dispatching' phase (just marked failed).
+        if db_phase_str == TaskPhase.PENDING.value:
+            # Atomically flip pending -> dispatching. Losing the claim means
+            # another dispatch already took it: refuse with no side effects.
+            if not await task_states.claim_for_dispatch(self._db, task_id):
+                logger.info(
+                    "Task %s: lost dispatch claim (already claimed/advanced), "
+                    "skipping", task_id,
+                )
+                await self._emit_claim_lost(task_id, db_phase_str)
+                return False
+            resuming = False
+            self._active_tasks[task_id] = TaskPhase.DISPATCHING
+        elif db_phase_str in _RESUMABLE_PHASES:
+            resuming = True
             self._active_tasks[task_id] = TaskPhase(db_phase_str)
             logger.info(
                 "Task %s: resuming from %s phase (skipping observe/review/plan)",
                 task_id, db_phase_str,
             )
         else:
+            # Restartable pre-execution phase (observing/reviewing/planning):
+            # crashed before anything was decomposed/run, so re-run fresh.
+            resuming = False
             self._active_tasks[task_id] = TaskPhase.PENDING
 
         cancel_event = asyncio.Event()
@@ -542,6 +583,14 @@ class CCSessionExecutor:
                     )
                     return False
 
+            # A task paused right at the exec->verify boundary (all steps already
+            # completed) has an empty remaining_steps loop, so the per-step
+            # _checkpoint never ran. Honor a pending pause here so a paused task
+            # recovered after its last step stays paused instead of delivering
+            # without an explicit resume.
+            if not await self._honor_pause(task_id, cancel_event):
+                return False
+
             # --- VERIFYING (review loop, Amendment #4) ---
             deliverable = _dispatch.synthesize_deliverable(step_results)
 
@@ -709,6 +758,22 @@ class CCSessionExecutor:
     # State machine (Amendment #10)
     # =================================================================
 
+    async def _emit_claim_lost(self, task_id: str, phase: str) -> None:
+        """Emit an observability event when a dispatch is refused (lost claim
+        or non-dispatchable phase). Should be rare; a spike signals races."""
+        if not self._event_bus:
+            return
+        from genesis.observability.types import Severity, Subsystem
+        with contextlib.suppress(Exception):
+            await self._event_bus.emit(
+                Subsystem.AUTONOMY,
+                Severity.INFO,
+                "task.dispatch_claim_lost",
+                f"Task {task_id[:8]}: dispatch refused in phase {phase}",
+                task_id=task_id,
+                phase=phase,
+            )
+
     async def _transition(self, task_id: str, to_phase: TaskPhase) -> None:
         """Validate and apply a state transition. Emits event."""
         from genesis.db.crud import task_states
@@ -719,6 +784,7 @@ class CCSessionExecutor:
         self._active_tasks[task_id] = to_phase
         await task_states.update(
             self._db, task_id, current_phase=to_phase.value,
+            updated_at=datetime.now(UTC).isoformat(),
         )
 
         if self._event_bus:
@@ -970,6 +1036,54 @@ class CCSessionExecutor:
     # Checkpoint (Amendment #13: global pause)
     # =================================================================
 
+    async def _honor_pause(
+        self, task_id: str, cancel: asyncio.Event | None,
+    ) -> bool:
+        """If a global or per-task pause is active, transition to PAUSED,
+        release the exec semaphore, and wait for resume (or cancel).
+
+        Returns ``False`` if the task was cancelled while paused, ``True``
+        otherwise (including when no pause is active — a no-op). Callers must
+        ``return False`` on a False result. Shared by the per-step checkpoint
+        and the pre-verify gate, so a task paused with no remaining steps still
+        stays paused across a restart instead of delivering without a resume.
+        """
+        should_pause = (
+            (self._runtime and getattr(self._runtime, "paused", False))
+            or task_id in self._paused_tasks
+        )
+        if not should_pause:
+            return True
+
+        await self._transition(task_id, TaskPhase.PAUSED)
+
+        # Release execution semaphore so another task can run
+        if self._exec_semaphore:
+            self._exec_semaphore.release()
+            self._semaphore_released.add(task_id)
+
+        pause_event = asyncio.Event()
+        self._pause_events[task_id] = pause_event
+
+        # Wait for resume OR cancel
+        while not pause_event.is_set():
+            if cancel and cancel.is_set():
+                with contextlib.suppress(InvalidTransitionError):
+                    await self._transition(task_id, TaskPhase.CANCELLED)
+                # semaphore_released stays set — dispatcher skips release
+                # in _guarded_execute finally block
+                return False
+            await asyncio.sleep(0.1)
+
+        # Reacquire semaphore before resuming
+        if self._exec_semaphore:
+            await self._exec_semaphore.acquire()
+            self._semaphore_released.discard(task_id)
+
+        self._paused_tasks.discard(task_id)
+        await self._transition(task_id, TaskPhase.EXECUTING)
+        return True
+
     async def _checkpoint(
         self,
         task_id: str,
@@ -987,38 +1101,8 @@ class CCSessionExecutor:
             return False
 
         # Amendment #13: global pause check + per-task pause
-        should_pause = (
-            (self._runtime and getattr(self._runtime, "paused", False))
-            or task_id in self._paused_tasks
-        )
-        if should_pause:
-            await self._transition(task_id, TaskPhase.PAUSED)
-
-            # Release execution semaphore so another task can run
-            if self._exec_semaphore:
-                self._exec_semaphore.release()
-                self._semaphore_released.add(task_id)
-
-            pause_event = asyncio.Event()
-            self._pause_events[task_id] = pause_event
-
-            # Wait for resume OR cancel
-            while not pause_event.is_set():
-                if cancel and cancel.is_set():
-                    with contextlib.suppress(InvalidTransitionError):
-                        await self._transition(task_id, TaskPhase.CANCELLED)
-                    # semaphore_released stays set — dispatcher will
-                    # skip release in _guarded_execute finally block
-                    return False
-                await asyncio.sleep(0.1)
-
-            # Reacquire semaphore before resuming
-            if self._exec_semaphore:
-                await self._exec_semaphore.acquire()
-                self._semaphore_released.discard(task_id)
-
-            self._paused_tasks.discard(task_id)
-            await self._transition(task_id, TaskPhase.EXECUTING)
+        if not await self._honor_pause(task_id, cancel):
+            return False
 
         # Emit progress event
         if self._event_bus:

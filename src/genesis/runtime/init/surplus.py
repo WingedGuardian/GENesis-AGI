@@ -60,7 +60,7 @@ def _wire_memory_extraction_job(
     restarts more often than the interval starves the job entirely. CronTrigger
     computes each fire from the wall clock and never resets. The explicit
     ``next_run_time`` ~60s out additionally guarantees a run shortly after every
-    boot (the same boot-run pin the ``schedule_code_audit`` job uses).
+    boot.
     """
     from apscheduler.triggers.cron import CronTrigger
 
@@ -103,11 +103,9 @@ async def init(rt: GenesisRuntime) -> None:
             idle_detector=idle_detector,
             compute_availability=compute,
             event_bus=rt._event_bus,
-            enable_code_audits=False,
             dispatch_interval_minutes=int(dispatch.get("interval_minutes", 5)),
             brainstorm_check_hours=int(jobs.get("brainstorm_check_hours", 12)),
             task_expiry_hours=int(dispatch.get("task_expiry_hours", 72)),
-            code_audit_hours=int(jobs.get("code_audit_hours", 12)),
             code_index_hours=int(jobs.get("code_index_hours", 4)),
             recon_gather_hours=int(jobs.get("recon_gather_hours", 84)),
             maintenance_hours=int(jobs.get("maintenance_hours", 6)),

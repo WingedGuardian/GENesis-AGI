@@ -20,7 +20,6 @@ from genesis.surplus.scheduler import SurplusScheduler
 DELEGATES = {
     "brainstorm_check": (gates, "brainstorm_check"),
     "_recently_completed": (gates, "recently_completed"),
-    "schedule_code_audit": (gates, "schedule_code_audit"),
     "schedule_code_index": (gates, "schedule_code_index"),
     "schedule_j9_eval_batch": (gates, "schedule_j9_eval_batch"),
     "_schedule_fresh_session_test": (gates, "schedule_fresh_session_test"),

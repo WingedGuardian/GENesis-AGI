@@ -136,6 +136,14 @@ class _InitDelegatesMixin:
     async def _init_tasks(self) -> None:
         await tasks.init(self)
 
+    def _selfheal_credentials_startup(self) -> None:
+        from genesis.runtime.init.cred_integrity import selfheal_startup
+        selfheal_startup(self)
+
+    def _init_cred_integrity(self) -> None:
+        from genesis.runtime.init.cred_integrity import wire
+        wire(self)
+
     async def _init_guardian_monitoring(self) -> None:
         from genesis.runtime.init.guardian import init_guardian_monitoring
         await init_guardian_monitoring(self)

@@ -1892,6 +1892,7 @@ def _ambient_fold(
             prompt_keywords=_extract_keywords(prompt),
             file_keywords=_keywords_from_files(recent_files) if recent_files else [],
             pivoted=_turn_pivoted(session_id),
+            prompt_text=prompt,
         )
         if result and result.get("fired"):
             _spawn_ambient_worker(session_id)
@@ -1905,8 +1906,9 @@ def _spawn_ambient_worker(session_id: str) -> None:
     start_new_session=True: the worker outlives this hook process.
     stdout is discarded; stderr goes to a shared error log (the worker
     records outcomes in ambient_verdict.json / shadow_log.jsonl, so
-    stderr only matters for crashes-before-logging). --no-arbiter until
-    PR3 lands the judgment stage.
+    stderr only matters for crashes-before-logging). The full pipeline
+    (retrieve + rank + arbiter) runs in SHADOW: verdicts are recorded,
+    nothing is ever injected into a session until the PR5 live flip.
     """
     try:
         script = Path(__file__).resolve().parent / "ambient_awareness_worker.py"
@@ -1922,7 +1924,6 @@ def _spawn_ambient_worker(session_id: str) -> None:
                         str(script),
                         "--session-id",
                         session_id,
-                        "--no-arbiter",
                     ],
                     stdout=subprocess.DEVNULL,
                     stderr=log_fh,

@@ -70,6 +70,15 @@ Easy-to-forget mechanisms:
   (`learning/procedural/matcher.py find_relevant`), not hybrid retrieval.
 - External-world recall results are provenance-wrapped (`wrap_external_recall`)
   — first-party memory vs knowledge-base is a load-bearing distinction.
+- **Entity layer (WS-H Pillar 2)** — typed entity nodes with identity:
+  `entities`/`entity_mentions`/`entity_links` tables (migration 0051),
+  `db/crud/entities.py` (recursive-CTE traversal, bi-temporal edge validity,
+  EXTRACTED/INFERRED/AMBIGUOUS provenance), `memory/entity_registry.py`
+  (string→ID resolution tiering; fuzzy matches queue `entity_adjudication`),
+  `memory/entity_seed.py` (curated spine incl. the repo-split rule).
+  Distinct from `memory/entity_resolution.py`, which is near-duplicate
+  memory-PAIR dedup. Bitemporal timestamps are canonicalized at the write
+  gate (`db/timeutil.canonical_iso`, migration 0050).
 
 **Consolidation (dream cycle)** — `memory/dream_cycle.py` (~1480 LOC):
 weekly clustering (Sun 4am) persists a value-ranked worklist to
@@ -169,21 +178,27 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: a7aa076b 2026-07-07
+verified: d8d9b5e4 2026-07-09
 ```
 
 - `surplus/scheduler.py` (~790 LOC) is the system-job hub (dream cycle, recon,
-  pipeline cycles, maintenance, code index/audit, model evals…); job bodies
+  pipeline cycles, maintenance, code index, model evals…); job bodies
   live in `surplus/jobs/` (gates/runners/dream/gitnexus) and the dispatch
   pipeline in `surplus/dispatch.py`, with the scheduler keeping every method
-  name as a thin delegate/facade.
+  name as a thin delegate/facade. (The long-disabled `schedule_code_audit`
+  job was removed 2026-07; `CodeAuditExecutor` + the CODE_AUDIT task type
+  remain for dispatch/judge consumers and manual enqueue.)
   `dispatch_once()` is **idle-gated** — surplus tasks only run when idle;
   follow-up dispatch is deliberately NOT idle-gated.
 - **Durability model:** no persistent jobstore — jobs are re-registered at
   every boot + CronTrigger + `misfire_grace_time`, backed by three durable DB
   queues (`surplus_tasks`, `dead_letter`, `deferred_work_queue`).
   **IntervalTrigger resets on restart** — anything >1h must be a CronTrigger
-  (documented bug class).
+  (documented bug class). Boot sweeps reclaim orphans immediately: the
+  surplus scheduler resets `running` rows at start() without burning
+  attempt_count (restart ≠ task failure), and the learning init kicks the
+  recovery orchestrator at boot. Both assume SINGLE-WORKER dispatch —
+  re-gate on worker ownership if v4-parallel-dispatch ships.
 - **`surplus/intake.py`** (intelligence intake: atomize → score → route)
   auto-ingests curated sources into the knowledge base with NO manifest gate —
   an INTENTIONAL bypass of the conversational confirm-first path; don't "fix"
@@ -374,15 +389,18 @@ verified: 8dac642c 2026-07-09
   into a per-session EMA + entity ledger
   (`~/.genesis/sessions/<id>/session_theme.json`); on a drift-trigger
   fire it spawns the detached worker (2-slot flock semaphore), which
-  retrieves+ranks candidates over three lanes — vector, decisions
-  (`tags~decision`, the OMI-incident class), entity-keyword drift — all
-  Qdrant lanes EXACT search (filtered HNSW without payload indexes
-  drops valid results; found 2026-07-09). Verdicts →
-  `ambient_verdict.json`, tuning → size-capped shadow log. **Zero
-  DB/Qdrant writes — never bumps retrieved_count** (protects
-  MEM-005/H-1 baselines). Fail-open at the hook boundary. Kill switch:
-  `GENESIS_SESSION_AWARENESS_DISABLED=1`. Arbiter (PR3) + replay gate
-  (PR4) pending.
+  retrieves+ranks candidates over four lanes — vector, decisions
+  (`tags~decision`, the OMI-incident class), entity-keyword drift, and
+  the **entity lane** (ledger keywords → entity nodes → ≤2 typed hops →
+  mentions; `ranking.ENTITY_LANE_MODE`, SHADOW — entity-only hits ride
+  `entity_shadow` telemetry, never candidates, until the OMI-replay-
+  gated flip) — all Qdrant lanes EXACT search (filtered HNSW without
+  payload indexes drops valid results; found 2026-07-09). Headless-
+  Haiku arbiter judges candidates per fire (fail-closed parse, group-
+  kill on timeout). Verdicts → `ambient_verdict.json`, tuning →
+  size-capped shadow log. **Zero DB/Qdrant writes — never bumps
+  retrieved_count** (protects MEM-005/H-1 baselines). Fail-open at the
+  hook boundary. Kill switch: `GENESIS_SESSION_AWARENESS_DISABLED=1`.
 
 ## 10. Learning & evaluation
 

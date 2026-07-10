@@ -113,27 +113,48 @@ async def run_worker(
             qdrant = QdrantClient(url=url, timeout=10)
             provider = EmbeddingProvider()
             entity_query = " ".join(top_entities(state, ENTITY_QUERY_TERMS))
+            entity_shadow: list[dict] = []
             candidates = await rank_candidates(
                 ema=state["ema"],
                 entity_query=entity_query,
                 db=db,
                 qdrant_client=qdrant,
                 embedding_provider=provider,
+                entity_shadow_out=entity_shadow,
             )
         finally:
             await db.close()
 
-        return finish({
-            "status": "no_arbiter" if no_arbiter else "ranked",
-            "theme": {
-                "ema_turns": state.get("ema_turns", 0),
-                "stability": stability(state.get("ring", [])),
-                "fired_count": state.get("fired_count", 0),
-                "outlier_skips": state.get("outlier_skips", 0),
-            },
+        theme_stats = {
+            "ema_turns": state.get("ema_turns", 0),
+            "stability": stability(state.get("ring", [])),
+            "fired_count": state.get("fired_count", 0),
+            "outlier_skips": state.get("outlier_skips", 0),
+        }
+        verdict: dict = {
+            "status": "no_arbiter" if no_arbiter else "judged",
+            "theme": theme_stats,
             "entity_query": entity_query,
             "candidates": candidates,
-        })
+            # E4 shadow telemetry: what the entity lane would have added
+            # (empty once the lane goes live — hits then ride candidates).
+            "entity_shadow": entity_shadow,
+        }
+        if not no_arbiter:
+            # Deferred: --no-arbiter runs never load the subprocess
+            # machinery (and its genesis.security/env imports).
+            from .arbiter import judge_candidates
+
+            verdict.update(
+                await judge_candidates(theme_stats, entity_query, candidates)
+            )
+            picks = verdict.get("picks") or []
+            verdict["picked_memory_ids"] = [
+                candidates[n - 1]["memory_id"]
+                for n in picks
+                if 1 <= n <= len(candidates)
+            ]
+        return finish(verdict)
     except Exception as exc:  # recorded, never raised — detached process
         return finish({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
     finally:

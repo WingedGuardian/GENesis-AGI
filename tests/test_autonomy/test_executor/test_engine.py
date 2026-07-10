@@ -1201,3 +1201,295 @@ async def test_notify_e2e_verbatim_telegram_and_tokenfree_voice(db):
     spoken = voice.send_message.call_args.args[1]
     assert spoken == "A build was parked by the safety gate."
     assert "src/genesis" not in spoken  # no path read aloud
+
+
+# ---------------------------------------------------------------------------
+# WS-C: atomic dispatch claim + refuse-taxonomy (F2 — duplicate execution)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDispatchClaim:
+    """Atomic PENDING claim + explicit refuse-taxonomy in execute().
+
+    Proves the F2 fix: a task may only be run once. Overlapping dispatches
+    lose the atomic claim, and a task already in a terminal / tail /
+    transient phase is refused instead of silently re-run from scratch.
+    """
+
+    async def test_completed_task_is_refused_not_rerun(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """A 'completed' task must be refused, never re-run fresh (the harm)."""
+        await _seed_task(db, plan_path=plan_file, phase="completed")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        result = await engine.execute("t-001")
+
+        assert result is False
+        mock_decomposer.decompose.assert_not_called()
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "completed"
+
+    async def test_tail_phase_task_is_refused(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """A task stuck in a non-resumable tail phase (synthesizing) is refused."""
+        await _seed_task(db, plan_path=plan_file, phase="synthesizing")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        result = await engine.execute("t-001")
+
+        assert result is False
+        mock_decomposer.decompose.assert_not_called()
+
+    async def test_dispatching_phase_is_refused(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """The transient 'dispatching' claim phase is refused by execute()
+        (only the reaper resets it to pending)."""
+        await _seed_task(db, plan_path=plan_file, phase="dispatching")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        result = await engine.execute("t-001")
+
+        assert result is False
+        mock_decomposer.decompose.assert_not_called()
+
+    async def test_concurrent_execute_runs_once(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """Two overlapping execute() calls for one pending task → exactly one runs."""
+        await _seed_task(db, plan_path=plan_file, phase="pending")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        results = await asyncio.gather(
+            engine.execute("t-001"), engine.execute("t-001"),
+        )
+
+        assert sum(1 for r in results if r is True) == 1
+        assert mock_decomposer.decompose.call_count == 1
+
+    async def test_claim_for_dispatch_is_atomic(self, db):
+        """First claim wins (pending -> dispatching); a second claim loses."""
+        await _seed_task(db, phase="pending")
+
+        won_first = await task_states.claim_for_dispatch(db, "t-001")
+        won_second = await task_states.claim_for_dispatch(db, "t-001")
+
+        assert won_first is True
+        assert won_second is False
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "dispatching"
+
+    async def test_claim_for_dispatch_stamps_updated_at(self, db):
+        """A winning claim refreshes updated_at (reaper staleness relies on it)."""
+        await _seed_task(db, phase="pending")
+        await task_states.update(
+            db, "t-001", updated_at="2020-01-01T00:00:00+00:00",
+        )
+
+        assert await task_states.claim_for_dispatch(db, "t-001") is True
+
+        after = (await task_states.get_by_id(db, "t-001"))["updated_at"]
+        assert after != "2020-01-01T00:00:00+00:00"
+
+    async def test_claim_for_dispatch_rejects_non_pending(self, db):
+        """Only a 'pending' row is claimable; a 'blocked' row is not."""
+        await _seed_task(db, phase="blocked")
+        assert await task_states.claim_for_dispatch(db, "t-001") is False
+
+    async def test_recover_stale_dispatching_resets_old(self, db):
+        """A 'dispatching' row older than max_age is reset to pending."""
+        await _seed_task(db, phase="pending")
+        await task_states.update(
+            db, "t-001", current_phase="dispatching",
+            updated_at="2020-01-01T00:00:00+00:00",
+        )
+
+        n = await task_states.recover_stale_dispatching(db, max_age_s=120)
+
+        assert n == 1
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "pending"
+
+    async def test_recover_stale_dispatching_spares_fresh(self, db):
+        """A freshly-claimed 'dispatching' row is NOT reaped."""
+        await _seed_task(db, phase="pending")
+        fresh = datetime.now(UTC).isoformat()
+        await task_states.update(
+            db, "t-001", current_phase="dispatching", updated_at=fresh,
+        )
+
+        n = await task_states.recover_stale_dispatching(db, max_age_s=120)
+
+        assert n == 0
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "dispatching"
+
+    async def test_paused_task_resumes_without_redoing_completed_work(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """A paused task recovered at startup RESUMES from persisted steps — it
+        is neither refused (would orphan it: the reaper only resets
+        'dispatching', never 'paused') nor re-run fresh (would redo completed
+        steps + re-spend cost). Proven by decompose/review NOT being called."""
+        await _seed_task(db, plan_path=plan_file, phase="paused")
+        await task_steps.create_step(
+            db, task_id="t-001", step_idx=0, step_type="research",
+            description="Research",
+        )
+        await db.execute(
+            """UPDATE task_steps SET status = 'completed',
+               result_json = '{"result": "done", "artifacts": []}'
+               WHERE task_id = ? AND step_idx = ?""",
+            ("t-001", 0),
+        )
+        await db.commit()
+
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        result = await engine.execute("t-001")
+
+        assert result is True
+        mock_decomposer.decompose.assert_not_called()  # no re-plan
+        mock_reviewer.review_plan.assert_not_called()  # no re-review
+
+    async def test_paused_task_repauses_on_resume(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """A paused task with _paused_tasks pre-set (as recover_incomplete does)
+        resumes and re-pauses at the first checkpoint rather than wedging or
+        re-planning."""
+        await _seed_task(db, plan_path=plan_file, phase="paused")
+        # Two steps; step 0 is then marked completed, step 1 stays pending so
+        # resume executes it and the checkpoint honors the pre-set pause flag.
+        for idx in (0, 1):
+            await task_steps.create_step(
+                db, task_id="t-001", step_idx=idx, step_type="research",
+                description=f"Step {idx}",
+            )
+        await db.execute(
+            """UPDATE task_steps SET status='completed',
+               result_json='{"result": "done", "artifacts": []}'
+               WHERE task_id='t-001' AND step_idx=0""",
+        )
+        await db.commit()
+
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        engine._paused_tasks.add("t-001")  # as recover_incomplete pre-sets
+
+        # execute() parks in the checkpoint pause-wait loop, so run it as a task.
+        task = asyncio.create_task(engine.execute("t-001"))
+        await asyncio.sleep(0.3)
+
+        # Resumed from persisted steps (not re-planned) and re-paused at the
+        # first checkpoint — it did not wedge or re-decompose.
+        assert engine._active_tasks.get("t-001") == TaskPhase.PAUSED
+        mock_decomposer.decompose.assert_not_called()
+
+        # Clear the pause flag and release the wait loop; it runs to completion.
+        engine._paused_tasks.discard("t-001")
+        pause_event = engine._pause_events.get("t-001")
+        assert pause_event is not None
+        pause_event.set()
+        result = await asyncio.wait_for(task, timeout=5.0)
+        assert result is True
+
+    async def test_restartable_planning_phase_reruns_fresh(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """A task crashed mid-planning re-runs fresh (pre-execution phase, no
+        committed side effects), rather than being refused."""
+        await _seed_task(db, plan_path=plan_file, phase="planning")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        result = await engine.execute("t-001")
+
+        assert result is True
+        mock_decomposer.decompose.assert_called()
+
+    async def test_pending_with_unreadable_plan_is_failed_not_claimed(
+        self, db, mock_invoker, mock_decomposer, mock_reviewer,
+    ):
+        """A pending task with an unreadable plan is marked failed, and the plan
+        read (which fails) happens before the claim — so the row is never left
+        stuck in the transient 'dispatching' phase."""
+        await _seed_task(db, plan_path="/nonexistent/plan.md", phase="pending")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        result = await engine.execute("t-001")
+
+        assert result is False
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "failed"  # not stuck in 'dispatching'
+        assert "t-001" not in engine.get_active_tasks()  # terminal, not surfaced
+
+    async def test_e2e_guarded_execute_real_chain_single_run(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """End-to-end integration: two overlapping dispatches of one pending
+        task through the REAL TaskDispatcher._guarded_execute + REAL executor +
+        REAL Semaphore + REAL atomic claim run the task exactly once, and the
+        _dispatch_inflight guard cleans up. Only the LLM calls are mocked."""
+        from genesis.autonomy.dispatcher import TaskDispatcher
+
+        await _seed_task(db, plan_path=plan_file, phase="pending")
+        executor = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        dispatcher = TaskDispatcher(
+            db=db, executor=executor, exec_semaphore=asyncio.Semaphore(1),
+        )
+
+        results = await asyncio.gather(
+            dispatcher._guarded_execute("t-001"),
+            dispatcher._guarded_execute("t-001"),
+        )
+
+        assert sum(1 for r in results if r is True) == 1  # exactly one ran
+        assert mock_decomposer.decompose.call_count == 1  # no duplicate work
+        assert dispatcher._dispatch_inflight == set()  # guard cleaned up
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "completed"
+
+    async def test_paused_at_verify_boundary_stays_paused(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """A task paused after its LAST step completed (empty remaining_steps)
+        must stay paused on recovery — not verify/deliver without an explicit
+        resume. Codex P2: the per-step checkpoint never runs when the loop is
+        empty, so a pre-verify pause gate is required."""
+        await _seed_task(db, plan_path=plan_file, phase="paused")
+        await task_steps.create_step(
+            db, task_id="t-001", step_idx=0, step_type="research",
+            description="Step 0",
+        )
+        await db.execute(
+            """UPDATE task_steps SET status='completed',
+               result_json='{"result": "done", "artifacts": []}'
+               WHERE task_id='t-001' AND step_idx=0""",
+        )
+        await db.commit()
+
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        engine._paused_tasks.add("t-001")
+
+        task = asyncio.create_task(engine.execute("t-001"))
+        await asyncio.sleep(0.3)
+
+        # Paused at the verify boundary — did NOT verify/deliver.
+        assert engine._active_tasks.get("t-001") == TaskPhase.PAUSED
+        mock_reviewer.verify_deliverable.assert_not_called()
+
+        # Explicit resume -> completes.
+        engine._paused_tasks.discard("t-001")
+        engine._pause_events["t-001"].set()
+        assert await asyncio.wait_for(task, timeout=5.0) is True
+        mock_reviewer.verify_deliverable.assert_called()

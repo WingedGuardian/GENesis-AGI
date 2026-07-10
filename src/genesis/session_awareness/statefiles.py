@@ -18,9 +18,14 @@ from pathlib import Path
 SCHEMA_VERSION = 1
 FILENAME = "session_theme.json"
 
-# A session idle longer than this is a new working context: the theme
-# EMA restarts rather than blending yesterday's topic into today's.
+# A session idle longer than this re-arms rather than resets (user
+# decision, 2026-07-09): a CC session spans days and hundreds of compactions —
+# identity (EMA + entity ledger) must survive idle gaps. Softening
+# clears the trigger state (ring, fired regions, claims) so yesterday's
+# fires can't gate today's, halves ledger weights, and keeps the theme.
 STALE_AFTER = timedelta(hours=24)
+_SOFTEN_ENTITY_FACTOR = 0.5
+_SOFTEN_MIN_WEIGHT = 0.05  # mirrors accumulator.MIN_ENTITY_WEIGHT
 
 
 def _sessions_dir() -> Path:
@@ -83,7 +88,7 @@ def load_state(
         if updated:
             now = now or datetime.now(UTC)
             if now - datetime.fromisoformat(updated) > STALE_AFTER:
-                return empty_state(session_id)
+                data = _soften_stale(data)
         data.setdefault("version", SCHEMA_VERSION)
         data.setdefault("session_id", session_id)
         for key, default in empty_state(session_id).items():
@@ -91,6 +96,24 @@ def load_state(
         return data
     except Exception:
         return empty_state(session_id)
+
+
+def _soften_stale(data: dict) -> dict:
+    """Re-arm a stale session without forgetting what it was about."""
+    entities = {
+        k: w * _SOFTEN_ENTITY_FACTOR
+        for k, w in (data.get("entities") or {}).items()
+        if w * _SOFTEN_ENTITY_FACTOR >= _SOFTEN_MIN_WEIGHT
+    }
+    data.update(
+        entities=entities,
+        ring=[],  # stability must rebuild before any fire
+        fired=[],  # yesterday's regions must not gate today
+        fired_count=0,  # daily fire budget, effectively
+        worker_pending_since=None,
+        consecutive_outliers=0,
+    )
+    return data
 
 
 def save_state(session_id: str, state: dict, base: Path | None = None) -> None:

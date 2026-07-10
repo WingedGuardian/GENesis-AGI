@@ -51,17 +51,34 @@ def test_corrupt_file_returns_empty(tmp_path):
     assert load_state("sess-c", base=tmp_path, now=NOW) == empty_state("sess-c")
 
 
-def test_stale_state_resets(tmp_path):
+def test_stale_state_softens_not_resets(tmp_path):
+    """A multi-day session keeps its identity (EMA + decayed ledger) but
+    re-arms the trigger: ring/fired/claims cleared (user decision,
+    2026-07-09 — one CC session spans days and many compactions)."""
     s = empty_state("sess-s")
     s["ema"] = [1.0]
     s["ema_turns"] = 5
+    s["entities"] = {"voice": 2.0, "faint": 0.08}
+    s["ring"] = [[1.0]] * 3
+    s["fired"] = [{"ema": [1.0], "turn": 4, "at": "x"}]
+    s["fired_count"] = 3
+    s["worker_pending_since"] = "2026-07-08T00:00:00+00:00"
     s["updated_at"] = (NOW - timedelta(hours=25)).isoformat()
     save_state("sess-s", s, base=tmp_path)
-    assert load_state("sess-s", base=tmp_path, now=NOW) == empty_state("sess-s")
-    # Under the threshold: preserved
+    loaded = load_state("sess-s", base=tmp_path, now=NOW)
+    assert loaded["ema"] == [1.0]  # theme identity survives
+    assert loaded["ema_turns"] == 5
+    assert loaded["entities"] == {"voice": 1.0}  # halved; faint pruned
+    assert loaded["ring"] == []
+    assert loaded["fired"] == []
+    assert loaded["fired_count"] == 0
+    assert loaded["worker_pending_since"] is None
+    # Under the threshold: fully preserved
     s["updated_at"] = (NOW - timedelta(hours=23)).isoformat()
     save_state("sess-s", s, base=tmp_path)
-    assert load_state("sess-s", base=tmp_path, now=NOW)["ema_turns"] == 5
+    loaded = load_state("sess-s", base=tmp_path, now=NOW)
+    assert loaded["fired_count"] == 3
+    assert loaded["ring"] != []
 
 
 def test_missing_keys_backfilled(tmp_path):

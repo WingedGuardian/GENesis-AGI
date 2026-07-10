@@ -179,6 +179,12 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "the target and the credentials live outside the container. "
         "Escalate-notify only."
     ),
+    "creds:": (
+        "Credential-file corruption is already self-healed on the awareness "
+        "tick (guardian/cred_selfheal restores from the encrypted backup), "
+        "with the host guardian as a backstop. The creds:corrupt/restored "
+        "alerts are user-notification only — no separate Sentinel remediation."
+    ),
     "provider:credit_exhaustion:": (
         "Provider billing. Refilling credits is a user action, and a "
         "financial one (no-unsanctioned-transactions rule). Same reasoning "

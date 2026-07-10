@@ -109,6 +109,7 @@ async def test_recall_returns_results(mock_qdrant, mock_crud, mock_links, _mock_
         _make_fts_row("mem-1", -5.0),
         _make_fts_row("mem-3", -3.0),
     ])
+    mock_crud.batch_created_at = AsyncMock(return_value={})
     _setup_link_mocks(mock_links, link_count=2)
 
     results = await retriever.recall("test query", limit=10)
@@ -209,6 +210,7 @@ async def test_recall_threads_collection_fts_only(mock_qdrant, mock_crud, mock_l
     mock_crud.search_ranked = AsyncMock(return_value=[
         {**_make_fts_row("mem-kb", -5.0), "collection": "knowledge_base"},
     ])
+    mock_crud.batch_created_at = AsyncMock(return_value={})
     _setup_link_mocks(mock_links)
 
     results = await retriever.recall(
@@ -685,6 +687,7 @@ async def test_recall_graph_boost_floor_gating(mock_qdrant, mock_crud, mock_link
         _make_fts_row("s3", -6.0),
         _make_fts_row("weak", -1.0),
     ])
+    mock_crud.batch_created_at = AsyncMock(return_value={})
 
     # weak has massive inbound links — but should be floor-gated
     mock_links.batch_link_counts = AsyncMock(return_value={
@@ -922,6 +925,7 @@ async def test_recall_reranker_replaces_fused_with_positional_scores(
         _make_qdrant_hit("mem-2", 0.80),
     ]
     mock_crud.search_ranked = AsyncMock(return_value=[_make_fts_row("mem-3", -5.0)])
+    mock_crud.batch_created_at = AsyncMock(return_value={})
     _setup_link_mocks(mock_links)
 
     results = await retriever.recall("test query", limit=5, rerank=True)
@@ -1016,3 +1020,46 @@ async def test_no_penalty_retrieval_score_equals_score(
     assert len(results) == 2
     for r in results:
         assert r.score == pytest.approx(r.retrieval_score)
+
+
+# --- D4: FTS-only rows must not get phantom now_str freshness ---
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+async def test_compute_activations_fts_only_uses_metadata_created_at(
+    mock_crud, mock_links,
+):
+    """D4: an FTS-only row (no Qdrant hit) takes its real created_at from
+    memory_metadata via batch_created_at, not the now_str phantom that
+    yields recency = exp(0) = 1.0 (and a phantom age of 0 in MEM-005)."""
+    retriever, _, _, _ = _build_retriever()
+    mock_links.batch_link_counts = AsyncMock(return_value={})
+    old = "2020-01-01T00:00:00+00:00"
+    mock_crud.batch_created_at = AsyncMock(return_value={"fts-1": old})
+
+    now_str = datetime.now(UTC).isoformat()
+    _act, _inb, _rc, created_at_by_id = await retriever._compute_activations(
+        {"fts-1"}, {}, now_str,  # empty qdrant_by_id → fts-1 is FTS-only
+    )
+    assert created_at_by_id["fts-1"] == old  # real date, NOT now_str
+    mock_crud.batch_created_at.assert_awaited_once_with(retriever._db, ["fts-1"])
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+async def test_compute_activations_fts_ghost_falls_back_to_now(
+    mock_crud, mock_links,
+):
+    """A legacy FTS ghost with no metadata row keeps the now_str fallback."""
+    retriever, _, _, _ = _build_retriever()
+    mock_links.batch_link_counts = AsyncMock(return_value={})
+    mock_crud.batch_created_at = AsyncMock(return_value={})  # no metadata row
+
+    now_str = datetime.now(UTC).isoformat()
+    _a, _i, _r, created_at_by_id = await retriever._compute_activations(
+        {"ghost"}, {}, now_str,
+    )
+    assert created_at_by_id["ghost"] == now_str

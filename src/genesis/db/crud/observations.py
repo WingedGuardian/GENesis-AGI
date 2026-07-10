@@ -314,6 +314,7 @@ async def query(
     person_id: str | None = None,
     source: str | None = None,
     source_in: list[str] | None = None,
+    source_prefix: str | None = None,
     type: str | None = None,
     priority: str | None = None,
     category: str | None = None,
@@ -321,8 +322,8 @@ async def query(
     exclude_types: tuple[str, ...] | frozenset[str] | None = None,
     limit: int = 50,
 ) -> list[dict]:
-    if source and source_in:
-        raise ValueError("Cannot specify both 'source' and 'source_in'")
+    if sum(map(bool, (source, source_in, source_prefix))) > 1:
+        raise ValueError("Specify at most one of 'source', 'source_in', 'source_prefix'")
     sql = "SELECT * FROM observations WHERE 1=1"
     params: list = []
     if person_id is not None:
@@ -335,6 +336,11 @@ async def query(
         placeholders = ",".join("?" for _ in source_in)
         sql += f" AND source IN ({placeholders})"
         params.extend(source_in)
+    if source_prefix:
+        # Callers pass fixed literals (e.g. "session:"), never user-supplied
+        # patterns, so no LIKE-wildcard escaping is needed.
+        sql += " AND source LIKE ? || '%'"
+        params.append(source_prefix)
     if type:
         sql += " AND type = ?"
         params.append(type)
@@ -355,6 +361,37 @@ async def query(
     params.append(limit)
     rows = await db.execute_fetchall(sql, params)
     return [dict(r) for r in rows]
+
+
+async def distinct_unresolved_types(db: aiosqlite.Connection) -> list[str]:
+    """Distinct ``type`` values among unresolved observations (dropdown feed)."""
+    rows = await db.execute_fetchall(
+        "SELECT DISTINCT type FROM observations WHERE resolved = 0 ORDER BY type"
+    )
+    return [row[0] for row in rows]
+
+
+async def distinct_unresolved_sources(
+    db: aiosqlite.Connection,
+    *,
+    exclude_types: tuple[str, ...] | frozenset[str] | None = None,
+) -> list[str]:
+    """Distinct ``source`` values among unresolved observations (dropdown feed).
+
+    ``exclude_types`` drops observations of those types before deriving sources,
+    so a source whose unresolved rows are ALL internal types (e.g. a
+    ``session:<uuid>`` source with only ``conversation_pivot`` rows) never
+    appears as a filter option the list endpoint would then show zero rows for.
+    """
+    sql = "SELECT DISTINCT source FROM observations WHERE resolved = 0"
+    params: list = []
+    if exclude_types:
+        placeholders = ",".join("?" for _ in exclude_types)
+        sql += f" AND type NOT IN ({placeholders})"
+        params.extend(exclude_types)
+    sql += " ORDER BY source"
+    rows = await db.execute_fetchall(sql, params)
+    return [row[0] for row in rows]
 
 
 async def resolve(
@@ -616,6 +653,34 @@ async def get_unsurfaced(
         rows = await cursor.fetchall()
         cols = [d[0] for d in cursor.description]
         return [dict(zip(cols, r, strict=False)) for r in rows]
+
+
+async def count_unsurfaced(
+    db: aiosqlite.Connection,
+    *,
+    priority_filter: tuple[str, ...] = ("critical", "high", "medium"),
+    exclude_types: tuple[str, ...] | frozenset[str] = (),
+) -> int:
+    """COUNT mirror of :func:`get_unsurfaced` (same WHERE, no rows fetched).
+
+    The dashboard badge polls this every 15s — a COUNT keeps that O(1) rows
+    instead of pulling up to ``limit`` full rows (with content) to ``len()``
+    them, and doesn't silently cap at the fetch limit.
+    """
+    if not priority_filter:
+        return 0
+    prio_placeholders = ",".join("?" for _ in priority_filter)
+    sql = (
+        "SELECT COUNT(*) FROM observations "
+        f"WHERE surfaced_at IS NULL AND resolved = 0 AND priority IN ({prio_placeholders})"
+    )
+    params: list = list(priority_filter)
+    if exclude_types:
+        type_placeholders = ",".join("?" for _ in exclude_types)
+        sql += f" AND type NOT IN ({type_placeholders})"
+        params.extend(exclude_types)
+    rows = await db.execute_fetchall(sql, params)
+    return int(rows[0][0]) if rows else 0
 
 
 async def mark_surfaced(
