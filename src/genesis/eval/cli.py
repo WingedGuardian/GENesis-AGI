@@ -166,6 +166,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--no-verify-prod", action="store_true",
         help="Skip the prod-delta isolation probe (NOT recommended)",
     )
+    ab_cmd.add_argument(
+        "--judge-provider", default=None,
+        help="Start the judge chain at this routing provider (e.g. "
+             "openrouter-deepseek-v4 when the free NIM tier is down)",
+    )
 
     eval_cmd.set_defaults(func=_run_eval_cli)
 
@@ -333,6 +338,7 @@ async def _cmd_bench(args: argparse.Namespace) -> int:
             db=db,
             keep_workdir=args.keep_workdir,
             verify_prod=not args.no_verify_prod,
+            judge_provider=args.judge_provider,
         )
         print(render_console(report))
     except TaskFileError as e:

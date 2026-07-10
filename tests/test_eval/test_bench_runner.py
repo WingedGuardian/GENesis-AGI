@@ -334,6 +334,6 @@ class TestCli:
         args = argparse.Namespace(
             model="gpt-99", effort="medium", tasks=None, limit=None,
             task_id=None, epsilon=0.05, no_db=True, keep_workdir=False,
-            no_verify_prod=True,
+            no_verify_prod=True, judge_provider=None,
         )
         assert await _cmd_bench(args) == 2

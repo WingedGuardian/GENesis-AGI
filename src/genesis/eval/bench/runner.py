@@ -239,6 +239,7 @@ async def run_bench(
     invoker=None,
     run_root: Path | None = None,
     allow_repo_tasks: bool = False,
+    judge_provider: str | None = None,
 ) -> BenchReport:
     """Run the full paired bench. Returns the report (also written to disk).
 
@@ -313,12 +314,18 @@ async def run_bench(
             # Mirror the runtime `judge` call site's chain (free NIM first,
             # then paid OpenRouter) — one attempt per provider, so a hanging
             # provider costs one timeout, not the whole judge budget.
-            router = StandaloneLiteLLMRouter(
+            # `judge_provider` reorders the chain to start elsewhere (user
+            # lever for a known-down primary; e.g. NIM hanging at 120s/call
+            # would cost 2 minutes per judgment before failover).
+            chain = [
                 DEFAULT_JUDGE_PROVIDER,
-                fallback_providers=(
-                    "openrouter-deepseek-v4",
-                    "openrouter-deepseek-v4-flash",
-                ),
+                "openrouter-deepseek-v4",
+                "openrouter-deepseek-v4-flash",
+            ]
+            if judge_provider:
+                chain = [judge_provider, *[p for p in chain if p != judge_provider]]
+            router = StandaloneLiteLLMRouter(
+                chain[0], fallback_providers=tuple(chain[1:]),
             )
         scorer = LLMJudgeScorer(router=router)
 
