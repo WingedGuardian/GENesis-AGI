@@ -90,7 +90,8 @@ async def _ensure_graph(db: aiosqlite.Connection) -> object:
     )
     if G.number_of_edges() > 50_000:
         logger.warning(
-            "Graph has %d edges — consider FalkorDB migration",
+            "Graph has %d edges — measure NetworkX rebuild cost; consider an "
+            "incremental or server-backed graph if rebuilds become a bottleneck",
             G.number_of_edges(),
         )
 
@@ -194,69 +195,6 @@ async def traverse(
     return TraversalResult(root_id=root_id, nodes=nodes, query_ms=elapsed_ms)
 
 
-async def find_connected_by_type(
-    db: aiosqlite.Connection,
-    root_id: str,
-    link_type: str,
-    *,
-    max_depth: int = 2,
-) -> list[GraphNode]:
-    """Find memories connected by a specific link type.
-
-    Useful for queries like "what was evaluated for X?" or
-    "what decisions relate to X?".
-    """
-    start = time.monotonic()
-
-    if _NX_AVAILABLE:
-        G = await _ensure_graph(db)
-        nodes = _bfs_with_strength(
-            G, root_id, max_depth=max_depth, min_strength=0.0,
-            link_type_filter=link_type,
-        )
-    else:
-        nodes = await _find_connected_by_type_cte(db, root_id, link_type, max_depth)
-
-    elapsed_ms = (time.monotonic() - start) * 1000
-    if elapsed_ms > 100:
-        logger.warning(
-            "Typed traversal (%s) from %s took %.1fms",
-            link_type, root_id, elapsed_ms,
-        )
-
-    return nodes
-
-
-async def get_cluster(
-    db: aiosqlite.Connection,
-    root_id: str,
-    *,
-    max_depth: int = 2,
-    min_strength: float = 0.5,
-) -> list[str]:
-    """Get all memory IDs in a cluster around root_id.
-
-    Follows links in BOTH directions (source->target and target->source)
-    to find the full connected component within depth/strength bounds.
-    """
-    start = time.monotonic()
-
-    if _NX_AVAILABLE:
-        G = await _ensure_graph(db)
-        cluster_ids = _cluster_nx(G, root_id, max_depth, min_strength)
-    else:
-        cluster_ids = await _get_cluster_cte(db, root_id, max_depth, min_strength)
-
-    elapsed_ms = (time.monotonic() - start) * 1000
-    if elapsed_ms > 100:
-        logger.warning(
-            "Cluster query from %s took %.1fms (%d members)",
-            root_id, elapsed_ms, len(cluster_ids),
-        )
-
-    return cluster_ids
-
-
 # ─── New NetworkX-only functions ──────────────────────────────────────────────
 
 
@@ -282,65 +220,6 @@ async def centrality_scores(
     scores = nx.betweenness_centrality(G, k=k)
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return ranked[:top_n]
-
-
-async def shortest_path(
-    db: aiosqlite.Connection,
-    source_id: str,
-    target_id: str,
-) -> list[str] | None:
-    """Find shortest path between two memories.
-
-    Returns list of memory IDs from source to target, or None if no path.
-    Requires NetworkX; returns None if unavailable.
-    """
-    if not _NX_AVAILABLE:
-        return None
-
-    G = await _ensure_graph(db)
-    try:
-        return nx.shortest_path(G, source_id, target_id)
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
-        return None
-
-
-# ─── NetworkX helpers ─────────────────────────────────────────────────────────
-
-
-def _cluster_nx(
-    G: object,  # nx.DiGraph
-    root_id: str,
-    max_depth: int,
-    min_strength: float,
-) -> list[str]:
-    """Bidirectional BFS cluster discovery using NetworkX."""
-    if root_id not in G:
-        return []
-
-    visited: set[str] = set()
-    queue: deque[tuple[str, int]] = deque([(root_id, 0)])
-
-    while queue:
-        node, depth = queue.popleft()
-        if node in visited:
-            continue
-        visited.add(node)
-
-        if depth >= max_depth:
-            continue
-
-        # Follow both directions
-        for _, neighbor, data in G.out_edges(node, data=True):
-            if neighbor not in visited and data.get("strength", 0.0) >= min_strength:
-                queue.append((neighbor, depth + 1))
-
-        for predecessor, _, data in G.in_edges(node, data=True):
-            if predecessor not in visited and data.get("strength", 0.0) >= min_strength:
-                queue.append((predecessor, depth + 1))
-
-    # Exclude root from result (matches CTE behavior)
-    visited.discard(root_id)
-    return list(visited)
 
 
 # ─── CTE fallbacks ───────────────────────────────────────────────────────────
@@ -381,83 +260,3 @@ async def _traverse_cte(
         GraphNode(memory_id=row[0], link_type=row[1], depth=row[2], strength=row[3])
         for row in rows
     ]
-
-
-async def _find_connected_by_type_cte(
-    db: aiosqlite.Connection,
-    root_id: str,
-    link_type: str,
-    max_depth: int,
-) -> list[GraphNode]:
-    """Original typed CTE traversal (fallback)."""
-    cursor = await db.execute(
-        """
-        WITH RECURSIVE connected(target_id, link_type, depth, strength, path) AS (
-            SELECT target_id, link_type, 1, strength,
-                   source_id || ',' || target_id
-            FROM memory_links
-            WHERE source_id = ?
-              AND link_type = ?
-            UNION ALL
-            SELECT ml.target_id, ml.link_type, c.depth + 1, ml.strength,
-                   c.path || ',' || ml.target_id
-            FROM memory_links ml
-            JOIN connected c ON ml.source_id = c.target_id
-            WHERE c.depth < ?
-              AND ml.link_type = ?
-              AND c.path NOT LIKE '%' || ml.target_id || '%'
-        )
-        SELECT DISTINCT target_id, link_type, depth, strength
-        FROM connected
-        ORDER BY depth, strength DESC
-        """,
-        (root_id, link_type, max_depth, link_type),
-    )
-    rows = await cursor.fetchall()
-    return [
-        GraphNode(memory_id=row[0], link_type=row[1], depth=row[2], strength=row[3])
-        for row in rows
-    ]
-
-
-async def _get_cluster_cte(
-    db: aiosqlite.Connection,
-    root_id: str,
-    max_depth: int,
-    min_strength: float,
-) -> list[str]:
-    """Original bidirectional CTE cluster query (fallback)."""
-    cursor = await db.execute(
-        """
-        WITH RECURSIVE cluster(mem_id, depth, path) AS (
-            SELECT target_id, 1, ? || ',' || target_id
-            FROM memory_links
-            WHERE source_id = ? AND strength >= ?
-            UNION ALL
-            SELECT source_id, 1, ? || ',' || source_id
-            FROM memory_links
-            WHERE target_id = ? AND strength >= ?
-            UNION ALL
-            SELECT
-                CASE WHEN ml.source_id = c.mem_id THEN ml.target_id
-                     ELSE ml.source_id END,
-                c.depth + 1,
-                c.path || ',' ||
-                CASE WHEN ml.source_id = c.mem_id THEN ml.target_id
-                     ELSE ml.source_id END
-            FROM memory_links ml
-            JOIN cluster c ON (ml.source_id = c.mem_id OR ml.target_id = c.mem_id)
-            WHERE c.depth < ?
-              AND ml.strength >= ?
-              AND c.path NOT LIKE '%' ||
-                  CASE WHEN ml.source_id = c.mem_id THEN ml.target_id
-                       ELSE ml.source_id END || '%'
-        )
-        SELECT DISTINCT mem_id FROM cluster
-        """,
-        (root_id, root_id, min_strength,
-         root_id, root_id, min_strength,
-         max_depth, min_strength),
-    )
-    rows = await cursor.fetchall()
-    return [row[0] for row in rows]

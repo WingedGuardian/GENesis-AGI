@@ -7,10 +7,7 @@ import pytest
 
 from genesis.memory.graph import (
     centrality_scores,
-    find_connected_by_type,
-    get_cluster,
     invalidate_graph_cache,
-    shortest_path,
     traverse,
 )
 
@@ -123,50 +120,6 @@ class TestTraverse:
         assert len(ids) == len(set(ids))  # No duplicates
 
 
-class TestFindConnectedByType:
-    """Tests for type-filtered traversal."""
-
-    @pytest.mark.asyncio
-    async def test_filter_by_supports(self, graph_db):
-        nodes = await find_connected_by_type(graph_db, "A", "supports")
-        assert len(nodes) == 1
-        assert nodes[0].memory_id == "B"
-        assert nodes[0].link_type == "supports"
-
-    @pytest.mark.asyncio
-    async def test_filter_by_evaluated_for(self, graph_db):
-        nodes = await find_connected_by_type(graph_db, "A", "evaluated_for")
-        assert len(nodes) == 1
-        assert nodes[0].memory_id == "D"
-
-    @pytest.mark.asyncio
-    async def test_no_matching_type(self, graph_db):
-        nodes = await find_connected_by_type(graph_db, "A", "contradicts")
-        assert nodes == []
-
-
-class TestGetCluster:
-    """Tests for bidirectional cluster discovery."""
-
-    @pytest.mark.asyncio
-    async def test_cluster_from_A(self, graph_db):
-        cluster = await get_cluster(graph_db, "A", max_depth=2, min_strength=0.5)
-        # A→B (0.8), A→D (0.7), B→C (0.9), B→E (0.6)
-        assert "B" in cluster
-        assert "D" in cluster
-
-    @pytest.mark.asyncio
-    async def test_cluster_from_leaf(self, graph_db):
-        # From D, bidirectional should find A (since A→D exists)
-        cluster = await get_cluster(graph_db, "D", max_depth=2, min_strength=0.5)
-        assert "A" in cluster
-
-    @pytest.mark.asyncio
-    async def test_isolated_node(self, graph_db):
-        cluster = await get_cluster(graph_db, "Z_isolated")
-        assert cluster == []
-
-
 class TestNetworkXCache:
     """Tests for the NetworkX cache lifecycle."""
 
@@ -221,32 +174,3 @@ class TestCentrality:
         score_by_id = dict(scores)
         # B connects to C and E — should have non-zero centrality
         assert score_by_id.get("B", 0.0) > 0.0
-
-
-class TestShortestPath:
-    """Tests for shortest path finding."""
-
-    @pytest.mark.asyncio
-    async def test_direct_path(self, graph_db):
-        invalidate_graph_cache()
-        path = await shortest_path(graph_db, "A", "B")
-        assert path == ["A", "B"]
-
-    @pytest.mark.asyncio
-    async def test_multi_hop_path(self, graph_db):
-        invalidate_graph_cache()
-        path = await shortest_path(graph_db, "A", "C")
-        assert path == ["A", "B", "C"]
-
-    @pytest.mark.asyncio
-    async def test_no_path(self, graph_db):
-        invalidate_graph_cache()
-        # F has no outgoing edges, can't reach A
-        path = await shortest_path(graph_db, "F", "A")
-        assert path is None
-
-    @pytest.mark.asyncio
-    async def test_nonexistent_node(self, graph_db):
-        invalidate_graph_cache()
-        path = await shortest_path(graph_db, "Z_nonexistent", "A")
-        assert path is None
