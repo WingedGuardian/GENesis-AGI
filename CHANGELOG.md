@@ -30,6 +30,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   row now shows "in N fallbacks (24h) · last …" beside its key status, so an
   ongoing fallback storm is visible at a glance instead of hiding in the logs.
 
+- **Your credentials now survive losing the whole container.** Genesis mirrors
+  its encrypted credential bundle (secrets, SSH keys including the guardian
+  control-plane key, and Claude/GitHub credentials — all GPG-encrypted) onto the
+  host, outside the container's blast radius, and the host guardian keeps a
+  second copy the container can't touch. If the container is ever destroyed, a
+  fresh one can be rebuilt with credentials intact from the host — no network and
+  no chicken-and-egg (previously the only backup copies lived *inside* the
+  container). The guardian also warns you if that mirror goes stale, so you find
+  out backups have stopped landing *before* you need them. See the
+  container-loss runbook in `docs/reference/recovery-and-portability-workflow.md`.
+
 - **Genesis now detects and repairs corrupted credential files on its own.**
   If a critical credential or wiring file (`secrets.env`, your Claude Code and
   GitHub credentials, SSH keys, `guardian_remote.yaml`, `genesis.yaml`) gets

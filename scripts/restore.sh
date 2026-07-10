@@ -135,7 +135,8 @@ if [ -z "$_BACKUP_PASSPHRASE" ]; then
     for _escrow in \
         "${GENESIS_PASSPHRASE_ESCROW:-}" \
         "$HOME/.genesis/shared/guardian/backup_passphrase.env" \
-        "$HOME/.local/state/genesis-guardian/shared/guardian/backup_passphrase.env"; do
+        "$HOME/.local/state/genesis-guardian/shared/guardian/backup_passphrase.env" \
+        "$HOME/.local/state/genesis-guardian/creds-archive/backup_passphrase.env"; do
         [ -n "$_escrow" ] && [ -f "$_escrow" ] || continue
         # Bridge writes exactly `GENESIS_BACKUP_PASSPHRASE=<value>` (no quotes);
         # tolerate an optional `export ` prefix. Do NOT strip quotes — the
@@ -148,6 +149,25 @@ if [ -z "$_BACKUP_PASSPHRASE" ]; then
         fi
     done
 fi
+
+# G.4 host-side credential mirror fallback. If the Tier-1 backup clone lacks the
+# encrypted creds/secrets payloads (e.g. a freshly rebuilt container whose backup
+# clone has not been re-cloned yet), fall back to the host-side mirror on the
+# shared mount — or, for a host-side restore, the guardian's host-only archive.
+# Same two-path (+archive) probe discipline as the escrow above. Sections 7/8
+# consult $_MIRROR_ROOT only when the primary clone payload is absent.
+_MIRROR_ROOT=""
+for _m in \
+    "${GENESIS_CREDS_MIRROR:-}" \
+    "$HOME/.genesis/shared/guardian/creds-mirror" \
+    "$HOME/.local/state/genesis-guardian/shared/guardian/creds-mirror" \
+    "$HOME/.local/state/genesis-guardian/creds-archive"; do
+    [ -n "$_m" ] && [ -d "$_m" ] || continue
+    if [ -f "$_m/secrets/secrets.env.gpg" ] || [ -d "$_m/creds" ]; then
+        _MIRROR_ROOT="$_m"
+        break
+    fi
+done
 
 # decrypt_file <src.gpg> <dst>
 decrypt_file() {
@@ -600,6 +620,10 @@ fi
 # ── 7. Secrets ───────────────────────────────────────────────────────
 log "--- Secrets ---"
 SECRETS_SRC="$BACKUP_DIR/secrets/secrets.env.gpg"
+if [ ! -f "$SECRETS_SRC" ] && [ -n "$_MIRROR_ROOT" ] && [ -f "$_MIRROR_ROOT/secrets/secrets.env.gpg" ]; then
+    SECRETS_SRC="$_MIRROR_ROOT/secrets/secrets.env.gpg"
+    log "Secrets: Tier-1 clone payload absent — using host-side mirror $SECRETS_SRC"
+fi
 if [ -f "$SECRETS_SRC" ]; then
     if [ -f "$SECRETS_FILE" ] && ! $FORCE; then
         log "Secrets: $SECRETS_FILE already exists — skipping (use --force to overwrite)"
@@ -630,6 +654,10 @@ fi
 # clone, so no off-site pull is needed.
 log "--- Credential & wiring files ---"
 CREDS_SRC_DIR="$BACKUP_DIR/creds"
+if [ ! -d "$CREDS_SRC_DIR" ] && [ -n "$_MIRROR_ROOT" ] && [ -d "$_MIRROR_ROOT/creds" ]; then
+    CREDS_SRC_DIR="$_MIRROR_ROOT/creds"
+    log "Creds: Tier-1 clone payload absent — using host-side mirror $CREDS_SRC_DIR"
+fi
 if [ -d "$CREDS_SRC_DIR" ]; then
     CREDS_STAGE="${GENESIS_CREDS_STAGE:-$HOME/.genesis/restore-creds}"
     _CREDS_STAGED=0
