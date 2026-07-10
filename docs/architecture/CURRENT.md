@@ -87,7 +87,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 9037d45b 2026-07-07
+verified: e01e0c49 2026-07-09
 ```
 
 - `cc/direct_session.py` + `cc/conversation.py` (both >1000 LOC; split
@@ -97,9 +97,16 @@ verified: 9037d45b 2026-07-07
 - **Spawn autonomy circuit breaker** (direct_session.py ~:600-635):
   `bayesian_posterior < 0.15 and total_corrections > 3` blocks non-foreground
   dispatch — flagged for review as a visible lever (Design Principle 3).
-- Recovery: `recover_stale_claims` on boot; `reap_stale` runs as the
-  `session_reaper` job on the **learning** scheduler (CronTrigger every 6h).
-  `SessionManager.cleanup_stale` is built but UNWIRED.
+- Recovery: `recover_stale_claims` on boot (queue claims); the
+  `session_reaper` job on the **learning** scheduler (CronTrigger every 6h
+  + a boot-time kick) routes through `SessionManager.cleanup_stale` —
+  stale non-foreground 'active' rows → `expired` (outcome unknown),
+  end-hooks fired. Known interruptions record `failed`: `_run_session` has
+  an explicit `CancelledError` handler, and `GenesisRuntime.shutdown()`
+  cancel-and-awaits the runner's in-flight tasks (`DirectSessionRunner
+  .shutdown`, 10s grace) BEFORE closing the DB so that handler can persist
+  (2026-07-09; the old crud `reap_stale`, which relabeled orphans
+  'completed', is deleted). J-9 counts only `completed` as success.
 - **Perimeter-session hardening:** `_NO_WEB_TOOLS` / `_NO_OUTREACH_EXTRAS`
   blocklists strip risky tools from perimeter profiles — a security edge, not
   configuration convenience.

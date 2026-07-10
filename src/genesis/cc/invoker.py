@@ -841,6 +841,27 @@ class CCInvoker:
                 os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, ValueError, TypeError):
                 proc.kill()
+        except asyncio.CancelledError:
+            # Task cancellation (runtime shutdown cancelling an in-flight
+            # session) must not leak the CC child: without this handler the
+            # finally below only unregistered the proc, leaving the subprocess
+            # running — spending tokens and editing files — after the session
+            # row was already finalized. Same guarded group-kill as the
+            # timeout path; the non-streaming run() already kills in its
+            # finally for exactly this case.
+            logger.warning(
+                "CC streaming cancelled (PID %s) — killing subprocess",
+                proc.pid,
+            )
+            try:
+                pgid = os.getpgid(proc.pid)
+                if pgid <= 1:
+                    raise ValueError(f"Refusing killpg with pgid={pgid}")
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, ValueError, TypeError):
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    proc.kill()
+            raise
         finally:
             self._unregister_proc(reg_key)
 

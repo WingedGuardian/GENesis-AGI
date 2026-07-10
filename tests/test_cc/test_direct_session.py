@@ -286,3 +286,120 @@ async def test_run_session_isolates_and_cleans_sandbox(db, tmp_path, monkeypatch
     assert "bg-cc-sessions" in captured["path"]
     # finally cleanup removed the whole per-session tree
     assert not _bg_session_root(sess["id"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_run_session_cancelled_marks_failed(db):
+    """T2-B: a cancelled session must not linger 'active'.
+
+    CancelledError is a BaseException, so the ``except Exception`` failure
+    path never saw it — the row stayed 'active' until the stale reaper
+    swept it (historically relabeling it 'completed', i.e. a crash
+    masquerading as success in J-9's success rates).
+    """
+    from types import SimpleNamespace
+
+    from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    invoker = AsyncMock()
+    # Cancellation delivered at the await point inside _run_session's try
+    invoker.run_streaming = AsyncMock(side_effect=asyncio.CancelledError())
+    runner = DirectSessionRunner(
+        invoker=invoker,
+        session_manager=sm,
+        config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db),
+    )
+    runner._build_invocation = lambda _req, _sid: CCInvocation(prompt="x")
+    sess = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._run_session(DirectSessionRequest(prompt="t"), sess["id"])
+
+    row = await cc_sessions.get_by_id(db, sess["id"])
+    assert row["status"] == "failed", (
+        f"cancelled session left status={row['status']!r} — must be terminal"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_shutdown_cancels_and_persists_failed(db):
+    """Review P2: runtime shutdown must cancel-and-await in-flight session
+    tasks BEFORE the DB closes, so the CancelledError handler can persist a
+    terminal status. Without this, `systemctl restart` tears the loop down
+    after the DB is gone and rows stay 'active'."""
+    from types import SimpleNamespace
+
+    from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    invoker = AsyncMock()
+
+    async def _blocks_forever(inv, on_event=None):
+        await asyncio.Event().wait()  # never set — a wedged CC child
+
+    invoker.run_streaming = _blocks_forever
+    runner = DirectSessionRunner(
+        invoker=invoker,
+        session_manager=sm,
+        config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db),
+    )
+    runner._build_invocation = lambda _req, _sid: CCInvocation(prompt="x")
+    sess = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+    )
+    task = asyncio.create_task(
+        runner._run_session(DirectSessionRequest(prompt="t"), sess["id"]),
+    )
+    runner._active[sess["id"]] = task
+    await asyncio.sleep(0.05)  # let the task enter run_streaming
+
+    stopped = await runner.shutdown()
+
+    assert stopped == 1
+    assert task.done()
+    row = await cc_sessions.get_by_id(db, sess["id"])
+    assert row["status"] == "failed", (
+        f"in-flight session left status={row['status']!r} after shutdown"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_session_cancelled_records_proposal_outcome(db):
+    """Review P3: the CancelledError path must feed the outcome back to an
+    ego proposal, matching the generic failure path."""
+    from types import SimpleNamespace
+
+    from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    invoker = AsyncMock()
+    invoker.run_streaming = AsyncMock(side_effect=asyncio.CancelledError())
+    runner = DirectSessionRunner(
+        invoker=invoker,
+        session_manager=sm,
+        config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db),
+    )
+    runner._build_invocation = lambda _req, _sid: CCInvocation(prompt="x")
+    runner._record_proposal_outcome = AsyncMock()
+    sess = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._run_session(DirectSessionRequest(prompt="t"), sess["id"])
+
+    runner._record_proposal_outcome.assert_awaited_once()
+    result = runner._record_proposal_outcome.await_args.args[1]
+    assert result.success is False

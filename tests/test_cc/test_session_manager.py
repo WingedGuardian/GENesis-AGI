@@ -160,3 +160,57 @@ async def test_cleanup_stale(db, manager):
     assert bg_row["status"] == "expired"
     fg_row = await cc_sessions.get_by_id(db, "stale-fg")
     assert fg_row["status"] == "active"  # Foreground never auto-expired
+
+
+async def test_cleanup_stale_fires_end_hooks(db, manager):
+    """T2-B: the reaper path must fire session end-hooks for swept rows —
+    the old crud reap_stale bypassed SessionManager and never did."""
+    await cc_sessions.create(
+        db,
+        id="stale-hook",
+        session_type="background_task",
+        model="sonnet",
+        effort="medium",
+        status="active",
+        user_id="u1",
+        channel="telegram",
+        started_at="2026-03-07T06:00:00",
+        last_activity_at="2026-03-07T06:00:00",
+        source_tag="direct_session",
+    )
+    fired: list[str] = []
+
+    async def _hook(session_id: str) -> None:
+        fired.append(session_id)
+
+    manager.add_on_end(_hook)
+    count = await manager.cleanup_stale(max_idle_minutes=60)
+    assert count == 1
+    assert fired == ["stale-hook"]
+    row = await cc_sessions.get_by_id(db, "stale-hook")
+    assert row["status"] == "expired"
+
+
+async def test_cleanup_stale_respects_cutoff(db, manager):
+    """A recently-active background session is NOT swept (6h cron passes
+    max_idle_minutes=360; recent activity must survive)."""
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    await cc_sessions.create(
+        db,
+        id="fresh-bg",
+        session_type="background_task",
+        model="sonnet",
+        effort="medium",
+        status="active",
+        user_id="u1",
+        channel="telegram",
+        started_at=now,
+        last_activity_at=now,
+        source_tag="direct_session",
+    )
+    count = await manager.cleanup_stale(max_idle_minutes=360)
+    assert count == 0
+    row = await cc_sessions.get_by_id(db, "fresh-bg")
+    assert row["status"] == "active"

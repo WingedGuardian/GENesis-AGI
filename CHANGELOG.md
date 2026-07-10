@@ -79,6 +79,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   included knowledge sources could only surface knowledge via vector
   similarity — exact-phrase and keyword matches on ingested docs were
   silently dropped. It now searches every requested collection.
+
+- **Background sessions that crash or get cancelled no longer show up as
+  "completed."** A session interrupted mid-run used to sit "active" until a
+  cleanup job quietly relabeled it completed — so the dashboard and
+  Genesis's own success metrics counted crashes as wins. Cancelled sessions
+  are now recorded as failed on the spot, orphaned ones are marked expired
+  (outcome unknown) at boot and every 6 hours, and only genuinely finished
+  sessions read as completed.
 - **Asking Genesis to grow a disk or wait on your reply now works from a Claude
   Code session, not only from inside the running server.** The two tools that
   block on your Telegram reply (`provision_grow`, `outreach_send_and_wait`) need

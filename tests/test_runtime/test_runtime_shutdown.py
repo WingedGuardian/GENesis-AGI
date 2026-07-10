@@ -181,3 +181,36 @@ async def test_ashutdown_clears_instance_even_when_shutdown_raises(
     await GenesisRuntime.ashutdown()
 
     assert GenesisRuntime._instance is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_stops_direct_session_runner_before_db_close() -> None:
+    """Review P2 ordering guard: the direct-session runner's in-flight tasks
+    are cancelled-and-awaited while the DB connection is still OPEN — that's
+    the whole point (the CancelledError handler persists terminal status).
+    The fake runner proves it by using the DB inside its shutdown()."""
+    GenesisRuntime.reset()
+    rt = GenesisRuntime.instance()
+    rt._db = await aiosqlite.connect(":memory:")
+    rt._bootstrapped = True
+
+    db_was_usable: list[bool] = []
+
+    class _FakeRunner:
+        async def shutdown(self) -> int:
+            try:
+                async with rt._db.execute("SELECT 1") as cursor:
+                    db_was_usable.append((await cursor.fetchone()) == (1,))
+            except Exception:
+                db_was_usable.append(False)
+            return 0
+
+    rt._direct_session_runner = _FakeRunner()
+    try:
+        await GenesisRuntime.ashutdown()
+    finally:
+        GenesisRuntime.reset()
+
+    assert db_was_usable == [True], (
+        "runner.shutdown() must run BEFORE the DB closes"
+    )

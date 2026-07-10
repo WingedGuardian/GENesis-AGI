@@ -1422,3 +1422,41 @@ class TestEffortClamping:
         with caplog.at_level(logging.WARNING, logger="genesis.cc.invoker"):
             invoker._build_args(inv)
         assert not any("clamping" in r.message.lower() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_cancelled_kills_subprocess(invoker):
+    """Cancellation mid-stream must terminate the CC child.
+
+    The streaming loop's CancelledError path previously only unregistered
+    the proc — the child kept running (spending tokens, editing files)
+    after the session row was finalized. Mirrors the guarded-killpg
+    pattern the TimeoutError path already uses.
+    """
+    mock_proc = AsyncMock()
+    mock_proc.pid = 99999  # real int — killpg(1) would signal EVERYTHING
+    mock_proc.returncode = None
+    mock_proc.kill = MagicMock()
+    mock_proc.terminate = MagicMock()
+    stdin = MagicMock()
+    stdin.drain = AsyncMock()
+    mock_proc.stdin = stdin
+
+    class _CancelledStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            # Simulate task.cancel() delivered at the stdout await point
+            raise asyncio.CancelledError
+
+    mock_proc.stdout = _CancelledStream()
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
+         pytest.raises(asyncio.CancelledError):
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+
+    # getpgid(99999) raises ProcessLookupError -> falls back to proc.kill()
+    assert mock_proc.kill.called, (
+        "cancelled streaming run must kill the CC subprocess"
+    )
