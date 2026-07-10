@@ -95,12 +95,21 @@ TASK_ENVELOPE = (
 
 #: Genesis-arm system-prompt addendum (styled after direct_session's profile
 #: addenda): points the arm at its memory without scripting the answer.
+#: The wait-and-retry protocol is load-bearing: the memory server takes
+#: ~10-15s to import/connect, and `claude -p` does NOT block the first turn
+#: on MCP startup — without the wait, the arm inventories tools at t≈2s,
+#: finds nothing, and answers cold (both 2026-07-09 shakedowns failed this
+#: way; the retry probe then confirmed the tools register mid-session).
 _BENCH_ADDENDUM = (
     "\n\n---\n\n"
     "You have access to your memory system via the genesis-memory MCP tools. "
-    "Recall relevant memories, knowledge, and procedures before answering "
-    "when the task touches prior work or stored facts. Memory is READ-ONLY "
-    "in this session: store nothing, and do not attempt memory writes."
+    "IMPORTANT: those tools can take ~20 seconds to register after session "
+    "start. Before answering, confirm memory tools are available (e.g. "
+    "search for memory_recall); if not yet available, run `sleep 5` in Bash "
+    "and re-check — up to six times. Recall relevant memories, knowledge, "
+    "and procedures before answering when the task touches prior work or "
+    "stored facts. Memory is READ-ONLY in this session: store nothing, and "
+    "do not attempt memory writes."
 )
 
 
