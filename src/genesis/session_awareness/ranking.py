@@ -68,7 +68,7 @@ PREVIEW_CHARS = 200
 # "live": entity candidates rank normally with a reserved floor.
 # "off": lane skipped entirely.
 # The E4b flip is this ONE constant → "live", gated on the OMI replay.
-ENTITY_LANE_MODE = "shadow"
+ENTITY_LANE_MODE = "live"
 ENTITY_RESERVED = 2  # entity-lane floor (live mode), mirrors DECISION_RESERVED
 ENTITY_DEPTH_DECAY = 0.7  # per-hop decay on top of edge confidences
 ENTITY_MENTIONS_PER_ENTITY = 10
