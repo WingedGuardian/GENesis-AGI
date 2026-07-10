@@ -20,7 +20,7 @@ things, and what trips developers up repeatedly.
 | `reflection/` | Deep/strategic reflection scheduler, observation creation | ACTIVE |
 | `perception/` | Reflection engine — context assembling, LLM calling, output parsing | ACTIVE |
 | `routing/` | LLM provider fallback chains, circuit breakers, cost tracking, dead-letter queue | ACTIVE |
-| `surplus/` | Idle detector, compute scheduler, brainstorm tasks | ACTIVE (executor is stub) |
+| `surplus/` | Idle detector, compute scheduler, per-task-type executors | ACTIVE |
 | `cc/` | Claude Code integration — invoker, session manager, checkpoints | ACTIVE |
 | `observability/` | Event bus, structured logging, health probes, neural monitor UI | ACTIVE |
 | `outreach/` | Governance gate, draft/deliver pipeline, engagement tracker, scheduler | ACTIVE |
@@ -89,11 +89,13 @@ export order in `runtime/init/__init__.py`.
 Always resolve via `genesis.env.genesis_db_path()`. The DB has 60+ tables —
 use `db_schema` MCP before assuming column names.
 
-### 2. Ego Sessions Are Inert
+### 2. Ego Sessions Are LIVE Production
 
-`src/genesis/ego/` has real data structures (session.py, cadence.py,
-proposals.py, compaction.py, dispatch.py) but ZERO production callers.
-Don't wire them, don't treat them as broken. Waiting for beta.
+`src/genesis/ego/` (session.py, cadence.py, proposals.py, compaction.py,
+dispatch.py) is live. Two egos — user (CEO, Opus) and Genesis (COO, Sonnet) —
+run on an adaptive cadence via the awareness loop and propose actions through
+the approval gate. Changes here are PRODUCTION changes; review the cadence
+manager and budget controls before adding call sites.
 
 ### 3. Capabilities Manifest Is Write-Once
 
@@ -152,10 +154,15 @@ Sentinel is correct.
 in `cc_relay` debrief. Only basic memory writing happens. Decision ->
 outcome -> rule extraction not yet flowing.
 
-### 12. Surplus Executor Is a Stub
+### 12. Surplus Executor — Real Per-Task-Type Executors + Stub Fallback
 
-`SurplusScheduler` fires on 12h cadence but `StubExecutor` does nothing.
-Queue fills up; tasks don't execute.
+`SurplusScheduler` dispatches through a `TaskType → executor` registry
+(`scheduler.py`) with real executors: `SurplusLLMExecutor`,
+`CodeIndexExecutor`, `CCMemoryStalenessExecutor`, `FreshSessionTestExecutor`.
+`StubExecutor` remains only as the **default fallback** for any task type
+without a registered executor — so an unregistered type is a no-op, but the
+system does execute real surplus work. Check the registry before assuming a
+given `TaskType` runs.
 
 ### 13. `time.monotonic()` + `0.0` Sentinel Silently Breaks on Fresh Processes
 
