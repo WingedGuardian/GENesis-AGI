@@ -64,6 +64,24 @@ def test_build_args_with_mcp_config(invoker):
     assert "/path/to/mcp.json" in args
 
 
+def test_build_args_strict_mcp_config(invoker):
+    inv = CCInvocation(
+        prompt="hello", mcp_config="/path/to/mcp.json", strict_mcp_config=True,
+    )
+    args = invoker._build_args(inv)
+    assert "--strict-mcp-config" in args
+    # Default stays additive: flag absent unless opted in.
+    default_args = invoker._build_args(CCInvocation(prompt="hello"))
+    assert "--strict-mcp-config" not in default_args
+
+
+def test_build_args_safe_mode(invoker):
+    args = invoker._build_args(CCInvocation(prompt="hello", safe_mode=True))
+    assert "--safe-mode" in args
+    default_args = invoker._build_args(CCInvocation(prompt="hello"))
+    assert "--safe-mode" not in default_args
+
+
 def test_build_args_includes_span_settings(invoker, monkeypatch):
     """Dispatched sessions get --settings pointing at the span-hook file."""
     import genesis.cc.invoker as inv_mod
@@ -188,6 +206,32 @@ def test_build_env_strips_parent_anthropic_base_url(invoker):
     with patch.dict("os.environ", {"ANTHROPIC_BASE_URL": "http://leaked:8100"}):
         env = invoker._build_env(inv)
         assert "ANTHROPIC_BASE_URL" not in env
+
+
+def test_build_env_applies_env_overrides_last(invoker):
+    """env_overrides wins over keys the invoker itself computes.
+
+    GENESIS_CC_SESSION and CLAUDE_CODE_TMPDIR are both set unconditionally by
+    _build_env, so overriding them proves the applied-LAST contract (not just
+    dict-merge over the inherited environ).
+    """
+    inv = CCInvocation(
+        prompt="hello",
+        env_overrides={
+            "GENESIS_CC_SESSION": "bench-override",
+            "CLAUDE_CONFIG_DIR": "/isolated/config",
+        },
+    )
+    env = invoker._build_env(inv)
+    assert env["GENESIS_CC_SESSION"] == "bench-override"
+    assert env["CLAUDE_CONFIG_DIR"] == "/isolated/config"
+
+
+def test_build_env_no_overrides_is_noop(invoker):
+    """Default env_overrides=None changes nothing (regression guard)."""
+    inv = CCInvocation(prompt="hello")
+    env = invoker._build_env(inv)
+    assert env["GENESIS_CC_SESSION"] == "1"
 
 
 def test_build_env_sets_bash_allowlist(invoker):
