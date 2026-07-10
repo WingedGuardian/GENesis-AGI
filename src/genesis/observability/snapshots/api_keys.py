@@ -48,6 +48,7 @@ def has_api_key(provider_cfg) -> bool:
 def api_key_health(
     routing_config: RoutingConfig | None,
     breakers: object | None = None,
+    recent_fallbacks: dict | None = None,
 ) -> dict:
     """Provider API key health with chain-aware criticality and CB state.
 
@@ -56,6 +57,10 @@ def api_key_health(
     Each provider entry includes the original fields (status, provider_type)
     plus chain_count, criticality, is_free, cb_state, cb_reason, and
     alert_severity — derived from the routing config and circuit breakers.
+    When ``recent_fallbacks`` (``{provider: {"count", "last_at"}}``, keyed by
+    provider config name) is supplied, a matched provider also gets
+    ``recent_fallbacks`` / ``last_fallback_at`` — additive display context only,
+    never used for severity or color.
 
     The ``alerts`` list contains pre-computed attention-strip items for
     critical/warning conditions (credit exhaustion, missing critical keys).
@@ -176,6 +181,14 @@ def api_key_health(
             essential_uncovered=essential_uncovered,
         )
         entry["key_health"] = _key_health_color(entry["status"], cb_state)
+        # Attach recent fallback churn (by config name) so a missing/failing
+        # provider's key status reads next to how often it's causing fallbacks.
+        # Additive display context only — no severity/color branching on it.
+        if recent_fallbacks:
+            rf = recent_fallbacks.get(name)
+            if rf and rf.get("count"):
+                entry["recent_fallbacks"] = rf["count"]
+                entry["last_fallback_at"] = rf.get("last_at")
         results[name] = entry
 
     # Include disabled providers for visibility — but mark as "disabled",

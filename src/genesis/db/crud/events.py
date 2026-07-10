@@ -374,3 +374,46 @@ async def query_grouped_errors(
         params,
     )
     return [dict(r) for r in rows]
+
+
+async def recent_provider_fallback_counts(
+    db: aiosqlite.Connection,
+    *,
+    since: str,
+) -> dict[str, dict]:
+    """Per-provider fallback counts from ``provider.fallback`` events since ``since``.
+
+    A ``provider.fallback`` event's ``details.failed_providers`` lists the
+    providers that were SKIPPED or FAILED before the successful fallback, keyed by
+    provider *config name* (e.g. ``nvidia-nim-deepseek``) — the same key the
+    API-key health snapshot uses. This unnests that array (``json_each``) and
+    counts how often each provider appears, so a missing/failing provider's churn
+    can be surfaced next to its key status.
+
+    Semantics note: ``failed_providers`` is dominated by config *skips* (missing
+    key, circuit-breaker open, budget) rather than true call failures, so callers
+    must label this "fallbacks", not "failures". ``breaker.tripped`` (genuine
+    call failures) is a distinct signal already carried by the CB state and is
+    intentionally NOT merged here.
+
+    Filters on ``timestamp`` (index ``idx_events_ts``; same ISO value as
+    ``created_at`` on insert). Rows whose ``details`` lacks ``failed_providers``
+    contribute nothing — ``json_extract`` returns NULL and ``json_each(NULL)``
+    yields zero rows. Returns ``{provider: {"count": n, "last_at": iso}}``.
+    """
+    rows = await db.execute_fetchall(
+        """SELECT je.value AS provider,
+                  COUNT(*) AS n,
+                  MAX(e.timestamp) AS last_at
+           FROM events e,
+                json_each(json_extract(e.details, '$.failed_providers')) je
+           WHERE e.event_type = 'provider.fallback' AND e.timestamp >= ?
+           GROUP BY je.value
+           ORDER BY n DESC""",
+        (since,),
+    )
+    return {
+        str(r[0]): {"count": int(r[1]), "last_at": r[2]}
+        for r in rows
+        if r[0] is not None
+    }
