@@ -268,14 +268,11 @@ class HealthDataService:
         except Exception:
             logger.debug("Probe-transition emit pass failed", exc_info=True)
 
-        # Fallback counts feed the API-keys card. Defensive guard: the method
-        # already swallows its own errors → {}, but if _or_error ever injected a
-        # {"status": "error"} sentinel we must not pass that as the provider map.
+        # Fallback counts feed the API-keys card. _recent_provider_fallbacks
+        # self-isolates its errors to {}, so this is always a provider map; the
+        # isinstance keeps the attach loop safe if that contract ever changes.
         recent_fallbacks = (
-            r_provider_fallbacks
-            if isinstance(r_provider_fallbacks, dict)
-            and "status" not in r_provider_fallbacks
-            else {}
+            r_provider_fallbacks if isinstance(r_provider_fallbacks, dict) else {}
         )
 
         return {
