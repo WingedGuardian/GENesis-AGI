@@ -172,21 +172,27 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: a7aa076b 2026-07-07
+verified: d8d9b5e4 2026-07-09
 ```
 
 - `surplus/scheduler.py` (~790 LOC) is the system-job hub (dream cycle, recon,
-  pipeline cycles, maintenance, code index/audit, model evals…); job bodies
+  pipeline cycles, maintenance, code index, model evals…); job bodies
   live in `surplus/jobs/` (gates/runners/dream/gitnexus) and the dispatch
   pipeline in `surplus/dispatch.py`, with the scheduler keeping every method
-  name as a thin delegate/facade.
+  name as a thin delegate/facade. (The long-disabled `schedule_code_audit`
+  job was removed 2026-07; `CodeAuditExecutor` + the CODE_AUDIT task type
+  remain for dispatch/judge consumers and manual enqueue.)
   `dispatch_once()` is **idle-gated** — surplus tasks only run when idle;
   follow-up dispatch is deliberately NOT idle-gated.
 - **Durability model:** no persistent jobstore — jobs are re-registered at
   every boot + CronTrigger + `misfire_grace_time`, backed by three durable DB
   queues (`surplus_tasks`, `dead_letter`, `deferred_work_queue`).
   **IntervalTrigger resets on restart** — anything >1h must be a CronTrigger
-  (documented bug class).
+  (documented bug class). Boot sweeps reclaim orphans immediately: the
+  surplus scheduler resets `running` rows at start() without burning
+  attempt_count (restart ≠ task failure), and the learning init kicks the
+  recovery orchestrator at boot. Both assume SINGLE-WORKER dispatch —
+  re-gate on worker ownership if v4-parallel-dispatch ships.
 - **`surplus/intake.py`** (intelligence intake: atomize → score → route)
   auto-ingests curated sources into the knowledge base with NO manifest gate —
   an INTENTIONAL bypass of the conversational confirm-first path; don't "fix"
