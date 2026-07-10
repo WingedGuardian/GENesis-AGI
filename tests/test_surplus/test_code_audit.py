@@ -5,9 +5,15 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiosqlite
 import pytest
 
-from genesis.surplus.code_audit import CodeAuditExecutor, CodebaseContextGatherer, _is_slop
+from genesis.surplus.code_audit import (
+    _MAX_CONTEXT_CHARS,
+    CodeAuditExecutor,
+    CodebaseContextGatherer,
+    _is_slop,
+)
 from genesis.surplus.types import (
     ComputeTier,
     ExecutorResult,
@@ -82,7 +88,7 @@ async def test_gatherer_assembles_context():
 
 @pytest.mark.asyncio
 async def test_gatherer_caps_context_length():
-    """Context is truncated to ~4000 chars."""
+    """Context is truncated to _MAX_CONTEXT_CHARS (6000)."""
     db = AsyncMock()
     cursor_mock = AsyncMock()
     cursor_mock.fetchall = AsyncMock(return_value=[])
@@ -92,13 +98,13 @@ async def test_gatherer_caps_context_length():
 
     with patch.object(gatherer, "_run_cmd", new_callable=AsyncMock) as mock_cmd:
         mock_cmd.side_effect = [
-            "x" * 2000,
-            "y" * 2000,
-            "z" * 2000,
+            "x" * 3000,
+            "y" * 3000,
+            "z" * 3000,
         ]
         ctx = await gatherer.gather()
 
-    assert len(ctx) <= 4100  # 4000 + truncation notice
+    assert len(ctx) <= _MAX_CONTEXT_CHARS + 100  # cap + truncation notice
     assert "truncated" in ctx
 
 
@@ -380,3 +386,210 @@ def test_parse_findings_all_slop_returns_no_findings():
     assert len(results) == 1
     assert results[0]["suggestion"] == "No findings"
     assert results[0]["confidence"] == 0.15
+    assert results[0]["category"] == "other"
+
+
+# ---------------------------------------------------------------------------
+# Category passthrough
+# ---------------------------------------------------------------------------
+
+
+def test_parse_findings_passes_through_valid_category():
+    """A known taxonomy category survives parsing unchanged."""
+    findings_json = json.dumps([
+        {"file": "a.py", "severity": "high", "category": "async_state",
+         "suggestion": "Swallowed error in poll loop", "confidence": 0.9},
+    ])
+    results = CodeAuditExecutor._parse_findings(
+        findings_json, provider="test", drive_alignment="competence",
+    )
+    assert len(results) == 1
+    assert results[0]["category"] == "async_state"
+
+
+def test_parse_findings_missing_category_defaults_to_other():
+    """A finding without a category gets 'other'."""
+    findings_json = json.dumps([
+        {"file": "a.py", "severity": "low",
+         "suggestion": "Unused import asyncio", "confidence": 0.9},
+    ])
+    results = CodeAuditExecutor._parse_findings(
+        findings_json, provider="test", drive_alignment="competence",
+    )
+    assert results[0]["category"] == "other"
+
+
+def test_parse_findings_garbage_category_normalized_to_other():
+    """An unknown or non-string category is normalized to 'other'."""
+    findings_json = json.dumps([
+        {"file": "a.py", "severity": "low", "category": "vibes",
+         "suggestion": "Finding one", "confidence": 0.9},
+        {"file": "b.py", "severity": "low", "category": 42,
+         "suggestion": "Finding two", "confidence": 0.9},
+        {"file": "c.py", "severity": "low", "category": ["tests"],
+         "suggestion": "Finding three", "confidence": 0.9},
+    ])
+    results = CodeAuditExecutor._parse_findings(
+        findings_json, provider="test", drive_alignment="competence",
+    )
+    assert [r["category"] for r in results] == ["other", "other", "other"]
+
+
+def test_parse_findings_category_case_insensitive():
+    """Category matching normalizes case/whitespace before validating."""
+    findings_json = json.dumps([
+        {"file": "a.py", "severity": "low", "category": " Structural ",
+         "suggestion": "Duplicate helper pair", "confidence": 0.9},
+    ])
+    results = CodeAuditExecutor._parse_findings(
+        findings_json, provider="test", drive_alignment="competence",
+    )
+    assert results[0]["category"] == "structural"
+
+
+@pytest.mark.asyncio
+async def test_prompt_schema_includes_critical_and_category():
+    """The inline prompt schema allows 'critical' severity and asks for a category."""
+    routing_result = MagicMock()
+    routing_result.success = True
+    routing_result.content = "[]"
+    routing_result.provider_used = "test"
+    routing_result.error = None
+
+    router = AsyncMock()
+    router.route_call = AsyncMock(return_value=routing_result)
+
+    db = AsyncMock()
+    cursor_mock = AsyncMock()
+    cursor_mock.fetchall = AsyncMock(return_value=[])
+    db.execute = AsyncMock(return_value=cursor_mock)
+
+    executor = CodeAuditExecutor(router=router, db=db, repo_root="/tmp/fake")
+
+    with patch.object(executor._gatherer, "_run_cmd", new_callable=AsyncMock) as mock_cmd:
+        mock_cmd.side_effect = ["log", "diff", "files"]
+        await executor.execute(_make_task())
+
+    call_site, messages = router.route_call.call_args.args
+    assert call_site == "36_code_auditor"
+    user_prompt = messages[-1]["content"]
+    assert '"critical|high|medium|low"' in user_prompt
+    assert '"category"' in user_prompt
+    assert "structural|async_state|error_handling|tests|security|other" in user_prompt
+
+
+# ---------------------------------------------------------------------------
+# Audit Targets inventory (fan-in / god-modules)
+# ---------------------------------------------------------------------------
+
+
+async def _index_db(*, seed: bool) -> aiosqlite.Connection:
+    """In-memory DB with the real code index tables (see codebase/indexer.py)."""
+    from genesis.codebase.indexer import ensure_tables
+
+    conn = await aiosqlite.connect(":memory:")
+    await ensure_tables(conn)
+    if seed:
+        modules = [
+            ("src/genesis/routing/router.py", "routing", "router"),
+            ("src/genesis/memory/store.py", "memory", "store"),
+            ("src/genesis/surplus/types.py", "surplus", "types"),
+            ("src/genesis/runtime/bootstrap.py", "runtime", "bootstrap"),
+        ]
+        for path, pkg, name in modules:
+            await conn.execute(
+                "INSERT INTO code_modules "
+                "(path, package, module_name, loc, file_mtime, last_indexed_at) "
+                "VALUES (?, ?, ?, 100, 0.0, '2026-07-10T00:00:00')",
+                (path, pkg, name),
+            )
+        # Fan-in: genesis.routing.router imported by 3 distinct sources,
+        # genesis.memory.store by 1.
+        imports = [
+            ("src/genesis/memory/store.py", "genesis.routing.router"),
+            ("src/genesis/surplus/types.py", "genesis.routing.router"),
+            ("src/genesis/runtime/bootstrap.py", "genesis.routing.router"),
+            ("src/genesis/runtime/bootstrap.py", "genesis.memory.store"),
+            # God-module: bootstrap.py imports from 5 distinct top-level
+            # genesis packages (routing, memory, surplus, ego, channels).
+            ("src/genesis/runtime/bootstrap.py", "genesis.surplus.types"),
+            ("src/genesis/runtime/bootstrap.py", "genesis.ego.core"),
+            ("src/genesis/runtime/bootstrap.py", "genesis.channels.telegram"),
+            # Relative import stored unresolved — must NOT count as internal.
+            ("src/genesis/routing/router.py", "types"),
+            # Stdlib import — must not appear anywhere.
+            ("src/genesis/routing/router.py", "asyncio"),
+        ]
+        for source, target in imports:
+            await conn.execute(
+                "INSERT INTO code_imports (source_path, target_module) "
+                "VALUES (?, ?)",
+                (source, target),
+            )
+        await conn.commit()
+    return conn
+
+
+@pytest.mark.asyncio
+async def test_gatherer_audit_targets_from_seeded_index():
+    """Seeded code_imports produce the Audit Targets section in context."""
+    conn = await _index_db(seed=True)
+    try:
+        gatherer = CodebaseContextGatherer(conn, repo_root="/tmp/fake")
+        with patch.object(gatherer, "_run_cmd", new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.side_effect = ["log", "diff"]
+            ctx = await gatherer.gather()
+    finally:
+        await conn.close()
+
+    assert "## Audit Targets (fan-in / god-modules)" in ctx
+    # Fan-in leader with its distinct-importer count
+    assert "genesis.routing.router: 3" in ctx
+    # God-module (5 distinct internal top-level packages)
+    assert "src/genesis/runtime/bootstrap.py: 5 packages" in ctx
+    assert "asyncio" not in ctx.split("## Audit Targets")[1]
+
+
+@pytest.mark.asyncio
+async def test_gatherer_audit_targets_god_module_threshold():
+    """Sources importing from <5 internal packages are not god-modules."""
+    conn = await _index_db(seed=True)
+    try:
+        gatherer = CodebaseContextGatherer(conn, repo_root="/tmp/fake")
+        targets = await gatherer._get_audit_targets()
+    finally:
+        await conn.close()
+
+    god_section = targets.split("God-modules")[1]
+    # bootstrap.py qualifies (5 packages); store.py (1 import) must not.
+    assert "src/genesis/runtime/bootstrap.py" in god_section
+    assert "src/genesis/memory/store.py" not in god_section
+
+
+@pytest.mark.asyncio
+async def test_gatherer_empty_index_omits_audit_targets():
+    """Empty index tables: no crash, no Audit Targets section."""
+    conn = await _index_db(seed=False)
+    try:
+        gatherer = CodebaseContextGatherer(conn, repo_root="/tmp/fake")
+        with patch.object(gatherer, "_run_cmd", new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.side_effect = ["log", "diff", "files"]
+            ctx = await gatherer.gather()
+    finally:
+        await conn.close()
+
+    assert "Audit Targets" not in ctx
+    assert "Recent Commits" in ctx
+
+
+@pytest.mark.asyncio
+async def test_gatherer_missing_index_tables_omit_audit_targets():
+    """A DB without the code index tables degrades to an empty inventory."""
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        gatherer = CodebaseContextGatherer(conn, repo_root="/tmp/fake")
+        targets = await gatherer._get_audit_targets()
+    finally:
+        await conn.close()
+
+    assert targets == ""

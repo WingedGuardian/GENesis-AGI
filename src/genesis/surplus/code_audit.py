@@ -50,7 +50,28 @@ def _safe_float(val: object, *, default: float = 0.5) -> float:
         return float(val)  # type: ignore[arg-type]
     except (ValueError, TypeError):
         return default
-_MAX_CONTEXT_CHARS = 4000
+
+
+# Taxonomy classes findings are tagged with (mirrors CODE_AUDITOR.md).
+# Anything the LLM emits outside this set is normalized to "other".
+_AUDIT_CATEGORIES = frozenset(
+    {"structural", "async_state", "error_handling", "tests", "security", "other"}
+)
+
+
+def _safe_category(val: object) -> str:
+    """Normalize an LLM-supplied category to the known taxonomy, else 'other'."""
+    if isinstance(val, str):
+        normalized = val.strip().lower()
+        if normalized in _AUDIT_CATEGORIES:
+            return normalized
+    return "other"
+
+
+# 6000 (was 4000): the Audit Targets inventory (fan-in + god-modules) adds two
+# ~400-char sections that materially improve targeting. This is an idle-time
+# surplus task, so the marginal token cost is acceptable.
+_MAX_CONTEXT_CHARS = 6000
 _SUBPROCESS_TIMEOUT = 10
 
 
@@ -117,17 +138,71 @@ class CodebaseContextGatherer:
         except Exception:
             return ""
 
+    async def _get_audit_targets(self) -> str:
+        """Build the Audit Targets inventory from the code_imports index.
+
+        Two cheap queries: top fan-in modules (many distinct importers =
+        highest-value audit targets) and god-modules (source files importing
+        from >=5 distinct internal top-level genesis packages). Returns ""
+        when the index is empty or missing so the section is omitted.
+
+        Note on semantics (see codebase/indexer.py): target_module is the raw
+        dotted name from the AST — relative imports are stored unresolved
+        (e.g. "types", is_relative=1), so the LIKE 'genesis%' filter counts
+        absolute internal imports only. This undercounts intra-package fan-in
+        but is the right signal for cross-package audit targeting.
+        """
+        try:
+            cursor = await self._db.execute(
+                "SELECT target_module, COUNT(DISTINCT source_path) AS c "
+                "FROM code_imports WHERE target_module LIKE 'genesis%' "
+                "GROUP BY 1 ORDER BY c DESC LIMIT 10"
+            )
+            fan_in_rows = await cursor.fetchall()
+
+            # Top-level package of an absolute internal import: the segment
+            # after "genesis." up to the next dot (substr offset 9 skips the
+            # 8-char "genesis." prefix). "genesis" alone names no subpackage,
+            # hence LIKE 'genesis.%' here.
+            cursor = await self._db.execute(
+                "SELECT source_path, COUNT(DISTINCT "
+                "  CASE WHEN instr(substr(target_module, 9), '.') > 0 "
+                "       THEN substr(target_module, 9, "
+                "                   instr(substr(target_module, 9), '.') - 1) "
+                "       ELSE substr(target_module, 9) END) AS pkgs "
+                "FROM code_imports WHERE target_module LIKE 'genesis.%' "
+                "GROUP BY source_path HAVING pkgs >= 5 "
+                "ORDER BY pkgs DESC LIMIT 10"
+            )
+            god_rows = await cursor.fetchall()
+
+            lines: list[str] = []
+            if fan_in_rows:
+                lines.append("Top fan-in (module: distinct importers):")
+                lines.extend(f"- {mod}: {count}" for mod, count in fan_in_rows)
+            if god_rows:
+                lines.append("God-modules (import >=5 internal packages):")
+                lines.extend(
+                    f"- {path}: {pkgs} packages" for path, pkgs in god_rows
+                )
+            return "\n".join(lines)
+        except Exception:
+            return ""
+
     async def gather(self) -> str:
-        """Assemble codebase context, capped at ~4000 chars.
+        """Assemble codebase context, capped at _MAX_CONTEXT_CHARS.
 
         Prefers the code_modules index (fast, structured) over subprocess
         calls. Falls back to subprocess if the index is empty.
         """
-        git_log, git_diff, index_summary, prev_findings = await asyncio.gather(
-            self._run_cmd("git", "log", "--oneline", "-20"),
-            self._run_cmd("git", "diff", "HEAD~5", "--stat"),
-            self._get_index_summary(),
-            self._get_previous_findings(),
+        git_log, git_diff, index_summary, audit_targets, prev_findings = (
+            await asyncio.gather(
+                self._run_cmd("git", "log", "--oneline", "-20"),
+                self._run_cmd("git", "diff", "HEAD~5", "--stat"),
+                self._get_index_summary(),
+                self._get_audit_targets(),
+                self._get_previous_findings(),
+            )
         )
 
         # Use index-based summary if available, otherwise fall back to find
@@ -144,6 +219,10 @@ class CodebaseContextGatherer:
         sections.append("## Recent Commits\n" + (git_log or "(none)"))
         sections.append("## Recent Changes (stat)\n" + (git_diff or "(none)"))
         sections.append(file_section)
+        if audit_targets:
+            sections.append(
+                "## Audit Targets (fan-in / god-modules)\n" + audit_targets
+            )
         if prev_findings:
             sections.append("## Previous Unresolved Findings\n" + prev_findings)
 
@@ -193,7 +272,9 @@ class CodeAuditExecutor:
         prompt = (
             "Analyze this codebase for issues. Return a JSON array of findings.\n"
             'Each finding: {"file": "...", "line": null, "severity": '
-            '"low|medium|high", "suggestion": "...", "confidence": 0.0-1.0}\n\n'
+            '"critical|high|medium|low", "category": '
+            '"structural|async_state|error_handling|tests|security|other", '
+            '"suggestion": "...", "confidence": 0.0-1.0}\n\n'
             f"{context}"
         )
 
@@ -269,6 +350,7 @@ class CodeAuditExecutor:
                 "file": None,
                 "line": None,
                 "severity": "low",
+                "category": "other",
                 "suggestion": text[:500] if text else "No findings",
             }]
 
@@ -293,6 +375,7 @@ class CodeAuditExecutor:
                 "file": item.get("file"),
                 "line": item.get("line"),
                 "severity": item.get("severity", "low"),
+                "category": _safe_category(item.get("category", "other")),
                 "suggestion": suggestion,
             })
 
@@ -305,5 +388,6 @@ class CodeAuditExecutor:
             "file": None,
             "line": None,
             "severity": "low",
+            "category": "other",
             "suggestion": "No findings",
         }]

@@ -1031,7 +1031,8 @@ async def test_run_weekly_aggregation_writes_new_dimensions(db):
     results = await run_weekly_aggregation(db)
 
     expected = {"memory", "system", "ego", "cognitive", "procedure",
-                "cognitive_drift", "approvals", "goals", "noise"}
+                "cognitive_drift", "approvals", "goals", "noise",
+                "dev_quality"}
     missing = expected - results.keys()
     assert not missing, f"dimensions failed silently: {missing}"
 
