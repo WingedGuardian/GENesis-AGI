@@ -191,6 +191,10 @@ class CredIntegrityConfig:
     restore_timeout_s: int = 60
     backup_dir: str = ""             # container-side backup path; "" = module default
     container_home: str = ""         # "" = the container's real home; set only for E2E
+    # G.4 host-side credential mirror. The container mirrors the encrypted backup
+    # bundle to the shared mount each awareness tick; the guardian warns if that
+    # mirror goes stale (backups not landing) and keeps a host-only archive copy.
+    mirror_stale_hours: float = 48.0  # WARN if the mirror's newest cred is older (8 missed 6h cycles)
 
 
 @dataclass

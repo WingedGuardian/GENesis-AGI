@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import shlex
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,9 +29,25 @@ from genesis.guardian import cred_integrity
 from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.cred_integrity import RESTORABLE_STATUSES, allowed_restore
 
+# Shared atomic-copy primitive lives in the credential_bridge module — imported
+# here so the host-only archive uses the identical copy discipline as the
+# container-side mirror. Import is side-effect-free.
+from genesis.guardian.credential_bridge import _atomic_copy
+
 logger = logging.getLogger(__name__)
 
 _STATE_FILE = "cred_alert_state.json"
+
+# G.4 host-side credential mirror. The container's awareness tick mirrors the
+# encrypted backup bundle to the shared mount at <state>/shared/guardian/
+# creds-mirror/; the guardian warns if it goes stale and keeps a host-only
+# archive copy (<state>/creds-archive/) the container cannot reach.
+_MIRROR_STATE_FILE = "mirror_alert_state.json"
+_SHARED_GUARDIAN = ("shared", "guardian")   # under state_path → host view of the mount
+_MIRROR_SUBDIR = "creds-mirror"
+_MIRROR_STAMP = "MIRROR_STAMP"
+_ARCHIVE_SUBDIR = "creds-archive"
+_ESCROW_FILE = "backup_passphrase.env"
 
 
 @dataclass(frozen=True)
@@ -196,6 +213,14 @@ async def check_credential_integrity_and_alert(config, dispatcher) -> None:
     if not cfg.enabled:
         return
 
+    # G.4 mirror freshness + host-only archive hop. Host-side file ops only, so
+    # they run every enabled tick — independent of (and before) the container
+    # verdict below, which may be 'no signal' when genesis-server is degraded.
+    try:
+        await _check_mirror_and_archive(config, dispatcher)
+    except Exception:
+        logger.warning("cred mirror/archive check failed", exc_info=True)
+
     report = await run_container_check(config)
     if report is None:
         logger.debug("cred_watch: no verdict this tick (container unreachable?)")
@@ -312,6 +337,140 @@ async def check_credential_integrity_and_alert(config, dispatcher) -> None:
                             "Manual intervention needed.")
 
     _save_state(state_file, episodes)
+
+
+async def _check_mirror_and_archive(config, dispatcher) -> None:
+    """G.4: warn if the host-side credential mirror is stale, then keep a
+    host-only archive copy (container-unreachable) of the mirror + escrow.
+
+    Pure host-side file operations — no incus exec, no container dependency."""
+    shared_guardian = config.state_path.joinpath(*_SHARED_GUARDIAN)
+    mirror_dir = shared_guardian / _MIRROR_SUBDIR
+    escrow = shared_guardian / _ESCROW_FILE
+
+    # Freshness alerting only makes sense once backups are configured; the escrow
+    # file (written by the same bridge tick) is the proxy for "backups on".
+    if escrow.exists():
+        await _mirror_freshness_alert(config, dispatcher, mirror_dir)
+    else:
+        # Backups not configured (or turned off): drop any lingering stale-warn
+        # state so a later re-enable starts clean. No alert — absence is expected.
+        state_file = config.state_path / _MIRROR_STATE_FILE
+        if _load_mirror_state(state_file).get("warned_at"):
+            _save_mirror_state(state_file, {})
+
+    _archive_mirror(config, mirror_dir, escrow)
+
+
+def _mirror_newest_mtime(mirror_dir: Path) -> datetime | None:
+    """Newest ``*.gpg`` mtime under the mirror, or None if the mirror is
+    incomplete. The MIRROR_STAMP completeness marker must be present — a
+    half-written mirror (files but no stamp) counts as 'no complete mirror'."""
+    if not (mirror_dir / _MIRROR_STAMP).exists():
+        return None
+    newest = 0.0
+    for f in mirror_dir.rglob("*.gpg"):
+        try:
+            newest = max(newest, f.stat().st_mtime)
+        except OSError:
+            continue
+    if newest <= 0:
+        return None
+    return datetime.fromtimestamp(newest, tz=UTC)
+
+
+async def _mirror_freshness_alert(config, dispatcher, mirror_dir: Path) -> None:
+    cfg = config.cred_integrity
+    now = datetime.now(UTC)
+    state_file = config.state_path / _MIRROR_STATE_FILE
+    state = _load_mirror_state(state_file)
+
+    newest = _mirror_newest_mtime(mirror_dir)
+    if newest is not None:
+        age_h = (now - newest).total_seconds() / 3600
+        stale = age_h > cfg.mirror_stale_hours
+    else:
+        age_h = None
+        stale = True
+
+    if not stale:
+        if state.get("warned_at"):
+            _save_mirror_state(state_file, {})
+            await _send(dispatcher, AlertSeverity.INFO,
+                        "Credential mirror fresh again",
+                        "The host-side encrypted credential mirror is updating "
+                        "normally again.")
+        return
+
+    last_alert = _parse(state.get("last_alert_at"))
+    if last_alert and (now - last_alert).total_seconds() < cfg.realert_hours * 3600:
+        return
+    detail = (
+        f"newest backed-up credential is {age_h:.1f}h old" if age_h is not None
+        else "no complete mirror found (missing MIRROR_STAMP)"
+    )
+    _save_mirror_state(state_file, {
+        "warned_at": state.get("warned_at") or now.isoformat(),
+        "last_alert_at": now.isoformat(),
+    })
+    await _send(dispatcher, AlertSeverity.WARNING,
+                "Credential backup mirror stale",
+                f"The host-side credential mirror is stale: {detail} "
+                f"(threshold {cfg.mirror_stale_hours:.0f}h). Encrypted backups may "
+                "not be landing — a container loss right now could not be recovered "
+                "from the host. Check the backup timer and the awareness loop.")
+
+
+def _archive_mirror(config, mirror_dir: Path, escrow: Path) -> None:
+    """Copy the mirror tree + escrow → a host-only archive the container cannot
+    reach. Refuse an empty or stamp-less mirror so a zeroed shared mount never
+    even starts an archive round.
+
+    The archive is deliberately GROW-ONLY (it never prunes). It is the last line
+    of defence, so it must never delete a credential based on a single —
+    possibly transient or partial — view of the mirror (e.g. a backup.sh rewrite
+    window that briefly drops a .gpg, then the container's own mirror prunes it,
+    then this tick sees the shrunken set). Stale extra encrypted blobs are
+    harmless on restore; losing the only surviving copy is not. Same-named creds
+    are still refreshed in place, so rotations propagate."""
+    stamp = mirror_dir / _MIRROR_STAMP
+    if not stamp.exists():
+        logger.debug("cred archive: mirror has no STAMP (incomplete/absent) — skipping")
+        return
+    gpg_files = [f for f in mirror_dir.rglob("*.gpg") if f.is_file()]
+    if not gpg_files:
+        logger.debug("cred archive: mirror has no encrypted files — skipping")
+        return
+
+    archive = config.state_path / _ARCHIVE_SUBDIR
+    try:
+        archive.mkdir(parents=True, exist_ok=True)
+        os.chmod(archive, 0o700)
+        for f in gpg_files:
+            _atomic_copy(f, archive / f.relative_to(mirror_dir))
+        _atomic_copy(stamp, archive / _MIRROR_STAMP)
+        if escrow.exists():
+            _atomic_copy(escrow, archive / _ESCROW_FILE)
+    except OSError:
+        logger.warning("cred archive hop failed", exc_info=True)
+
+
+def _load_mirror_state(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text())
+        return obj if isinstance(obj, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_mirror_state(path: Path, state: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state))
+    except OSError:
+        logger.warning("failed to persist cred mirror alert state", exc_info=True)
 
 
 async def _send(dispatcher, severity: AlertSeverity, title: str, body: str) -> None:
