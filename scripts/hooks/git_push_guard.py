@@ -116,6 +116,99 @@ _CLEAN_PATTERNS = [
 # Bot usernames that post automated reviews
 _REVIEW_BOTS = {"chatgpt-codex-connector[bot]", "github-actions[bot]"}
 
+# ── Inline review comments (pulls/N/comments — a DIFFERENT endpoint) ──
+# Codex posts its actual P1/P2 findings ONLY as inline review comments;
+# its review body is boilerplate. This endpoint was never scanned, so
+# the gate was blind to them (audited 2026-07-10: 173 findings across
+# 118 merged PRs passed unseen, 64 of them P1).
+_INLINE_P1_RE = re.compile(r"!\[P1 Badge\]")
+_INLINE_P2_RE = re.compile(r"!\[P2 Badge\]")
+_INLINE_REVIEW_BOTS = {
+    "chatgpt-codex-connector[bot]",
+    "github-advanced-security[bot]",
+}
+# Badge/markup prefix stripped when rendering a finding's title line.
+_INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
+
+
+def _inline_title(body: str) -> str:
+    """First readable line of an inline finding body."""
+    first = _INLINE_MARKUP_RE.sub("", body).strip().splitlines()
+    return (first[0].strip() if first else "")[:120]
+
+
+def _check_inline_review_findings(
+    pr_num: str, *, force: bool = False,
+) -> tuple[bool, str]:
+    """Scan INLINE review comments for P1/P2 badge findings.
+
+    Returns (should_block, message). P1 findings block unless their
+    thread has a reply (engagement = read) or the merge carries
+    '# review-override'. P2 findings never block but are printed to
+    stderr one per line — the session must consciously accept them.
+    Fail-open on any error, like _check_pr_review_findings.
+    """
+    if force:
+        return False, ""  # override NOTE already printed by the body gate
+    try:
+        # --paginate: findings beyond the first REST page (30 comments)
+        # must still gate. With a per-element jq filter, gh emits one
+        # compact JSON object per line across ALL pages.
+        result = subprocess.run(
+            [
+                "gh", "api",
+                f"repos/:owner/:repo/pulls/{pr_num}/comments",
+                "--paginate",
+                "--jq",
+                '.[] | {id: .id, reply_to: .in_reply_to_id, '
+                'login: .user.login, type: .user.type, body: .body}',
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return False, ""
+        raw = [
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if line.strip()
+        ]
+    except Exception:
+        return False, ""
+
+    replied_to = {c.get("reply_to") for c in raw if c.get("reply_to")}
+    p1: list[str] = []
+    p2: list[str] = []
+    for c in raw:
+        login, utype = c.get("login") or "", c.get("type") or ""
+        body = c.get("body") or ""
+        if utype != "Bot" and login not in _INLINE_REVIEW_BOTS:
+            continue
+        if c.get("reply_to"):
+            continue  # replies aren't findings
+        if _INLINE_P1_RE.search(body):
+            if c.get("id") in replied_to:
+                continue  # thread engaged — treated as acknowledged
+            p1.append(_inline_title(body))
+        elif _INLINE_P2_RE.search(body):
+            p2.append(_inline_title(body))
+
+    if p2:
+        print(
+            f"WARNING: PR #{pr_num} has {len(p2)} inline [P2] review "
+            f"finding(s) (not blocking — address or consciously accept):",
+            file=sys.stderr,
+        )
+        for title in p2[:8]:
+            print(f"  [P2] {title}", file=sys.stderr)
+    if p1:
+        listing = "\n".join(f"  [P1] {t}" for t in p1[:5])
+        return True, (
+            f"{len(p1)} inline [P1] finding(s) with no reply:\n{listing}\n"
+            f"Fix and reply in-thread, or append '# review-override' "
+            f"to the merge command to acknowledge and proceed."
+        )
+    return False, ""
+
 
 def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool, str]:
     """Check PR comments for unresolved automated review findings.
@@ -305,6 +398,20 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     print(review_msg, file=sys.stderr)
+                    return 2
+
+                # Inline review comments (Codex P1/P2 badges) — separate
+                # endpoint, separate check. P1 blocks; P2 warns.
+                should_block, inline_msg = _check_inline_review_findings(
+                    pr_num, force=force_override,
+                )
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} has unresolved INLINE "
+                        f"review findings.",
+                        file=sys.stderr,
+                    )
+                    print(inline_msg, file=sys.stderr)
                     return 2
 
         # ── sqlite3 write operations ────────────────────────────────

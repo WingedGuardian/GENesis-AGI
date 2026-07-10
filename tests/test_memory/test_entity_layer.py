@@ -226,3 +226,130 @@ class TestSeed:
         mentions = await entities_crud.memories_mentioning(db, list(reached))
         target = SEED_MENTIONS[0][1]
         assert any(m["memory_id"] == target for m in mentions)
+
+
+class TestCodexRemediationCrud:
+    """Regression tests for the 2026-07-10 Codex P2 findings (crud side)."""
+
+    @pytest.mark.asyncio
+    async def test_upsert_link_keeps_dated_validity(self, db):
+        a = await _mk(db, "A")
+        b = await _mk(db, "B")
+        # Undated weak claim, then a stronger dated one: date must land.
+        await entities_crud.upsert_link(
+            db, source_id=a, target_id=b, link_type="is_a",
+            provenance="INFERRED", confidence=0.5,
+        )
+        await entities_crud.upsert_link(
+            db, source_id=a, target_id=b, link_type="is_a",
+            provenance="EXTRACTED", confidence=0.9, valid_at="2026-06-14",
+        )
+        rows = await db.execute_fetchall(
+            "SELECT valid_at, confidence FROM entity_links",
+        )
+        assert rows[0][0] == "2026-06-14" and rows[0][1] == 0.9
+        # An even stronger UNdated claim must not erase the known date.
+        await entities_crud.upsert_link(
+            db, source_id=a, target_id=b, link_type="is_a",
+            provenance="EXTRACTED", confidence=0.95,
+        )
+        rows = await db.execute_fetchall(
+            "SELECT valid_at, confidence FROM entity_links",
+        )
+        assert rows[0][0] == "2026-06-14" and rows[0][1] == 0.95
+
+    @pytest.mark.asyncio
+    async def test_merge_keeps_stronger_rows(self, db):
+        survivor = await _mk(db, "OMI", "device")
+        loser = await _mk(db, "omi-dupe", "concept")
+        other = await _mk(db, "voice-edge-device")
+        # Survivor holds the WEAKER mention and link; loser the stronger.
+        await entities_crud.upsert_mention(
+            db, memory_id="m1", entity_id=survivor, provenance="INFERRED",
+            confidence=0.4,
+        )
+        await entities_crud.upsert_mention(
+            db, memory_id="m1", entity_id=loser, provenance="EXTRACTED",
+            confidence=0.9,
+        )
+        await entities_crud.upsert_link(
+            db, source_id=survivor, target_id=other, link_type="is_a",
+            provenance="INFERRED", confidence=0.3,
+        )
+        await entities_crud.upsert_link(
+            db, source_id=loser, target_id=other, link_type="is_a",
+            provenance="EXTRACTED", confidence=0.9, valid_at="2026-06-14",
+        )
+        await entities_crud.merge_entity(
+            db, loser_id=loser, survivor_id=survivor,
+        )
+        mention = await db.execute_fetchall(
+            "SELECT provenance, confidence FROM entity_mentions "
+            "WHERE memory_id = 'm1' AND entity_id = ?",
+            (survivor,),
+        )
+        assert list(mention[0]) == ["EXTRACTED", 0.9]
+        link = await db.execute_fetchall(
+            "SELECT provenance, confidence, valid_at FROM entity_links "
+            "WHERE source_id = ? AND target_id = ?",
+            (survivor, other),
+        )
+        assert list(link[0]) == ["EXTRACTED", 0.9, "2026-06-14"]
+
+    @pytest.mark.asyncio
+    async def test_merge_carries_invalidation_state(self, db):
+        survivor = await _mk(db, "OMI", "device")
+        loser = await _mk(db, "omi-dupe", "concept")
+        other = await _mk(db, "voice-edge-device")
+        # Survivor: weaker ACTIVE link. Loser: stronger link already
+        # CLOSED — the merge must not resurrect it as active.
+        await entities_crud.upsert_link(
+            db, source_id=survivor, target_id=other, link_type="is_a",
+            provenance="INFERRED", confidence=0.3,
+        )
+        await entities_crud.upsert_link(
+            db, source_id=loser, target_id=other, link_type="is_a",
+            provenance="EXTRACTED", confidence=0.9,
+        )
+        await entities_crud.invalidate_links_for_entity(
+            db, entity_id=loser, invalid_at="2026-07-01",
+            invalidated_by="superseding-memory",
+        )
+        await entities_crud.merge_entity(
+            db, loser_id=loser, survivor_id=survivor,
+        )
+        link = await db.execute_fetchall(
+            "SELECT confidence, invalid_at, invalidated_by "
+            "FROM entity_links WHERE source_id = ? AND target_id = ?",
+            (survivor, other),
+        )
+        assert link[0][0] == 0.9
+        assert link[0][1] is not None
+        assert link[0][2] == "superseding-memory"
+
+    @pytest.mark.asyncio
+    async def test_delete_entities_cascade(self, db):
+        doomed = await _mk(db, "000000001", "commit")
+        kept = await _mk(db, "OMI", "device")
+        await entities_crud.upsert_mention(
+            db, memory_id="m1", entity_id=doomed, provenance="EXTRACTED",
+            confidence=0.9,
+        )
+        await entities_crud.upsert_mention(
+            db, memory_id="m1", entity_id=kept, provenance="EXTRACTED",
+            confidence=0.9,
+        )
+        await entities_crud.upsert_link(
+            db, source_id=doomed, target_id=kept, link_type="mentions",
+            provenance="EXTRACTED", confidence=0.8,
+        )
+        counts = await entities_crud.delete_entities_cascade(db, [doomed])
+        assert counts == {"entities": 1, "mentions": 1, "links": 1}
+        remaining = await db.execute_fetchall("SELECT entity_id FROM entities")
+        assert [r[0] for r in remaining] == [kept]
+        # Idempotent second pass + empty-input no-op.
+        counts = await entities_crud.delete_entities_cascade(db, [doomed])
+        assert counts == {"entities": 0, "mentions": 0, "links": 0}
+        assert await entities_crud.delete_entities_cascade(db, []) == {
+            "entities": 0, "mentions": 0, "links": 0,
+        }

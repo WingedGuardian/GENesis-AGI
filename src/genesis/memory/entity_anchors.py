@@ -24,8 +24,11 @@ _PATH_RE = re.compile(
 )
 _SYMBOL_RE = re.compile(r"\bgenesis(?:\.[a-z_][a-z0-9_]*){1,6}\b")
 _PR_RE = re.compile(r"\bPR\s?#(\d{1,6})\b|(?<![\w#])#(\d{2,6})\b")
-# Require ≥1 digit so all-letter hex-alphabet words ("deadbee...") skip.
-_SHA_RE = re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b")
+# Require ≥1 digit AND ≥1 hex letter: all-letter words ("deadbee...")
+# and plain numeric IDs ("1234567890" — tickets, builds, timestamps)
+# both skip. Cost: the ~4% of real 7-char SHA prefixes that are
+# all-digit are missed — conservative by design (see module docstring).
+_SHA_RE = re.compile(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
 
 _MAX_ANCHORS_PER_MEMORY = 16
 

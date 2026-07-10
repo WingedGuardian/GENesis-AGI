@@ -931,3 +931,119 @@ class TestAuthkeyHardening:
             await wd._check_authkey_hardening(
                 _authkey_vi(from_matches=False, src_hash=_SRC_C))
         assert r.reharden_key.await_count == 2
+
+
+def _cc_watchdog():
+    """Watchdog wired with mock remote/event_bus/outreach for the CC-auth
+    reconciler (alert-only — no remote action)."""
+    r = AsyncMock()
+    event_bus = AsyncMock()
+    outreach = AsyncMock()
+    wd = GuardianWatchdog(r, event_bus=event_bus, outreach_pipeline=outreach)
+    return wd, r, event_bus, outreach
+
+
+def _cc_vi(logged_in, present=False, age=-1):
+    return {
+        "cc_logged_in": logged_in,
+        "cc_token_present": present,
+        "cc_token_age_days": age,
+    }
+
+
+def _alert_source_ids(outreach) -> list[str]:
+    return [c.args[1].source_id for c in outreach.submit_raw.call_args_list]
+
+
+class TestCCAuthReconciler:
+    """Host CC recovery-brain auth-health: dead-brain alert + pre-expiry warn."""
+
+    @pytest.mark.asyncio
+    async def test_old_gateway_no_cc_fields_skips(self):
+        wd, _, eb, outreach = _cc_watchdog()
+        await wd._check_cc_auth({"cc_version": "1.2.3"})  # no cc_logged_in key
+        outreach.submit_raw.assert_not_called()
+        eb.emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_logged_in_is_silent(self):
+        wd, _, _, outreach = _cc_watchdog()
+        for _ in range(_THRESHOLD + 2):
+            await wd._check_cc_auth(_cc_vi(True))
+        outreach.submit_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_expiry_warns_while_login_healthy(self):
+        # The insurance token rots exactly while the primary login is fine —
+        # the warning MUST fire despite the healthy early-return.
+        wd, _, eb, outreach = _cc_watchdog()
+        await wd._check_cc_auth(_cc_vi(True, present=True, age=340))
+        ids = _alert_source_ids(outreach)
+        assert "guardian:cc_token_expiring" in ids
+        assert "guardian:cc_auth_unhealthy" not in ids
+        assert any("cc_token_expiring" in e for e in _emitted_events(eb))
+        # once per episode
+        await wd._check_cc_auth(_cc_vi(True, present=True, age=341))
+        assert _alert_source_ids(outreach).count("guardian:cc_token_expiring") == 1
+
+    @pytest.mark.asyncio
+    async def test_expiry_rearms_on_refresh(self):
+        wd, _, _, outreach = _cc_watchdog()
+        await wd._check_cc_auth(_cc_vi(True, present=True, age=340))   # warn
+        await wd._check_cc_auth(_cc_vi(True, present=True, age=5))     # refreshed
+        await wd._check_cc_auth(_cc_vi(True, present=True, age=336))   # warn again
+        assert _alert_source_ids(outreach).count("guardian:cc_token_expiring") == 2
+
+    @pytest.mark.asyncio
+    async def test_dead_brain_alerts_at_threshold(self):
+        wd, _, eb, outreach = _cc_watchdog()
+        for _ in range(_THRESHOLD - 1):
+            await wd._check_cc_auth(_cc_vi(False))
+        outreach.submit_raw.assert_not_called()
+        await wd._check_cc_auth(_cc_vi(False))
+        ids = _alert_source_ids(outreach)
+        assert ids.count("guardian:cc_auth_unhealthy") == 1
+        assert any("cc_auth_unhealthy" in e for e in _emitted_events(eb))
+        # once per episode
+        await wd._check_cc_auth(_cc_vi(False))
+        assert _alert_source_ids(outreach).count("guardian:cc_auth_unhealthy") == 1
+
+    @pytest.mark.asyncio
+    async def test_alert_text_names_setup_token(self):
+        wd, _, _, outreach = _cc_watchdog()
+        for _ in range(_THRESHOLD):
+            await wd._check_cc_auth(_cc_vi(False))
+        msg = outreach.submit_raw.call_args.args[0]
+        assert "setup-token" in msg and "store_cc_token.sh" in msg
+
+    @pytest.mark.asyncio
+    async def test_dead_login_with_usable_token_is_healthy(self):
+        wd, _, _, outreach = _cc_watchdog()
+        for _ in range(_THRESHOLD + 2):
+            await wd._check_cc_auth(_cc_vi(False, present=True, age=10))
+        assert "guardian:cc_auth_unhealthy" not in _alert_source_ids(outreach)
+
+    @pytest.mark.asyncio
+    async def test_dead_login_with_expired_token_alerts(self):
+        wd, _, _, outreach = _cc_watchdog()
+        for _ in range(_THRESHOLD):
+            await wd._check_cc_auth(_cc_vi(False, present=True, age=400))
+        assert "guardian:cc_auth_unhealthy" in _alert_source_ids(outreach)
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_null_never_alarms(self):
+        wd, _, _, outreach = _cc_watchdog()
+        for _ in range(_THRESHOLD + 3):
+            await wd._check_cc_auth(_cc_vi(None))
+        outreach.submit_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_recovery_rearms_dead_brain_alert(self):
+        wd, _, _, outreach = _cc_watchdog()
+        for _ in range(_THRESHOLD):
+            await wd._check_cc_auth(_cc_vi(False))
+        assert _alert_source_ids(outreach).count("guardian:cc_auth_unhealthy") == 1
+        await wd._check_cc_auth(_cc_vi(True))  # recovered → reset
+        for _ in range(_THRESHOLD):
+            await wd._check_cc_auth(_cc_vi(False))
+        assert _alert_source_ids(outreach).count("guardian:cc_auth_unhealthy") == 2

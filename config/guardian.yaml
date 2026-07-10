@@ -103,6 +103,7 @@ cred_integrity:
   max_restores_per_day: 3  # per-target guardian step-in cap
   check_timeout_s: 30
   restore_timeout_s: 60
+  mirror_stale_hours: 48   # WARN if the host-side credential mirror's newest cred is older
   # backup_dir: ""         # container-side backup path; empty = module default
   # container_home: ""     # empty = container's real home; set only for E2E
 
