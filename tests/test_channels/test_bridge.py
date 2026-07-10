@@ -65,3 +65,51 @@ class TestLoadBridgeConfig:
         config = _load_bridge_config()
         assert config["forum_chat_id"] == 999
         os.unlink(path)
+
+
+class TestYieldToServer:
+    """The bridge must refuse to run alongside genesis-server (dual-runtime /
+    dual-getUpdates guard). Server not running → guard is a no-op (legacy
+    fallback preserved)."""
+
+    def test_exits_200_when_server_lock_held(self, tmp_path, monkeypatch):
+        import subprocess
+        import sys as _sys
+        import textwrap
+        import time
+
+        import pytest
+
+        from genesis.channels.bridge import _yield_to_server
+        from genesis.util.process_lock import EXIT_ALREADY_RUNNING
+
+        holder = subprocess.Popen(
+            [
+                _sys.executable,
+                "-c",
+                textwrap.dedent(f"""\
+                    import time
+                    from pathlib import Path
+                    from genesis.util.process_lock import ProcessLock
+                    with ProcessLock("genesis-server", pid_dir=Path("{tmp_path}")):
+                        time.sleep(30)
+                """),
+            ],
+        )
+        try:
+            lock_path = tmp_path / "genesis-server.lock"
+            for _ in range(100):
+                if lock_path.exists() and lock_path.read_text().strip():
+                    break
+                time.sleep(0.1)
+            with pytest.raises(SystemExit) as exc:
+                _yield_to_server(pid_dir=tmp_path)
+            assert exc.value.code == EXIT_ALREADY_RUNNING
+        finally:
+            holder.terminate()
+            holder.wait(timeout=10)
+
+    def test_noop_when_server_not_running(self, tmp_path):
+        from genesis.channels.bridge import _yield_to_server
+
+        _yield_to_server(pid_dir=tmp_path)  # must not raise
