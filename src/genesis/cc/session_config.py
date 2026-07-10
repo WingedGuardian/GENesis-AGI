@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from genesis.cc.types import CCModel, EffortLevel
 
 if TYPE_CHECKING:
-    pass
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ _READONLY_DISALLOWED = [
 # Hooks fire for ALL sessions including claude -p, so protection is global.
 
 def render_mcp_servers(
-    template_path, genesis_root: str, servers: set[str] | None = None,
+    template_path: Path, genesis_root: str, servers: set[str] | None = None,
 ) -> dict:
     """Render ``config/mcp.json.template`` into an MCP-config dict.
 

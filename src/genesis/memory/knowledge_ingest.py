@@ -49,6 +49,7 @@ async def ingest_knowledge_unit(
     collection: str = "knowledge_base",
     memory_type: str = "knowledge",
     confidence: float = 0.85,
+    origin_class: str | None = None,
 ) -> str:
     """Ingest or upsert a knowledge unit, returning the stable unit_id.
 
@@ -109,6 +110,15 @@ async def ingest_knowledge_unit(
 
     source_pipeline_val = (provenance or {}).get("source_pipeline", "knowledge_ingest")
     source_session_id = (provenance or {}).get("session_id")
+    # WS-3: derive ONCE and pass the same value to both stores below — the
+    # same both-stores-consistent discipline as the source_pipeline mirror.
+    from genesis.memory.provenance import derive_origin_class
+
+    resolved_origin = derive_origin_class(
+        origin_class=origin_class,
+        source_pipeline=source_pipeline_val,
+        collection=collection,
+    )
     qdrant_memory_id = await store.store(
         content,
         f"knowledge:{project}/{domain}",
@@ -122,6 +132,7 @@ async def ingest_knowledge_unit(
         source_session_id=source_session_id,
         force_fts5_only=force_fts5_only,
         project_type=project,
+        origin_class=resolved_origin,
     )
 
     # If we replaced an existing entry whose Qdrant point ID differs from
@@ -161,6 +172,7 @@ async def ingest_knowledge_unit(
         source_pipeline=source_pipeline_val,
         purpose=json.dumps(purpose) if purpose else None,
         ingestion_source=ingestion_source,
+        origin_class=resolved_origin,
     )
 
     logger.info(

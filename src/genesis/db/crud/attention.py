@@ -44,7 +44,7 @@ async def bulk_upsert_events(db: aiosqlite.Connection, rows: list[tuple]) -> int
     placeholders = ", ".join(["?"] * len(COLUMNS))
     set_clause = ", ".join(f"{c}=excluded.{c}" for c in _UPSERT_SET_COLS)
     await db.executemany(
-        f"INSERT INTO attention_events ({', '.join(COLUMNS)}) VALUES ({placeholders}) "  # noqa: S608
+        f"INSERT INTO attention_events ({', '.join(COLUMNS)}) VALUES ({placeholders}) "
         f"ON CONFLICT(id) DO UPDATE SET {set_clause} "
         f"WHERE attention_events.acceptance_signal IS NULL",
         rows,
@@ -121,7 +121,7 @@ async def list_events(
     off = max(0, int(offset))
     params.extend([lim, off])
     cursor = await db.execute(
-        f"SELECT * FROM attention_events{where_sql} "  # noqa: S608
+        f"SELECT * FROM attention_events{where_sql} "
         f"ORDER BY ts DESC LIMIT ? OFFSET ?",
         params,
     )
@@ -185,7 +185,7 @@ async def activation_stats(db: aiosqlite.Connection, config_version: str | None 
     """Per-activation event counts (hard / soft / suppressed) — the fire-rate breakdown."""
     where, params = _cv_clause(config_version)
     cursor = await db.execute(
-        f"SELECT activation, COUNT(*) AS n FROM attention_events{where} GROUP BY activation",  # noqa: S608
+        f"SELECT activation, COUNT(*) AS n FROM attention_events{where} GROUP BY activation",
         params,
     )
     return {r["activation"]: r["n"] for r in await cursor.fetchall()}
@@ -196,7 +196,7 @@ async def trigger_stats(db: aiosqlite.Connection, config_version: str | None = N
     where, params = _cv_clause(config_version, alias="ae")
     cursor = await db.execute(
         "SELECT json_extract(je.value, '$.name') AS name, COUNT(*) AS n "
-        f"FROM attention_events ae, json_each(ae.triggers_fired) je{where} "  # noqa: S608
+        f"FROM attention_events ae, json_each(ae.triggers_fired) je{where} "
         "GROUP BY name ORDER BY n DESC",
         params,
     )
@@ -208,7 +208,7 @@ async def suppressor_stats(db: aiosqlite.Connection, config_version: str | None 
     where, params = _cv_clause(config_version, alias="ae")
     cursor = await db.execute(
         "SELECT je.value AS name, COUNT(*) AS n "
-        f"FROM attention_events ae, json_each(ae.suppressors) je{where} "  # noqa: S608
+        f"FROM attention_events ae, json_each(ae.suppressors) je{where} "
         "GROUP BY name ORDER BY n DESC",
         params,
     )
@@ -219,7 +219,7 @@ async def label_counts(db: aiosqlite.Connection, config_version: str | None = No
     """total / labeled / unlabeled + a by-signal breakdown."""
     where, params = _cv_clause(config_version)
     cursor = await db.execute(
-        f"SELECT acceptance_signal, COUNT(*) AS n FROM attention_events{where} "  # noqa: S608
+        f"SELECT acceptance_signal, COUNT(*) AS n FROM attention_events{where} "
         "GROUP BY acceptance_signal",
         params,
     )

@@ -262,6 +262,22 @@ The enforcement hooks (`review_enforcement_prompt.py`,
 safety nets, not the decision-maker. This protocol provides the
 judgment framework.
 
+Two protocol steps apply to every review at "Code-reviewer inline" level or
+above (full definitions in `.claude/agents/genesis-architect.md`):
+
+- **Scope-drift check first**: compare stated intent (plan file / PR
+  description / commit messages) against `git diff --stat` vs the merge-base,
+  and open the review with the `Scope Check: CLEAN / DRIFT DETECTED /
+  REQUIREMENTS MISSING` + Intent/Delivered block. Informational, never
+  blocking.
+- **Completion status last**: every review (and every skill workflow that
+  concludes work) ends with exactly one of DONE / DONE_WITH_CONCERNS /
+  BLOCKED / NEEDS_CONTEXT — with concerns listed, or blocker + what was
+  tried, or exactly what context is missing. Findings use the
+  BLOCKER / SHOULD-FIX / NOTE severity ladder with per-finding confidence
+  and the pre-emit quote gate (a finding must quote its motivating
+  file:line or be confidence-capped).
+
 ## Pre-Commit Gate
 
 Verify before any commit:

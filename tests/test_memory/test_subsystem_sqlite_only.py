@@ -24,7 +24,8 @@ async def _build_db(path: str) -> aiosqlite.Connection:
             room TEXT,
             valid_at TEXT,
             invalid_at TEXT,
-            source_subsystem TEXT
+            source_subsystem TEXT,
+            origin_class TEXT
         )
     """)
     await conn.execute("""

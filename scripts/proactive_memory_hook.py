@@ -628,7 +628,7 @@ def _search_code_index(db_path: Path, keywords: list[str]) -> list[dict]:
                 WHERE ({placeholders}) AND cs.is_public = 1
                 ORDER BY cs.line_start
                 LIMIT 6
-                """,
+                """,  # noqa: S608 - literal SQL fragments; values bound as parameters
                 params,
             )
             rows = cursor.fetchall()

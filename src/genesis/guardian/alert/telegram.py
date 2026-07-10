@@ -104,8 +104,8 @@ class TelegramAlertChannel(AlertChannel):
         """Synchronous connectivity test."""
         try:
             url = f"{self._api_base}/getMe"
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            req = urllib.request.Request(url, method="GET")  # noqa: S310 - stdlib-only guardian; https endpoint from config
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:  # noqa: S310 - stdlib-only guardian; https endpoint from config
                 data = json.loads(resp.read())
                 return data.get("ok", False)
         except Exception as exc:
@@ -158,13 +158,13 @@ class TelegramAlertChannel(AlertChannel):
             payload["message_thread_id"] = int(self._thread_id)
 
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
+        req = urllib.request.Request(  # noqa: S310 - stdlib-only guardian; https endpoint from config
             url, data=data, method="POST",
             headers={"Content-Type": "application/json"},
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:  # noqa: S310 - stdlib-only guardian; https endpoint from config
                 result = json.loads(resp.read())
                 if result.get("ok"):
                     msg_id = result.get("result", {}).get("message_id")
@@ -231,7 +231,7 @@ class TelegramAlertChannel(AlertChannel):
             "allowed_updates": [],
         }
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
+        req = urllib.request.Request(  # noqa: S310 - stdlib-only guardian; https endpoint from config
             url, data=data, method="POST",
             headers={"Content-Type": "application/json"},
         )
@@ -242,7 +242,7 @@ class TelegramAlertChannel(AlertChannel):
         socket_timeout = max(self._timeout, timeout_s + 10)
 
         try:
-            with urllib.request.urlopen(req, timeout=socket_timeout) as resp:
+            with urllib.request.urlopen(req, timeout=socket_timeout) as resp:  # noqa: S310 - stdlib-only guardian; https endpoint from config
                 result = json.loads(resp.read())
             if not result.get("ok"):
                 logger.warning("Telegram getUpdates returned not ok: %s", result)

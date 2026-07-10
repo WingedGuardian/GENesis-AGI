@@ -54,7 +54,7 @@ class TerminalSession:
             if slave > 2:
                 os.close(slave)
             os.chdir(self.cwd)
-            os.execvpe("bash", ["bash", "--login"], env)
+            os.execvpe("bash", ["bash", "--login"], env)  # noqa: S606 - intentional exec of a login shell in the PTY child
         else:
             # ── Parent process ──
             os.close(slave)

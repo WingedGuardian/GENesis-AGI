@@ -61,12 +61,12 @@ async def up(db: aiosqlite.Connection) -> None:
             # would fail with a PK conflict. Delete the old row in that case
             # -- the new-ID row is the authoritative one going forward.
             await db.execute(
-                f"DELETE FROM {table} WHERE call_site_id = ?"
+                f"DELETE FROM {table} WHERE call_site_id = ?"  # noqa: S608 - table name from the fixed _RENAMES loop
                 f"  AND EXISTS (SELECT 1 FROM {table} WHERE call_site_id = ?)",
                 (old_id, new_id),
             )
             await db.execute(
-                f"UPDATE {table} SET call_site_id = ? WHERE call_site_id = ?",
+                f"UPDATE {table} SET call_site_id = ? WHERE call_site_id = ?",  # noqa: S608 - table name from the fixed _RENAMES loop
                 (new_id, old_id),
             )
 
@@ -81,6 +81,6 @@ async def down(db: aiosqlite.Connection) -> None:
             continue
         for old_id, new_id in _RENAMES:
             await db.execute(
-                f"UPDATE {table} SET call_site_id = ? WHERE call_site_id = ?",
+                f"UPDATE {table} SET call_site_id = ? WHERE call_site_id = ?",  # noqa: S608 - table name from the fixed _RENAMES loop
                 (old_id, new_id),
             )

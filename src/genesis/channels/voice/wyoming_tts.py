@@ -173,7 +173,7 @@ class WyomingTTSServer:
     def __init__(
         self,
         *,
-        host: str = "0.0.0.0",
+        host: str = "0.0.0.0",  # noqa: S104 - Wyoming server must listen on LAN for the Voice PE device
         port: int | None = None,
     ) -> None:
         self._host = host

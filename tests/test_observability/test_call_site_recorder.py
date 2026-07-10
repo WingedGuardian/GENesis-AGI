@@ -29,12 +29,13 @@ async def db(tmp_path):
 
 @pytest.mark.asyncio
 async def test_record_inserts_new(db):
-    await record_last_run(
+    landed = await record_last_run(
         db, "test_site",
         provider="openrouter", model_id="haiku-3.5",
         response_text="hello world",
         input_tokens=100, output_tokens=50,
     )
+    assert landed is True  # contract: True iff the row landed
     cursor = await db.execute("SELECT * FROM call_site_last_run WHERE call_site_id = ?", ("test_site",))
     row = await cursor.fetchone()
     assert row is not None
@@ -70,8 +71,17 @@ async def test_record_failure(db):
 
 @pytest.mark.asyncio
 async def test_record_survives_missing_table(tmp_path):
-    """Should not raise even if table doesn't exist — just logs a warning."""
+    """Should not raise even if table doesn't exist — just logs a warning
+    and reports False (a swallowed INSERT failure is not a landed row).
+
+    This is the unit-level guard for the contract the ambient worker's
+    telemetry_recorded flag depends on: callers that account for
+    telemetry must not be told a row landed when it silently didn't.
+    """
     path = tmp_path / "empty.db"
     async with aiosqlite.connect(str(path)) as conn:
-        # No table created — should not raise
-        await record_last_run(conn, "x", provider="p", model_id="m", response_text="t")
+        # No table created — should not raise, and must report False
+        landed = await record_last_run(
+            conn, "x", provider="p", model_id="m", response_text="t",
+        )
+        assert landed is False

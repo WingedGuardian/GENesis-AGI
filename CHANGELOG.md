@@ -33,6 +33,37 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   report a critical-severity finding — its output schema simply didn't
   include the word.
 
+- **Every memory now carries a provenance class — and immunity gets its kill
+  switch before it gets its gates.** Everything Genesis stores is stamped
+  `owner`, `first_party`, or `external_untrusted` at write time (your words /
+  Genesis's own observations / content pulled off the world, including
+  ingested documents), with all existing memories backfilled. This is the
+  foundation for the WS-3 immunity gates: crafted external content becomes
+  blockable from turning into procedures, identity edits, or autonomy
+  evidence by *origin*, not content guessing. The control surface ships
+  first: a live-editable `ws3_immunity` settings domain (master switch +
+  per-gate off/shadow/enforce) that takes effect instantly with no restart —
+  and owner/first-party content can never be blocked in any mode, by
+  construction. No gates are active yet; they arrive in the next phase, in
+  observe-only shadow mode.
+
+- **Lint feedback now reaches the session instead of disappearing.** The
+  edit-time ruff hook used to auto-fix what it could and silently swallow the
+  rest; now anything it can't fix comes back to the working session as a
+  short advisory note (capped, explicitly non-blocking) so problems surface
+  the moment they're written instead of at commit time. Security linting
+  (the full bandit ruleset via ruff's `S` family) is enabled repo-wide with
+  every suppression individually justified in-line — `shell=True` misuse now
+  fails lint everywhere, including CI.
+
+- **Code reviews follow a written protocol instead of convention.** The
+  architect reviewer now opens with a scope-drift check (did the change do
+  what was asked — nothing more, nothing less), grades findings on an
+  explicit BLOCKER / SHOULD-FIX / NOTE ladder, must quote the exact line
+  motivating each finding or have the finding's confidence capped, consults
+  prior review learnings before starting, and closes with an explicit
+  completion status. Adapted from the gstack review framework.
+
 - **The host Guardian now tells you before its AI recovery brain loses its
   login — and can survive it without you touching the host.** The Guardian's
   autonomous diagnosis runs on Claude Code authenticated by a one-time login at

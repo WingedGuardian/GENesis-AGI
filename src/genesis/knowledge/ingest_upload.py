@@ -135,8 +135,8 @@ async def _store_as_is(
     import genesis.mcp.memory_mcp as memory_mod
 
     memory_mod._require_init()
-    assert memory_mod._store is not None
-    assert memory_mod._db is not None
+    assert memory_mod._store is not None  # noqa: S101 - type-narrowing invariant
+    assert memory_mod._db is not None  # noqa: S101 - type-narrowing invariant
 
     from genesis.db.crud import knowledge as knowledge_crud
 
@@ -181,6 +181,13 @@ async def _store_as_is(
         tags.append("user-context")
 
     # Store to Qdrant
+    # WS-3: curated ingest is external_untrusted (authority tier, not
+    # authorship); derived once, mirrored to both stores.
+    from genesis.memory.provenance import derive_origin_class
+
+    resolved_origin = derive_origin_class(
+        source_pipeline="curated", collection="knowledge_base",
+    )
     qdrant_id = await memory_mod._store.store(
         file_content,
         f"knowledge:{project_type}/{effective_domain}",
@@ -190,6 +197,7 @@ async def _store_as_is(
         confidence=0.95,
         auto_link=False,
         source_pipeline="curated",
+        origin_class=resolved_origin,
     )
 
     # Store to SQLite
@@ -213,6 +221,7 @@ async def _store_as_is(
         source_pipeline="curated",
         purpose=purpose_json,
         ingestion_source=file_path,
+        origin_class=resolved_origin,
         _commit=True,
     )
 

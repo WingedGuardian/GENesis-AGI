@@ -458,6 +458,42 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        async def _inbox_marker_decay_sweep() -> None:
+            # Soft-age-out stale inbox WATCH/BOOKMARK attention markers (the
+            # tabled lane): status→completed after 60d. Mechanical TTL, so it
+            # lives here (learning scheduler), NOT in the ego — the ego has no
+            # authority to close a user-curated marker.
+            try:
+                if rt.paused:
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping inbox marker decay",
+                    exc_info=True,
+                )
+                return
+            try:
+                from genesis.db.crud import follow_ups
+
+                decayed = await follow_ups.decay_stale_inbox_markers(rt._db)
+                rt.record_job_success("inbox_marker_decay")
+                if decayed:
+                    logger.info(
+                        "Inbox marker decay: aged out %d stale attention "
+                        "marker(s)", decayed,
+                    )
+            except Exception as exc:
+                rt.record_job_failure("inbox_marker_decay", str(exc))
+                logger.exception("Inbox marker decay sweep failed")
+
+        rt._learning_scheduler.add_job(
+            _inbox_marker_decay_sweep,
+            CronTrigger(hour=4, minute=35, timezone=user_timezone()),
+            id="inbox_marker_decay",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         async def _run_recovery() -> None:
             if rt._recovery_orchestrator is not None:
                 try:

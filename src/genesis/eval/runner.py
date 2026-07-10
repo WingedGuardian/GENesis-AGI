@@ -192,7 +192,7 @@ async def run_eval(
             ))
             continue
 
-        assert call_result is not None
+        assert call_result is not None  # noqa: S101 - type-narrowing invariant
         latency_ms = (time.monotonic() - case_start) * 1000
 
         if not call_result.success:

@@ -150,7 +150,7 @@ async def _identify_clusters(
     query = f"""
         SELECT memory_id, wing, room FROM memory_metadata
         WHERE memory_id IN ({placeholders}) AND wing IS NOT NULL
-    """
+    """  # noqa: S608 - literal SQL fragments; values bound as parameters
     async with db.execute(query, memory_ids) as cursor:
         async for row in cursor:
             wing = row[1]
@@ -219,7 +219,7 @@ async def _local_drilldown(
             wing_query = f"""
                 SELECT memory_id FROM memory_metadata
                 WHERE memory_id IN ({placeholders}) AND wing = ?
-            """
+            """  # noqa: S608 - literal SQL fragments; values bound as parameters
             async with db.execute(wing_query, [*fts_ids, wing]) as cursor:
                 wing_members = {row[0] async for row in cursor}
             fts_ids = [mid for mid in fts_ids if mid in wing_members]

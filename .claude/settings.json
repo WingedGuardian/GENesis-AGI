@@ -312,8 +312,8 @@
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "bash -c 'FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .file_path 2>/dev/null); if [[ \"$FILE\" == *.py ]]; then RUFF=/home/ubuntu/genesis/.venv/bin/ruff; \"$RUFF\" format --quiet \"$FILE\" 2>/dev/null; \"$RUFF\" check --fix --quiet \"$FILE\" 2>/dev/null; fi; true'",
-                        "timeout": 3000
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/edit_verify_advisory.py",
+                        "timeout": 10
                     }
                 ]
             },

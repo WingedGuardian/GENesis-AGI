@@ -398,7 +398,7 @@ class MigrationRunner:
             # `result` is always set: every path in the retry loop either breaks
             # (success / reconciled / terminal failure) or continues to retry, and
             # the final attempt cannot continue.
-            assert result is not None
+            assert result is not None  # noqa: S101 - type-narrowing invariant
             results.append(result)
             if not result.success:
                 break  # Stop on first (terminal) failure

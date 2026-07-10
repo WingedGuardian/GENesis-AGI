@@ -7,7 +7,6 @@ import os
 import sqlite3
 import subprocess
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -15,29 +14,20 @@ import pytest
 
 from genesis.session_awareness import worker as worker_mod
 from genesis.session_awareness.slots import try_acquire_slot
-from genesis.session_awareness.statefiles import empty_state, save_state
 from genesis.session_awareness.worker import run_worker
+
+from .conftest import DIM, seed_theme
 
 REPO_DIR = Path(__file__).resolve().parent.parent.parent
 SCRIPT = REPO_DIR / "scripts" / "ambient_awareness_worker.py"
 
-DIM = 8
 SID = "worker-test-1"
 
 
 def _seed_theme(sessions_root: Path, *, ema=None) -> None:
-    s = empty_state(SID)
-    s["ema"] = ema or [1.0] + [0.0] * (DIM - 1)
-    s["ema_turns"] = 4
-    s["ring"] = [s["ema"]] * 3
-    s["entities"] = {"genesis": 2.0, "voice": 1.1, "faint": 0.06}
-    # NOW-relative, never hardcoded: run_worker's load_state compares
-    # updated_at against the wall clock (STALE_AFTER softening shrinks the
-    # ring → stability 0.0). The original hardcoded 2026-07-09 stamp was a
-    # time bomb — green when written, red for every run after the staleness
-    # horizon passed (broke main CI on 2026-07-10).
-    s["updated_at"] = datetime.now(UTC).isoformat()
-    save_state(SID, s, base=sessions_root)
+    # Shared helper (conftest.seed_theme) owns the theme recipe and the
+    # NOW-relative updated_at discipline — see its docstring.
+    seed_theme(sessions_root, SID, ema=ema)
 
 
 def _tmp_db(tmp_path: Path) -> Path:

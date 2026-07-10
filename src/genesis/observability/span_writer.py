@@ -36,7 +36,7 @@ _COLS = (
     "input_tokens", "output_tokens", "cost_usd", "cost_known", "attributes_json",
 )
 _INSERT = (
-    f"INSERT OR IGNORE INTO otel_spans ({', '.join(_COLS)}) "
+    f"INSERT OR IGNORE INTO otel_spans ({', '.join(_COLS)}) "  # noqa: S608 - column names from the fixed _COLS list; values are placeholders
     f"VALUES ({', '.join('?' * len(_COLS))})"
 )
 

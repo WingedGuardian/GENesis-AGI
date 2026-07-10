@@ -1464,7 +1464,7 @@ class UserEgoContextBuilder:
             cat_placeholders = ",".join("?" for _ in _GENESIS_CATEGORIES)
             type_placeholders = ",".join("?" for _ in INTERNAL_OBS_TYPES)
             cursor = await self._db.execute(
-                "SELECT type, category, COUNT(*) AS cnt, "
+                "SELECT type, category, COUNT(*) AS cnt, "  # noqa: S608 - literal SQL fragments; values bound as parameters
                 "  MAX(content) AS sample, MAX(created_at) AS latest "
                 "FROM observations "
                 "WHERE created_at >= datetime('now', '-3 days') "

@@ -44,6 +44,10 @@ test = [
     "pytest-asyncio",
     "pytest-timeout",
     "aioresponses>=0.7.7",
+    # tests/test_hooks/test_edit_verify_advisory.py executes the real hook,
+    # which shells out to the venv's ruff — CI's test job installs only this
+    # extra, so ruff must be here (the lint job installs its own copy).
+    "ruff>=0.5",
 ]
 browser = [
     "playwright>=1.40",
@@ -83,10 +87,37 @@ select = [
     "B",    # flake8-bugbear (catches common gotchas)
     "SIM",  # flake8-simplify
     "UP",   # pyupgrade
+    "S",    # flake8-bandit (security) — see the documented ignores below
 ]
 ignore = [
     "E501",  # line length (handled by formatter)
+    # S603/S607 flag EVERY subprocess call regardless of safety; this codebase
+    # shells to git/gh/ruff by design. The real shell-risk rule, S602
+    # (shell=True), stays ENABLED.
+    "S603", "S607",
+    # S110/S112 (try-except-pass/continue): most hits implement the deliberate
+    # "hooks/best-effort telemetry never crash" convention. A linter cannot
+    # distinguish that from bad swallowing in data-returning code — the review
+    # protocol + CODE_AUDITOR taxonomy own that class with judgment. This is a
+    # documented trade, not noise cleanup (user-accepted 2026-07-10).
+    "S110", "S112",
+    # S311 (non-crypto random): all uses are timing jitter / sampling / backoff
+    # (browser stealth, retry spread). No token or secret generation uses
+    # `random` — re-grep before adding any such use; use `secrets` there.
+    "S311",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert, use fake credentials, /tmp literals, chmod fixtures,
+# subprocess/shell fixtures, and literal fixture SQL by nature.
+"tests/**" = ["S101", "S105", "S106", "S108", "S103", "S324", "S602", "S608"]
+# Parametrized dynamic-WHERE builder pattern: SQL fragments are literal
+# strings assembled in code; user values are ALWAYS bound parameters. S608
+# stays live outside these data-access layers.
+"src/genesis/db/crud/*" = ["S608"]
+"src/genesis/dashboard/routes/*" = ["S608"]
+# Type-narrowing asserts in MCP handlers (follow-up: convert to explicit raises).
+"src/genesis/mcp/memory/*" = ["S101"]
 
 [tool.ruff.format]
 quote-style = "double"
