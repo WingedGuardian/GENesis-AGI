@@ -329,9 +329,11 @@ class TestWSCDispatchGuards:
     async def test_path1b_skips_task_already_executing(
         self, dispatcher: TaskDispatcher, mock_executor: AsyncMock,
     ) -> None:
-        """A blocked+approved task already live in the executor is NOT re-fired
+        """A blocked+approved task with a live dispatch is NOT re-fired
         (without the guard it re-dispatches every 120s cycle)."""
-        mock_executor._active_tasks = {"t-blk": "blocked"}
+        # Simulate a dispatch already in flight (running OR queued on the
+        # semaphore — the window where _active_tasks is not yet set).
+        dispatcher._dispatch_inflight.add("t-blk")
         with (
             patch("genesis.db.crud.task_states.list_active", new_callable=AsyncMock,
                   return_value=[{"task_id": "t-blk", "current_phase": "blocked"}]),

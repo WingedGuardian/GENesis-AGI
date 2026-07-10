@@ -121,35 +121,25 @@ class CCSessionExecutor:
             logger.error("Task %s not found in DB", task_id)
             return False
 
-        # --- Dispatch claim + refuse-taxonomy (WS-C / F2) ------------------
-        # Decide fresh-vs-resume-vs-refuse BEFORE any side-effecting work, so a
-        # duplicate or stale dispatch returns without re-running the task.
+        # --- Refuse non-restartable phases up front (WS-C / F2) -----------
+        # A duplicate or stale dispatch that lands on a task which already ran
+        # (completed), is past a safe restart point (synthesizing/delivering/
+        # retrospective), is a transient claim (dispatching), or is terminal
+        # must never re-run it. Refuse before any work. The atomic claim and
+        # the resume-vs-restart decision happen AFTER the plan read below, so a
+        # task that fails its plan read is never claimed into 'dispatching'.
         db_phase_str = task.get("current_phase", "pending")
         _RESUMABLE_PHASES = {"executing", "verifying", "blocked"}
-        if db_phase_str == TaskPhase.PENDING.value:
-            # Atomically flip pending -> dispatching. Losing the claim means
-            # another dispatch already took it: refuse with no side effects.
-            if not await task_states.claim_for_dispatch(self._db, task_id):
-                logger.info(
-                    "Task %s: lost dispatch claim (already claimed/advanced), "
-                    "skipping", task_id,
-                )
-                await self._emit_claim_lost(task_id, db_phase_str)
-                return False
-            resuming = False
-            self._active_tasks[task_id] = TaskPhase.DISPATCHING
-        elif db_phase_str in _RESUMABLE_PHASES:
-            resuming = True
-            self._active_tasks[task_id] = TaskPhase(db_phase_str)
-            logger.info(
-                "Task %s: resuming from %s phase (skipping observe/review/plan)",
-                task_id, db_phase_str,
-            )
-        else:
-            # Terminal, transient 'dispatching', or a non-resumable tail phase
-            # (synthesizing/delivering/retrospective). Never re-run — refuse.
+        # Pre-execution phases (no code run / nothing delivered yet) plus a
+        # paused task recovered at startup: safe to re-run fresh, never refuse.
+        _RESTARTABLE_PHASES = {"observing", "reviewing", "planning", "paused"}
+        if (
+            db_phase_str != TaskPhase.PENDING.value
+            and db_phase_str not in _RESUMABLE_PHASES
+            and db_phase_str not in _RESTARTABLE_PHASES
+        ):
             logger.warning(
-                "Task %s: refusing execute() in non-dispatchable phase %s",
+                "Task %s: refusing execute() in non-restartable phase %s",
                 task_id, db_phase_str,
             )
             await self._emit_claim_lost(task_id, db_phase_str)
@@ -193,6 +183,35 @@ class CCSessionExecutor:
         # rendered file, not a git branch). Keyed on plan_content so it survives
         # resume, where reconstructed step dicts have no `skills` key.
         is_deliverable = has_deliverable_frame(plan_content)
+
+        # --- Claim / resume / restart (WS-C / F2) -------------------------
+        # Done after the plan read so a task that fails its plan read is never
+        # claimed into the transient 'dispatching' phase (just marked failed).
+        if db_phase_str == TaskPhase.PENDING.value:
+            # Atomically flip pending -> dispatching. Losing the claim means
+            # another dispatch already took it: refuse with no side effects.
+            if not await task_states.claim_for_dispatch(self._db, task_id):
+                logger.info(
+                    "Task %s: lost dispatch claim (already claimed/advanced), "
+                    "skipping", task_id,
+                )
+                await self._emit_claim_lost(task_id, db_phase_str)
+                return False
+            resuming = False
+            self._active_tasks[task_id] = TaskPhase.DISPATCHING
+        elif db_phase_str in _RESUMABLE_PHASES:
+            resuming = True
+            self._active_tasks[task_id] = TaskPhase(db_phase_str)
+            logger.info(
+                "Task %s: resuming from %s phase (skipping observe/review/plan)",
+                task_id, db_phase_str,
+            )
+        else:
+            # Restartable pre-execution phase (observing/reviewing/planning) or
+            # a paused task recovered at startup: re-run fresh from PENDING (a
+            # paused task re-pauses at the first checkpoint via _paused_tasks).
+            resuming = False
+            self._active_tasks[task_id] = TaskPhase.PENDING
 
         cancel_event = asyncio.Event()
         self._cancel_events[task_id] = cancel_event

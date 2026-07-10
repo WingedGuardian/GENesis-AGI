@@ -101,6 +101,11 @@ class TaskDispatcher:
         self._event_bus = event_bus
         self._exec_semaphore = exec_semaphore
         self._dispatched: set[str] = set()  # in-memory dedup guard
+        # Tasks with a live _guarded_execute. Added before the semaphore
+        # acquire, so it also covers a dispatch still QUEUED on the semaphore —
+        # the window where the executor's _active_tasks is not yet set. Path 1b
+        # checks this to avoid re-firing a blocked+approved task every cycle.
+        self._dispatch_inflight: set[str] = set()
 
     async def _guarded_execute(self, task_id: str) -> bool:
         """Execute a task, serialized through the semaphore if present.
@@ -111,17 +116,21 @@ class TaskDispatcher:
         via ``_semaphore_released`` that it already released, so we
         must NOT release again here.
         """
-        if self._exec_semaphore is None:
-            return await self._executor.execute(task_id)
-        await self._exec_semaphore.acquire()
+        self._dispatch_inflight.add(task_id)
         try:
-            return await self._executor.execute(task_id)
+            if self._exec_semaphore is None:
+                return await self._executor.execute(task_id)
+            await self._exec_semaphore.acquire()
+            try:
+                return await self._executor.execute(task_id)
+            finally:
+                # Only release if engine didn't already release during pause
+                if task_id not in self._executor._semaphore_released:
+                    self._exec_semaphore.release()
+                else:
+                    self._executor._semaphore_released.discard(task_id)
         finally:
-            # Only release if engine didn't already release during pause
-            if task_id not in self._executor._semaphore_released:
-                self._exec_semaphore.release()
-            else:
-                self._executor._semaphore_released.discard(task_id)
+            self._dispatch_inflight.discard(task_id)
 
     async def submit(
         self,
@@ -285,10 +294,12 @@ class TaskDispatcher:
             if phase != TaskPhase.BLOCKED.value:
                 continue
 
-            # Bug B guard: if this task is already executing in-process, don't
-            # stack another dispatch. Without this a blocked+approved task
-            # re-fires every cycle until execute() consumes the approval.
-            if task_id in self._executor._active_tasks:
+            # Bug B guard: skip if this task already has a live dispatch — this
+            # covers both a running execute() and a dispatch still queued on the
+            # semaphore (the window where _active_tasks is not yet set). Without
+            # it, a blocked+approved task re-fires every 120s cycle until the
+            # approval is consumed.
+            if task_id in self._dispatch_inflight:
                 continue
 
             # Check if there's an approved-but-unconsumed approval for this task

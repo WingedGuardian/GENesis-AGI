@@ -1330,3 +1330,49 @@ class TestDispatchClaim:
         assert n == 0
         task = await task_states.get_by_id(db, "t-001")
         assert task["current_phase"] == "dispatching"
+
+    async def test_restartable_paused_phase_is_not_refused(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """A paused task recovered at startup re-runs fresh, not refused
+        (regression: refusing would orphan it forever — reaper only resets
+        'dispatching', never 'paused')."""
+        await _seed_task(db, plan_path=plan_file, phase="paused")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        result = await engine.execute("t-001")
+
+        # _paused_tasks is empty in this unit, so it runs fresh to completion.
+        assert result is True
+        mock_decomposer.decompose.assert_called()
+
+    async def test_restartable_planning_phase_reruns_fresh(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """A task crashed mid-planning re-runs fresh (pre-execution phase, no
+        committed side effects), rather than being refused."""
+        await _seed_task(db, plan_path=plan_file, phase="planning")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        result = await engine.execute("t-001")
+
+        assert result is True
+        mock_decomposer.decompose.assert_called()
+
+    async def test_pending_with_unreadable_plan_is_failed_not_claimed(
+        self, db, mock_invoker, mock_decomposer, mock_reviewer,
+    ):
+        """A pending task with an unreadable plan is marked failed, and the plan
+        read (which fails) happens before the claim — so the row is never left
+        stuck in the transient 'dispatching' phase."""
+        await _seed_task(db, plan_path="/nonexistent/plan.md", phase="pending")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        result = await engine.execute("t-001")
+
+        assert result is False
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "failed"  # not stuck in 'dispatching'
+        assert "t-001" not in engine.get_active_tasks()  # terminal, not surfaced
