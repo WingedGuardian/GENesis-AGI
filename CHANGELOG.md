@@ -23,6 +23,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   recall's own usage counters are suppressed for the run so benchmarking
   never distorts what your live Genesis considers important.
 
+- **The API Keys panel now shows how often each provider is causing fallbacks.**
+  A provider that is misconfigured or failing — for example one whose key is
+  missing yet is still wired in as the preferred choice on many call sites — used
+  to read only "missing (fallback active)" with no sense of scale. Each provider
+  row now shows "in N fallbacks (24h) · last …" beside its key status, so an
+  ongoing fallback storm is visible at a glance instead of hiding in the logs.
+
 - **Genesis now detects and repairs corrupted credential files on its own.**
   If a critical credential or wiring file (`secrets.env`, your Claude Code and
   GitHub credentials, SSH keys, `guardian_remote.yaml`, `genesis.yaml`) gets
