@@ -164,3 +164,18 @@ def test_is_locked_true_while_held(tmp_path):
         holder.wait(timeout=10)
     # flock auto-releases on process death
     assert ProcessLock.is_locked("held", pid_dir=tmp_path) is False
+
+
+def test_is_locked_vanishing_file_is_free(tmp_path, monkeypatch):
+    """Holder unlinks the lock file between exists() and open() → free,
+    not a crash (TOCTOU guard)."""
+    (tmp_path / "gone.lock").write_text("1")
+    real_open = os.open
+
+    def _vanish(path, *a, **kw):
+        if path.endswith("gone.lock"):
+            raise FileNotFoundError(path)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(os, "open", _vanish)
+    assert ProcessLock.is_locked("gone", pid_dir=tmp_path) is False

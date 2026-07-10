@@ -50,7 +50,11 @@ class ProcessLock:
         lock_path = (pid_dir or _DEFAULT_PID_DIR) / f"{name}.lock"
         if not lock_path.exists():
             return False
-        fd = os.open(str(lock_path), os.O_RDWR)
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR)
+        except FileNotFoundError:
+            # Holder unlinked the file between exists() and open() — free.
+            return False
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:

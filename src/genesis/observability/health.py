@@ -261,7 +261,19 @@ async def probe_scheduler_heartbeats(
         if job_health is None:
             from genesis.runtime import GenesisRuntime
 
-            job_health = GenesisRuntime.instance().job_health
+            # peek(), not instance(): a read-only probe must never
+            # lazy-construct a blank runtime (masks bootstrap failures).
+            rt = GenesisRuntime.peek()
+            if rt is None:
+                latency = (time.monotonic() - start) * 1000
+                return ProbeResult(
+                    name="scheduler_heartbeats",
+                    status=ProbeStatus.HEALTHY,
+                    latency_ms=round(latency, 2),
+                    message="no live runtime",
+                    checked_at=_clock().isoformat(),
+                )
+            job_health = rt.job_health
         now = _clock()
         stale: list[str] = []
         for job_name in ("awareness_tick", "surplus_dispatch"):

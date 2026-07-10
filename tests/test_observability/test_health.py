@@ -453,3 +453,14 @@ class TestProbeSchedulerHeartbeats:
               (now - timedelta(seconds=1200)).replace(tzinfo=None).isoformat()}}
         result = await probe_scheduler_heartbeats(jh, clock=FROZEN_CLOCK)
         assert result.status == ProbeStatus.DOWN
+
+    @pytest.mark.asyncio
+    async def test_no_runtime_does_not_construct_one(self):
+        """peek()-based read: with no live runtime the probe reports healthy
+        no-data and must NOT lazy-construct a blank singleton."""
+        with patch("genesis.runtime.GenesisRuntime.peek", return_value=None), \
+             patch("genesis.runtime.GenesisRuntime.instance") as inst:
+            result = await probe_scheduler_heartbeats(None, clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.HEALTHY
+        assert "no live runtime" in result.message
+        inst.assert_not_called()
