@@ -32,8 +32,13 @@ For each extraction, provide:
 - confidence: 0.0 to 1.0 (how certain are you this is correctly extracted?)
 - entities: Named entities mentioned (tools, projects, people, organizations)
 - relationships: Typed connections between entities
-  - type: One of: discussed_in, evaluated_for, decided, action_item_for,
-    categorized_as, related_to, succeeded_by, preceded_by
+  - type: Preferred vocabulary: is_a, part_of, constrained_by, depends_on,
+    supersedes, alternative_to, discussed_in, evaluated_for, decided,
+    action_item_for, categorized_as, related_to, succeeded_by, preceded_by.
+    Prefer is_a for category membership ("X is a voice device") and
+    constrained_by for rules/decisions that govern an entity.
+  - optionally add "confidence" (0.0-1.0) and "ambiguous": true when you
+    are unsure the two names refer to distinct known things
 - temporal: Date or time reference if mentioned (ISO format preferred)
 
 For each extraction that has a temporal reference AND describes a concrete
