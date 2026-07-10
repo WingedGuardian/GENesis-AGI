@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import aiosqlite  # noqa: E402
 
 from genesis import env as genesis_env  # noqa: E402
+from genesis.db.crud.entities import delete_entities_cascade  # noqa: E402
 from genesis.memory.entity_anchors import _SHA_RE  # noqa: E402
 
 
@@ -53,25 +54,13 @@ async def main() -> int:
             return 0
 
         ids = [eid for eid, _ in fake]
-        ph = ",".join("?" * len(ids))
-        cur = await db.execute(
-            f"DELETE FROM entity_mentions WHERE entity_id IN ({ph})",  # noqa: S608
-            ids,
+        # All genesis.db writes go through the crud layer (structural
+        # rule) — the cascade lives in crud.entities, testable there.
+        counts = await delete_entities_cascade(db, ids)
+        print(
+            f"deleted: {counts['entities']} entities, "
+            f"{counts['mentions']} mentions, {counts['links']} links"
         )
-        mentions = cur.rowcount
-        cur = await db.execute(
-            f"DELETE FROM entity_links "  # noqa: S608
-            f"WHERE source_id IN ({ph}) OR target_id IN ({ph})",
-            ids + ids,
-        )
-        links = cur.rowcount
-        cur = await db.execute(
-            f"DELETE FROM entities WHERE entity_id IN ({ph})",  # noqa: S608
-            ids,
-        )
-        entities = cur.rowcount
-        await db.commit()
-        print(f"deleted: {entities} entities, {mentions} mentions, {links} links")
         return 0
     finally:
         await db.close()

@@ -345,10 +345,14 @@ class TestCheckInlineReviewFindings:
     (2026-07-10 audit)."""
 
     def _mock(self, guard_module, comments, rc=0):
+        # gh api --paginate with a per-element jq filter emits one
+        # compact JSON object per line across ALL result pages.
         return patch.object(
             guard_module.subprocess, "run",
             return_value=subprocess.CompletedProcess(
-                args=[], returncode=rc, stdout=json.dumps(comments), stderr="",
+                args=[], returncode=rc,
+                stdout="\n".join(json.dumps(c) for c in comments),
+                stderr="",
             ),
         )
 
@@ -392,6 +396,19 @@ class TestCheckInlineReviewFindings:
         with self._mock(guard_module, [], rc=1):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+
+    def test_gh_call_paginates(self, guard_module):
+        # Findings beyond REST page 1 (30 comments) must still gate —
+        # the very first PR through this gate (#996) drew a P1 for it.
+        with self._mock(guard_module, []) as run_mock:
+            guard_module._check_inline_review_findings("100")
+        assert "--paginate" in run_mock.call_args[0][0]
+
+    def test_p1_beyond_first_page_blocks(self, guard_module):
+        filler = [self._codex(i, "note") for i in range(1, 32)]
+        with self._mock(guard_module, [*filler, self._codex(99, _P1_BODY)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
 
     def test_human_inline_comments_ignored(self, guard_module):
         comments = [{

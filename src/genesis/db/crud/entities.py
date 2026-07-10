@@ -344,7 +344,12 @@ async def merge_entity(
             f"provenance = excluded.provenance, "
             f"confidence = excluded.confidence, "
             f"evidence_memory_id = excluded.evidence_memory_id, "
-            f"valid_at = COALESCE(excluded.valid_at, entity_links.valid_at) "
+            f"valid_at = COALESCE(excluded.valid_at, entity_links.valid_at), "
+            # Invalidation state travels with the winning row: a stronger
+            # loser link that was already closed must not resurrect as
+            # active on the survivor (as-of traversal would follow it).
+            f"invalid_at = excluded.invalid_at, "
+            f"invalidated_by = excluded.invalidated_by "
             f"WHERE excluded.confidence > entity_links.confidence",
             (survivor_id, loser_id, survivor_id),
         )
@@ -359,6 +364,43 @@ async def merge_entity(
     )
     if _commit:
         await db.commit()
+
+
+async def delete_entities_cascade(
+    db: aiosqlite.Connection,
+    entity_ids: list[str],
+    *,
+    _commit: bool = True,
+) -> dict[str, int]:
+    """Delete entities plus their mentions and links (cleanup/repair path).
+
+    Batch counterpart to the ledger's write paths for data-repair scripts
+    (e.g. purging fake ``commit`` entities minted by the pre-fix SHA
+    regex). Returns per-table deleted-row counts. Caller batches under
+    ``_commit=False`` when composing with other writes.
+    """
+    if not entity_ids:
+        return {"entities": 0, "mentions": 0, "links": 0}
+    ph = ",".join("?" * len(entity_ids))
+    cur = await db.execute(
+        f"DELETE FROM entity_mentions WHERE entity_id IN ({ph})",  # noqa: S608
+        entity_ids,
+    )
+    mentions = cur.rowcount
+    cur = await db.execute(
+        f"DELETE FROM entity_links "  # noqa: S608
+        f"WHERE source_id IN ({ph}) OR target_id IN ({ph})",
+        entity_ids + entity_ids,
+    )
+    links = cur.rowcount
+    cur = await db.execute(
+        f"DELETE FROM entities WHERE entity_id IN ({ph})",  # noqa: S608
+        entity_ids,
+    )
+    deleted = cur.rowcount
+    if _commit:
+        await db.commit()
+    return {"entities": deleted, "mentions": mentions, "links": links}
 
 
 async def enqueue_adjudication(

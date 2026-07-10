@@ -151,19 +151,27 @@ def _check_inline_review_findings(
     if force:
         return False, ""  # override NOTE already printed by the body gate
     try:
+        # --paginate: findings beyond the first REST page (30 comments)
+        # must still gate. With a per-element jq filter, gh emits one
+        # compact JSON object per line across ALL pages.
         result = subprocess.run(
             [
                 "gh", "api",
                 f"repos/:owner/:repo/pulls/{pr_num}/comments",
+                "--paginate",
                 "--jq",
-                '[.[] | {id: .id, reply_to: .in_reply_to_id, '
-                'login: .user.login, type: .user.type, body: .body}]',
+                '.[] | {id: .id, reply_to: .in_reply_to_id, '
+                'login: .user.login, type: .user.type, body: .body}',
             ],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
             return False, ""
-        raw = json.loads(result.stdout.strip() or "[]")
+        raw = [
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if line.strip()
+        ]
     except Exception:
         return False, ""
 
