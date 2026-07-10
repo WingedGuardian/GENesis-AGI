@@ -45,6 +45,7 @@ async def insert(
     source_pipeline: str | None = None,
     purpose: str | None = None,
     ingestion_source: str | None = None,
+    origin_class: str | None = None,
     _commit: bool = True,
 ) -> str:
     """Insert a knowledge unit into both knowledge_units and knowledge_fts. Returns id.
@@ -59,12 +60,12 @@ async def insert(
            (id, project_type, domain, source_doc, source_platform, section_title,
             concept, body, relationships, caveats, tags, confidence,
             source_date, ingested_at, qdrant_id, embedding_model,
-            source_pipeline, purpose, ingestion_source)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            source_pipeline, purpose, ingestion_source, origin_class)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (unit_id, project_type, domain, source_doc, source_platform, section_title,
          concept, body, relationships, caveats, tags, confidence,
          source_date, now_iso, qdrant_id, embedding_model,
-         source_pipeline, purpose, ingestion_source),
+         source_pipeline, purpose, ingestion_source, origin_class),
     )
 
     await db.execute(
