@@ -1859,8 +1859,14 @@
           this.backupConfigMsg = null;
           try {
             const f = this.backupConfigForm;
-            const body = { tier2_backend: f.tier2_backend };
-            // The cron job is a stateful side-effect — only touch it when the
+            const body = {};
+            // Only send the backend when the user actually changed it — the
+            // loaded value may be a backward-compat resolution (NAS-only → smb);
+            // re-sending it unchanged would gratuitously pin an explicit selector.
+            if (f.tier2_backend !== (this.backupConfig?.tier2_backend || 'none')) {
+              body.tier2_backend = f.tier2_backend;
+            }
+            // The schedule is a stateful side-effect — only touch it when the
             // user actually changed the schedule controls.
             if (this.scheduleDirty) {
               body.schedule_interval = f.schedule_interval;
