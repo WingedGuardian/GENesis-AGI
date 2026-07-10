@@ -1430,3 +1430,30 @@ class TestDispatchClaim:
         task = await task_states.get_by_id(db, "t-001")
         assert task["current_phase"] == "failed"  # not stuck in 'dispatching'
         assert "t-001" not in engine.get_active_tasks()  # terminal, not surfaced
+
+    async def test_e2e_guarded_execute_real_chain_single_run(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """End-to-end integration: two overlapping dispatches of one pending
+        task through the REAL TaskDispatcher._guarded_execute + REAL executor +
+        REAL Semaphore + REAL atomic claim run the task exactly once, and the
+        _dispatch_inflight guard cleans up. Only the LLM calls are mocked."""
+        from genesis.autonomy.dispatcher import TaskDispatcher
+
+        await _seed_task(db, plan_path=plan_file, phase="pending")
+        executor = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        dispatcher = TaskDispatcher(
+            db=db, executor=executor, exec_semaphore=asyncio.Semaphore(1),
+        )
+
+        results = await asyncio.gather(
+            dispatcher._guarded_execute("t-001"),
+            dispatcher._guarded_execute("t-001"),
+        )
+
+        assert sum(1 for r in results if r is True) == 1  # exactly one ran
+        assert mock_decomposer.decompose.call_count == 1  # no duplicate work
+        assert dispatcher._dispatch_inflight == set()  # guard cleaned up
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "completed"
