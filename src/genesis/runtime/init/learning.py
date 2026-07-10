@@ -1144,6 +1144,39 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        # PR-review findings harvest (Sundays 6:45am — 45 min BEFORE the
+        # 07:30 j9_eval_aggregation reads the pr_review_findings rows, and
+        # in the SAME timezone so the ordering can't invert across DST).
+        async def _run_pr_review_harvest():
+            try:
+                from genesis.eval.pr_review_harvest import (
+                    harvest_pr_review_findings,
+                )
+                summary = await harvest_pr_review_findings(rt._db)
+                if summary.get("error"):
+                    # Error-dict return (repo-resolve / pr-list failure):
+                    # the harvest didn't raise, but the job did no work —
+                    # surface it as a job failure, not a false green.
+                    raise RuntimeError(str(summary["error"]))
+                logger.info(
+                    "PR review harvest: %d PRs, %d findings, %d errors",
+                    summary.get("prs_seen", 0),
+                    summary.get("findings_total", 0),
+                    len(summary.get("errors") or []),
+                )
+                rt.record_job_success("pr_review_harvest")
+            except Exception as exc:
+                rt.record_job_failure("pr_review_harvest", str(exc))
+                logger.exception("PR review harvest failed")
+
+        rt._learning_scheduler.add_job(
+            _run_pr_review_harvest,
+            CronTrigger(day_of_week="sun", hour=6, minute=45, timezone=user_timezone()),
+            id="pr_review_harvest",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         # Model-roster gauntlet (weekly, Sat 5am). Validates each runnable roster
         # member can still drive CC through a coding fix-loop; a PASS->FAIL
         # regression surfaces an advisory BLOCKER alert + human-gated proposal

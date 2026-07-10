@@ -13,6 +13,8 @@ Dimensions:
 7. Approvals (WS-1 A2): approval-gate resolution throughput
 8. Goals (WS-1 A2, scaffold): user_goals status ratios + completion rate
 9. Noise/passivity (WS-1 A2): loop-closure leaks + empty-ego-cycle rate
+10. Dev quality (component g): PR-review findings + code-audit backlog +
+    edit-failure rate
 """
 
 from __future__ import annotations
@@ -107,6 +109,7 @@ async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
         ("approvals", _compute_approvals),
         ("goals", _compute_goal_completion),
         ("noise", _compute_noise_passivity),
+        ("dev_quality", _compute_dev_quality),
     ]:
         try:
             metrics, sample_count = await fn(db, period_start, period_end)
@@ -868,6 +871,145 @@ async def _compute_noise_passivity(
         "realist_quality_hold": verdicts.get("quality_hold", 0),
     }
     return metrics, ego_cycles + proposals_in_period
+
+
+# ── Dimension 10: Dev Quality (component g) ──────────────────────────────────
+
+
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    """Lenient ISO-8601 parse → aware UTC datetime (None on garbage).
+
+    pr_review_findings ``merged_at`` comes from GitHub (``...Z``); the window
+    bounds are Python isoformat (``+00:00``) — fromisoformat handles both,
+    and naive values are assumed UTC.
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+async def _compute_dev_quality(
+    db: aiosqlite.Connection, since: str, until: str,
+) -> tuple[dict, int]:
+    """Dev-quality metrics: PR-review findings + code-audit backlog + edit failures.
+
+    Three read paths, no writes:
+    - observations category='pr_review_findings' (written by
+      eval/pr_review_harvest.py, Sundays 06:45 — 45 min before this runs):
+      windowed on the ``merged_at`` INSIDE the content JSON, not the row's
+      created_at (re-harvest refreshes rows without changing what week the
+      PR merged). ``harvest_prs_seen`` counts ALL rows regardless of window
+      so thin harvest coverage is visible, not hidden.
+    - observations source='recon' category='code_audit', unresolved — an
+      all-time backlog gauge (stock, not flow). ``code_audit_by_category``
+      stays sparse until the audit taxonomy prompt ships (see ``note``).
+    - tool_call_outcomes windowed on timestamp (Edit/Write rows written by
+      scripts/edit_failure_sensor.py). datetime() normalization mirrors the
+      approvals dimension: both formats seen in the wild must window.
+
+    Honesty rules: every rate carries its raw numerator + denominator, and
+    is None on a zero denominator — NEVER 0.0 on 0/0. Ambiguity is
+    acknowledged where it exists (fewer findings/PR = better code OR weaker
+    review — the dashboard renders this dimension direction-neutral).
+
+    Snapshot-only dimension (writes no eval_events — the eval_events CHECK
+    constraint does not include 'dev_quality', and must not: this is weekly
+    aggregate telemetry, not an event stream).
+    """
+    start_dt = _parse_iso_utc(since)
+    end_dt = _parse_iso_utc(until)
+
+    # ── PR-review findings (windowed on content merged_at) ──────────────
+    cursor = await db.execute(
+        "SELECT content FROM observations WHERE category = 'pr_review_findings'",
+    )
+    rows = await cursor.fetchall()
+    harvest_prs_seen = len(rows)
+
+    prs_merged = 0
+    review_findings_total = 0
+    by_severity = dict.fromkeys(
+        ("blocker", "should_fix", "note", "unlabeled"), 0,
+    )
+    review_count_total = 0
+    for r in rows:
+        try:
+            payload = json.loads(r["content"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        merged = _parse_iso_utc(payload.get("merged_at"))
+        if merged is None or start_dt is None or end_dt is None:
+            continue
+        if not (start_dt <= merged < end_dt):
+            continue
+        prs_merged += 1
+        review_count_total += int(payload.get("review_count") or 0)
+        for f in payload.get("findings") or []:
+            review_findings_total += 1
+            sev = f.get("severity")
+            # Unknown severity strings fold into the honest bucket, never
+            # a guessed one.
+            by_severity[sev if sev in by_severity else "unlabeled"] += 1
+
+    # ── Code-audit backlog (all-time stock; mirrors the surplus panel's
+    #    source='recon' + unresolved population so the numbers agree) ─────
+    cursor = await db.execute(
+        "SELECT content FROM observations "
+        "WHERE source = 'recon' AND category = 'code_audit' AND resolved = 0",
+    )
+    audit_rows = await cursor.fetchall()
+    audit_by_severity: dict[str, int] = {}
+    audit_by_category: dict[str, int] = {}
+    for r in audit_rows:
+        try:
+            parsed = json.loads(r["content"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            parsed = {}
+        sev = parsed.get("severity") or "unknown"
+        audit_by_severity[sev] = audit_by_severity.get(sev, 0) + 1
+        cat = parsed.get("category")
+        if cat:
+            audit_by_category[cat] = audit_by_category.get(cat, 0) + 1
+
+    # ── Edit failures (windowed flow; Edit/Write only — the sensor's
+    #    contract — so a future emitter of other tools can't skew this) ───
+    cursor = await db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(success = 0), 0) FROM tool_call_outcomes "
+        "WHERE tool_name IN ('Edit', 'Write') "
+        "AND datetime(timestamp) >= datetime(?) AND datetime(timestamp) < datetime(?)",
+        (since, until),
+    )
+    row = await cursor.fetchone()
+    edit_calls_total, edit_failures = row[0], row[1]
+
+    metrics = {
+        "prs_merged": prs_merged,
+        "review_findings_total": review_findings_total,
+        "review_findings_by_severity": by_severity,
+        "findings_per_pr": round(review_findings_total / prs_merged, 2)
+        if prs_merged else None,
+        "review_count_total": review_count_total,
+        "mean_reviews_per_pr": round(review_count_total / prs_merged, 2)
+        if prs_merged else None,
+        "code_audit_open_findings": len(audit_rows),
+        "code_audit_by_severity": audit_by_severity,
+        "code_audit_by_category": audit_by_category,
+        "edit_calls_total": edit_calls_total,
+        "edit_failures": edit_failures,
+        "edit_failure_rate": round(edit_failures / edit_calls_total, 4)
+        if edit_calls_total else None,
+        # Coverage honesty: all harvested PR rows, windowed or not.
+        "harvest_prs_seen": harvest_prs_seen,
+        "note": "scaffold: code_audit_by_category sparse until the audit "
+                "taxonomy prompt ships",
+    }
+    return metrics, prs_merged + edit_calls_total
 
 
 # ── Composite Trends ─────────────────────────────────────────────────────────

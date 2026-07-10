@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 _DIMENSIONS = (
     "memory", "system", "ego", "cognitive", "procedure",
-    "approvals", "goals", "noise",
+    "approvals", "goals", "noise", "dev_quality",
 )
 
 # Which metric to extract as the "headline" value per dimension
@@ -25,6 +25,7 @@ _HEADLINE_METRIC = {
     "approvals": "user_resolved_rate",
     "goals": "completion_rate",
     "noise": "empty_ego_cycle_pct",
+    "dev_quality": "findings_per_pr",
 }
 
 # Valence of a RISING headline value per dimension: True = improving,
@@ -41,6 +42,8 @@ _HIGHER_IS_BETTER = {
     "approvals": None,
     "goals": True,
     "noise": False,
+    # fewer findings/PR = better code OR a weaker review — direction-ambiguous
+    "dev_quality": None,
 }
 
 
