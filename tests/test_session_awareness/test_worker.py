@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -30,7 +31,10 @@ def _seed_theme(sessions_root: Path, *, ema=None) -> None:
     s["ema_turns"] = 4
     s["ring"] = [s["ema"]] * 3
     s["entities"] = {"genesis": 2.0, "voice": 1.1, "faint": 0.06}
-    s["updated_at"] = "2026-07-09T12:00:00+00:00"
+    # Dynamic: a frozen timestamp crosses statefiles.STALE_AFTER (24h)
+    # and load_state's _soften_stale clears the ring — a frozen value
+    # makes the test rot on the wall clock (bit us 2026-07-10).
+    s["updated_at"] = datetime.now(UTC).isoformat()
     save_state(SID, s, base=sessions_root)
 
 
