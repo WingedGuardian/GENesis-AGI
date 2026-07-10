@@ -377,18 +377,45 @@ async def test_archive_refuses_stampless_mirror(cfg):
     assert not (arc / "creds" / "x.gpg").exists()
 
 
-async def test_archive_prunes_vanished_cred(cfg):
+async def test_archive_is_grow_only_partial_mirror_keeps_creds(cfg):
+    """The last-line archive must NEVER lose a cred to a transient/partial mirror
+    (e.g. a backup.sh rewrite window) — it is grow-only."""
     _escrow(cfg)
     mdir = _mirror(cfg, rels=("creds/a.gpg", "creds/b.gpg"), age_h=1.0)
     disp = _Dispatcher()
     await cred_watch._check_mirror_and_archive(cfg, disp)
     arc = cfg.state_path / "creds-archive"
     assert (arc / "creds" / "a.gpg").exists()
-    # Drop b from the mirror, re-archive → pruned from the archive too.
+    assert (arc / "creds" / "b.gpg").exists()
+    # b momentarily vanishes from the mirror (partial round) → archive KEEPS it.
     (mdir / "creds" / "b.gpg").unlink()
     await cred_watch._check_mirror_and_archive(cfg, disp)
-    assert not (arc / "creds" / "b.gpg").exists()
+    assert (arc / "creds" / "b.gpg").exists()  # grow-only: last copy preserved
     assert (arc / "creds" / "a.gpg").exists()
+
+
+async def test_archive_keeps_escrow_across_transient_read_miss(cfg):
+    """A one-tick escrow read-miss must not drop the archived passphrase."""
+    esc = _escrow(cfg)
+    _mirror(cfg, age_h=1.0)
+    disp = _Dispatcher()
+    await cred_watch._check_mirror_and_archive(cfg, disp)
+    arc = cfg.state_path / "creds-archive"
+    assert (arc / "backup_passphrase.env").exists()
+    esc.unlink()  # transient miss
+    await cred_watch._check_mirror_and_archive(cfg, disp)
+    assert (arc / "backup_passphrase.env").exists()  # grow-only: kept
+
+
+async def test_stale_warn_state_cleared_when_escrow_disappears(cfg):
+    _escrow(cfg)
+    _mirror(cfg, age_h=60.0)
+    disp = _Dispatcher()
+    await cred_watch._check_mirror_and_archive(cfg, disp)  # WARNING + state written
+    assert "warned_at" in (cfg.state_path / "mirror_alert_state.json").read_text()
+    (cfg.state_path / "shared" / "guardian" / "backup_passphrase.env").unlink()
+    await cred_watch._check_mirror_and_archive(cfg, disp)  # escrow gone → cleared
+    assert (cfg.state_path / "mirror_alert_state.json").read_text() == "{}"
 
 
 async def test_orchestrator_runs_mirror_even_when_container_unreachable(cfg, monkeypatch):

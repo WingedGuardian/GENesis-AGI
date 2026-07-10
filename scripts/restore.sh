@@ -654,7 +654,15 @@ fi
 # clone, so no off-site pull is needed.
 log "--- Credential & wiring files ---"
 CREDS_SRC_DIR="$BACKUP_DIR/creds"
-if [ ! -d "$CREDS_SRC_DIR" ] && [ -n "$_MIRROR_ROOT" ] && [ -d "$_MIRROR_ROOT/creds" ]; then
+# Key the fallback on actual .gpg PAYLOAD presence, not directory existence:
+# backup.sh skips creds when the passphrase was unset (§8), which can leave an
+# empty/placeholder creds/ dir that would otherwise mask a good host mirror.
+# Symmetric with the secrets file test above; set -e-safe (checks live in `if`).
+_creds_has_payload=false
+if [ -d "$CREDS_SRC_DIR" ] && find "$CREDS_SRC_DIR" -name '*.gpg' -print -quit 2>/dev/null | grep -q .; then
+    _creds_has_payload=true
+fi
+if ! $_creds_has_payload && [ -n "$_MIRROR_ROOT" ] && [ -d "$_MIRROR_ROOT/creds" ]; then
     CREDS_SRC_DIR="$_MIRROR_ROOT/creds"
     log "Creds: Tier-1 clone payload absent — using host-side mirror $CREDS_SRC_DIR"
 fi

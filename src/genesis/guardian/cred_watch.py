@@ -29,10 +29,10 @@ from genesis.guardian import cred_integrity
 from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.cred_integrity import RESTORABLE_STATUSES, allowed_restore
 
-# Shared file primitives (atomic copy / containment-guarded prune) live in the
-# credential_bridge module — imported here so the mirror and its host-only
-# archive use the identical copy/prune discipline. Import is side-effect-free.
-from genesis.guardian.credential_bridge import _atomic_copy, _prune_to_keep
+# Shared atomic-copy primitive lives in the credential_bridge module — imported
+# here so the host-only archive uses the identical copy discipline as the
+# container-side mirror. Import is side-effect-free.
+from genesis.guardian.credential_bridge import _atomic_copy
 
 logger = logging.getLogger(__name__)
 
@@ -352,6 +352,12 @@ async def _check_mirror_and_archive(config, dispatcher) -> None:
     # file (written by the same bridge tick) is the proxy for "backups on".
     if escrow.exists():
         await _mirror_freshness_alert(config, dispatcher, mirror_dir)
+    else:
+        # Backups not configured (or turned off): drop any lingering stale-warn
+        # state so a later re-enable starts clean. No alert — absence is expected.
+        state_file = config.state_path / _MIRROR_STATE_FILE
+        if _load_mirror_state(state_file).get("warned_at"):
+            _save_mirror_state(state_file, {})
 
     _archive_mirror(config, mirror_dir, escrow)
 
@@ -417,32 +423,34 @@ async def _mirror_freshness_alert(config, dispatcher, mirror_dir: Path) -> None:
 
 def _archive_mirror(config, mirror_dir: Path, escrow: Path) -> None:
     """Copy the mirror tree + escrow → a host-only archive the container cannot
-    reach. Refuse an empty or stamp-less mirror so a zeroed shared mount can
-    never propagate into (and destroy) the last-line archive."""
+    reach. Refuse an empty or stamp-less mirror so a zeroed shared mount never
+    even starts an archive round.
+
+    The archive is deliberately GROW-ONLY (it never prunes). It is the last line
+    of defence, so it must never delete a credential based on a single —
+    possibly transient or partial — view of the mirror (e.g. a backup.sh rewrite
+    window that briefly drops a .gpg, then the container's own mirror prunes it,
+    then this tick sees the shrunken set). Stale extra encrypted blobs are
+    harmless on restore; losing the only surviving copy is not. Same-named creds
+    are still refreshed in place, so rotations propagate."""
     stamp = mirror_dir / _MIRROR_STAMP
     if not stamp.exists():
         logger.debug("cred archive: mirror has no STAMP (incomplete/absent) — skipping")
         return
     gpg_files = [f for f in mirror_dir.rglob("*.gpg") if f.is_file()]
     if not gpg_files:
-        logger.debug("cred archive: mirror has no encrypted files — refusing to overwrite archive")
+        logger.debug("cred archive: mirror has no encrypted files — skipping")
         return
 
     archive = config.state_path / _ARCHIVE_SUBDIR
     try:
         archive.mkdir(parents=True, exist_ok=True)
         os.chmod(archive, 0o700)
-        keep: set[Path] = set()
         for f in gpg_files:
-            rel = f.relative_to(mirror_dir)
-            _atomic_copy(f, archive / rel)
-            keep.add(rel)
+            _atomic_copy(f, archive / f.relative_to(mirror_dir))
         _atomic_copy(stamp, archive / _MIRROR_STAMP)
-        keep.add(Path(_MIRROR_STAMP))
         if escrow.exists():
             _atomic_copy(escrow, archive / _ESCROW_FILE)
-            keep.add(Path(_ESCROW_FILE))
-        _prune_to_keep(archive, keep)
     except OSError:
         logger.warning("cred archive hop failed", exc_info=True)
 

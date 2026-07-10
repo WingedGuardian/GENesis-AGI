@@ -388,6 +388,9 @@ def _needs_copy(src: Path, dest: Path) -> bool:
 
     Steady state is stat-only: ``_atomic_copy`` preserves the source mtime, so an
     unchanged source (the common per-tick case) compares equal and is skipped.
+    This is only an optimisation — on an exotic shared mount that does not
+    round-trip mtime, the worst case is re-copying a ~100 KB bundle each tick,
+    which is harmless (the copy is atomic and the outcome identical).
     """
     if not dest.exists():
         return True
