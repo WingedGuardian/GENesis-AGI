@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -158,6 +158,29 @@ class HealthDataService:
             if exc is not None:
                 logger.debug("Orphaned health snapshot compute failed", exc_info=exc)
 
+    async def _recent_provider_fallbacks(self) -> dict:
+        """Per-provider fallback counts (last 24h) for the API-keys card.
+
+        Sources ``provider.fallback`` events — the only place a skipped/failed
+        provider's identity is recorded (the activity tracker never sees
+        missing-key / circuit-breaker skips, which bail before ``.record()``).
+        Self-contained error handling returns ``{}`` on any failure so a bad
+        query can never poison the ``api_keys`` section (its result is consumed
+        synchronously outside the gather's ``_or_error`` isolation).
+        """
+        if self._db is None:
+            return {}
+        try:
+            from genesis.db.crud import events as events_crud
+
+            since = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+            return await events_crud.recent_provider_fallback_counts(
+                self._db, since=since,
+            )
+        except Exception:
+            logger.debug("recent provider-fallback counts query failed", exc_info=True)
+            return {}
+
     async def _compute_snapshot(self) -> dict:
         """Build the full system health state as a dict (uncoalesced)."""
         from genesis.observability.snapshots import (
@@ -224,6 +247,8 @@ class HealthDataService:
             services_async(),
             asyncio.to_thread(conversation_activity),
             asyncio.to_thread(proactive_memory_metrics),
+            # APPENDED last so the 16 existing positions are untouched (see unpack).
+            self._recent_provider_fallbacks(),
             return_exceptions=True,
         )
         # Isolate any failed section uniformly: one raising sub-snapshot degrades
@@ -233,7 +258,7 @@ class HealthDataService:
             r_call_sites, r_cc_sessions, r_infrastructure, r_queues, r_surplus,
             r_cost, r_awareness, r_outreach, r_mcp, r_provider_activity,
             r_memory_health, r_eval_staleness, r_vcr,
-            r_services, r_conversation, r_proactive,
+            r_services, r_conversation, r_proactive, r_provider_fallbacks,
         ) = results
 
         # Surface infra probe healthy<->unhealthy transitions to the activity
@@ -242,6 +267,16 @@ class HealthDataService:
             await self._emit_probe_transitions(r_infrastructure)
         except Exception:
             logger.debug("Probe-transition emit pass failed", exc_info=True)
+
+        # Fallback counts feed the API-keys card. Defensive guard: the method
+        # already swallows its own errors → {}, but if _or_error ever injected a
+        # {"status": "error"} sentinel we must not pass that as the provider map.
+        recent_fallbacks = (
+            r_provider_fallbacks
+            if isinstance(r_provider_fallbacks, dict)
+            and "status" not in r_provider_fallbacks
+            else {}
+        )
 
         return {
             "timestamp": now,
@@ -255,7 +290,10 @@ class HealthDataService:
             "awareness": r_awareness,
             "outreach_stats": r_outreach,
             "services": r_services,
-            "api_keys": api_key_health(self._routing_config, breakers=self._breakers),
+            "api_keys": api_key_health(
+                self._routing_config, breakers=self._breakers,
+                recent_fallbacks=recent_fallbacks,
+            ),
             "mcp_servers": r_mcp,
             "conversation": r_conversation,
             "provider_activity": r_provider_activity,
