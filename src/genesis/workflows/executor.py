@@ -166,9 +166,9 @@ def execute_deterministic_step(
     if not step.command:
         return False, "No command specified"
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: S602 - trusted YAML from ~/.genesis/workflows/ only, see docstring
             step.command,
-            shell=True,  # noqa: S602 — trusted YAML source, see docstring
+            shell=True,
             capture_output=True,
             text=True,
             cwd=cwd,

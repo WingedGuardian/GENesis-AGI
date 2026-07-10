@@ -66,7 +66,7 @@ def _record_procedures_surfaced(proc_ids: list[str]) -> None:
         conn = sqlite3.connect(str(db_path), timeout=1)
         try:
             conn.execute(
-                f"UPDATE procedural_memory "
+                f"UPDATE procedural_memory "  # noqa: S608 - literal SQL fragments; values bound as parameters
                 f"SET surfaced_count = surfaced_count + 1 WHERE id IN ({placeholders})",
                 proc_ids,
             )

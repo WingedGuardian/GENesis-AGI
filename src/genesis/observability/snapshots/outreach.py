@@ -26,7 +26,7 @@ async def outreach_stats(db: aiosqlite.Connection | None) -> dict:
                 SUM(CASE WHEN engagement_outcome IN ({_POSITIVE_IN}) THEN 1 ELSE 0 END) as engaged
             FROM outreach_history
             WHERE created_at >= datetime('now', '-7 days')
-              AND category != 'digest'"""
+              AND category != 'digest'"""  # noqa: S608 - literal SQL fragments; values bound as parameters
         )
         row = await cursor.fetchone()
         total = row["total"] if row else 0
