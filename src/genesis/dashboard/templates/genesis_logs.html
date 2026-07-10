@@ -230,15 +230,6 @@
                   "perception", "learning", "inbox", "reflection", "providers", "web", "outreach", "dashboard"];
         },
 
-        get severityOptions() {
-          return [
-            { value: "debug", label: "DEBUG+" },
-            { value: "info", label: "INFO+" },
-            { value: "warning", label: "WARN+" },
-            { value: "error", label: "ERROR+" },
-            { value: "critical", label: "CRIT" },
-          ];
-        },
       });
     });
   </script>
@@ -578,10 +569,15 @@
 
     <!-- Filter bar -->
     <div class="filter-bar">
+      <!-- Static options: x-model applies its initial value ("info") before
+           x-for renders options, which left the select DISPLAYING the first
+           option (DEBUG+) while actually filtering INFO+. -->
       <select x-model="$store.genesisLogs.filters.severities" @change="$store.genesisLogs.applyFilters()">
-        <template x-for="opt in $store.genesisLogs.severityOptions" :key="opt.value">
-          <option :value="opt.value" x-text="opt.label"></option>
-        </template>
+        <option value="debug">DEBUG+</option>
+        <option value="info">INFO+</option>
+        <option value="warning">WARN+</option>
+        <option value="error">ERROR+</option>
+        <option value="critical">CRIT</option>
       </select>
 
       <select x-model="$store.genesisLogs.filters.subsystem" @change="$store.genesisLogs.applyFilters()">
