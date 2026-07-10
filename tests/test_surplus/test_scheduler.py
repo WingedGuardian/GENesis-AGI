@@ -20,7 +20,7 @@ from genesis.surplus.types import ComputeTier, TaskType
 pytestmark = pytest.mark.asyncio
 
 
-def _make_scheduler(db, *, idle=True, lmstudio_up=False, enable_code_audits=False):
+def _make_scheduler(db, *, idle=True, lmstudio_up=False):
     idle_detector = IdleDetector()
     if idle:
         idle_detector._last_activity_at = datetime.now(UTC) - timedelta(minutes=30)
@@ -30,7 +30,6 @@ def _make_scheduler(db, *, idle=True, lmstudio_up=False, enable_code_audits=Fals
     return SurplusScheduler(
         db=db, queue=SurplusQueue(db), idle_detector=idle_detector,
         compute_availability=compute, executor=StubExecutor(),
-        enable_code_audits=enable_code_audits,
     ), compute
 
 
@@ -58,13 +57,13 @@ async def test_restart_safe_hourly_subdaily_is_stepped_and_daily_differs():
 
 
 async def test_long_interval_jobs_use_restart_safe_crontriggers(db):
-    """The >1h jobs — schedule_maintenance, schedule_code_index, schedule_code_audit — must
+    """The >1h jobs — schedule_maintenance, schedule_code_index — must
     use CronTrigger, not IntervalTrigger: a >1h IntervalTrigger resets on every restart and
     starves the job (the CLAUDE.md trap). Enumerated as a class, not just the flagged job."""
-    sched, _ = _make_scheduler(db, enable_code_audits=True)
+    sched, _ = _make_scheduler(db)
     await sched.start()
     try:
-        for job_id in ("schedule_maintenance", "schedule_code_index", "schedule_code_audit"):
+        for job_id in ("schedule_maintenance", "schedule_code_index"):
             job = sched._scheduler.get_job(job_id)
             assert job is not None, f"{job_id} not registered"
             assert isinstance(job.trigger, CronTrigger), f"{job_id} must be CronTrigger"
@@ -360,7 +359,7 @@ async def test_brainstorm_check_schedules_sessions(db):
 
 
 async def test_start_and_stop(db):
-    sched, compute = _make_scheduler(db, idle=True, enable_code_audits=True)
+    sched, compute = _make_scheduler(db, idle=True)
     with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False), \
          patch.object(sched, "run_gitnexus_strip", new_callable=AsyncMock):
         await sched.start()
@@ -368,27 +367,11 @@ async def test_start_and_stop(db):
     # Verify jobs were registered
     assert sched._scheduler.get_job("surplus_brainstorm_check") is not None
     assert sched._scheduler.get_job("surplus_dispatch") is not None
-    assert sched._scheduler.get_job("schedule_code_audit") is not None
-    # Brainstorm (3) + code audit (1) + code index (1) + model_eval (1)
-    # + maintenance (4) + j9_eval_batch (1) + analytical (1: gap_clustering)
-    # + pipeline (2: prompt_effectiveness + anticipatory_research step 1) = 14
-    assert await sched._queue.pending_count() == 14
-    # Stop should not raise
-    await sched.stop()
-
-
-async def test_start_without_code_audits(db):
-    sched, compute = _make_scheduler(db, idle=True, enable_code_audits=False)
-    with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False), \
-         patch.object(sched, "run_gitnexus_strip", new_callable=AsyncMock):
-        await sched.start()
-    assert sched._scheduler.running is True
-    # Code audit job should NOT be registered
-    assert sched._scheduler.get_job("schedule_code_audit") is None
     # Brainstorm (3) + code index (1) + model_eval (1)
     # + maintenance (4) + j9_eval_batch (1) + analytical (1: gap_clustering)
     # + pipeline (2: prompt_effectiveness + anticipatory_research step 1) = 13
     assert await sched._queue.pending_count() == 13
+    # Stop should not raise
     await sched.stop()
 
 
@@ -421,13 +404,6 @@ async def test_start_registers_github_discovery(db):
         await sched.start()
     assert sched._scheduler.get_job("github_discovery") is not None
     await sched.stop()
-
-
-async def test_schedule_code_audit_noop_when_disabled(db):
-    sched, compute = _make_scheduler(db, idle=True, enable_code_audits=False)
-    # Direct call should be a no-op
-    await sched.schedule_code_audit()
-    assert await sched._queue.pending_count() == 0
 
 
 async def test_dispatch_drains_expired_tasks(db):

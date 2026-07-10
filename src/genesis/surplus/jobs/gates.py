@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING
 from genesis.db.crud import surplus as surplus_crud
 from genesis.observability.types import Severity, Subsystem
 from genesis.surplus.jobs._guard import (
-    SKIP,
     job_guard,
     record_failure,
     record_success,
@@ -78,25 +77,6 @@ async def recently_completed(
         return age_s < cooldown_hours * 3600
     except (ValueError, TypeError):
         return False
-
-
-@job_guard("schedule_code_audit", "Code audit scheduling failed")
-async def schedule_code_audit(sched: SchedulerContext) -> None:
-    """Enqueue a code audit task if none pending/running."""
-    if not sched._enable_code_audits:
-        # Disabled-by-config: record neither success nor failure, exactly
-        # as the pre-guard early return did (the job_health row is
-        # stale-by-design while audits are off).
-        return SKIP
-    from genesis.surplus.types import ComputeTier, TaskType
-
-    active = await sched._queue.active_by_type(TaskType.CODE_AUDIT)
-    if active == 0 and not await sched._recently_completed(
-        TaskType.CODE_AUDIT, sched._code_audit_hours,
-    ):
-        await sched._queue.enqueue(
-            TaskType.CODE_AUDIT, ComputeTier.FREE_API, 0.5, "competence"
-        )
 
 
 @job_guard("schedule_code_index", "Code index scheduling failed")

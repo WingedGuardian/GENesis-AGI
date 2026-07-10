@@ -10,7 +10,6 @@ dispatch:
 
 jobs:
   brainstorm_check_hours: 12
-  code_audit_hours: 12
   code_index_hours: 4
   recon_gather_hours: 84       # ~3.5 days
   maintenance_hours: 24
