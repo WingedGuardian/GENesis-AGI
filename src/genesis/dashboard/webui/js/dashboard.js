@@ -225,7 +225,7 @@
         backupConfigForm: {
           repo: '', tier2_backend: 'none', local_path: '',
           nas: '', nas_user: '', nas_pass: '', passphrase: '',
-          schedule: '0 */6 * * *', schedule_enabled: true,
+          schedule_interval: '6h', schedule_enabled: true,
         },
         backupConfigSaving: false,
         backupConfigMsg: null,
@@ -1771,10 +1771,63 @@
             if (resp && resp.ok) { this.backupStatus = await resp.json(); }
           } catch (e) { console.warn("Backup status failed:", e); }
         },
+        // Human labels for the interval preset keys the API speaks.
+        _intervalLabels: { '3h': 'every 3 hours', '6h': 'every 6 hours',
+          '12h': 'every 12 hours', daily: 'daily' },
+        // Headline health: is the backup system OK, at-risk, or failing?
+        backupHeadline() {
+          const bs = this.backupStatus;
+          const lb = bs && bs.last_backup;
+          const sch = bs && bs.schedule;
+          const enabled = sch && sch.enabled;
+          const active = sch && sch.active;
+          if (!lb) return { text: 'No backups yet', color: '#ffb74d' };
+          if (!lb.success) return { text: 'Failing', color: '#ef9a9a' };
+          if (!enabled) return { text: 'On demand only (not scheduled)', color: '#ffb74d' };
+          // enabled but not loaded/running (e.g. stopped out-of-band, or failed to
+          // start) — the timer won't fire, so "Active" would misreport. Say so.
+          if (!active) return { text: 'Scheduled, but the timer is not running', color: '#ffb74d' };
+          return { text: 'Active', color: '#81c784' };
+        },
+        // "every 6 hours · last 12:10 PM ✓ · next 6:10 PM" — the at-a-glance line.
+        backupScheduleLine() {
+          const bs = this.backupStatus;
+          const sch = bs && bs.schedule;
+          const lb = bs && bs.last_backup;
+          const parts = [];
+          if (sch && sch.enabled) {
+            const key = sch.interval;
+            if (key && key !== 'custom' && this._intervalLabels[key]) parts.push(this._intervalLabels[key]);
+            else if (key === 'custom') parts.push('custom schedule');
+            else parts.push('scheduled');
+          } else {
+            parts.push('not scheduled');
+          }
+          if (lb && lb.timestamp) {
+            const when = new Date(lb.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+            parts.push('last ' + when + (lb.success ? ' ✓' : ' ✗'));
+          }
+          if (sch && sch.enabled && sch.next_run) parts.push('next ' + sch.next_run);
+          return parts.join(' · ');
+        },
+        // Off-site (Tier-2) health label + colour from the status/backend fields.
+        tier2Health() {
+          const t2 = this.backupStatus && this.backupStatus.destinations
+            && this.backupStatus.destinations.tier2;
+          if (!t2 || t2.backend === 'none' || !t2.backend)
+            return { text: 'Not configured', color: 'var(--color-text-secondary)' };
+          const s = t2.status;
+          if (s === 'ok') return { text: 'Off-site copy confirmed', color: '#81c784' };
+          if (s === 'partial') return { text: 'Partial — last off-site copy incomplete', color: '#ffb74d' };
+          if (s === 'no_smbclient') return { text: 'smbclient not installed', color: '#ef9a9a' };
+          if (s === 'not_configured') return { text: 'Not configured', color: 'var(--color-text-secondary)' };
+          return { text: s || 'unknown', color: '#ffb74d' };
+        },
         async triggerBackup() {
           try {
             const resp = await fetchApi("/api/genesis/backup/trigger", { method: "POST" });
-            if (resp && resp.ok) { alert("Backup triggered"); setTimeout(() => this.fetchBackupStatus(), 5000); }
+            // Type=oneshot backup runs ~5 min; status won't reflect it immediately.
+            if (resp && resp.ok) { alert("Backup started — a full run takes a few minutes."); setTimeout(() => this.fetchBackupStatus(), 8000); }
             else { alert("Trigger failed"); }
           } catch (e) { alert("Trigger failed: " + e.message); }
         },
@@ -1790,7 +1843,11 @@
               f.local_path = c.local_path || '';
               f.nas = c.nas || '';
               f.nas_user = c.nas_user || '';
-              f.schedule = c.schedule || '0 */6 * * *';
+              // A "custom"/null server interval can't be a preset dropdown value;
+              // default the control to 6h but DON'T mark dirty, so a plain Save
+              // never rewrites a hand-edited schedule (scheduleDirty gates it).
+              f.schedule_interval = (c.schedule_interval && c.schedule_interval !== 'custom')
+                ? c.schedule_interval : '6h';
               f.schedule_enabled = c.schedule_enabled !== false;
               this.scheduleDirty = false;   // loaded state is not a user change
               // passphrase / nas_pass are write-only — never populated.
@@ -1806,7 +1863,7 @@
             // The cron job is a stateful side-effect — only touch it when the
             // user actually changed the schedule controls.
             if (this.scheduleDirty) {
-              body.schedule = f.schedule;
+              body.schedule_interval = f.schedule_interval;
               body.schedule_enabled = f.schedule_enabled;
             }
             // Only send repo if the user actually changed it — re-sending the
@@ -1826,7 +1883,7 @@
             if (resp && resp.ok) {
               this.backupConfigMsg = {
                 ok: true,
-                text: "Saved — applies on the next backup run.",
+                text: "Saved. Schedule changes apply now; destination/credential changes apply on the next run.",
                 warnings: (data && data.warnings) || [],
               };
               f.nas_pass = ''; f.passphrase = '';   // clear write-only fields

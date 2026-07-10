@@ -153,6 +153,33 @@ def test_local_only_not_configured_no_alert(backup_env):
     assert not tg.strip(), f"local-only must not alert:\n{tg}"
 
 
+def test_status_enrichment_fields_nas_ok(backup_env):
+    """The dashboard reads these fields — assert the real script writes them with
+    the right JSON types on a successful two-tier run (guards the enriched
+    ``_write_status`` heredoc: counts are ints, not the ``null`` default)."""
+    proc, status, _ = _run(backup_env, smb_rc=0, nas=True)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert status["tier2_backend"] == "smb", status
+    # snapshot_id is this run's UTC stamp (YYYYMMDDTHHMMSSZ).
+    assert len(status["snapshot_id"]) == 16 and status["snapshot_id"].endswith("Z"), status
+    # GFS block ran (tier2 ok) → counts are integers (0 here: the smbclient stub
+    # lists nothing), NEVER null and NEVER the wc -l off-by-one 1.
+    assert status["snapshot_count"] == 0 and isinstance(status["snapshot_count"], int), status
+    assert status["pruned_count"] == 0 and isinstance(status["pruned_count"], int), status
+    assert status["tier1_pushed"] is True, status
+
+
+def test_status_enrichment_fields_local_only(backup_env):
+    """No off-site backend → snapshot bookkeeping stays JSON ``null`` (honest
+    'unknown', not 0), backend is 'none', but Tier-1 still pushed."""
+    proc, status, _ = _run(backup_env, nas=False)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert status["tier2_backend"] == "none", status
+    assert status["snapshot_id"] == "", status
+    assert status["snapshot_count"] is None and status["pruned_count"] is None, status
+    assert status["tier1_pushed"] is True, status
+
+
 def test_complete_marker_failure_is_offsite_failure(backup_env):
     """If payloads upload but the COMPLETE marker fails, restore would skip the
     snapshot — so it must report partial + offsite_confirmed:false + alert, not ok."""

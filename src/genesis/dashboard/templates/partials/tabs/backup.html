@@ -165,12 +165,19 @@
         </template>
         <template x-if="$store.genesisDashboard.backupStatus">
           <div>
-            <!-- Status card -->
+            <!-- Status headline card -->
             <div class="card" style="padding:1rem; margin-bottom:1rem;">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
-                <h3 style="margin:0; font-size:1rem;">Backup Status</h3>
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.75rem; gap:1rem;">
+                <div>
+                  <h3 style="margin:0 0 0.2rem 0; font-size:1rem;">Backups</h3>
+                  <div style="font-size:0.95rem; font-weight:600;"
+                       :style="'color:' + $store.genesisDashboard.backupHeadline().color"
+                       x-text="$store.genesisDashboard.backupHeadline().text"></div>
+                  <div style="font-size:0.78rem; color:var(--color-text-secondary); margin-top:0.15rem;"
+                       x-text="$store.genesisDashboard.backupScheduleLine()"></div>
+                </div>
                 <button @click="$store.genesisDashboard.triggerBackup()"
-                        style="background:var(--color-accent); color:#000; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                        style="background:var(--color-accent); color:#000; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem; white-space:nowrap;">
                   Run Now</button>
               </div>
               <template x-if="$store.genesisDashboard.backupStatus.last_backup">
@@ -217,23 +224,41 @@
                 <div style="color:var(--color-text-secondary);">No backup status file found. Run a backup to generate status.</div>
               </template>
             </div>
-            <!-- Config card -->
-            <div class="card" style="padding:1rem;">
-              <h3 style="margin:0 0 0.5rem 0; font-size:1rem;">Configuration</h3>
-              <div style="font-size:0.85rem;">
-                <div style="margin-bottom:0.25rem;">
-                  <span style="color:var(--color-text-secondary);">Repo:</span>
-                  <span x-text="$store.genesisDashboard.backupStatus.repo || 'Not configured'"></span>
-                </div>
-                <div style="margin-bottom:0.25rem;">
-                  <span style="color:var(--color-text-secondary);">Cron:</span>
-                  <code style="font-size:0.8rem;" x-text="$store.genesisDashboard.backupStatus.cron_schedule || 'Not scheduled'"></code>
-                </div>
+
+            <!-- Destinations card — where backups actually go (both tiers) -->
+            <div class="card" style="padding:1rem; margin-bottom:1rem;">
+              <h3 style="margin:0 0 0.6rem 0; font-size:1rem;">Destinations</h3>
+              <!-- Tier 1: GitHub -->
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem; padding:0.4rem 0; border-bottom:1px solid var(--color-border);">
                 <div>
-                  <span style="color:var(--color-text-secondary);">Script:</span>
-                  <span x-text="$store.genesisDashboard.backupStatus.configured ? 'Installed' : 'Not found'"
-                        :style="$store.genesisDashboard.backupStatus.configured ? 'color:#81c784' : 'color:#ef9a9a'"></span>
+                  <div style="font-size:0.85rem;">GitHub <span style="color:var(--color-text-secondary); font-size:0.72rem;">· Tier 1 (memory, config, secrets)</span></div>
+                  <code style="font-size:0.72rem; color:var(--color-text-secondary);"
+                        x-text="$store.genesisDashboard.backupStatus.destinations?.tier1?.repo || 'Not configured'"></code>
                 </div>
+                <span style="font-size:0.8rem; white-space:nowrap;"
+                      :style="$store.genesisDashboard.backupStatus.destinations?.tier1?.pushed === true ? 'color:#81c784' : ($store.genesisDashboard.backupStatus.destinations?.tier1?.pushed === false ? 'color:#ef9a9a' : 'color:var(--color-text-secondary)')"
+                      x-text="$store.genesisDashboard.backupStatus.destinations?.tier1?.pushed === true ? 'Synced ✓' : ($store.genesisDashboard.backupStatus.destinations?.tier1?.pushed === false ? 'Not pushed ✗' : '—')"></span>
+              </div>
+              <!-- Tier 2: off-site -->
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem; padding:0.5rem 0 0.2rem;">
+                <div>
+                  <div style="font-size:0.85rem;">Off-site
+                    <span style="color:var(--color-text-secondary); font-size:0.72rem;">· Tier 2 (Qdrant + SQL, large binaries)</span>
+                    <span x-show="$store.genesisDashboard.backupStatus.destinations?.tier2?.backend && $store.genesisDashboard.backupStatus.destinations?.tier2?.backend !== 'none'"
+                          style="font-size:0.7rem; color:var(--color-text-secondary); text-transform:uppercase;"
+                          x-text="'(' + $store.genesisDashboard.backupStatus.destinations?.tier2?.backend + ')'"></span>
+                  </div>
+                  <!-- NAS/local target only rendered when the API returned it (authenticated) -->
+                  <code x-show="$store.genesisDashboard.backupStatus.destinations?.tier2?.target"
+                        style="font-size:0.72rem; color:var(--color-text-secondary);"
+                        x-text="$store.genesisDashboard.backupStatus.destinations?.tier2?.target"></code>
+                  <div x-show="$store.genesisDashboard.backupStatus.destinations?.tier2?.snapshot_count != null"
+                       style="font-size:0.72rem; color:var(--color-text-secondary);"
+                       x-text="$store.genesisDashboard.backupStatus.destinations?.tier2?.snapshot_count + ' snapshot(s) retained' + ($store.genesisDashboard.backupStatus.destinations?.tier2?.snapshot_id ? ' · latest ' + $store.genesisDashboard.backupStatus.destinations.tier2.snapshot_id : '')"></div>
+                </div>
+                <span style="font-size:0.8rem; white-space:nowrap;"
+                      :style="'color:' + $store.genesisDashboard.tier2Health().color"
+                      x-text="$store.genesisDashboard.tier2Health().text"></span>
               </div>
             </div>
             <!-- Editable backup configuration -->
@@ -301,19 +326,27 @@
                   </div>
                 </template>
 
-                <!-- Schedule -->
+                <!-- Schedule (systemd timer) -->
                 <label style="display:flex; align-items:center; gap:0.4rem; margin-top:0.2rem;">
                   <input type="checkbox" x-model="$store.genesisDashboard.backupConfigForm.schedule_enabled"
                          @change="$store.genesisDashboard.scheduleDirty = true">
-                  <span>Scheduled (cron) backups</span>
+                  <span>Scheduled automatic backups</span>
                 </label>
                 <template x-if="$store.genesisDashboard.backupConfigForm.schedule_enabled">
                   <label style="display:flex; flex-direction:column; gap:0.15rem;">
-                    <span style="color:var(--color-text-secondary);">Cron schedule</span>
-                    <input type="text" x-model="$store.genesisDashboard.backupConfigForm.schedule" placeholder="0 */6 * * *"
-                           @input="$store.genesisDashboard.scheduleDirty = true"
-                           style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary); font-family:monospace;">
-                    <span style="font-size:0.7rem; color:var(--color-text-secondary);">5-field cron — e.g. <code>0 */6 * * *</code> = every 6 hours</span>
+                    <span style="color:var(--color-text-secondary);">Run backups</span>
+                    <select x-model="$store.genesisDashboard.backupConfigForm.schedule_interval"
+                            @change="$store.genesisDashboard.scheduleDirty = true"
+                            style="font-size:0.82rem; padding:0.3rem 0.4rem; border-radius:4px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                      <option value="3h">Every 3 hours</option>
+                      <option value="6h">Every 6 hours</option>
+                      <option value="12h">Every 12 hours</option>
+                      <option value="daily">Daily (4:10 AM)</option>
+                    </select>
+                    <!-- M4: a hand-edited OnCalendar the presets can't represent -->
+                    <span x-show="$store.genesisDashboard.backupConfig?.schedule_interval === 'custom'"
+                          style="font-size:0.7rem; color:#ffb74d;">
+                      ⚠ This host currently runs a custom schedule (set outside the dashboard). Choosing a preset above and saving will replace it.</span>
                   </label>
                 </template>
 

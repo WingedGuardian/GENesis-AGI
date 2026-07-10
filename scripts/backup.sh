@@ -44,6 +44,12 @@ _MEMORY_COUNT=0
 _SECRETS_OK=false
 _SUCCESS=false
 _FAILURE_REASON=""
+# Tier-1 replication: true once the local repo is in sync with the GitHub remote.
+_TIER1_PUSHED=false
+# Off-site snapshot bookkeeping. _T2_SNAPSHOT_COUNT / _T2_PRUNED stay UNSET until
+# the GFS prune runs (only on a fully-uploaded off-site snapshot), so the status
+# line emits a JSON `null` (not 0) when off-site was skipped/partial — an honest
+# "unknown", and never an empty expansion (which would be invalid JSON).
 
 _write_status() {
     local _ended_at
@@ -57,7 +63,7 @@ _write_status() {
     if [ "${_T2_STATUS:-}" = "ok" ]; then _offsite_confirmed=true; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 trap '_write_status; backend_cleanup' EXIT
@@ -553,16 +559,23 @@ else
             )"
             _gfs_delete="$(printf '%s\n' "$_gfs_complete" \
                 | python3 "$_SCRIPT_DIR/gfs_select.py" --daily 7 --weekly 4 --monthly 6)" || _gfs_delete=""
+            # Count COMPLETE snapshots present this run (grep -c . not `wc -l`,
+            # which counts 1 for an empty var). _T2_PRUNED tracks successful
+            # deletes; retained = total - pruned, surfaced in backup_status.json.
+            _T2_PRUNED=0
+            _T2_COMPLETE_TOTAL=$(printf '%s\n' "$_gfs_complete" | grep -c . || true)
             for _st in $_gfs_delete; do
                 if [ "$_st" = "$_T2_STAMP" ]; then
                     continue   # never the current run's snapshot
                 fi
                 if backend_delete "$_T2_HOST_DIR/$_st"; then
+                    _T2_PRUNED=$(( _T2_PRUNED + 1 ))
                     log "GFS prune: removed off-site snapshot $_st"
                 else
                     log "WARNING: GFS prune failed for off-site snapshot $_st"
                 fi
             done
+            _T2_SNAPSHOT_COUNT=$(( _T2_COMPLETE_TOTAL - _T2_PRUNED ))
         fi
     fi
 fi
@@ -585,6 +598,11 @@ log "Committing backup..."
 git add -A
 if git diff --cached --quiet; then
     log "No changes since last backup"
+    # Remote is in sync only if HEAD is not ahead of upstream — a PRIOR run's push
+    # may have failed, leaving unpushed commits despite a clean worktree today.
+    if git rev-list --count '@{u}..HEAD' 2>/dev/null | grep -qx 0; then
+        _TIER1_PUSHED=true
+    fi
 else
     # Explicit error handling — set -e is suppressed by ||.
     # Without this, a corrupt git repo silently kills the script
@@ -594,6 +612,7 @@ else
             _FAILURE_REASON="git push failed — backup exists locally only (not replicated to remote)"
             log "ERROR: $_FAILURE_REASON"
         else
+            _TIER1_PUSHED=true
             log "Backup committed and pushed"
         fi
     else
