@@ -135,7 +135,9 @@ if echo "$CMD" | grep -qE "^gh pr merge|[;&|] *gh pr merge"; then
     _after=$(printf '%s' "$_after" | sed -E "s/'[^']*'//g; s/\"[^\"]*\"//g")
     # Stop at the first shell separator — a chained `; echo 456` must not
     # let its digits stand in for this merge's PR (2026-07-10 review).
-    # Quotes were dropped above, so any remaining separator is real.
+    # Quotes were dropped above, so any remaining separator is real. A
+    # newline ends the command too, so cut there first.
+    _after="${_after%%$'\n'*}"
     _after="${_after%%[;&|]*}"
     _pr_num=""
     for _tok in $_after; do

@@ -446,6 +446,8 @@ class TestResolvePrNumber:
             ("gh pr merge 123 && echo 999", "123"),
             ("gh pr merge --admin xyz; echo 456", None),  # no number → fall back
             ("gh pr merge 5 | tee 777", "5"),
+            ("gh pr merge --admin xyz\necho 456", None),  # newline chain
+            ("gh pr merge 123\necho 456", "123"),
         ],
     )
     def test_stops_at_shell_separator(self, guard_module, cmd, expected):

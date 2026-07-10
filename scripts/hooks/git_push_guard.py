@@ -81,10 +81,14 @@ def _extract_pr_number(cmd: str) -> str | None:
     match = re.search(r"\bgh pr merge\b(.*)$", cmd, re.DOTALL)
     if not match:
         return None
+    # A newline ends the command too, but shlex collapses it to plain
+    # whitespace (so a `\n echo 456` chain would leak its digits) — cut
+    # the tail at the first newline before tokenizing.
+    tail = match.group(1).split("\n", 1)[0]
     # Pre-space shell separators into standalone tokens (shlex keeps them
     # attached, e.g. '123;'). Quotes still protect a separator inside an
     # arg value — shlex parses the quoted region as one token afterwards.
-    spaced = re.sub(r"(\|\||&&|[|;&])", r" \1 ", match.group(1))
+    spaced = re.sub(r"(\|\||&&|[|;&])", r" \1 ", tail)
     try:
         # shlex keeps quoted args whole so digits inside a --subject
         # string are never mistaken for the PR number.
