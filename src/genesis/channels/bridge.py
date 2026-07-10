@@ -1,8 +1,16 @@
-"""Genesis channel bridge — entry point for the messaging bridge service.
+"""Genesis channel bridge — LEGACY FALLBACK entry point.
 
 Runs the Telegram bot with ConversationLoop routing messages through CC CLI.
 Bootstraps the full GenesisRuntime so all subsystems (awareness, memory,
 learning, reflection, inbox) are active during user conversation.
+
+genesis-server hosts the same Telegram adapter plus everything else, so the
+bridge only has a job when the server is NOT running. Two full runtimes on
+one install means duelling getUpdates pollers (telegram.error.Conflict, split
+updates, broken approval buttons), two status.json writers, and duplicate
+schedulers — so the bridge YIELDS at startup (exit 200, which the systemd
+unit's RestartPreventExitStatus treats as do-not-restart) whenever the
+genesis-server process lock is held.
 
 Must run outside a CC session (same constraint as terminal.py).
 
@@ -163,6 +171,13 @@ async def main():
     if not runtime.is_bootstrapped or runtime.cc_invoker is None:
         log.error("GenesisRuntime bootstrap failed — cannot start bridge")
         sys.exit(1)
+
+    # Re-probe before EITHER continuation (polling or headless): on a
+    # simultaneous co-start the __main__ probe can pass before the server
+    # acquires its lock, and even a headless bridge is a full duplicate
+    # runtime (schedulers, status.json writer). By the end of our ~90s
+    # bootstrap a co-started server definitely holds its lock.
+    await _late_yield_check(runtime)
 
     config = _load_bridge_config()
     if config is None:
@@ -352,8 +367,48 @@ async def main():
     log.info("Bridge stopped.")
 
 
+async def _late_yield_check(runtime, pid_dir=None) -> None:
+    """Second yield probe, run right after bootstrap in main().
+
+    Closes the co-start race the __main__ probe can't see: if the server was
+    started in the window since that probe, shut the runtime down cleanly and
+    exit 200 BEFORE this process polls getUpdates or continues headless
+    (a headless bridge is still a full duplicate runtime).
+    """
+    from genesis.util.process_lock import EXIT_ALREADY_RUNNING, ProcessLock
+
+    if ProcessLock.is_locked("genesis-server", pid_dir=pid_dir):
+        log.critical(
+            "genesis-server started during bridge bootstrap — yielding "
+            "before polling begins (exit 200)"
+        )
+        await runtime.shutdown()
+        sys.exit(EXIT_ALREADY_RUNNING)
+
+
+def _yield_to_server(pid_dir=None) -> None:
+    """Exit (code 200) if genesis-server is running — it owns the full stack.
+
+    The check covers every start path (deploy-session restarts, watchdog
+    fallback, manual start): whoever starts the bridge while the server is
+    alive gets a clean refusal instead of a second runtime silently fighting
+    the server for getUpdates, status.json, and the schedulers. Exit 200 is
+    in the unit's RestartPreventExitStatus, so systemd does not crash-loop.
+    """
+    from genesis.util.process_lock import EXIT_ALREADY_RUNNING, ProcessLock
+
+    if ProcessLock.is_locked("genesis-server", pid_dir=pid_dir):
+        log.critical(
+            "genesis-server is running — bridge yields Telegram/runtime "
+            "ownership and exits (legacy fallback runs only when the server "
+            "is down)"
+        )
+        sys.exit(EXIT_ALREADY_RUNNING)
+
+
 if __name__ == "__main__":
     from genesis.util.process_lock import ProcessLock
 
+    _yield_to_server()
     with ProcessLock("bridge"):
         asyncio.run(main())

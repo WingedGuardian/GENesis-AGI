@@ -12,6 +12,7 @@ from genesis.observability.health import (
     probe_ollama,
     probe_qdrant,
     probe_scheduler,
+    probe_scheduler_heartbeats,
     probe_wal,
 )
 from genesis.observability.types import ProbeResult, ProbeStatus
@@ -404,3 +405,62 @@ class TestInfrastructureAmbientPlumbing:
             )
         assert infra["ambient"]["status"] == "error"
         assert "boom" in infra["ambient"]["error"]
+
+
+class TestProbeSchedulerHeartbeats:
+    """Alert-only staleness probe over rt.job_health — the same heartbeat
+    source status_writer publishes for the external watchdog."""
+
+    def _jh(self, *, awareness_age_s=60, surplus_age_s=60, now=None):
+        now = now or FROZEN_CLOCK()
+        return {
+            "awareness_tick": {
+                "last_run": (now - timedelta(seconds=awareness_age_s)).isoformat()
+            },
+            "surplus_dispatch": {
+                "last_run": (now - timedelta(seconds=surplus_age_s)).isoformat()
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_fresh_heartbeats_healthy(self):
+        result = await probe_scheduler_heartbeats(
+            self._jh(), clock=FROZEN_CLOCK,
+        )
+        assert result.status == ProbeStatus.HEALTHY
+
+    @pytest.mark.asyncio
+    async def test_stale_heartbeat_down_and_named(self):
+        result = await probe_scheduler_heartbeats(
+            self._jh(surplus_age_s=1200), clock=FROZEN_CLOCK,
+        )
+        assert result.status == ProbeStatus.DOWN
+        assert "surplus_dispatch" in result.message
+
+    @pytest.mark.asyncio
+    async def test_no_data_does_not_alarm(self):
+        result = await probe_scheduler_heartbeats({}, clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.HEALTHY
+        result = await probe_scheduler_heartbeats(
+            {"awareness_tick": {}}, clock=FROZEN_CLOCK,
+        )
+        assert result.status == ProbeStatus.HEALTHY
+
+    @pytest.mark.asyncio
+    async def test_naive_timestamp_treated_as_utc(self):
+        now = FROZEN_CLOCK()
+        jh = {"awareness_tick": {"last_run":
+              (now - timedelta(seconds=1200)).replace(tzinfo=None).isoformat()}}
+        result = await probe_scheduler_heartbeats(jh, clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.DOWN
+
+    @pytest.mark.asyncio
+    async def test_no_runtime_does_not_construct_one(self):
+        """peek()-based read: with no live runtime the probe reports healthy
+        no-data and must NOT lazy-construct a blank singleton."""
+        with patch("genesis.runtime.GenesisRuntime.peek", return_value=None), \
+             patch("genesis.runtime.GenesisRuntime.instance") as inst:
+            result = await probe_scheduler_heartbeats(None, clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.HEALTHY
+        assert "no live runtime" in result.message
+        inst.assert_not_called()

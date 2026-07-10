@@ -1,6 +1,7 @@
 """Process singleton guard using fcntl file locking."""
 
 import contextlib
+import errno
 import fcntl
 import logging
 import os
@@ -37,6 +38,42 @@ class ProcessLock:
     @property
     def lock_path(self) -> Path:
         return self._lock_path
+
+    @staticmethod
+    def is_locked(name: str, pid_dir: Path | None = None) -> bool:
+        """Return True if a live process currently holds *name*'s lock.
+
+        Probe-only: briefly acquires the flock if free, then releases it
+        WITHOUT unlinking the file (an unlink could race a holder acquiring
+        between the probe and the unlink). flock auto-releases on holder
+        death, so a leftover file from a dead process reads as free.
+        """
+        lock_path = (pid_dir or _DEFAULT_PID_DIR) / f"{name}.lock"
+        if not lock_path.exists():
+            return False
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR)
+        except FileNotFoundError:
+            # Holder unlinked the file between exists() and open() — free.
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                # I/O-level failure, not contention. Still report "locked":
+                # callers use this to avoid booting a duplicate runtime, and
+                # a dual runtime is worse than a skipped fallback start —
+                # but say so instead of silently conflating the two.
+                log.warning(
+                    "Lock probe for %s inconclusive (errno=%s) — "
+                    "treating as locked", name, exc.errno,
+                )
+            return True
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
 
     def __enter__(self) -> "ProcessLock":
         self._dir.mkdir(parents=True, exist_ok=True)

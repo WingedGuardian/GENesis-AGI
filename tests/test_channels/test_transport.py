@@ -433,3 +433,64 @@ class TestAdapterOffsetDebounce:
             # force=True bypasses the debounce check
             adapter._persist_offset(force=True)
             assert mock_write.call_count == 2
+
+
+class TestLivenessHTTPXRequest:
+    """The getUpdates request pool must report every successful poll
+    round-trip — including EMPTY ones — so a quiet chat doesn't read as a
+    stalled poller (false stalls restarted the updater every threshold
+    window all day on 2026-07-08)."""
+
+    def _make(self, do_request_result=None, do_request_exc=None):
+        from unittest.mock import AsyncMock, patch
+
+        from genesis.channels.telegram.transport.polling import (
+            LivenessHTTPXRequest,
+        )
+
+        calls = []
+        req = LivenessHTTPXRequest(
+            connection_pool_size=1, on_success=lambda: calls.append(1),
+        )
+        parent = AsyncMock()
+        if do_request_exc is not None:
+            parent.side_effect = do_request_exc
+        else:
+            parent.return_value = do_request_result
+        patcher = patch(
+            "telegram.request.HTTPXRequest.do_request", parent,
+        )
+        return req, calls, patcher
+
+    @pytest.mark.asyncio
+    async def test_successful_empty_poll_records(self):
+        req, calls, patcher = self._make(do_request_result=(200, b'{"ok":true,"result":[]}'))
+        with patcher:
+            await req.do_request(url="u", method="post")
+        assert calls == [1]
+
+    @pytest.mark.asyncio
+    async def test_http_error_does_not_record(self):
+        req, calls, patcher = self._make(do_request_result=(409, b"conflict"))
+        with patcher:
+            await req.do_request(url="u", method="post")
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_exception_does_not_record(self):
+        req, calls, patcher = self._make(do_request_exc=RuntimeError("net down"))
+        with patcher, pytest.raises(RuntimeError):
+            await req.do_request(url="u", method="post")
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_no_callback_is_safe(self):
+        from unittest.mock import AsyncMock, patch
+
+        from genesis.channels.telegram.transport.polling import (
+            LivenessHTTPXRequest,
+        )
+
+        req = LivenessHTTPXRequest(connection_pool_size=1)
+        with patch("telegram.request.HTTPXRequest.do_request", AsyncMock(return_value=(200, b""))):
+            await req.do_request(url="u", method="post")  # must not raise

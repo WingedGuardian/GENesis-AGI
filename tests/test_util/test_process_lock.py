@@ -123,3 +123,77 @@ def test_creates_pid_dir(tmp_path):
     with ProcessLock("nested", pid_dir=nested):
         assert nested.exists()
         assert (nested / "nested.lock").exists()
+
+
+def test_is_locked_false_when_free(tmp_path):
+    """No holder (or no lock file at all) → not locked."""
+    assert ProcessLock.is_locked("free", pid_dir=tmp_path) is False
+    # Probing must not delete a pre-existing lock file left on disk
+    (tmp_path / "stale.lock").write_text("12345")
+    assert ProcessLock.is_locked("stale", pid_dir=tmp_path) is False
+    assert (tmp_path / "stale.lock").exists()
+
+
+def test_is_locked_true_while_held(tmp_path):
+    """A live holder in another process → locked; released → unlocked."""
+    import textwrap
+    import time
+
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(f"""\
+                import time
+                from pathlib import Path
+                from genesis.util.process_lock import ProcessLock
+                with ProcessLock("held", pid_dir=Path("{tmp_path}")):
+                    time.sleep(30)
+            """),
+        ],
+    )
+    try:
+        lock_path = tmp_path / "held.lock"
+        for _ in range(100):
+            if lock_path.exists() and lock_path.read_text().strip():
+                break
+            time.sleep(0.1)
+        assert ProcessLock.is_locked("held", pid_dir=tmp_path) is True
+    finally:
+        holder.send_signal(signal.SIGTERM)
+        holder.wait(timeout=10)
+    # flock auto-releases on process death
+    assert ProcessLock.is_locked("held", pid_dir=tmp_path) is False
+
+
+def test_is_locked_vanishing_file_is_free(tmp_path, monkeypatch):
+    """Holder unlinks the lock file between exists() and open() → free,
+    not a crash (TOCTOU guard)."""
+    (tmp_path / "gone.lock").write_text("1")
+    real_open = os.open
+
+    def _vanish(path, *a, **kw):
+        if path.endswith("gone.lock"):
+            raise FileNotFoundError(path)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(os, "open", _vanish)
+    assert ProcessLock.is_locked("gone", pid_dir=tmp_path) is False
+
+
+def test_is_locked_io_error_reports_locked_with_warning(tmp_path, monkeypatch, caplog):
+    """Non-contention flock failures (EIO etc.) read as locked — refusing a
+    fallback start is safer than risking a dual runtime — but loudly."""
+    import errno as _errno
+    import fcntl
+    import logging
+
+    (tmp_path / "weird.lock").write_text("1")
+
+    def _eio(*a, **kw):
+        raise OSError(_errno.EIO, "io error")
+
+    monkeypatch.setattr(fcntl, "flock", _eio)
+    with caplog.at_level(logging.WARNING):
+        assert ProcessLock.is_locked("weird", pid_dir=tmp_path) is True
+    assert any("inconclusive" in r.message for r in caplog.records)

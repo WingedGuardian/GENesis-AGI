@@ -239,6 +239,75 @@ async def probe_scheduler(
         )
 
 
+async def probe_scheduler_heartbeats(
+    job_health: dict | None = None,
+    *,
+    stale_after_s: float = 900.0,
+    clock=None,
+) -> ProbeResult:
+    """DOWN if any scheduler heartbeat in rt.job_health is stale.
+
+    Reads the same last_run entries the status writer publishes as
+    ``scheduler_heartbeats`` for the external watchdog. The watchdog owns the
+    RESTART response (zombie-scheduler path, with heavy-workload/stabilization
+    guards); this probe only feeds the alert-only remediation lane. Because it
+    is evaluated inside the awareness tick, a fully hung awareness loop can
+    never alert on itself — this catches zombie SIBLING schedulers (e.g.
+    surplus dead while awareness alive). Missing entries don't alarm.
+    """
+    _clock = clock or (lambda: datetime.now(UTC))
+    start = time.monotonic()
+    try:
+        if job_health is None:
+            from genesis.runtime import GenesisRuntime
+
+            # peek(), not instance(): a read-only probe must never
+            # lazy-construct a blank runtime (masks bootstrap failures).
+            rt = GenesisRuntime.peek()
+            if rt is None:
+                latency = (time.monotonic() - start) * 1000
+                return ProbeResult(
+                    name="scheduler_heartbeats",
+                    status=ProbeStatus.HEALTHY,
+                    latency_ms=round(latency, 2),
+                    message="no live runtime",
+                    checked_at=_clock().isoformat(),
+                )
+            job_health = rt.job_health
+        now = _clock()
+        stale: list[str] = []
+        for job_name in ("awareness_tick", "surplus_dispatch"):
+            last_run = job_health.get(job_name, {}).get("last_run")
+            if not last_run:
+                continue  # no data yet — don't alarm
+            try:
+                ts = datetime.fromisoformat(last_run)
+            except (ValueError, TypeError):
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=UTC)
+            age_s = (now - ts).total_seconds()
+            if age_s > stale_after_s:
+                stale.append(f"{job_name} ({int(age_s)}s stale)")
+        latency = (time.monotonic() - start) * 1000
+        return ProbeResult(
+            name="scheduler_heartbeats",
+            status=ProbeStatus.DOWN if stale else ProbeStatus.HEALTHY,
+            latency_ms=round(latency, 2),
+            message="; ".join(stale),
+            checked_at=_clock().isoformat(),
+        )
+    except Exception as exc:
+        latency = (time.monotonic() - start) * 1000
+        return ProbeResult(
+            name="scheduler_heartbeats",
+            status=ProbeStatus.HEALTHY,  # can't evaluate ≠ schedulers dead
+            latency_ms=round(latency, 2),
+            message=f"heartbeat data unavailable: {exc}",
+            checked_at=_clock().isoformat(),
+        )
+
+
 async def probe_disk(
     mount_path: str = "/",
     *,
@@ -553,6 +622,7 @@ async def collect_probe_results(
         _safe("disk", probe_disk()),
         _safe("guardian", probe_guardian(guardian_remote=guardian_remote)),
         _safe("browser_processes", probe_browser_processes()),
+        _safe("scheduler_heartbeats", probe_scheduler_heartbeats()),
     ]
     if db is not None:
         tasks.append(_safe("db", probe_db(db)))

@@ -516,6 +516,23 @@ class StandaloneAdapter:
             from genesis.channels.bridge import _load_bridge_config
             from genesis.channels.config import load_channel_defaults
 
+            # Belt for the bridge-side yield guard: a legacy bridge that
+            # predates the guard (or was started in the probe→bootstrap race
+            # window) would silently fight this adapter for getUpdates.
+            # The server is the owner — start anyway, but loudly.
+            try:
+                from genesis.util.process_lock import ProcessLock
+
+                if ProcessLock.is_locked("bridge"):
+                    logger.critical(
+                        "genesis-bridge is running alongside the server — "
+                        "dual getUpdates pollers will conflict (dropped "
+                        "updates, broken approval buttons). Stop it: "
+                        "systemctl --user stop genesis-bridge"
+                    )
+            except Exception:
+                logger.debug("Bridge-lock probe failed", exc_info=True)
+
             config = _load_bridge_config()
             if config is None:
                 logger.info("No Telegram token — running dashboard-only")

@@ -84,6 +84,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   now restores those fields. Separately, keyword-only memories were being scored as
   if created just now (maximum freshness), letting old notes outrank genuinely recent
   ones; they now use their real creation time.
+- **Telegram no longer drops messages or breaks approval buttons when the
+  legacy bridge gets started alongside the server.** Two Genesis processes
+  polling the same bot token split incoming updates between them (observed:
+  thousands of `Conflict` errors, unresponsive approval buttons, and a
+  corrupted health-status file monitored by the watchdog). The bridge now
+  yields cleanly at startup whenever the server is running — however it was
+  started (deploy script habit, manual, self-heal) — and the server calls out
+  a rogue bridge loudly instead of failing silently. The broken self-heal
+  rule that restarted the bridge on a stale awareness heartbeat (a leftover
+  from when the bridge owned the awareness loop) is gone; a health alert
+  takes its place, and server restarts for genuinely dead schedulers remain
+  with the external watchdog.
+- **Quiet hours no longer restart the Telegram poller.** The stall detector
+  only counted arriving messages as signs of life, so any 15+ minutes of
+  silence looked like a hung poller and triggered an updater restart, all day
+  long. Successful empty polls now count as liveness; real network hangs
+  still trigger the restart.
 
 - **Protected-path guarding now covers the real systemd unit sources.** The
   critical-path rules protected a stale copy of the watchdog unit under

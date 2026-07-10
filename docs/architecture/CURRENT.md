@@ -247,11 +247,17 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 8235a607 2026-07-08
+verified: 0eb21377 2026-07-10
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
-  `genesis-bridge.service`, boots a full headless runtime); voice (HA,
+  `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
+  it yields at startup, exit 200, when the genesis-server process lock is
+  held, because two runtimes dual-poll getUpdates and both write
+  status.json; the server hosts the same adapter via
+  `hosting/standalone.py`. The polling stall watchdog records liveness
+  from successful EMPTY getUpdates round trips too —
+  `LivenessHTTPXRequest` — so idle chat is not a stall); voice (HA,
   OUTBOUND-only — inbound voice arrives via `dashboard/routes/voice_api.py`;
   uses `media_player.play_media`, never `assist_satellite.announce` which
   reopens the mic); Discord webhook; email SMTP. All env-gated. "OpenClaw" here
