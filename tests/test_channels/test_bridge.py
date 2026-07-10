@@ -3,6 +3,8 @@
 import os
 import tempfile
 
+import pytest
+
 from genesis.channels.bridge import _load_bridge_config
 
 
@@ -116,9 +118,10 @@ class TestYieldToServer:
 
 
 class TestLateYieldCheck:
-    """The pre-polling re-probe: a server that started during the bridge's
-    ~90s bootstrap is detected before the first getUpdates poll."""
+    """The post-bootstrap re-probe: a server that started during the bridge's
+    ~90s bootstrap is detected before polling OR headless continuation."""
 
+    @pytest.mark.asyncio
     async def test_shuts_down_and_exits_200_when_server_appeared(self, tmp_path):
         import subprocess
         import sys as _sys
@@ -159,6 +162,7 @@ class TestLateYieldCheck:
             holder.terminate()
             holder.wait(timeout=10)
 
+    @pytest.mark.asyncio
     async def test_noop_when_server_absent(self, tmp_path):
         from unittest.mock import AsyncMock
 
