@@ -1457,3 +1457,39 @@ class TestDispatchClaim:
         assert dispatcher._dispatch_inflight == set()  # guard cleaned up
         task = await task_states.get_by_id(db, "t-001")
         assert task["current_phase"] == "completed"
+
+    async def test_paused_at_verify_boundary_stays_paused(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """A task paused after its LAST step completed (empty remaining_steps)
+        must stay paused on recovery — not verify/deliver without an explicit
+        resume. Codex P2: the per-step checkpoint never runs when the loop is
+        empty, so a pre-verify pause gate is required."""
+        await _seed_task(db, plan_path=plan_file, phase="paused")
+        await task_steps.create_step(
+            db, task_id="t-001", step_idx=0, step_type="research",
+            description="Step 0",
+        )
+        await db.execute(
+            """UPDATE task_steps SET status='completed',
+               result_json='{"result": "done", "artifacts": []}'
+               WHERE task_id='t-001' AND step_idx=0""",
+        )
+        await db.commit()
+
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        engine._paused_tasks.add("t-001")
+
+        task = asyncio.create_task(engine.execute("t-001"))
+        await asyncio.sleep(0.3)
+
+        # Paused at the verify boundary — did NOT verify/deliver.
+        assert engine._active_tasks.get("t-001") == TaskPhase.PAUSED
+        mock_reviewer.verify_deliverable.assert_not_called()
+
+        # Explicit resume -> completes.
+        engine._paused_tasks.discard("t-001")
+        engine._pause_events["t-001"].set()
+        assert await asyncio.wait_for(task, timeout=5.0) is True
+        mock_reviewer.verify_deliverable.assert_called()

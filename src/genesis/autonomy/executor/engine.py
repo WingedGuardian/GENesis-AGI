@@ -583,6 +583,14 @@ class CCSessionExecutor:
                     )
                     return False
 
+            # A task paused right at the exec->verify boundary (all steps already
+            # completed) has an empty remaining_steps loop, so the per-step
+            # _checkpoint never ran. Honor a pending pause here so a paused task
+            # recovered after its last step stays paused instead of delivering
+            # without an explicit resume.
+            if not await self._honor_pause(task_id, cancel_event):
+                return False
+
             # --- VERIFYING (review loop, Amendment #4) ---
             deliverable = _dispatch.synthesize_deliverable(step_results)
 
@@ -1028,6 +1036,54 @@ class CCSessionExecutor:
     # Checkpoint (Amendment #13: global pause)
     # =================================================================
 
+    async def _honor_pause(
+        self, task_id: str, cancel: asyncio.Event | None,
+    ) -> bool:
+        """If a global or per-task pause is active, transition to PAUSED,
+        release the exec semaphore, and wait for resume (or cancel).
+
+        Returns ``False`` if the task was cancelled while paused, ``True``
+        otherwise (including when no pause is active — a no-op). Callers must
+        ``return False`` on a False result. Shared by the per-step checkpoint
+        and the pre-verify gate, so a task paused with no remaining steps still
+        stays paused across a restart instead of delivering without a resume.
+        """
+        should_pause = (
+            (self._runtime and getattr(self._runtime, "paused", False))
+            or task_id in self._paused_tasks
+        )
+        if not should_pause:
+            return True
+
+        await self._transition(task_id, TaskPhase.PAUSED)
+
+        # Release execution semaphore so another task can run
+        if self._exec_semaphore:
+            self._exec_semaphore.release()
+            self._semaphore_released.add(task_id)
+
+        pause_event = asyncio.Event()
+        self._pause_events[task_id] = pause_event
+
+        # Wait for resume OR cancel
+        while not pause_event.is_set():
+            if cancel and cancel.is_set():
+                with contextlib.suppress(InvalidTransitionError):
+                    await self._transition(task_id, TaskPhase.CANCELLED)
+                # semaphore_released stays set — dispatcher skips release
+                # in _guarded_execute finally block
+                return False
+            await asyncio.sleep(0.1)
+
+        # Reacquire semaphore before resuming
+        if self._exec_semaphore:
+            await self._exec_semaphore.acquire()
+            self._semaphore_released.discard(task_id)
+
+        self._paused_tasks.discard(task_id)
+        await self._transition(task_id, TaskPhase.EXECUTING)
+        return True
+
     async def _checkpoint(
         self,
         task_id: str,
@@ -1045,38 +1101,8 @@ class CCSessionExecutor:
             return False
 
         # Amendment #13: global pause check + per-task pause
-        should_pause = (
-            (self._runtime and getattr(self._runtime, "paused", False))
-            or task_id in self._paused_tasks
-        )
-        if should_pause:
-            await self._transition(task_id, TaskPhase.PAUSED)
-
-            # Release execution semaphore so another task can run
-            if self._exec_semaphore:
-                self._exec_semaphore.release()
-                self._semaphore_released.add(task_id)
-
-            pause_event = asyncio.Event()
-            self._pause_events[task_id] = pause_event
-
-            # Wait for resume OR cancel
-            while not pause_event.is_set():
-                if cancel and cancel.is_set():
-                    with contextlib.suppress(InvalidTransitionError):
-                        await self._transition(task_id, TaskPhase.CANCELLED)
-                    # semaphore_released stays set — dispatcher will
-                    # skip release in _guarded_execute finally block
-                    return False
-                await asyncio.sleep(0.1)
-
-            # Reacquire semaphore before resuming
-            if self._exec_semaphore:
-                await self._exec_semaphore.acquire()
-                self._semaphore_released.discard(task_id)
-
-            self._paused_tasks.discard(task_id)
-            await self._transition(task_id, TaskPhase.EXECUTING)
+        if not await self._honor_pause(task_id, cancel):
+            return False
 
         # Emit progress event
         if self._event_bus:
