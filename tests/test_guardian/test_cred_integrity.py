@@ -283,6 +283,27 @@ def test_pipe_mode_parity_and_no_genesis_imports(tmp_path):
     assert piped["claude_credentials"]["status"] == in_proc["claude_credentials"].status
 
 
+def test_cli_backup_dir_follows_home(tmp_path, capsys, monkeypatch):
+    """CLI --home must tie the default backup dir to the RESOLVED home, not $HOME
+    — otherwise a sandbox leaks to the real backup clone (missing vs absent)."""
+    from genesis.guardian.cred_integrity import main
+
+    # A real HOME with a backup clone that would (wrongly) be consulted.
+    real_home = tmp_path / "real"
+    (real_home / "backups" / "genesis-backups" / "secrets").mkdir(parents=True)
+    (real_home / "backups" / "genesis-backups" / "secrets" / "secrets.env.gpg").write_bytes(b"x")
+    monkeypatch.setenv("HOME", str(real_home))
+
+    sandbox = tmp_path / "sandbox"  # no backups here
+    sandbox.mkdir()
+    main(["check", "--json", "--home", str(sandbox)])
+    out = json.loads(capsys.readouterr().out)["results"]
+    # secrets.env is missing in the sandbox and there's NO sandbox backup →
+    # must be "absent", not "missing" (which would mean the real clone leaked in).
+    assert out["secrets_env"]["status"] == "absent"
+    assert out["secrets_env"]["backup_exists"] is False
+
+
 def test_secrets_env_small_but_valid_is_ok():
     """min_keys=1: a legitimate small secrets.env (few keys) must NOT be flagged
     corrupt — only a file that parses to ZERO keys is."""

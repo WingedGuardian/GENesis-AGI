@@ -396,8 +396,10 @@ def _default_home() -> Path:
     return Path(os.environ.get("HOME") or os.path.expanduser("~"))
 
 
-def _default_backup_dir() -> Path:
-    return _default_home() / "backups" / "genesis-backups"
+def _default_backup_dir(home: Path) -> Path:
+    # Derive from the RESOLVED home (respects --home), not $HOME — otherwise a
+    # --home sandbox / container_home override leaks to the real backup clone.
+    return home / "backups" / "genesis-backups"
 
 
 def _targets_by_name() -> dict[str, CredTarget]:
@@ -422,7 +424,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     home = Path(args.home).expanduser() if args.home else _default_home()
     backup_dir = (
-        Path(args.backup_dir).expanduser() if args.backup_dir else _default_backup_dir()
+        Path(args.backup_dir).expanduser() if args.backup_dir
+        else _default_backup_dir(home)
     )
     backup_arg = backup_dir if backup_dir.exists() else None
 
