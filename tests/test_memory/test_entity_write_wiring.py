@@ -139,6 +139,48 @@ class TestRecordExtraction:
         assert n == 1  # no duplicate concept-typed OMI
 
     @pytest.mark.asyncio
+    async def test_parser_preserves_relationship_provenance_fields(self, db):
+        """END-TO-END through the real parser (review finding: the
+        earlier test hand-built dicts and masked a parser field-drop)."""
+        from genesis.memory.extraction import parse_extraction_response
+
+        raw = (
+            '{"extractions": [{"content": "OMI is a voice device", '
+            '"type": "entity", "confidence": 0.8, "entities": ["OMI"], '
+            '"relationships": [{"from": "OMI", "to": "voice-edge-device", '
+            '"type": "is_a", "confidence": 0.55, "ambiguous": true}], '
+            '"temporal": null}]}'
+        )
+        extractions = parse_extraction_response(raw)
+        assert extractions, "parser returned nothing"
+        await record_extraction(db, "mem-1", extractions[0], aliases={})
+        rows = await db.execute_fetchall(
+            "SELECT provenance, confidence FROM entity_links"
+        )
+        assert rows[0][0] == "AMBIGUOUS"
+        assert rows[0][1] == 0.55
+
+    @pytest.mark.asyncio
+    async def test_merge_no_self_loop_on_preexisting_pair_link(self, db):
+        """Review finding: merging entities that already link to each
+        other must not mint a self-loop edge."""
+        loser = await entities_crud.create_entity(
+            db, name="QdrantDB", norm_name="qdrantdb", entity_type="product",
+        )
+        survivor = await entities_crud.create_entity(
+            db, name="Qdrant", norm_name="qdrant", entity_type="product",
+        )
+        await entities_crud.upsert_link(
+            db, source_id=loser, target_id=survivor, link_type="supersedes",
+            provenance="EXTRACTED",
+        )
+        await entities_crud.merge_entity(db, loser_id=loser, survivor_id=survivor)
+        rows = await db.execute_fetchall(
+            "SELECT source_id, target_id FROM entity_links"
+        )
+        assert all(r[0] != r[1] for r in rows), f"self-loop minted: {list(rows)}"
+
+    @pytest.mark.asyncio
     async def test_self_link_and_blank_names_skipped(self, db):
         extraction = FakeExtraction(
             relationships=[

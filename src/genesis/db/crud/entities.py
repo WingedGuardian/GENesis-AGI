@@ -315,14 +315,16 @@ async def merge_entity(
         "DELETE FROM entity_mentions WHERE entity_id = ?", (loser_id,),
     )
     for src_col, dst_col in (("source_id", "target_id"), ("target_id", "source_id")):
+        # dst != survivor guard: a pre-existing loser↔survivor link
+        # (e.g. an LLM-emitted supersedes) must not become a self-loop.
         await db.execute(
             f"INSERT OR IGNORE INTO entity_links "  # noqa: S608
             f"({src_col}, {dst_col}, link_type, provenance, confidence, "
             f"evidence_memory_id, valid_at, invalid_at, invalidated_by, created_at) "
             f"SELECT ?, {dst_col}, link_type, provenance, confidence, "
             f"evidence_memory_id, valid_at, invalid_at, invalidated_by, created_at "
-            f"FROM entity_links WHERE {src_col} = ?",
-            (survivor_id, loser_id),
+            f"FROM entity_links WHERE {src_col} = ? AND {dst_col} != ?",
+            (survivor_id, loser_id, survivor_id),
         )
         await db.execute(
             f"DELETE FROM entity_links WHERE {src_col} = ?",  # noqa: S608
