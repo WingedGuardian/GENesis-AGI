@@ -216,6 +216,17 @@ async def call_sites(
         except sqlite3.Error:
             logger.debug("call_site_last_run query failed", exc_info=True)
 
+    # ── Model Fusion (non-routing, on-demand paid consult) ──────────────
+    # The `deliberate` MCP tool records via record_last_run_detached, so once it
+    # has run the loop above already added it as active. Seed it here so the node
+    # is ALWAYS present on the monitor — idle before its first run — since it is
+    # not a routing call site and would otherwise never appear until first use.
+    # setdefault → no-op when a last_run row already created it. Meta is layered
+    # per-key so both the idle seed and an existing active node self-describe.
+    mf = result.setdefault("model_fusion", {"status": "idle", "routing": False})
+    for _k, _v in _CALL_SITE_META.get("model_fusion", {}).items():
+        mf.setdefault(_k, _v)
+
     # ── Groundwork sites → idle (gray) ──────────────────────────────────
     # Sites with wired=False and no last_run record are groundwork/ceremonial.
     for sid, site_data in result.items():

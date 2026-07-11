@@ -466,6 +466,10 @@ const SITE_META = {
         name: 'G. Background', desc: 'Autonomous background sessions for reflections, inbox, and surplus tasks.',
         category: 'core', frequency: 'On demand', costPolicy: 'Subscription',
     },
+    'model_fusion': {
+        name: 'Fusion', desc: 'On-demand panel-of-models consult (OpenRouter Fusion) — synthesized verdict plus explicit dissent for high-stakes decisions. Invoked via the deliberate MCP tool.',
+        category: 'reasoning', frequency: 'On demand (opt-in)', costPolicy: 'Paid (OpenRouter Fusion)',
+    },
     // ── Routing call sites — name + category only (desc/frequency/costPolicy from backend) ──
     '3_micro_reflection': { name: 'Micro Reflect', category: 'reflection' },
     '4_light_reflection': { name: 'Light Reflect', category: 'reflection' },
@@ -925,11 +929,21 @@ function showDetail(item) {
     // Status + disabled banner
     const STATUS_COLORS = { healthy: '#4ade80', active: '#4ade80', warning: '#f59e0b', degraded: '#ffe600', down: '#ef4444', idle: '#888', disabled: '#888' };
     const statusColor = STATUS_COLORS[item.status] || '#888';
+    // A wired site seeded idle (status_reason WIRED) is available-but-not-yet-run
+    // \u2014 e.g. the on-demand Model Fusion consult \u2014 NOT groundwork. Distinguish it
+    // from true groundwork (wired=False, config-only sites) so a live tool isn't
+    // mislabeled "Disabled (groundwork)".
+    const isWiredIdle = item.status === 'idle' && item.data.status_reason === 'WIRED';
     let statusLabel = item.status;
-    if (item.status === 'idle') statusLabel = 'Disabled (groundwork)';
+    if (isWiredIdle) statusLabel = 'Idle \u2014 on-demand (not yet run)';
+    else if (item.status === 'idle') statusLabel = 'Disabled (groundwork)';
     else if (item.status === 'disabled') statusLabel = 'Disabled (no API key)';
     content.appendChild(sectionRow('Status', statusLabel, 'color:' + statusColor));
-    if (item.status === 'idle') {
+    if (isWiredIdle) {
+        const banner = el('div', null, 'Wired and available \u2014 this on-demand tool simply has not run yet. It records a run each time it is invoked.');
+        banner.style.cssText = 'background:rgba(167,139,250,0.15);color:#c4b5fd;padding:6px 10px;border-radius:4px;font-size:11px;margin:8px 0;';
+        content.appendChild(banner);
+    } else if (item.status === 'idle') {
         const banner = el('div', null, 'This call site is groundwork \u2014 config exists but no code invokes it yet.');
         banner.style.cssText = 'background:rgba(136,136,136,0.15);color:#888;padding:6px 10px;border-radius:4px;font-size:11px;margin:8px 0;';
         content.appendChild(banner);
@@ -1905,6 +1919,11 @@ const SUBSYSTEM_GROUPS = {
                 '11_user_model_synthesis', '18_meta_prompting', '22_tagging',
                 '28_observation_sweep', '34_research_synthesis', '35_content_draft'],
     },
+    model_fusion: {
+        name: 'Model Fusion', domId: 'sub-model-fusion',
+        desc: 'On-demand panel-of-models consult (OpenRouter Fusion) — a custom panel + judge return a synthesized verdict plus explicit dissent for high-stakes, contested decisions. Invoked via the deliberate MCP tool.',
+        sites: ['model_fusion'],
+    },
 };
 
 function aggregateStatus(statuses) {
@@ -1928,7 +1947,7 @@ function statusDotColor(status) {
 const SUBSYSTEM_BORDER_COLORS = {
     ego: '#c084fc', reflection: '#818cf8', memory: '#38bdf8', surplus: '#4ade80',
     outreach: '#fbbf24', executor: '#a78bfa', learning: '#fb923c',
-    contingency: '#f87171', utility: '#94a3b8',
+    contingency: '#f87171', utility: '#94a3b8', model_fusion: '#e879f9',
 };
 
 
@@ -1962,6 +1981,7 @@ function updateSubsystemGrid(data) {
         executor:    [[5,5],[6,5],[5,6],[6,6]],
         outreach:    [[3,7],[4,7]],
         contingency: [[5,7],[6,7]],
+        model_fusion: [[7,7]],
     };
 
     for (const [key, group] of Object.entries(SUBSYSTEM_GROUPS)) {
@@ -1979,7 +1999,8 @@ function updateSubsystemGrid(data) {
             const dot = el('div', 'grid-dot ' + gridDotClass(status));
             dot.addEventListener('click', () => showDetail({ id: siteId, status, data: siteData }));
             const tipRows = [{ cls: 'dot-tip-name', text: meta.name }];
-            if (status === 'idle') tipRows.push({ text: 'Groundwork' });
+            if (status === 'idle' && siteData.status_reason === 'WIRED') tipRows.push({ text: 'On-demand · not yet run' });
+            else if (status === 'idle') tipRows.push({ text: 'Groundwork' });
             else if (status === 'disabled') tipRows.push({ text: 'No API key' });
             else tipRows.push({ text: status });
             if (siteData.active_provider) tipRows.push({ text: siteData.active_provider });
