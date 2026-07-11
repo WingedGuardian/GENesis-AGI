@@ -16,6 +16,7 @@ from genesis.memory.reference_ops import (
 from genesis.memory.reference_ops import (
     delete_reference_entry,
 )
+from genesis.security import immunity_shadow
 
 from ..memory import mcp
 from ._scoring import DEFAULT_KB_FLOOR_RATIO, relative_kb_floor
@@ -212,11 +213,24 @@ async def knowledge_recall(
     # Injection defense (PR2): every knowledge_recall hit is external-world —
     # wrap the content (vector `r.content` and FTS `body` both land under the
     # `content` key here) so the model treats it as data, not instructions.
+    blockable = 0
     for d in final:
         if isinstance(d, dict) and "content" in d:
             d["content"] = wrap_external_recall(
                 d["content"], source_pipeline=d.get("source_pipeline"),
             )
+            if immunity_shadow.item_is_blockable(
+                collection=d.get("collection"),
+                source_pipeline=d.get("source_pipeline"),
+            ):
+                blockable += 1
+    # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
+    # knowledge-recall prompt (observe-only — every hit is external-world).
+    await immunity_shadow.record_would_block(
+        gate="injection", source_kind="recall_inject",
+        source_ref="mcp/memory/knowledge.py::knowledge_recall", process="server",
+        blockable_count=blockable, db=memory_mod._db,
+    )
     return final
 
 

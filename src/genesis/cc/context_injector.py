@@ -6,6 +6,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from genesis.memory.provenance import is_external, wrap_external_recall
+from genesis.security import immunity_shadow
 
 if TYPE_CHECKING:
     from genesis.memory.retrieval import HybridRetriever
@@ -55,6 +56,7 @@ class ContextInjector:
             return ""
 
         lines = ["## Relevant Prior Experience\n"]
+        blockable = 0
         for r in results:
             content = r.content[:200]
             # Injection defense (PR2): this path recalls source="episodic"
@@ -64,8 +66,21 @@ class ContextInjector:
                 content = wrap_external_recall(
                     content, source_pipeline=getattr(r, "source_pipeline", None),
                 )
+                if immunity_shadow.item_is_blockable(
+                    collection=getattr(r, "collection", None),
+                    source_pipeline=getattr(r, "source_pipeline", None),
+                ):
+                    blockable += 1
             lines.append(
                 f"- **[{r.memory_type}]** (score: {r.score:.2f}) {content}"
             )
 
+        # WS-3 B1 gate 4 (injection): shadow-record external content reaching the
+        # CC context prompt. Episodic-only today -> 0 rows; wired for future
+        # widening (observe-only; db=None -> self-resolve).
+        await immunity_shadow.record_would_block(
+            gate="injection", source_kind="recall_inject",
+            source_ref="cc/context_injector.py::inject", process="server",
+            blockable_count=blockable, db=None,
+        )
         return "\n".join(lines)
