@@ -211,3 +211,51 @@ async def test_api_site_auto_derives_and_has_no_cc_entry():
     assert result["judge"]["cost_policy"].startswith("Paid primary")
     chain = result["judge"]["chain_health"]
     assert not any(entry.get("is_cc") for entry in chain)
+
+
+# ── D: Model Fusion — non-routing node, seeded idle, active with a run ───────
+# The deliberate MCP tool (OpenRouter Fusion, raw httpx — not the router) is not
+# a routing call site, so it would never appear until its first run. call_sites()
+# seeds it idle so it is ALWAYS present on the monitor, then flips to active once
+# a call_site_last_run row exists.
+
+
+@pytest.mark.asyncio
+async def test_model_fusion_seeded_idle_without_run():
+    cfg = _config({}, {})
+    result = await call_sites(db=None, routing_config=cfg, breakers=_registry())
+    mf = result.get("model_fusion")
+    assert mf is not None, "model_fusion node missing from snapshot"
+    assert mf["status"] == "idle"
+    assert mf["routing"] is False
+    # Backend meta is layered onto the seed → self-describing payload.
+    assert mf["category"] == "reasoning"
+    assert mf["cost_policy"] == "Paid (OpenRouter Fusion)"
+
+
+@pytest.mark.asyncio
+async def test_model_fusion_active_with_recorded_run(tmp_path):
+    import aiosqlite
+
+    from genesis.observability.call_site_recorder import record_last_run
+
+    path = tmp_path / "cs.db"
+    async with aiosqlite.connect(str(path)) as conn:
+        await conn.execute(
+            """CREATE TABLE call_site_last_run (
+                call_site_id TEXT PRIMARY KEY, last_run_at TEXT NOT NULL,
+                provider_used TEXT, model_id TEXT, response_text TEXT,
+                input_tokens INTEGER, output_tokens INTEGER,
+                success INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL)"""
+        )
+        await conn.commit()
+        await record_last_run(
+            conn, "model_fusion", provider="openrouter",
+            model_id="fusion:budget", response_text="verdict text",
+        )
+        result = await call_sites(db=conn, routing_config=_config({}, {}), breakers=_registry())
+    mf = result["model_fusion"]
+    assert mf["status"] == "active"  # seed no-ops; the recorded row drives active
+    assert mf["routing"] is False
+    assert mf["last_run_model"] == "fusion:budget"
+    assert mf["last_response"] == "verdict text"

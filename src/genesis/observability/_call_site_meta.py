@@ -579,4 +579,19 @@ _CALL_SITE_META: dict[str, dict] = {
         "cc_model": "Haiku",
         "model_tier": "cc",
     },
+    "model_fusion": {
+        # Non-routing, on-demand paid consult: the deliberate MCP tool POSTs
+        # OpenRouter Fusion over raw httpx (NOT through the router), then records
+        # via record_last_run_detached. snapshots/call_sites.py seeds it idle so
+        # the node is always present. Manual cost_policy: it never touches a
+        # routing chain, so cost is not auto-derived. No `dispatch` (not CC) and
+        # no `wired` key (it IS wired — a wired:False would force it permanently
+        # idle via the groundwork block).
+        "description": "On-demand panel-of-models consult (OpenRouter Fusion): a custom panel + judge return a synthesized verdict PLUS explicit dissent for genuinely high-stakes or contested decisions. PAID + opt-in — invoked via the `deliberate` MCP tool, never a default judgment path.",
+        "category": "reasoning",
+        "frequency": "On demand (opt-in)",
+        "cost_policy": "Paid (OpenRouter Fusion)",
+        "model_tier": "frontier",
+        "status_reason": "WIRED",
+    },
 }

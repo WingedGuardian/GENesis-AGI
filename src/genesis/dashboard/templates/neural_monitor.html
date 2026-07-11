@@ -466,6 +466,10 @@ const SITE_META = {
         name: 'G. Background', desc: 'Autonomous background sessions for reflections, inbox, and surplus tasks.',
         category: 'core', frequency: 'On demand', costPolicy: 'Subscription',
     },
+    'model_fusion': {
+        name: 'Fusion', desc: 'On-demand panel-of-models consult (OpenRouter Fusion) — synthesized verdict plus explicit dissent for high-stakes decisions. Invoked via the deliberate MCP tool.',
+        category: 'reasoning', frequency: 'On demand (opt-in)', costPolicy: 'Paid (OpenRouter Fusion)',
+    },
     // ── Routing call sites — name + category only (desc/frequency/costPolicy from backend) ──
     '3_micro_reflection': { name: 'Micro Reflect', category: 'reflection' },
     '4_light_reflection': { name: 'Light Reflect', category: 'reflection' },
@@ -1905,6 +1909,11 @@ const SUBSYSTEM_GROUPS = {
                 '11_user_model_synthesis', '18_meta_prompting', '22_tagging',
                 '28_observation_sweep', '34_research_synthesis', '35_content_draft'],
     },
+    model_fusion: {
+        name: 'Model Fusion', domId: 'sub-model-fusion',
+        desc: 'On-demand panel-of-models consult (OpenRouter Fusion) — a custom panel + judge return a synthesized verdict plus explicit dissent for high-stakes, contested decisions. Invoked via the deliberate MCP tool.',
+        sites: ['model_fusion'],
+    },
 };
 
 function aggregateStatus(statuses) {
@@ -1928,7 +1937,7 @@ function statusDotColor(status) {
 const SUBSYSTEM_BORDER_COLORS = {
     ego: '#c084fc', reflection: '#818cf8', memory: '#38bdf8', surplus: '#4ade80',
     outreach: '#fbbf24', executor: '#a78bfa', learning: '#fb923c',
-    contingency: '#f87171', utility: '#94a3b8',
+    contingency: '#f87171', utility: '#94a3b8', model_fusion: '#e879f9',
 };
 
 
@@ -1962,6 +1971,7 @@ function updateSubsystemGrid(data) {
         executor:    [[5,5],[6,5],[5,6],[6,6]],
         outreach:    [[3,7],[4,7]],
         contingency: [[5,7],[6,7]],
+        model_fusion: [[7,7]],
     };
 
     for (const [key, group] of Object.entries(SUBSYSTEM_GROUPS)) {

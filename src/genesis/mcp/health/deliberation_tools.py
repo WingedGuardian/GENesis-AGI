@@ -28,6 +28,25 @@ async def _impl_deliberate(
     result = await deliberate(
         question, context=(context or None), stakes=stakes_arg, mode=mode, preset=preset_arg, backend="fusion"
     )
+    # Surface each deliberation on the neural monitor (model_fusion call site).
+    # Detached + best-effort: the health MCP server holds no server DB handle, so
+    # this opens its own short-lived connection via record_last_run_detached
+    # (the sanctioned seam, same as the contribution gate and ambient worker).
+    # A failed record is logged and swallowed — it must never break the tool.
+    try:
+        from genesis.env import genesis_db_path
+        from genesis.observability.call_site_recorder import record_last_run_detached
+
+        await record_last_run_detached(
+            str(genesis_db_path()),
+            "model_fusion",
+            provider="openrouter",
+            model_id=f"fusion:{result.preset_used or mode}",
+            response_text=(result.answer or result.error or "")[:200],
+            success=(result.error is None),
+        )
+    except Exception:
+        logger.debug("model_fusion call-site record failed", exc_info=True)
     return {
         "answer": result.answer,
         "consensus": result.consensus,
