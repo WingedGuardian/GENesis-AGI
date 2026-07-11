@@ -231,6 +231,10 @@ async def test_model_fusion_seeded_idle_without_run():
     # Backend meta is layered onto the seed → self-describing payload.
     assert mf["category"] == "reasoning"
     assert mf["cost_policy"] == "Paid (OpenRouter Fusion)"
+    # The monitor's detail panel/tooltip key off status_reason == "WIRED" to render
+    # this idle-but-wired on-demand node as "not yet run" instead of "groundwork".
+    # Lock it so the seed can't silently drop the flag the frontend depends on.
+    assert mf["status_reason"] == "WIRED"
 
 
 @pytest.mark.asyncio
