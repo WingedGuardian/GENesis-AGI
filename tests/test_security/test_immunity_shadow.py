@@ -188,6 +188,7 @@ def test_sync_emit_records(tmp_path, monkeypatch):
     "collection,source_pipeline,expected",
     [
         ("knowledge_base", "knowledge_ingest", True),  # external KB content
+        ("knowledge_base", "drift", True),  # drift MECHANISM tag, not first-party
         ("knowledge_base", None, True),  # KB default → external
         ("knowledge_base", "surplus", False),  # first-party pipeline IN kb
         ("knowledge_base", "reference_store", False),  # first-party pipeline IN kb

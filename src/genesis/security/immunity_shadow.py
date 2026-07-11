@@ -44,38 +44,41 @@ from datetime import UTC, datetime, timedelta
 
 from genesis.db.connection import get_raw_db
 from genesis.db.crud import immunity_shadow as crud
-from genesis.memory.provenance import (
-    ORIGIN_EXTERNAL_UNTRUSTED,
-    derive_origin_class,
-    is_external,
-)
+from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, is_external
 from genesis.security import immunity
 
 logger = logging.getLogger(__name__)
 
 
+# Pipelines that write genuine FIRST-PARTY content INTO the knowledge_base
+# (the B0 origin_class backfill set, migration 0054). Only these flip a
+# KB-collection item to first-party for the gate. A retrieval-MECHANISM tag
+# such as ``drift`` (which overwrites source_pipeline on drift-fallback
+# results) must NOT — otherwise drift recalls of external KB content go
+# uncounted, undercounting the gate-4 blast radius this shadow measures.
+_FIRST_PARTY_KB_PIPELINES = frozenset({"surplus", "reference_store", "extraction_job"})
+
+
 def item_is_blockable(*, collection: str | None, source_pipeline: str | None) -> bool:
     """True iff a recalled item would be blocked by the injection gate.
 
-    An item is blockable only when it is external by collection AND its derived
-    origin_class is ``external_untrusted``. First-party pipelines that live IN
-    the knowledge_base (surplus / reference_store / extraction_job) are NOT
-    blockable — so counting these keeps the never-block invariant honest at the
-    site, before the row is even emitted.
+    The AUTHORITATIVE external signal is the COLLECTION — ``knowledge_base`` ==
+    external-world, always known at recall time (unlike the per-item
+    source_pipeline, which drift recall overwrites with ``drift``). A KB item is
+    first-party (not blockable) ONLY when its source_pipeline is one that writes
+    first-party content INTO the KB (:data:`_FIRST_PARTY_KB_PIPELINES`) — never
+    because of a retrieval-mechanism tag. This keeps the never-block invariant
+    honest at the site AND counts drift-recalled external content.
 
-    NOTE (B4): this re-derives origin_class from the recall dict's
-    (source_pipeline, collection) because the retriever does not yet plumb the
-    STORED origin_class into results. It is conservative — the rare
-    subsystem-tagged first-party item in KB (no source_subsystem on the recall
-    dict) derives external here, so shadow may slightly over-observe. That is
-    safe in shadow (never blocks); ENFORCE (B4) must gate on the stored
-    origin_class, not this re-derivation. Tracked as a B1 follow-up.
+    NOTE (B4): this uses the recall dict's (collection, source_pipeline), not
+    the STORED origin_class (the retriever doesn't plumb it yet). Safe in shadow
+    (never blocks; conservative — over-observes only a first-party item stored
+    via a non-KB-content pipeline yet living in the KB); ENFORCE (B4) must gate
+    on the stored origin_class. Tracked as a B1 follow-up.
     """
     if not is_external(collection):
         return False
-    return immunity.is_blockable(
-        derive_origin_class(source_pipeline=source_pipeline, collection=collection)
-    )
+    return source_pipeline not in _FIRST_PARTY_KB_PIPELINES
 
 
 def _build_row(
