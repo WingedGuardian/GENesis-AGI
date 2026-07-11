@@ -404,8 +404,9 @@ PYEOF
         #   1. When the optional 2nd arg (sha256 of the whole tar stream) is
         #      present, the stream is spooled and verified BEFORE the running
         #      guardian is disturbed (timer still up, no backup churn).
-        #   2. A post-extract required-file gate runs on BOTH forms (legacy
-        #      no-sha included) and rolls back from the backup on failure.
+        #   2. A membership gate checks the tar CONTAINS the required files
+        #      (tar -tf, also pre-extraction) on BOTH forms — catching a
+        #      wrong-pathspec / partial archive.
         # Older update.sh clients that send only <hash> still work (sha skipped).
         REDEPLOY_ARGS="${SSH_ORIGINAL_COMMAND#redeploy }"
         COMMIT_HASH="${REDEPLOY_ARGS%% *}"
@@ -416,13 +417,16 @@ PYEOF
         INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
         BACKUP_DIR="${STATE_DIR}/deploy-backup"
 
-        # Validate commit hash (must be 7-40 hex chars — defense in depth)
-        if ! echo "$COMMIT_HASH" | grep -qE '^[0-9a-f]{7,40}$'; then
+        # Validate commit hash (7-40 hex). Use bash [[ =~ ]] NOT `echo | grep`:
+        # grep is line-oriented, so a multiline arg would pass on its first line
+        # and pollute deployed_commit (the update-cc verb was hardened the same
+        # way). [[ =~ ]] anchors against the WHOLE string.
+        if ! [[ "$COMMIT_HASH" =~ ^[0-9a-f]{7,40}$ ]]; then
             echo '{"ok": false, "action": "redeploy", "error": "invalid commit hash"}' >&2
             exit 1
         fi
         # Validate the optional archive sha256 (exactly 64 hex when present)
-        if [ -n "$TREE_SHA" ] && ! echo "$TREE_SHA" | grep -qE '^[0-9a-f]{64}$'; then
+        if [ -n "$TREE_SHA" ] && ! [[ "$TREE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
             echo '{"ok": false, "action": "redeploy", "error": "invalid archive sha256"}' >&2
             exit 1
         fi
@@ -430,10 +434,13 @@ PYEOF
         # Spool the stdin tar to a temp file so we can (a) verify its sha256
         # before touching the running install and (b) extract deterministically.
         # Single-purpose process (one SSH command per invocation) → an EXIT trap
-        # is the safe place to guarantee the spool is removed on every path.
+        # is the safe place to (1) always remove the spool AND (2) guarantee the
+        # guardian timer comes back up if any post-stop step aborts under set -e
+        # (a failed self-update/cp/write must never leave the guardian DOWN).
         mkdir -p "$STATE_DIR"
         SPOOL="$(mktemp "${STATE_DIR}/redeploy.XXXXXX.tar")"
-        trap 'rm -f "$SPOOL" 2>/dev/null || true' EXIT
+        _TIMER_STOPPED=0
+        trap 'rm -f "$SPOOL" 2>/dev/null || true; [ "$_TIMER_STOPPED" = 1 ] && systemctl --user start genesis-guardian.timer 2>/dev/null; true' EXIT
         if ! cat > "$SPOOL"; then
             echo '{"ok": false, "action": "redeploy", "error": "failed to receive archive"}' >&2
             exit 1
@@ -469,8 +476,11 @@ PYEOF
             exit 1
         fi
 
-        # Stop timer during extraction to prevent running on partial state
+        # Stop timer during extraction to prevent running on partial state.
+        # From here on the EXIT trap guarantees the timer is restarted even if a
+        # later best-effort step aborts under set -e.
         systemctl --user stop genesis-guardian.timer 2>/dev/null || true
+        _TIMER_STOPPED=1
 
         # Backup current installation for rollback
         rm -rf "$BACKUP_DIR"
@@ -493,18 +503,22 @@ PYEOF
             exit 1
         fi
 
-        # Self-update gateway script (atomic rename — safe mid-execution)
+        # Self-update gateway script (atomic rename — safe mid-execution).
+        # Best-effort: guarded so a failure here can't abort under set -e and
+        # strand the guardian with its timer stopped (the sibling `update` verb
+        # guards the identical lines the same way).
         if [ -f "$INSTALL_DIR/scripts/guardian-gateway.sh" ]; then
-            cp "$INSTALL_DIR/scripts/guardian-gateway.sh" "$HOME/.local/bin/guardian-gateway.sh.new"
-            chmod +x "$HOME/.local/bin/guardian-gateway.sh.new"
-            mv "$HOME/.local/bin/guardian-gateway.sh.new" "$HOME/.local/bin/guardian-gateway.sh"
+            cp "$INSTALL_DIR/scripts/guardian-gateway.sh" "$HOME/.local/bin/guardian-gateway.sh.new" \
+                && chmod +x "$HOME/.local/bin/guardian-gateway.sh.new" \
+                && mv "$HOME/.local/bin/guardian-gateway.sh.new" "$HOME/.local/bin/guardian-gateway.sh" \
+                || true
         fi
 
         # Regenerate CLAUDE.md from template (never use repo version on host).
         # Shared host/container facts live in the user-level ~/.claude/CLAUDE.md
-        # (D16), so nothing is appended here.
+        # (D16), so nothing is appended here. Best-effort (see note above).
         if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
-            cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
+            cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md" || true
         fi
 
         # Record deployed commit + the verified tree sha (separate file —
@@ -537,6 +551,7 @@ PYEOF
 
         # Restart timer so new code takes effect immediately
         systemctl --user restart genesis-guardian.timer 2>/dev/null || true
+        _TIMER_STOPPED=0  # cleanly restarted — don't let the EXIT trap re-start
 
         # Clean up backup on success
         rm -rf "$BACKUP_DIR"

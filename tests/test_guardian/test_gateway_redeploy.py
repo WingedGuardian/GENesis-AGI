@@ -205,6 +205,33 @@ class TestRedeployRejects:
         assert json.loads(res.stderr)["error"] == "invalid commit hash"
         assert "stop" not in _calls(sandbox)
 
+    def test_timer_restarted_when_post_stop_step_aborts(self, sandbox):
+        # Force the deploy_state write to fail (path is a directory) AFTER the
+        # timer has been stopped. The EXIT trap must still bring the guardian
+        # timer back up — a failed post-stop step must never leave it DOWN.
+        (sandbox["state"] / "deploy_state.json").unlink()
+        (sandbox["state"] / "deploy_state.json").mkdir()
+        tar = _make_tar(_good_members())
+        sha = hashlib.sha256(tar).hexdigest()
+        res = _run(sandbox, f"redeploy abc1234 {sha}", stdin=tar)
+        assert res.returncode != 0  # aborted on the deploy_state write
+        calls = _calls(sandbox)
+        assert "stop genesis-guardian.timer" in calls
+        assert "start genesis-guardian.timer" in calls  # trap restarted it
+        assert _no_spool_left(sandbox)
+
+    def test_broken_local_bin_does_not_abort_deploy(self, sandbox):
+        # A failing gateway self-update (cp into a bad .local/bin) is best-effort
+        # and guarded — the deploy must still succeed and record deploy_state.
+        shutil.rmtree(sandbox["home"] / ".local" / "bin")
+        (sandbox["home"] / ".local" / "bin").write_text("not-a-dir\n")
+        tar = _make_tar(_good_members())
+        sha = hashlib.sha256(tar).hexdigest()
+        res = _run(sandbox, f"redeploy abc1234 {sha}", stdin=tar)
+        assert res.returncode == 0, res.stderr
+        assert json.loads(res.stdout)["ok"] is True
+        assert _deploy_state(sandbox)["deployed_commit"] == "abc1234"
+
     def test_corrupt_tar_with_matching_sha_rejected(self, sandbox):
         # Random bytes that are NOT a tar, sent with their own correct sha: sha
         # passes, but `tar -tf` lists no members → the membership gate rejects it
