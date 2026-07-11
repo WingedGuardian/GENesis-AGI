@@ -526,7 +526,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, env.py, _config_overlay.py]
-verified: 36563f95 2026-07-10
+verified: fa2e692a 2026-07-11
 ```
 
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
@@ -560,15 +560,24 @@ verified: 36563f95 2026-07-10
   `output_scanner` = deterministic outbound secrets/IP scan; `skill_scan`
   shells to external NVIDIA SkillSpector. NOT auth or secrets storage (that's
   `runtime/init/secrets.py` + `env.py`). **`immunity.py` = the WS-3 kill
-  switch (control surface LIVE, gates NOT built — B1)**: `gate_mode()`
-  re-reads `config/ws3_immunity.yaml` + its `.local.yaml` overlay per call
-  (no cache, no restart — the `ws3_immunity` settings domain is writable);
-  master `enabled: false` short-circuits every gate; `is_blockable()` is the
-  never-block-owner/first-party invariant every B1 gate must route through;
-  the gate-time fail-closed unknown→external rule lives ONLY in
-  `effective_origin_class()` (store-time derivation never fail-closes).
-  Auto-demote state is written INTO the overlay so state and behavior share
-  one file.
+  switch + gate policy**: `gate_mode()` re-reads `config/ws3_immunity.yaml` +
+  its `.local.yaml` overlay per call (no cache, no restart — the
+  `ws3_immunity` settings domain is writable); master `enabled: false`
+  short-circuits every gate; `is_blockable()` is the never-block-owner/
+  first-party invariant every gate routes through; the gate-time fail-closed
+  unknown→external rule lives ONLY in `effective_origin_class()` (store-time
+  derivation never fail-closes). Auto-demote state is written INTO the overlay
+  so state and behavior share one file. **B1: gate 4 (injection) is LIVE in
+  SHADOW** — `immunity_shadow.py` records a would-block into
+  `immunity_shadow_events` (migration 0055) at all 8 `wrap_external_recall`
+  inject sites + the proactive hook whenever `external_untrusted` content
+  reaches an action-capable prompt (observe-only — the item still reaches the
+  model; owner/first-party never recorded). The gate set is CI-locked in
+  `test_recall_inject_coverage.py` (a new inject site or a removed emit fails).
+  **Gates 1-3 (procedure/identity/autonomy) do NOT yet emit** — inert in
+  shadow until source provenance is threaded to their decision points
+  (flip-blocking follow-ups). Auto-demote wired but dormant (server + enforce
+  only); retention via `scripts/prune_immunity_shadow.py` (disk-hygiene).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
