@@ -1833,7 +1833,7 @@ async def _run(prompt: str, session_id: str = "") -> None:
                 try:
                     record_would_block_sync(
                         conn, gate="injection", source_kind="proactive_hook",
-                        source_ref="scripts/proactive_memory_hook.py::_format_results",
+                        source_ref="scripts/proactive_memory_hook.py::_run",
                         blockable_count=blockable,
                     )
                 finally:

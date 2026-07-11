@@ -203,6 +203,9 @@ def record_would_block_sync(
         return False
 
 
+# GROUNDWORK(ws3-b1-readsurface): the B1 observability read. No live caller
+# yet (B4 / a dashboard card consumes it — see follow-up); do NOT delete as
+# dead code. crud.summary/list_recent are reached only through here.
 async def recent_summary(*, since: str | None = None, db=None) -> list[dict]:
     """Per-gate / per-site would-block rollup (COUNTS only, no content).
 

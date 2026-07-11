@@ -87,7 +87,7 @@ TABLES = {
             observed_at   TEXT NOT NULL,      -- ISO8601 UTC — when the recall/inject was observed
             gate          TEXT NOT NULL,      -- procedure | identity | autonomy | injection
             mode          TEXT NOT NULL,      -- shadow | enforce (mode at observation; 'off' never records)
-            origin_class  TEXT NOT NULL,      -- blockable origin (external_untrusted for gate 4); owner/first_party NEVER recorded
+            origin_class  TEXT NOT NULL,      -- blockable origin (external_untrusted for gate 4); a row is written only when the DERIVED origin is blockable
             would_block   INTEGER NOT NULL,   -- 1 = a live gate WOULD block; kept uniform for gates 1-3 forward-compat
             source_kind   TEXT,               -- site class: recall_inject | proactive_hook | ...
             source_ref    TEXT,               -- the site: 'mcp/memory/core.py::memory_recall'

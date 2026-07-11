@@ -138,7 +138,7 @@ _EXTRA_WRAPPED_SITES: dict[str, tuple[str, str]] = {
 # hatch for a future site that legitimately should not gate.
 INJECTION_GATE_SITES: dict[str, tuple[str, str]] = {
     "mcp/memory/core.py::memory_recall": (
-        "gated", "per-call blockable count over the enriched result set"),
+        "gated", "emits on BOTH the full (enriched) and compact-preview branches"),
     "mcp/memory/core.py::memory_proactive": (
         "gated", "source=both default; emits per-call blockable count"),
     "mcp/memory/knowledge.py::knowledge_recall": (
@@ -154,6 +154,14 @@ INJECTION_GATE_SITES: dict[str, tuple[str, str]] = {
     **_EXTRA_WRAPPED_SITES,
 }
 
+
+# OUT OF GATE-4 SCOPE (external-tool-output, not recall-inject): document_query
+# (mcp/memory/documents.py) sends a PDF to the external PageIndex QA service
+# and returns its SYNTHESIZED answer to the prompt; web_fetch / web_search
+# likewise return external tool output. These reach a prompt but carry no
+# origin_class / wrap_external_recall model, so they are a DIFFERENT gate
+# class (quarantine tool output), not part of the provenance-based recall
+# gate this registry enforces. Tracked as a separate WS-3 follow-up.
 
 def _functions_calling(attrs: set[str]) -> set[str]:
     """Return {"relpath::func"} for every function under src that calls a method

@@ -335,6 +335,21 @@ async def memory_recall(
         pass  # instrumentation must never break recall
 
     if compact:
+        # WS-3 B1 gate 4 (injection): the compact branch returns external
+        # previews and RETURNS before the full-path wrap/emit below — record
+        # here too so compact recalls are not undercounted (observe-only).
+        blockable = sum(
+            1
+            for r in results
+            if immunity_shadow.item_is_blockable(
+                collection=r.collection, source_pipeline=r.source_pipeline,
+            )
+        )
+        await immunity_shadow.record_would_block(
+            gate="injection", source_kind="recall_inject",
+            source_ref="mcp/memory/core.py::memory_recall", process="server",
+            blockable_count=blockable, db=memory_mod._db, detail={"path": "compact"},
+        )
         return [
             {
                 "memory_id": r.memory_id,
