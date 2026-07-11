@@ -10,7 +10,9 @@
 #   version        — report CC, code, and Node versions
 #   update         — pull latest code + self-update gateway script
 #   sync-gateway    — redeploy gateway script from install dir (no pull; recovery)
-#   redeploy <hash> — receive tar archive on stdin, deploy to install dir
+#   redeploy <hash> [sha256] — receive tar archive on stdin, deploy to install
+#                     dir; when the optional sha256 of the tar stream is given
+#                     it is verified before the running guardian is disturbed
 #   update-cc <ver> — install a pinned Claude Code version (validated semver)
 #   update-node <N> — install a pinned Node.js major via NodeSource (validated)
 #   test-approval   — E2E test the keyword-reply approval gate (no recovery)
@@ -105,7 +107,13 @@ PYEOF
         NODE_VER=$(node --version 2>/dev/null || echo "unavailable")
         CODE_VER=$(cd "$INSTALL_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
         CODE_DATE=$(cd "$INSTALL_DIR" && git log -1 --format=%ci 2>/dev/null || echo "unknown")
-        DEPLOYED=$(python3 -c "import json; print(json.load(open('$STATE_DIR/deploy_state.json')).get('deployed_commit','unknown'))" 2>/dev/null || echo "unknown")
+        # Read deployed_commit AND the F.0 tree_sha256 in ONE python3 spawn —
+        # `version` runs every 5-min awareness tick, so keep spawns off the hot
+        # path (host OOM history). Line 1 = commit, line 2 = tree sha ("" legacy).
+        _DEPLOY_INFO=$(python3 -c "import json; d=json.load(open('$STATE_DIR/deploy_state.json')); print(d.get('deployed_commit','unknown')); print(d.get('tree_sha256',''))" 2>/dev/null || printf 'unknown\n\n')
+        DEPLOYED=$(printf '%s\n' "$_DEPLOY_INFO" | sed -n '1p')
+        DEPLOYED_TREE_SHA=$(printf '%s\n' "$_DEPLOY_INFO" | sed -n '2p')
+        [ -n "$DEPLOYED" ] || DEPLOYED="unknown"
         # sha256 of the DEPLOYED gateway script — lets the container detect a
         # stale/frozen gateway whose self-update silently failed (the install-dir
         # code can be current while ~/.local/bin/guardian-gateway.sh lags).
@@ -236,8 +244,11 @@ except Exception:
                 fi
             fi
         fi
-        printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s", "deployed_commit": "%s", "gateway_sha": "%s", "authkey_no_pty": %s, "authkey_has_from": %s, "authkey_from_matches": %s, "authkey_observed_src_hash": "%s", "authkey_opts_hash": "%s", "cc_logged_in": %s, "cc_token_present": %s, "cc_token_age_days": %s}\n' \
-            "$CC_VER" "$NODE_VER" "$CODE_VER" "$CODE_DATE" "$DEPLOYED" "$GW_SHA" \
+        # Surface the deployed tree_sha256 (F.0, read above) so the container can
+        # tell a verified deploy from a legacy one, and advertise redeploy_verify
+        # so a newer update.sh knows this gateway understands the sha-checked form.
+        printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s", "deployed_commit": "%s", "deployed_tree_sha256": "%s", "redeploy_verify": true, "gateway_sha": "%s", "authkey_no_pty": %s, "authkey_has_from": %s, "authkey_from_matches": %s, "authkey_observed_src_hash": "%s", "authkey_opts_hash": "%s", "cc_logged_in": %s, "cc_token_present": %s, "cc_token_age_days": %s}\n' \
+            "$CC_VER" "$NODE_VER" "$CODE_VER" "$CODE_DATE" "$DEPLOYED" "$DEPLOYED_TREE_SHA" "$GW_SHA" \
             "$AK_NO_PTY" "$AK_HAS_FROM" "$AK_FROM_MATCHES" "$AK_SRC_HASH" "$AK_OPTS_HASH" \
             "$CC_LOGGED_IN" "$CC_TOKEN_PRESENT" "$CC_TOKEN_AGE_DAYS"
         ;;
@@ -381,21 +392,95 @@ PYEOF
         fi
         ;;
     redeploy\ *)
-        # Push-based redeploy: container sends tar archive on stdin.
-        # Usage: tar ... | ssh host "redeploy <commit_hash>"
+        # Push-based redeploy: container sends a tar archive on stdin.
+        # Usage: tar ... | ssh host "redeploy <commit_hash> [tar_sha256]"
         # The container is the source of truth — no git pull needed.
-        COMMIT_HASH="${SSH_ORIGINAL_COMMAND#redeploy }"
+        #
+        # F.0 tree-integrity: the ONLY gate here used to be tar's exit code, so
+        # a truncated/corrupt stream (or an archive built with the wrong
+        # pathspec) could overwrite a healthy install and record a good-looking
+        # deploy_state — which every downstream drift check then trusts. Two
+        # guards close that:
+        #   1. When the optional 2nd arg (sha256 of the whole tar stream) is
+        #      present, the stream is spooled and verified BEFORE the running
+        #      guardian is disturbed (timer still up, no backup churn).
+        #   2. A membership gate checks the tar CONTAINS the required files
+        #      (tar -tf, also pre-extraction) on BOTH forms — catching a
+        #      wrong-pathspec / partial archive.
+        # Older update.sh clients that send only <hash> still work (sha skipped).
+        REDEPLOY_ARGS="${SSH_ORIGINAL_COMMAND#redeploy }"
+        COMMIT_HASH="${REDEPLOY_ARGS%% *}"
+        TREE_SHA=""
+        if [ "$REDEPLOY_ARGS" != "$COMMIT_HASH" ]; then
+            TREE_SHA="${REDEPLOY_ARGS#* }"
+        fi
         INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
         BACKUP_DIR="${STATE_DIR}/deploy-backup"
 
-        # Validate commit hash (must be 7-40 hex chars — defense in depth)
-        if ! echo "$COMMIT_HASH" | grep -qE '^[0-9a-f]{7,40}$'; then
+        # Validate commit hash (7-40 hex). Use bash [[ =~ ]] NOT `echo | grep`:
+        # grep is line-oriented, so a multiline arg would pass on its first line
+        # and pollute deployed_commit (the update-cc verb was hardened the same
+        # way). [[ =~ ]] anchors against the WHOLE string.
+        if ! [[ "$COMMIT_HASH" =~ ^[0-9a-f]{7,40}$ ]]; then
             echo '{"ok": false, "action": "redeploy", "error": "invalid commit hash"}' >&2
             exit 1
         fi
+        # Validate the optional archive sha256 (exactly 64 hex when present)
+        if [ -n "$TREE_SHA" ] && ! [[ "$TREE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+            echo '{"ok": false, "action": "redeploy", "error": "invalid archive sha256"}' >&2
+            exit 1
+        fi
 
-        # Stop timer during extraction to prevent running on partial state
+        # Spool the stdin tar to a temp file so we can (a) verify its sha256
+        # before touching the running install and (b) extract deterministically.
+        # Single-purpose process (one SSH command per invocation) → an EXIT trap
+        # is the safe place to (1) always remove the spool AND (2) guarantee the
+        # guardian timer comes back up if any post-stop step aborts under set -e
+        # (a failed self-update/cp/write must never leave the guardian DOWN).
+        mkdir -p "$STATE_DIR"
+        SPOOL="$(mktemp "${STATE_DIR}/redeploy.XXXXXX.tar")"
+        _TIMER_STOPPED=0
+        trap 'rm -f "$SPOOL" 2>/dev/null || true; [ "$_TIMER_STOPPED" = 1 ] && systemctl --user start genesis-guardian.timer 2>/dev/null; true' EXIT
+        if ! cat > "$SPOOL"; then
+            echo '{"ok": false, "action": "redeploy", "error": "failed to receive archive"}' >&2
+            exit 1
+        fi
+
+        # Verify the stream sha256 BEFORE stopping the timer / taking a backup —
+        # a bad transfer must not disturb the healthy running guardian at all.
+        if [ -n "$TREE_SHA" ]; then
+            ACTUAL_SHA="$(sha256sum "$SPOOL" | cut -d' ' -f1)"
+            if [ "$ACTUAL_SHA" != "$TREE_SHA" ]; then
+                echo '{"ok": false, "action": "redeploy", "error": "archive sha256 mismatch"}' >&2
+                exit 1
+            fi
+        fi
+
+        # Required-file gate — check the ARCHIVE CONTENTS (not the extracted
+        # tree): the install is extracted as a MERGE onto the existing dir (so
+        # host-specific config/guardian.yaml + secrets.env, which are NOT in the
+        # archive, survive), which means a post-extract check would be masked by
+        # stale files. Verifying membership in the tar catches an archive built
+        # with the wrong pathspec, or a partial one that lost whole paths, and —
+        # like the sha check — runs BEFORE the running guardian is disturbed.
+        TAR_LIST="$(tar -tf "$SPOOL" 2>/dev/null || true)"
+        REDEPLOY_TREE_OK=true
+        for _req in src/genesis/guardian/check.py scripts/guardian-gateway.sh pyproject.toml; do
+            if ! printf '%s\n' "$TAR_LIST" | grep -qxF "$_req"; then
+                REDEPLOY_TREE_OK=false
+                break
+            fi
+        done
+        if [ "$REDEPLOY_TREE_OK" != true ]; then
+            echo '{"ok": false, "action": "redeploy", "error": "archive missing required files"}' >&2
+            exit 1
+        fi
+
+        # Stop timer during extraction to prevent running on partial state.
+        # From here on the EXIT trap guarantees the timer is restarted even if a
+        # later best-effort step aborts under set -e.
         systemctl --user stop genesis-guardian.timer 2>/dev/null || true
+        _TIMER_STOPPED=1
 
         # Backup current installation for rollback
         rm -rf "$BACKUP_DIR"
@@ -403,9 +488,10 @@ PYEOF
             cp -a "$INSTALL_DIR" "$BACKUP_DIR"
         fi
 
-        # Extract archive from stdin into install dir
+        # Extract archive from the verified spool into install dir (merge — see
+        # the required-file gate note above on why we don't wipe first).
         mkdir -p "$INSTALL_DIR"
-        if ! tar -xf - -C "$INSTALL_DIR" 2>/dev/null; then
+        if ! tar -xf "$SPOOL" -C "$INSTALL_DIR" 2>/dev/null; then
             # Rollback on extraction failure
             if [ -d "$BACKUP_DIR" ]; then
                 rm -rf "$INSTALL_DIR"
@@ -417,34 +503,55 @@ PYEOF
             exit 1
         fi
 
-        # Self-update gateway script (atomic rename — safe mid-execution)
+        # Self-update gateway script (atomic rename — safe mid-execution).
+        # Best-effort: guarded so a failure here can't abort under set -e and
+        # strand the guardian with its timer stopped (the sibling `update` verb
+        # guards the identical lines the same way).
         if [ -f "$INSTALL_DIR/scripts/guardian-gateway.sh" ]; then
-            cp "$INSTALL_DIR/scripts/guardian-gateway.sh" "$HOME/.local/bin/guardian-gateway.sh.new"
-            chmod +x "$HOME/.local/bin/guardian-gateway.sh.new"
-            mv "$HOME/.local/bin/guardian-gateway.sh.new" "$HOME/.local/bin/guardian-gateway.sh"
+            cp "$INSTALL_DIR/scripts/guardian-gateway.sh" "$HOME/.local/bin/guardian-gateway.sh.new" \
+                && chmod +x "$HOME/.local/bin/guardian-gateway.sh.new" \
+                && mv "$HOME/.local/bin/guardian-gateway.sh.new" "$HOME/.local/bin/guardian-gateway.sh" \
+                || true
         fi
 
         # Regenerate CLAUDE.md from template (never use repo version on host).
         # Shared host/container facts live in the user-level ~/.claude/CLAUDE.md
-        # (D16), so nothing is appended here.
+        # (D16), so nothing is appended here. Best-effort (see note above).
         if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
-            cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
+            cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md" || true
         fi
 
-        # Record deployed commit (separate file — state.json is overwritten by Guardian ticks)
+        # Record deployed commit + the verified tree sha (separate file —
+        # state.json is overwritten by Guardian ticks). Values are passed via
+        # the environment (not string-interpolated into the heredoc), and the
+        # delimiter is quoted, so nothing in them can break out of the script —
+        # defense in depth even though both are regex-validated above.
+        # tree_sha256 is "" for a legacy no-sha deploy.
         mkdir -p "$STATE_DIR"
-        python3 << PYEOF
+        GENESIS_COMMIT_HASH="$COMMIT_HASH" GENESIS_TREE_SHA="$TREE_SHA" GENESIS_SF="$STATE_DIR/deploy_state.json" \
+            python3 << 'PYEOF'
 import json
+import os
 from datetime import datetime, timezone
-sf = "$STATE_DIR/deploy_state.json"
-d = {"deployed_commit": "$COMMIT_HASH", "deployed_at": datetime.now(timezone.utc).isoformat()}
+sf = os.environ["GENESIS_SF"]
+commit = os.environ["GENESIS_COMMIT_HASH"]
+tree_sha = os.environ.get("GENESIS_TREE_SHA", "")
+d = {
+    "deployed_commit": commit,
+    "deployed_at": datetime.now(timezone.utc).isoformat(),
+    "tree_sha256": tree_sha,
+}
 with open(sf, "w") as f:
     json.dump(d, f, indent=2)
-print(json.dumps({"ok": True, "action": "redeploy", "commit": "$COMMIT_HASH"}))
+print(json.dumps({
+    "ok": True, "action": "redeploy", "commit": commit,
+    "verified": bool(tree_sha),
+}))
 PYEOF
 
         # Restart timer so new code takes effect immediately
         systemctl --user restart genesis-guardian.timer 2>/dev/null || true
+        _TIMER_STOPPED=0  # cleanly restarted — don't let the EXIT trap re-start
 
         # Clean up backup on success
         rm -rf "$BACKUP_DIR"

@@ -34,7 +34,7 @@ def _extract_snippet(var: str) -> str:
     """Pull the python -c payload off the HOST_IP=/HOST_USER= line."""
     for line in UPDATE_SH.read_text().splitlines():
         stripped = line.strip()
-        if stripped.startswith(f'{var}=$(') and '-c "' in stripped:
+        if stripped.startswith(f"{var}=$(") and '-c "' in stripped:
             m = re.search(r'-c "(.+)" 2>/dev/null', stripped)
             assert m, f"could not extract -c payload from {var} line: {stripped}"
             return m.group(1)
@@ -43,9 +43,7 @@ def _extract_snippet(var: str) -> str:
 
 def _run_snippet(var: str, config_path: Path) -> subprocess.CompletedProcess:
     code = _extract_snippet(var).replace("$GUARDIAN_CONFIG", str(config_path))
-    return subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=30
-    )
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
 
 
 def test_host_ip_snippet_parses_and_reads_config(tmp_path):
@@ -121,9 +119,7 @@ def test_unusable_guardian_config_warns_and_marks_degraded(tmp_path):
         + _extract_sync_function()
         + '\n_sync_deploy_targets\necho "DEGRADED=$HOST_CC_DEGRADED"\n'
     )
-    result = subprocess.run(
-        ["bash", "-c", harness], capture_output=True, text=True, timeout=60
-    )
+    result = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     assert "host sync SKIPPED" in result.stdout
     assert "DEGRADED=guardian_config_unreadable" in result.stdout
@@ -159,9 +155,7 @@ def _run_reason(*args: str) -> subprocess.CompletedProcess:
         + " ".join(shlex.quote(a) for a in args)
         + "\n"
     )
-    return subprocess.run(
-        ["bash", "-c", harness], capture_output=True, text=True, timeout=30
-    )
+    return subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30)
 
 
 def test_reason_in_sync_is_empty():
@@ -223,3 +217,44 @@ def test_redeploy_gate_reconciles_against_host_deployed_commit():
     assert 'if [ -n "$_gv_reason" ]; then' in fn, (
         "redeploy must be gated on the helper's reason, not a raw pull-delta diff"
     )
+
+
+def test_redeploy_sends_verified_form_with_legacy_fallback():
+    """Structural regression guard (F.0): the sender must materialize the
+    archive to a file, hash it, send the sha-checked ``redeploy <hash> <sha>``
+    form, and KEEP a bare ``redeploy <hash>`` fallback so a mid-rollout old
+    gateway (redeploy verb but no sha arg) still deploys."""
+    fn = _extract_sync_function()
+    # Archive materialized to a file (not piped) so it can be hashed + re-sent.
+    assert 'git -C "$GENESIS_ROOT" archive HEAD' in fn
+    assert '> "$GUARDIAN_ARCHIVE"' in fn, "archive must be written to a file, not piped"
+    # Big-temp discipline: never the inherited TMPDIR (cc-tmp/tmpfs).
+    assert "$HOME/tmp/guardian-deploy" in fn, "archive temp must route to ~/tmp"
+    # Stream sha256 computed and sent as the 2nd redeploy arg.
+    assert 'sha256sum "$GUARDIAN_ARCHIVE"' in fn
+    assert "redeploy $DEPLOY_HASH $GUARDIAN_ARCHIVE_SHA" in fn, (
+        "must send the sha-checked redeploy form"
+    )
+    # Legacy 1-arg fallback preserved for old gateways.
+    assert '"redeploy $DEPLOY_HASH"' in fn, (
+        "must retain the bare redeploy <hash> fallback for old gateways"
+    )
+    # ...but the unguarded fallback is GATED on the gateway NOT advertising
+    # redeploy_verify — a verify-capable gateway rejecting the verified form
+    # (e.g. sha mismatch) must not be retried without the guard (defeats F.0).
+    assert "_gv_verify_capable" in fn, (
+        "the unguarded fallback must be gated on the gateway's redeploy_verify "
+        "capability, not attempted after any verified-form failure"
+    )
+    assert "redeploy_verify" in fn, (
+        "the redeploy_verify capability must be parsed from the version output"
+    )
+    # Temp archive cleaned up regardless of path.
+    assert 'rm -f "$GUARDIAN_ARCHIVE"' in fn
+
+
+def test_update_sh_parses_clean():
+    """`bash -n` on the whole update.sh — cheap guard that the F.0 edits (and
+    anything else) didn't introduce a syntax error the structural greps miss."""
+    res = subprocess.run(["bash", "-n", str(UPDATE_SH)], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
