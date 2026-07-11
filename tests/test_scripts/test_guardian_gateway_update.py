@@ -63,8 +63,7 @@ def _make_stub(path: Path, body: str) -> None:
 
 
 def _git(*args: str, cwd: Path) -> None:
-    subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                   capture_output=True, text=True)
+    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
 
 
 @pytest.fixture
@@ -90,8 +89,7 @@ def stub_bin_sudo_passwordless(tmp_path):
     bind = tmp_path / "bin"
     bind.mkdir()
     _make_stub(bind / "systemctl", "#!/usr/bin/env bash\nexit 0\n")
-    _make_stub(bind / "sudo",
-               '#!/usr/bin/env bash\n[ "$1" = "-n" ] && exit 0\nexit 1\n')
+    _make_stub(bind / "sudo", '#!/usr/bin/env bash\n[ "$1" = "-n" ] && exit 0\nexit 1\n')
     return bind
 
 
@@ -121,8 +119,14 @@ def _seed_repo(home: Path) -> Path:
     (seed / "config" / "guardian.yaml").write_text(_GUARDIAN_YAML)
     (seed / "scripts").mkdir()
     (seed / "scripts" / "guardian-gateway.sh").write_text(_SEED_GATEWAY)
-    _git("add", "CLAUDE.md", "config/guardian-claude.md", "config/guardian.yaml",
-         "scripts/guardian-gateway.sh", cwd=seed)
+    _git(
+        "add",
+        "CLAUDE.md",
+        "config/guardian-claude.md",
+        "config/guardian.yaml",
+        "scripts/guardian-gateway.sh",
+        cwd=seed,
+    )
     _git("commit", "-qm", "init", cwd=seed)
     _git("push", "-q", "origin", "main", cwd=seed)
 
@@ -151,10 +155,10 @@ def _run_verb(home: Path, stub_bin: Path, verb: str, stdin_bytes: bytes | None =
     env["PATH"] = f"{stub_bin}:{env['PATH']}"
     env["SSH_ORIGINAL_COMMAND"] = verb
     if stdin_bytes is None:
-        return subprocess.run(["bash", str(_GATEWAY)], env=env,
-                              capture_output=True, stdin=subprocess.DEVNULL)
-    return subprocess.run(["bash", str(_GATEWAY)], env=env,
-                          capture_output=True, input=stdin_bytes)
+        return subprocess.run(
+            ["bash", str(_GATEWAY)], env=env, capture_output=True, stdin=subprocess.DEVNULL
+        )
+    return subprocess.run(["bash", str(_GATEWAY)], env=env, capture_output=True, input=stdin_bytes)
 
 
 def _run_update(home: Path, stub_bin: Path):
@@ -162,12 +166,12 @@ def _run_update(home: Path, stub_bin: Path):
 
 
 def _short_head(install: Path) -> str:
-    return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(install),
-                          capture_output=True, text=True).stdout.strip()
+    return subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"], cwd=str(install), capture_output=True, text=True
+    ).stdout.strip()
 
 
-@pytest.mark.parametrize("skip_worktree", [False, True],
-                         ids=["clean", "legacy-skip-worktree"])
+@pytest.mark.parametrize("skip_worktree", [False, True], ids=["clean", "legacy-skip-worktree"])
 def test_update_regenerates_guardian_identity_exactly(skip_worktree, stub_bin, tmp_path):
     """`update` pulls, then regenerates CLAUDE.md == guardian-claude.md exactly.
 
@@ -185,11 +189,12 @@ def test_update_regenerates_guardian_identity_exactly(skip_worktree, stub_bin, t
     assert proc.returncode == 0, f"update failed: {proc.stdout}\n{proc.stderr}"
     assert b'"ok": true' in proc.stdout, proc.stdout
     # Pull actually advanced HEAD to the upstream commit.
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(install),
-                          capture_output=True, text=True).stdout.strip()
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(install), capture_output=True, text=True
+    ).stdout.strip()
     remote_head = subprocess.run(
-        ["git", "rev-parse", "main"], cwd=str(home / "remote.git"),
-        capture_output=True, text=True).stdout.strip()
+        ["git", "rev-parse", "main"], cwd=str(home / "remote.git"), capture_output=True, text=True
+    ).stdout.strip()
     assert head == remote_head, "update did not fast-forward to upstream"
     # Regenerated file is the Guardian identity, byte-for-byte (no network block,
     # not the upstream container file).
@@ -198,7 +203,8 @@ def test_update_regenerates_guardian_identity_exactly(skip_worktree, stub_bin, t
 
 
 def test_update_self_updates_and_succeeds_when_sudo_tuning_fails(
-        stub_bin_sudo_passwordless, tmp_path):
+    stub_bin_sudo_passwordless, tmp_path
+):
     """Bug A regression: on a passwordless-sudo host whose sysctl/udev `sudo`
     commands fail, `update` must STILL self-update the deployed gateway and exit
     0 with JSON. The best-effort host tuning must never abort the update."""
@@ -209,12 +215,13 @@ def test_update_self_updates_and_succeeds_when_sudo_tuning_fails(
     proc = _run_update(home, stub_bin_sudo_passwordless)
 
     assert proc.returncode == 0, (
-        f"update aborted on best-effort sudo tuning failure (Bug A): "
-        f"{proc.stdout}\n{proc.stderr}")
+        f"update aborted on best-effort sudo tuning failure (Bug A): {proc.stdout}\n{proc.stderr}"
+    )
     assert b'"ok": true' in proc.stdout, proc.stdout
     deployed = (home / ".local" / "bin" / "guardian-gateway.sh").read_text()
     assert deployed == _SEED_GATEWAY, (
-        "self-update did not deploy the install-dir gateway despite a clean pull")
+        "self-update did not deploy the install-dir gateway despite a clean pull"
+    )
 
 
 def test_update_writes_deployed_commit(stub_bin, tmp_path):
@@ -248,7 +255,8 @@ def test_update_conflict_preserves_local_config_in_stash(stub_bin, tmp_path):
 
     # Local uncommitted config change in the install dir → becomes the stash.
     (install / "config" / "guardian.yaml").write_text(
-        'container_name: genesis\ncontainer_ip: "LOCAL-ONLY-VALUE"\n')
+        'container_name: genesis\ncontainer_ip: "LOCAL-ONLY-VALUE"\n'
+    )
 
     # Upstream changes the SAME line differently → `git stash pop` will conflict.
     pusher2 = home / "pusher2"
@@ -256,7 +264,8 @@ def test_update_conflict_preserves_local_config_in_stash(stub_bin, tmp_path):
     _git("config", "user.email", "t@t.t", cwd=pusher2)
     _git("config", "user.name", "t", cwd=pusher2)
     (pusher2 / "config" / "guardian.yaml").write_text(
-        'container_name: genesis\ncontainer_ip: "UPSTREAM-VALUE"\n')
+        'container_name: genesis\ncontainer_ip: "UPSTREAM-VALUE"\n'
+    )
     _git("commit", "-aqm", "upstream guardian.yaml change", cwd=pusher2)
     _git("push", "-q", "origin", "main", cwd=pusher2)
 
@@ -269,22 +278,27 @@ def test_update_conflict_preserves_local_config_in_stash(stub_bin, tmp_path):
     data = json.loads(proc.stdout)
     assert data["ok"] is True, data
     assert "preserved in git stash" in data["warning"], (
-        f"conflict warning must say the config is recoverable, not discarded:\n{data}")
+        f"conflict warning must say the config is recoverable, not discarded:\n{data}"
+    )
 
     # The stash was NOT dropped — the operator's local config is recoverable.
-    stash_list = subprocess.run(["git", "stash", "list"], cwd=str(install),
-                                capture_output=True, text=True).stdout
+    stash_list = subprocess.run(
+        ["git", "stash", "list"], cwd=str(install), capture_output=True, text=True
+    ).stdout
     assert stash_list.strip(), "stash was dropped — local config silently lost (the bug)"
-    stash_show = subprocess.run(["git", "stash", "show", "-p"], cwd=str(install),
-                                capture_output=True, text=True).stdout
+    stash_show = subprocess.run(
+        ["git", "stash", "show", "-p"], cwd=str(install), capture_output=True, text=True
+    ).stdout
     assert "LOCAL-ONLY-VALUE" in stash_show, (
-        f"stash does not contain the operator's local config value:\n{stash_show}")
+        f"stash does not contain the operator's local config value:\n{stash_show}"
+    )
 
     # guardian.yaml is reset cleanly to the upstream state — no leftover conflict
     # markers (the gateway worktree stays functional for the next pull).
     gy = (install / "config" / "guardian.yaml").read_text()
     assert "<<<<<<<" not in gy and "UPSTREAM-VALUE" in gy, (
-        f"guardian.yaml left in conflict / not reset to upstream:\n{gy!r}")
+        f"guardian.yaml left in conflict / not reset to upstream:\n{gy!r}"
+    )
 
 
 def test_update_response_is_pure_json(stub_bin, tmp_path):
@@ -322,7 +336,8 @@ def test_sync_gateway_redeploys_from_install_dir(stub_bin, tmp_path):
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     assert b'"ok": true' in proc.stdout, proc.stdout
     assert deployed_path.read_text() == _SEED_GATEWAY, (
-        "sync-gateway did not refresh the deployed gateway from the install dir")
+        "sync-gateway did not refresh the deployed gateway from the install dir"
+    )
 
 
 def test_version_reports_gateway_sha(stub_bin, tmp_path):
@@ -348,8 +363,7 @@ def _run_redeploy(home: Path, stub_bin: Path, commit: str, tar_bytes: bytes):
     env["PATH"] = f"{stub_bin}:{env['PATH']}"
     env["SSH_ORIGINAL_COMMAND"] = f"redeploy {commit}"
     (home / ".local" / "bin").mkdir(parents=True, exist_ok=True)
-    return subprocess.run(["bash", str(_GATEWAY)], env=env, input=tar_bytes,
-                          capture_output=True)
+    return subprocess.run(["bash", str(_GATEWAY)], env=env, input=tar_bytes, capture_output=True)
 
 
 def test_redeploy_regenerates_guardian_identity(stub_bin, tmp_path):
@@ -359,8 +373,16 @@ def test_redeploy_regenerates_guardian_identity(stub_bin, tmp_path):
     home.mkdir()
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tf:
-        for name, content in (("CLAUDE.md", _CONTAINER_V1),
-                              ("config/guardian-claude.md", _GUARDIAN_MD)):
+        # Include the files the F.0 membership gate requires (a real redeploy
+        # archive always carries them — update.sh's pathspec is src/ scripts/
+        # pyproject.toml); plus the two identity files under test.
+        for name, content in (
+            ("CLAUDE.md", _CONTAINER_V1),
+            ("config/guardian-claude.md", _GUARDIAN_MD),
+            ("src/genesis/guardian/check.py", "# check\n"),
+            ("scripts/guardian-gateway.sh", "#!/usr/bin/env bash\n"),
+            ("pyproject.toml", "[project]\nname='g'\n"),
+        ):
             data = content.encode()
             ti = tarfile.TarInfo(name)
             ti.size = len(data)
@@ -381,6 +403,7 @@ def test_redeploy_regenerates_guardian_identity(stub_bin, tmp_path):
 # in-band. These exercise the verb hermetically — sudo/curl/node are stubbed so
 # nothing real is installed and no network is hit.
 
+
 def _make_node_bin(tmp_path, *, node_version="v22.22.2", sudo_ok=True):
     """PATH dir for the `update-node` verb. Stubs systemctl (no-op), sudo
     (passwordless ok/blocked; install commands are no-op 0 so nothing runs),
@@ -394,14 +417,17 @@ def _make_node_bin(tmp_path, *, node_version="v22.22.2", sudo_ok=True):
         # "install" trivially succeeds without touching the system.
         _make_stub(bind / "sudo", "#!/usr/bin/env bash\nexit 0\n")
     else:
-        _make_stub(bind / "sudo", '#!/usr/bin/env bash\nexit 1\n')
+        _make_stub(bind / "sudo", "#!/usr/bin/env bash\nexit 1\n")
     _make_stub(bind / "curl", "#!/usr/bin/env bash\nexit 0\n")
     _make_stub(bind / "node", f'#!/usr/bin/env bash\necho "{node_version}"\n')
     return bind
 
 
-@pytest.mark.parametrize("bad", ["2.2", "abc", "22x", "123", ""],
-                         ids=["semver", "word", "suffix", "three-digit", "empty"])
+@pytest.mark.parametrize(
+    "bad",
+    ["2.2", "abc", "22x", "123", ""],
+    ids=["semver", "word", "suffix", "three-digit", "empty"],
+)
 def test_update_node_rejects_non_major(bad, tmp_path):
     """The major is interpolated into a privileged NodeSource URL + install, so
     only a bare 1-2 digit major is accepted (mirrors update-cc's semver guard).
