@@ -223,3 +223,34 @@ def test_redeploy_gate_reconciles_against_host_deployed_commit():
     assert 'if [ -n "$_gv_reason" ]; then' in fn, (
         "redeploy must be gated on the helper's reason, not a raw pull-delta diff"
     )
+
+
+def test_redeploy_sends_verified_form_with_legacy_fallback():
+    """Structural regression guard (F.0): the sender must materialize the
+    archive to a file, hash it, send the sha-checked ``redeploy <hash> <sha>``
+    form, and KEEP a bare ``redeploy <hash>`` fallback so a mid-rollout old
+    gateway (redeploy verb but no sha arg) still deploys."""
+    fn = _extract_sync_function()
+    # Archive materialized to a file (not piped) so it can be hashed + re-sent.
+    assert 'git -C "$GENESIS_ROOT" archive HEAD' in fn
+    assert '> "$GUARDIAN_ARCHIVE"' in fn, "archive must be written to a file, not piped"
+    # Big-temp discipline: never the inherited TMPDIR (cc-tmp/tmpfs).
+    assert '$HOME/tmp/guardian-deploy' in fn, "archive temp must route to ~/tmp"
+    # Stream sha256 computed and sent as the 2nd redeploy arg.
+    assert 'sha256sum "$GUARDIAN_ARCHIVE"' in fn
+    assert 'redeploy $DEPLOY_HASH $GUARDIAN_ARCHIVE_SHA' in fn, (
+        "must send the sha-checked redeploy form"
+    )
+    # Legacy 1-arg fallback preserved for old gateways.
+    assert '"redeploy $DEPLOY_HASH"' in fn, (
+        "must retain the bare redeploy <hash> fallback for old gateways"
+    )
+    # Temp archive cleaned up regardless of path.
+    assert 'rm -f "$GUARDIAN_ARCHIVE"' in fn
+
+
+def test_update_sh_parses_clean():
+    """`bash -n` on the whole update.sh — cheap guard that the F.0 edits (and
+    anything else) didn't introduce a syntax error the structural greps miss."""
+    res = subprocess.run(["bash", "-n", str(UPDATE_SH)], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
