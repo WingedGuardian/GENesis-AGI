@@ -81,6 +81,24 @@ TABLES = {
             -- Observe-only — no hold/approval is created here; the send always proceeds.
         )
     """,
+    "immunity_shadow_events": """
+        CREATE TABLE IF NOT EXISTS immunity_shadow_events (
+            id            TEXT PRIMARY KEY,
+            observed_at   TEXT NOT NULL,      -- ISO8601 UTC — when the recall/inject was observed
+            gate          TEXT NOT NULL,      -- procedure | identity | autonomy | injection
+            mode          TEXT NOT NULL,      -- shadow | enforce (mode at observation; 'off' never records)
+            origin_class  TEXT NOT NULL,      -- blockable origin (external_untrusted for gate 4); owner/first_party NEVER recorded
+            would_block   INTEGER NOT NULL,   -- 1 = a live gate WOULD block; kept uniform for gates 1-3 forward-compat
+            source_kind   TEXT,               -- site class: recall_inject | proactive_hook | ...
+            source_ref    TEXT,               -- the site: 'mcp/memory/core.py::memory_recall'
+            detail        TEXT,               -- freeform (e.g. blockable item count); NEVER recalled content
+            process       TEXT                -- server | proactive_hook | outreach_mcp | ...
+            -- WS-3 immunity SHADOW store: gate DECISIONS + provenance refs only. Observe-only
+            -- — no recall is blocked or altered here; the item still reaches the prompt
+            -- (wrapped as it already was). Never stores recalled content. Not read by any
+            -- cognition job.
+        )
+    """,
     "observations": """
         CREATE TABLE IF NOT EXISTS observations (
             id               TEXT PRIMARY KEY,
@@ -1658,6 +1676,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_attention_events_unlabeled ON attention_events(acceptance_signal) WHERE acceptance_signal IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_capability_shadow_events_observed_at ON capability_shadow_events(observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_capability_shadow_events_cell ON capability_shadow_events(cell_domain, cell_verb, cell_risk_class)",
+    "CREATE INDEX IF NOT EXISTS idx_immunity_shadow_events_observed_at ON immunity_shadow_events(observed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_immunity_shadow_events_gate ON immunity_shadow_events(gate, observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_procedural_task_type ON procedural_memory(task_type)",
     "CREATE INDEX IF NOT EXISTS idx_procedural_draft ON procedural_memory(draft)",
     "CREATE INDEX IF NOT EXISTS idx_procedural_activation_tier ON procedural_memory(activation_tier)",
