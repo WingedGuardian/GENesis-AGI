@@ -207,6 +207,14 @@ _sync_deploy_targets() {
                 "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
             HOST_DEPLOYED_COMMIT="$(printf '%s' "$HOST_VER_RAW" \
                 | sed -n 's/.*"deployed_commit": "\([^"]*\)".*/\1/p' || true)"
+            # F.0 capability probe: does the host gateway advertise the
+            # sha-checked redeploy form? If so, a verified-form failure is a REAL
+            # rejection (e.g. archive sha256 mismatch) and we must NOT retry the
+            # unguarded 1-arg form (that would defeat the integrity check).
+            _gv_verify_capable=0
+            if printf '%s' "$HOST_VER_RAW" | grep -q '"redeploy_verify": *true'; then
+                _gv_verify_capable=1
+            fi
 
             # Compute redeploy-decision facts (no side effects) and let the pure
             # _guardian_redeploy_reason helper resolve the reason string.
@@ -259,10 +267,18 @@ _sync_deploy_targets() {
                     GUARDIAN_ARCHIVE_SHA="$(sha256sum "$GUARDIAN_ARCHIVE" | cut -d' ' -f1)"
                     if _redeploy_ssh "redeploy $DEPLOY_HASH $GUARDIAN_ARCHIVE_SHA"; then
                         echo "  Guardian redeployed ($DEPLOY_HASH, verified)"
+                    elif [ "$_gv_verify_capable" = 1 ]; then
+                        # The gateway advertises redeploy_verify, so the verified
+                        # form's failure is a REAL rejection (archive sha256
+                        # mismatch / missing files / write error) — retrying the
+                        # unguarded 1-arg form would send the same bytes WITHOUT
+                        # the integrity check and defeat F.0. Report non-fatal;
+                        # the next run (drift keeps re-triggering) retries.
+                        echo "  Guardian verified redeploy failed (non-fatal) — NOT falling back to the unguarded form (gateway is verify-capable)"
                     elif _redeploy_ssh "redeploy $DEPLOY_HASH"; then
-                        # A gateway with redeploy but not the sha-checked form
-                        # (mid-rollout old gateway) rejects the 2-arg command as
-                        # an invalid hash — retry the legacy 1-arg form.
+                        # Old gateway with redeploy-but-no-sha (does NOT advertise
+                        # redeploy_verify): it rejects the 2-arg command as an
+                        # invalid hash — the bare 1-arg form is the only option.
                         echo "  Guardian redeployed ($DEPLOY_HASH, legacy unverified form)"
                     else
                         # Gateway too old to know 'redeploy' at all — use 'update'
