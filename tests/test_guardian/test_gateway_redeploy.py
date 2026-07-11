@@ -87,8 +87,11 @@ def sandbox(tmp_path):
     shim.chmod(0o755)
 
     return {
-        "home": home, "install": install, "state": state,
-        "fakebin": fakebin, "calls": calls,
+        "home": home,
+        "install": install,
+        "state": state,
+        "fakebin": fakebin,
+        "calls": calls,
     }
 
 
@@ -99,8 +102,11 @@ def _run(sandbox: dict, verb: str, stdin: bytes = b"") -> subprocess.CompletedPr
         "SSH_ORIGINAL_COMMAND": verb,
     }
     return subprocess.run(
-        ["bash", str(GATEWAY)], env=env, input=stdin,
-        capture_output=True, timeout=60,
+        ["bash", str(GATEWAY)],
+        env=env,
+        input=stdin,
+        capture_output=True,
+        timeout=60,
     )
 
 
@@ -132,6 +138,27 @@ class TestRedeployVerified:
         assert ds["tree_sha256"] == sha
         # New tree actually landed; old sentinel gone (clean extract, backup pruned).
         assert (sandbox["install"] / "src" / "genesis" / "guardian" / "__init__.py").exists()
+        assert _no_spool_left(sandbox)
+
+    def test_verified_deploy_with_large_archive(self, sandbox):
+        # Regression for the pipefail+SIGPIPE membership bug: a real git archive
+        # lists ~1900 entries (~86 KB), well over the 64 KB pipe buffer. The old
+        # `printf | grep -q` gate short-circuited, printf got SIGPIPE, and
+        # pipefail reported the PRESENT required files as missing. Build a tar
+        # whose `tar -tf` output far exceeds the pipe buffer, with the required
+        # files present, and confirm the verified deploy succeeds.
+        members = _good_members()
+        # ~3000 long-named dummy entries → listing well over 64 KB.
+        for i in range(3000):
+            members[f"src/genesis/pkg/really_long_module_name_number_{i:05d}.py"] = b"x\n"
+        tar = _make_tar(members)
+        sha = hashlib.sha256(tar).hexdigest()
+        res = _run(sandbox, f"redeploy abc1234 {sha}", stdin=tar)
+        assert res.returncode == 0, res.stderr
+        payload = json.loads(res.stdout)
+        assert payload["ok"] is True
+        assert payload["verified"] is True
+        assert _deploy_state(sandbox)["deployed_commit"] == "abc1234"
         assert _no_spool_left(sandbox)
 
     def test_version_advertises_redeploy_verify_and_tree_sha(self, sandbox):

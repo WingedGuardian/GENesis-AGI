@@ -465,11 +465,20 @@ PYEOF
         # like the sha check — runs BEFORE the running guardian is disturbed.
         TAR_LIST="$(tar -tf "$SPOOL" 2>/dev/null || true)"
         REDEPLOY_TREE_OK=true
+        # Whole-line membership via a PURE-BASH substring match — deliberately
+        # NOT `printf '%s\n' "$TAR_LIST" | grep -qxF`. Under `set -o pipefail`,
+        # grep -q short-circuits on a match and the writer (printf) then gets
+        # SIGPIPE, so the pipeline exits non-zero and a PRESENT file reads as
+        # missing — but only once the listing exceeds the ~64 KB pipe buffer
+        # (a real archive's `tar -tf` is ~86 KB). Wrapping the list in newlines
+        # and matching `\n<req>\n` as a substring has no subprocess, no pipe,
+        # and no SIGPIPE, so it is correct at any size.
+        _tar_wrapped=$'\n'"${TAR_LIST}"$'\n'
         for _req in src/genesis/guardian/check.py scripts/guardian-gateway.sh pyproject.toml; do
-            if ! printf '%s\n' "$TAR_LIST" | grep -qxF "$_req"; then
-                REDEPLOY_TREE_OK=false
-                break
-            fi
+            case "$_tar_wrapped" in
+                *$'\n'"$_req"$'\n'*) : ;;   # present
+                *) REDEPLOY_TREE_OK=false; break ;;
+            esac
         done
         if [ "$REDEPLOY_TREE_OK" != true ]; then
             echo '{"ok": false, "action": "redeploy", "error": "archive missing required files"}' >&2
