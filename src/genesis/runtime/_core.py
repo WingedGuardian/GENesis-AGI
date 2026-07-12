@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -284,7 +285,8 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             if age > 7200:  # 2 hours — no legitimate batch job runs longer
                 logger.warning(
                     "Heavy workload '%s' expired after %.0fs — auto-clearing",
-                    self._heavy_workload, age,
+                    self._heavy_workload,
+                    age,
                 )
                 self._heavy_workload = None
                 self._heavy_workload_since = None
@@ -312,16 +314,21 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
             if self._awareness_loop is not None:
                 registry.register("awareness_tick", self._awareness_loop._on_tick)
-            if self._surplus_scheduler is not None and hasattr(self._surplus_scheduler, "brainstorm_check"):
+            if self._surplus_scheduler is not None and hasattr(
+                self._surplus_scheduler, "brainstorm_check"
+            ):
                 registry.register("surplus_brainstorm", self._surplus_scheduler.brainstorm_check)
-            if self._outreach_scheduler is not None and hasattr(self._outreach_scheduler, "_health_check_job"):
+            if self._outreach_scheduler is not None and hasattr(
+                self._outreach_scheduler, "_health_check_job"
+            ):
                 registry.register("health_check", self._outreach_scheduler._health_check_job)
 
             self._job_retry_registry = registry
             registered = registry.list_registered()
             logger.info(
                 "JobRetryRegistry wired with %d jobs: %s",
-                len(registered), ", ".join(registered),
+                len(registered),
+                ", ".join(registered),
             )
         except Exception:
             logger.error("Failed to wire JobRetryRegistry", exc_info=True)
@@ -343,10 +350,18 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         _full = mode == "full"
         logger.info("GenesisRuntime bootstrap starting (mode=%s)", mode)
 
+        # WS-3: the runtime process must NEVER carry a session-origin env var —
+        # the same memory MCP tool functions run in-process here (dashboard
+        # tool_api, runtime memory init), and a stale GENESIS_SESSION_ORIGIN
+        # inherited from a dev shell would silently stamp every in-process
+        # write. Dispatched CC children get theirs from CCInvoker._build_env.
+        os.environ.pop("GENESIS_SESSION_ORIGIN", None)
+
         # Validate + restore corrupt credential files BEFORE loading secrets,
         # so a zeroed/corrupt secrets.env is healed before load_dotenv reads it.
         self._run_init_step(
-            "cred_integrity_startup", self._selfheal_credentials_startup,
+            "cred_integrity_startup",
+            self._selfheal_credentials_startup,
         )
 
         self._run_init_step("secrets", self._load_secrets)
@@ -386,7 +401,8 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         if _full:
             await self._run_init_step_async(
-                "direct_session", self._init_direct_session,
+                "direct_session",
+                self._init_direct_session,
             )
 
         await self._run_init_step_async("memory", self._init_memory)
@@ -395,6 +411,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         if self._db is not None:
             try:
                 from genesis.knowledge.ingest_upload import recover_stale_processing
+
                 recovered = await recover_stale_processing()
                 if recovered:
                     logger.info("Recovered %d stale knowledge uploads", recovered)
@@ -441,7 +458,8 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         if _full:
             await self._run_init_step_async(
-                "guardian_monitoring", self._init_guardian_monitoring,
+                "guardian_monitoring",
+                self._init_guardian_monitoring,
             )
 
         if _full:
@@ -481,7 +499,8 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
                     from genesis.util.tasks import tracked_task
 
                     tracked_task(
-                        _reaper_job.func(), name="initial_session_reap",
+                        _reaper_job.func(),
+                        name="initial_session_reap",
                     )
             except Exception:
                 logger.warning("Boot session-reap kick failed", exc_info=True)
@@ -489,13 +508,13 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._wire_job_retry_registry()
 
         critical_ok = all(
-            self._bootstrap_manifest.get(name) == "ok"
-            for name in self._CRITICAL_SUBSYSTEMS
+            self._bootstrap_manifest.get(name) == "ok" for name in self._CRITICAL_SUBSYSTEMS
         )
         self._bootstrapped = critical_ok
         if not critical_ok:
             failed = [
-                name for name in self._CRITICAL_SUBSYSTEMS
+                name
+                for name in self._CRITICAL_SUBSYSTEMS
                 if self._bootstrap_manifest.get(name) != "ok"
             ]
             logger.error("Bootstrap incomplete — critical subsystems failed: %s", failed)
@@ -503,7 +522,12 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             self._bootstrap_completed_at = datetime.now(UTC)
         ok = sum(1 for v in self._bootstrap_manifest.values() if v == "ok")
         total = len(self._bootstrap_manifest)
-        logger.info("GenesisRuntime bootstrap complete: %d/%d subsystems ok (bootstrapped=%s)", ok, total, critical_ok)
+        logger.info(
+            "GenesisRuntime bootstrap complete: %d/%d subsystems ok (bootstrapped=%s)",
+            ok,
+            total,
+            critical_ok,
+        )
         for name, status in self._bootstrap_manifest.items():
             if status != "ok":
                 logger.warning("Bootstrap: %s → %s", name, status)
@@ -537,7 +561,8 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
                 stopped = await self._direct_session_runner.shutdown()
                 if stopped:
                     logger.info(
-                        "Cancelled %d in-flight direct sessions", stopped,
+                        "Cancelled %d in-flight direct sessions",
+                        stopped,
                     )
             except Exception:
                 logger.exception("Failed to stop direct-session runner")
@@ -657,4 +682,3 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             self._bootstrap_manifest[name] = "degraded"
         else:
             self._bootstrap_manifest[name] = "ok"
-

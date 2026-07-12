@@ -576,13 +576,41 @@ verified: fa2e692a 2026-07-11
   reaches an action-capable prompt (observe-only — the item still reaches the
   model; owner/first-party never recorded). The gate set is CI-locked in
   `test_recall_inject_coverage.py` (a new inject site or a removed emit fails).
-  **Gates 1-3 (procedure/identity/autonomy) do NOT yet emit** — inert in
-  shadow until source provenance is threaded to their decision points
-  (flip-blocking follow-ups). Auto-demote wired but dormant (server + enforce
-  only); retention via `scripts/prune_immunity_shadow.py` (disk-hygiene). The
-  shadow log is readable via the `immunity_status` health MCP tool
-  (gate-agnostic: per-gate live mode + per-site would-block counts — sizes the
-  B4 enforce blast radius; gates 1-3 surface here automatically once they emit).
+  **Gate 1 (procedure) is LIVE in SHADOW** — `record_would_block(gate="procedure")`
+  fires at the two promotion paths that have a trustworthy SOURCE-origin signal:
+  the judge convergence (`judge._store_judged_procedure`, covering BOTH the
+  struggle and rebuild callers) classifies by a coarse tool-name ingest scan over
+  the real transcript spine (`provenance.origin_from_tool_names` — external-ingest
+  tool → `external_untrusted`; over-observes by design since fetched content lives
+  in tool RESULTS the spine doesn't carry); the autonomy retrospective
+  (`executor/trace.py`) classifies by `initiated_by` (Genesis's own execution =
+  first_party/owner; the trace has no source-tool spine). Two promotion paths are
+  DEFERRED (classified `deferred-with-reason`, no emit): the deprecated
+  auto-extractor (`extractor.py` — its only signals are replay tools or a
+  hyphen-truncating prose scrape, both undercount) and `procedure_store` (an MCP
+  tool needing the caller's session origin — the session-origin PR's env; it
+  wires that emit). CI-locked in `test_procedure_gate_coverage.py`.
+  **Gates 2-3 (identity/autonomy) are LIVE in SHADOW.** Gate 2: the steering
+  write (`learning/pipeline.py`) emits with a CHANNEL allow-map origin
+  (`_CHANNEL_ORIGIN`: terminal/telegram/whatsapp/web = owner; voice + unknown
+  channels fail CLOSED to external_untrusted — the polarity fix for the
+  fail-open `_AUTONOMOUS_CHANNELS` deny-list, so a deny-list escape is now
+  OBSERVED), and the USER_KNOWLEDGE synthesis (`runtime/init/learning.py`)
+  emits first_party-by-authorship (FLIP BLOCKER: observations carry no
+  origin_class, so externally-planted user-facts remain first_party until
+  delta-level provenance lands). Gate 3: the emit lives INSIDE
+  `db/crud/capability_grants.py` (record_success/record_correction/apply_event
+  — `origin_class` is a REQUIRED kwarg so every future caller must state
+  provenance); all six live callers thread owner/first_party → zero rows today
+  by construction. Locks: `test_identity_autonomy_gate_coverage.py` pins the
+  loader's 4-method write_text surface by set-equality + the dashboard PUT
+  writer manually, and discovers grant-mutation callers ALIAS-RESOLVED (bare
+  `record_success` name collisions excluded). The legacy `autonomy_state`
+  evidence store is a documented out-of-scope exclusion. Auto-demote wired but
+  dormant (server + enforce only); retention via
+  `scripts/prune_immunity_shadow.py` (disk-hygiene). The shadow log is readable
+  via the `immunity_status` health MCP tool (gate-agnostic: per-gate live mode
+  + per-site would-block counts — sizes the B4 enforce blast radius).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h

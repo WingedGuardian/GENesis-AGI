@@ -205,7 +205,8 @@ class MailMonitor:
         # 5. Layer 1: Gemini paralegal — analyze all emails, produce briefs
         try:
             relevant, low_signal = await self._layer1_analyze(
-                new_emails, email_ids,
+                new_emails,
+                email_ids,
             )
             result.layer1_briefed = len(relevant)
             result.layer1_low_signal = len(low_signal)
@@ -224,10 +225,15 @@ class MailMonitor:
             msg_id = new_emails[brief.email_index - 1].message_id
             row_id = email_ids[msg_id]
             await mail_items.update_layer1_verdict(
-                self._db, row_id, verdict="low_signal",
+                self._db,
+                row_id,
+                verdict="low_signal",
             )
             await mail_items.update_status(
-                self._db, row_id, status="skipped", processed_at=now,
+                self._db,
+                row_id,
+                status="skipped",
+                processed_at=now,
             )
 
         # 6. Layer 2: CC judge — review surviving briefs
@@ -236,11 +242,16 @@ class MailMonitor:
                 msg_id = new_emails[brief.email_index - 1].message_id
                 row_id = email_ids[msg_id]
                 await mail_items.update_layer1_verdict(
-                    self._db, row_id, verdict="relevant",
+                    self._db,
+                    row_id,
+                    verdict="relevant",
                 )
 
             await self._layer2_judge(
-                relevant, new_emails, email_ids, result,
+                relevant,
+                new_emails,
+                email_ids,
+                result,
             )
 
         # 7. Mark ALL fetched emails as read
@@ -284,16 +295,20 @@ class MailMonitor:
             msg_id = emails[brief.email_index - 1].message_id
             row_id = email_ids[msg_id]
             await mail_items.update_layer1_brief(
-                self._db, row_id, brief_json=json.dumps({
-                    "email_index": brief.email_index,
-                    "sender": brief.sender,
-                    "subject": brief.subject,
-                    "classification": brief.classification,
-                    "relevance": brief.relevance,
-                    "key_findings": brief.key_findings,
-                    "assessment": brief.assessment,
-                    "recommendation": brief.recommendation,
-                }),
+                self._db,
+                row_id,
+                brief_json=json.dumps(
+                    {
+                        "email_index": brief.email_index,
+                        "sender": brief.sender,
+                        "subject": brief.subject,
+                        "classification": brief.classification,
+                        "relevance": brief.relevance,
+                        "key_findings": brief.key_findings,
+                        "assessment": brief.assessment,
+                        "recommendation": brief.recommendation,
+                    }
+                ),
             )
 
         # Split by relevance threshold
@@ -304,7 +319,9 @@ class MailMonitor:
         return relevant, low_signal
 
     def _parse_briefs(
-        self, response: str, expected_count: int,
+        self,
+        response: str,
+        expected_count: int,
     ) -> list[EmailBrief]:
         """Parse Gemini's JSON response into EmailBrief objects.
 
@@ -325,9 +342,9 @@ class MailMonitor:
                 raise TypeError(f"Expected list, got {type(raw_briefs).__name__}")
         except (json.JSONDecodeError, TypeError, ValueError):
             logger.error(
-                "Layer 1 paralegal returned unparseable response "
-                "(len=%d, first 200 chars: %s)",
-                len(response), response[:200],
+                "Layer 1 paralegal returned unparseable response (len=%d, first 200 chars: %s)",
+                len(response),
+                response[:200],
                 exc_info=True,
             )
             return _fallback_briefs_from_count(expected_count)
@@ -356,48 +373,55 @@ class MailMonitor:
                     continue
                 seen_indices.add(clamped_idx)
 
-                briefs.append(EmailBrief(
-                    email_index=clamped_idx,
-                    sender=str(raw.get("sender", "")),
-                    subject=str(raw.get("subject", "")),
-                    classification=str(raw.get("classification", "Unknown")),
-                    relevance=relevance_val,
-                    key_findings=[str(f) for f in findings],
-                    assessment=str(raw.get("assessment", "")),
-                    recommendation=str(raw.get("recommendation", "")),
-                ))
+                briefs.append(
+                    EmailBrief(
+                        email_index=clamped_idx,
+                        sender=str(raw.get("sender", "")),
+                        subject=str(raw.get("subject", "")),
+                        classification=str(raw.get("classification", "Unknown")),
+                        relevance=relevance_val,
+                        key_findings=[str(f) for f in findings],
+                        assessment=str(raw.get("assessment", "")),
+                        recommendation=str(raw.get("recommendation", "")),
+                    )
+                )
             except (TypeError, ValueError):
                 fallback_idx = max(1, min(expected_count, i + 1))
                 if fallback_idx not in seen_indices:
                     seen_indices.add(fallback_idx)
                     logger.warning(
                         "Failed to parse brief %d, using fallback",
-                        fallback_idx, exc_info=True,
+                        fallback_idx,
+                        exc_info=True,
                     )
-                    briefs.append(EmailBrief(
-                        email_index=fallback_idx,
-                        sender="",
-                        subject="",
-                        classification="Unknown",
-                        relevance=3,
-                        key_findings=["brief_parse_failure"],
-                        assessment="Paralegal output could not be parsed.",
-                        recommendation="Judge should review the original email.",
-                    ))
+                    briefs.append(
+                        EmailBrief(
+                            email_index=fallback_idx,
+                            sender="",
+                            subject="",
+                            classification="Unknown",
+                            relevance=3,
+                            key_findings=["brief_parse_failure"],
+                            assessment="Paralegal output could not be parsed.",
+                            recommendation="Judge should review the original email.",
+                        )
+                    )
 
         # Backfill any missing indices with fallback briefs
         for idx in range(1, expected_count + 1):
             if idx not in seen_indices:
-                briefs.append(EmailBrief(
-                    email_index=idx,
-                    sender="",
-                    subject="",
-                    classification="Unknown",
-                    relevance=3,
-                    key_findings=["missing_from_paralegal_response"],
-                    assessment="Paralegal did not produce a brief for this email.",
-                    recommendation="Judge should review the original email.",
-                ))
+                briefs.append(
+                    EmailBrief(
+                        email_index=idx,
+                        sender="",
+                        subject="",
+                        classification="Unknown",
+                        relevance=3,
+                        key_findings=["missing_from_paralegal_response"],
+                        assessment="Paralegal did not produce a brief for this email.",
+                        recommendation="Judge should review the original email.",
+                    )
+                )
 
         briefs.sort(key=lambda b: b.email_index)
         return briefs
@@ -469,14 +493,17 @@ class MailMonitor:
             msg_id = emails[brief.email_index - 1].message_id
             row_id = email_ids[msg_id]
             await mail_items.update_status(
-                self._db, row_id, status="processing", batch_id=batch_id,
+                self._db,
+                row_id,
+                status="processing",
+                batch_id=batch_id,
             )
 
         try:
             # Judge outputs JSON decisions only — no tools needed.
-            _no_mcp = str(
-                Path(__file__).resolve().parents[2] / "config" / "no_mcp.json"
-            )
+            _no_mcp = str(Path(__file__).resolve().parents[2] / "config" / "no_mcp.json")
+            from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
+
             invocation = CCInvocation(
                 prompt=prompt,
                 expect_output=True,  # silent-cap detection (judge silently no-ops on empty)
@@ -488,6 +515,10 @@ class MailMonitor:
                 disallowed_tools=["Write", "Edit", "Agent", "NotebookEdit"],
                 mcp_config=_no_mcp,
                 working_dir=background_session_dir(),
+                # WS-3: the judge reads external EMAIL bodies. Belt-and-
+                # suspenders — its MCP config is no_mcp (no memory server), so
+                # this is content-true classification, not a live write path.
+                origin=ORIGIN_EXTERNAL_UNTRUSTED,
             )
             cc_output = await self._invoker.run(invocation)
             judge_text = cc_output.text
@@ -504,22 +535,30 @@ class MailMonitor:
 
                 # Store judge decision in DB (audit trail for ALL judged emails)
                 await mail_items.update_layer2_decision(
-                    self._db, row_id, decision_json=json.dumps(decision),
+                    self._db,
+                    row_id,
+                    decision_json=json.dumps(decision),
                 )
 
                 if decision["decision"] == "KEEP":
                     await self._store_finding(
-                        emails[idx - 1], decision, batch_id,
+                        emails[idx - 1],
+                        decision,
+                        batch_id,
                     )
                     await mail_items.update_status(
-                        self._db, row_id,
-                        status="completed", processed_at=now,
+                        self._db,
+                        row_id,
+                        status="completed",
+                        processed_at=now,
                     )
                     result.layer2_kept += 1
                 else:
                     await mail_items.update_status(
-                        self._db, row_id,
-                        status="skipped", processed_at=now,
+                        self._db,
+                        row_id,
+                        status="skipped",
+                        processed_at=now,
                     )
                     result.layer2_discarded += 1
 
@@ -528,16 +567,12 @@ class MailMonitor:
                 from genesis.cc.types import CCOutput
                 from genesis.util.tasks import tracked_task
 
-                kept_decisions = [
-                    d for d in decisions if d["decision"] == "KEEP"
-                ]
+                kept_decisions = [d for d in decisions if d["decision"] == "KEEP"]
                 findings_text = "\n\n".join(
-                    f"## {d.get('refined_finding', d.get('rationale', ''))}"
-                    for d in kept_decisions
+                    f"## {d.get('refined_finding', d.get('rationale', ''))}" for d in kept_decisions
                 )
                 user_text = "\n".join(
-                    f"Subject: {emails[d['email_index'] - 1].subject}"
-                    for d in kept_decisions
+                    f"Subject: {emails[d['email_index'] - 1].subject}" for d in kept_decisions
                 )
                 # Wrap findings in CCOutput so the triage pipeline can
                 # access .session_id, .text, .input_tokens, etc.
@@ -568,8 +603,11 @@ class MailMonitor:
                 msg_id = emails[brief.email_index - 1].message_id
                 row_id = email_ids[msg_id]
                 await mail_items.update_status(
-                    self._db, row_id,
-                    status="failed", error_message=err, processed_at=now,
+                    self._db,
+                    row_id,
+                    status="failed",
+                    error_message=err,
+                    processed_at=now,
                 )
 
     def _parse_judge_decisions(
@@ -606,27 +644,28 @@ class MailMonitor:
                 if raw_idx not in valid_indices:
                     raw_idx = briefs[min(i, len(briefs) - 1)].email_index
 
-                decisions.append({
-                    "email_index": raw_idx,
-                    "decision": str(raw.get("decision", "KEEP")).upper(),
-                    "rationale": str(raw.get("rationale", "")),
-                    "refined_finding": str(raw.get("refined_finding", "")),
-                })
+                decisions.append(
+                    {
+                        "email_index": raw_idx,
+                        "decision": str(raw.get("decision", "KEEP")).upper(),
+                        "rationale": str(raw.get("rationale", "")),
+                        "refined_finding": str(raw.get("refined_finding", "")),
+                    }
+                )
             return decisions
 
         except (json.JSONDecodeError, TypeError, ValueError):
             logger.error(
-                "Judge output unparseable — treating all as KEEP "
-                "(len=%d, first 200 chars: %s)",
-                len(judge_text), judge_text[:200],
+                "Judge output unparseable — treating all as KEEP (len=%d, first 200 chars: %s)",
+                len(judge_text),
+                judge_text[:200],
                 exc_info=True,
             )
             return [
                 {
                     "email_index": b.email_index,
                     "decision": "KEEP",
-                    "rationale": "Judge output could not be parsed; "
-                    "defaulting to KEEP.",
+                    "rationale": "Judge output could not be parsed; defaulting to KEEP.",
                     "refined_finding": b.assessment,
                 }
                 for b in briefs
@@ -649,7 +688,9 @@ class MailMonitor:
         ).hexdigest()[:16]
 
         if await observations.exists_by_hash(
-            self._db, source="recon", content_hash=content_hash,
+            self._db,
+            source="recon",
+            content_hash=content_hash,
         ):
             return
 
@@ -684,9 +725,11 @@ class MailMonitor:
         ]
 
         for brief in briefs:
-            findings_str = "\n".join(
-                f"    - {f}" for f in brief.key_findings
-            ) if brief.key_findings else "    (none extracted)"
+            findings_str = (
+                "\n".join(f"    - {f}" for f in brief.key_findings)
+                if brief.key_findings
+                else "    (none extracted)"
+            )
             parts.append(
                 f"\n---\n\n## Brief {brief.email_index}: {brief.subject}\n"
                 f"**From:** {brief.sender}\n"
@@ -712,7 +755,10 @@ class MailMonitor:
     # ------------------------------------------------------------------
 
     async def _emit_event(
-        self, event_type: str, message: str, **details,
+        self,
+        event_type: str,
+        message: str,
+        **details,
     ) -> None:
         """Emit an event to the event bus."""
         if self._event_bus:
@@ -726,7 +772,9 @@ class MailMonitor:
                 )
             except Exception:
                 logger.warning(
-                    "Failed to emit event %s", event_type, exc_info=True,
+                    "Failed to emit event %s",
+                    event_type,
+                    exc_info=True,
                 )
 
     async def _emit_heartbeat(self) -> None:
@@ -746,6 +794,7 @@ class MailMonitor:
 # ------------------------------------------------------------------
 # Module-level helpers
 # ------------------------------------------------------------------
+
 
 def _fallback_briefs(emails: list[ParsedEmail]) -> list[EmailBrief]:
     """Create pass-through briefs when Layer 1 fails entirely."""

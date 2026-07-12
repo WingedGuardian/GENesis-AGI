@@ -1569,3 +1569,94 @@ async def test_knowledge_recall_enrichment_uses_raw_scores(db):
         )
     finally:
         mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+@pytest.mark.asyncio
+async def test_procedure_store_gate1_emit_honors_session_origin(monkeypatch):
+    """WS-3 gate-1 at the explicit-teach path: an external-influenced session
+    (GENESIS_SESSION_ORIGIN=external_untrusted) produces ONE shadow would-block
+    row; an unset env (foreground/internal session) coalesces to first_party
+    and produces NONE (never-block invariant) — never a raw None into the
+    gate's fail-closed normalizer."""
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+    from genesis.db.crud import immunity_shadow as ishadow_crud
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        real_db.row_factory = aiosqlite.Row
+        from genesis.db.schema import create_all_tables
+        await create_all_tables(real_db)
+        await real_db.commit()
+
+        old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+        old_verified = ishadow_crud._table_verified
+        try:
+            ishadow_crud._table_verified = False
+            mod._store = MagicMock()
+            mod._db = real_db
+            mod._retriever = MagicMock()
+            tools = await _get_tools()
+
+            # Unset env → first_party → no row.
+            monkeypatch.delenv("GENESIS_SESSION_ORIGIN", raising=False)
+            await tools["procedure_store"].fn(
+                task_type="internal-teach",
+                principle="A first-party taught procedure.",
+                steps=["do the thing"],
+                tools_used=["Bash"],
+                context_tags=["internal"],
+            )
+            assert await ishadow_crud.count(real_db) == 0
+
+            # External session env → exactly one gate=procedure row.
+            monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "external_untrusted")
+            await tools["procedure_store"].fn(
+                task_type="external-teach",
+                principle="A procedure taught from an external-influenced session.",
+                steps=["do the other thing"],
+                tools_used=["Bash"],
+                context_tags=["external"],
+            )
+            rows = await ishadow_crud.list_recent(real_db)
+            assert len(rows) == 1
+            assert rows[0]["gate"] == "procedure"
+            assert rows[0]["origin_class"] == "external_untrusted"
+            assert rows[0]["source_ref"] == "mcp/memory/procedural.py::procedure_store"
+        finally:
+            ishadow_crud._table_verified = old_verified
+            mod._store, mod._db, mod._retriever = old_store, old_db, old_retriever
+
+
+@pytest.mark.asyncio
+async def test_reference_store_forwards_session_origin(monkeypatch):
+    """WS-3: reference_store forwards the dispatched session's env origin into
+    the knowledge ingest (previously doubly blind: first-party pipeline AND
+    exempt from injection-gate counting)."""
+    import genesis.mcp.memory_mcp as mod
+    from genesis.memory import knowledge_ingest as ki
+
+    captured: dict = {}
+
+    async def _fake_ingest(**kwargs):
+        captured.update(kwargs)
+        return "unit-1"
+
+    old = (mod._store, mod._db, mod._qdrant, mod._retriever)
+    try:
+        mod._store, mod._db, mod._qdrant, mod._retriever = (
+            MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+        )
+        monkeypatch.setattr(ki, "ingest_knowledge_unit", _fake_ingest)
+        monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "external_untrusted")
+        tools = await _get_tools()
+        out = await tools["reference_store"].fn(
+            kind="url",
+            identifier="example service",
+            value="https://example.invalid/x",
+            description="synthetic test reference",
+        )
+        assert out == "unit-1"
+        assert captured["origin_class"] == "external_untrusted"
+    finally:
+        mod._store, mod._db, mod._qdrant, mod._retriever = old

@@ -66,7 +66,9 @@ def test_build_args_with_mcp_config(invoker):
 
 def test_build_args_strict_mcp_config(invoker):
     inv = CCInvocation(
-        prompt="hello", mcp_config="/path/to/mcp.json", strict_mcp_config=True,
+        prompt="hello",
+        mcp_config="/path/to/mcp.json",
+        strict_mcp_config=True,
     )
     args = invoker._build_args(inv)
     assert "--strict-mcp-config" in args
@@ -87,7 +89,9 @@ def test_build_args_includes_span_settings(invoker, monkeypatch):
     import genesis.cc.invoker as inv_mod
 
     monkeypatch.setattr(
-        inv_mod, "cc_span_settings_path", lambda: "/tmp/cc-span-settings.json",
+        inv_mod,
+        "cc_span_settings_path",
+        lambda: "/tmp/cc-span-settings.json",
     )
     args = invoker._build_args(CCInvocation(prompt="hi"))
     assert "--settings" in args
@@ -195,6 +199,7 @@ def test_build_env_omits_anthropic_base_url_when_none(invoker):
     inv = CCInvocation(prompt="hello")
     with patch.dict("os.environ", {}, clear=False):
         import os
+
         os.environ.pop("ANTHROPIC_BASE_URL", None)
         env = invoker._build_env(inv)
         assert "ANTHROPIC_BASE_URL" not in env
@@ -240,11 +245,15 @@ def test_parse_result_dict_ignores_auxiliary_model_for_downgrade(invoker):
     present; an aux haiku listed FIRST must not read as a downgrade
     (false-positived the bench fairness check, 2026-07-09)."""
     result_data = {
-        "result": "ok", "session_id": "s", "usage": {},
+        "result": "ok",
+        "session_id": "s",
+        "usage": {},
         "modelUsage": {"claude-haiku-4-5-20251001": {}, "claude-sonnet-5": {}},
     }
     out = invoker._parse_result_dict(
-        result_data, CCInvocation(prompt="x", model=CCModel.SONNET), 100,
+        result_data,
+        CCInvocation(prompt="x", model=CCModel.SONNET),
+        100,
     )
     assert out.downgraded is False
     assert "sonnet" in out.model_used
@@ -252,11 +261,15 @@ def test_parse_result_dict_ignores_auxiliary_model_for_downgrade(invoker):
 
 def test_parse_result_dict_detects_genuine_downgrade(invoker):
     result_data = {
-        "result": "ok", "session_id": "s", "usage": {},
+        "result": "ok",
+        "session_id": "s",
+        "usage": {},
         "modelUsage": {"claude-haiku-4-5-20251001": {}},
     }
     out = invoker._parse_result_dict(
-        result_data, CCInvocation(prompt="x", model=CCModel.SONNET), 100,
+        result_data,
+        CCInvocation(prompt="x", model=CCModel.SONNET),
+        100,
     )
     assert out.downgraded is True
 
@@ -274,6 +287,41 @@ def test_build_env_omits_bash_allowlist_when_empty(invoker):
     with patch.dict("os.environ", {"GENESIS_BASH_ALLOWLIST": "leaked"}):
         env = invoker._build_env(inv)
         assert "GENESIS_BASH_ALLOWLIST" not in env
+
+
+def test_build_env_sets_session_origin(invoker):
+    """WS-3: an origin-tagged invocation exports GENESIS_SESSION_ORIGIN so the
+    session's memory MCP writes classify accordingly."""
+    inv = CCInvocation(prompt="hello", origin="external_untrusted")
+    env = invoker._build_env(inv)
+    assert env["GENESIS_SESSION_ORIGIN"] == "external_untrusted"
+
+
+def test_build_env_pops_session_origin_when_unset(invoker):
+    """No origin → the var is POPPED (a stale parent value must never leak
+    into a first-party session)."""
+    inv = CCInvocation(prompt="hello")
+    with patch.dict("os.environ", {"GENESIS_SESSION_ORIGIN": "external_untrusted"}):
+        env = invoker._build_env(inv)
+        assert "GENESIS_SESSION_ORIGIN" not in env
+
+
+def test_build_env_env_overrides_win_over_session_origin(invoker):
+    """env_overrides are applied LAST by contract — they beat the origin stamp."""
+    inv = CCInvocation(
+        prompt="hello",
+        origin="external_untrusted",
+        env_overrides={"GENESIS_SESSION_ORIGIN": "first_party"},
+    )
+    env = invoker._build_env(inv)
+    assert env["GENESIS_SESSION_ORIGIN"] == "first_party"
+
+
+def test_invocation_rejects_invalid_origin():
+    """Producer-side loud validation: a typo'd origin fails at construction,
+    never silently classifies a session first_party."""
+    with pytest.raises(ValueError, match="origin"):
+        CCInvocation(prompt="hello", origin="external-untrusted")  # hyphen typo
 
 
 @pytest.mark.asyncio
@@ -354,14 +402,18 @@ async def test_run_via_proxy_sets_flag(invoker):
 @pytest.mark.asyncio
 async def test_run_timeout(invoker):
     mock_proc = AsyncMock()
-    mock_proc.pid = 99999  # Must set — AsyncMock().pid int() == 1 → killpg(1) == kill(-1) == kill ALL
+    mock_proc.pid = (
+        99999  # Must set — AsyncMock().pid int() == 1 → killpg(1) == kill(-1) == kill ALL
+    )
     mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
     mock_proc.kill = MagicMock()
     mock_proc.wait = AsyncMock()
     mock_proc.returncode = -9
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
-         pytest.raises(CCTimeoutError, match="Timeout"):
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCTimeoutError, match="Timeout"),
+    ):
         await invoker.run(CCInvocation(prompt="hello", timeout_s=1))
 
 
@@ -371,8 +423,10 @@ async def test_run_nonzero_exit(invoker):
     mock_proc.communicate = AsyncMock(return_value=(b"", b"Error: something failed"))
     mock_proc.returncode = 1
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
-         pytest.raises(CCProcessError):
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCProcessError),
+    ):
         await invoker.run(CCInvocation(prompt="hello"))
 
 
@@ -516,7 +570,8 @@ async def test_run_streaming_success(invoker):
 
     with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
         output = await invoker.run_streaming(
-            CCInvocation(prompt="hello"), on_event=on_event,
+            CCInvocation(prompt="hello"),
+            on_event=on_event,
         )
 
     assert output.text == "hello"
@@ -564,8 +619,10 @@ async def test_run_streaming_timeout_returns_partial(invoker):
     mock_proc.wait = AsyncMock()
     mock_proc.returncode = -9
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
-         pytest.raises(CCTimeoutError, match="Timeout"):
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCTimeoutError, match="Timeout"),
+    ):
         await invoker.run_streaming(
             CCInvocation(prompt="hello", timeout_s=0),
         )
@@ -611,17 +668,13 @@ async def test_run_streaming_tool_use_events(invoker):
         {
             "type": "assistant",
             "message": {
-                "content": [
-                    {"type": "tool_use", "name": "Read", "input": {"path": "foo.py"}}
-                ]
+                "content": [{"type": "tool_use", "name": "Read", "input": {"path": "foo.py"}}]
             },
         },
         {
             "type": "user",
             "message": {
-                "content": [
-                    {"tool_use_id": "t1", "type": "tool_result", "content": "data"}
-                ]
+                "content": [{"tool_use_id": "t1", "type": "tool_result", "content": "data"}]
             },
         },
         {
@@ -653,7 +706,8 @@ async def test_run_streaming_tool_use_events(invoker):
 
     with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
         output = await invoker.run_streaming(
-            CCInvocation(prompt="find foo"), on_event=on_event,
+            CCInvocation(prompt="find foo"),
+            on_event=on_event,
         )
 
     assert output.text == "found it"
@@ -680,9 +734,13 @@ async def test_run_streaming_rate_limit_with_valid_response():
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "Got it"}]}},
         {"type": "rate_limit_event", "info": {}},
         {
-            "type": "result", "subtype": "success", "is_error": False,
-            "result": "Got it", "session_id": "s1",
-            "total_cost_usd": 0.01, "duration_ms": 100,
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "Got it",
+            "session_id": "s1",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
             "usage": {"input_tokens": 5, "output_tokens": 3},
             "modelUsage": {"claude-sonnet-4-6": {}},
         },
@@ -718,9 +776,13 @@ async def test_run_streaming_rate_limit_with_empty_response_raises():
         {"type": "system", "subtype": "init", "session_id": "s1"},
         {"type": "rate_limit_event", "info": {}},
         {
-            "type": "result", "subtype": "success", "is_error": False,
-            "result": "", "session_id": "s1",
-            "total_cost_usd": 0.0, "duration_ms": 50,
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "",
+            "session_id": "s1",
+            "total_cost_usd": 0.0,
+            "duration_ms": 50,
             "usage": {"input_tokens": 5, "output_tokens": 0},
             "modelUsage": {"claude-sonnet-4-6": {}},
         },
@@ -735,8 +797,10 @@ async def test_run_streaming_rate_limit_with_empty_response_raises():
     mock_proc.terminate = MagicMock()
     mock_proc.returncode = 0
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
-         pytest.raises(CCRateLimitError):
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCRateLimitError),
+    ):
         await inv.run_streaming(CCInvocation(prompt="test"))
 
 
@@ -745,18 +809,21 @@ async def test_run_streaming_rate_limit_with_empty_response_raises():
 
 def test_classify_error_session_expired(invoker):
     from genesis.cc.exceptions import CCSessionError
+
     err = invoker._classify_error("Session 'abc' not found or expired")
     assert isinstance(err, CCSessionError)
 
 
 def test_classify_error_rate_limit(invoker):
     from genesis.cc.exceptions import CCRateLimitError
+
     err = invoker._classify_error("Rate limit exceeded, status 429")
     assert isinstance(err, CCRateLimitError)
 
 
 def test_classify_error_mcp(invoker):
     from genesis.cc.exceptions import CCMCPError
+
     err = invoker._classify_error("MCP server 'memory' returned error")
     assert isinstance(err, CCMCPError)
     assert err.server_name == "memory"
@@ -771,9 +838,7 @@ def test_classify_error_thinking_block(invoker):
     """Thinking-block corruption on resume classified as session error."""
     from genesis.cc.exceptions import CCSessionError
 
-    err = invoker._classify_error(
-        "thinking blocks cannot be modified after initial creation"
-    )
+    err = invoker._classify_error("thinking blocks cannot be modified after initial creation")
     assert isinstance(err, CCSessionError)
 
 
@@ -868,14 +933,23 @@ def test_register_prunes_dead_entries():
 async def test_run_registers_under_session_key_and_clears(invoker):
     """End-to-end: run() registers the proc under invocation.session_key while
     executing, and unregisters it in finally (cc-loop-01)."""
-    result_line = json.dumps({
-        "type": "result", "subtype": "success", "is_error": False,
-        "result": "ok", "session_id": "s", "total_cost_usd": 0.0,
-        "duration_ms": 1, "usage": {
-            "input_tokens": 1, "output_tokens": 1,
-            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
-        },
-    })
+    result_line = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "ok",
+            "session_id": "s",
+            "total_cost_usd": 0.0,
+            "duration_ms": 1,
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+        }
+    )
     captured: dict = {}
     mock_proc = AsyncMock()
     mock_proc.returncode = 0
@@ -899,9 +973,14 @@ async def test_run_streaming_registers_under_session_key_and_clears(invoker):
     events = [
         {"type": "system", "subtype": "init", "session_id": "s1"},
         {
-            "type": "result", "subtype": "success", "is_error": False,
-            "result": "ok", "session_id": "s1", "total_cost_usd": 0.0,
-            "duration_ms": 1, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "ok",
+            "session_id": "s1",
+            "total_cost_usd": 0.0,
+            "duration_ms": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
             "modelUsage": {"claude-sonnet-4-6": {}},
         },
     ]
@@ -921,7 +1000,8 @@ async def test_run_streaming_registers_under_session_key_and_clears(invoker):
 
     with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
         await invoker.run_streaming(
-            CCInvocation(prompt="hi", session_key="tg:3:4"), on_event=on_event,
+            CCInvocation(prompt="hi", session_key="tg:3:4"),
+            on_event=on_event,
         )
 
     assert captured["keys"] == ["tg:3:4"]  # registered during streaming
@@ -943,7 +1023,8 @@ async def test_interrupt_real_procs_targets_correct_one():
     try:
         for key in ("session-a", "session-b"):
             p = await asyncio.create_subprocess_exec(
-                "sleep", "30",
+                "sleep",
+                "30",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
                 preexec_fn=_os.setpgrp,
@@ -971,6 +1052,7 @@ async def test_interrupt_real_procs_targets_correct_one():
 
 def test_invoker_satisfies_agent_provider():
     from genesis.cc.protocol import AgentProvider
+
     assert isinstance(CCInvoker(), AgentProvider)
 
 
@@ -1045,15 +1127,15 @@ async def test_status_callback_on_quota_exhaustion():
     inv = CCInvoker(claude_path="claude", on_cc_status_change=on_status)
 
     mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(b"", b"Usage limit exceeded")
-    )
+    mock_proc.communicate = AsyncMock(return_value=(b"", b"Usage limit exceeded"))
     mock_proc.returncode = 1
 
     from genesis.cc.exceptions import CCQuotaExhaustedError
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
-         pytest.raises(CCQuotaExhaustedError):
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCQuotaExhaustedError),
+    ):
         await inv.run(CCInvocation(prompt="hello"))
 
     assert statuses == ["UNAVAILABLE"]
@@ -1070,15 +1152,15 @@ async def test_status_callback_on_rate_limit():
     inv = CCInvoker(claude_path="claude", on_cc_status_change=on_status)
 
     mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(b"", b"Rate limit exceeded, 429")
-    )
+    mock_proc.communicate = AsyncMock(return_value=(b"", b"Rate limit exceeded, 429"))
     mock_proc.returncode = 1
 
     from genesis.cc.exceptions import CCRateLimitError
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
-         pytest.raises(CCRateLimitError):
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCRateLimitError),
+    ):
         await inv.run(CCInvocation(prompt="hello"))
 
     assert statuses == ["RATE_LIMITED"]
@@ -1096,30 +1178,35 @@ async def test_status_callback_recovery_after_failure():
 
     # First call: rate limit error
     mock_proc_fail = AsyncMock()
-    mock_proc_fail.communicate = AsyncMock(
-        return_value=(b"", b"Rate limit exceeded, 429")
-    )
+    mock_proc_fail.communicate = AsyncMock(return_value=(b"", b"Rate limit exceeded, 429"))
     mock_proc_fail.returncode = 1
 
     from genesis.cc.exceptions import CCRateLimitError
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc_fail), \
-         pytest.raises(CCRateLimitError):
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc_fail),
+        pytest.raises(CCRateLimitError),
+    ):
         await inv.run(CCInvocation(prompt="hello"))
 
     assert statuses == ["RATE_LIMITED"]
 
     # Second call: success
-    result_json = json.dumps({
-        "type": "result", "subtype": "success", "is_error": False,
-        "result": "ok", "session_id": "s1", "total_cost_usd": 0.01,
-        "duration_ms": 100, "usage": {"input_tokens": 5, "output_tokens": 2},
-        "modelUsage": {},
-    })
-    mock_proc_ok = AsyncMock()
-    mock_proc_ok.communicate = AsyncMock(
-        return_value=(result_json.encode(), b"")
+    result_json = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "ok",
+            "session_id": "s1",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+            "modelUsage": {},
+        }
     )
+    mock_proc_ok = AsyncMock()
+    mock_proc_ok.communicate = AsyncMock(return_value=(result_json.encode(), b""))
     mock_proc_ok.returncode = 0
 
     with patch("asyncio.create_subprocess_exec", return_value=mock_proc_ok):
@@ -1140,13 +1227,13 @@ async def test_no_callback_on_generic_error():
     inv = CCInvoker(claude_path="claude", on_cc_status_change=on_status)
 
     mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(b"", b"Something unknown went wrong")
-    )
+    mock_proc.communicate = AsyncMock(return_value=(b"", b"Something unknown went wrong"))
     mock_proc.returncode = 1
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
-         pytest.raises(CCProcessError):
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCProcessError),
+    ):
         await inv.run(CCInvocation(prompt="hello"))
 
     assert statuses == []  # No callback for generic errors
@@ -1159,9 +1246,14 @@ async def test_run_streaming_uses_invocation_working_dir():
 
     events = [
         {
-            "type": "result", "subtype": "success", "is_error": False,
-            "result": "ok", "session_id": "s1", "total_cost_usd": 0.01,
-            "duration_ms": 100, "usage": {"input_tokens": 5, "output_tokens": 2},
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "ok",
+            "session_id": "s1",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 5, "output_tokens": 2},
             "modelUsage": {},
         },
     ]
@@ -1189,16 +1281,21 @@ async def test_run_uses_invocation_working_dir():
     """Invocation working_dir overrides invoker default."""
     inv = CCInvoker(claude_path="claude", working_dir="/default-dir")
 
-    result_json = json.dumps({
-        "type": "result", "subtype": "success", "is_error": False,
-        "result": "ok", "session_id": "s1", "total_cost_usd": 0.01,
-        "duration_ms": 100, "usage": {"input_tokens": 5, "output_tokens": 2},
-        "modelUsage": {},
-    })
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(result_json.encode(), b"")
+    result_json = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "ok",
+            "session_id": "s1",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+            "modelUsage": {},
+        }
     )
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(result_json.encode(), b""))
     mock_proc.returncode = 0
 
     with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
@@ -1213,16 +1310,21 @@ async def test_run_falls_back_to_invoker_working_dir():
     """When invocation has no working_dir, invoker default is used."""
     inv = CCInvoker(claude_path="claude", working_dir="/invoker-dir")
 
-    result_json = json.dumps({
-        "type": "result", "subtype": "success", "is_error": False,
-        "result": "ok", "session_id": "s1", "total_cost_usd": 0.01,
-        "duration_ms": 100, "usage": {"input_tokens": 5, "output_tokens": 2},
-        "modelUsage": {},
-    })
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(result_json.encode(), b"")
+    result_json = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "ok",
+            "session_id": "s1",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+            "modelUsage": {},
+        }
     )
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(result_json.encode(), b""))
     mock_proc.returncode = 0
 
     with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
@@ -1242,16 +1344,21 @@ async def test_no_callback_on_repeated_success():
 
     inv = CCInvoker(claude_path="claude", on_cc_status_change=on_status)
 
-    result_json = json.dumps({
-        "type": "result", "subtype": "success", "is_error": False,
-        "result": "ok", "session_id": "s1", "total_cost_usd": 0.01,
-        "duration_ms": 100, "usage": {"input_tokens": 5, "output_tokens": 2},
-        "modelUsage": {},
-    })
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(result_json.encode(), b"")
+    result_json = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "ok",
+            "session_id": "s1",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+            "modelUsage": {},
+        }
     )
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(result_json.encode(), b""))
     mock_proc.returncode = 0
 
     with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
@@ -1317,6 +1424,7 @@ def test_build_args_bare_with_other_flags(invoker):
 
 def test_invocation_on_spawn_construction():
     """CCInvocation accepts on_spawn as a callable field."""
+
     async def my_callback(pid: int) -> None:
         pass
 
@@ -1326,6 +1434,7 @@ def test_invocation_on_spawn_construction():
 
 def test_invocation_on_spawn_excluded_from_eq():
     """on_spawn is excluded from __eq__ (compare=False)."""
+
     async def cb1(pid: int) -> None:
         pass
 
@@ -1339,6 +1448,7 @@ def test_invocation_on_spawn_excluded_from_eq():
 
 def test_invocation_on_spawn_excluded_from_repr():
     """on_spawn is excluded from repr (repr=False)."""
+
     async def cb(pid: int) -> None:
         pass
 
@@ -1354,17 +1464,22 @@ async def test_run_fires_on_spawn_with_pid(invoker):
     async def on_spawn(pid: int) -> None:
         spawned_pids.append(pid)
 
-    result_json = json.dumps({
-        "type": "result", "subtype": "success", "is_error": False,
-        "result": "ok", "session_id": "s1", "total_cost_usd": 0.01,
-        "duration_ms": 100, "usage": {"input_tokens": 5, "output_tokens": 2},
-        "modelUsage": {},
-    })
+    result_json = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "ok",
+            "session_id": "s1",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+            "modelUsage": {},
+        }
+    )
     mock_proc = AsyncMock()
     mock_proc.pid = 42000
-    mock_proc.communicate = AsyncMock(
-        return_value=(result_json.encode(), b"")
-    )
+    mock_proc.communicate = AsyncMock(return_value=(result_json.encode(), b""))
     mock_proc.returncode = 0
 
     with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
@@ -1376,20 +1491,26 @@ async def test_run_fires_on_spawn_with_pid(invoker):
 @pytest.mark.asyncio
 async def test_run_on_spawn_exception_does_not_abort(invoker):
     """on_spawn failure must not kill the subprocess or abort the run."""
+
     async def bad_callback(pid: int) -> None:
         raise RuntimeError("DB write failed")
 
-    result_json = json.dumps({
-        "type": "result", "subtype": "success", "is_error": False,
-        "result": "ok", "session_id": "s1", "total_cost_usd": 0.01,
-        "duration_ms": 100, "usage": {"input_tokens": 5, "output_tokens": 2},
-        "modelUsage": {},
-    })
+    result_json = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "ok",
+            "session_id": "s1",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+            "modelUsage": {},
+        }
+    )
     mock_proc = AsyncMock()
     mock_proc.pid = 42001
-    mock_proc.communicate = AsyncMock(
-        return_value=(result_json.encode(), b"")
-    )
+    mock_proc.communicate = AsyncMock(return_value=(result_json.encode(), b""))
     mock_proc.returncode = 0
 
     with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
@@ -1401,16 +1522,21 @@ async def test_run_on_spawn_exception_does_not_abort(invoker):
 @pytest.mark.asyncio
 async def test_run_no_on_spawn_callback(invoker):
     """Without on_spawn, run() works exactly as before (backward compat)."""
-    result_json = json.dumps({
-        "type": "result", "subtype": "success", "is_error": False,
-        "result": "ok", "session_id": "s1", "total_cost_usd": 0.01,
-        "duration_ms": 100, "usage": {"input_tokens": 5, "output_tokens": 2},
-        "modelUsage": {},
-    })
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(result_json.encode(), b"")
+    result_json = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "ok",
+            "session_id": "s1",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+            "modelUsage": {},
+        }
     )
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(result_json.encode(), b""))
     mock_proc.returncode = 0
 
     with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
@@ -1422,6 +1548,7 @@ async def test_run_no_on_spawn_callback(invoker):
 # ---------------------------------------------------------------------------
 # Model-aware effort guard
 # ---------------------------------------------------------------------------
+
 
 class TestEffortClamping:
     """clamp_effort() / model_supports_effort() and _build_args() effort gating.
@@ -1489,6 +1616,7 @@ class TestEffortClamping:
 
     def test_build_args_no_clamp_warning_for_sonnet_xhigh(self, invoker, caplog):
         import logging
+
         inv = CCInvocation(prompt="hi", model=CCModel.SONNET, effort=EffortLevel.XHIGH)
         with caplog.at_level(logging.WARNING, logger="genesis.cc.invoker"):
             invoker._build_args(inv)
@@ -1523,11 +1651,11 @@ async def test_run_streaming_cancelled_kills_subprocess(invoker):
 
     mock_proc.stdout = _CancelledStream()
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
-         pytest.raises(asyncio.CancelledError):
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(asyncio.CancelledError),
+    ):
         await invoker.run_streaming(CCInvocation(prompt="hello"))
 
     # getpgid(99999) raises ProcessLookupError -> falls back to proc.kill()
-    assert mock_proc.kill.called, (
-        "cancelled streaming run must kill the CC subprocess"
-    )
+    assert mock_proc.kill.called, "cancelled streaming run must kill the CC subprocess"

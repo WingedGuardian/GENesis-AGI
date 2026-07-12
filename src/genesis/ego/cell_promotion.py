@@ -109,9 +109,11 @@ async def handle_cell_promotion_resolution(
         and current["state"] == CellState.ASK.value
         and current["successes"] >= cg.MIN_PROMOTE_N
         and cg.cell_posterior(
-            current["successes"], current["corrections"],
+            current["successes"],
+            current["corrections"],
             current["weighted_corrections"] or 0.0,
-        ) >= cg.PROMOTE_THRESHOLD
+        )
+        >= cg.PROMOTE_THRESHOLD
     )
     if not still_promotable:
         logger.info(
@@ -120,20 +122,30 @@ async def handle_cell_promotion_resolution(
         )
         with contextlib.suppress(Exception):
             await ego_crud.execute_proposal(
-                db, proposal["id"], status="executed",
+                db,
+                proposal["id"],
+                status="executed",
                 user_response="cell promotion skipped: evidence changed",
             )
         return False
 
     try:
         await cg.apply_event(
-            db, domain=domain, verb=verb, risk_class=risk,
-            event=CellEvent.APPROVE, updated_at=now,
+            db,
+            domain=domain,
+            verb=verb,
+            risk_class=risk,
+            event=CellEvent.APPROVE,
+            updated_at=now,
+            # WS-3 gate-3: executing an OWNER-approved promotion proposal.
+            origin_class="owner",
         )
         ok = True
     except Exception:
         logger.warning(
-            "cell_promotion apply_event failed for %s", cell_key, exc_info=True,
+            "cell_promotion apply_event failed for %s",
+            cell_key,
+            exc_info=True,
         )
         ok = False
 
@@ -141,9 +153,12 @@ async def handle_cell_promotion_resolution(
     # (which would clutter the board AND let the sweep dispatch it as a session).
     with contextlib.suppress(Exception):
         await ego_crud.execute_proposal(
-            db, proposal["id"], status="executed",
+            db,
+            proposal["id"],
+            status="executed",
             user_response=(
-                f"cell {cell_key} promoted to GRANTED" if ok
+                f"cell {cell_key} promoted to GRANTED"
+                if ok
                 else f"cell {cell_key} promotion failed"
             ),
         )

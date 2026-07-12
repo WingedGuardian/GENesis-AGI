@@ -89,13 +89,20 @@ async def autonomy_flag_send(send_id: str):
     if newly_flagged:
         state = await cg.record_correction(
             rt.db,
-            domain=send["cell_domain"], verb=send["cell_verb"],
-            risk_class=send["cell_risk_class"], updated_at=now,
+            domain=send["cell_domain"],
+            verb=send["cell_verb"],
+            risk_class=send["cell_risk_class"],
+            updated_at=now,
+            # WS-3 gate-3: the OWNER flagged this send from the dashboard.
+            origin_class="owner",
         )
         cell_state = state.value
         logger.info(
             "Owner flagged autonomous send %s — corrected cell %s:%s:%s (now %s)",
-            send_id, send["cell_domain"], send["cell_verb"],
-            send["cell_risk_class"], cell_state,
+            send_id,
+            send["cell_domain"],
+            send["cell_verb"],
+            send["cell_risk_class"],
+            cell_state,
         )
     return jsonify({"flagged": newly_flagged, "cell_state": cell_state})
