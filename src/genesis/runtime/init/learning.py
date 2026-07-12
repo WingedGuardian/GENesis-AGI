@@ -94,6 +94,60 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
     )
 
 
+def _wire_git_health_deep_job(scheduler, rt) -> None:
+    """Register the daily `git fsck --connectivity-only` deep check (F.1).
+
+    The per-tick awareness probe (`awareness/loop._check_git_health`) is cheap +
+    structural; this catches deeper loose-object/reachability corruption that
+    only fsck finds — the class the thin-pool outage created. CronTrigger, NOT
+    IntervalTrigger: an interval resets on restart and, on a box that restarts
+    more often than the interval, would never fire. 04:10 sits just before the
+    drip-prune jobs (04:40+). Extracted as a testable seam."""
+    from apscheduler.triggers.cron import CronTrigger
+
+    async def _git_health_deep() -> None:
+        try:
+            from genesis.observability import git_health
+
+            report = await git_health.check_git_deep()
+            git_health.write_git_health_verdict(report)
+            rt.record_job_success("git_health_deep")
+            if not report.ok:
+                failures = ", ".join(report.failures)
+                logger.error("git fsck deep check FAILED: %s", failures)
+                if rt._db is not None:
+                    import uuid
+                    from datetime import UTC, datetime
+
+                    from genesis.db.crud import observations
+
+                    await observations.create(
+                        rt._db,
+                        id=str(uuid.uuid4()),
+                        source="git_health_monitor",
+                        type="infrastructure_alert",
+                        content=(
+                            f"`git fsck --connectivity-only` reported problems ({failures}) — "
+                            "reachable objects are missing or corrupt, which disables the "
+                            "guardian's REVERT_CODE lever. Run `scripts/git_repair.py` "
+                            "(dry-run first) in ~/genesis to diagnose and repair."
+                        ),
+                        priority="critical",
+                        created_at=datetime.now(UTC).isoformat(),
+                    )
+        except Exception as exc:
+            rt.record_job_failure("git_health_deep", str(exc))
+            logger.exception("git health deep check failed")
+
+    scheduler.add_job(
+        _git_health_deep,
+        CronTrigger(hour=4, minute=10, timezone=user_timezone()),
+        id="git_health_deep",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+
 async def init(rt: GenesisRuntime) -> None:
     """Initialize learning pipeline, triage, calibration, harvest, and all scheduled jobs."""
     if rt._db is None or rt._router is None:
@@ -960,6 +1014,10 @@ async def init(rt: GenesisRuntime) -> None:
         # genesis.db drip-table retention (restart-safe CronTrigger; extracted to a
         # testable seam so the registration is covered, not just the crud prunes).
         _wire_drip_retention_jobs(rt._learning_scheduler, rt)
+
+        # Daily git fsck deep check (F.1) — catches loose-object/reachability
+        # corruption the cheap per-tick probe can't. Restart-safe CronTrigger.
+        _wire_git_health_deep_job(rt._learning_scheduler, rt)
 
         async def _reap_stale_processes() -> None:
             """Kill leaked processes older than their configured threshold.

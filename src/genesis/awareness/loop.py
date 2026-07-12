@@ -212,6 +212,65 @@ async def _check_db_nodatacow(db) -> None:
         logger.debug("Failed to create nodatacow alert observation", exc_info=True)
 
 
+# Git-repository health (F.1): the thin-pool outage zeroed .git/config,
+# packed-refs, and loose objects with ZERO detection, silently disabling the
+# guardian's REVERT_CODE recovery lever. A cheap per-tick structural probe (plus
+# a rootfs-RO write-probe) catches that class within one tick and writes a
+# verdict to the shared mount so the host guardian can enrich its own alert.
+# Same monotonic-since-boot caveat as the WAL alert: None = "never alerted".
+_GIT_ALERT_COOLDOWN_S = 6 * 3600  # one critical observation per 6h max
+_last_git_alert_at: float | None = None
+
+
+async def _check_git_health(db) -> None:
+    """Probe local git integrity + rootfs writability; write a shared-mount
+    verdict and, on failure, create a critical observation pointing at
+    ``scripts/git_repair.py``.
+
+    Deliberately NOT gated on ``db_available`` — git health matters MOST when the
+    DB is broken, and the observation write is guarded on ``db`` internally.
+    Best-effort; never raises into the tick."""
+    global _last_git_alert_at
+    try:
+        from genesis.observability import git_health
+
+        report = await git_health.check_git_cheap()
+        # Always publish the verdict (best-effort) so the guardian can read it.
+        git_health.write_git_health_verdict(report)
+    except Exception:
+        logger.debug("git health probe failed", exc_info=True)
+        return
+
+    if report.ok or db is None:
+        return
+    now = time.monotonic()
+    if _last_git_alert_at is not None and now - _last_git_alert_at < _GIT_ALERT_COOLDOWN_S:
+        return
+    # Set the cooldown BEFORE the write so a failed create still suppresses
+    # per-tick retries (the DB may be on the same wedged fs this is detecting).
+    _last_git_alert_at = now
+    failures = ", ".join(report.failures)
+    try:
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="git_health_monitor",
+            type="infrastructure_alert",
+            content=(
+                f"Local git repository is UNHEALTHY ({failures}). This disables the "
+                f"guardian's REVERT_CODE recovery lever, which needs a healthy local "
+                f"git. Run `scripts/git_repair.py` (dry-run first) in ~/genesis to "
+                f"diagnose and repair. If 'rootfs_readonly', the container filesystem "
+                f"has gone read-only (thin-pool exhaustion) — check host storage first."
+            ),
+            priority="critical",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        logger.error("git health alert: %s", failures)
+    except Exception:
+        logger.debug("Failed to create git health alert observation", exc_info=True)
+
+
 # Per-CC-slot RSS alerting. Same monotonic-since-boot caveat as WAL above: use a
 # key-existence check (a missing key means "never alerted"), NEVER a default of
 # 0.0 — on a host booted <cooldown ago, `now - 0.0` is small and would wrongly
@@ -1006,6 +1065,11 @@ class AwarenessLoop:
             # completions (recorded by the invoker) and alerts on a run. Guarded
             # on db internally; a query failure no-ops (never breaks the tick).
             await _check_cc_cap_detection(self._db)
+            # Git-repository health (F.1) — cheap structural probe + rootfs-RO
+            # write-probe. NOT gated on db_available: git health matters most
+            # when the DB is broken (the observation write is guarded on db
+            # inside). Writes a verdict to the shared mount for the guardian.
+            await _check_git_health(self._db)
 
             # SQLite WAL checkpoint — prevent unbounded WAL growth from
             # external scripts or concurrent writers. PASSIVE is non-blocking.
