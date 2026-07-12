@@ -156,6 +156,33 @@ async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
     except Exception:
         logger.warning("GC: pending_embeddings purge failed", exc_info=True)
 
+    # GC tripwire: FTS <-> metadata store consistency, BOTH directions. An FTS
+    # row with no metadata row is a ghost; a metadata row with no FTS row is
+    # invisible to keyword/hybrid search. Both should be 0 (store() writes both
+    # stores); non-zero means a store-path or migration regression — surface it
+    # rather than silently accumulate. (No repair job built: 0 live occurrences;
+    # this is the monitored tripwire that would justify one.)
+    try:
+        from genesis.db.crud import memory as mem_crud
+        fts_ghosts, fts_invisible = await mem_crud.count_fts_metadata_drift(db)
+        if fts_ghosts or fts_invisible:
+            logger.warning(
+                "FTS/metadata drift: %d FTS-ghost rows (no metadata), "
+                "%d metadata rows invisible to FTS",
+                fts_ghosts, fts_invisible,
+            )
+            from genesis.runtime import GenesisRuntime
+            rt = GenesisRuntime.instance()
+            if rt.event_bus:
+                await rt.event_bus.emit(
+                    Subsystem.MEMORY,
+                    Severity.WARNING,
+                    "memory.fts_metadata_drift",
+                    f"{fts_ghosts} FTS-ghost + {fts_invisible} FTS-invisible rows",
+                )
+    except Exception:
+        logger.warning("GC: FTS/metadata tripwire failed", exc_info=True)
+
     # GC: rotate heartbeat events older than 7 days
     try:
         from genesis.db.crud import events as events_crud

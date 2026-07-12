@@ -99,7 +99,28 @@ async def reset_failed_to_pending(
 
     If error_filter is provided, only reset items whose error_message
     contains the filter string.  Returns count of items reset.
+
+    Also flips the ``memory_metadata.embedding_status`` mirror back to
+    'pending' for the same memories, in the SAME transaction. The recovery
+    worker marks BOTH stores 'failed' on embed failure; re-queueing here
+    without resetting the mirror would leave metadata stuck 'failed' while
+    the queue row is 'pending' — a lie that _mark_superseded's Qdrant-write
+    guard reads (see store.py). Orphans with no queue row are untouched
+    (correctly stay 'failed' — nothing will retry them).
     """
+    # Capture the memory_ids being reset BEFORE the UPDATE, to mirror them.
+    if error_filter:
+        id_cursor = await db.execute(
+            "SELECT memory_id FROM pending_embeddings "
+            "WHERE status = 'failed' AND error_message LIKE ?",
+            (f"%{error_filter}%",),
+        )
+    else:
+        id_cursor = await db.execute(
+            "SELECT memory_id FROM pending_embeddings WHERE status = 'failed'"
+        )
+    memory_ids = [row[0] for row in await id_cursor.fetchall()]
+
     if error_filter:
         cursor = await db.execute(
             """UPDATE pending_embeddings
@@ -112,6 +133,13 @@ async def reset_failed_to_pending(
             """UPDATE pending_embeddings
                SET status = 'pending', error_message = NULL
                WHERE status = 'failed'"""
+        )
+    if memory_ids:
+        placeholders = ",".join("?" for _ in memory_ids)
+        await db.execute(
+            "UPDATE memory_metadata SET embedding_status = 'pending' "  # noqa: S608
+            f"WHERE embedding_status = 'failed' AND memory_id IN ({placeholders})",
+            memory_ids,
         )
     await db.commit()
     return cursor.rowcount
@@ -141,6 +169,37 @@ async def purge_completed(
     )
     await db.commit()
     return cursor.rowcount
+
+
+async def query_orphaned_metadata(
+    db: aiosqlite.Connection,
+    *,
+    min_age_seconds: int = 3600,
+) -> list[tuple[str, str]]:
+    """Return ``(memory_id, collection)`` for metadata orphans to reconcile.
+
+    An orphan is a ``memory_metadata`` row stuck at 'pending' with no
+    ``pending_embeddings`` queue row. That happens two ways and they need
+    OPPOSITE fixes: the embed genuinely failed and its 'failed' queue row was
+    later reaped (no vector -> 'failed'), OR the embed SUCCEEDED but its
+    metadata update was lost and the queue row was reaped (vector present ->
+    'embedded'). Only Qdrant can tell them apart, so this query just surfaces
+    the candidates; the caller (EmbeddingRecoveryWorker) checks the vector and
+    sets the truthful status.
+
+    ``min_age_seconds`` (default 1h) spares the brief mid-``store()`` window
+    between the create_metadata write and the pending_embeddings.create write.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(seconds=min_age_seconds)).isoformat()
+    rows = await db.execute_fetchall(
+        "SELECT memory_id, collection FROM memory_metadata "
+        "WHERE embedding_status = 'pending' AND created_at < ? "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM pending_embeddings pe "
+        "WHERE pe.memory_id = memory_metadata.memory_id)",
+        (cutoff,),
+    )
+    return [(r[0], r[1]) for r in rows]
 
 
 async def count_pending(
