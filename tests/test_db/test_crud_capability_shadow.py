@@ -111,3 +111,29 @@ async def test_summary_groups_by_door_and_verdict(tmp_path):
     assert top["path"] == "deliver" and top["would_hold"] == 1 and top["n"] == 2
     assert any(r["path"] == "reply" and r["would_hold"] == 0 and r["n"] == 1 for r in rows)
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_prune_deletes_only_old_rows(tmp_path):
+    db = await _db(tmp_path / "g.db")
+    await crud.record(db, **{**_kw(1), "observed_at": "2026-01-01T00:00:00+00:00"})  # old
+    await crud.record(db, **{**_kw(2), "observed_at": "2026-07-11T00:00:00+00:00"})  # fresh
+    deleted = await crud.prune_capability_shadow_events(
+        db, older_than_days=45, now="2026-07-11T12:00:00+00:00"
+    )
+    assert deleted == 1
+    assert await crud.count(db) == 1
+    remaining = await crud.list_recent(db)
+    assert remaining[0]["id"] == "sh-2"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_prune_noops_when_table_absent(tmp_path):
+    # Best-effort, mirrors record(): a missing table returns 0, never raises/creates.
+    db = await _db(tmp_path / "g.db", with_table=False)
+    deleted = await crud.prune_capability_shadow_events(
+        db, older_than_days=45, now="2026-07-11T12:00:00+00:00"
+    )
+    assert deleted == 0
+    await db.close()
