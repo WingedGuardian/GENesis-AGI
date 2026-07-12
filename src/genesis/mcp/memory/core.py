@@ -15,6 +15,7 @@ from genesis.memory.provenance import (
     provenance_descriptor,
     wrap_external_recall,
 )
+from genesis.security import immunity_shadow
 
 from ..memory import mcp
 from ._scoring import DEFAULT_KB_FLOOR_RATIO, relative_kb_floor
@@ -334,6 +335,21 @@ async def memory_recall(
         pass  # instrumentation must never break recall
 
     if compact:
+        # WS-3 B1 gate 4 (injection): the compact branch returns external
+        # previews and RETURNS before the full-path wrap/emit below — record
+        # here too so compact recalls are not undercounted (observe-only).
+        blockable = sum(
+            1
+            for r in results
+            if immunity_shadow.item_is_blockable(
+                collection=r.collection, source_pipeline=r.source_pipeline,
+            )
+        )
+        await immunity_shadow.record_would_block(
+            gate="injection", source_kind="recall_inject",
+            source_ref="mcp/memory/core.py::memory_recall", process="server",
+            blockable_count=blockable, db=memory_mod._db, detail={"path": "compact"},
+        )
         return [
             {
                 "memory_id": r.memory_id,
@@ -406,11 +422,24 @@ async def memory_recall(
     # Injection defense (PR2): structurally delimit external-world content so
     # the model treats it as data, not first-party instructions. Gate on the
     # post-label collection so CRAG web-fallback items are covered too.
+    blockable = 0
     for d in enriched:
         if isinstance(d, dict) and is_external(d.get("collection")):
             d["content"] = wrap_external_recall(
                 d.get("content", ""), source_pipeline=d.get("source_pipeline"),
             )
+            if immunity_shadow.item_is_blockable(
+                collection=d.get("collection"),
+                source_pipeline=d.get("source_pipeline"),
+            ):
+                blockable += 1
+    # WS-3 B1 gate 4 (injection): shadow-record that external content reached
+    # this action-capable prompt (observe-only — the item still reaches the model).
+    await immunity_shadow.record_would_block(
+        gate="injection", source_kind="recall_inject",
+        source_ref="mcp/memory/core.py::memory_recall", process="server",
+        blockable_count=blockable, db=memory_mod._db,
+    )
     return enriched
 
 
@@ -518,6 +547,7 @@ async def memory_expand(
             logger.debug("eval: recall_used emit failed", exc_info=True)
 
     results = []
+    blockable = 0
     for point in points:
         mid = str(point.id)
         payload = point.payload or {}
@@ -551,6 +581,11 @@ async def memory_expand(
             d["content"] = wrap_external_recall(
                 d["content"], source_pipeline=payload.get("source_pipeline"),
             )
+            if immunity_shadow.item_is_blockable(
+                collection=_collection,
+                source_pipeline=payload.get("source_pipeline"),
+            ):
+                blockable += 1
 
         # Graph enrichment
         try:
@@ -571,6 +606,14 @@ async def memory_expand(
             logger.warning("Graph enrichment failed for %s", mid, exc_info=True)
 
         results.append(d)
+
+    # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
+    # expand prompt (observe-only). memory_mod._db is asserted non-None above.
+    await immunity_shadow.record_would_block(
+        gate="injection", source_kind="recall_inject",
+        source_ref="mcp/memory/core.py::memory_expand", process="server",
+        blockable_count=blockable, db=memory_mod._db,
+    )
 
     if not_found or ambiguous:
         trailer = {"not_found": not_found}
@@ -660,13 +703,26 @@ async def memory_proactive(
     # can appear here and flow straight into prompt context — wrap external-world
     # items so the model treats them as data, not first-party instructions.
     out: list[dict] = []
+    blockable = 0
     for r in filtered:
         d = asdict(r)
         if is_external(r.collection):
             d["content"] = wrap_external_recall(
                 d.get("content", ""), source_pipeline=r.source_pipeline,
             )
+            if immunity_shadow.item_is_blockable(
+                collection=r.collection, source_pipeline=r.source_pipeline,
+            ):
+                blockable += 1
         out.append(d)
+    # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
+    # proactive-recall prompt (observe-only). db=memory_mod._db when set, else
+    # the emit self-resolves a short-lived connection.
+    await immunity_shadow.record_would_block(
+        gate="injection", source_kind="recall_inject",
+        source_ref="mcp/memory/core.py::memory_proactive", process="server",
+        blockable_count=blockable, db=memory_mod._db,
+    )
     return out
 
 

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from genesis.channels.tts_config import sanitize_for_speech
 from genesis.channels.voice.sessions import VoiceSessionManager
 from genesis.memory.provenance import is_external, wrap_external_recall
+from genesis.security import immunity_shadow
 
 if TYPE_CHECKING:
     from genesis.memory.retrieval import HybridRetriever
@@ -100,6 +101,7 @@ class VoiceConversationHandler:
         llm_memories_text = ""
         try:
             results = await self._retriever.recall(transcript, limit=5, rerank=False)
+            blockable = 0
             if results:
                 spoken_snippets = []
                 llm_snippets = []
@@ -116,11 +118,23 @@ class VoiceConversationHandler:
                                     content[:300], source_pipeline=source_pipeline,
                                 )
                             )
+                            if immunity_shadow.item_is_blockable(
+                                collection=getattr(r, "collection", None),
+                                source_pipeline=source_pipeline,
+                            ):
+                                blockable += 1
                         else:
                             llm_snippets.append(f"- {content[:300]}")
                 if spoken_snippets:
                     memories_text = "Recalled memories:\n" + "\n".join(spoken_snippets)
                     llm_memories_text = "Recalled memories:\n" + "\n".join(llm_snippets)
+            # WS-3 B1 gate 4 (injection): shadow-record external content reaching
+            # the voice LLM system prompt (observe-only; db=None -> self-resolve).
+            await immunity_shadow.record_would_block(
+                gate="injection", source_kind="recall_inject",
+                source_ref="channels/voice/handler.py::handle", process="server",
+                blockable_count=blockable, db=None,
+            )
         except Exception:
             logger.warning(
                 "Memory recall failed for voice session %s",

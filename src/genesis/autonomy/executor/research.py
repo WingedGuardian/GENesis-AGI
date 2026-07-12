@@ -22,6 +22,7 @@ from typing import Any
 from genesis.autonomy.executor.types import ResearchResult
 from genesis.cc.types import CCInvocation, CCModel, CCOutput, EffortLevel, background_session_dir
 from genesis.memory.provenance import is_external, wrap_external_recall
+from genesis.security import immunity_shadow
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +222,7 @@ class DeepResearcherImpl:
             if not results:
                 return ""
             lines = []
+            blockable = 0
             for r in results[:5]:
                 content = r.content[:200] if hasattr(r, "content") else str(r)[:200]
                 # Injection defense (PR2): recall defaults to source="both", so a
@@ -229,7 +231,20 @@ class DeepResearcherImpl:
                     content = wrap_external_recall(
                         content, source_pipeline=getattr(r, "source_pipeline", None),
                     )
+                    if immunity_shadow.item_is_blockable(
+                        collection=getattr(r, "collection", None),
+                        source_pipeline=getattr(r, "source_pipeline", None),
+                    ):
+                        blockable += 1
                 lines.append(f"- {content}")
+            # WS-3 B1 gate 4 (injection): the autonomous due-diligence path is the
+            # highest-write-capability recall site — shadow-record external content
+            # reaching it (observe-only; db=None -> self-resolve).
+            await immunity_shadow.record_would_block(
+                gate="injection", source_kind="recall_inject",
+                source_ref="autonomy/executor/research.py::_memory_recall",
+                process="server", blockable_count=blockable, db=None,
+            )
             return "\n".join(lines)
         except Exception as exc:
             logger.debug("Memory recall error in due diligence: %s", exc)
