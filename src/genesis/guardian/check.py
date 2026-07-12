@@ -329,6 +329,10 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # guardian WARNs on first sight and steps in only after the grace window —
         # covering the window a degraded/dead server's awareness loop can't.
         await _check_credential_integrity_and_alert(config, dispatcher)
+        # Git-repository health (F.1) — the PRIMARY detector for the outage class
+        # that zeroed .git and disabled REVERT_CODE; a live incus-exec probe, since
+        # the container's own awareness check may be dead exactly when it matters.
+        await _check_container_git_and_alert(config, dispatcher)
     finally:
         # Always save state, even on error
         sm.save_state(state_path)
@@ -516,6 +520,21 @@ async def _check_credential_integrity_and_alert(
         await check_credential_integrity_and_alert(config, dispatcher)
     except Exception:
         logger.warning("credential-integrity watch failed", exc_info=True)
+
+
+async def _check_container_git_and_alert(
+    config: GuardianConfig, dispatcher: AlertDispatcher,
+) -> None:
+    """Guardian-side git-health watch (delegates to git_watch).
+
+    Live incus-exec probe of the container's local git — the PRIMARY detector,
+    since the rootfs-RO outage this guards against can take the container's own
+    awareness-loop alerting down. Never raises into the tick."""
+    try:
+        from genesis.guardian.git_watch import check_container_git_and_alert
+        await check_container_git_and_alert(config, dispatcher)
+    except Exception:
+        logger.warning("git-health watch failed", exc_info=True)
 
 
 async def _check_storage_pool_and_alert(
@@ -1203,6 +1222,34 @@ async def _execute_recovery_with_approval(
     diagnostic = await collect_diagnostics(config)
     signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
     diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
+
+    # F.1: REVERT_CODE runs `git stash`/`git revert`, which need healthy, WRITABLE
+    # local git. If the container's git is unhealthy (the F.1 outage class — incl. a
+    # read-only rootfs that passes reads but fails the writes stash/revert need), a
+    # revert is doomed. Redirect the PROPOSAL to SNAPSHOT_ROLLBACK *before* Gate 2 so
+    # the user approves the action that actually runs — never silently swap a
+    # post-approval action (that would break gate-everything and hand the user a more
+    # destructive recovery than they authorized). Rollback restores a healthy .git AND
+    # repairs a read-only rootfs in one move.
+    if diagnosis.recommended_action == RecoveryAction.REVERT_CODE:
+        from genesis.guardian.git_watch import container_git_supports_revert
+
+        if not await container_git_supports_revert(config):
+            from dataclasses import replace
+
+            logger.warning(
+                "REVERT_CODE proposed but container git is unhealthy/read-only — "
+                "redirecting the proposal to SNAPSHOT_ROLLBACK before approval"
+            )
+            diagnosis = replace(
+                diagnosis,
+                recommended_action=RecoveryAction.SNAPSHOT_ROLLBACK,
+                likely_cause=(
+                    diagnosis.likely_cause
+                    + " — container git is unhealthy, so a code revert is unavailable; "
+                    "proposing snapshot rollback instead"
+                ),
+            )
 
     logger.info(
         "Gate-1 approved; diagnosis: %s (confidence=%d%%, action=%s, source=%s)",

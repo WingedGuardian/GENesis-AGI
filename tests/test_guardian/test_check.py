@@ -38,8 +38,11 @@ def _healthy_snapshot() -> HealthSnapshot:
         signals={
             name: SignalResult(name, True, 1.0, "ok", "t")
             for name in [
-                "container_exists", "icmp_reachable", "health_api",
-                "heartbeat_canary", "log_freshness",
+                "container_exists",
+                "icmp_reachable",
+                "health_api",
+                "heartbeat_canary",
+                "log_freshness",
             ]
         },
         pause_state=PauseState(paused=False),
@@ -47,7 +50,6 @@ def _healthy_snapshot() -> HealthSnapshot:
 
 
 class TestBuildDispatcher:
-
     def test_no_credentials(self) -> None:
         config = GuardianConfig()
         dispatcher = _build_dispatcher(config)
@@ -62,7 +64,6 @@ class TestBuildDispatcher:
 
 
 class TestWriteGuardianHeartbeat:
-
     @pytest.mark.asyncio
     async def test_writes_heartbeat(self) -> None:
         config = GuardianConfig()
@@ -83,7 +84,6 @@ class TestWriteGuardianHeartbeat:
 
 
 class TestHandleHealthy:
-
     @pytest.mark.asyncio
     async def test_does_not_write_heartbeat_directly(self, config: GuardianConfig) -> None:
         """_handle_healthy must NOT call the heartbeat — run_check owns it."""
@@ -109,7 +109,6 @@ class TestHandleHealthy:
 
 
 class TestMaintainSnapshots:
-
     @pytest.mark.asyncio
     async def test_prunes_when_due(self, config: GuardianConfig) -> None:
         snapshots = MagicMock()
@@ -123,11 +122,13 @@ class TestMaintainSnapshots:
 
     @pytest.mark.asyncio
     async def test_skips_all_work_when_not_due(
-        self, config: GuardianConfig,
+        self,
+        config: GuardianConfig,
     ) -> None:
         """Within the 24h throttle window, neither expiry nor prune runs — the
         marker gate avoids a per-tick incus subprocess."""
         from datetime import UTC, datetime
+
         marker = config.state_path / ".last_prune"
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(datetime.now(UTC).isoformat())  # fresh → not due
@@ -142,7 +143,8 @@ class TestMaintainSnapshots:
 
     @pytest.mark.asyncio
     async def test_prune_failure_does_not_stop_marker_write(
-        self, config: GuardianConfig,
+        self,
+        config: GuardianConfig,
     ) -> None:
         """A prune exception is swallowed and the marker still advances (no
         tight-loop retry storm on a persistently failing incus)."""
@@ -155,15 +157,13 @@ class TestMaintainSnapshots:
 
 
 class TestStoragePoolAlert:
-
     @pytest.mark.asyncio
     async def test_crit_alerts_and_persists_state(self, config: GuardianConfig) -> None:
         dispatcher = MagicMock()
         dispatcher.send = AsyncMock(return_value=True)
         status = StoragePoolStatus(detected=True, data_pct=95.0, metadata_pct=30.0)
 
-        with patch("genesis.guardian.check.measure_storage_pool",
-                   AsyncMock(return_value=status)):
+        with patch("genesis.guardian.check.measure_storage_pool", AsyncMock(return_value=status)):
             await _check_storage_pool_and_alert(config, dispatcher)
 
         dispatcher.send.assert_called_once()
@@ -177,8 +177,7 @@ class TestStoragePoolAlert:
         dispatcher.send = AsyncMock(return_value=True)
         status = StoragePoolStatus(detected=True, data_pct=95.0)
 
-        with patch("genesis.guardian.check.measure_storage_pool",
-                   AsyncMock(return_value=status)):
+        with patch("genesis.guardian.check.measure_storage_pool", AsyncMock(return_value=status)):
             await _check_storage_pool_and_alert(config, dispatcher)  # first: alerts
             await _check_storage_pool_and_alert(config, dispatcher)  # same tier, within interval
         # Only the first tick alerts; the second is suppressed by hysteresis.
@@ -190,8 +189,7 @@ class TestStoragePoolAlert:
         dispatcher.send = AsyncMock(return_value=True)
         status = StoragePoolStatus(detected=False, detail="not lvm")
 
-        with patch("genesis.guardian.check.measure_storage_pool",
-                   AsyncMock(return_value=status)):
+        with patch("genesis.guardian.check.measure_storage_pool", AsyncMock(return_value=status)):
             await _check_storage_pool_and_alert(config, dispatcher)
         dispatcher.send.assert_not_called()
 
@@ -215,7 +213,6 @@ def _prov_cfg(config: GuardianConfig) -> GuardianConfig:
 
 
 class TestBuildProvisioningAdapter:
-
     def test_disabled_returns_none(self, config: GuardianConfig) -> None:
         assert _build_provisioning_adapter(config) is None
 
@@ -224,7 +221,9 @@ class TestBuildProvisioningAdapter:
         assert _build_provisioning_adapter(config) is None
 
     def test_env_tokens_build_adapter(
-        self, config: GuardianConfig, monkeypatch: pytest.MonkeyPatch,
+        self,
+        config: GuardianConfig,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _prov_cfg(config)
         monkeypatch.setenv("PROXMOX_AUDIT_TOKEN", "aud-tok")
@@ -235,7 +234,9 @@ class TestBuildProvisioningAdapter:
         assert adapter._provision == "prov-tok"
 
     def test_audit_only_is_readonly_adapter(
-        self, config: GuardianConfig, monkeypatch: pytest.MonkeyPatch,
+        self,
+        config: GuardianConfig,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _prov_cfg(config)
         monkeypatch.setenv("PROXMOX_AUDIT_TOKEN", "aud-tok")
@@ -248,7 +249,9 @@ class TestBuildProvisioningAdapter:
         assert adapter._provision == ""
 
     def test_no_tokens_anywhere_returns_none(
-        self, config: GuardianConfig, monkeypatch: pytest.MonkeyPatch,
+        self,
+        config: GuardianConfig,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _prov_cfg(config)
         monkeypatch.delenv("PROXMOX_AUDIT_TOKEN", raising=False)
@@ -266,10 +269,8 @@ class TestProvisioningProposeHook:
         dispatcher.send = AsyncMock(return_value=True)
         status = StoragePoolStatus(detected=True, data_pct=95.0)
         with (
-            patch("genesis.guardian.check.measure_storage_pool",
-                  AsyncMock(return_value=status)),
-            patch("genesis.guardian.check._maybe_propose_provisioning",
-                  AsyncMock()) as propose,
+            patch("genesis.guardian.check.measure_storage_pool", AsyncMock(return_value=status)),
+            patch("genesis.guardian.check._maybe_propose_provisioning", AsyncMock()) as propose,
         ):
             await _check_storage_pool_and_alert(config, dispatcher, genesis_down=True)
         propose.assert_called_once()
@@ -280,10 +281,8 @@ class TestProvisioningProposeHook:
         dispatcher.send = AsyncMock(return_value=True)
         status = StoragePoolStatus(detected=True, data_pct=95.0)
         with (
-            patch("genesis.guardian.check.measure_storage_pool",
-                  AsyncMock(return_value=status)),
-            patch("genesis.guardian.check._maybe_propose_provisioning",
-                  AsyncMock()) as propose,
+            patch("genesis.guardian.check.measure_storage_pool", AsyncMock(return_value=status)),
+            patch("genesis.guardian.check._maybe_propose_provisioning", AsyncMock()) as propose,
         ):
             await _check_storage_pool_and_alert(config, dispatcher, genesis_down=False)
         propose.assert_not_called()
@@ -294,17 +293,14 @@ class TestProvisioningProposeHook:
         dispatcher.send = AsyncMock(return_value=True)
         status = StoragePoolStatus(detected=True, data_pct=80.0)  # warn, not crit
         with (
-            patch("genesis.guardian.check.measure_storage_pool",
-                  AsyncMock(return_value=status)),
-            patch("genesis.guardian.check._maybe_propose_provisioning",
-                  AsyncMock()) as propose,
+            patch("genesis.guardian.check.measure_storage_pool", AsyncMock(return_value=status)),
+            patch("genesis.guardian.check._maybe_propose_provisioning", AsyncMock()) as propose,
         ):
             await _check_storage_pool_and_alert(config, dispatcher, genesis_down=True)
         propose.assert_not_called()
 
 
 class TestRunCheck:
-
     @pytest.mark.asyncio
     async def test_healthy_cycle(self, config: GuardianConfig) -> None:
         """Full healthy cycle: collect signals → HEALTHY → write heartbeat → save state."""
@@ -331,7 +327,8 @@ class TestRunCheck:
                 AsyncMock(return_value=_healthy_snapshot()),
             ),
             patch(
-                "genesis.guardian.check._write_guardian_heartbeat", AsyncMock(),
+                "genesis.guardian.check._write_guardian_heartbeat",
+                AsyncMock(),
             ) as mock_hb,
             patch("genesis.guardian.check.load_secrets", return_value={}),
         ):
@@ -357,7 +354,8 @@ class TestRunCheck:
                 AsyncMock(return_value=dead_snapshot),
             ),
             patch(
-                "genesis.guardian.check._write_guardian_heartbeat", AsyncMock(),
+                "genesis.guardian.check._write_guardian_heartbeat",
+                AsyncMock(),
             ) as mock_hb,
             patch("genesis.guardian.check.load_secrets", return_value={}),
         ):
@@ -374,7 +372,8 @@ class TestRunCheck:
                 AsyncMock(side_effect=RuntimeError("boom")),
             ),
             patch(
-                "genesis.guardian.check._write_guardian_heartbeat", AsyncMock(),
+                "genesis.guardian.check._write_guardian_heartbeat",
+                AsyncMock(),
             ) as mock_hb,
             patch("genesis.guardian.check.load_secrets", return_value={}),
             pytest.raises(RuntimeError, match="boom"),
@@ -407,6 +406,7 @@ class TestRunCheck:
 
         # First run should move to SIGNAL_DROPPED
         import json
+
         state = json.loads((config.state_path / "state.json").read_text())
         assert state["current_state"] == "signal_dropped"
 
@@ -528,9 +528,7 @@ class TestGuardianAlertOnce:
         recovery_engine = MagicMock()
         recovery_engine.execute = AsyncMock()
 
-        await _handle_confirmed_dead(
-            config, sm, dispatcher, diagnosis_engine, recovery_engine
-        )
+        await _handle_confirmed_dead(config, sm, dispatcher, diagnosis_engine, recovery_engine)
 
         diagnosis_engine.diagnose.assert_not_called()  # no expensive Opus re-run
         dispatcher.send.assert_not_called()  # no re-alert
@@ -557,9 +555,7 @@ class TestGuardianAlertOnce:
             patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
             patch("genesis.guardian.check.write_diagnosis_result"),
         ):
-            await _handle_confirmed_dead(
-                config, sm, dispatcher, diagnosis_engine, recovery_engine
-            )
+            await _handle_confirmed_dead(config, sm, dispatcher, diagnosis_engine, recovery_engine)
 
         diagnosis_engine.diagnose.assert_awaited_once()
         assert sm.state.down_alert_sent is True  # episode now marked — next tick skips
@@ -601,9 +597,7 @@ class TestGuardianAlertOnce:
         assert saved["down_alert_sent"] is False  # cleared on genuine recovery
 
     @pytest.mark.asyncio
-    async def test_auto_reset_does_not_ping_or_clear_flag(
-        self, config: GuardianConfig
-    ) -> None:
+    async def test_auto_reset_does_not_ping_or_clear_flag(self, config: GuardianConfig) -> None:
         """Auto-reset (still-down) must NOT emit a restored ping nor clear the flag.
 
         The auto-reset trap: auto-reset routes CONFIRMED_DEAD→HEALTHY while the
@@ -633,9 +627,9 @@ class TestGuardianAlertOnce:
             await run_check(config)
 
         titles = _alert_titles(mock_dispatcher)
-        assert not any(
-            "restored" in t.lower() or "recovered" in t.lower() for t in titles
-        ), f"auto-reset must not ping restored; titles={titles}"
+        assert not any("restored" in t.lower() or "recovered" in t.lower() for t in titles), (
+            f"auto-reset must not ping restored; titles={titles}"
+        )
 
         import json
 
@@ -662,7 +656,8 @@ class TestGuardianAlertOnce:
             patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
             patch("genesis.guardian.check.write_diagnosis_result"),
             patch.object(
-                DiagnosisEngine, "diagnose",
+                DiagnosisEngine,
+                "diagnose",
                 AsyncMock(return_value=_cc_unavailable_diagnosis()),
             ),
             patch("genesis.guardian.check._build_dispatcher", return_value=mock_dispatcher),
@@ -680,9 +675,7 @@ class TestGuardianAlertOnce:
         )
 
     @pytest.mark.asyncio
-    async def test_diagnosis_crash_unmarks_flag_for_retry(
-        self, config: GuardianConfig
-    ) -> None:
+    async def test_diagnosis_crash_unmarks_flag_for_retry(self, config: GuardianConfig) -> None:
         """If diagnosis raises before any alert, the flag is un-marked so the
         next tick retries instead of silently muting the episode."""
         sm = ConfirmationStateMachine(config)
@@ -700,9 +693,7 @@ class TestGuardianAlertOnce:
             patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
             pytest.raises(RuntimeError, match="cc crashed"),
         ):
-            await _handle_confirmed_dead(
-                config, sm, dispatcher, diagnosis_engine, recovery_engine
-            )
+            await _handle_confirmed_dead(config, sm, dispatcher, diagnosis_engine, recovery_engine)
 
         assert sm.state.down_alert_sent is False  # un-marked → next tick retries
 
@@ -745,8 +736,7 @@ class TestGuardianAlertOnce:
         # A manual-intervention alert must have fired (no Telegram approval channel).
         titles = _alert_titles(dispatcher)
         assert any(
-            "approval gate unavailable" in t.lower() or "no telegram" in t.lower()
-            for t in titles
+            "approval gate unavailable" in t.lower() or "no telegram" in t.lower() for t in titles
         ), f"expected manual-intervention alert; got {titles}"
 
     @pytest.mark.asyncio
@@ -773,7 +763,8 @@ class TestGuardianAlertOnce:
             patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
             patch("genesis.guardian.check.write_diagnosis_result"),
             patch.object(
-                DiagnosisEngine, "diagnose",
+                DiagnosisEngine,
+                "diagnose",
                 AsyncMock(return_value=_cc_unavailable_diagnosis()),
             ),
             patch("genesis.guardian.check._build_dispatcher", return_value=mock_dispatcher),
@@ -846,15 +837,22 @@ class TestTwoGateApproval:
 
         with (
             patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
-            patch("genesis.guardian.check.collect_all_signals",
-                  AsyncMock(return_value=_dead_snapshot())),
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_dead_snapshot()),
+            ),
             patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
             patch("genesis.guardian.check.write_diagnosis_result"),
-            patch.object(DiagnosisEngine, "diagnose",
-                         AsyncMock(return_value=_proposed_diagnosis())),
+            patch.object(
+                DiagnosisEngine, "diagnose", AsyncMock(return_value=_proposed_diagnosis())
+            ),
         ):
             await _execute_recovery_with_approval(
-                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+                config,
+                sm,
+                dispatcher,
+                recovery_engine,
+                _proposed_diagnosis(),
             )
 
         recovery_engine.execute.assert_awaited_once()
@@ -863,6 +861,99 @@ class TestTwoGateApproval:
         # engine (which clears only on VERIFIED recovery). On APPROVE it must NOT
         # clear the flag itself — recovery_engine is mocked here, so it stays set.
         assert sm.state.down_alert_sent is True
+
+    @pytest.mark.asyncio
+    async def test_revert_redirected_to_rollback_when_git_unhealthy(
+        self,
+        config: GuardianConfig,
+    ) -> None:
+        """F.1: diagnosis proposes REVERT_CODE but container git is unhealthy → the
+        PROPOSAL is redirected to SNAPSHOT_ROLLBACK BEFORE Gate 2, so the user
+        approves (and the engine executes) the action that actually runs — never a
+        silent post-approval action swap."""
+        sm = self._sm(config)
+        channel = _mock_gate_channel(["APPROVE", "APPROVE"])
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock()
+        recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
+
+        with (
+            patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_dead_snapshot()),
+            ),
+            patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
+            patch("genesis.guardian.check.write_diagnosis_result"),
+            patch.object(
+                DiagnosisEngine,
+                "diagnose",
+                AsyncMock(return_value=_proposed_diagnosis(RecoveryAction.REVERT_CODE)),
+            ),
+            patch(
+                "genesis.guardian.git_watch.container_git_supports_revert",
+                AsyncMock(return_value=False),
+            ),
+        ):
+            await _execute_recovery_with_approval(
+                config,
+                sm,
+                dispatcher,
+                recovery_engine,
+                _proposed_diagnosis(RecoveryAction.REVERT_CODE),
+            )
+
+        recovery_engine.execute.assert_awaited_once()
+        executed = recovery_engine.execute.await_args.args[0]
+        assert executed.recommended_action == RecoveryAction.SNAPSHOT_ROLLBACK
+        # The Gate-2 approval prompt must name the redirected action, not the revert.
+        all_sent = " ".join(str(c.args[0]) for c in channel.send_text.await_args_list)
+        assert "SNAPSHOT_ROLLBACK" in all_sent
+        assert "REVERT_CODE" not in all_sent
+
+    @pytest.mark.asyncio
+    async def test_revert_preserved_when_git_healthy(
+        self,
+        config: GuardianConfig,
+    ) -> None:
+        """REVERT_CODE proposal + healthy container git → executed as REVERT_CODE
+        (no redirect); the user approves exactly what runs."""
+        sm = self._sm(config)
+        channel = _mock_gate_channel(["APPROVE", "APPROVE"])
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock()
+        recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
+
+        with (
+            patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_dead_snapshot()),
+            ),
+            patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
+            patch("genesis.guardian.check.write_diagnosis_result"),
+            patch.object(
+                DiagnosisEngine,
+                "diagnose",
+                AsyncMock(return_value=_proposed_diagnosis(RecoveryAction.REVERT_CODE)),
+            ),
+            patch(
+                "genesis.guardian.git_watch.container_git_supports_revert",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            await _execute_recovery_with_approval(
+                config,
+                sm,
+                dispatcher,
+                recovery_engine,
+                _proposed_diagnosis(RecoveryAction.REVERT_CODE),
+            )
+
+        executed = recovery_engine.execute.await_args.args[0]
+        assert executed.recommended_action == RecoveryAction.REVERT_CODE
 
     @pytest.mark.asyncio
     async def test_deny_at_gate1_does_not_execute(self, config: GuardianConfig) -> None:
@@ -876,12 +967,18 @@ class TestTwoGateApproval:
 
         with (
             patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
-            patch("genesis.guardian.check.collect_all_signals",
-                  AsyncMock(return_value=_dead_snapshot())),
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_dead_snapshot()),
+            ),
             patch.object(DiagnosisEngine, "diagnose", AsyncMock()) as diag,
         ):
             await _execute_recovery_with_approval(
-                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+                config,
+                sm,
+                dispatcher,
+                recovery_engine,
+                _proposed_diagnosis(),
             )
 
         recovery_engine.execute.assert_not_called()
@@ -900,15 +997,22 @@ class TestTwoGateApproval:
 
         with (
             patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
-            patch("genesis.guardian.check.collect_all_signals",
-                  AsyncMock(return_value=_dead_snapshot())),
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_dead_snapshot()),
+            ),
             patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
             patch("genesis.guardian.check.write_diagnosis_result"),
-            patch.object(DiagnosisEngine, "diagnose",
-                         AsyncMock(return_value=_proposed_diagnosis())),
+            patch.object(
+                DiagnosisEngine, "diagnose", AsyncMock(return_value=_proposed_diagnosis())
+            ),
         ):
             await _execute_recovery_with_approval(
-                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+                config,
+                sm,
+                dispatcher,
+                recovery_engine,
+                _proposed_diagnosis(),
             )
 
         recovery_engine.execute.assert_not_called()
@@ -916,7 +1020,8 @@ class TestTwoGateApproval:
 
     @pytest.mark.asyncio
     async def test_self_recovery_stands_down_without_executing(
-        self, config: GuardianConfig,
+        self,
+        config: GuardianConfig,
     ) -> None:
         """Health returns while waiting at Gate 1 → stand down: no poll, no
         execution, flag cleared (the no-timeout self-cancel)."""
@@ -929,11 +1034,17 @@ class TestTwoGateApproval:
 
         with (
             patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
-            patch("genesis.guardian.check.collect_all_signals",
-                  AsyncMock(return_value=_healthy_snapshot())),
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_healthy_snapshot()),
+            ),
         ):
             await _execute_recovery_with_approval(
-                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+                config,
+                sm,
+                dispatcher,
+                recovery_engine,
+                _proposed_diagnosis(),
             )
 
         recovery_engine.execute.assert_not_called()
@@ -952,7 +1063,10 @@ class TestTwoGateApproval:
 
         with patch("genesis.guardian.check._find_telegram_channel") as find:
             await _execute_recovery_with_approval(
-                config, sm, dispatcher, recovery_engine,
+                config,
+                sm,
+                dispatcher,
+                recovery_engine,
                 _proposed_diagnosis(RecoveryAction.ESCALATE),
             )
 
@@ -961,7 +1075,8 @@ class TestTwoGateApproval:
 
     @pytest.mark.asyncio
     async def test_no_telegram_channel_never_auto_recovers(
-        self, config: GuardianConfig,
+        self,
+        config: GuardianConfig,
     ) -> None:
         """No Telegram channel → alert for manual action, NEVER auto-recover."""
         sm = self._sm(config)
@@ -972,23 +1087,29 @@ class TestTwoGateApproval:
 
         with (
             patch("genesis.guardian.check._find_telegram_channel", return_value=None),
-            patch("genesis.guardian.check.collect_all_signals",
-                  AsyncMock(return_value=_dead_snapshot())),
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_dead_snapshot()),
+            ),
         ):
             await _execute_recovery_with_approval(
-                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+                config,
+                sm,
+                dispatcher,
+                recovery_engine,
+                _proposed_diagnosis(),
             )
 
         recovery_engine.execute.assert_not_called()
         titles = _alert_titles(dispatcher)
         assert any(
-            "approval gate unavailable" in t.lower() or "no telegram" in t.lower()
-            for t in titles
+            "approval gate unavailable" in t.lower() or "no telegram" in t.lower() for t in titles
         ), f"expected manual-intervention alert; got {titles}"
 
     @pytest.mark.asyncio
     async def test_gate1_send_failure_clears_flag_for_retry(
-        self, config: GuardianConfig,
+        self,
+        config: GuardianConfig,
     ) -> None:
         """A failed Gate-1 prompt send must NOT permanently mute the Guardian: a
         failed delivery isn't a successful 'alert once', so the flag is cleared and
@@ -1004,11 +1125,17 @@ class TestTwoGateApproval:
 
         with (
             patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
-            patch("genesis.guardian.check.collect_all_signals",
-                  AsyncMock(return_value=_dead_snapshot())),
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_dead_snapshot()),
+            ),
         ):
             await _execute_recovery_with_approval(
-                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+                config,
+                sm,
+                dispatcher,
+                recovery_engine,
+                _proposed_diagnosis(),
             )
 
         recovery_engine.execute.assert_not_called()
@@ -1017,7 +1144,8 @@ class TestTwoGateApproval:
 
     @pytest.mark.asyncio
     async def test_gate2_send_failure_clears_flag_for_retry(
-        self, config: GuardianConfig,
+        self,
+        config: GuardianConfig,
     ) -> None:
         """APPROVE Gate 1, then the Gate-2 prompt send fails → no execution, and
         the flag is cleared so the next cycle retries instead of going silent."""
@@ -1033,15 +1161,22 @@ class TestTwoGateApproval:
 
         with (
             patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
-            patch("genesis.guardian.check.collect_all_signals",
-                  AsyncMock(return_value=_dead_snapshot())),
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_dead_snapshot()),
+            ),
             patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
             patch("genesis.guardian.check.write_diagnosis_result"),
-            patch.object(DiagnosisEngine, "diagnose",
-                         AsyncMock(return_value=_proposed_diagnosis())),
+            patch.object(
+                DiagnosisEngine, "diagnose", AsyncMock(return_value=_proposed_diagnosis())
+            ),
         ):
             await _execute_recovery_with_approval(
-                config, sm, dispatcher, recovery_engine, _proposed_diagnosis(),
+                config,
+                sm,
+                dispatcher,
+                recovery_engine,
+                _proposed_diagnosis(),
             )
 
         recovery_engine.execute.assert_not_called()
@@ -1067,7 +1202,8 @@ class TestHealthySnapshotWiring:
 
     @pytest.mark.asyncio
     async def test_takes_healthy_snapshot_when_healthy(
-        self, config: GuardianConfig,
+        self,
+        config: GuardianConfig,
     ) -> None:
         snapshots = self._snapshots_mock()
         await _maintain_snapshots(config, snapshots, is_healthy=True)
@@ -1075,7 +1211,8 @@ class TestHealthySnapshotWiring:
 
     @pytest.mark.asyncio
     async def test_no_healthy_snapshot_when_not_healthy(
-        self, config: GuardianConfig,
+        self,
+        config: GuardianConfig,
     ) -> None:
         """NEVER snapshot a broken container as 'healthy'."""
         snapshots = self._snapshots_mock()
@@ -1084,7 +1221,8 @@ class TestHealthySnapshotWiring:
 
     @pytest.mark.asyncio
     async def test_no_healthy_snapshot_when_disabled(
-        self, config: GuardianConfig,
+        self,
+        config: GuardianConfig,
     ) -> None:
         config.snapshots.healthy_enabled = False
         snapshots = self._snapshots_mock()
@@ -1093,9 +1231,11 @@ class TestHealthySnapshotWiring:
 
     @pytest.mark.asyncio
     async def test_healthy_snapshot_respects_daily_marker(
-        self, config: GuardianConfig,
+        self,
+        config: GuardianConfig,
     ) -> None:
         from datetime import UTC, datetime
+
         marker = config.state_path / ".last_prune"
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(datetime.now(UTC).isoformat())
@@ -1106,7 +1246,8 @@ class TestHealthySnapshotWiring:
 
     @pytest.mark.asyncio
     async def test_mark_healthy_failure_does_not_stop_marker(
-        self, config: GuardianConfig,
+        self,
+        config: GuardianConfig,
     ) -> None:
         """A failing healthy-take must not wedge the daily cadence."""
         snapshots = self._snapshots_mock()
