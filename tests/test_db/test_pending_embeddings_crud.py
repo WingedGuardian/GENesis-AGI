@@ -200,3 +200,94 @@ class TestCountPending:
                 created_at=f"2026-03-11T12:00:0{i}",
             )
         assert await crud.count_pending(db) == 3
+
+
+class TestReconcileOrphanedMetadata:
+    """D5: relabel metadata orphans stuck 'pending' with no queue row as 'failed'."""
+
+    @pytest.mark.asyncio
+    async def test_relabels_aged_orphan(self, db):
+        from genesis.db.crud import memory as memory_crud
+
+        # metadata 'pending', old, with NO pending_embeddings row -> orphan.
+        await memory_crud.create_metadata(
+            db, memory_id="orphan-1", created_at="2020-01-01T00:00:00",
+            embedding_status="pending",
+        )
+        await crud.reconcile_orphaned_metadata(db)
+        meta = await memory_crud.get_metadata(db, "orphan-1")
+        assert meta["embedding_status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_spares_recent_orphan(self, db):
+        from datetime import UTC, datetime
+
+        from genesis.db.crud import memory as memory_crud
+
+        # A row younger than the age-gate is spared (mid-store() window).
+        now = datetime.now(UTC).isoformat()
+        await memory_crud.create_metadata(
+            db, memory_id="fresh-1", created_at=now, embedding_status="pending",
+        )
+        await crud.reconcile_orphaned_metadata(db)
+        meta = await memory_crud.get_metadata(db, "fresh-1")
+        assert meta["embedding_status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_ignores_pending_with_live_queue_row(self, db):
+        from genesis.db.crud import memory as memory_crud
+
+        # Aged metadata 'pending' but WITH a live queue row -> not an orphan.
+        await memory_crud.create_metadata(
+            db, memory_id="queued-1", created_at="2020-01-01T00:00:00",
+            embedding_status="pending",
+        )
+        await crud.create(
+            db, id="pe-q1", memory_id="queued-1", content="x",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2020-01-01T00:00:00",
+        )
+        await crud.reconcile_orphaned_metadata(db)
+        meta = await memory_crud.get_metadata(db, "queued-1")
+        assert meta["embedding_status"] == "pending"
+
+
+class TestResetFailedMirror:
+    """F1: reset_failed_to_pending must flip the memory_metadata mirror too."""
+
+    @pytest.mark.asyncio
+    async def test_reset_flips_metadata_mirror(self, db):
+        from genesis.db.crud import memory as memory_crud
+
+        await crud.create(
+            db, id="pe-f1", memory_id="mem-f1", content="x",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00",
+        )
+        await crud.mark_failed(db, "pe-f1", error_message="boom")
+        await memory_crud.create_metadata(
+            db, memory_id="mem-f1", created_at="2026-03-11T12:00:00",
+            embedding_status="failed",
+        )
+        reset = await crud.reset_failed_to_pending(db)
+        assert reset == 1
+        # queue row back to pending
+        assert any(it["memory_id"] == "mem-f1" for it in await crud.query_pending(db))
+        # metadata mirror back to pending (the F1 fix)
+        meta = await memory_crud.get_metadata(db, "mem-f1")
+        assert meta["embedding_status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_reset_leaves_queueless_orphan_failed(self, db):
+        from genesis.db.crud import memory as memory_crud
+
+        # metadata 'failed' with NO queue row (a reconciled orphan) stays failed -
+        # nothing will retry it, so the mirror must keep telling the truth.
+        await memory_crud.create_metadata(
+            db, memory_id="orphan-f", created_at="2020-01-01T00:00:00",
+            embedding_status="failed",
+        )
+        reset = await crud.reset_failed_to_pending(db)
+        assert reset == 0
+        meta = await memory_crud.get_metadata(db, "orphan-f")
+        assert meta["embedding_status"] == "failed"

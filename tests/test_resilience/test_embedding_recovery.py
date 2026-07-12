@@ -109,7 +109,8 @@ class TestDrainPending:
         # WS-3: origin_class restored from the authoritative metadata row so
         # an outage-recovered point carries the indexed provenance key.
         assert payload["origin_class"] == "first_party"
-        # project_type is not recoverable on this path — must stay absent
+        # this row carries no project_type: tag, so project_type stays absent
+        # (when tagged it IS recovered — see test_project_type_tag_restored)
         assert "project_type" not in payload
         # the stray memory_id key is dropped to match the normal write path
         assert "memory_id" not in payload
@@ -174,3 +175,45 @@ class TestDrainPending:
         count = await w.drain_pending(limit=2)
         assert count == 2
         assert await w.count_pending() == 3
+
+    @pytest.mark.asyncio
+    async def test_project_type_tag_restored(self, db, worker):
+        """Piece 2: a queued row carrying a ``project_type:`` tag has that
+        faceting key re-hydrated into the Qdrant payload on re-embed, so a
+        recovered point survives project_type= filtered recall (#975 index)."""
+        w, _, qdrant = worker
+        await crud.create(
+            db, id="pe-pt", memory_id="mem-pt", content="infra note",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00",
+            tags="wing:infrastructure,project_type:genesis-infra",
+        )
+        assert await w.drain_pending() == 1
+        payload = qdrant.upsert.call_args.kwargs["points"][0].payload
+        assert payload["project_type"] == "genesis-infra"
+
+    @pytest.mark.asyncio
+    async def test_embed_failure_marks_metadata_failed(self, db, worker):
+        """D5: an embed failure marks BOTH the queue row and the
+        memory_metadata mirror 'failed' — never leaving metadata stuck
+        'pending' (which would later orphan and lie to the supersede guard)."""
+        from genesis.db.crud import memory as memory_crud
+
+        w, embedder, _ = worker
+        await crud.create(
+            db, id="pe-x", memory_id="mem-x", content="bad",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00",
+        )
+        await memory_crud.create_metadata(
+            db, memory_id="mem-x", created_at="2026-03-11T12:00:00",
+            embedding_status="pending",
+        )
+        embedder.embed = AsyncMock(side_effect=RuntimeError("provider down"))
+
+        assert await w.drain_pending() == 0
+        # queue row failed (nothing left pending)
+        assert await crud.count_pending(db) == 0
+        # metadata mirror also 'failed' — the D5 fix
+        meta = await memory_crud.get_metadata(db, "mem-x")
+        assert meta["embedding_status"] == "failed"

@@ -361,6 +361,40 @@ async def get_metadata(
     }
 
 
+async def count_fts_metadata_drift(db: aiosqlite.Connection) -> tuple[int, int]:
+    """Return ``(fts_ghosts, fts_invisible)`` cross-store drift counts.
+
+    ``fts_ghosts``: ``memory_fts`` rows with no ``memory_metadata`` row (a
+    keyword hit whose provenance/status is unknown). ``fts_invisible``:
+    ``memory_metadata`` rows with no ``memory_fts`` row (a memory that can
+    never surface in keyword/hybrid search). Both are 0 when ``store()`` has
+    written both stores for every memory; a non-zero count flags a store-path
+    or migration regression worth surfacing.
+    """
+    # Set-difference via COUNT + INTERSECT (O(n log n)). A correlated
+    # NOT EXISTS in the memory_metadata->memory_fts direction would be O(n^2):
+    # ``memory_fts.memory_id`` is UNINDEXED, so each per-row lookup scans the
+    # whole FTS content table — pathologically slow at 20k+ rows and run under
+    # the shared-connection lock. Comparing distinct-id set sizes avoids it.
+    fts_rows = await db.execute_fetchall(
+        "SELECT COUNT(DISTINCT memory_id) FROM memory_fts"
+    )
+    meta_rows = await db.execute_fetchall(
+        "SELECT COUNT(DISTINCT memory_id) FROM memory_metadata"
+    )
+    both_rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM ("
+        "SELECT memory_id FROM memory_fts "
+        "INTERSECT SELECT memory_id FROM memory_metadata)"
+    )
+    fts = int(fts_rows[0][0]) if fts_rows else 0
+    meta = int(meta_rows[0][0]) if meta_rows else 0
+    both = int(both_rows[0][0]) if both_rows else 0
+    ghosts = fts - both  # memory_fts rows with no memory_metadata row
+    invisible = meta - both  # memory_metadata rows with no memory_fts row
+    return ghosts, invisible
+
+
 async def get_taxonomy(
     db: aiosqlite.Connection,
     memory_id: str,

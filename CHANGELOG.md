@@ -181,6 +181,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   now restores those fields. Separately, keyword-only memories were being scored as
   if created just now (maximum freshness), letting old notes outrank genuinely recent
   ones; they now use their real creation time.
+- **A failed re-embed no longer leaves a memory in a permanent limbo state, and
+  recovered memories keep their project_type recall filter.** When the embedding
+  provider gave up on a memory, its status was left saying "still queued" forever —
+  a stale marker that could trigger doomed writes to the vector store for a memory
+  that has no vector. Failed embeds are now recorded truthfully, a maintenance sweep
+  heals any that were already stranded, and deleting a memory now also clears its
+  entity mentions. Memories re-embedded after an outage also keep their `project_type`
+  so they stay visible in project-scoped recall.
+- **Storing a memory no longer briefly stalls other work while it talks to the
+  vector store.** The store, supersede, and delete paths made blocking vector-store
+  HTTP calls directly on the event loop, so a slow round-trip could momentarily
+  freeze concurrent Telegram, dashboard, and reflection activity. Those calls now
+  run off-thread (matching the background paths), keeping the system responsive
+  under load.
 - **Telegram no longer drops messages or breaks approval buttons when the
   legacy bridge gets started alongside the server.** Two Genesis processes
   polling the same bot token split incoming updates between them (observed:
