@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import logging
 from datetime import UTC, datetime
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.env import cc_project_dir, user_timezone
+from genesis.runtime.init.process_reaper import _wire_process_reaper
 
 if TYPE_CHECKING:
     from genesis.runtime._core import GenesisRuntime
@@ -720,6 +720,30 @@ async def init(rt: GenesisRuntime) -> None:
                                 evidence_count=result.evidence_count,
                                 narrative=narrative,
                             )
+                            # WS-3 B1 gate-2 (identity): shadow-record the
+                            # USER_KNOWLEDGE write. first_party BY AUTHORSHIP
+                            # (Genesis's own reflection-derived user-model
+                            # deltas) -> self-guards to NO row today. FLIP
+                            # BLOCKER (do not enforce past this): observation
+                            # rows carry no origin_class, so externally-planted
+                            # "facts about the user" in reflected transcripts
+                            # remain first_party until delta-level provenance
+                            # lands. Counts only, never content.
+                            from genesis.security import immunity_shadow
+
+                            await immunity_shadow.record_would_block(
+                                gate="identity",
+                                source_kind="identity_write",
+                                source_ref=("runtime/init/learning.py::_evolve_user_model"),
+                                process="server",
+                                blockable_count=1,
+                                origin_class="first_party",
+                                db=rt._db,
+                                detail={
+                                    "mode": "narrative" if narrative else "rules",
+                                    "evidence_count": result.evidence_count,
+                                },
+                            )
                             try:
                                 from genesis.learning.cognitive_ledger import (
                                     record_existing,
@@ -983,160 +1007,10 @@ async def init(rt: GenesisRuntime) -> None:
         # from the awareness loop (`_check_git_health_deep`) on a ~daily guard so
         # it survives a router-degraded startup that skips this learning init.
 
-        async def _reap_stale_processes() -> None:
-            """Kill leaked processes older than their configured threshold.
-
-            Targets:
-              - opencode-ai: 24 hours (pgrep -f, matches command line)
-              - claude: 7 days (pgrep -x, matches exact process name)
-
-            Kills the full descendant tree (children, grandchildren) of each
-            stale process to prevent orphaned MCP servers, Playwright, etc.
-            """
-            import asyncio
-            import os
-
-            from genesis.browser.types import BROWSER_PGREP_PATTERNS
-
-            # (pgrep_flag, pattern, max_age_hours, label)
-            targets = [
-                ("-f", "opencode-ai", 24, "opencode-ai"),
-                ("-x", "claude", 168, "claude"),  # 7 days
-            ]
-            # Browser processes — 4h max age. Idle timeout fires at 1h,
-            # MCP lifespan fires on session end. A 4h-old browser process
-            # has survived both layers and is definitively orphaned.
-            for bp in BROWSER_PGREP_PATTERNS:
-                targets.append(("-f", bp, 4, f"browser:{bp}"))
-            my_pid = os.getpid()
-            my_ppid = os.getppid()
-            protected = {my_pid, my_ppid}
-
-            async def _get_descendants(pid: int, depth: int = 0) -> list[int]:
-                """Return all descendant PIDs (children-first / bottom-up)."""
-                if depth >= 10:
-                    return []
-                proc = await asyncio.create_subprocess_exec(
-                    "pgrep",
-                    "-P",
-                    str(pid),
-                    stdout=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await proc.communicate()
-                if not stdout.strip():
-                    return []
-                children = [
-                    int(p.strip()) for p in stdout.decode().strip().split("\n") if p.strip()
-                ]
-                result: list[int] = []
-                for child in children:
-                    result.extend(await _get_descendants(child, depth + 1))
-                result.extend(children)
-                return result
-
-            try:
-                all_killed: list[tuple[int, str]] = []
-                for flag, pattern, max_age_h, label in targets:
-                    proc = await asyncio.create_subprocess_exec(
-                        "pgrep",
-                        flag,
-                        pattern,
-                        stdout=asyncio.subprocess.PIPE,
-                    )
-                    stdout, _ = await proc.communicate()
-                    if not stdout.strip():
-                        continue
-
-                    max_age = max_age_h * 3600
-                    clock_ticks = os.sysconf("SC_CLK_TCK")
-
-                    for pid_str in stdout.decode().strip().split("\n"):
-                        pid = int(pid_str.strip())
-                        if pid <= 1 or pid in protected:
-                            continue
-                        try:
-                            if not Path(f"/proc/{pid}/stat").exists():
-                                continue
-                            with open(f"/proc/{pid}/stat") as f:
-                                raw = f.read()
-                            # comm field (field 2) is in parens and may
-                            # contain spaces; split after the last ')'.
-                            after_comm = raw[raw.rfind(")") + 2 :]
-                            start_ticks = int(after_comm.split()[19])
-                            with open("/proc/uptime") as f:
-                                uptime_secs = float(f.read().split()[0])
-                            age_secs = uptime_secs - (start_ticks / clock_ticks)
-                            if age_secs > max_age:
-                                # Collect descendants bottom-up, then the root
-                                tree = await _get_descendants(pid)
-                                tree.append(pid)
-                                for p in tree:
-                                    if p <= 1 or p in protected:
-                                        continue
-                                    with contextlib.suppress(ProcessLookupError):
-                                        os.kill(p, 15)  # SIGTERM
-                                    all_killed.append((p, label))
-                        except (ProcessLookupError, FileNotFoundError, ValueError):
-                            continue
-
-                if all_killed:
-                    # 5s grace period for graceful shutdown — browsers need
-                    # time to flush profile SQLite and release locks.
-                    await asyncio.sleep(5)
-                    for pid, _ in all_killed:
-                        with contextlib.suppress(ProcessLookupError):
-                            os.kill(pid, 9)  # SIGKILL
-                    logger.info(
-                        "Process reaper: killed %d stale process(es): %s",
-                        len(all_killed),
-                        all_killed,
-                    )
-                    # Create observation for visibility
-                    if rt._db is not None:
-                        try:
-                            import json
-                            from datetime import UTC, datetime
-                            from uuid import uuid4
-
-                            from genesis.db.crud import observations
-
-                            await observations.create(
-                                rt._db,
-                                id=f"reaper-{uuid4().hex[:8]}",
-                                source="process_reaper",
-                                type="process_reaper_kill",
-                                priority="low",
-                                content=json.dumps(
-                                    {
-                                        "killed_count": len(all_killed),
-                                        "processes": [
-                                            {"pid": p, "label": lbl} for p, lbl in all_killed
-                                        ],
-                                    }
-                                ),
-                                created_at=datetime.now(UTC).isoformat(),
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Failed to create reaper observation",
-                                exc_info=True,
-                            )
-                rt.record_job_success("process_reaper")
-            except Exception as exc:
-                rt.record_job_failure("process_reaper", str(exc))
-                logger.exception("Process reaper failed")
-
-        # CronTrigger instead of IntervalTrigger: IntervalTrigger resets on
-        # server restart, so the reaper never fires if the server restarts
-        # within the hour.  Runs at :15 past every hour to avoid collision
-        # with hour-boundary jobs.
-        rt._learning_scheduler.add_job(
-            _reap_stale_processes,
-            CronTrigger(minute=15),
-            id="process_reaper",
-            max_instances=1,
-            misfire_grace_time=600,
-        )
+        # Process reaper (leaked opencode/browser by age; claude by IDLE
+        # policy — activity markers + live-terminal gate, dry-run→auto-arm).
+        # Extracted to a testable seam; see process_reaper.py.
+        _wire_process_reaper(rt._learning_scheduler, rt)
 
         # ── Skill evolution pipeline (weekly backup trigger) ────────────────
         async def _run_skill_evolution() -> None:

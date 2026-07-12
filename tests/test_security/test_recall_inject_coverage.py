@@ -26,7 +26,8 @@ import ast
 import pathlib
 
 # Repo-root-relative source tree.
-_SRC = pathlib.Path(__file__).resolve().parents[2] / "src" / "genesis"
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_SRC = _REPO_ROOT / "src" / "genesis"
 
 # Valid dispositions for a recall call site.
 #   wrapped          — external-world content can reach an LLM prompt here; it is
@@ -109,6 +110,127 @@ def _discover_recall_sites() -> dict[str, int]:
                         best, enclosing = start, name
                 found.setdefault(f"{rel}::{enclosing}", node.lineno)
     return found
+
+
+# ── WS-3 B1: injection-gate (gate 4) coverage lock ─────────────────────────
+# Every `wrapped` recall site (external-world content reaching an
+# action-capable LLM prompt) must ALSO be classified here as `gated` (it emits
+# a shadow would-block via ``security.immunity_shadow``) or
+# `deferred-with-reason`. This converts gate coverage into a PR-time forcing
+# function: a new wrapped site cannot silently bypass the injection gate, and
+# removing an emit from a gated site fails CI (see
+# ``test_gated_sites_actually_emit``).
+_GATE_VALID = {"gated", "deferred-with-reason"}
+
+# Two wrapped inject sites reach an LLM prompt but are NOT captured by the
+# ``.recall()`` AST sweep above — ``memory_expand`` retrieves by-id via
+# ``_qdrant.retrieve``, and the proactive hook lives outside ``src/genesis``.
+# They are enumerated explicitly so the gate set is complete.
+_EXTRA_WRAPPED_SITES: dict[str, tuple[str, str]] = {
+    "mcp/memory/core.py::memory_expand": (
+        "gated", "by-id retrieve (not .recall); wraps + emits external hits"),
+    "scripts/proactive_memory_hook.py::_run": (
+        "gated", "sync emit after stdout flush; lives outside src/genesis"),
+}
+
+# file::func -> (gate disposition, why). All wrapped sites are gated now
+# (enumeration-complete); `deferred-with-reason` stays as the explicit escape
+# hatch for a future site that legitimately should not gate.
+INJECTION_GATE_SITES: dict[str, tuple[str, str]] = {
+    "mcp/memory/core.py::memory_recall": (
+        "gated", "emits on BOTH the full (enriched) and compact-preview branches"),
+    "mcp/memory/core.py::memory_proactive": (
+        "gated", "source=both default; emits per-call blockable count"),
+    "mcp/memory/knowledge.py::knowledge_recall": (
+        "gated", "every hit external-world; emits per-call blockable count"),
+    "knowledge/applications/resume_review.py::_query_knowledge_base": (
+        "gated", "source=knowledge; emits (user-facing but enumeration-complete)"),
+    "autonomy/executor/research.py::_memory_recall": (
+        "gated", "highest write-capability path; emits"),
+    "cc/context_injector.py::inject": (
+        "gated", "episodic today -> 0 rows; emit wired for a future source widening"),
+    "channels/voice/handler.py::handle": (
+        "gated", "wraps external into the LLM system prompt; emits"),
+    **_EXTRA_WRAPPED_SITES,
+}
+
+
+# OUT OF GATE-4 SCOPE (external-tool-output, not recall-inject): document_query
+# (mcp/memory/documents.py) sends a PDF to the external PageIndex QA service
+# and returns its SYNTHESIZED answer to the prompt; web_fetch / web_search
+# likewise return external tool output. These reach a prompt but carry no
+# origin_class / wrap_external_recall model, so they are a DIFFERENT gate
+# class (quarantine tool output), not part of the provenance-based recall
+# gate this registry enforces. Tracked as a separate WS-3 follow-up.
+
+def _functions_calling(attrs: set[str]) -> set[str]:
+    """Return {"relpath::func"} for every function under src that calls a method
+    whose attribute name is in *attrs* (e.g. record_would_block)."""
+    found: set[str] = set()
+    for path in _SRC.rglob("*.py"):
+        try:
+            tree = ast.parse(path.read_text(), filename=str(path))
+        except SyntaxError:
+            continue
+        funcs = [
+            (n.lineno, getattr(n, "end_lineno", n.lineno), n.name)
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        rel = path.relative_to(_SRC).as_posix()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in attrs
+            ):
+                best, enclosing = -1, "<module>"
+                for start, end, name in funcs:
+                    if start <= node.lineno <= (end or start) and start > best:
+                        best, enclosing = start, name
+                found.add(f"{rel}::{enclosing}")
+    return found
+
+
+def test_injection_gate_dispositions_valid():
+    for key, (disp, why) in INJECTION_GATE_SITES.items():
+        assert disp in _GATE_VALID, f"{key}: invalid gate disposition {disp!r}"
+        assert why.strip(), f"{key}: empty rationale"
+
+
+def test_every_wrapped_recall_site_is_gate_classified():
+    wrapped = {k for k, (disp, _) in KNOWN_RECALL_SITES.items() if disp == "wrapped"}
+    classified = set(INJECTION_GATE_SITES)
+    missing = wrapped - classified
+    assert not missing, (
+        "wrapped recall site(s) not classified for the WS-3 injection gate:\n  "
+        + "\n  ".join(sorted(missing))
+        + "\n\nClassify each in INJECTION_GATE_SITES: wire "
+        "security.immunity_shadow.record_would_block and mark it 'gated', or "
+        "mark 'deferred-with-reason' with a rationale."
+    )
+
+
+def test_gated_sites_actually_emit():
+    """Every 'gated' site under src/genesis must call record_would_block[_sync]
+    — so deleting/moving the emit fails CI. (The proactive hook is verified by
+    test_proactive_hook_emits_sync; it lives outside src/genesis.)"""
+    emitters = _functions_calling({"record_would_block", "record_would_block_sync"})
+    for key, (disp, _why) in INJECTION_GATE_SITES.items():
+        if disp != "gated" or key.startswith("scripts/"):
+            continue
+        assert key in emitters, (
+            f"{key} is classified 'gated' but its function does not call "
+            "immunity_shadow.record_would_block[_sync] — the gate emit was "
+            "removed or moved. Re-wire it or reclassify with a reason."
+        )
+
+
+def test_proactive_hook_emits_sync():
+    hook = _REPO_ROOT / "scripts" / "proactive_memory_hook.py"
+    assert "record_would_block_sync" in hook.read_text(), (
+        "the proactive-memory hook no longer emits the injection shadow gate"
+    )
 
 
 def test_all_registry_dispositions_valid():

@@ -16,6 +16,7 @@ from genesis.memory.reference_ops import (
 from genesis.memory.reference_ops import (
     delete_reference_entry,
 )
+from genesis.security import immunity_shadow
 
 from ..memory import mcp
 from ._scoring import DEFAULT_KB_FLOOR_RATIO, relative_kb_floor
@@ -25,6 +26,7 @@ def _memory_mod():
     import genesis.mcp.memory_mcp as memory_mod
 
     return memory_mod
+
 
 logger = logging.getLogger(__name__)
 
@@ -91,14 +93,21 @@ async def knowledge_recall(
     # than emitting a second recall_fired that double-counts downstream.
     recall_event_sink: list[str] = []
     vector_results = await memory_mod._retriever.recall(
-        query, source="knowledge", limit=limit, project_type=project,
+        query,
+        source="knowledge",
+        limit=limit,
+        project_type=project,
         event_id_sink=recall_event_sink,
     )
 
     fts_results: list[dict] = []
     try:
         fts_results = await memory_mod.knowledge.search_fts(
-            memory_mod._db, query, project=project, domain=domain, limit=limit,
+            memory_mod._db,
+            query,
+            project=project,
+            domain=domain,
+            limit=limit,
         )
     except Exception:
         logger.warning("knowledge_fts search failed", exc_info=True)
@@ -108,19 +117,21 @@ async def knowledge_recall(
 
     for r in vector_results:
         seen_ids.add(r.memory_id)
-        merged.append({
-            "unit_id": r.memory_id,
-            "content": r.content,
-            "source": r.source,
-            "source_doc": r.source,
-            "score": r.score,
-            # Pre-diversity-penalty score, for J-9 metrics only —
-            # ordering/floor stay on the penalized ``score``. Fallback for
-            # paths that don't populate it (0.0 == unset).
-            "retrieval_score": r.retrieval_score or r.score,
-            "origin": "vector",
-            "source_pipeline": r.source_pipeline,
-        })
+        merged.append(
+            {
+                "unit_id": r.memory_id,
+                "content": r.content,
+                "source": r.source,
+                "source_doc": r.source,
+                "score": r.score,
+                # Pre-diversity-penalty score, for J-9 metrics only —
+                # ordering/floor stay on the penalized ``score``. Fallback for
+                # paths that don't populate it (0.0 == unset).
+                "retrieval_score": r.retrieval_score or r.score,
+                "origin": "vector",
+                "source_pipeline": r.source_pipeline,
+            }
+        )
 
     for idx, fts_row in enumerate(fts_results):
         uid = fts_row["unit_id"]
@@ -130,19 +141,21 @@ async def knowledge_recall(
             # with vector results. FTS5 rank is negative (closer to 0 = better).
             # Map rank position to score: first result ~0.8, decaying linearly.
             fts_score = max(0.1, 0.8 - (idx * 0.05))
-            merged.append({
-                "unit_id": uid,
-                "content": fts_row.get("body", ""),
-                "concept": fts_row.get("concept", ""),
-                "domain": fts_row.get("domain", ""),
-                "project_type": fts_row.get("project_type", ""),
-                "score": fts_score,
-                # The synthetic FTS score never saw the diversity
-                # penalty — raw == final.
-                "retrieval_score": fts_score,
-                "origin": "fts",
-                "source_pipeline": fts_row.get("source_pipeline"),
-            })
+            merged.append(
+                {
+                    "unit_id": uid,
+                    "content": fts_row.get("body", ""),
+                    "concept": fts_row.get("concept", ""),
+                    "domain": fts_row.get("domain", ""),
+                    "project_type": fts_row.get("project_type", ""),
+                    "score": fts_score,
+                    # The synthetic FTS score never saw the diversity
+                    # penalty — raw == final.
+                    "retrieval_score": fts_score,
+                    "origin": "fts",
+                    "source_pipeline": fts_row.get("source_pipeline"),
+                }
+            )
 
     boosted = _apply_authority_boost(merged)
     # Relative floor over the (all-KB) result set (audit MEM-004): keep results
@@ -159,18 +172,15 @@ async def knowledge_recall(
     # final, post-merge/floor result set; emit a fresh one only if the retriever
     # didn't (e.g. it returned early). Done before CRAG so the recall_corrected
     # calibration event can link back to recall_event_id (subject_id).
-    recall_event_id: str | None = (
-        recall_event_sink[0] if recall_event_sink else None
-    )
+    recall_event_id: str | None = recall_event_sink[0] if recall_event_sink else None
     try:
         # J-9 metrics read the pre-diversity-penalty score
         # (authority boost included); ordering/floor above used ``score``.
-        _top_scores = [
-            r.get("retrieval_score") or r.get("score", 0.0) for r in final[:5]
-        ]
+        _top_scores = [r.get("retrieval_score") or r.get("score", 0.0) for r in final[:5]]
         _memory_ids = [r.get("unit_id", "") for r in final[:10]]
         if recall_event_id is not None:
             from genesis.eval.j9_hooks import update_recall_metrics
+
             await update_recall_metrics(
                 memory_mod._db,
                 recall_event_id,
@@ -180,6 +190,7 @@ async def knowledge_recall(
             )
         else:
             from genesis.eval.j9_hooks import emit_recall_fired
+
             recall_event_id = await emit_recall_fired(
                 memory_mod._db,
                 query=query,
@@ -197,6 +208,7 @@ async def knowledge_recall(
     # (external knowledge is legitimately on the web; episodic memory is not).
     if corrective:
         from genesis.memory.corrective import maybe_correct_recall
+
         final = await maybe_correct_recall(
             query=query,
             results=final,
@@ -212,11 +224,28 @@ async def knowledge_recall(
     # Injection defense (PR2): every knowledge_recall hit is external-world —
     # wrap the content (vector `r.content` and FTS `body` both land under the
     # `content` key here) so the model treats it as data, not instructions.
+    blockable = 0
     for d in final:
         if isinstance(d, dict) and "content" in d:
             d["content"] = wrap_external_recall(
-                d["content"], source_pipeline=d.get("source_pipeline"),
+                d["content"],
+                source_pipeline=d.get("source_pipeline"),
             )
+            if immunity_shadow.item_is_blockable(
+                collection=d.get("collection"),
+                source_pipeline=d.get("source_pipeline"),
+            ):
+                blockable += 1
+    # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
+    # knowledge-recall prompt (observe-only — every hit is external-world).
+    await immunity_shadow.record_would_block(
+        gate="injection",
+        source_kind="recall_inject",
+        source_ref="mcp/memory/knowledge.py::knowledge_recall",
+        process="server",
+        blockable_count=blockable,
+        db=memory_mod._db,
+    )
     return final
 
 
@@ -234,6 +263,7 @@ async def _ingest_knowledge_unit(
     ingestion_source: str | None = None,
     collection: str = "knowledge_base",
     memory_type: str = "knowledge",
+    origin_class: str | None = None,
 ) -> str:
     """MCP-side wrapper around :func:`ingest_knowledge_unit`.
 
@@ -265,6 +295,7 @@ async def _ingest_knowledge_unit(
         ingestion_source=ingestion_source,
         collection=collection,
         memory_type=memory_type,
+        origin_class=origin_class,
     )
 
 
@@ -360,6 +391,7 @@ async def knowledge_status(
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _format_reference_body(
     *,
     kind: str,
@@ -444,8 +476,7 @@ async def reference_store(
     """
     if kind not in _REFERENCE_KINDS:
         raise ValueError(
-            f"reference_store: unknown kind '{kind}', must be one of "
-            f"{sorted(_REFERENCE_KINDS)}"
+            f"reference_store: unknown kind '{kind}', must be one of {sorted(_REFERENCE_KINDS)}"
         )
     if not description or not description.strip():
         raise ValueError(
@@ -484,6 +515,12 @@ async def reference_store(
     if session_id:
         provenance["session_id"] = session_id
 
+    # WS-3: forward the dispatched session's origin (env). Without this,
+    # references captured by an external-influenced session land first_party
+    # via the reference_store pipeline AND are exempt from the injection
+    # gate's counting (_FIRST_PARTY_KB_PIPELINES) — a doubly-blind path.
+    from genesis.memory.provenance import session_origin_from_env
+
     unit_id = await _ingest_knowledge_unit(
         content=body,
         project=_REFERENCE_PROJECT,
@@ -495,6 +532,7 @@ async def reference_store(
         tags_json=tags_json,
         collection="episodic_memory",
         memory_type="episodic",
+        origin_class=session_origin_from_env(),
     )
     return unit_id
 
@@ -519,16 +557,14 @@ async def _log_credential_access(
             "INSERT INTO credential_access_log "
             "(unit_id, accessor_context, accessed_at, query_match_score) "
             "VALUES (?, ?, ?, ?)",
-            [
-                (uid, accessor_context, now_iso, query_match_score)
-                for uid in unit_ids
-            ],
+            [(uid, accessor_context, now_iso, query_match_score) for uid in unit_ids],
         )
         await memory_mod._db.commit()
     except Exception:
         logger.warning(
             "Failed to append credential_access_log rows for %d units",
-            len(unit_ids), exc_info=True,
+            len(unit_ids),
+            exc_info=True,
         )
 
 
@@ -579,8 +615,7 @@ async def reference_lookup(
 
     if kind is not None and kind not in _REFERENCE_KINDS:
         raise ValueError(
-            f"reference_lookup: unknown kind '{kind}', must be one of "
-            f"{sorted(_REFERENCE_KINDS)}"
+            f"reference_lookup: unknown kind '{kind}', must be one of {sorted(_REFERENCE_KINDS)}"
         )
     domain_filter: str | None = f"reference.{kind}" if kind else None
 
@@ -592,14 +627,18 @@ async def reference_lookup(
     vector_hits: list[dict] = []
     try:
         vector_results = await memory_mod._retriever.recall(
-            query, source="episodic", limit=vector_limit,
+            query,
+            source="episodic",
+            limit=vector_limit,
         )
         for r in vector_results:
-            vector_hits.append({
-                "unit_id": r.memory_id,
-                "score": getattr(r, "score", 0.0),
-                "origin": "vector",
-            })
+            vector_hits.append(
+                {
+                    "unit_id": r.memory_id,
+                    "score": getattr(r, "score", 0.0),
+                    "origin": "vector",
+                }
+            )
     except Exception:
         logger.warning(
             "reference_lookup: vector path failed, falling back to FTS only",
@@ -618,7 +657,8 @@ async def reference_lookup(
         )
     except Exception:
         logger.warning(
-            "reference_lookup: FTS path failed", exc_info=True,
+            "reference_lookup: FTS path failed",
+            exc_info=True,
         )
 
     # Merge + dedup by unit_id, tracking origin.
@@ -640,25 +680,26 @@ async def reference_lookup(
             continue
         if domain_filter and row.get("domain") != domain_filter:
             continue
-        full_rows.append({
-            "unit_id": row["id"],
-            "concept": row["concept"],
-            "body": row["body"],
-            "domain": row["domain"],
-            "tags": row["tags"],
-            "confidence": row["confidence"],
-            "source_doc": row["source_doc"],
-            "ingested_at": row["ingested_at"],
-            "origin": origin,
-        })
+        full_rows.append(
+            {
+                "unit_id": row["id"],
+                "concept": row["concept"],
+                "body": row["body"],
+                "domain": row["domain"],
+                "tags": row["tags"],
+                "confidence": row["confidence"],
+                "source_doc": row["source_doc"],
+                "ingested_at": row["ingested_at"],
+                "origin": origin,
+            }
+        )
         if len(full_rows) >= limit:
             break
 
     # Audit trail: log access for any credentials-kind entry that surfaces,
     # regardless of whether it came from the vector or FTS path.
     credential_hits = [
-        row["unit_id"] for row in full_rows
-        if row["domain"] == "reference.credentials"
+        row["unit_id"] for row in full_rows if row["domain"] == "reference.credentials"
     ]
     if credential_hits:
         await _log_credential_access(
@@ -689,7 +730,9 @@ async def reference_delete(unit_id: str) -> bool:
     # also used by the dashboard reference browser. Raises ValueError if the
     # unit is not a reference entry.
     return await delete_reference_entry(
-        memory_mod._db, memory_mod._store, unit_id,
+        memory_mod._db,
+        memory_mod._store,
+        unit_id,
     )
 
 
@@ -709,7 +752,8 @@ async def reference_export() -> dict:
     assert memory_mod._db is not None
 
     stats_result = await memory_mod.knowledge.stats(
-        memory_mod._db, project=_REFERENCE_PROJECT,
+        memory_mod._db,
+        project=_REFERENCE_PROJECT,
     )
     return {
         "project_type": _REFERENCE_PROJECT,
@@ -731,11 +775,10 @@ def _get_orchestrator():
     rt = GenesisRuntime.instance()
     if rt._router is None:
         from genesis.routing.standalone import create_standalone_router
+
         create_standalone_router()
     if rt._router is None:
-        raise RuntimeError(
-            "Router not available — standalone bootstrap also failed"
-        )
+        raise RuntimeError("Router not available — standalone bootstrap also failed")
 
     from genesis.knowledge.tree_index import get_client as get_tree_index_client
 
@@ -767,7 +810,10 @@ async def knowledge_ingest_source(
     """
     orchestrator = _get_orchestrator()
     result = await orchestrator.ingest_source(
-        source, project_type=project_type, domain=domain, purpose=purpose,
+        source,
+        project_type=project_type,
+        domain=domain,
+        purpose=purpose,
     )
     response = {
         "source": result.source,
@@ -801,8 +847,11 @@ async def knowledge_ingest_batch(
     """
     orchestrator = _get_orchestrator()
     results = await orchestrator.ingest_batch(
-        directory, project_type=project_type, domain=domain,
-        purpose=purpose, extensions=extensions,
+        directory,
+        project_type=project_type,
+        domain=domain,
+        purpose=purpose,
+        extensions=extensions,
     )
     return {
         "total_sources": len(results),
@@ -845,6 +894,7 @@ async def resume_review(
     rt = GenesisRuntime.instance()
     if rt._router is None:
         from genesis.routing.standalone import create_standalone_router
+
         create_standalone_router()
     if rt._router is None:
         return {"error": "Router not available — standalone bootstrap failed"}

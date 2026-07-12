@@ -37,7 +37,10 @@ class OutreachConfig:
         "cc:quota_exhausted",
         "provider:embedding_failing",
         "provider:qdrant_unreachable",
-        "provider:credit_exhaustion",  # Prefix — matches any provider
+        # provider:credit_exhaustion deliberately NOT escalated — it is now a
+        # dashboard-only WARNING (refilling credits is a user financial action;
+        # provider exhaustion alone is not an outage, routing fallbacks cover
+        # it). See mcp/health/errors.py credit-exhaustion block.
         "awareness:tick_overdue",
         "service:health_data_uninitialized",
         # Backups are outside Sentinel scope (external target — see
@@ -101,11 +104,12 @@ _DEFAULTS = OutreachConfig(
         "cc:quota_exhausted",
         "provider:embedding_failing",
         "provider:qdrant_unreachable",
-        "provider:credit_exhaustion",  # Prefix — matches any provider
+        # provider:credit_exhaustion deliberately NOT escalated — dashboard-only
+        # WARNING now (see the dataclass default above and errors.py).
         "awareness:tick_overdue",
         "service:health_data_uninitialized",
         "backup:",  # Prefix — push channel now that backups are out of Sentinel scope
-        "creds:",   # Prefix — credential corruption / auto-restore (creds:corrupt/restored)
+        "creds:",  # Prefix — credential corruption / auto-restore (creds:corrupt/restored)
     ),
     delivery_routing={"default": "supergroup"},
 )
@@ -133,6 +137,7 @@ def validate_preferences(preferences: dict) -> list[str]:
                 val = qh.get(field)
                 if val is not None:
                     import re
+
                     if not re.fullmatch(r"\d{2}:\d{2}", str(val)):
                         errors.append(f"quiet_hours.{field} must be HH:MM format, got {val!r}")
             # timezone removed — uses genesis.env.user_timezone()
@@ -198,8 +203,10 @@ def save_outreach_config(config: OutreachConfig, path: Path | None = None) -> No
     }
 
     import tempfile
+
     tmp_fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent), suffix=".yaml.tmp",
+        dir=str(path.parent),
+        suffix=".yaml.tmp",
     )
     try:
         with open(tmp_fd, "w") as f:
@@ -244,11 +251,7 @@ def load_outreach_config(path: Path | None = None) -> OutreachConfig:
                 _DEFAULTS.immediate_escalation_alerts,
             )
         ),
-        voice_alert_ids=tuple(
-            raw.get("voice", {}).get("alert_ids", _DEFAULTS.voice_alert_ids)
-        ),
-        voice_hours=tuple(
-            raw.get("voice", {}).get("hours", _DEFAULTS.voice_hours)
-        ),
+        voice_alert_ids=tuple(raw.get("voice", {}).get("alert_ids", _DEFAULTS.voice_alert_ids)),
+        voice_hours=tuple(raw.get("voice", {}).get("hours", _DEFAULTS.voice_hours)),
         delivery_routing=raw.get("delivery_routing", {"default": "supergroup"}),
     )

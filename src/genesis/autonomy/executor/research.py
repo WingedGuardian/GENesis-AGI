@@ -22,6 +22,7 @@ from typing import Any
 from genesis.autonomy.executor.types import ResearchResult
 from genesis.cc.types import CCInvocation, CCModel, CCOutput, EffortLevel, background_session_dir
 from genesis.memory.provenance import is_external, wrap_external_recall
+from genesis.security import immunity_shadow
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,9 @@ class DeepResearcherImpl:
         web_task = self._web_search(query)
         memory_task = self._memory_recall(query)
         web_results, memory_results = await asyncio.gather(
-            web_task, memory_task, return_exceptions=True,
+            web_task,
+            memory_task,
+            return_exceptions=True,
         )
 
         # Collect whatever succeeded
@@ -121,6 +124,8 @@ class DeepResearcherImpl:
         # MCP servers (memory recall, web search tools).
         mcp_config = self._build_mcp_config()
 
+        from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
+
         invocation = CCInvocation(
             prompt=prompt,
             expect_output=True,  # silent-cap detection (research needs output)
@@ -131,9 +136,15 @@ class DeepResearcherImpl:
             mcp_config=mcp_config,
             timeout_s=1800,  # 30 min max for research
             working_dir=background_session_dir(),
+            # WS-3: deep-research sessions ingest external web content by
+            # construction, and their MCP profile includes genesis-memory.
+            origin=ORIGIN_EXTERNAL_UNTRUSTED,
             skip_permissions=True,
             disallowed_tools=[
-                "Bash", "Edit", "Write", "NotebookEdit",
+                "Bash",
+                "Edit",
+                "Write",
+                "NotebookEdit",
                 "mcp__genesis-health__task_submit",
                 "mcp__genesis-health__settings_update",
                 "mcp__genesis-health__direct_session_run",
@@ -145,7 +156,8 @@ class DeepResearcherImpl:
 
         logger.info(
             "Research session dispatching for step %s (error: %s...)",
-            step.get("idx", "?"), error[:80],
+            step.get("idx", "?"),
+            error[:80],
         )
 
         try:
@@ -216,27 +228,50 @@ class DeepResearcherImpl:
 
         try:
             results = await self._retriever.recall(
-                query, limit=5, wing="learning",
+                query,
+                limit=5,
+                wing="learning",
             )
             if not results:
                 return ""
             lines = []
+            blockable = 0
             for r in results[:5]:
                 content = r.content[:200] if hasattr(r, "content") else str(r)[:200]
                 # Injection defense (PR2): recall defaults to source="both", so a
                 # KB hit can reach the triage prompt — wrap external-world content.
                 if is_external(getattr(r, "collection", "")):
                     content = wrap_external_recall(
-                        content, source_pipeline=getattr(r, "source_pipeline", None),
+                        content,
+                        source_pipeline=getattr(r, "source_pipeline", None),
                     )
+                    if immunity_shadow.item_is_blockable(
+                        collection=getattr(r, "collection", None),
+                        source_pipeline=getattr(r, "source_pipeline", None),
+                    ):
+                        blockable += 1
                 lines.append(f"- {content}")
+            # WS-3 B1 gate 4 (injection): the autonomous due-diligence path is the
+            # highest-write-capability recall site — shadow-record external content
+            # reaching it (observe-only; db=None -> self-resolve).
+            await immunity_shadow.record_would_block(
+                gate="injection",
+                source_kind="recall_inject",
+                source_ref="autonomy/executor/research.py::_memory_recall",
+                process="server",
+                blockable_count=blockable,
+                db=None,
+            )
             return "\n".join(lines)
         except Exception as exc:
             logger.debug("Memory recall error in due diligence: %s", exc)
             return ""
 
     async def _triage_relevance(
-        self, step: dict, error: str, combined_results: str,
+        self,
+        step: dict,
+        error: str,
+        combined_results: str,
     ) -> str | None:
         """Ask the LLM: are these search results relevant to this error?"""
         desc = step.get("description", step.get("title", "unknown step"))
@@ -283,14 +318,11 @@ class DeepResearcherImpl:
             )
 
         desc = step.get("description", step.get("title", "unknown step"))
-        attempts_text = "\n".join(
-            f"- {a}" for a in prior_attempts
-        ) if prior_attempts else "None"
+        attempts_text = "\n".join(f"- {a}" for a in prior_attempts) if prior_attempts else "None"
         dd_text = due_diligence_results or "No prior research results"
 
         return (
-            template
-            .replace("{{step_description}}", desc)
+            template.replace("{{step_description}}", desc)
             .replace("{{error_text}}", error[:3000])
             .replace("{{prior_attempts}}", attempts_text)
             .replace("{{due_diligence_results}}", dd_text)

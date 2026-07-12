@@ -1046,7 +1046,7 @@ section is safe to hand-edit; install scripts preserve it.
 
 <!-- begin:container-specs -->
 ## Container
-- **Specs**: (run host-setup.sh to detect and populate)
+- **Specs**: (populated by Genesis on first boot — see ~/.genesis/infrastructure/INFRASTRUCTURE.md)
 <!-- end:container-specs -->
 
 <!-- begin:network-identity -->
@@ -1087,6 +1087,15 @@ if p.exists():
 build_network_identity_block "$_c_ip" "$_c_ipv6" "$_host_ip" "" "$_ts_ip" \
     | write_sentinel_block "$_user_claude" "network-identity"
 echo "  Network identity updated in ~/.claude/CLAUDE.md"
+echo ""
+
+# Refresh the container-specs block from the LAST collected infrastructure
+# profile (content owner: genesis.infra_profile.claude_md — no collection, no
+# runtime import; safe while the server is down). Skips gracefully pre-first-
+# collection or on older checkouts without the module.
+"$VENV_DIR/bin/python" -m genesis.infra_profile --claude-md-block 2>/dev/null \
+    && echo "  Container specs refreshed in ~/.claude/CLAUDE.md" \
+    || echo "  Container specs refresh skipped (no profile yet)"
 echo ""
 
 _write_state "health_check"

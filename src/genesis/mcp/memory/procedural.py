@@ -113,6 +113,34 @@ async def procedure_store(
         principle_embedding=principle_blob,
     )
 
+    # WS-3 B1 gate-1 (procedure): shadow-record the teach, classified by the
+    # CALLER session's origin (GENESIS_SESSION_ORIGIN env — this MCP tool is
+    # exposed in research/campaign profiles alongside web tools, so an
+    # external-influenced background session can teach a procedure; the taught
+    # tools_used is REPLAY tools, not caller provenance). MUST coalesce the env
+    # read: the gate normalizes None ADVERSARIALLY (is_blockable(None) → True),
+    # so a raw None would record a false would-block row for EVERY internal
+    # teach — unset env = not a dispatched session = first_party (never owner:
+    # reflection/ego/sentinel profiles also reach this tool with the env unset).
+    # Skipped duplicate teaches promote nothing → no emit.
+    if result.action != "skipped":
+        from genesis.memory.provenance import (
+            ORIGIN_FIRST_PARTY,
+            session_origin_from_env,
+        )
+        from genesis.security import immunity_shadow
+
+        await immunity_shadow.record_would_block(
+            gate="procedure",
+            source_kind="procedure_teach",
+            source_ref="mcp/memory/procedural.py::procedure_store",
+            process="server",
+            blockable_count=1,
+            origin_class=session_origin_from_env() or ORIGIN_FIRST_PARTY,
+            db=memory_mod._db,
+            detail={"procedure_id": result.procedure_id, "action": result.action},
+        )
+
     response = result.procedure_id
     if result.action == "updated":
         response = f"Updated existing procedure {result.procedure_id} (version bumped)"
@@ -159,6 +187,7 @@ async def procedure_recall(
     if results:
         from genesis.db.crud import procedural
         from genesis.eval.j9_hooks import emit_procedure_invoked
+
         for r in results:
             pid = r.get("procedure_id", "")
             if not pid:

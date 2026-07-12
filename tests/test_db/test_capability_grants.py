@@ -44,8 +44,7 @@ class TestSchema:
     @pytest.mark.asyncio
     async def test_table_and_index_exist(self, db):
         cur = await db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name='capability_grants'"
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='capability_grants'"
         )
         assert await cur.fetchone() is not None
         cur = await db.execute(
@@ -62,8 +61,7 @@ class TestSchema:
             await MIGRATION.up(conn)  # IF NOT EXISTS → must not raise
             await conn.commit()
             cur = await conn.execute(
-                "SELECT COUNT(*) FROM sqlite_master "
-                "WHERE type='table' AND name='capability_grants'"
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='capability_grants'"
             )
             assert (await cur.fetchone())[0] == 1
 
@@ -75,8 +73,7 @@ class TestSchema:
             await MIGRATION.down(conn)
             await conn.commit()
             cur = await conn.execute(
-                "SELECT COUNT(*) FROM sqlite_master "
-                "WHERE type='table' AND name='capability_grants'"
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='capability_grants'"
             )
             assert (await cur.fetchone())[0] == 0
 
@@ -90,8 +87,7 @@ class TestSchema:
             await create_all_tables(conn)
             await conn.commit()
             cur = await conn.execute(
-                "SELECT COUNT(*) FROM sqlite_master "
-                "WHERE type='table' AND name='capability_grants'"
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='capability_grants'"
             )
             assert (await cur.fetchone())[0] == 1
 
@@ -129,10 +125,16 @@ class TestCrud:
 
     @pytest.mark.asyncio
     async def test_classify_then_approve_grants_and_stamps(self, db):
-        s1 = await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
+        s1 = await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL
+        )
         assert s1 == CellState.ASK
         s2 = await cg.apply_event(
-            db, event=CellEvent.APPROVE, updated_at="2026-06-21T01:00:00", **_EMAIL
+            db,
+            origin_class="first_party",
+            event=CellEvent.APPROVE,
+            updated_at="2026-06-21T01:00:00",
+            **_EMAIL,
         )
         assert s2 == CellState.GRANTED
         row = await cg.get_cell(db, **_EMAIL)
@@ -143,22 +145,28 @@ class TestCrud:
     async def test_illegal_event_raises(self, db):
         # APPROVE from NOT_DETERMINED is illegal.
         with pytest.raises(InvalidTransition):
-            await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL)
+            await cg.apply_event(
+                db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL
+            )
 
     @pytest.mark.asyncio
     async def test_record_success_increments(self, db):
-        await cg.record_success(db, updated_at=_TS, **_EMAIL)
-        await cg.record_success(db, updated_at=_TS, **_EMAIL)
+        await cg.record_success(db, origin_class="first_party", updated_at=_TS, **_EMAIL)
+        await cg.record_success(db, origin_class="first_party", updated_at=_TS, **_EMAIL)
         row = await cg.get_cell(db, **_EMAIL)
         assert row["successes"] == 2
         assert row["last_used_at"] == _TS
 
     @pytest.mark.asyncio
     async def test_correction_regresses_granted_cell_below_floor(self, db):
-        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
-        await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL
+        )
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL
+        )
         # 0 successes, 1 correction → posterior 1/3 < 0.50 → regress to ASK.
-        state = await cg.record_correction(db, updated_at=_TS, **_EMAIL)
+        state = await cg.record_correction(db, origin_class="first_party", updated_at=_TS, **_EMAIL)
         assert state == CellState.ASK
         row = await cg.get_cell(db, **_EMAIL)
         assert row["state"] == CellState.ASK.value
@@ -169,11 +177,15 @@ class TestCrud:
         # WS-8 PR-D "easy to lose": even a heavily-supported GRANTED cell
         # regresses to ASK on a SINGLE correction (deterministic, NOT posterior-
         # gated).  The well-supported counters only make it cheaper to re-earn.
-        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
-        await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL
+        )
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL
+        )
         for _ in range(5):
-            await cg.record_success(db, updated_at=_TS, **_EMAIL)
-        state = await cg.record_correction(db, updated_at=_TS, **_EMAIL)
+            await cg.record_success(db, origin_class="first_party", updated_at=_TS, **_EMAIL)
+        state = await cg.record_correction(db, origin_class="first_party", updated_at=_TS, **_EMAIL)
         assert state == CellState.ASK
         row = await cg.get_cell(db, **_EMAIL)
         assert row["state"] == CellState.ASK.value
@@ -181,8 +193,10 @@ class TestCrud:
 
     @pytest.mark.asyncio
     async def test_correction_on_non_granted_is_inert(self, db):
-        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
-        state = await cg.record_correction(db, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL
+        )
+        state = await cg.record_correction(db, origin_class="first_party", updated_at=_TS, **_EMAIL)
         assert state == CellState.ASK  # unchanged; only counter moved
         row = await cg.get_cell(db, **_EMAIL)
         assert row["corrections"] == 1
@@ -191,22 +205,35 @@ class TestCrud:
     async def test_regrant_restamps_granted_at(self, db):
         # grant → correction-regress → re-approve must refresh granted_at to the
         # most recent grant (the decay clock must not see it as stale-old).
-        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
-        await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL
+        )
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL
+        )
         assert (await cg.get_cell(db, **_EMAIL))["granted_at"] == _TS
         # 0 successes + 1 correction → regress to ASK.
-        assert await cg.record_correction(db, updated_at=_TS, **_EMAIL) == CellState.ASK
+        assert (
+            await cg.record_correction(db, origin_class="first_party", updated_at=_TS, **_EMAIL)
+            == CellState.ASK
+        )
         later = "2026-06-22T12:00:00"
-        s = await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=later, **_EMAIL)
+        s = await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=later, **_EMAIL
+        )
         assert s == CellState.GRANTED
         assert (await cg.get_cell(db, **_EMAIL))["granted_at"] == later
 
     @pytest.mark.asyncio
     async def test_correction_atomic_single_state(self, db):
         # The counter increment and regression land together (one UPDATE).
-        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
-        await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL)
-        state = await cg.record_correction(db, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL
+        )
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL
+        )
+        state = await cg.record_correction(db, origin_class="first_party", updated_at=_TS, **_EMAIL)
         row = await cg.get_cell(db, **_EMAIL)
         assert state == CellState.ASK
         assert row["state"] == CellState.ASK.value and row["corrections"] == 1
@@ -227,13 +254,23 @@ class TestPRDCompetence:
     async def test_correction_accumulates_severity_weight(self, db):
         # A standard correction adds 1.0; a bulk correction adds 2.0.
         await cg.record_correction(
-            db, updated_at=_TS, domain="email", verb="send", risk_class="standard"
+            db,
+            origin_class="first_party",
+            updated_at=_TS,
+            domain="email",
+            verb="send",
+            risk_class="standard",
         )
         assert (await cg.get_cell(db, "email", "send", "standard"))[
             "weighted_corrections"
         ] == pytest.approx(1.0)
         await cg.record_correction(
-            db, updated_at=_TS, domain="email", verb="send", risk_class="bulk"
+            db,
+            origin_class="first_party",
+            updated_at=_TS,
+            domain="email",
+            verb="send",
+            risk_class="bulk",
         )
         assert (await cg.get_cell(db, "email", "send", "bulk"))[
             "weighted_corrections"
@@ -241,7 +278,9 @@ class TestPRDCompetence:
 
     @pytest.mark.asyncio
     async def test_consequence_weight_override(self, db):
-        await cg.record_correction(db, updated_at=_TS, consequence_weight=3.5, **_EMAIL)
+        await cg.record_correction(
+            db, origin_class="first_party", updated_at=_TS, consequence_weight=3.5, **_EMAIL
+        )
         row = await cg.get_cell(db, **_EMAIL)
         assert row["weighted_corrections"] == pytest.approx(3.5)
         assert row["corrections"] == 1
@@ -250,12 +289,12 @@ class TestPRDCompetence:
     async def test_correction_on_ask_accrues_crater_without_regress(self, db):
         # Demotion fires only on GRANTED; an ASK cell stays ASK but still
         # accumulates the weighted crater (a rejected held send is negative).
-        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
-        state = await cg.record_correction(db, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL
+        )
+        state = await cg.record_correction(db, origin_class="first_party", updated_at=_TS, **_EMAIL)
         assert state == CellState.ASK
-        assert (await cg.get_cell(db, **_EMAIL))[
-            "weighted_corrections"
-        ] == pytest.approx(1.0)
+        assert (await cg.get_cell(db, **_EMAIL))["weighted_corrections"] == pytest.approx(1.0)
 
     @pytest.mark.asyncio
     async def test_touch_used_bumps_last_used_not_successes(self, db):
@@ -267,21 +306,29 @@ class TestPRDCompetence:
 
     @pytest.mark.asyncio
     async def test_detect_promotable_requires_min_n_and_threshold(self, db):
-        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL
+        )
         for _ in range(4):  # below MIN_PROMOTE_N
-            await cg.record_success(db, updated_at=_TS, **_EMAIL)
+            await cg.record_success(db, origin_class="first_party", updated_at=_TS, **_EMAIL)
         assert await cg.detect_promotable_cells(db) == []
-        await cg.record_success(db, updated_at=_TS, **_EMAIL)  # 5th → promotable
+        await cg.record_success(
+            db, origin_class="first_party", updated_at=_TS, **_EMAIL
+        )  # 5th → promotable
         cands = await cg.detect_promotable_cells(db)
         assert [c["id"] for c in cands] == ["email:send:standard"]
         assert cands[0]["posterior"] > 0.70
 
     @pytest.mark.asyncio
     async def test_detect_promotable_excludes_granted(self, db):
-        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
-        await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL)
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL
+        )
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL
+        )
         for _ in range(5):
-            await cg.record_success(db, updated_at=_TS, **_EMAIL)
+            await cg.record_success(db, origin_class="first_party", updated_at=_TS, **_EMAIL)
         assert await cg.detect_promotable_cells(db) == []  # already GRANTED
 
     @pytest.mark.asyncio
@@ -293,27 +340,50 @@ class TestPRDCompetence:
     @pytest.mark.asyncio
     async def test_list_granted_returns_only_granted(self, db):
         # standard → GRANTED; bulk left at ASK.
-        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL)
-        await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL)
-        await cg.apply_event(db, domain="email", verb="send", risk_class="bulk",
-                             event=CellEvent.CLASSIFY, updated_at=_TS)
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_EMAIL
+        )
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=_TS, **_EMAIL
+        )
+        await cg.apply_event(
+            db,
+            origin_class="first_party",
+            domain="email",
+            verb="send",
+            risk_class="bulk",
+            event=CellEvent.CLASSIFY,
+            updated_at=_TS,
+        )
         granted = await cg.list_granted(db)
         assert [g["id"] for g in granted] == ["email:send:standard"]
 
     @pytest.mark.asyncio
     async def test_decay_lapses_only_stale_grants(self, db):
         from datetime import UTC, datetime, timedelta
+
         now_dt = datetime(2026, 6, 21, tzinfo=UTC)
         now = now_dt.isoformat()
         # fresh grant (used today) — must NOT decay
-        await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=now, **_EMAIL)
-        await cg.apply_event(db, event=CellEvent.APPROVE, updated_at=now, **_EMAIL)
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=now, **_EMAIL
+        )
+        await cg.apply_event(
+            db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=now, **_EMAIL
+        )
         await cg.touch_used(db, used_at=now, **_EMAIL)
         # stale grant (granted 100d ago, never used) — must decay
         old = (now_dt - timedelta(days=100)).isoformat()
         for ev in (CellEvent.CLASSIFY, CellEvent.APPROVE):
-            await cg.apply_event(db, domain="email", verb="send", risk_class="bulk",
-                                 event=ev, updated_at=old)
+            await cg.apply_event(
+                db,
+                origin_class="first_party",
+                domain="email",
+                verb="send",
+                risk_class="bulk",
+                event=ev,
+                updated_at=old,
+            )
 
         decayed = await cg.decay_stale_cells(db, now=now, half_life_days=90)
 

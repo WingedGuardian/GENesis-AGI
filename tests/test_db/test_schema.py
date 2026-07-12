@@ -63,6 +63,7 @@ EXPECTED_TABLES = [
     "pending_email_sends",  # WS-8 PR-C: email autonomy gate hold store
     "autonomous_email_sends",  # WS-8 PR-D: autonomous-send ledger (visibility + flag + rate-limit)
     "capability_shadow_events",  # WS5 Stage 2: Discord capability shadow-gate observations
+    "immunity_shadow_events",  # WS-3 B1: provenance-gate (injection) shadow observations
     "build_candidates",  # capability-build lane: verdicts + calibration + build outcomes
 ]
 

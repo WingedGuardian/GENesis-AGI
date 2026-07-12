@@ -65,10 +65,16 @@ def _build_scope_args() -> list[str]:
     if not shutil.which("systemd-run"):
         return []
     return [
-        "systemd-run", "--user", "--scope", "--quiet",
-        "-p", "IOWeight=100",
-        "-p", "MemoryHigh=22G",
-        "-p", "MemoryMax=27G",
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "-p",
+        "IOWeight=100",
+        "-p",
+        "MemoryHigh=22G",
+        "-p",
+        "MemoryMax=27G",
         "--",
     ]
 
@@ -151,7 +157,9 @@ def cc_span_settings_path() -> str | None:
         return str(path)
     except OSError:
         logger.warning(
-            "Could not write CC span settings file at %s", path, exc_info=True,
+            "Could not write CC span settings file at %s",
+            path,
+            exc_info=True,
         )
         return None
 
@@ -166,15 +174,9 @@ class CCInvoker:
         *,
         claude_path: str = "claude",
         working_dir: str | None = None,
-        on_cc_status_change: (
-            Callable[[str], Awaitable[None]] | None
-        ) = None,
-        on_model_downgrade: (
-            Callable[[str, str, str], Awaitable[None]] | None
-        ) = None,
-        on_cc_empty_output: (
-            Callable[[CCInvocation, CCOutput], Awaitable[None]] | None
-        ) = None,
+        on_cc_status_change: (Callable[[str], Awaitable[None]] | None) = None,
+        on_model_downgrade: (Callable[[str, str, str], Awaitable[None]] | None) = None,
+        on_cc_empty_output: (Callable[[CCInvocation, CCOutput], Awaitable[None]] | None) = None,
         protected_paths: object | None = None,
     ):
         self._claude_path = claude_path
@@ -218,13 +220,17 @@ class CCInvoker:
             return
         try:
             await self._on_model_downgrade(
-                output.model_requested, output.model_used, output.session_id,
+                output.model_requested,
+                output.model_used,
+                output.session_id,
             )
         except Exception:
             logger.warning("Model downgrade callback failed", exc_info=True)
 
     async def _fire_empty_output_callback(
-        self, invocation: CCInvocation, output: CCOutput,
+        self,
+        invocation: CCInvocation,
+        output: CCOutput,
     ) -> None:
         """Notify the runtime when an output-EXPECTING invocation returns empty.
 
@@ -261,7 +267,9 @@ class CCInvoker:
             if effort != inv.effort:
                 logger.warning(
                     "Effort %r exceeds max for model %r — clamping to %r",
-                    str(inv.effort), str(inv.model), str(effort),
+                    str(inv.effort),
+                    str(inv.model),
+                    str(effort),
                 )
             args += ["--effort", str(effort)]
         elif inv.effort != EffortLevel.MEDIUM:
@@ -269,7 +277,8 @@ class CCInvoker:
             # that we're dropping, so intent stays visible without log spam.
             logger.debug(
                 "Model %r does not use an effort setting — dropping requested effort %r",
-                str(inv.model), str(inv.effort),
+                str(inv.model),
+                str(inv.effort),
             )
         system_prompt = inv.system_prompt
         if system_prompt and inv.skip_permissions and self._protected_paths:
@@ -323,15 +332,26 @@ class CCInvoker:
         # Propagate Genesis session_id to child CC + MCP server processes
         # so eval hooks can attribute recall events to specific sessions.
         from genesis.observability.session_context import get_session_id
+
         _sid = get_session_id()
         if _sid:
             env["GENESIS_SESSION_ID"] = _sid
         else:
             env.pop("GENESIS_SESSION_ID", None)
+        # WS-3 session-level provenance: stamp the dispatched session's origin so
+        # its memory MCP writes classify accordingly (read fail-safe by
+        # memory.provenance.session_origin_from_env in the MCP children).
+        # Validated loudly at CCInvocation construction; POP when unset so a
+        # stale value can never leak from this process's own environment.
+        if inv and inv.origin:
+            env["GENESIS_SESSION_ORIGIN"] = inv.origin
+        else:
+            env.pop("GENESIS_SESSION_ORIGIN", None)
         # Propagate the active trace context so the CC PostToolUse span hook can
         # stitch this session's tool spans under the dispatching operation's
         # trace (cross-process). Absent when no span is active → hook no-ops.
         from genesis.observability.spans import current_trace_context
+
         _tc = current_trace_context()
         if _tc:
             env["GENESIS_TRACE_ID"], env["GENESIS_PARENT_SPAN_ID"] = _tc
@@ -431,20 +451,27 @@ class CCInvoker:
         combined = f"{stderr_text}\n{stdout_text}"
         lower = combined.lower()
         # Session expiry
-        if ("session" in lower and ("not found" in lower or "expired" in lower)):
+        if "session" in lower and ("not found" in lower or "expired" in lower):
             return CCSessionError(stderr_text or stdout_text)
         # Hard quota exhaustion (usage limit hit for hours — distinct from 429)
         _QUOTA_PATTERNS = (
-            "usage limit", "quota exceeded", "limit reached",
-            "usage cap", "spending limit", "token limit exceeded",
+            "usage limit",
+            "quota exceeded",
+            "limit reached",
+            "usage cap",
+            "spending limit",
+            "token limit exceeded",
         )
         if any(p in lower for p in _QUOTA_PATTERNS):
             return CCQuotaExhaustedError(stderr_text or stdout_text)
         # Transient rate limit (429, recovers in minutes)
         # CC CLI says "You've hit your limit · resets Xpm" — not "rate limit"
         _RATE_LIMIT_PATTERNS = (
-            "rate limit", "rate_limit", "429",
-            "hit your limit", "hit the limit",
+            "rate limit",
+            "rate_limit",
+            "429",
+            "hit your limit",
+            "hit the limit",
         )
         if any(p in lower for p in _RATE_LIMIT_PATTERNS):
             return CCRateLimitError(stderr_text or stdout_text)
@@ -531,7 +558,8 @@ class CCInvoker:
             },
         ) as span:
             output = replace(
-                await self._run_inner(invocation), roster_model=roster_model,
+                await self._run_inner(invocation),
+                roster_model=roster_model,
             )
             with contextlib.suppress(Exception):
                 span.set_attr("cost_usd", output.cost_usd)
@@ -550,14 +578,14 @@ class CCInvoker:
         # Extract dispatched effort from args — may differ from invocation.effort
         # if clamp_effort() clamped it, and is absent entirely for models that
         # don't use an effort setting (Haiku).
-        dispatched_effort = (
-            args[args.index("--effort") + 1] if "--effort" in args else "n/a"
-        )
+        dispatched_effort = args[args.index("--effort") + 1] if "--effort" in args else "n/a"
 
         prompt_preview = invocation.prompt[:80].replace("\n", " ")
         logger.info(
             "CC session starting: model=%s effort=%s timeout=%ds prompt=%r...",
-            invocation.model, dispatched_effort, invocation.timeout_s,
+            invocation.model,
+            dispatched_effort,
+            invocation.timeout_s,
             prompt_preview,
         )
 
@@ -566,7 +594,8 @@ class CCInvoker:
         try:
             scope_args = _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
-                *scope_args, *args,
+                *scope_args,
+                *args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -584,7 +613,8 @@ class CCInvoker:
                 except Exception:
                     logger.warning(
                         "on_spawn callback failed for PID %s",
-                        proc.pid, exc_info=True,
+                        proc.pid,
+                        exc_info=True,
                     )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=invocation.prompt.encode()),
@@ -624,7 +654,9 @@ class CCInvoker:
 
             logger.error(
                 "CC session TIMEOUT after %.0fs (PID %s, limit=%ds)%s",
-                elapsed_s, proc.pid, invocation.timeout_s,
+                elapsed_s,
+                proc.pid,
+                invocation.timeout_s,
                 f" stderr: {stderr_text}" if stderr_text else "",
             )
             raise CCTimeoutError(f"Timeout after {invocation.timeout_s}s") from None
@@ -640,7 +672,9 @@ class CCInvoker:
         elapsed = int((time.monotonic() - start) * 1000)
         logger.info(
             "CC subprocess finished (PID %s, exit=%s, %.1fs)",
-            proc.pid, proc.returncode, elapsed / 1000,
+            proc.pid,
+            proc.returncode,
+            elapsed / 1000,
         )
         if proc.returncode != 0:
             stderr_text = stderr.decode(errors="replace").strip()
@@ -723,21 +757,22 @@ class CCInvoker:
         # Extract dispatched effort from args — may differ from invocation.effort
         # if clamp_effort() clamped it, and is absent entirely for models that
         # don't use an effort setting (Haiku).
-        dispatched_effort = (
-            args[args.index("--effort") + 1] if "--effort" in args else "n/a"
-        )
+        dispatched_effort = args[args.index("--effort") + 1] if "--effort" in args else "n/a"
 
         prompt_preview = invocation.prompt[:80].replace("\n", " ")
         logger.info(
             "CC streaming session starting: model=%s effort=%s timeout=%ds prompt=%r...",
-            invocation.model, dispatched_effort, invocation.timeout_s,
+            invocation.model,
+            dispatched_effort,
+            invocation.timeout_s,
             prompt_preview,
         )
 
         try:
             scope_args = _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
-                *scope_args, *args,
+                *scope_args,
+                *args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -772,7 +807,8 @@ class CCInvoker:
                 except Exception:
                     logger.warning(
                         "on_spawn callback failed for PID %s",
-                        proc.pid, exc_info=True,
+                        proc.pid,
+                        exc_info=True,
                     )
             # Feed prompt via stdin, then close to signal EOF
             if proc.stdin is not None:
@@ -823,7 +859,8 @@ class CCInvoker:
                         result_text = event_raw.get("result", "")
                         logger.info(
                             "CC stream result: is_error=%s, result_len=%d, result_preview=%r",
-                            event_raw.get("is_error"), len(result_text or ""),
+                            event_raw.get("is_error"),
+                            len(result_text or ""),
                             (result_text or "")[:200],
                         )
                         # First result is authoritative.  Terminate the
@@ -842,7 +879,8 @@ class CCInvoker:
             timed_out = True
             logger.error(
                 "CC streaming TIMEOUT after %.0fs (PID %s)",
-                time.monotonic() - start, proc.pid,
+                time.monotonic() - start,
+                proc.pid,
             )
             try:
                 pgid = os.getpgid(proc.pid)
@@ -888,8 +926,12 @@ class CCInvoker:
         logger.info(
             "CC streaming finished (PID %s, exit=%s, lines=%d, has_result=%s, "
             "terminated=%s, %.1fs)",
-            proc.pid, proc.returncode, line_count, result_data is not None,
-            terminated_after_result, elapsed / 1000,
+            proc.pid,
+            proc.returncode,
+            line_count,
+            result_data is not None,
+            terminated_after_result,
+            elapsed / 1000,
         )
         if event_types:
             logger.info("CC stream events: %s", " → ".join(event_types))
@@ -907,6 +949,7 @@ class CCInvoker:
             # but the actual response was emitted as text events during streaming
             if not output.text and collected_text:
                 from dataclasses import replace
+
                 output = replace(output, text="".join(collected_text))
             if output.is_error:
                 stderr_hint = stderr_data.decode(errors="replace") if stderr_data else ""
@@ -987,7 +1030,10 @@ class CCInvoker:
         return CCInvoker._TIER_RANK.get(actual_tier, 0) < CCInvoker._TIER_RANK.get(requested, 0)
 
     def _parse_result_dict(
-        self, result_data: dict, inv: CCInvocation, elapsed_ms: int,
+        self,
+        result_data: dict,
+        inv: CCInvocation,
+        elapsed_ms: int,
     ) -> CCOutput:
         """Build CCOutput from a parsed result dict."""
         usage = result_data.get("usage", {})
@@ -1002,7 +1048,8 @@ class CCInvoker:
             max(
                 model_usage,
                 key=lambda name: self._TIER_RANK.get(
-                    CCModel.from_full_name(name), -1,
+                    CCModel.from_full_name(name),
+                    -1,
                 ),
             )
             if model_usage
@@ -1012,7 +1059,8 @@ class CCInvoker:
         if downgraded:
             logger.warning(
                 "MODEL DOWNGRADE DETECTED: requested=%s actual=%s",
-                inv.model, model_name,
+                inv.model,
+                model_name,
             )
         return CCOutput(
             session_id=result_data.get("session_id", ""),
@@ -1069,7 +1117,8 @@ class CCInvoker:
         logger.warning(
             "CC output has no JSON result line — falling back to plain text. "
             "First line: %s (total %d chars)",
-            first_line, len(raw),
+            first_line,
+            len(raw),
         )
         return CCOutput(
             session_id="",

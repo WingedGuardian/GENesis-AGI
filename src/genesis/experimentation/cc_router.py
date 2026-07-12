@@ -86,6 +86,12 @@ class CCCliRouter:
         # Avoid CC-in-CC nesting confusion (mirrors CCInvoker._build_env).
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        # WS-3: never leak a session origin into a nested claude subprocess
+        # (mirrors _build_env's pop-if-absent invariant). Inert today (this
+        # launcher pins strict no-MCP), but a future MCP config here would
+        # silently misclassify writes with whatever origin THIS process
+        # happened to inherit.
+        env.pop("GENESIS_SESSION_ORIGIN", None)
         # Mark as a Genesis-dispatched session so the SessionStart hooks skip
         # identity/context injection — we want a clean completion on the given
         # text, not Genesis's project context bleeding into the reflection.

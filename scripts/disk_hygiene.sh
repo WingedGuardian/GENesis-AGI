@@ -11,6 +11,10 @@
 #   4. Age-prune ~/tmp direct children (>7d, excluding bg-cc-sessions)
 #   5. Label-aware attention-snapshot GC   → scripts/attention_snapshot_gc.py
 #      (home >60d / OMI >14d, but NEVER a snapshot a labeled event references)
+#   6. Retention prune of immunity_shadow_events (>45d) → scripts/prune_immunity_shadow.py
+#      (WS-3 B1 observe-only gate log; bounds the shadow store)
+#   7. Retention prune of capability_shadow_events (>45d) → scripts/prune_capability_shadow.py
+#      (WS-5 Discord observe-only gate log; bounds the shadow store)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -74,6 +78,14 @@ main() {
     echo "--- attention snapshot GC (label-aware) ---"
     "$VENV_PY" "$REPO_DIR/scripts/attention_snapshot_gc.py" --home-days 60 --omi-days 14 \
         || echo "attention_snapshot_gc exited $?"
+
+    echo "--- immunity shadow retention prune (>45d) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_immunity_shadow.py" --days 45 \
+        || echo "prune_immunity_shadow exited $?"
+
+    echo "--- capability shadow retention prune (>45d) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_capability_shadow.py" --days 45 \
+        || echo "prune_capability_shadow exited $?"
 
     echo "=== genesis-disk-hygiene done ==="
 }

@@ -33,17 +33,24 @@ async def db():
 
 async def _promotable_cell(db, successes=5):
     """An ASK cell with enough approved successes to be promotable."""
-    await cg.apply_event(db, event=CellEvent.CLASSIFY, updated_at=_TS, **_CELL)
+    await cg.apply_event(
+        db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_CELL
+    )
     for _ in range(successes):
-        await cg.record_success(db, updated_at=_TS, **_CELL)
+        await cg.record_success(db, origin_class="first_party", updated_at=_TS, **_CELL)
 
 
-async def _make_proposal(db, *, status="approved", action_type="cell_promotion",
-                         cell=("email", "send", "standard")):
+async def _make_proposal(
+    db, *, status="approved", action_type="cell_promotion", cell=("email", "send", "standard")
+):
     pid = "cp1"
     await ego_crud.create_proposal(
-        db, id=pid, action_type=action_type, action_category=":".join(cell),
-        content="promote", status="pending",
+        db,
+        id=pid,
+        action_type=action_type,
+        action_category=":".join(cell),
+        content="promote",
+        status="pending",
         created_at="2026-06-20T00:00:00+00:00",
         expected_outputs=json.dumps({"cell": list(cell)}),
     )
@@ -84,9 +91,13 @@ async def test_rejected_sets_cooldown_no_promote(db):
 
     assert ok is False
     assert (await cg.get_cell(db, **_CELL))["state"] == CellState.ASK.value
-    assert await ego_crud.get_state(
-        db, "cell_promotion_reject:email:send:standard",
-    ) is not None
+    assert (
+        await ego_crud.get_state(
+            db,
+            "cell_promotion_reject:email:send:standard",
+        )
+        is not None
+    )
 
 
 async def test_non_cell_proposal_is_noop(db):

@@ -1809,6 +1809,38 @@ async def _run(prompt: str, session_id: str = "") -> None:
     if fused:
         await _increment_retrieved(fused)
 
+    # Post-output: WS-3 B1 gate 4 (injection) shadow-record. External-world hits
+    # in this proactive injection reach the CC-session prompt (action-capable).
+    # Fire-and-forget AFTER flush — never delays the injection, never crashes the
+    # hook; skipped live if the gate is off (master kill switch / per-gate off).
+    if fused:
+        try:
+            from genesis.security.immunity_shadow import (
+                item_is_blockable,
+                record_would_block_sync,
+            )
+
+            blockable = sum(
+                1
+                for r in fused
+                if item_is_blockable(
+                    collection=r.get("collection"),
+                    source_pipeline=r.get("source_pipeline"),
+                )
+            )
+            if blockable:
+                conn = sqlite3.connect(str(_DB_PATH), timeout=2)
+                try:
+                    record_would_block_sync(
+                        conn, gate="injection", source_kind="proactive_hook",
+                        source_ref="scripts/proactive_memory_hook.py::_run",
+                        blockable_count=blockable,
+                    )
+                finally:
+                    conn.close()
+        except Exception as exc:
+            print(f"Immunity shadow emit skipped: {exc}", file=sys.stderr)
+
     # ── Working-set measurement (H-1 PR1 record-only + PR2a shadow) ─
     # Overlap stats + the shadow novelty-gate projection feed the PR2b
     # enforcement decision. Runs after all stdout is flushed — never touches

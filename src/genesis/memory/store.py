@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -7,6 +8,7 @@ from datetime import UTC, datetime
 import aiosqlite
 from qdrant_client import QdrantClient
 
+from genesis.db.crud import entities as entities_crud
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links as memory_links_crud
 from genesis.db.crud import pending_embeddings
@@ -247,6 +249,17 @@ class MemoryStore:
         ld_tag = f"life_domain:{life_domain}"
         if ld_tag not in resolved_tags:
             resolved_tags = [*resolved_tags, ld_tag]
+        # Append project_type tag (when set) so the FTS5-only fallback path
+        # preserves it — the recovery worker re-hydrates the Qdrant payload key
+        # from this tag on re-embed (see embedding_recovery.py). Mirrors the
+        # wing/life_domain tags above; #975 indexed project_type for faceted
+        # recall, so a re-embedded point lacking it would silently drop out of
+        # project_type= filtered recall. The payload key below is still set on
+        # the happy path; the tag is the breadcrumb for the fallback path.
+        if project_type:
+            pt_tag = f"project_type:{project_type}"
+            if pt_tag not in resolved_tags:
+                resolved_tags = [*resolved_tags, pt_tag]
 
         embedding_ok = not force_fts5_only
         if embedding_ok:
@@ -295,7 +308,12 @@ class MemoryStore:
                     if project_type:
                         payload["project_type"] = project_type
 
-                    upsert_point(
+                    # Sync Qdrant HTTP call — off the event loop so a slow
+                    # round-trip on this hot store() path doesn't stall every
+                    # other coroutine (background paths already do this; see
+                    # memory/health.py, dream_cycle.py, entity_resolution.py).
+                    await asyncio.to_thread(
+                        upsert_point,
                         self._qdrant,
                         collection=resolved_collection,
                         point_id=memory_id,
@@ -436,11 +454,16 @@ class MemoryStore:
         # SQLite: mark deprecated + record successor (via CRUD module)
         await memory_crud.mark_superseded(self._db, old_id, new_id, timestamp)
 
-        # Qdrant: look up collection from metadata, then update payload
+        # Qdrant: look up collection from metadata, then update payload.
+        # Only touch Qdrant when a vector actually exists (status 'embedded').
+        # 'fts5_only' (subsystem write), 'pending' (embed queued), and 'failed'
+        # (embed gave up) rows have NO point — the old `!= "fts5_only"` form
+        # fired a doomed update_payload on 'pending'/'failed' rows every time.
         meta = await memory_crud.get_metadata(self._db, old_id)
-        if meta and meta["embedding_status"] != "fts5_only":
+        if meta and meta["embedding_status"] == "embedded":
             try:
-                update_payload(
+                await asyncio.to_thread(
+                    update_payload,
                     self._qdrant,
                     collection=meta["collection"],
                     point_id=old_id,
@@ -492,7 +515,9 @@ class MemoryStore:
         # 3. Qdrant — try both collections (collection column unreliable)
         for coll in ("episodic_memory", "knowledge_base"):
             try:
-                delete_point(self._qdrant, collection=coll, point_id=memory_id)
+                await asyncio.to_thread(
+                    delete_point, self._qdrant, collection=coll, point_id=memory_id,
+                )
                 results[f"qdrant_{coll}"] = True
             except Exception:
                 logger.error(
@@ -513,5 +538,18 @@ class MemoryStore:
         results["pending_deleted"] = await pending_embeddings.delete_by_memory(
             self._db, memory_id=memory_id,
         )
+
+        # 6. Cascade: entity_mentions (written keyed by memory_id on the store
+        # path via record_anchors -> upsert_mention; without this a deleted
+        # memory leaves dangling mentions pointing at a gone memory_id).
+        try:
+            results["mentions_deleted"] = await entities_crud.delete_mentions_by_memory(
+                self._db, memory_id=memory_id,
+            )
+        except Exception:
+            logger.error(
+                "entity_mentions delete failed for %s", memory_id, exc_info=True,
+            )
+            results["mentions_deleted"] = False
 
         return results

@@ -333,3 +333,27 @@ async def test_qdrant_search_skips_deprecated_filter_when_included():
             getattr(cond, "key", None) == "deprecated"
             for cond in must_not
         )
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("status", ["pending", "failed", "fts5_only"])
+async def test_supersede_skips_qdrant_for_non_embedded(store, status):
+    """D5 F3: _mark_superseded must NOT touch Qdrant for a memory with no
+    vector. Only 'embedded' rows have a point; 'pending'/'failed'/'fts5_only'
+    have none, so an update_payload on them is a doomed write. The old guard
+    (`!= 'fts5_only'`) fired it for 'pending'/'failed' — this is the RED proof.
+    """
+    with patch("genesis.memory.store.update_payload") as mock_update, \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links:
+        mock_mem.mark_superseded = AsyncMock(return_value=True)
+        mock_mem.get_metadata = AsyncMock(return_value={
+            "memory_id": "old", "collection": "episodic_memory",
+            "embedding_status": status, "deprecated": 0,
+            "superseded_by": None, "superseded_at": None,
+        })
+        mock_links.create = AsyncMock(return_value=("old", "new"))
+
+        await store._mark_superseded("old", "new", "2026-03-11T12:00:00")
+
+    mock_update.assert_not_called()

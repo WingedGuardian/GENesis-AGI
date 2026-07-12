@@ -234,6 +234,16 @@ class CCInvocation:
     # interrupt (e.g. Telegram /stop) targets THIS session's subprocess and not
     # a concurrent background one. None → keyed by pid (never cross-fired).
     session_key: str | None = None
+    # WS-3 session-level provenance. When set, CCInvoker._build_env stamps
+    # GENESIS_SESSION_ORIGIN so the session's memory MCP writes carry this
+    # origin_class (memory.provenance.session_origin_from_env). Set it ONLY at
+    # dispatch sites whose sessions process external content by construction
+    # (inbox eval, mail judge, research, external-facing DirectSession
+    # profiles). None → env var popped → writes classify first_party via
+    # pipeline derivation. Validated LOUDLY in __post_init__ (a typo'd origin
+    # silently degrading to first_party would resurrect the exact origin-loss
+    # gap this field closes).
+    origin: str | None = None
     # Applied LAST in CCInvoker._build_env, after every computed key — the
     # per-invocation escape hatch for env the invoker doesn't model (e.g. the
     # eval bench's CLAUDE_CONFIG_DIR cleanroom). Overrides win over inherited
@@ -241,8 +251,24 @@ class CCInvocation:
     # values may reference credential paths.
     env_overrides: dict[str, str] | None = field(default=None, repr=False)
     on_spawn: Callable[[int], Awaitable[None]] | None = field(
-        default=None, compare=False, repr=False,
+        default=None,
+        compare=False,
+        repr=False,
     )
+
+    def __post_init__(self) -> None:
+        # Producer-side loud validation of the WS-3 origin (the env READER is
+        # fail-safe instead): a dispatch-site typo like "external-untrusted"
+        # must fail at construction, not silently classify a session's memory
+        # writes first_party. Deferred import keeps cc.types light.
+        if self.origin is not None:
+            from genesis.memory.provenance import ORIGIN_CLASSES
+
+            if self.origin not in ORIGIN_CLASSES:
+                raise ValueError(
+                    f"CCInvocation.origin={self.origin!r} is not a valid "
+                    f"origin_class (expected one of {sorted(ORIGIN_CLASSES)})"
+                )
 
 
 # Background CC session isolation.  Background sessions run from a

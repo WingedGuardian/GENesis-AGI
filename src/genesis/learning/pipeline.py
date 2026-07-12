@@ -29,6 +29,22 @@ logger = logging.getLogger(__name__)
 # that should fire only on foreground activity (e.g., STEERING.md auto-update).
 _AUTONOMOUS_CHANNELS = {"inbox", "mail", "reflection", "surplus"}
 
+# WS-3 gate-2 (identity): channel -> origin for a steering-rule write. An
+# ALLOW-map of positively-owner channels (ChannelType StrEnum values; all four
+# are owner-gated surfaces), defaulting fail-closed to external_untrusted --
+# deliberately the OPPOSITE polarity of _AUTONOMOUS_CHANNELS above, which is a
+# deny-list that fails OPEN for any new/unlisted channel. `voice` is absent on
+# purpose: ambient multi-speaker STT means user_text can be a non-owner human
+# in the room. The gate only OBSERVES (shadow) -- a deny-list escape that
+# writes a steering rule now produces a would-block row instead of being
+# invisible.
+_CHANNEL_ORIGIN = {
+    "terminal": "owner",
+    "telegram": "owner",
+    "whatsapp": "owner",
+    "web": "owner",
+}
+
 
 # A STEERING.md rule must READ as a terse imperative directive addressed to
 # Genesis — not a chatty, multi-sentence status update. This guard is why the
@@ -222,9 +238,7 @@ def build_triage_pipeline(
             or (outcome == OutcomeClass.SUCCESS and is_autonomous)
         ):
             try:
-                logger.debug(
-                    "Running deprecated procedure extraction (legacy 500-char path)"
-                )
+                logger.debug("Running deprecated procedure extraction (legacy 500-char path)")
                 summary_text = f"User: {summary.user_text}\nOutput: {summary.response_text[:500]}"
                 await extract_procedure(
                     db,
@@ -245,7 +259,29 @@ def build_triage_pipeline(
             and summary.channel not in _AUTONOMOUS_CHANNELS
         ):
             try:
-                _extract_steering_rule(summary, identity_loader)
+                written_rule = _extract_steering_rule(summary, identity_loader)
+                if written_rule:
+                    # WS-3 B1 gate-2 (identity): shadow-record the steering
+                    # write, classified by CHANNEL (allow-map; unknown/voice ->
+                    # external_untrusted, fail-closed) -- so a deny-list escape
+                    # is OBSERVED. Owner channels self-guard to no row.
+                    # Best-effort, never raises; counts only, never content.
+                    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
+                    from genesis.security import immunity_shadow
+
+                    await immunity_shadow.record_would_block(
+                        gate="identity",
+                        source_kind="identity_write",
+                        source_ref="learning/pipeline.py::_run_pipeline",
+                        process="server",
+                        blockable_count=1,
+                        origin_class=_CHANNEL_ORIGIN.get(
+                            summary.channel,
+                            ORIGIN_EXTERNAL_UNTRUSTED,
+                        ),
+                        db=db,
+                        detail={"mode": "steering", "channel": summary.channel},
+                    )
             except Exception:
                 logger.error("Steering rule extraction failed (non-fatal)", exc_info=True)
 
@@ -253,7 +289,9 @@ def build_triage_pipeline(
             # GROUNDWORK(bis): Additive — steering rule behavior unchanged.
             try:
                 await _record_behavioral_correction(
-                    db, summary, observation_writer,
+                    db,
+                    summary,
+                    observation_writer,
                 )
             except Exception:
                 logger.error("BIS correction capture failed (non-fatal)", exc_info=True)
@@ -271,8 +309,9 @@ def build_triage_pipeline(
             )
 
     def _extract_steering_rule(
-        summary: Any, loader: Any,
-    ) -> None:
+        summary: Any,
+        loader: Any,
+    ) -> str | None:
         """Extract a steering rule from a user correction and add to STEERING.md.
 
         Fires only on approach_failure (gated upstream). A rule is written ONLY
@@ -288,14 +327,20 @@ def build_triage_pipeline(
         """
         user_text = (summary.user_text or "").strip()
         if not _looks_like_directive(user_text):
-            return
+            return None
 
         rule = user_text if len(user_text) <= 200 else user_text[:200] + "..."
         loader.add_steering_rule(rule)
         logger.info("Auto-added steering rule from user correction: %.80s...", rule)
+        # Return the written rule so the caller can distinguish a REAL write
+        # from a directive-filter reject (the WS-3 gate-2 emit fires only on
+        # actual writes -- a reject is a non-event).
+        return rule
 
     async def _record_behavioral_correction(
-        db_conn: Any, summary: Any, obs_writer: ObservationWriter,
+        db_conn: Any,
+        summary: Any,
+        obs_writer: ObservationWriter,
     ) -> None:
         """Capture a raw behavioral correction for BIS theme clustering.
 
@@ -355,7 +400,9 @@ def build_triage_pipeline(
 
         attributions = set()
         if delta and hasattr(delta, "attributions"):
-            attributions = {a.value if hasattr(a, "value") else str(a) for a in (delta.attributions or [])}
+            attributions = {
+                a.value if hasattr(a, "value") else str(a) for a in (delta.attributions or [])
+            }
 
         outcome_val = outcome.value if hasattr(outcome, "value") else str(outcome)
 

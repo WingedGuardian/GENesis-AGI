@@ -30,9 +30,13 @@ def config():
         quiet_hours=QuietHours(start="22:00", end="07:00"),
         channel_preferences={"default": "email"},
         thresholds={"blocker": 0.0, "surplus": 0.0},
-        max_daily=50, surplus_daily=50, content_daily=50, notification_daily=50,
+        max_daily=50,
+        surplus_daily=50,
+        content_daily=50,
+        notification_daily=50,
         morning_report_time="07:00",
-        engagement_timeout_hours=24, engagement_poll_minutes=60,
+        engagement_timeout_hours=24,
+        engagement_poll_minutes=60,
     )
 
 
@@ -55,7 +59,8 @@ def email_adapter():
 def _pipeline(config, db, email_adapter):
     formatter = MagicMock()
     formatter.format.return_value = FormattedContent(
-        text="re: hello", target=FormatTarget.EMAIL,
+        text="re: hello",
+        target=FormatTarget.EMAIL,
     )
     pipeline = OutreachPipeline(
         governance=GovernanceGate(config, db),
@@ -75,7 +80,13 @@ def _pipeline(config, db, email_adapter):
 async def _grant_standard(db):
     for ev in (CellEvent.CLASSIFY, CellEvent.APPROVE):
         await cg.apply_event(
-            db, domain="email", verb="send", risk_class="standard", event=ev, updated_at=_TS,
+            db,
+            origin_class="first_party",
+            domain="email",
+            verb="send",
+            risk_class="standard",
+            event=ev,
+            updated_at=_TS,
         )
 
 
@@ -91,9 +102,14 @@ async def _add_inbound(db, thread_id, sender="alice@example.com"):
 
 def _req():
     return OutreachRequest(
-        category=OutreachCategory.SURPLUS, topic="re: hello", context="body",
-        salience_score=0.9, signal_type="email_reply", channel="email",
-        validated_recipient="alice@example.com", thread_id="t1",
+        category=OutreachCategory.SURPLUS,
+        topic="re: hello",
+        context="body",
+        salience_score=0.9,
+        signal_type="email_reply",
+        channel="email",
+        validated_recipient="alice@example.com",
+        thread_id="t1",
     )
 
 
@@ -138,8 +154,10 @@ async def test_resume_path_is_not_logged(config, db, email_adapter):
     await _add_inbound(db, "t1")
     pipeline = _pipeline(config, db, email_adapter)
     pending = {
-        "category": "surplus", "message": "approved reply",
-        "validated_recipient": "alice@example.com", "thread_id": "t1",
+        "category": "surplus",
+        "message": "approved reply",
+        "validated_recipient": "alice@example.com",
+        "thread_id": "t1",
     }
 
     result = await pipeline.deliver_approved(pending, subject="re: hello")

@@ -161,7 +161,9 @@ verified: 9037d45b 2026-07-07
 - **Discord is shadow-gated** (`autonomy/shadow_gate.py`): three doors —
   `pipeline._deliver`, `outreach_poll` webhook, discord-bot `send_reply` —
   observe-only into `capability_shadow`, best-effort so it can NEVER break the
-  real send. Enforcement (hold-for-approval) is the designed next stage. CI
+  real send. Retention-pruned >45d via `scripts/prune_capability_shadow.py`
+  (disk-hygiene), mirroring the immunity shadow store. Enforcement
+  (hold-for-approval) is the designed next stage. CI
   backstop: `scripts/check_external_io.py` fails on new ungated egress
   endpoints.
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
@@ -475,6 +477,13 @@ verified: fe5d0945 2026-07-10
   v1 (every surface stamps `judge_calibrated: false`). Every new
   genesis-memory tool must be classified in `eval/bench/arms.py`
   (static-AST forcing test). Don't run across Sun 07:30 (J-9 aggregation).
+  **A5 read surface** (WS-1 A5): the persisted paired win-rate is readable via
+  `/api/genesis/eval/bench` (a compact result card in the dashboard internals
+  tab) and the `bench_status` MCP tool — both aggregate-only (never per-task
+  private text), shaped by the shared `eval/bench/surface.py`, filtered on
+  `model_profile='bench:genesis'` (the genesis row's `metadata_json.stats` is
+  self-contained), and stamped with the uncalibrated-judge + `insufficient_data`
+  caveat. A stats-less/all-skip run surfaces flagged, never crashes.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
@@ -525,8 +534,8 @@ config resolution, and hygiene utilities.
 ```yaml subsystem-map
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
-          restore, util, env.py, _config_overlay.py]
-verified: 36563f95 2026-07-10
+          restore, util, infra_profile, env.py, _config_overlay.py]
+verified: 613ff6ff 2026-07-12
 ```
 
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
@@ -560,17 +569,71 @@ verified: 36563f95 2026-07-10
   `output_scanner` = deterministic outbound secrets/IP scan; `skill_scan`
   shells to external NVIDIA SkillSpector. NOT auth or secrets storage (that's
   `runtime/init/secrets.py` + `env.py`). **`immunity.py` = the WS-3 kill
-  switch (control surface LIVE, gates NOT built — B1)**: `gate_mode()`
-  re-reads `config/ws3_immunity.yaml` + its `.local.yaml` overlay per call
-  (no cache, no restart — the `ws3_immunity` settings domain is writable);
-  master `enabled: false` short-circuits every gate; `is_blockable()` is the
-  never-block-owner/first-party invariant every B1 gate must route through;
-  the gate-time fail-closed unknown→external rule lives ONLY in
-  `effective_origin_class()` (store-time derivation never fail-closes).
-  Auto-demote state is written INTO the overlay so state and behavior share
-  one file.
+  switch + gate policy**: `gate_mode()` re-reads `config/ws3_immunity.yaml` +
+  its `.local.yaml` overlay per call (no cache, no restart — the
+  `ws3_immunity` settings domain is writable); master `enabled: false`
+  short-circuits every gate; `is_blockable()` is the never-block-owner/
+  first-party invariant every gate routes through; the gate-time fail-closed
+  unknown→external rule lives ONLY in `effective_origin_class()` (store-time
+  derivation never fail-closes). Auto-demote state is written INTO the overlay
+  so state and behavior share one file. **B1: gate 4 (injection) is LIVE in
+  SHADOW** — `immunity_shadow.py` records a would-block into
+  `immunity_shadow_events` (migration 0055) at all 8 `wrap_external_recall`
+  inject sites + the proactive hook whenever `external_untrusted` content
+  reaches an action-capable prompt (observe-only — the item still reaches the
+  model; owner/first-party never recorded). The gate set is CI-locked in
+  `test_recall_inject_coverage.py` (a new inject site or a removed emit fails).
+  **Gate 1 (procedure) is LIVE in SHADOW** — `record_would_block(gate="procedure")`
+  fires at the two promotion paths that have a trustworthy SOURCE-origin signal:
+  the judge convergence (`judge._store_judged_procedure`, covering BOTH the
+  struggle and rebuild callers) classifies by a coarse tool-name ingest scan over
+  the real transcript spine (`provenance.origin_from_tool_names` — external-ingest
+  tool → `external_untrusted`; over-observes by design since fetched content lives
+  in tool RESULTS the spine doesn't carry); the autonomy retrospective
+  (`executor/trace.py`) classifies by `initiated_by` (Genesis's own execution =
+  first_party/owner; the trace has no source-tool spine). Two promotion paths are
+  DEFERRED (classified `deferred-with-reason`, no emit): the deprecated
+  auto-extractor (`extractor.py` — its only signals are replay tools or a
+  hyphen-truncating prose scrape, both undercount) and `procedure_store` (an MCP
+  tool needing the caller's session origin — the session-origin PR's env; it
+  wires that emit). CI-locked in `test_procedure_gate_coverage.py`.
+  **Gates 2-3 (identity/autonomy) are LIVE in SHADOW.** Gate 2: the steering
+  write (`learning/pipeline.py`) emits with a CHANNEL allow-map origin
+  (`_CHANNEL_ORIGIN`: terminal/telegram/whatsapp/web = owner; voice + unknown
+  channels fail CLOSED to external_untrusted — the polarity fix for the
+  fail-open `_AUTONOMOUS_CHANNELS` deny-list, so a deny-list escape is now
+  OBSERVED), and the USER_KNOWLEDGE synthesis (`runtime/init/learning.py`)
+  emits first_party-by-authorship (FLIP BLOCKER: observations carry no
+  origin_class, so externally-planted user-facts remain first_party until
+  delta-level provenance lands). Gate 3: the emit lives INSIDE
+  `db/crud/capability_grants.py` (record_success/record_correction/apply_event
+  — `origin_class` is a REQUIRED kwarg so every future caller must state
+  provenance); all six live callers thread owner/first_party → zero rows today
+  by construction. Locks: `test_identity_autonomy_gate_coverage.py` pins the
+  loader's 4-method write_text surface by set-equality + the dashboard PUT
+  writer manually, and discovers grant-mutation callers ALIAS-RESOLVED (bare
+  `record_success` name collisions excluded). The legacy `autonomy_state`
+  evidence store is a documented out-of-scope exclusion. Auto-demote wired but
+  dormant (server + enforce only); retention via
+  `scripts/prune_immunity_shadow.py` (disk-hygiene). The shadow log is readable
+  via the `immunity_status` health MCP tool (gate-agnostic: per-gate live mode
+  + per-site would-block counts — sizes the B4 enforce blast radius).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
+- **infra_profile/**: the infrastructure body schema — deterministic fact
+  collectors (container plane; host plane via a PR2 guardian verb, degrades to
+  "not visible from this vantage") → per-section hashed `profile.json` +
+  rendered `INFRASTRUCTURE.md` under `~/.genesis/infrastructure/`. **The
+  facts/metrics split is load-bearing**: only `facts` are hashed; a hash change
+  emits a dedup-gated `infrastructure_drift` observation and regenerates that
+  section's LLM annotation (call site 46, strong-first — annotations are PINNED
+  to source hashes; staleness derived at render, never stored). Consumers: boot
+  step (delayed, non-blocking) + daily 06:20 cron + `infrastructure_profile`
+  MCP tool (facts-only refresh cross-process, flock-guarded) + sentinel digest
+  + the user-CLAUDE.md `container-specs` block (content owner:
+  `infra_profile/claude_md.py`; update.sh invokes `--claude-md-block`).
+  Distinct from `observability/snapshots/infrastructure.py` (dynamic health) —
+  don't merge them.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),

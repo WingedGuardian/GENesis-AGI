@@ -43,7 +43,10 @@ class _FakePipeline:
     async def deliver_approved(self, row, *, subject=None):
         self.calls.append((row["id"], subject))
         return OutreachResult(
-            outreach_id="o", status=self._status, channel="email", message_content="",
+            outreach_id="o",
+            status=self._status,
+            channel="email",
+            message_content="",
         )
 
 
@@ -55,16 +58,24 @@ class _FakeRt:
 
 async def _hold(db, *, pid, rid):
     await pes.create(
-        db, id=pid, request_id=rid, validated_recipient="a@b.c",
-        category="outreach", message="body", held_at=_TS, **_CELL,
+        db,
+        id=pid,
+        request_id=rid,
+        validated_recipient="a@b.c",
+        category="outreach",
+        message="body",
+        held_at=_TS,
+        **_CELL,
     )
 
 
 async def _approval(db, *, status):
     mgr = ApprovalManager(db=db)
     rid = await mgr.request_approval(
-        action_type="email_capability_gate", action_class="costly_reversible",
-        description="d", context=json.dumps({"subject": "hi"}),
+        action_type="email_capability_gate",
+        action_class="costly_reversible",
+        description="d",
+        context=json.dumps({"subject": "hi"}),
     )
     if status != "pending":
         await mgr.resolve(rid, status=status)

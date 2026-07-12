@@ -168,6 +168,9 @@ async def judge_candidates(
         argv = build_argv(claude_path, no_mcp_config)
         env = dict(os.environ)
         env["GENESIS_CC_SESSION"] = "1"  # never re-enter Genesis hooks
+        # WS-3: never leak a session origin into the nested claude subprocess
+        # (mirrors CCInvoker._build_env's pop-if-absent invariant).
+        env.pop("GENESIS_SESSION_ORIGIN", None)
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,

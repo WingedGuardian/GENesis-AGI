@@ -15,6 +15,7 @@ import logging
 from dataclasses import dataclass, field
 
 from genesis.memory.provenance import wrap_external_recall
+from genesis.security import immunity_shadow
 
 logger = logging.getLogger(__name__)
 
@@ -213,23 +214,38 @@ class ResumeReviewer:
             # KB FTS — every hit is external-world. Wrap both the vector
             # (`r.content`) and FTS (`body`) branches before they enter the
             # review LLM prompt so payloads are treated as data, not instructions.
+            blockable = 0
             for r in results:
                 if r.memory_id not in seen:
                     seen.add(r.memory_id)
-                    wrapped = wrap_external_recall(
-                        r.content, source_pipeline=getattr(r, "source_pipeline", None),
-                    )
+                    sp = getattr(r, "source_pipeline", None)
+                    wrapped = wrap_external_recall(r.content, source_pipeline=sp)
                     context_parts.append(f"[Knowledge: {r.source}]\n{wrapped}")
+                    if immunity_shadow.item_is_blockable(
+                        collection="knowledge_base", source_pipeline=sp,
+                    ):
+                        blockable += 1
 
             for fts in fts_results:
                 uid = fts["unit_id"]
                 if uid not in seen:
                     seen.add(uid)
                     concept = fts.get("concept", "")
-                    body = wrap_external_recall(
-                        fts.get("body", ""), source_pipeline=fts.get("source_pipeline"),
-                    )
+                    sp = fts.get("source_pipeline")
+                    body = wrap_external_recall(fts.get("body", ""), source_pipeline=sp)
                     context_parts.append(f"[Knowledge: {concept}]\n{body}")
+                    if immunity_shadow.item_is_blockable(
+                        collection="knowledge_base", source_pipeline=sp,
+                    ):
+                        blockable += 1
+
+            # WS-3 B1 gate 4 (injection): shadow-record external KB content
+            # reaching the resume-review LLM prompt (observe-only).
+            await immunity_shadow.record_would_block(
+                gate="injection", source_kind="recall_inject",
+                source_ref="knowledge/applications/resume_review.py::_query_knowledge_base",
+                process="server", blockable_count=blockable, db=memory_mod._db,
+            )
 
             return "\n\n---\n\n".join(context_parts[:20])
         except Exception:

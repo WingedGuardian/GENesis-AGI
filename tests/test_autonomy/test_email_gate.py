@@ -46,8 +46,11 @@ def _gate(db):
 
 def _req(**kw):
     base = dict(
-        category=OutreachCategory.BLOCKER, topic="hi", context="body",
-        salience_score=0.5, channel="email",
+        category=OutreachCategory.BLOCKER,
+        topic="hi",
+        context="body",
+        salience_score=0.5,
+        channel="email",
     )
     base.update(kw)
     return OutreachRequest(**base)
@@ -77,8 +80,15 @@ async def _add_inbound_from(db, thread_id, sender):
 
 async def _grant_standard(db):
     for event in (CellEvent.CLASSIFY, CellEvent.APPROVE):
-        await cg.apply_event(db, domain="email", verb="send", risk_class="standard",
-                             event=event, updated_at=_TS)
+        await cg.apply_event(
+            db,
+            origin_class="first_party",
+            domain="email",
+            verb="send",
+            risk_class="standard",
+            event=event,
+            updated_at=_TS,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -109,10 +119,24 @@ async def test_cold_ungranted_email_is_held(db):
 async def test_granted_known_thread_reply_is_allowed(db):
     # pre-grant the standard (known-thread reply) cell, with the recipient as a
     # recorded thread participant so the g1 recipient-match guard passes.
-    await cg.apply_event(db, domain="email", verb="send", risk_class="standard",
-                         event=CellEvent.CLASSIFY, updated_at=_TS)
-    await cg.apply_event(db, domain="email", verb="send", risk_class="standard",
-                         event=CellEvent.APPROVE, updated_at=_TS)
+    await cg.apply_event(
+        db,
+        origin_class="first_party",
+        domain="email",
+        verb="send",
+        risk_class="standard",
+        event=CellEvent.CLASSIFY,
+        updated_at=_TS,
+    )
+    await cg.apply_event(
+        db,
+        origin_class="first_party",
+        domain="email",
+        verb="send",
+        risk_class="standard",
+        event=CellEvent.APPROVE,
+        updated_at=_TS,
+    )
     await _add_inbound_from(db, "t1", "alice@example.com")
 
     gate = _gate(db)
@@ -127,14 +151,29 @@ async def test_granted_known_thread_reply_is_allowed(db):
 @pytest.mark.asyncio
 async def test_financial_is_hardline_held_without_a_cell(db):
     # Even pre-granting a financial cell must not let a financial email through.
-    await cg.apply_event(db, domain="email", verb="send", risk_class="financial",
-                         event=CellEvent.CLASSIFY, updated_at=_TS)
-    await cg.apply_event(db, domain="email", verb="send", risk_class="financial",
-                         event=CellEvent.APPROVE, updated_at=_TS)
+    await cg.apply_event(
+        db,
+        origin_class="first_party",
+        domain="email",
+        verb="send",
+        risk_class="financial",
+        event=CellEvent.CLASSIFY,
+        updated_at=_TS,
+    )
+    await cg.apply_event(
+        db,
+        origin_class="first_party",
+        domain="email",
+        verb="send",
+        risk_class="financial",
+        event=CellEvent.APPROVE,
+        updated_at=_TS,
+    )
     gate = _gate(db)
     req = _req(validated_recipient="alice@example.com", thread_id="t1")
     decision = await gate.check(
-        request=req, recipient="alice@example.com",
+        request=req,
+        recipient="alice@example.com",
         message_text="Please wire transfer the invoice balance to this IBAN.",
     )
     assert decision.allow is False  # hardline — held despite the granted cell
@@ -165,11 +204,13 @@ async def test_approve_all_pending_excludes_email_gate(db):
 
     mgr = ApprovalManager(db=db)
     email_rid = await mgr.request_approval(
-        action_type=EMAIL_GATE_ACTION_TYPE, action_class="costly_reversible",
+        action_type=EMAIL_GATE_ACTION_TYPE,
+        action_class="costly_reversible",
         description="email send",
     )
     other_rid = await mgr.request_approval(
-        action_type="autonomous_cli_fallback", action_class="reversible",
+        action_type="autonomous_cli_fallback",
+        action_class="reversible",
         description="cli action",
     )
     gate = AutonomousCliApprovalGate(runtime=MagicMock(), approval_manager=mgr)
@@ -194,7 +235,9 @@ async def test_granted_reply_recipient_mismatch_demotes_and_holds(db):
     gate = _gate(db)
     req = _req(validated_recipient="mallory@evil.com", thread_id="t1")
     decision = await gate.check(
-        request=req, recipient="mallory@evil.com", message_text="re",
+        request=req,
+        recipient="mallory@evil.com",
+        message_text="re",
     )
     assert decision.allow is False  # held
     cell = await cg.get_cell(db, "email", "send", "standard")
@@ -213,7 +256,9 @@ async def test_granted_reply_unknown_sender_trips_guard(db):
     gate = _gate(db)
     req = _req(validated_recipient="anyone@example.com", thread_id="t1")
     decision = await gate.check(
-        request=req, recipient="anyone@example.com", message_text="re",
+        request=req,
+        recipient="anyone@example.com",
+        message_text="re",
     )
     assert decision.allow is False  # held — ambiguous scope is not waved through
     assert (await cg.get_cell(db, "email", "send", "standard"))["state"] == "ask"
@@ -228,13 +273,20 @@ async def test_granted_rate_limit_burst_demotes_and_holds(db):
     now = datetime.now(UTC).isoformat()
     for i in range(_RATE_LIMIT_MAX):
         await aes.create(
-            db, id=f"a{i}", recipient="alice@example.com", sent_at=now,
-            cell_domain="email", cell_verb="send", cell_risk_class="standard",
+            db,
+            id=f"a{i}",
+            recipient="alice@example.com",
+            sent_at=now,
+            cell_domain="email",
+            cell_verb="send",
+            cell_risk_class="standard",
         )
     gate = _gate(db)
     req = _req(validated_recipient="alice@example.com", thread_id="t1")
     decision = await gate.check(
-        request=req, recipient="alice@example.com", message_text="re",
+        request=req,
+        recipient="alice@example.com",
+        message_text="re",
     )
     assert decision.allow is False  # rate-limit tripped
     assert (await cg.get_cell(db, "email", "send", "standard"))["state"] == "ask"

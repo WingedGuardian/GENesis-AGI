@@ -57,6 +57,11 @@ def init_health_mcp(
     logger.info("Health MCP wired to HealthDataService")
 
 
+from genesis.mcp.health import (  # noqa: E402
+    bench_status,  # noqa: F401
+    immunity_status,  # noqa: F401
+    loop_closure_status,  # noqa: F401
+)
 from genesis.mcp.health import browser as _browser  # noqa: E402
 from genesis.mcp.health import build_lane_status as _build_lane_status  # noqa: E402, F401
 from genesis.mcp.health import campaign_tools as _campaign_tools  # noqa: E402, F401
@@ -73,8 +78,8 @@ from genesis.mcp.health import experiment_run as _experiment_run  # noqa: E402, 
 from genesis.mcp.health import experiment_status as _experiment_status  # noqa: E402, F401
 from genesis.mcp.health import follow_up_tools as _follow_up_tools  # noqa: E402
 from genesis.mcp.health import inbox_digest as _inbox_digest  # noqa: E402
+from genesis.mcp.health import infrastructure_profile as _infrastructure_profile  # noqa: E402, F401
 from genesis.mcp.health import j9_eval as _j9_eval  # noqa: E402, F401
-from genesis.mcp.health import loop_closure_status  # noqa: E402, F401
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
 from genesis.mcp.health import module_ops as _module_ops  # noqa: E402
 from genesis.mcp.health import provider as _provider  # noqa: E402
