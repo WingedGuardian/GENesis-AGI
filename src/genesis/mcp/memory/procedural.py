@@ -113,12 +113,17 @@ async def procedure_store(
         principle_embedding=principle_blob,
     )
 
-    # WS-3 B1 gate-1 (procedure): the owner explicitly taught this procedure, so
-    # its origin is `owner` — which the shadow gate NEVER records (never-block
-    # invariant). The emit is wired for uniformity + future-proofing (if this tool
-    # ever accepts non-owner input, provenance is already plumbed). Best-effort.
+    # WS-3 B1 gate-1 (procedure): classify by the tools the taught procedure uses
+    # — the SAME tool-name signal as the judge/trace/extractor paths. NOT hardcoded
+    # `owner`: procedure_store is exposed in the research profile
+    # (cc/direct_session.py) alongside web tools, so a background research session
+    # can teach an externally-influenced procedure, which an owner hardcode would
+    # silently never record. (PR-B upgrades the MCP write tools to read the
+    # per-session origin env for precise caller provenance; until then the taught
+    # tools are the coarse proxy.) Self-guards to NO row for first_party/owner
+    # origins + the kill switch. Best-effort.
     if result.action != "skipped":
-        from genesis.memory.provenance import ORIGIN_OWNER
+        from genesis.memory.provenance import origin_from_tool_names
         from genesis.security import immunity_shadow
 
         await immunity_shadow.record_would_block(
@@ -127,7 +132,7 @@ async def procedure_store(
             source_ref=result.procedure_id,
             process="server",
             blockable_count=1,
-            origin_class=ORIGIN_OWNER,
+            origin_class=origin_from_tool_names(tools_used or []),
             db=memory_mod._db,
         )
 

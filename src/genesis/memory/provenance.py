@@ -140,6 +140,15 @@ _EXTERNAL_INGEST_TOOLS = frozenset(
         "knowledge_ingest_source",
         "knowledge_ingest_batch",
         "document_query",
+        # Mixed-source recall that can surface external KB content
+        # (memory_recall/memory_expand default to source='both'). Included per the
+        # over-observe posture — a session that recalled KB then promoted a
+        # procedure counts. If shadow saturates (these are common tools), the fix
+        # is item-level recall provenance (B4), not a coarser net. NB: knowledge_*
+        # recall above is KB-only (always external); memory_proactive runs as a
+        # hook, never in the tool spine, so it can't appear here.
+        "memory_recall",
+        "memory_expand",
         # external recon (GitHub / model-intel / skill scans off the world)
         "recon_run_github_discovery",
         "recon_run_github_discovery_job",

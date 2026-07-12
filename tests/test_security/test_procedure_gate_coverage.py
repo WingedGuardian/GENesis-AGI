@@ -50,8 +50,10 @@ PROCEDURE_GATE_SITES: dict[str, tuple[str, str]] = {
     ),
     "mcp/memory/procedural.py::procedure_store": (
         "gated",
-        "owner explicit-teach; emits origin=owner -> never a row (never-block "
-        "invariant), wired for uniformity + future non-owner input",
+        "explicit-teach; emits origin_from_tool_names(tools_used) — NOT hardcoded "
+        "owner (the research profile exposes this tool alongside web tools, so a "
+        "background session can teach externally-influenced content). PR-B upgrades "
+        "to per-session origin",
     ),
     "learning/procedural/extractor.py::extract_procedure": (
         "gated",
