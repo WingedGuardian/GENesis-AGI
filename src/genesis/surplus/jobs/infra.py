@@ -43,6 +43,6 @@ async def run_infra_profile_refresh() -> None:
             len(sections),
         )
         record_success(JOB_ID)
-    except Exception:
+    except Exception as exc:
         logger.exception("infra_profile scheduled refresh failed")
-        record_failure(JOB_ID)
+        record_failure(JOB_ID, repr(exc))

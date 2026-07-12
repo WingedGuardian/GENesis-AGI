@@ -133,7 +133,9 @@ async def emit_drift_observations(db, drift: list[dict[str, Any]], event_bus=Non
                 try:
                     from genesis.observability.events import Severity, Subsystem
 
-                    event_bus.emit(
+                    # emit is a coroutine — unawaited it never reaches the
+                    # ring/persist queue (Codex P2, 2026-07-12).
+                    await event_bus.emit(
                         Subsystem.OBSERVABILITY,
                         Severity.WARNING,
                         "infra_profile_drift_write_failed",

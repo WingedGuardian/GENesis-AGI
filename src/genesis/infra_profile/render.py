@@ -24,7 +24,7 @@ def _is_stale(section: dict[str, Any], annotation: dict[str, Any] | None) -> boo
 
 
 def _fmt_bytes(value: Any) -> str:
-    if not isinstance(value, (int, float)) or value is None:
+    if not isinstance(value, (int, float)):
         return str(value)
     gib = value / (1024**3)
     return f"{gib:.1f} GiB" if gib >= 1 else f"{value / (1024**2):.0f} MiB"

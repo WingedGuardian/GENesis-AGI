@@ -1,11 +1,8 @@
 """SQLite configuration facts for the live Genesis database.
 
-Opens a SEPARATE read-only connection (``mode=ro`` URI — WAL-aware, unlike
-``immutable=1``) in a worker thread. Never touches the runtime's
-``SerializedConnection``, never ATTACHes the live WAL db.
-
-Pragmas are facts (a changed journal_mode or page_size is a real config
-event); file sizes and freelist are metrics.
+The raw SQL lives in ``db/crud/pragma_facts.py`` (repo rule: DB access goes
+through db.crud); this collector owns file sizes, path resolution, and the
+facts/metrics degradation policy.
 """
 
 from __future__ import annotations
@@ -15,21 +12,11 @@ import logging
 import sqlite3
 from pathlib import Path
 
+from genesis.db.crud.pragma_facts import read_pragma_facts
 from genesis.env import genesis_db_path
 from genesis.infra_profile.types import SectionResult
 
 logger = logging.getLogger(__name__)
-
-_FACT_PRAGMAS = (
-    "journal_mode",
-    "synchronous",
-    "page_size",
-    "mmap_size",
-    "wal_autocheckpoint",
-    "auto_vacuum",
-    "cache_size",
-    "user_version",
-)
 
 
 def _collect_sync(db_path: Path) -> SectionResult:
@@ -39,21 +26,9 @@ def _collect_sync(db_path: Path) -> SectionResult:
     if not db_path.exists():
         return SectionResult.failed("sqlite", f"database not found at {db_path}")
 
-    # timeout = SQLite busy-timeout: PRAGMA reads on a mode=ro connection can
-    # still hit SQLITE_BUSY against the live writer's WAL checkpoints; 10s
-    # rides out a checkpoint burst, then the section degrades — never the
-    # refresh (this runs inside the boot-path task holding the flock).
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
-    try:
-        pragmas: dict[str, object] = {}
-        for name in _FACT_PRAGMAS:
-            row = conn.execute(f"PRAGMA {name}").fetchone()
-            pragmas[name] = row[0] if row else None
-        facts["pragmas"] = pragmas
-        row = conn.execute("PRAGMA freelist_count").fetchone()
-        metrics["freelist_pages"] = row[0] if row else None
-    finally:
-        conn.close()
+    pragma_facts, pragma_metrics = read_pragma_facts(db_path)
+    facts["pragmas"] = pragma_facts
+    metrics.update(pragma_metrics)
 
     metrics["db_size_bytes"] = db_path.stat().st_size
     try:

@@ -58,7 +58,7 @@ def _replace_block(text: str, name: str, content: str) -> str:
 
 def update_block(
     profile: dict[str, Any],
-    claude_md_path: Path = CLAUDE_MD_PATH,
+    claude_md_path: Path | None = None,
     *,
     ignore_update_gate: bool = False,
 ) -> bool:
@@ -71,6 +71,8 @@ def update_block(
     from genesis.env import update_in_progress
     from genesis.util.atomic import atomic_write_text
 
+    if claude_md_path is None:  # call-time resolution — see store.py rationale
+        claude_md_path = CLAUDE_MD_PATH
     if not profile.get("sections"):
         logger.debug("infra_profile: no profile yet — leaving CLAUDE.md block alone")
         return False

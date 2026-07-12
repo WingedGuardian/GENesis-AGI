@@ -18,10 +18,13 @@ a healthy system; 15s tolerates heavy load while still releasing the lock.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import platform
 import shutil
 import socket
+import sqlite3
 from pathlib import Path
 
 from genesis.infra_profile.types import SectionResult
@@ -298,7 +301,6 @@ async def collect_storage(
                 facts["io_scheduler"] = _read(disk_dir / "queue/scheduler")
                 break
 
-    import os
 
     # /tmp is a MEASUREMENT TARGET here (small tmpfs = known incident class),
     # not a temp-file location.
@@ -356,8 +358,6 @@ async def collect_network(etc_root: Path = Path("/etc")) -> SectionResult:
     Addresses are FACTS by design: an IP change on this plane is a real
     identity event worth a drift observation, not noise.
     """
-    import json as _json
-
     facts: dict = {}
     metrics: dict = {}
 
@@ -371,7 +371,7 @@ async def collect_network(etc_root: Path = Path("/etc")) -> SectionResult:
     addresses: dict[str, list[str]] = {}
     if ip_json:
         try:
-            for iface in _json.loads(ip_json):
+            for iface in json.loads(ip_json):
                 name = iface.get("ifname")
                 addresses[name] = sorted(
                     a.get("local", "")
@@ -396,7 +396,7 @@ async def collect_network(etc_root: Path = Path("/etc")) -> SectionResult:
     route = await _run_cmd("ip", "-j", "route", "show", "default")
     if route:
         try:
-            default = _json.loads(route)
+            default = json.loads(route)
             if default:
                 facts["default_route_dev"] = default[0].get("dev")
                 metrics["default_gateway"] = default[0].get("gateway")
@@ -456,7 +456,6 @@ async def collect_systemd() -> SectionResult:
 
 async def collect_versions() -> SectionResult:
     """Tool versions. Facts: a version change (CC update, node bump) is a signal."""
-    import sqlite3
 
     facts: dict = {
         "python": platform.python_version(),

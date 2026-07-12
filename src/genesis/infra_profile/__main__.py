@@ -21,6 +21,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 
 def main() -> int:
+    """Dispatch --claude-md-block / --refresh (see module docstring)."""
     parser = argparse.ArgumentParser(prog="python -m genesis.infra_profile")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(

@@ -96,9 +96,16 @@ async def test_emit_db_failure_falls_back_to_event_bus():
             "priority": "medium",
         },
     ]
+    # emit is a coroutine on the real GenesisEventBus and is AWAITED by the
+    # fallback — the fake must be async too (a sync lambda here masked an
+    # unawaited-coroutine bug; Codex P2 2026-07-12).
     bus = AsyncMock()
-    bus.emit = lambda *a, **k: bus.emitted.append((a, k))
     bus.emitted = []
+
+    async def _emit(*a, **k):
+        bus.emitted.append((a, k))
+
+    bus.emit = _emit
     with patch(
         "genesis.db.crud.observations.create",
         new=AsyncMock(side_effect=RuntimeError("db locked")),

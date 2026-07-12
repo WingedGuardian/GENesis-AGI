@@ -40,19 +40,31 @@ def _load_json(path: Path, label: str) -> dict[str, Any]:
     return data
 
 
-def load_profile(path: Path = PROFILE_PATH) -> dict[str, Any]:
+# Paths resolve at CALL time (None → module constant), not at def time:
+# a default arg binds the constant when the module loads, which silently
+# defeats test redirection and any runtime path override (found when a test
+# wrote to the real ~/.genesis, 2026-07-12).
+
+
+def load_profile(path: Path | None = None) -> dict[str, Any]:
     """Load profile.json; missing/corrupt → empty dict."""
-    return _load_json(path, "profile")
+    return _load_json(path if path is not None else PROFILE_PATH, "profile")
 
 
-def save_profile(profile: dict[str, Any], path: Path = PROFILE_PATH) -> None:
-    atomic_write_text(path, json.dumps(profile, indent=2, default=str))
+def save_profile(profile: dict[str, Any], path: Path | None = None) -> None:
+    atomic_write_text(
+        path if path is not None else PROFILE_PATH,
+        json.dumps(profile, indent=2, default=str),
+    )
 
 
-def load_annotations(path: Path = ANNOTATIONS_PATH) -> dict[str, Any]:
+def load_annotations(path: Path | None = None) -> dict[str, Any]:
     """Load annotations.json; missing/corrupt → empty dict."""
-    return _load_json(path, "annotations")
+    return _load_json(path if path is not None else ANNOTATIONS_PATH, "annotations")
 
 
-def save_annotations(annotations: dict[str, Any], path: Path = ANNOTATIONS_PATH) -> None:
-    atomic_write_text(path, json.dumps(annotations, indent=2, default=str))
+def save_annotations(annotations: dict[str, Any], path: Path | None = None) -> None:
+    atomic_write_text(
+        path if path is not None else ANNOTATIONS_PATH,
+        json.dumps(annotations, indent=2, default=str),
+    )
