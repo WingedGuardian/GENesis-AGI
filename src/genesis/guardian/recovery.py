@@ -64,6 +64,20 @@ class RecoveryEngine:
         if action == RecoveryAction.ESCALATE:
             return await self._escalate(diagnosis)
 
+        # REVERT_CODE needs healthy, WRITABLE local git. If the container's git is
+        # broken (the F.1 outage class — including a read-only rootfs, which passes
+        # reads but fails the writes `git stash`/`git revert` need), reverting can't
+        # work. Rather than burn the approved attempt on a doomed action (which sets
+        # confirmed_dead and STALLS the ladder), advance to SNAPSHOT_ROLLBACK — the
+        # safer rung that restores a healthy .git AND working code (and repairs a
+        # read-only rootfs) in one move. Done BEFORE any attempt is recorded.
+        if action == RecoveryAction.REVERT_CODE and not await self._container_git_healthy():
+            logger.warning(
+                "REVERT_CODE unavailable (container git unhealthy/read-only) — "
+                "advancing to SNAPSHOT_ROLLBACK"
+            )
+            action = RecoveryAction.SNAPSHOT_ROLLBACK
+
         # Check exponential backoff before proceeding
         backoff_s = self._sm.recovery_backoff_remaining_s(action.value)
         if backoff_s > 0:
@@ -293,24 +307,25 @@ class RecoveryEngine:
         # Restart services
         return await self._restart_services(container)
 
+    async def _container_git_healthy(self) -> bool:
+        """True if the container's local git can support REVERT_CODE — HEAD
+        resolvable, config parseable, AND .git writable (a read-only rootfs passes
+        the reads but fails the write, exactly where stash/revert would). Reuses
+        the guardian git probe. Returns True on an INCONCLUSIVE probe (unreachable
+        / unparseable) — fail OPEN so a flaky probe never blocks a recovery that
+        might otherwise work."""
+        try:
+            from genesis.guardian.git_watch import probe_container_git
+
+            probe = await probe_container_git(self._config)
+        except Exception:
+            return True
+        if probe is None:
+            return True
+        return bool(probe.get("healthy", True))
+
     async def _revert_code(self, container: str) -> tuple[bool, str]:
         """Stash uncommitted changes and revert last commit, then restart."""
-        # Preflight: REVERT_CODE needs healthy local git. If the container's git
-        # is broken (the F.1 outage class), `git stash`/`git revert` would fail
-        # mid-way — refuse up front so the recovery ladder escalates instead of
-        # burning an attempt. (15s: incus exec + two quick plumbing commands.)
-        pf_rc, _, _ = await _run_subprocess(
-            "incus", "exec", container, "--",
-            "su", "-", "ubuntu", "-c",
-            "cd ~/genesis && git rev-parse --verify 'HEAD^{commit}' >/dev/null "
-            "&& git config --get remote.origin.url >/dev/null",
-            timeout=15.0,
-        )
-        if pf_rc != 0:
-            return False, (
-                "container git unhealthy — REVERT_CODE unavailable "
-                "(see docs/reference/recovery-and-portability-workflow.md); escalating"
-            )
         # Stash any uncommitted work
         rc, _, _ = await _run_subprocess(
             "incus", "exec", container, "--",

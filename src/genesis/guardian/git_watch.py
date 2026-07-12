@@ -43,7 +43,10 @@ REPO="$HOME/genesis"
 if ! cd "$REPO" 2>/dev/null; then echo "GITHEALTH repo_missing"; exit 0; fi
 fails=""
 git rev-parse --verify "HEAD^{commit}" >/dev/null 2>&1 || fails="$fails head_unresolvable"
-git config --get remote.origin.url >/dev/null 2>&1 || fails="$fails config_invalid"
+# Config parseability, NOT remote presence (a valid local clone may lack origin;
+# git revert is local). `git config --list` fails only on a genuinely corrupt
+# config (the incident null-filled .git/config).
+git config --list >/dev/null 2>&1 || fails="$fails config_invalid"
 t=".git/.gw-probe-$$"
 if (echo x > "$t") 2>/dev/null; then rm -f "$t"; else fails="$fails rootfs_readonly"; fi
 fails="${fails# }"

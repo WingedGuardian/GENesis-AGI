@@ -337,27 +337,48 @@ class TestSnapshotRollbackRetry:
         assert snapshots.restore.call_count == 1
 
 
-class TestRevertCodePreflight:
-    """F.1: REVERT_CODE needs healthy local git — the preflight must short-circuit
-    when the container's git is broken so the ladder escalates instead of burning
-    a doomed `git stash`/`git revert` attempt."""
+class TestRevertCodeGitPreflight:
+    """F.1: when diagnosis picks REVERT_CODE but the container's git is unhealthy,
+    execute() must ADVANCE to SNAPSHOT_ROLLBACK (a working rung that restores a
+    healthy .git) — never burn the attempt on a doomed revert (which would set
+    confirmed_dead and STALL the ladder)."""
 
     @pytest.mark.asyncio
-    async def test_blocks_on_unhealthy_git(self, engine: RecoveryEngine) -> None:
-        # Preflight is the FIRST subprocess call in _revert_code; rc=1 → block.
-        with patch("genesis.guardian.recovery._run_subprocess", _mock_subprocess(1, "", "fatal")):
-            ok, detail = await engine._revert_code("genesis")
-        assert ok is False
-        assert "container git unhealthy" in detail
-        assert "recovery-and-portability" in detail
-
-    @pytest.mark.asyncio
-    async def test_proceeds_when_git_healthy(self, engine: RecoveryEngine) -> None:
-        # Preflight passes (rc=0) → _revert_code proceeds; isolate _restart_services.
+    async def test_redirects_to_rollback_on_unhealthy_git(self, engine: RecoveryEngine) -> None:
         with (
-            patch("genesis.guardian.recovery._run_subprocess", _mock_subprocess(0, "")),
-            patch.object(engine, "_restart_services", AsyncMock(return_value=(True, "restarted"))),
+            patch.object(engine, "_container_git_healthy", AsyncMock(return_value=False)),
+            patch.object(engine._snapshots, "get_latest_healthy", return_value="guardian-healthy"),
+            patch.object(engine._snapshots, "restore", return_value=True),
+            patch("genesis.guardian.recovery.collect_all_signals", return_value=_healthy_snapshot()),
+            patch("asyncio.sleep", new_callable=AsyncMock),
         ):
-            ok, detail = await engine._revert_code("genesis")
-        assert ok is True
-        assert "container git unhealthy" not in detail
+            result = await engine.execute(_diagnosis(RecoveryAction.REVERT_CODE))
+        # Advanced to a working rung, not stalled on a failed revert.
+        assert result.action == RecoveryAction.SNAPSHOT_ROLLBACK
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_revert_proceeds_when_git_healthy(self, engine: RecoveryEngine) -> None:
+        with (
+            patch.object(engine, "_container_git_healthy", AsyncMock(return_value=True)),
+            patch("genesis.guardian.recovery._run_subprocess", _mock_subprocess(0, "")),
+            patch("genesis.guardian.recovery.collect_all_signals", return_value=_healthy_snapshot()),
+            patch.object(engine._snapshots, "take", return_value="pre-recovery"),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = await engine.execute(_diagnosis(RecoveryAction.REVERT_CODE))
+        assert result.action == RecoveryAction.REVERT_CODE
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_container_git_healthy_fails_open_on_inconclusive(self, engine: RecoveryEngine) -> None:
+        import genesis.guardian.git_watch as gw
+
+        # Inconclusive probe (None: unreachable/unparseable) → fail OPEN (True).
+        with patch.object(gw, "probe_container_git", AsyncMock(return_value=None)):
+            assert await engine._container_git_healthy() is True
+        # Positively unhealthy → False.
+        with patch.object(
+            gw, "probe_container_git", AsyncMock(return_value={"healthy": False, "failures": ["rootfs_readonly"]})
+        ):
+            assert await engine._container_git_healthy() is False
