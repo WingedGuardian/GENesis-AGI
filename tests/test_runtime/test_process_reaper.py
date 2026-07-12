@@ -291,6 +291,7 @@ async def test_auto_arm_lifecycle(monkeypatch):
 
     async def fake_notify(rt, msg):
         notified.append(msg)
+        return True  # delivered → arming may proceed
 
     monkeypatch.setattr(pr, "_notify_owner", fake_notify)
 
@@ -356,6 +357,30 @@ async def test_no_arm_without_hook_proof(monkeypatch):
     assert signals == []
     assert saved.get("armed_at") is None  # refused to arm without hook proof
     assert notified == []
+
+
+async def test_no_arm_when_notification_fails(monkeypatch):
+    """All arm criteria met, but the owner veto notice can't be delivered →
+    stay in dry-run, do NOT arm (never arm silently)."""
+
+    async def fake_notify_fail(rt, msg):
+        return False  # delivery failed / outreach unavailable
+
+    monkeypatch.setattr(pr, "_notify_owner", fake_notify_fail)
+    signals, saved, _ = _patch_io(
+        monkeypatch,
+        pids_by_pattern={"claude": [900001]},
+        ages={900001: 8 * _DAY},
+        markers={},
+        ttys={},
+        live_ttys=set(),
+        state={"dry_run": True, "dry_run_since": _NOW, "hook_verified": True},
+    )
+    rt = _FakeRT(pipeline=object())
+    await run_reaper(rt, now=_NOW + 3 * _DAY + 60)
+    assert signals == []
+    assert saved.get("armed_at") is None  # not armed — notice undelivered
+    assert saved.get("dry_run", True) is True
 
 
 async def test_hard_disable_prevents_arm(monkeypatch):

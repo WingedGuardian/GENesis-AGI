@@ -445,33 +445,52 @@ async def _maybe_arm(
         and state.get("hook_verified")
         and not state.get("armed_at")
     ):
-        state["dry_run"] = False
-        state["armed_at"] = now
-        changed = True
-        logger.warning(
-            "Process reaper auto-armed after %.1f clean dry-run days; "
-            "future passes will reap detached idle claude processes.",
-            elapsed / 86400,
+        # Arming REQUIRES a delivered veto notice: the owner must receive the
+        # heads-up + disable instructions before any real kill. If outreach is
+        # unavailable or delivery fails, stay in dry-run and retry next pass —
+        # never arm silently.
+        msg = (
+            "🔫 Process reaper auto-armed after "
+            f"{elapsed / 86400:.1f} clean dry-run days. It will now reap "
+            "claude processes that are >7d old AND idle >7d AND detached "
+            "from any live terminal (a strict subset of the old age-only "
+            "rule). Last dry-run would-kill set: "
+            f"{armed_summary or 'none'}. To keep it disabled, set "
+            '"dry_run": true in ~/.genesis/reaper_state.json or export '
+            f"{_ENV_HARD_DISABLE}=1."
         )
-        if rt._outreach_pipeline is not None:
-            msg = (
-                "🔫 Process reaper auto-armed after "
-                f"{elapsed / 86400:.1f} clean dry-run days. It will now reap "
-                "claude processes that are >7d old AND idle >7d AND detached "
-                "from any live terminal (a strict subset of the old age-only "
-                "rule). Last dry-run would-kill set: "
-                f"{armed_summary or 'none'}. To keep it disabled, set "
-                '"dry_run": true in ~/.genesis/reaper_state.json or export '
-                f"{_ENV_HARD_DISABLE}=1."
+        if await _notify_owner(rt, msg):
+            state["dry_run"] = False
+            state["armed_at"] = now
+            changed = True
+            logger.warning(
+                "Process reaper auto-armed after %.1f clean dry-run days; "
+                "future passes will reap detached idle claude processes.",
+                elapsed / 86400,
             )
-            await _notify_owner(rt, msg)
+        else:
+            logger.warning(
+                "Process reaper met the auto-arm criteria but could not deliver "
+                "the owner veto notification; staying in dry-run, retrying next "
+                "pass."
+            )
     if changed:
         _save_state(state)
 
 
-async def _notify_owner(rt: GenesisRuntime, message: str) -> None:
-    """Send a verbatim ALERT to the owner via the outreach pipeline."""
-    from genesis.outreach.types import OutreachCategory, OutreachRequest
+async def _notify_owner(rt: GenesisRuntime, message: str) -> bool:
+    """Send a verbatim ALERT to the owner. Returns True only if delivered.
+
+    The auto-arm gate relies on the return value — arming must not proceed
+    unless the owner actually received the veto notice.
+    """
+    if rt._outreach_pipeline is None:
+        return False
+    from genesis.outreach.types import (
+        OutreachCategory,
+        OutreachRequest,
+        OutreachStatus,
+    )
 
     req = OutreachRequest(
         category=OutreachCategory.ALERT,
@@ -482,8 +501,15 @@ async def _notify_owner(rt: GenesisRuntime, message: str) -> None:
         channel="telegram",
         verbatim=True,
     )
-    with contextlib.suppress(Exception):
-        await rt._outreach_pipeline.submit_urgent(req)
+    try:
+        result = await rt._outreach_pipeline.submit_urgent(req)
+    except Exception:
+        logger.warning("Process reaper owner notification failed", exc_info=True)
+        return False
+    return getattr(result, "status", None) in (
+        OutreachStatus.DELIVERED,
+        OutreachStatus.ENGAGED,
+    )
 
 
 async def _record_observation(
