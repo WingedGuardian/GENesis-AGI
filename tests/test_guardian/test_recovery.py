@@ -335,3 +335,29 @@ class TestSnapshotRollbackRetry:
         assert ok is False
         snapshots.delete.assert_not_called()
         assert snapshots.restore.call_count == 1
+
+
+class TestRevertCodePreflight:
+    """F.1: REVERT_CODE needs healthy local git — the preflight must short-circuit
+    when the container's git is broken so the ladder escalates instead of burning
+    a doomed `git stash`/`git revert` attempt."""
+
+    @pytest.mark.asyncio
+    async def test_blocks_on_unhealthy_git(self, engine: RecoveryEngine) -> None:
+        # Preflight is the FIRST subprocess call in _revert_code; rc=1 → block.
+        with patch("genesis.guardian.recovery._run_subprocess", _mock_subprocess(1, "", "fatal")):
+            ok, detail = await engine._revert_code("genesis")
+        assert ok is False
+        assert "container git unhealthy" in detail
+        assert "recovery-and-portability" in detail
+
+    @pytest.mark.asyncio
+    async def test_proceeds_when_git_healthy(self, engine: RecoveryEngine) -> None:
+        # Preflight passes (rc=0) → _revert_code proceeds; isolate _restart_services.
+        with (
+            patch("genesis.guardian.recovery._run_subprocess", _mock_subprocess(0, "")),
+            patch.object(engine, "_restart_services", AsyncMock(return_value=(True, "restarted"))),
+        ):
+            ok, detail = await engine._revert_code("genesis")
+        assert ok is True
+        assert "container git unhealthy" not in detail

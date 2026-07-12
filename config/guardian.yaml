@@ -107,6 +107,16 @@ cred_integrity:
   # backup_dir: ""         # container-side backup path; empty = module default
   # container_home: ""     # empty = container's real home; set only for E2E
 
+# Guardian-side git-health watch (F.1) — the PRIMARY detector for the outage
+# class that zeroed .git and disabled REVERT_CODE. Live incus-exec probe each
+# tick (HEAD resolvable, remote configured, rootfs writable), since the
+# container's own awareness alerting can be down exactly when this matters.
+git_health:
+  enabled: true
+  confirm_ticks: 2         # consecutive unhealthy probes before the first WARN
+  realert_hours: 6         # re-alert cadence while unhealthy persists
+  check_timeout_s: 30
+
 recovery:
   verification_delay_s: 30
   max_escalations: 3

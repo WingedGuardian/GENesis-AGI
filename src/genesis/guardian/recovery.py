@@ -295,6 +295,22 @@ class RecoveryEngine:
 
     async def _revert_code(self, container: str) -> tuple[bool, str]:
         """Stash uncommitted changes and revert last commit, then restart."""
+        # Preflight: REVERT_CODE needs healthy local git. If the container's git
+        # is broken (the F.1 outage class), `git stash`/`git revert` would fail
+        # mid-way — refuse up front so the recovery ladder escalates instead of
+        # burning an attempt. (15s: incus exec + two quick plumbing commands.)
+        pf_rc, _, _ = await _run_subprocess(
+            "incus", "exec", container, "--",
+            "su", "-", "ubuntu", "-c",
+            "cd ~/genesis && git rev-parse --verify 'HEAD^{commit}' >/dev/null "
+            "&& git config --get remote.origin.url >/dev/null",
+            timeout=15.0,
+        )
+        if pf_rc != 0:
+            return False, (
+                "container git unhealthy — REVERT_CODE unavailable "
+                "(see docs/reference/recovery-and-portability-workflow.md); escalating"
+            )
         # Stash any uncommitted work
         rc, _, _ = await _run_subprocess(
             "incus", "exec", container, "--",

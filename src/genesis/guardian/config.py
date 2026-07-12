@@ -198,6 +198,23 @@ class CredIntegrityConfig:
 
 
 @dataclass
+class GitHealthConfig:
+    """Guardian-side git-health watch (F.1) — the PRIMARY git-integrity detector.
+
+    The container's awareness tick probes its own git first, but the outage this
+    guards against (rootfs read-only from thin-pool exhaustion) can take the
+    container's own alerting down with it. So the guardian probes LIVE via
+    read-only ``incus exec`` each tick and treats the container's shared-mount
+    verdict only as enrichment for the alert body.
+    """
+
+    enabled: bool = True
+    confirm_ticks: int = 2       # consecutive unhealthy probes before the first WARN
+    realert_hours: float = 6.0   # re-alert cadence while unhealthy persists
+    check_timeout_s: int = 30    # incus exec + login shell ~1s healthy; bound a wedge
+
+
+@dataclass
 class ProvisioningConfig:
     """Hypervisor provisioning (rung 5 of the escalation ladder).
 
@@ -268,6 +285,7 @@ class GuardianConfig:
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     storage_pool: StoragePoolConfig = field(default_factory=StoragePoolConfig)
     cred_integrity: CredIntegrityConfig = field(default_factory=CredIntegrityConfig)
+    git_health: GitHealthConfig = field(default_factory=GitHealthConfig)
     provisioning: ProvisioningConfig = field(default_factory=ProvisioningConfig)
 
     @property
@@ -525,6 +543,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         recovery=_build_sub(RecoveryConfig, raw, "recovery"),
         storage_pool=_build_sub(StoragePoolConfig, raw, "storage_pool"),
         cred_integrity=_build_sub(CredIntegrityConfig, raw, "cred_integrity"),
+        git_health=_build_sub(GitHealthConfig, raw, "git_health"),
         provisioning=_build_sub(ProvisioningConfig, raw, "provisioning"),
     )
 
