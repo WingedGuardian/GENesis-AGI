@@ -1030,7 +1030,7 @@ section is safe to hand-edit; install scripts preserve it.
 
 <!-- begin:container-specs -->
 ## Container
-- **Specs**: (run host-setup.sh to detect and populate)
+- **Specs**: (populated by Genesis on first boot — see ~/.genesis/infrastructure/INFRASTRUCTURE.md)
 <!-- end:container-specs -->
 
 <!-- begin:network-identity -->
