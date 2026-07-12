@@ -576,6 +576,20 @@ verified: fa2e692a 2026-07-11
   reaches an action-capable prompt (observe-only — the item still reaches the
   model; owner/first-party never recorded). The gate set is CI-locked in
   `test_recall_inject_coverage.py` (a new inject site or a removed emit fails).
+  **Gate 1 (procedure) is LIVE in SHADOW** — `record_would_block(gate="procedure")`
+  fires at the two promotion paths that have a trustworthy SOURCE-origin signal:
+  the judge convergence (`judge._store_judged_procedure`, covering BOTH the
+  struggle and rebuild callers) classifies by a coarse tool-name ingest scan over
+  the real transcript spine (`provenance.origin_from_tool_names` — external-ingest
+  tool → `external_untrusted`; over-observes by design since fetched content lives
+  in tool RESULTS the spine doesn't carry); the autonomy retrospective
+  (`executor/trace.py`) classifies by `initiated_by` (Genesis's own execution =
+  first_party/owner; the trace has no source-tool spine). Two promotion paths are
+  DEFERRED (classified `deferred-with-reason`, no emit): the deprecated
+  auto-extractor (`extractor.py` — its only signals are replay tools or a
+  hyphen-truncating prose scrape, both undercount) and `procedure_store` (an MCP
+  tool needing the caller's session origin — the session-origin PR's env; it
+  wires that emit). CI-locked in `test_procedure_gate_coverage.py`.
   **Gates 2-3 (identity/autonomy) are LIVE in SHADOW.** Gate 2: the steering
   write (`learning/pipeline.py`) emits with a CHANNEL allow-map origin
   (`_CHANNEL_ORIGIN`: terminal/telegram/whatsapp/web = owner; voice + unknown

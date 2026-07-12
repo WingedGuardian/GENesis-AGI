@@ -59,8 +59,8 @@ NOVELTY_THRESHOLD = 0.85
 # "is the new procedure redundant with any of these?". Precision-first (the dedup
 # spike found 0 false-merges on S-tier); fail-open (any error → treat as novel).
 _NOVELTY_CALL_SITE = "38a_procedure_novelty_llm"
-CROSS_TYPE_PREFILTER = 0.62   # cosine floor for candidates (spike found dups @0.66)
-CROSS_TYPE_TOPK = 10          # cap candidates sent to the LLM (bounds cost)
+CROSS_TYPE_PREFILTER = 0.62  # cosine floor for candidates (spike found dups @0.66)
+CROSS_TYPE_TOPK = 10  # cap candidates sent to the LLM (bounds cost)
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 _CROSS_TYPE_DEDUP_PROMPT = """\
@@ -109,7 +109,8 @@ async def _cross_type_duplicate(
         active = await list_active(db, limit=500)
     except Exception:
         logger.warning(
-            "Cross-type dedup: list_active failed; treating as novel", exc_info=True,
+            "Cross-type dedup: list_active failed; treating as novel",
+            exc_info=True,
         )
         return False, 0.0
 
@@ -146,7 +147,10 @@ async def _cross_type_duplicate(
     # principle/steps/candidates (e.g. shell `{src,tests}` or `${VAR}`) are safe —
     # only the template's own {fields} are interpolated. (Verified; do not "fix".)
     prompt = _CROSS_TYPE_DEDUP_PROMPT.format(
-        nt=task_type, np=principle, ns=ns_txt, candidates="\n".join(lines),
+        nt=task_type,
+        np=principle,
+        ns=ns_txt,
+        candidates="\n".join(lines),
     )
 
     # Fail fast when the novelty-judge chain has NO available provider: a
@@ -164,7 +168,8 @@ async def _cross_type_duplicate(
         if _chain and not _breakers.chain_has_available(_chain):
             logger.debug(
                 "Cross-type dedup: all %s providers circuit-breaker-open — "
-                "skipping novelty judge, treating as novel", _NOVELTY_CALL_SITE,
+                "skipping novelty judge, treating as novel",
+                _NOVELTY_CALL_SITE,
             )
             return False, max_cross_sim
 
@@ -182,7 +187,9 @@ async def _cross_type_duplicate(
             dup = top[rw - 1][1]
             logger.info(
                 "Cross-type duplicate: new '%s' ~ existing '%s' (cosine=%.3f): %s",
-                task_type, _row_get(dup, "task_type"), top[rw - 1][0],
+                task_type,
+                _row_get(dup, "task_type"),
+                top[rw - 1][0],
                 data.get("reason", ""),
             )
             return True, max_cross_sim
@@ -221,7 +228,8 @@ async def _principle_is_novel(
         existing = await list_by_task_type(db, task_type)
     except Exception:
         logger.warning(
-            "Procedure novelty lookup failed; allowing storage", exc_info=True,
+            "Procedure novelty lookup failed; allowing storage",
+            exc_info=True,
         )
         return True, 0.0, None, True
 
@@ -273,6 +281,7 @@ async def _principle_is_novel(
     if is_dup:
         return False, seen, new_emb, False
     return True, seen, new_emb, False
+
 
 # 38_procedure_extraction — extracts reusable procedures from interaction outcomes.
 # Currently in the learning-pipeline-only path (partially wired per _call_site_meta.py).
@@ -388,7 +397,10 @@ async def extract_procedure(
     from genesis.learning.procedural.scoping import is_behavioral_directive
 
     if await is_behavioral_directive(
-        router, task_type=data["task_type"], principle=data["principle"], steps=data["steps"],
+        router,
+        task_type=data["task_type"],
+        principle=data["principle"],
+        steps=data["steps"],
     ):
         logger.info(
             "Extraction: skipping behavioral directive %s (belongs in CLAUDE.md)",
@@ -404,7 +416,8 @@ async def extract_procedure(
         if existing and existing.get("draft") == 0:
             logger.info(
                 "Skipped extraction for %s: explicit-teach %s exists",
-                data["task_type"], existing["id"],
+                data["task_type"],
+                existing["id"],
             )
             return None
     except Exception:
@@ -425,7 +438,9 @@ async def extract_procedure(
     if not is_novel:
         logger.info(
             "Skipped extraction for %s: near-duplicate principle (cosine=%.3f >= %.2f)",
-            data["task_type"], max_sim, NOVELTY_THRESHOLD,
+            data["task_type"],
+            max_sim,
+            NOVELTY_THRESHOLD,
         )
         return None
 
@@ -435,7 +450,10 @@ async def extract_procedure(
     if fell_open:
         now = time.monotonic()
         task_type_key = data["task_type"]
-        if task_type_key in _fail_open_timestamps and now - _fail_open_timestamps[task_type_key] < FAIL_OPEN_COOLDOWN_SECS:
+        if (
+            task_type_key in _fail_open_timestamps
+            and now - _fail_open_timestamps[task_type_key] < FAIL_OPEN_COOLDOWN_SECS
+        ):
             logger.warning(
                 "Fail-open rate limited for %s: cooldown active",
                 task_type_key,
@@ -452,7 +470,10 @@ async def extract_procedure(
         from genesis.db.crud.procedural import find_by_context_overlap
 
         overlapping = await find_by_context_overlap(
-            db, data["context_tags"], jaccard_threshold=0.5, limit=5,
+            db,
+            data["context_tags"],
+            jaccard_threshold=0.5,
+            limit=5,
         )
         for ov in overlapping:
             if (
@@ -466,16 +487,18 @@ async def extract_procedure(
                     sim = cosine_similarity(principle_vec, ov_emb)
                     if sim >= NOVELTY_THRESHOLD:
                         logger.info(
-                            "Cross-type duplicate: '%s' vs existing '%s' "
-                            "(cosine=%.3f)",
-                            data["task_type"], ov["task_type"], sim,
+                            "Cross-type duplicate: '%s' vs existing '%s' (cosine=%.3f)",
+                            data["task_type"],
+                            ov["task_type"],
+                            sim,
                         )
                         return None
                     if sim < 0.3:
                         logger.warning(
-                            "Potential cross-type contradiction: '%s' vs "
-                            "'%s' (cosine=%.3f)",
-                            data["task_type"], ov["task_type"], sim,
+                            "Potential cross-type contradiction: '%s' vs '%s' (cosine=%.3f)",
+                            data["task_type"],
+                            ov["task_type"],
+                            sim,
                         )
                 except Exception:
                     pass  # Best-effort embedding comparison
@@ -512,7 +535,8 @@ async def extract_procedure(
     if not gate_result.allowed:
         logger.info(
             "Validation gate blocked extraction: task_type=%s flags=%s",
-            data["task_type"], gate_result.flags,
+            data["task_type"],
+            gate_result.flags,
         )
         # Emit J9 event for monitoring
         try:
@@ -547,8 +571,22 @@ async def extract_procedure(
             extraction_context=gate_result.extraction_context,
             first_mover=1 if gate_result.first_mover else 0,
         )
-        logger.info("Extracted procedure %s: %s (conf=%.2f)",
-                    proc_id, data["task_type"], gate_result.adjusted_confidence)
+        logger.info(
+            "Extracted procedure %s: %s (conf=%.2f)",
+            proc_id,
+            data["task_type"],
+            gate_result.adjusted_confidence,
+        )
+
+        # WS-3 B1 gate-1 (procedure): NOT gated here — this legacy path has no
+        # reliable source-session tool signal. The only origin candidates are
+        # data["tools_used"] (the extractor LLM's proposed REPLAY tools, not
+        # source provenance) and summary.tool_calls (a heuristic, hyphen-
+        # truncating prose scrape from the summarizer). Gating on either would
+        # undercount silently. Deferred with the path's own removal (follow-up
+        # 3558802740d5); the primary judge path (extraction_job) IS gated on the
+        # real transcript spine.
+
         # Emit J9 event
         try:
             from genesis.eval.j9_hooks import emit_gate_decision
