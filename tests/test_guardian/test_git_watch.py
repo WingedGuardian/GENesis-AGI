@@ -155,6 +155,42 @@ class TestOrchestrator:
         await git_watch.check_container_git_and_alert(_Cfg(tmp_path), AsyncMock())
 
 
+class TestContainerGitSupportsRevert:
+    """The fail-open helper the guardian uses to redirect a doomed REVERT_CODE
+    PROPOSAL to SNAPSHOT_ROLLBACK before approval (never a post-approval swap)."""
+
+    @pytest.mark.asyncio
+    async def test_healthy_true(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            git_watch,
+            "probe_container_git",
+            AsyncMock(return_value={"healthy": True, "failures": []}),
+        )
+        assert await git_watch.container_git_supports_revert(_Cfg(tmp_path)) is True
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_false(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            git_watch,
+            "probe_container_git",
+            AsyncMock(return_value={"healthy": False, "failures": ["rootfs_readonly"]}),
+        )
+        assert await git_watch.container_git_supports_revert(_Cfg(tmp_path)) is False
+
+    @pytest.mark.asyncio
+    async def test_inconclusive_probe_fails_open(self, tmp_path, monkeypatch):
+        # None (unreachable/unparseable) → fail OPEN so a flaky probe never blocks recovery.
+        monkeypatch.setattr(git_watch, "probe_container_git", AsyncMock(return_value=None))
+        assert await git_watch.container_git_supports_revert(_Cfg(tmp_path)) is True
+
+    @pytest.mark.asyncio
+    async def test_probe_raises_fails_open(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            git_watch, "probe_container_git", AsyncMock(side_effect=RuntimeError("boom"))
+        )
+        assert await git_watch.container_git_supports_revert(_Cfg(tmp_path)) is True
+
+
 def test_config_defaults_present():
     # The guardian config must carry a git_health sub-config by default.
     c = GuardianConfig()

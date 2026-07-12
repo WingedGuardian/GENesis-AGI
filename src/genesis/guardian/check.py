@@ -1223,6 +1223,34 @@ async def _execute_recovery_with_approval(
     signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
     diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
 
+    # F.1: REVERT_CODE runs `git stash`/`git revert`, which need healthy, WRITABLE
+    # local git. If the container's git is unhealthy (the F.1 outage class — incl. a
+    # read-only rootfs that passes reads but fails the writes stash/revert need), a
+    # revert is doomed. Redirect the PROPOSAL to SNAPSHOT_ROLLBACK *before* Gate 2 so
+    # the user approves the action that actually runs — never silently swap a
+    # post-approval action (that would break gate-everything and hand the user a more
+    # destructive recovery than they authorized). Rollback restores a healthy .git AND
+    # repairs a read-only rootfs in one move.
+    if diagnosis.recommended_action == RecoveryAction.REVERT_CODE:
+        from genesis.guardian.git_watch import container_git_supports_revert
+
+        if not await container_git_supports_revert(config):
+            from dataclasses import replace
+
+            logger.warning(
+                "REVERT_CODE proposed but container git is unhealthy/read-only — "
+                "redirecting the proposal to SNAPSHOT_ROLLBACK before approval"
+            )
+            diagnosis = replace(
+                diagnosis,
+                recommended_action=RecoveryAction.SNAPSHOT_ROLLBACK,
+                likely_cause=(
+                    diagnosis.likely_cause
+                    + " — container git is unhealthy, so a code revert is unavailable; "
+                    "proposing snapshot rollback instead"
+                ),
+            )
+
     logger.info(
         "Gate-1 approved; diagnosis: %s (confidence=%d%%, action=%s, source=%s)",
         diagnosis.likely_cause, diagnosis.confidence_pct,

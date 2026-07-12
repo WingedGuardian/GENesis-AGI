@@ -86,6 +86,28 @@ async def probe_container_git(config) -> dict | None:
     return _parse_probe(out)
 
 
+async def container_git_supports_revert(config) -> bool:
+    """True if the container's local git can support a REVERT_CODE recovery.
+
+    REVERT_CODE runs ``git stash``/``git revert`` — it needs HEAD resolvable, a
+    parseable config, AND a WRITABLE ``.git`` (a read-only rootfs passes the reads
+    but fails the write, exactly where stash/revert would). Reuses the live probe.
+
+    Fails OPEN (returns True) on an inconclusive/unreachable probe so a flaky probe
+    never suppresses a revert that might otherwise work. The guardian uses this to
+    redirect a doomed REVERT_CODE *proposal* to SNAPSHOT_ROLLBACK BEFORE asking the
+    user to approve it — never to silently swap an action after approval.
+    """
+    try:
+        probe = await probe_container_git(config)
+    except Exception:
+        logger.debug("container_git_supports_revert probe raised — failing open", exc_info=True)
+        return True
+    if probe is None:
+        return True
+    return bool(probe.get("healthy", True))
+
+
 def decide(is_unhealthy: bool, episode: dict | None, now: datetime, cfg) -> EpisodeDecision:
     """Pure escalation decision for the single git-health signal (unit-tested).
 
