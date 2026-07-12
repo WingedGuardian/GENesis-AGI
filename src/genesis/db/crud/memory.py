@@ -395,6 +395,18 @@ async def count_fts_metadata_drift(db: aiosqlite.Connection) -> tuple[int, int]:
     return ghosts, invisible
 
 
+async def set_embedding_status(
+    db: aiosqlite.Connection, memory_id: str, status: str
+) -> bool:
+    """Set ``memory_metadata.embedding_status`` for a memory. Returns True if a row changed."""
+    cursor = await db.execute(
+        "UPDATE memory_metadata SET embedding_status = ? WHERE memory_id = ?",
+        (status, memory_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def get_taxonomy(
     db: aiosqlite.Connection,
     memory_id: str,

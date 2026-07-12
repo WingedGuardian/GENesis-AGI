@@ -171,39 +171,35 @@ async def purge_completed(
     return cursor.rowcount
 
 
-async def reconcile_orphaned_metadata(
+async def query_orphaned_metadata(
     db: aiosqlite.Connection,
     *,
     min_age_seconds: int = 3600,
-) -> int:
-    """Relabel metadata orphans stuck at 'pending' with no queue row as 'failed'.
+) -> list[tuple[str, str]]:
+    """Return ``(memory_id, collection)`` for metadata orphans to reconcile.
 
-    When the recovery worker fails to embed an item it now marks BOTH the
-    queue row and ``memory_metadata.embedding_status`` 'failed'. But rows
-    that failed BEFORE this fix (or whose 'failed' queue row was already
-    reaped by :func:`purge_completed` after 30 days) are stranded at
-    'pending' in metadata with no queue row to ever retry them — no vector,
-    and a lying 'pending' status that passes ``_mark_superseded``'s
-    Qdrant-write guard (store.py) and drives a doomed ``update_payload``.
-    Relabel them 'failed' so the mirror tells the truth.
+    An orphan is a ``memory_metadata`` row stuck at 'pending' with no
+    ``pending_embeddings`` queue row. That happens two ways and they need
+    OPPOSITE fixes: the embed genuinely failed and its 'failed' queue row was
+    later reaped (no vector -> 'failed'), OR the embed SUCCEEDED but its
+    metadata update was lost and the queue row was reaped (vector present ->
+    'embedded'). Only Qdrant can tell them apart, so this query just surfaces
+    the candidates; the caller (EmbeddingRecoveryWorker) checks the vector and
+    sets the truthful status.
 
     ``min_age_seconds`` (default 1h) spares the brief mid-``store()`` window
-    between the create_metadata write and the pending_embeddings.create
-    write, where a legitimately-new row transiently has metadata but not yet
-    a queue row. Returns the count relabeled.
+    between the create_metadata write and the pending_embeddings.create write.
     """
     cutoff = (datetime.now(UTC) - timedelta(seconds=min_age_seconds)).isoformat()
-    cursor = await db.execute(
-        "UPDATE memory_metadata SET embedding_status = 'failed' "
+    rows = await db.execute_fetchall(
+        "SELECT memory_id, collection FROM memory_metadata "
         "WHERE embedding_status = 'pending' AND created_at < ? "
         "AND NOT EXISTS ("
-        "  SELECT 1 FROM pending_embeddings pe "
-        "  WHERE pe.memory_id = memory_metadata.memory_id"
-        ")",
+        "SELECT 1 FROM pending_embeddings pe "
+        "WHERE pe.memory_id = memory_metadata.memory_id)",
         (cutoff,),
     )
-    await db.commit()
-    return cursor.rowcount
+    return [(r[0], r[1]) for r in rows]
 
 
 async def count_pending(

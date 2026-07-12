@@ -162,10 +162,8 @@ class EmbeddingRecoveryWorker:
                 # rollback discards EVERY coroutine's pending write (connection.py).
                 now = datetime.now(UTC).isoformat()
                 try:
-                    await self._db.execute(
-                        "UPDATE memory_metadata SET embedding_status = 'embedded' "
-                        "WHERE memory_id = ?",
-                        (item["memory_id"],),
+                    await memory_crud.set_embedding_status(
+                        self._db, item["memory_id"], "embedded"
                     )
                     await crud.mark_embedded(self._db, item["id"], embedded_at=now)
                     processed += 1
@@ -188,10 +186,8 @@ class EmbeddingRecoveryWorker:
                 # retry; reconcile_orphaned_metadata is the longer-term backstop
                 # once a 'failed' queue row is purged.
                 try:
-                    await self._db.execute(
-                        "UPDATE memory_metadata SET embedding_status = 'failed' "
-                        "WHERE memory_id = ?",
-                        (item["memory_id"],),
+                    await memory_crud.set_embedding_status(
+                        self._db, item["memory_id"], "failed"
                     )
                     await crud.mark_failed(
                         self._db, item["id"], error_message=str(exc),
@@ -210,3 +206,47 @@ class EmbeddingRecoveryWorker:
             "Embedding recovery: processed %d/%d items", processed, len(items),
         )
         return processed
+
+    async def reconcile_orphaned_metadata(self, *, min_age_seconds: int = 3600) -> int:
+        """Fix metadata orphans stuck 'pending' with no queue row.
+
+        Such a row is either a failed embed whose 'failed' queue row was reaped
+        (no vector -> 'failed') or a successful embed whose metadata update was
+        lost (vector present -> 'embedded'). Only Qdrant can tell them apart, so
+        check each candidate's point existence and set the truthful status.
+        Returns the number of rows reconciled.
+        """
+        candidates = await crud.query_orphaned_metadata(
+            self._db, min_age_seconds=min_age_seconds,
+        )
+        reconciled = 0
+        for memory_id, collection in candidates:
+            has_vector = await asyncio.to_thread(
+                self._point_exists, memory_id, collection,
+            )
+            status = "embedded" if has_vector else "failed"
+            await memory_crud.set_embedding_status(self._db, memory_id, status)
+            reconciled += 1
+        return reconciled
+
+    def _point_exists(self, memory_id: str, collection: str | None) -> bool:
+        """True if a Qdrant point for *memory_id* exists. Checks the metadata
+        collection first, then the other (the collection column can be stale).
+        Synchronous — call via ``asyncio.to_thread``.
+        """
+        collections = ["episodic_memory", "knowledge_base"]
+        if collection in collections:
+            collections.remove(collection)
+            collections.insert(0, collection)
+        for coll in collections:
+            try:
+                if self._qdrant.retrieve(
+                    collection_name=coll,
+                    ids=[memory_id],
+                    with_payload=False,
+                    with_vectors=False,
+                ):
+                    return True
+            except Exception:
+                continue
+        return False

@@ -185,9 +185,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   recovered memories keep their project_type recall filter.** When the embedding
   provider gave up on a memory, its status was left saying "still queued" forever —
   a stale marker that could trigger doomed writes to the vector store for a memory
-  that has no vector. Failed embeds are now recorded truthfully, a maintenance sweep
-  heals any that were already stranded, and deleting a memory now also clears its
-  entity mentions. Memories re-embedded after an outage also keep their `project_type`
+  that has no vector. Failed embeds are now recorded truthfully, and a
+  recovery pass heals any already-stranded rows — restoring the ones that did
+  embed and marking the ones that truly failed. Deleting a memory now also clears
+  its entity mentions. Memories re-embedded after an outage also keep their `project_type`
   so they stay visible in project-scoped recall.
 - **Storing a memory no longer briefly stalls other work while it talks to the
   vector store.** The store, supersede, and delete paths made blocking vector-store

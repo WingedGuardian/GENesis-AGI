@@ -202,21 +202,20 @@ class TestCountPending:
         assert await crud.count_pending(db) == 3
 
 
-class TestReconcileOrphanedMetadata:
-    """D5: relabel metadata orphans stuck 'pending' with no queue row as 'failed'."""
+class TestQueryOrphanedMetadata:
+    """D5: surface metadata orphans (pending, aged, no queue row) for reconcile."""
 
     @pytest.mark.asyncio
-    async def test_relabels_aged_orphan(self, db):
+    async def test_returns_aged_orphan_with_collection(self, db):
         from genesis.db.crud import memory as memory_crud
 
-        # metadata 'pending', old, with NO pending_embeddings row -> orphan.
+        # metadata 'pending', old, with NO pending_embeddings row -> candidate.
         await memory_crud.create_metadata(
             db, memory_id="orphan-1", created_at="2020-01-01T00:00:00",
-            embedding_status="pending",
+            collection="episodic_memory", embedding_status="pending",
         )
-        await crud.reconcile_orphaned_metadata(db)
-        meta = await memory_crud.get_metadata(db, "orphan-1")
-        assert meta["embedding_status"] == "failed"
+        cands = await crud.query_orphaned_metadata(db)
+        assert ("orphan-1", "episodic_memory") in cands
 
     @pytest.mark.asyncio
     async def test_spares_recent_orphan(self, db):
@@ -224,20 +223,19 @@ class TestReconcileOrphanedMetadata:
 
         from genesis.db.crud import memory as memory_crud
 
-        # A row younger than the age-gate is spared (mid-store() window).
+        # A row younger than the age-gate is not a candidate (mid-store() window).
         now = datetime.now(UTC).isoformat()
         await memory_crud.create_metadata(
             db, memory_id="fresh-1", created_at=now, embedding_status="pending",
         )
-        await crud.reconcile_orphaned_metadata(db)
-        meta = await memory_crud.get_metadata(db, "fresh-1")
-        assert meta["embedding_status"] == "pending"
+        cands = await crud.query_orphaned_metadata(db)
+        assert not any(mid == "fresh-1" for mid, _ in cands)
 
     @pytest.mark.asyncio
     async def test_ignores_pending_with_live_queue_row(self, db):
         from genesis.db.crud import memory as memory_crud
 
-        # Aged metadata 'pending' but WITH a live queue row -> not an orphan.
+        # Aged metadata 'pending' but WITH a live queue row -> not a candidate.
         await memory_crud.create_metadata(
             db, memory_id="queued-1", created_at="2020-01-01T00:00:00",
             embedding_status="pending",
@@ -247,9 +245,8 @@ class TestReconcileOrphanedMetadata:
             memory_type="episodic", collection="episodic_memory",
             created_at="2020-01-01T00:00:00",
         )
-        await crud.reconcile_orphaned_metadata(db)
-        meta = await memory_crud.get_metadata(db, "queued-1")
-        assert meta["embedding_status"] == "pending"
+        cands = await crud.query_orphaned_metadata(db)
+        assert not any(mid == "queued-1" for mid, _ in cands)
 
 
 class TestResetFailedMirror:

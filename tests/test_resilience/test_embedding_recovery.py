@@ -217,3 +217,52 @@ class TestDrainPending:
         # metadata mirror also 'failed' — the D5 fix
         meta = await memory_crud.get_metadata(db, "mem-x")
         assert meta["embedding_status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_orphan_with_vector_marks_embedded(self, db, worker):
+        """A metadata orphan whose Qdrant point EXISTS was a lost-metadata-update
+        success -> reconcile heals it to 'embedded', not 'failed'."""
+        from genesis.db.crud import memory as memory_crud
+
+        w, _, qdrant = worker
+        await memory_crud.create_metadata(
+            db, memory_id="orph-vec", created_at="2020-01-01T00:00:00",
+            collection="episodic_memory", embedding_status="pending",
+        )
+        qdrant.retrieve = MagicMock(return_value=[object()])  # a point exists
+        assert await w.reconcile_orphaned_metadata() == 1
+        meta = await memory_crud.get_metadata(db, "orph-vec")
+        assert meta["embedding_status"] == "embedded"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_orphan_without_vector_marks_failed(self, db, worker):
+        """A metadata orphan with NO Qdrant point was a genuine failed embed ->
+        reconcile marks it 'failed'."""
+        from genesis.db.crud import memory as memory_crud
+
+        w, _, qdrant = worker
+        await memory_crud.create_metadata(
+            db, memory_id="orph-novec", created_at="2020-01-01T00:00:00",
+            collection="episodic_memory", embedding_status="pending",
+        )
+        qdrant.retrieve = MagicMock(return_value=[])  # no point in either collection
+        assert await w.reconcile_orphaned_metadata() == 1
+        meta = await memory_crud.get_metadata(db, "orph-novec")
+        assert meta["embedding_status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_spares_fresh_orphan(self, db, worker):
+        """A fresh orphan (< age gate) is not reconciled — the mid-store() window."""
+        from datetime import UTC, datetime
+
+        from genesis.db.crud import memory as memory_crud
+
+        w, _, qdrant = worker
+        qdrant.retrieve = MagicMock(return_value=[])
+        await memory_crud.create_metadata(
+            db, memory_id="fresh-orph", created_at=datetime.now(UTC).isoformat(),
+            embedding_status="pending",
+        )
+        assert await w.reconcile_orphaned_metadata() == 0
+        meta = await memory_crud.get_metadata(db, "fresh-orph")
+        assert meta["embedding_status"] == "pending"

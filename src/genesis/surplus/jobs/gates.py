@@ -156,21 +156,6 @@ async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
     except Exception:
         logger.warning("GC: pending_embeddings purge failed", exc_info=True)
 
-    # GC: reconcile metadata orphans stuck at 'pending' with no queue row.
-    # An embed that failed before the truthful-on-failure fix (or whose 'failed'
-    # queue row was already reaped above) leaves memory_metadata at 'pending'
-    # forever — no vector, and a lie that _mark_superseded's Qdrant guard reads.
-    try:
-        from genesis.db.crud import pending_embeddings as pe_crud
-        reconciled = await pe_crud.reconcile_orphaned_metadata(db)
-        if reconciled:
-            logger.info(
-                "Reconciled %d orphaned memory_metadata rows (pending->failed)",
-                reconciled,
-            )
-    except Exception:
-        logger.warning("GC: metadata orphan reconcile failed", exc_info=True)
-
     # GC tripwire: FTS <-> metadata store consistency, BOTH directions. An FTS
     # row with no metadata row is a ghost; a metadata row with no FTS row is
     # invisible to keyword/hybrid search. Both should be 0 (store() writes both

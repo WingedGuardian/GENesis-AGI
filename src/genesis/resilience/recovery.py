@@ -124,6 +124,18 @@ class RecoveryOrchestrator:
             # cycle output (extraction queues FTS5-only, recovery embeds at pace).
             report.embeddings_recovered = await self._embedding_worker.drain_pending(limit=500)
 
+            # 2b. Reconcile metadata orphans (pending, no queue row) against
+            # Qdrant — a lost metadata update can leave a vectored memory stuck
+            # 'pending'; mark it 'embedded' if the point exists, else 'failed'.
+            try:
+                reconciled = await self._embedding_worker.reconcile_orphaned_metadata()
+                if reconciled:
+                    logger.info(
+                        "Reconciled %d orphaned memory_metadata rows", reconciled,
+                    )
+            except Exception:
+                logger.warning("Failed to reconcile orphaned metadata", exc_info=True)
+
             # 3. Re-dispatch dead letters (or mark-only if no dispatch_fn).
             if self._dispatch_fn is not None and hasattr(self._dead_letter, "redispatch"):
                 succeeded, failed = await self._dead_letter.redispatch(self._dispatch_fn)
