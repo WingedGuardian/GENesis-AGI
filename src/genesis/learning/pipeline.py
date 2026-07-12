@@ -222,9 +222,7 @@ def build_triage_pipeline(
             or (outcome == OutcomeClass.SUCCESS and is_autonomous)
         ):
             try:
-                logger.debug(
-                    "Running deprecated procedure extraction (legacy 500-char path)"
-                )
+                logger.debug("Running deprecated procedure extraction (legacy 500-char path)")
                 summary_text = f"User: {summary.user_text}\nOutput: {summary.response_text[:500]}"
                 await extract_procedure(
                     db,
@@ -253,7 +251,9 @@ def build_triage_pipeline(
             # GROUNDWORK(bis): Additive — steering rule behavior unchanged.
             try:
                 await _record_behavioral_correction(
-                    db, summary, observation_writer,
+                    db,
+                    summary,
+                    observation_writer,
                 )
             except Exception:
                 logger.error("BIS correction capture failed (non-fatal)", exc_info=True)
@@ -271,7 +271,8 @@ def build_triage_pipeline(
             )
 
     def _extract_steering_rule(
-        summary: Any, loader: Any,
+        summary: Any,
+        loader: Any,
     ) -> None:
         """Extract a steering rule from a user correction and add to STEERING.md.
 
@@ -295,7 +296,9 @@ def build_triage_pipeline(
         logger.info("Auto-added steering rule from user correction: %.80s...", rule)
 
     async def _record_behavioral_correction(
-        db_conn: Any, summary: Any, obs_writer: ObservationWriter,
+        db_conn: Any,
+        summary: Any,
+        obs_writer: ObservationWriter,
     ) -> None:
         """Capture a raw behavioral correction for BIS theme clustering.
 
@@ -355,7 +358,9 @@ def build_triage_pipeline(
 
         attributions = set()
         if delta and hasattr(delta, "attributions"):
-            attributions = {a.value if hasattr(a, "value") else str(a) for a in (delta.attributions or [])}
+            attributions = {
+                a.value if hasattr(a, "value") else str(a) for a in (delta.attributions or [])
+            }
 
         outcome_val = outcome.value if hasattr(outcome, "value") else str(outcome)
 

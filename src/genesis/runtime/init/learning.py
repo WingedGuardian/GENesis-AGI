@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import logging
 from datetime import UTC, datetime
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.env import cc_project_dir, user_timezone
+from genesis.runtime.init.process_reaper import _wire_process_reaper
 
 if TYPE_CHECKING:
     from genesis.runtime._core import GenesisRuntime
@@ -35,6 +35,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             return
         try:
             from genesis.db.crud import execution_traces as _et
+
             removed = await _et.prune_older_than(rt._db, days=90)
             rt.record_job_success("execution_traces_prune")
             if removed:
@@ -56,6 +57,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             return
         try:
             from genesis.db.crud import cost_events as _ce
+
             removed = await _ce.prune_older_than(rt._db, days=90)
             rt.record_job_success("cost_events_prune")
             if removed:
@@ -77,6 +79,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             return
         try:
             from genesis.db.crud import file_modifications as _fm
+
             removed = await _fm.prune_older_than(rt._db, days=90)
             rt.record_job_success("file_modifications_prune")
             if removed:
@@ -98,8 +101,7 @@ async def init(rt: GenesisRuntime) -> None:
     """Initialize learning pipeline, triage, calibration, harvest, and all scheduled jobs."""
     if rt._db is None or rt._router is None:
         logger.warning(
-            "Learning skipped — missing prerequisites "
-            "(db=%s, router=%s)",
+            "Learning skipped — missing prerequisites (db=%s, router=%s)",
             rt._db is not None,
             rt._router is not None,
         )
@@ -254,7 +256,9 @@ async def init(rt: GenesisRuntime) -> None:
                     logger.debug("Triage calibration skipped (Genesis paused)")
                     return
             except Exception:
-                logger.warning("Pause check failed — skipping calibration as precaution", exc_info=True)
+                logger.warning(
+                    "Pause check failed — skipping calibration as precaution", exc_info=True
+                )
                 return
             try:
                 result = await _original_calibration()
@@ -287,7 +291,8 @@ async def init(rt: GenesisRuntime) -> None:
                     return
             except Exception:
                 logger.warning(
-                    "Pause check failed — skipping email gate drain", exc_info=True,
+                    "Pause check failed — skipping email gate drain",
+                    exc_info=True,
                 )
                 return
             try:
@@ -318,18 +323,21 @@ async def init(rt: GenesisRuntime) -> None:
                     return
             except Exception:
                 logger.warning(
-                    "Pause check failed — skipping capability decay", exc_info=True,
+                    "Pause check failed — skipping capability decay",
+                    exc_info=True,
                 )
                 return
             try:
                 decayed = await _cg.decay_stale_cells(
-                    rt._db, now=datetime.now(UTC).isoformat(),
+                    rt._db,
+                    now=datetime.now(UTC).isoformat(),
                 )
                 rt.record_job_success("capability_decay_sweep")
                 if decayed:
                     logger.info(
                         "Capability decay: %d stale grant(s) lapsed: %s",
-                        len(decayed), ", ".join(decayed),
+                        len(decayed),
+                        ", ".join(decayed),
                     )
             except Exception as exc:
                 rt.record_job_failure("capability_decay_sweep", str(exc))
@@ -364,13 +372,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         async def _harvest_and_store() -> None:
             try:
-                memory_dir = (
-                    Path.home()
-                    / ".claude"
-                    / "projects"
-                    / cc_project_dir()
-                    / "memory"
-                )
+                memory_dir = Path.home() / ".claude" / "projects" / cc_project_dir() / "memory"
                 items = harvest_auto_memory(memory_dir)
                 stored = 0
                 skipped = 0
@@ -399,7 +401,9 @@ async def init(rt: GenesisRuntime) -> None:
                 if items:
                     logger.info(
                         "Harvested %d auto-memory items (%d new, %d dedup-skipped)",
-                        len(items), stored, skipped,
+                        len(items),
+                        stored,
+                        skipped,
                     )
                 rt.record_job_success("auto_memory_harvest")
             except Exception as exc:
@@ -422,7 +426,8 @@ async def init(rt: GenesisRuntime) -> None:
                 if count or stale:
                     logger.info(
                         "Observation expiry sweep: resolved %d expired, %d stale persistent",
-                        count, stale,
+                        count,
+                        stale,
                     )
             except Exception as exc:
                 rt.record_job_failure("observation_expiry_sweep", str(exc))
@@ -444,7 +449,8 @@ async def init(rt: GenesisRuntime) -> None:
                 rt.record_job_success("follow_up_retention_sweep")
                 if count:
                     logger.info(
-                        "Follow-up retention sweep: purged %d old records", count,
+                        "Follow-up retention sweep: purged %d old records",
+                        count,
                     )
             except Exception as exc:
                 rt.record_job_failure("follow_up_retention_sweep", str(exc))
@@ -479,8 +485,8 @@ async def init(rt: GenesisRuntime) -> None:
                 rt.record_job_success("inbox_marker_decay")
                 if decayed:
                     logger.info(
-                        "Inbox marker decay: aged out %d stale attention "
-                        "marker(s)", decayed,
+                        "Inbox marker decay: aged out %d stale attention marker(s)",
+                        decayed,
                     )
             except Exception as exc:
                 rt.record_job_failure("inbox_marker_decay", str(exc))
@@ -535,6 +541,7 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=300,
         )
         from genesis.util.tasks import tracked_task as _tt
+
         _tt(_validate_keys(), name="initial_api_key_validation")
         # Boot kick: run recovery housekeeping (dead-letter replay, stuck-
         # processing expiry, pending embeddings) immediately instead of
@@ -564,9 +571,12 @@ async def init(rt: GenesisRuntime) -> None:
         async def _expire_stale_messages() -> None:
             try:
                 from genesis.db.crud import message_queue
+
                 now = datetime.now(UTC).isoformat()
                 expired = await message_queue.expire_older_than(
-                    rt._db, max_age_hours=168, expired_at=now,
+                    rt._db,
+                    max_age_hours=168,
+                    expired_at=now,
                 )
                 rt.record_job_success("message_queue_expiry")
                 if expired:
@@ -589,7 +599,9 @@ async def init(rt: GenesisRuntime) -> None:
                     logger.debug("Dead letter redispatch skipped (Genesis paused)")
                     return
             except Exception:
-                logger.warning("Pause check failed — skipping redispatch as precaution", exc_info=True)
+                logger.warning(
+                    "Pause check failed — skipping redispatch as precaution", exc_info=True
+                )
                 return
             if rt._dead_letter_queue is not None and rt._router is not None:
                 try:
@@ -600,11 +612,13 @@ async def init(rt: GenesisRuntime) -> None:
                     if ok or fail:
                         logger.info(
                             "Dead letter redispatch: %d succeeded, %d failed",
-                            ok, fail,
+                            ok,
+                            fail,
                         )
                 except Exception:
                     rt.record_job_failure(
-                        "dead_letter_redispatch", "redispatch failed",
+                        "dead_letter_redispatch",
+                        "redispatch failed",
                     )
                     logger.exception("Dead letter redispatch failed")
 
@@ -619,6 +633,7 @@ async def init(rt: GenesisRuntime) -> None:
         async def _run_procedure_promotion() -> None:
             try:
                 from genesis.learning.procedural.promoter import promote_and_demote
+
                 result = await promote_and_demote(rt._db)
                 rt.record_job_success("procedure_promotion")
                 if any(v > 0 for v in result.values()):
@@ -634,6 +649,7 @@ async def init(rt: GenesisRuntime) -> None:
                 from genesis.learning.procedural.promoter import (
                     backfill_missing_embeddings,
                 )
+
                 await backfill_missing_embeddings(rt._db)
             except Exception:
                 logger.exception("Procedure embedding backfill failed")
@@ -676,8 +692,7 @@ async def init(rt: GenesisRuntime) -> None:
                     identity_loader = getattr(rt, "_identity_loader", None)
                     if identity_loader is None:
                         logger.warning(
-                            "identity_loader not available, skipping "
-                            "USER_KNOWLEDGE.md synthesis",
+                            "identity_loader not available, skipping USER_KNOWLEDGE.md synthesis",
                         )
                     else:
                         narrative: str | None = None
@@ -698,8 +713,7 @@ async def init(rt: GenesisRuntime) -> None:
                             # synthesis can be rolled back (Option B: no loader change).
                             uk_path = identity_loader._dir / "USER_KNOWLEDGE.md"
                             prior_uk = (
-                                uk_path.read_text(encoding="utf-8")
-                                if uk_path.exists() else None
+                                uk_path.read_text(encoding="utf-8") if uk_path.exists() else None
                             )
                             identity_loader.write_user_knowledge_md(
                                 result.model,
@@ -733,8 +747,7 @@ async def init(rt: GenesisRuntime) -> None:
                                 )
                             if narrative:
                                 logger.info(
-                                    "USER_KNOWLEDGE.md updated via LLM "
-                                    "synthesis (call site 11)",
+                                    "USER_KNOWLEDGE.md updated via LLM synthesis (call site 11)",
                                 )
                             else:
                                 logger.info(
@@ -750,7 +763,9 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _evolve_user_model,
-            CronTrigger(hour=6, minute=30, timezone=user_timezone()),  # moved from 4:30 to avoid dream cycle window
+            CronTrigger(
+                hour=6, minute=30, timezone=user_timezone()
+            ),  # moved from 4:30 to avoid dream cycle window
             id="user_model_evolution",
             max_instances=1,
             misfire_grace_time=3600,
@@ -814,7 +829,9 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _refresh_capability_map,
-            CronTrigger(hour="9,21", minute=15, timezone=user_timezone()),  # moved from 4:15/16:15 to avoid dream cycle window
+            CronTrigger(
+                hour="9,21", minute=15, timezone=user_timezone()
+            ),  # moved from 4:15/16:15 to avoid dream cycle window
             id="capability_map_refresh",
             max_instances=1,
             misfire_grace_time=3600,
@@ -872,7 +889,8 @@ async def init(rt: GenesisRuntime) -> None:
                 if snap is not None:
                     logger.info(
                         "Ego calibration: ECE=%.4f n=%d%s",
-                        snap["ece"], snap["sample_count"],
+                        snap["ece"],
+                        snap["sample_count"],
                         " (low-confidence)" if snap["low_confidence"] else "",
                     )
             except Exception as exc:
@@ -961,156 +979,10 @@ async def init(rt: GenesisRuntime) -> None:
         # testable seam so the registration is covered, not just the crud prunes).
         _wire_drip_retention_jobs(rt._learning_scheduler, rt)
 
-        async def _reap_stale_processes() -> None:
-            """Kill leaked processes older than their configured threshold.
-
-            Targets:
-              - opencode-ai: 24 hours (pgrep -f, matches command line)
-              - claude: 7 days (pgrep -x, matches exact process name)
-
-            Kills the full descendant tree (children, grandchildren) of each
-            stale process to prevent orphaned MCP servers, Playwright, etc.
-            """
-            import asyncio
-            import os
-
-            from genesis.browser.types import BROWSER_PGREP_PATTERNS
-
-            # (pgrep_flag, pattern, max_age_hours, label)
-            targets = [
-                ("-f", "opencode-ai", 24, "opencode-ai"),
-                ("-x", "claude", 168, "claude"),  # 7 days
-            ]
-            # Browser processes — 4h max age. Idle timeout fires at 1h,
-            # MCP lifespan fires on session end. A 4h-old browser process
-            # has survived both layers and is definitively orphaned.
-            for bp in BROWSER_PGREP_PATTERNS:
-                targets.append(("-f", bp, 4, f"browser:{bp}"))
-            my_pid = os.getpid()
-            my_ppid = os.getppid()
-            protected = {my_pid, my_ppid}
-
-            async def _get_descendants(pid: int, depth: int = 0) -> list[int]:
-                """Return all descendant PIDs (children-first / bottom-up)."""
-                if depth >= 10:
-                    return []
-                proc = await asyncio.create_subprocess_exec(
-                    "pgrep", "-P", str(pid),
-                    stdout=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await proc.communicate()
-                if not stdout.strip():
-                    return []
-                children = [
-                    int(p.strip()) for p in stdout.decode().strip().split("\n")
-                    if p.strip()
-                ]
-                result: list[int] = []
-                for child in children:
-                    result.extend(await _get_descendants(child, depth + 1))
-                result.extend(children)
-                return result
-
-            try:
-                all_killed: list[tuple[int, str]] = []
-                for flag, pattern, max_age_h, label in targets:
-                    proc = await asyncio.create_subprocess_exec(
-                        "pgrep", flag, pattern,
-                        stdout=asyncio.subprocess.PIPE,
-                    )
-                    stdout, _ = await proc.communicate()
-                    if not stdout.strip():
-                        continue
-
-                    max_age = max_age_h * 3600
-                    clock_ticks = os.sysconf("SC_CLK_TCK")
-
-                    for pid_str in stdout.decode().strip().split("\n"):
-                        pid = int(pid_str.strip())
-                        if pid <= 1 or pid in protected:
-                            continue
-                        try:
-                            if not Path(f"/proc/{pid}/stat").exists():
-                                continue
-                            with open(f"/proc/{pid}/stat") as f:
-                                raw = f.read()
-                            # comm field (field 2) is in parens and may
-                            # contain spaces; split after the last ')'.
-                            after_comm = raw[raw.rfind(")") + 2:]
-                            start_ticks = int(after_comm.split()[19])
-                            with open("/proc/uptime") as f:
-                                uptime_secs = float(f.read().split()[0])
-                            age_secs = uptime_secs - (start_ticks / clock_ticks)
-                            if age_secs > max_age:
-                                # Collect descendants bottom-up, then the root
-                                tree = await _get_descendants(pid)
-                                tree.append(pid)
-                                for p in tree:
-                                    if p <= 1 or p in protected:
-                                        continue
-                                    with contextlib.suppress(ProcessLookupError):
-                                        os.kill(p, 15)  # SIGTERM
-                                    all_killed.append((p, label))
-                        except (ProcessLookupError, FileNotFoundError, ValueError):
-                            continue
-
-                if all_killed:
-                    # 5s grace period for graceful shutdown — browsers need
-                    # time to flush profile SQLite and release locks.
-                    await asyncio.sleep(5)
-                    for pid, _ in all_killed:
-                        with contextlib.suppress(ProcessLookupError):
-                            os.kill(pid, 9)  # SIGKILL
-                    logger.info(
-                        "Process reaper: killed %d stale process(es): %s",
-                        len(all_killed),
-                        all_killed,
-                    )
-                    # Create observation for visibility
-                    if rt._db is not None:
-                        try:
-                            import json
-                            from datetime import UTC, datetime
-                            from uuid import uuid4
-
-                            from genesis.db.crud import observations
-
-                            await observations.create(
-                                rt._db,
-                                id=f"reaper-{uuid4().hex[:8]}",
-                                source="process_reaper",
-                                type="process_reaper_kill",
-                                priority="low",
-                                content=json.dumps({
-                                    "killed_count": len(all_killed),
-                                    "processes": [
-                                        {"pid": p, "label": lbl}
-                                        for p, lbl in all_killed
-                                    ],
-                                }),
-                                created_at=datetime.now(UTC).isoformat(),
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Failed to create reaper observation",
-                                exc_info=True,
-                            )
-                rt.record_job_success("process_reaper")
-            except Exception as exc:
-                rt.record_job_failure("process_reaper", str(exc))
-                logger.exception("Process reaper failed")
-
-        # CronTrigger instead of IntervalTrigger: IntervalTrigger resets on
-        # server restart, so the reaper never fires if the server restarts
-        # within the hour.  Runs at :15 past every hour to avoid collision
-        # with hour-boundary jobs.
-        rt._learning_scheduler.add_job(
-            _reap_stale_processes,
-            CronTrigger(minute=15),
-            id="process_reaper",
-            max_instances=1,
-            misfire_grace_time=600,
-        )
+        # Process reaper (leaked opencode/browser by age; claude by IDLE
+        # policy — activity markers + live-terminal gate, dry-run→auto-arm).
+        # Extracted to a testable seam; see process_reaper.py.
+        _wire_process_reaper(rt._learning_scheduler, rt)
 
         # ── Skill evolution pipeline (weekly backup trigger) ────────────────
         async def _run_skill_evolution() -> None:
@@ -1123,7 +995,9 @@ async def init(rt: GenesisRuntime) -> None:
                     outreach_fn = outreach_pipeline.submit
 
                 pipeline = SkillEvolutionPipeline(
-                    db=rt._db, router=rt._router, outreach_fn=outreach_fn,
+                    db=rt._db,
+                    router=rt._router,
+                    outreach_fn=outreach_fn,
                 )
                 result = await pipeline.run()
                 if result["proposed"] > 0 or result["applied"] > 0:
@@ -1135,7 +1009,9 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _run_skill_evolution,
-            CronTrigger(day_of_week="sat", hour=4, minute=0, timezone=user_timezone()),  # moved off Sunday to avoid dream cycle
+            CronTrigger(
+                day_of_week="sat", hour=4, minute=0, timezone=user_timezone()
+            ),  # moved off Sunday to avoid dream cycle
             id="skill_evolution",
             max_instances=1,
             misfire_grace_time=3600,
@@ -1146,6 +1022,7 @@ async def init(rt: GenesisRuntime) -> None:
         async def _run_j9_eval_aggregation():
             try:
                 from genesis.eval.j9_aggregator import run_weekly_aggregation
+
                 results = await run_weekly_aggregation(rt._db)
                 dims_computed = len(results)
                 logger.info("J9 weekly aggregation: %d dimensions computed", dims_computed)
@@ -1158,7 +1035,8 @@ async def init(rt: GenesisRuntime) -> None:
                     )
 
                     regressions = await check_and_alert_regressions(
-                        rt._db, getattr(rt, "_outreach_pipeline", None),
+                        rt._db,
+                        getattr(rt, "_outreach_pipeline", None),
                     )
                     if regressions:
                         logger.info(
@@ -1174,7 +1052,9 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _run_j9_eval_aggregation,
-            CronTrigger(day_of_week="sun", hour=7, minute=30, timezone=user_timezone()),  # :30 to avoid schedule_analytical at 7:00
+            CronTrigger(
+                day_of_week="sun", hour=7, minute=30, timezone=user_timezone()
+            ),  # :30 to avoid schedule_analytical at 7:00
             id="j9_eval_aggregation",
             max_instances=1,
             misfire_grace_time=3600,
@@ -1188,6 +1068,7 @@ async def init(rt: GenesisRuntime) -> None:
                 from genesis.eval.pr_review_harvest import (
                     harvest_pr_review_findings,
                 )
+
                 summary = await harvest_pr_review_findings(rt._db)
                 if summary.get("error"):
                     # Error-dict return (repo-resolve / pr-list failure):
@@ -1243,7 +1124,9 @@ async def init(rt: GenesisRuntime) -> None:
                 for model in models:
                     try:
                         summary = await run_gauntlet(
-                            model, db=rt._db, trigger=EvalTrigger.SCHEDULE,
+                            model,
+                            db=rt._db,
+                            trigger=EvalTrigger.SCHEDULE,
                         )
                     except RosterError:
                         logger.info(
@@ -1257,11 +1140,15 @@ async def init(rt: GenesisRuntime) -> None:
                     ran += 1
                     try:
                         await check_gauntlet_regression(
-                            rt._db, summary, getattr(rt, "_outreach_pipeline", None),
+                            rt._db,
+                            summary,
+                            getattr(rt, "_outreach_pipeline", None),
                         )
                     except Exception:
                         logger.warning(
-                            "gauntlet regression check failed for %s", model, exc_info=True,
+                            "gauntlet regression check failed for %s",
+                            model,
+                            exc_info=True,
                         )
                 logger.info("Model gauntlet: ran %d/%d roster model(s)", ran, len(models))
                 rt.record_job_success("model_gauntlet")
@@ -1285,4 +1172,7 @@ async def init(rt: GenesisRuntime) -> None:
     except Exception as exc:
         logger.exception("Failed to initialize learning")
         from genesis.runtime._degradation import record_init_degradation
-        await record_init_degradation(rt._db, rt._event_bus, "learning", "learning_scheduler", str(exc), severity="error")
+
+        await record_init_degradation(
+            rt._db, rt._event_bus, "learning", "learning_scheduler", str(exc), severity="error"
+        )

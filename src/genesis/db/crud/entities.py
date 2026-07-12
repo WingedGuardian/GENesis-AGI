@@ -153,6 +153,28 @@ async def upsert_mention(
         await db.commit()
 
 
+async def delete_mentions_by_memory(
+    db: aiosqlite.Connection,
+    *,
+    memory_id: str,
+    _commit: bool = True,
+) -> int:
+    """Delete all entity mentions for a memory. Returns count deleted.
+
+    Mentions are written keyed by ``memory_id`` (see :func:`upsert_mention`,
+    called from memory/store.py's write path). ``MemoryStore.delete`` must
+    cascade here or a deleted memory leaves dangling mention rows pointing at
+    a memory_id that no longer exists.
+    """
+    cursor = await db.execute(
+        "DELETE FROM entity_mentions WHERE memory_id = ?",
+        (memory_id,),
+    )
+    if _commit:
+        await db.commit()
+    return cursor.rowcount
+
+
 async def upsert_link(
     db: aiosqlite.Connection,
     *,

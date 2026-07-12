@@ -36,8 +36,13 @@ _WEIGHTS = {
 # moderate cap. (Replaces a flat 80-char truncation that destroyed every command
 # — verified 2026-06-30 to be the reason the builder wrote essays, not playbooks.)
 _ARG_CAPS = {
-    "Bash": 800, "Edit": 800, "Write": 800, "Read": 800, "NotebookEdit": 800,
-    "Grep": 400, "Glob": 300,
+    "Bash": 800,
+    "Edit": 800,
+    "Write": 800,
+    "Read": 800,
+    "NotebookEdit": 800,
+    "Grep": 400,
+    "Glob": 300,
     # ExitPlanMode is handled by an early return in _summarize_args (plan prose,
     # not an action); kept here as defense if that early return is ever removed.
     "ExitPlanMode": 0,
@@ -59,11 +64,14 @@ def _summarize_args(tool_name: str, tool_input: object) -> str:
         return ""  # plan prose, not an action
     if isinstance(tool_input, dict):
         if tool_name == "Edit" and "old_string" in tool_input:
-            return json.dumps({
-                "file_path": tool_input.get("file_path", ""),
-                "old": str(tool_input.get("old_string", ""))[:400],
-                "new": str(tool_input.get("new_string", ""))[:400],
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "file_path": tool_input.get("file_path", ""),
+                    "old": str(tool_input.get("old_string", ""))[:400],
+                    "new": str(tool_input.get("new_string", ""))[:400],
+                },
+                ensure_ascii=False,
+            )
         args_text = json.dumps(tool_input, ensure_ascii=False)
     else:
         args_text = str(tool_input)
@@ -122,14 +130,16 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
                         text = content_blocks[:200]
                         if text.strip():
                             turn += 1
-                            spine.append({
-                                "turn": turn,
-                                "type": "user",
-                                "tool": None,
-                                "args_summary": text,
-                                "outcome": "ok",
-                                "error_text": "",
-                            })
+                            spine.append(
+                                {
+                                    "turn": turn,
+                                    "type": "user",
+                                    "tool": None,
+                                    "args_summary": text,
+                                    "outcome": "ok",
+                                    "error_text": "",
+                                }
+                            )
                     continue
 
                 for block in content_blocks:
@@ -173,7 +183,8 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
                         result_content = block.get("content", "")
                         if isinstance(result_content, list):
                             result_content = " ".join(
-                                str(b.get("text", "")) for b in result_content
+                                str(b.get("text", ""))
+                                for b in result_content
                                 if isinstance(b, dict)
                             )
 
@@ -187,14 +198,16 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
                         text = block.get("text", "")
                         if text.strip():
                             turn += 1
-                            spine.append({
-                                "turn": turn,
-                                "type": "user",
-                                "tool": None,
-                                "args_summary": text[:200],
-                                "outcome": "ok",
-                                "error_text": "",
-                            })
+                            spine.append(
+                                {
+                                    "turn": turn,
+                                    "type": "user",
+                                    "tool": None,
+                                    "args_summary": text[:200],
+                                    "outcome": "ok",
+                                    "error_text": "",
+                                }
+                            )
 
     except FileNotFoundError:
         logger.warning("Transcript not found: %s", transcript_path)
@@ -216,6 +229,23 @@ def build_action_spine(transcript_path: Path) -> list[dict]:
     their ``list[dict]`` contract; the builder path uses build_spine_and_haystack.
     """
     return build_spine_and_haystack(transcript_path)[0]
+
+
+def derive_session_origin(spine: list[dict]) -> str:
+    """WS-3 gate-1 origin for a procedure promoted from this session's spine.
+
+    Coarse tool-name provenance: ``external_untrusted`` if the session used any
+    external-ingest tool, else ``first_party``. The tool-name set + matching
+    logic live in ``memory.provenance.origin_from_tool_names`` (the DRY home);
+    this only projects the spine down to its tool names. See that helper for the
+    shadow-vs-enforce honesty note (tool NAMES over-approximate; enforce needs
+    tool_result provenance).
+    """
+    from genesis.memory.provenance import origin_from_tool_names
+
+    return origin_from_tool_names(
+        entry.get("tool") for entry in spine if entry.get("type") == "tool"
+    )
 
 
 def score_struggle(spine: list[dict]) -> float:
@@ -250,9 +280,11 @@ def score_struggle(spine: list[dict]) -> float:
             continue
         # Same tool, within 10 turns of each other
         prev = tool_entries[i - 1]
-        if (entry["tool"] == prev["tool"]
-                and entry["args_summary"] != prev["args_summary"]
-                and entry["turn"] - prev["turn"] <= 10):
+        if (
+            entry["tool"] == prev["tool"]
+            and entry["args_summary"] != prev["args_summary"]
+            and entry["turn"] - prev["turn"] <= 10
+        ):
             retries += 1
     retry_signal = min(1.0, retries / 3)  # Normalize: 3+ retries → 1.0
 
@@ -323,9 +355,7 @@ def format_spine_for_judge(spine: list[dict]) -> str:
             continue
         turn = entry["turn"]
         outcome = "OK" if entry["outcome"] == "ok" else f"ERR: {entry['error_text'][:300]}"
-        lines.append(
-            f"[T={turn}] TOOL: {entry['tool']} {entry['args_summary']} -> {outcome}"
-        )
+        lines.append(f"[T={turn}] TOOL: {entry['tool']} {entry['args_summary']} -> {outcome}")
     text = "\n".join(lines)
     if len(text) > _MAX_SPINE_CHARS:
         text = "...[earlier turns truncated]...\n" + text[-_MAX_SPINE_CHARS:]

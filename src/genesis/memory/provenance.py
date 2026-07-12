@@ -16,6 +16,7 @@ retrieved from — always known at retrieval time, unlike the per-item store-tim
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 
 from genesis.security.sanitizer import (
     ContentSanitizer,
@@ -148,6 +149,105 @@ _FIRST_PARTY_PIPELINES = frozenset(
         "reference_store",
     }
 )
+
+# Tool NAMES whose USE means a session pulled EXTERNAL-WORLD content into its
+# working context — the signal WS-3 gate-1 (procedure) uses to classify a
+# promoted procedure's origin (from the action spine, or an ExecutionTrace's
+# ``tools_used``). CC built-ins are CamelCase; Genesis MCP tools arrive
+# namespaced (``mcp__<server>__web_fetch``) and are matched on their final
+# ``__``-delimited segment.
+#
+# Coarse-conservative BY DESIGN: "the session touched an external-ingest tool"
+# over-approximates "external content induced THIS procedure" — the judge builds
+# procedures from tool INPUTS plus its own reasoning, and fetched bodies live in
+# tool RESULTS, which the spine/haystack do not carry. Over-observing is the
+# correct SHADOW posture: the recorded rate is exactly what B4 measures before
+# any flip to enforce. Enforce-grade signal needs tool_RESULT provenance
+# (tracked as a WS-3 B4 follow-up).
+_EXTERNAL_INGEST_TOOLS = frozenset(
+    {
+        # CC built-in web tools
+        "WebFetch",
+        "WebSearch",
+        # Genesis MCP web + knowledge ingest (matched on final namespaced segment)
+        "web_fetch",
+        "web_search",
+        "web_agent",
+        "knowledge_recall",
+        "knowledge_ingest",
+        "knowledge_ingest_source",
+        "knowledge_ingest_batch",
+        "document_query",
+        # Mixed-source recall that can surface external KB content
+        # (memory_recall/memory_expand default to source='both'). Included per the
+        # over-observe posture — a session that recalled KB then promoted a
+        # procedure counts. If shadow saturates (these are common tools), the fix
+        # is item-level recall provenance (B4), not a coarser net. NB: knowledge_*
+        # recall above is KB-only (always external); memory_proactive runs as a
+        # hook, never in the tool spine, so it can't appear here.
+        "memory_recall",
+        "memory_expand",
+        # external recon — both the RUNNERS (fetch off the world) and the
+        # READERS (return stored external findings into the session context)
+        "recon_run_github_discovery",
+        "recon_run_github_discovery_job",
+        "recon_run_model_intelligence",
+        "recon_run_skill_scan",
+        "recon_findings",
+        "recon_triage",
+        "recon_cc_update_check",
+        # inbox evaluations summarize EXTERNAL inbox content into the session
+        "inbox_digest",
+        # module capabilities are external-facing by definition ("hands, not
+        # brain") — a module_call result can carry arbitrary external data
+        "module_call",
+        # external social fetch
+        "fetch_messages",
+        "fetch_forum_threads",
+    }
+)
+# Membership criterion for the set above: the tool's RESULT carries
+# external-world content into the session context (fetched, recalled from the
+# KB, or summarized from external sources). NOT in the set (documented
+# non-members): outreach_poll / conversation_history (inbound OWNER messages —
+# owner content, not external world), bookmark/observation readers (first-party
+# stored), health/campaign/status tools (internal state). When adding an MCP
+# tool whose output is external-derived, add it here — the shadow gate
+# undercounts silently otherwise.
+
+# Tool-name PREFIXES that signal external ingest. `browser_` covers the whole
+# browser-automation family by construction: ANY browser tool implies an
+# attached live web page whose content can enter the session (a session
+# resuming an already-open page reads it via browser_snapshot/browser_run_js/
+# browser_click without ever calling browser_navigate — Codex-flagged on PR
+# #1014). A future browser tool is external BY DEFAULT (same philosophy as the
+# reserved pipelines in _EXTERNAL_PIPELINES). Over-observes the couple of
+# page-less admin tools (browser_sessions, browser_clear_domain) — the correct
+# shadow posture.
+_EXTERNAL_INGEST_TOOL_PREFIXES = ("browser_",)
+
+
+def origin_from_tool_names(tool_names: Iterable[str | None]) -> str:
+    """Classify a session/trace origin from the NAMES of tools it used.
+
+    Returns :data:`ORIGIN_EXTERNAL_UNTRUSTED` if any tool name signals ingest of
+    external-world content (see :data:`_EXTERNAL_INGEST_TOOLS` and
+    :data:`_EXTERNAL_INGEST_TOOL_PREFIXES`), else :data:`ORIGIN_FIRST_PARTY`.
+    MCP names are matched on their final ``__``-delimited segment
+    (``mcp__genesis-health__web_fetch`` → ``web_fetch``).
+
+    Never returns ``owner`` — owner authorship is asserted at explicit call
+    sites (e.g. an explicit-teach MCP tool), never inferred from tool usage.
+    """
+    for name in tool_names:
+        if not name:
+            continue
+        base = name.rsplit("__", 1)[-1]
+        if name in _EXTERNAL_INGEST_TOOLS or base in _EXTERNAL_INGEST_TOOLS:
+            return ORIGIN_EXTERNAL_UNTRUSTED
+        if base.startswith(_EXTERNAL_INGEST_TOOL_PREFIXES):
+            return ORIGIN_EXTERNAL_UNTRUSTED
+    return ORIGIN_FIRST_PARTY
 
 
 def derive_origin_class(
