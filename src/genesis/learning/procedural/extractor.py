@@ -336,7 +336,6 @@ async def extract_procedure(
     router: _Router,
     embedding_provider: EmbeddingProvider | None = None,
     session_tools_count: int = 0,
-    session_origin: str | None = None,
 ) -> str | None:
     """Extract a procedure from an interaction summary via LLM.
 
@@ -579,27 +578,14 @@ async def extract_procedure(
             gate_result.adjusted_confidence,
         )
 
-        # WS-3 B1 gate-1 (procedure): shadow-record a would-block for this
-        # auto-extracted procedure, classified by ``session_origin`` — derived by
-        # the caller from the SOURCE session's actual tool spine
-        # (summary.tool_calls), NOT from data["tools_used"] (which is the
-        # extractor LLM's proposed replay-tool list, not source provenance). This
-        # path fires on exactly the autonomous / failure-recovery outcomes most
-        # likely to carry external content, so gating it on the true source tools
-        # is where the real shadow signal is. Self-guards to NO row for
-        # first_party/owner origins + the kill switch. Best-effort.
-        from genesis.memory.provenance import ORIGIN_FIRST_PARTY
-        from genesis.security import immunity_shadow
-
-        await immunity_shadow.record_would_block(
-            gate="procedure",
-            source_kind="procedure_promotion",
-            source_ref=proc_id,
-            process="server",
-            blockable_count=1,
-            origin_class=session_origin or ORIGIN_FIRST_PARTY,
-            db=db,
-        )
+        # WS-3 B1 gate-1 (procedure): NOT gated here — this legacy path has no
+        # reliable source-session tool signal. The only origin candidates are
+        # data["tools_used"] (the extractor LLM's proposed REPLAY tools, not
+        # source provenance) and summary.tool_calls (a heuristic, hyphen-
+        # truncating prose scrape from the summarizer). Gating on either would
+        # undercount silently. Deferred with the path's own removal (follow-up
+        # 3558802740d5); the primary judge path (extraction_job) IS gated on the
+        # real transcript spine.
 
         # Emit J9 event
         try:

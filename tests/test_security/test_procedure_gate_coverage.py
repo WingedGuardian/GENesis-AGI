@@ -52,20 +52,20 @@ PROCEDURE_GATE_SITES: dict[str, tuple[str, str]] = {
         "source-provenance follow-up, not a tool-name signal here",
     ),
     "mcp/memory/procedural.py::procedure_store": (
-        "gated",
-        "explicit-teach; emits origin_from_tool_names(tools_used) — NOT hardcoded "
-        "owner (the research profile exposes this tool alongside web tools, so a "
-        "background session can teach externally-influenced content). PR-B upgrades "
-        "to per-session origin",
+        "deferred-with-reason",
+        "MCP explicit-teach exposed in research/campaign profiles alongside web "
+        "tools — the correct origin is the CALLER's session provenance, which an "
+        "MCP tool sees only via PR-B's GENESIS_SESSION_ORIGIN env. tools_used is "
+        "the taught REPLAY tools, not caller provenance; gating on it undercounts. "
+        "PR-B wires the emit with the real session origin",
     ),
     "learning/procedural/extractor.py::extract_procedure": (
-        "gated",
-        "legacy 500-char fallback (still live from pipeline.py on "
-        "APPROACH_FAILURE / WORKAROUND_SUCCESS / autonomous SUCCESS — exactly the "
-        "outcomes most likely to carry external content); emits session_origin, "
-        "which the pipeline.py caller derives from the SOURCE session's tool spine "
-        "(summary.tool_calls) — NOT data['tools_used'] (the procedure's replay "
-        "tools). Full removal of this path is tracked as follow-up 3558802740d5",
+        "deferred-with-reason",
+        "deprecated 500-char fallback with NO reliable source-tool signal: "
+        "data['tools_used'] is the extractor's REPLAY tools, and summary.tool_calls "
+        "is a heuristic hyphen-truncating prose scrape (summarizer._extract_tool_calls) "
+        "— gating on either undercounts silently. Deferred with the path's removal "
+        "(follow-up 3558802740d5); the primary judge path is gated on the real spine",
     ),
     "learning/procedural/operations.py::store_procedure_checked": (
         "internal",

@@ -224,18 +224,12 @@ def build_triage_pipeline(
             try:
                 logger.debug("Running deprecated procedure extraction (legacy 500-char path)")
                 summary_text = f"User: {summary.user_text}\nOutput: {summary.response_text[:500]}"
-                # WS-3 gate-1: classify the extracted procedure's origin by the
-                # SOURCE session's actual tool spine (summary.tool_calls), not the
-                # extractor's proposed replay tools.
-                from genesis.memory.provenance import origin_from_tool_names
-
                 await extract_procedure(
                     db,
                     summary_text=summary_text,
                     outcome=outcome.value,
                     router=router,
                     session_tools_count=len(summary.tool_calls),
-                    session_origin=origin_from_tool_names(summary.tool_calls),
                 )
             except Exception:
                 logger.error("Procedure extraction failed (non-fatal)", exc_info=True)
