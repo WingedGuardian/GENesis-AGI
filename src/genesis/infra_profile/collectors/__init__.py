@@ -25,7 +25,6 @@ from genesis.infra_profile.collectors.container import (
 )
 from genesis.infra_profile.collectors.qdrant_facts import collect_qdrant
 from genesis.infra_profile.collectors.sqlite_facts import collect_sqlite
-
 from genesis.infra_profile.types import SectionResult
 
 # Container-plane collectors, in render order. Names must be unique — they key
