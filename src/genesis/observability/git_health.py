@@ -6,8 +6,10 @@ recovery lever (which needs healthy local git). These probes catch that class:
 
 - ``check_git_cheap`` — fast structural plumbing (config/HEAD/refs/packed-refs)
   + a rootfs read-only probe, safe to run on every awareness tick.
-- ``check_git_deep`` — ``git fsck --connectivity-only``, a slower reachability
-  scan for a daily job.
+- ``check_git_deep`` — ``git fsck --full``, a slower CONTENT-verifying scan for a
+  daily job (``--connectivity-only`` is deliberately NOT used: it skips object
+  rehashing, so a zero-filled-but-present loose blob — the exact outage pattern —
+  passes it; ``--full`` recomputes SHA-1s and catches it).
 
 Both write a verdict to the shared mount (``<shared>/guardian/git_health.json``)
 so the host guardian can enrich its own alert with the failure detail.
@@ -36,9 +38,9 @@ logger = logging.getLogger(__name__)
 # condition being detected. 10 s bounds the awareness tick without ever killing
 # legitimate work; a timeout is itself reported as a failure, never swallowed.
 _CHEAP_TIMEOUT_S = 10
-# `git fsck --connectivity-only` on this repo's ~118 MB .git is seconds-to-a-
-# minute healthy; 900 s gives 10x headroom on an IO-pressured pool while bounding
-# the daily job. A timeout is emitted as a signal, not a silent skip.
+# `git fsck --full` (content-verifying) on this repo's ~82 MB object store is ~6 s
+# healthy (measured); 900 s gives ~150x headroom on an IO-pressured pool while
+# bounding the daily job. A timeout is emitted as a signal, not a silent skip.
 _DEEP_TIMEOUT_S = 900
 
 _VERDICT_DIR = "guardian"
@@ -226,7 +228,7 @@ def _check_git_cheap_sync(repo: Path) -> GitHealthReport:
 
 
 async def check_git_deep(repo: Path | None = None) -> GitHealthReport:
-    """Deep reachability scan (`git fsck --connectivity-only`) for a daily job."""
+    """Deep content-verifying scan (`git fsck --full`) for a daily job."""
     repo = repo or repo_root()
     return await asyncio.to_thread(_check_git_deep_sync, repo)
 
@@ -234,12 +236,11 @@ async def check_git_deep(repo: Path | None = None) -> GitHealthReport:
 def _check_git_deep_sync(repo: Path) -> GitHealthReport:
     failures: list[str] = []
     details: dict = {}
-    # --connectivity-only checks that every reachable object is present without
-    # rehashing every object (which --full would, too heavy for a scheduled job).
-    # Missing reachable objects → non-zero. Dangling objects → exit 0 (benign).
-    rc, out, err = _run_git(
-        repo, "fsck", "--no-progress", "--connectivity-only", timeout=_DEEP_TIMEOUT_S
-    )
+    # --full recomputes every object's SHA-1, so it catches a zero-filled-but-
+    # present loose blob (the outage pattern) that --connectivity-only would miss
+    # (that flag only checks reachability, not content). Missing/corrupt objects →
+    # non-zero. Dangling objects → exit 0 (benign, not a failure).
+    rc, out, err = _run_git(repo, "fsck", "--no-progress", "--full", timeout=_DEEP_TIMEOUT_S)
     if rc == -1:
         failures.append("fsck_timeout")
     elif rc != 0:

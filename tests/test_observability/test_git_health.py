@@ -122,11 +122,9 @@ class TestDeepCheck:
         assert rep.ok is True
         assert rep.kind == "deep"
 
-    @pytest.mark.asyncio
-    async def test_missing_loose_object_fails_fsck(self, repo):
-        # Write a file + commit so there are real blob/tree objects, then delete
-        # one loose object → fsck --connectivity-only reports it missing.
-        (repo / "f.txt").write_text("hello\n")
+    @staticmethod
+    def _commit_file(repo, name="f.txt", content="hello\n"):
+        (repo / name).write_text(content)
         env = {
             **os.environ,
             "GIT_AUTHOR_NAME": "t",
@@ -134,14 +132,42 @@ class TestDeepCheck:
             "GIT_COMMITTER_NAME": "t",
             "GIT_COMMITTER_EMAIL": "t@t",
         }
-        subprocess.run(["git", "-C", str(repo), "add", "f.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", name], check=True)
         subprocess.run(["git", "-C", str(repo), "commit", "-m", "add", "-q"], check=True, env=env)
+
+    @pytest.mark.asyncio
+    async def test_missing_loose_object_fails_fsck(self, repo):
+        # Write a file + commit so there are real blob/tree objects, then delete
+        # one loose object → fsck reports it missing.
+        self._commit_file(repo)
         objdir = repo / ".git" / "objects"
         loose = [
             p for d in objdir.iterdir() if d.is_dir() and len(d.name) == 2 for p in d.iterdir()
         ]
         assert loose, "expected loose objects"
         loose[0].unlink()
+        rep = await g.check_git_deep(repo)
+        assert rep.ok is False
+        assert "fsck_failed" in rep.failures
+
+    @pytest.mark.asyncio
+    async def test_zeroed_loose_object_fails_fsck(self, repo):
+        # The exact outage pattern: a reachable loose blob is zero-filled but still
+        # PRESENT. `git fsck --connectivity-only` (the old impl) passes this — it
+        # never rehashes content — so the deep check MUST use `--full`, which
+        # recomputes SHA-1 and flags the corruption. This test fails under the old
+        # flag and passes under the fix (P1, #1010 Codex re-review).
+        self._commit_file(repo)
+        blob = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD:f.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        obj = repo / ".git" / "objects" / blob[:2] / blob[2:]
+        size = obj.stat().st_size
+        obj.chmod(0o644)
+        obj.write_bytes(b"\x00" * size)  # present, right size, all-NUL content
         rep = await g.check_git_deep(repo)
         assert rep.ok is False
         assert "fsck_failed" in rep.failures
