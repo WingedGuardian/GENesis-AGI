@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -307,7 +308,12 @@ class MemoryStore:
                     if project_type:
                         payload["project_type"] = project_type
 
-                    upsert_point(
+                    # Sync Qdrant HTTP call — off the event loop so a slow
+                    # round-trip on this hot store() path doesn't stall every
+                    # other coroutine (background paths already do this; see
+                    # memory/health.py, dream_cycle.py, entity_resolution.py).
+                    await asyncio.to_thread(
+                        upsert_point,
                         self._qdrant,
                         collection=resolved_collection,
                         point_id=memory_id,
@@ -456,7 +462,8 @@ class MemoryStore:
         meta = await memory_crud.get_metadata(self._db, old_id)
         if meta and meta["embedding_status"] == "embedded":
             try:
-                update_payload(
+                await asyncio.to_thread(
+                    update_payload,
                     self._qdrant,
                     collection=meta["collection"],
                     point_id=old_id,
@@ -508,7 +515,9 @@ class MemoryStore:
         # 3. Qdrant — try both collections (collection column unreliable)
         for coll in ("episodic_memory", "knowledge_base"):
             try:
-                delete_point(self._qdrant, collection=coll, point_id=memory_id)
+                await asyncio.to_thread(
+                    delete_point, self._qdrant, collection=coll, point_id=memory_id,
+                )
                 results[f"qdrant_{coll}"] = True
             except Exception:
                 logger.error(
