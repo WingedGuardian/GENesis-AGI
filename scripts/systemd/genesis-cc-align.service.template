@@ -1,0 +1,21 @@
+[Unit]
+Description=Genesis Host CC/Node Alignment — nightly pin sync to the guardian host
+After=genesis-server.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=/bin/bash __REPO_DIR__/scripts/cc_align_host.sh
+# The script bounds each SSH op itself (600s node / 300s cc); cap the unit
+# generously above the worst single op so a slow host update-node isn't SIGTERMed.
+TimeoutStartSec=900
+# Needs ssh + flock (/usr/bin) and the venv python (called by absolute path).
+# No npm/sudo here — the host-side update-cc/update-node verbs own their privilege,
+# so NoNewPrivileges + ProtectSystem=strict are safe (unlike a container-CC align).
+Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+# Home-scoped: the only file it writes is the single-flight lock under ~/.genesis.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h
