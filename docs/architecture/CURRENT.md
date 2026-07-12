@@ -579,7 +579,10 @@ verified: fa2e692a 2026-07-11
   **Gates 1-3 (procedure/identity/autonomy) do NOT yet emit** — inert in
   shadow until source provenance is threaded to their decision points
   (flip-blocking follow-ups). Auto-demote wired but dormant (server + enforce
-  only); retention via `scripts/prune_immunity_shadow.py` (disk-hygiene).
+  only); retention via `scripts/prune_immunity_shadow.py` (disk-hygiene). The
+  shadow log is readable via the `immunity_status` health MCP tool
+  (gate-agnostic: per-gate live mode + per-site would-block counts — sizes the
+  B4 enforce blast radius; gates 1-3 surface here automatically once they emit).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h

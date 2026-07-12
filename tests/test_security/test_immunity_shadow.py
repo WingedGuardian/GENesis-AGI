@@ -233,3 +233,15 @@ def test_sync_emit_gate_off(tmp_path, monkeypatch):
     )
     assert wrote is False
     conn.close()
+
+
+@pytest.mark.asyncio
+async def test_recent_summary_raises_on_broken_read(tmp_path):
+    # A read must NOT fail-open to [] — that would mask broken telemetry (missing
+    # table / wrong path / failed SELECT) as a healthy zero. It RAISES so a health
+    # caller can honestly report "unavailable" instead of "ok / 0 would-blocks".
+    conn = await aiosqlite.connect(tmp_path / "no_table.db")
+    conn.row_factory = aiosqlite.Row
+    with pytest.raises(sqlite3.OperationalError):
+        await immunity_shadow.recent_summary(db=conn)
+    await conn.close()
