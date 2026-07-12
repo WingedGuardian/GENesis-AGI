@@ -80,6 +80,15 @@
                         "timeout": 10
                     }
                 ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash ${CLAUDE_PROJECT_DIR}/scripts/hooks/session_activity_touch.sh",
+                        "timeout": 2000
+                    }
+                ]
             }
         ],
         "PreToolUse": [
@@ -384,6 +393,15 @@
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook plan_bookmark_hook.py",
                         "timeout": 10
+                    }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash ${CLAUDE_PROJECT_DIR}/scripts/hooks/session_activity_touch.sh",
+                        "timeout": 2000
                     }
                 ]
             }
