@@ -37,3 +37,9 @@ async def test_wire_drip_retention_jobs_registers_all_three():
             assert isinstance(job.trigger, CronTrigger)
     finally:
         sched.shutdown(wait=False)
+
+
+# NOTE: the daily deep `git fsck --full` (F.1) is NO LONGER a learning-scheduler
+# job — it runs from the awareness loop (`_check_git_health_deep`) so it survives a
+# router-degraded startup that skips learning init. Its coverage lives in
+# tests/test_awareness/test_git_health_check.py.

@@ -1003,6 +1003,10 @@ async def init(rt: GenesisRuntime) -> None:
         # testable seam so the registration is covered, not just the crud prunes).
         _wire_drip_retention_jobs(rt._learning_scheduler, rt)
 
+        # NOTE: the daily deep `git fsck --full` (F.1) is NOT wired here. It runs
+        # from the awareness loop (`_check_git_health_deep`) on a ~daily guard so
+        # it survives a router-degraded startup that skips this learning init.
+
         # Process reaper (leaked opencode/browser by age; claude by IDLE
         # policy — activity markers + live-terminal gate, dry-run→auto-arm).
         # Extracted to a testable seam; see process_reaper.py.
