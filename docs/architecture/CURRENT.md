@@ -161,7 +161,9 @@ verified: 9037d45b 2026-07-07
 - **Discord is shadow-gated** (`autonomy/shadow_gate.py`): three doors —
   `pipeline._deliver`, `outreach_poll` webhook, discord-bot `send_reply` —
   observe-only into `capability_shadow`, best-effort so it can NEVER break the
-  real send. Enforcement (hold-for-approval) is the designed next stage. CI
+  real send. Retention-pruned >45d via `scripts/prune_capability_shadow.py`
+  (disk-hygiene), mirroring the immunity shadow store. Enforcement
+  (hold-for-approval) is the designed next stage. CI
   backstop: `scripts/check_external_io.py` fails on new ungated egress
   endpoints.
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
@@ -591,7 +593,10 @@ verified: fa2e692a 2026-07-11
   **Gates 2-3 (identity/autonomy) do NOT yet emit** — inert in shadow until
   source provenance is threaded to their decision points (flip-blocking
   follow-ups). Auto-demote wired but dormant (server + enforce only); retention
-  via `scripts/prune_immunity_shadow.py` (disk-hygiene).
+  via `scripts/prune_immunity_shadow.py` (disk-hygiene). The shadow log is
+  readable via the `immunity_status` health MCP tool (gate-agnostic: per-gate
+  live mode + per-site would-block counts — sizes the B4 enforce blast radius;
+  gate 1 and, once they emit, gates 2-3 surface here automatically).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
