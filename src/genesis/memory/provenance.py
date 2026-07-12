@@ -68,9 +68,45 @@ _PLACEHOLDER_DOCS = {"", "manual"}
 ORIGIN_OWNER = "owner"
 ORIGIN_FIRST_PARTY = "first_party"
 ORIGIN_EXTERNAL_UNTRUSTED = "external_untrusted"
-ORIGIN_CLASSES = frozenset(
-    {ORIGIN_OWNER, ORIGIN_FIRST_PARTY, ORIGIN_EXTERNAL_UNTRUSTED}
-)
+ORIGIN_CLASSES = frozenset({ORIGIN_OWNER, ORIGIN_FIRST_PARTY, ORIGIN_EXTERNAL_UNTRUSTED})
+
+#: Env var CCInvoker stamps on dispatched CC sessions (and their MCP server
+#: children) carrying the session-level WS-3 origin. See
+#: :func:`session_origin_from_env`.
+SESSION_ORIGIN_ENV = "GENESIS_SESSION_ORIGIN"
+
+
+def session_origin_from_env() -> str | None:
+    """The dispatching session's origin_class from ``GENESIS_SESSION_ORIGIN``.
+
+    Read from ``os.environ`` PER CALL — never cached at import — because the
+    same MCP tool functions also run in-process in genesis-server (dashboard
+    tool_api, runtime memory init), where the var must never apply.
+
+    Fail-SAFE by contract: unset or invalid → ``None`` (one warning on
+    garbage), so consumers fall back to pipeline-derived classification
+    (first_party) rather than raising or fail-closing. CONSUMER WARNING: the
+    immunity gates normalize ``None`` ADVERSARIALLY (``is_blockable(None)`` →
+    blockable) — a gate emit must therefore coalesce this helper's result
+    (``session_origin_from_env() or ORIGIN_FIRST_PARTY``), never forward a
+    raw ``None``. The producer side (CCInvocation) validates loudly instead,
+    so a typo'd origin fails at dispatch, not silently here.
+    """
+    import os
+
+    value = os.environ.get(SESSION_ORIGIN_ENV)
+    if not value:
+        return None
+    if value not in ORIGIN_CLASSES:
+        logger.warning(
+            "Ignoring invalid %s=%r (not in %s)",
+            SESSION_ORIGIN_ENV,
+            value,
+            sorted(ORIGIN_CLASSES),
+        )
+        return None
+    return value
+
 
 # Pipelines whose CONTENT is text pulled off the world. ``curated`` is here
 # deliberately: "curated" is an authority tier, not authorship — URL/file
@@ -81,33 +117,37 @@ ORIGIN_CLASSES = frozenset(
 # already knows source_type). ``email``/``inbox``/``web_search``/
 # ``web_fetch`` have no store() writers today; reserving them means a
 # future writer is external BY DEFAULT rather than silently first-party.
-_EXTERNAL_PIPELINES = frozenset({
-    "crag_web",
-    "recon",
-    "knowledge_ingest",
-    "knowledge_ingest_source",
-    "curated",
-    "email",
-    "inbox",
-    "web_search",
-    "web_fetch",
-})
+_EXTERNAL_PIPELINES = frozenset(
+    {
+        "crag_web",
+        "recon",
+        "knowledge_ingest",
+        "knowledge_ingest_source",
+        "curated",
+        "email",
+        "inbox",
+        "web_search",
+        "web_fetch",
+    }
+)
 
 # Pipelines that write Genesis's own observations/derivations or the
 # owner's conversational content.
-_FIRST_PARTY_PIPELINES = frozenset({
-    "conversation",
-    "session_observer",
-    "harvest",
-    "synthesis",
-    "event_calendar",
-    "dream_cycle",
-    "reflection",
-    "drift",
-    "extraction_job",
-    "surplus",
-    "reference_store",
-})
+_FIRST_PARTY_PIPELINES = frozenset(
+    {
+        "conversation",
+        "session_observer",
+        "harvest",
+        "synthesis",
+        "event_calendar",
+        "dream_cycle",
+        "reflection",
+        "drift",
+        "extraction_job",
+        "surplus",
+        "reference_store",
+    }
+)
 
 
 def derive_origin_class(
@@ -139,8 +179,7 @@ def derive_origin_class(
     if origin_class is not None:
         if origin_class not in ORIGIN_CLASSES:
             raise ValueError(
-                f"invalid origin_class {origin_class!r}; "
-                f"expected one of {sorted(ORIGIN_CLASSES)}"
+                f"invalid origin_class {origin_class!r}; expected one of {sorted(ORIGIN_CLASSES)}"
             )
         return origin_class
     if source_pipeline in _EXTERNAL_PIPELINES:

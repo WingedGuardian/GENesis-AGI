@@ -702,3 +702,52 @@ def test_build_invocation_sets_isolated_tmpdir():
     assert inv.claude_code_tmpdir == _bg_session_sandbox("sess-xyz")
     assert "bg-cc-sessions/sess-xyz" in (inv.claude_code_tmpdir or "")
     assert ".genesis/cc-tmp" not in (inv.claude_code_tmpdir or "")
+
+
+# --- WS-3 session-origin plumbing (per-profile provenance) ---
+
+def test_every_profile_has_an_origin_disposition():
+    """Forcing function: a new profile cannot ship provenance-unclassified.
+    Every profile routed by _PROFILE_TO_MCP must be classified external in
+    _PROFILE_ORIGIN or deliberately first-party in _PROFILE_ORIGIN_FIRST_PARTY."""
+    from genesis.cc.direct_session import (
+        _PROFILE_ORIGIN,
+        _PROFILE_ORIGIN_FIRST_PARTY,
+        _PROFILE_TO_MCP,
+    )
+
+    unclassified = (
+        set(_PROFILE_TO_MCP) - set(_PROFILE_ORIGIN) - set(_PROFILE_ORIGIN_FIRST_PARTY)
+    )
+    assert not unclassified, (
+        f"Profiles without a WS-3 origin disposition: {sorted(unclassified)}. "
+        "Classify each in _PROFILE_ORIGIN (external_untrusted) or "
+        "_PROFILE_ORIGIN_FIRST_PARTY (with the reason in the comment block)."
+    )
+    # No profile may be in both (contradictory dispositions).
+    both = set(_PROFILE_ORIGIN) & set(_PROFILE_ORIGIN_FIRST_PARTY)
+    assert not both, f"Profiles classified BOTH external and first-party: {sorted(both)}"
+
+
+def test_profile_origin_values_are_valid_classes():
+    from genesis.cc.direct_session import _PROFILE_ORIGIN
+    from genesis.memory.provenance import ORIGIN_CLASSES
+
+    for profile, origin in _PROFILE_ORIGIN.items():
+        assert origin in ORIGIN_CLASSES, f"{profile}: invalid origin {origin!r}"
+
+
+def test_external_profile_invocation_carries_origin():
+    """research (external by construction) stamps CCInvocation.origin."""
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="t", profile="research", model=CCModel.SONNET)
+    inv = runner._build_invocation(req, "test-session")
+    assert inv.origin == "external_untrusted"
+
+
+def test_observe_profile_invocation_has_no_origin():
+    """observe is deliberately first-party (self-observation) — origin unset."""
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="t", profile="observe", model=CCModel.HAIKU)
+    inv = runner._build_invocation(req, "test-session")
+    assert inv.origin is None

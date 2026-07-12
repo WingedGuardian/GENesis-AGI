@@ -180,19 +180,18 @@ _VENV_PYTHON = sys.executable
 
 PROFILES: dict[str, list[str]] = {
     "observe": (
-        _UNIVERSAL_DISALLOW + _NO_FILE_WRITE + _NO_OUTREACH_SEND
-        + _NO_BROWSER_INTERACTION + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS
-        + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES
+        _UNIVERSAL_DISALLOW
+        + _NO_FILE_WRITE
+        + _NO_OUTREACH_SEND
+        + _NO_BROWSER_INTERACTION
+        + _NO_MEMORY_WRITES
+        + _NO_FOLLOW_UPS
+        + _NO_OUTREACH_ENGAGEMENT
+        + _NO_RECON_WRITES
     ),
-    "interact": (
-        _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES
-    ),
-    "research": (
-        _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION
-    ),
-    "campaign": (
-        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION
-    ),
+    "interact": (_UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES),
+    "research": (_UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION),
+    "campaign": (_UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION),
     # ── Steward profile ──────────────────────────────────────────
     # For the upstream-PR stewardship campaign. UNIQUE among profiles: it
     # grants Bash (so it can run `gh`) — every other profile blocks Bash.
@@ -201,8 +200,7 @@ PROFILES: dict[str, list[str]] = {
     # stay blocked — the campaign comments/reopens/closes PRs and ESCALATES
     # code fixes rather than editing/pushing itself.
     "steward": (
-        [t for t in _UNIVERSAL_DISALLOW if t != "Bash"]
-        + _NO_BROWSER_INTERACTION + _NO_FILE_WRITE
+        [t for t in _UNIVERSAL_DISALLOW if t != "Bash"] + _NO_BROWSER_INTERACTION + _NO_FILE_WRITE
     ),
     # ── Community responder profile ─────────────────────────────
     # Reactive community responder: reads a community's channels and replies
@@ -210,8 +208,7 @@ PROFILES: dict[str, list[str]] = {
     # outreach (no memory server). Belt-and-suspenders: block memory writes at
     # tool level too, in case MCP config generation fails and falls back to full.
     "community-responder": (
-        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION
-        + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS
+        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS
     ),
     # ── Perimeter profile ────────────────────────────────────────
     # For sessions that process untrusted inbound content (email
@@ -220,9 +217,15 @@ PROFILES: dict[str, list[str]] = {
     # only — no memory or health servers. Belt-and-suspenders: tools
     # are also listed here in case MCP config is misconfigured.
     "mail": (
-        _UNIVERSAL_DISALLOW + _NO_FILE_WRITE + _NO_BROWSER_INTERACTION
-        + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS + _NO_OUTREACH_ENGAGEMENT
-        + _NO_RECON_WRITES + _NO_WEB_TOOLS + _NO_OUTREACH_EXTRAS
+        _UNIVERSAL_DISALLOW
+        + _NO_FILE_WRITE
+        + _NO_BROWSER_INTERACTION
+        + _NO_MEMORY_WRITES
+        + _NO_FOLLOW_UPS
+        + _NO_OUTREACH_ENGAGEMENT
+        + _NO_RECON_WRITES
+        + _NO_WEB_TOOLS
+        + _NO_OUTREACH_EXTRAS
     ),
 }
 
@@ -233,7 +236,7 @@ PROFILES: dict[str, list[str]] = {
 
 _MISSION_INJECTION = (
     "If it's digital, it's within reach. Adapt and overcome. "
-    "Don't conclude \"impossible\" — conclude \"blocked by X\" and identify what would unblock it."
+    'Don\'t conclude "impossible" — conclude "blocked by X" and identify what would unblock it.'
 )
 
 _PROFILE_ADDENDA: dict[str, str] = {
@@ -354,6 +357,38 @@ _PROFILE_TO_MCP: dict[str, str] = {
     "mail": "mail",
 }
 
+# WS-3 session-level provenance per profile (stamped as CCInvocation.origin →
+# GENESIS_SESSION_ORIGIN → the session's memory MCP writes). Classified by what
+# the profile INGESTS by construction, not its label:
+#   research  — web/knowledge ingestion is the job.
+#   interact  — the browser profile; arbitrary external page content.
+#   campaign  — engages external platforms, reads external replies.
+#   steward   — reads GitHub PR content (external contributors/bots).
+#   community-responder — reads external Discord messages.
+#   mail      — external email bodies (belt-and-suspenders: its MCP profile has
+#               no memory server today, but the classification is content-true).
+#   observe   — DELIBERATELY absent → first_party: its purpose is Genesis
+#               self-observation; web tools are incidental, and blanket-tagging
+#               Genesis's own self-model writes external would be the
+#               autoimmune failure WS-3 is built to avoid.
+# Unknown/overlay profiles default to first_party (B0's conservative store-time
+# stance); tests/test_cc/test_direct_session_profiles.py forces every
+# registered profile to be classified here or in the explicit first-party set.
+_PROFILE_ORIGIN: dict[str, str] = {
+    "research": "external_untrusted",
+    "interact": "external_untrusted",
+    "campaign": "external_untrusted",
+    "steward": "external_untrusted",
+    "community-responder": "external_untrusted",
+    "mail": "external_untrusted",
+}
+
+# Profiles deliberately classified first-party (origin left unset) — with the
+# reason above. The coverage test asserts _PROFILE_TO_MCP ⊆
+# (_PROFILE_ORIGIN ∪ _PROFILE_ORIGIN_FIRST_PARTY) so a new profile cannot ship
+# unclassified.
+_PROFILE_ORIGIN_FIRST_PARTY: frozenset[str] = frozenset({"observe"})
+
 
 # ---------------------------------------------------------------------------
 # Profile overlays — install-local profile registration
@@ -401,9 +436,7 @@ class ProfileOverlayContext:
         never silently redefine a shipped profile's tool scope.
         """
         if name in PROFILES:
-            raise ValueError(
-                f"profile overlay may not override built-in profile {name!r}"
-            )
+            raise ValueError(f"profile overlay may not override built-in profile {name!r}")
         PROFILES[name] = list(disallow)
         _PROFILE_ADDENDA[name] = addendum
         _PROFILE_BASH_ALLOWLIST[name] = tuple(bash_allowlist)
@@ -610,6 +643,7 @@ class DirectSessionRunner:
             if mgr is not None:
                 try:
                     from genesis.autonomy.types import AutonomyCategory
+
                     state = await mgr.get_state(
                         AutonomyCategory.BACKGROUND_COGNITIVE.value,
                     )
@@ -617,15 +651,19 @@ class DirectSessionRunner:
                     # (posterior < 0.15 means overwhelming corrections)
                     if state is not None:
                         from genesis.db.crud.autonomy import bayesian_posterior
+
                         posterior = bayesian_posterior(
-                            state.total_successes, state.total_corrections,
+                            state.total_successes,
+                            state.total_corrections,
                         )
                         if posterior < 0.15 and state.total_corrections > 3:
                             logger.warning(
                                 "Spawn blocked: background_cognitive posterior %.3f "
                                 "(L%d, %dS/%dC) — autonomy circuit breaker",
-                                posterior, state.current_level,
-                                state.total_successes, state.total_corrections,
+                                posterior,
+                                state.current_level,
+                                state.total_successes,
+                                state.total_corrections,
                             )
                             raise RuntimeError(
                                 f"Autonomy circuit breaker: background_cognitive "
@@ -712,13 +750,12 @@ class DirectSessionRunner:
 
         async def on_event(event: StreamEvent) -> None:
             if event.event_type == "tool_use" and event.tool_name:
-                telemetry.append({
-                    "name": event.tool_name,
-                    "input_preview": (
-                        str(event.tool_input)[:200]
-                        if event.tool_input else ""
-                    ),
-                })
+                telemetry.append(
+                    {
+                        "name": event.tool_name,
+                        "input_preview": (str(event.tool_input)[:200] if event.tool_input else ""),
+                    }
+                )
 
         try:
             async with self._semaphore:
@@ -730,10 +767,12 @@ class DirectSessionRunner:
                 # (the old behaviour) rather than this crashing.
                 if invocation.claude_code_tmpdir:
                     Path(invocation.claude_code_tmpdir).mkdir(
-                        parents=True, exist_ok=True,
+                        parents=True,
+                        exist_ok=True,
                     )
                 output: CCOutput = await self._invoker.run_streaming(
-                    invocation, on_event=on_event,
+                    invocation,
+                    on_event=on_event,
                 )
 
             elapsed = time.monotonic() - start
@@ -785,6 +824,7 @@ class DirectSessionRunner:
                     db = getattr(self._rt, "_db", None)
                     if db is not None:
                         from genesis.db.crud import cc_sessions as cs_crud
+
                         row = await cs_crud.get_by_id(db, session_id)
                         if row and row.get("metadata"):
                             with contextlib.suppress(json.JSONDecodeError, TypeError):
@@ -813,7 +853,10 @@ class DirectSessionRunner:
 
             logger.info(
                 "Direct session %s completed: %.1fs, $%.4f, %d tools",
-                session_id[:8], elapsed, output.cost_usd, len(telemetry),
+                session_id[:8],
+                elapsed,
+                output.cost_usd,
+                len(telemetry),
             )
             return result
 
@@ -841,16 +884,19 @@ class DirectSessionRunner:
                 # generic failure path below.
                 await self._record_proposal_outcome(request, cancel_result)
                 await self._session_manager.fail(
-                    session_id, reason="cancelled",
+                    session_id,
+                    reason="cancelled",
                 )
             except Exception:
                 logger.error(
                     "Failed to record session %s cancellation",
-                    session_id[:8], exc_info=True,
+                    session_id[:8],
+                    exc_info=True,
                 )
             logger.warning(
                 "Direct session %s cancelled after %.1fs",
-                session_id[:8], elapsed,
+                session_id[:8],
+                elapsed,
             )
             raise
 
@@ -869,11 +915,13 @@ class DirectSessionRunner:
                 await self._store_result(session_id, request, error_result)
                 await self._record_proposal_outcome(request, error_result)
                 await self._session_manager.fail(
-                    session_id, reason=str(exc)[:500],
+                    session_id,
+                    reason=str(exc)[:500],
                 )
             except Exception:
                 logger.error(
-                    "Failed to record session %s failure", session_id[:8],
+                    "Failed to record session %s failure",
+                    session_id[:8],
                     exc_info=True,
                 )
 
@@ -883,12 +931,15 @@ class DirectSessionRunner:
                 except Exception:
                     logger.error(
                         "Failed to send failure notification for %s",
-                        session_id[:8], exc_info=True,
+                        session_id[:8],
+                        exc_info=True,
                     )
 
             logger.error(
                 "Direct session %s failed after %.1fs: %s",
-                session_id[:8], elapsed, exc,
+                session_id[:8],
+                elapsed,
+                exc,
             )
             raise
 
@@ -922,12 +973,15 @@ class DirectSessionRunner:
             # recording the outcome.
             if result.success:
                 verification_failed = await self._verify_proposal_outputs(
-                    db, proposal_id,
+                    db,
+                    proposal_id,
                 )
                 if verification_failed:
                     # Mark as failed + store observation; skip normal outcome
                     await mark_proposal_verification_failed(
-                        db, proposal_id, summary=verification_failed,
+                        db,
+                        proposal_id,
+                        summary=verification_failed,
                     )
                     try:
                         store = getattr(self._rt, "_memory_store", None)
@@ -950,13 +1004,18 @@ class DirectSessionRunner:
                             exc_info=True,
                         )
                     await self._notify_dispatch_debrief(
-                        proposal_id, request, result,
+                        proposal_id,
+                        request,
+                        result,
                     )
                     return
 
             summary = (result.output_text or result.error or "")[:1000]
             await update_proposal_outcome(
-                db, proposal_id, success=result.success, summary=summary,
+                db,
+                proposal_id,
+                success=result.success,
+                summary=summary,
             )
             # On failure: create observation so ego sees it next cycle
             if not result.success:
@@ -964,9 +1023,7 @@ class DirectSessionRunner:
                     store = getattr(self._rt, "_memory_store", None)
                     if store is not None:
                         await store.store(
-                            content=(
-                                f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"
-                            ),
+                            content=(f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"),
                             source="ego_dispatch_outcome",
                             tags=["ego", "dispatch_failure"],
                             memory_type="episodic",
@@ -1049,7 +1106,9 @@ class DirectSessionRunner:
             logger.debug("Failed to send dispatch debrief", exc_info=True)
 
     def _build_invocation(
-        self, request: DirectSessionRequest, session_id: str,
+        self,
+        request: DirectSessionRequest,
+        session_id: str,
     ) -> CCInvocation:
         system_prompt = request.system_prompt
         if system_prompt is None:
@@ -1147,6 +1206,8 @@ class DirectSessionRunner:
             skip_permissions=True,
             disallowed_tools=disallowed,
             working_dir=background_session_dir(),
+            # WS-3: per-profile session provenance (see _PROFILE_ORIGIN).
+            origin=_PROFILE_ORIGIN.get(request.profile),
             claude_code_tmpdir=_bg_session_sandbox(session_id),
             mcp_config=mcp_config,
             bash_allowlist=_PROFILE_BASH_ALLOWLIST.get(request.profile, ()),
@@ -1189,21 +1250,22 @@ class DirectSessionRunner:
         if result.cc_session_id:
             project_key = cc_project_key(background_session_dir())
             transcript_path = str(
-                Path.home() / ".claude" / "projects"
-                / project_key / f"{result.cc_session_id}.jsonl"
+                Path.home() / ".claude" / "projects" / project_key / f"{result.cc_session_id}.jsonl"
             )
 
-        existing.update({
-            "profile": request.profile,
-            "caller_context": request.caller_context,
-            "output_text": result.output_text[:20000],
-            "tools_summary": tool_counts,
-            "cc_session_id": result.cc_session_id,
-            "transcript_path": transcript_path,
-            "error": result.error,
-            "model_used": result.model_used,
-            "duration_s": result.duration_s,
-        })
+        existing.update(
+            {
+                "profile": request.profile,
+                "caller_context": request.caller_context,
+                "output_text": result.output_text[:20000],
+                "tools_summary": tool_counts,
+                "cc_session_id": result.cc_session_id,
+                "transcript_path": transcript_path,
+                "error": result.error,
+                "model_used": result.model_used,
+                "duration_s": result.duration_s,
+            }
+        )
 
         # Roster resume continuity: record the endpoint a routed session ran on,
         # keyed off the roster model NAME the chokepoint selected (ground truth),
@@ -1243,11 +1305,16 @@ class DirectSessionRunner:
             return
 
         tool_counts = self._summarize_tools(result.tools_called)
-        tools_str = ", ".join(
-            f"{n} ({c})" for n, c in sorted(
-                tool_counts.items(), key=lambda x: -x[1],
-            )[:8]
-        ) or "none"
+        tools_str = (
+            ", ".join(
+                f"{n} ({c})"
+                for n, c in sorted(
+                    tool_counts.items(),
+                    key=lambda x: -x[1],
+                )[:8]
+            )
+            or "none"
+        )
 
         body = (
             f"<b>Direct Session FAILED</b>\n\n"
@@ -1261,11 +1328,13 @@ class DirectSessionRunner:
         try:
             from genesis.outreach.types import OutreachCategory, OutreachRequest
 
-            await pipeline.submit(OutreachRequest(
-                category=OutreachCategory.ALERT,
-                topic="direct_session_fail",
-                context=body,
-                salience_score=0.9,
-            ))
+            await pipeline.submit(
+                OutreachRequest(
+                    category=OutreachCategory.ALERT,
+                    topic="direct_session_fail",
+                    context=body,
+                    salience_score=0.9,
+                )
+            )
         except Exception:
             logger.error("Outreach submit failed", exc_info=True)
