@@ -45,8 +45,11 @@ PROCEDURE_GATE_SITES: dict[str, tuple[str, str]] = {
     ),
     "autonomy/executor/trace.py::_store_new_procedure": (
         "gated",
-        "autonomy retrospective; emits with origin_from_tool_names(tools_used) — "
-        "same tool-name provenance as the judge path",
+        "autonomy retrospective; emits initiated_by-derived origin (Genesis's own "
+        "execution = first_party/owner). The ExecutionTrace exposes no source-tool "
+        "spine, and proc_data['tools_used'] is the retrospective's replay tools, "
+        "not source provenance — so external-research influence is a deferred "
+        "source-provenance follow-up, not a tool-name signal here",
     ),
     "mcp/memory/procedural.py::procedure_store": (
         "gated",
@@ -59,10 +62,10 @@ PROCEDURE_GATE_SITES: dict[str, tuple[str, str]] = {
         "gated",
         "legacy 500-char fallback (still live from pipeline.py on "
         "APPROACH_FAILURE / WORKAROUND_SUCCESS / autonomous SUCCESS — exactly the "
-        "outcomes most likely to carry external content); emits with "
-        "origin_from_tool_names(data['tools_used']) — the required+validated LLM "
-        "response field, same tool-name signal as the judge/trace paths. Full "
-        "removal of this path is tracked as follow-up 3558802740d5",
+        "outcomes most likely to carry external content); emits session_origin, "
+        "which the pipeline.py caller derives from the SOURCE session's tool spine "
+        "(summary.tool_calls) — NOT data['tools_used'] (the procedure's replay "
+        "tools). Full removal of this path is tracked as follow-up 3558802740d5",
     ),
     "learning/procedural/operations.py::store_procedure_checked": (
         "internal",

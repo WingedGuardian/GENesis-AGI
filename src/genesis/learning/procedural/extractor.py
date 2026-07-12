@@ -336,6 +336,7 @@ async def extract_procedure(
     router: _Router,
     embedding_provider: EmbeddingProvider | None = None,
     session_tools_count: int = 0,
+    session_origin: str | None = None,
 ) -> str | None:
     """Extract a procedure from an interaction summary via LLM.
 
@@ -579,13 +580,15 @@ async def extract_procedure(
         )
 
         # WS-3 B1 gate-1 (procedure): shadow-record a would-block for this
-        # auto-extracted procedure, classified by the tools the extraction used
-        # (data["tools_used"], a required+validated field) — the SAME tool-name
-        # provenance as the judge and trace paths. This path fires on exactly the
-        # autonomous / failure-recovery outcomes most likely to carry external
-        # content, so gating it is where the real shadow signal is. Self-guards to
-        # NO row for first_party/owner origins + the kill switch. Best-effort.
-        from genesis.memory.provenance import origin_from_tool_names
+        # auto-extracted procedure, classified by ``session_origin`` — derived by
+        # the caller from the SOURCE session's actual tool spine
+        # (summary.tool_calls), NOT from data["tools_used"] (which is the
+        # extractor LLM's proposed replay-tool list, not source provenance). This
+        # path fires on exactly the autonomous / failure-recovery outcomes most
+        # likely to carry external content, so gating it on the true source tools
+        # is where the real shadow signal is. Self-guards to NO row for
+        # first_party/owner origins + the kill switch. Best-effort.
+        from genesis.memory.provenance import ORIGIN_FIRST_PARTY
         from genesis.security import immunity_shadow
 
         await immunity_shadow.record_would_block(
@@ -594,7 +597,7 @@ async def extract_procedure(
             source_ref=proc_id,
             process="server",
             blockable_count=1,
-            origin_class=origin_from_tool_names(data.get("tools_used") or []),
+            origin_class=session_origin or ORIGIN_FIRST_PARTY,
             db=db,
         )
 

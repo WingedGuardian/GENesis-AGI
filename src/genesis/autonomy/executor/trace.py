@@ -468,20 +468,25 @@ class ExecutionTracer:
         )
 
         # WS-3 B1 gate-1 (procedure): shadow-record a would-block for a procedure
-        # promoted from this autonomous execution, classified by the tools the
-        # trace used — the SAME tool-name provenance as the judge path (consistent
-        # shadow signal). Self-guards to NO row for first_party/owner origins + the
-        # kill switch. Best-effort, never raises.
-        from genesis.memory.provenance import origin_from_tool_names
+        # promoted from this autonomous execution. Origin is Genesis's OWN
+        # execution (first_party; owner when the task was user-initiated) — the
+        # honest classification: the ExecutionTrace exposes no source-tool spine,
+        # and proc_data["tools_used"] is the RETROSPECTIVE's replay-tool list, not
+        # the tools the task actually ran (so it can't detect an
+        # external-research-influenced execution). That subtler vector needs
+        # source-tool provenance plumbed into the trace — tracked as a follow-up.
+        # Self-guards to NO row for first_party/owner + the kill switch.
+        from genesis.memory.provenance import ORIGIN_FIRST_PARTY, ORIGIN_OWNER
         from genesis.security import immunity_shadow
 
+        trace_origin = ORIGIN_OWNER if trace.initiated_by == "user" else ORIGIN_FIRST_PARTY
         await immunity_shadow.record_would_block(
             gate="procedure",
             source_kind="procedure_promotion",
             source_ref=proc_id,
             process="server",
             blockable_count=1,
-            origin_class=origin_from_tool_names(proc_data.get("tools_used") or []),
+            origin_class=trace_origin,
             db=self._db,
         )
 
