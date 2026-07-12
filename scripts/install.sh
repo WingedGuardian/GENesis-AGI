@@ -959,6 +959,9 @@ else
                 cat > "$HOME/.qdrant/config.yaml" <<QDCONF
 storage:
   storage_path: $HOME/.qdrant/storage
+# WARN drops the per-request actix access-log INFO lines (the dashboard polls
+# a dozen endpoints every few seconds); WARN+ still surfaces real problems.
+log_level: WARN
 service:
   # Bind to localhost only for security (prevents external access).
   # To allow remote access, change to 0.0.0.0 and add authentication.

@@ -5,7 +5,24 @@ import sys
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 
-from genesis.observability.logging_config import GenesisFormatter, configure_logging
+from genesis.observability.logging_config import (
+    GenesisFormatter,
+    _install_werkzeug_poll_filter,
+    _WerkzeugPollFilter,
+    configure_logging,
+)
+
+
+def _werkzeug_record(msg: str) -> logging.LogRecord:
+    return logging.LogRecord(
+        name="werkzeug",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg=msg,
+        args=(),
+        exc_info=None,
+    )
 
 
 class TestGenesisFormatter:
@@ -23,7 +40,7 @@ class TestGenesisFormatter:
         )
         output = fmt.format(record)
         assert output == (
-            'ts=2026-03-04T12:00:00+00:00 level=WARNING '
+            "ts=2026-03-04T12:00:00+00:00 level=WARNING "
             'name=genesis.routing msg="breaker tripped for openrouter"'
         )
 
@@ -107,8 +124,62 @@ class TestConfigureLogging:
         genesis_logger = logging.getLogger("genesis")
         genesis_logger.handlers.clear()
         configure_logging(log_dir=str(tmp_path))
-        file_handlers = [
-            h for h in genesis_logger.handlers
-            if isinstance(h, RotatingFileHandler)
-        ]
+        file_handlers = [h for h in genesis_logger.handlers if isinstance(h, RotatingFileHandler)]
         assert len(file_handlers) == 0
+
+
+class TestWerkzeugPollFilter:
+    def test_drops_successful_dashboard_polls(self):
+        f = _WerkzeugPollFilter()
+        for path in (
+            "health",
+            "pause",
+            "heartbeat",
+            "ego/status",
+            "unified-errors?grouped=true&limit=6",
+        ):
+            rec = _werkzeug_record(
+                f'127.0.0.1 - - [12/Jul/2026 15:50:11] "GET /api/genesis/{path} HTTP/1.1" 200 -'
+            )
+            assert f.filter(rec) is False, path
+
+    def test_drops_304_and_head(self):
+        f = _WerkzeugPollFilter()
+        assert (
+            f.filter(_werkzeug_record('- - - [..] "GET /api/genesis/health HTTP/1.1" 304 -'))
+            is False
+        )
+        assert (
+            f.filter(_werkzeug_record('- - - [..] "HEAD /api/genesis/health HTTP/1.1" 200 -'))
+            is False
+        )
+
+    def test_keeps_error_responses(self):
+        """4xx/5xx on a polled endpoint must stay visible."""
+        f = _WerkzeugPollFilter()
+        for status in ("404", "500"):
+            rec = _werkzeug_record(f'- - - [..] "GET /api/genesis/health HTTP/1.1" {status} -')
+            assert f.filter(rec) is True, status
+
+    def test_keeps_non_get_and_non_dashboard(self):
+        f = _WerkzeugPollFilter()
+        # POST (state change) to a dashboard path stays.
+        assert (
+            f.filter(_werkzeug_record('- - - [..] "POST /api/genesis/pause HTTP/1.1" 200 -'))
+            is True
+        )
+        # A non-dashboard GET stays.
+        assert f.filter(_werkzeug_record('- - - [..] "GET /static/app.js HTTP/1.1" 200 -')) is True
+
+    def test_install_is_idempotent(self):
+        wz = logging.getLogger("werkzeug")
+        wz.filters = [x for x in wz.filters if not isinstance(x, _WerkzeugPollFilter)]
+        _install_werkzeug_poll_filter()
+        _install_werkzeug_poll_filter()
+        assert sum(isinstance(x, _WerkzeugPollFilter) for x in wz.filters) == 1
+
+    def test_configure_logging_installs_filter(self):
+        wz = logging.getLogger("werkzeug")
+        wz.filters = [x for x in wz.filters if not isinstance(x, _WerkzeugPollFilter)]
+        configure_logging()
+        assert any(isinstance(x, _WerkzeugPollFilter) for x in wz.filters)

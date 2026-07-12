@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
@@ -33,12 +34,36 @@ class GenesisFormatter(logging.Formatter):
         if record.exc_info and record.exc_info[0] is not None:
             import traceback
 
-            line += "\n" + "".join(
-                traceback.format_exception(*record.exc_info)
-            ).rstrip()
+            line += "\n" + "".join(traceback.format_exception(*record.exc_info)).rstrip()
         elif record.exc_text:
             line += "\n" + record.exc_text
         return line
+
+
+# Successful (2xx/3xx) GET/HEAD dashboard poll requests. The dashboard polls a
+# dozen ``/api/genesis/*`` endpoints every few seconds; at INFO each success
+# floods the journal. This matches ONLY those — every 4xx/5xx error, every
+# non-GET (state changes), and every non-dashboard path is preserved.
+_DASHBOARD_POLL_RE = re.compile(r'"(?:GET|HEAD) /api/genesis/\S* HTTP/[0-9.]+" [23]\d\d\b')
+
+
+class _WerkzeugPollFilter(logging.Filter):
+    """Drop werkzeug access-log lines for successful dashboard poll GETs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return _DASHBOARD_POLL_RE.search(record.getMessage()) is None
+
+
+def _install_werkzeug_poll_filter() -> None:
+    """Attach the poll filter to the ``werkzeug`` access logger (idempotent).
+
+    A filter on the origin logger drops the record before it reaches any
+    handler (including root via propagation), regardless of who configured
+    werkzeug's handlers.
+    """
+    wz = logging.getLogger("werkzeug")
+    if not any(isinstance(f, _WerkzeugPollFilter) for f in wz.filters):
+        wz.addFilter(_WerkzeugPollFilter())
 
 
 def configure_logging(
@@ -63,6 +88,10 @@ def configure_logging(
     genesis_logger = logging.getLogger("genesis")
     genesis_logger.setLevel(level)
     genesis_logger.propagate = False
+
+    # Silence the dashboard-poll access-log storm (idempotent; independent of
+    # the genesis-handler dedup below, so it installs even on repeat calls).
+    _install_werkzeug_poll_filter()
 
     # Avoid duplicate handlers on repeated calls
     if any(isinstance(h, logging.StreamHandler) for h in genesis_logger.handlers):
