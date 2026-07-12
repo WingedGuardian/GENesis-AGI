@@ -477,6 +477,13 @@ verified: fe5d0945 2026-07-10
   v1 (every surface stamps `judge_calibrated: false`). Every new
   genesis-memory tool must be classified in `eval/bench/arms.py`
   (static-AST forcing test). Don't run across Sun 07:30 (J-9 aggregation).
+  **A5 read surface** (WS-1 A5): the persisted paired win-rate is readable via
+  `/api/genesis/eval/bench` (a compact result card in the dashboard internals
+  tab) and the `bench_status` MCP tool — both aggregate-only (never per-task
+  private text), shaped by the shared `eval/bench/surface.py`, filtered on
+  `model_profile='bench:genesis'` (the genesis row's `metadata_json.stats` is
+  self-contained), and stamped with the uncalibrated-judge + `insufficient_data`
+  caveat. A stats-less/all-skip run surfaces flagged, never crashes.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).

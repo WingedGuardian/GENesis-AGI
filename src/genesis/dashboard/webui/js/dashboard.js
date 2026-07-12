@@ -121,6 +121,7 @@
         userJobs: { jobs: [] },
         evalMetrics: null,
         subsystemGrades: null,
+        benchAB: null,
         autonomyConfig: null,
         approvalActions: {},
         _restartingBridge: false,
@@ -2571,6 +2572,14 @@
             }
           } catch (e) {
             console.warn("Subsystem grades fetch failed:", e);
+          }
+          try {
+            const resp = await fetchApi("/api/genesis/eval/bench");
+            if (resp && resp.ok) {
+              this.benchAB = await resp.json();
+            }
+          } catch (e) {
+            console.warn("Bench A/B fetch failed:", e);
           }
         },
 

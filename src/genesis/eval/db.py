@@ -174,3 +174,25 @@ async def get_latest_run(
     if row is None:
         return None
     return dict(zip(cols, row, strict=False))
+
+
+async def get_bench_comparisons(
+    db: aiosqlite.Connection,
+    *,
+    limit: int = 12,
+) -> list[dict]:
+    """Fetch recent genesis-arm bench rows (``model_profile='bench:genesis'``),
+    newest first.
+
+    Each row's ``metadata_json.stats`` is self-contained (the paired A/B
+    win-rates), so no join to the bare arm is needed for the headline. Mirrors
+    ``get_experiment_runs``; the ``bench:genesis`` profile is the bench filter
+    (bench persists ``trigger='manual'``, so trigger cannot distinguish it).
+    """
+    cursor = await db.execute(
+        "SELECT * FROM eval_runs WHERE model_profile = ? ORDER BY created_at DESC LIMIT ?",
+        ("bench:genesis", limit),
+    )
+    cols = [d[0] for d in cursor.description]
+    rows = await cursor.fetchall()
+    return [dict(zip(cols, row, strict=False)) for row in rows]

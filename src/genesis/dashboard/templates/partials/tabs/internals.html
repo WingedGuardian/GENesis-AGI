@@ -530,6 +530,60 @@
       </div>
     </div>
 
+    <!-- Panel: Bench A/B — Genesis vs bare [Tab: internals] (WS-1 A5) -->
+    <div class="panel" x-data="{ benchOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header" style="cursor: pointer;" @click="benchOpen = !benchOpen">
+        <span class="material-symbols-outlined" :style="benchOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">compare_arrows</span>
+        Bench: Genesis vs bare (A/B)
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.benchAB?.latest?.task_set_version">
+            <span style="font-size: 0.68rem; opacity: 0.7;"
+                  x-text="$store.genesisDashboard.benchAB.latest.task_set_version + ' · rubric v' + ($store.genesisDashboard.benchAB.latest.rubric_version || '?')"></span>
+          </template>
+        </span>
+      </div>
+      <div class="panel-body" x-show="benchOpen" x-transition>
+        <template x-if="!$store.genesisDashboard.benchAB || $store.genesisDashboard.benchAB.count === 0">
+          <div class="empty-state">No bench runs yet. Run <code>genesis eval bench</code>.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.benchAB && $store.genesisDashboard.benchAB.count > 0">
+          <div x-data="{ b: $store.genesisDashboard.benchAB.latest }">
+            <!-- Headline: latest complete comparison -->
+            <template x-if="b && b.has_stats">
+              <div>
+                <div style="display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap;">
+                  <span style="font-size: 0.72rem; opacity: 0.7;">bare</span>
+                  <span style="font-size: 1.2rem; font-weight: 700;" x-text="b.bare_mean != null ? b.bare_mean.toFixed(3) : '—'"></span>
+                  <span class="material-symbols-outlined" style="font-size: 1rem; opacity: 0.6;">arrow_forward</span>
+                  <span style="font-size: 0.72rem; opacity: 0.7;">genesis</span>
+                  <span style="font-size: 1.2rem; font-weight: 700;" x-text="b.genesis_mean != null ? b.genesis_mean.toFixed(3) : '—'"></span>
+                  <span style="font-size: 0.85rem; font-weight: 600;"
+                        :style="b.mean_delta > 0 ? 'color:#4caf50' : b.mean_delta < 0 ? 'color:#d9534f' : 'color:#888'"
+                        x-text="'(Δ ' + (b.mean_delta >= 0 ? '+' : '') + (b.mean_delta != null ? b.mean_delta.toFixed(3) : '?') + ')'"></span>
+                </div>
+                <div style="font-size: 0.7rem; opacity: 0.75; margin-top: 0.3rem;"
+                     x-text="'win-rate: genesis ' + b.genesis_wins + ' / bare ' + b.bare_wins + ' / ties ' + b.ties + '  ·  ' + b.n_cases + ' cases'"></div>
+                <div style="font-size: 0.7rem; opacity: 0.75; margin-top: 0.15rem;"
+                     x-text="'verdict: ' + (b.recommendation || 'n/a') + (b.p_value != null ? ' (p=' + b.p_value.toFixed(2) + ')' : '')"></div>
+              </div>
+            </template>
+            <template x-if="b && !b.has_stats">
+              <div style="font-size: 0.72rem; opacity: 0.7;">Latest run has no complete pairs (invalid / all-skip) — no A/B stats.</div>
+            </template>
+            <!-- Honesty badge: the bench judge is uncalibrated; numbers are provisional. -->
+            <template x-if="!$store.genesisDashboard.benchAB.judge_calibrated">
+              <div style="margin-top: 0.5rem; display: inline-block; font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #b8860b; border: 1px solid #b8860b; border-radius: 4px; padding: 0.15rem 0.4rem;">
+                ⚠ judge uncalibrated — provisional, do not quote
+              </div>
+            </template>
+            <div style="font-size: 0.62rem; opacity: 0.5; margin-top: 0.4rem;"
+                 x-text="$store.genesisDashboard.benchAB.count + ' prior run' + ($store.genesisDashboard.benchAB.count === 1 ? '' : 's')"></div>
+          </div>
+        </template>
+      </div>
+    </div>
+
     <!-- Panel: Drives & Thresholds (Collapsible) [Tab: internals] -->
     <div class="panel" x-data="{ drivesOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
       <div class="panel-header" style="cursor: pointer;" @click="drivesOpen = !drivesOpen">
