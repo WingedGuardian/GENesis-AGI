@@ -51,9 +51,13 @@ def config():
         quiet_hours=QuietHours(start="22:00", end="07:00"),
         channel_preferences={"default": "email"},
         thresholds={"blocker": 0.0, "surplus": 0.0},
-        max_daily=999, surplus_daily=999, content_daily=999, notification_daily=999,
+        max_daily=999,
+        surplus_daily=999,
+        content_daily=999,
+        notification_daily=999,
         morning_report_time="07:00",
-        engagement_timeout_hours=24, engagement_poll_minutes=60,
+        engagement_timeout_hours=24,
+        engagement_poll_minutes=60,
     )
 
 
@@ -70,8 +74,12 @@ def _pipeline(config, db, adapter):
     formatter = MagicMock()
     formatter.format.return_value = FormattedContent(text="re: hi", target=FormatTarget.EMAIL)
     pipe = OutreachPipeline(
-        governance=GovernanceGate(config, db), drafter=AsyncMock(), formatter=formatter,
-        channels={"email": adapter}, db=db, config=config,
+        governance=GovernanceGate(config, db),
+        drafter=AsyncMock(),
+        formatter=formatter,
+        channels={"email": adapter},
+        db=db,
+        config=config,
         recipients={"email": "fallback@example.com"},
     )
     pipe.set_autonomy_gate(
@@ -91,9 +99,14 @@ async def _add_inbound(db, thread, sender):
 
 def _reply(recipient="alice@example.com", thread="t1"):
     return OutreachRequest(
-        category=OutreachCategory.SURPLUS, topic="re: hi", context="body",
-        salience_score=0.9, signal_type="email_reply", channel="email",
-        validated_recipient=recipient, thread_id=thread,
+        category=OutreachCategory.SURPLUS,
+        topic="re: hi",
+        context="body",
+        salience_score=0.9,
+        signal_type="email_reply",
+        channel="email",
+        validated_recipient=recipient,
+        thread_id=thread,
     )
 
 
@@ -154,7 +167,7 @@ async def test_full_earn_grant_send_flag_demote_loop(config, db):
     now = datetime.now(UTC).isoformat()
     flagged = await aes.mark_flagged(db, log[0]["id"], flagged_at=now)
     assert flagged is True
-    state = await cg.record_correction(db, updated_at=now, **_CELL)
+    state = await cg.record_correction(db, origin_class="first_party", updated_at=now, **_CELL)
     assert state == CellState.ASK
     cell = await cg.get_cell(db, **_CELL)
     assert cell["state"] == CellState.ASK.value

@@ -57,9 +57,7 @@ def cell_id(domain: str, verb: str, risk_class: str) -> str:
     return f"{domain}:{verb}:{risk_class}"
 
 
-def cell_posterior(
-    successes: int, corrections: int, weighted_corrections: float = 0.0
-) -> float:
+def cell_posterior(successes: int, corrections: int, weighted_corrections: float = 0.0) -> float:
     """Beta(1,1) posterior mean, re-earn flavour (WS-8 PR-D).
 
     ``weighted_corrections`` is the Σ of consequence-weighted corrections; when
@@ -102,8 +100,7 @@ async def ensure_cell(
              (id, domain, verb, risk_class, state, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO NOTHING""",
-        (cid, domain, verb, risk_class,
-         CellState.NOT_DETERMINED.value, updated_at, updated_at),
+        (cid, domain, verb, risk_class, CellState.NOT_DETERMINED.value, updated_at, updated_at),
     )
     await db.commit()
     row = await get_cell(db, domain, verb, risk_class)
@@ -113,9 +110,7 @@ async def ensure_cell(
 
 
 async def list_all(db: aiosqlite.Connection) -> list[dict]:
-    cursor = await db.execute(
-        "SELECT * FROM capability_grants ORDER BY domain, verb, risk_class"
-    )
+    cursor = await db.execute("SELECT * FROM capability_grants ORDER BY domain, verb, risk_class")
     return [dict(r) for r in await cursor.fetchall()]
 
 
@@ -123,11 +118,41 @@ async def list_granted(db: aiosqlite.Connection) -> list[dict]:
     """All GRANTED cells — what Genesis is authorized to do autonomously (the
     'standing autonomy' pane of the owner-visibility Activity tab)."""
     cursor = await db.execute(
-        "SELECT * FROM capability_grants WHERE state = ? "
-        "ORDER BY domain, verb, risk_class",
+        "SELECT * FROM capability_grants WHERE state = ? ORDER BY domain, verb, risk_class",
         (CellState.GRANTED.value,),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def _emit_autonomy_gate(
+    db: aiosqlite.Connection,
+    *,
+    fn: str,
+    origin_class: str,
+    domain: str,
+    verb: str,
+    risk_class: str,
+    extra: dict | None = None,
+) -> None:
+    """WS-3 B1 gate-3 (autonomy) shadow emit — the SINGLE choke for grant
+    evidence/state mutations. Self-guarding + fail-open (record_would_block
+    swallows everything); owner/first_party origins and the kill switch produce
+    NO row. Detail carries the cell key only — never content."""
+    from genesis.security import immunity_shadow
+
+    detail: dict = {"cell": f"{domain}:{verb}:{risk_class}"}
+    if extra:
+        detail.update(extra)
+    await immunity_shadow.record_would_block(
+        gate="autonomy",
+        source_kind="grant_evidence",
+        source_ref=f"db/crud/capability_grants.py::{fn}",
+        process="server",
+        blockable_count=1,
+        origin_class=origin_class,
+        db=db,
+        detail=detail,
+    )
 
 
 async def apply_event(
@@ -138,12 +163,20 @@ async def apply_event(
     risk_class: str,
     event: CellEvent,
     updated_at: str,
+    origin_class: str,
 ) -> CellState:
     """Apply a state-machine event to the cell and persist the new state.
 
     Raises :class:`genesis.autonomy.capabilities.InvalidTransition` if the
     event is illegal from the current state.  Sets ``granted_at`` when the
     cell first reaches GRANTED.
+
+    ``origin_class`` (REQUIRED — WS-3 gate-3) is the provenance of whatever
+    prompted this state change: ``owner`` for owner decisions
+    (approve/reject), ``first_party`` for Genesis's own deterministic
+    guards/classifiers. Required, not defaulted, so every future caller must
+    STATE provenance — a silent first_party default would be a permanently
+    inert gate.
     """
     row = await ensure_cell(
         db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
@@ -164,6 +197,15 @@ async def apply_event(
         (new_state.value, granted_at, updated_at, row["id"]),
     )
     await db.commit()
+    await _emit_autonomy_gate(
+        db,
+        fn="apply_event",
+        origin_class=origin_class,
+        domain=domain,
+        verb=verb,
+        risk_class=risk_class,
+        extra={"event": event.value},
+    )
     return new_state
 
 
@@ -174,8 +216,13 @@ async def record_success(
     verb: str,
     risk_class: str,
     updated_at: str,
+    origin_class: str,
 ) -> bool:
-    """Increment the success counter.  Promotion stays explicit (user approve)."""
+    """Increment the success counter.  Promotion stays explicit (user approve).
+
+    ``origin_class`` (REQUIRED — WS-3 gate-3): provenance of the success
+    evidence. See :func:`apply_event`.
+    """
     row = await ensure_cell(
         db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
     )
@@ -186,6 +233,14 @@ async def record_success(
         (updated_at, updated_at, row["id"]),
     )
     await db.commit()
+    await _emit_autonomy_gate(
+        db,
+        fn="record_success",
+        origin_class=origin_class,
+        domain=domain,
+        verb=verb,
+        risk_class=risk_class,
+    )
     return cursor.rowcount > 0
 
 
@@ -196,6 +251,7 @@ async def record_correction(
     verb: str,
     risk_class: str,
     updated_at: str,
+    origin_class: str,
     consequence_weight: float | None = None,
 ) -> CellState:
     """Record a correction on a cell and, if it was GRANTED, DEMOTE it to ASK.
@@ -214,11 +270,7 @@ async def record_correction(
     row = await ensure_cell(
         db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
     )
-    weight = (
-        consequence_weight
-        if consequence_weight is not None
-        else correction_weight(risk_class)
-    )
+    weight = consequence_weight if consequence_weight is not None else correction_weight(risk_class)
     new_corrections = row["corrections"] + 1
     new_weighted = (row["weighted_corrections"] or 0.0) + weight
 
@@ -233,10 +285,17 @@ async def record_correction(
              SET corrections = ?, weighted_corrections = ?, state = ?,
                  granted_at = ?, updated_at = ?
            WHERE id = ?""",
-        (new_corrections, new_weighted, new_state.value, granted_at,
-         updated_at, row["id"]),
+        (new_corrections, new_weighted, new_state.value, granted_at, updated_at, row["id"]),
     )
     await db.commit()
+    await _emit_autonomy_gate(
+        db,
+        fn="record_correction",
+        origin_class=origin_class,
+        domain=domain,
+        verb=verb,
+        risk_class=risk_class,
+    )
     return new_state
 
 
@@ -294,7 +353,10 @@ async def detect_promotable_cells(
 
 
 async def decay_stale_cells(
-    db: aiosqlite.Connection, *, now: str, half_life_days: int = 90,
+    db: aiosqlite.Connection,
+    *,
+    now: str,
+    half_life_days: int = 90,
 ) -> list[str]:
     """Decay GRANTED cells idle longer than the half-life back to NOT_DETERMINED
     (the ``DECAY`` transition, applied in bulk).
@@ -304,9 +366,7 @@ async def decay_stale_cells(
     so a long-unused standing autonomy lapses rather than entrenching.  Atomic
     ``UPDATE…RETURNING``.  Returns the decayed cell ids.
     """
-    cutoff = (
-        datetime.fromisoformat(now) - timedelta(days=half_life_days)
-    ).isoformat()
+    cutoff = (datetime.fromisoformat(now) - timedelta(days=half_life_days)).isoformat()
     cursor = await db.execute(
         """UPDATE capability_grants
              SET state = ?, granted_at = NULL, last_decayed_at = ?, updated_at = ?

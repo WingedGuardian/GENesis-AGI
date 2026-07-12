@@ -49,8 +49,8 @@ EMAIL_GATE_ACTION_TYPE = "email_capability_gate"
 #: WS-8 PR-D deterministic pre-send scope guards for a GRANTED cell.  A trip is
 #: treated as scope drift inside the grant ⇒ the send is HELD and the cell is
 #: demoted (recorded as a correction).  Conservative defaults; calibration here.
-_RATE_LIMIT_WINDOW = timedelta(hours=1)   # g3: per-cell autonomous-send window
-_RATE_LIMIT_MAX = 10                      # g3: max autonomous sends per cell per window
+_RATE_LIMIT_WINDOW = timedelta(hours=1)  # g3: per-cell autonomous-send window
+_RATE_LIMIT_MAX = 10  # g3: max autonomous sends per cell per window
 
 
 @dataclass(frozen=True)
@@ -81,7 +81,11 @@ class EmailAutonomyGate:
         self._event_bus = event_bus
 
     async def check(
-        self, *, request: object, recipient: str, message_text: str,
+        self,
+        *,
+        request: object,
+        recipient: str,
+        message_text: str,
     ) -> GateDecision:
         """Allow or hold an outbound email. ``recipient`` is the resolved
         delivery address (validated thread recipient or pipeline default)."""
@@ -109,8 +113,14 @@ class EmailAutonomyGate:
         #    Suppress InvalidTransition: the cell may already be past ASK.
         with contextlib.suppress(InvalidTransition):
             await cg.apply_event(
-                self._db, domain=domain, verb=verb, risk_class=risk,
-                event=CellEvent.CLASSIFY, updated_at=now,
+                self._db,
+                domain=domain,
+                verb=verb,
+                risk_class=risk,
+                event=CellEvent.CLASSIFY,
+                updated_at=now,
+                # WS-3 gate-3: Genesis's own deterministic classifier.
+                origin_class="first_party",
             )
         cell = await cg.get_cell(self._db, domain, verb, risk)
         state = CellState(cell["state"]) if cell else CellState.ASK
@@ -122,15 +132,27 @@ class EmailAutonomyGate:
             trip = await self._scope_guard_trip(request, recipient, domain, verb, risk)
             if trip is None:
                 return GateDecision(
-                    allow=True, reason="granted", cell=(domain, verb, risk),
+                    allow=True,
+                    reason="granted",
+                    cell=(domain, verb, risk),
                 )
             logger.warning(
                 "Email scope guard '%s' tripped on GRANTED cell %s:%s:%s "
                 "(recipient=%s) — demoting + holding",
-                trip, domain, verb, risk, recipient,
+                trip,
+                domain,
+                verb,
+                risk,
+                recipient,
             )
             await cg.record_correction(
-                self._db, domain=domain, verb=verb, risk_class=risk, updated_at=now,
+                self._db,
+                domain=domain,
+                verb=verb,
+                risk_class=risk,
+                updated_at=now,
+                # WS-3 gate-3: Genesis's own deterministic scope guard tripped.
+                origin_class="first_party",
             )
             return await self._hold(request, message_text, classification, recipient, now)
 
@@ -145,7 +167,12 @@ class EmailAutonomyGate:
         return await et.has_inbound(self._db, thread_id)
 
     async def _scope_guard_trip(
-        self, request: object, recipient: str, domain: str, verb: str, risk: str,
+        self,
+        request: object,
+        recipient: str,
+        domain: str,
+        verb: str,
+        risk: str,
     ) -> str | None:
         """Deterministic pre-send scope guards for a GRANTED cell.
 
@@ -165,7 +192,10 @@ class EmailAutonomyGate:
         # g3 (primary): a burst of autonomous sends for one cell = a runaway loop.
         since = (datetime.now(UTC) - _RATE_LIMIT_WINDOW).isoformat()
         count = await aes.count_for_cell_since(
-            self._db, cell_domain=domain, cell_verb=verb, cell_risk_class=risk,
+            self._db,
+            cell_domain=domain,
+            cell_verb=verb,
+            cell_risk_class=risk,
             since=since,
         )
         if count >= _RATE_LIMIT_MAX:
@@ -173,7 +203,9 @@ class EmailAutonomyGate:
         return None
 
     async def _recipient_in_thread(
-        self, thread_id: str | None, recipient: str,
+        self,
+        thread_id: str | None,
+        recipient: str,
     ) -> bool:
         """True iff ``recipient`` is a known participant (received-message sender)
         of the thread.  The inbound path always records ``sender`` (the From
@@ -187,21 +219,27 @@ class EmailAutonomyGate:
         return await et.recipient_in_thread(self._db, thread_id, recipient)
 
     async def _hold(
-        self, request: object, message_text: str, classification: object,
-        recipient: str, now: str,
+        self,
+        request: object,
+        message_text: str,
+        classification: object,
+        recipient: str,
+        now: str,
     ) -> GateDecision:
         domain, verb, risk = classification.cell_key
         thread_id = getattr(request, "thread_id", None)
         category = getattr(request, "category", None)
         category_val = category.value if category is not None else "outreach"
-        context = json.dumps({
-            "kind": EMAIL_GATE_ACTION_TYPE,
-            "cell": [domain, verb, risk],
-            "validated_recipient": recipient,
-            "thread_id": thread_id,
-            "subject": getattr(request, "topic", "") or "",
-            "category": category_val,
-        })
+        context = json.dumps(
+            {
+                "kind": EMAIL_GATE_ACTION_TYPE,
+                "cell": [domain, verb, risk],
+                "validated_recipient": recipient,
+                "thread_id": thread_id,
+                "subject": getattr(request, "topic", "") or "",
+                "category": category_val,
+            }
+        )
 
         # Approval row FIRST — so a crash between the two writes never leaves a
         # pending_email_sends row pointing at a non-existent approval.
@@ -229,10 +267,18 @@ class EmailAutonomyGate:
         await self._emit_held(classification, recipient)
         logger.info(
             "Email gate HELD %s send to %s (cell=%s:%s:%s, request=%s)",
-            classification.sub_class, recipient, domain, verb, risk, request_id,
+            classification.sub_class,
+            recipient,
+            domain,
+            verb,
+            risk,
+            request_id,
         )
         return GateDecision(
-            allow=False, pending_id=pending_id, request_id=request_id, reason="held",
+            allow=False,
+            pending_id=pending_id,
+            request_id=request_id,
+            reason="held",
         )
 
     async def _emit_held(self, classification: object, recipient: str) -> None:
