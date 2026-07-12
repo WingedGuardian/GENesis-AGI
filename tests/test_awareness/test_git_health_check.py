@@ -56,7 +56,7 @@ async def test_unhealthy_raises_critical_observation(monkeypatch):
     assert kw["priority"] == "critical"
     assert kw["source"] == "git_health_monitor"
     assert kw["type"] == "infrastructure_alert"
-    assert "git_repair.py" in kw["content"]
+    assert "recovery-and-portability" in kw["content"]
     assert "rootfs_readonly" in kw["content"]
 
 

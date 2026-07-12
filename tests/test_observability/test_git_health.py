@@ -57,11 +57,30 @@ class TestCheapCheck:
         assert rep.kind == "cheap"
 
     @pytest.mark.asyncio
-    async def test_zeroed_config_flags_invalid(self, repo):
-        (repo / ".git" / "config").write_bytes(b"")
+    async def test_corrupt_config_flags_invalid(self, repo):
+        # Null-filled config (the incident signature) → `git config --list` fatal.
+        (repo / ".git" / "config").write_bytes(b"\x00" * 64)
         rep = await g.check_git_cheap(repo)
         assert rep.ok is False
         assert "config_invalid" in rep.failures
+
+    @pytest.mark.asyncio
+    async def test_missing_origin_not_flagged(self, repo):
+        # A valid local clone with NO origin remote is healthy for local recovery
+        # (git revert is local); must NOT flag config_invalid, only note absence.
+        subprocess.run(["git", "-C", str(repo), "remote", "remove", "origin"], check=True)
+        rep = await g.check_git_cheap(repo)
+        assert "config_invalid" not in rep.failures
+        assert rep.ok is True
+        assert rep.details.get("remote_url_present") is False
+
+    @pytest.mark.asyncio
+    async def test_empty_config_not_flagged(self, repo):
+        # A truncated-to-empty config parses fine (git falls back to global) —
+        # recoverable, so not flagged.
+        (repo / ".git" / "config").write_bytes(b"")
+        rep = await g.check_git_cheap(repo)
+        assert "config_invalid" not in rep.failures
 
     @pytest.mark.asyncio
     async def test_nulled_packed_refs_flagged(self, repo):

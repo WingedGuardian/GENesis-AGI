@@ -165,15 +165,23 @@ def _check_git_cheap_sync(repo: Path) -> GitHealthReport:
         gc = Path(gcd.strip())
         git_common = gc if gc.is_absolute() else (repo / gc)
 
-    # .git/config parseable and carries a remote url (a zeroed/garbage config
-    # makes `git config --get` return non-zero → config_invalid).
-    rc, out, _ = _run_git(repo, "config", "--get", "remote.origin.url", timeout=_CHEAP_TIMEOUT_S)
+    # Config PARSEABILITY — NOT remote presence. `git config --list` fails only on
+    # a genuinely corrupt/unreadable config (e.g. the incident's null-filled
+    # .git/config → "fatal: bad config"); a valid local clone with no origin, or a
+    # truncated-to-empty config, parses fine and is recoverable (git falls back to
+    # global config, and REVERT_CODE's `git revert` is purely local). Remote
+    # presence is recorded as informational only — a missing origin degrades just
+    # the git_repair fetch rung, not local recovery, so it is NOT a failure.
+    rc, out, _ = _run_git(repo, "config", "--list", timeout=_CHEAP_TIMEOUT_S)
     if rc == -1:
         failures.append("cheap_timeout")
-    elif rc != 0 or not out.strip():
+    elif rc != 0:
         failures.append("config_invalid")
     else:
-        details["remote_url_present"] = True
+        details["remote_url_present"] = any(
+            line.startswith("remote.origin.url=") and line.split("=", 1)[1].strip()
+            for line in out.splitlines()
+        )
 
     # HEAD resolves to a real commit.
     rc, _, _ = _run_git(repo, "rev-parse", "--verify", "HEAD^{commit}", timeout=_CHEAP_TIMEOUT_S)

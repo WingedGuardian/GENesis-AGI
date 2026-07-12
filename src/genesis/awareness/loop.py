@@ -224,8 +224,8 @@ _last_git_alert_at: float | None = None
 
 async def _check_git_health(db) -> None:
     """Probe local git integrity + rootfs writability; write a shared-mount
-    verdict and, on failure, create a critical observation pointing at
-    ``scripts/git_repair.py``.
+    verdict and, on failure, create a critical observation pointing at the
+    local-git repair procedure (recovery runbook).
 
     Deliberately NOT gated on ``db_available`` — git health matters MOST when the
     DB is broken, and the observation write is guarded on ``db`` internally.
@@ -259,8 +259,9 @@ async def _check_git_health(db) -> None:
             content=(
                 f"Local git repository is UNHEALTHY ({failures}). This disables the "
                 f"guardian's REVERT_CODE recovery lever, which needs a healthy local "
-                f"git. Run `scripts/git_repair.py` (dry-run first) in ~/genesis to "
-                f"diagnose and repair. If 'rootfs_readonly', the container filesystem "
+                f"git. Diagnose and repair the local git repository in ~/genesis — see "
+                f"the recovery runbook (docs/reference/recovery-and-portability-workflow.md). "
+                f"If 'rootfs_readonly', the container filesystem "
                 f"has gone read-only (thin-pool exhaustion) — check host storage first."
             ),
             priority="critical",

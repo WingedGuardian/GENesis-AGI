@@ -129,8 +129,8 @@ def _wire_git_health_deep_job(scheduler, rt) -> None:
                         content=(
                             f"`git fsck --connectivity-only` reported problems ({failures}) — "
                             "reachable objects are missing or corrupt, which disables the "
-                            "guardian's REVERT_CODE lever. Run `scripts/git_repair.py` "
-                            "(dry-run first) in ~/genesis to diagnose and repair."
+                            "guardian's REVERT_CODE lever. Diagnose and repair the local "
+                            "git in ~/genesis — see docs/reference/recovery-and-portability-workflow.md."
                         ),
                         priority="critical",
                         created_at=datetime.now(UTC).isoformat(),
