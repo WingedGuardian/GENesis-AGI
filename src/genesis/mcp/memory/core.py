@@ -26,6 +26,7 @@ def _memory_mod():
 
     return memory_mod
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,7 +47,9 @@ def _increment_retrieved(qdrant, results) -> None:
                 if pts:
                     old = (pts[0].payload or {}).get("retrieved_count", 0)
                     qdrant_ops.update_payload(
-                        qdrant, collection=coll, point_id=r.memory_id,
+                        qdrant,
+                        collection=coll,
+                        point_id=r.memory_id,
                         payload={"retrieved_count": old + 1},
                     )
                     break
@@ -128,8 +131,11 @@ async def memory_recall(
     # Validate life_domain early to catch typos before expensive search
     if life_domain is not None:
         from genesis.memory.taxonomy import LIFE_DOMAINS
+
         if life_domain not in LIFE_DOMAINS:
-            return [{"error": f"life_domain must be one of {sorted(LIFE_DOMAINS)}, got {life_domain!r}"}]
+            return [
+                {"error": f"life_domain must be one of {sorted(LIFE_DOMAINS)}, got {life_domain!r}"}
+            ]
 
     _t0 = _time.monotonic()
     memory_mod = _memory_mod()
@@ -153,9 +159,13 @@ async def memory_recall(
             parts = time_range.split("/", 1)
             if len(parts) == 2:
                 from genesis.db.crud import memory_events
+
                 event_boost_ids = set(
                     await memory_events.get_memory_ids_in_range(
-                        memory_mod._db, parts[0], parts[1], limit=limit * 3,
+                        memory_mod._db,
+                        parts[0],
+                        parts[1],
+                        limit=limit * 3,
                     )
                 )
         except Exception:
@@ -184,8 +194,13 @@ async def memory_recall(
         _increment_retrieved(memory_mod._qdrant, results)
     else:
         results = await memory_mod._retriever.recall(
-            query, source=source, limit=limit, min_activation=min_activation,
-            wing=wing, room=room, life_domain=life_domain,
+            query,
+            source=source,
+            limit=limit,
+            min_activation=min_activation,
+            wing=wing,
+            room=room,
+            life_domain=life_domain,
             expand_query_terms=expand_query_terms,
             include_subsystem=include_subsystem,
             only_subsystem=only_subsystem,
@@ -197,13 +212,7 @@ async def memory_recall(
 
         # Drift fallback (mode="auto" only): when standard recall returns
         # sparse results, try drift retrieval automatically.
-        if (
-            mode == "auto"
-            and len(results) < min(3, limit)
-            and limit >= 3
-            and not wing
-            and not room
-        ):
+        if mode == "auto" and len(results) < min(3, limit) and limit >= 3 and not wing and not room:
             try:
                 from genesis.memory.drift import drift_recall
 
@@ -220,9 +229,10 @@ async def memory_recall(
                 )
                 if len(drift_results) > len(results):
                     logger.info(
-                        "drift_recall fallback: standard=%d → drift=%d results"
-                        " (query=%r)",
-                        len(results), len(drift_results), query[:80],
+                        "drift_recall fallback: standard=%d → drift=%d results (query=%r)",
+                        len(results),
+                        len(drift_results),
+                        query[:80],
                     )
                     results = drift_results
                     _increment_retrieved(memory_mod._qdrant, drift_results)
@@ -241,22 +251,25 @@ async def memory_recall(
             try:
                 row = await memory_crud.get_by_id(memory_mod._db, mid)
                 if row:
-                    results.append(RetrievalResult(
-                        memory_id=mid,
-                        content=row.get("content", ""),
-                        source=row.get("source_type", ""),
-                        memory_type=row.get("collection", ""),
-                        score=0.01,
-                        vector_rank=None,
-                        fts_rank=None,
-                        activation_score=0.0,
-                        payload=row,
-                        source_pipeline="event_calendar",
-                        collection=row.get("collection", "episodic_memory"),
-                    ))
+                    results.append(
+                        RetrievalResult(
+                            memory_id=mid,
+                            content=row.get("content", ""),
+                            source=row.get("source_type", ""),
+                            memory_type=row.get("collection", ""),
+                            score=0.01,
+                            vector_rank=None,
+                            fts_rank=None,
+                            activation_score=0.0,
+                            payload=row,
+                            source_pipeline="event_calendar",
+                            collection=row.get("collection", "episodic_memory"),
+                        )
+                    )
             except Exception:
                 logger.warning(
-                    "Failed to fetch event-calendar memory %s", mid,
+                    "Failed to fetch event-calendar memory %s",
+                    mid,
                     exc_info=True,
                 )
 
@@ -282,9 +295,7 @@ async def memory_recall(
     # recall() (its id is in recall_event_sink) — enrich THAT event in place with
     # the MCP-layer attribution (mode / pipeline_used) and the final post-filter
     # results. Drift mode emitted nothing (empty sink) → emit a fresh event here.
-    recall_event_id: str | None = (
-        recall_event_sink[0] if recall_event_sink else None
-    )
+    recall_event_id: str | None = recall_event_sink[0] if recall_event_sink else None
     try:
         # J-9 quality metrics use the PRE-diversity-penalty score
         # (retrieval_score); ``score`` is the final ordering value with the
@@ -294,12 +305,11 @@ async def memory_recall(
         _top_scores = [r.retrieval_score or r.score for r in results[:5]]
         _memory_ids = [r.memory_id for r in results[:10]]
         _all_scores = [r.retrieval_score or r.score for r in results]
-        _mean_score = (
-            round(sum(_all_scores) / len(_all_scores), 4) if _all_scores else None
-        )
+        _mean_score = round(sum(_all_scores) / len(_all_scores), 4) if _all_scores else None
         _latency_ms = round((_time.monotonic() - _t0) * 1000, 1)
         if recall_event_id is not None:
             from genesis.eval.j9_hooks import update_recall_metrics
+
             # Realign the retriever's event with the FINAL returned set — the KB
             # floor and any auto_drift fallback change result_count / ids / scores
             # after the inner emit. The MEM-005 entrenchment fields stay as the
@@ -319,6 +329,7 @@ async def memory_recall(
             )
         else:
             from genesis.eval.j9_hooks import emit_recall_fired
+
             recall_event_id = await emit_recall_fired(
                 memory_mod._db,
                 query=query,
@@ -342,13 +353,18 @@ async def memory_recall(
             1
             for r in results
             if immunity_shadow.item_is_blockable(
-                collection=r.collection, source_pipeline=r.source_pipeline,
+                collection=r.collection,
+                source_pipeline=r.source_pipeline,
             )
         )
         await immunity_shadow.record_would_block(
-            gate="injection", source_kind="recall_inject",
-            source_ref="mcp/memory/core.py::memory_recall", process="server",
-            blockable_count=blockable, db=memory_mod._db, detail={"path": "compact"},
+            gate="injection",
+            source_kind="recall_inject",
+            source_ref="mcp/memory/core.py::memory_recall",
+            process="server",
+            blockable_count=blockable,
+            db=memory_mod._db,
+            detail={"path": "compact"},
         )
         return [
             {
@@ -380,7 +396,10 @@ async def memory_recall(
         if include_graph and graph_elapsed_ms < graph_budget_ms:
             try:
                 traversal = await graph_traverse(
-                    memory_mod._db, r.memory_id, max_depth=2, min_strength=0.3,
+                    memory_mod._db,
+                    r.memory_id,
+                    max_depth=2,
+                    min_strength=0.3,
                 )
                 graph_elapsed_ms += traversal.query_ms
                 if traversal.nodes:
@@ -395,7 +414,9 @@ async def memory_recall(
                     ]
             except Exception:
                 logger.warning(
-                    "Graph enrichment failed for %s", r.memory_id, exc_info=True,
+                    "Graph enrichment failed for %s",
+                    r.memory_id,
+                    exc_info=True,
                 )
         enriched.append(d)
 
@@ -406,6 +427,7 @@ async def memory_recall(
     # expand later via memory_expand. (compact-corrective: deferred follow-up.)
     if corrective:
         from genesis.memory.corrective import maybe_correct_recall
+
         enriched = await maybe_correct_recall(
             query=query,
             results=enriched,
@@ -426,7 +448,8 @@ async def memory_recall(
     for d in enriched:
         if isinstance(d, dict) and is_external(d.get("collection")):
             d["content"] = wrap_external_recall(
-                d.get("content", ""), source_pipeline=d.get("source_pipeline"),
+                d.get("content", ""),
+                source_pipeline=d.get("source_pipeline"),
             )
             if immunity_shadow.item_is_blockable(
                 collection=d.get("collection"),
@@ -436,9 +459,12 @@ async def memory_recall(
     # WS-3 B1 gate 4 (injection): shadow-record that external content reached
     # this action-capable prompt (observe-only — the item still reaches the model).
     await immunity_shadow.record_would_block(
-        gate="injection", source_kind="recall_inject",
-        source_ref="mcp/memory/core.py::memory_recall", process="server",
-        blockable_count=blockable, db=memory_mod._db,
+        gate="injection",
+        source_kind="recall_inject",
+        source_ref="mcp/memory/core.py::memory_recall",
+        process="server",
+        blockable_count=blockable,
+        db=memory_mod._db,
     )
     return enriched
 
@@ -450,7 +476,8 @@ _ID_PREFIX_RE = re.compile(r"^[0-9a-f][0-9a-f-]{3,34}$")
 
 
 async def _resolve_id_prefixes(
-    db, memory_ids: list[str],
+    db,
+    memory_ids: list[str],
 ) -> tuple[list[str], list[str]]:
     """Resolve short hex handles to full memory UUIDs via memory_metadata.
 
@@ -579,7 +606,8 @@ async def memory_expand(
         # context after a compact recall (the real full-payload surface).
         if is_external(_collection):
             d["content"] = wrap_external_recall(
-                d["content"], source_pipeline=payload.get("source_pipeline"),
+                d["content"],
+                source_pipeline=payload.get("source_pipeline"),
             )
             if immunity_shadow.item_is_blockable(
                 collection=_collection,
@@ -590,7 +618,10 @@ async def memory_expand(
         # Graph enrichment
         try:
             traversal = await graph_traverse(
-                memory_mod._db, mid, max_depth=2, min_strength=0.3,
+                memory_mod._db,
+                mid,
+                max_depth=2,
+                min_strength=0.3,
             )
             if traversal.nodes:
                 d["graph_neighbors"] = [
@@ -610,9 +641,12 @@ async def memory_expand(
     # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
     # expand prompt (observe-only). memory_mod._db is asserted non-None above.
     await immunity_shadow.record_would_block(
-        gate="injection", source_kind="recall_inject",
-        source_ref="mcp/memory/core.py::memory_expand", process="server",
-        blockable_count=blockable, db=memory_mod._db,
+        gate="injection",
+        source_kind="recall_inject",
+        source_ref="mcp/memory/core.py::memory_expand",
+        process="server",
+        blockable_count=blockable,
+        db=memory_mod._db,
     )
 
     if not_found or ambiguous:
@@ -653,10 +687,25 @@ async def memory_store(
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._store is not None
+    # WS-3: dispatched sessions carry a session-level origin via env
+    # (GENESIS_SESSION_ORIGIN, stamped by CCInvoker). Forward it so an
+    # external-influenced session's writes stop landing first_party via the
+    # "conversation" pipeline. None (foreground/unset) → pipeline-derived.
+    from genesis.memory.provenance import session_origin_from_env
+
     return await memory_mod._store.store(
-        content, source, memory_type=memory_type, tags=tags, confidence=confidence,
-        memory_class=memory_class, source_pipeline="conversation",
-        wing=wing, room=room, collection=collection, supersedes=supersedes,
+        content,
+        source,
+        memory_type=memory_type,
+        tags=tags,
+        confidence=confidence,
+        memory_class=memory_class,
+        source_pipeline="conversation",
+        origin_class=session_origin_from_env(),
+        wing=wing,
+        room=room,
+        collection=collection,
+        supersedes=supersedes,
     )
 
 
@@ -668,6 +717,10 @@ async def memory_extract(
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._store is not None
+    # WS-3: same session-origin forwarding as memory_store (see there).
+    from genesis.memory.provenance import session_origin_from_env
+
+    _origin = session_origin_from_env()
     ids: list[str] = []
     for item in extractions:
         mid = await memory_mod._store.store(
@@ -677,6 +730,7 @@ async def memory_extract(
             tags=item.get("tags"),
             confidence=item.get("confidence", 0.7),
             source_pipeline="harvest",
+            origin_class=_origin,
         )
         ids.append(mid)
     return ids
@@ -694,11 +748,12 @@ async def memory_proactive(
     # min_activation=0.0: use activation as a ranking signal, not a filter gate.
     # With confidence=0.5 (96% of memories) and retrieved_count=0 (80%),
     # even day-old memories fail a 0.3 threshold. Let RRF fusion rank instead.
-    results = await memory_mod._retriever.recall(current_message, limit=limit * 2, min_activation=0.0, rerank=False)
-    filtered = [
-        r for r in results
-        if "memory_operation" not in (r.payload.get("tags") or [])
-    ][:limit]
+    results = await memory_mod._retriever.recall(
+        current_message, limit=limit * 2, min_activation=0.0, rerank=False
+    )
+    filtered = [r for r in results if "memory_operation" not in (r.payload.get("tags") or [])][
+        :limit
+    ]
     # Injection defense (PR2): recall defaults to source="both", so KB content
     # can appear here and flow straight into prompt context — wrap external-world
     # items so the model treats them as data, not first-party instructions.
@@ -708,10 +763,12 @@ async def memory_proactive(
         d = asdict(r)
         if is_external(r.collection):
             d["content"] = wrap_external_recall(
-                d.get("content", ""), source_pipeline=r.source_pipeline,
+                d.get("content", ""),
+                source_pipeline=r.source_pipeline,
             )
             if immunity_shadow.item_is_blockable(
-                collection=r.collection, source_pipeline=r.source_pipeline,
+                collection=r.collection,
+                source_pipeline=r.source_pipeline,
             ):
                 blockable += 1
         out.append(d)
@@ -719,9 +776,12 @@ async def memory_proactive(
     # proactive-recall prompt (observe-only). db=memory_mod._db when set, else
     # the emit self-resolves a short-lived connection.
     await immunity_shadow.record_would_block(
-        gate="injection", source_kind="recall_inject",
-        source_ref="mcp/memory/core.py::memory_proactive", process="server",
-        blockable_count=blockable, db=memory_mod._db,
+        gate="injection",
+        source_kind="recall_inject",
+        source_ref="mcp/memory/core.py::memory_proactive",
+        process="server",
+        blockable_count=blockable,
+        db=memory_mod._db,
     )
     return out
 
@@ -750,9 +810,11 @@ async def memory_core_facts(
 
         points = memory_mod._qdrant.scroll(
             collection_name="episodic_memory",
-            scroll_filter=Filter(must=[
-                FieldCondition(key="confidence", range=Range(gte=0.7)),
-            ]),
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="confidence", range=Range(gte=0.7)),
+                ]
+            ),
             limit=limit * 3,
             with_payload=True,
         )[0]  # scroll returns (points, next_offset)
@@ -774,19 +836,21 @@ async def memory_core_facts(
             source=payload.get("source", ""),
             now=now_str,
         )
-        scored.append((
-            {
-                "memory_id": mid,
-                "content": payload.get("content", ""),
-                "source": payload.get("source", ""),
-                "memory_class": payload.get("memory_class", "fact"),
-                "wing": payload.get("wing", ""),
-                "room": payload.get("room", ""),
-                "confidence": payload.get("confidence"),
-                "activation_score": round(act.final_score, 3),
-            },
-            act.final_score,
-        ))
+        scored.append(
+            (
+                {
+                    "memory_id": mid,
+                    "content": payload.get("content", ""),
+                    "source": payload.get("source", ""),
+                    "memory_class": payload.get("memory_class", "fact"),
+                    "wing": payload.get("wing", ""),
+                    "room": payload.get("room", ""),
+                    "confidence": payload.get("confidence"),
+                    "activation_score": round(act.final_score, 3),
+                },
+                act.final_score,
+            )
+        )
 
     scored.sort(key=lambda x: x[1], reverse=True)
     top = scored[:limit]
@@ -801,7 +865,9 @@ async def memory_core_facts(
             for item, _ in top:
                 mid = item["memory_id"]
                 pts = memory_mod._qdrant.retrieve(
-                    collection_name="episodic_memory", ids=[mid], with_payload=True,
+                    collection_name="episodic_memory",
+                    ids=[mid],
+                    with_payload=True,
                 )
                 if pts:
                     old_count = (pts[0].payload or {}).get("retrieved_count", 0)
@@ -857,6 +923,7 @@ async def memory_stats() -> dict:
             _extraction_coverage,
             _wing_distribution,
         )
+
         wings = await _wing_distribution(memory_mod._db)
         classes = await _class_distribution(memory_mod._db)
         extraction = await _extraction_coverage(memory_mod._db)
@@ -910,6 +977,10 @@ async def memory_synthesize(
     if "synthesis" not in resolved_tags:
         resolved_tags.append("synthesis")
 
+    # WS-3: same session-origin forwarding as memory_store — a synthesis made
+    # INSIDE an external-influenced session inherits that session's origin.
+    from genesis.memory.provenance import session_origin_from_env
+
     memory_id = await memory_mod._store.store(
         content,
         source="synthesis",
@@ -917,6 +988,7 @@ async def memory_synthesize(
         tags=resolved_tags,
         confidence=0.8,  # Higher confidence — validated by cross-memory derivation
         source_pipeline="synthesis",
+        origin_class=session_origin_from_env(),
         wing=wing,
         room=room,
     )
@@ -932,7 +1004,9 @@ async def memory_synthesize(
             except Exception:
                 logger.warning(
                     "Failed to link synthesis %s to source %s",
-                    memory_id, source_id, exc_info=True,
+                    memory_id,
+                    source_id,
+                    exc_info=True,
                 )
 
     return memory_id

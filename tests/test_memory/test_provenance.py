@@ -196,3 +196,42 @@ def test_wrap_external_recall_fail_open(monkeypatch):
 
     monkeypatch.setattr(prov, "_wrap_sanitizer", lambda: _Boom())
     assert prov.wrap_external_recall("keep me") == "keep me"
+
+
+# ── WS-3 session-origin env reader ──────────────────────────────────────────
+
+
+def test_session_origin_from_env_valid(monkeypatch):
+    from genesis.memory.provenance import session_origin_from_env
+
+    monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "external_untrusted")
+    assert session_origin_from_env() == "external_untrusted"
+
+
+def test_session_origin_from_env_unset(monkeypatch):
+    from genesis.memory.provenance import session_origin_from_env
+
+    monkeypatch.delenv("GENESIS_SESSION_ORIGIN", raising=False)
+    assert session_origin_from_env() is None
+
+
+def test_session_origin_from_env_garbage_is_fail_safe(monkeypatch, caplog):
+    """Invalid value → None + one warning; never a raise (the producer side —
+    CCInvocation.__post_init__ — is where typos fail loudly)."""
+    from genesis.memory.provenance import session_origin_from_env
+
+    monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "external-untrusted")
+    with caplog.at_level("WARNING"):
+        assert session_origin_from_env() is None
+    assert any("GENESIS_SESSION_ORIGIN" in r.message for r in caplog.records)
+
+
+def test_session_origin_read_per_call_not_cached(monkeypatch):
+    """The reader must see env changes live — the same tool functions run
+    in-process in genesis-server where the var must never apply."""
+    from genesis.memory.provenance import session_origin_from_env
+
+    monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "external_untrusted")
+    assert session_origin_from_env() == "external_untrusted"
+    monkeypatch.delenv("GENESIS_SESSION_ORIGIN")
+    assert session_origin_from_env() is None
