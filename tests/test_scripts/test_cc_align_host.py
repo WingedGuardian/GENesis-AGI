@@ -145,3 +145,17 @@ def test_timer_script_sources_shared_aligner_and_self_guards():
 def test_timer_script_parses_clean():
     res = subprocess.run(["bash", "-n", str(ALIGN_SH)], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
+
+
+def test_install_sh_enables_timers_generically():
+    """install.sh must enable timers via a GENERIC loop over the timer templates
+    (mirrors bootstrap.sh), not a hardcoded per-timer list — otherwise a newly
+    added timer like genesis-cc-align is left rendered-but-dead in the fresh
+    install path (the exact gap Codex caught on PR #1025)."""
+    txt = (REPO_ROOT / "scripts" / "install.sh").read_text()
+    assert 'for template in "$SYSTEMD_TEMPLATE_DIR"/*.timer.template' in txt, (
+        "install.sh must enable rendered timers with a generic loop over the "
+        "timer templates, not a hardcoded per-timer enable list"
+    )
+    # backup stays a deliberate opt-in setup step — never auto-enabled here.
+    assert "genesis-backup.timer) continue" in txt
