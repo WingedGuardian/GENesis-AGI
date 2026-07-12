@@ -75,6 +75,16 @@ class TestCheapCheck:
         assert "packed_refs_corrupt" in rep.failures
 
     @pytest.mark.asyncio
+    async def test_empty_packed_refs_is_healthy(self, repo):
+        # A 0-byte packed-refs is a LEGITIMATE state (refs all loose) — it must
+        # NOT flag corrupt, only null-BYTE content does. The healthy repo's refs
+        # stay resolvable, so the overall report is ok.
+        (repo / ".git" / "packed-refs").write_bytes(b"")
+        rep = await g.check_git_cheap(repo)
+        assert "packed_refs_corrupt" not in rep.failures
+        assert rep.ok is True
+
+    @pytest.mark.asyncio
     async def test_missing_git_dir_unresolvable(self, tmp_path):
         # A plain directory that is not a git repo.
         plain = tmp_path / "plain"

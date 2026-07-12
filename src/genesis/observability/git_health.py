@@ -189,14 +189,17 @@ def _check_git_cheap_sync(repo: Path) -> GitHealthReport:
     elif rc != 0:
         failures.append("refs_unreadable")
 
-    # packed-refs zeroed — the exact incident signature: the file still "exists"
-    # so higher-level git may not scream immediately, but it's been nulled.
+    # packed-refs NULLED — the exact incident signature: the file still "exists"
+    # so higher-level git may not scream immediately, but its bytes are \x00.
+    # NOTE: a 0-byte packed-refs is a LEGITIMATE git state (all refs loose, or a
+    # gc that packed nothing), so empty is NOT flagged here — a truncation that
+    # actually loses refs surfaces as `refs_unreadable` above instead.
     if git_common is not None:
         pr = git_common / "packed-refs"
         try:
             if pr.exists():
                 head = pr.read_bytes()[:512]
-                if len(head) == 0 or head[:1] == b"\x00":
+                if head[:1] == b"\x00":
                     failures.append("packed_refs_corrupt")
         except OSError:
             failures.append("packed_refs_unreadable")
