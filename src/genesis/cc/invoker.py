@@ -60,6 +60,12 @@ def _build_scope_args() -> list[str]:
     limits.  Each session gets its own cgroup under app.slice/run-XXXX.scope,
     separate from genesis-server.service.
 
+    Memory limits are PERCENTAGES so they scale with the host: systemd
+    resolves ``N%`` against the container's memory cgroup (verified: on a
+    16 GiB container ``62%``→9.9 GiB soft, ``75%``→12 GiB hard). This keeps
+    a heavy CC build from OOM-ing the box while auto-scaling up on larger
+    installs and down on the 8 GiB floor — no hardcoded ceiling to re-tune.
+
     Returns an empty list if systemd-run is unavailable (graceful degradation).
     """
     if not shutil.which("systemd-run"):
@@ -72,9 +78,9 @@ def _build_scope_args() -> list[str]:
         "-p",
         "IOWeight=100",
         "-p",
-        "MemoryHigh=22G",
+        "MemoryHigh=62%",
         "-p",
-        "MemoryMax=27G",
+        "MemoryMax=75%",
         "--",
     ]
 

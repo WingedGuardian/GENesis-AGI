@@ -1021,7 +1021,8 @@ Type=simple
 ExecStart="$QDRANT_BIN" "--config-path" "$HOME/.qdrant/config.yaml"
 Restart=on-failure
 RestartSec=5
-MemoryMax=4G
+# 25% of container RAM (scales with the box); live qdrant RSS is ~0.3G.
+MemoryMax=25%
 LimitNOFILE=65536
 OOMScoreAdjust=-500
 StandardOutput=journal

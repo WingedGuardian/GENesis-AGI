@@ -21,11 +21,14 @@ StandardError=journal
 TimeoutStartSec=3900
 
 # Resource limits — prevent CC diagnostic from consuming unbounded host memory.
-# 6G covers the guardian Python process + one CC session + tool subprocesses.
+# 30% of host RAM covers the guardian Python process + one CC session + tool
+# subprocesses, and scales with the host (systemd resolves the % at runtime),
+# so there is no hardcoded ceiling to re-tune per install — and it auto-shrinks
+# on small hosts, protecting an 8 GiB box a fixed 6G would have starved.
 # MemorySwapMax=0 prevents I/O thrashing under pressure.
 # OOMScoreAdjust=500 (positive) makes guardian first to be OOM-killed vs
 # genesis (-500) or ollama — guardian is expendable, primary workloads are not.
-MemoryMax=6G
+MemoryMax=30%
 MemorySwapMax=0
 OOMScoreAdjust=500
 
