@@ -1047,3 +1047,153 @@ class TestCCAuthReconciler:
         for _ in range(_THRESHOLD):
             await wd._check_cc_auth(_cc_vi(False))
         assert _alert_source_ids(outreach).count("guardian:cc_auth_unhealthy") == 2
+
+
+# ─────────────────────────── F4-linger reconcilers ───────────────────────────
+def _host_linger_vi(linger):
+    """A version() payload carrying just host_linger (or 'absent' = old gateway)."""
+    if linger == "absent":
+        return {"cc_version": "1.2.3"}  # no host_linger key
+    return {"host_linger": linger}
+
+
+def _loginctl_returning(output: bytes):
+    """Replacement for asyncio.create_subprocess_exec yielding a fake proc whose
+    communicate() returns the given loginctl stdout."""
+    async def _fake(*_a, **_k):
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(output, b""))
+        return proc
+    return _fake
+
+
+async def _raise_exec(*_a, **_k):
+    raise OSError("loginctl unavailable")
+
+
+class TestHostLingerReconciler:
+    """Host systemd-linger health, read from the gateway version payload."""
+
+    @pytest.mark.asyncio
+    async def test_old_gateway_no_field_skips(self):
+        wd, _, eb, outreach = _cc_watchdog()
+        await wd._check_host_linger(_host_linger_vi("absent"))
+        outreach.submit_raw.assert_not_called()
+        eb.emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enabled_is_silent(self):
+        wd, _, _, outreach = _cc_watchdog()
+        for _ in range(_THRESHOLD + 2):
+            await wd._check_host_linger(_host_linger_vi(True))
+        outreach.submit_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_none_never_alarms(self):
+        wd, _, _, outreach = _cc_watchdog()
+        for _ in range(_THRESHOLD + 3):
+            await wd._check_host_linger(_host_linger_vi(None))
+        outreach.submit_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disabled_alerts_at_threshold_once(self):
+        wd, _, eb, outreach = _cc_watchdog()
+        for _ in range(_THRESHOLD - 1):
+            await wd._check_host_linger(_host_linger_vi(False))
+        outreach.submit_raw.assert_not_called()
+        await wd._check_host_linger(_host_linger_vi(False))
+        ids = _alert_source_ids(outreach)
+        assert ids.count("guardian:host_linger_disabled") == 1
+        assert any("host_linger_disabled" in e for e in _emitted_events(eb))
+        await wd._check_host_linger(_host_linger_vi(False))  # still 1/episode
+        assert _alert_source_ids(outreach).count("guardian:host_linger_disabled") == 1
+
+    @pytest.mark.asyncio
+    async def test_alert_text_names_enable_linger(self):
+        wd, _, _, outreach = _cc_watchdog()
+        for _ in range(_THRESHOLD):
+            await wd._check_host_linger(_host_linger_vi(False))
+        msg = outreach.submit_raw.call_args.args[0]
+        assert "enable-linger" in msg
+
+    @pytest.mark.asyncio
+    async def test_recovery_rearms(self):
+        wd, _, _, outreach = _cc_watchdog()
+        for _ in range(_THRESHOLD):
+            await wd._check_host_linger(_host_linger_vi(False))
+        assert _alert_source_ids(outreach).count("guardian:host_linger_disabled") == 1
+        await wd._check_host_linger(_host_linger_vi(True))  # recovered → reset
+        for _ in range(_THRESHOLD):
+            await wd._check_host_linger(_host_linger_vi(False))
+        assert _alert_source_ids(outreach).count("guardian:host_linger_disabled") == 2
+
+
+class TestContainerLingerReconciler:
+    """Container-local systemd-linger health via a local loginctl probe."""
+
+    @pytest.mark.asyncio
+    async def test_enabled_is_silent(self):
+        wd, _, _, outreach = _cc_watchdog()
+        with patch("asyncio.create_subprocess_exec",
+                   new=_loginctl_returning(b"Linger=yes\n")):
+            for _ in range(_THRESHOLD + 2):
+                await wd._check_container_linger()
+        outreach.submit_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disabled_alerts_at_threshold_once(self):
+        wd, _, eb, outreach = _cc_watchdog()
+        with patch("asyncio.create_subprocess_exec",
+                   new=_loginctl_returning(b"Linger=no\n")):
+            for _ in range(_THRESHOLD - 1):
+                await wd._check_container_linger()
+            outreach.submit_raw.assert_not_called()
+            await wd._check_container_linger()
+        ids = _alert_source_ids(outreach)
+        assert ids.count("guardian:container_linger_disabled") == 1
+        assert any("container_linger_disabled" in e for e in _emitted_events(eb))
+
+    @pytest.mark.asyncio
+    async def test_probe_error_never_alarms(self):
+        wd, _, _, outreach = _cc_watchdog()
+        with patch("asyncio.create_subprocess_exec", new=_raise_exec):
+            for _ in range(_THRESHOLD + 3):
+                await wd._check_container_linger()
+        outreach.submit_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unexpected_output_never_alarms(self):
+        wd, _, _, outreach = _cc_watchdog()
+        with patch("asyncio.create_subprocess_exec",
+                   new=_loginctl_returning(b"")):  # no user record
+            for _ in range(_THRESHOLD + 3):
+                await wd._check_container_linger()
+        outreach.submit_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_alert_names_user_and_remedy(self):
+        wd, _, _, outreach = _cc_watchdog()
+        with patch("getpass.getuser", return_value="testuser"), \
+                patch("asyncio.create_subprocess_exec",
+                      new=_loginctl_returning(b"Linger=no\n")):
+            for _ in range(_THRESHOLD):
+                await wd._check_container_linger()
+        msg = outreach.submit_raw.call_args.args[0]
+        assert "testuser" in msg and "enable-linger" in msg
+
+    @pytest.mark.asyncio
+    async def test_recovery_rearms(self):
+        wd, _, _, outreach = _cc_watchdog()
+        with patch("asyncio.create_subprocess_exec",
+                   new=_loginctl_returning(b"Linger=no\n")):
+            for _ in range(_THRESHOLD):
+                await wd._check_container_linger()
+        assert _alert_source_ids(outreach).count("guardian:container_linger_disabled") == 1
+        with patch("asyncio.create_subprocess_exec",
+                   new=_loginctl_returning(b"Linger=yes\n")):
+            await wd._check_container_linger()  # recovered → reset
+        with patch("asyncio.create_subprocess_exec",
+                   new=_loginctl_returning(b"Linger=no\n")):
+            for _ in range(_THRESHOLD):
+                await wd._check_container_linger()
+        assert _alert_source_ids(outreach).count("guardian:container_linger_disabled") == 2

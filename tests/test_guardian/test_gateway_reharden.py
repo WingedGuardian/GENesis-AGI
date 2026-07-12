@@ -256,3 +256,14 @@ class TestOptionsDivergenceGuardrail:
 
     def test_gateway_and_installer_opts_identical(self):
         assert self._extract(GATEWAY) == self._extract(INSTALLER)
+
+
+def test_version_reports_host_linger_tristate(sandbox):
+    """host_linger is always emitted as a JSON true/false/null literal — `null`
+    (never a bogus `false`) when loginctl can't be probed. Environment-robust:
+    asserts the field is present and well-formed regardless of logind state."""
+    res = _run(sandbox, "version")
+    assert res.returncode == 0, res.stderr
+    payload = json.loads(res.stdout)
+    assert "host_linger" in payload
+    assert payload["host_linger"] in (True, False, None)
