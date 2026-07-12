@@ -3,6 +3,14 @@
 How Genesis's infrastructure is organized. User-specific values (IPs,
 repo names, machine specs) live in CLAUDE.md per-install.
 
+> **Machine specifics live in the infrastructure body schema.** For any
+> infrastructure-adjacent work — timeouts, disk/tmpfs, DB pragmas, cgroup
+> limits, kernel/sysctls, service units — consult
+> `~/.genesis/infrastructure/INFRASTRUCTURE.md` FIRST (programmatically
+> collected facts + per-section gotcha annotations; refresh/inspect via the
+> `infrastructure_profile` MCP tool). Don't rediscover the environment by
+> hand.
+
 ## Runtime Stack
 
 - **Python 3.12** with a project venv at `~/genesis/.venv`. Activate

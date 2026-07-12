@@ -39,7 +39,7 @@ def main() -> int:
         from genesis.infra_profile import claude_md, store
 
         profile = store.load_profile()
-        changed = claude_md.update_block(profile)
+        changed = claude_md.update_block(profile, ignore_update_gate=True)
         print(json.dumps({"ok": True, "changed": changed}))
         return 0
 

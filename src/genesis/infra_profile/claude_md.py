@@ -59,15 +59,22 @@ def _replace_block(text: str, name: str, content: str) -> str:
 def update_block(
     profile: dict[str, Any],
     claude_md_path: Path = CLAUDE_MD_PATH,
+    *,
+    ignore_update_gate: bool = False,
 ) -> bool:
-    """Rewrite the container-specs block. Returns True if the file changed."""
+    """Rewrite the container-specs block. Returns True if the file changed.
+
+    ``ignore_update_gate`` is for the ``--claude-md-block`` CLI, which
+    update.sh itself invokes AFTER its own sed pass — sequenced, not racing.
+    The gate protects only the runtime-side refresh path.
+    """
     from genesis.env import update_in_progress
     from genesis.util.atomic import atomic_write_text
 
     if not profile.get("sections"):
         logger.debug("infra_profile: no profile yet — leaving CLAUDE.md block alone")
         return False
-    if update_in_progress():
+    if not ignore_update_gate and update_in_progress():
         logger.info("infra_profile: deploy in progress — skipping CLAUDE.md rewrite")
         return False
     if not claude_md_path.exists():
