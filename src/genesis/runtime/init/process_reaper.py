@@ -19,11 +19,12 @@ old rule wrongly killed (the 2026-07-11 incident: interactive sessions
 killed 77 min after they went quiet).
 
 Ships in DRY-RUN by default: it logs ``WOULD KILL`` and writes an
-observation but never signals a process. After a clean observation window
-(``_DRY_RUN_ARM_AFTER_SECS``) with the job running successfully, it
-auto-arms and sends the owner a Telegram summary (with disable
-instructions). State persists in a human-editable JSON file so the owner
-can force dry-run back by hand or a hard env kill-switch can veto arming.
+observation but never signals a process. It arms ONLY on an explicit
+operator opt-in — ``"armed_by_operator": true`` in the state JSON (set via
+``set_operator_armed``) or ``GENESIS_REAPER_ARMED=1`` in the environment.
+There is no automatic time-based arming: a human reviews the dry-run
+WOULD-KILL log and deliberately flips the switch. A hard env kill-switch
+(``GENESIS_REAPER_KILL_DISABLED``) forces dry-run regardless of the flag.
 """
 
 from __future__ import annotations
@@ -45,7 +46,6 @@ logger = logging.getLogger("genesis.runtime")
 # ── Policy constants ────────────────────────────────────────────────────
 _CLAUDE_AGE_FLOOR_SECS = 168 * 3600  # 7d — floor before a claude proc is even considered
 _CLAUDE_IDLE_WINDOW_SECS = 168 * 3600  # 7d — "active within" window (marker freshness)
-_DRY_RUN_ARM_AFTER_SECS = 3 * 86400  # arm after 3 clean dry-run days
 _KILL_GRACE_SECS = 5  # SIGTERM → SIGKILL grace (browsers flush SQLite)
 
 _GENESIS_DIR = Path.home() / ".genesis"
@@ -55,6 +55,13 @@ _STATE_PATH = _GENESIS_DIR / "reaper_state.json"
 # Hard kill-switch: when set (to a truthy value) the reaper can never arm —
 # it stays in dry-run regardless of persisted state. Owner's emergency brake.
 _ENV_HARD_DISABLE = "GENESIS_REAPER_KILL_DISABLED"
+
+# Operator opt-in to actually reap (env alternative to the state-file flag).
+# Absent both → dry-run. The reaper never arms itself; a human flips this.
+_ENV_ARM = "GENESIS_REAPER_ARMED"
+
+# State-file key an operator sets (via ``set_operator_armed``) to arm.
+_STATE_ARMED_KEY = "armed_by_operator"
 
 
 # ── Pure decision core (fully unit-testable) ────────────────────────────
@@ -250,6 +257,30 @@ def _save_state(state: dict) -> None:
         tmp.replace(_STATE_PATH)
 
 
+def _operator_armed(state: dict) -> bool:
+    """True only if a human explicitly opted in to real kills — via the
+    ``armed_by_operator`` state flag or the ``GENESIS_REAPER_ARMED`` env.
+    """
+    return bool(state.get(_STATE_ARMED_KEY)) or bool(os.environ.get(_ENV_ARM))
+
+
+def set_operator_armed(armed: bool) -> None:
+    """Operator switch: arm (real kills) or disarm (dry-run) the reaper.
+
+    Read-modify-writes the state JSON so the change takes effect on the next
+    pass (within the hour) with no server restart. Arming is a deliberate
+    human action taken after reviewing the dry-run WOULD-KILL log; disarming
+    clears the flag. The hard ``GENESIS_REAPER_KILL_DISABLED`` env stays an
+    independent emergency brake that overrides an armed flag.
+    """
+    state = _load_state()
+    if armed:
+        state[_STATE_ARMED_KEY] = True
+    else:
+        state.pop(_STATE_ARMED_KEY, None)
+    _save_state(state)
+
+
 def _gc_markers(live_pids: set[int]) -> None:
     """Delete activity markers for PIDs that are no longer alive."""
     with contextlib.suppress(FileNotFoundError, NotADirectoryError):
@@ -263,7 +294,9 @@ def _gc_markers(live_pids: set[int]) -> None:
 
 # ── Orchestrator ────────────────────────────────────────────────────────
 async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
-    """One reaper pass. Dry-run by default; auto-arms after a clean window.
+    """One reaper pass. Dry-run unless an operator has explicitly armed it
+    (``armed_by_operator`` state flag or ``GENESIS_REAPER_ARMED`` env); the
+    hard kill-switch overrides. There is no automatic arming.
 
     ``now`` is injectable (epoch secs) for deterministic tests.
     """
@@ -274,8 +307,9 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
 
     hard_disabled = bool(os.environ.get(_ENV_HARD_DISABLE))
     state = _load_state()
-    # Effective dry-run for THIS pass: persisted flag OR the hard kill-switch.
-    dry_run = bool(state.get("dry_run", True)) or hard_disabled
+    # Arm ONLY on explicit operator opt-in (state flag or env). The hard
+    # kill-switch overrides both. There is no automatic time-based arming.
+    dry_run = not (_operator_armed(state) and not hard_disabled)
 
     my_pid = os.getpid()
     protected = {my_pid, os.getppid()}
@@ -292,13 +326,6 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
         uptime_secs = _read_uptime()
         live_ttys = await _live_ttys()
         all_live_pids: set[int] = set()
-        # Proof-of-life for the hook: did we see ANY live claude PID with a
-        # fresh activity marker this pass? The marker is the sole trustworthy
-        # "user is active here" signal (process structure can't distinguish a
-        # live session from an orphan — verified 2026-07-11: all sessions had
-        # live bash/tmux parents). Auto-arm is gated on this, so the reaper
-        # never arms while its load-bearing signal is absent (hook not firing).
-        saw_fresh_marker = False
         # candidates: (root_pid, label, reason, is_claude, tree)
         candidates: list[tuple[int, str, str, bool, list[int]]] = []
 
@@ -315,8 +342,6 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
                 if is_claude:
                     tty = await _process_tty(pid)
                     marker = _marker_mtime(pid)
-                    if marker is not None and (now - marker) < _CLAUDE_IDLE_WINDOW_SECS:
-                        saw_fresh_marker = True
                     should_reap, reason = classify_claude_pid(
                         age_secs=age,
                         now=now,
@@ -336,15 +361,6 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
         _gc_markers(all_live_pids)
 
         if not candidates:
-            await _maybe_arm(
-                state,
-                now,
-                dry_run,
-                hard_disabled,
-                rt,
-                hook_active=saw_fresh_marker,
-                armed_summary=None,
-            )
             rt.record_job_success("process_reaper")
             return
 
@@ -360,15 +376,6 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
                     tree,
                 )
             await _record_observation(rt, candidates, dry_run=True)
-            await _maybe_arm(
-                state,
-                now,
-                dry_run,
-                hard_disabled,
-                rt,
-                hook_active=saw_fresh_marker,
-                armed_summary=_summarize(candidates),
-            )
             rt.record_job_success("process_reaper")
             return
 
@@ -409,80 +416,11 @@ def _summarize(candidates: list[tuple[int, str, str, bool, list[int]]]) -> str:
     return ", ".join(f"{root}({label}/{reason})" for root, label, reason, _, _ in candidates)
 
 
-async def _maybe_arm(
-    state: dict,
-    now: float,
-    dry_run: bool,
-    hard_disabled: bool,
-    rt: GenesisRuntime,
-    *,
-    hook_active: bool,
-    armed_summary: str | None,
-) -> None:
-    """Advance the dry-run→armed lifecycle. Never arms this pass; the flip
-    takes effect on the NEXT pass so the owner gets the notification + a
-    veto window before anything is signalled.
-
-    Auto-arm requires BOTH the elapsed dry-run window AND proof-of-life for
-    the hook (``hook_active`` — a fresh marker was seen at least once). The
-    marker is the reaper's only trustworthy activity signal, so arming while
-    it has never appeared would reap on the unreliable tty backstop alone.
-    ``hook_verified`` latches once true so a transient markerless pass (e.g.
-    all sessions momentarily idle) can't un-verify a hook already proven live.
-    """
-    if not dry_run or hard_disabled:
-        return  # already armed, or hard kill-switch engaged
-    changed = False
-    if not state.get("dry_run_since"):
-        state["dry_run_since"] = now
-        changed = True
-    if hook_active and not state.get("hook_verified"):
-        state["hook_verified"] = True
-        changed = True
-    elapsed = now - float(state["dry_run_since"])
-    if (
-        elapsed >= _DRY_RUN_ARM_AFTER_SECS
-        and state.get("hook_verified")
-        and not state.get("armed_at")
-    ):
-        # Arming REQUIRES a delivered veto notice: the owner must receive the
-        # heads-up + disable instructions before any real kill. If outreach is
-        # unavailable or delivery fails, stay in dry-run and retry next pass —
-        # never arm silently.
-        msg = (
-            "🔫 Process reaper auto-armed after "
-            f"{elapsed / 86400:.1f} clean dry-run days. It will now reap "
-            "claude processes that are >7d old AND idle >7d AND detached "
-            "from any live terminal (a strict subset of the old age-only "
-            "rule). Last dry-run would-kill set: "
-            f"{armed_summary or 'none'}. To keep it disabled, set "
-            '"dry_run": true in ~/.genesis/reaper_state.json or export '
-            f"{_ENV_HARD_DISABLE}=1."
-        )
-        if await _notify_owner(rt, msg):
-            state["dry_run"] = False
-            state["armed_at"] = now
-            changed = True
-            logger.warning(
-                "Process reaper auto-armed after %.1f clean dry-run days; "
-                "future passes will reap detached idle claude processes.",
-                elapsed / 86400,
-            )
-        else:
-            logger.warning(
-                "Process reaper met the auto-arm criteria but could not deliver "
-                "the owner veto notification; staying in dry-run, retrying next "
-                "pass."
-            )
-    if changed:
-        _save_state(state)
-
-
 async def _notify_owner(rt: GenesisRuntime, message: str) -> bool:
     """Send a verbatim ALERT to the owner. Returns True only if delivered.
 
-    The auto-arm gate relies on the return value — arming must not proceed
-    unless the owner actually received the veto notice.
+    Used to notify the owner when the (operator-armed) reaper actually kills
+    a detached claude process.
     """
     if rt._outreach_pipeline is None:
         return False
