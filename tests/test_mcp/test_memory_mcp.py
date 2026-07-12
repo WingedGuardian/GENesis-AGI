@@ -1626,3 +1626,37 @@ async def test_procedure_store_gate1_emit_honors_session_origin(monkeypatch):
         finally:
             ishadow_crud._table_verified = old_verified
             mod._store, mod._db, mod._retriever = old_store, old_db, old_retriever
+
+
+@pytest.mark.asyncio
+async def test_reference_store_forwards_session_origin(monkeypatch):
+    """WS-3: reference_store forwards the dispatched session's env origin into
+    the knowledge ingest (previously doubly blind: first-party pipeline AND
+    exempt from injection-gate counting)."""
+    import genesis.mcp.memory_mcp as mod
+    from genesis.memory import knowledge_ingest as ki
+
+    captured: dict = {}
+
+    async def _fake_ingest(**kwargs):
+        captured.update(kwargs)
+        return "unit-1"
+
+    old = (mod._store, mod._db, mod._qdrant, mod._retriever)
+    try:
+        mod._store, mod._db, mod._qdrant, mod._retriever = (
+            MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+        )
+        monkeypatch.setattr(ki, "ingest_knowledge_unit", _fake_ingest)
+        monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "external_untrusted")
+        tools = await _get_tools()
+        out = await tools["reference_store"].fn(
+            kind="url",
+            identifier="example service",
+            value="https://example.invalid/x",
+            description="synthetic test reference",
+        )
+        assert out == "unit-1"
+        assert captured["origin_class"] == "external_untrusted"
+    finally:
+        mod._store, mod._db, mod._qdrant, mod._retriever = old
