@@ -54,11 +54,13 @@ PROCEDURE_GATE_SITES: dict[str, tuple[str, str]] = {
         "invariant), wired for uniformity + future non-owner input",
     ),
     "learning/procedural/extractor.py::extract_procedure": (
-        "deferred-with-reason",
-        "legacy 500-char fallback past its 2026-07-09 removal date; only "
-        "session_tools_count (an int) is in scope — no tool-name signal to derive "
-        "origin from; superseded by the gated judge path; removal tracked as "
-        "follow-up 3558802740d5",
+        "gated",
+        "legacy 500-char fallback (still live from pipeline.py on "
+        "APPROACH_FAILURE / WORKAROUND_SUCCESS / autonomous SUCCESS — exactly the "
+        "outcomes most likely to carry external content); emits with "
+        "origin_from_tool_names(data['tools_used']) — the required+validated LLM "
+        "response field, same tool-name signal as the judge/trace paths. Full "
+        "removal of this path is tracked as follow-up 3558802740d5",
     ),
     "learning/procedural/operations.py::store_procedure_checked": (
         "internal",

@@ -578,8 +578,9 @@ verified: fa2e692a 2026-07-11
   `immunity_shadow.record_would_block(gate="procedure")` fires at every
   procedure-promotion site: the judge convergence
   (`judge._store_judged_procedure`, covering BOTH the struggle and rebuild
-  callers), the autonomy retrospective (`executor/trace.py`), and owner
-  explicit-teach (`mcp/memory/procedural.py`). Origin is a coarse tool-name
+  callers), the autonomy retrospective (`executor/trace.py`), the legacy
+  auto-extractor (`extractor.py`, still live from the triage pipeline), and
+  owner explicit-teach (`mcp/memory/procedural.py`). Origin is a coarse tool-name
   ingest scan (`provenance.origin_from_tool_names` — the session/trace touched
   an external-ingest tool → `external_untrusted`; over-observes by design, since
   fetched content lives in tool RESULTS the spine doesn't carry — enforce needs
