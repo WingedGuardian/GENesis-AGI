@@ -77,6 +77,7 @@ from genesis.mcp.health import (  # noqa: E402
     loop_closure_status,  # noqa: F401
 )
 from genesis.mcp.health import inbox_digest as _inbox_digest  # noqa: E402
+from genesis.mcp.health import infrastructure_profile as _infrastructure_profile  # noqa: E402, F401
 from genesis.mcp.health import j9_eval as _j9_eval  # noqa: E402, F401
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
 from genesis.mcp.health import module_ops as _module_ops  # noqa: E402

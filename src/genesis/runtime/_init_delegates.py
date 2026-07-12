@@ -152,6 +152,10 @@ class _InitDelegatesMixin:
         from genesis.runtime.init.sentinel import init_sentinel
         await init_sentinel(self)
 
+    async def _init_infra_profile(self) -> None:
+        from genesis.runtime.init.infra_profile import init_infra_profile
+        await init_infra_profile(self)
+
     def _probe_guardian_status(self) -> None:
         """Check if the Guardian is alive by reading its heartbeat file.
 

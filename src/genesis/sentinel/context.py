@@ -165,7 +165,21 @@ async def assemble_diagnostic_context(
         except Exception:
             logger.debug("Failed to query recent observations", exc_info=True)
 
-    # 6. Essential knowledge (recent operational context)
+    # 6. Infrastructure body schema — headline facts + gotcha annotations +
+    #    recently drifted sections. Best-effort: diagnosis must work without it.
+    try:
+        from genesis.infra_profile import store as infra_store
+        from genesis.infra_profile.render import sentinel_digest
+
+        digest = sentinel_digest(
+            infra_store.load_profile(), infra_store.load_annotations(),
+        )
+        if digest:
+            sections.append(f"## Infrastructure Body Schema\n\n{digest}")
+    except Exception:
+        logger.debug("Failed to build infrastructure digest", exc_info=True)
+
+    # 7. Essential knowledge (recent operational context)
     try:
         ek_path = Path.home() / ".genesis" / "essential_knowledge.md"
         if ek_path.exists():

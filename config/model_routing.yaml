@@ -529,6 +529,20 @@ call_sites:
     never_pays: true
     retry_profile: background
     description: "Intelligence intake — score uncurated recon findings for relevance and quality"
+  # Strong-first by user decision (2026-07-11): annotations are the value layer
+  # of the infrastructure body schema and regenerate only when a fact section's
+  # hash changes, so quality wins over cost (call site 37 showed free-model
+  # judgment output is too weak for this class of task).
+  46_infra_annotation:
+    chain:
+    - openrouter-sonnet
+    - gemini-free
+    - groq-free
+    - mistral-large-free
+    - openrouter-free
+    default_paid: true
+    retry_profile: background
+    description: "Infrastructure body-schema annotations — operational gotchas per fact section"
   35_content_draft:
     chain:
     - gemini-free

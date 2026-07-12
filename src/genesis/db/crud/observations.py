@@ -119,6 +119,7 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "escalation_to_user_ego": timedelta(days=7),
     "sentinel_escalated": timedelta(days=7),
     "guardian_diagnosis": timedelta(days=7),
+    "infrastructure_drift": timedelta(days=7),
     # ── 14-day (learning artifacts & assessments — also the DEFAULT) ───
     "build_state": timedelta(days=14),
     "project_context": timedelta(days=14),

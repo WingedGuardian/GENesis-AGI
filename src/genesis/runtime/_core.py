@@ -444,6 +444,13 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
                 "guardian_monitoring", self._init_guardian_monitoring,
             )
 
+        # After guardian_monitoring so rt._guardian_remote exists for the
+        # host plane; non-blocking (spawns a delayed background refresh).
+        if _full:
+            await self._run_init_step_async(
+                "infra_profile", self._init_infra_profile,
+            )
+
         if _full:
             await self._run_init_step_async("sentinel", self._init_sentinel)
 
