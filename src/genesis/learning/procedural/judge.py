@@ -352,11 +352,15 @@ async def _store_judged_procedure(
     await immunity_shadow.record_would_block(
         gate="procedure",
         source_kind="procedure_promotion",
-        source_ref=result.procedure_id,
+        # Stable per-SITE ref — summary() groups by source_ref to size per-site
+        # would-block volume, so the procedure id goes in detail (traceable), not
+        # here (which would make every promotion its own bucket).
+        source_ref="learning/procedural/judge.py::_store_judged_procedure",
         process="server",
         blockable_count=1,
         origin_class=origin_class or ORIGIN_FIRST_PARTY,
         db=db,
+        detail={"procedure_id": result.procedure_id},
     )
 
     return result.procedure_id

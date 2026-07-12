@@ -483,11 +483,13 @@ class ExecutionTracer:
         await immunity_shadow.record_would_block(
             gate="procedure",
             source_kind="procedure_promotion",
-            source_ref=proc_id,
+            # Stable per-SITE ref (summary() groups by it); procedure id → detail.
+            source_ref="autonomy/executor/trace.py::_store_new_procedure",
             process="server",
             blockable_count=1,
             origin_class=trace_origin,
             db=self._db,
+            detail={"procedure_id": proc_id},
         )
 
         trace.procedural_extractions.append(proc_id)
