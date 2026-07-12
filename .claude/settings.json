@@ -11,7 +11,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_session_context.py",
-                        "timeout": 5000
+                        "timeout": 30
                     }
                 ]
             },
@@ -20,7 +20,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook check_stale_pending.py",
-                        "timeout": 5000
+                        "timeout": 30
                     }
                 ]
             },
@@ -30,7 +30,7 @@
                     {
                         "type": "command",
                         "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
-                        "timeout": 2000
+                        "timeout": 30
                     }
                 ]
             }
@@ -41,7 +41,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_urgent_alerts.py",
-                        "timeout": 3000
+                        "timeout": 10
                     }
                 ]
             },
@@ -50,7 +50,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook review_enforcement_prompt.py",
-                        "timeout": 3000
+                        "timeout": 10
                     }
                 ]
             },
@@ -59,7 +59,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook proactive_memory_hook.py",
-                        "timeout": 1650
+                        "timeout": 10
                     }
                 ]
             },
@@ -68,7 +68,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/skill_injection_hook.py",
-                        "timeout": 500
+                        "timeout": 10
                     }
                 ]
             },
@@ -77,7 +77,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook contribution_offer_hook.py",
-                        "timeout": 500
+                        "timeout": 10
                     }
                 ]
             }
@@ -89,7 +89,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook procedure_advisor.py",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -99,7 +99,7 @@
                     {
                         "type": "command",
                         "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-discovery-gate.sh",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -118,7 +118,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/destructive_command_guard.py",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -128,7 +128,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/worktree_cwd_guard.py",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -138,7 +138,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/protected_paths_guard.py",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -148,7 +148,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/credential_surface_hook.py",
-                        "timeout": 500
+                        "timeout": 10
                     }
                 ]
             },
@@ -158,7 +158,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/git_push_guard.py",
-                        "timeout": 2000
+                        "timeout": 60
                     }
                 ]
             },
@@ -168,7 +168,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/repo_routing_guard.py",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -178,7 +178,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/concurrent_test_guard.py",
-                        "timeout": 3000
+                        "timeout": 10
                     }
                 ]
             },
@@ -188,7 +188,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/full_suite_guard.py",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -198,7 +198,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook review_enforcement_commit.py",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -230,7 +230,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/web_tools_gate.py",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -240,7 +240,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/agent_tool_guidance.py",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -250,7 +250,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/worktree_cwd_guard.py --exit-worktree",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -260,7 +260,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/worktree_cwd_guard.py --enter-worktree",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             }
@@ -271,7 +271,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_stop_hook.py",
-                        "timeout": 2000
+                        "timeout": 30
                     }
                 ]
             },
@@ -280,7 +280,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/deliverable_gate_guard.py",
-                        "timeout": 2000
+                        "timeout": 30
                     }
                 ]
             }
@@ -291,7 +291,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_session_end.py",
-                        "timeout": 1500
+                        "timeout": 30
                     }
                 ]
             }
@@ -303,7 +303,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook file_context_hook.py",
-                        "timeout": 500
+                        "timeout": 10
                     }
                 ]
             },
@@ -323,12 +323,12 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook file_modification_audit_hook.py",
-                        "timeout": 500
+                        "timeout": 10
                     },
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook edit_failure_sensor.py",
-                        "timeout": 500
+                        "timeout": 10
                     },
                     {
                         "type": "command",
@@ -343,7 +343,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook review_invalidate_on_commit.py",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -353,7 +353,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook content_safety_hook.py",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             },
@@ -363,7 +363,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/stealth_skill_nudge.py",
-                        "timeout": 500
+                        "timeout": 10
                     }
                 ]
             },
@@ -373,7 +373,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/session_observer_hook.py",
-                        "timeout": 500
+                        "timeout": 10
                     }
                 ]
             },
@@ -383,7 +383,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook plan_bookmark_hook.py",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             }
@@ -395,7 +395,7 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook edit_failure_sensor.py",
-                        "timeout": 500
+                        "timeout": 10
                     }
                 ]
             }
