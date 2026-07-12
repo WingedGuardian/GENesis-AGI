@@ -206,25 +206,27 @@ def record_would_block_sync(
         return False
 
 
-# GROUNDWORK(ws3-b1-readsurface): the B1 observability read. No live caller
-# yet (B4 / a dashboard card consumes it — see follow-up); do NOT delete as
-# dead code. crud.summary/list_recent are reached only through here.
+# GROUNDWORK(ws3-b1-readsurface): the B1 observability read. Consumed by the
+# immunity_status health MCP tool (per-gate would-block counts); crud.list_recent
+# stays GROUNDWORK (no caller yet — a detail/dashboard view consumes it). Do NOT
+# delete as dead code.
 async def recent_summary(*, since: str | None = None, db=None) -> list[dict]:
     """Per-gate / per-site would-block rollup (COUNTS only, no content).
 
     The B1 observability read: how much external content reaches each
     action-capable inject site, sizing the B4 enforce blast radius. Optionally
     bounded to rows at/after ISO ``since``. Self-resolves a connection when
-    ``db`` is None. Best-effort: returns [] on error.
+    ``db`` is None.
+
+    Unlike the emit path this does NOT swallow errors — a broken read (missing
+    table, wrong DB path, failed SELECT) RAISES, so a health caller reports
+    "unavailable" rather than a misleading healthy zero (a swallowed failure
+    would look identical to "genuinely 0 would-blocks").
     """
-    try:
-        if db is not None:
-            return await crud.summary(db, since=since)
-        async with get_raw_db() as conn:
-            return await crud.summary(conn, since=since)
-    except Exception:
-        logger.debug("immunity shadow summary read failed", exc_info=True)
-        return []
+    if db is not None:
+        return await crud.summary(db, since=since)
+    async with get_raw_db() as conn:
+        return await crud.summary(conn, since=since)
 
 
 async def _maybe_auto_demote(db, *, gate: str, mode: str, process: str | None) -> None:
