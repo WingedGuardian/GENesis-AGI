@@ -161,7 +161,9 @@ verified: 9037d45b 2026-07-07
 - **Discord is shadow-gated** (`autonomy/shadow_gate.py`): three doors —
   `pipeline._deliver`, `outreach_poll` webhook, discord-bot `send_reply` —
   observe-only into `capability_shadow`, best-effort so it can NEVER break the
-  real send. Enforcement (hold-for-approval) is the designed next stage. CI
+  real send. Retention-pruned >45d via `scripts/prune_capability_shadow.py`
+  (disk-hygiene), mirroring the immunity shadow store. Enforcement
+  (hold-for-approval) is the designed next stage. CI
   backstop: `scripts/check_external_io.py` fails on new ungated egress
   endpoints.
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +

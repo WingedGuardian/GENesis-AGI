@@ -109,3 +109,35 @@ async def summary(db: aiosqlite.Connection) -> list[dict]:
         "ORDER BY n DESC"
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def prune_capability_shadow_events(
+    db: aiosqlite.Connection,
+    *,
+    older_than_days: int = 45,
+    now: str,
+) -> int:
+    """Delete rows older than *older_than_days* relative to ISO ``now``.
+
+    Retention for the unbounded shadow log (wired into ``disk_hygiene.sh``),
+    mirroring ``crud.immunity_shadow.prune_immunity_shadow_events``. ``now`` is
+    injected (never wall-clock here) so the cutover is deterministic and
+    testable. No-ops (returns 0) before migration 0044's table exists; never
+    creates it. Returns the number of rows deleted.
+    """
+    if not await _table_available(db):
+        return 0
+    cutoff = _iso_days_before(now, older_than_days)
+    cursor = await db.execute(
+        "DELETE FROM capability_shadow_events WHERE observed_at < ?", (cutoff,)
+    )
+    await db.commit()
+    return cursor.rowcount if cursor.rowcount is not None else 0
+
+
+def _iso_days_before(now_iso: str, days: int) -> str:
+    """Return the ISO8601 timestamp *days* before ``now_iso``."""
+    from datetime import datetime, timedelta
+
+    dt = datetime.fromisoformat(now_iso)
+    return (dt - timedelta(days=days)).isoformat()
