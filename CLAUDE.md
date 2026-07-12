@@ -59,7 +59,10 @@ pollers split updates and break approval buttons),
 `genesis-tmp-watchgod.service` (/tmp protection), `genesis-watchdog.timer`
 (health check), `genesis-backup.timer` (6h encrypted backup via
 `scripts/backup.sh`), `genesis-disk-hygiene.timer` (daily worktree reaping, cache reclaim, `~/tmp`
-prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`). MCP servers are CC child processes
+prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`),
+`genesis-cc-align.timer` (nightly host CC/Node pin alignment via the guardian
+gateway, so the host recovery brain never lags a pin bump between updates; see
+`scripts/cc_align_host.sh`). MCP servers are CC child processes
 (not systemd) — code changes take effect on next CC session start.
 
 ## Common Commands
