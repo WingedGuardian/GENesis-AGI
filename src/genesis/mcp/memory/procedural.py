@@ -113,6 +113,15 @@ async def procedure_store(
         principle_embedding=principle_blob,
     )
 
+    # WS-3 B1 gate-1 (procedure): NOT gated here yet. procedure_store is an MCP
+    # tool exposed in the research/campaign direct-session profiles alongside web
+    # tools, so an externally-influenced background session can teach a procedure.
+    # The correct origin is the CALLER's session provenance — which an MCP tool
+    # cannot see except via PR-B's per-session origin env (GENESIS_SESSION_ORIGIN).
+    # The taught `tools_used` are REPLAY tools, not caller provenance, so gating on
+    # them would undercount silently. Deferred to PR-B, which wires the emit with
+    # the real session origin (follow-up tracks it).
+
     response = result.procedure_id
     if result.action == "updated":
         response = f"Updated existing procedure {result.procedure_id} (version bumped)"
@@ -159,6 +168,7 @@ async def procedure_recall(
     if results:
         from genesis.db.crud import procedural
         from genesis.eval.j9_hooks import emit_procedure_invoked
+
         for r in results:
             pid = r.get("procedure_id", "")
             if not pid:

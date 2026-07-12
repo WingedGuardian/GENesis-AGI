@@ -576,13 +576,27 @@ verified: fa2e692a 2026-07-11
   reaches an action-capable prompt (observe-only — the item still reaches the
   model; owner/first-party never recorded). The gate set is CI-locked in
   `test_recall_inject_coverage.py` (a new inject site or a removed emit fails).
-  **Gates 1-3 (procedure/identity/autonomy) do NOT yet emit** — inert in
-  shadow until source provenance is threaded to their decision points
-  (flip-blocking follow-ups). Auto-demote wired but dormant (server + enforce
-  only); retention via `scripts/prune_immunity_shadow.py` (disk-hygiene). The
-  shadow log is readable via the `immunity_status` health MCP tool
-  (gate-agnostic: per-gate live mode + per-site would-block counts — sizes the
-  B4 enforce blast radius; gates 1-3 surface here automatically once they emit).
+  **Gate 1 (procedure) is LIVE in SHADOW** — `record_would_block(gate="procedure")`
+  fires at the two promotion paths that have a trustworthy SOURCE-origin signal:
+  the judge convergence (`judge._store_judged_procedure`, covering BOTH the
+  struggle and rebuild callers) classifies by a coarse tool-name ingest scan over
+  the real transcript spine (`provenance.origin_from_tool_names` — external-ingest
+  tool → `external_untrusted`; over-observes by design since fetched content lives
+  in tool RESULTS the spine doesn't carry); the autonomy retrospective
+  (`executor/trace.py`) classifies by `initiated_by` (Genesis's own execution =
+  first_party/owner; the trace has no source-tool spine). Two promotion paths are
+  DEFERRED (classified `deferred-with-reason`, no emit): the deprecated
+  auto-extractor (`extractor.py` — its only signals are replay tools or a
+  hyphen-truncating prose scrape, both undercount) and `procedure_store` (an MCP
+  tool needing the caller's session origin — PR-B's env). CI-locked in
+  `test_procedure_gate_coverage.py`.
+  **Gates 2-3 (identity/autonomy) do NOT yet emit** — inert in shadow until
+  source provenance is threaded to their decision points (flip-blocking
+  follow-ups). Auto-demote wired but dormant (server + enforce only); retention
+  via `scripts/prune_immunity_shadow.py` (disk-hygiene). The shadow log is
+  readable via the `immunity_status` health MCP tool (gate-agnostic: per-gate
+  live mode + per-site would-block counts — sizes the B4 enforce blast radius;
+  gate 1 and, once they emit, gates 2-3 surface here automatically).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
