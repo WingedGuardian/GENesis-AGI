@@ -720,6 +720,30 @@ async def init(rt: GenesisRuntime) -> None:
                                 evidence_count=result.evidence_count,
                                 narrative=narrative,
                             )
+                            # WS-3 B1 gate-2 (identity): shadow-record the
+                            # USER_KNOWLEDGE write. first_party BY AUTHORSHIP
+                            # (Genesis's own reflection-derived user-model
+                            # deltas) -> self-guards to NO row today. FLIP
+                            # BLOCKER (do not enforce past this): observation
+                            # rows carry no origin_class, so externally-planted
+                            # "facts about the user" in reflected transcripts
+                            # remain first_party until delta-level provenance
+                            # lands. Counts only, never content.
+                            from genesis.security import immunity_shadow
+
+                            await immunity_shadow.record_would_block(
+                                gate="identity",
+                                source_kind="identity_write",
+                                source_ref=("runtime/init/learning.py::_evolve_user_model"),
+                                process="server",
+                                blockable_count=1,
+                                origin_class="first_party",
+                                db=rt._db,
+                                detail={
+                                    "mode": "narrative" if narrative else "rules",
+                                    "evidence_count": result.evidence_count,
+                                },
+                            )
                             try:
                                 from genesis.learning.cognitive_ledger import (
                                     record_existing,

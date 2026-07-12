@@ -58,7 +58,8 @@ async def drain_pending_email_sends(rt: object) -> int:
         if approval is None:
             await pes.mark_rejected(db, row["id"], rejected_at=now, expired=True)
             logger.warning(
-                "Held email %s orphaned (approval missing) — expired", row["id"],
+                "Held email %s orphaned (approval missing) — expired",
+                row["id"],
             )
             resolved += 1
             continue
@@ -81,19 +82,26 @@ async def drain_pending_email_sends(rt: object) -> int:
             # mark sent/consumed — a transient failure leaves the row held for
             # the next cycle (the drain owns resume retries).
             result = await pipeline.deliver_approved(
-                row, subject=_subject(approval.get("context")),
+                row,
+                subject=_subject(approval.get("context")),
             )
             if result.status == OutreachStatus.DELIVERED:
                 await approval_crud.mark_consumed(db, row["request_id"], consumed_at=now)
                 await pes.mark_sent(db, row["id"], sent_at=now)
                 await cg.record_success(
-                    db, domain=row["cell_domain"], verb=row["cell_verb"],
-                    risk_class=row["cell_risk_class"], updated_at=now,
+                    db,
+                    domain=row["cell_domain"],
+                    verb=row["cell_verb"],
+                    risk_class=row["cell_risk_class"],
+                    updated_at=now,
+                    # WS-3 gate-3: the OWNER approved this send — owner evidence.
+                    origin_class="owner",
                 )
                 resolved += 1
                 logger.info(
                     "Resolved held email %s → sent to %s",
-                    row["id"], row["validated_recipient"],
+                    row["id"],
+                    row["validated_recipient"],
                 )
             elif result.status == OutreachStatus.IGNORED:
                 # The pipeline terminally SKIPPED this approved send (self-
@@ -103,7 +111,9 @@ async def drain_pending_email_sends(rt: object) -> int:
                 # approved/unconsumed row. No correction (a guard, not owner intent).
                 if await pes.mark_rejected(db, row["id"], rejected_at=now):
                     await approval_crud.mark_consumed(
-                        db, row["request_id"], consumed_at=now,
+                        db,
+                        row["request_id"],
+                        consumed_at=now,
                     )
                     resolved += 1
                 logger.warning(
@@ -113,13 +123,19 @@ async def drain_pending_email_sends(rt: object) -> int:
             else:
                 logger.warning(
                     "Held email %s delivery failed (%s) — retry next cycle",
-                    row["id"], result.status.value,
+                    row["id"],
+                    result.status.value,
                 )
         elif status in ("rejected", "cancelled"):
             if await pes.mark_rejected(db, row["id"], rejected_at=now):
                 await cg.record_correction(
-                    db, domain=row["cell_domain"], verb=row["cell_verb"],
-                    risk_class=row["cell_risk_class"], updated_at=now,
+                    db,
+                    domain=row["cell_domain"],
+                    verb=row["cell_verb"],
+                    risk_class=row["cell_risk_class"],
+                    updated_at=now,
+                    # WS-3 gate-3: the OWNER rejected/cancelled — owner decision.
+                    origin_class="owner",
                 )
                 resolved += 1
         elif status == "expired":
