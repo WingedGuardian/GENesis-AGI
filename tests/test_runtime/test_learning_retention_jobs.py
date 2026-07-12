@@ -39,21 +39,7 @@ async def test_wire_drip_retention_jobs_registers_all_three():
         sched.shutdown(wait=False)
 
 
-async def test_wire_git_health_deep_job_registered_as_cron():
-    """F.1: the daily git fsck deep check must register as a restart-safe
-    CronTrigger (an IntervalTrigger would reset each restart and never fire on a
-    frequently-restarted box)."""
-    from apscheduler.triggers.interval import IntervalTrigger
-
-    from genesis.runtime.init.learning import _wire_git_health_deep_job
-
-    sched = AsyncIOScheduler()
-    _wire_git_health_deep_job(sched, _StubRT())
-    sched.start(paused=True)
-    try:
-        job = sched.get_job("git_health_deep")
-        assert job is not None, "git_health_deep not registered"
-        assert isinstance(job.trigger, CronTrigger)
-        assert not isinstance(job.trigger, IntervalTrigger)
-    finally:
-        sched.shutdown(wait=False)
+# NOTE: the daily deep `git fsck --full` (F.1) is NO LONGER a learning-scheduler
+# job — it runs from the awareness loop (`_check_git_health_deep`) so it survives a
+# router-degraded startup that skips learning init. Its coverage lives in
+# tests/test_awareness/test_git_health_check.py.

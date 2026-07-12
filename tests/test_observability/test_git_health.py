@@ -264,6 +264,38 @@ class TestVerdictWriter:
         assert loaded["failures"] == []
         assert loaded["deep"]["ok"] is True  # preserved
 
+    def test_legacy_v1_deep_failure_survives_migration(self, tmp_path):
+        """P2 (#1010 Codex re-review): a pre-upgrade v1 verdict (top-level
+        kind/failures, no slots) written by the OLD deep job must be seeded into
+        the deep slot, so the first v2 cheap-ok tick doesn't drop it and reopen the
+        24h blind spot the two-slot format closes."""
+        import json
+
+        shared = tmp_path / "shared"
+        (shared / "guardian").mkdir(parents=True)
+        # Hand-write a legacy v1 deep failure (the pre-migration schema).
+        (shared / "guardian" / "git_health.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "ok": False,
+                    "failures": ["fsck_failed"],
+                    "kind": "deep",
+                    "checked_at": "old",
+                    "details": {},
+                }
+            )
+        )
+        # First v2 write is a passing cheap tick.
+        p = g.write_git_health_verdict(
+            g.GitHealthReport(ok=True, failures=[], details={}, kind="cheap", checked_at="new"),
+            shared_dir=shared,
+        )
+        loaded = json.loads(p.read_text())
+        assert loaded["ok"] is False, "legacy deep failure must survive v1→v2 migration"
+        assert "fsck_failed" in loaded["failures"]
+        assert loaded["deep"]["ok"] is False
+
     def test_top_level_failures_are_union_of_both_slots(self, tmp_path):
         import json
 

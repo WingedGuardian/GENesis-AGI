@@ -283,6 +283,22 @@ def _merge_verdict(existing: dict | None, report: GitHealthReport) -> dict:
             cheap = existing["cheap"]
         if isinstance(existing.get("deep"), dict):
             deep = existing["deep"]
+        # v1 migration: a legacy single-kind verdict has top-level kind/failures
+        # but no slots. Seed the matching slot from it so a pre-upgrade FAILED
+        # deep verdict isn't dropped by the first v2 write (which would reopen the
+        # ~24h blind spot this format closes). The new report below still wins for
+        # its own slot.
+        if cheap is None and deep is None and existing.get("kind") in ("cheap", "deep"):
+            legacy = {
+                "ok": bool(existing.get("ok", True)),
+                "failures": list(existing.get("failures") or []),
+                "checked_at": existing.get("checked_at", ""),
+                "details": existing.get("details") or {},
+            }
+            if existing["kind"] == "deep":
+                deep = legacy
+            else:
+                cheap = legacy
     if report.kind == "deep":
         deep = _report_slot(report)
     else:  # any non-deep kind is the live cheap slot
