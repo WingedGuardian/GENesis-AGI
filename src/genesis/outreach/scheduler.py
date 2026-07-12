@@ -18,11 +18,19 @@ logger = logging.getLogger(__name__)
 
 # Discord sub-channel names used by campaign sessions in pending_outreach.
 # The outreach pipeline routes via adapter name ("discord"), not sub-channel.
-_DISCORD_CHANNELS = frozenset({
-    "announcements", "dev-discussion", "general", "showcase",
-    "getting-started", "design", "bug-reports", "feature-requests",
-    "troubleshooting",
-})
+_DISCORD_CHANNELS = frozenset(
+    {
+        "announcements",
+        "dev-discussion",
+        "general",
+        "showcase",
+        "getting-started",
+        "design",
+        "bug-reports",
+        "feature-requests",
+        "troubleshooting",
+    }
+)
 
 
 class OutreachScheduler:
@@ -148,9 +156,13 @@ class OutreachScheduler:
             replace_existing=True,
         )
         self._scheduler.start()
-        logger.info("OutreachScheduler started (morning=%s:%s %s, engagement=%dm, health=30m, drain=5m, critical_obs=5m)",
-                     hour, minute, tz,
-                     self._config.engagement_poll_minutes)
+        logger.info(
+            "OutreachScheduler started (morning=%s:%s %s, engagement=%dm, health=30m, drain=5m, critical_obs=5m)",
+            hour,
+            minute,
+            tz,
+            self._config.engagement_poll_minutes,
+        )
 
     async def stop(self) -> None:
         if self._scheduler:
@@ -168,8 +180,10 @@ class OutreachScheduler:
                 from genesis.observability.types import Severity, Subsystem
 
                 await self._event_bus.emit(
-                    Subsystem.OUTREACH, Severity.ERROR,
-                    f"{name}.failed", f"Scheduled job {name} failed: {error}",
+                    Subsystem.OUTREACH,
+                    Severity.ERROR,
+                    f"{name}.failed",
+                    f"Scheduled job {name} failed: {error}",
                 )
         else:
             rt.record_job_success(name)
@@ -178,14 +192,17 @@ class OutreachScheduler:
                 from genesis.observability.types import Severity, Subsystem
 
                 await self._event_bus.emit(
-                    Subsystem.OUTREACH, Severity.DEBUG,
-                    "heartbeat", f"{name} completed",
+                    Subsystem.OUTREACH,
+                    Severity.DEBUG,
+                    "heartbeat",
+                    f"{name} completed",
                 )
 
     @staticmethod
     def _is_paused() -> bool:
         try:
             from genesis.runtime import GenesisRuntime
+
             return GenesisRuntime.instance().paused
         except Exception:
             return False
@@ -290,9 +307,8 @@ class OutreachScheduler:
             from datetime import datetime
 
             from genesis.outreach.health_outreach import HealthOutreachBridge
-            escalation_ids = frozenset(
-                self._config.immediate_escalation_alerts
-            )
+
+            escalation_ids = frozenset(self._config.immediate_escalation_alerts)
             bridge = HealthOutreachBridge(self._db, escalation_ids=escalation_ids)
             requests = await bridge.check_and_generate()
 
@@ -304,6 +320,7 @@ class OutreachScheduler:
             # This is the primary dedup layer; the DB query in
             # HealthOutreachBridge is the secondary (cross-restart) layer.
             from genesis.outreach.health_outreach import _DEDUP_HOURS
+
             dedup_window_s = _DEDUP_HOURS * 3600
             now_mono = time.monotonic()
             deduped = []
@@ -355,7 +372,8 @@ class OutreachScheduler:
             result = await self._pipeline.submit_raw(batched_text, envelope)
             logger.info(
                 "Health outreach (batched %d alert(s)): %s",
-                len(requests), result.status.value,
+                len(requests),
+                result.status.value,
             )
             # Record send time in memory — regardless of whether DB
             # write succeeded. This prevents re-send on next cycle.
@@ -407,7 +425,8 @@ class OutreachScheduler:
                 if self._cached_critical_obs and cache_age < _MAX_CACHE_AGE_S:
                     logger.warning(
                         "Critical obs DB query failed — using cache (%d items, %.0fs old)",
-                        len(self._cached_critical_obs), cache_age,
+                        len(self._cached_critical_obs),
+                        cache_age,
                     )
                     observations = self._cached_critical_obs
                 else:
@@ -421,17 +440,14 @@ class OutreachScheduler:
             # In-memory dedup — filter out observations already alerted recently
             # (protects against mark_surfaced DB failure causing repeat alerts)
             import time
+
             now_mono = time.monotonic()
             dedup_window = 30 * 60  # 30 minutes
             # Evict expired entries
             self._critical_obs_sent = {
-                k: v for k, v in self._critical_obs_sent.items()
-                if (now_mono - v) < dedup_window
+                k: v for k, v in self._critical_obs_sent.items() if (now_mono - v) < dedup_window
             }
-            observations = [
-                obs for obs in observations
-                if obs["id"] not in self._critical_obs_sent
-            ]
+            observations = [obs for obs in observations if obs["id"] not in self._critical_obs_sent]
             if not observations:
                 await self._record_job_result("critical_observations")
                 return
@@ -469,11 +485,13 @@ class OutreachScheduler:
             result = await self._pipeline.submit_raw(batched_text, envelope)
             logger.info(
                 "Critical observations outreach (%d obs): %s",
-                len(observations), result.status.value,
+                len(observations),
+                result.status.value,
             )
 
             # Only mark surfaced if delivery succeeded AND DB is available
             from genesis.outreach.types import OutreachStatus
+
             ids = [obs["id"] for obs in observations]
             if result.status == OutreachStatus.DELIVERED and db_ok:
                 try:
@@ -485,6 +503,7 @@ class OutreachScheduler:
             # In-memory dedup — prevent re-alerting if mark_surfaced fails
             # after delivery, or if delivery was rejected by dedup layer.
             import time
+
             now_mono = time.monotonic()
             for obs_id in ids:
                 self._critical_obs_sent[obs_id] = now_mono
@@ -553,7 +572,9 @@ class OutreachScheduler:
                         source_id=f"ambient_health:{verdict.status}",
                     )
                     result = await self._pipeline.submit_raw(text, envelope)
-                    logger.info("Ambient health alert (%s): %s", verdict.status, result.status.value)
+                    logger.info(
+                        "Ambient health alert (%s): %s", verdict.status, result.status.value
+                    )
                 self._ambient_health_status = verdict.status
                 self._ambient_health_causes = set(verdict.causes)
             elif verdict.status == "ok":
@@ -613,6 +634,30 @@ class OutreachScheduler:
             logger.exception("Calibration job failed")
             await self._record_job_result("calibration", error=str(exc))
 
+    async def _mark_row_delivered(self, row: dict, delivered_at: str) -> None:
+        """Mark a drained row delivered, keying on ``id`` or falling back to
+        ``rowid`` when ``id`` is NULL.
+
+        Legacy rows with a NULL ``id`` would otherwise never clear (``WHERE
+        id = NULL`` matches nothing), so every drain cycle re-processes and
+        re-logs them forever. ``rowid`` is always present, so the fallback
+        always clears the exact row.
+        """
+        from genesis.db.crud import pending_outreach
+
+        if row.get("id") is not None:
+            await pending_outreach.mark_delivered(
+                self._db,
+                row["id"],
+                delivered_at=delivered_at,
+            )
+        else:
+            await pending_outreach.mark_delivered_by_rowid(
+                self._db,
+                row["rowid"],
+                delivered_at=delivered_at,
+            )
+
     async def _drain_pending_job(self) -> None:
         """Drain pending_outreach table — deliver queued messages from foreground sessions."""
         if self._is_paused():
@@ -646,14 +691,11 @@ class OutreachScheduler:
                         except (ValueError, TypeError):
                             age = None
                         if age is not None and age > timedelta(hours=24):
-                            await pending_outreach.mark_delivered(
-                                self._db, row["id"],
-                                delivered_at=datetime.now(UTC).isoformat(),
-                            )
+                            await self._mark_row_delivered(row, datetime.now(UTC).isoformat())
                             logger.warning(
-                                "Pending outreach %s aged out (%.1fh, never "
-                                "delivered) — dropping",
-                                row["id"], age.total_seconds() / 3600,
+                                "Pending outreach %s aged out (%.1fh, never delivered) — dropping",
+                                row.get("id") or f"rowid:{row.get('rowid')}",
+                                age.total_seconds() / 3600,
                             )
                             continue
 
@@ -671,7 +713,8 @@ class OutreachScheduler:
                         if raw_cat not in _CATEGORY_ALIASES:
                             logger.warning(
                                 "Unknown category '%s' in pending outreach %s, using DIGEST",
-                                raw_cat, row["id"],
+                                raw_cat,
+                                row["id"],
                             )
 
                     # Map Discord sub-channel names to adapter name.
@@ -708,22 +751,24 @@ class OutreachScheduler:
                         OutreachStatus.IGNORED,
                     ):
                         delivered_at = datetime.now(UTC).isoformat()
-                        await pending_outreach.mark_delivered(
-                            self._db, row["id"], delivered_at=delivered_at,
-                        )
+                        await self._mark_row_delivered(row, delivered_at)
                         logger.info(
                             "Drained pending outreach %s: %s (terminal)",
-                            row["id"], result.status.value,
+                            row.get("id") or f"rowid:{row.get('rowid')}",
+                            result.status.value,
                         )
                     else:
                         logger.warning(
                             "Pending outreach %s not delivered (%s: %s) — will retry",
-                            row["id"], result.status.value, result.error or "",
+                            row["id"],
+                            result.status.value,
+                            result.error or "",
                         )
                 except Exception:
                     logger.error(
                         "Failed to deliver pending outreach %s — will retry next cycle",
-                        row["id"], exc_info=True,
+                        row["id"],
+                        exc_info=True,
                     )
 
             await self._record_job_result("drain_pending")

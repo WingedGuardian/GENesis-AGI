@@ -49,9 +49,54 @@ async def test_enqueue_persists_thread_and_recipient(db):
 @pytest.mark.asyncio
 async def test_enqueue_defaults_to_none(db):
     await pending_outreach.enqueue(
-        db, message="m", category="notification", channel="telegram",
+        db,
+        message="m",
+        category="notification",
+        channel="telegram",
     )
     rows = await pending_outreach.drain(db, now="2999-01-01T00:00:00+00:00")
     assert len(rows) == 1
     assert rows[0]["thread_id"] is None
     assert rows[0]["validated_recipient"] is None
+
+
+@pytest.mark.asyncio
+async def test_drain_exposes_rowid(db):
+    """drain must surface rowid so NULL-id rows can be cleared by rowid."""
+    await pending_outreach.enqueue(
+        db,
+        message="m",
+        category="notification",
+        channel="telegram",
+    )
+    rows = await pending_outreach.drain(db, now="2999-01-01T00:00:00+00:00")
+    assert len(rows) == 1
+    assert isinstance(rows[0]["rowid"], int)
+
+
+@pytest.mark.asyncio
+async def test_mark_delivered_by_rowid_clears_null_id_row(db):
+    """A NULL-id row can't be marked by id (WHERE id=NULL matches nothing);
+    mark_delivered_by_rowid targets it by its always-present rowid."""
+    await db.execute(
+        "INSERT INTO pending_outreach (message, category, channel, urgency, "
+        "created_at, delivered) VALUES ('m', 'notification', 'telegram', "
+        "'low', '2020-01-01T00:00:00+00:00', 0)",
+    )
+    await db.commit()
+    rows = await pending_outreach.drain(db, now="2999-01-01T00:00:00+00:00")
+    assert len(rows) == 1 and rows[0]["id"] is None
+    rowid = rows[0]["rowid"]
+
+    # id-keyed mark is a no-op on a NULL id; rowid-keyed clears it.
+    assert (
+        await pending_outreach.mark_delivered(db, None, delivered_at="2026-01-01T00:00:00+00:00")
+        is False
+    )
+    assert (
+        await pending_outreach.mark_delivered_by_rowid(
+            db, rowid, delivered_at="2026-01-01T00:00:00+00:00"
+        )
+        is True
+    )
+    assert await pending_outreach.drain(db, now="2999-01-01T00:00:00+00:00") == []
