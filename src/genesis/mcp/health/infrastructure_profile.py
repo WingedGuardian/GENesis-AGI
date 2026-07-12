@@ -36,15 +36,19 @@ async def _impl_infrastructure_profile(
     from genesis.infra_profile.paths import DOC_PATH
     from genesis.infra_profile.render import headline_facts
 
+    profile = None
     if refresh:
         from genesis.infra_profile.service import refresh as service_refresh
 
         try:
-            await service_refresh("mcp", db=_get_db(), router=None)
+            # Use the returned profile — a re-load could race the daily job
+            # and desync `headline` from `sections` (review 2026-07-12).
+            profile = await service_refresh("mcp", db=_get_db(), router=None)
         except Exception:
             logger.warning("infrastructure_profile: refresh failed", exc_info=True)
 
-    profile = store.load_profile()
+    if profile is None:
+        profile = store.load_profile()
     if not profile.get("sections"):
         return {
             "error": "no profile collected yet",

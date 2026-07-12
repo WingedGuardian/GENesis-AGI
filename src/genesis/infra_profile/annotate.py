@@ -102,9 +102,9 @@ async def regenerate_annotations(
         )
         async with semaphore:
             try:
-                response = await router.call(
-                    call_site_id=CALL_SITE_ID,
-                    messages=[{"role": "user", "content": prompt}],
+                response = await router.route_call(
+                    CALL_SITE_ID,
+                    [{"role": "user", "content": prompt}],
                 )
             except Exception:
                 logger.warning(
@@ -113,16 +113,22 @@ async def regenerate_annotations(
                     exc_info=True,
                 )
                 return
-        if not response:
-            logger.warning("infra_profile: empty annotation response for %s", name)
+        # router.call returns a RoutingResult dataclass (routing/types.py) —
+        # NEVER a dict. A failed chain RETURNS success=False (doesn't raise),
+        # so it must be checked or a failure repr gets pinned as a fresh
+        # annotation (review 2026-07-12, finder B).
+        if response is None or not response.success:
+            logger.warning(
+                "infra_profile: annotation call unsuccessful for %s (%s) — keeping previous",
+                name,
+                getattr(response, "error", "no response"),
+            )
             return
-        text = (
-            response.get("content", "") if isinstance(response, dict) else str(response)
-        ).strip()
+        text = (response.content or "").strip()
         if not text:
+            logger.warning("infra_profile: empty annotation content for %s", name)
             return
-        model = response.get("model") if isinstance(response, dict) else None
-        updated[name] = _annotation_entry(text, section["hash"], model)
+        updated[name] = _annotation_entry(text, section["hash"], response.model_id)
 
     await asyncio.gather(*(_one(name, section) for name, section in stale))
 

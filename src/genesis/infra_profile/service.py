@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import logging
-import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
@@ -34,8 +33,23 @@ from genesis.util.atomic import atomic_write_text
 logger = logging.getLogger(__name__)
 
 _LOCK = asyncio.Lock()
-_MIN_REFRESH_INTERVAL = 300.0  # seconds; MCP refresh=true stays cheap
-_last_refresh_monotonic: float = 0.0
+
+# Refresh short-circuit window. Checked against the persisted profile's
+# collected_at (wall clock) so it holds ACROSS processes — the MCP server and
+# genesis-server each run this module, and a per-process monotonic would let
+# an MCP refresh=true re-collect right after the server's daily run.
+_MIN_REFRESH_INTERVAL = 300.0
+
+
+def _recently_refreshed(profile: dict[str, Any]) -> bool:
+    collected_at = profile.get("collected_at")
+    if not collected_at:
+        return False
+    try:
+        collected = datetime.fromisoformat(collected_at)
+    except (TypeError, ValueError):
+        return False
+    return (datetime.now(UTC) - collected).total_seconds() < _MIN_REFRESH_INTERVAL
 
 
 @contextmanager
@@ -119,12 +133,15 @@ async def refresh(
     logs. Callers that want the runtime's dependencies use
     ``refresh_from_runtime``.
     """
-    global _last_refresh_monotonic
-
     async with _LOCK:
-        if not force and time.monotonic() - _last_refresh_monotonic < _MIN_REFRESH_INTERVAL:
-            logger.debug("infra_profile: refresh short-circuited (<%ss)", _MIN_REFRESH_INTERVAL)
-            return store.load_profile()
+        if not force:
+            existing = store.load_profile()
+            if _recently_refreshed(existing):
+                logger.debug(
+                    "infra_profile: refresh short-circuited (<%ss)",
+                    _MIN_REFRESH_INTERVAL,
+                )
+                return existing
 
         with _cross_process_lock() as acquired:
             if not acquired:
@@ -151,8 +168,6 @@ async def _refresh_locked(
     guardian_remote,
 ) -> dict[str, Any]:
     """The refresh body; caller holds both the module lock and the flock."""
-    global _last_refresh_monotonic
-
     now = datetime.now(UTC).isoformat()
     previous = store.load_profile()
     prev_sections = previous.get("sections", {})
@@ -207,9 +222,8 @@ async def _refresh_locked(
         )
         await emit_drift_observations(db, drift, event_bus)
 
-    # ── persist facts ───────────────────────────────────────────────
+    # ── persist facts (collected_at doubles as the short-circuit clock) ──
     store.save_profile(profile)
-    _last_refresh_monotonic = time.monotonic()
 
     # ── annotate (LLM; failure keeps old annotations) ────────────────
     annotations = store.load_annotations()

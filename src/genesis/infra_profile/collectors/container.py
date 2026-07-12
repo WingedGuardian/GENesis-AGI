@@ -98,6 +98,34 @@ def _read(path: Path) -> str | None:
         return None
 
 
+# Local twins of runtime/cgroup.py helpers, NOT imports: `import
+# genesis.runtime.cgroup` executes genesis/runtime/__init__ and drags the full
+# GenesisRuntime graph into whatever process collects — including the
+# lightweight genesis-health MCP server on `infrastructure_profile
+# (refresh=true)`. MCP-process RSS is a known OOM class on this install
+# (review 2026-07-12, finder B). Keep these in sync with runtime/cgroup.py.
+
+
+def _read_cgroup_memory_max(sys_root: Path) -> int | None:
+    raw = _read(sys_root / "fs/cgroup/memory.max")
+    if raw is None or raw == "max":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _detect_root_device(proc_root: Path) -> str | None:
+    """Block device major:minor for the root filesystem (via mountinfo)."""
+    raw = _read(proc_root / "self/mountinfo") or ""
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) >= 10 and fields[4] == "/":
+            return fields[2]
+    return None
+
+
 # ── os ───────────────────────────────────────────────────────────────────
 
 
@@ -158,10 +186,13 @@ async def collect_cpu(
                 vulns[entry.name] = value
     facts["vulnerabilities"] = vulns
 
+    # Truthiness, not `is not None`: _read returns "" for an empty file
+    # (cpufreq-less guests), and an empty string must not become a hashed
+    # fact baseline (review 2026-07-12).
     governor = _read(
         sys_root / "devices/system/cpu/cpu0/cpufreq/scaling_governor",
     )
-    if governor is not None:
+    if governor:
         facts["governor"] = governor
 
     numa_nodes = sys_root / "devices/system/node"
@@ -192,12 +223,10 @@ async def collect_memory(
     sys_root: Path = Path("/sys"),
 ) -> SectionResult:
     """Cgroup limit, swap/zram config, THP; availability as metrics."""
-    from genesis.runtime.cgroup import read_container_memory_max
-
     facts: dict = {}
     metrics: dict = {}
 
-    facts["cgroup_memory_max"] = read_container_memory_max()
+    facts["cgroup_memory_max"] = _read_cgroup_memory_max(sys_root)
 
     meminfo = _read(proc_root / "meminfo") or ""
     mem: dict[str, int] = {}
@@ -218,7 +247,7 @@ async def collect_memory(
     )
 
     thp = _read(sys_root / "kernel/mm/transparent_hugepage/enabled")
-    if thp is not None:
+    if thp:  # truthiness — "" from an empty file must not become a fact
         facts["transparent_hugepage"] = thp
 
     return SectionResult(name="memory", facts=facts, metrics=metrics)
@@ -232,8 +261,6 @@ async def collect_storage(
     sys_root: Path = Path("/sys"),
 ) -> SectionResult:
     """Mount table + IO scheduler as facts; df/inode headroom as metrics."""
-    from genesis.runtime.cgroup import detect_root_device
-
     facts: dict = {}
     metrics: dict = {}
 
@@ -257,14 +284,18 @@ async def collect_storage(
     mounts.sort(key=lambda m: m["mountpoint"])
     facts["mounts"] = mounts
 
-    root_dev = detect_root_device()
+    root_dev = _detect_root_device(proc_root)
     facts["root_device"] = root_dev
     if root_dev:
-        # major:minor → scheduler, best-effort (virtual devices have none).
-        for queue in sys_root.glob("block/*/queue/scheduler"):
-            dev_dir = queue.parent.parent
-            if _read(dev_dir / "dev") == root_dev:
-                facts["io_scheduler"] = _read(queue)
+        # root_dev is usually a PARTITION's major:minor, but queue/scheduler
+        # exists only on the whole disk — so match the disk's own dev file OR
+        # any of its partition subdirs (review 2026-07-12). Best-effort:
+        # virtual devices have neither.
+        for disk_dir in sorted(sys_root.glob("block/*")):
+            devs = [_read(disk_dir / "dev")]
+            devs += [_read(p) for p in disk_dir.glob(f"{disk_dir.name}*/dev")]
+            if root_dev in devs:
+                facts["io_scheduler"] = _read(disk_dir / "queue/scheduler")
                 break
 
     import os
@@ -328,29 +359,32 @@ async def collect_network(etc_root: Path = Path("/etc")) -> SectionResult:
     import json as _json
 
     facts: dict = {}
+    metrics: dict = {}
 
+    # Addresses and gateway are METRICS, not facts: under DHCP/bridged
+    # networking they can change on every container recreation, and hashing
+    # them would spam drift observations + burn annotation calls per restart
+    # on portable installs (review 2026-07-12). Interface NAMES/MTU are the
+    # stable topology and stay facts.
     ip_json = await _run_cmd("ip", "-j", "addr")
     interfaces: list[dict] = []
+    addresses: dict[str, list[str]] = {}
     if ip_json:
         try:
             for iface in _json.loads(ip_json):
-                addrs = sorted(
+                name = iface.get("ifname")
+                addresses[name] = sorted(
                     a.get("local", "")
                     for a in iface.get("addr_info", [])
                     if a.get("scope") == "global"
                 )
-                interfaces.append(
-                    {
-                        "name": iface.get("ifname"),
-                        "mtu": iface.get("mtu"),
-                        "addresses": addrs,
-                    },
-                )
+                interfaces.append({"name": name, "mtu": iface.get("mtu")})
         except (ValueError, KeyError, TypeError):
             logger.debug("infra_profile: cannot parse `ip -j addr` output")
     interfaces.sort(key=lambda i: i["name"] or "")
     facts["interfaces"] = interfaces
     facts["tailscale"] = any(i["name"] == "tailscale0" for i in interfaces)
+    metrics["addresses"] = addresses
 
     resolv = _read(etc_root / "resolv.conf") or ""
     facts["nameservers"] = [
@@ -365,11 +399,11 @@ async def collect_network(etc_root: Path = Path("/etc")) -> SectionResult:
             default = _json.loads(route)
             if default:
                 facts["default_route_dev"] = default[0].get("dev")
-                facts["default_gateway"] = default[0].get("gateway")
+                metrics["default_gateway"] = default[0].get("gateway")
         except (ValueError, IndexError, TypeError):
             pass
 
-    return SectionResult(name="network", facts=facts)
+    return SectionResult(name="network", facts=facts, metrics=metrics)
 
 
 # ── systemd ──────────────────────────────────────────────────────────────
@@ -428,13 +462,15 @@ async def collect_versions() -> SectionResult:
         "python": platform.python_version(),
         "sqlite_library": sqlite3.sqlite_version,
     }
-    for key, argv in (
+    probes = (
         ("node", ("node", "--version")),
         ("claude_cli", ("claude", "--version")),
         ("git", ("git", "--version")),
         ("ruff", ("ruff", "--version")),
-    ):
-        out = await _run_cmd(*argv)
+    )
+    # Independent spawns — gather so one slow tool doesn't serialize the rest.
+    outputs = await asyncio.gather(*(_run_cmd(*argv) for _, argv in probes))
+    for (key, _), out in zip(probes, outputs, strict=True):
         if out is not None:
             facts[key] = out.splitlines()[0]
     return SectionResult(name="versions", facts=facts)

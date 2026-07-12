@@ -4,18 +4,30 @@ from __future__ import annotations
 
 from genesis.infra_profile.annotate import regenerate_annotations
 
+# The REAL router contract — router.call returns this dataclass, never a dict.
+# Using it here keeps the fake honest (a dict-shaped fake masked a repr-storing
+# bug in review 2026-07-12).
+from genesis.routing.types import RoutingResult
+
 
 class FakeRouter:
-    def __init__(self, response="- watch the thing", raise_exc=False):
+    def __init__(self, response="- watch the thing", raise_exc=False, success=True):
         self.calls = []
         self._response = response
         self._raise = raise_exc
+        self._success = success
 
-    async def call(self, *, call_site_id, messages):
+    async def route_call(self, call_site_id, messages, **kwargs):
         self.calls.append(call_site_id)
         if self._raise:
             raise RuntimeError("provider down")
-        return {"content": self._response, "model": "fake-model"}
+        return RoutingResult(
+            success=self._success,
+            call_site_id=call_site_id,
+            content=self._response if self._success else None,
+            model_id="fake-model" if self._success else None,
+            error=None if self._success else "all providers failed",
+        )
 
 
 def _profile(section_hash="abc123"):
@@ -90,6 +102,21 @@ async def test_router_failure_keeps_old_annotation():
     entry = result["sections"]["storage"]
     assert entry["annotation"] == "- old note"
     assert entry["source_hash"] == "abc123"  # still pinned to OLD facts → stale
+
+
+async def test_unsuccessful_result_keeps_old_annotation():
+    """A failed chain RETURNS success=False (doesn't raise) — must not be pinned."""
+    router = FakeRouter(success=False)
+    result = await regenerate_annotations(
+        profile=_profile("NEW"),
+        annotations=_annotations("abc123", "- old note"),
+        router=router,
+        summary="s",
+    )
+    assert len(router.calls) == 1
+    entry = result["sections"]["storage"]
+    assert entry["annotation"] == "- old note"
+    assert entry["source_hash"] == "abc123"
 
 
 async def test_no_router_is_noop():

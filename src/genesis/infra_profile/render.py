@@ -138,12 +138,16 @@ def sentinel_digest(
     annotations: dict[str, Any],
     *,
     drift_since_days: int = 7,
-    max_lines: int = 40,
+    max_chars: int = 6000,
 ) -> str:
     """Compact digest for the sentinel diagnostic context.
 
     Headline facts + annotations (they ARE the gotchas a diagnostic session
     needs) + recently drifted sections + stale-annotation flags.
+
+    Size cap is by CHARACTERS with an explicit truncation marker — a line
+    slice under-counted multi-line annotation bodies and silently dropped
+    the tail, which is exactly where the gotchas live (review 2026-07-12).
     """
     if not profile.get("sections"):
         return ""
@@ -185,4 +189,9 @@ def sentinel_digest(
         lines.append(f"### {name}{marker}")
         lines.append(text)
 
-    return "\n".join(lines[:max_lines] if max_lines else lines)
+    digest = "\n".join(lines)
+    if max_chars and len(digest) > max_chars:
+        cut = digest.rfind("\n", 0, max_chars)
+        digest = digest[: cut if cut > 0 else max_chars]
+        digest += "\n…(digest truncated — full profile in INFRASTRUCTURE.md)"
+    return digest

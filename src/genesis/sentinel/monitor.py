@@ -52,17 +52,19 @@ async def run_infrastructure_monitor(
     prompt = _build_monitor_prompt(health_snapshot)
 
     try:
-        # Dispatch via API on free model (call site 37)
-        response = await router.call(
-            call_site_id=CALL_SITE_ID,
-            messages=[{"role": "user", "content": prompt}],
+        # Dispatch via API on free model (call site 37). Router exposes
+        # route_call returning a RoutingResult dataclass — the old
+        # `router.call(...)` + str(response) pair would AttributeError and
+        # then parse a dataclass repr. Latent while call site 37 is disabled;
+        # fixed alongside its copy in infra_profile/annotate.py (2026-07-12).
+        response = await router.route_call(
+            CALL_SITE_ID,
+            [{"role": "user", "content": prompt}],
         )
-        if response is None:
+        if response is None or not response.success:
             return None
 
-        # Parse the response
-        text = response.get("content", "") if isinstance(response, dict) else str(response)
-        assessment = _parse_monitor_output(text)
+        assessment = _parse_monitor_output(response.content or "")
 
         if assessment is None:
             return None
@@ -83,11 +85,13 @@ async def run_infrastructure_monitor(
             from genesis.util.tasks import tracked_task
 
             tracked_task(
-                sentinel.dispatch(SentinelRequest(
-                    trigger_source="infrastructure_monitor",
-                    trigger_reason=assessment.get("reason", "monitor judgment"),
-                    tier=2,  # Monitor-triggered = Tier 2 (pattern, not threshold)
-                )),
+                sentinel.dispatch(
+                    SentinelRequest(
+                        trigger_source="infrastructure_monitor",
+                        trigger_reason=assessment.get("reason", "monitor judgment"),
+                        tier=2,  # Monitor-triggered = Tier 2 (pattern, not threshold)
+                    )
+                ),
                 name="sentinel-monitor-wake",
             )
 
@@ -97,6 +101,7 @@ async def run_infrastructure_monitor(
                 import uuid
 
                 from genesis.db.crud import observations
+
                 await observations.create(
                     db,
                     id=f"infra-monitor-{uuid.uuid4().hex[:8]}",

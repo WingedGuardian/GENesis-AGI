@@ -39,6 +39,10 @@ def _collect_sync(db_path: Path) -> SectionResult:
     if not db_path.exists():
         return SectionResult.failed("sqlite", f"database not found at {db_path}")
 
+    # timeout = SQLite busy-timeout: PRAGMA reads on a mode=ro connection can
+    # still hit SQLITE_BUSY against the live writer's WAL checkpoints; 10s
+    # rides out a checkpoint burst, then the section degrades — never the
+    # refresh (this runs inside the boot-path task holding the flock).
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
     try:
         pragmas: dict[str, object] = {}
@@ -52,8 +56,12 @@ def _collect_sync(db_path: Path) -> SectionResult:
         conn.close()
 
     metrics["db_size_bytes"] = db_path.stat().st_size
-    wal = db_path.with_name(db_path.name + "-wal")
-    metrics["wal_size_bytes"] = wal.stat().st_size if wal.exists() else 0
+    try:
+        # No exists() pre-check — a WAL checkpoint can rotate the -wal file
+        # between check and stat; treat any miss as size 0.
+        metrics["wal_size_bytes"] = db_path.with_name(db_path.name + "-wal").stat().st_size
+    except OSError:
+        metrics["wal_size_bytes"] = 0
 
     return SectionResult(name="sqlite", facts=facts, metrics=metrics)
 
@@ -63,5 +71,7 @@ async def collect_sqlite(db_path: Path | None = None) -> SectionResult:
     path = db_path if db_path is not None else genesis_db_path()
     try:
         return await asyncio.to_thread(_collect_sync, path)
-    except sqlite3.Error as exc:
-        return SectionResult.failed("sqlite", f"pragma read failed: {exc}")
+    except (sqlite3.Error, OSError) as exc:
+        # OSError: the size stat() calls can race a WAL checkpoint rotating
+        # the -wal file, or a restore swapping the db (review 2026-07-12).
+        return SectionResult.failed("sqlite", f"collection failed: {exc}")

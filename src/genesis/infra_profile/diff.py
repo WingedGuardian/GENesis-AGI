@@ -101,8 +101,13 @@ async def emit_drift_observations(db, drift: list[dict[str, Any]], event_bus=Non
         paths = ", ".join(record["changed_paths"]) or "<unresolved>"
         suffix = ", …" if record.get("truncated") else ""
         content = f"{section}: infrastructure facts changed — {paths}{suffix}"
+        # Dedup key = DESTINATION state only. Keying on (old→new) lets a fact
+        # flapping between two values mint a new hash every transition
+        # (A→B, B→A, A→B …) and flood unresolved observations; keyed on the
+        # destination, an oscillation collapses to at most one open
+        # observation per endpoint (review 2026-07-12).
         content_hash = hashlib.sha256(
-            f"{section}:{record['old_hash']}:{record['new_hash']}".encode(),
+            f"{section}:{record['new_hash']}".encode(),
         ).hexdigest()
         try:
             result = await observations.create(

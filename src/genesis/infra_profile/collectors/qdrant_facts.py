@@ -17,6 +17,11 @@ from genesis.infra_profile.types import SectionResult
 
 logger = logging.getLogger(__name__)
 
+# Failure mode: Qdrant wedged-but-listening (seen during snapshot restores)
+# would otherwise hold the refresh flock indefinitely from a boot-path task.
+# Healthy localhost responses are single-digit ms; 5s per request tolerates
+# heavy load. Requests are per-collection (2 today), so worst case ~15s
+# before the section degrades to error — the section, never the refresh.
 _HTTP_TIMEOUT = 5.0
 
 
