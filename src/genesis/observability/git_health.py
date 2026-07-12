@@ -251,13 +251,68 @@ def _check_git_deep_sync(repo: Path) -> GitHealthReport:
     )
 
 
+_VERDICT_SCHEMA = 2  # v2: per-kind slots (see _merge_verdict)
+
+
+def _report_slot(report: GitHealthReport) -> dict:
+    return {
+        "ok": report.ok,
+        "failures": list(report.failures),
+        "checked_at": report.checked_at,
+        "details": report.details,
+    }
+
+
+def _merge_verdict(existing: dict | None, report: GitHealthReport) -> dict:
+    """Fold ``report`` into a two-slot (``cheap`` / ``deep``) verdict.
+
+    The cheap per-tick probe and the daily deep fsck share ``git_health.json``.
+    Deep-only corruption (a zeroed-but-present reachable blob) is INVISIBLE to the
+    cheap probe, so if a passing cheap tick simply overwrote the file it would
+    erase a failed deep verdict within one tick — the shared state would report
+    healthy until the next daily fsck (~24h). Instead each writer updates only its
+    own slot and preserves the other; the daily deep run refreshes its slot, so a
+    deep failure persists exactly until re-checked (never unboundedly stale).
+
+    Top-level ``ok`` / ``failures`` are the UNION across slots — the reader
+    contract the host guardian relies on (``_verdict_detail`` reads ``failures``).
+    """
+    cheap = deep = None
+    if isinstance(existing, dict):
+        if isinstance(existing.get("cheap"), dict):
+            cheap = existing["cheap"]
+        if isinstance(existing.get("deep"), dict):
+            deep = existing["deep"]
+    if report.kind == "deep":
+        deep = _report_slot(report)
+    else:  # any non-deep kind is the live cheap slot
+        cheap = _report_slot(report)
+
+    slots = [s for s in (cheap, deep) if s is not None]
+    failures: list[str] = []
+    for s in slots:
+        for f in s.get("failures") or []:
+            if f not in failures:
+                failures.append(f)
+    return {
+        "version": _VERDICT_SCHEMA,
+        "ok": all(s.get("ok", True) for s in slots) and not failures,
+        "failures": failures,
+        "kind": report.kind,  # the writer of THIS update
+        "checked_at": report.checked_at,
+        "cheap": cheap,
+        "deep": deep,
+    }
+
+
 def write_git_health_verdict(
     report: GitHealthReport, shared_dir: Path | None = None
 ) -> Path | None:
     """Atomically write the verdict to ``<shared>/guardian/git_health.json`` (0600).
 
-    Returns the path, or None if the shared mount is absent (no-guardian install).
-    Never raises.
+    Merges into a two-slot cheap/deep verdict (``_merge_verdict``) so a passing
+    cheap tick never erases a failed deep result. Returns the path, or None if the
+    shared mount is absent (no-guardian install). Never raises.
     """
     try:
         shared = shared_dir if shared_dir is not None else (genesis_home() / "shared")
@@ -266,8 +321,14 @@ def write_git_health_verdict(
         dest_dir = shared / _VERDICT_DIR
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / _VERDICT_FILE
+        existing: dict | None = None
+        try:
+            existing = json.loads(dest.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = None
+        merged = _merge_verdict(existing, report)
         tmp = dest_dir / f".{_VERDICT_FILE}.tmp"
-        tmp.write_text(json.dumps(report.to_json(), indent=2))
+        tmp.write_text(json.dumps(merged, indent=2))
         os.chmod(tmp, 0o600)
         os.replace(tmp, dest)
         return dest

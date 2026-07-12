@@ -206,8 +206,81 @@ class TestVerdictWriter:
         loaded = json.loads(p.read_text())
         assert loaded["ok"] is False
         assert loaded["failures"] == ["rootfs_readonly"]
-        assert loaded["version"] == 1
+        assert loaded["version"] == 2
 
     def test_absent_mount_returns_none(self, tmp_path):
         rep = g.GitHealthReport(ok=True, failures=[], details={}, kind="cheap", checked_at="t")
         assert g.write_git_health_verdict(rep, shared_dir=tmp_path / "nope") is None
+
+    def test_passing_cheap_tick_does_not_erase_failed_deep_verdict(self, tmp_path):
+        """P2 (#1010 Codex re-review): deep-only corruption (a zeroed reachable
+        blob) is invisible to the cheap probe. A subsequent passing cheap tick must
+        NOT flip the shared verdict back to healthy — the deep failure persists in
+        its own slot and stays in the top-level union the guardian reads."""
+        import json
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        # Daily deep run finds corruption.
+        deep_fail = g.GitHealthReport(
+            ok=False, failures=["fsck_failed"], details={}, kind="deep", checked_at="t1"
+        )
+        g.write_git_health_verdict(deep_fail, shared_dir=shared)
+        # Next cheap tick is healthy (it can't see the deep corruption).
+        cheap_ok = g.GitHealthReport(
+            ok=True, failures=[], details={}, kind="cheap", checked_at="t2"
+        )
+        p = g.write_git_health_verdict(cheap_ok, shared_dir=shared)
+
+        loaded = json.loads(p.read_text())
+        assert loaded["ok"] is False, "deep failure must survive a passing cheap tick"
+        assert "fsck_failed" in loaded["failures"]
+        assert loaded["deep"]["ok"] is False
+        assert loaded["cheap"]["ok"] is True
+
+    def test_cheap_failure_is_live_and_clears_on_next_ok(self, tmp_path):
+        """The cheap slot is LIVE: a fixed cheap failure clears on the next tick,
+        while any recorded deep result is preserved untouched."""
+        import json
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        g.write_git_health_verdict(
+            g.GitHealthReport(ok=True, failures=[], details={}, kind="deep", checked_at="d"),
+            shared_dir=shared,
+        )
+        g.write_git_health_verdict(
+            g.GitHealthReport(
+                ok=False, failures=["rootfs_readonly"], details={}, kind="cheap", checked_at="c1"
+            ),
+            shared_dir=shared,
+        )
+        p = g.write_git_health_verdict(
+            g.GitHealthReport(ok=True, failures=[], details={}, kind="cheap", checked_at="c2"),
+            shared_dir=shared,
+        )
+        loaded = json.loads(p.read_text())
+        assert loaded["ok"] is True
+        assert loaded["failures"] == []
+        assert loaded["deep"]["ok"] is True  # preserved
+
+    def test_top_level_failures_are_union_of_both_slots(self, tmp_path):
+        import json
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        g.write_git_health_verdict(
+            g.GitHealthReport(
+                ok=False, failures=["fsck_failed"], details={}, kind="deep", checked_at="d"
+            ),
+            shared_dir=shared,
+        )
+        p = g.write_git_health_verdict(
+            g.GitHealthReport(
+                ok=False, failures=["rootfs_readonly"], details={}, kind="cheap", checked_at="c"
+            ),
+            shared_dir=shared,
+        )
+        loaded = json.loads(p.read_text())
+        assert set(loaded["failures"]) == {"fsck_failed", "rootfs_readonly"}
+        assert loaded["ok"] is False
