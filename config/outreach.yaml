@@ -74,6 +74,12 @@ health_alerts:
     - "provider:embedding_failing"
     - "provider:qdrant_unreachable"
     - "awareness:tick_overdue"
+    # A blind health system IS a highest-severity page: this is the ONLY alert
+    # emitted when HealthDataService is uninitialised (errors.py early-return),
+    # it is Sentinel-remediable (restart), and dropping it here silenced it.
+    # (Contrast provider:credit_exhaustion, deliberately absent — that is now a
+    # dashboard-only WARNING; refilling credits is a user financial action.)
+    - "service:health_data_uninitialized"
     # Prefixes. This list REPLACES the code default when present, so anything the
     # default escalates must be repeated here. backup: was missing (backup-failure
     # alerts were silently non-escalating); creds: is new for G.1.

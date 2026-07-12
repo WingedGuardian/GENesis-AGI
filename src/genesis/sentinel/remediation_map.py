@@ -94,6 +94,7 @@ def _host_resource_alloc() -> bool:
     path = Path.home() / ".genesis" / "guardian_remote.yaml"
     try:
         import yaml
+
         data = yaml.safe_load(path.read_text()) or {}
     except Exception:  # noqa: BLE001 — missing/unreadable/malformed ⇒ unavailable
         return False
@@ -150,9 +151,7 @@ REMEDIATION_MAP: dict[str, frozenset[str]] = {
     "awareness:tick_overdue": frozenset({"container.services"}),
     "guardian:heartbeat_stale": frozenset({"guardian.ssh_restart"}),
     "infra:disk_low": frozenset({"container.disk_reclaim", "host.resource_alloc"}),
-    "infra:container_memory_high": frozenset(
-        {"container.process_control", "host.resource_alloc"}
-    ),
+    "infra:container_memory_high": frozenset({"container.process_control", "host.resource_alloc"}),
     "infra:qdrant_collections_missing": frozenset({"qdrant.local"}),
     "provider:qdrant_unreachable": frozenset({"qdrant.local"}),
     "genesis:update_failed": frozenset({"container.services"}),
@@ -198,9 +197,7 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "The Sentinel's only response tool IS a CC session; waking it for "
         "CC budget/quota problems is self-defeating (see classifier note)."
     ),
-    "cc:quota_exhausted": (
-        "Self-defeating loop — see cc:budget / classifier Tier-1 note."
-    ),
+    "cc:quota_exhausted": ("Self-defeating loop — see cc:budget / classifier Tier-1 note."),
     "infra:ollama_model_mismatch": (
         "Ollama is optional and typically runs on a separate machine — "
         "model pulls there are not the container's to make."
@@ -209,15 +206,22 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "Backup configuration guidance, not an emergency (WARNING-level; "
         "also covered by the backup: prefix rule above)."
     ),
-    "genesis:update_available": (
-        "INFO-level notice; updating is a user/steward decision."
-    ),
+    "genesis:update_available": ("INFO-level notice; updating is a user/steward decision."),
     "call_site:": (
         "Provider call sites going down is dominated by external API "
         "outages the Sentinel cannot fix (user decision 2026-07-04: an API "
         "site being down is for the user/ego to know about, not the "
         "firefighter). In-container circuit-breaker resets can return as a "
         "dedicated tool later if the stuck-breaker case proves real."
+    ),
+    "callsite:down:": (
+        "Unified call-site health signal (last run failed) from the "
+        "call_site_last_run table — a dashboard-only availability view. Same "
+        "reasoning as call_site: above: the dominant cause is external "
+        "provider/API failure or exhausted credits, neither of which the "
+        "firefighter can remediate (credit refills are a user financial "
+        "action). GROUNDWORK(sentinel-auto-topup): a future user-gated "
+        "auto-credit-top-up keyed off CRITICAL_CALL_SITES would plug in here."
     ),
 }
 
@@ -237,7 +241,8 @@ def available_tools() -> frozenset[str]:
         except Exception:
             logger.warning(
                 "Remediation tool detector %s raised — treating as unavailable",
-                tool.id, exc_info=True,
+                tool.id,
+                exc_info=True,
             )
     return frozenset(available)
 
