@@ -149,16 +149,33 @@ _EXTERNAL_INGEST_TOOLS = frozenset(
         # hook, never in the tool spine, so it can't appear here.
         "memory_recall",
         "memory_expand",
-        # external recon (GitHub / model-intel / skill scans off the world)
+        # external recon — both the RUNNERS (fetch off the world) and the
+        # READERS (return stored external findings into the session context)
         "recon_run_github_discovery",
         "recon_run_github_discovery_job",
         "recon_run_model_intelligence",
         "recon_run_skill_scan",
+        "recon_findings",
+        "recon_triage",
+        "recon_cc_update_check",
+        # inbox evaluations summarize EXTERNAL inbox content into the session
+        "inbox_digest",
+        # module capabilities are external-facing by definition ("hands, not
+        # brain") — a module_call result can carry arbitrary external data
+        "module_call",
         # external social fetch
         "fetch_messages",
         "fetch_forum_threads",
     }
 )
+# Membership criterion for the set above: the tool's RESULT carries
+# external-world content into the session context (fetched, recalled from the
+# KB, or summarized from external sources). NOT in the set (documented
+# non-members): outreach_poll / conversation_history (inbound OWNER messages —
+# owner content, not external world), bookmark/observation readers (first-party
+# stored), health/campaign/status tools (internal state). When adding an MCP
+# tool whose output is external-derived, add it here — the shadow gate
+# undercounts silently otherwise.
 
 # Tool-name PREFIXES that signal external ingest. `browser_` covers the whole
 # browser-automation family by construction: ANY browser tool implies an
