@@ -574,10 +574,20 @@ verified: fa2e692a 2026-07-11
   reaches an action-capable prompt (observe-only — the item still reaches the
   model; owner/first-party never recorded). The gate set is CI-locked in
   `test_recall_inject_coverage.py` (a new inject site or a removed emit fails).
-  **Gates 1-3 (procedure/identity/autonomy) do NOT yet emit** — inert in
-  shadow until source provenance is threaded to their decision points
-  (flip-blocking follow-ups). Auto-demote wired but dormant (server + enforce
-  only); retention via `scripts/prune_immunity_shadow.py` (disk-hygiene).
+  **Gate 1 (procedure) is LIVE in SHADOW** — the same
+  `immunity_shadow.record_would_block(gate="procedure")` fires at every
+  procedure-promotion site: the judge convergence
+  (`judge._store_judged_procedure`, covering BOTH the struggle and rebuild
+  callers), the autonomy retrospective (`executor/trace.py`), and owner
+  explicit-teach (`mcp/memory/procedural.py`). Origin is a coarse tool-name
+  ingest scan (`provenance.origin_from_tool_names` — the session/trace touched
+  an external-ingest tool → `external_untrusted`; over-observes by design, since
+  fetched content lives in tool RESULTS the spine doesn't carry — enforce needs
+  result provenance). CI-locked in `test_procedure_gate_coverage.py`.
+  **Gates 2-3 (identity/autonomy) do NOT yet emit** — inert in shadow until
+  source provenance is threaded to their decision points (flip-blocking
+  follow-ups). Auto-demote wired but dormant (server + enforce only); retention
+  via `scripts/prune_immunity_shadow.py` (disk-hygiene).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h

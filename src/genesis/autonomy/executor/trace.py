@@ -106,9 +106,7 @@ class ExecutionTracer:
         ]
 
         # Classify outcome
-        completed_steps = sum(
-            1 for s in trace.step_results if s.status == "completed"
-        )
+        completed_steps = sum(1 for s in trace.step_results if s.status == "completed")
         total_steps = len(trace.step_results)
         outcome = "success" if completed_steps == total_steps else "partial"
         tags.append(f"outcome:{outcome}")
@@ -124,7 +122,8 @@ class ExecutionTracer:
             )
             logger.info(
                 "Stored execution trace for task %s as memory %s",
-                trace.task_id, memory_id,
+                trace.task_id,
+                memory_id,
             )
             trace.retrospective_id = memory_id
         except Exception:
@@ -235,7 +234,8 @@ class ExecutionTracer:
                 exc_info=True,
             )
             await self._record_retrospective_failure(
-                trace.task_id, f"Exception: {exc}",
+                trace.task_id,
+                f"Exception: {exc}",
             )
 
     async def _build_retrospective_prompt(
@@ -258,8 +258,8 @@ class ExecutionTracer:
                 "Analyze this task execution trace and extract learnings.\n\n"
                 "## Execution Trace\n{{trace_summary}}\n\n"
                 "## Existing Procedures\n{{existing_procedures}}\n\n"
-                "Return JSON: {\"new_procedures\": [], "
-                "\"procedure_updates\": [], \"skill_observations\": []}"
+                'Return JSON: {"new_procedures": [], '
+                '"procedure_updates": [], "skill_observations": []}'
             )
 
         # Replace placeholders
@@ -280,25 +280,23 @@ class ExecutionTracer:
             from genesis.learning.procedural.matcher import find_relevant
 
             # Extract keywords from user request for procedure matching
-            words = [
-                w for w in trace.user_request.lower().split()
-                if len(w) > 3
-            ][:10]
+            words = [w for w in trace.user_request.lower().split() if len(w) > 3][:10]
 
             if not words:
                 return "No relevant procedures found."
 
             matches = await find_relevant(
-                self._db, words, min_confidence=0.1, limit=10,
+                self._db,
+                words,
+                min_confidence=0.1,
+                limit=10,
             )
             if not matches:
                 return "No relevant procedures found."
 
             lines = []
             for m in matches:
-                lines.append(
-                    f"- **{m.task_type}** ({m.confidence:.0%}): {m.principle}"
-                )
+                lines.append(f"- **{m.task_type}** ({m.confidence:.0%}): {m.principle}")
             return "\n".join(lines)
         except Exception:
             logger.debug("Failed to load existing procedures", exc_info=True)
@@ -383,7 +381,8 @@ class ExecutionTracer:
                     await self._record_calibration(trace.task_id, cal)
                 except Exception:
                     logger.warning(
-                        "Failed to record calibration", exc_info=True,
+                        "Failed to record calibration",
+                        exc_info=True,
                     )
 
         # 5. Workflow optimizations
@@ -396,7 +395,8 @@ class ExecutionTracer:
                     await self._record_optimization(trace.task_id, opt)
                 except Exception:
                     logger.warning(
-                        "Failed to record optimization", exc_info=True,
+                        "Failed to record optimization",
+                        exc_info=True,
                     )
 
         # 6. Context drift
@@ -409,14 +409,16 @@ class ExecutionTracer:
                     await self._record_drift(trace.task_id, drift)
                 except Exception:
                     logger.warning(
-                        "Failed to record context drift", exc_info=True,
+                        "Failed to record context drift",
+                        exc_info=True,
                     )
 
         proc_count = len(trace.procedural_extractions)
         if proc_count:
             logger.info(
                 "Retrospective for task %s: %d procedures extracted",
-                trace.task_id, proc_count,
+                trace.task_id,
+                proc_count,
             )
 
     async def _store_new_procedure(
@@ -465,10 +467,30 @@ class ExecutionTracer:
             principle_embedding=principle_blob,
         )
 
+        # WS-3 B1 gate-1 (procedure): shadow-record a would-block for a procedure
+        # promoted from this autonomous execution, classified by the tools the
+        # trace used — the SAME tool-name provenance as the judge path (consistent
+        # shadow signal). Self-guards to NO row for first_party/owner origins + the
+        # kill switch. Best-effort, never raises.
+        from genesis.memory.provenance import origin_from_tool_names
+        from genesis.security import immunity_shadow
+
+        await immunity_shadow.record_would_block(
+            gate="procedure",
+            source_kind="procedure_promotion",
+            source_ref=proc_id,
+            process="server",
+            blockable_count=1,
+            origin_class=origin_from_tool_names(proc_data.get("tools_used") or []),
+            db=self._db,
+        )
+
         trace.procedural_extractions.append(proc_id)
         logger.info(
             "Stored procedure %s (%s) from task %s retrospective",
-            proc_id[:8], proc_data["task_type"], trace.task_id,
+            proc_id[:8],
+            proc_data["task_type"],
+            trace.task_id,
         )
 
     async def _update_procedure(self, update: dict) -> None:
@@ -486,7 +508,10 @@ class ExecutionTracer:
         from genesis.learning.procedural.matcher import find_relevant
 
         matches = await find_relevant(
-            self._db, [task_type], min_confidence=0.0, limit=1,
+            self._db,
+            [task_type],
+            min_confidence=0.0,
+            limit=1,
         )
         if not matches:
             logger.debug("No existing procedure found for type '%s'", task_type)
@@ -503,21 +528,25 @@ class ExecutionTracer:
             await record_success(self._db, match.procedure_id)
             logger.info(
                 "Recorded success for procedure %s (%s)",
-                match.procedure_id[:8], task_type,
+                match.procedure_id[:8],
+                task_type,
             )
         elif outcome == "failure":
             condition = update.get("failure_condition", "unknown")
             await record_failure(self._db, match.procedure_id, condition=condition)
             logger.info(
                 "Recorded failure for procedure %s (%s): %s",
-                match.procedure_id[:8], task_type, condition,
+                match.procedure_id[:8],
+                task_type,
+                condition,
             )
 
             # Record workaround if provided
             workaround = update.get("workaround")
             if workaround:
                 await record_workaround(
-                    self._db, match.procedure_id,
+                    self._db,
+                    match.procedure_id,
                     failed_method=condition,
                     working_method=workaround,
                     context=f"task retrospective: {task_type}",
@@ -630,7 +659,9 @@ class ExecutionTracer:
     ) -> None:
         """Create a follow-up when retrospective fails — visible, not silent."""
         logger.warning(
-            "Retrospective failed for task %s: %s", task_id, error_detail,
+            "Retrospective failed for task %s: %s",
+            task_id,
+            error_detail,
         )
         if self._db is None:
             return
@@ -641,8 +672,7 @@ class ExecutionTracer:
             await follow_up_crud.create(
                 self._db,
                 content=(
-                    f"Task {task_id[:12]} retrospective extraction failed: "
-                    f"{error_detail[:200]}"
+                    f"Task {task_id[:12]} retrospective extraction failed: {error_detail[:200]}"
                 ),
                 source="task_executor",
                 strategy="ego_judgment",

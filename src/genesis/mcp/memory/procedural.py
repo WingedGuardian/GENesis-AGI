@@ -113,6 +113,24 @@ async def procedure_store(
         principle_embedding=principle_blob,
     )
 
+    # WS-3 B1 gate-1 (procedure): the owner explicitly taught this procedure, so
+    # its origin is `owner` — which the shadow gate NEVER records (never-block
+    # invariant). The emit is wired for uniformity + future-proofing (if this tool
+    # ever accepts non-owner input, provenance is already plumbed). Best-effort.
+    if result.action != "skipped":
+        from genesis.memory.provenance import ORIGIN_OWNER
+        from genesis.security import immunity_shadow
+
+        await immunity_shadow.record_would_block(
+            gate="procedure",
+            source_kind="procedure_teach",
+            source_ref=result.procedure_id,
+            process="server",
+            blockable_count=1,
+            origin_class=ORIGIN_OWNER,
+            db=memory_mod._db,
+        )
+
     response = result.procedure_id
     if result.action == "updated":
         response = f"Updated existing procedure {result.procedure_id} (version bumped)"
@@ -159,6 +177,7 @@ async def procedure_recall(
     if results:
         from genesis.db.crud import procedural
         from genesis.eval.j9_hooks import emit_procedure_invoked
+
         for r in results:
             pid = r.get("procedure_id", "")
             if not pid:

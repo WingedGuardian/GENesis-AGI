@@ -16,6 +16,7 @@ retrieved from — always known at retrieval time, unlike the per-item store-tim
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 
 from genesis.security.sanitizer import (
     ContentSanitizer,
@@ -68,9 +69,7 @@ _PLACEHOLDER_DOCS = {"", "manual"}
 ORIGIN_OWNER = "owner"
 ORIGIN_FIRST_PARTY = "first_party"
 ORIGIN_EXTERNAL_UNTRUSTED = "external_untrusted"
-ORIGIN_CLASSES = frozenset(
-    {ORIGIN_OWNER, ORIGIN_FIRST_PARTY, ORIGIN_EXTERNAL_UNTRUSTED}
-)
+ORIGIN_CLASSES = frozenset({ORIGIN_OWNER, ORIGIN_FIRST_PARTY, ORIGIN_EXTERNAL_UNTRUSTED})
 
 # Pipelines whose CONTENT is text pulled off the world. ``curated`` is here
 # deliberately: "curated" is an authority tier, not authorship — URL/file
@@ -81,33 +80,98 @@ ORIGIN_CLASSES = frozenset(
 # already knows source_type). ``email``/``inbox``/``web_search``/
 # ``web_fetch`` have no store() writers today; reserving them means a
 # future writer is external BY DEFAULT rather than silently first-party.
-_EXTERNAL_PIPELINES = frozenset({
-    "crag_web",
-    "recon",
-    "knowledge_ingest",
-    "knowledge_ingest_source",
-    "curated",
-    "email",
-    "inbox",
-    "web_search",
-    "web_fetch",
-})
+_EXTERNAL_PIPELINES = frozenset(
+    {
+        "crag_web",
+        "recon",
+        "knowledge_ingest",
+        "knowledge_ingest_source",
+        "curated",
+        "email",
+        "inbox",
+        "web_search",
+        "web_fetch",
+    }
+)
 
 # Pipelines that write Genesis's own observations/derivations or the
 # owner's conversational content.
-_FIRST_PARTY_PIPELINES = frozenset({
-    "conversation",
-    "session_observer",
-    "harvest",
-    "synthesis",
-    "event_calendar",
-    "dream_cycle",
-    "reflection",
-    "drift",
-    "extraction_job",
-    "surplus",
-    "reference_store",
-})
+_FIRST_PARTY_PIPELINES = frozenset(
+    {
+        "conversation",
+        "session_observer",
+        "harvest",
+        "synthesis",
+        "event_calendar",
+        "dream_cycle",
+        "reflection",
+        "drift",
+        "extraction_job",
+        "surplus",
+        "reference_store",
+    }
+)
+
+# Tool NAMES whose USE means a session pulled EXTERNAL-WORLD content into its
+# working context — the signal WS-3 gate-1 (procedure) uses to classify a
+# promoted procedure's origin (from the action spine, or an ExecutionTrace's
+# ``tools_used``). CC built-ins are CamelCase; Genesis MCP tools arrive
+# namespaced (``mcp__<server>__web_fetch``) and are matched on their final
+# ``__``-delimited segment.
+#
+# Coarse-conservative BY DESIGN: "the session touched an external-ingest tool"
+# over-approximates "external content induced THIS procedure" — the judge builds
+# procedures from tool INPUTS plus its own reasoning, and fetched bodies live in
+# tool RESULTS, which the spine/haystack do not carry. Over-observing is the
+# correct SHADOW posture: the recorded rate is exactly what B4 measures before
+# any flip to enforce. Enforce-grade signal needs tool_RESULT provenance
+# (tracked as a WS-3 B4 follow-up).
+_EXTERNAL_INGEST_TOOLS = frozenset(
+    {
+        # CC built-in web tools
+        "WebFetch",
+        "WebSearch",
+        # Genesis MCP web + knowledge ingest (matched on final namespaced segment)
+        "web_fetch",
+        "web_search",
+        "web_agent",
+        "knowledge_recall",
+        "knowledge_ingest",
+        "knowledge_ingest_source",
+        "knowledge_ingest_batch",
+        "document_query",
+        # external recon (GitHub / model-intel / skill scans off the world)
+        "recon_run_github_discovery",
+        "recon_run_github_discovery_job",
+        "recon_run_model_intelligence",
+        "recon_run_skill_scan",
+        # external social fetch
+        "fetch_messages",
+        "fetch_forum_threads",
+        # arbitrary web navigation
+        "browser_navigate",
+    }
+)
+
+
+def origin_from_tool_names(tool_names: Iterable[str | None]) -> str:
+    """Classify a session/trace origin from the NAMES of tools it used.
+
+    Returns :data:`ORIGIN_EXTERNAL_UNTRUSTED` if any tool name signals ingest of
+    external-world content (see :data:`_EXTERNAL_INGEST_TOOLS`), else
+    :data:`ORIGIN_FIRST_PARTY`. MCP names are matched on their final
+    ``__``-delimited segment (``mcp__genesis-health__web_fetch`` → ``web_fetch``).
+
+    Never returns ``owner`` — owner authorship is asserted at explicit call
+    sites (e.g. an explicit-teach MCP tool), never inferred from tool usage.
+    """
+    for name in tool_names:
+        if not name:
+            continue
+        base = name.rsplit("__", 1)[-1]
+        if name in _EXTERNAL_INGEST_TOOLS or base in _EXTERNAL_INGEST_TOOLS:
+            return ORIGIN_EXTERNAL_UNTRUSTED
+    return ORIGIN_FIRST_PARTY
 
 
 def derive_origin_class(
@@ -139,8 +203,7 @@ def derive_origin_class(
     if origin_class is not None:
         if origin_class not in ORIGIN_CLASSES:
             raise ValueError(
-                f"invalid origin_class {origin_class!r}; "
-                f"expected one of {sorted(ORIGIN_CLASSES)}"
+                f"invalid origin_class {origin_class!r}; expected one of {sorted(ORIGIN_CLASSES)}"
             )
         return origin_class
     if source_pipeline in _EXTERNAL_PIPELINES:

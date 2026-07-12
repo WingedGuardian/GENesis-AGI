@@ -43,6 +43,7 @@ class ProcedureBuilderUnavailable(Exception):
     and still returns ``[]`` (retrying it forever is waste).
     """
 
+
 # Outer guard for the whole-session builder (extraction_job caller). NOT a single
 # call: the builder makes up to ~15 sequential LLM calls (1 build + 1 retry, then
 # per stored procedure a scoping check + a cross-type dedup check). Realistic
@@ -93,7 +94,7 @@ _MULTI_PROCEDURE_INTRO = (
 _MULTI_SEGMENTATION = (
     "A session may contain ZERO, ONE, or SEVERAL procedures. Segment BY TOPIC / GOAL:\n"
     "- Each distinct goal accomplished via a concrete replayable playbook = one procedure "
-    "(e.g. \"publish a post to Medium\").\n"
+    '(e.g. "publish a post to Medium").\n'
     "- ALSO emit a SEPARATE procedure for a sub-sequence that is INDEPENDENTLY REUSABLE in a "
     "DIFFERENT task (set is_subprocedure_of to the parent task_type) — captured specifically "
     "(exact tool/selectors/commands). Do this ONLY when the sub-sequence would genuinely be "
@@ -106,11 +107,11 @@ _MULTI_SEGMENTATION = (
     "data — hardcoded row/record/follow-up IDs, one-time resolution notes, a specific list of "
     "items that will not recur — it is a one-off cleanup, NOT a playbook: do NOT emit it. If a "
     "candidate mixes a generic investigation with one-off actions tied to specific IDs, skip "
-    "it. Ask: \"next month, in a NEW situation, could Genesis replay these exact steps?\" If "
+    'it. Ask: "next month, in a NEW situation, could Genesis replay these exact steps?" If '
     "no, skip.\n\n"
     "EVERY step must quote an EXACT command/path/flag that appears verbatim in the spine — "
     "never paraphrase or invent. For credentials / PII: never embed actual secrets — reference "
-    "the reference store instead (e.g. \"use the medium.com login from the reference store\").\n\n"
+    'the reference store instead (e.g. "use the medium.com login from the reference store").\n\n'
 )
 
 _MULTI_SCHEMA_EXAMPLE = """\
@@ -127,14 +128,15 @@ def _build_multi_struggle_prompt(spine_text: str, score: float) -> str:
         + _PROCEDURE_DEF
         + _MULTI_SEGMENTATION
         + "## Action Spine\n"
-        + spine_text + "\n\n"
+        + spine_text
+        + "\n\n"
         "## Struggle Score: " + f"{score:.2f}" + "\n\n"
-        "Return ONLY this JSON in backticks (the list may be empty):\n\n"
-        + _MULTI_SCHEMA_EXAMPLE
+        "Return ONLY this JSON in backticks (the list may be empty):\n\n" + _MULTI_SCHEMA_EXAMPLE
     )
 
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
+
 
 def _coerce_json(text: object) -> object | None:
     """Extract a JSON value from an LLM response (handles ```json fences).
@@ -202,6 +204,7 @@ def _parse_judge_response_list(text: str) -> list[dict] | None:
 
 # ── Storage ──────────────────────────────────────────────────────────────────
 
+
 async def _store_judged_procedure(
     db: aiosqlite.Connection,
     data: dict,
@@ -210,10 +213,15 @@ async def _store_judged_procedure(
     source_type: str,
     source_session_id: str | None = None,
     grounding_score: float | None = None,
+    origin_class: str | None = None,
 ) -> str | None:
     """Run the scoping + (same-type + cross-type) novelty checks, then store via
     store_procedure_checked. Returns procedure ID on success, None on
-    skip/duplicate/directive."""
+    skip/duplicate/directive.
+
+    ``origin_class`` is the WS-3 gate-1 session provenance (from the caller's
+    tool-name scan); the shadow gate emits it after a successful store. Defaults
+    to first_party when unset."""
     from genesis.learning.procedural.extractor import _principle_is_novel
     from genesis.learning.procedural.operations import store_procedure_checked
     from genesis.learning.procedural.scoping import is_behavioral_directive
@@ -239,15 +247,22 @@ async def _store_judged_procedure(
     # and are the dominant near-duplicate source. Fails open to "keep" on any
     # classifier error — never suppress a real procedure.
     if await is_behavioral_directive(
-        router, task_type=task_type, principle=principle, steps=steps,
+        router,
+        task_type=task_type,
+        principle=principle,
+        steps=steps,
     ):
         return None
 
     # Novelty: same-task_type cosine gate + cross-task_type LLM dedup (router-gated).
     embedder = get_embedding_provider()
     is_novel, max_sim, principle_vec, fell_open = await _principle_is_novel(
-        db, task_type=task_type, new_principle=principle, embedder=embedder,
-        router=router, new_steps=steps,
+        db,
+        task_type=task_type,
+        new_principle=principle,
+        embedder=embedder,
+        router=router,
+        new_steps=steps,
     )
 
     # Fail-open rate limiter: when the novelty gate couldn't check (embedder down),
@@ -273,7 +288,8 @@ async def _store_judged_procedure(
     if not is_novel:
         logger.info(
             "Judge: procedure for %s rejected by novelty gate (sim=%.3f)",
-            task_type, max_sim,
+            task_type,
+            max_sim,
         )
         return None
 
@@ -315,16 +331,39 @@ async def _store_judged_procedure(
 
     logger.info(
         "Judge: procedure %s %s for task_type=%s (source=%s)",
-        result.procedure_id, result.action, task_type, source_type,
+        result.procedure_id,
+        result.action,
+        task_type,
+        source_type,
     )
 
     if result.action == "skipped":
         return None
 
+    # WS-3 B1 gate-1 (procedure): shadow-record that a procedure promoted from an
+    # external-influenced session WOULD be blocked (observe-only; the procedure is
+    # stored exactly as before). The emit self-guards — owner/first_party origins
+    # and the kill switch produce NO row — so this is a no-op for Genesis's own
+    # sessions. Best-effort, never raises. Reuse the shared `db` handle (safe:
+    # the emit only INSERTs and never rolls back the SerializedConnection).
+    from genesis.memory.provenance import ORIGIN_FIRST_PARTY
+    from genesis.security import immunity_shadow
+
+    await immunity_shadow.record_would_block(
+        gate="procedure",
+        source_kind="procedure_promotion",
+        source_ref=result.procedure_id,
+        process="server",
+        blockable_count=1,
+        origin_class=origin_class or ORIGIN_FIRST_PARTY,
+        db=db,
+    )
+
     return result.procedure_id
 
 
 # ── Public entry point ─────────────────────────────────────────────────────────
+
 
 async def _call_and_parse_list(router: object, prompt: str) -> list[dict]:
     """Call the builder LLM and parse a procedure list, retrying ONCE on an
@@ -343,20 +382,24 @@ async def _call_and_parse_list(router: object, prompt: str) -> list[dict]:
             )
         except Exception as exc:
             logger.warning(
-                "Judge LLM call failed for multi-procedure (attempt %d)", attempt,
+                "Judge LLM call failed for multi-procedure (attempt %d)",
+                attempt,
                 exc_info=True,
             )
             raise ProcedureBuilderUnavailable(str(exc)) from exc
         if not result.success:
             logger.warning(
-                "Judge LLM call unsuccessful (attempt %d): %s", attempt, result.error,
+                "Judge LLM call unsuccessful (attempt %d): %s",
+                attempt,
+                result.error,
             )
             raise ProcedureBuilderUnavailable(result.error or "call unsuccessful")
         parsed = _parse_judge_response_list(result.content)
         if parsed is not None:
             return parsed
         logger.warning(
-            "Judge multi-procedure response unparseable (attempt %d of 2)", attempt,
+            "Judge multi-procedure response unparseable (attempt %d of 2)",
+            attempt,
         )
     return []
 
@@ -384,10 +427,18 @@ async def judge_multi_procedure(
     yields no procedures returns ``[]`` (nothing to rebuild).
     """
     from genesis.learning.procedural.grounding import grounding_score
-    from genesis.learning.procedural.struggle_detector import format_spine_for_judge
+    from genesis.learning.procedural.struggle_detector import (
+        derive_session_origin,
+        format_spine_for_judge,
+    )
 
     spine_text = format_spine_for_judge(spine)
     prompt = _build_multi_struggle_prompt(spine_text, score)
+
+    # WS-3 gate-1: one origin for the whole session — every procedure this call
+    # promotes shares it (covers BOTH the struggle and rebuild callers, since
+    # both route their spine through here).
+    origin_class = derive_session_origin(spine)
 
     procedures = await _call_and_parse_list(router, prompt)
     if not procedures:
@@ -397,8 +448,9 @@ async def judge_multi_procedure(
     for idx, data in enumerate(procedures):
         if max_new is not None and len(stored) >= max_new:
             logger.info(
-                "Multi-procedure builder hit per-session cap (%d); %d candidate(s) "
-                "not evaluated", max_new, len(procedures) - idx,
+                "Multi-procedure builder hit per-session cap (%d); %d candidate(s) not evaluated",
+                max_new,
+                len(procedures) - idx,
             )
             break
 
@@ -415,7 +467,8 @@ async def judge_multi_procedure(
             logger.warning(
                 "Procedure '%s' weakly grounded (%.0f%% of step tokens in the "
                 "execution record) — storing anyway (grounding is observability only)",
-                data.get("task_type"), gscore * 100,
+                data.get("task_type"),
+                gscore * 100,
             )
 
         # Sub-procedure linkage → context_tags tag (no schema change).
@@ -427,10 +480,13 @@ async def judge_multi_procedure(
             data["context_tags"] = [*tags, f"subprocedure_of:{parent}"]
 
         proc_id = await _store_judged_procedure(
-            db, data, router,
+            db,
+            data,
+            router,
             source_type="struggle_extraction",
             source_session_id=source_session_id,
             grounding_score=gscore,
+            origin_class=origin_class,
         )
         if proc_id:
             stored.append(proc_id)
