@@ -441,6 +441,62 @@ def test_normalize_tags():
     assert _normalize_tags("single") == ["single"]
     assert _normalize_tags([1, 2]) == ["1", "2"]  # non-str elements
     assert _normalize_tags(["a", "", "  "]) == ["a"]  # drop empty/whitespace
+    assert _normalize_tags([None, "cloud"]) == ["cloud"]  # drop None, not "None"
     assert _normalize_tags(None) == []
     assert _normalize_tags("") == []
     assert _normalize_tags(42) == []  # non-str/list → []
+
+
+def test_normalize_str_list():
+    """caveats/relationships variant: a string is NOT comma-split (free text)."""
+    from genesis.knowledge.distillation import _normalize_str_list
+
+    assert _normalize_str_list(["a", "b"]) == ["a", "b"]
+    # A sentence caveat with a comma stays ONE item (unlike tags).
+    assert _normalize_str_list("simplified, not exhaustive") == ["simplified, not exhaustive"]
+    assert _normalize_str_list([1, None, "x"]) == ["1", "x"]  # drop None, stringify
+    assert _normalize_str_list(["a", "", "  "]) == ["a"]  # drop empty/whitespace
+    assert _normalize_str_list(None) == []
+    assert _normalize_str_list("") == []
+    assert _normalize_str_list(42) == []  # non-str/list → []
+
+
+async def test_distill_string_caveats_with_user_context_not_dropped():
+    """A string `caveats` + user_context must not crash .append()/drop the chunk."""
+    router = _one_unit_router(
+        {
+            "concept": "C",
+            "body": "Body content.",
+            "domain": "test",
+            "confidence": 0.9,
+            "caveats": "simplified",
+        }
+    )
+    pipeline = DistillationPipeline(router=router)
+    content = ProcessedContent(text="Some content here.", source_type="text", source_path="t.txt")
+
+    units = await pipeline.distill(content, project_type="test", user_context="a note")
+
+    assert len(units) == 1  # chunk NOT dropped by AttributeError
+    assert "simplified" in units[0].caveats
+    assert any("User context" in c for c in units[0].caveats)
+
+
+async def test_distill_normalizes_string_relationships():
+    """A string `relationships` field becomes a single-element list[str]."""
+    router = _one_unit_router(
+        {
+            "concept": "C",
+            "body": "Body content.",
+            "domain": "test",
+            "confidence": 0.9,
+            "relationships": "subnets",
+        }
+    )
+    pipeline = DistillationPipeline(router=router)
+    content = ProcessedContent(text="Some content here.", source_type="text", source_path="t.txt")
+
+    units = await pipeline.distill(content, project_type="test")
+
+    assert len(units) == 1
+    assert units[0].relationships == ["subnets"]

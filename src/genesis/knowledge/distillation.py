@@ -188,21 +188,53 @@ def _coerce_confidence(value: object, *, default: float = 0.85) -> float:
     return max(0.0, min(1.0, conf))
 
 
+def _clean_str_items(items: object) -> list[str]:
+    """Stringify an iterable's items to non-empty stripped strings.
+
+    Drops ``None`` and blank/whitespace-only items (``str(None)`` would
+    otherwise become the literal tag ``"None"``). Shared by the tag and
+    free-text list normalizers.
+    """
+    out: list[str] = []
+    for item in items:  # type: ignore[union-attr]
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
+
+
 def _normalize_tags(value: object) -> list[str]:
     """Normalize an LLM-provided ``tags`` field to ``list[str]``.
 
     The LLM may return tags as a comma-joined string ("networking, cloud") or
     a list with non-string elements. A raw string flows into
     ``KnowledgeUnit.tags`` and later crashes ``unit.tags + [...]`` (str + list)
-    at the store call site. Normalize: a string is comma-split (or treated as a
-    single tag); a list/tuple has its elements stringified; empties are dropped;
-    anything else yields ``[]``.
+    at the store call site. Tags are short labels, so a string is comma-split;
+    list/tuple elements are stringified; None/blank dropped; else ``[]``.
     """
     if isinstance(value, str):
-        parts = value.split(",") if "," in value else [value]
-        return [p.strip() for p in parts if p.strip()]
+        return _clean_str_items(value.split(","))
     if isinstance(value, (list, tuple)):
-        return [str(t).strip() for t in value if str(t).strip()]
+        return _clean_str_items(value)
+    return []
+
+
+def _normalize_str_list(value: object) -> list[str]:
+    """Normalize an LLM free-text list field (``caveats`` / ``relationships``).
+
+    Same silent-chunk-drop failure class as ``tags``: an un-coerced string
+    ``caveats`` reaches ``caveats.append(...)`` and raises ``AttributeError``,
+    swallowed by ``return_exceptions=True`` — dropping the whole chunk. Unlike
+    ``_normalize_tags``, a string is kept WHOLE (a caveat sentence must not be
+    comma-split); list/tuple elements are stringified; None/blank dropped;
+    else ``[]``.
+    """
+    if isinstance(value, str):
+        return _clean_str_items([value])
+    if isinstance(value, (list, tuple)):
+        return _clean_str_items(value)
     return []
 
 
@@ -281,7 +313,7 @@ class DistillationPipeline:
                         continue
 
                     # Include user context in caveats if provided
-                    caveats = raw.get("caveats", []) or []
+                    caveats = _normalize_str_list(raw.get("caveats"))
                     if user_context:
                         caveats.append(f"User context: {user_context[:200]}")
 
@@ -289,7 +321,7 @@ class DistillationPipeline:
                         concept=str(raw.get("concept", ""))[:200],
                         body=str(raw.get("body", "")),
                         domain=str(raw.get("domain", domain)),
-                        relationships=raw.get("relationships", []) or [],
+                        relationships=_normalize_str_list(raw.get("relationships")),
                         caveats=caveats,
                         tags=_normalize_tags(raw.get("tags")),
                         confidence=confidence,
