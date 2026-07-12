@@ -161,11 +161,80 @@ def _parse_llm_response(response_text: str) -> list[dict]:
         end = text.rfind("]")
         if start != -1 and end != -1 and end > start:
             try:
-                return json.loads(text[start:end + 1])
+                return json.loads(text[start : end + 1])
             except json.JSONDecodeError:
                 pass
 
     logger.warning("Failed to parse LLM distillation response as JSON")
+    return []
+
+
+def _coerce_confidence(value: object, *, default: float = 0.85) -> float:
+    """Coerce an LLM-provided confidence to a float in ``[0.0, 1.0]``.
+
+    The distillation LLM occasionally returns ``confidence`` as a string
+    ("0.9", "high") or omits/garbles it. An un-coerced string raises
+    ``TypeError`` at the ``confidence < 0.3`` filter — and because chunk tasks
+    are gathered with ``return_exceptions=True``, that silently drops the
+    *entire* chunk's units. Coerce to a real float (fallback ``default`` on
+    non-numeric/NaN) and clamp to the valid range.
+    """
+    try:
+        conf = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if conf != conf:  # NaN
+        return default
+    return max(0.0, min(1.0, conf))
+
+
+def _clean_str_items(items: object) -> list[str]:
+    """Stringify an iterable's items to non-empty stripped strings.
+
+    Drops ``None`` and blank/whitespace-only items (``str(None)`` would
+    otherwise become the literal tag ``"None"``). Shared by the tag and
+    free-text list normalizers.
+    """
+    out: list[str] = []
+    for item in items:  # type: ignore[union-attr]
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _normalize_tags(value: object) -> list[str]:
+    """Normalize an LLM-provided ``tags`` field to ``list[str]``.
+
+    The LLM may return tags as a comma-joined string ("networking, cloud") or
+    a list with non-string elements. A raw string flows into
+    ``KnowledgeUnit.tags`` and later crashes ``unit.tags + [...]`` (str + list)
+    at the store call site. Tags are short labels, so a string is comma-split;
+    list/tuple elements are stringified; None/blank dropped; else ``[]``.
+    """
+    if isinstance(value, str):
+        return _clean_str_items(value.split(","))
+    if isinstance(value, (list, tuple)):
+        return _clean_str_items(value)
+    return []
+
+
+def _normalize_str_list(value: object) -> list[str]:
+    """Normalize an LLM free-text list field (``caveats`` / ``relationships``).
+
+    Same silent-chunk-drop failure class as ``tags``: an un-coerced string
+    ``caveats`` reaches ``caveats.append(...)`` and raises ``AttributeError``,
+    swallowed by ``return_exceptions=True`` — dropping the whole chunk. Unlike
+    ``_normalize_tags``, a string is kept WHOLE (a caveat sentence must not be
+    comma-split); list/tuple elements are stringified; None/blank dropped;
+    else ``[]``.
+    """
+    if isinstance(value, str):
+        return _clean_str_items([value])
+    if isinstance(value, (list, tuple)):
+        return _clean_str_items(value)
     return []
 
 
@@ -222,23 +291,29 @@ class DistillationPipeline:
         async def _process_one(i: int, chunk: str) -> ChunkResult:
             async with sem:
                 raw_units = await self._distill_chunk(
-                    chunk, content, project_type, domain, user_context,
-                    chunk_index=i, total_chunks=total_chunks,
+                    chunk,
+                    content,
+                    project_type,
+                    domain,
+                    user_context,
+                    chunk_index=i,
+                    total_chunks=total_chunks,
                     total_chars=total_chars,
                     content_source=content_source,
                 )
                 units = []
                 for raw in raw_units:
-                    confidence = raw.get("confidence", 0.85)
+                    confidence = _coerce_confidence(raw.get("confidence"))
                     if confidence < 0.3:
                         logger.info(
                             "Skipping low-confidence unit: %s (%.2f)",
-                            raw.get("concept", "?")[:60], confidence,
+                            raw.get("concept", "?")[:60],
+                            confidence,
                         )
                         continue
 
                     # Include user context in caveats if provided
-                    caveats = raw.get("caveats", []) or []
+                    caveats = _normalize_str_list(raw.get("caveats"))
                     if user_context:
                         caveats.append(f"User context: {user_context[:200]}")
 
@@ -246,9 +321,9 @@ class DistillationPipeline:
                         concept=str(raw.get("concept", ""))[:200],
                         body=str(raw.get("body", "")),
                         domain=str(raw.get("domain", domain)),
-                        relationships=raw.get("relationships", []) or [],
+                        relationships=_normalize_str_list(raw.get("relationships")),
                         caveats=caveats,
-                        tags=raw.get("tags", []) or [],
+                        tags=_normalize_tags(raw.get("tags")),
                         confidence=confidence,
                         section_title=f"Section {i + 1}" if len(chunks) > 1 else None,
                         source_date=content.metadata.get("source_date")
@@ -263,15 +338,13 @@ class DistillationPipeline:
                     try:
                         await on_chunk_done(i, len(chunks), units)
                     except Exception:
-                        logger.warning("on_chunk_done callback failed for chunk %d", i, exc_info=True)
+                        logger.warning(
+                            "on_chunk_done callback failed for chunk %d", i, exc_info=True
+                        )
 
                 return result
 
-        tasks = [
-            _process_one(i, chunk)
-            for i, chunk in enumerate(chunks)
-            if chunk.strip()
-        ]
+        tasks = [_process_one(i, chunk) for i, chunk in enumerate(chunks) if chunk.strip()]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Collect units in chunk order
@@ -294,13 +367,19 @@ class DistillationPipeline:
         if self.last_extraction_ratio < MIN_EXTRACTION_RATIO and all_units:
             logger.warning(
                 "Thin extraction: %.1f%% ratio (%d output chars / %d input chars, %d units) from %s",
-                self.last_extraction_ratio * 100, output_chars, total_chars,
-                len(all_units), content.source_path,
+                self.last_extraction_ratio * 100,
+                output_chars,
+                total_chars,
+                len(all_units),
+                content.source_path,
             )
 
         logger.info(
             "Distilled %d knowledge units from %s (%d chunks, %d concurrent, %.1f%% extraction ratio)",
-            len(all_units), content.source_path, len(chunks), _MAX_CONCURRENT_CHUNKS,
+            len(all_units),
+            content.source_path,
+            len(chunks),
+            _MAX_CONCURRENT_CHUNKS,
             self.last_extraction_ratio * 100,
         )
         return all_units
@@ -359,8 +438,9 @@ class DistillationPipeline:
         try:
             result = await self._router.route_call(_CALL_SITE, messages, chain_offset=chunk_index)
             if not result.success or not result.content:
-                logger.warning("Distillation LLM call failed for chunk: %s",
-                               result.error or "empty response")
+                logger.warning(
+                    "Distillation LLM call failed for chunk: %s", result.error or "empty response"
+                )
                 return []
             return _parse_llm_response(result.content)
         except Exception:
