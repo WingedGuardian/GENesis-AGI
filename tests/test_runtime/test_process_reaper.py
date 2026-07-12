@@ -294,13 +294,14 @@ async def test_auto_arm_lifecycle(monkeypatch):
 
     monkeypatch.setattr(pr, "_notify_owner", fake_notify)
 
-    # Pass 1: fresh dry-run, a detached candidate present. Should record
-    # dry_run_since and NOT arm, NOT signal.
+    # Pass 1: fresh dry-run. 900001 is a detached candidate; 900002 is a
+    # live session with a fresh marker (hook proof-of-life). Should record
+    # dry_run_since + hook_verified, but NOT arm, NOT signal.
     signals, saved, _ = _patch_io(
         monkeypatch,
-        pids_by_pattern={"claude": [900001]},
-        ages={900001: 8 * _DAY},
-        markers={},
+        pids_by_pattern={"claude": [900001, 900002]},
+        ages={900001: 8 * _DAY, 900002: 8 * _DAY},
+        markers={900002: _NOW - 100},  # fresh marker → hook is alive
         ttys={},
         live_ttys=set(),
         state={},
@@ -309,12 +310,13 @@ async def test_auto_arm_lifecycle(monkeypatch):
     await run_reaper(rt, now=_NOW)
     assert signals == []
     assert saved.get("dry_run_since") == _NOW
+    assert saved.get("hook_verified") is True
     assert saved.get("dry_run", True) is True
     assert not saved.get("armed_at")
     assert notified == []
 
-    # Pass 2: >3 days later, still dry-run. Should FLIP to armed + notify,
-    # but still NOT signal this pass (arm gives the owner a veto window).
+    # Pass 2: >3 days later, hook already verified. Should FLIP to armed +
+    # notify, but still NOT signal this pass (arm gives the owner a veto window).
     signals2, saved2, _ = _patch_io(
         monkeypatch,
         pids_by_pattern={"claude": [900001]},
@@ -322,7 +324,7 @@ async def test_auto_arm_lifecycle(monkeypatch):
         markers={},
         ttys={},
         live_ttys=set(),
-        state={"dry_run": True, "dry_run_since": _NOW},
+        state={"dry_run": True, "dry_run_since": _NOW, "hook_verified": True},
     )
     rt2 = _FakeRT(pipeline=object())
     await run_reaper(rt2, now=_NOW + 3 * _DAY + 60)
@@ -330,6 +332,30 @@ async def test_auto_arm_lifecycle(monkeypatch):
     assert saved2.get("dry_run") is False
     assert saved2.get("armed_at") == _NOW + 3 * _DAY + 60
     assert len(notified) == 1 and "auto-armed" in notified[0]
+
+
+async def test_no_arm_without_hook_proof(monkeypatch):
+    """Elapsed window alone must NOT arm — the hook must be proven live first."""
+    notified: list[str] = []
+
+    async def fake_notify(rt, msg):
+        notified.append(msg)
+
+    monkeypatch.setattr(pr, "_notify_owner", fake_notify)
+    signals, saved, _ = _patch_io(
+        monkeypatch,
+        pids_by_pattern={"claude": [900001]},
+        ages={900001: 8 * _DAY},
+        markers={},  # NO fresh marker anywhere → hook never proven
+        ttys={},
+        live_ttys=set(),
+        state={"dry_run": True, "dry_run_since": _NOW},  # no hook_verified
+    )
+    rt = _FakeRT(pipeline=object())
+    await run_reaper(rt, now=_NOW + 30 * _DAY)  # long past the window
+    assert signals == []
+    assert saved.get("armed_at") is None  # refused to arm without hook proof
+    assert notified == []
 
 
 async def test_hard_disable_prevents_arm(monkeypatch):

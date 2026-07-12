@@ -292,6 +292,13 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
         uptime_secs = _read_uptime()
         live_ttys = await _live_ttys()
         all_live_pids: set[int] = set()
+        # Proof-of-life for the hook: did we see ANY live claude PID with a
+        # fresh activity marker this pass? The marker is the sole trustworthy
+        # "user is active here" signal (process structure can't distinguish a
+        # live session from an orphan — verified 2026-07-11: all sessions had
+        # live bash/tmux parents). Auto-arm is gated on this, so the reaper
+        # never arms while its load-bearing signal is absent (hook not firing).
+        saw_fresh_marker = False
         # candidates: (root_pid, label, reason, is_claude, tree)
         candidates: list[tuple[int, str, str, bool, list[int]]] = []
 
@@ -307,10 +314,13 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
                     continue
                 if is_claude:
                     tty = await _process_tty(pid)
+                    marker = _marker_mtime(pid)
+                    if marker is not None and (now - marker) < _CLAUDE_IDLE_WINDOW_SECS:
+                        saw_fresh_marker = True
                     should_reap, reason = classify_claude_pid(
                         age_secs=age,
                         now=now,
-                        marker_mtime=_marker_mtime(pid),
+                        marker_mtime=marker,
                         controlling_tty=tty,
                         live_ttys=live_ttys,
                     )
@@ -326,7 +336,15 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
         _gc_markers(all_live_pids)
 
         if not candidates:
-            await _maybe_arm(state, now, dry_run, hard_disabled, rt, armed_summary=None)
+            await _maybe_arm(
+                state,
+                now,
+                dry_run,
+                hard_disabled,
+                rt,
+                hook_active=saw_fresh_marker,
+                armed_summary=None,
+            )
             rt.record_job_success("process_reaper")
             return
 
@@ -348,6 +366,7 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
                 dry_run,
                 hard_disabled,
                 rt,
+                hook_active=saw_fresh_marker,
                 armed_summary=_summarize(candidates),
             )
             rt.record_job_success("process_reaper")
@@ -397,11 +416,19 @@ async def _maybe_arm(
     hard_disabled: bool,
     rt: GenesisRuntime,
     *,
+    hook_active: bool,
     armed_summary: str | None,
 ) -> None:
     """Advance the dry-run→armed lifecycle. Never arms this pass; the flip
     takes effect on the NEXT pass so the owner gets the notification + a
     veto window before anything is signalled.
+
+    Auto-arm requires BOTH the elapsed dry-run window AND proof-of-life for
+    the hook (``hook_active`` — a fresh marker was seen at least once). The
+    marker is the reaper's only trustworthy activity signal, so arming while
+    it has never appeared would reap on the unreliable tty backstop alone.
+    ``hook_verified`` latches once true so a transient markerless pass (e.g.
+    all sessions momentarily idle) can't un-verify a hook already proven live.
     """
     if not dry_run or hard_disabled:
         return  # already armed, or hard kill-switch engaged
@@ -409,8 +436,15 @@ async def _maybe_arm(
     if not state.get("dry_run_since"):
         state["dry_run_since"] = now
         changed = True
+    if hook_active and not state.get("hook_verified"):
+        state["hook_verified"] = True
+        changed = True
     elapsed = now - float(state["dry_run_since"])
-    if elapsed >= _DRY_RUN_ARM_AFTER_SECS and not state.get("armed_at"):
+    if (
+        elapsed >= _DRY_RUN_ARM_AFTER_SECS
+        and state.get("hook_verified")
+        and not state.get("armed_at")
+    ):
         state["dry_run"] = False
         state["armed_at"] = now
         changed = True
