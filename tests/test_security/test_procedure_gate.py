@@ -54,6 +54,17 @@ def test_origin_external_on_knowledge_recall():
     )
 
 
+def test_origin_external_on_page_reading_browser_tool_without_navigate():
+    # A session resuming an ALREADY-OPEN page reads it via snapshot/run_js/click
+    # without ever calling browser_navigate — any browser_* tool implies an
+    # attached live page (prefix rule).
+    assert (
+        origin_from_tool_names(["Read", "mcp__genesis-health__browser_snapshot"])
+        == ORIGIN_EXTERNAL_UNTRUSTED
+    )
+    assert origin_from_tool_names(["browser_run_js"]) == ORIGIN_EXTERNAL_UNTRUSTED
+
+
 def test_origin_first_party_on_internal_only():
     # memory_store is a first-party WRITE, not an external ingest — must not flip.
     assert (

@@ -157,19 +157,29 @@ _EXTERNAL_INGEST_TOOLS = frozenset(
         # external social fetch
         "fetch_messages",
         "fetch_forum_threads",
-        # arbitrary web navigation
-        "browser_navigate",
     }
 )
+
+# Tool-name PREFIXES that signal external ingest. `browser_` covers the whole
+# browser-automation family by construction: ANY browser tool implies an
+# attached live web page whose content can enter the session (a session
+# resuming an already-open page reads it via browser_snapshot/browser_run_js/
+# browser_click without ever calling browser_navigate — Codex-flagged on PR
+# #1014). A future browser tool is external BY DEFAULT (same philosophy as the
+# reserved pipelines in _EXTERNAL_PIPELINES). Over-observes the couple of
+# page-less admin tools (browser_sessions, browser_clear_domain) — the correct
+# shadow posture.
+_EXTERNAL_INGEST_TOOL_PREFIXES = ("browser_",)
 
 
 def origin_from_tool_names(tool_names: Iterable[str | None]) -> str:
     """Classify a session/trace origin from the NAMES of tools it used.
 
     Returns :data:`ORIGIN_EXTERNAL_UNTRUSTED` if any tool name signals ingest of
-    external-world content (see :data:`_EXTERNAL_INGEST_TOOLS`), else
-    :data:`ORIGIN_FIRST_PARTY`. MCP names are matched on their final
-    ``__``-delimited segment (``mcp__genesis-health__web_fetch`` → ``web_fetch``).
+    external-world content (see :data:`_EXTERNAL_INGEST_TOOLS` and
+    :data:`_EXTERNAL_INGEST_TOOL_PREFIXES`), else :data:`ORIGIN_FIRST_PARTY`.
+    MCP names are matched on their final ``__``-delimited segment
+    (``mcp__genesis-health__web_fetch`` → ``web_fetch``).
 
     Never returns ``owner`` — owner authorship is asserted at explicit call
     sites (e.g. an explicit-teach MCP tool), never inferred from tool usage.
@@ -179,6 +189,8 @@ def origin_from_tool_names(tool_names: Iterable[str | None]) -> str:
             continue
         base = name.rsplit("__", 1)[-1]
         if name in _EXTERNAL_INGEST_TOOLS or base in _EXTERNAL_INGEST_TOOLS:
+            return ORIGIN_EXTERNAL_UNTRUSTED
+        if base.startswith(_EXTERNAL_INGEST_TOOL_PREFIXES):
             return ORIGIN_EXTERNAL_UNTRUSTED
     return ORIGIN_FIRST_PARTY
 
