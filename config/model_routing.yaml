@@ -83,14 +83,14 @@ providers:
     open_duration_s: 120
   openrouter-sonnet:
     type: openrouter
-    model: anthropic/claude-sonnet-4-6-20250514
+    model: anthropic/claude-sonnet-4.6
     profile: claude-sonnet-4.6
     free: false
     rpm_limit: 20
     open_duration_s: 120
   openrouter-opus:
     type: openrouter
-    model: anthropic/claude-opus-4-6-20250514
+    model: anthropic/claude-opus-4.6
     profile: claude-opus-4.6
     free: false
     rpm_limit: 20
@@ -529,15 +529,17 @@ call_sites:
     never_pays: true
     retry_profile: background
     description: "Intelligence intake — score uncurated recon findings for relevance and quality"
-  # Strong-first by user decision (2026-07-11): annotations are the value layer
-  # of the infrastructure body schema and regenerate only when a fact section's
-  # hash changes, so quality wins over cost (call site 37 showed free-model
-  # judgment output is too weak for this class of task).
+  # Reasoning-first (2026-07-12): generating operational gotchas from structured
+  # infra facts is failure-mode reasoning over data, so it mirrors the `judge`
+  # chain (deepseek reasoning) rather than a general-chat model — better matched
+  # AND cheaper than sonnet. Regenerates only on a section's fact-hash change, so
+  # cost is negligible. Free general models (gemini/mistral) proved high-quality
+  # on the live first run and serve as robust fallback.
   46_infra_annotation:
     chain:
-    - openrouter-sonnet
+    - openrouter-deepseek-v4
+    - nvidia-nim-deepseek
     - gemini-free
-    - groq-free
     - mistral-large-free
     - openrouter-free
     default_paid: true
