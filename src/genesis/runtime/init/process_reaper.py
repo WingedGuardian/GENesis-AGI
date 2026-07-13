@@ -257,11 +257,21 @@ def _save_state(state: dict) -> None:
         tmp.replace(_STATE_PATH)
 
 
+_ENV_AFFIRMATIVE = frozenset({"1", "true", "yes", "on"})
+
+
 def _operator_armed(state: dict) -> bool:
     """True only if a human explicitly opted in to real kills — via the
-    ``armed_by_operator`` state flag or the ``GENESIS_REAPER_ARMED`` env.
+    ``armed_by_operator`` state flag or ``GENESIS_REAPER_ARMED`` set to an
+    explicit affirmative (``1``/``true``/``yes``/``on``).
+
+    The env value is parsed strictly: ``GENESIS_REAPER_ARMED=0`` / ``false`` —
+    a deployment documenting that the reaper is OFF — must NOT arm it (generic
+    truthiness would treat any non-empty string, including ``"0"``, as opt-in).
     """
-    return bool(state.get(_STATE_ARMED_KEY)) or bool(os.environ.get(_ENV_ARM))
+    if state.get(_STATE_ARMED_KEY):
+        return True
+    return os.environ.get(_ENV_ARM, "").strip().lower() in _ENV_AFFIRMATIVE
 
 
 def set_operator_armed(armed: bool) -> None:
@@ -403,8 +413,9 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
                 rt,
                 "⚠️ Process reaper killed a detached claude process "
                 f"(idle >7d, no live terminal): {_summarize(candidates)}. "
-                "If this was a live session, disable the reaper by setting "
-                '"dry_run": true in ~/.genesis/reaper_state.json.',
+                'To disarm, remove "armed_by_operator" from '
+                "~/.genesis/reaper_state.json (or call set_operator_armed(False)); "
+                f"to hard-stop immediately, export {_ENV_HARD_DISABLE}=1.",
             )
         rt.record_job_success("process_reaper")
     except Exception as exc:  # noqa: BLE001 — job boundary

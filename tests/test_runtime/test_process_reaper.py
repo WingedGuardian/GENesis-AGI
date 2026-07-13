@@ -305,6 +305,25 @@ async def test_default_state_is_dry_run(monkeypatch):
     assert signals == []  # not armed → never signals
 
 
+async def test_env_arm_non_affirmative_does_not_arm(monkeypatch):
+    """GENESIS_REAPER_ARMED=0/false documents OFF and must NOT arm the reaper."""
+    for val in ("0", "false", "no", "off", ""):
+        signals, _, _ = _patch_io(
+            monkeypatch,
+            pids_by_pattern={"claude": [900001]},
+            ages={900001: 30 * _DAY},
+            markers={},
+            ttys={},
+            live_ttys=set(),
+            descendants={900001: []},
+            state={},
+        )
+        monkeypatch.setenv(pr._ENV_ARM, val)
+        rt = _FakeRT()
+        await run_reaper(rt, now=_NOW)
+        assert signals == [], f"value {val!r} wrongly armed the reaper"
+
+
 async def test_env_arm_kills_detached_claude(monkeypatch):
     """Arming via GENESIS_REAPER_ARMED (no state flag) reaps a detached idle claude."""
     signals, _, _ = _patch_io(
