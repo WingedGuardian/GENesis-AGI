@@ -37,8 +37,17 @@ async def enqueue(
            (id, message, category, channel, urgency, deliver_after, created_at,
             thread_id, validated_recipient)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (pending_id, message, category, channel, urgency, deliver_after, now,
-         thread_id, validated_recipient),
+        (
+            pending_id,
+            message,
+            category,
+            channel,
+            urgency,
+            deliver_after,
+            now,
+            thread_id,
+            validated_recipient,
+        ),
     )
     await db.commit()
     return pending_id
@@ -49,9 +58,17 @@ async def drain(
     *,
     now: str,
 ) -> list[dict]:
-    """Fetch undelivered messages ready for delivery (max 20 per cycle)."""
+    """Fetch undelivered messages ready for delivery (max 20 per cycle).
+
+    Exposes the always-present ``rowid`` alongside the columns so a row whose
+    ``id`` is NULL (legacy rows inserted before ``enqueue`` set a uuid) can
+    still be marked delivered by rowid — otherwise ``mark_delivered`` matches
+    ``WHERE id = NULL`` (zero rows), the row never clears, and it is
+    re-drained every cycle forever (a churn/log-noise loop the 24h age-out
+    could not break because the age-out drop *is* a ``mark_delivered`` call).
+    """
     cursor = await db.execute(
-        """SELECT * FROM pending_outreach
+        """SELECT rowid AS rowid, * FROM pending_outreach
            WHERE delivered = 0
              AND (deliver_after IS NULL OR deliver_after <= ?)
            ORDER BY created_at ASC
@@ -67,10 +84,29 @@ async def mark_delivered(
     *,
     delivered_at: str,
 ) -> bool:
-    """Mark a pending message as delivered."""
+    """Mark a pending message as delivered by its ``id`` primary key."""
     cursor = await db.execute(
         "UPDATE pending_outreach SET delivered = 1, delivered_at = ? WHERE id = ?",
         (delivered_at, pending_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def mark_delivered_by_rowid(
+    db: aiosqlite.Connection,
+    rowid: int,
+    *,
+    delivered_at: str,
+) -> bool:
+    """Mark a pending message as delivered by ``rowid``.
+
+    Fallback for rows with a NULL ``id`` (see ``drain``). ``rowid`` is always
+    present and unique, so this always targets exactly the intended row.
+    """
+    cursor = await db.execute(
+        "UPDATE pending_outreach SET delivered = 1, delivered_at = ? WHERE rowid = ?",
+        (delivered_at, rowid),
     )
     await db.commit()
     return cursor.rowcount > 0

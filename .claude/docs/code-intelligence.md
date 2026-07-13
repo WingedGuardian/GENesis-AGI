@@ -71,7 +71,7 @@ symbol/reference/impact questions.
 Genesis). Supports 66 languages. 3D visualization at `localhost:9749`.
 Indexed (reindex on local commit); if stale, run `index_repository`.
 Runs under a hard 2G memory cap (`.claude/mcp/run-codebase-memory` wraps it in
-a systemd scope) because upstream v0.8.1 leaks memory without bound on query
+a systemd scope) because upstream v0.9.0 still leaks memory without bound on query (issue #581 open)
 operations (DeusData/codebase-memory-mcp#581). If its tools suddenly error
 mid-session, the instance likely hit the cap and was killed — run `/mcp` to
 reconnect a fresh one; Serena/GitNexus/Grep are unaffected. Cap override:

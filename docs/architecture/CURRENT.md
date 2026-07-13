@@ -534,8 +534,8 @@ config resolution, and hygiene utilities.
 ```yaml subsystem-map
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
-          restore, util, env.py, _config_overlay.py]
-verified: fa2e692a 2026-07-11
+          restore, util, infra_profile, env.py, _config_overlay.py]
+verified: 613ff6ff 2026-07-12
 ```
 
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
@@ -620,6 +620,20 @@ verified: fa2e692a 2026-07-11
   + per-site would-block counts — sizes the B4 enforce blast radius).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
+- **infra_profile/**: the infrastructure body schema — deterministic fact
+  collectors (container plane; host plane via a PR2 guardian verb, degrades to
+  "not visible from this vantage") → per-section hashed `profile.json` +
+  rendered `INFRASTRUCTURE.md` under `~/.genesis/infrastructure/`. **The
+  facts/metrics split is load-bearing**: only `facts` are hashed; a hash change
+  emits a dedup-gated `infrastructure_drift` observation and regenerates that
+  section's LLM annotation (call site 46, strong-first — annotations are PINNED
+  to source hashes; staleness derived at render, never stored). Consumers: boot
+  step (delayed, non-blocking) + daily 06:20 cron + `infrastructure_profile`
+  MCP tool (facts-only refresh cross-process, flock-guarded) + sentinel digest
+  + the user-CLAUDE.md `container-specs` block (content owner:
+  `infra_profile/claude_md.py`; update.sh invokes `--claude-md-block`).
+  Distinct from `observability/snapshots/infrastructure.py` (dynamic health) —
+  don't merge them.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),

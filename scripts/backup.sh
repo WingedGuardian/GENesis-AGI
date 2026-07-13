@@ -314,6 +314,18 @@ if [ -d "$GENESIS_DIR/config" ]; then
     log "Local overlays: $_LOCAL_OVERLAY_COUNT files"
 fi
 
+# --- 6b. Infrastructure body schema (Tier 1) ---
+# profile.json is regenerable, but annotations.json is LLM-spent judgment and
+# the rendered doc keeps restores self-describing. Small (<100KB), plain copy —
+# the backups repo is private.
+if [ -d "$HOME/.genesis/infrastructure" ]; then
+    log "Backing up infrastructure profile..."
+    mkdir -p infrastructure
+    for _f in profile.json annotations.json INFRASTRUCTURE.md; do
+        [ -f "$HOME/.genesis/infrastructure/$_f" ] && cp "$HOME/.genesis/infrastructure/$_f" infrastructure/
+    done
+fi
+
 # --- 7. Secrets (encrypted with GPG symmetric) ---
 log "Backing up secrets (encrypted)..."
 mkdir -p secrets
@@ -582,7 +594,7 @@ fi
 backend_cleanup
 
 # --- Ensure .gitignore excludes Tier 2 files ---
-# Tier 1 (git): memory/, config_overrides/, secrets/
+# Tier 1 (git): memory/, config_overrides/, secrets/, infrastructure/
 # Tier 2 (off-site): data/, transcripts/
 if ! grep -q '^data/$' .gitignore 2>/dev/null; then
     cat >> .gitignore << 'GITIGNORE'

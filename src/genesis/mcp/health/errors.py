@@ -528,7 +528,24 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
 
             for row in recent_rows:
                 prov, recent_calls, recent_errors = row
-                prov_crit = crit_map.get(prov, {})
+                # activity_log stores LLM calls as ``llm.<name>`` but crit_map
+                # (derive_criticality) is keyed by provider_type. Resolve in two
+                # hops: strip ``llm.`` prefix -> provider name -> provider_type ->
+                # criticality. Non-routed rows (embedding / qdrant.* / mcp.*) have
+                # no provider config and are skipped. (Pre-fix this lookup was
+                # single-hop on the raw ``llm.<name>`` string, so it ALWAYS missed
+                # -> every provider read "dormant" -> the detector was 100% dead.)
+                prov_name = (
+                    prov[4:]
+                    if isinstance(prov, str) and prov.startswith("llm.")
+                    else prov
+                )
+                provider_cfg = (
+                    routing_config.providers.get(prov_name) if routing_config else None
+                )
+                if provider_cfg is None:
+                    continue  # not a routed LLM provider (embeddings/mcp.*/qdrant.*)
+                prov_crit = crit_map.get(provider_cfg.provider_type, {})
                 criticality = prov_crit.get("criticality", "dormant")
                 if criticality == "dormant":
                     continue  # Skip providers not in any chain
@@ -557,20 +574,23 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 if baseline_error_rate > 0.05:
                     continue  # Wasn't healthy before — not credit exhaustion
 
-                # Was healthy (>95% success) over 7 days, now failing (>50% errors)
-                alert_id = f"provider:credit_exhaustion:{prov}"
-                is_free = prov_crit.get("is_free", False)
-                if criticality in ("sole", "systemic") and not is_free:
-                    severity = "CRITICAL"
-                elif criticality == "sole" and is_free:
-                    severity = "WARNING"
-                else:
-                    severity = "WARNING"
+                # Was healthy (>95% success) over 7 days, now failing (>50%
+                # errors). Dashboard WARNING ONLY -- never CRITICAL. Refilling
+                # credits/quota is a user (financial) action the Sentinel cannot
+                # take, and provider exhaustion alone is not an outage (routing
+                # fallbacks cover it). Telegram/Sentinel are reserved for genuine
+                # call-site-down + infra emergencies -- see the unified call-site
+                # health detector below for the "whole call site down" signal.
+                # GROUNDWORK(sentinel-auto-topup): CRITICAL_CALL_SITES
+                # (mcp/health/critical_sites.py) + this per-provider signal are the
+                # seam for a future user-gated auto-credit-top-up; see
+                # remediation_map.UNMAPPED_BY_DESIGN["provider:credit_exhaustion:"].
+                alert_id = f"provider:credit_exhaustion:{prov_name}"
                 alerts.append({
                     "id": alert_id,
-                    "severity": severity,
+                    "severity": "WARNING",
                     "message": (
-                        f"Suspected credit/quota exhaustion for {prov}: "
+                        f"Suspected credit/quota exhaustion for {prov_name}: "
                         f"was {1 - baseline_error_rate:.0%} success over 7d, "
                         f"now {recent_error_rate:.0%} errors in last hour "
                         f"({recent_errors}/{recent_calls} calls)"
@@ -579,6 +599,58 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 current_ids.add(alert_id)
         except Exception:
             logger.debug("Credit exhaustion detection failed", exc_info=True)
+
+    # ── Unified critical call-site health ────────────────
+    # "Is a whole call site down?" -- orthogonal to the per-provider credit
+    # signal above. call_site_last_run holds ONE row per site (its latest run,
+    # written by every execution path: router / cc / embedding / pipeline /
+    # gate), so success=0 on the last run is the honest "this site's last
+    # attempt failed" signal -- and it captures cc + embedding failures the
+    # provider-tier checks above miss. Sites in CRITICAL_CALL_SITES render
+    # CRITICAL/red; every other failing site renders WARNING/yellow (watched,
+    # not alarming). Dashboard-only BY CONSTRUCTION: ``callsite:down:`` is never
+    # on the outreach escalation whitelist (no Telegram) and is UNMAPPED in the
+    # Sentinel remediation map (no firefighter) -- both fail-closed. The recency
+    # window drops long-abandoned stale-failed rows (a weeks-old one-off is not
+    # an actionable outage). This deliberately overlaps the escalation-path
+    # alerts (cc:quota_exhausted / provider:embedding_failing) -- this is the
+    # glanceable unified availability view, those are the paging path.
+    if _service and _service._db:
+        try:
+            from datetime import timedelta as _td3
+
+            from genesis.mcp.health.critical_sites import (
+                CALLSITE_DOWN_RECENCY_HOURS,
+                CRITICAL_CALL_SITES,
+            )
+
+            cs_cutoff = (
+                datetime.now(UTC) - _td3(hours=CALLSITE_DOWN_RECENCY_HOURS)
+            ).isoformat()
+            cs_cursor = await _service._db.execute(
+                "SELECT call_site_id, last_run_at, provider_used "
+                "FROM call_site_last_run WHERE success = 0 AND last_run_at >= ?",
+                (cs_cutoff,),
+            )
+            for cs_row in await cs_cursor.fetchall():
+                site_id, last_run_at, provider_used = cs_row
+                is_critical = site_id in CRITICAL_CALL_SITES
+                alert_id = f"callsite:down:{site_id}"
+                alerts.append({
+                    "id": alert_id,
+                    "severity": "CRITICAL" if is_critical else "WARNING",
+                    "message": (
+                        f"Call site '{site_id}' last run failed "
+                        f"(provider {provider_used or 'unknown'}, last attempt "
+                        f"{str(last_run_at)[:19]})"
+                        + (" -- CRITICAL site" if is_critical else "")
+                    ),
+                })
+                current_ids.add(alert_id)
+        except Exception:
+            # call_site_last_run is a core table (migration 0015) -- a failure
+            # here is a real operational fault, not an expected-absent case.
+            logger.error("Call-site health check failed", exc_info=True)
 
     if _job_retry_registry is not None:
         for job_name in _job_retry_registry.list_registered():

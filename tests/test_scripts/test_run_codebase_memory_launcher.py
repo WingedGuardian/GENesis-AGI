@@ -1,6 +1,6 @@
 """Memory-cap launcher for codebase-memory-mcp (.claude/mcp/run-codebase-memory).
 
-Upstream v0.8.1 leaks memory without bound on query operations
+Upstream v0.9.0 still leaks memory without bound on query operations (#581)
 (DeusData/codebase-memory-mcp#581), so the launcher wraps the server in a
 transient systemd scope with MemoryMax, falling back to an address-space
 rlimit where no user manager is reachable.

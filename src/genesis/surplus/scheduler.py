@@ -23,6 +23,7 @@ from genesis.surplus.idle_detector import IdleDetector
 from genesis.surplus.jobs import dream as dream_jobs
 from genesis.surplus.jobs import gates as gate_jobs
 from genesis.surplus.jobs import gitnexus as gitnexus_jobs
+from genesis.surplus.jobs import infra as infra_jobs
 from genesis.surplus.jobs import runners as runner_jobs
 
 # Re-export: tests/test_surplus/test_gitnexus_strip.py imports the strip
@@ -378,6 +379,16 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=3600,
         )
+        # Infrastructure body-schema refresh: daily 6:20am local. CronTrigger
+        # (daily > 1h — IntervalTrigger would reset on restart). Cheap when
+        # nothing changed: unchanged section hashes skip all LLM annotation.
+        self._scheduler.add_job(
+            self.run_infra_profile_refresh,
+            CronTrigger(hour=6, minute=20, timezone=user_timezone()),
+            id="infra_profile_refresh",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
         # GitNexus CLAUDE.md strip: hourly. Decoupled from the reindex job above —
         # out-of-band reindexes (GitNexus's own staleness `analyze`) also re-inject
         # the block but never run that job's post-strip, so without this the block
@@ -710,6 +721,10 @@ class SurplusScheduler:
     async def run_gitnexus_strip(self) -> None:
         """Strip GitNexus's auto-injected block from CLAUDE.md (hourly + on startup)."""
         await gitnexus_jobs.run_gitnexus_strip()
+
+    async def run_infra_profile_refresh(self) -> None:
+        """Refresh the infrastructure body schema (daily 6:20am local)."""
+        await infra_jobs.run_infra_profile_refresh()
 
     async def run_memory_extraction(self) -> None:
         """Run periodic memory extraction from session transcripts."""

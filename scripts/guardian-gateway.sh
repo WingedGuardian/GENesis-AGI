@@ -244,13 +244,26 @@ except Exception:
                 fi
             fi
         fi
+        # --- systemd linger health (consumed by the container's _check_linger
+        # host leg). Linger keeps this user's timers/services alive after logout;
+        # if it is ever disabled the guardian's user timers die silently on the
+        # next logout. Fail-safe: emit a JSON literal true/false/null — `null`
+        # (NOT false) on any probe error, so a transient loginctl failure can
+        # never false-alarm as "linger disabled". Only an explicit `Linger=no`
+        # yields false. System-bus call (logind) — no PATH/login-shell dependence.
+        HOST_LINGER=null
+        _LINGER_RAW=$(loginctl show-user "$(id -un)" --property=Linger 2>/dev/null || true)
+        case "$_LINGER_RAW" in
+            Linger=yes) HOST_LINGER=true ;;
+            Linger=no)  HOST_LINGER=false ;;
+        esac
         # Surface the deployed tree_sha256 (F.0, read above) so the container can
         # tell a verified deploy from a legacy one, and advertise redeploy_verify
         # so a newer update.sh knows this gateway understands the sha-checked form.
-        printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s", "deployed_commit": "%s", "deployed_tree_sha256": "%s", "redeploy_verify": true, "gateway_sha": "%s", "authkey_no_pty": %s, "authkey_has_from": %s, "authkey_from_matches": %s, "authkey_observed_src_hash": "%s", "authkey_opts_hash": "%s", "cc_logged_in": %s, "cc_token_present": %s, "cc_token_age_days": %s}\n' \
+        printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s", "deployed_commit": "%s", "deployed_tree_sha256": "%s", "redeploy_verify": true, "gateway_sha": "%s", "authkey_no_pty": %s, "authkey_has_from": %s, "authkey_from_matches": %s, "authkey_observed_src_hash": "%s", "authkey_opts_hash": "%s", "cc_logged_in": %s, "cc_token_present": %s, "cc_token_age_days": %s, "host_linger": %s}\n' \
             "$CC_VER" "$NODE_VER" "$CODE_VER" "$CODE_DATE" "$DEPLOYED" "$DEPLOYED_TREE_SHA" "$GW_SHA" \
             "$AK_NO_PTY" "$AK_HAS_FROM" "$AK_FROM_MATCHES" "$AK_SRC_HASH" "$AK_OPTS_HASH" \
-            "$CC_LOGGED_IN" "$CC_TOKEN_PRESENT" "$CC_TOKEN_AGE_DAYS"
+            "$CC_LOGGED_IN" "$CC_TOKEN_PRESENT" "$CC_TOKEN_AGE_DAYS" "$HOST_LINGER"
         ;;
     update)
         INSTALL_DIR="${HOME}/.local/share/genesis-guardian"

@@ -1,9 +1,10 @@
-"""Tests for the idle-aware process reaper (fix/reaper-idle-semantics).
+"""Tests for the idle-aware process reaper.
 
-Covers the pure classifier, the dry-run/armed orchestrator, the auto-arm
-lifecycle, the hard kill-switch, non-claude age paths, marker GC, protected
-PIDs, and job wiring. The 2026-07-11 incident (interactive claude sessions
-killed purely on 7d age) is the regression these lock down.
+Covers the pure classifier, the dry-run/armed orchestrator, the manual
+operator-arm switch (state flag + env, with the hard kill-switch override),
+non-claude age paths, marker GC, protected PIDs, and job wiring. The
+2026-07-11 incident (interactive claude sessions killed purely on 7d age)
+is the regression these lock down.
 """
 
 from __future__ import annotations
@@ -164,6 +165,7 @@ def _patch_io(
     monkeypatch.setattr(pr, "_save_state", fake_save)
     monkeypatch.setattr(pr, "_KILL_GRACE_SECS", 0)
     monkeypatch.delenv(pr._ENV_HARD_DISABLE, raising=False)
+    monkeypatch.delenv(pr._ENV_ARM, raising=False)
     return signals, saved, gc_calls
 
 
@@ -203,7 +205,7 @@ async def test_armed_kills_detached_claude_tree(monkeypatch):
         ttys={},
         live_ttys=set(),
         descendants={900001: [900002]},
-        state={"dry_run": False, "armed_at": 1.0},
+        state={"armed_by_operator": True},
     )
     rt = _FakeRT()
     await run_reaper(rt, now=_NOW)
@@ -221,7 +223,7 @@ async def test_armed_spares_fresh_marker_claude(monkeypatch):
         markers={900001: _NOW - 3600},  # …but active 1h ago
         ttys={},
         live_ttys=set(),
-        state={"dry_run": False, "armed_at": 1.0},
+        state={"armed_by_operator": True},
     )
     rt = _FakeRT()
     await run_reaper(rt, now=_NOW)
@@ -236,7 +238,7 @@ async def test_armed_spares_live_tty_claude(monkeypatch):
         markers={},  # no marker (e.g. hooks didn't fire)
         ttys={900001: "pts/5"},
         live_ttys={"pts/5"},
-        state={"dry_run": False, "armed_at": 1.0},
+        state={"armed_by_operator": True},
     )
     rt = _FakeRT()
     await run_reaper(rt, now=_NOW)
@@ -248,7 +250,7 @@ async def test_non_claude_reaped_by_age(monkeypatch):
         monkeypatch,
         pids_by_pattern={"opencode-ai": [900010, 900011]},
         ages={900010: 25 * 3600, 900011: 10 * 3600},  # 25h stale, 10h young
-        state={"dry_run": False, "armed_at": 1.0},
+        state={"armed_by_operator": True},
     )
     rt = _FakeRT()
     await run_reaper(rt, now=_NOW)
@@ -267,7 +269,7 @@ async def test_protected_pid_never_signalled(monkeypatch):
         ttys={},
         live_ttys=set(),
         descendants={my_pid: []},
-        state={"dry_run": False, "armed_at": 1.0},
+        state={"armed_by_operator": True},
     )
     rt = _FakeRT()
     await run_reaper(rt, now=_NOW)
@@ -279,132 +281,96 @@ async def test_marker_gc_receives_live_pids(monkeypatch):
         monkeypatch,
         pids_by_pattern={"claude": [900001], "opencode-ai": [900010]},
         ages={900001: 1 * _DAY, 900010: 1 * 3600},  # both young → no reap
-        state={"dry_run": False, "armed_at": 1.0},
+        state={"armed_by_operator": True},
     )
     rt = _FakeRT()
     await run_reaper(rt, now=_NOW)
     assert gc_calls and {900001, 900010} <= gc_calls[0]
 
 
-async def test_auto_arm_lifecycle(monkeypatch):
-    notified: list[str] = []
-
-    async def fake_notify(rt, msg):
-        notified.append(msg)
-        return True  # delivered → arming may proceed
-
-    monkeypatch.setattr(pr, "_notify_owner", fake_notify)
-
-    # Pass 1: fresh dry-run. 900001 is a detached candidate; 900002 is a
-    # live session with a fresh marker (hook proof-of-life). Should record
-    # dry_run_since + hook_verified, but NOT arm, NOT signal.
-    signals, saved, _ = _patch_io(
+async def test_default_state_is_dry_run(monkeypatch):
+    """Empty state + no env → dry-run: the reaper never arms itself."""
+    signals, _, _ = _patch_io(
         monkeypatch,
-        pids_by_pattern={"claude": [900001, 900002]},
-        ages={900001: 8 * _DAY, 900002: 8 * _DAY},
-        markers={900002: _NOW - 100},  # fresh marker → hook is alive
+        pids_by_pattern={"claude": [900001]},
+        ages={900001: 30 * _DAY},  # ancient + detached — would reap IF armed
+        markers={},
         ttys={},
         live_ttys=set(),
+        descendants={900001: []},
         state={},
     )
-    rt = _FakeRT(pipeline=object())
+    rt = _FakeRT()
     await run_reaper(rt, now=_NOW)
-    assert signals == []
-    assert saved.get("dry_run_since") == _NOW
-    assert saved.get("hook_verified") is True
-    assert saved.get("dry_run", True) is True
-    assert not saved.get("armed_at")
-    assert notified == []
+    assert signals == []  # not armed → never signals
 
-    # Pass 2: >3 days later, hook already verified. Should FLIP to armed +
-    # notify, but still NOT signal this pass (arm gives the owner a veto window).
-    signals2, saved2, _ = _patch_io(
+
+async def test_env_arm_non_affirmative_does_not_arm(monkeypatch):
+    """GENESIS_REAPER_ARMED=0/false documents OFF and must NOT arm the reaper."""
+    for val in ("0", "false", "no", "off", ""):
+        signals, _, _ = _patch_io(
+            monkeypatch,
+            pids_by_pattern={"claude": [900001]},
+            ages={900001: 30 * _DAY},
+            markers={},
+            ttys={},
+            live_ttys=set(),
+            descendants={900001: []},
+            state={},
+        )
+        monkeypatch.setenv(pr._ENV_ARM, val)
+        rt = _FakeRT()
+        await run_reaper(rt, now=_NOW)
+        assert signals == [], f"value {val!r} wrongly armed the reaper"
+
+
+async def test_env_arm_kills_detached_claude(monkeypatch):
+    """Arming via GENESIS_REAPER_ARMED (no state flag) reaps a detached idle claude."""
+    signals, _, _ = _patch_io(
         monkeypatch,
         pids_by_pattern={"claude": [900001]},
         ages={900001: 8 * _DAY},
         markers={},
         ttys={},
         live_ttys=set(),
-        state={"dry_run": True, "dry_run_since": _NOW, "hook_verified": True},
+        descendants={900001: []},
+        state={},  # no state flag…
     )
-    rt2 = _FakeRT(pipeline=object())
-    await run_reaper(rt2, now=_NOW + 3 * _DAY + 60)
-    assert signals2 == []  # arm pass does not kill
-    assert saved2.get("dry_run") is False
-    assert saved2.get("armed_at") == _NOW + 3 * _DAY + 60
-    assert len(notified) == 1 and "auto-armed" in notified[0]
+    monkeypatch.setenv(pr._ENV_ARM, "1")  # …armed via env
+    rt = _FakeRT()
+    await run_reaper(rt, now=_NOW)
+    assert (900001, 15) in signals and (900001, 9) in signals
 
 
-async def test_no_arm_without_hook_proof(monkeypatch):
-    """Elapsed window alone must NOT arm — the hook must be proven live first."""
-    notified: list[str] = []
-
-    async def fake_notify(rt, msg):
-        notified.append(msg)
-
-    monkeypatch.setattr(pr, "_notify_owner", fake_notify)
-    signals, saved, _ = _patch_io(
-        monkeypatch,
-        pids_by_pattern={"claude": [900001]},
-        ages={900001: 8 * _DAY},
-        markers={},  # NO fresh marker anywhere → hook never proven
-        ttys={},
-        live_ttys=set(),
-        state={"dry_run": True, "dry_run_since": _NOW},  # no hook_verified
-    )
-    rt = _FakeRT(pipeline=object())
-    await run_reaper(rt, now=_NOW + 30 * _DAY)  # long past the window
-    assert signals == []
-    assert saved.get("armed_at") is None  # refused to arm without hook proof
-    assert notified == []
-
-
-async def test_no_arm_when_notification_fails(monkeypatch):
-    """All arm criteria met, but the owner veto notice can't be delivered →
-    stay in dry-run, do NOT arm (never arm silently)."""
-
-    async def fake_notify_fail(rt, msg):
-        return False  # delivery failed / outreach unavailable
-
-    monkeypatch.setattr(pr, "_notify_owner", fake_notify_fail)
-    signals, saved, _ = _patch_io(
+async def test_hard_disable_overrides_operator_arm(monkeypatch):
+    """The hard kill-switch forces dry-run even when the operator armed it."""
+    signals, _, _ = _patch_io(
         monkeypatch,
         pids_by_pattern={"claude": [900001]},
         ages={900001: 8 * _DAY},
         markers={},
         ttys={},
         live_ttys=set(),
-        state={"dry_run": True, "dry_run_since": _NOW, "hook_verified": True},
+        descendants={900001: []},
+        state={"armed_by_operator": True},  # operator armed…
     )
-    rt = _FakeRT(pipeline=object())
-    await run_reaper(rt, now=_NOW + 3 * _DAY + 60)
-    assert signals == []
-    assert saved.get("armed_at") is None  # not armed — notice undelivered
-    assert saved.get("dry_run", True) is True
+    monkeypatch.setenv(pr._ENV_HARD_DISABLE, "1")  # …but kill-switch engaged
+    rt = _FakeRT()
+    await run_reaper(rt, now=_NOW)
+    assert signals == []  # kill-switch wins over the arm flag
 
 
-async def test_hard_disable_prevents_arm(monkeypatch):
-    notified: list[str] = []
-
-    async def fake_notify(rt, msg):
-        notified.append(msg)
-
-    monkeypatch.setattr(pr, "_notify_owner", fake_notify)
-    signals, saved, _ = _patch_io(
-        monkeypatch,
-        pids_by_pattern={"claude": [900001]},
-        ages={900001: 8 * _DAY},
-        markers={},
-        ttys={},
-        live_ttys=set(),
-        state={"dry_run": True, "dry_run_since": _NOW},
-    )
-    monkeypatch.setenv(pr._ENV_HARD_DISABLE, "1")
-    rt = _FakeRT(pipeline=object())
-    await run_reaper(rt, now=_NOW + 10 * _DAY)
-    assert signals == []
-    assert saved.get("armed_at") is None  # never armed while kill-switch on
-    assert notified == []
+def test_set_operator_armed_roundtrip(tmp_path, monkeypatch):
+    """set_operator_armed flips the persisted flag; _operator_armed reflects it."""
+    monkeypatch.setattr(pr, "_STATE_PATH", tmp_path / "reaper_state.json")
+    monkeypatch.delenv(pr._ENV_ARM, raising=False)
+    assert pr._operator_armed(pr._load_state()) is False  # default: dry-run
+    pr.set_operator_armed(True)
+    assert pr._load_state().get("armed_by_operator") is True
+    assert pr._operator_armed(pr._load_state()) is True
+    pr.set_operator_armed(False)
+    assert "armed_by_operator" not in pr._load_state()
+    assert pr._operator_armed(pr._load_state()) is False
 
 
 async def test_job_failure_recorded(monkeypatch):

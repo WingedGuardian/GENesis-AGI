@@ -88,6 +88,15 @@ class GuardianWatchdog:
         self._cc_auth_drift_count: int = 0
         self._cc_auth_escalated: bool = False
         self._cc_token_expiry_warned: bool = False
+        # systemd-linger health: alert when linger is disabled (user timers die
+        # silently on next logout). Two INDEPENDENT legs with separate episode
+        # state — host (read from the gateway version payload) and container (a
+        # local loginctl probe). Alert-only: enable-linger is privileged +
+        # interactive, so there is no safe non-interactive remediation this ship.
+        self._host_linger_drift_count: int = 0
+        self._host_linger_escalated: bool = False
+        self._container_linger_drift_count: int = 0
+        self._container_linger_escalated: bool = False
 
     async def _alert_user(self, *, topic: str, context: str, source_id: str) -> None:
         """Deliver a user-facing (Telegram) alert about a Guardian degradation.
@@ -152,6 +161,15 @@ class GuardianWatchdog:
         # Drift detection runs regardless of health status — its purpose is
         # to catch stale host code even when Guardian appears healthy.
         await self._check_code_drift()
+
+        # Container-local systemd-linger health — runs on EVERY tick, deliberately
+        # NOT inside _check_code_drift: a purely-local probe must not be disabled
+        # by a feature-branch checkout, a missing update baseline, or a down host
+        # (all of which early-return in the drift path). Own suppress so a probe
+        # failure can't perturb recovery below.
+        import contextlib
+        with contextlib.suppress(Exception):
+            await self._check_container_linger()
 
         result = await probe_guardian(guardian_remote=self._remote)
 
@@ -358,6 +376,11 @@ class GuardianWatchdog:
         # suppress so a failure here can't skip code-drift logic below.
         with contextlib.suppress(Exception):
             await self._check_cc_auth(version_info)
+
+        # Host systemd-linger health reconciler reuses the same version() payload.
+        # Own suppress so a failure here can't skip the code-drift logic below.
+        with contextlib.suppress(Exception):
+            await self._check_host_linger(version_info)
 
         host_hash = version_info.get("deployed_commit", "unknown")
 
@@ -787,6 +810,138 @@ class GuardianWatchdog:
         """
         self._cc_auth_drift_count = 0
         self._cc_auth_escalated = False
+
+    def _reset_host_linger_state(self) -> None:
+        """Re-arm the host-linger episode on confirmed health."""
+        self._host_linger_drift_count = 0
+        self._host_linger_escalated = False
+
+    def _reset_container_linger_state(self) -> None:
+        """Re-arm the container-linger episode on confirmed health."""
+        self._container_linger_drift_count = 0
+        self._container_linger_escalated = False
+
+    async def _check_host_linger(self, version_info: dict) -> None:
+        """Alert when the HOST guardian user's systemd linger is disabled.
+
+        Linger keeps the host user's timers/services (incl. the guardian's own
+        units) alive after logout; disabled, they die silently on the next host
+        logout. The ``version`` verb reports ``host_linger`` (True/False/None):
+
+        * key absent (old gateway) -> skip, nothing to reconcile.
+        * True -> healthy; reset the episode.
+        * None -> probe error / ambiguous; never false-alarm AND never clear a
+          real disabled streak (mirrors _check_cc_auth's None handling).
+        * False (Linger=no) for DRIFT_ALERT_THRESHOLD ticks -> one alert/episode.
+
+        Alert-only — ``loginctl enable-linger`` is privileged + interactive, so
+        there is no safe non-interactive remediation. Best-effort (invoked under
+        _check_code_drift's suppress).
+        """
+        if "host_linger" not in version_info:
+            return  # old gateway without the field — nothing to reconcile
+        linger = version_info.get("host_linger")  # True / False / None
+        if linger is True:
+            if self._host_linger_drift_count > 0:
+                logger.info("Guardian host linger re-enabled")
+            self._reset_host_linger_state()
+            return
+        if linger is not False:
+            # None -> ambiguous/probe error: never false-alarm, never clear.
+            return
+        # linger is False -> genuinely disabled.
+        self._host_linger_drift_count += 1
+        if self._host_linger_drift_count < self.DRIFT_ALERT_THRESHOLD:
+            return
+        await self._escalate_host_linger()
+
+    async def _check_container_linger(self) -> None:
+        """Alert when the CONTAINER user's systemd linger is disabled.
+
+        Dispatched from check_and_recover on EVERY tick (not the drift path), so
+        this purely-local check survives a feature-branch checkout / down host.
+        If linger is disabled here, genesis-server itself dies on the next
+        logout. Probes the local logind over the SYSTEM bus (no login shell / no
+        PATH dependence). Fail-safe: any probe error -> treat as unknown (never
+        false-alarm, never clear a real streak). Alert-only (enable-linger is
+        privileged + interactive).
+        """
+        import asyncio
+        import getpass
+
+        user = getpass.getuser()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "loginctl", "show-user", user, "--property=Linger",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except Exception:
+            # loginctl missing / bus unreachable / timeout -> unknown; never
+            # false-alarm, and leave the drift streak untouched.
+            return
+        value = out.decode(errors="replace").strip()
+        if value == "Linger=yes":
+            if self._container_linger_drift_count > 0:
+                logger.info("Container linger re-enabled")
+            self._reset_container_linger_state()
+            return
+        if value != "Linger=no":
+            # Unexpected output / no user record -> ambiguous; never false-alarm.
+            return
+        # Linger=no -> genuinely disabled.
+        self._container_linger_drift_count += 1
+        if self._container_linger_drift_count < self.DRIFT_ALERT_THRESHOLD:
+            return
+        await self._escalate_container_linger(user)
+
+    async def _escalate_host_linger(self) -> None:
+        """One host-linger ALERT per episode (re-armed by _reset_host_linger_state)."""
+        if self._host_linger_escalated:
+            return
+        self._host_linger_escalated = True
+        msg = (
+            "Guardian HOST systemd linger is DISABLED — the host user's timers "
+            "and services (including the guardian's own units) will die silently "
+            "on the next host logout. Re-enable it on the host: "
+            "`sudo loginctl enable-linger <guardian-user>` (or re-run the installer)."
+        )
+        logger.error(msg)
+        if self._event_bus:
+            from genesis.observability.types import Severity, Subsystem
+            await self._event_bus.emit(
+                Subsystem.GUARDIAN, Severity.ERROR,
+                "guardian.host_linger_disabled", msg,
+            )
+        await self._alert_user(
+            topic="Guardian host linger disabled",
+            context=msg,
+            source_id="guardian:host_linger_disabled",
+        )
+
+    async def _escalate_container_linger(self, user: str) -> None:
+        """One container-linger ALERT per episode (re-armed on health)."""
+        if self._container_linger_escalated:
+            return
+        self._container_linger_escalated = True
+        msg = (
+            f"Container systemd linger is DISABLED for '{user}' — genesis-server "
+            "and all Genesis user timers will die silently on the next logout. "
+            f"Re-enable it: `sudo loginctl enable-linger {user}`."
+        )
+        logger.error(msg)
+        if self._event_bus:
+            from genesis.observability.types import Severity, Subsystem
+            await self._event_bus.emit(
+                Subsystem.GUARDIAN, Severity.ERROR,
+                "guardian.container_linger_disabled", msg,
+            )
+        await self._alert_user(
+            topic="Container linger disabled",
+            context=msg,
+            source_id="guardian:container_linger_disabled",
+        )
 
     async def _check_cc_auth(self, version_info: dict) -> None:
         """Alert when the host CC recovery brain cannot authenticate.

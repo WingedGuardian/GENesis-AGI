@@ -149,10 +149,12 @@ def test_load_full_yaml(monkeypatch):
     # 2026-06-30: 52 → 53 after 38a_procedure_novelty_llm added (C2b cross-type procedure dedup).
     # 2026-07-01: 53 → 54 after attention_salience added (PR3b L1.5 salience gate).
     # 2026-07-10: 54 → 55 after ambient_arbiter added (WS-C arbiter neural-monitor registration).
-    assert len(cfg.call_sites) == 55
+    # 2026-07-12: 55 → 56 after 46_infra_annotation added (infrastructure body-schema annotations).
+    assert len(cfg.call_sites) == 56
     assert "crag_grade" in cfg.call_sites  # W-CRAG runtime grader (2026-06-20)
     assert "38a_procedure_novelty_llm" in cfg.call_sites  # C2b cross-type dedup (2026-06-30)
     assert "attention_salience" in cfg.call_sites  # PR3b L1.5 salience gate (2026-07-01)
+    assert "46_infra_annotation" in cfg.call_sites  # body-schema annotations (2026-07-12)
     # ambient_arbiter: display-only cli site — the detached ambient worker spawns
     # CC directly (model pinned in session_awareness/arbiter.py); empty chain BY
     # DESIGN (no API fallback). First empty-chain cli site — lock the shape.
