@@ -17,9 +17,13 @@ def config():
         quiet_hours=QuietHours(start="22:00", end="07:00"),
         channel_preferences={"default": "telegram"},
         thresholds={"blocker": 0.0, "alert": 0.3, "surplus": 0.7, "digest": 0.0},
-        max_daily=5, surplus_daily=1, content_daily=3, notification_daily=10,
+        max_daily=5,
+        surplus_daily=1,
+        content_daily=3,
+        notification_daily=10,
         morning_report_time="07:00",
-        engagement_timeout_hours=24, engagement_poll_minutes=60,
+        engagement_timeout_hours=24,
+        engagement_poll_minutes=60,
     )
 
 
@@ -37,6 +41,7 @@ def test_scheduler_creates(config):
     morning = AsyncMock()
     engagement = AsyncMock()
     import unittest.mock
+
     mock_db = unittest.mock.MagicMock()
     scheduler = OutreachScheduler(pipeline, morning, engagement, config, mock_db)
     assert scheduler is not None
@@ -68,8 +73,11 @@ async def test_morning_report_job(config, db):
     pipeline = AsyncMock()
     morning = AsyncMock()
     morning.generate.return_value = OutreachRequest(
-        category=OutreachCategory.DIGEST, topic="Morning Report",
-        context="Content", salience_score=0.0, signal_type="morning_report",
+        category=OutreachCategory.DIGEST,
+        topic="Morning Report",
+        context="Content",
+        salience_score=0.0,
+        signal_type="morning_report",
     )
     engagement = AsyncMock()
     scheduler = OutreachScheduler(pipeline, morning, engagement, config, db)
@@ -210,7 +218,10 @@ async def test_health_check_single_alert_still_batches(config, db):
 def _drain_pipeline(status):
     pipeline = AsyncMock()
     result = OutreachResult(
-        outreach_id="o", status=status, channel="email", message_content="",
+        outreach_id="o",
+        status=status,
+        channel="email",
+        message_content="",
     )
     pipeline.submit = AsyncMock(return_value=result)
     pipeline.submit_urgent = AsyncMock(return_value=result)
@@ -220,6 +231,7 @@ def _drain_pipeline(status):
 async def _remaining(db):
     """Rows still eligible for the next drain (delivered=0)."""
     from genesis.db.crud import pending_outreach
+
     return await pending_outreach.drain(db, now="2999-01-01T00:00:00+00:00")
 
 
@@ -228,9 +240,14 @@ async def test_drain_reconstructs_request_with_thread_and_recipient(config, db):
     """A queued email row must rebuild an OutreachRequest carrying its thread_id
     + validated_recipient — so _deliver routes to the real recipient, not self."""
     from genesis.db.crud import pending_outreach
+
     await pending_outreach.enqueue(
-        db, message="follow up", category="notification", channel="email",
-        thread_id="t1", validated_recipient="real@prospect.com",
+        db,
+        message="follow up",
+        category="notification",
+        channel="email",
+        thread_id="t1",
+        validated_recipient="real@prospect.com",
     )
     pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
     scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
@@ -248,8 +265,12 @@ async def test_drain_held_is_terminal_not_retried(config, db):
     """HELD = handed off to the gate's approval queue; the queue row is done.
     Re-submitting every cycle is exactly the spam multiplier we are killing."""
     from genesis.db.crud import pending_outreach
+
     await pending_outreach.enqueue(
-        db, message="x", category="notification", channel="email",
+        db,
+        message="x",
+        category="notification",
+        channel="email",
     )
     pipeline = _drain_pipeline(OutreachStatus.HELD)
     scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
@@ -262,8 +283,12 @@ async def test_drain_held_is_terminal_not_retried(config, db):
 @pytest.mark.asyncio
 async def test_drain_ignored_is_terminal(config, db):
     from genesis.db.crud import pending_outreach
+
     await pending_outreach.enqueue(
-        db, message="x", category="notification", channel="email",
+        db,
+        message="x",
+        category="notification",
+        channel="email",
     )
     pipeline = _drain_pipeline(OutreachStatus.IGNORED)
     scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
@@ -277,8 +302,12 @@ async def test_drain_ignored_is_terminal(config, db):
 async def test_drain_rejected_is_retried(config, db):
     """A transient governance rejection (e.g. quiet_hours) stays queued."""
     from genesis.db.crud import pending_outreach
+
     await pending_outreach.enqueue(
-        db, message="x", category="notification", channel="telegram",
+        db,
+        message="x",
+        category="notification",
+        channel="telegram",
     )
     pipeline = _drain_pipeline(OutreachStatus.REJECTED)
     scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
@@ -293,6 +322,7 @@ async def test_drain_ages_out_perpetually_stuck_row(config, db):
     """A row that never reaches a terminal status must be dropped after 24h
     instead of looping forever (the churn that locked the DB)."""
     from datetime import UTC, datetime, timedelta
+
     old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
     await db.execute(
         "INSERT INTO pending_outreach (id, message, category, channel, urgency, "
@@ -307,7 +337,52 @@ async def test_drain_ages_out_perpetually_stuck_row(config, db):
     await scheduler._drain_pending_job()
 
     pipeline.submit.assert_not_called()  # aged out BEFORE re-submitting
-    assert await _remaining(db) == []    # dropped
+    assert await _remaining(db) == []  # dropped
+
+
+@pytest.mark.asyncio
+async def test_drain_null_id_row_is_cleared_not_looped(config, db):
+    """A legacy NULL-id row must be cleared via the rowid fallback, not
+    re-drained forever. Before the fix, mark_delivered(WHERE id=NULL) matched
+    nothing, so the row (aged out every cycle) never left the queue."""
+    from datetime import UTC, datetime, timedelta
+
+    old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    # NULL id: omit the id column (SQLite allows NULL in a TEXT PRIMARY KEY).
+    await db.execute(
+        "INSERT INTO pending_outreach (message, category, channel, urgency, "
+        "created_at, delivered) VALUES ('x', 'notification', 'telegram', "
+        "'low', ?, 0)",
+        (old,),
+    )
+    await db.commit()
+    pipeline = _drain_pipeline(OutreachStatus.REJECTED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    assert await _remaining(db) == []  # cleared by rowid, not looping forever
+
+
+@pytest.mark.asyncio
+async def test_drain_null_id_row_delivered_terminal(config, db):
+    """A deliverable NULL-id row reaches a terminal status and clears by rowid."""
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    await db.execute(
+        "INSERT INTO pending_outreach (message, category, channel, urgency, "
+        "created_at, delivered) VALUES ('x', 'notification', 'telegram', "
+        "'low', ?, 0)",
+        (now,),
+    )
+    await db.commit()
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    assert await _remaining(db) == []  # delivered + marked via rowid fallback
 
 
 @pytest.mark.asyncio
@@ -315,9 +390,8 @@ async def test_drain_ages_out_naive_timestamp_row(config, db):
     """A created_at WITHOUT a tz offset must still age out — a naive timestamp
     must not silently bypass the cap (and loop forever)."""
     from datetime import UTC, datetime, timedelta
-    old_naive = (
-        (datetime.now(UTC) - timedelta(hours=25)).replace(tzinfo=None).isoformat()
-    )
+
+    old_naive = (datetime.now(UTC) - timedelta(hours=25)).replace(tzinfo=None).isoformat()
     assert "+00:00" not in old_naive  # genuinely naive
     await db.execute(
         "INSERT INTO pending_outreach (id, message, category, channel, urgency, "
