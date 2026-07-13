@@ -103,6 +103,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   recall's own usage counters are suppressed for the run so benchmarking
   never distorts what your live Genesis considers important.
 
+- **`genesis eval longmemeval` — measure Genesis's memory on a public
+  benchmark.** Runs LongMemEval, an external long-term-memory QA benchmark:
+  each question's prior-conversation "haystack" is loaded into a throwaway
+  memory store built from scratch (so your real memory is never touched), then
+  Genesis recalls and answers, and the standard gpt-4o judge grades it — giving
+  a number you can compare to published results. It reports accuracy per
+  question type and across two query styles (the raw question vs. keyword
+  terms), so you can see how much question phrasing affects recall. One command
+  against the public dataset; nothing about your own data leaves the machine.
+
 - **The API Keys panel now shows how often each provider is causing fallbacks.**
   A provider that is misconfigured or failing — for example one whose key is
   missing yet is still wired in as the preferred choice on many call sites — used
