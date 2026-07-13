@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now notices when memories quietly lose semantic search.** When an
+  embedding permanently fails, that memory becomes keyword-only — findable by
+  exact words but invisible to meaning-based recall — and nothing flagged the
+  pile building up (the existing alert only caught embeddings failing *right
+  now*, not the backlog left behind). A new hourly check counts these
+  permanently-stuck memories: a modest pile shows on the dashboard, and a large
+  one (a real chunk of the store gone semantically dark) pages you on Telegram.
+  It clears itself once the memories are re-embedded.
+
 - **The recovery brain no longer drifts behind a version bump.** A nightly
   job re-aligns the host's Claude Code and Node.js to the pinned versions.
   Previously this happened only when you ran an update, so a pin bump could

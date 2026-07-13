@@ -395,6 +395,27 @@ async def count_fts_metadata_drift(db: aiosqlite.Connection) -> tuple[int, int]:
     return ghosts, invisible
 
 
+async def embedding_status_counts(db: aiosqlite.Connection) -> dict[str, int]:
+    """Return a ``{embedding_status: count}`` map over ``memory_metadata``.
+
+    A single grouped aggregate — the one source of truth shared by both the
+    dashboard memory-health snapshot and the awareness embedding-backlog probe.
+    Statuses with zero rows are simply absent from the map (callers use
+    ``.get(status, 0)``). ``embedding_status`` is ``NOT NULL`` in the schema, so
+    no NULL/None key can occur.
+
+    Status meanings: ``embedded`` (has a vector — the healthy default);
+    ``pending`` (embed failed and is queued — self-heals via the recovery
+    worker); ``fts5_only`` (a deliberate, permanent keyword-only write, NOT a
+    failure); ``failed`` (recovery gave up — permanently non-vector-searchable).
+    """
+    rows = await db.execute_fetchall(
+        "SELECT embedding_status, COUNT(*) FROM memory_metadata "
+        "GROUP BY embedding_status"
+    )
+    return {str(status): int(cnt) for status, cnt in rows}
+
+
 async def set_embedding_status(
     db: aiosqlite.Connection, memory_id: str, status: str
 ) -> bool:
