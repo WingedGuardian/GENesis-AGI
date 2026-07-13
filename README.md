@@ -126,7 +126,7 @@ Genesis is a full system, not a pip package. It runs best on a dedicated Linux m
 | Resource | Minimum | Recommended | Notes |
 |---|---|---|---|
 | **OS** | Ubuntu 22.04+ | Ubuntu 24.04 LTS | Debian-based required for auto-install. Other Linux works with manual setup. |
-| **RAM** | 8 GB | 16 GB+ | Genesis + Qdrant + Claude Code + background tasks. 8 GB is tight under load. |
+| **RAM** | 8 GB | 16 GB+ | Genesis + Qdrant + Claude Code + background tasks. 8 GB is tight under load. Service memory caps are percentage-based, so Genesis right-sizes itself to the box — scaling down on an 8 GB host and up on a 32 GB+ one. |
 | **Disk** | 10 GB | 40 GB+ | Fresh install ~400 MB. Memory, logs, and caches grow steadily with use. |
 | **CPU** | 2 cores | 4-8 cores | Concurrent background tasks benefit from parallelism. |
 | **Network** | Internet access | Always-on | Cloud LLM APIs required. Offline not supported. |

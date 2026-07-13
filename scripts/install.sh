@@ -1027,7 +1027,8 @@ Type=simple
 ExecStart="$QDRANT_BIN" "--config-path" "$HOME/.qdrant/config.yaml"
 Restart=on-failure
 RestartSec=5
-MemoryMax=4G
+# 25% of container RAM (scales with the box); live qdrant RSS is ~0.3G.
+MemoryMax=25%
 LimitNOFILE=65536
 OOMScoreAdjust=-500
 StandardOutput=journal
@@ -1041,7 +1042,16 @@ WantedBy=default.target
 QDSERVICE
     echo "    + qdrant.service created"
 elif [ -f "$SYSTEMD_USER_DIR/qdrant.service" ]; then
-    echo "    . qdrant.service already exists"
+    # Migrate the legacy hardcoded cap to the portable percentage in place.
+    # Only the exact old default is touched, so a custom value is never clobbered.
+    if grep -q '^MemoryMax=4G$' "$SYSTEMD_USER_DIR/qdrant.service"; then
+        sed -i 's/^MemoryMax=4G$/MemoryMax=25%/' "$SYSTEMD_USER_DIR/qdrant.service"
+        systemctl --user daemon-reload 2>/dev/null || true
+        systemctl --user try-restart qdrant.service 2>/dev/null || true
+        echo "    ~ qdrant.service MemoryMax 4G -> 25% (portable)"
+    else
+        echo "    . qdrant.service already exists"
+    fi
 else
     echo "    - Qdrant binary not found — skipping service"
 fi
