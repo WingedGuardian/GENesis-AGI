@@ -11,12 +11,16 @@ persisted run per arm) with overall + per-question-type accuracy.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import shutil
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from statistics import fmean
 from typing import TYPE_CHECKING
 
@@ -185,14 +189,24 @@ async def run_question(
             recalled_ids = {h.memory_id for h in hits}
             evidence_recalled = bool(ingest.evidence_memory_ids & recalled_ids)
             memories = [h.content for h in hits]
-            ans = answer_question(instance.question, memories, client=client)
-            verdict = judge_answer(
-                instance.question_type,
+            # answer_question / judge_answer use the SYNC OpenAI client, so run
+            # them in a worker thread — a blocking create() on the event loop
+            # would stall ALL concurrent questions and defeat `concurrency`.
+            ans = await asyncio.to_thread(
+                answer_question,
                 instance.question,
-                instance.answer,
-                ans.hypothesis,
-                abstention=instance.is_abstention,
+                memories,
                 client=client,
+            )
+            verdict = await asyncio.to_thread(
+                lambda a=ans: judge_answer(
+                    instance.question_type,
+                    instance.question,
+                    instance.answer,
+                    a.hypothesis,
+                    abstention=instance.is_abstention,
+                    client=client,
+                ),
             )
             out.append(
                 QuestionArmResult(
@@ -242,6 +256,23 @@ async def run_longmemeval(
             "will produce identical results to their non-rerank twins",
         )
 
+    # Build ONE embedder for the whole run (not per question): its httpx clients
+    # + diskcache would otherwise accumulate ~2 per question and never close.
+    # Sharing is safe (stateless per question) and reuses the connection pool +
+    # cache across questions.
+    owns_embedder = embedding_provider is None
+    run_cache_dir: Path | None = None
+    if owns_embedder:
+        from genesis.memory.embeddings import EmbeddingProvider
+
+        root = Path.home() / "tmp" / "longmemeval_runs"
+        root.mkdir(parents=True, exist_ok=True)
+        run_cache_dir = Path(tempfile.mkdtemp(prefix="lme_emb_", dir=str(root)))
+        embedding_provider = EmbeddingProvider(
+            backends=EmbeddingProvider.build_chain(ollama_first=False),
+            cache_dir=run_cache_dir,
+        )
+
     sem = asyncio.Semaphore(concurrency)
 
     async def _one(inst: LongMemEvalInstance) -> list[QuestionArmResult]:
@@ -259,7 +290,13 @@ async def run_longmemeval(
                 logger.exception("question %s failed; skipping", inst.question_id)
                 return []
 
-    gathered = await asyncio.gather(*[_one(i) for i in instances])
+    try:
+        gathered = await asyncio.gather(*[_one(i) for i in instances])
+    finally:
+        if owns_embedder:
+            await _close_embedder(embedding_provider)
+            if run_cache_dir is not None:
+                shutil.rmtree(run_cache_dir, ignore_errors=True)
 
     # Regroup by arm.
     by_arm: dict[str, list[QuestionArmResult]] = {a.label: [] for a in arms}
@@ -281,3 +318,20 @@ async def run_longmemeval(
 
             await insert_run(db, summary)
     return summaries
+
+
+async def _close_embedder(embedder: object) -> None:
+    """Best-effort close of an embedder's httpx clients + diskcache.
+
+    ``EmbeddingProvider`` exposes no ``close()``; reach in defensively so a
+    future internal change degrades to a no-op rather than raising.
+    """
+    for backend in getattr(embedder, "backends", []) or []:
+        http_client = getattr(backend, "_client", None)
+        if http_client is not None and hasattr(http_client, "aclose"):
+            with contextlib.suppress(Exception):
+                await http_client.aclose()
+    cache = getattr(embedder, "_disk_cache", None)
+    if cache is not None and hasattr(cache, "close"):
+        with contextlib.suppress(Exception):
+            cache.close()
