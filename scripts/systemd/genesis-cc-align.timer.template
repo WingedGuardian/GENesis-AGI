@@ -1,0 +1,14 @@
+[Unit]
+Description=Genesis Host CC/Node Alignment — nightly schedule
+
+[Timer]
+# 03:30 — offset from disk-hygiene (04:00) so the two housekeeping jobs don't
+# contend. Persistent catches a missed run after downtime; RandomizedDelaySec
+# spreads load and de-correlates from other timers.
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+AccuracySec=1h
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

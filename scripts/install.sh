@@ -1093,14 +1093,25 @@ if [ -f "$SYSTEMD_USER_DIR/qdrant.service" ]; then
     fi
 fi
 
-if [ -f "$SYSTEMD_USER_DIR/genesis-watchdog.timer" ]; then
-    systemctl --user enable --now genesis-watchdog.timer 2>/dev/null && \
-        echo "    + genesis-watchdog.timer enabled + started" || true
-fi
-
-if [ -f "$SYSTEMD_USER_DIR/genesis-disk-hygiene.timer" ]; then
-    systemctl --user enable --now genesis-disk-hygiene.timer 2>/dev/null && \
-        echo "    + genesis-disk-hygiene.timer enabled + started" || true
+# Enable + start every rendered timer (idempotent), EXCEPT genesis-backup.timer
+# — that one is a deliberate setup step (it needs a passphrase + a verify run
+# before it should fire; auto-enabling a 6h schedule gives a false sense of
+# safety while data is still local-only). Generic loop (mirrors bootstrap.sh) so
+# a newly-added timer is never left rendered-but-dead in the fresh-install path —
+# the exact gap that left genesis-cc-align.timer disabled under the old
+# hardcoded per-timer list.
+if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
+    for template in "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
+        [ -f "$template" ] || continue
+        timer_name=$(basename "$template" .template)
+        case "$timer_name" in
+            genesis-backup.timer) continue ;;  # deliberate setup step
+        esac
+        if [ -f "$SYSTEMD_USER_DIR/$timer_name" ]; then
+            systemctl --user enable --now "$timer_name" 2>/dev/null && \
+                echo "    + $timer_name enabled + started" || true
+        fi
+    done
 fi
 
 # Enable AND start tmp watchgod (OS-level temp protection)

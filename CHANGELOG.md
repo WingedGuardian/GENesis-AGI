@@ -11,6 +11,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The recovery brain no longer drifts behind a version bump.** A nightly
+  job re-aligns the host's Claude Code and Node.js to the pinned versions.
+  Previously this happened only when you ran an update, so a pin bump could
+  leave the host's autonomous-recovery Claude Code lagging for days. It heals
+  only real drift, is a clean no-op when everything is already aligned, and a
+  failed alignment now shows up as a failed timer instead of going quiet.
+
+- **Genesis notices if systemd "linger" gets turned off.** Linger is what
+  keeps Genesis's background services alive after you log out — if it is ever
+  disabled, everything dies silently at the next logout. A new health check
+  watches both the host and the container and raises a single alert (with the
+  exact re-enable command) when linger is off, before the next logout can bite.
+
 - **Code quality is now a measured series, not a feeling.** A new
   `dev_quality` dimension in the weekly eval snapshots tracks review
   findings per merged PR (by severity, harvested from the PR bots' inline
