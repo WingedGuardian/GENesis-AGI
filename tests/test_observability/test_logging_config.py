@@ -154,6 +154,12 @@ class TestWerkzeugPollFilter:
             is False
         )
 
+    def test_drops_ansi_styled_polls(self):
+        """Werkzeug-3 ANSI-styled request lines are still recognized as polls."""
+        f = _WerkzeugPollFilter()
+        styled = '- - - [..] "\x1b[36mGET /api/genesis/health HTTP/1.1\x1b[0m" 304 -'
+        assert f.filter(_werkzeug_record(styled)) is False
+
     def test_keeps_error_responses(self):
         """4xx/5xx on a polled endpoint must stay visible."""
         f = _WerkzeugPollFilter()

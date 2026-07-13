@@ -45,13 +45,18 @@ class GenesisFormatter(logging.Formatter):
 # floods the journal. This matches ONLY those — every 4xx/5xx error, every
 # non-GET (state changes), and every non-dashboard path is preserved.
 _DASHBOARD_POLL_RE = re.compile(r'"(?:GET|HEAD) /api/genesis/\S* HTTP/[0-9.]+" [23]\d\d\b')
+# Werkzeug 3 colorizes the request line/status with ANSI when it thinks output
+# supports it — strip those before matching so styled poll lines are still
+# dropped (our journal is non-TTY so lines are plain, but a TTY context styles).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class _WerkzeugPollFilter(logging.Filter):
     """Drop werkzeug access-log lines for successful dashboard poll GETs."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return _DASHBOARD_POLL_RE.search(record.getMessage()) is None
+        msg = _ANSI_RE.sub("", record.getMessage())
+        return _DASHBOARD_POLL_RE.search(msg) is None
 
 
 def _install_werkzeug_poll_filter() -> None:
