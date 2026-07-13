@@ -234,9 +234,12 @@ async def _check_embedding_backlog(db) -> None:
                 f"permanently keyword-only (no vector/semantic search) and "
                 f"invisible to the rate-based embedding-failure alert (the outage "
                 f"that created them is over). {pending} more are 'pending' and "
-                f"still self-healing. To recover: reset the failed rows to "
-                f"'pending' so the recovery worker retries, and check embedding-"
-                f"provider health."
+                f"still self-healing. Recovery: these failed rows have no "
+                f"live pending_embeddings queue entry (it was reaped), so a "
+                f"plain failed->pending reset will NOT retry them (nothing "
+                f"auto-recovers a reaped failure) — re-enqueue the affected "
+                f"memories for embedding (a fresh pending_embeddings row "
+                f"each) after checking embedding-provider health."
             ),
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),
