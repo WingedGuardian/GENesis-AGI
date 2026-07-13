@@ -143,6 +143,27 @@ see the linked commit / PR.
 
 ## Changelog
 
+### 2026-07-12 — Neural monitor "Other" group for ungrouped call sites
+
+The battleship grid (`neural_monitor.html` `SUBSYSTEM_GROUPS`) renders only call
+sites assigned to a subsystem group. Sites the backend snapshot emits but that
+aren't in any group — e.g. `40_ego_focus_selection`, `43_task_retrospective`,
+`44_task_premortem`, `45_intelligence_intake`, `46_infra_annotation`, `judge`,
+`crag_grade`, `attention_salience`, the `dream_cycle_*` sites, `voice_conversation`
+— rendered nowhere and were invisible. A new "Other" enrichment card, computed at
+render time from `Object.keys(callSites)` minus the grouped ids, surfaces them
+(clickable, opens the detail panel) and self-maintains as new sites are added.
+
+Two related grouping gaps are tracked separately, not fixed here: (a) `2_triage`
+and `bookmark_enrichment` remain in `SUBSYSTEM_GROUPS` but are no longer emitted by
+the snapshot, so they render as permanently-idle dead tiles; (b) the `ego` group
+still lists the legacy `7_ego_cycle` (last run ~79d ago) alongside `8_ego_compaction`,
+while the current ego call sites (`7_genesis_ego_cycle`, `7_user_ego_cycle`,
+`40_ego_focus_selection` — all active) are emitted and now surface under "Other"
+rather than the Ego group; the group's site list should be refreshed to the current
+ids. (Verified against the live `/api/genesis/health` snapshot, which emits from
+`call_site_last_run` + `_CALL_SITE_META`, not just `config/model_routing.yaml`.)
+
 ### 2026-05-10 — Confusable call-site ID rename (PR #311, Tier 3)
 
 Three IDs whose descriptors collided were renamed to lead with the domain:
