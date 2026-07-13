@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Launcher for codebase-memory-mcp MCP server, with a hard memory cap.
 #
-# WHY THE CAP: upstream v0.8.1 (latest as of 2026-07-05) has a known unbounded
-# memory leak on query/read operations — DeusData/codebase-memory-mcp#581,
-# acknowledged by the maintainer, no fix shipped. Long-lived CC sessions grow
+# WHY THE CAP: upstream v0.9.0 (latest as of 2026-07-12) still has an unbounded
+# memory leak on query/read operations — DeusData/codebase-memory-mcp#581 is
+# OPEN (0.9.0 landed memory-safety fixes but not the leak). Long-lived CC sessions grow
 # an instance from ~10MB to multiple GB over hours/days; several concurrent
 # sessions can exhaust a container's (or host's) RAM. Until upstream ships a
 # fix, every instance runs inside a transient systemd scope with MemoryMax:

@@ -320,8 +320,11 @@ echo "--- Installing code intelligence tools ---"
 # codebase-memory-mcp (code graph — 66 languages)
 # Always re-runs the upstream installer: it is idempotent and pulls the latest
 # release, so existing installs are upgraded in place.
+# --skip-config: the installer's own agent-config step registers the RAW binary
+# in ~/.claude/.mcp.json, bypassing our 2G-capped launcher. We register the
+# capped wrapper below via _register_mcp, so the installer must NOT self-register.
 echo "  codebase-memory-mcp: installing/upgrading..."
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui \
+curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui --skip-config \
     || echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)"
 if command -v codebase-memory-mcp &>/dev/null; then
     echo "  codebase-memory-mcp: $(codebase-memory-mcp --version 2>/dev/null || echo 'installed')"

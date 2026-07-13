@@ -608,7 +608,10 @@ echo "    Installing code intelligence tools..."
 
 # Always re-runs the upstream installer: it is idempotent and pulls the latest
 # release, so existing installs are upgraded in place.
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui 2>/dev/null \
+# --skip-config: the installer would otherwise register the RAW binary in
+# ~/.claude/.mcp.json, bypassing our 2G-capped launcher (_register_mcp below
+# registers the capped wrapper instead).
+curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui --skip-config 2>/dev/null \
     && echo "    + codebase-memory-mcp installed/upgraded" \
     || echo "    NOTE: codebase-memory-mcp unavailable (optional)"
 
@@ -959,6 +962,9 @@ else
                 cat > "$HOME/.qdrant/config.yaml" <<QDCONF
 storage:
   storage_path: $HOME/.qdrant/storage
+# WARN drops the per-request actix access-log INFO lines (the dashboard polls
+# a dozen endpoints every few seconds); WARN+ still surfaces real problems.
+log_level: WARN
 service:
   # Bind to localhost only for security (prevents external access).
   # To allow remote access, change to 0.0.0.0 and add authentication.
