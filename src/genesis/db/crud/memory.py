@@ -231,19 +231,32 @@ async def search_ranked(
 async def origin_class_by_ids(db: aiosqlite.Connection, ids: list[str]) -> dict[str, str | None]:
     """memory_id → stored ``origin_class`` for the given ids (missing ids omitted).
 
-    Used by surfaces that read Qdrant payloads directly (memory_core_facts)
-    to recover the backfilled SQLite value when a point's payload predates
-    the origin_class payload backfill — a stale payload must not bypass the
-    WS-3 injection gate.
+    Used by surfaces that read Qdrant payloads directly (memory_core_facts,
+    memory_expand, the retriever backfill) to recover the backfilled SQLite
+    value when a point's payload predates the origin_class payload backfill —
+    a stale payload must not bypass the WS-3 injection gate.
+
+    Chunked like ``batch_created_at``: memory_expand accepts arbitrary-length
+    id lists and core_facts scrolls ``limit*3`` points, so a single IN-clause
+    could breach SQLite's 999 bind-variable cap and raise ``too many SQL
+    variables`` — whereupon the callers fail open to ``origin_class=None`` and
+    a stale external row would slip the gate. Chunking keeps the recovery
+    reliable at any scale.
     """
     if not ids:
         return {}
-    marks = ",".join("?" * len(ids))
-    rows = await db.execute_fetchall(
-        f"SELECT memory_id, origin_class FROM memory_metadata WHERE memory_id IN ({marks})",  # noqa: S608 -- placeholders bound
-        ids,
-    )
-    return {r[0]: r[1] for r in rows}
+    _CHUNK = 900  # single-column query, stays under SQLite's 999 limit
+    out: dict[str, str | None] = {}
+    for offset in range(0, len(ids), _CHUNK):
+        chunk = ids[offset : offset + _CHUNK]
+        marks = ",".join("?" * len(chunk))
+        rows = await db.execute_fetchall(
+            f"SELECT memory_id, origin_class FROM memory_metadata WHERE memory_id IN ({marks})",  # noqa: S608 -- placeholders bound
+            chunk,
+        )
+        for r in rows:
+            out[r[0]] = r[1]
+    return out
 
 
 async def delete(db: aiosqlite.Connection, *, memory_id: str) -> bool:

@@ -126,3 +126,30 @@ async def test_origin_class_by_ids(tmp_path):
         assert await memory_crud.origin_class_by_ids(conn, []) == {}
     finally:
         await conn.close()
+
+
+async def test_origin_class_by_ids_chunks_past_bind_cap(tmp_path):
+    """Codex #1048 P2: a large id list (memory_expand / core_facts scroll) must
+    NOT breach SQLite's 999 bind-variable cap — the helper chunks so origin
+    recovery stays reliable at any scale (a raised 'too many SQL variables'
+    would fail the callers open to origin_class=None, slipping the gate)."""
+    conn = await _build_db(str(tmp_path / "chunk.db"))
+    try:
+        n = 2500  # well past the 999 cap and the 900 chunk size
+        for i in range(n):
+            oc = "external_untrusted" if i % 2 == 0 else "first_party"
+            await conn.execute(
+                "INSERT INTO memory_metadata (memory_id, created_at, origin_class) "
+                "VALUES (?, ?, ?)",
+                (f"m{i}", "2026-01-01T00:00:00+00:00", oc),
+            )
+        await conn.commit()
+
+        ids = [f"m{i}" for i in range(n)] + ["absent-1", "absent-2"]
+        got = await memory_crud.origin_class_by_ids(conn, ids)
+        assert len(got) == n  # every present id resolved across chunks
+        assert got["m0"] == "external_untrusted"
+        assert got["m1"] == "first_party"
+        assert "absent-1" not in got
+    finally:
+        await conn.close()
