@@ -9,6 +9,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **The CC Sessions card now tells the truth, and clicking it shows why.**
+  The dashboard card used to show a DB-side "active" count that routinely
+  disagreed with the processes actually running, plus a bare "3/20" that
+  looked like a session count but was really the hourly rate budget. The card
+  now shows both counts side by side ("N live / M db", amber when they
+  diverge), labels the budget as a budget, and opens a per-session modal:
+  every session from the last 24 hours with its live process (slot, pid,
+  memory), its charter (mission, compactions, open ledger items), and
+  explicit badges wherever the database and reality disagree — including
+  live processes with no session row at all.
+
 ### Fixed
 
 - **Code-intelligence indexing can no longer storm the machine.** Keeping the
