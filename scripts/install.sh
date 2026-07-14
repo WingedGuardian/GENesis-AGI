@@ -907,15 +907,17 @@ if command -v claude &>/dev/null; then
         _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
 fi
 
-# Trigger initial code intelligence indexing (background) — through the
-# single locked + resource-capped entrypoint ONLY (raw indexer spawns once
-# wedged the container in a D-state I/O storm; a guardrail test bans them).
+# Queue initial code intelligence indexing — write an index-request marker for
+# the idle-gated runner (genesis-code-intel.timer) instead of spawning an
+# indexer inline. A fire-and-forget full-mode index at setup helped storm the
+# container (D-state I/O); a guardrail test bans raw spawns. The runner does the
+# first (full, no .last-full) rebuild at its first idle window, under watchdog.
 CI_LOG="$HOME/.genesis/code-intelligence-setup.log"
 mkdir -p "$(dirname "$CI_LOG")"
-if [ -f "$REPO_DIR/scripts/lib/code_intel_index.sh" ]; then
-    ( bash "$REPO_DIR/scripts/lib/code_intel_index.sh" "$REPO_DIR" both >> "$CI_LOG" 2>&1 ) &
-    disown 2>/dev/null || true
-    echo "    + code intelligence: indexing (background, locked + capped)"
+if [ -f "$REPO_DIR/scripts/lib/index_marker.py" ]; then
+    python3 "$REPO_DIR/scripts/lib/index_marker.py" write \
+        --repo "$REPO_DIR" --tools both --mode fast >> "$CI_LOG" 2>&1 || true
+    echo "    + code intelligence: initial index queued (idle-gated runner)"
 fi
 
 

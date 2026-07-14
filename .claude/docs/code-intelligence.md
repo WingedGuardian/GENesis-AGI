@@ -69,7 +69,11 @@ symbol/reference/impact questions.
 
 **codebase-memory-mcp** — Tree-sitter code graph, SQLite index (~48MB for
 Genesis). Supports 66 languages. 3D visualization at `localhost:9749`.
-Indexed (reindex on local commit); if stale, run `index_repository`.
+Reindexed by the idle-gated runner, not inline on every commit — a commit
+queues a request marker and the runner rebuilds when the box is quiet (see
+below). If you need a fresh index, queue a marker; do NOT call the
+`index_repository` MCP tool directly for `~/genesis` (it bypasses the lock +
+host freeze — see the storm warning below).
 Runs under a hard 2G memory cap (`.claude/mcp/run-codebase-memory` wraps it in
 a systemd scope) because upstream v0.9.0 still leaks memory without bound on query (issue #581 open)
 operations (DeusData/codebase-memory-mcp#581). If its tools suddenly error
@@ -97,13 +101,23 @@ container's disk-write throttle and wedged the whole container in a D-state
 I/O storm. In a worktree session, use **Serena** (live LSP, no index needed)
 plus the main repo's existing CBM/GitNexus graphs.
 
-All out-of-session index spawns route through
-`scripts/lib/code_intel_index.sh` — the single entrypoint enforcing
-worktree-skip, a per-repo single-flight lock, and memory/IO/CPU caps
-(`CODE_INTEL_INDEX_DISABLE=1` to skip entirely). A guardrail test
-(`tests/test_scripts/test_code_intel_index.py`) fails the build on any new
-raw spawn site. In-session MCP indexing (e.g. CBM's `index_repository` tool)
-is unaffected — it runs inside the already-capped server process.
+Indexing flows through a **request queue, not per-commit spawns** (fire-and-forget
+full indexes on every commit stormed the container twice in 2026-07). Triggers
+(post-commit hook, setup, the gitnexus surplus job, disk_reclaim) drop a marker
+via `scripts/lib/index_marker.py`; the idle-gated runner
+(`genesis-code-intel.timer` → `scripts/code_intel_runner.sh`) is the ONLY thing
+that consumes a marker and invokes `scripts/lib/code_intel_index.sh` — the single
+entrypoint enforcing worktree-skip, a per-repo single-flight lock, memory/CPU
+caps, and a **pressure watchdog** that pauses the index (cgroup freeze — the only
+working I/O throttle here) under load and kills a run that can't make headway. A
+guardrail test (`tests/test_scripts/test_code_intel_index.py`) fails the build on
+any new raw spawn site. `CODE_INTEL_INDEX_DISABLE=1` skips indexing entirely.
+
+**Do NOT call CBM's `index_repository` MCP tool for a fresh full index of
+`~/genesis`.** It runs in-process and bypasses the lock, the caps, AND the host
+kill-switch — a from-scratch full index that way is exactly what read-saturated
+the container. Queue a marker instead and let the idle runner do it:
+`python3 scripts/lib/index_marker.py write --repo ~/genesis --tools both --mode fast`.
 
 ---
 

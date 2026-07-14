@@ -558,13 +558,12 @@ fi
 echo
 
 # --- Code Intelligence Indexing ---
-# No direct indexer spawns here: setup_claude_config.py (invoked earlier)
-# already triggers indexing through scripts/lib/code_intel_index.sh — the
-# single locked + resource-capped entrypoint. The raw spawns this block used
-# to hold ran a SECOND concurrent index of the same repo on every bootstrap
-# (and a third via the post-commit hook), which once wedged the container in
-# a D-state I/O storm. All indexing must go through the entrypoint.
-echo "--- Code intelligence indexing: handled by setup_claude_config (locked entrypoint) ---"
+# No indexer spawns here: setup_claude_config.py (invoked earlier) queues an
+# index-request marker (scripts/lib/index_marker.py) that the idle-gated runner
+# (genesis-code-intel.timer -> scripts/code_intel_runner.sh) consumes when the
+# box is quiet. Inline full-mode spawns on every bootstrap once wedged the
+# container in a D-state I/O storm; all indexing now flows through the queue.
+echo "--- Code intelligence indexing: queued for the idle-gated runner ---"
 echo
 
 # --- Timezone ---
