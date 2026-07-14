@@ -19,6 +19,28 @@ async def test_create_campaign(db):
     assert campaign_id == "c1"
 
 
+async def test_create_campaign_defaults_to_campaign_profile(db):
+    """Default session_profile must not silently grant recon or force Opus.
+
+    The 'research' profile now loads genesis-recon (read+write) and 'interact'
+    force-pins Opus + grants browser; campaigns run unattended, so the default is
+    the purpose-built 'campaign' profile (health+memory+outreach, no recon, no
+    model pin) instead.
+    """
+    from genesis.db.crud import campaigns as crud
+
+    await crud.create_campaign(
+        db,
+        id="c-default",
+        name="default-profile",
+        strategy_doc_path="/tmp/strategy.md",
+        cron_cadence="0 */8 * * *",
+        created_at="2026-06-07T00:00:00Z",
+    )
+    row = await crud.get_campaign_by_name(db, "default-profile")
+    assert row["session_profile"] == "campaign"
+
+
 async def test_get_campaign_by_name(db):
     from genesis.db.crud import campaigns as crud
 

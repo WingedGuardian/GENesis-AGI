@@ -606,7 +606,8 @@ class TaskReviewer:
             "is clear enough for the executor to act on.\n\n"
             "## What the Executor Already Handles\n\n"
             "Do NOT flag gaps in these areas — the executor manages them "
-            "automatically:\n"
+            "automatically, unless the task requirements explicitly specify "
+            "such behavior:\n"
             "- **Timeouts and retries** — each step has configurable "
             "timeouts with automatic workaround recovery on failure\n"
             "- **Git worktrees** — code steps run in isolated worktrees, "
@@ -652,7 +653,8 @@ class TaskReviewer:
             '"recommendations": ["list of recommendations"]}\n\n'
             "Only flag genuine gaps that would prevent the executor from "
             "completing the task. Do not flag infrastructure concerns the "
-            "executor already handles."
+            "executor already handles, unless the task requirements explicitly "
+            "require such behavior."
         )
 
     @staticmethod

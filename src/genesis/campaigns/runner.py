@@ -245,7 +245,7 @@ class CampaignRunner:
         request = DirectSessionRequest(
             prompt=prompt,
             system_prompt=strategy_text,
-            profile=campaign.get("session_profile", "interact"),
+            profile=campaign.get("session_profile", "campaign"),
             model=_resolve_model(campaign.get("model", "sonnet")),
             effort=_resolve_effort(campaign.get("effort", "medium")),
             notify=False,  # Campaigns handle their own notifications
