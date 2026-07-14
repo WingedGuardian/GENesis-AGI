@@ -443,7 +443,8 @@ def _assemble_results(
                 # it has no SQLite column and is NOT recoverable on FTS.
                 origin_class=(
                     payload.get("origin_class")
-                    or (fts_hit.get("origin_class") if fts_hit else None)
+                    if payload.get("origin_class") is not None
+                    else (fts_hit.get("origin_class") if fts_hit else None)
                 ),
                 memory_class=_p.get("memory_class", "fact"),
                 query_intent=intent.category,

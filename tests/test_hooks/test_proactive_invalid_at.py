@@ -56,7 +56,7 @@ def _build_db(path: str) -> None:
                 valid_at         TEXT,
                 invalid_at       TEXT,
                 source_subsystem TEXT,
-            origin_class TEXT,
+                origin_class TEXT,
                 deprecated       INTEGER NOT NULL DEFAULT 0,
                 dream_cycle_run_id TEXT
             )
