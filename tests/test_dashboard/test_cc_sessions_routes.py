@@ -183,7 +183,14 @@ async def test_charter_and_ledger_join(db):
 
 
 async def test_missing_charter_tables_tolerated(db):
-    """Pre-0058 install: no session_charters/session_ledger tables."""
+    """Pre-0058 install: no session_charters/session_ledger tables.
+
+    Migration 0058 is on main now, so the shared fixture creates the tables —
+    drop them explicitly to simulate an un-migrated install.
+    """
+    await db.execute("DROP TABLE IF EXISTS session_charters")
+    await db.execute("DROP TABLE IF EXISTS session_ledger")
+    await db.commit()
     await _seed_session(db, sid="s1", cc_session_id="cc-abc")
     result = await _collect_detail(db, [], now=_NOW)
     assert result["charters_available"] is False
