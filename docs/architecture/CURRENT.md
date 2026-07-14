@@ -636,6 +636,30 @@ verified: 3d5234b9 2026-07-13
   `scripts/prune_immunity_shadow.py` (disk-hygiene). The shadow log is readable
   via the `immunity_status` health MCP tool (gate-agnostic: per-gate live mode
   + per-site would-block counts — sizes the B4 enforce blast radius).
+  **B4: stored-origin recall + enforce for gates 3-4 (shipped shadow; flip is a
+  live `settings_update`).** Recall now plumbs the stored `origin_class`
+  (migration 0054) end-to-end — `RetrievalResult.origin_class` on both the
+  Qdrant and FTS5-only paths (the latter via a `search_ranked` column,
+  coalescing SQLite when a pre-backfill payload is None) — so
+  `item_is_blockable` is STORED-FIRST (widens to episodic-external rows; fixes
+  the first-party-in-KB over-observe). A second CI sweep
+  (`KNOWN_QDRANT_READ_SITES`) locks every direct Qdrant `.scroll`/`.retrieve`
+  content→prompt surface; it caught `memory_core_facts` (now gated). The
+  gate-2 L-tier substrate: `cc_sessions.origin_class` + `observations.origin_class`
+  (migration 0057), stamped at registration from the DISPATCH PROFILE (never a
+  tool scan); reflection `user_model_delta` writers carry a run-level window
+  aggregate (`cc_sessions.reflection_window_origin`), so the identity emit
+  derives real provenance instead of hardcoded first_party (gate-2 stays
+  shadow). Enforce (gates 3-4 only; procedure/identity rejected by the
+  validator honesty guard): gate-4 drops `external_untrusted` from PUSHED feeds
+  (proactive hook, `memory_proactive`, `memory_core_facts`) ONLY in dispatched
+  sessions (`GENESIS_SESSION_ID` env) under enforce — explicit queries
+  (`memory_recall`/`knowledge_recall`/`memory_expand`) and every foreground
+  surface keep wrapped external in all modes (`should_enforce_drop`, fail-open);
+  gate-3 refuses grant evidence/state writes with a blockable origin. Every
+  drop/refusal still records (the enforce-mode row IS the block ledger).
+  Auto-demote now pages a `critical` `infrastructure_alert` when a gate stands
+  down. Red-team acceptance: `test_redteam_enforce.py` (synthetic).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **infra_profile/**: the infrastructure body schema — deterministic fact
