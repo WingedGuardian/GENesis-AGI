@@ -71,13 +71,13 @@ _GRADE_CONCURRENCY = 3
 _WEB_TIMEOUT_S = 25.0
 
 # Re-retrieval / output sizing.
-_ORIG_LIMIT = 10            # assumed original recall limit (MCP default)
+_ORIG_LIMIT = 10  # assumed original recall limit (MCP default)
 _RELAXED_LIMIT = _ORIG_LIMIT * 2  # relaxed re-retrieve fetches a wider net
-_KB_LIMIT = 10              # raw knowledge-base re-retrieve limit
+_KB_LIMIT = 10  # raw knowledge-base re-retrieve limit
 
 # Web refinement bounds.
-_WEB_MAX_URLS = 2          # fetch at most this many search-result URLs
-_WEB_TOP_CHUNKS = 3        # keep this many reranked paragraphs per snippet
+_WEB_MAX_URLS = 2  # fetch at most this many search-result URLs
+_WEB_TOP_CHUNKS = 3  # keep this many reranked paragraphs per snippet
 _WEB_SNIPPET_MAX_CHARS = 1500  # recomposed snippet cap
 
 
@@ -246,10 +246,7 @@ async def _grade_results(
     semaphore = asyncio.Semaphore(_GRADE_CONCURRENCY)
     to_grade = normalized[:_GRADE_TOP_N]
     grades = await asyncio.gather(
-        *(
-            _grade_one(router, semaphore, query, item["content"], template)
-            for item in to_grade
-        ),
+        *(_grade_one(router, semaphore, query, item["content"], template) for item in to_grade),
         return_exceptions=True,
     )
     # gather(return_exceptions=True) can surface raised exceptions as objects;
@@ -348,14 +345,16 @@ async def _web_augment(query: str) -> list[dict]:
         if snippet.strip():
             # Match the knowledge_recall result shape (unit_id/origin) so web
             # candidates survive merge + don't KeyError downstream consumers.
-            out.append({
-                "unit_id": url,
-                "id": url,
-                "content": snippet,
-                "score": score,
-                "origin": "web",
-                "source_pipeline": "crag_web",
-            })
+            out.append(
+                {
+                    "unit_id": url,
+                    "id": url,
+                    "content": snippet,
+                    "score": score,
+                    "origin": "web",
+                    "source_pipeline": "crag_web",
+                }
+            )
 
     with contextlib.suppress(Exception):
         await reranker.close()
@@ -379,6 +378,12 @@ def _retrieval_to_dict(rr: Any) -> dict:
         # the relaxed/raw-KB re-retrieve can legitimately pull KB content.
         "collection": getattr(rr, "collection", "episodic_memory"),
         "source_pipeline": getattr(rr, "source_pipeline", None),
+        # WS-3: carry the STORED origin so an external_untrusted EPISODIC item
+        # (whose collection alone reads first-party) is still wrapped + counted
+        # at the MCP return pass. Without this, a CRAG-augmented external
+        # episodic hit reopens the stored-origin bypass on the corrective
+        # memory_recall path (Codex #1048).
+        "origin_class": getattr(rr, "origin_class", None),
     }
 
 
@@ -651,6 +656,5 @@ async def maybe_correct_recall(
         return out
 
     except Exception:
-        logger.warning("CRAG: maybe_correct_recall failed, returning original",
-                       exc_info=True)
+        logger.warning("CRAG: maybe_correct_recall failed, returning original", exc_info=True)
         return results
