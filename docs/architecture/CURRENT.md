@@ -652,7 +652,8 @@ verified: 3d5234b9 2026-07-13
   derives real provenance instead of hardcoded first_party (gate-2 stays
   shadow). Enforce (gates 3-4 only; procedure/identity rejected by the
   validator honesty guard): gate-4 drops `external_untrusted` from PUSHED feeds
-  (proactive hook, `memory_proactive`, `memory_core_facts`) ONLY in dispatched
+  (`memory_proactive`, `memory_core_facts`; the proactive hook needs no filter —
+  dispatched sessions exit it at module import, total absence) ONLY in dispatched
   UNSUPERVISED sessions under enforce — the discriminator is
   `GENESIS_CC_SESSION` present (stamped unconditionally on every CCInvoker
   child) AND `GENESIS_SESSION_SUPERVISED` absent (`CCInvocation.supervised`,

@@ -1263,50 +1263,6 @@ def _enrich_with_metadata(results: list[dict]) -> None:
         pass  # Best-effort enrichment — never block the hook
 
 
-def _enforce_drop_filter(fused: list[dict]) -> tuple[list[dict], int]:
-    """WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): the proactive hook is THE
-    pushed feed — in a dispatched session (GENESIS_SESSION_ID env) under
-    enforce, blockable stored-external items are dropped before formatting.
-    Returns ``(kept, dropped_count)``; the caller counts dropped items into
-    the post-output emit (the enforce-mode row is the block ledger). Any
-    import/config error fails OPEN (all items kept, wrapped downstream).
-    """
-    try:
-        from genesis.security.immunity_shadow import (
-            is_dispatched_session_env,
-            should_enforce_drop,
-        )
-
-        # Provenance must be complete BEFORE the drop decision: a legacy
-        # Qdrant point whose payload predates the origin_class backfill
-        # carries None here, but SQLite memory_metadata has the backfilled
-        # value — without this, stored-external episodic rows would evade
-        # the enforce drop (Codex P1). Idempotent (see _enriched marker).
-        _enrich_with_metadata(fused)
-        kept: list[dict] = []
-        dropped = 0
-        # Attribution id alone is NOT a supervision signal — foreground
-        # conversations carry one too. The shared helper also requires the
-        # supervised marker to be absent.
-        unsup = is_dispatched_session_env()
-        for r in fused:
-            if should_enforce_drop(
-                gate="injection",
-                collection=r.get("collection"),
-                source_pipeline=r.get("source_pipeline"),
-                origin_class=r.get("origin_class"),
-                pushed_surface=True,
-                unsupervised=unsup,
-            ):
-                dropped += 1
-            else:
-                kept.append(r)
-        return kept, dropped
-    except Exception as exc:
-        print(f"Enforce-drop check skipped: {exc}", file=sys.stderr)
-        return fused, 0
-
-
 def _format_results(results: list[dict]) -> str:
     """Format surfaced memories for injection with age, wing, and ID.
 
@@ -1791,9 +1747,17 @@ async def _run(prompt: str, session_id: str = "") -> None:
     fts_only_fallback = len(vector_results) == 0 and len(fts_results) > 0
 
     # Fuse results (with wing boost, code index, and knowledge base)
+    # WS-3 B4 gate-4 (pushed-surfaces cut) — DISPOSITION, not a filter:
+    # dispatched sessions NEVER execute this hook (module-level
+    # GENESIS_CC_SESSION exit at the top of this file), so the pushed-feed
+    # protection here is total absence — stronger than any per-item drop.
+    # Every process that reaches this point is a user-launched foreground
+    # terminal session (supervised by definition), which keeps wrapped/labeled
+    # external content in every mode per the cut. If that early exit is ever
+    # narrowed, this surface re-enters the enforce-drop set — see the registry
+    # disposition in tests/test_security/test_recall_inject_coverage.py.
     fused: list[dict] = []
     fused_count = 0
-    _enforce_dropped = 0  # defined outside the fusion block: the emit guard reads it
     # H-1 PR2a: shadow-project the novelty gate. suppress_ids feeds the shadow
     # projection ONLY — the real selection loop ignores it, so injected output
     # is unchanged. _shadow accumulates the projection for the injection log.
@@ -1809,7 +1773,6 @@ async def _run(prompt: str, session_id: str = "") -> None:
             shadow=_shadow,
         )
         fused = [r for r in fused if not _is_garbage(r.get("content", ""))]
-        fused, _enforce_dropped = _enforce_drop_filter(fused)
         fused_count = len(fused)
 
         # Graph breadcrumbs: 1-hop sync SQL for top results (~5ms total).
@@ -1880,16 +1843,14 @@ async def _run(prompt: str, session_id: str = "") -> None:
     # proactive injection reach the CC-session prompt (action-capable).
     # Fire-and-forget AFTER flush — never delays the injection, never crashes the
     # hook; skipped live if the gate is off (master kill switch / per-gate off).
-    # Guard includes _enforce_dropped: an all-dropped run must still write its
-    # block-ledger row (fused would be empty).
-    if fused or _enforce_dropped:
+    if fused:
         try:
             from genesis.security.immunity_shadow import (
                 item_is_blockable,
                 record_would_block_sync,
             )
 
-            blockable = _enforce_dropped + sum(
+            blockable = sum(
                 1
                 for r in fused
                 if item_is_blockable(

@@ -5,8 +5,9 @@ content is SYNTHETIC (crafted injection-style strings invented for this file —
 never real private artifacts).
 
 The matrix:
-- gate-4 DROP at the pushed surfaces (proactive hook filter, memory_proactive,
-  memory_core_facts) under dispatched-env + enforce;
+- gate-4 DROP at the pushed surfaces (memory_proactive, memory_core_facts)
+  under dispatched-env + enforce; the proactive hook's cut is TOTAL ABSENCE
+  (dispatched sessions exit it at import — pinned by subprocess test);
 - gate-4 WRAP-RETAINED at explicit queries (memory_recall) even under enforce —
   the pushed-vs-explicit cut is load-bearing, so it is tested, not assumed;
 - foreground (no dispatched env) never drops anywhere;
@@ -142,40 +143,30 @@ async def test_kill_switch_live_restore_same_process(config_dirs):
     assert immunity_shadow.should_enforce_drop(**kwargs) is False  # per-gate demote
 
 
-# ─── gate-4 DROP: proactive hook filter ──────────────────────────────────────
+# ─── gate-4 pushed-feed cut: proactive hook = total absence in dispatch ─────
 
 
-async def test_hook_filter_drops_external_in_dispatched_enforce(config_dirs, monkeypatch):
+async def test_hook_exits_before_injecting_in_dispatched_sessions():
+    """The hook's pushed-feed protection is NOT a per-item filter: every
+    CCInvoker child (GENESIS_CC_SESSION=1) exits the hook at module import,
+    so dispatched sessions receive NO proactive injection at all (Codex
+    round-4: an in-process filter behind that exit was unreachable — removed).
+    Pinned at the REAL runtime boundary: a subprocess with the dispatch marker
+    must produce zero injection output and exit 0."""
+    import subprocess
     import sys as _sys
 
-    _sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-    import proactive_memory_hook as hook
-
-    base, _ = config_dirs
-    _write(base, {"injection": {"mode": "enforce"}})
-    _dispatched(monkeypatch)
-    fused = [
-        {
-            "memory_id": "ext",
-            "content": INJECTION_TEXT,
-            "collection": "episodic_memory",
-            "origin_class": "external_untrusted",
-        },
-        {
-            "memory_id": "fp",
-            "content": "benign",
-            "collection": "episodic_memory",
-            "origin_class": "first_party",
-        },
-    ]
-    kept, dropped = hook._enforce_drop_filter(fused)
-    assert dropped == 1
-    assert [r["memory_id"] for r in kept] == ["fp"]
-
-    # Foreground: nothing drops even under enforce.
-    _foreground(monkeypatch)
-    kept2, dropped2 = hook._enforce_drop_filter(fused)
-    assert dropped2 == 0 and len(kept2) == 2
+    hook_path = Path(__file__).resolve().parents[2] / "scripts" / "proactive_memory_hook.py"
+    proc = subprocess.run(
+        [_sys.executable, str(hook_path)],
+        input='{"prompt": "hello", "session_id": "redteam"}',
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={"GENESIS_CC_SESSION": "1", "PATH": "/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == ""
 
 
 # ─── gate-4 DROP: memory_proactive / memory_core_facts (MCP surfaces) ───────
@@ -801,58 +792,3 @@ async def test_memory_proactive_supervised_conversation_keeps_wrapped(config_dir
 
     assert [d["memory_id"] for d in out] == ["ext-1"]  # kept (supervised)
     assert "<external-content" in out[0]["content"]  # ... but wrapped
-
-
-async def test_hook_filter_supervised_conversation_never_drops(config_dirs, monkeypatch):
-    import sys as _sys
-
-    _sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-    import proactive_memory_hook as hook
-
-    base, _ = config_dirs
-    _write(base, {"injection": {"mode": "enforce"}})
-    _supervised_conversation(monkeypatch)
-    fused = [
-        {
-            "memory_id": "ext",
-            "content": INJECTION_TEXT,
-            "collection": "episodic_memory",
-            "origin_class": "external_untrusted",
-            "_enriched": True,
-        },
-    ]
-    kept, dropped = hook._enforce_drop_filter(fused)
-    assert dropped == 0 and len(kept) == 1
-
-
-async def test_hook_filter_enriches_legacy_payload_before_drop(config_dirs, monkeypatch):
-    """Codex P1 round 2: a legacy Qdrant hit whose payload predates the
-    origin_class backfill (None in the fused dict) must be enriched from
-    SQLite BEFORE the drop decision — otherwise stored-external episodic rows
-    evade enforce."""
-    import sys as _sys
-
-    _sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-    import proactive_memory_hook as hook
-
-    base, _ = config_dirs
-    _write(base, {"injection": {"mode": "enforce"}})
-    _dispatched(monkeypatch)
-
-    def _fake_enrich(results):
-        for r in results:
-            if r.get("origin_class") is None:
-                r["origin_class"] = "external_untrusted"  # simulated SQLite backfill
-            r["_enriched"] = True
-
-    monkeypatch.setattr(hook, "_enrich_with_metadata", _fake_enrich)
-    fused = [
-        {
-            "memory_id": "legacy-ext",
-            "content": INJECTION_TEXT,
-            "collection": "episodic_memory",
-            # origin_class ABSENT — pre-backfill Qdrant payload
-        },
-    ]
-    kept, dropped = hook._enforce_drop_filter(fused)
-    assert dropped == 1 and kept == []
