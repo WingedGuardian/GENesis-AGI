@@ -269,13 +269,16 @@ def test_provenance_descriptor_origin_none_falls_back_to_collection():
     )
 
 
-def test_provenance_descriptor_stored_first_party_kb_stays_external_label():
-    # Collection still wins toward external: KB content is external-world info
-    # for labeling purposes even when its stored origin is first_party (e.g.
-    # surplus-pipeline units) — blockability is a separate, stored-first call.
-    assert provenance_descriptor(
-        collection="knowledge_base", origin_class="first_party"
-    ).startswith("external-world knowledge")
+def test_provenance_descriptor_kb_stays_external_regardless_of_origin():
+    # The KB collection is external-world for BOTH the wrap decision
+    # (`... or is_external(collection)`) and the label, so a KB unit labels
+    # external whatever its stored origin — the label tracks the wrapper, and
+    # KB content is always wrapped. (Codex #1048 P2 was about the EPISODIC
+    # corrupt-origin case, not this one.)
+    for origin in ("first_party", "external_untrusted", None):
+        assert provenance_descriptor(collection="knowledge_base", origin_class=origin).startswith(
+            "external-world knowledge"
+        )
 
 
 def test_label_result_dicts_threads_origin_class():
@@ -286,3 +289,28 @@ def test_label_result_dicts_threads_origin_class():
     }
     label_result_dicts([d])
     assert d["provenance"].startswith("external-world knowledge")
+
+
+def test_provenance_descriptor_agrees_with_is_blockable():
+    """Codex #1048 P2: the label must never disagree with the gate. For every
+    stored origin value the wrap/drop path would classify as blockable
+    (is_blockable True), provenance_descriptor must label external-world — and
+    vice-versa — so compact-recall/dashboard provenance can't present
+    gate-blockable content as first-party."""
+    from genesis.security.immunity import is_blockable
+
+    for origin in ("owner", "first_party", "external_untrusted", "corrupt-XYZ", "", "kb"):
+        label = provenance_descriptor(collection="episodic_memory", origin_class=origin)
+        labels_external = label.startswith("external-world knowledge")
+        assert labels_external == is_blockable(origin), (
+            f"label/gate disagree for origin={origin!r}: "
+            f"label_external={labels_external}, is_blockable={is_blockable(origin)}"
+        )
+
+
+def test_provenance_descriptor_corrupt_origin_labels_external():
+    # A corrupt/unknown non-null stored class is external-world (fail-closed),
+    # matching the gate — NOT silently first-party.
+    assert provenance_descriptor(collection="episodic_memory", origin_class="garbage").startswith(
+        "external-world knowledge"
+    )
