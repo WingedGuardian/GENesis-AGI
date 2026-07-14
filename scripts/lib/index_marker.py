@@ -249,6 +249,27 @@ def restore(h: str, *, attempts_inc: bool = False) -> str:
     return "pending"
 
 
+def repend_stale_inflight() -> list[str]:
+    """Re-pend any orphaned ``<hash>.inflight.json`` and return the hashes.
+
+    A runner that dies between claim and the rc handler (OOM, host stop, unit
+    TimeoutStartSec) leaves a marker stranded as ``.inflight`` — ``list_markers``
+    skips those, so a quiet repo would never be reindexed until a new trigger.
+    The runner self-flocks (one tick at a time), so any inflight present when a
+    fresh tick starts is necessarily from a DEAD previous run — safe to restore.
+    """
+    d = marker_dir()
+    if not d.is_dir():
+        return []
+    out = []
+    suffix = ".inflight.json"
+    for p in sorted(d.glob(f"*{suffix}")):
+        h = p.name[: -len(suffix)]
+        restore(h)  # merge back into any canonical, no penalty
+        out.append(h)
+    return out
+
+
 def last_full_path(h: str) -> Path:
     return marker_dir() / f".last-full-{h}"
 
@@ -328,6 +349,8 @@ def main(argv: list[str] | None = None) -> int:
         sp = sub.add_parser(name)
         sp.add_argument("--hash", required=True)
 
+    sub.add_parser("reconcile-inflight", help="re-pend orphaned inflight markers")
+
     p_restore = sub.add_parser("restore")
     p_restore.add_argument("--hash", required=True)
     p_restore.add_argument("--attempts-inc", action="store_true")
@@ -368,6 +391,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "mark-full-backoff":
         mark_full_backoff(args.hash)
+        return 0
+    if args.cmd == "reconcile-inflight":
+        repended = repend_stale_inflight()
+        if repended:
+            print(f"re-pended {len(repended)} stale inflight marker(s)")
         return 0
     return 2
 

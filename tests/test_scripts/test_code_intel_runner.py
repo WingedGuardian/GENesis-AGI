@@ -212,6 +212,40 @@ def test_escalated_full_failure_falls_back_no_penalty(tmp_path):
     assert (_mdir(tmp_path) / f".full-backoff-{h}").exists()
 
 
+def test_gitnexus_only_marker_does_not_escalate_or_stamp(tmp_path):
+    # "full" is cbm-only; a gitnexus-only marker (from the surplus job) must NOT
+    # escalate or stamp .last-full, or it would falsely satisfy cbm's weekly gate.
+    h = _seed_marker(tmp_path, tools="gitnexus", mode="fast")  # due (no .last-full)
+    _run_runner(tmp_path, entry_rc=0)
+    assert "mode=fast" in (tmp_path / "entry.log").read_text()  # NOT escalated
+    assert not (_mdir(tmp_path) / f".last-full-{h}").exists()  # NOT stamped
+
+
+def test_rc3_on_escalated_full_backs_off(tmp_path):
+    # A missing sibling tool (rc3) after an escalated full must back off full so
+    # it doesn't re-escalate a heavy cbm full every idle tick.
+    h = _seed_marker(tmp_path, tools="both", mode="fast")  # escalates to full
+    _run_runner(tmp_path, entry_rc=3)
+    listed = _markers(tmp_path)
+    assert len(listed) == 1
+    assert listed[0].split("\t")[4] == "0"  # no attempts penalty
+    assert (_mdir(tmp_path) / f".full-backoff-{h}").exists()  # backed off
+
+
+def test_runner_reconciles_orphaned_inflight(tmp_path):
+    # A marker stranded as .inflight by a dead prior run is re-pended at tick start.
+    h = _seed_marker(tmp_path, tools="both", mode="fast")
+    subprocess.run(
+        ["python3", str(_MARKER_PY), "claim", "--hash", h],
+        env={**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")},
+        check=True,
+        capture_output=True,
+    )
+    assert _markers(tmp_path) == []  # stranded as inflight
+    _run_runner(tmp_path, entry_rc=0, load="9.0")  # busy → defers running, but re-pends
+    assert len(_markers(tmp_path)) == 1
+
+
 def test_no_markers_is_quiet_noop(tmp_path):
     res = _run_runner(tmp_path, entry_rc=0)
     assert res.returncode == 0

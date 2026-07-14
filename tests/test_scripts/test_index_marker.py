@@ -219,6 +219,30 @@ def test_stamp_full_clears_backoff(tmp_path, monkeypatch):
     assert not im.full_backoff_path(h).exists()
 
 
+# ── inflight reconciliation (a runner died mid-index) ──────────────────────
+
+
+def test_reconcile_repends_orphaned_inflight(tmp_path, monkeypatch):
+    _with_home(tmp_path, monkeypatch)
+    im.write_marker("/tmp", tools="both", mode="full")
+    h = im.marker_hash("/tmp")
+    im.claim(h)  # runner claimed, then "died"
+    assert (im.marker_dir() / f"{h}.inflight.json").exists()
+    assert im.list_markers() == []  # inflight is invisible to list
+    repended = im.repend_stale_inflight()
+    assert repended == [h]
+    assert not (im.marker_dir() / f"{h}.inflight.json").exists()
+    listed = im.list_markers()
+    assert len(listed) == 1 and listed[0]["mode"] == "full"  # request preserved
+
+
+def test_reconcile_noop_when_no_inflight(tmp_path, monkeypatch):
+    _with_home(tmp_path, monkeypatch)
+    im.write_marker("/tmp", tools="both", mode="fast")
+    assert im.repend_stale_inflight() == []  # a live pending marker is untouched
+    assert len(im.list_markers()) == 1
+
+
 # ── CLI surface (bash callers) ─────────────────────────────────────────────
 
 

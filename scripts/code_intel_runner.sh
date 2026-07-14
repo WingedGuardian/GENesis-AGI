@@ -96,6 +96,11 @@ if [ ! -f "$ENTRYPOINT" ] || [ ! -f "$MARKER_PY" ]; then
     exit 0
 fi
 
+# Re-pend any orphaned in-flight markers from a previous run that died mid-index
+# (OOM / host stop / unit timeout). Safe here: we hold the runner flock, so no
+# other tick is mid-claim — any *.inflight is necessarily from a dead run.
+_marker reconcile-inflight >> "$LOG_FILE" 2>&1 || true
+
 # Snapshot the pending markers up front (TSV: hash repo tools mode attempts age).
 mapfile -t _MARKERS < <(_marker list 2>/dev/null)
 if [ "${#_MARKERS[@]}" -eq 0 ]; then
@@ -113,10 +118,14 @@ for line in "${_MARKERS[@]}"; do
     fi
 
     # Escalate a fast marker to full when the graph is due (and not backed off).
+    # "full" is a cbm-only concept — gitnexus analyze ignores mode (always
+    # incremental) — so a gitnexus-only marker must NOT escalate or it would
+    # stamp .last-full and falsely suppress cbm's genuinely-needed full pass.
     run_mode="$mode"
-    if [ "$mode" != "full" ] && _marker should-escalate --hash "$hash"; then
+    if [ "$mode" != "full" ] && { [ "$tools" = "cbm" ] || [ "$tools" = "both" ]; } \
+        && _marker should-escalate --hash "$hash"; then
         run_mode="full"
-        _log "escalating $repo to full (weekly/first full index due)"
+        _log "escalating $repo to full (weekly/first full cbm index due)"
     fi
 
     # Move-aside claim so a commit landing mid-index is never dropped.
@@ -133,7 +142,12 @@ for line in "${_MARKERS[@]}"; do
     case "$rc" in
         0)
             _marker consume --hash "$hash"
-            [ "$run_mode" = "full" ] && _marker stamp-full --hash "$hash"
+            # Only a successful FULL run that INCLUDED cbm records .last-full
+            # (the escalation guard already ensures run_mode=full ⟹ cbm, but be
+            # explicit — .last-full is shared across tools and gates cbm's full).
+            if [ "$run_mode" = "full" ] && { [ "$tools" = "cbm" ] || [ "$tools" = "both" ]; }; then
+                _marker stamp-full --hash "$hash"
+            fi
             _log "indexed OK: $repo (mode=$run_mode)"
             ;;
         75)
@@ -141,7 +155,13 @@ for line in "${_MARKERS[@]}"; do
             _log "lock held / host-frozen — kept marker for $repo"
             ;;
         3)
+            # A requested tool is missing from PATH (a persistent misconfig, not a
+            # transient). Keep the marker (the present tool still wants indexing)
+            # with no attempts penalty — but if this was an escalated full, back
+            # off full so it doesn't re-escalate a heavy cbm full EVERY idle tick;
+            # it degrades to cheap fast retries until PATH is fixed.
             _marker restore --hash "$hash" >/dev/null
+            [ "$run_mode" = "full" ] && _marker mark-full-backoff --hash "$hash"
             _log "requested tool missing (rc=3) — kept marker, no penalty: $repo"
             ;;
         *)
