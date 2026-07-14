@@ -9,6 +9,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Code-intelligence indexing can no longer storm the machine.** Keeping the
+  code graph fresh used to fire a full reindex on every commit, in the
+  background, with no coordination — and if disk cleanup had reclaimed the index
+  first, each "quick refresh" was secretly a full rebuild from scratch. Enough
+  of them at once saturated disk I/O and dragged the whole box to a crawl. Three
+  changes fix this at the root: (1) disk cleanup no longer deletes the code
+  index except as a genuine last resort (very low free space), so refreshes stay
+  incremental; (2) commits and setup now *queue* an index request instead of
+  spawning one — a small idle-gated job does the work only when the machine is
+  quiet, one at a time; and (3) whatever does run is watched live and
+  automatically paused when the system gets busy, so an index can never hold the
+  box hostage. Routine refreshes are now the cheap "fast" pass, with the full
+  pass reserved for a weekly idle window. Also fixes a latent bug where the
+  GitNexus refresh had been silently failing on every run due to an unsupported
+  flag.
+
 ### Added
 
 - **The recovery brain no longer drifts behind a version bump.** A nightly

@@ -80,6 +80,12 @@ def _run_entry(tmp_path: Path, *args, path: str, env_extra=None, **popen_kw):
         "PATH": path,
         "HOME": str(tmp_path),
         "GENESIS_HOME": str(tmp_path / ".genesis"),
+        # Fast, never-pausing watchdog by default so a fast fake tool doesn't
+        # idle on the real 15s sample gap; watchdog tests override these.
+        "CODE_INTEL_WATCHDOG_INTERVAL": "1",
+        "CODE_INTEL_WATCHDOG_WARMUP_S": "0",
+        "CODE_INTEL_FAKE_LOADAVG": "0",
+        "CODE_INTEL_FAKE_IOWAIT": "0",
         **(env_extra or {}),
     }
     return subprocess.run(
@@ -282,7 +288,13 @@ def test_parallel_double_invocation_exactly_one_runs(tmp_path):
     _fake_tools(fakebin, log, sleep=2)
     repo = _make_repo(tmp_path)
     env = {"PATH": f"{fakebin}:{_SYSTEM_PATH}", "HOME": str(tmp_path),
-           "GENESIS_HOME": str(tmp_path / ".genesis")}
+           "GENESIS_HOME": str(tmp_path / ".genesis"),
+           # Quiet, non-pausing watchdog so the fake tool isn't paused by the
+           # test host's real load (this test bypasses the _run_entry defaults).
+           "CODE_INTEL_WATCHDOG_INTERVAL": "1",
+           "CODE_INTEL_WATCHDOG_WARMUP_S": "0",
+           "CODE_INTEL_FAKE_LOADAVG": "0",
+           "CODE_INTEL_FAKE_IOWAIT": "0"}
     procs = [
         subprocess.Popen(
             ["bash", str(_ENTRYPOINT), str(repo), "cbm"],
@@ -380,6 +392,68 @@ def test_no_systemd_fallback_applies_rlimit(tmp_path):
     res = _run_entry(tmp_path, repo, "cbm", path=str(minbin))
     assert res.returncode == 0, res.stderr
     assert "ULIMIT_V:2097152" in log.read_text()
+
+
+# ── 4. pressure watchdog ──────────────────────────────────────────────────
+
+
+def test_watchdog_wall_cap_kills_stuck_index(tmp_path):
+    """A tool that never finishes is SIGKILLed at the wall cap — a runaway index
+    can't hold the box hostage (the incident's failure mode)."""
+    import time
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    _write_exec(fakebin / "codebase-memory-mcp", "#!/usr/bin/env bash\nsleep 60\n")
+    repo = _make_repo(tmp_path)
+    t0 = time.time()
+    res = _run_entry(
+        tmp_path, repo, "cbm", "fast", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_WATCHDOG_WALL_FAST": "2",
+                   "CODE_INTEL_WATCHDOG_INTERVAL": "1",
+                   "CODE_INTEL_WATCHDOG_WARMUP_S": "0",
+                   "CODE_INTEL_FAKE_LOADAVG": "0"},
+    )
+    elapsed = time.time() - t0
+    assert res.returncode != 0, "a killed index must report failure"
+    assert elapsed < 30, f"wall cap did not kill a 60s tool (took {elapsed:.0f}s)"
+    assert "wall cap" in res.stdout
+
+
+def test_watchdog_pauses_under_pressure(tmp_path):
+    """High load pauses the running index (cgroup freeze / SIGSTOP) — the only
+    working I/O throttle on this host."""
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    _write_exec(fakebin / "codebase-memory-mcp", "#!/usr/bin/env bash\nsleep 20\n")
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", "fast", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_WATCHDOG_WALL_FAST": "4",
+                   "CODE_INTEL_WATCHDOG_INTERVAL": "1",
+                   "CODE_INTEL_WATCHDOG_WARMUP_S": "0",
+                   "CODE_INTEL_FAKE_LOADAVG": "99"},
+    )
+    assert "pausing index" in res.stdout
+
+
+def test_watchdog_full_mode_uses_longer_wall_cap(tmp_path):
+    """full mode reads the FULL wall cap, not the fast one — a legit full rebuild
+    (throttled, duty-cycled) is given time the fast cap wouldn't allow."""
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    _write_exec(fakebin / "codebase-memory-mcp", "#!/usr/bin/env bash\nsleep 3\n")
+    repo = _make_repo(tmp_path)
+    # A 1s FAST cap would kill a 3s tool; the 30s FULL cap lets it finish.
+    res = _run_entry(
+        tmp_path, repo, "cbm", "full", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_WATCHDOG_WALL_FAST": "1",
+                   "CODE_INTEL_WATCHDOG_WALL_FULL": "30",
+                   "CODE_INTEL_WATCHDOG_INTERVAL": "1",
+                   "CODE_INTEL_WATCHDOG_WARMUP_S": "0",
+                   "CODE_INTEL_FAKE_LOADAVG": "0"},
+    )
+    assert res.returncode == 0, res.stdout
+    assert "wall cap" not in res.stdout
 
 
 # ── guardrail: no raw index spawns outside the entrypoint ─────────────────
