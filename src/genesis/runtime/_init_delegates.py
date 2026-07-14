@@ -144,6 +144,10 @@ class _InitDelegatesMixin:
         from genesis.runtime.init.cred_integrity import wire
         wire(self)
 
+    def _init_alert_drain(self) -> None:
+        from genesis.runtime.init.alert_drain import wire
+        wire(self)
+
     async def _init_guardian_monitoring(self) -> None:
         from genesis.runtime.init.guardian import init_guardian_monitoring
         await init_guardian_monitoring(self)
