@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # code_intel_index.sh — the ONE entrypoint for code-intelligence indexing.
 #
-#   Usage: code_intel_index.sh <repo_path> [cbm|gitnexus|both]
+#   Usage: code_intel_index.sh <repo_path> [cbm|gitnexus|both] [fast|moderate|full]
 #
 # Every code-intel index spawn (codebase-memory-mcp cli index_repository,
 # gitnexus analyze) MUST go through this script. Raw spawns caused a
@@ -24,24 +24,42 @@
 #      nice/ionice + a soft address-space rlimit.
 #
 # The script runs the requested tools SEQUENTIALLY in the foreground and
-# exits when done — callers that want fire-and-forget background it
-# themselves (`( code_intel_index.sh "$repo" both ) & disown`), which keeps
-# the lock held by the backgrounded process for its full lifetime.
+# exits when done — but it is NOT meant to be called on every commit anymore.
+# Triggers write an index-request marker (scripts/lib/index_marker.py) and the
+# idle-gated runner (scripts/code_intel_runner.sh) is the only caller that
+# consumes a marker and invokes this entrypoint, when the box is idle. A
+# fire-and-forget spawn here was the second index-storm's trigger.
+#
+# MODE (3rd arg, default fast): fast = filtered files, no similarity/semantic
+# edges — cheap, the routine default. full = all files + similarity/semantic,
+# the expensive pipeline that saturated the container's read throttle; reserve
+# it for the runner's weekly-full window. GitNexus is incremental regardless.
+#
+# Exit codes: 0 success · 1 hard error · 3 a REQUESTED tool was missing from
+# PATH (nothing indexed — the runner must NOT treat this as success, or a
+# minimal-PATH service unit silently disables indexing forever) · the lock-skip
+# path returns CODE_INTEL_INDEX_LOCK_SKIP_RC (default 0; the runner sets 75 to
+# tell "lock held / host-frozen — keep the marker" apart from a real success).
 #
 # Env overrides:
 #   CODE_INTEL_INDEX_MEMORY_MAX   default 2G     (per systemd scope)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
 #   CODE_INTEL_INDEX_CPU_QUOTA    default 200%   (2 cores worth)
+#   CODE_INTEL_INDEX_MODE         default fast   (fast|moderate|full; 3rd arg wins)
+#   CODE_INTEL_INDEX_PERSISTENCE  default true   (cbm .codebase-memory artifact)
+#   CODE_INTEL_INDEX_LOCK_SKIP_RC default 0      (runner sets 75)
 #   CODE_INTEL_INDEX_DISABLE=1    skip all indexing (escape hatch)
 
 set -u
 
 REPO_PATH="${1:-}"
 TOOLS="${2:-both}"
+MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 
 MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-2G}"
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
+PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
 
 _log() { printf '[code-intel-index] %s\n' "$*"; }
 
@@ -56,6 +74,9 @@ if [ -z "$REPO_PATH" ] || [ ! -d "$REPO_PATH" ]; then
 fi
 case "$TOOLS" in cbm|gitnexus|both) ;; *)
     _log "ERROR: tool must be cbm|gitnexus|both, got '$TOOLS'"; exit 1 ;;
+esac
+case "$MODE" in fast|moderate|full) ;; *)
+    _log "ERROR: mode must be fast|moderate|full, got '$MODE'"; exit 1 ;;
 esac
 
 # Physical path (-P): the single-flight lock is keyed on this, and a symlinked
@@ -80,8 +101,13 @@ LOCK_FILE="$LOCK_DIR/code-intel-$(printf '%s' "$REPO_PATH" | sha1sum | cut -c1-1
 # `flock -n 9` failure is indistinguishable from "lock held" otherwise).
 if command -v flock >/dev/null 2>&1 && { exec 9>"$LOCK_FILE"; } 2>/dev/null; then
     if ! flock -n 9; then
+        # Lock held: either a concurrent index, or the host's genesis-code-intel-freeze
+        # unit holding THIS flock as a kill-switch. Default rc 0 (back-compat); the
+        # runner sets CODE_INTEL_INDEX_LOCK_SKIP_RC=75 so it can tell "frozen — keep
+        # the marker" apart from a real success. The lock ACQUISITION above is
+        # byte-unchanged, so the freeze keeps neutralizing every trigger regardless.
         _log "skip: an index for $REPO_PATH is already running (lock held)"
-        exit 0
+        exit "${CODE_INTEL_INDEX_LOCK_SKIP_RC:-0}"
     fi
 else
     _log "WARNING: flock or lock file unavailable ($LOCK_FILE) — proceeding UNLOCKED"
@@ -132,14 +158,20 @@ _run_capped() {
 }
 
 RC=0
+MISSING=""  # requested-but-absent tools — makes a no-op run rc=3, not a false success
 
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
     if command -v codebase-memory-mcp >/dev/null 2>&1; then
-        _log "indexing (codebase-memory-mcp): $REPO_PATH"
+        _log "indexing (codebase-memory-mcp, mode=$MODE): $REPO_PATH"
+        # Flag form (cbm >=0.9): --mode selects the pipeline depth (default here is
+        # fast — no similarity/semantic edges); --persistence writes the shareable
+        # .codebase-memory/graph.db.zst artifact so a wiped cache restores from it
+        # instead of a full 0->100 re-index.
         _run_capped codebase-memory-mcp cli index_repository \
-            "{\"repo_path\": \"$REPO_PATH\"}" || RC=$?
+            --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" || RC=$?
     else
         _log "codebase-memory-mcp not on PATH — skipped"
+        MISSING="${MISSING}cbm "
     fi
 fi
 
@@ -151,11 +183,26 @@ if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
         _GN="npx gitnexus"
     fi
     if [ -n "$_GN" ]; then
+        # gitnexus analyze is already incremental (only -f forces a full re-parse)
+        # and quiet by default (-v opts into verbose), so no mode plumbing here.
+        # NOTE: the `--quiet` flag added in #910 does NOT exist in gitnexus 1.6.x
+        # ("error: unknown option '--quiet'" -> rc 1 on EVERY run); it silently
+        # broke every entrypoint-driven gitnexus index since #910. Dropped.
         _log "indexing (gitnexus analyze): $REPO_PATH"
-        ( cd "$REPO_PATH" && _run_capped $_GN analyze --quiet ) || RC=$?
+        ( cd "$REPO_PATH" && _run_capped $_GN analyze ) || RC=$?
     else
         _log "gitnexus not available — skipped"
+        MISSING="${MISSING}gitnexus "
     fi
+fi
+
+# B1: a requested tool absent from PATH means NOTHING was indexed for it. Never
+# report that as success (rc 0) — the idle runner would consume the marker and
+# stamp a fresh full-index timestamp, silently disabling indexing until someone
+# notices the graph is stale. Distinct rc 3 == "requested tool missing".
+if [ "$RC" = "0" ] && [ -n "$MISSING" ]; then
+    _log "ERROR: requested tool(s) missing from PATH: ${MISSING%% } — nothing indexed (rc=3)"
+    RC=3
 fi
 
 _log "done (rc=$RC): $REPO_PATH"

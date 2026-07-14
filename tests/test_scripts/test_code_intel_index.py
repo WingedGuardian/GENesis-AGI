@@ -160,8 +160,11 @@ def test_main_repo_runs_both_tools(tmp_path):
     assert res.returncode == 0, res.stderr
     out = log.read_text()
     assert "codebase-memory-mcp ARGS:cli" in out
-    assert f'"repo_path": "{repo}"' in out
-    assert re.search(r"gitnexus ARGS:analyze --quiet", out)
+    assert f"--repo-path {repo}" in out
+    assert "--mode fast" in out  # default mode is fast
+    assert "--persistence true" in out
+    assert re.search(r"gitnexus ARGS:analyze\b", out)
+    assert "--quiet" not in out  # #910's bogus flag removed (gitnexus 1.6 has none)
 
 
 def test_tool_selection_cbm_only(tmp_path):
@@ -182,17 +185,57 @@ def test_tool_selection_gitnexus_only(tmp_path):
     res = _run_entry(tmp_path, repo, "gitnexus", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stderr
     out = log.read_text()
-    assert "gitnexus ARGS:analyze --quiet" in out
+    assert "gitnexus ARGS:analyze" in out
+    assert "--quiet" not in out
     assert "codebase-memory-mcp ARGS:" not in out
 
 
-def test_missing_tools_skip_cleanly(tmp_path):
-    # No indexer binaries anywhere on PATH → informative skip, exit 0.
+def test_missing_requested_tools_return_rc3(tmp_path):
+    # A REQUESTED tool absent from PATH must be rc 3 — never a false success, or
+    # the idle runner consumes the marker + stamps a fresh full-index timestamp,
+    # silently disabling indexing until someone notices the graph is stale.
     repo = _make_repo(tmp_path)
     res = _run_entry(tmp_path, repo, "both", path=str(_minimal_path(tmp_path)))
-    assert res.returncode == 0, res.stderr
+    assert res.returncode == 3, res.stderr
     assert "codebase-memory-mcp not on PATH" in res.stdout
     assert "gitnexus not available" in res.stdout
+    assert "missing from PATH" in res.stdout
+
+
+def test_mode_arg_reaches_cbm(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", "full", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stderr
+    assert "--mode full" in log.read_text()
+
+
+def test_mode_env_default_used_when_arg_absent(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+                     env_extra={"CODE_INTEL_INDEX_MODE": "moderate"})
+    assert res.returncode == 0, res.stderr
+    assert "--mode moderate" in log.read_text()
+
+
+def test_bad_mode_errors(tmp_path):
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", "turbo", path=_SYSTEM_PATH)
+    assert res.returncode == 1
+    assert "fast|moderate|full" in res.stdout
+
+
+def test_persistence_env_override(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+                     env_extra={"CODE_INTEL_INDEX_PERSISTENCE": "false"})
+    assert res.returncode == 0, res.stderr
+    assert "--persistence false" in log.read_text()
 
 
 # ── 2. single-flight lock ─────────────────────────────────────────────────
@@ -215,6 +258,22 @@ def test_lock_held_skips_without_running(tmp_path):
         res = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stderr
     assert "already running" in res.stdout
+    assert not log.exists()
+
+
+def test_lock_skip_rc_override(tmp_path):
+    # The runner sets CODE_INTEL_INDEX_LOCK_SKIP_RC=75 so it can tell "lock held
+    # / host-frozen — keep the marker" apart from a real success (rc 0). The lock
+    # ACQUISITION is byte-unchanged, so the host freeze still neutralizes it.
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    lock_file = _lock_file_for(tmp_path, repo)
+    with open(lock_file, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        res = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}",
+                         env_extra={"CODE_INTEL_INDEX_LOCK_SKIP_RC": "75"})
+    assert res.returncode == 75, res.stderr
     assert not log.exists()
 
 

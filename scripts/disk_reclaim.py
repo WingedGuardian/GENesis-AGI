@@ -4,16 +4,22 @@
 Companion to ``worktree_lifecycle.py`` (which reaps merged worktrees). This
 handles the OTHER disk accumulators: regenerable caches and stale output.
 
-Three tiers, cleared in order until the disk is comfortable:
+Tiers, cleared in order until the disk is comfortable:
 
-  CHEAP   — always cleared on ``--apply``. Rebuild is free/near-free
-            (package-manager download caches).
-  MEDIUM  — cleared only when disk usage >= ``--if-above`` PCT. Rebuild is
-            expensive (a CBM / GitNexus reindex), so we only pay it under
-            genuine pressure.
-  SYSTEM  — best-effort, needs sudo + write access to /var. Silently skipped
-            when unavailable (e.g. inside the hardened systemd service, which
-            runs with NoNewPrivileges + ProtectSystem=strict).
+  CHEAP       — always cleared on ``--apply``. Rebuild is free/near-free
+                (package-manager download caches).
+  MEDIUM      — cleared only when disk usage >= ``--if-above`` PCT. Rebuild is
+                expensive, so we only pay it under genuine pressure.
+  LAST_RESORT — the code-intel index DBs. Deleting these turns every later
+                "incremental" index into a full 0->100 rebuild, which read-
+                saturates the container and storms it (2026-07 incident). So
+                they are cleared ONLY at >= ``--last-resort-above`` PCT (default
+                95, well past the medium gate), and clearing one drops an
+                index-request marker so the rebuild runs idle-gated via the
+                code-intel runner, never as an unthrottled reactive spawn.
+  SYSTEM      — best-effort, needs sudo + write access to /var. Silently
+                skipped when unavailable (e.g. inside the hardened systemd
+                service, which runs with NoNewPrivileges + ProtectSystem=strict).
 
 NEVER touches: the git repo tree, .venv, data/, config/, secrets, browser
 profiles (they hold logins), ~/tau3-bench, embedding_cache (re-embedding costs
@@ -24,6 +30,7 @@ Usage:
     disk_reclaim.py                         # dry-run (report only) — default
     disk_reclaim.py --apply                 # clear CHEAP tier
     disk_reclaim.py --apply --if-above 90   # also clear MEDIUM tier if >= 90%
+    disk_reclaim.py --apply --last-resort-above 95  # also clear index DBs if >= 95%
 
 Note: ~/.genesis/output is intentionally NOT touched — those are generated
 deliverables (not regenerable cache), managed by the user, not this tool.
@@ -39,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -75,7 +83,7 @@ class CacheTarget:
 
     description: str
     path: Path
-    tier: str  # "cheap" | "medium"
+    tier: str  # "cheap" | "medium" | "last_resort"
 
 
 # Directories cleared wholesale (they are pure regenerable caches). Each is
@@ -86,11 +94,11 @@ _CACHE_TARGETS: list[CacheTarget] = [
     CacheTarget("uv download cache", HOME / ".cache" / "uv", "cheap"),
     CacheTarget("pip cache", HOME / ".cache" / "pip", "cheap"),
     CacheTarget("codebase-memory-mcp index (forces reindex)",
-                HOME / ".cache" / "codebase-memory-mcp", "medium"),
+                HOME / ".cache" / "codebase-memory-mcp", "last_resort"),
     CacheTarget("code-graph cache (forces reindex)",
-                HOME / ".cache" / "code-graph", "medium"),
+                HOME / ".cache" / "code-graph", "last_resort"),
     CacheTarget("GitNexus index (forces reanalyze)",
-                HOME / "genesis" / ".gitnexus", "medium"),
+                HOME / "genesis" / ".gitnexus", "last_resort"),
 ]
 
 
@@ -181,6 +189,30 @@ def _is_safe_target(path: Path) -> bool:
 
 
 # ─── Reclaim operations ──────────────────────────────────────────────────
+
+
+def _drop_index_marker() -> bool:
+    """Queue an idle-gated reindex of ~/genesis after wiping a code-intel DB.
+
+    Deleting an index DB forces a from-scratch rebuild; routing it through a
+    request marker means the idle-gated runner rebuilds it politely, instead of
+    the next random commit spawning an unthrottled full index (the 2026-07
+    read storm). Imports the marker module BY PATH so disk_reclaim keeps its
+    stdlib-only, no-genesis-imports property (runs even when the venv/server is
+    unhealthy). Never raises — a marker failure must not block reclamation.
+    """
+    try:
+        lib = str(pathlib.Path(__file__).resolve().parent / "lib")
+        if lib not in sys.path:
+            sys.path.insert(0, lib)
+        import index_marker  # stdlib-only sibling
+
+        index_marker.write_marker(str(HOME / "genesis"), tools="both", mode="fast")
+        _log(f"Queued idle reindex marker for {HOME / 'genesis'} (index DB cleared)")
+        return True
+    except Exception as exc:  # noqa: BLE001 — best-effort, never block reclaim
+        _log(f"WARN: could not drop index-request marker: {exc}")
+        return False
 
 
 def _clear_cache(target: CacheTarget, *, apply: bool) -> int:
@@ -279,6 +311,10 @@ def main() -> int:
     parser.add_argument("--if-above", type=float, default=101.0, metavar="PCT",
                         help="Also clear MEDIUM tier when disk usage >= PCT "
                              "(default 101 = never)")
+    parser.add_argument("--last-resort-above", type=float, default=95.0, metavar="PCT",
+                        help="Also clear LAST_RESORT tier (code-intel index DBs) "
+                             "when disk usage >= PCT (default 95). Clearing one "
+                             "drops an index-request marker for an idle rebuild.")
     parser.add_argument("--fail-above", type=float, default=101.0, metavar="PCT",
                         help="Exit non-zero if usage is still >= PCT after "
                              "applying (signals 'cleaned but still critical' to "
@@ -290,18 +326,31 @@ def main() -> int:
     apply = args.apply and not args.dry_run
     pct = _disk_pct()
     include_medium = pct >= args.if_above
+    include_last_resort = pct >= args.last_resort_above
 
     _log(f"Disk reclaim starting (usage={pct:.1f}%, mode={'APPLY' if apply else 'DRY-RUN'}, "
-         f"medium_tier={'ON' if include_medium else 'OFF'} @>={args.if_above})")
+         f"medium_tier={'ON' if include_medium else 'OFF'} @>={args.if_above}, "
+         f"last_resort_tier={'ON' if include_last_resort else 'OFF'} @>={args.last_resort_above})")
 
     total = 0
+    dropped_marker = False
     for target in _CACHE_TARGETS:
         if target.tier == "medium" and not include_medium:
             if target.path.exists():
                 _log(f"HOLD [medium] {target.description}: disk {pct:.1f}% "
                      f"< {args.if_above}% threshold ({target.path})")
             continue
-        total += _clear_cache(target, apply=apply)
+        if target.tier == "last_resort" and not include_last_resort:
+            if target.path.exists():
+                _log(f"HOLD [last_resort] {target.description}: disk {pct:.1f}% "
+                     f"< {args.last_resort_above}% threshold ({target.path})")
+            continue
+        reclaimed = _clear_cache(target, apply=apply)
+        total += reclaimed
+        # A cleared index DB means the next index is from-scratch — queue it for
+        # the idle runner instead of leaving it to a reactive commit-time spawn.
+        if apply and reclaimed > 0 and target.tier == "last_resort":
+            dropped_marker = _drop_index_marker() or dropped_marker
 
     if args.system:
         total += _system_clean(apply=apply)
