@@ -786,9 +786,12 @@ async def memory_proactive(
     results = await memory_mod._retriever.recall(
         current_message, limit=limit * 2, min_activation=0.0, rerank=False
     )
-    filtered = [r for r in results if "memory_operation" not in (r.payload.get("tags") or [])][
-        :limit
-    ]
+    # Keep the full candidate pool (recall fetched limit*2) UNSLICED — the
+    # enforce drop below removes items, and slicing to `limit` first would
+    # leave the result underfilled when the top slice is blockable-external
+    # while safe candidates sit just past it (Codex #1048 P2). We take the
+    # final `limit` AFTER dropping, backfilling from the deeper pool.
+    filtered = [r for r in results if "memory_operation" not in (r.payload.get("tags") or [])]
     # Injection defense (PR2): recall defaults to source="both", so KB content
     # can appear here and flow straight into prompt context — wrap external-world
     # items so the model treats them as data, not first-party instructions.
@@ -797,6 +800,8 @@ async def memory_proactive(
     dropped = 0
     _unsupervised = immunity_shadow.is_dispatched_session_env()
     for r in filtered:
+        if len(out) >= limit:
+            break
         d = asdict(r)
         # WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): memory_proactive is a
         # query-less ambient feed — in a DISPATCHED session under enforce,
@@ -918,7 +923,10 @@ async def memory_core_facts(
         )
 
     scored.sort(key=lambda x: x[1], reverse=True)
-    top = scored[:limit]
+    # Keep the full scored pool (scroll fetched limit*3) — the enforce drop
+    # below can remove top-ranked blockable-external facts, and slicing to
+    # `limit` first would underfill the result when safe facts sit just past
+    # the top slice (Codex #1048 P2). We take the final `limit` AFTER dropping.
 
     # Stored-origin enrichment: a point whose Qdrant payload predates the
     # origin_class payload backfill carries None here, but SQLite
@@ -926,13 +934,13 @@ async def memory_core_facts(
     # would bypass both the enforce drop and the wrap below (the episodic
     # collection can never flag via the fallback derivation). Best-effort: on
     # any error items keep their payload values (fail-open, gate posture).
-    _missing = [item["memory_id"] for item, _ in top if item.get("origin_class") is None]
+    _missing = [item["memory_id"] for item, _ in scored if item.get("origin_class") is None]
     if _missing:
         try:
             from genesis.db.crud import memory as memory_crud
 
             _by_id = await memory_crud.origin_class_by_ids(memory_mod._db, _missing)
-            for item, _ in top:
+            for item, _ in scored:
                 if item.get("origin_class") is None:
                     item["origin_class"] = _by_id.get(item["memory_id"])
         except Exception:
@@ -950,7 +958,9 @@ async def memory_core_facts(
     dropped = 0
     _unsupervised = immunity_shadow.is_dispatched_session_env()
     _kept: list[tuple[dict, float]] = []
-    for item, score in top:
+    for item, score in scored:
+        if len(_kept) >= limit:
+            break
         # WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): core_facts is a
         # query-less ambient feed — dispatched session + enforce -> DROP the
         # blockable item (still recorded below). Otherwise wrap-and-return.

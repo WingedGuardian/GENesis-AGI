@@ -879,3 +879,87 @@ async def test_memory_expand_backfills_stale_payload_origin(config_dirs, monkeyp
     assert "<external-content" in items[0]["content"]
     assert items[0]["provenance"].startswith("external-world knowledge")
     assert items[0]["origin_class"] == "external_untrusted"
+
+
+async def test_memory_proactive_refills_after_enforced_drops(config_dirs, monkeypatch, db):
+    """Codex #1048 P2: dropping blockable-external items must not underfill the
+    result — safe candidates from the deeper pool (recall fetches limit*2)
+    backfill so the caller still gets `limit` memories."""
+    base, _ = config_dirs
+    _write(base, {"injection": {"mode": "enforce"}})
+    _dispatched(monkeypatch)
+
+    import genesis.mcp.memory_mcp as mod
+
+    # Top of the pool is blockable-external; safe first-party sit just past it.
+    retriever = MagicMock()
+    retriever.recall = AsyncMock(
+        return_value=[
+            _rr("ext-1", "external_untrusted"),
+            _rr("ext-2", "external_untrusted"),
+            _rr("fp-1", "first_party"),
+            _rr("fp-2", "first_party"),
+        ]
+    )
+    old = (mod._store, mod._db, mod._retriever)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._retriever = retriever
+        tools = await _mcp_tools()
+        out = await tools["memory_proactive"].fn(current_message="hello", limit=2)
+    finally:
+        mod._store, mod._db, mod._retriever = old
+
+    ids = [d["memory_id"] for d in out]
+    assert ids == ["fp-1", "fp-2"], f"expected backfill to limit, got {ids}"
+
+
+async def test_memory_core_facts_refills_after_enforced_drops(config_dirs, monkeypatch, db):
+    """Codex #1048 P2: core_facts must backfill from the deeper scroll pool
+    (limit*3) when the top-activation slice is blockable-external."""
+    base, _ = config_dirs
+    _write(base, {"injection": {"mode": "enforce"}})
+    _dispatched(monkeypatch)
+
+    import genesis.mcp.memory_mcp as mod
+
+    def _point(mid, origin, content, confidence):
+        payload = {
+            "content": content,
+            "source": "test",
+            "confidence": confidence,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "retrieved_count": 1,
+            "memory_class": "fact",
+            "wing": "",
+            "room": "",
+            "source_pipeline": "conversation",
+        }
+        if origin is not None:
+            payload["origin_class"] = origin
+        return SimpleNamespace(id=mid, payload=payload)
+
+    qdrant = MagicMock()
+    qdrant.scroll.return_value = (
+        [
+            # Higher confidence → higher activation → sorts first, but blockable.
+            _point("ext-hi", "external_untrusted", INJECTION_TEXT, 0.95),
+            _point("fp-lo", "first_party", "benign fact", 0.75),
+        ],
+        None,
+    )
+    qdrant.retrieve.return_value = []
+    old = (mod._store, mod._db, mod._qdrant, mod._retriever)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._qdrant = qdrant
+        mod._retriever = MagicMock()
+        tools = await _mcp_tools()
+        out = await tools["memory_core_facts"].fn(limit=1)
+    finally:
+        mod._store, mod._db, mod._qdrant, mod._retriever = old
+
+    ids = [d["memory_id"] for d in out]
+    assert ids == ["fp-lo"], f"expected backfill past the dropped external, got {ids}"
