@@ -2154,6 +2154,18 @@ function updateSubsystemGrid(data) {
             if (q.pending_embeddings) { enrichment.appendChild(sectionRow('Pending', String(q.pending_embeddings), 'color:#ffe600')); hasEnrichment = true; }
             if (q.failed_embeddings) { enrichment.appendChild(sectionRow('Failed', String(q.failed_embeddings), 'color:#ef4444')); hasEnrichment = true; }
 
+            // Permanent embedding backlog: memory_metadata rows stuck at
+            // embedding_status='failed' (keyword-only forever). Distinct from the
+            // transient queue 'Failed' above (pending_embeddings table, TTL-reaped)
+            // — this durable mirror survives the reaper and is what the awareness
+            // probe escalates on. Shown only when non-zero (baseline is 0).
+            const eb = mh.embedding_backlog || {};
+            if (eb.failed) {
+                const ebVal = eb.failed + ' no-vector (permanent)' + (eb.pending ? ' · ' + eb.pending + ' pending' : '');
+                enrichment.appendChild(sectionRow('Embed backlog', ebVal, 'color:#ef4444'));
+                hasEnrichment = true;
+            }
+
             if (mh.growth) {
                 const g = mh.growth;
                 if (g.last_7d !== undefined) { enrichment.appendChild(sectionRow('+7d', String(g.last_7d))); hasEnrichment = true; }

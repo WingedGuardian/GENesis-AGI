@@ -141,6 +141,27 @@ async def _code_index_stats(db: aiosqlite.Connection) -> dict:
         return {}
 
 
+async def _embedding_backlog(db: aiosqlite.Connection) -> dict:
+    """Non-vector-searchable memory counts for the neural-monitor dashboard.
+
+    ``failed`` = the embedding recovery worker gave up (permanent, keyword-only
+    — the signal the awareness probe escalates on); ``pending`` = embed queued
+    and still self-healing. ``fts5_only`` is deliberately excluded — it is a
+    permanent keyword-only write by design, not degradation. Shares the one
+    grouped aggregate the awareness probe uses (SQLite is authoritative)."""
+    try:
+        from genesis.db.crud.memory import embedding_status_counts
+
+        counts = await embedding_status_counts(db)
+        return {
+            "failed": counts.get("failed", 0),
+            "pending": counts.get("pending", 0),
+        }
+    except Exception:
+        logger.debug("embedding backlog query failed", exc_info=True)
+        return {}
+
+
 def _essential_knowledge_stats() -> dict:
     """EK file age and size."""
     try:
@@ -183,6 +204,7 @@ async def memory_health(db: aiosqlite.Connection | None) -> dict:
         links = await _link_distribution(db)
         extraction = await _extraction_coverage(db)
         code_index = await _code_index_stats(db)
+        embedding_backlog = await _embedding_backlog(db)
         ek = _essential_knowledge_stats()
 
         # Derive health status
@@ -203,6 +225,7 @@ async def memory_health(db: aiosqlite.Connection | None) -> dict:
             "links": links,
             "extraction": extraction,
             "code_index": code_index,
+            "embedding_backlog": embedding_backlog,
             "essential_knowledge": ek,
         }
     except ImportError:

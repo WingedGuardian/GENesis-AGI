@@ -386,7 +386,10 @@ verified: 780cc8de 2026-07-10
   collectors). Tick → depth classification (MICRO/LIGHT/DEEP/STRATEGIC) →
   reflection dispatch. Also per-tick `_check_*` housekeeping: CC-slot RSS leak
   watch, subscription-cap detection, SQLite WAL hygiene, resilience-axis folds,
-  liveness heartbeat. It does NOT drive the ego cadence (ego has its own
+  liveness heartbeat, and (hourly) embedding-backlog degradation — counts
+  `memory_metadata.embedding_status='failed'` (permanently keyword-only rows the
+  rate alert misses), hybrid `high` (dashboard) / `critical` (Telegram) by band.
+  It does NOT drive the ego cadence (ego has its own
   scheduler). Trap: PEP 562 lazy `__init__` — don't eager-import `loop.py`.
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
   a CC bridge) run in-process via the router; DEEP/STRATEGIC go to the CC
