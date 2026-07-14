@@ -341,6 +341,11 @@ class GuardianConfig:
         return Path(self.state_dir).expanduser()
 
     @property
+    def shared_path(self) -> Path:
+        """Host-side root of the container's ~/.genesis/shared mount."""
+        return self.state_path / self.briefing.shared_subdir
+
+    @property
     def briefing_path(self) -> Path:
         """Full path to the Guardian briefing file on the host."""
         return (
