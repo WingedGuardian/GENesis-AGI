@@ -11,6 +11,8 @@ import json
 import time
 from pathlib import Path
 
+import pytest
+
 from genesis.guardian.alert import queue as q
 
 
@@ -107,6 +109,7 @@ def test_malformed_entry_quarantined_not_wedging(tmp_path: Path) -> None:
     assert not (root / "bad.json").exists()
 
 
+@pytest.mark.asyncio
 async def test_drain_delivers_and_unlinks(tmp_path: Path) -> None:
     root = tmp_path / "queue"
     for i in range(3):
@@ -123,6 +126,7 @@ async def test_drain_delivers_and_unlinks(tmp_path: Path) -> None:
     assert _entries(root) == []
 
 
+@pytest.mark.asyncio
 async def test_drain_stops_on_transient_failure(tmp_path: Path) -> None:
     root = tmp_path / "queue"
     root.mkdir()
@@ -154,6 +158,7 @@ async def test_drain_stops_on_transient_failure(tmp_path: Path) -> None:
     assert remaining == ["t1", "t2"]
 
 
+@pytest.mark.asyncio
 async def test_drain_rejected_is_terminal_unlinks(tmp_path: Path) -> None:
     # A caller mapping REJECTED→True must see the entry removed, not stuck.
     root = tmp_path / "queue"
@@ -166,6 +171,7 @@ async def test_drain_rejected_is_terminal_unlinks(tmp_path: Path) -> None:
     assert _entries(root) == []
 
 
+@pytest.mark.asyncio
 async def test_drain_send_raising_keeps_entry(tmp_path: Path) -> None:
     root = tmp_path / "queue"
     q.enqueue_alert(root, severity="info", source="s", title="t", body="b")
@@ -178,6 +184,7 @@ async def test_drain_send_raising_keeps_entry(tmp_path: Path) -> None:
     assert len(_entries(root)) == 1  # kept, not lost
 
 
+@pytest.mark.asyncio
 async def test_drain_respects_max_per_run(tmp_path: Path) -> None:
     root = tmp_path / "queue"
     for i in range(5):
@@ -191,6 +198,7 @@ async def test_drain_respects_max_per_run(tmp_path: Path) -> None:
     assert len(_entries(root)) == 3
 
 
+@pytest.mark.asyncio
 async def test_drain_missing_root_is_noop(tmp_path: Path) -> None:
     async def send(entry: dict) -> bool:
         return True
