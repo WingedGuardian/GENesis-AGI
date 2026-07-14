@@ -685,6 +685,9 @@ class DirectSessionRunner:
             source_tag=request.source_tag,
             dispatch_mode="direct",
             profile=request.profile,
+            # WS-3: same per-profile provenance the CCInvocation env stamp
+            # uses (_build_invocation) — now durable in cc_sessions.
+            origin=_PROFILE_ORIGIN.get(request.profile),
             # Record the skills resolved for this session so the
             # skill-evolution effectiveness analyzer has usage signal.
             # (Same resolution used for prompt injection in _build_invocation.)

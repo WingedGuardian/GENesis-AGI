@@ -52,8 +52,18 @@ async def ingest_haystack(
     *,
     origin_class: str = ORIGIN_FIRST_PARTY,
     source: str = _SOURCE,
+    auto_link: bool = False,
 ) -> IngestResult:
-    """Store every non-empty haystack turn as an episodic first-party memory."""
+    """Store every non-empty haystack turn as an episodic first-party memory.
+
+    ``auto_link=True`` (graph arm only; needs a store built ``with_linker``)
+    creates similarity links at insert time exactly as prod does: each turn
+    links against the ALREADY-ingested earlier turns, so link topology is
+    prod-faithful (later→earlier edges; a post-hoc pass would produce edges to
+    later memories that prod can never build). Baseline arms keep ``False`` —
+    links contaminate ranking for every arm sharing a store (graph boost AND
+    activation connectivity), so the graph arm gets its own store.
+    """
     stored = 0
     evidence: set[str] = set()
     for _session_idx, turn, date in instance.iter_turns():
@@ -69,10 +79,7 @@ async def ingest_haystack(
             memory_type="episodic",
             origin_class=origin_class,
             valid_at=normalize_date(date),
-            # No cross-memory linking: the linker is unwired for the ephemeral
-            # store, and the benchmark measures recall of stored evidence, not
-            # associative link quality. auto_link would be a no-op anyway.
-            auto_link=False,
+            auto_link=auto_link,
         )
         stored += 1
         if turn.has_answer:

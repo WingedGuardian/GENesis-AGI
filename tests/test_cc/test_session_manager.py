@@ -214,3 +214,30 @@ async def test_cleanup_stale_respects_cutoff(db, manager):
     assert count == 0
     row = await cc_sessions.get_by_id(db, "fresh-bg")
     assert row["status"] == "active"
+
+
+async def test_create_background_stamps_origin(db, manager):
+    sess = await manager.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        origin="external_untrusted",
+    )
+    row = await cc_sessions.get_by_id(db, sess["id"])
+    assert row["origin_class"] == "external_untrusted"
+
+
+async def test_create_background_origin_defaults_null(db, manager):
+    sess = await manager.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+    )
+    row = await cc_sessions.get_by_id(db, sess["id"])
+    assert row["origin_class"] is None
+
+
+async def test_foreground_origin_stays_null(db, manager):
+    sess = await manager.get_or_create_foreground(
+        user_id="u1", channel=ChannelType.TELEGRAM,
+    )
+    row = await cc_sessions.get_by_id(db, sess["id"])
+    assert row["origin_class"] is None  # owner-supervised, read first_party

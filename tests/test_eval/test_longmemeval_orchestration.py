@@ -20,6 +20,7 @@ from genesis.eval.longmemeval.dataset import LongMemEvalInstance, Turn
 from genesis.eval.longmemeval.query import QueryArm
 from genesis.eval.longmemeval.runner import Arm, run_longmemeval
 from genesis.qdrant.collections import VECTOR_DIM
+from tests.test_eval.lme_fixtures import make_linkable_instance as _multi_evidence_instance
 
 _TOKEN = re.compile(r"[a-z0-9]+")
 
@@ -92,6 +93,224 @@ def _instance(qid: str) -> LongMemEvalInstance:
         ],
         answer_session_ids=["a1"],
     )
+
+
+class _PromptRecordingClient:
+    """Sync client that records every prompt and answers deterministically."""
+
+    def __init__(self):
+        self.prompts: list[str] = []
+        self._lock = threading.Lock()
+
+        chat = type("Chat", (), {})()
+        completions = type("Completions", (), {})()
+
+        def create(**kwargs):
+            with self._lock:
+                self.prompts.append(kwargs["messages"][0]["content"])
+            return _FakeCompletion("yes Business Administration")
+
+        completions.create = create
+        chat.completions = completions
+        self.chat = chat
+
+
+@pytest.mark.asyncio
+async def test_run_longmemeval_dumps_jsonl_and_anchors_date(tmp_path):
+    """--dump-dir writes one JSONL per arm with per-question diagnostics, and
+    the reader prompt carries the upstream 'Current Date:' anchor end-to-end."""
+    import json as _json
+
+    instances = [_instance("q1"), _instance("q2")]
+    client = _PromptRecordingClient()
+    summaries = await run_longmemeval(
+        instances,
+        db=None,
+        arms=[Arm(QueryArm.RAW, rerank=False)],
+        k=5,
+        concurrency=2,
+        client=client,
+        embedding_provider=_HashingEmbedder(),
+        dump_dir=tmp_path,
+    )
+    dump = tmp_path / "raw.jsonl"
+    assert dump.exists()
+    recs = [_json.loads(line) for line in dump.read_text().splitlines()]
+    assert len(recs) == 2
+    for rec in recs:
+        assert rec["arm"] == "raw"
+        assert rec["query"]
+        assert rec["recalled_ids"]
+        assert rec["evidence_coverage"] == 1.0  # single evidence turn, k=5
+        assert rec["hypothesis"]
+        assert "judged_correct" in rec
+    # dump path is recorded on the persisted summary metadata
+    assert summaries["raw"].metadata["dump_path"] == str(dump)
+    # reader prompts (not judge prompts) carry the upstream date anchor
+    reader_prompts = [p for p in client.prompts if "MEMORIES:" in p]
+    assert reader_prompts
+    assert all("Current Date: 2023/05/23 (Tue) 19:11" in p for p in reader_prompts)
+
+
+@pytest.mark.asyncio
+async def test_graph_arm_isolated_dual_store_and_expansion(tmp_path):
+    """The graph arm runs on its OWN linked store (baseline store stays
+    link-free: activation-connectivity would otherwise tint baseline ranking),
+    and 1-hop expansion merges the linked-but-unretrieved evidence turn."""
+    import json as _json
+
+    instances = [_multi_evidence_instance("q1")]
+    client = _PromptRecordingClient()
+    summaries = await run_longmemeval(
+        instances,
+        db=None,
+        arms=[
+            Arm(QueryArm.RAW, rerank=False),
+            Arm(QueryArm.RAW, rerank=False, graph=True),
+        ],
+        k=1,
+        concurrency=1,
+        client=client,
+        embedding_provider=_HashingEmbedder(),
+        dump_dir=tmp_path,
+    )
+    base = _json.loads((tmp_path / "raw.jsonl").read_text().splitlines()[0])
+    graph = _json.loads((tmp_path / "raw+graph.jsonl").read_text().splitlines()[0])
+
+    # baseline arm: link-free store, no expansion fields populated
+    assert base["links_created"] == 0
+    assert base["expanded_ids"] == []
+    assert base["evidence_coverage"] == 0.5  # k=1 of 2 evidence turns
+
+    # graph arm: links were created at ingest on its own store
+    assert graph["links_created"] >= 1
+    # top-K metrics stay baseline-comparable...
+    assert graph["evidence_coverage"] == 0.5
+    # ...and expansion pulls the linked sibling: full coverage post-expansion
+    assert graph["expanded_ids"]
+    assert graph["evidence_coverage_final"] == 1.0
+    assert graph["evidence_recalled_final"] is True
+
+    # summary means surface the graph diagnostics
+    assert summaries["raw+graph"].scores["evidence_coverage_final_mean"] == 1.0
+    assert summaries["raw+graph"].metadata["links_created_mean"] >= 1
+    # the reader saw MORE memories in the graph arm (expanded context)
+    reader_prompts = [p for p in client.prompts if "MEMORIES:" in p]
+    assert max(p.count("\n- ") for p in reader_prompts) > min(
+        p.count("\n- ") for p in reader_prompts
+    )
+
+
+@pytest.mark.asyncio
+async def test_link_threshold_reaches_the_linker(tmp_path, caplog):
+    """The link_threshold plumbing chain (run_longmemeval -> run_question ->
+    ephemeral_store -> MemoryLinker) is real: a near-1.0 threshold makes the
+    otherwise-linkable pair form ZERO links and fires the loud warning."""
+    import json as _json
+
+    instances = [_multi_evidence_instance("q1")]
+    client = _PromptRecordingClient()
+    with caplog.at_level("WARNING", logger="genesis.eval.longmemeval"):
+        await run_longmemeval(
+            instances,
+            db=None,
+            arms=[Arm(QueryArm.RAW, rerank=False, graph=True)],
+            k=1,
+            concurrency=1,
+            client=client,
+            embedding_provider=_HashingEmbedder(),
+            dump_dir=tmp_path,
+            link_threshold=0.999,
+        )
+    rec = _json.loads((tmp_path / "raw+graph.jsonl").read_text().splitlines()[0])
+    assert rec["links_created"] == 0
+    assert rec["expanded_ids"] == []
+    assert any("zero links" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_graph_block_failure_keeps_baseline_results(tmp_path, caplog):
+    """A graph-store failure skips ONLY the graph arms: completed (judged)
+    baseline results are kept, and the skip ledger never records an attempted
+    arm as 'NOT attempted' (per-arm skip attribution)."""
+    import json as _json
+
+    instances = [_multi_evidence_instance("q1")]
+    client = _PromptRecordingClient()
+    with caplog.at_level("ERROR", logger="genesis.eval.longmemeval"):
+        summaries = await run_longmemeval(
+            instances,
+            db=None,
+            arms=[
+                Arm(QueryArm.RAW, rerank=False),
+                Arm(QueryArm.RAW, rerank=False, graph=True),
+            ],
+            k=1,
+            concurrency=1,
+            client=client,
+            embedding_provider=_HashingEmbedder(),
+            dump_dir=tmp_path,
+            link_threshold=5.0,  # invalid: MemoryLinker construction raises
+        )
+    # baseline arm: attempted and kept
+    assert summaries["raw"].total_cases == 1
+    assert summaries["raw"].skipped_cases == 0
+    base = _json.loads((tmp_path / "raw.jsonl").read_text().splitlines()[0])
+    assert "skipped" not in base
+    # graph arm: skipped, loudly
+    assert summaries["raw+graph"].skipped_cases == 1
+    graph = _json.loads((tmp_path / "raw+graph.jsonl").read_text().splitlines()[0])
+    assert graph["skipped"] is True
+    assert any("graph store block failed" in r.message for r in caplog.records)
+
+
+def test_select_arms_composition():
+    from genesis.eval.longmemeval.runner import select_arms
+
+    assert {a.label for a in select_arms()} == {
+        "raw",
+        "raw+rerank",
+        "keyword",
+        "keyword+rerank",
+    }
+    assert {a.label for a in select_arms(no_rerank=True, graph=True)} == {
+        "raw",
+        "keyword",
+        "raw+graph",
+        "keyword+graph",
+    }
+    assert len(select_arms(graph=True)) == 8
+
+
+@pytest.mark.asyncio
+async def test_duplicate_arm_labels_rejected():
+    with pytest.raises(ValueError, match="duplicate arm labels"):
+        await run_longmemeval(
+            [],
+            db=None,
+            arms=[Arm(QueryArm.RAW, rerank=False), Arm(QueryArm.RAW, rerank=False)],
+            client=object(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_graph_arm_warns_on_zero_links(tmp_path, caplog):
+    """No-silent-caps parity: a graph arm whose store formed zero links must
+    say so loudly (it would otherwise silently equal its baseline twin)."""
+    instances = [_instance("q1")]  # single turn — nothing to link to
+    client = _PromptRecordingClient()
+    with caplog.at_level("WARNING", logger="genesis.eval.longmemeval"):
+        await run_longmemeval(
+            instances,
+            db=None,
+            arms=[Arm(QueryArm.RAW, rerank=False, graph=True)],
+            k=5,
+            concurrency=1,
+            client=client,
+            embedding_provider=_HashingEmbedder(),
+            dump_dir=tmp_path,
+        )
+    assert any("zero links" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio

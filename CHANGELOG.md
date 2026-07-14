@@ -42,6 +42,39 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Sessions now keep a durable TODO ledger that survives compaction.** An
+  agreement made mid-session ("yes, do that") used to live only in
+  conversation — one compaction summary could quietly drop it. Sessions can
+  now record agreements as ledger items the moment they happen; open items
+  re-inject into every post-compaction window (with a per-turn
+  `[Charter: … | open: N]` tag showing drift at a glance) until they're
+  closed as done, absorbed elsewhere, or consciously dropped. Charters — the
+  session's origin, a living mission line, and pointers to its governing
+  docs — moved from per-session JSON files into the database so all of this
+  is queryable; the human-readable `charter.md` mirror stays.
+
+- **The memory benchmark can now measure whether Genesis's memory graph
+  actually helps.** A new `--graph` mode runs every benchmark arm twice — once
+  against a plain store and once against a store where memories link to
+  similar earlier memories exactly as they do in production — and follows
+  those links at recall time to pull in related memories the search itself
+  missed. Baseline and graph runs use fully separate stores, so the
+  comparison is honest (links can't quietly tint the baseline's ranking). Per
+  question, the results record how many links formed and how much extra gold
+  evidence the graph surfaced, and a graph run that formed no links says so
+  loudly instead of silently matching its baseline. The memory linker's
+  similarity threshold is also now configurable per instance instead of fixed.
+
+- **The memory benchmark now grades temporal questions fairly and explains
+  its misses.** The LongMemEval reader gets the question's date (the
+  benchmark's own convention — without it, "how many weeks ago…" questions
+  were unanswerable by construction), so temporal scores now measure memory,
+  not a missing calendar. New `--dump-dir` writes per-question diagnostics
+  (query, recalled memories, answer, verdict) for failure analysis, a new
+  evidence-coverage metric shows *how much* of the gold evidence was
+  retrieved (not just whether any was), and `--types` runs a single question
+  category — so a targeted slice no longer costs a full 500-question run.
+
 - **Claude Code sessions no longer forget what they were started for.** Long
   sessions compact their context many times, and each summary is biased toward
   recent work — after enough compactions a session can no longer connect

@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import sqlite3
 from pathlib import Path
 
 # Load the hook scripts as modules (not packages — use importlib)
@@ -193,8 +194,42 @@ def test_extract_origin_survives_malformed_lines(tmp_path):
 # ── charter lifecycle via main() ────────────────────────────────────────────
 
 
+def _make_db(tmp_path: Path) -> Path:
+    """tmp GENESIS_REPO_ROOT with data/genesis.db carrying the 0058 tables.
+
+    Uses the canonical DDL from db/schema/_tables.py so the fresh-DB mirror
+    is exactly what the hook is exercised against. Idempotent.
+    """
+    from genesis.db.schema._tables import TABLES
+
+    root = tmp_path / "repo"
+    (root / "data").mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(root / "data" / "genesis.db")
+    conn.execute(TABLES["session_charters"])
+    conn.execute(TABLES["session_ledger"])
+    conn.commit()
+    conn.close()
+    return root
+
+
+def _db_row(tmp_path: Path, session_id: str) -> dict | None:
+    conn = sqlite3.connect(tmp_path / "repo" / "data" / "genesis.db")
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM session_charters WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def _run_main(
-    monkeypatch, tmp_path, *, session_id: str, transcript: Path | str, trigger: str = "manual"
+    monkeypatch,
+    tmp_path,
+    *,
+    session_id: str,
+    transcript: Path | str,
+    trigger: str = "manual",
+    with_db: bool = True,
 ):
     """Invoke the hook main() the way CC does: stdin JSON, env, module dirs."""
     sessions_dir = tmp_path / "sessions"
@@ -203,6 +238,8 @@ def _run_main(
     monkeypatch.setattr(_pc, "_SESSIONS_DIR", sessions_dir)
     monkeypatch.setattr(_pc, "_FLAG", flag)
     monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
+    root = _make_db(tmp_path) if with_db else tmp_path / "repo"
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(root))
     stdin_payload = json.dumps(
         {
             "session_id": session_id,
@@ -220,13 +257,14 @@ def test_first_compaction_creates_charter(monkeypatch, tmp_path):
     t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
     sessions_dir = _run_main(monkeypatch, tmp_path, session_id="sid-1", transcript=t)
 
-    charter_file = sessions_dir / "sid-1" / "charter.json"
-    assert charter_file.exists()
-    charter = json.loads(charter_file.read_text())
-    assert charter["origin_prompt"].startswith("Let's take a look at the flaky retry")
-    assert charter["compaction_count"] == 1
-    assert charter["mission"] is None
-    assert charter["pointers"] == []
+    row = _db_row(tmp_path, "sid-1")
+    assert row is not None
+    assert row["origin_prompt"].startswith("Let's take a look at the flaky retry")
+    assert row["compaction_count"] == 1
+    assert row["mission"] is None
+    assert row["pointers"] == "[]"
+    # DB is canonical — charter.json is no longer written
+    assert not (sessions_dir / "sid-1" / "charter.json").exists()
     # human mirror + waypoint spine
     md = (sessions_dir / "sid-1" / "charter.md").read_text()
     assert "Let's take a look at the flaky retry" in md
@@ -238,12 +276,12 @@ def test_first_compaction_creates_charter(monkeypatch, tmp_path):
 def test_second_compaction_bumps_count_origin_immutable(monkeypatch, tmp_path):
     t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
     _run_main(monkeypatch, tmp_path, session_id="sid-1", transcript=t)
-    first = json.loads((tmp_path / "sessions" / "sid-1" / "charter.json").read_text())
+    first = _db_row(tmp_path, "sid-1")
 
-    # Transcript grows and its head could theoretically change — origin must not.
+    # Transcript head could theoretically change — origin must not.
     _write_transcript(tmp_path / "s.jsonl", [_typed_line("some OTHER prompt")])
     _run_main(monkeypatch, tmp_path, session_id="sid-1", transcript=t, trigger="auto")
-    second = json.loads((tmp_path / "sessions" / "sid-1" / "charter.json").read_text())
+    second = _db_row(tmp_path, "sid-1")
 
     assert second["compaction_count"] == 2
     assert second["origin_prompt"] == first["origin_prompt"]
@@ -254,6 +292,128 @@ def test_second_compaction_bumps_count_origin_immutable(monkeypatch, tmp_path):
     assert [json.loads(w)["trigger"] for w in waypoints] == ["manual", "auto"]
 
 
+def test_stub_origin_filled_exactly_once(monkeypatch, tmp_path):
+    """An MCP write can create the charter row before the first compaction;
+    the hook fills origin once and preserves the living fields."""
+    root = _make_db(tmp_path)
+    conn = sqlite3.connect(root / "data" / "genesis.db")
+    conn.execute(
+        "INSERT INTO session_charters"
+        " (session_id, mission, pointers, compaction_count, created_at)"
+        " VALUES ('sid-1', 'pre-set mission', '[\"p1\"]', 0, '2026-07-13T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
+    _run_main(monkeypatch, tmp_path, session_id="sid-1", transcript=t)
+    row = _db_row(tmp_path, "sid-1")
+    assert row["origin_prompt"].startswith("Let's take a look at the flaky retry")
+    assert row["compaction_count"] == 1
+    assert row["mission"] == "pre-set mission"
+    assert row["pointers"] == '["p1"]'
+    md = (tmp_path / "sessions" / "sid-1" / "charter.md").read_text()
+    assert "pre-set mission" in md
+
+    # A later compaction with a mutated head must not refill origin.
+    _write_transcript(tmp_path / "s.jsonl", [_typed_line("some OTHER prompt")])
+    _run_main(monkeypatch, tmp_path, session_id="sid-1", transcript=t)
+    row2 = _db_row(tmp_path, "sid-1")
+    assert row2["origin_prompt"] == row["origin_prompt"]
+    assert row2["compaction_count"] == 2
+
+
+def test_stub_with_promptless_transcript_still_bumps(monkeypatch, tmp_path):
+    """Stub row + a transcript with no typed prompt: the compaction is real,
+    so the count bumps and origin stays NULL for a later boundary to fill."""
+    root = _make_db(tmp_path)
+    conn = sqlite3.connect(root / "data" / "genesis.db")
+    conn.execute(
+        "INSERT INTO session_charters (session_id, pointers, compaction_count, created_at)"
+        " VALUES ('sid-1', '[]', 0, '2026-07-13T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+    t = _write_transcript(tmp_path / "s.jsonl", [_attachment_line(), _tool_result_line()])
+    _run_main(monkeypatch, tmp_path, session_id="sid-1", transcript=t)
+    row = _db_row(tmp_path, "sid-1")
+    assert row["origin_prompt"] is None
+    assert row["compaction_count"] == 1
+
+
+def test_charter_md_includes_ledger(monkeypatch, tmp_path):
+    root = _make_db(tmp_path)
+    conn = sqlite3.connect(root / "data" / "genesis.db")
+    conn.execute(
+        "INSERT INTO session_ledger (id, session_id, text, status, added_by, created_at)"
+        " VALUES ('l1', 'sid-1', 'open item', 'open', 'foreground', '2026-07-13T00:00:01+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO session_ledger (id, session_id, text, status, added_by, created_at)"
+        " VALUES ('l2', 'sid-1', 'done item', 'done', 'foreground', '2026-07-13T00:00:02+00:00')"
+    )
+    conn.commit()
+    conn.close()
+    t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
+    _run_main(monkeypatch, tmp_path, session_id="sid-1", transcript=t)
+    md = (tmp_path / "sessions" / "sid-1" / "charter.md").read_text()
+    assert "- [ ] open item" in md
+    assert "- [x] done item" in md
+
+
+def test_renderer_parity_with_canonical():
+    """The hook's stdlib _charter_md must render byte-identically to the
+    canonical genesis/session_charter.py renderer — drift fails here."""
+    from genesis.session_charter import charter_md as canonical
+
+    full = {
+        "session_id": "sid-parity",
+        "origin_prompt": "The original ask.",
+        "origin_ts": "2026-06-30T15:21:06.000Z",
+        "mission": "Do the work",
+        "pointers": ["p1", "p2"],
+        "compaction_count": 4,
+        "created_at": "2026-07-13T00:00:00+00:00",
+    }
+    stub = {"session_id": "sid-stub", "origin_prompt": None, "compaction_count": 0}
+    ledger = [
+        {"text": "a", "status": "open"},
+        {"text": "b", "status": "in_progress"},
+        {"text": "c", "status": "done"},
+        {"text": "d", "status": "absorbed"},
+        {"text": "e", "status": "dropped"},
+        {"text": "f", "status": "unknown-status"},
+    ]
+    assert _pc._charter_md(full, ledger) == canonical(full, ledger)
+    assert _pc._charter_md(stub, None) == canonical(stub, None)
+    assert _pc._charter_md(full, []) == canonical(full, [])
+
+
+def test_missing_db_fails_open_and_creates_nothing(monkeypatch, tmp_path):
+    t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
+    sessions_dir = _run_main(monkeypatch, tmp_path, session_id="sid-1", transcript=t, with_db=False)
+    assert not (sessions_dir / "sid-1").exists()
+    # The hook must never create a DB file as a side effect
+    assert not (tmp_path / "repo" / "data" / "genesis.db").exists()
+
+
+def test_busy_db_fails_open(monkeypatch, tmp_path):
+    """A writer holding the DB lock past busy_timeout → this boundary is
+    skipped cleanly (self-heals at the next compaction)."""
+    root = _make_db(tmp_path)
+    blocker = sqlite3.connect(root / "data" / "genesis.db", timeout=1)
+    blocker.isolation_level = None
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
+        sessions_dir = _run_main(monkeypatch, tmp_path, session_id="sid-1", transcript=t)
+        assert not (sessions_dir / "sid-1").exists()  # no md, no waypoint
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    assert _db_row(tmp_path, "sid-1") is None
+
+
 def test_dispatched_session_is_noop(monkeypatch, tmp_path):
     t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
     sessions_dir = tmp_path / "sessions"
@@ -261,6 +421,7 @@ def test_dispatched_session_is_noop(monkeypatch, tmp_path):
     flag.touch()
     monkeypatch.setattr(_pc, "_SESSIONS_DIR", sessions_dir)
     monkeypatch.setattr(_pc, "_FLAG", flag)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(_make_db(tmp_path)))
     monkeypatch.setenv("GENESIS_CC_SESSION", "1")
     monkeypatch.setattr(
         _pc.sys,
@@ -269,22 +430,23 @@ def test_dispatched_session_is_noop(monkeypatch, tmp_path):
     )
     _pc.main()
     assert not (sessions_dir / "sid-bg").exists()
+    assert _db_row(tmp_path, "sid-bg") is None
 
 
 def test_malicious_session_id_rejected(monkeypatch, tmp_path):
     t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
     sessions_dir = _run_main(monkeypatch, tmp_path, session_id="../evil", transcript=t)
     assert not (sessions_dir.parent / "evil").exists()
-    assert not (sessions_dir / ".." / "evil" / "charter.json").resolve().exists()
+    assert _db_row(tmp_path, "../evil") is None
 
 
 def test_missing_transcript_fails_open(monkeypatch, tmp_path):
     sessions_dir = _run_main(
         monkeypatch, tmp_path, session_id="sid-x", transcript=tmp_path / "nope.jsonl"
     )
-    # No crash, no partial charter, no waypoint
-    assert not (sessions_dir / "sid-x" / "charter.json").exists()
-    assert not (sessions_dir / "sid-x" / "waypoints.jsonl").exists()
+    # No crash, no partial charter row, no waypoint
+    assert _db_row(tmp_path, "sid-x") is None
+    assert not (sessions_dir / "sid-x").exists()
 
 
 def test_context_flag_absent_is_noop(monkeypatch, tmp_path):
@@ -303,6 +465,13 @@ def test_context_flag_absent_is_noop(monkeypatch, tmp_path):
 
 
 # ── SessionStart charter injection ──────────────────────────────────────────
+# Existing file-based tests exercise the legacy charter.json FALLBACK path by
+# pointing db_path at a nonexistent file; the DB-first tests below exercise
+# the canonical path against a real 0058-shaped SQLite file.
+
+
+def _no_db(tmp_path: Path) -> Path:
+    return tmp_path / "absent" / "genesis.db"
 
 
 def _make_charter(tmp_path: Path, session_id: str, **overrides) -> Path:
@@ -322,9 +491,11 @@ def _make_charter(tmp_path: Path, session_id: str, **overrides) -> Path:
     return tmp_path / "sessions"
 
 
-def test_charter_block_emitted_when_present(tmp_path):
+def test_charter_block_emitted_from_file_fallback(tmp_path):
     sessions_dir = _make_charter(tmp_path, "sid-1")
-    block = _ctx._charter_emission_block("sid-1", "compact", sessions_dir=sessions_dir)
+    block = _ctx._charter_emission_block(
+        "sid-1", "compact", sessions_dir=sessions_dir, db_path=_no_db(tmp_path)
+    )
     assert "## Session Charter" in block
     assert "Let's take a look at the flaky retry" in block
     assert "Compactions: 3" in block
@@ -337,31 +508,52 @@ def test_charter_block_includes_mission_and_pointers(tmp_path):
         mission="Ship the session manager",
         pointers=["~/.genesis/output/session-manager-spec-2026-07-13.md"],
     )
-    block = _ctx._charter_emission_block("sid-1", "resume", sessions_dir=sessions_dir)
+    block = _ctx._charter_emission_block(
+        "sid-1", "resume", sessions_dir=sessions_dir, db_path=_no_db(tmp_path)
+    )
     assert "Ship the session manager" in block
     assert "session-manager-spec-2026-07-13.md" in block
 
 
 def test_charter_block_empty_when_absent(tmp_path):
-    block = _ctx._charter_emission_block("sid-none", "compact", sessions_dir=tmp_path / "sessions")
+    block = _ctx._charter_emission_block(
+        "sid-none", "compact", sessions_dir=tmp_path / "sessions", db_path=_no_db(tmp_path)
+    )
     assert block == ""
 
 
 def test_charter_block_empty_on_clear(tmp_path):
     """/clear is an explicit fresh start — never re-assert the old origin."""
     sessions_dir = _make_charter(tmp_path, "sid-1")
-    assert _ctx._charter_emission_block("sid-1", "clear", sessions_dir=sessions_dir) == ""
+    assert (
+        _ctx._charter_emission_block(
+            "sid-1", "clear", sessions_dir=sessions_dir, db_path=_no_db(tmp_path)
+        )
+        == ""
+    )
 
 
 def test_charter_block_empty_on_bad_session_id(tmp_path):
     sessions_dir = _make_charter(tmp_path, "sid-1")
-    assert _ctx._charter_emission_block("../sid-1", "compact", sessions_dir=sessions_dir) == ""
-    assert _ctx._charter_emission_block("", "compact", sessions_dir=sessions_dir) == ""
+    assert (
+        _ctx._charter_emission_block(
+            "../sid-1", "compact", sessions_dir=sessions_dir, db_path=_no_db(tmp_path)
+        )
+        == ""
+    )
+    assert (
+        _ctx._charter_emission_block(
+            "", "compact", sessions_dir=sessions_dir, db_path=_no_db(tmp_path)
+        )
+        == ""
+    )
 
 
 def test_charter_block_truncates_long_origin(tmp_path):
     sessions_dir = _make_charter(tmp_path, "sid-1", origin_prompt="x" * 5000)
-    block = _ctx._charter_emission_block("sid-1", "compact", sessions_dir=sessions_dir)
+    block = _ctx._charter_emission_block(
+        "sid-1", "compact", sessions_dir=sessions_dir, db_path=_no_db(tmp_path)
+    )
     assert "truncated" in block
     assert len(block) < 3000
 
@@ -371,5 +563,129 @@ def test_charter_block_corrupt_json_fails_open(tmp_path):
     session_dir.mkdir(parents=True)
     (session_dir / "charter.json").write_text("{corrupt")
     assert (
-        _ctx._charter_emission_block("sid-1", "compact", sessions_dir=tmp_path / "sessions") == ""
+        _ctx._charter_emission_block(
+            "sid-1", "compact", sessions_dir=tmp_path / "sessions", db_path=_no_db(tmp_path)
+        )
+        == ""
     )
+
+
+# ── DB-first injection path ─────────────────────────────────────────────────
+
+
+def _seed_db_charter(tmp_path: Path, session_id: str = "sid-db", **overrides) -> Path:
+    """0058-shaped tmp DB with a charter row (+ returns the db path)."""
+    root = _make_db(tmp_path)
+    db_file = root / "data" / "genesis.db"
+    row = {
+        "session_id": session_id,
+        "transcript_path": "/tmp/t.jsonl",
+        "origin_prompt": "The DB-canonical origin prompt.",
+        "origin_ts": "2026-06-30T15:21:06.000Z",
+        "mission": None,
+        "pointers": "[]",
+        "compaction_count": 5,
+        "created_at": "2026-07-13T02:00:00+00:00",
+        **overrides,
+    }
+    conn = sqlite3.connect(db_file)
+    conn.execute(
+        "INSERT INTO session_charters (session_id, transcript_path, origin_prompt,"
+        " origin_ts, mission, pointers, compaction_count, created_at)"
+        " VALUES (:session_id, :transcript_path, :origin_prompt, :origin_ts,"
+        " :mission, :pointers, :compaction_count, :created_at)",
+        row,
+    )
+    conn.commit()
+    conn.close()
+    return db_file
+
+
+def _seed_ledger(db_file: Path, session_id: str, items: list[tuple[str, str, str]]) -> None:
+    conn = sqlite3.connect(db_file)
+    for i, (item_id, text, status) in enumerate(items):
+        conn.execute(
+            "INSERT INTO session_ledger (id, session_id, text, status, added_by, created_at)"
+            f" VALUES (?, ?, ?, ?, 'foreground', '2026-07-13T00:00:0{i}+00:00')",
+            (item_id, session_id, text, status),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_charter_block_db_first(tmp_path):
+    db_file = _seed_db_charter(
+        tmp_path, mission="Ship PR-2a", pointers='["~/.claude/plans/plan.md"]'
+    )
+    _seed_ledger(
+        db_file,
+        "sid-db",
+        [
+            ("l1", "open thing", "open"),
+            ("l2", "wip thing", "in_progress"),
+            ("l3", "finished thing", "done"),
+        ],
+    )
+    block = _ctx._charter_emission_block(
+        "sid-db", "compact", sessions_dir=tmp_path / "sessions", db_path=db_file
+    )
+    assert "The DB-canonical origin prompt." in block
+    assert "**Mission:** Ship PR-2a" in block
+    assert "- ~/.claude/plans/plan.md" in block
+    assert "- [ ] open thing (id: l1)" in block
+    assert "- [~] wip thing (id: l2)" in block
+    assert "finished thing" not in block  # closed items stay out of the block
+    assert "ledger: 2 open / 1 closed" in block
+    assert "Compactions: 5" in block
+
+
+def test_charter_block_db_beats_stale_file(tmp_path):
+    """When both stores have the session, the DB (canonical) wins."""
+    db_file = _seed_db_charter(tmp_path, session_id="sid-1")
+    _make_charter(tmp_path, "sid-1", origin_prompt="STALE file origin")
+    block = _ctx._charter_emission_block(
+        "sid-1", "compact", sessions_dir=tmp_path / "sessions", db_path=db_file
+    )
+    assert "The DB-canonical origin prompt." in block
+    assert "STALE file origin" not in block
+
+
+def test_charter_block_db_stub_falls_back_to_empty(tmp_path):
+    """A stub row (origin NULL) has nothing to re-assert yet."""
+    db_file = _seed_db_charter(tmp_path, origin_prompt=None)
+    block = _ctx._charter_emission_block(
+        "sid-db", "compact", sessions_dir=tmp_path / "sessions", db_path=db_file
+    )
+    assert block == ""
+
+
+def test_charter_block_db_missing_table_falls_back_to_file(tmp_path):
+    """An un-migrated DB (no session_charters table) must not break the
+    legacy path — OperationalError → file fallback."""
+    empty_db = tmp_path / "repo" / "data" / "genesis.db"
+    empty_db.parent.mkdir(parents=True)
+    sqlite3.connect(empty_db).close()
+    sessions_dir = _make_charter(tmp_path, "sid-1")
+    block = _ctx._charter_emission_block(
+        "sid-1", "compact", sessions_dir=sessions_dir, db_path=empty_db
+    )
+    assert "Let's take a look at the flaky retry" in block
+
+
+def test_charter_block_budget_guard(tmp_path):
+    db_file = _seed_db_charter(
+        tmp_path,
+        origin_prompt="o" * 4000,
+        mission="m" * 1000,
+        pointers=json.dumps(["p" * 300] * 12),
+    )
+    _seed_ledger(
+        db_file,
+        "sid-db",
+        [(f"l{i}", "t" * 900, "open") for i in range(6)],
+    )
+    block = _ctx._charter_emission_block(
+        "sid-db", "compact", sessions_dir=tmp_path / "sessions", db_path=db_file
+    )
+    assert len(block) <= 2900
+    assert "truncated" in block

@@ -60,6 +60,7 @@ class UserModelEvolver:
         *,
         auto_accept_threshold: float = 0.7,
         accumulation_count: int = 3,
+        accepted_ids_out: list[str] | None = None,
     ) -> UserModelSnapshot | None:
         """Process unresolved user_model_delta observations.
 
@@ -68,6 +69,11 @@ class UserModelEvolver:
         - confidence < threshold: accumulate; when same field+value appears
           accumulation_count+ times, accept
         - Mark processed deltas as resolved
+
+        ``accepted_ids_out``: optional caller-supplied list extended with the
+        observation ids of the deltas ACCEPTED into the model this run (WS-3
+        gate-2 — lets the USER_KNOWLEDGE writer aggregate their stored
+        origin_class without changing this method's return contract).
         """
         pending = await observations.query(
             self._db, type="user_model_delta", resolved=False
@@ -129,6 +135,9 @@ class UserModelEvolver:
 
         if not changed:
             return None
+
+        if accepted_ids_out is not None:
+            accepted_ids_out.extend(accepted_ids)
 
         # Mark accepted deltas as resolved
         now = datetime.now(UTC).isoformat()

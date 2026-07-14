@@ -282,3 +282,24 @@ def test_build_synthesis_prompt_caps_evidence_count():
     assert "field_0" in prompt
     assert f"field_{_NARRATIVE_EVIDENCE_LIMIT - 1}" in prompt
     assert f"field_{_NARRATIVE_EVIDENCE_LIMIT}" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_accepted_ids_out_collects_accepted(db):
+    """WS-3 gate-2: the out-param exposes exactly the ACCEPTED delta ids."""
+    await _create_delta(db, id="d-hi", field="preferred_language", value="Python", confidence=0.9)
+    await _create_delta(db, id="d-lo", field="timezone", value="UTC", confidence=0.4)
+    evolver = UserModelEvolver(db=db)
+    out: list[str] = []
+    result = await evolver.process_pending_deltas(accepted_ids_out=out)
+    assert result is not None
+    assert out == ["d-hi"]  # low-confidence single delta NOT accepted
+
+
+@pytest.mark.asyncio
+async def test_accepted_ids_out_untouched_when_nothing_accepted(db):
+    await _create_delta(db, id="d-lo", field="timezone", value="UTC", confidence=0.4)
+    evolver = UserModelEvolver(db=db)
+    out: list[str] = []
+    assert await evolver.process_pending_deltas(accepted_ids_out=out) is None
+    assert out == []

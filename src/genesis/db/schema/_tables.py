@@ -118,7 +118,8 @@ TABLES = {
             expires_at       TEXT,
             content_hash     TEXT,
             surfaced_at      TEXT,
-            surfaced_count   INTEGER NOT NULL DEFAULT 0
+            surfaced_count   INTEGER NOT NULL DEFAULT 0,
+            origin_class     TEXT
         )
     """,
     "execution_traces": """
@@ -483,7 +484,8 @@ TABLES = {
             cc_session_id    TEXT,
             thread_id        TEXT,
             rate_limited_at  TEXT,
-            rate_limit_resumes_at TEXT
+            rate_limit_resumes_at TEXT,
+            origin_class     TEXT
         )
     """,
     "inbox_items": """
@@ -1642,6 +1644,39 @@ TABLES = {
             PRIMARY KEY (source_id, target_id, link_type)
         )
     """,
+    # Session-manager durable spine (PR-2a, migration 0058). session_id is the
+    # CC transcript session id (= cc_sessions.cc_session_id, NOT cc_sessions.id).
+    # origin_prompt/origin_ts are write-once: nullable so MCP stubs can exist
+    # pre-first-compaction; every writer fills origin only WHERE origin_prompt
+    # IS NULL and never lists origin columns in a general UPDATE SET.
+    "session_charters": """
+        CREATE TABLE IF NOT EXISTS session_charters (
+            session_id       TEXT PRIMARY KEY,
+            transcript_path  TEXT,
+            origin_prompt    TEXT,
+            origin_ts        TEXT,
+            mission          TEXT,
+            pointers         TEXT NOT NULL DEFAULT '[]',
+            compaction_count INTEGER NOT NULL DEFAULT 0,
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT
+        )
+    """,
+    "session_ledger": """
+        CREATE TABLE IF NOT EXISTS session_ledger (
+            id          TEXT PRIMARY KEY,
+            session_id  TEXT NOT NULL,
+            text        TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ('open','in_progress','done','absorbed','dropped')),
+            source_ref  TEXT,
+            added_by    TEXT NOT NULL DEFAULT 'foreground'
+                        CHECK(added_by IN ('foreground','ambient','pulse')),
+            evidence    TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1937,6 +1972,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_otel_spans_session ON otel_spans(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_otel_spans_roots "
     "ON otel_spans(start_unix_us) WHERE parent_span_id IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_session_ledger_session ON session_ledger(session_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_session_charters_updated_at ON session_charters(updated_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

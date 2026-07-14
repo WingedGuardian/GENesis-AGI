@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
+
+logger = logging.getLogger(__name__)
 
 
 async def create(
@@ -94,10 +97,7 @@ async def batch_link_counts(
         for row in inbound_rows:
             inbound_map[row[0]] = inbound_map.get(row[0], 0) + row[1]
 
-    return {
-        mid: (total_map.get(mid, 0), inbound_map.get(mid, 0))
-        for mid in memory_ids
-    }
+    return {mid: (total_map.get(mid, 0), inbound_map.get(mid, 0)) for mid in memory_ids}
 
 
 async def inter_candidate_links(
@@ -126,6 +126,75 @@ async def inter_candidate_links(
     return [(row[0], row[1]) for row in rows]
 
 
+# Seed cap for neighbors_of: the query binds 2*len(seeds) (+ optional link
+# types) + 1 placeholders, so 450 keeps the worst case ~901 — under the 999
+# SQLITE_MAX_VARIABLE_NUMBER floor this file's IN-list convention targets.
+# (inter_candidate_links' 499 assumes its own 2n shape; don't borrow caps.)
+_NEIGHBOR_SEED_CAP = 450
+
+
+async def neighbors_of(
+    db: aiosqlite.Connection,
+    memory_ids: list[str],
+    *,
+    exclude: list[str] | tuple[str, ...] = (),
+    limit: int = 10,
+    link_types: tuple[str, ...] | None = None,
+) -> list[dict]:
+    """1-hop neighbors of *memory_ids* via ``memory_links``, strongest first.
+
+    Both directions are followed and collapsed to ONE row per neighbor with
+    ``MAX(strength)`` — the PK is ``(source_id, target_id, link_type)`` (DLI-04),
+    so a pair with multiple link types yields multiple rows, and several seeds
+    can reach the same neighbor; a naive UNION would burn ``limit`` slots on
+    duplicates. Ties break on neighbor id (deterministic across runs). Seeds
+    and ``exclude`` ids are never returned: exclusion happens in PYTHON, not
+    SQL, so (a) the placeholder count stays bounded regardless of exclude
+    size, and (b) capping an oversized seed list can never re-admit a
+    truncated seed as a "neighbor".
+
+    ``link_types`` optionally restricts which edge types are followed —
+    callers expanding into LLM-visible context should exclude adversarial
+    types like ``contradicts`` (the LongMemEval graph arm only ever stores
+    supports/extends, so it passes None).
+
+    Returns ``[{"memory_id": ..., "strength": ...}]``. Used by recall-time
+    graph expansion (LongMemEval graph arm; intended canonical home for the
+    committed prod graph/entity recall wiring).
+    """
+    if not memory_ids or limit <= 0:
+        return []
+    seeds = memory_ids
+    if len(seeds) > _NEIGHBOR_SEED_CAP:
+        logger.warning(
+            "neighbors_of: %d seed ids truncated to %d (placeholder budget)",
+            len(seeds),
+            _NEIGHBOR_SEED_CAP,
+        )
+        seeds = seeds[:_NEIGHBOR_SEED_CAP]
+    # Drop the FULL original seed list (not just the capped slice) + exclude.
+    dropped = {*memory_ids, *exclude}
+    ph = ",".join("?" * len(seeds))
+    type_clause = ""
+    type_params: list[str] = []
+    if link_types:
+        type_ph = ",".join("?" * len(link_types))
+        type_clause = f" AND link_type IN ({type_ph})"
+        type_params = list(link_types)
+    rows = await db.execute_fetchall(
+        f"SELECT neighbor, MAX(strength) AS s FROM ("
+        f"  SELECT target_id AS neighbor, strength FROM memory_links"
+        f"    WHERE source_id IN ({ph}){type_clause}"
+        f"  UNION ALL"
+        f"  SELECT source_id AS neighbor, strength FROM memory_links"
+        f"    WHERE target_id IN ({ph}){type_clause}"
+        f") GROUP BY neighbor ORDER BY s DESC, neighbor LIMIT ?",
+        [*seeds, *type_params, *seeds, *type_params, limit + len(dropped)],
+    )
+    out = [{"memory_id": row[0], "strength": row[1]} for row in rows if row[0] not in dropped]
+    return out[:limit]
+
+
 async def get_bidirectional(db: aiosqlite.Connection, memory_id: str) -> list[dict]:
     """Get all links where memory_id is source or target (undirected query)."""
     return await get_links_for(db, memory_id)
@@ -147,8 +216,7 @@ async def delete(
     """
     if link_type is not None:
         cursor = await db.execute(
-            "DELETE FROM memory_links "
-            "WHERE source_id = ? AND target_id = ? AND link_type = ?",
+            "DELETE FROM memory_links WHERE source_id = ? AND target_id = ? AND link_type = ?",
             (source_id, target_id, link_type),
         )
     else:
@@ -191,6 +259,7 @@ async def prune_weak(
     if pruned:
         try:
             from genesis.memory.graph import invalidate_graph_cache
+
             invalidate_graph_cache()
         except ImportError:
             pass

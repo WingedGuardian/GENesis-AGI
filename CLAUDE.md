@@ -275,6 +275,22 @@ in conversation, call `reference_store` immediately — don't rely on batch
 extraction to catch it later. You are the first line of defense; the
 extraction pipeline is the safety net.
 
+## Session Ledger (Agreement Capture)
+
+Foreground sessions carry a durable charter + ledger (DB-backed, re-injected
+into every post-compaction window — see the `## Session Charter` block and
+the per-turn `[Charter: … | open: N]` tag).
+
+**Real-time capture is your responsibility.** At agreement moments — the
+user says "yes, do that", approves a plan item, or you promise work — call
+`session_ledger_add` immediately so the agreement becomes a row no
+compaction summary can erase. Close items with `session_ledger_update`
+(done / absorbed-with-evidence / dropped) as work lands; set the living
+mission via `session_charter_update` when the session's purpose
+crystallizes or pivots. You are the first line of defense; ambient
+extraction (session-manager PR-3) is only the safety net. Plan files stay
+the working documents — ledger rows are the durable index, not a duplicate.
+
 ## Knowledge Ingestion (Conversational Path)
 
 When a user shares a file path or URL in conversation:

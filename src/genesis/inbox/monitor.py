@@ -1504,6 +1504,9 @@ class InboxMonitor:
                 model=model,
                 effort=effort,
                 source_tag="inbox_evaluation",
+                # WS-3: inbox sessions evaluate EXTERNAL mail content — same
+                # origin the CCInvocation env stamp uses (_build_invocation).
+                origin="external_untrusted",
             )
             session_id = sess["id"]
         except Exception as exc:
