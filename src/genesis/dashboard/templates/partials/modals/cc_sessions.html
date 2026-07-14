@@ -38,7 +38,7 @@
               </div>
               <div style="font-size: 0.82rem; padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; transition: opacity 0.15s;"
                    :style="`background: rgba(217,83,79,${$store.genesisDashboard.ccSessionsModal.filter === 'discrepant' ? '0.3' : '0.12'}); color: #d9534f; opacity: ${!$store.genesisDashboard.ccSessionsModal.filter || $store.genesisDashboard.ccSessionsModal.filter === 'discrepant' ? '1' : '0.5'}`"
-                   title="Rows where DB state and live processes disagree"
+                   title="Rows where DB state and live processes disagree — count includes live processes with no DB row (listed below the table)"
                    @click="$store.genesisDashboard.ccSessionsModal.filter = $store.genesisDashboard.ccSessionsModal.filter === 'discrepant' ? null : 'discrepant'">
                 <span x-text="($store.genesisDashboard.ccSessionsModal.data.stats?.discrepant || 0)"></span> discrepant
               </div>
