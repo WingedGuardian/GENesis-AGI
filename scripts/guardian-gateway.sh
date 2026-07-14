@@ -543,6 +543,25 @@ PYEOF
             cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md" || true
         fi
 
+        # Refresh systemd units from the archived repo config (picks up
+        # MemoryMax, OOMScoreAdjust, TimeoutStartSec, etc.) — mirrors the `update`
+        # verb, which was the ONLY path that refreshed units, so push-redeploys
+        # (the path update.sh actually uses) left host units frozen at install
+        # time. Copy-if-present: an older client whose archive lacks the unit
+        # files simply leaves the installed units untouched — the redeploy
+        # required-file gate deliberately does NOT demand them (backward-compat).
+        # Best-effort/guarded so a cp or daemon-reload failure can never abort the
+        # redeploy under set -e and strand the Guardian with its timer stopped.
+        SYSTEMD_DIR="$HOME/.config/systemd/user"
+        mkdir -p "$SYSTEMD_DIR" 2>/dev/null || true
+        for unit in genesis-guardian.service genesis-guardian.timer \
+                    genesis-guardian-watchman.service genesis-guardian-watchman.timer; do
+            if [ -f "$INSTALL_DIR/config/$unit" ]; then
+                cp "$INSTALL_DIR/config/$unit" "$SYSTEMD_DIR/$unit" 2>/dev/null || true
+            fi
+        done
+        systemctl --user daemon-reload 2>/dev/null || true
+
         # Record deployed commit + the verified tree sha (separate file —
         # state.json is overwritten by Guardian ticks). Values are passed via
         # the environment (not string-interpolated into the heredoc), and the
