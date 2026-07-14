@@ -316,3 +316,20 @@ async def test_count_external_by_ids(db):
     assert await obs.count_external_by_ids(db, ["o-c2", "o-c3"]) == 0
     assert await obs.count_external_by_ids(db, []) == 0
     assert await obs.count_external_by_ids(db, ["missing"]) == 0
+
+
+def test_process_reaper_would_kill_ttl_registered(caplog):
+    """The dry-run reaper emits `process_reaper_would_kill` (audit-trail
+    counterpart to `process_reaper_kill`). It must be explicitly registered in
+    _TTL_BY_TYPE so it resolves to a real TTL WITHOUT logging the recurring
+    'Unknown observation type' warning on every reaper tick."""
+    import logging
+    from datetime import timedelta
+
+    assert "process_reaper_would_kill" in observations._TTL_BY_TYPE
+    with caplog.at_level(logging.WARNING, logger="genesis.db.crud.observations"):
+        ttl = observations._compute_ttl("process_reaper_would_kill")
+    assert ttl == timedelta(days=14)
+    assert not any("Unknown observation type" in r.getMessage() for r in caplog.records), (
+        "a registered type must not trigger the unknown-type warning"
+    )

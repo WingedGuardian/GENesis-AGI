@@ -251,7 +251,8 @@ async def search_fts(
         return []
     sql = (
         "SELECT f.unit_id, f.concept, f.body, f.tags, f.domain, f.project_type,"
-        " f.rank, k.source_pipeline, k.ingested_at, k.confidence"
+        " f.rank, k.source_pipeline, k.ingested_at, k.confidence,"
+        " k.origin_class"
         " FROM knowledge_fts f"
         " LEFT JOIN knowledge_units k ON k.id = f.unit_id"
         " WHERE knowledge_fts MATCH ?"
@@ -271,6 +272,8 @@ async def search_fts(
             "unit_id": r[0], "concept": r[1], "body": r[2],
             "tags": r[3], "domain": r[4], "project_type": r[5], "rank": r[6],
             "source_pipeline": r[7], "ingested_at": r[8], "confidence": r[9],
+            # WS-3 stored provenance (0054-stamped at ingest).
+            "origin_class": r[10],
         }
         for r in rows
     ]

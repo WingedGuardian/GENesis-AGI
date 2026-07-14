@@ -489,6 +489,18 @@ for launcher in "$GENESIS_ROOT/.claude/hooks/genesis-hook" "$GENESIS_ROOT/.claud
 done
 echo
 
+# --- Install identity (stable per-install UUID) ---
+# Materialize ~/.genesis/install.json so the prepare-commit-msg hook can
+# stamp the Install: trailer from its first commit. Owned by
+# genesis.contribution.identity (create-on-first-access); non-fatal.
+echo "--- Ensuring install identity ---"
+if "$VENV_DIR/bin/python" -c "from genesis.contribution.identity import get_install_id; print(get_install_id()[:8])" 2>/dev/null; then
+    echo "  Install identity present"
+else
+    echo "  WARNING: could not materialize install identity (non-fatal)"
+fi
+echo
+
 # --- Git hooks (worktree safety, push guards) ---
 echo "--- Installing git hooks ---"
 HOOKS_SRC="$GENESIS_ROOT/scripts/hooks"
@@ -546,13 +558,12 @@ fi
 echo
 
 # --- Code Intelligence Indexing ---
-# No direct indexer spawns here: setup_claude_config.py (invoked earlier)
-# already triggers indexing through scripts/lib/code_intel_index.sh — the
-# single locked + resource-capped entrypoint. The raw spawns this block used
-# to hold ran a SECOND concurrent index of the same repo on every bootstrap
-# (and a third via the post-commit hook), which once wedged the container in
-# a D-state I/O storm. All indexing must go through the entrypoint.
-echo "--- Code intelligence indexing: handled by setup_claude_config (locked entrypoint) ---"
+# No indexer spawns here: setup_claude_config.py (invoked earlier) queues an
+# index-request marker (scripts/lib/index_marker.py) that the idle-gated runner
+# (genesis-code-intel.timer -> scripts/code_intel_runner.sh) consumes when the
+# box is quiet. Inline full-mode spawns on every bootstrap once wedged the
+# container in a D-state I/O storm; all indexing now flows through the queue.
+echo "--- Code intelligence indexing: queued for the idle-gated runner ---"
 echo
 
 # --- Timezone ---

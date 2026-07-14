@@ -20,7 +20,8 @@ set -o pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSIONS_FILE="$REPO_ROOT/.genesis-hook-versions"
 
-TRACKED_HOOKS=(post-commit pre-commit pre-push)
+# Keep in lockstep with update_hook_versions.sh and sync-hooks.sh.
+TRACKED_HOOKS=(commit-msg post-commit pre-commit prepare-commit-msg pre-push)
 
 # Get list of staged files (relative to repo root)
 STAGED=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null || echo "")

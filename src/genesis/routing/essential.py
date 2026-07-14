@@ -32,7 +32,10 @@ ESSENTIAL_CLOUD_SITES: frozenset[str] = frozenset(
         "4_light_reflection",
         "9_fact_extraction",
         "40_ego_focus_selection",
-        "8_ego_compaction",
+        # 8_ego_compaction removed 2026-07-13 — the ego went ephemeral (#26), so
+        # CompactionEngine never routes; leaving it here mapped a dead chain whose
+        # "uncovered" state could trigger a FALSE ESSENTIAL degradation for a site
+        # that never runs. Its model_routing.yaml entry was removed in the same PR.
     }
 )
 

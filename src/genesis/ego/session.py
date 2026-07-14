@@ -56,7 +56,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_CALL_SITE = "7_ego_cycle"
+# Fallback call-site LABEL only (used as the record_last_run tag when an
+# EgoSession is built without an explicit call_site; live callers always pass
+# 7_user_ego_cycle / 7_genesis_ego_cycle). Ego dispatches via CCInvocation, not
+# route_call, so this is never a routed id — it just must be a live label so a
+# no-arg session can't resurrect the removed 7_ego_cycle phantom in the monitor.
+_DEFAULT_CALL_SITE = "7_genesis_ego_cycle"
 _DEFAULT_FOCUS_SUMMARY_KEY = "ego_focus_summary"
 
 # Action_types that are applied + marked 'executed' by their resolution handler

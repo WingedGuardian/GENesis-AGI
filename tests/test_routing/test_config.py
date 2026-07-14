@@ -150,7 +150,10 @@ def test_load_full_yaml(monkeypatch):
     # 2026-07-01: 53 → 54 after attention_salience added (PR3b L1.5 salience gate).
     # 2026-07-10: 54 → 55 after ambient_arbiter added (WS-C arbiter neural-monitor registration).
     # 2026-07-12: 55 → 56 after 46_infra_annotation added (infrastructure body-schema annotations).
-    assert len(cfg.call_sites) == 56
+    # 2026-07-13: 56 → 54 after removing orphaned legacy ego sites 7_ego_cycle
+    # + 8_ego_compaction (superseded by 7_user/7_genesis_ego_cycle + ephemeral
+    # compaction in #26; their model_routing.yaml entries were never cleaned up).
+    assert len(cfg.call_sites) == 54
     assert "crag_grade" in cfg.call_sites  # W-CRAG runtime grader (2026-06-20)
     assert "38a_procedure_novelty_llm" in cfg.call_sites  # C2b cross-type dedup (2026-06-30)
     assert "attention_salience" in cfg.call_sites  # PR3b L1.5 salience gate (2026-07-01)
@@ -164,6 +167,8 @@ def test_load_full_yaml(monkeypatch):
     assert "models_md_synthesis" not in cfg.call_sites  # removed 2026-05-24
     assert "2_triage" not in cfg.call_sites  # removed 2026-05-10
     assert "7_task_retrospective" not in cfg.call_sites  # removed 2026-05-10 (duplicate; live one is 43_task_retrospective)
+    assert "7_ego_cycle" not in cfg.call_sites  # removed 2026-07-13 (→ 7_user/7_genesis_ego_cycle)
+    assert "8_ego_compaction" not in cfg.call_sites  # removed 2026-07-13 (ego went ephemeral; no LLM compaction)
     assert "background" in cfg.retry_profiles
     assert cfg.call_sites["12_surplus_brainstorm"].never_pays is True
     assert cfg.call_sites["5_deep_reflection"].default_paid is True
@@ -525,3 +530,21 @@ call_sites:
         "extra_body": {"include_reasoning": False, "reasoning_effort": "low"},
     }
     assert cfg.providers["plain"].params is None
+
+
+def test_sanitize_drops_local_call_site_absent_from_base():
+    """A local overlay may override an existing base call site, not resurrect one
+    the base removed. A stale .local.yaml entry (e.g. a dashboard edit to a
+    since-deleted 7_ego_cycle) must be dropped at load time, not deep-merged back."""
+    from genesis.routing.config import _sanitize_local_overlay
+
+    base = {"providers": {"p1": {}}, "call_sites": {"live_site": {"chain": ["p1"]}}}
+    local = {
+        "call_sites": {
+            "live_site": {"chain": ["p1"]},  # valid override of a base site — kept
+            "7_ego_cycle": {"chain": ["p1"]},  # absent from base — must be dropped
+        }
+    }
+    result = _sanitize_local_overlay(base, local)
+    assert "7_ego_cycle" not in (result.get("call_sites") or {})
+    assert "live_site" in result["call_sites"]

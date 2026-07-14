@@ -168,7 +168,8 @@ def _registry() -> MagicMock:
 @pytest.mark.asyncio
 async def test_cli_site_retains_manual_cost_policy():
     """cli sites keep their manual 'CC background' label instead of auto-deriving
-    a misleading 'Paid primary' (7_ego_cycle mis-rendered before this fix)."""
+    a misleading 'Paid primary' (regression originally caught via 7_ego_cycle,
+    now removed from YAML — 6_strategic_reflection is an equivalent cli+Opus site)."""
     providers = {
         "openrouter-sonnet": _provider("openrouter-sonnet", free=False),
         "openrouter-opus": _provider("openrouter-opus", free=False),
@@ -176,14 +177,106 @@ async def test_cli_site_retains_manual_cost_policy():
     cfg = _config(
         {
             "5_deep_reflection": CallSiteConfig(id="5_deep_reflection", chain=["openrouter-sonnet"]),
-            "7_ego_cycle": CallSiteConfig(id="7_ego_cycle", chain=["openrouter-opus"]),
+            "6_strategic_reflection": CallSiteConfig(id="6_strategic_reflection", chain=["openrouter-opus"]),
         },
         providers,
     )
     result = await call_sites(db=None, routing_config=cfg, breakers=_registry())
     assert result["5_deep_reflection"]["cost_policy"] == "CC background (Sonnet)"
-    assert result["7_ego_cycle"]["cost_policy"] == "CC background (Opus)"
-    assert "Paid primary" not in result["7_ego_cycle"]["cost_policy"]
+    assert result["6_strategic_reflection"]["cost_policy"] == "CC background (Opus)"
+    assert "Paid primary" not in result["6_strategic_reflection"]["cost_policy"]
+
+
+@pytest.mark.asyncio
+async def test_deprecated_removed_site_not_resurrected_by_stale_last_run():
+    """A DEPRECATED_REMOVED site (e.g. 7_ego_cycle, superseded by the #26 ego
+    split) must NOT reappear as an active tile off an old call_site_last_run row.
+    Removing it from YAML is not enough — a stale historical row would otherwise
+    keep resurrecting it. See snapshots/call_sites.py deprecated-skip guard."""
+    import aiosqlite
+
+    db = await aiosqlite.connect(":memory:")
+    await db.execute(
+        "CREATE TABLE call_site_last_run (call_site_id TEXT PRIMARY KEY, "
+        "last_run_at TEXT, provider_used TEXT, model_id TEXT, response_text TEXT, "
+        "input_tokens INTEGER, output_tokens INTEGER, success INTEGER)"
+    )
+    await db.execute(
+        "INSERT INTO call_site_last_run VALUES "
+        "('7_ego_cycle', '2026-04-24T16:46:51+00:00', 'cc', 'claude-opus-4-6', 'x', 10, 20, 1)"
+    )
+    await db.commit()
+    # 7_ego_cycle is NOT in routing config (removed from YAML) — only the stale row.
+    cfg = _config({}, {})
+    result = await call_sites(db=db, routing_config=cfg, breakers=_registry())
+    await db.close()
+    assert "7_ego_cycle" not in result, (
+        "DEPRECATED_REMOVED site resurrected by a stale last_run row"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_yaml_last_run_site_carries_its_meta():
+    """A CC-dispatched (non-YAML) site like 7_genesis_ego_cycle enters the snapshot
+    ONLY via the call_site_last_run merge; it must still carry its _CALL_SITE_META
+    (description/category/cost_policy) so the monitor tile is not a bare stub."""
+    import aiosqlite
+
+    db = await aiosqlite.connect(":memory:")
+    await db.execute(
+        "CREATE TABLE call_site_last_run (call_site_id TEXT PRIMARY KEY, "
+        "last_run_at TEXT, provider_used TEXT, model_id TEXT, response_text TEXT, "
+        "input_tokens INTEGER, output_tokens INTEGER, success INTEGER)"
+    )
+    await db.execute(
+        "INSERT INTO call_site_last_run VALUES "
+        "('7_genesis_ego_cycle', '2026-07-14T02:19:00+00:00', 'cc', 'claude-sonnet-5', 'x', 10, 20, 1)"
+    )
+    await db.commit()
+    cfg = _config({}, {})  # 7_genesis_ego_cycle is deliberately NOT a YAML site
+    result = await call_sites(db=db, routing_config=cfg, breakers=_registry())
+    await db.close()
+    entry = result["7_genesis_ego_cycle"]
+    assert entry["status"] in ("active", "healthy")
+    assert entry.get("description")  # meta merged in via the last_run else-branch
+    assert entry.get("category") == "reasoning"
+    assert entry.get("cost_policy") == "CC background (Sonnet)"
+
+
+@pytest.mark.asyncio
+async def test_cc_native_ego_site_gets_cc_chain_entry_and_outage_overlay():
+    """A non-YAML CC-native site (model_tier='cc', no dispatch) like
+    7_genesis_ego_cycle must get a CC/{model} chain entry that reflects CC health,
+    not stay a bare 'active' last-run row with an empty chain (Codex P2)."""
+    from unittest.mock import MagicMock
+
+    import aiosqlite
+
+    from genesis.resilience.state import CCStatus
+
+    db = await aiosqlite.connect(":memory:")
+    await db.execute(
+        "CREATE TABLE call_site_last_run (call_site_id TEXT PRIMARY KEY, "
+        "last_run_at TEXT, provider_used TEXT, model_id TEXT, response_text TEXT, "
+        "input_tokens INTEGER, output_tokens INTEGER, success INTEGER)"
+    )
+    await db.execute(
+        "INSERT INTO call_site_last_run VALUES "
+        "('7_genesis_ego_cycle', '2026-07-14T02:19:00+00:00', 'cc', 'claude-sonnet-5', 'x', 10, 20, 1)"
+    )
+    await db.commit()
+    sm = MagicMock()
+    sm.current.cc = CCStatus.UNAVAILABLE  # simulate a CC outage
+    cfg = _config({}, {})
+    result = await call_sites(
+        db=db, routing_config=cfg, breakers=_registry(), state_machine=sm
+    )
+    await db.close()
+    chain = result["7_genesis_ego_cycle"].get("chain_health", [])
+    cc = [c for c in chain if c.get("is_cc")]
+    assert cc, "CC-native ego tile has no CC chain entry"
+    assert cc[0]["provider"] == "CC/Sonnet"
+    assert cc[0]["state"] == "open"  # CC outage is reflected on the Ego tile
 
 
 @pytest.mark.asyncio

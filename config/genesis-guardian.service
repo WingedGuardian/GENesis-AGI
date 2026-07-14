@@ -20,17 +20,22 @@ StandardError=journal
 # hour plus 5 min for signal collection, alerts, and cleanup.
 TimeoutStartSec=3900
 
-# Resource limits — prevent CC diagnostic from consuming unbounded host memory.
-# 30% of host RAM covers the guardian Python process + one CC session + tool
-# subprocesses, and scales with the host (systemd resolves the % at runtime),
-# so there is no hardcoded ceiling to re-tune per install — and it auto-shrinks
-# on small hosts, protecting an 8 GiB box a fixed 6G would have starved.
+# Resource limits — the Guardian is a LAST-DITCH host-side recovery tool. When
+# it runs, Genesis is presumed down and NOTHING revives the Guardian if it dies,
+# so it gets GENEROUS resources: the cap is only a host-survival backstop, not a
+# workload shaper. MemoryMax=80% of host RAM (systemd resolves the % at runtime)
+# is 2-8x what a CC diagnosis needs, while still leaving headroom so a runaway
+# Guardian dies at the cap instead of freezing the whole host — which would kill
+# the very timer that re-fires it. The real "don't fight a healthy Genesis" guard
+# is runtime-aware and lives in diagnosis.py's pre-flight (it refuses CC diagnosis
+# when host memory is already tight), not this ceiling.
 # MemorySwapMax=0 prevents I/O thrashing under pressure.
-# OOMScoreAdjust=500 (positive) makes guardian first to be OOM-killed vs
-# genesis (-500) or ollama — guardian is expendable, primary workloads are not.
-MemoryMax=30%
+# OOMScoreAdjust=0 (neutral) — the Guardian is NOT expendable (it is the last
+# line of defense), but must not preferentially kill the user's host-side Claude
+# Code or the container either; it competes as an equal under host pressure.
+MemoryMax=80%
 MemorySwapMax=0
-OOMScoreAdjust=500
+OOMScoreAdjust=0
 
 # I/O limits — prevent Guardian's own diagnosis (CC session, log collection)
 # from contributing to I/O saturation on the genesis storage device.

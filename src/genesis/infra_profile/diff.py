@@ -69,8 +69,12 @@ def compute_drift(
         prev = prev_sections.get(name)
         if prev is None:
             continue  # newly appeared ≠ drift
-        if curr.get("status") == "unavailable" or prev.get("status") == "unavailable":
-            continue  # plane availability change ≠ drift
+        # No status gate: the hash guards below already absorb availability
+        # flips (a never-ok section has no hash; an unavailable/error section
+        # keeps its prior facts+hash through the outage), while a fact that
+        # REALLY changed during an outage window still surfaces on recovery —
+        # a status gate silently swallowed exactly that case (review
+        # 2026-07-13).
         old_hash, new_hash = prev.get("hash"), curr.get("hash")
         if not old_hash or not new_hash or old_hash == new_hash:
             continue

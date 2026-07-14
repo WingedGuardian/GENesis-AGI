@@ -156,3 +156,42 @@ class TestInvoke:
 
         assert isinstance(result, ProviderResult)
         assert result.success is False
+
+
+class TestSearch:
+    @pytest.mark.asyncio
+    async def test_search_returns_searchresults(self, adapter):
+        from genesis.research.types import SearchResult
+
+        r1 = MagicMock(url="https://a.com", title="T1", score=0.8, text="body text", highlights=[])
+        r2 = MagicMock(url="https://b.com", title="T2", score=0.4, text=None, highlights=["hl one", "hl two"])
+        mock_response = MagicMock(results=[r1, r2])
+        mock_client = AsyncMock()
+        mock_client.search = AsyncMock(return_value=mock_response)
+        with patch.dict("os.environ", ENV), \
+             patch("exa_py.AsyncExa", return_value=mock_client):
+            results = await adapter.search("q", max_results=7)
+
+        assert all(isinstance(r, SearchResult) for r in results)
+        assert [r.url for r in results] == ["https://a.com", "https://b.com"]
+        assert results[0].snippet == "body text"
+        assert results[1].snippet == "hl one hl two"
+        assert all(r.source == "exa" for r in results)
+
+    @pytest.mark.asyncio
+    async def test_search_bridges_max_results_to_num_results(self, adapter):
+        mock_response = MagicMock(results=[])
+        mock_client = AsyncMock()
+        mock_client.search = AsyncMock(return_value=mock_response)
+        with patch.dict("os.environ", ENV), \
+             patch("exa_py.AsyncExa", return_value=mock_client):
+            await adapter.search("q", max_results=9)
+        call_kwargs = mock_client.search.call_args.kwargs
+        assert call_kwargs["num_results"] == 9
+        assert "contents" in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_search_empty_on_missing_key(self, adapter):
+        with patch.dict("os.environ", {}, clear=True):
+            results = await adapter.search("q")
+        assert results == []

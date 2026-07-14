@@ -130,6 +130,9 @@ async def knowledge_recall(
                 "retrieval_score": r.retrieval_score or r.score,
                 "origin": "vector",
                 "source_pipeline": r.source_pipeline,
+                # WS-3 stored provenance — carried so item_is_blockable can
+                # key on the stored class instead of re-deriving.
+                "origin_class": r.origin_class,
             }
         )
 
@@ -154,6 +157,8 @@ async def knowledge_recall(
                     "retrieval_score": fts_score,
                     "origin": "fts",
                     "source_pipeline": fts_row.get("source_pipeline"),
+                    # WS-3 stored provenance (search_fts JOINs knowledge_units).
+                    "origin_class": fts_row.get("origin_class"),
                 }
             )
 
@@ -234,6 +239,7 @@ async def knowledge_recall(
             if immunity_shadow.item_is_blockable(
                 collection=d.get("collection"),
                 source_pipeline=d.get("source_pipeline"),
+                origin_class=d.get("origin_class"),
             ):
                 blockable += 1
     # WS-3 B1 gate 4 (injection): shadow-record external content reaching this

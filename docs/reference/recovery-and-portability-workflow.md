@@ -116,3 +116,95 @@ Two mechanisms make this observable and survivable without host access:
 You can mint the token proactively at install, or defer it entirely: the first
 auth-health alert is the cue, and the response becomes "mint + store from
 anywhere" instead of "SSH to the host and re-run `claude login`."
+
+## Git-Metadata Corruption Recovery (`scripts/git_repair.py`)
+
+A storage fault (the 2026-07-03 thin-pool outage) can leave the repo's *own*
+git metadata silently corrupt: an ext4 `data=ordered` journal replay preserves
+file **structure** while zeroing **unflushed data blocks**, so `.git/config`,
+`packed-refs`, and any loose objects being written read back as NUL — with **no
+git-level error**. This silently disables the guardian's `REVERT_CODE` recovery
+lever (it needs healthy local git). The F.1 detectors
+(`genesis.observability.git_health` on the container tick + the guardian's
+`git_watch` live probe) surface it and both alerts say **"run
+`scripts/git_repair.py`."** This is that tool.
+
+**Properties.** Stdlib-only, targets **system `python3`** (survives a broken
+venv), **dry-run by default** — `--apply` gates every mutation. It never touches
+the working tree or index in the automated rungs, and it **never swaps `.git`
+automatically** (the last resort only prints steps for a human).
+
+```bash
+# 1. See what's wrong + what it WOULD do — mutates nothing:
+python3 scripts/git_repair.py
+# 2. Repair (captures a recovery baseline first, then walks the ladder):
+python3 scripts/git_repair.py --apply
+# 3. If a-d cannot fix it, enable the guided last-resort re-clone (prints the
+#    .git-swap steps for you to run by hand; still never swaps automatically):
+python3 scripts/git_repair.py --apply --allow-reclone
+# Override the origin URL when .git/config is unrecoverable:
+python3 scripts/git_repair.py --apply --remote-url https://github.com/<owner>/<repo>.git
+```
+
+**Repair ladder** (re-diagnoses after each rung; stops when `fsck --full` is
+clean): (a) regenerate `.git/config` + a zeroed `.git/HEAD` from a template
+(origin URL resolved from existing config → `--remote-url` → `GENESIS_REPO_URL`
+→ the capture — never from a backup, which is circular); (b) **move** corrupt
+loose objects to `.git/RECOVERY-corrupt-objects/<ts>/` (they are mode 0444 — the
+tool moves, never overwrites); (c) `git fetch --refetch origin` (a *plain* fetch
+does **not** backfill a quarantined object — only `--refetch` does) + reflog tip
+repair; (d) `git repack -a -d` (only once the store is complete — repack
+hard-fails on a missing reachable object); (e) guided re-clone.
+
+**Re-clone caveat (the last resort).** Swapping `.git` orphans **every linked
+worktree** — their gitdir pointers reference `<main>/.git/worktrees/<name>`,
+which the fresh `.git` does not contain. The tool therefore refuses to swap
+automatically: with `--allow-reclone` it clones + `fsck`-verifies a fresh copy,
+enumerates the linked worktrees at risk, and prints the exact `mv`/`git reset
+--mixed HEAD`/`git worktree prune`+re-add steps for you to run after review. Your
+working tree is preserved (the swap + `git reset --mixed HEAD` leaves tracked
+edits and untracked files byte-identical); the old database is set aside as
+`.git-broken-<ts>` (moved *outside* the repo) so nothing is destroyed.
+
+Exit codes: `0` healthy · `1` residual issues remain (escalate) · `2` aborted
+(no writable capture, or no origin URL resolvable for a config restore).
+
+## Durable Alert Queue (F.3)
+
+Alerts used to die silently when their transport was down: the host
+`AlertDispatcher` logged to journald and returned False, and
+`scripts/backup.sh`'s `_send_telegram` dropped the message if `curl` failed.
+F.3 adds a **store-and-forward queue** so an alert raised while Telegram is
+unreachable is persisted and delivered on the next drain.
+
+**Per-side topology — each side drains its OWN queue** (never a shared mount,
+which would invert reliability and race on delivery):
+
+| Side | Queue dir | Enqueue | Drain |
+|---|---|---|---|
+| Host guardian | `<state_path>/alerts/queue/` | `AlertDispatcher.send` when ALL channels fail | top of `run_check` (the 30s tick) |
+| Container | `~/.genesis/alerts/queue/` | shell (`scripts/lib/alert_queue.sh`) + any Python caller | awareness tick (`runtime/init/alert_drain.py`) |
+
+The queue (`genesis.guardian.alert.queue`) is one schema-v1 JSON file per alert
+(`{schema, ts, severity, source, title, body, dedupe_key, meta}`), written
+atomically at 0600. It is deliberately dependency-free so shell scripts write the
+same format via `queue_alert <severity> <source> <title> <body> [dedupe]`. The
+container queue lives in a `queue/` **subdir** so it never collides with
+`tmp_watchgod`'s `tmp_warning` / `tmp_emergency` flag files in
+`~/.genesis/alerts/`.
+
+**Delivery contract.** `drain(root, send)` calls `send(entry)` oldest-first:
+`True` = terminal (delivered OR intentionally deduped → unlink); `False` =
+transient failure (channel still down → keep the entry and stop the batch, retry
+next tick). The container drainer maps the outreach result: `DELIVERED`/
+`REJECTED` → terminal (a `REJECTED` dedup is redundant, not a failure to retry —
+treating it otherwise would wedge the entry forever); `FAILED`/`HELD`/`PENDING`
+→ keep. `prune()` bounds the queue (200 files / 14 days).
+
+**What pages vs. what stays quiet.** `tmp_watchgod` pages only the **emergency
+(red)** tier, transition-only (once per red episode, gated on the shared
+`tmp_emergency` flag). The **warning (orange)** tier stays dashboard-only — it is
+already surfaced via `~/.genesis/watchgod_state.json` →
+`service_status.collect_cc_tmp_usage()` → the dashboard `cc_tmp` tile — so it
+never touches the queue. `backup.sh` failures page (a backup that did not run is
+an emergency).

@@ -101,9 +101,23 @@ def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
     """
     result = copy.deepcopy(local_raw)
     base_providers = set((base_raw.get("providers") or {}).keys())
+    base_call_sites = set((base_raw.get("call_sites") or {}).keys())
     local_call_sites = (result.get("call_sites") or {})
 
     for cs_name, cs in list(local_call_sites.items()):
+        # A local overlay may OVERRIDE an existing base call site, never
+        # resurrect one the base removed. Drop overlay entries whose ID is
+        # absent from the base (e.g. a stale dashboard edit to a since-deleted
+        # site like 7_ego_cycle) so a .local.yaml can't re-introduce a removed
+        # routed call site after it is deleted upstream.
+        if cs_name not in base_call_sites:
+            logger.warning(
+                "Local override for call site '%s' has no matching base entry "
+                "(removed upstream?) — dropping the stale overlay",
+                cs_name,
+            )
+            del local_call_sites[cs_name]
+            continue
         if not isinstance(cs, dict) or "chain" not in cs:
             continue
         original_chain = cs["chain"]

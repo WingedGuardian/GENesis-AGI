@@ -190,8 +190,12 @@ _sync_deploy_targets() {
         SSH_KEY="$HOME/.ssh/genesis_guardian_ed25519"
 
         if [ -n "$HOST_IP" ] && [ -f "$SSH_KEY" ]; then
-            # Check if Guardian-relevant paths changed in this update
-            GUARDIAN_PATHS="src/genesis/guardian src/genesis/util src/genesis/env.py src/genesis/observability src/genesis/db config/guardian-claude.md pyproject.toml scripts/install_guardian.sh scripts/guardian-gateway.sh"
+            # Check if Guardian-relevant paths changed in this update. Includes
+            # the systemd unit files so a unit-only change (e.g. MemoryMax,
+            # TimeoutStartSec) registers as drift and triggers a redeploy — the
+            # archive below ships those units and the gateway's redeploy verb
+            # copies them, but none of that fires unless the drift gate sees them.
+            GUARDIAN_PATHS="src/genesis/guardian src/genesis/util src/genesis/env.py src/genesis/observability src/genesis/db config/guardian-claude.md config/genesis-guardian.service config/genesis-guardian.timer config/genesis-guardian-watchman.service config/genesis-guardian-watchman.timer pyproject.toml scripts/install_guardian.sh scripts/guardian-gateway.sh"
             DEPLOY_HASH=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 
             # ── Read host state ONCE: deployed_commit + node/cc versions ──
@@ -263,6 +267,8 @@ _sync_deploy_targets() {
                     echo "  Guardian archive temp unavailable (non-fatal) — skipping redeploy"
                 elif git -C "$GENESIS_ROOT" archive HEAD -- \
                        src/ scripts/ pyproject.toml config/guardian-claude.md \
+                       config/genesis-guardian.service config/genesis-guardian.timer \
+                       config/genesis-guardian-watchman.service config/genesis-guardian-watchman.timer \
                        > "$GUARDIAN_ARCHIVE" 2>/dev/null; then
                     GUARDIAN_ARCHIVE_SHA="$(sha256sum "$GUARDIAN_ARCHIVE" | cut -d' ' -f1)"
                     if _redeploy_ssh "redeploy $DEPLOY_HASH $GUARDIAN_ARCHIVE_SHA"; then

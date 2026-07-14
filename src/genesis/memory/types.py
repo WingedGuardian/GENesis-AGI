@@ -63,6 +63,12 @@ class RetrievalResult:
     # never masquerades as retrieval quality. 0.0 == not populated (paths
     # other than HybridRetriever.recall don't compute it).
     retrieval_score: float = 0.0
+    # WS-3 stored provenance (migration 0054): the origin_class stamped at
+    # store time (owner / first_party / external_untrusted). None == the
+    # retrieval path couldn't recover it (pre-0054 row or a surface that
+    # doesn't read it) — consumers fall back to the (collection,
+    # source_pipeline) re-derivation in security.immunity_shadow.
+    origin_class: str | None = None
 
 
 @dataclass(frozen=True)

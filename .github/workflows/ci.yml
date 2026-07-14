@@ -167,6 +167,12 @@ jobs:
           fi
           echo "Portability scan: CLEAN"
 
+      - name: Portability scan (network-address classes)
+        run: |
+          set -euo pipefail
+          bash scripts/check_portability.sh
+          echo "Portability scan (address classes): CLEAN"
+
       - name: Email scan
         run: |
           set -euo pipefail

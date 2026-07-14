@@ -100,7 +100,10 @@ Before recommending IO_TRIAGE, check the PSI trend:
   check cycle is skipped entirely
 - CC diagnosis runs in `/var/lib/guardian-snapshots/cc-sessions` (isolated work dir)
 - Diagnosis refused if pool usage > 90% (disk space preflight)
-- Guardian service limited to 30% of host RAM (MemoryMax=30%), OOMScoreAdjust=500
+- Guardian service given generous resources (MemoryMax=80% of host RAM — a
+  host-survival backstop, not a workload cap), OOMScoreAdjust=0 (neutral): the
+  Guardian is last-ditch recovery, never expendable, but must not preferentially
+  kill the user's host-side Claude Code or the container
 - Snapshot gating: headroom-based check (requires free > max(5GB, 2x avg recent
   snapshots)), not fixed percentage
 

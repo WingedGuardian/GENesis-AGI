@@ -203,6 +203,36 @@ def test_item_is_blockable_honors_first_party_in_kb(collection, source_pipeline,
     )
 
 
+@pytest.mark.parametrize(
+    "origin_class,collection,source_pipeline,expected",
+    [
+        # Stored value is AUTHORITATIVE — the (collection, pipeline) fallback
+        # inputs below are chosen to DISAGREE with it, proving precedence.
+        # Widening: episodic external rows (dispatched sessions, #1021) count.
+        ("external_untrusted", "episodic_memory", "conversation", True),
+        # FP fix: first-party item in the KB via a non-whitelist pipeline no
+        # longer over-observes once its stored class says first_party.
+        ("first_party", "knowledge_base", "knowledge_ingest", False),
+        ("owner", "knowledge_base", "knowledge_ingest", False),
+        # Garbage stored value -> fail-closed external (immunity normalizer).
+        ("banana", "episodic_memory", "conversation", True),
+        # No stored value -> the original fallback derivation decides.
+        (None, "knowledge_base", "knowledge_ingest", True),
+        (None, "knowledge_base", "surplus", False),
+        (None, "episodic_memory", "conversation", False),
+    ],
+)
+def test_item_is_blockable_stored_first(origin_class, collection, source_pipeline, expected):
+    assert (
+        immunity_shadow.item_is_blockable(
+            collection=collection,
+            source_pipeline=source_pipeline,
+            origin_class=origin_class,
+        )
+        is expected
+    )
+
+
 @pytest.mark.asyncio
 async def test_recent_summary_rolls_up(tmp_path, monkeypatch):
     monkeypatch.setattr(immunity, "gate_mode", lambda g: "shadow")

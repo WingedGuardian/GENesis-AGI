@@ -32,9 +32,10 @@ async def test_host_plane_without_guardian():
     assert all(s.status == "unavailable" and s.plane == PLANE_HOST for s in sections)
 
 
-async def test_host_plane_with_guardian_still_unavailable_pre_pr2():
-    """GROUNDWORK contract: even with a guardian handle, PR1 reports the verb missing."""
+async def test_host_plane_with_incompatible_remote_degrades():
+    """A remote without host_profile() (pre-PR2 GuardianRemote build) degrades
+    to plane-unavailable — never raises into the refresh."""
     available, reason, sections = await collect_host(object())
     assert available is False
-    assert "host-profile" in reason
+    assert "host-profile call failed" in reason
     assert len(sections) == len(HOST_SECTIONS)

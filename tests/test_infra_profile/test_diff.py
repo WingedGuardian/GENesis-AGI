@@ -42,8 +42,31 @@ def test_new_section_is_not_drift():
 
 
 def test_unavailable_transitions_are_not_drift():
+    # A section that was never ok has no hash — first data ≠ drift.
     prev = _profile({"host_system": _section(None, status="unavailable")})
     curr = _profile({"host_system": _section("x", {"cores": 8})})
+    assert compute_drift(prev, curr) == []
+
+
+def test_fact_change_across_outage_window_is_drift():
+    # service.py preserves last-ok facts+hash through an unavailable window;
+    # a fact that REALLY changed while the plane was down must surface on
+    # recovery (review 2026-07-13 — a status gate used to swallow this).
+    prev = _profile(
+        {"host_virt": _section("old", {"limits": "8"}, status="unavailable")},
+    )
+    curr = _profile({"host_virt": _section("new", {"limits": "5"})})
+    drift = compute_drift(prev, curr)
+    assert len(drift) == 1
+    assert drift[0]["section"] == "host_virt"
+
+
+def test_going_unavailable_keeps_hash_no_drift():
+    # Curr unavailable keeps the prior hash (service merge) — no drift.
+    prev = _profile({"host_virt": _section("same", {"limits": "8"})})
+    curr = _profile(
+        {"host_virt": _section("same", {"limits": "8"}, status="unavailable")},
+    )
     assert compute_drift(prev, curr) == []
 
 

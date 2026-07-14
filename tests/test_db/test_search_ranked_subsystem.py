@@ -23,6 +23,7 @@ async def _build_db(path: str) -> aiosqlite.Connection:
             valid_at TEXT,
             invalid_at TEXT,
             source_subsystem TEXT,
+            origin_class TEXT,
             deprecated INTEGER NOT NULL DEFAULT 0,
             dream_cycle_run_id TEXT
         )
@@ -139,5 +140,26 @@ async def test_collection_filter_combines_with_subsystem(tmp_path) -> None:
         )
         ids = {r["memory_id"] for r in rows}
         assert ids == {"user-1"}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_rows_carry_origin_class(tmp_path) -> None:
+    """WS-3 B4: search_ranked returns memory_metadata.origin_class (the FTS5
+    path's only route to the stored provenance; NULL for pre-0054 rows)."""
+    conn = await _build_db(str(tmp_path / "fts.db"))
+    try:
+        await conn.execute(
+            "UPDATE memory_metadata SET origin_class = 'external_untrusted' "
+            "WHERE memory_id = 'user-1'"
+        )
+        await conn.commit()
+        rows = await memory_crud.search_ranked(
+            conn, query="decision recovery", include_only_subsystems=None,
+        )
+        by_id = {r["memory_id"]: r for r in rows}
+        assert by_id["user-1"]["origin_class"] == "external_untrusted"
+        assert by_id["ego-1"]["origin_class"] is None
     finally:
         await conn.close()

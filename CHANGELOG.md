@@ -9,6 +9,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Code-intelligence indexing can no longer storm the machine.** Keeping the
+  code graph fresh used to fire a full reindex on every commit, in the
+  background, with no coordination — and if disk cleanup had reclaimed the index
+  first, each "quick refresh" was secretly a full rebuild from scratch. Enough
+  of them at once saturated disk I/O and dragged the whole box to a crawl. Three
+  changes fix this at the root: (1) disk cleanup no longer deletes the code
+  index except as a genuine last resort (very low free space), so refreshes stay
+  incremental; (2) commits and setup now *queue* an index request instead of
+  spawning one — a small idle-gated job does the work only when the machine is
+  quiet, one at a time; and (3) whatever does run is watched live and
+  automatically paused when the system gets busy, so an index can never hold the
+  box hostage. Routine refreshes are now the cheap "fast" pass, with the full
+  pass reserved for a weekly idle window. Also fixes a latent bug where the
+  GitNexus refresh had been silently failing on every run due to an unsupported
+  flag.
+
 ### Added
 
 - **Claude Code sessions no longer forget what they were started for.** Long
@@ -214,6 +232,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The neural monitor's Ego panel now shows real ego activity, not phantom tiles.**
+  The dashboard was rendering a few "ego" tiles that looked healthy but never
+  actually ran — leftovers from an earlier ego redesign that split the ego into
+  two cycles and made its compaction step non-LLM. They're gone, the Ego panel now
+  lists the three live ego call sites, and a couple of other stale tiles (triage,
+  bookmark enrichment) were removed too. A months-old leftover activity record can
+  no longer resurrect a removed tile as if it were live.
 - **Memories recovered after an embedding outage keep their wing/room/life_domain
   filters, and keyword-only results are no longer ranked as artificially fresh.**
   When the embedding provider was down, memories were stored keyword-only and

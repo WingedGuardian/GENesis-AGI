@@ -14,12 +14,16 @@ capture_repo() {
     local target="$OUT_DIR/$name"
 
     mkdir -p "$target"
-    git -C "$repo" rev-parse HEAD > "$target/head.txt"
-    git -C "$repo" branch --show-current > "$target/branch.txt"
-    git -C "$repo" status --short > "$target/status.txt"
+    # `|| true` on every git call: this script also runs mid-incident (git_repair.py
+    # invokes it on a CORRUPT repo), where any git command may fail. Under
+    # `set -e` an unguarded failure would abort the whole capture — losing the
+    # partial baseline we most need. Degrade gracefully, capture what we can.
+    git -C "$repo" rev-parse HEAD > "$target/head.txt" || true
+    git -C "$repo" branch --show-current > "$target/branch.txt" || true
+    git -C "$repo" status --short > "$target/status.txt" || true
     git -C "$repo" diff > "$target/unstaged.diff" || true
     git -C "$repo" diff --cached > "$target/staged.diff" || true
-    git -C "$repo" ls-files --others --exclude-standard > "$target/untracked.txt"
+    git -C "$repo" ls-files --others --exclude-standard > "$target/untracked.txt" || true
 }
 
 capture_repo genesis "$GENESIS_REPO"

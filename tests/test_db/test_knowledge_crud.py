@@ -438,3 +438,34 @@ async def test_proposal_list_pending_filters(db):
     )
     assert len(only_alpha) == 1
     assert only_alpha[0]["id"] == pid_a
+
+
+# ─── WS-3 B4: search_fts carries stored origin_class ─────────────────────────
+
+
+async def test_search_fts_carries_origin_class(db):
+    await knowledge.upsert(
+        db,
+        project_type="research",
+        domain="web",
+        source_doc="crawl-1",
+        concept="Zebra Migration Patterns",
+        body="Zebra migration corridors shift with seasonal rainfall.",
+        source_pipeline="crag_web",
+        origin_class="external_untrusted",
+    )
+    await knowledge.upsert(
+        db,
+        project_type="research",
+        domain="notes",
+        source_doc="note-1",
+        concept="Zebra Notes",
+        body="Zebra observation summary written first-party.",
+        source_pipeline="surplus",
+        origin_class="first_party",
+    )
+    results = await knowledge.search_fts(db, "zebra")
+    assert len(results) == 2
+    by_concept = {r["concept"]: r for r in results}
+    assert by_concept["Zebra Migration Patterns"]["origin_class"] == "external_untrusted"
+    assert by_concept["Zebra Notes"]["origin_class"] == "first_party"

@@ -705,7 +705,8 @@ def _search_fts5(
                 f"""
                 SELECT memory_fts.memory_id, memory_fts.content,
                        memory_fts.source_type, memory_fts.collection,
-                       memory_fts.rank
+                       memory_fts.rank,
+                       memory_metadata.origin_class
                 FROM memory_fts
                 LEFT JOIN memory_metadata
                   ON memory_fts.memory_id = memory_metadata.memory_id
@@ -990,6 +991,8 @@ async def _search_qdrant(
                         # Provenance source tier for KB results (audit D12) — the
                         # label needs it; memory_metadata doesn't carry it.
                         "source_pipeline": payload.get("source_pipeline"),
+                        # WS-3 stored provenance (0054-stamped at store).
+                        "origin_class": payload.get("origin_class"),
                     })
                 return results
     except Exception as exc:
@@ -1230,8 +1233,8 @@ def _enrich_with_metadata(results: list[dict]) -> None:
             conn.row_factory = sqlite3.Row
             placeholders = ",".join("?" for _ in ids)
             rows = conn.execute(
-                f"SELECT memory_id, created_at, wing, collection FROM memory_metadata"  # noqa: S608
-                f" WHERE memory_id IN ({placeholders})",
+                f"SELECT memory_id, created_at, wing, collection, origin_class"  # noqa: S608
+                f" FROM memory_metadata WHERE memory_id IN ({placeholders})",
                 ids,
             ).fetchall()
             meta = {row["memory_id"]: dict(row) for row in rows}
@@ -1242,6 +1245,12 @@ def _enrich_with_metadata(results: list[dict]) -> None:
                     if not r.get("_wing"):
                         r["_wing"] = meta[mid].get("wing")
                     r.setdefault("collection", meta[mid].get("collection"))
+                    # WS-3 stored provenance — fills paths whose search value
+                    # is missing OR None (Qdrant dicts always carry the key,
+                    # None for pre-backfill payloads, so setdefault would
+                    # refuse the fill). A real search-path value always wins.
+                    if r.get("origin_class") is None:
+                        r["origin_class"] = meta[mid].get("origin_class")
         finally:
             conn.close()
     except Exception:
@@ -1826,6 +1835,7 @@ async def _run(prompt: str, session_id: str = "") -> None:
                 if item_is_blockable(
                     collection=r.get("collection"),
                     source_pipeline=r.get("source_pipeline"),
+                    origin_class=r.get("origin_class"),
                 )
             )
             if blockable:
