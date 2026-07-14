@@ -97,12 +97,15 @@ def _host_system() -> dict:
 
 async def _host_storage_pool(config) -> dict:
     """The guardian's own pool measurement, verbatim (asdict of the dataclass)."""
-    from genesis.guardian.pool import measure_storage_pool, worst_tier
+    from genesis.guardian.pool import _detect_pool_name, measure_storage_pool, worst_tier
 
     status = await measure_storage_pool(config)
     section = dataclasses.asdict(status)
     section["tier"] = worst_tier(status, config.storage_pool) if status.detected else "unknown"
-    section["pool_name"] = getattr(config.storage_pool, "pool_name", None)
+    # The incus pool NAME lives in pool.py's detection helper, not in
+    # StoragePoolConfig (which is thresholds-only — reading pool_name off it
+    # always yielded None; Codex P2 2026-07-13).
+    section["pool_name"] = await _detect_pool_name(config)
     return section
 
 

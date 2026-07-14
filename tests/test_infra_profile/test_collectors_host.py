@@ -36,7 +36,7 @@ _LIVE_BLOB = {
         "pool_used_pct": None,
         "detail": "lvm vg0 data=61.19 meta=42.6",
         "tier": "ok",
-        "pool_name": "IncusThinPool",
+        "pool_name": "default",
     },
     "host_virt": {
         "incus_client_version": "6.0.0",
@@ -138,7 +138,7 @@ async def test_live_blob_splits_facts_and_metrics() -> None:
     assert "uptime_seconds" in system.metrics
 
     pool = by_name["host_storage_pool"]
-    assert pool.facts == {"detected": True, "pool_name": "IncusThinPool"}
+    assert pool.facts == {"detected": True, "pool_name": "default"}
     # `detail` embeds live percentages — a fact would churn every refresh.
     assert "detail" in pool.metrics
     assert "data_pct" in pool.metrics

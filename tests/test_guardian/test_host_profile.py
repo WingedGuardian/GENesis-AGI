@@ -73,6 +73,11 @@ class TestGatherHostProfile:
 
         monkeypatch.setattr("genesis.guardian.pool.measure_storage_pool", fake_measure)
 
+        async def fake_pool_name(cfg):
+            return "default"
+
+        monkeypatch.setattr("genesis.guardian.pool._detect_pool_name", fake_pool_name)
+
         async def fake_run(*argv):
             if argv == ("incus", "version"):
                 return "Client version: 6.0.0\nServer version: 6.0.0\n"
@@ -91,6 +96,7 @@ class TestGatherHostProfile:
         assert pool["detected"] is True
         assert pool["data_pct"] == 61.19
         assert pool["tier"] in ("ok", "warn", "high", "crit", "unknown")
+        assert pool["pool_name"] == "default"
         virt = result["host_virt"]
         assert virt["incus_server_version"] == "6.0.0"
         assert virt["container_limits"] == {"limits.cpu": "8", "limits.memory": "16GiB"}
@@ -120,7 +126,11 @@ class TestGatherHostProfile:
         async def fake_measure(cfg):
             return StoragePoolStatus(detected=False, detail="incus unavailable")
 
+        async def fake_pool_name(cfg):
+            return None
+
         monkeypatch.setattr("genesis.guardian.pool.measure_storage_pool", fake_measure)
+        monkeypatch.setattr("genesis.guardian.pool._detect_pool_name", fake_pool_name)
         section = await hp._host_storage_pool(config)
         assert section["detected"] is False
         assert section["tier"] == "unknown"
