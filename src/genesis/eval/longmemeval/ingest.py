@@ -59,8 +59,12 @@ async def ingest_haystack(
     for _session_idx, turn, date in instance.iter_turns():
         if not turn.content.strip():
             continue
+        # Prepend the session date to the content so the reader can reason over
+        # time (temporal-reasoning / knowledge-update questions need to compute
+        # intervals and pick the latest fact); recall carries content verbatim.
+        date_prefix = f"[{date}] " if date else ""
         memory_id = await store.store(
-            content=f"[{turn.role}] {turn.content}",
+            content=f"{date_prefix}[{turn.role}] {turn.content}",
             source=source,
             memory_type="episodic",
             origin_class=origin_class,

@@ -102,12 +102,21 @@ def build_run_summary(
     model: str,
     dataset: str,
     results: Sequence[QuestionArmResult],
+    skipped_case_ids: Sequence[str] = (),
 ) -> EvalRunSummary:
-    """Aggregate one arm's per-question results into a persistable summary."""
-    total = len(results)
-    passed = sum(1 for r in results if r.judged_correct)
+    """Aggregate one arm's per-question results into a persistable summary.
 
-    # Per-question-type accuracy.
+    ``skipped_case_ids`` are questions that errored out (network/embedding/etc.)
+    and were NOT attempted for this arm. They count toward ``total_cases`` and
+    ``skipped_cases`` but NOT the denominator of ``aggregate_score`` — an infra
+    failure shrinks N and is surfaced, never silently tilts accuracy or hides a
+    provider outage (mirrors the A3 bench skip contract).
+    """
+    attempted = len(results)
+    passed = sum(1 for r in results if r.judged_correct)
+    skipped = len(skipped_case_ids)
+
+    # Per-question-type accuracy (over attempted questions).
     by_type: dict[str, list[int]] = {}
     for r in results:
         by_type.setdefault(r.question_type, []).append(1 if r.judged_correct else 0)
@@ -142,6 +151,18 @@ def build_run_summary(
                 cost_usd=_cost(r.input_tokens, r.output_tokens),
             ),
         )
+    for qid in skipped_case_ids:
+        scored.append(
+            ScoredOutput(
+                case_id=qid,
+                passed=False,
+                score=0.0,
+                actual_output="",
+                scorer_type=ScorerType.LLM_JUDGE,
+                scorer_detail=json.dumps({"arm": arm_label, "skipped": True}),
+                skipped=True,
+            ),
+        )
 
     return EvalRunSummary(
         run_id=uuid.uuid4().hex,
@@ -150,13 +171,13 @@ def build_run_summary(
         dataset=dataset,
         trigger=EvalTrigger.MANUAL,
         task_category=TaskCategory.REASONING,
-        total_cases=total,
+        total_cases=attempted + skipped,
         passed_cases=passed,
-        failed_cases=total - passed,
-        skipped_cases=0,
-        aggregate_score=round(passed / total, 4) if total else 0.0,
+        failed_cases=attempted - passed,
+        skipped_cases=skipped,
+        aggregate_score=round(passed / attempted, 4) if attempted else 0.0,
         scores=scores,
-        metadata={"arm": arm_label, "dataset": dataset},
+        metadata={"arm": arm_label, "dataset": dataset, "skipped": skipped},
         results=scored,
     )
 
@@ -238,13 +259,16 @@ async def run_longmemeval(
 ) -> dict[str, EvalRunSummary]:
     """Run the full harness over ``instances``; return per-arm summaries.
 
-    Sets ``GENESIS_MEMORY_WRITEBACKS_OFF`` so multi-arm recall against a shared
-    per-question store cannot re-rank memories across arms. Persists one run per
-    arm when ``db`` is provided.
+    Forces ``GENESIS_MEMORY_WRITEBACKS_OFF`` for the duration of the run so
+    multi-arm recall against a shared per-question store cannot re-rank memories
+    across arms, and RESTORES the prior value afterwards so an in-process caller
+    (e.g. the test suite) isn't polluted. Persists one run per arm when ``db``
+    is provided.
     """
-    os.environ.setdefault(_WRITEBACKS_OFF_ENV, "1")
     arms = list(arms) if arms is not None else default_arms()
     client = client or build_client()
+    prior_writebacks = os.environ.get(_WRITEBACKS_OFF_ENV)
+    os.environ[_WRITEBACKS_OFF_ENV] = "1"
 
     # No silent caps: if rerank arms are requested but no enabled reranker is
     # wired, those arms silently equal their non-rerank twins — say so loudly.
@@ -293,14 +317,25 @@ async def run_longmemeval(
     try:
         gathered = await asyncio.gather(*[_one(i) for i in instances])
     finally:
+        # Restore prior env so a direct in-process caller isn't polluted.
+        if prior_writebacks is None:
+            os.environ.pop(_WRITEBACKS_OFF_ENV, None)
+        else:
+            os.environ[_WRITEBACKS_OFF_ENV] = prior_writebacks
         if owns_embedder:
             await _close_embedder(embedding_provider)
             if run_cache_dir is not None:
                 shutil.rmtree(run_cache_dir, ignore_errors=True)
 
-    # Regroup by arm.
+    # Regroup by arm; a question with no results errored out (skipped) and is
+    # recorded per-arm so the denominator reflects the requested N and provider
+    # failures surface instead of silently shrinking the sample.
     by_arm: dict[str, list[QuestionArmResult]] = {a.label: [] for a in arms}
-    for question_results in gathered:
+    skipped_qids: list[str] = []
+    for inst, question_results in zip(instances, gathered, strict=True):
+        if not question_results:
+            skipped_qids.append(inst.question_id)
+            continue
         for r in question_results:
             by_arm.setdefault(r.arm_label, []).append(r)
 
@@ -308,6 +343,7 @@ async def run_longmemeval(
     for arm in arms:
         summary = build_run_summary(
             arm_label=arm.label,
+            skipped_case_ids=skipped_qids,
             model=DEFAULT_MODEL,
             dataset=_DATASET,
             results=by_arm.get(arm.label, []),

@@ -105,3 +105,25 @@ def test_build_run_summary_empty_results_is_safe():
     )
     assert summary.total_cases == 0
     assert summary.aggregate_score == 0.0
+
+
+def test_build_run_summary_skipped_do_not_tilt_accuracy():
+    # 1 correct + 1 wrong attempted, 2 errored-out (skipped): accuracy is over
+    # the 2 ATTEMPTED (0.5), not diluted by the skips, but total/skipped reflect them.
+    results = [
+        _r("q1", "multi-session", True),
+        _r("q2", "multi-session", False),
+    ]
+    summary = build_run_summary(
+        arm_label="raw",
+        model="m",
+        dataset="longmemeval_oracle",
+        results=results,
+        skipped_case_ids=["q3", "q4"],
+    )
+    assert summary.total_cases == 4
+    assert summary.skipped_cases == 2
+    assert summary.passed_cases == 1
+    assert summary.failed_cases == 1
+    assert summary.aggregate_score == 0.5  # 1 / 2 attempted, not 1 / 4
+    assert sum(1 for s in summary.results if s.skipped) == 2

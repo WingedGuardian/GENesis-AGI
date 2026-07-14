@@ -36,7 +36,12 @@ def build_reranker():
 def print_report(summaries: dict[str, EvalRunSummary]) -> None:
     print("\n===== LongMemEval results (per arm) =====")
     for arm_label, s in summaries.items():
-        print(f"\n[{arm_label}]  overall={s.aggregate_score}  n={s.total_cases}")
+        attempted = s.total_cases - s.skipped_cases
+        skip_note = f"  skipped={s.skipped_cases}" if s.skipped_cases else ""
+        print(
+            f"\n[{arm_label}]  overall={s.aggregate_score}  "
+            f"attempted={attempted}/{s.total_cases}{skip_note}",
+        )
         ev = s.scores.get("evidence_recall_rate")
         if ev is not None:
             print(f"    evidence_recall_rate: {ev}")
