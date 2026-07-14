@@ -82,7 +82,9 @@ _idle_ok() {
 }
 
 # Runner self-lock: one tick at a time (own lock, NOT the entrypoint's).
-mkdir -p "$LOCK_DIR" 2>/dev/null || LOCK_DIR="${TMPDIR:-/tmp}"
+# Fallback stays under $HOME so it works under the service's ProtectSystem=strict
+# + ReadWritePaths=%h (and honors the "~/tmp, never /tmp" convention).
+mkdir -p "$LOCK_DIR" 2>/dev/null || { mkdir -p "$HOME/tmp" 2>/dev/null; LOCK_DIR="$HOME/tmp"; }
 RUNNER_LOCK="$LOCK_DIR/code-intel-runner.lock"
 if command -v flock >/dev/null 2>&1 && { exec 8>"$RUNNER_LOCK"; } 2>/dev/null; then
     if ! flock -n 8; then

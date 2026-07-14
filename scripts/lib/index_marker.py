@@ -271,10 +271,15 @@ def repend_stale_inflight() -> list[str]:
 
 
 def last_full_path(h: str) -> Path:
+    """Path of the marker recording when a FULL index last succeeded for this
+    repo. Its age gates weekly-full escalation (see ``should_escalate_full``)."""
     return marker_dir() / f".last-full-{h}"
 
 
 def full_backoff_path(h: str) -> Path:
+    """Path of the marker recording when a FULL escalation last FAILED. Its
+    presence within ``FULL_BACKOFF_S`` suppresses re-escalation so a doomed full
+    falls back to cheap fast runs instead of thrashing."""
     return marker_dir() / f".full-backoff-{h}"
 
 
