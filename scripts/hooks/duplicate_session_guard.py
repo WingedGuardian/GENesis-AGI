@@ -54,6 +54,9 @@ OWNERS_DIR = Path.home() / ".genesis" / "session-owners"
 
 ALLOW = "allow"
 DENY = "deny"
+# Shared between decide() and _guard()'s self-heal branch — a reword that
+# drifts the two apart would silently disable the hook-side conflict cleanup.
+REASON_STALE = "conflict stale (fewer than two live executors)"
 
 
 def _read_json(path: Path) -> dict | None:
@@ -122,7 +125,7 @@ def decide(
 
     live = [(pid, st) for pid, st in executors if alive(pid, st)]
     if len(live) < 2:
-        return ALLOW, "conflict stale (fewer than two live executors)"
+        return ALLOW, REASON_STALE
 
     me = (my_pid, my_starttime)
     if me not in live:
@@ -222,10 +225,11 @@ def _guard(payload: dict) -> int:
     action, reason = decide(_read_json(conflict_path), my_pid, my_starttime)
 
     if action == ALLOW:
-        # Self-heal: a conflict without two live executors is stale.
-        if reason == "conflict stale (fewer than two live executors)":
+        # Self-heal: a conflict without two live executors is stale. (The
+        # override file can't exist here — it short-circuits above; the
+        # awareness-loop GC owns override cleanup.)
+        if reason == REASON_STALE:
             _unlink_quiet(conflict_path)
-            _unlink_quiet(override_path)
         return 0
 
     print(

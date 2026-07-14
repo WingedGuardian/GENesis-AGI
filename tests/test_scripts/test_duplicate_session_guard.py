@@ -299,3 +299,112 @@ def test_main_is_fail_open_on_internal_error(owners, monkeypatch, capsys):
     monkeypatch.setattr(guard.sys, "argv", ["duplicate_session_guard.py"])
     assert guard.main() == 0
     assert "failing open" in capsys.readouterr().err
+
+
+# -- ancestor walk / stat parse ------------------------------------------------
+
+
+def test_find_claude_ancestor_walks_to_nearest(monkeypatch):
+    # 500 (hook) -> 400 (sh) -> 300 (claude, nested -p) -> 200 (claude session)
+    comms = {400: "sh", 300: "claude", 200: "claude", 100: "bash"}
+    parents = {500: 400, 400: 300, 300: 200, 200: 100, 100: 1}
+    monkeypatch.setattr(proc_ident, "read_comm", comms.get)
+    monkeypatch.setattr(proc_ident, "read_ppid", parents.get)
+    # Nearest wins: a nested claude -p attributes to ITSELF, not the outer one.
+    assert proc_ident.find_claude_ancestor(500) == 300
+    assert proc_ident.find_claude_ancestor(200) == 200  # self counts
+
+
+def test_find_claude_ancestor_none_without_claude(monkeypatch):
+    monkeypatch.setattr(proc_ident, "read_comm", lambda pid: "bash")
+    monkeypatch.setattr(proc_ident, "read_ppid", lambda pid: pid - 1 if pid > 1 else None)
+    assert proc_ident.find_claude_ancestor(10) is None  # hits pid 1
+    assert proc_ident.find_claude_ancestor(1) is None
+
+
+def test_find_claude_ancestor_bounded_walk(monkeypatch):
+    # A cycle in the (mocked) ppid chain must not loop forever.
+    monkeypatch.setattr(proc_ident, "read_comm", lambda pid: "zsh")
+    monkeypatch.setattr(proc_ident, "read_ppid", lambda pid: 7)
+    assert proc_ident.find_claude_ancestor(7) is None
+
+
+def test_proc_stat_fields_survives_hostile_comm():
+    # A comm containing spaces and ')' — the exact case the last-')' split
+    # exists for. Rename a real child process via prctl(PR_SET_NAME) and
+    # parse its live /proc entry.
+    import subprocess
+    import textwrap
+
+    code = textwrap.dedent(
+        """
+        import ctypes, time
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(15, b"a) b (c", 0, 0, 0)  # PR_SET_NAME
+        print("ready", flush=True)
+        time.sleep(30)
+        """
+    )
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        assert proc_ident.read_comm(proc.pid) == "a) b (c"
+        fields = proc_ident.proc_stat_fields(proc.pid)
+        assert fields is not None
+        assert fields[0] == "S"  # state field, first after comm
+        assert proc_ident.read_ppid(proc.pid) == os.getpid()
+        st = proc_ident.read_starttime(proc.pid)
+        assert isinstance(st, int) and st > 0
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+# -- SessionStart advisory (_duplicate_executor_warning) ------------------------
+
+
+@pytest.fixture
+def session_context():
+    scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
+    spec = importlib.util.spec_from_file_location(
+        "genesis_session_context", scripts_dir / "genesis_session_context.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _owner_file(home: Path, transcript: str, payload: dict) -> Path:
+    d = home / ".genesis" / "session-owners"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{proc_ident.transcript_key(transcript)}.json"
+    p.write_text(json.dumps(payload))
+    return p
+
+
+def test_warning_fires_for_live_foreign_owner(session_context, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    st1 = proc_ident.read_starttime(1)  # pid 1: alive, never our ancestor
+    _owner_file(tmp_path, "/t/w.jsonl", {"pid": 1, "starttime": st1})
+    warning = session_context._duplicate_executor_warning("/t/w.jsonl")
+    assert warning is not None
+    assert "DUPLICATE SESSION EXECUTOR" in warning
+    assert "pid 1" in warning
+
+
+def test_warning_silent_without_owner_or_transcript(session_context, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert session_context._duplicate_executor_warning("") is None
+    assert session_context._duplicate_executor_warning("/t/none.jsonl") is None
+
+
+def test_warning_silent_for_dead_owner(session_context, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _owner_file(tmp_path, "/t/w.jsonl", {"pid": 2**22 + 999, "starttime": 4})
+    assert session_context._duplicate_executor_warning("/t/w.jsonl") is None
+
+
+def test_warning_silent_for_malformed_owner(session_context, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _owner_file(tmp_path, "/t/w.jsonl", {"pid": "x", "starttime": None})
+    assert session_context._duplicate_executor_warning("/t/w.jsonl") is None

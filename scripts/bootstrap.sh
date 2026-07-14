@@ -659,7 +659,9 @@ echo
 echo "--- sshd dead-client detection (ClientAlive) ---"
 SSHD_DROP_IN="/etc/ssh/sshd_config.d/00-genesis-clientalive.conf"
 SSHD_CONTENT=$'# Genesis: detect dead SSH clients fast so an orphaned foreground session\n# cannot keep executing headless (see duplicate-session guard).\nClientAliveInterval 15\nClientAliveCountMax 4'
-if ! command -v sshd >/dev/null 2>&1; then
+# sshd lives in /usr/sbin, which minimal/non-login shells may not have on
+# PATH — check both so the hardening never silently skips on a real install.
+if ! command -v sshd >/dev/null 2>&1 && [[ ! -x /usr/sbin/sshd ]]; then
     echo "  sshd not installed — skipping"
 elif [[ "$(sudo cat "$SSHD_DROP_IN" 2>/dev/null)" == "$SSHD_CONTENT" ]] \
     && sudo sshd -T 2>/dev/null | grep -qi '^clientaliveinterval 15$'; then
