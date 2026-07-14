@@ -30,11 +30,16 @@ if TYPE_CHECKING:
 
 @dataclass
 class EphemeralStore:
-    """A throwaway store + retriever pair sharing one in-memory Qdrant + temp DB."""
+    """A throwaway store + retriever pair sharing one in-memory Qdrant + temp DB.
+
+    ``db`` is the ephemeral SQLite connection — exposed so the graph arm can
+    run link queries (``memory_links.neighbors_of``) against this store.
+    """
 
     store: MemoryStore
     retriever: HybridRetriever
     workdir: Path
+    db: object = None
 
 
 def _default_tmp_root() -> Path:
@@ -50,6 +55,8 @@ async def ephemeral_store(
     embedding_provider: object | None = None,
     reranker: object | None = None,
     tmp_root: str | Path | None = None,
+    with_linker: bool = False,
+    link_threshold: float = 0.75,
 ) -> AsyncIterator[EphemeralStore]:
     """Build a fresh ephemeral store; tear down all temp state on exit.
 
@@ -57,6 +64,12 @@ async def ephemeral_store(
     omitted, Genesis's real cloud-first embedding chain is used. ``reranker``
     (a VoyageReranker) is wired into the retriever so the ``rerank`` arm is
     real; ``None`` makes ``recall(rerank=True)`` a graceful no-op.
+
+    ``with_linker`` wires a real ``MemoryLinker`` into the store so
+    ``store(auto_link=True)`` creates ``memory_links`` (the graph arm's store).
+    It is opt-in: ``MemoryStore.store()`` defaults ``auto_link=True``, so an
+    always-present linker would let any future direct ``store()`` call create
+    links silently on baseline stores.
     """
     from qdrant_client import QdrantClient
 
@@ -78,7 +91,21 @@ async def ephemeral_store(
         backends=EmbeddingProvider.build_chain(ollama_first=False),
         cache_dir=workdir / "cache",
     )
-    store = MemoryStore(embedding_provider=embedder, qdrant_client=qdrant, db=db)
+    linker = None
+    if with_linker:
+        from genesis.memory.linker import MemoryLinker
+
+        linker = MemoryLinker(
+            qdrant_client=qdrant,
+            db=db,
+            similarity_threshold=link_threshold,
+        )
+    store = MemoryStore(
+        embedding_provider=embedder,
+        qdrant_client=qdrant,
+        db=db,
+        linker=linker,
+    )
     retriever = HybridRetriever(
         embedding_provider=embedder,
         qdrant_client=qdrant,
@@ -87,7 +114,7 @@ async def ephemeral_store(
     )
 
     try:
-        yield EphemeralStore(store=store, retriever=retriever, workdir=workdir)
+        yield EphemeralStore(store=store, retriever=retriever, workdir=workdir, db=db)
     finally:
         with contextlib.suppress(Exception):
             await db.close()

@@ -15,20 +15,43 @@ from genesis.qdrant.collections import search
 logger = logging.getLogger(__name__)
 
 # Valid typed link types from schema CHECK constraint
-_VALID_LINK_TYPES = frozenset({
-    "supports", "contradicts", "extends", "elaborates",
-    "discussed_in", "evaluated_for", "decided",
-    "action_item_for", "categorized_as", "related_to",
-    "succeeded_by", "preceded_by",
-})
+_VALID_LINK_TYPES = frozenset(
+    {
+        "supports",
+        "contradicts",
+        "extends",
+        "elaborates",
+        "discussed_in",
+        "evaluated_for",
+        "decided",
+        "action_item_for",
+        "categorized_as",
+        "related_to",
+        "succeeded_by",
+        "preceded_by",
+    }
+)
 
 
 class MemoryLinker:
-    """Find similar memories and create bidirectional links."""
+    """Find similar memories and create bidirectional links.
 
-    def __init__(self, *, qdrant_client: QdrantClient, db: aiosqlite.Connection) -> None:
+    ``similarity_threshold`` on the constructor becomes ``auto_link``'s
+    default: callers that never pass a per-call threshold (``MemoryStore.
+    store()``) inherit it, so a non-default linking policy needs only a
+    differently-constructed linker, not call-site churn.
+    """
+
+    def __init__(
+        self,
+        *,
+        qdrant_client: QdrantClient,
+        db: aiosqlite.Connection,
+        similarity_threshold: float = 0.75,
+    ) -> None:
         self._qdrant = qdrant_client
         self._db = db
+        self._similarity_threshold = similarity_threshold
 
     async def auto_link(
         self,
@@ -36,10 +59,12 @@ class MemoryLinker:
         vector: list[float],
         *,
         collection: str = "episodic_memory",
-        similarity_threshold: float = 0.75,
+        similarity_threshold: float | None = None,
         max_links: int = 5,
     ) -> list[LinkRecord]:
         """Find similar memories and create links."""
+        if similarity_threshold is None:
+            similarity_threshold = self._similarity_threshold
         results = search(
             self._qdrant,
             collection=collection,
@@ -84,6 +109,7 @@ class MemoryLinker:
 
         if links:
             from genesis.memory.graph import invalidate_graph_cache
+
             invalidate_graph_cache()
         return links
 
@@ -124,7 +150,8 @@ class MemoryLinker:
             if link_type not in _VALID_LINK_TYPES:
                 logger.debug(
                     "Skipping invalid link type %r for memory %s",
-                    link_type, memory_id,
+                    link_type,
+                    memory_id,
                 )
                 continue
 
@@ -133,7 +160,8 @@ class MemoryLinker:
             if not target_id:
                 logger.debug(
                     "No matching memory found for entity %r (link from %s)",
-                    target_name, memory_id,
+                    target_name,
+                    memory_id,
                 )
                 continue
 
@@ -162,12 +190,15 @@ class MemoryLinker:
                 # Likely duplicate primary key — link already exists
                 logger.debug(
                     "Link %s → %s (%s) already exists or failed",
-                    memory_id, target_id, link_type,
+                    memory_id,
+                    target_id,
+                    link_type,
                     exc_info=True,
                 )
 
         if links:
             from genesis.memory.graph import invalidate_graph_cache
+
             invalidate_graph_cache()
         return links
 

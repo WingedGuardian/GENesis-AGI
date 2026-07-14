@@ -29,6 +29,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The memory benchmark can now measure whether Genesis's memory graph
+  actually helps.** A new `--graph` mode runs every benchmark arm twice — once
+  against a plain store and once against a store where memories link to
+  similar earlier memories exactly as they do in production — and follows
+  those links at recall time to pull in related memories the search itself
+  missed. Baseline and graph runs use fully separate stores, so the
+  comparison is honest (links can't quietly tint the baseline's ranking). Per
+  question, the results record how many links formed and how much extra gold
+  evidence the graph surfaced, and a graph run that formed no links says so
+  loudly instead of silently matching its baseline. The memory linker's
+  similarity threshold is also now configurable per instance instead of fixed.
+
 - **The memory benchmark now grades temporal questions fairly and explains
   its misses.** The LongMemEval reader gets the question's date (the
   benchmark's own convention — without it, "how many weeks ago…" questions

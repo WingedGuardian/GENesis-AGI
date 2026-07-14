@@ -181,3 +181,49 @@ async def test_inter_candidate_links_empty(db):
     """Empty candidate set returns empty list."""
     edges = await memory_links.inter_candidate_links(db, [])
     assert edges == []
+
+
+async def test_neighbors_of_dedupes_directions_and_types(db):
+    """neighbors_of collapses multi-type rows + both directions to one row per
+    neighbor with MAX(strength), strongest first."""
+    # seed <-> n1 linked twice (two types, both directions), n2 weaker, n3 via inbound only
+    await memory_links.create(
+        db, source_id="seed", target_id="n1", link_type="supports",
+        strength=0.8, created_at="2026-01-01",
+    )
+    await memory_links.create(
+        db, source_id="n1", target_id="seed", link_type="extends",
+        strength=0.92, created_at="2026-01-01",
+    )
+    await memory_links.create(
+        db, source_id="seed", target_id="n2", link_type="supports",
+        strength=0.76, created_at="2026-01-01",
+    )
+    await memory_links.create(
+        db, source_id="n3", target_id="seed", link_type="supports",
+        strength=0.85, created_at="2026-01-01",
+    )
+    rows = await memory_links.neighbors_of(db, ["seed"])
+    ids = [r["memory_id"] for r in rows]
+    assert ids == ["n1", "n3", "n2"]  # strongest-first, n1 once (max 0.92)
+    assert rows[0]["strength"] == 0.92
+
+
+async def test_neighbors_of_excludes_and_caps(db):
+    for i, s in enumerate((0.9, 0.85, 0.8)):
+        await memory_links.create(
+            db, source_id="seed", target_id=f"n{i}", link_type="supports",
+            strength=s, created_at="2026-01-01",
+        )
+    rows = await memory_links.neighbors_of(db, ["seed"], exclude=["n0"], limit=1)
+    assert [r["memory_id"] for r in rows] == ["n1"]  # n0 excluded, capped to 1
+
+
+async def test_neighbors_of_never_returns_seeds_or_empty(db):
+    await memory_links.create(
+        db, source_id="a", target_id="b", link_type="supports",
+        strength=0.9, created_at="2026-01-01",
+    )
+    rows = await memory_links.neighbors_of(db, ["a", "b"])
+    assert rows == []  # b is itself a seed, not a neighbor
+    assert await memory_links.neighbors_of(db, []) == []

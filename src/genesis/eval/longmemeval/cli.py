@@ -65,12 +65,17 @@ async def execute(
     db_path: Path | None = None,
     types: str | None = None,
     dump_dir: Path | None = None,
+    graph: bool = False,
+    graph_link_threshold: float = 0.75,
 ) -> dict[str, EvalRunSummary]:
     """Load the dataset, run the harness, persist (optionally), return summaries.
 
     ``types`` (comma-separated question types) filters BEFORE ``limit`` so
     ``--types temporal-reasoning --limit 20`` means "the first 20 temporal
     questions", not "temporal questions among the first 20".
+
+    ``graph`` ADDS a ``+graph`` variant of every selected arm (paired
+    baseline-vs-graph comparison in one run, one dump dir).
     """
     load_secrets()
     instances = load_oracle(dataset_path)
@@ -83,6 +88,10 @@ async def execute(
     arms = default_arms()
     if no_rerank:
         arms = [a for a in arms if not a.rerank]
+    if graph:
+        from dataclasses import replace
+
+        arms = [*arms, *(replace(a, graph=True) for a in arms)]
     reranker = None if no_rerank else build_reranker()
 
     db = None
@@ -109,6 +118,7 @@ async def execute(
             concurrency=concurrency,
             reranker=reranker,
             dump_dir=dump_dir,
+            link_threshold=graph_link_threshold,
         )
     finally:
         if db is not None:

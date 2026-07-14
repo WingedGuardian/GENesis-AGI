@@ -25,6 +25,13 @@ def test_arm_label():
     assert Arm(QueryArm.KEYWORD, rerank=True).label == "keyword+rerank"
 
 
+def test_arm_label_graph_suffix_is_deterministic():
+    # rerank before graph, always — model_profile stability across runs
+    assert Arm(QueryArm.RAW, rerank=False, graph=True).label == "raw+graph"
+    assert Arm(QueryArm.RAW, rerank=True, graph=True).label == "raw+rerank+graph"
+    assert Arm(QueryArm.KEYWORD, rerank=True, graph=True).label == "keyword+rerank+graph"
+
+
 def test_default_arms_are_the_four_combinations():
     labels = {a.label for a in default_arms()}
     assert labels == {"raw", "raw+rerank", "keyword", "keyword+rerank"}
@@ -106,6 +113,57 @@ def test_build_run_summary_empty_results_is_safe():
     )
     assert summary.total_cases == 0
     assert summary.aggregate_score == 0.0
+
+
+def test_build_run_summary_reports_graph_means_when_present():
+    results = [
+        QuestionArmResult(
+            question_id="q1",
+            question_type="multi-session",
+            arm_label="raw+graph",
+            hypothesis="h",
+            judged_correct=True,
+            evidence_recalled=True,
+            evidence_coverage=0.5,
+            evidence_coverage_final=1.0,
+            links_created=6,
+            expanded_ids=("n1", "n2"),
+            judge_raw="yes",
+        ),
+        QuestionArmResult(
+            question_id="q2",
+            question_type="multi-session",
+            arm_label="raw+graph",
+            hypothesis="h",
+            judged_correct=False,
+            evidence_recalled=True,
+            evidence_coverage=1.0,
+            evidence_coverage_final=1.0,
+            links_created=2,
+            expanded_ids=(),
+            judge_raw="no",
+        ),
+    ]
+    summary = build_run_summary(
+        arm_label="raw+graph",
+        model="m",
+        dataset="longmemeval_oracle",
+        results=results,
+    )
+    assert summary.scores["evidence_coverage_final_mean"] == 1.0
+    assert summary.metadata["links_created_mean"] == 4.0
+    assert summary.metadata["expanded_mean"] == 1.0
+
+
+def test_build_run_summary_omits_graph_means_for_baseline_arms():
+    summary = build_run_summary(
+        arm_label="raw",
+        model="m",
+        dataset="longmemeval_oracle",
+        results=[_r("q1", "multi-session", True, coverage=0.5)],
+    )
+    assert "evidence_coverage_final_mean" not in summary.scores
+    assert "links_created_mean" not in summary.metadata
 
 
 def test_build_run_summary_reports_mean_evidence_coverage():

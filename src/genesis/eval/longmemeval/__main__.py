@@ -44,6 +44,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="write per-question diagnostics (one <arm>.jsonl per arm) here",
     )
+    p.add_argument(
+        "--graph",
+        action="store_true",
+        help="ADD a +graph variant of every selected arm (linked store + 1-hop expansion)",
+    )
+    p.add_argument(
+        "--graph-link-threshold",
+        type=float,
+        default=0.75,
+        help="cosine threshold for auto-linking on the graph arm's store",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -65,6 +76,8 @@ def main(argv: list[str] | None = None) -> int:
             db_path=args.db_path,
             types=args.types,
             dump_dir=args.dump_dir,
+            graph=args.graph,
+            graph_link_threshold=args.graph_link_threshold,
         ),
     )
     print_report(summaries)

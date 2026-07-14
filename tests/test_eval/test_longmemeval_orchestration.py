@@ -151,6 +151,99 @@ async def test_run_longmemeval_dumps_jsonl_and_anchors_date(tmp_path):
     assert all("Current Date: 2023/05/23 (Tue) 19:11" in p for p in reader_prompts)
 
 
+def _multi_evidence_instance(qid: str) -> LongMemEvalInstance:
+    """Two near-identical evidence turns across two sessions: the hashing
+    embedder links them (cosine >> 0.75), and a k=1 recall retrieves exactly
+    one — so graph expansion is the ONLY way to reach full evidence coverage."""
+    base = (
+        "I spent the whole afternoon repairing the old wooden fence around the "
+        "garden before the storm arrived"
+    )
+    return LongMemEvalInstance(
+        question_id=qid,
+        question_type="multi-session",
+        question="What did I repair around the garden before the storm arrived?",
+        answer="the wooden fence",
+        question_date="2023/05/23 (Tue) 19:11",
+        haystack_dates=["2023/05/01 (Mon) 10:00", "2023/05/02 (Tue) 10:00"],
+        haystack_session_ids=["s1", "s2"],
+        haystack_sessions=[
+            [Turn("user", f"{base} yesterday.", True)],
+            [Turn("user", f"{base} today.", True)],
+        ],
+        answer_session_ids=["a1", "a2"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_graph_arm_isolated_dual_store_and_expansion(tmp_path):
+    """The graph arm runs on its OWN linked store (baseline store stays
+    link-free: activation-connectivity would otherwise tint baseline ranking),
+    and 1-hop expansion merges the linked-but-unretrieved evidence turn."""
+    import json as _json
+
+    instances = [_multi_evidence_instance("q1")]
+    client = _PromptRecordingClient()
+    summaries = await run_longmemeval(
+        instances,
+        db=None,
+        arms=[
+            Arm(QueryArm.RAW, rerank=False),
+            Arm(QueryArm.RAW, rerank=False, graph=True),
+        ],
+        k=1,
+        concurrency=1,
+        client=client,
+        embedding_provider=_HashingEmbedder(),
+        dump_dir=tmp_path,
+    )
+    base = _json.loads((tmp_path / "raw.jsonl").read_text().splitlines()[0])
+    graph = _json.loads((tmp_path / "raw+graph.jsonl").read_text().splitlines()[0])
+
+    # baseline arm: link-free store, no expansion fields populated
+    assert base["links_created"] == 0
+    assert base["expanded_ids"] == []
+    assert base["evidence_coverage"] == 0.5  # k=1 of 2 evidence turns
+
+    # graph arm: links were created at ingest on its own store
+    assert graph["links_created"] >= 1
+    # top-K metrics stay baseline-comparable...
+    assert graph["evidence_coverage"] == 0.5
+    # ...and expansion pulls the linked sibling: full coverage post-expansion
+    assert graph["expanded_ids"]
+    assert graph["evidence_coverage_final"] == 1.0
+    assert graph["evidence_recalled_final"] is True
+
+    # summary means surface the graph diagnostics
+    assert summaries["raw+graph"].scores["evidence_coverage_final_mean"] == 1.0
+    assert summaries["raw+graph"].metadata["links_created_mean"] >= 1
+    # the reader saw MORE memories in the graph arm (expanded context)
+    reader_prompts = [p for p in client.prompts if "MEMORIES:" in p]
+    assert max(p.count("\n- ") for p in reader_prompts) > min(
+        p.count("\n- ") for p in reader_prompts
+    )
+
+
+@pytest.mark.asyncio
+async def test_graph_arm_warns_on_zero_links(tmp_path, caplog):
+    """No-silent-caps parity: a graph arm whose store formed zero links must
+    say so loudly (it would otherwise silently equal its baseline twin)."""
+    instances = [_instance("q1")]  # single turn — nothing to link to
+    client = _PromptRecordingClient()
+    with caplog.at_level("WARNING", logger="genesis.eval.longmemeval"):
+        await run_longmemeval(
+            instances,
+            db=None,
+            arms=[Arm(QueryArm.RAW, rerank=False, graph=True)],
+            k=5,
+            concurrency=1,
+            client=client,
+            embedding_provider=_HashingEmbedder(),
+            dump_dir=tmp_path,
+        )
+    assert any("zero links" in r.message for r in caplog.records)
+
+
 @pytest.mark.asyncio
 async def test_run_longmemeval_runs_questions_concurrently():
     instances = [_instance(f"q{i}") for i in range(4)]

@@ -208,6 +208,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--dump-dir", default=None,
         help="write per-question diagnostics (one <arm>.jsonl per arm) here",
     )
+    lme_cmd.add_argument(
+        "--graph", action="store_true",
+        help="ADD a +graph variant of every selected arm (linked store + expansion)",
+    )
+    lme_cmd.add_argument(
+        "--graph-link-threshold", type=float, default=0.75,
+        help="cosine threshold for auto-linking on the graph arm's store",
+    )
 
     eval_cmd.set_defaults(func=_run_eval_cli)
 
@@ -274,6 +282,8 @@ async def _cmd_longmemeval(args: argparse.Namespace) -> int:
         db_path=Path(args.db_path) if args.db_path else None,
         types=args.types,
         dump_dir=Path(args.dump_dir) if args.dump_dir else None,
+        graph=args.graph,
+        graph_link_threshold=args.graph_link_threshold,
     )
     print_report(summaries)
     return 0

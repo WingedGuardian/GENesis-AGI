@@ -94,10 +94,7 @@ async def batch_link_counts(
         for row in inbound_rows:
             inbound_map[row[0]] = inbound_map.get(row[0], 0) + row[1]
 
-    return {
-        mid: (total_map.get(mid, 0), inbound_map.get(mid, 0))
-        for mid in memory_ids
-    }
+    return {mid: (total_map.get(mid, 0), inbound_map.get(mid, 0)) for mid in memory_ids}
 
 
 async def inter_candidate_links(
@@ -126,6 +123,46 @@ async def inter_candidate_links(
     return [(row[0], row[1]) for row in rows]
 
 
+async def neighbors_of(
+    db: aiosqlite.Connection,
+    memory_ids: list[str],
+    *,
+    exclude: list[str] | tuple[str, ...] = (),
+    limit: int = 10,
+) -> list[dict]:
+    """1-hop neighbors of *memory_ids* via ``memory_links``, strongest first.
+
+    Both directions are followed and collapsed to ONE row per neighbor with
+    ``MAX(strength)`` — the PK is ``(source_id, target_id, link_type)`` (DLI-04),
+    so a pair with multiple link types yields multiple rows, and several seeds
+    can reach the same neighbor; a naive UNION would burn ``limit`` slots on
+    duplicates. Seeds themselves and ``exclude`` ids are never returned.
+
+    Returns ``[{"memory_id": ..., "strength": ...}]``. Used by recall-time
+    graph expansion (LongMemEval graph arm; prod graph/entity recall wiring
+    reuses this as the canonical neighbor query).
+    """
+    if not memory_ids:
+        return []
+    if len(memory_ids) > 499:
+        memory_ids = memory_ids[:499]
+    dropped = {*memory_ids, *exclude}
+    ph = ",".join("?" * len(memory_ids))
+    drop_ph = ",".join("?" * len(dropped))
+    rows = await db.execute_fetchall(
+        f"SELECT neighbor, MAX(strength) AS s FROM ("
+        f"  SELECT target_id AS neighbor, strength FROM memory_links"
+        f"    WHERE source_id IN ({ph})"
+        f"  UNION ALL"
+        f"  SELECT source_id AS neighbor, strength FROM memory_links"
+        f"    WHERE target_id IN ({ph})"
+        f") WHERE neighbor NOT IN ({drop_ph})"
+        f" GROUP BY neighbor ORDER BY s DESC LIMIT ?",
+        [*memory_ids, *memory_ids, *dropped, limit],
+    )
+    return [{"memory_id": row[0], "strength": row[1]} for row in rows]
+
+
 async def get_bidirectional(db: aiosqlite.Connection, memory_id: str) -> list[dict]:
     """Get all links where memory_id is source or target (undirected query)."""
     return await get_links_for(db, memory_id)
@@ -147,8 +184,7 @@ async def delete(
     """
     if link_type is not None:
         cursor = await db.execute(
-            "DELETE FROM memory_links "
-            "WHERE source_id = ? AND target_id = ? AND link_type = ?",
+            "DELETE FROM memory_links WHERE source_id = ? AND target_id = ? AND link_type = ?",
             (source_id, target_id, link_type),
         )
     else:
@@ -191,6 +227,7 @@ async def prune_weak(
     if pruned:
         try:
             from genesis.memory.graph import invalidate_graph_cache
+
             invalidate_graph_cache()
         except ImportError:
             pass
