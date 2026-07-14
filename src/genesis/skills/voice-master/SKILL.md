@@ -193,6 +193,7 @@ changes if asked).
 | Professional peers | 2–3 | OK | professional.md |
 | Formal / cold outreach | 3–4 | None | professional.md, longform.md |
 | Public content | 4–5 | None | longform.md |
+| Forum / Anonymous | Register varies | OK (if in-character) | references/media/forum.md |
 
 ## References
 
