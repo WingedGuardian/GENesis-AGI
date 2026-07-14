@@ -19,6 +19,27 @@ async def test_create_campaign(db):
     assert campaign_id == "c1"
 
 
+async def test_create_campaign_defaults_to_interact_profile(db):
+    """Default session_profile must not silently grant recon (idx 37 follow-through).
+
+    The 'research' profile now loads genesis-recon (read+write); campaigns run
+    unattended, so they must not inherit that surface by default. The runner's
+    own fallback is already 'interact'.
+    """
+    from genesis.db.crud import campaigns as crud
+
+    await crud.create_campaign(
+        db,
+        id="c-default",
+        name="default-profile",
+        strategy_doc_path="/tmp/strategy.md",
+        cron_cadence="0 */8 * * *",
+        created_at="2026-06-07T00:00:00Z",
+    )
+    row = await crud.get_campaign_by_name(db, "default-profile")
+    assert row["session_profile"] == "interact"
+
+
 async def test_get_campaign_by_name(db):
     from genesis.db.crud import campaigns as crud
 

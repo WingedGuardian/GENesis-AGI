@@ -34,7 +34,7 @@ class Campaign:
     cron_cadence: str
     model: str = "sonnet"
     effort: str = "medium"
-    session_profile: str = "research"
+    session_profile: str = "interact"
     status: CampaignStatus = CampaignStatus.ACTIVE
     state_json: str = "{}"
     pre_checks: str = '["rate_limit", "budget", "slots_available"]'
