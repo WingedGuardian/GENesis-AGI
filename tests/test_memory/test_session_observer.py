@@ -14,6 +14,7 @@ from genesis.memory.session_observer import (
     _infer_wing_from_files,
     _parse_notes,
     _read_observations,
+    _restore_processing_files,
     process_pending_observations,
 )
 
@@ -282,3 +283,48 @@ async def test_process_pending_observations_stores_notes(tmp_path, monkeypatch):
     # then deleted after processing)
     assert not obs_file.exists()
     assert not obs_file.with_suffix(".jsonl.processing").exists()
+# ── restore path ────────────────────────────────────────────────────────
+
+
+class TestRestoreProcessingFiles:
+    """Leftover .processing files must return to their EXACT original path.
+
+    Regression guard for the with_suffix bug: Path.with_suffix replaces only
+    the LAST suffix, so deriving the original from the processing path turned
+    tool_observations.jsonl.processing into tool_observations.jsonl.jsonl —
+    a name the finder never scans, orphaning every restored file forever
+    (108 orphans found on disk, 2026-07-13).
+    """
+
+    def test_restores_to_exact_original_name(self, tmp_path):
+        original = tmp_path / "tool_observations.jsonl"
+        processing = tmp_path / "tool_observations.jsonl.processing"
+        processing.write_text('{"tool": "Read"}\n')
+
+        _restore_processing_files([(original, processing)])
+
+        assert original.exists()
+        assert original.read_text() == '{"tool": "Read"}\n'
+        assert not processing.exists()
+        assert not (tmp_path / "tool_observations.jsonl.jsonl").exists()
+
+    def test_appends_when_hook_recreated_original(self, tmp_path):
+        original = tmp_path / "tool_observations.jsonl"
+        original.write_text('{"tool": "Write"}\n')  # hook wrote while we processed
+        processing = tmp_path / "tool_observations.jsonl.processing"
+        processing.write_text('{"tool": "Read"}\n')
+
+        _restore_processing_files([(original, processing)])
+
+        assert original.read_text() == '{"tool": "Write"}\n{"tool": "Read"}\n'
+        assert not processing.exists()
+        assert not (tmp_path / "tool_observations.jsonl.jsonl").exists()
+
+    def test_already_consumed_processing_is_noop(self, tmp_path):
+        original = tmp_path / "tool_observations.jsonl"
+        processing = tmp_path / "tool_observations.jsonl.processing"
+
+        _restore_processing_files([(original, processing)])  # neither exists
+
+        assert not original.exists()
+        assert not processing.exists()

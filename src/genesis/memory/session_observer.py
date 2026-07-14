@@ -360,20 +360,7 @@ async def process_pending_observations(
         # Restore any `.processing` files still on disk. On normal completion
         # these are the budget-exceeded/unread ones; on cancellation this
         # restores everything not yet consumed so it's reprocessed next tick.
-        for _original, processing_path in processing_files:
-            if processing_path.exists():
-                try:
-                    original = processing_path.with_suffix(".jsonl")
-                    if original.exists():
-                        # Original was recreated by hook — append our unprocessed
-                        # data to the new file.
-                        with open(original, "a") as dst, open(processing_path) as src:
-                            dst.write(src.read())
-                        processing_path.unlink(missing_ok=True)
-                    else:
-                        os.rename(processing_path, original)
-                except OSError:
-                    logger.warning("Failed to restore %s", processing_path, exc_info=True)
+        _restore_processing_files(processing_files)
 
     result.files_processed = len(all_observations)
     result.elapsed_s = time.monotonic() - start
@@ -385,6 +372,31 @@ async def process_pending_observations(
         )
 
     return result
+
+
+def _restore_processing_files(processing_files: list[tuple[Path, Path]]) -> None:
+    """Restore leftover `.processing` files to their EXACT original path.
+
+    The original path MUST come from the rename tuple, never be re-derived
+    via `processing_path.with_suffix(".jsonl")`: with_suffix replaces only
+    the LAST suffix, so `tool_observations.jsonl.processing` became
+    `tool_observations.jsonl.jsonl` — a name `_find_observation_files` never
+    scans, silently orphaning every restored file (108 orphans found on
+    disk, 2026-07-13).
+    """
+    for original, processing_path in processing_files:
+        if processing_path.exists():
+            try:
+                if original.exists():
+                    # Original was recreated by hook — append our unprocessed
+                    # data to the new file.
+                    with open(original, "a") as dst, open(processing_path) as src:
+                        dst.write(src.read())
+                    processing_path.unlink(missing_ok=True)
+                else:
+                    os.rename(processing_path, original)
+            except OSError:
+                logger.warning("Failed to restore %s", processing_path, exc_info=True)
 
 
 def _cleanup_stale_files(files: list[Path]) -> None:
