@@ -685,7 +685,10 @@ verified: 3d5234b9 2026-07-13
   compensating control on the explicit surfaces the enforce cut retains. Every
   drop/refusal still records (the enforce-mode row IS the block ledger).
   Auto-demote now pages a `critical` `infrastructure_alert` when a gate stands
-  down. Red-team acceptance: `test_redteam_enforce.py` (synthetic).
+  down, and counts only ENFORCED INTERVENTIONS (`count_enforced_interventions`
+  — rows whose detail carries `refused`/`enforced_drops`), never wrap-only
+  observation rows, so a normal explicit-recall session can't flip the gate
+  back to shadow. Red-team acceptance: `test_redteam_enforce.py` (synthetic).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **infra_profile/**: the infrastructure body schema — deterministic fact

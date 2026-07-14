@@ -318,10 +318,16 @@ async def recent_summary(*, since: str | None = None, db=None) -> list[dict]:
 
 
 async def _maybe_auto_demote(db, *, gate: str, mode: str, process: str | None) -> None:
-    """Demote *gate* enforce→shadow if would-blocks breach the configured
-    threshold. DORMANT in shadow: only acts from the server process AND only
-    when the gate is already ``enforce`` (B4). Never mutates config from a
-    hook subprocess."""
+    """Demote *gate* enforce→shadow if ENFORCED INTERVENTIONS (drops/refusals)
+    breach the configured threshold. DORMANT in shadow: only acts from the
+    server process AND only when the gate is already ``enforce`` (B4). Never
+    mutates config from a hook subprocess.
+
+    Counts only rows where the gate actually withheld something (detail
+    ``refused``/``enforced_drops`` markers) — NEVER wrap-only observation rows
+    (Codex round-6 on #1048: explicit recalls of wrapped KB content emit
+    ledger rows under enforce too, and counting those would let a normal
+    research session flip the gate back to shadow within the hour)."""
     if process != "server" or mode != "enforce":
         return
     cfg = immunity.load_immunity_config().get("auto_demote", {})
@@ -330,9 +336,9 @@ async def _maybe_auto_demote(db, *, gate: str, mode: str, process: str | None) -
     window = int(cfg.get("window_minutes", 60))
     threshold = int(cfg.get("would_block_threshold", 5))
     since = (datetime.now(UTC) - timedelta(minutes=window)).isoformat()
-    n = await crud.count_would_block(db, gate=gate, since=since)
+    n = await crud.count_enforced_interventions(db, gate=gate, since=since)
     if n >= threshold:
-        reason = f"auto-demote: {n} would-blocks in {window}m >= {threshold}"
+        reason = f"auto-demote: {n} enforced drops/refusals in {window}m >= {threshold}"
         immunity.record_demotion(gate, reason)
         # B4: page-worthy — an auto-demotion means the gate fought legitimate
         # flow (a mis-STORED origin bug post-PR-1, or an external-content

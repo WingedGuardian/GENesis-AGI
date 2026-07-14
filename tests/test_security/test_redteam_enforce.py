@@ -549,6 +549,7 @@ async def test_auto_demote_flips_to_shadow_and_pages(config_dirs, db):
             process="server",
             blockable_count=1,
             db=db,
+            detail={"enforced_drops": 1},  # actual drops, not wrap-only rows
         )
     assert immunity.gate_mode("injection") == "shadow"  # demoted, live
     assert overlay.exists() and "shadow" in overlay.read_text()
@@ -556,6 +557,40 @@ async def test_auto_demote_flips_to_shadow_and_pages(config_dirs, db):
         "SELECT priority, type, source FROM observations WHERE source='ws3_auto_demote'"
     )
     assert ("critical", "infrastructure_alert", "ws3_auto_demote") in [tuple(r) for r in rows]
+
+
+async def test_auto_demote_ignores_wrap_only_observations(config_dirs, db):
+    """Codex round-6: explicit recalls of wrapped KB content emit ledger rows
+    under enforce too — a normal research session must NOT demote the gate.
+    Only rows carrying enforced-action markers (refused / enforced_drops)
+    count toward the threshold."""
+    base, overlay = config_dirs
+    _write(
+        base,
+        {
+            "injection": {"mode": "enforce"},
+            "auto_demote": {"enabled": True, "window_minutes": 60, "would_block_threshold": 3},
+        },
+    )
+    # A busy explicit-recall session: many wrap-only observation rows.
+    for _ in range(10):
+        await immunity_shadow.record_would_block(
+            gate="injection",
+            source_kind="recall_inject",
+            source_ref="mcp/memory/core.py::memory_recall",
+            process="server",
+            blockable_count=2,
+            db=db,
+        )
+    assert immunity.gate_mode("injection") == "enforce"  # NOT demoted
+    assert not overlay.exists()
+    # ...and the counter itself sees zero interventions.
+    from genesis.db.crud import immunity_shadow as shadow_crud
+
+    n = await shadow_crud.count_enforced_interventions(
+        db, gate="injection", since="2020-01-01T00:00:00+00:00"
+    )
+    assert n == 0
 
 
 # ─── validator honesty guard ─────────────────────────────────────────────────

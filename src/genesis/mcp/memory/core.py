@@ -794,6 +794,7 @@ async def memory_proactive(
     # items so the model treats them as data, not first-party instructions.
     out: list[dict] = []
     blockable = 0
+    dropped = 0
     _unsupervised = immunity_shadow.is_dispatched_session_env()
     for r in filtered:
         d = asdict(r)
@@ -810,7 +811,7 @@ async def memory_proactive(
             pushed_surface=True,
             unsupervised=_unsupervised,
         ):
-            blockable += 1
+            dropped += 1
             continue
         # Kept items (shadow mode / foreground): wrap keys on STORED origin
         # first — a kept external episodic row must stay delimited + counted,
@@ -830,14 +831,18 @@ async def memory_proactive(
         out.append(d)
     # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
     # proactive-recall prompt (observe-only). db=memory_mod._db when set, else
-    # the emit self-resolves a short-lived connection.
+    # the emit self-resolves a short-lived connection. `enforced_drops` in the
+    # detail is the auto-demote signal — wrap-only observations must never
+    # count toward demotion (Codex round-6: a normal explicit-recall session
+    # would otherwise flip the gate back to shadow).
     await immunity_shadow.record_would_block(
         gate="injection",
         source_kind="recall_inject",
         source_ref="mcp/memory/core.py::memory_proactive",
         process="server",
-        blockable_count=blockable,
+        blockable_count=blockable + dropped,
         db=memory_mod._db,
+        detail={"enforced_drops": dropped} if dropped else None,
     )
     return out
 
@@ -942,6 +947,7 @@ async def memory_core_facts(
     # STORED origin_class: episodic content is only external when its stored
     # class says so — the collection fallback alone can never flag it here.
     blockable = 0
+    dropped = 0
     _unsupervised = immunity_shadow.is_dispatched_session_env()
     _kept: list[tuple[dict, float]] = []
     for item, score in top:
@@ -956,7 +962,7 @@ async def memory_core_facts(
             pushed_surface=True,
             unsupervised=_unsupervised,
         ):
-            blockable += 1
+            dropped += 1
             continue
         if immunity_shadow.item_is_blockable(
             collection="episodic_memory",
@@ -970,13 +976,16 @@ async def memory_core_facts(
             blockable += 1
         _kept.append((item, score))
     top = _kept
+    # `enforced_drops` is the auto-demote signal — wrap-only observations
+    # never count toward demotion (Codex round-6).
     await immunity_shadow.record_would_block(
         gate="injection",
         source_kind="recall_inject",
         source_ref="mcp/memory/core.py::memory_core_facts",
         process="server",
-        blockable_count=blockable,
+        blockable_count=blockable + dropped,
         db=memory_mod._db,
+        detail={"enforced_drops": dropped} if dropped else None,
     )
 
     # Track retrieval so activation scores reflect actual usage.
