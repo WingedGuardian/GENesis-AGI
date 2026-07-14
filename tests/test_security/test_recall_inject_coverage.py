@@ -46,11 +46,10 @@ _VALID = {"wrapped", "first-party", "user-facing", "display", "pipeline-internal
 
 # file (relative to src/genesis) :: enclosing function  ->  (disposition, why)
 KNOWN_RECALL_SITES: dict[str, tuple[str, str]] = {
-    "eval/longmemeval/runner.py::run_question": (
-        "first-party",
-        "eval-harness recall against an EPHEMERAL store of "
-        "first_party LongMemEval haystack; no production trust boundary",
-    ),
+    "eval/longmemeval/runner.py::_run_arm": (
+        "first-party", "eval-harness recall against an EPHEMERAL store of "
+        "first_party LongMemEval haystack; no production trust boundary "
+        "(extracted from run_question for the dual-store graph arm)"),
     "mcp/memory/core.py::memory_recall": (
         "wrapped",
         "external items wrapped after label_result_dicts (full path)",

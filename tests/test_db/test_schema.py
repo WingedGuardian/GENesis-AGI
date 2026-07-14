@@ -65,6 +65,8 @@ EXPECTED_TABLES = [
     "capability_shadow_events",  # WS5 Stage 2: Discord capability shadow-gate observations
     "immunity_shadow_events",  # WS-3 B1: provenance-gate (injection) shadow observations
     "build_candidates",  # capability-build lane: verdicts + calibration + build outcomes
+    "session_charters",  # session-manager PR-2a: durable charter (origin/mission/pointers)
+    "session_ledger",  # session-manager PR-2a: per-session TODO ledger rows
 ]
 
 

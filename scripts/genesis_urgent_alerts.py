@@ -26,6 +26,7 @@ import contextlib
 import json
 import os
 import re
+import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -145,6 +146,58 @@ def _check_shelve_hint(prompt: str) -> None:
         sys.stdout.flush()
 
 
+def _emit_charter_tag(session_id: str) -> None:
+    """One-line drift tag: [Charter: <mission|origin snippet> | open: N].
+
+    Read-only stdlib sqlite3, mode=ro URI (WAL-aware — never immutable=1,
+    which misses un-checkpointed writes), 500ms connect / 300ms busy budget:
+    this runs on EVERY prompt and must never cost the user anything.
+    Omitted entirely when the session has no charter row yet (pre-first-
+    compaction — the origin is still in context), the DB/table is missing
+    (un-migrated install), or the DB is locked. open counts open+in_progress
+    ledger rows; "open: 0" IS shown for a chartered session — a clear ledger
+    is signal.
+    """
+    try:
+        root = os.environ.get("GENESIS_REPO_ROOT", "")
+        db = (Path(root) if root else Path.home() / "genesis") / "data" / "genesis.db"
+        if not db.exists():
+            return
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.5)
+        try:
+            conn.execute("PRAGMA busy_timeout=300")
+            row = conn.execute(
+                "SELECT mission, origin_prompt FROM session_charters"
+                " WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return
+            (open_n,) = conn.execute(
+                "SELECT COUNT(*) FROM session_ledger WHERE session_id = ?"
+                " AND status IN ('open','in_progress')",
+                (session_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        mission, origin = row
+        label = (mission or "").strip()
+        if label:
+            label = label[:80] + ("…" if len(label) > 80 else "")
+        else:
+            first_line = next(
+                (ln for ln in (origin or "").strip().splitlines() if ln.strip()), ""
+            )
+            if not first_line:
+                return
+            snippet = first_line[:60] + ("…" if len(first_line) > 60 else "")
+            label = f'origin: "{snippet}"'
+        print(f"[Charter: {label} | open: {open_n}]")
+        sys.stdout.flush()
+    except Exception:
+        return  # fail-open: a tag miss must never surface as an error
+
+
 def main() -> None:
     # Skip if Genesis context is disabled
     if not _FLAG.exists():
@@ -168,6 +221,8 @@ def main() -> None:
     # 1. Temporal context (always, even if no session_id)
     if session_id:
         _emit_temporal_context(session_id, now)
+        # 1b. Charter drift tag (chartered sessions only; fail-open)
+        _emit_charter_tag(session_id)
 
     # 2. Buffer user message for bookmarks
     if session_id and prompt:
