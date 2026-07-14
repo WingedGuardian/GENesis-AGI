@@ -431,16 +431,26 @@ verified: 780cc8de 2026-07-10
   retrieved_count** (retrieval connection is mode=ro; protects
   MEM-005/H-1 baselines). Fail-open at the hook boundary. Kill switch:
   `GENESIS_SESSION_AWARENESS_DISABLED=1`.
-- **Session charter** (session-manager stage 1): `scripts/genesis_precompact.py`
-  (PreCompact hook, both triggers, 5s fail-open timeout) persists a foreground
-  session's IMMUTABLE origin — the first typed user prompt, extracted from the
-  transcript head at the FIRST compaction boundary — to
-  `~/.genesis/sessions/<sid>/charter.json` (+ `charter.md` mirror,
-  `waypoints.jsonl` deterministic spine); `genesis_session_context.py`
-  re-injects it on every startup/resume/compact (NOT clear), so
-  recency-biased compaction can never erase what a session is for.
-  `origin_prompt`/`origin_ts` are write-once; `mission`/`pointers` are living
-  fields reserved for the ledger stage. Dispatched sessions
+- **Session charter + ledger** (session-manager stages 1-2): the
+  `session_charters` + `session_ledger` DB tables (migration 0058) are the
+  canonical store; `~/.genesis/sessions/<sid>/charter.md` is the regenerated
+  human mirror (pre-0058 `charter.json` files are a legacy read-fallback,
+  imported once by `scripts/backfill_session_charters.py`).
+  `scripts/genesis_precompact.py` (PreCompact hook, both triggers, 5s
+  fail-open timeout, stdlib-only sqlite3, BEGIN IMMEDIATE) persists a
+  foreground session's IMMUTABLE origin — the first typed user prompt,
+  extracted from the transcript head at the FIRST compaction boundary — and
+  bumps `compaction_count` thereafter (+ `waypoints.jsonl` deterministic
+  spine). `origin_prompt`/`origin_ts` are write-once (filled only WHERE
+  origin_prompt IS NULL); `mission`/`pointers`/ledger rows are living fields
+  owned by the `session_charter*`/`session_ledger*` MCP tools on
+  genesis-health (`mcp/health/session_charter_tools.py`), which may create a
+  stub row before the first compaction. Read paths:
+  `genesis_session_context.py` re-injects origin + open ledger on every
+  startup/resume/compact (NOT clear), and `genesis_urgent_alerts.py` emits a
+  per-turn `[Charter: <mission> | open: N]` drift tag (both mode=ro,
+  fail-open). Ledger statuses: open/in_progress/done/absorbed/dropped —
+  `absorbed` + `evidence` is the repo-pulse (PR-4) seam. Dispatched sessions
   (GENESIS_CC_SESSION=1) are skipped — task_states is their continuity spine.
 
 ## 10. Learning & evaluation

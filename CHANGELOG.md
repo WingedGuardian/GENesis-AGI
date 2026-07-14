@@ -11,6 +11,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Sessions now keep a durable TODO ledger that survives compaction.** An
+  agreement made mid-session ("yes, do that") used to live only in
+  conversation — one compaction summary could quietly drop it. Sessions can
+  now record agreements as ledger items the moment they happen; open items
+  re-inject into every post-compaction window (with a per-turn
+  `[Charter: … | open: N]` tag showing drift at a glance) until they're
+  closed as done, absorbed elsewhere, or consciously dropped. Charters — the
+  session's origin, a living mission line, and pointers to its governing
+  docs — moved from per-session JSON files into the database so all of this
+  is queryable; the human-readable `charter.md` mirror stays.
+
 - **Claude Code sessions no longer forget what they were started for.** Long
   sessions compact their context many times, and each summary is biased toward
   recent work — after enough compactions a session can no longer connect
