@@ -113,6 +113,19 @@ def main() -> None:
     if not _FLAG.exists():
         return
 
+    # Hook input (session_id, source) — mirrors genesis_session_end.py. CC
+    # pipes SessionStart input as stdin JSON; before this was parsed, the
+    # script had no session identity and could not read per-session state.
+    import json as _json_stdin
+
+    try:
+        _raw_stdin = sys.stdin.read()
+        _hook_input = _json_stdin.loads(_raw_stdin) if _raw_stdin.strip() else {}
+    except (_json_stdin.JSONDecodeError, OSError):
+        _hook_input = {}
+    _hook_session_id = str(_hook_input.get("session_id", "") or "")
+    _hook_source = str(_hook_input.get("source", "") or "")
+
     # Phase 6: self-heal Genesis git hooks before doing anything else.
     # Runs on every session start so community installs auto-pick up hook
     # updates without requiring a bootstrap.sh re-run.
@@ -253,6 +266,20 @@ def main() -> None:
                 first = False
         except Exception:
             pass  # In-flight state is advisory — never block session start
+
+        # Session charter (advisory): the immutable origin + living mission
+        # persisted by the PreCompact hook (scripts/genesis_precompact.py) —
+        # re-asserted into every window so recency-biased compaction can
+        # never erase what this session is FOR. Foreground-only.
+        try:
+            _charter_block = _charter_emission_block(_hook_session_id, _hook_source)
+            if _charter_block:
+                if not first:
+                    _emit("\n\n---\n\n")
+                _emit(_charter_block)
+                first = False
+        except Exception:
+            pass  # Charter is advisory — never block session start
 
         # Critical-only alert: surface genuinely user-blocking issues (DB down, etc.)
         _status_file = Path.home() / ".genesis" / "status.json"
@@ -648,6 +675,62 @@ def _load_inflight_block() -> str:
         return asyncio.run(_run())
     except Exception:
         return ""  # Advisory — never block session start
+
+
+def _charter_emission_block(
+    session_id: str, source: str, *, sessions_dir: Path | None = None
+) -> str:
+    """Session-charter block for the foreground context (pure disk read).
+
+    Reads ~/.genesis/sessions/<session_id>/charter.json, written by the
+    PreCompact hook (scripts/genesis_precompact.py) at every compaction
+    boundary. Emitted on startup/resume/compact so a chartered session gets
+    its origin back in EVERY window — but NOT on clear: /clear is an explicit
+    fresh start, and re-asserting the old origin would fight the user.
+
+    Returns "" when there is no charter, the session_id is missing/unsafe,
+    or the charter is unreadable (fail-open — charter is advisory).
+    """
+    import json
+
+    if not session_id or source == "clear":
+        return ""
+    if "/" in session_id or ".." in session_id:
+        return ""
+    base = sessions_dir or (Path.home() / ".genesis" / "sessions")
+    charter_file = base / session_id / "charter.json"
+    try:
+        charter = json.loads(charter_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    origin = str(charter.get("origin_prompt") or "").strip()
+    if not origin:
+        return ""
+    if len(origin) > 1200:
+        origin = origin[:1200] + " …[truncated — full text in charter.md]"
+    origin_quoted = "\n".join(f"> {line}" for line in origin.splitlines())
+
+    lines = [
+        "## Session Charter (persists across compaction)",
+        "",
+        f"**Origin — the prompt this session was born from"
+        f" ({charter.get('origin_ts') or 'time unknown'}):**",
+        origin_quoted,
+    ]
+    mission = charter.get("mission")
+    if mission:
+        lines += ["", f"**Mission:** {mission}"]
+    pointers = charter.get("pointers") or []
+    if pointers:
+        lines += ["", "**Pointers:**"]
+        lines += [f"- {p}" for p in pointers[:6]]
+    count = charter.get("compaction_count", 0)
+    lines += [
+        "",
+        f"_Compactions: {count} · full charter:"
+        f" ~/.genesis/sessions/{session_id}/charter.md_",
+    ]
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

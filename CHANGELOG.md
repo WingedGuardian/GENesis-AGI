@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Claude Code sessions no longer forget what they were started for.** Long
+  sessions compact their context many times, and each summary is biased toward
+  recent work — after enough compactions a session can no longer connect
+  "what's next" to its original goal. Now the first compaction snapshots the
+  session's charter (the verbatim opening prompt) to disk, and every later
+  window gets it re-injected automatically. The origin survives any number of
+  compactions; `/clear` still means a genuinely fresh start. Charters live in
+  `~/.genesis/sessions/<session-id>/charter.md`.
+
 - **Genesis now notices when memories quietly lose semantic search.** When an
   embedding permanently fails, that memory becomes keyword-only — findable by
   exact words but invisible to meaning-based recall — and nothing flagged the
