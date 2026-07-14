@@ -29,6 +29,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The memory benchmark now grades temporal questions fairly and explains
+  its misses.** The LongMemEval reader gets the question's date (the
+  benchmark's own convention — without it, "how many weeks ago…" questions
+  were unanswerable by construction), so temporal scores now measure memory,
+  not a missing calendar. New `--dump-dir` writes per-question diagnostics
+  (query, recalled memories, answer, verdict) for failure analysis, a new
+  evidence-coverage metric shows *how much* of the gold evidence was
+  retrieved (not just whether any was), and `--types` runs a single question
+  category — so a targeted slice no longer costs a full 500-question run.
+
 - **Claude Code sessions no longer forget what they were started for.** Long
   sessions compact their context many times, and each summary is biased toward
   recent work — after enough compactions a session can no longer connect

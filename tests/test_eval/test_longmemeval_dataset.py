@@ -8,6 +8,7 @@ import pytest
 
 from genesis.eval.longmemeval.dataset import (
     LongMemEvalInstance,
+    filter_by_types,
     load_oracle,
 )
 
@@ -104,3 +105,17 @@ def test_empty_content_turns_are_still_iterated(oracle_file):
     # loader does not filter; ingest decides what to skip
     inst = load_oracle(oracle_file)[1]
     assert len(list(inst.iter_turns())) == 1
+
+
+def test_filter_by_types_selects_matching_instances(oracle_file):
+    instances = load_oracle(oracle_file)
+    only_pref = filter_by_types(instances, "single-session-preference")
+    assert [i.question_id for i in only_pref] == ["def456_abs"]
+    both = filter_by_types(instances, "single-session-user, single-session-preference")
+    assert len(both) == 2
+
+
+def test_filter_by_types_rejects_unknown_type(oracle_file):
+    instances = load_oracle(oracle_file)
+    with pytest.raises(ValueError, match="unknown question type"):
+        filter_by_types(instances, "temporal-reasoning,not-a-type")

@@ -106,3 +106,20 @@ def load_oracle(path: str | Path) -> list[LongMemEvalInstance]:
     """Load and parse a LongMemEval oracle JSON file into typed instances."""
     data = json.loads(Path(path).read_text())
     return [_parse_instance(raw) for raw in data]
+
+
+def filter_by_types(
+    instances: list[LongMemEvalInstance],
+    types_csv: str,
+) -> list[LongMemEvalInstance]:
+    """Keep only instances whose question_type is in the comma-separated list.
+
+    Validates every requested type against ``QUESTION_TYPES`` so a typo fails
+    loudly instead of silently returning an empty slice.
+    """
+    wanted = {t.strip() for t in types_csv.split(",") if t.strip()}
+    unknown = wanted - QUESTION_TYPES
+    if unknown:
+        msg = f"unknown question type(s): {sorted(unknown)}; valid: {sorted(QUESTION_TYPES)}"
+        raise ValueError(msg)
+    return [i for i in instances if i.question_type in wanted]

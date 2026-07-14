@@ -200,6 +200,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--db-path", default=None,
         help="results DB (default: production genesis.db; a fresh path is migrated)",
     )
+    lme_cmd.add_argument(
+        "--types", default=None,
+        help="comma-separated question types to run (filtered before --limit)",
+    )
+    lme_cmd.add_argument(
+        "--dump-dir", default=None,
+        help="write per-question diagnostics (one <arm>.jsonl per arm) here",
+    )
 
     eval_cmd.set_defaults(func=_run_eval_cli)
 
@@ -264,6 +272,8 @@ async def _cmd_longmemeval(args: argparse.Namespace) -> int:
         no_rerank=args.no_rerank,
         persist=not args.no_persist,
         db_path=Path(args.db_path) if args.db_path else None,
+        types=args.types,
+        dump_dir=Path(args.dump_dir) if args.dump_dir else None,
     )
     print_report(summaries)
     return 0

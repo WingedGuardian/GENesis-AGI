@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.eval.longmemeval.client import load_secrets
-from genesis.eval.longmemeval.dataset import load_oracle
+from genesis.eval.longmemeval.dataset import filter_by_types, load_oracle
 from genesis.eval.longmemeval.runner import default_arms, run_longmemeval
 
 if TYPE_CHECKING:
@@ -62,10 +62,19 @@ async def execute(
     no_rerank: bool = False,
     persist: bool = True,
     db_path: Path | None = None,
+    types: str | None = None,
+    dump_dir: Path | None = None,
 ) -> dict[str, EvalRunSummary]:
-    """Load the dataset, run the harness, persist (optionally), return summaries."""
+    """Load the dataset, run the harness, persist (optionally), return summaries.
+
+    ``types`` (comma-separated question types) filters BEFORE ``limit`` so
+    ``--types temporal-reasoning --limit 20`` means "the first 20 temporal
+    questions", not "temporal questions among the first 20".
+    """
     load_secrets()
     instances = load_oracle(dataset_path)
+    if types:
+        instances = filter_by_types(instances, types)
     if limit:
         instances = instances[:limit]
     logger.info("loaded %d questions from %s", len(instances), dataset_path)
@@ -98,6 +107,7 @@ async def execute(
             k=k,
             concurrency=concurrency,
             reranker=reranker,
+            dump_dir=dump_dir,
         )
     finally:
         if db is not None:
