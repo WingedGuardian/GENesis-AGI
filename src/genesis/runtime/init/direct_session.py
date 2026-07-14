@@ -24,6 +24,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger("genesis.runtime")
 
 _POLL_INTERVAL_S = 5
+# Re-run stale-claim recovery roughly every 60s inside the poll loop (not just
+# once at startup): a claim made <120s before a fast restart is missed by the
+# one-shot startup pass and would otherwise stay 'claimed' until a later restart.
+_RECOVERY_EVERY_N_POLLS = max(1, 60 // _POLL_INTERVAL_S)
+
+
+async def _recover_stale_claims(db) -> None:
+    """Reset items stuck in 'claimed' (claimed but never dispatched) back to pending.
+
+    Items in 'dispatched' status are intentionally excluded — they track a running
+    session in cc_sessions. Because 'claimed' is a sub-second transient between
+    claim_next() and mark_dispatched(), this is safe to run repeatedly on a live
+    server: it only frees a claim orphaned by a crash mid-dispatch, never an
+    in-flight session. Best-effort — a failure here must not kill the poll loop.
+    """
+    from genesis.db.crud import direct_session_queue as dsq
+
+    try:
+        recovered = await dsq.recover_stale_claims(db)
+        if recovered:
+            logger.info("Recovered %d stale direct session queue claims", recovered)
+    except Exception:
+        logger.error("Direct session stale claim recovery failed", exc_info=True)
 
 
 async def _direct_session_poll(runner: DirectSessionRunner, db) -> None:
@@ -32,19 +55,20 @@ async def _direct_session_poll(runner: DirectSessionRunner, db) -> None:
     from genesis.cc.types import CCModel, EffortLevel
     from genesis.db.crud import direct_session_queue as dsq
 
-    # Crash recovery: reset items that were claimed but never dispatched
-    # before a crash/restart. Items in 'dispatched' status are intentionally
-    # excluded — they have a running session tracked in cc_sessions.
-    try:
-        recovered = await dsq.recover_stale_claims(db)
-        if recovered:
-            logger.info("Recovered %d stale direct session queue claims", recovered)
-    except Exception:
-        logger.error("Direct session stale claim recovery failed", exc_info=True)
+    # Crash recovery on boot: reset claims orphaned before a crash/restart.
+    await _recover_stale_claims(db)
 
+    poll_count = 0
     while True:
         try:
             await asyncio.sleep(_POLL_INTERVAL_S)
+
+            # Periodic re-run so a claim younger than the 120s floor at a fast
+            # restart doesn't stay stuck. Runs BEFORE the capacity check so a
+            # saturated runner can't starve recovery.
+            poll_count += 1
+            if poll_count % _RECOVERY_EVERY_N_POLLS == 0:
+                await _recover_stale_claims(db)
 
             # Don't over-claim: if runner is at capacity, wait for a slot.
             # spawn() returns immediately but sessions queue behind the

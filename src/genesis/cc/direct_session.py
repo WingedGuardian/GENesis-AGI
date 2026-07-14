@@ -145,6 +145,7 @@ _NO_MEMORY_WRITES = [
 
 _NO_FOLLOW_UPS = [
     "mcp__genesis-health__follow_up_create",
+    "mcp__genesis-health__follow_up_update",
 ]
 
 _NO_OUTREACH_ENGAGEMENT = [
@@ -349,7 +350,10 @@ _PROFILE_BASH_ALLOWLIST: dict[str, tuple[str, ...]] = {
 # _build_invocation) so profile overlays can register their own mapping.
 _PROFILE_TO_MCP: dict[str, str] = {
     "observe": "reflection",
-    "research": "reflection",
+    # research maps to its OWN MCP profile so it can reach genesis-recon (the
+    # discovery engine). Kept off "reflection" so observe — a passive profile —
+    # does NOT get recon. Recon tools are otherwise unreachable in any bg session.
+    "research": "research",
     "interact": "sentinel",
     "campaign": "campaign",
     "steward": "campaign",  # health + memory + outreach (for notify)
