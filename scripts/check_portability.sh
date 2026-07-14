@@ -53,15 +53,33 @@ excludes=(
   --glob '!**/scripts/spike_*'
 )
 
+# Scan only targets that exist: a missing path makes rg exit 2 even when
+# it found matches elsewhere, and `if rg` would then read that as "clean"
+# — real hits silently dropped (partial checkouts, test fixtures).
+existing=()
+for t in "${targets[@]}"; do
+    [ -e "$t" ] && existing+=("$t")
+done
+if [ ${#existing[@]} -eq 0 ]; then
+    echo "check_portability: no scan targets exist under $REPO_DIR" >&2
+    exit 2
+fi
+
 SCAN_OUT="$(mktemp)"
 trap 'rm -f "$SCAN_OUT"' EXIT
 
 status=0
 for pattern in "${patterns[@]}"; do
-    if rg -n --hidden "${excludes[@]}" "$pattern" "${targets[@]}" >"$SCAN_OUT"; then
+    rc=0
+    rg -n --hidden "${excludes[@]}" "$pattern" "${existing[@]}" >"$SCAN_OUT" || rc=$?
+    if [ "$rc" -eq 0 ]; then
         echo "Portability check failed for pattern: $pattern"
         cat "$SCAN_OUT"
         status=1
+    elif [ "$rc" -ge 2 ]; then
+        # rg itself failed (bad glob, I/O error) — never report clean.
+        echo "check_portability: rg error (exit $rc) for pattern: $pattern" >&2
+        status="$rc"
     fi
 done
 

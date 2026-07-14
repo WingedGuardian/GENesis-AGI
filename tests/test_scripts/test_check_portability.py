@@ -86,3 +86,23 @@ def test_missing_target_dirs_do_not_crash(tmp_path):
     (repo / "src" / "ok.py").write_text("x = 1\n")
     proc = subprocess.run(["bash", str(SCRIPT), str(repo)], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_missing_target_dirs_still_flag_hits(tmp_path):
+    # Codex P2 regression: with config/scripts/env.example absent, rg exits 2
+    # for the missing paths and the old `if rg` read that as clean — a real
+    # leak in the surviving target was silently dropped.
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "leak.py").write_text("ADDR = '10.1.2.3'\n")
+    proc = subprocess.run(["bash", str(SCRIPT), str(repo)], capture_output=True, text=True)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "leak.py" in proc.stdout
+
+
+def test_no_targets_at_all_is_an_error(tmp_path):
+    # Scanning nothing must fail loudly (misconfigured REPO_DIR), not pass.
+    repo = tmp_path / "empty"
+    repo.mkdir()
+    proc = subprocess.run(["bash", str(SCRIPT), str(repo)], capture_output=True, text=True)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
