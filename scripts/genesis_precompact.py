@@ -5,17 +5,29 @@ The charter-session model: compaction implies continuity — nobody compacts to
 change topic, so the pre-first-compaction window is the session's golden
 context. At the FIRST compaction boundary — while the full-fidelity transcript
 is still on disk — this hook extracts the session's IMMUTABLE origin (the
-first typed user prompt) into ~/.genesis/sessions/<session_id>/charter.json.
-At EVERY compaction it bumps the compaction count and appends a deterministic
-waypoint to waypoints.jsonl. The SessionStart hook
-(genesis_session_context.py) re-injects the charter into every
+first typed user prompt) into the session_charters DB table (migration 0058;
+canonical store). At EVERY compaction it bumps the compaction count,
+regenerates the human-readable ~/.genesis/sessions/<sid>/charter.md mirror,
+and appends a deterministic waypoint to waypoints.jsonl. The SessionStart
+hook (genesis_session_context.py) re-injects the charter into every
 post-compaction window, so no recency-biased summary can erase what the
-session is FOR.
+session is FOR. (Pre-0058 charter.json files are legacy: read as fallback by
+the injector, imported once by scripts/backfill_session_charters.py, no
+longer written here.)
 
 Charter fields:
-- origin_prompt / origin_ts — IMMUTABLE once written, never regenerated.
-- mission / pointers — living fields, written by later session-manager
-  stages (ledger MCP tools); this hook preserves them verbatim on update.
+- origin_prompt / origin_ts — IMMUTABLE once written: filled only via
+  WHERE origin_prompt IS NULL, never listed in a general UPDATE SET.
+- mission / pointers / ledger rows — living fields owned by the
+  session-charter MCP tools; this hook never writes them (field-scoped
+  SQL means there is no read-modify-write to clobber them with).
+
+Stdlib-only by design (sqlite3 IS stdlib): a dependency-free hook keeps the
+fail-open path fast and import-proof under the 5s budget. _charter_md is an
+intentional duplicate of genesis/session_charter.py's canonical renderer,
+pinned byte-identical by a parity test. DB-unavailable self-heal: a locked or
+missing DB at one boundary just skips that snapshot — origin extraction
+re-runs at the next compaction because the transcript keeps full history.
 
 Registered in .claude/settings.json under PreCompact (fires on both manual
 and auto compaction, timeout 5s). Fail-open by design: always exits 0 — a
@@ -29,12 +41,22 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
 _FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _SESSIONS_DIR = Path.home() / ".genesis" / "sessions"
+
+
+def _db_path() -> Path:
+    """genesis.db location, GENESIS_REPO_ROOT-aware (mirrors genesis.env
+    without importing it — this hook stays stdlib-only)."""
+    root = os.environ.get("GENESIS_REPO_ROOT", "")
+    base = Path(root) if root else Path.home() / "genesis"
+    return base / "data" / "genesis.db"
+
 
 # Bound the stored origin: real typed prompts are far shorter; a pasted-wall
 # first prompt still yields a useful (truncated) charter.
@@ -108,8 +130,22 @@ def _extract_origin(transcript_path: Path) -> dict | None:
     return None
 
 
-def _charter_md(charter: dict) -> str:
-    """Human-readable mirror of charter.json (regenerated on every update)."""
+_STATUS_MARKS = {
+    "open": " ",
+    "in_progress": "~",
+    "done": "x",
+    "absorbed": "a",
+    "dropped": "d",
+}
+
+
+def _charter_md(charter: dict, ledger: list[dict] | None = None) -> str:
+    """Human-readable charter.md mirror (regenerated on every update).
+
+    INTENTIONAL DUPLICATE of genesis/session_charter.py::charter_md — this
+    hook must not import the genesis package; a parity test pins both to
+    byte-identical output.
+    """
     lines = [
         f"# Session Charter — {charter.get('session_id', '')}",
         "",
@@ -119,7 +155,7 @@ def _charter_md(charter: dict) -> str:
         "",
         "## Origin (immutable)",
         "",
-        str(charter.get("origin_prompt", "")),
+        str(charter.get("origin_prompt") or ""),
     ]
     mission = charter.get("mission")
     if mission:
@@ -128,39 +164,138 @@ def _charter_md(charter: dict) -> str:
     if pointers:
         lines += ["", "## Pointers", ""]
         lines += [f"- {p}" for p in pointers]
+    if ledger:
+        lines += ["", "## Ledger", ""]
+        for item in ledger:
+            mark = _STATUS_MARKS.get(str(item.get("status", "open")), " ")
+            lines.append(f"- [{mark}] {item.get('text', '')}")
     return "\n".join(lines) + "\n"
 
 
 def _update_charter(session_dir: Path, session_id: str, transcript_path: str) -> dict | None:
-    """Create the charter at the first boundary; bump the count thereafter.
+    """Create the charter row at the first boundary; bump the count thereafter.
 
-    Returns the written charter, or None when there is nothing to charter yet
-    (no typed prompt found — e.g. a session compacted before any real turn).
-    origin_prompt/origin_ts are written exactly once and never regenerated;
-    mission/pointers written by other components are preserved verbatim.
+    Returns the charter dict (for the waypoint gate in main()), or None when
+    there is nothing to charter yet (no row AND no typed prompt found — e.g.
+    a session compacted before any real turn) or the DB is absent.
+
+    Concurrency: BEGIN IMMEDIATE takes the write lock up front, so the
+    SELECT+branch below is race-free against the MCP tools' field-scoped
+    writes (no read→write upgrade deadlock). All statements either commit
+    together or roll back together when the connection closes on error.
     """
-    charter_file = session_dir / "charter.json"
+    db_file = _db_path()
+    if not db_file.exists():
+        # Never create a DB as a side effect (fresh installs bootstrap it);
+        # this boundary self-heals at the next compaction.
+        return None
     now = datetime.now(UTC).isoformat()
-    if charter_file.exists():
-        charter = json.loads(charter_file.read_text(encoding="utf-8"))
-        charter["compaction_count"] = int(charter.get("compaction_count", 0)) + 1
-        charter["updated_at"] = now
-    else:
-        origin = _extract_origin(Path(transcript_path))
-        if origin is None:
-            return None
-        charter = {
-            "session_id": session_id,
-            "transcript_path": transcript_path,
-            "created_at": now,
-            "compaction_count": 1,
-            "mission": None,
-            "pointers": [],
-            **origin,
-        }
+    conn = sqlite3.connect(str(db_file), timeout=2)
+    try:
+        conn.isolation_level = None  # explicit transaction control
+        conn.execute("PRAGMA busy_timeout=2000")
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT origin_prompt, origin_ts, mission, pointers,"
+            " compaction_count, created_at FROM session_charters"
+            " WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            origin = _extract_origin(Path(transcript_path))
+            if origin is None:
+                conn.execute("ROLLBACK")
+                return None
+            charter = {
+                "session_id": session_id,
+                "mission": None,
+                "pointers": [],
+                "compaction_count": 1,
+                "created_at": now,
+                **origin,
+            }
+            conn.execute(
+                "INSERT INTO session_charters"
+                " (session_id, transcript_path, origin_prompt, origin_ts,"
+                "  pointers, compaction_count, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, '[]', 1, ?, ?)",
+                (
+                    session_id,
+                    transcript_path,
+                    charter["origin_prompt"],
+                    charter["origin_ts"],
+                    now,
+                    now,
+                ),
+            )
+        else:
+            origin_prompt, origin_ts, mission, pointers_json, count, created_at = row
+            if origin_prompt is None:
+                # Stub created by an MCP write before the first compaction:
+                # fill origin exactly once. The redundant WHERE guard makes
+                # write-once structural, not just logical.
+                origin = _extract_origin(Path(transcript_path))
+                if origin is not None:
+                    conn.execute(
+                        "UPDATE session_charters SET origin_prompt = ?,"
+                        " origin_ts = ?, compaction_count = compaction_count + 1,"
+                        " transcript_path = ?, updated_at = ?"
+                        " WHERE session_id = ? AND origin_prompt IS NULL",
+                        (
+                            origin["origin_prompt"],
+                            origin["origin_ts"],
+                            transcript_path,
+                            now,
+                            session_id,
+                        ),
+                    )
+                    origin_prompt = origin["origin_prompt"]
+                    origin_ts = origin["origin_ts"]
+                else:
+                    conn.execute(
+                        "UPDATE session_charters SET"
+                        " compaction_count = compaction_count + 1,"
+                        " transcript_path = ?, updated_at = ? WHERE session_id = ?",
+                        (transcript_path, now, session_id),
+                    )
+            else:
+                # Steady state: origin/mission/pointers are NOT in the SET
+                # list — immutable + living fields preserved by construction.
+                conn.execute(
+                    "UPDATE session_charters SET"
+                    " compaction_count = compaction_count + 1,"
+                    " transcript_path = ?, updated_at = ? WHERE session_id = ?",
+                    (transcript_path, now, session_id),
+                )
+            try:
+                pointers = json.loads(pointers_json or "[]")
+            except (json.JSONDecodeError, TypeError):
+                pointers = []
+            charter = {
+                "session_id": session_id,
+                "origin_prompt": origin_prompt,
+                "origin_ts": origin_ts,
+                "mission": mission,
+                "pointers": pointers,
+                "compaction_count": int(count) + 1,
+                "created_at": created_at,
+            }
+        ledger = [
+            {"text": text, "status": status}
+            for (text, status) in conn.execute(
+                "SELECT text, status FROM session_ledger WHERE session_id = ? ORDER BY created_at",
+                (session_id,),
+            ).fetchall()
+        ]
+        conn.execute("COMMIT")
+    finally:
+        # Close without commit on any error path → clean implicit rollback.
+        conn.close()
+    # File I/O only AFTER the DB transaction: the DB is canonical; a failed
+    # mirror write lands in main()'s fail-open boundary and the mirror
+    # regenerates at the next charter write.
     session_dir.mkdir(parents=True, exist_ok=True)
-    charter_file.write_text(json.dumps(charter, indent=2), encoding="utf-8")
-    (session_dir / "charter.md").write_text(_charter_md(charter), encoding="utf-8")
+    (session_dir / "charter.md").write_text(_charter_md(charter, ledger), encoding="utf-8")
     return charter
 
 
