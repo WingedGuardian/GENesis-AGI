@@ -1737,6 +1737,7 @@ async def _run(prompt: str, session_id: str = "") -> None:
     # Fuse results (with wing boost, code index, and knowledge base)
     fused: list[dict] = []
     fused_count = 0
+    _enforce_dropped = 0  # defined outside the fusion block: the emit guard reads it
     # H-1 PR2a: shadow-project the novelty gate. suppress_ids feeds the shadow
     # projection ONLY — the real selection loop ignores it, so injected output
     # is unchanged. _shadow accumulates the projection for the injection log.
@@ -1752,6 +1753,33 @@ async def _run(prompt: str, session_id: str = "") -> None:
             shadow=_shadow,
         )
         fused = [r for r in fused if not _is_garbage(r.get("content", ""))]
+        # WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): the proactive hook is
+        # THE pushed feed — in a dispatched session (GENESIS_SESSION_ID env)
+        # under enforce, blockable stored-external items are dropped before
+        # formatting. Dropped items are still counted into the post-output
+        # emit (the enforce-mode row is the block ledger). Any import/config
+        # error fails OPEN (items kept, wrapped downstream as today).
+        _enforce_dropped = 0
+        try:
+            from genesis.security.immunity_shadow import should_enforce_drop
+
+            _kept: list[dict] = []
+            _unsup = bool(os.environ.get("GENESIS_SESSION_ID"))
+            for r in fused:
+                if should_enforce_drop(
+                    gate="injection",
+                    collection=r.get("collection"),
+                    source_pipeline=r.get("source_pipeline"),
+                    origin_class=r.get("origin_class"),
+                    pushed_surface=True,
+                    unsupervised=_unsup,
+                ):
+                    _enforce_dropped += 1
+                else:
+                    _kept.append(r)
+            fused = _kept
+        except Exception as exc:
+            print(f"Enforce-drop check skipped: {exc}", file=sys.stderr)
         fused_count = len(fused)
 
         # Graph breadcrumbs: 1-hop sync SQL for top results (~5ms total).
@@ -1818,18 +1846,20 @@ async def _run(prompt: str, session_id: str = "") -> None:
     if fused:
         await _increment_retrieved(fused)
 
-    # Post-output: WS-3 B1 gate 4 (injection) shadow-record. External-world hits
-    # in this proactive injection reach the CC-session prompt (action-capable).
+    # Post-output: WS-3 gate 4 (injection) record. External-world hits in this
+    # proactive injection reach the CC-session prompt (action-capable).
     # Fire-and-forget AFTER flush — never delays the injection, never crashes the
     # hook; skipped live if the gate is off (master kill switch / per-gate off).
-    if fused:
+    # Guard includes _enforce_dropped: an all-dropped run must still write its
+    # block-ledger row (fused would be empty).
+    if fused or _enforce_dropped:
         try:
             from genesis.security.immunity_shadow import (
                 item_is_blockable,
                 record_would_block_sync,
             )
 
-            blockable = sum(
+            blockable = _enforce_dropped + sum(
                 1
                 for r in fused
                 if item_is_blockable(

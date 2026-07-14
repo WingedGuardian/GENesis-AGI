@@ -17,6 +17,7 @@ These functions commit their own writes — do NOT call them inside a migration
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -124,6 +125,26 @@ async def list_granted(db: aiosqlite.Connection) -> list[dict]:
     return [dict(r) for r in await cursor.fetchall()]
 
 
+def _autonomy_enforce_refuses(origin_class: str) -> bool:
+    """WS-3 B4 gate-3 ENFORCE: refuse grant-evidence/state writes whose
+    provenance is blockable. All current callers are owner-gated
+    (owner/first_party), so under enforce this is pure armor — zero behavior
+    change today; it exists so a FUTURE caller that threads external
+    provenance cannot mutate autonomy state. Fail-OPEN on config errors (the
+    write proceeds and the shadow emit still records it)."""
+    from genesis.security import immunity
+
+    try:
+        return immunity.gate_mode("autonomy") == "enforce" and immunity.is_blockable(
+            origin_class
+        )
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "autonomy enforce check failed open", exc_info=True
+        )
+        return False
+
+
 async def _emit_autonomy_gate(
     db: aiosqlite.Connection,
     *,
@@ -176,8 +197,19 @@ async def apply_event(
     (approve/reject), ``first_party`` for Genesis's own deterministic
     guards/classifiers. Required, not defaulted, so every future caller must
     STATE provenance — a silent first_party default would be a permanently
-    inert gate.
+    inert gate. Under gate-3 ENFORCE a blockable origin is REFUSED (no
+    transition; returns the CURRENT state) — the emit records the attempt.
     """
+    row = await ensure_cell(
+        db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
+    )
+    if _autonomy_enforce_refuses(origin_class):
+        await _emit_autonomy_gate(
+            db, fn="apply_event", origin_class=origin_class,
+            domain=domain, verb=verb, risk_class=risk_class,
+            extra={"event": event.value, "refused": True},
+        )
+        return CellState(row["state"])
     row = await ensure_cell(
         db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
     )
@@ -221,8 +253,17 @@ async def record_success(
     """Increment the success counter.  Promotion stays explicit (user approve).
 
     ``origin_class`` (REQUIRED — WS-3 gate-3): provenance of the success
-    evidence. See :func:`apply_event`.
+    evidence. See :func:`apply_event`. Under gate-3 ENFORCE a blockable
+    origin is REFUSED (returns False, no counter bump) — the emit still
+    records the attempt (the enforce-mode row is the block ledger).
     """
+    if _autonomy_enforce_refuses(origin_class):
+        await _emit_autonomy_gate(
+            db, fn="record_success", origin_class=origin_class,
+            domain=domain, verb=verb, risk_class=risk_class,
+            extra={"refused": True},
+        )
+        return False
     row = await ensure_cell(
         db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
     )
@@ -265,8 +306,19 @@ async def record_correction(
     ``consequence_weight`` defaults to the risk-class severity (gate-derived;
     NEVER LLM-supplied).  The counter bump and any regression land in ONE atomic
     UPDATE so a crash can't leave a corrected cell stuck GRANTED.  Returns the
-    resulting cell state.
+    resulting cell state. Under gate-3 ENFORCE a blockable origin is REFUSED
+    (no mutation; returns the CURRENT state) — the emit records the attempt.
     """
+    row = await ensure_cell(
+        db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
+    )
+    if _autonomy_enforce_refuses(origin_class):
+        await _emit_autonomy_gate(
+            db, fn="record_correction", origin_class=origin_class,
+            domain=domain, verb=verb, risk_class=risk_class,
+            extra={"refused": True},
+        )
+        return CellState(row["state"])
     row = await ensure_cell(
         db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
     )

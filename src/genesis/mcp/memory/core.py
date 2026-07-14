@@ -762,8 +762,24 @@ async def memory_proactive(
     # items so the model treats them as data, not first-party instructions.
     out: list[dict] = []
     blockable = 0
+    _unsupervised = immunity_shadow.is_dispatched_session_env()
     for r in filtered:
         d = asdict(r)
+        # WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): memory_proactive is a
+        # query-less ambient feed — in a DISPATCHED session under enforce,
+        # blockable stored-external items are DROPPED (not returned at all).
+        # The emit below still records them: the enforce-mode row IS the
+        # block ledger. Foreground and shadow mode keep wrap-and-return.
+        if immunity_shadow.should_enforce_drop(
+            gate="injection",
+            collection=r.collection,
+            source_pipeline=r.source_pipeline,
+            origin_class=r.origin_class,
+            pushed_surface=True,
+            unsupervised=_unsupervised,
+        ):
+            blockable += 1
+            continue
         if is_external(r.collection):
             d["content"] = wrap_external_recall(
                 d.get("content", ""),
@@ -872,7 +888,22 @@ async def memory_core_facts(
     # STORED origin_class: episodic content is only external when its stored
     # class says so — the collection fallback alone can never flag it here.
     blockable = 0
-    for item, _ in top:
+    _unsupervised = immunity_shadow.is_dispatched_session_env()
+    _kept: list[tuple[dict, float]] = []
+    for item, score in top:
+        # WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): core_facts is a
+        # query-less ambient feed — dispatched session + enforce -> DROP the
+        # blockable item (still recorded below). Otherwise wrap-and-return.
+        if immunity_shadow.should_enforce_drop(
+            gate="injection",
+            collection="episodic_memory",
+            source_pipeline=item.get("source_pipeline"),
+            origin_class=item.get("origin_class"),
+            pushed_surface=True,
+            unsupervised=_unsupervised,
+        ):
+            blockable += 1
+            continue
         if immunity_shadow.item_is_blockable(
             collection="episodic_memory",
             source_pipeline=item.get("source_pipeline"),
@@ -883,6 +914,8 @@ async def memory_core_facts(
                 source_pipeline=item.get("source_pipeline"),
             )
             blockable += 1
+        _kept.append((item, score))
+    top = _kept
     await immunity_shadow.record_would_block(
         gate="injection",
         source_kind="recall_inject",

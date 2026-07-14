@@ -687,6 +687,10 @@ def _validate_cc_roster(changes: dict) -> list[str]:
     return errors
 
 
+# WS-3 gates whose enforce branch is NOT built (B4 ships autonomy+injection).
+_ENFORCE_NOT_IMPLEMENTED = frozenset({"procedure", "identity"})
+
+
 def _validate_ws3_immunity(changes: dict) -> list[str]:
     """Validate ws3_immunity kill-switch changes (see genesis.security.immunity)."""
     from genesis.security.immunity import GATES, MODES
@@ -708,6 +712,15 @@ def _validate_ws3_immunity(changes: dict) -> list[str]:
                 errors.append(
                     f"'{key}.mode' must be one of {', '.join(MODES)}; "
                     f"got {value.get('mode')!r}"
+                )
+            elif value.get("mode") == "enforce" and key in _ENFORCE_NOT_IMPLEMENTED:
+                # Honesty guard (B4): a gate with no enforce branch must not
+                # accept mode=enforce — the config would LIE (rows relabel +
+                # auto-demote arms while content still crosses). Remove each
+                # gate from the set when its enforce lands.
+                errors.append(
+                    f"'{key}' does not implement enforce yet (WS-3 B4 ships "
+                    "enforce for autonomy + injection only) — shadow/off only"
                 )
         elif key == "auto_demote":
             if not isinstance(value, dict):
