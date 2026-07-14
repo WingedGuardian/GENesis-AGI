@@ -380,8 +380,9 @@ The loops that make Genesis think between conversations.
 
 ```yaml subsystem-map
 entry: ambient-cognition
-modules: [awareness, perception, reflection, attention, session_awareness]
-verified: 780cc8de 2026-07-10
+modules: [awareness, perception, reflection, attention, session_awareness,
+          session_charter.py]
+verified: b1851a70 2026-07-14
 ```
 
 - **awareness/**: the 5-min heartbeat. ~23 signal collectors (the richer
