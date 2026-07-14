@@ -59,30 +59,35 @@ async def test_distinct_unresolved_types_and_sources(db):
     await observations.create(db, id="du1", **_COMMON)
     await observations.create(db, id="du2", **{**_COMMON, "source": "session:abc"})
     await observations.create(db, id="du3", **{**_COMMON, "type": "anomaly"})
-    await observations.resolve(
-        db, "du3", resolved_at="2026-01-02T00:00:00", resolution_notes=""
-    )
+    await observations.resolve(db, "du3", resolved_at="2026-01-02T00:00:00", resolution_notes="")
     assert await observations.distinct_unresolved_types(db) == ["metric"]
     assert await observations.distinct_unresolved_sources(db) == ["sensor", "session:abc"]
 
 
 async def test_count_unsurfaced_mirrors_get_unsurfaced(db):
-    await observations.create(db, id="cu1", **_COMMON)                                # counted
-    await observations.create(db, id="cu2", **{**_COMMON, "priority": "low"})         # excluded by priority
-    await observations.create(db, id="cu3", **{**_COMMON, "type": "internal_thing"})  # excluded by type
+    await observations.create(db, id="cu1", **_COMMON)  # counted
+    await observations.create(
+        db, id="cu2", **{**_COMMON, "priority": "low"}
+    )  # excluded by priority
+    await observations.create(
+        db, id="cu3", **{**_COMMON, "type": "internal_thing"}
+    )  # excluded by type
     await observations.create(db, id="cu4", **_COMMON)
-    await observations.mark_surfaced(db, ["cu4"], "2026-01-02T00:00:00")              # surfaced
+    await observations.mark_surfaced(db, ["cu4"], "2026-01-02T00:00:00")  # surfaced
     await observations.create(db, id="cu5", **_COMMON)
     await observations.resolve(db, "cu5", resolved_at="2026-01-02T00:00:00", resolution_notes="")
 
     count = await observations.count_unsurfaced(
-        db, priority_filter=("critical", "high", "medium"),
+        db,
+        priority_filter=("critical", "high", "medium"),
         exclude_types=("internal_thing",),
     )
     assert count == 1
     rows = await observations.get_unsurfaced(
-        db, priority_filter=("critical", "high", "medium"),
-        exclude_types=("internal_thing",), limit=100,
+        db,
+        priority_filter=("critical", "high", "medium"),
+        exclude_types=("internal_thing",),
+        limit=100,
     )
     assert count == len(rows)
     assert await observations.count_unsurfaced(db, priority_filter=()) == 0
@@ -114,7 +119,10 @@ async def test_query_by_resolved(db):
 
 async def test_resolve(db):
     await observations.create(db, id="o7", **_COMMON)
-    assert await observations.resolve(db, "o7", resolved_at="2026-01-02", resolution_notes="fixed") is True
+    assert (
+        await observations.resolve(db, "o7", resolved_at="2026-01-02", resolution_notes="fixed")
+        is True
+    )
     row = await observations.get_by_id(db, "o7")
     assert row["resolved"] == 1
 
@@ -126,27 +134,46 @@ async def test_resolve_nonexistent(db):
 async def test_resolve_by_content_hash(db):
     """resolve_by_content_hash resolves only rows matching source + content_hash."""
     await observations.create(
-        db, id="pf-a", source="routing", type="provider_failure",
-        content="provider a down", priority="high",
-        created_at="2026-01-01T00:00:00", content_hash="hash-a",
+        db,
+        id="pf-a",
+        source="routing",
+        type="provider_failure",
+        content="provider a down",
+        priority="high",
+        created_at="2026-01-01T00:00:00",
+        content_hash="hash-a",
     )
     await observations.create(
-        db, id="pf-b", source="routing", type="provider_failure",
-        content="provider b down", priority="high",
-        created_at="2026-01-01T00:00:00", content_hash="hash-b",
+        db,
+        id="pf-b",
+        source="routing",
+        type="provider_failure",
+        content="provider b down",
+        priority="high",
+        created_at="2026-01-01T00:00:00",
+        content_hash="hash-b",
     )
     n = await observations.resolve_by_content_hash(
-        db, source="routing", content_hash="hash-a",
-        resolved_at="2026-01-02", resolution_notes="recovered",
+        db,
+        source="routing",
+        content_hash="hash-a",
+        resolved_at="2026-01-02",
+        resolution_notes="recovered",
     )
     assert n == 1
     assert (await observations.get_by_id(db, "pf-a"))["resolved"] == 1
     assert (await observations.get_by_id(db, "pf-b"))["resolved"] == 0
     # Idempotent — re-running resolves nothing more.
-    assert await observations.resolve_by_content_hash(
-        db, source="routing", content_hash="hash-a",
-        resolved_at="2026-01-02", resolution_notes="recovered",
-    ) == 0
+    assert (
+        await observations.resolve_by_content_hash(
+            db,
+            source="routing",
+            content_hash="hash-a",
+            resolved_at="2026-01-02",
+            resolution_notes="recovered",
+        )
+        == 0
+    )
 
 
 async def test_increment_retrieved(db):
@@ -211,20 +238,37 @@ async def test_create_and_upsert_carry_origin_class(db):
     from genesis.db.crud import observations as obs
 
     await obs.create(
-        db, id="o-ext", source="reflection", type="user_model_delta",
-        content="{}", priority="medium", created_at="2026-01-01T00:00:00+00:00",
+        db,
+        id="o-ext",
+        source="reflection",
+        type="user_model_delta",
+        content="{}",
+        priority="medium",
+        created_at="2026-01-01T00:00:00+00:00",
         origin_class="external_untrusted",
     )
     cur = await db.execute("SELECT origin_class FROM observations WHERE id='o-ext'")
     assert (await cur.fetchone())[0] == "external_untrusted"
 
     await obs.upsert(
-        db, id="o-up", source="s", type="t", content="c", priority="low",
-        created_at="2026-01-01T00:00:00+00:00", origin_class="first_party",
+        db,
+        id="o-up",
+        source="s",
+        type="t",
+        content="c",
+        priority="low",
+        created_at="2026-01-01T00:00:00+00:00",
+        origin_class="first_party",
     )
     await obs.upsert(
-        db, id="o-up", source="s", type="t", content="c2", priority="low",
-        created_at="2026-01-01T00:00:00+00:00", origin_class="external_untrusted",
+        db,
+        id="o-up",
+        source="s",
+        type="t",
+        content="c2",
+        priority="low",
+        created_at="2026-01-01T00:00:00+00:00",
+        origin_class="external_untrusted",
     )
     cur = await db.execute("SELECT origin_class, content FROM observations WHERE id='o-up'")
     row = await cur.fetchone()
@@ -235,8 +279,40 @@ async def test_create_origin_class_defaults_null(db):
     from genesis.db.crud import observations as obs
 
     await obs.create(
-        db, id="o-null", source="s", type="t", content="c", priority="low",
+        db,
+        id="o-null",
+        source="s",
+        type="t",
+        content="c",
+        priority="low",
         created_at="2026-01-01T00:00:00+00:00",
     )
     cur = await db.execute("SELECT origin_class FROM observations WHERE id='o-null'")
     assert (await cur.fetchone())[0] is None
+
+
+async def test_count_external_by_ids(db):
+    from genesis.db.crud import observations as obs
+
+    for oid, oc in [
+        ("o-c1", "external_untrusted"),
+        ("o-c2", "first_party"),
+        ("o-c3", None),
+        ("o-c4", "external_untrusted"),
+    ]:
+        await obs.create(
+            db,
+            id=oid,
+            source="s",
+            type="t",
+            content="c",
+            priority="low",
+            created_at="2026-01-01T00:00:00+00:00",
+            origin_class=oc,
+        )
+    # Only the external rows among the GIVEN ids count; NULL reads first-party.
+    assert await obs.count_external_by_ids(db, ["o-c1", "o-c2", "o-c3"]) == 1
+    assert await obs.count_external_by_ids(db, ["o-c1", "o-c4"]) == 2
+    assert await obs.count_external_by_ids(db, ["o-c2", "o-c3"]) == 0
+    assert await obs.count_external_by_ids(db, []) == 0
+    assert await obs.count_external_by_ids(db, ["missing"]) == 0

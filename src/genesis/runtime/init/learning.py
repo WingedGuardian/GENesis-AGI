@@ -742,15 +742,13 @@ async def init(rt: GenesisRuntime) -> None:
                             ext_deltas = 0
                             if accepted_delta_ids:
                                 try:
-                                    marks = ",".join("?" * len(accepted_delta_ids))
-                                    cur = await rt._db.execute(
-                                        "SELECT COUNT(*) FROM observations "  # noqa: S608 -- placeholders bound
-                                        f"WHERE id IN ({marks}) "
-                                        "AND origin_class = 'external_untrusted'",
-                                        accepted_delta_ids,
+                                    from genesis.db.crud import (
+                                        observations as obs_crud,
                                     )
-                                    row = await cur.fetchone()
-                                    ext_deltas = int(row[0]) if row else 0
+
+                                    ext_deltas = await obs_crud.count_external_by_ids(
+                                        rt._db, accepted_delta_ids
+                                    )
                                 except Exception:
                                     logger.debug(
                                         "gate-2 delta origin aggregate failed",
