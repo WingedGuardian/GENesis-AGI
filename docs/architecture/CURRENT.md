@@ -427,6 +427,17 @@ verified: 780cc8de 2026-07-10
   retrieved_count** (retrieval connection is mode=ro; protects
   MEM-005/H-1 baselines). Fail-open at the hook boundary. Kill switch:
   `GENESIS_SESSION_AWARENESS_DISABLED=1`.
+- **Session charter** (session-manager stage 1): `scripts/genesis_precompact.py`
+  (PreCompact hook, both triggers, 5s fail-open timeout) persists a foreground
+  session's IMMUTABLE origin — the first typed user prompt, extracted from the
+  transcript head at the FIRST compaction boundary — to
+  `~/.genesis/sessions/<sid>/charter.json` (+ `charter.md` mirror,
+  `waypoints.jsonl` deterministic spine); `genesis_session_context.py`
+  re-injects it on every startup/resume/compact (NOT clear), so
+  recency-biased compaction can never erase what a session is for.
+  `origin_prompt`/`origin_ts` are write-once; `mission`/`pointers` are living
+  fields reserved for the ledger stage. Dispatched sessions
+  (GENESIS_CC_SESSION=1) are skipped — task_states is their continuity spine.
 
 ## 10. Learning & evaluation
 
