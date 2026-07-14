@@ -465,6 +465,13 @@ def test_context_flag_absent_is_noop(monkeypatch, tmp_path):
 
 
 # ── SessionStart charter injection ──────────────────────────────────────────
+# Existing file-based tests exercise the legacy charter.json FALLBACK path by
+# pointing db_path at a nonexistent file; the DB-first tests below exercise
+# the canonical path against a real 0058-shaped SQLite file.
+
+
+def _no_db(tmp_path: Path) -> Path:
+    return tmp_path / "absent" / "genesis.db"
 
 
 def _make_charter(tmp_path: Path, session_id: str, **overrides) -> Path:
@@ -484,9 +491,11 @@ def _make_charter(tmp_path: Path, session_id: str, **overrides) -> Path:
     return tmp_path / "sessions"
 
 
-def test_charter_block_emitted_when_present(tmp_path):
+def test_charter_block_emitted_from_file_fallback(tmp_path):
     sessions_dir = _make_charter(tmp_path, "sid-1")
-    block = _ctx._charter_emission_block("sid-1", "compact", sessions_dir=sessions_dir)
+    block = _ctx._charter_emission_block(
+        "sid-1", "compact", sessions_dir=sessions_dir, db_path=_no_db(tmp_path)
+    )
     assert "## Session Charter" in block
     assert "Let's take a look at the flaky retry" in block
     assert "Compactions: 3" in block
@@ -499,31 +508,52 @@ def test_charter_block_includes_mission_and_pointers(tmp_path):
         mission="Ship the session manager",
         pointers=["~/.genesis/output/session-manager-spec-2026-07-13.md"],
     )
-    block = _ctx._charter_emission_block("sid-1", "resume", sessions_dir=sessions_dir)
+    block = _ctx._charter_emission_block(
+        "sid-1", "resume", sessions_dir=sessions_dir, db_path=_no_db(tmp_path)
+    )
     assert "Ship the session manager" in block
     assert "session-manager-spec-2026-07-13.md" in block
 
 
 def test_charter_block_empty_when_absent(tmp_path):
-    block = _ctx._charter_emission_block("sid-none", "compact", sessions_dir=tmp_path / "sessions")
+    block = _ctx._charter_emission_block(
+        "sid-none", "compact", sessions_dir=tmp_path / "sessions", db_path=_no_db(tmp_path)
+    )
     assert block == ""
 
 
 def test_charter_block_empty_on_clear(tmp_path):
     """/clear is an explicit fresh start — never re-assert the old origin."""
     sessions_dir = _make_charter(tmp_path, "sid-1")
-    assert _ctx._charter_emission_block("sid-1", "clear", sessions_dir=sessions_dir) == ""
+    assert (
+        _ctx._charter_emission_block(
+            "sid-1", "clear", sessions_dir=sessions_dir, db_path=_no_db(tmp_path)
+        )
+        == ""
+    )
 
 
 def test_charter_block_empty_on_bad_session_id(tmp_path):
     sessions_dir = _make_charter(tmp_path, "sid-1")
-    assert _ctx._charter_emission_block("../sid-1", "compact", sessions_dir=sessions_dir) == ""
-    assert _ctx._charter_emission_block("", "compact", sessions_dir=sessions_dir) == ""
+    assert (
+        _ctx._charter_emission_block(
+            "../sid-1", "compact", sessions_dir=sessions_dir, db_path=_no_db(tmp_path)
+        )
+        == ""
+    )
+    assert (
+        _ctx._charter_emission_block(
+            "", "compact", sessions_dir=sessions_dir, db_path=_no_db(tmp_path)
+        )
+        == ""
+    )
 
 
 def test_charter_block_truncates_long_origin(tmp_path):
     sessions_dir = _make_charter(tmp_path, "sid-1", origin_prompt="x" * 5000)
-    block = _ctx._charter_emission_block("sid-1", "compact", sessions_dir=sessions_dir)
+    block = _ctx._charter_emission_block(
+        "sid-1", "compact", sessions_dir=sessions_dir, db_path=_no_db(tmp_path)
+    )
     assert "truncated" in block
     assert len(block) < 3000
 
@@ -533,5 +563,129 @@ def test_charter_block_corrupt_json_fails_open(tmp_path):
     session_dir.mkdir(parents=True)
     (session_dir / "charter.json").write_text("{corrupt")
     assert (
-        _ctx._charter_emission_block("sid-1", "compact", sessions_dir=tmp_path / "sessions") == ""
+        _ctx._charter_emission_block(
+            "sid-1", "compact", sessions_dir=tmp_path / "sessions", db_path=_no_db(tmp_path)
+        )
+        == ""
     )
+
+
+# ── DB-first injection path ─────────────────────────────────────────────────
+
+
+def _seed_db_charter(tmp_path: Path, session_id: str = "sid-db", **overrides) -> Path:
+    """0058-shaped tmp DB with a charter row (+ returns the db path)."""
+    root = _make_db(tmp_path)
+    db_file = root / "data" / "genesis.db"
+    row = {
+        "session_id": session_id,
+        "transcript_path": "/tmp/t.jsonl",
+        "origin_prompt": "The DB-canonical origin prompt.",
+        "origin_ts": "2026-06-30T15:21:06.000Z",
+        "mission": None,
+        "pointers": "[]",
+        "compaction_count": 5,
+        "created_at": "2026-07-13T02:00:00+00:00",
+        **overrides,
+    }
+    conn = sqlite3.connect(db_file)
+    conn.execute(
+        "INSERT INTO session_charters (session_id, transcript_path, origin_prompt,"
+        " origin_ts, mission, pointers, compaction_count, created_at)"
+        " VALUES (:session_id, :transcript_path, :origin_prompt, :origin_ts,"
+        " :mission, :pointers, :compaction_count, :created_at)",
+        row,
+    )
+    conn.commit()
+    conn.close()
+    return db_file
+
+
+def _seed_ledger(db_file: Path, session_id: str, items: list[tuple[str, str, str]]) -> None:
+    conn = sqlite3.connect(db_file)
+    for i, (item_id, text, status) in enumerate(items):
+        conn.execute(
+            "INSERT INTO session_ledger (id, session_id, text, status, added_by, created_at)"
+            f" VALUES (?, ?, ?, ?, 'foreground', '2026-07-13T00:00:0{i}+00:00')",
+            (item_id, session_id, text, status),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_charter_block_db_first(tmp_path):
+    db_file = _seed_db_charter(
+        tmp_path, mission="Ship PR-2a", pointers='["~/.claude/plans/plan.md"]'
+    )
+    _seed_ledger(
+        db_file,
+        "sid-db",
+        [
+            ("l1", "open thing", "open"),
+            ("l2", "wip thing", "in_progress"),
+            ("l3", "finished thing", "done"),
+        ],
+    )
+    block = _ctx._charter_emission_block(
+        "sid-db", "compact", sessions_dir=tmp_path / "sessions", db_path=db_file
+    )
+    assert "The DB-canonical origin prompt." in block
+    assert "**Mission:** Ship PR-2a" in block
+    assert "- ~/.claude/plans/plan.md" in block
+    assert "- [ ] open thing (id: l1)" in block
+    assert "- [~] wip thing (id: l2)" in block
+    assert "finished thing" not in block  # closed items stay out of the block
+    assert "ledger: 2 open / 1 closed" in block
+    assert "Compactions: 5" in block
+
+
+def test_charter_block_db_beats_stale_file(tmp_path):
+    """When both stores have the session, the DB (canonical) wins."""
+    db_file = _seed_db_charter(tmp_path, session_id="sid-1")
+    _make_charter(tmp_path, "sid-1", origin_prompt="STALE file origin")
+    block = _ctx._charter_emission_block(
+        "sid-1", "compact", sessions_dir=tmp_path / "sessions", db_path=db_file
+    )
+    assert "The DB-canonical origin prompt." in block
+    assert "STALE file origin" not in block
+
+
+def test_charter_block_db_stub_falls_back_to_empty(tmp_path):
+    """A stub row (origin NULL) has nothing to re-assert yet."""
+    db_file = _seed_db_charter(tmp_path, origin_prompt=None)
+    block = _ctx._charter_emission_block(
+        "sid-db", "compact", sessions_dir=tmp_path / "sessions", db_path=db_file
+    )
+    assert block == ""
+
+
+def test_charter_block_db_missing_table_falls_back_to_file(tmp_path):
+    """An un-migrated DB (no session_charters table) must not break the
+    legacy path — OperationalError → file fallback."""
+    empty_db = tmp_path / "repo" / "data" / "genesis.db"
+    empty_db.parent.mkdir(parents=True)
+    sqlite3.connect(empty_db).close()
+    sessions_dir = _make_charter(tmp_path, "sid-1")
+    block = _ctx._charter_emission_block(
+        "sid-1", "compact", sessions_dir=sessions_dir, db_path=empty_db
+    )
+    assert "Let's take a look at the flaky retry" in block
+
+
+def test_charter_block_budget_guard(tmp_path):
+    db_file = _seed_db_charter(
+        tmp_path,
+        origin_prompt="o" * 4000,
+        mission="m" * 1000,
+        pointers=json.dumps(["p" * 300] * 12),
+    )
+    _seed_ledger(
+        db_file,
+        "sid-db",
+        [(f"l{i}", "t" * 900, "open") for i in range(6)],
+    )
+    block = _ctx._charter_emission_block(
+        "sid-db", "compact", sessions_dir=tmp_path / "sessions", db_path=db_file
+    )
+    assert len(block) <= 2900
+    assert "truncated" in block
