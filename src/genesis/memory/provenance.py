@@ -320,13 +320,21 @@ def provenance_descriptor(
     collection: str | None,
     source_pipeline: str | None = None,
     source_doc: str | None = None,
+    origin_class: str | None = None,
 ) -> str:
     """One-line provenance label for a recalled item.
 
     External → ``"external-world knowledge (source: <friendly>[, doc: <doc>])"``.
     First-party → ``"first-party memory"``.
+
+    ``origin_class`` is the item's STORED origin when the caller has it: an
+    episodic row stored as ``external_untrusted`` (e.g. written by a dispatched
+    session ingesting external content) labels external even though its
+    collection is not the KB — the label must never claim first-party for
+    content the immunity layer classifies as external. None/unknown falls back
+    to the collection discriminator unchanged.
     """
-    if not is_external(collection):
+    if origin_class != ORIGIN_EXTERNAL_UNTRUSTED and not is_external(collection):
         return _FIRST_PARTY
     friendly = _match(_PIPELINE_FRIENDLY, source_pipeline, "external source")
     if source_doc and source_doc not in _PLACEHOLDER_DOCS:
@@ -364,6 +372,7 @@ def label_result_dicts(
             collection=coll,
             source_pipeline=sp,
             source_doc=d.get("source_doc") or d.get("source") or payload.get("source"),
+            origin_class=d.get("origin_class") or payload.get("origin_class"),
         )
     return dicts
 

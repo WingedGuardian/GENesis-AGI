@@ -380,10 +380,13 @@ async def memory_recall(
                 "source_pipeline": r.source_pipeline or "",
                 # Provenance (audit D12): first-party memory vs external-world KB,
                 # so the model never treats ingested content as its own truth.
+                # Honors STORED origin so an external episodic preview is not
+                # labeled first-party.
                 "provenance": provenance_descriptor(
                     collection=r.collection,
                     source_pipeline=r.source_pipeline,
                     source_doc=r.source,
+                    origin_class=r.origin_class,
                 ),
             }
             for r in results
@@ -443,21 +446,28 @@ async def memory_recall(
     # output contract is uniform.
     label_result_dicts(enriched, default_collection="episodic_memory")
     # Injection defense (PR2): structurally delimit external-world content so
-    # the model treats it as data, not first-party instructions. Gate on the
-    # post-label collection so CRAG web-fallback items are covered too.
+    # the model treats it as data, not first-party instructions. Wrap keys on
+    # STORED origin first (an episodic item whose stored origin_class is
+    # external_untrusted must be wrapped too — collection alone misses it),
+    # falling back to the post-label collection so CRAG web-fallback items
+    # stay covered. The wrap is the compensating control on this explicit
+    # surface in every mode, enforce included.
     blockable = 0
     for d in enriched:
-        if isinstance(d, dict) and is_external(d.get("collection")):
+        if not isinstance(d, dict):
+            continue
+        _blockable = immunity_shadow.item_is_blockable(
+            collection=d.get("collection"),
+            source_pipeline=d.get("source_pipeline"),
+            origin_class=d.get("origin_class"),
+        )
+        if _blockable or is_external(d.get("collection")):
             d["content"] = wrap_external_recall(
                 d.get("content", ""),
                 source_pipeline=d.get("source_pipeline"),
             )
-            if immunity_shadow.item_is_blockable(
-                collection=d.get("collection"),
-                source_pipeline=d.get("source_pipeline"),
-                origin_class=d.get("origin_class"),
-            ):
-                blockable += 1
+        if _blockable:
+            blockable += 1
     # WS-3 B1 gate 4 (injection): shadow-record that external content reached
     # this action-capable prompt (observe-only — the item still reaches the model).
     await immunity_shadow.record_would_block(
@@ -595,28 +605,34 @@ async def memory_expand(
             "source_pipeline": payload.get("source_pipeline", ""),
             "source_session_id": payload.get("source_session_id"),
             "created_at": payload.get("created_at"),
-            # Provenance (audit D12): first-party memory vs external-world KB.
+            # Provenance (audit D12): first-party memory vs external-world KB,
+            # honoring STORED origin so external episodic rows don't read as
+            # first-party.
             "collection": _collection,
+            "origin_class": payload.get("origin_class"),
             "provenance": provenance_descriptor(
                 collection=_collection,
                 source_pipeline=payload.get("source_pipeline"),
                 source_doc=payload.get("source"),
+                origin_class=payload.get("origin_class"),
             ),
         }
 
         # Injection defense (PR2): wrap full external-world content pulled into
-        # context after a compact recall (the real full-payload surface).
-        if is_external(_collection):
+        # context after a compact recall (the real full-payload surface). Keys
+        # on STORED origin first — collection alone misses external episodic.
+        _blockable = immunity_shadow.item_is_blockable(
+            collection=_collection,
+            source_pipeline=payload.get("source_pipeline"),
+            origin_class=payload.get("origin_class"),
+        )
+        if _blockable or is_external(_collection):
             d["content"] = wrap_external_recall(
                 d["content"],
                 source_pipeline=payload.get("source_pipeline"),
             )
-            if immunity_shadow.item_is_blockable(
-                collection=_collection,
-                source_pipeline=payload.get("source_pipeline"),
-                origin_class=payload.get("origin_class"),
-            ):
-                blockable += 1
+        if _blockable:
+            blockable += 1
 
         # Graph enrichment
         try:
@@ -780,17 +796,21 @@ async def memory_proactive(
         ):
             blockable += 1
             continue
-        if is_external(r.collection):
+        # Kept items (shadow mode / foreground): wrap keys on STORED origin
+        # first — a kept external episodic row must stay delimited + counted,
+        # not just knowledge_base hits (Codex P1).
+        _blockable = immunity_shadow.item_is_blockable(
+            collection=r.collection,
+            source_pipeline=r.source_pipeline,
+            origin_class=r.origin_class,
+        )
+        if _blockable or is_external(r.collection):
             d["content"] = wrap_external_recall(
                 d.get("content", ""),
                 source_pipeline=r.source_pipeline,
             )
-            if immunity_shadow.item_is_blockable(
-                collection=r.collection,
-                source_pipeline=r.source_pipeline,
-                origin_class=r.origin_class,
-            ):
-                blockable += 1
+        if _blockable:
+            blockable += 1
         out.append(d)
     # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
     # proactive-recall prompt (observe-only). db=memory_mod._db when set, else

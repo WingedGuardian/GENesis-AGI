@@ -399,7 +399,9 @@ async def test_gate3_refuses_external_correction_and_event(config_dirs, db):
         origin_class="external_untrusted",
     )
     assert state == CellState.NOT_DETERMINED  # untouched default state
-    assert (await _cell_row(db, domain="d2"))[1] == 0  # no correction recorded
+    # Refusal creates NO cell — external provenance must not seed autonomy
+    # state, not even a NOT_DETERMINED row (Codex P2 / structural NOTE).
+    assert await _cell_row(db, domain="d2") is None
 
     state2 = await cg.apply_event(
         db,
@@ -411,6 +413,28 @@ async def test_gate3_refuses_external_correction_and_event(config_dirs, db):
         origin_class="external_untrusted",
     )
     assert state2 == CellState.NOT_DETERMINED  # transition refused
+    assert await _cell_row(db, domain="d2") is None  # still no cell
+
+    # With a PRE-EXISTING cell, a refused event reports its real state
+    # without mutating it.
+    await cg.ensure_cell(
+        db,
+        domain="d2",
+        verb="v",
+        risk_class="standard",
+        updated_at="2026-01-01T00:00:02+00:00",
+    )
+    state3 = await cg.apply_event(
+        db,
+        domain="d2",
+        verb="v",
+        risk_class="standard",
+        event=CellEvent.APPROVE,
+        updated_at="2026-01-01T00:00:03+00:00",
+        origin_class="external_untrusted",
+    )
+    assert state3 == CellState.NOT_DETERMINED  # existing state, not transitioned
+    assert (await _cell_row(db, domain="d2"))[2] == CellState.NOT_DETERMINED.value
 
 
 async def test_gate3_shadow_mode_never_refuses(config_dirs, db):
@@ -496,3 +520,140 @@ async def test_retrieval_result_replace_smoke():
     r = _rr("x", "first_party")
     r2 = replace(r, origin_class="external_untrusted")
     assert r2.origin_class == "external_untrusted" and r.origin_class == "first_party"
+
+
+# ─── stored-external EPISODIC rows: wrap keys on stored origin (Codex P1) ────
+
+
+@pytest.mark.parametrize(
+    ("mode", "env"),
+    [
+        ("shadow", "foreground"),
+        ("shadow", "dispatched"),
+        ("enforce", "foreground"),
+        ("enforce", "dispatched"),  # explicit surface: retained, wrapped
+    ],
+)
+async def test_memory_recall_wraps_stored_external_episodic(
+    config_dirs, monkeypatch, db, mode, env
+):
+    """An EPISODIC item whose STORED origin_class is external_untrusted must
+    come back WRAPPED from explicit memory_recall in every mode — collection
+    alone must not decide the wrap (the compensating control of the
+    pushed-surfaces cut)."""
+    base, _ = config_dirs
+    _write(base, {"injection": {"mode": mode}})
+    (_dispatched if env == "dispatched" else _foreground)(monkeypatch)
+
+    import genesis.mcp.memory_mcp as mod
+
+    retriever = MagicMock()
+    retriever.recall = AsyncMock(
+        return_value=[
+            _rr("ep-ext", "external_untrusted"),  # episodic collection
+            _rr("ep-fp", "first_party"),
+        ]
+    )
+    old = (mod._store, mod._db, mod._retriever)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._retriever = retriever
+        tools = await _mcp_tools()
+        out = await tools["memory_recall"].fn(
+            query="explicit question",
+            include_graph=False,
+            corrective=False,
+        )
+    finally:
+        mod._store, mod._db, mod._retriever = old
+
+    by_id = {d["memory_id"]: d for d in out}
+    assert "ep-ext" in by_id and "ep-fp" in by_id
+    assert "<external-content" in by_id["ep-ext"]["content"]
+    assert "<external-content" not in by_id["ep-fp"]["content"]
+    # The label must not claim first-party for the external row either.
+    assert by_id["ep-ext"]["provenance"].startswith("external-world knowledge")
+    assert by_id["ep-fp"]["provenance"] == "first-party memory"
+
+
+async def test_memory_proactive_keep_path_wraps_stored_external_episodic(
+    config_dirs, monkeypatch, db
+):
+    """Shadow mode keeps external items — but a kept episodic row with stored
+    external origin must be wrapped and counted, not returned raw."""
+    base, _ = config_dirs
+    _write(base, {"injection": {"mode": "shadow"}})
+    _foreground(monkeypatch)
+
+    import genesis.mcp.memory_mcp as mod
+
+    retriever = MagicMock()
+    retriever.recall = AsyncMock(
+        return_value=[
+            _rr("ep-ext", "external_untrusted"),
+            _rr("ep-fp", "first_party"),
+        ]
+    )
+    old = (mod._store, mod._db, mod._retriever)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._retriever = retriever
+        tools = await _mcp_tools()
+        out = await tools["memory_proactive"].fn(current_message="hello")
+    finally:
+        mod._store, mod._db, mod._retriever = old
+
+    by_id = {d["memory_id"]: d for d in out}
+    assert "ep-ext" in by_id, "shadow mode must KEEP the item"
+    assert "<external-content" in by_id["ep-ext"]["content"]
+    assert "<external-content" not in by_id["ep-fp"]["content"]
+    # Counted in the shadow ledger (stored-first blockability).
+    rows = await db.execute_fetchall("SELECT gate, mode, would_block FROM immunity_shadow_events")
+    assert ("injection", "shadow", 1) in [tuple(r) for r in rows]
+
+
+async def test_memory_expand_wraps_stored_external_episodic(config_dirs, monkeypatch, db):
+    """memory_expand's full-payload path is the real post-compact injection
+    surface — stored-external EPISODIC payloads must come back wrapped."""
+    from types import SimpleNamespace
+
+    base, _ = config_dirs
+    _write(base, {"injection": {"mode": "shadow"}})
+    _foreground(monkeypatch)
+
+    import genesis.mcp.memory_mcp as mod
+
+    mid = "00000000-0000-4000-8000-0000000000aa"
+    point = SimpleNamespace(
+        id=mid,
+        payload={
+            "content": INJECTION_TEXT,
+            "source": "s",
+            "source_pipeline": "conversation",
+            "origin_class": "external_untrusted",
+        },
+    )
+
+    qdrant = MagicMock()
+    qdrant.retrieve = MagicMock(
+        side_effect=lambda collection_name, ids, with_payload: (
+            [point] if collection_name == "episodic_memory" else []
+        )
+    )
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._retriever = MagicMock()
+        mod._qdrant = qdrant
+        tools = await _mcp_tools()
+        out = await tools["memory_expand"].fn(memory_ids=[mid])
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+    items = [d for d in out if d.get("memory_id") == mid]
+    assert items, f"expected expanded item, got {out!r}"
+    assert "<external-content" in items[0]["content"]
+    assert items[0]["provenance"].startswith("external-world knowledge")

@@ -1337,6 +1337,12 @@ def _format_results(results: list[dict]) -> str:
             # external-world info, not its own first-party memory (audit D12).
             from genesis.memory.provenance import short_source
             parts = [f"KB·{short_source(r.get('source_pipeline'))}"]
+        elif r.get("origin_class") == "external_untrusted":
+            # Stored-external EPISODIC row (written by a dispatched session
+            # ingesting external content, #1021): kept under shadow/foreground,
+            # but it must not render as first-party `[Memory]` — same
+            # external-world tier as KB hits, episodic collection.
+            parts = ["Memory·external"]
         else:
             parts = ["Memory"]
         if age != "?" and not is_kb:

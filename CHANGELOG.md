@@ -54,7 +54,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   ingested doc, an email). This work makes that tag follow the content all the
   way through recall, so Genesis can tell, at the moment content is about to
   enter a prompt, whether it is quoted outside material rather than a trusted
-  instruction. The protection is armed but watching, not acting: it records
+  instruction. The stored tag decides everywhere: outside material that landed
+  in Genesis's own session memory (not just the knowledge base) is delimited
+  and labeled external on every recall surface — proactive hints, voice
+  responses, and the dashboard memory browser included — instead of reading as
+  first-party memory. The protection is armed but watching, not acting: it records
   what it *would* block so the behavior can be verified against real traffic
   before it's switched on. When switched on (a live setting, instantly
   reversible), outside-world content is held back only from automatic,

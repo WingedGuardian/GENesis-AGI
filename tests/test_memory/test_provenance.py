@@ -43,7 +43,8 @@ def test_descriptor_first_party():
 
 def test_descriptor_external_names_the_source():
     d = provenance_descriptor(
-        collection="knowledge_base", source_pipeline="curated",
+        collection="knowledge_base",
+        source_pipeline="curated",
     )
     assert d.startswith("external-world knowledge")
     assert "user-curated" in d
@@ -115,8 +116,9 @@ def test_label_result_dicts_knowledge_default():
 
 
 def test_label_result_dicts_crag_web_is_external_web():
-    dicts = [{"unit_id": "https://x", "content": "w", "origin": "web",
-              "source_pipeline": "crag_web"}]
+    dicts = [
+        {"unit_id": "https://x", "content": "w", "origin": "web", "source_pipeline": "crag_web"}
+    ]
     label_result_dicts(dicts, default_collection="episodic_memory")
     assert dicts[0]["collection"] == "knowledge_base"
     assert "web" in dicts[0]["provenance"]
@@ -137,8 +139,14 @@ def test_label_result_dicts_skips_sentinels():
 
 
 def test_label_result_dicts_idempotent():
-    dicts = [{"memory_id": "m", "content": "c", "collection": "knowledge_base",
-              "source_pipeline": "recon"}]
+    dicts = [
+        {
+            "memory_id": "m",
+            "content": "c",
+            "collection": "knowledge_base",
+            "source_pipeline": "recon",
+        }
+    ]
     label_result_dicts(dicts)
     first = dicts[0]["provenance"]
     label_result_dicts(dicts)
@@ -235,3 +243,46 @@ def test_session_origin_read_per_call_not_cached(monkeypatch):
     assert session_origin_from_env() == "external_untrusted"
     monkeypatch.delenv("GENESIS_SESSION_ORIGIN")
     assert session_origin_from_env() is None
+
+
+# ── WS-3 B4: provenance labels honor STORED origin_class ────────────────────
+
+
+def test_provenance_descriptor_stored_external_episodic_labels_external():
+    # An episodic row stored external_untrusted (dispatched-session write) must
+    # not be labeled first-party — the label follows the immunity classification.
+    label = provenance_descriptor(
+        collection="episodic_memory",
+        source_pipeline="conversation",
+        origin_class="external_untrusted",
+    )
+    assert label.startswith("external-world knowledge")
+
+
+def test_provenance_descriptor_origin_none_falls_back_to_collection():
+    assert (
+        provenance_descriptor(collection="episodic_memory", origin_class=None)
+        == "first-party memory"
+    )
+    assert provenance_descriptor(collection="knowledge_base", origin_class=None).startswith(
+        "external-world knowledge"
+    )
+
+
+def test_provenance_descriptor_stored_first_party_kb_stays_external_label():
+    # Collection still wins toward external: KB content is external-world info
+    # for labeling purposes even when its stored origin is first_party (e.g.
+    # surplus-pipeline units) — blockability is a separate, stored-first call.
+    assert provenance_descriptor(
+        collection="knowledge_base", origin_class="first_party"
+    ).startswith("external-world knowledge")
+
+
+def test_label_result_dicts_threads_origin_class():
+    d = {
+        "memory_id": "m1",
+        "collection": "episodic_memory",
+        "origin_class": "external_untrusted",
+    }
+    label_result_dicts([d])
+    assert d["provenance"].startswith("external-world knowledge")

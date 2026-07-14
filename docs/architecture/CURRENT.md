@@ -656,7 +656,15 @@ verified: 3d5234b9 2026-07-13
   sessions (`GENESIS_SESSION_ID` env) under enforce — explicit queries
   (`memory_recall`/`knowledge_recall`/`memory_expand`) and every foreground
   surface keep wrapped external in all modes (`should_enforce_drop`, fail-open);
-  gate-3 refuses grant evidence/state writes with a blockable origin. Every
+  gate-3 refuses grant evidence/state writes with a blockable origin — and the
+  refusal is read-only (no `ensure_cell` before the guard: external provenance
+  can't even seed a NOT_DETERMINED cell). Wrap + provenance labels are
+  STORED-FIRST at every inject surface (review round): `wrap_external_recall`
+  and `provenance_descriptor(origin_class=…)` key on the stored origin with the
+  collection check as fallback, so external EPISODIC rows are delimited/labeled
+  external everywhere (MCP recall/expand/proactive, hook `Memory·external` tag,
+  context injector, voice, research executor, dashboard) — the wrap is the
+  compensating control on the explicit surfaces the enforce cut retains. Every
   drop/refusal still records (the enforce-mode row IS the block ledger).
   Auto-demote now pages a `critical` `infrastructure_alert` when a gate stands
   down. Red-team acceptance: `test_redteam_enforce.py` (synthetic).

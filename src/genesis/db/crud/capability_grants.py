@@ -200,16 +200,18 @@ async def apply_event(
     inert gate. Under gate-3 ENFORCE a blockable origin is REFUSED (no
     transition; returns the CURRENT state) — the emit records the attempt.
     """
-    row = await ensure_cell(
-        db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
-    )
     if _autonomy_enforce_refuses(origin_class):
         await _emit_autonomy_gate(
             db, fn="apply_event", origin_class=origin_class,
             domain=domain, verb=verb, risk_class=risk_class,
             extra={"event": event.value, "refused": True},
         )
-        return CellState(row["state"])
+        # Refusal must not mutate autonomy state — not even by creating the
+        # cell (a pre-refusal ensure_cell would let external provenance seed
+        # NOT_DETERMINED rows). Read-only: report the existing state, or the
+        # state machine's default when no cell exists.
+        row = await get_cell(db, domain, verb, risk_class)
+        return CellState(row["state"]) if row else CellState.NOT_DETERMINED
     row = await ensure_cell(
         db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
     )
@@ -309,16 +311,16 @@ async def record_correction(
     resulting cell state. Under gate-3 ENFORCE a blockable origin is REFUSED
     (no mutation; returns the CURRENT state) — the emit records the attempt.
     """
-    row = await ensure_cell(
-        db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
-    )
     if _autonomy_enforce_refuses(origin_class):
         await _emit_autonomy_gate(
             db, fn="record_correction", origin_class=origin_class,
             domain=domain, verb=verb, risk_class=risk_class,
             extra={"refused": True},
         )
-        return CellState(row["state"])
+        # No mutation on refusal — see apply_event: read-only state report,
+        # never a cell insert.
+        row = await get_cell(db, domain, verb, risk_class)
+        return CellState(row["state"]) if row else CellState.NOT_DETERMINED
     row = await ensure_cell(
         db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
     )
