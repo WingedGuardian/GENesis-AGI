@@ -306,7 +306,12 @@ async def call_sites(
                     entry["probe_status"] = "reachable"
 
         # 2. Insert CC entry for CC-dispatch sites (cli/dual, + retired cc alias)
-        if dispatch in _CC_DISPATCH:
+        #    OR non-YAML CC-native sites (model_tier="cc" with no dispatch key):
+        #    the split ego cycles 7_user/7_genesis_ego_cycle record via
+        #    CCInvocation and can't set a meta dispatch per the meta<->YAML gate,
+        #    so without this an Ego tile would stay a bare "active" row and never
+        #    reflect a CC outage/rate-limit overlay.
+        if dispatch in _CC_DISPATCH or (meta and meta.get("model_tier") == "cc"):
             cc_model = yaml_ov.get("cc_model") or (meta.get("cc_model", "?") if meta else "?")
             cc_entry: dict = {
                 "provider": f"CC/{cc_model}",

@@ -237,10 +237,46 @@ async def test_non_yaml_last_run_site_carries_its_meta():
     result = await call_sites(db=db, routing_config=cfg, breakers=_registry())
     await db.close()
     entry = result["7_genesis_ego_cycle"]
-    assert entry["status"] == "active"
+    assert entry["status"] in ("active", "healthy")
     assert entry.get("description")  # meta merged in via the last_run else-branch
     assert entry.get("category") == "reasoning"
     assert entry.get("cost_policy") == "CC background (Sonnet)"
+
+
+@pytest.mark.asyncio
+async def test_cc_native_ego_site_gets_cc_chain_entry_and_outage_overlay():
+    """A non-YAML CC-native site (model_tier='cc', no dispatch) like
+    7_genesis_ego_cycle must get a CC/{model} chain entry that reflects CC health,
+    not stay a bare 'active' last-run row with an empty chain (Codex P2)."""
+    from unittest.mock import MagicMock
+
+    import aiosqlite
+
+    from genesis.resilience.state import CCStatus
+
+    db = await aiosqlite.connect(":memory:")
+    await db.execute(
+        "CREATE TABLE call_site_last_run (call_site_id TEXT PRIMARY KEY, "
+        "last_run_at TEXT, provider_used TEXT, model_id TEXT, response_text TEXT, "
+        "input_tokens INTEGER, output_tokens INTEGER, success INTEGER)"
+    )
+    await db.execute(
+        "INSERT INTO call_site_last_run VALUES "
+        "('7_genesis_ego_cycle', '2026-07-14T02:19:00+00:00', 'cc', 'claude-sonnet-5', 'x', 10, 20, 1)"
+    )
+    await db.commit()
+    sm = MagicMock()
+    sm.current.cc = CCStatus.UNAVAILABLE  # simulate a CC outage
+    cfg = _config({}, {})
+    result = await call_sites(
+        db=db, routing_config=cfg, breakers=_registry(), state_machine=sm
+    )
+    await db.close()
+    chain = result["7_genesis_ego_cycle"].get("chain_health", [])
+    cc = [c for c in chain if c.get("is_cc")]
+    assert cc, "CC-native ego tile has no CC chain entry"
+    assert cc[0]["provider"] == "CC/Sonnet"
+    assert cc[0]["state"] == "open"  # CC outage is reflected on the Ego tile
 
 
 @pytest.mark.asyncio

@@ -530,3 +530,21 @@ call_sites:
         "extra_body": {"include_reasoning": False, "reasoning_effort": "low"},
     }
     assert cfg.providers["plain"].params is None
+
+
+def test_sanitize_drops_local_call_site_absent_from_base():
+    """A local overlay may override an existing base call site, not resurrect one
+    the base removed. A stale .local.yaml entry (e.g. a dashboard edit to a
+    since-deleted 7_ego_cycle) must be dropped at load time, not deep-merged back."""
+    from genesis.routing.config import _sanitize_local_overlay
+
+    base = {"providers": {"p1": {}}, "call_sites": {"live_site": {"chain": ["p1"]}}}
+    local = {
+        "call_sites": {
+            "live_site": {"chain": ["p1"]},  # valid override of a base site — kept
+            "7_ego_cycle": {"chain": ["p1"]},  # absent from base — must be dropped
+        }
+    }
+    result = _sanitize_local_overlay(base, local)
+    assert "7_ego_cycle" not in (result.get("call_sites") or {})
+    assert "live_site" in result["call_sites"]
