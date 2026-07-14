@@ -233,7 +233,13 @@ async def update_status(
     parts = ["status = ?"]
     params: list[str | None] = [status]
     if status in ("completed", "failed"):
-        parts.append("completed_at = ?")
+        # Stamp completed_at fresh only on a genuine transition INTO a terminal
+        # state; preserve it on an idempotent re-write (same status back — e.g.
+        # a notes-only update) so a mechanical re-write never resets the
+        # reaper/GC windows keyed off completed_at. SQLite evaluates SET RHS
+        # against the pre-update row, so `status` in the CASE is the OLD status.
+        parts.append("completed_at = CASE WHEN status = ? THEN completed_at ELSE ? END")
+        params.append(status)
         params.append(_now_iso())
     if resolution_notes is not None:
         parts.append("resolution_notes = ?")
@@ -654,7 +660,13 @@ async def update_status_batch(
     parts = ["status = ?"]
     params: list[str | None] = [status]
     if status in ("completed", "failed"):
-        parts.append("completed_at = ?")
+        # Stamp completed_at fresh only on a genuine transition INTO a terminal
+        # state; preserve it on an idempotent re-write (same status back — e.g.
+        # a notes-only update) so a mechanical re-write never resets the
+        # reaper/GC windows keyed off completed_at. SQLite evaluates SET RHS
+        # against the pre-update row, so `status` in the CASE is the OLD status.
+        parts.append("completed_at = CASE WHEN status = ? THEN completed_at ELSE ? END")
+        params.append(status)
         params.append(_now_iso())
     if resolution_notes is not None:
         parts.append("resolution_notes = ?")

@@ -2300,6 +2300,53 @@ function updateSubsystemGrid(data) {
         if (hasEnrichment) card.appendChild(enrichment);
         enrichGrid.appendChild(card);
     }
+
+    // ── "Other": call sites the backend emits that aren't assigned to any
+    // subsystem group above. The 7×7 battleship grid is a fixed hand-placed
+    // layout, so an ungrouped site would otherwise render nowhere and stay
+    // invisible. Computed from the live data, so it self-maintains as new
+    // sites are added; rendered as an enrichment card (no grid cell) to avoid
+    // disturbing the fixed layout.
+    const groupedIds = new Set();
+    for (const g of Object.values(SUBSYSTEM_GROUPS)) {
+        for (const s of g.sites) groupedIds.add(s);
+    }
+    const ungrouped = Object.keys(callSites).filter((id) => !groupedIds.has(id)).sort();
+    if (ungrouped.length > 0) {
+        const card = el('div', 'enrich-card');
+        card.id = 'enrich-other';
+        card.style.borderLeftColor = '#64748b';
+
+        const memberStatuses = ungrouped.map((id) => callSites[id].status || 'unknown');
+        const aggStatus = aggregateStatus(memberStatuses);
+        const activeCount = memberStatuses.filter((s) => s === 'healthy' || s === 'active').length;
+
+        const header = el('div', 'region-header');
+        const aggDot = el('span', 'agg-dot');
+        aggDot.style.background = statusDotColor(aggStatus);
+        header.appendChild(aggDot);
+        header.appendChild(el('h3', null, 'Other'));
+        header.appendChild(el('span', 'region-count', activeCount + '/' + ungrouped.length));
+        card.appendChild(header);
+
+        card.appendChild(el('div', 'region-desc', 'Ungrouped call sites not assigned to a subsystem'));
+
+        const enrichment = el('div', 'region-enrichment');
+        for (const siteId of ungrouped) {
+            const info = callSites[siteId] || {};
+            const st = info.status || 'unknown';
+            const row = el('div', 'cat-health');
+            row.style.cursor = 'pointer';
+            row.appendChild(el('span', 'cat-name', getMeta(siteId).name));
+            const dot = el('span', 'agg-dot');
+            dot.style.background = statusDotColor(st);
+            row.appendChild(dot);
+            row.addEventListener('click', () => showDetail({ id: siteId, status: st, data: info }));
+            enrichment.appendChild(row);
+        }
+        card.appendChild(enrichment);
+        enrichGrid.appendChild(card);
+    }
 }
 
 // ── Polling ─────────────────────────────────────────────────────────
