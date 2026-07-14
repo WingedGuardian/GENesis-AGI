@@ -386,6 +386,43 @@ class TestRecoverStaleProcessingFiles:
         assert fresh.exists()
         assert not (session_dir / "tool_observations.jsonl").exists()
 
+    @pytest.mark.asyncio
+    async def test_rename_stamps_processing_start(self, tmp_path, monkeypatch):
+        """Renamed .processing files carry a fresh mtime, not the source's.
+
+        os.rename preserves st_mtime, so an hour-old backlog file would look
+        "stale" to _recover_stale_processing_files the instant it's renamed —
+        a recovery pass could then adopt a file mid-processing. Stamping at
+        rename makes the guard measure time-since-rename (Codex P2, PR #1044).
+        """
+        import os as _os
+        import time as _time
+
+        import genesis.memory.session_observer as mod
+
+        monkeypatch.setattr(mod, "_sessions_dir", lambda: tmp_path)
+        session_dir = tmp_path / "sid-1"
+        session_dir.mkdir()
+        obs_file = session_dir / "tool_observations.jsonl"
+        obs_file.write_text('{"tool": "Read"}\n')
+        old = obs_file.stat().st_mtime - (mod.STALE_PROCESSING_AGE_S + 60)
+        _os.utime(obs_file, (old, old))
+
+        monkeypatch.setattr(mod, "_find_observation_files", lambda: [obs_file])
+
+        captured = {}
+
+        def capture_read(path, limit=None):
+            captured["mtime"] = path.stat().st_mtime
+            return []
+
+        monkeypatch.setattr(mod, "_read_observations", capture_read)
+
+        await process_pending_observations(store=AsyncMock(), router=AsyncMock())
+
+        assert "mtime" in captured
+        assert _time.time() - captured["mtime"] < mod.STALE_PROCESSING_AGE_S
+
     def test_stale_processing_merges_into_recreated_original(self, tmp_path, monkeypatch):
         import genesis.memory.session_observer as mod
 

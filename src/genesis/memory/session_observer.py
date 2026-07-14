@@ -17,6 +17,7 @@ This processor:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -263,10 +264,17 @@ async def process_pending_observations(
         processing_path = obs_file.with_suffix(".jsonl.processing")
         try:
             os.rename(obs_file, processing_path)
-            processing_files.append((obs_file, processing_path))
         except OSError:
             # File may have been removed or renamed by another process
             continue
+        # rename preserves the source mtime, so an hour-old backlog file
+        # would look "stale" to _recover_stale_processing_files the moment
+        # it's renamed. Stamp processing start so the guard measures
+        # time-since-rename. Best-effort: a missed stamp only matters if
+        # the single-flight invariant is ever broken.
+        with contextlib.suppress(OSError):
+            os.utime(processing_path)
+        processing_files.append((obs_file, processing_path))
 
     if not processing_files:
         _cleanup_stale_files(obs_files)
@@ -288,7 +296,6 @@ async def process_pending_observations(
 
     if not all_observations:
         # Clean up processing files (they were empty or unreadable)
-        import contextlib
         for _original, processing_path in processing_files:
             with contextlib.suppress(OSError):
                 processing_path.unlink(missing_ok=True)
