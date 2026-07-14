@@ -84,7 +84,7 @@ async def test_stale_external_session_does_not_taint(db):
     await cc_sessions.create(
         db, id="s-old", session_type="background_task", model="sonnet",
         started_at=stale, last_activity_at=stale, source_tag="inbox_evaluation",
-        origin_class="external_untrusted",
+        status="completed", origin_class="external_untrusted",
     )
     await store_reflection_output(
         Depth.LIGHT, _tick(now.isoformat()), _output("field_stale"), db=db,

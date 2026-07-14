@@ -462,26 +462,38 @@ async def get_recent_topics(
     return [row[0] for row in await cursor.fetchall()]
 
 
-async def any_external_session_since(
+async def any_external_session_overlapping(
     db: aiosqlite.Connection,
     *,
     since_iso: str,
+    end_iso: str,
 ) -> bool:
-    """True iff any session stamped ``external_untrusted`` was active in the
-    window [since_iso, now] (WS-3 gate-2 run-level provenance aggregate).
+    """True iff any ``external_untrusted`` session's lifespan OVERLAPS the
+    window [since_iso, end_iso] (WS-3 gate-2 run-level provenance aggregate).
 
     Reflection runs are ABOUT a tick window, not one session — the reflection
     context carries no per-session refs, so the honest granularity is: did any
-    external-origin session's activity fall inside the material window? NULL
-    ``origin_class`` rows (foreground / pre-substrate / first-party dispatch)
-    never match — they must not manufacture external signal in shadow.
+    external-origin session overlap the material window?
+
+    Overlap, not a point test on ``last_activity_at``: that column is set at
+    creation for background sessions and only advanced by the foreground
+    ``update_activity`` path, so a long-running inbox/direct session that
+    STARTED before the window but is still active (or completed) inside it
+    would have a stale ``last_activity_at`` and be missed by a naive
+    ``last_activity_at >= since`` filter. A session overlaps iff it started
+    at/before the window end AND either it is still active OR its last
+    recorded activity is at/after the window start. Conservative direction:
+    over-tag external (a still-active external session always counts), never
+    under-tag. NULL ``origin_class`` rows (foreground / pre-substrate /
+    first-party dispatch) never match.
     """
     cursor = await db.execute(
         """SELECT 1 FROM cc_sessions
            WHERE origin_class = 'external_untrusted'
-             AND last_activity_at >= ?
+             AND started_at <= ?
+             AND (status = 'active' OR last_activity_at >= ?)
            LIMIT 1""",
-        (since_iso,),
+        (end_iso, since_iso),
     )
     return await cursor.fetchone() is not None
 
@@ -511,7 +523,9 @@ async def reflection_window_origin(db: aiosqlite.Connection, *, end_iso: str) ->
             datetime.fromisoformat(end_iso)
             - timedelta(minutes=REFLECTION_ORIGIN_WINDOW_MINUTES)
         ).isoformat()
-        if await any_external_session_since(db, since_iso=since):
+        if await any_external_session_overlapping(
+            db, since_iso=since, end_iso=end_iso
+        ):
             return "external_untrusted"
     except Exception:
         _logger.debug(
