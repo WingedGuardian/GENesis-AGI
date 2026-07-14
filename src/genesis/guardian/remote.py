@@ -10,8 +10,8 @@ enforces this restriction, not our code.
 
 Gateway allowlist: restart-timer, pause, resume, status, reset-state, version,
 update, sync-gateway, redeploy, update-cc, update-node, test-approval,
-disk-status, reharden-key, ping, provision-status, provision-grow-disk,
-provision-grow-memory, storage-expand.
+disk-status, host-profile, reharden-key, ping, provision-status,
+provision-grow-disk, provision-grow-memory, storage-expand.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ _STATUS_TIMEOUT = 70.0       # gateway: timeout 60
 # the 10s instance default is too tight — a slow verb would return `unreachable`
 # and silently skip EVERY drift/authkey/cc-auth reconciler that reuses this call.
 _VERSION_TIMEOUT = 30.0      # gateway version verb: auth-status probe + version reads
+_HOST_PROFILE_TIMEOUT = 50.0  # gateway: timeout 45 (pool lvs + incus probes)
 _GROW_DISK_TIMEOUT = 660.0   # gateway: timeout 600 (PVE resize + storage-expand)
 _GROW_MEM_TIMEOUT = 180.0    # gateway: timeout 120 (config PUT + pending check)
 _EXPAND_TIMEOUT = 660.0      # gateway: timeout 600 (pvresize + autoextend profile)
@@ -277,6 +278,17 @@ class GuardianRemote:
         """Read-only host capacity (audit token). No approval, no mutation."""
         ok, out = await self._ssh_command("provision-status", timeout=_STATUS_TIMEOUT)
         return self._as_json(ok, out, "provision-status")
+
+    async def host_profile(self) -> dict:
+        """Read-only host body-schema blob for the infra_profile host plane.
+
+        Returns the gateway's JSON verbatim on success. A pre-redeploy gateway
+        answers ``denied`` (its unknown-verb default) — that surfaces here as
+        ``{"ok": False, "error": "denied"}``, which the host-plane collector
+        renders as plane-unavailable. No approval, no mutation.
+        """
+        ok, out = await self._ssh_command("host-profile", timeout=_HOST_PROFILE_TIMEOUT)
+        return self._as_json(ok, out, "host-profile")
 
     async def request_grow_disk(self, disk: str, add_gib: int) -> dict:
         """EXECUTE a pre-approved VM disk grow + absorb into the thin pool."""

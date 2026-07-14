@@ -348,7 +348,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 9037d45b 2026-07-07
+verified: 3d5234b9 2026-07-13
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -363,6 +363,10 @@ verified: 9037d45b 2026-07-07
   deployed script is NEWER than the host checkout.
 - Provisioning verbs are EXECUTE-ONLY — approval is the CALLER's
   responsibility (container obtains it via Telegram before invoking).
+- Read-only `host-profile` verb (`guardian/host_profile.py`) feeds the
+  `infra_profile` host plane; the CC diagnosis prompt inlines the shared-mount
+  `INFRASTRUCTURE.md` (truncated) so the diagnostician starts with the body
+  schema instead of re-deriving the machine's shape.
 - **sentinel/** is LIVE-wired but **shadow-only autonomy**: config mode
   `"live"` is NOT implemented (dispatcher warns + downgrades); every proposed
   action requires human approval. `InfrastructureMonitor` (call site 37, free
@@ -549,7 +553,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, env.py, _config_overlay.py]
-verified: 613ff6ff 2026-07-12
+verified: 3d5234b9 2026-07-13
 ```
 
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
@@ -635,7 +639,8 @@ verified: 613ff6ff 2026-07-12
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **infra_profile/**: the infrastructure body schema — deterministic fact
-  collectors (container plane; host plane via a PR2 guardian verb, degrades to
+  collectors (container plane + host plane via the guardian `host-profile`
+  gateway verb; a missing guardian or un-redeployed gateway degrades to
   "not visible from this vantage") → per-section hashed `profile.json` +
   rendered `INFRASTRUCTURE.md` under `~/.genesis/infrastructure/`. **The
   facts/metrics split is load-bearing**: only `facts` are hashed; a hash change
