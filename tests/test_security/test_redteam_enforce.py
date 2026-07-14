@@ -657,3 +657,103 @@ async def test_memory_expand_wraps_stored_external_episodic(config_dirs, monkeyp
     assert items, f"expected expanded item, got {out!r}"
     assert "<external-content" in items[0]["content"]
     assert items[0]["provenance"].startswith("external-world knowledge")
+
+
+# ─── supervised-conversation discriminator (Codex P2 round 2) ────────────────
+
+
+def _supervised_conversation(monkeypatch) -> None:
+    """Owner-attended foreground conversation: attribution id present (set by
+    observability.session_context for terminal/telegram chats) PLUS the
+    supervised marker stamped from CCInvocation.supervised."""
+    monkeypatch.setenv("GENESIS_SESSION_ID", "redteam-conv-0001")
+    monkeypatch.setenv("GENESIS_SESSION_SUPERVISED", "1")
+
+
+async def test_session_id_alone_is_not_unsupervised(config_dirs, monkeypatch):
+    """GENESIS_SESSION_ID is attribution, not supervision: with the supervised
+    marker present the process must NOT read as dispatched."""
+    _supervised_conversation(monkeypatch)
+    assert immunity_shadow.is_dispatched_session_env() is False
+    monkeypatch.delenv("GENESIS_SESSION_SUPERVISED")
+    assert immunity_shadow.is_dispatched_session_env() is True
+
+
+async def test_memory_proactive_supervised_conversation_keeps_wrapped(config_dirs, monkeypatch, db):
+    """Under enforce, an owner-attended conversation (session id + supervised
+    marker) keeps blockable external content — wrapped, never dropped."""
+    base, _ = config_dirs
+    _write(base, {"injection": {"mode": "enforce"}})
+    _supervised_conversation(monkeypatch)
+
+    import genesis.mcp.memory_mcp as mod
+
+    retriever = MagicMock()
+    retriever.recall = AsyncMock(return_value=[_rr("ext-1", "external_untrusted")])
+    old = (mod._store, mod._db, mod._retriever)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._retriever = retriever
+        tools = await _mcp_tools()
+        out = await tools["memory_proactive"].fn(current_message="hello")
+    finally:
+        mod._store, mod._db, mod._retriever = old
+
+    assert [d["memory_id"] for d in out] == ["ext-1"]  # kept (supervised)
+    assert "<external-content" in out[0]["content"]  # ... but wrapped
+
+
+async def test_hook_filter_supervised_conversation_never_drops(config_dirs, monkeypatch):
+    import sys as _sys
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    import proactive_memory_hook as hook
+
+    base, _ = config_dirs
+    _write(base, {"injection": {"mode": "enforce"}})
+    _supervised_conversation(monkeypatch)
+    fused = [
+        {
+            "memory_id": "ext",
+            "content": INJECTION_TEXT,
+            "collection": "episodic_memory",
+            "origin_class": "external_untrusted",
+            "_enriched": True,
+        },
+    ]
+    kept, dropped = hook._enforce_drop_filter(fused)
+    assert dropped == 0 and len(kept) == 1
+
+
+async def test_hook_filter_enriches_legacy_payload_before_drop(config_dirs, monkeypatch):
+    """Codex P1 round 2: a legacy Qdrant hit whose payload predates the
+    origin_class backfill (None in the fused dict) must be enriched from
+    SQLite BEFORE the drop decision — otherwise stored-external episodic rows
+    evade enforce."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    import proactive_memory_hook as hook
+
+    base, _ = config_dirs
+    _write(base, {"injection": {"mode": "enforce"}})
+    _dispatched(monkeypatch)
+
+    def _fake_enrich(results):
+        for r in results:
+            if r.get("origin_class") is None:
+                r["origin_class"] = "external_untrusted"  # simulated SQLite backfill
+            r["_enriched"] = True
+
+    monkeypatch.setattr(hook, "_enrich_with_metadata", _fake_enrich)
+    fused = [
+        {
+            "memory_id": "legacy-ext",
+            "content": INJECTION_TEXT,
+            "collection": "episodic_memory",
+            # origin_class ABSENT — pre-backfill Qdrant payload
+        },
+    ]
+    kept, dropped = hook._enforce_drop_filter(fused)
+    assert dropped == 1 and kept == []

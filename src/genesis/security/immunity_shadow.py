@@ -100,18 +100,30 @@ def item_is_blockable(
 
 
 def is_dispatched_session_env() -> bool:
-    """True iff this process runs inside a Genesis-DISPATCHED CC session.
+    """True iff this process runs inside an UNSUPERVISED Genesis-dispatched CC session.
 
-    ``GENESIS_SESSION_ID`` is stamped by ``CCInvoker._build_env`` on every
-    dispatched CC child (and inherited by its MCP servers and hooks); it is
-    popped when absent, and foreground terminal sessions never pass through
-    CCInvoker. Read per call, never cached. FAIL-OPEN residual (documented):
-    a dispatch path that bypasses CCInvoker would read as supervised and keep
-    wrapped external content — never the reverse.
+    Two env signals, both stamped by ``CCInvoker._build_env`` (inherited by the
+    session's MCP servers and hooks, popped when absent, read per call):
+
+    - ``GENESIS_SESSION_ID`` — ATTRIBUTION only. Foreground conversations
+      (terminal/telegram ConversationManager) set a session id too, via
+      ``observability.session_context``, so its presence alone must never be
+      read as "unsupervised" (Codex P2 on #1048: enforce would have dropped
+      pushed external content from the owner's own chat).
+    - ``GENESIS_SESSION_SUPERVISED`` — set from ``CCInvocation.supervised``,
+      True only for owner-attended interactive conversations.
+
+    Dispatched/unsupervised = session id present AND supervised marker absent.
+    Fail directions (documented): a dispatch path bypassing CCInvoker has no
+    session id → reads supervised → keeps wrapped external (fail-open); a new
+    foreground path missing the supervised flag drops pushed external there
+    (autoimmune direction — visible in the enforce ledger + auto-demote).
     """
     import os
 
-    return bool(os.environ.get("GENESIS_SESSION_ID"))
+    return bool(os.environ.get("GENESIS_SESSION_ID")) and (
+        os.environ.get("GENESIS_SESSION_SUPERVISED") != "1"
+    )
 
 
 def should_enforce_drop(

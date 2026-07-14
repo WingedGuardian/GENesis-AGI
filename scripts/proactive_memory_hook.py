@@ -1223,7 +1223,9 @@ def _enrich_with_metadata(results: list[dict]) -> None:
     ids = [
         r.get("memory_id", "")
         for r in results
-        if r.get("memory_id", "") and not r["memory_id"].startswith("code:")
+        if r.get("memory_id", "")
+        and not r["memory_id"].startswith("code:")
+        and not r.get("_enriched")
     ]
     if not ids:
         return
@@ -1251,6 +1253,10 @@ def _enrich_with_metadata(results: list[dict]) -> None:
                     # refuse the fill). A real search-path value always wins.
                     if r.get("origin_class") is None:
                         r["origin_class"] = meta[mid].get("origin_class")
+                    # Called both before the enforce filter and inside
+                    # _format_results — the marker keeps the second pass from
+                    # re-querying rows this pass already resolved.
+                    r["_enriched"] = True
         finally:
             conn.close()
     except Exception:
@@ -1266,11 +1272,23 @@ def _enforce_drop_filter(fused: list[dict]) -> tuple[list[dict], int]:
     import/config error fails OPEN (all items kept, wrapped downstream).
     """
     try:
-        from genesis.security.immunity_shadow import should_enforce_drop
+        from genesis.security.immunity_shadow import (
+            is_dispatched_session_env,
+            should_enforce_drop,
+        )
 
+        # Provenance must be complete BEFORE the drop decision: a legacy
+        # Qdrant point whose payload predates the origin_class backfill
+        # carries None here, but SQLite memory_metadata has the backfilled
+        # value — without this, stored-external episodic rows would evade
+        # the enforce drop (Codex P1). Idempotent (see _enriched marker).
+        _enrich_with_metadata(fused)
         kept: list[dict] = []
         dropped = 0
-        unsup = bool(os.environ.get("GENESIS_SESSION_ID"))
+        # Attribution id alone is NOT a supervision signal — foreground
+        # conversations carry one too. The shared helper also requires the
+        # supervised marker to be absent.
+        unsup = is_dispatched_session_env()
         for r in fused:
             if should_enforce_drop(
                 gate="injection",

@@ -317,6 +317,48 @@ def test_build_env_env_overrides_win_over_session_origin(invoker):
     assert env["GENESIS_SESSION_ORIGIN"] == "first_party"
 
 
+def test_build_env_sets_supervised_marker(invoker):
+    """WS-3 B4: a supervised (owner-attended conversation) invocation exports
+    GENESIS_SESSION_SUPERVISED so the gate-4 enforce drop spares the surface."""
+    inv = CCInvocation(prompt="hello", supervised=True)
+    env = invoker._build_env(inv)
+    assert env["GENESIS_SESSION_SUPERVISED"] == "1"
+
+
+def test_build_env_pops_supervised_marker_when_unset(invoker):
+    """Default (headless dispatch) → the marker is POPPED: a stale parent value
+    must never make a background session read as owner-attended."""
+    inv = CCInvocation(prompt="hello")
+    with patch.dict("os.environ", {"GENESIS_SESSION_SUPERVISED": "1"}):
+        env = invoker._build_env(inv)
+        assert "GENESIS_SESSION_SUPERVISED" not in env
+
+
+async def test_conversation_invocations_are_supervised():
+    """Every ConversationManager CCInvocation construction site must carry
+    supervised=True — GENESIS_SESSION_ID alone is attribution, and foreground
+    conversations set one too (Codex P2 on #1048). AST-pinned so a new
+    invocation site in conversation.py can't silently ship unsupervised."""
+    import ast
+    from pathlib import Path
+
+    import genesis.cc.conversation as conv_mod
+
+    tree = ast.parse(Path(conv_mod.__file__).read_text())
+    sites = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", getattr(node.func, "attr", "")) == "CCInvocation"
+    ]
+    assert len(sites) >= 3, "expected the three conversation invocation sites"
+    for node in sites:
+        kwargs = {k.arg for k in node.keywords if k.arg}
+        assert "supervised" in kwargs, (
+            f"CCInvocation at conversation.py:{node.lineno} missing supervised=True"
+        )
+
+
 def test_invocation_rejects_invalid_origin():
     """Producer-side loud validation: a typo'd origin fails at construction,
     never silently classifies a session first_party."""

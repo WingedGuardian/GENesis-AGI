@@ -653,7 +653,11 @@ verified: 3d5234b9 2026-07-13
   shadow). Enforce (gates 3-4 only; procedure/identity rejected by the
   validator honesty guard): gate-4 drops `external_untrusted` from PUSHED feeds
   (proactive hook, `memory_proactive`, `memory_core_facts`) ONLY in dispatched
-  sessions (`GENESIS_SESSION_ID` env) under enforce — explicit queries
+  UNSUPERVISED sessions under enforce — the discriminator is
+  `GENESIS_SESSION_ID` present AND `GENESIS_SESSION_SUPERVISED` absent
+  (`CCInvocation.supervised`, stamped by `_build_env`; the session id alone is
+  attribution and foreground conversations carry one too, so ConversationManager
+  marks its invocations supervised). Explicit queries
   (`memory_recall`/`knowledge_recall`/`memory_expand`) and every foreground
   surface keep wrapped external in all modes (`should_enforce_drop`, fail-open);
   gate-3 refuses grant evidence/state writes with a blockable origin — and the
