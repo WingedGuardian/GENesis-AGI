@@ -39,6 +39,11 @@ MAX_PROCESSING_TIME_S = 45.0  # Budget per tick (leave headroom under 60s)
 # Files older than this are cleaned up (stale sessions)
 STALE_FILE_AGE_S = 7 * 24 * 3600  # 7 days
 
+# A .processing file older than this cannot belong to a live tick (45s budget,
+# single-flight) — it was stranded by a crash/restart mid-tick and no future
+# tick would ever scan it. Adopted back at tick start.
+STALE_PROCESSING_AGE_S = 3600
+
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 OBSERVER_PROMPT = """\
@@ -241,6 +246,11 @@ async def process_pending_observations(
     result = ProcessingResult()
     start = time.monotonic()
 
+    # Adopt crash-stranded .processing files before scanning: the finally-
+    # restore below only covers files renamed by THIS run, so a mid-tick
+    # crash would otherwise strand its renamed files forever.
+    _recover_stale_processing_files()
+
     obs_files = _find_observation_files()
     if not obs_files:
         return result
@@ -372,6 +382,31 @@ async def process_pending_observations(
         )
 
     return result
+
+
+def _recover_stale_processing_files() -> None:
+    """Restore .processing files stranded by a crash/restart mid-tick.
+
+    Fail-open: scan errors are swallowed — recovery must never break the
+    tick. Freshness guard: a file younger than STALE_PROCESSING_AGE_S may
+    belong to the current (single-flight) run and is left alone.
+    """
+    sessions_dir = _sessions_dir()
+    if not sessions_dir.exists():
+        return
+    now = time.time()
+    stranded: list[tuple[Path, Path]] = []
+    for processing_path in sessions_dir.glob("*/tool_observations.jsonl.processing"):
+        try:
+            if (now - processing_path.stat().st_mtime) < STALE_PROCESSING_AGE_S:
+                continue
+        except OSError:
+            continue
+        original = processing_path.parent / "tool_observations.jsonl"
+        stranded.append((original, processing_path))
+    if stranded:
+        logger.info("Recovering %d crash-stranded .processing file(s)", len(stranded))
+        _restore_processing_files(stranded)
 
 
 def _restore_processing_files(processing_files: list[tuple[Path, Path]]) -> None:

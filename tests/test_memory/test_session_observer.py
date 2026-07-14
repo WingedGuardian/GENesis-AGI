@@ -14,6 +14,7 @@ from genesis.memory.session_observer import (
     _infer_wing_from_files,
     _parse_notes,
     _read_observations,
+    _recover_stale_processing_files,
     _restore_processing_files,
     process_pending_observations,
 )
@@ -214,8 +215,15 @@ class TestFindObservationFiles:
 
 
 @pytest.mark.asyncio
-async def test_process_pending_observations_no_files(monkeypatch):
+async def test_process_pending_observations_no_files(tmp_path, monkeypatch):
     """No observation files → immediate return with zero counts."""
+    # Isolate BOTH filesystem touchpoints: _find_observation_files AND the
+    # stale-recovery scan (_sessions_dir) — otherwise this unit test globs
+    # (and could rename) files under the real ~/.genesis/sessions.
+    monkeypatch.setattr(
+        "genesis.memory.session_observer._sessions_dir",
+        lambda: tmp_path,
+    )
     monkeypatch.setattr(
         "genesis.memory.session_observer._find_observation_files",
         lambda: [],
@@ -231,6 +239,11 @@ async def test_process_pending_observations_no_files(monkeypatch):
 @pytest.mark.asyncio
 async def test_process_pending_observations_stores_notes(tmp_path, monkeypatch):
     """Observations are read, LLM is called, notes are stored."""
+    # Keep the stale-recovery scan off the real ~/.genesis/sessions
+    monkeypatch.setattr(
+        "genesis.memory.session_observer._sessions_dir",
+        lambda: tmp_path,
+    )
     # Setup observation file in a realistic directory structure
     session_dir = tmp_path / "test-session"
     session_dir.mkdir()
@@ -328,3 +341,67 @@ class TestRestoreProcessingFiles:
 
         assert not original.exists()
         assert not processing.exists()
+class TestRecoverStaleProcessingFiles:
+    """Crash-stranded .processing files must be adopted back at tick start.
+
+    The restore in process_pending_observations only covers files renamed by
+    the CURRENT run — a server crash/restart mid-tick leaves a .processing
+    file no future tick would ever scan (found live: one stranded since
+    2026-05-13). Recovery: at tick start, restore any .processing older than
+    STALE_PROCESSING_AGE_S; a live tick never holds one that long (45s
+    budget, single-flight).
+    """
+
+    def test_stale_processing_is_recovered(self, tmp_path, monkeypatch):
+        import genesis.memory.session_observer as mod
+
+        monkeypatch.setattr(mod, "_sessions_dir", lambda: tmp_path)
+        session_dir = tmp_path / "sid-1"
+        session_dir.mkdir()
+        stale = session_dir / "tool_observations.jsonl.processing"
+        stale.write_text('{"tool": "Read"}\n')
+        import os as _os
+
+        old = stale.stat().st_mtime - (mod.STALE_PROCESSING_AGE_S + 60)
+        _os.utime(stale, (old, old))
+
+        _recover_stale_processing_files()
+
+        original = session_dir / "tool_observations.jsonl"
+        assert original.exists()
+        assert original.read_text() == '{"tool": "Read"}\n'
+        assert not stale.exists()
+
+    def test_fresh_processing_is_left_alone(self, tmp_path, monkeypatch):
+        import genesis.memory.session_observer as mod
+
+        monkeypatch.setattr(mod, "_sessions_dir", lambda: tmp_path)
+        session_dir = tmp_path / "sid-1"
+        session_dir.mkdir()
+        fresh = session_dir / "tool_observations.jsonl.processing"
+        fresh.write_text('{"tool": "Read"}\n')  # mtime = now (a live tick)
+
+        _recover_stale_processing_files()
+
+        assert fresh.exists()
+        assert not (session_dir / "tool_observations.jsonl").exists()
+
+    def test_stale_processing_merges_into_recreated_original(self, tmp_path, monkeypatch):
+        import genesis.memory.session_observer as mod
+
+        monkeypatch.setattr(mod, "_sessions_dir", lambda: tmp_path)
+        session_dir = tmp_path / "sid-1"
+        session_dir.mkdir()
+        original = session_dir / "tool_observations.jsonl"
+        original.write_text('{"tool": "Write"}\n')  # hook wrote since the crash
+        stale = session_dir / "tool_observations.jsonl.processing"
+        stale.write_text('{"tool": "Read"}\n')
+        import os as _os
+
+        old = stale.stat().st_mtime - (mod.STALE_PROCESSING_AGE_S + 60)
+        _os.utime(stale, (old, old))
+
+        _recover_stale_processing_files()
+
+        assert original.read_text() == '{"tool": "Write"}\n{"tool": "Read"}\n'
+        assert not stale.exists()
