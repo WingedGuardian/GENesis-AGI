@@ -792,3 +792,55 @@ async def test_memory_proactive_supervised_conversation_keeps_wrapped(config_dir
 
     assert [d["memory_id"] for d in out] == ["ext-1"]  # kept (supervised)
     assert "<external-content" in out[0]["content"]  # ... but wrapped
+
+
+async def test_memory_expand_backfills_stale_payload_origin(config_dirs, monkeypatch, db):
+    """Codex on #1048 (round 5): expand bypasses HybridRetriever, so a point
+    whose Qdrant payload predates the origin backfill must recover the stored
+    value from memory_metadata before the wrap/label/count decision."""
+    from types import SimpleNamespace
+
+    base, _ = config_dirs
+    _write(base, {"injection": {"mode": "shadow"}})
+    _foreground(monkeypatch)
+
+    mid = "00000000-0000-4000-8000-0000000000bb"
+    await db.execute(
+        "INSERT INTO memory_metadata (memory_id, created_at, origin_class) VALUES (?, ?, ?)",
+        (mid, "2026-01-01T00:00:00+00:00", "external_untrusted"),
+    )
+    await db.commit()
+
+    import genesis.mcp.memory_mcp as mod
+
+    point = SimpleNamespace(
+        id=mid,
+        payload={
+            # origin_class ABSENT — pre-backfill payload
+            "content": INJECTION_TEXT,
+            "source": "s",
+            "source_pipeline": "conversation",
+        },
+    )
+    qdrant = MagicMock()
+    qdrant.retrieve = MagicMock(
+        side_effect=lambda collection_name, ids, with_payload: (
+            [point] if collection_name == "episodic_memory" else []
+        )
+    )
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._retriever = MagicMock()
+        mod._qdrant = qdrant
+        tools = await _mcp_tools()
+        out = await tools["memory_expand"].fn(memory_ids=[mid])
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+    items = [d for d in out if d.get("memory_id") == mid]
+    assert items, f"expected expanded item, got {out!r}"
+    assert "<external-content" in items[0]["content"]
+    assert items[0]["provenance"].startswith("external-world knowledge")
+    assert items[0]["origin_class"] == "external_untrusted"

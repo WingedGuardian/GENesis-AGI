@@ -585,11 +585,27 @@ async def memory_expand(
         except Exception:
             logger.debug("eval: recall_used emit failed", exc_info=True)
 
+    # Stored-origin enrichment (same stale-payload case as memory_core_facts):
+    # expand bypasses HybridRetriever, so a point whose Qdrant payload predates
+    # the origin_class backfill would wrap/label/count from None — recover the
+    # SQLite value first. Best-effort (fail-open, gate posture).
+    _no_origin = [str(p.id) for p in points if (p.payload or {}).get("origin_class") is None]
+    _origin_fill: dict[str, str | None] = {}
+    if _no_origin:
+        try:
+            from genesis.db.crud import memory as memory_crud
+
+            _origin_fill = await memory_crud.origin_class_by_ids(memory_mod._db, _no_origin)
+        except Exception:
+            logger.debug("memory_expand origin enrichment failed", exc_info=True)
+
     results = []
     blockable = 0
     for point in points:
         mid = str(point.id)
         payload = point.payload or {}
+        if payload.get("origin_class") is None and _origin_fill.get(mid):
+            payload["origin_class"] = _origin_fill[mid]
         _collection = point_collection.get(mid, "episodic_memory")
 
         d = {

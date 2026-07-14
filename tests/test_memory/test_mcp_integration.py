@@ -742,7 +742,10 @@ async def test_memory_expand_non_hex_short_ids_skip_resolution(mock_deps, tools)
     memory_mcp._db = db
     memory_mcp._qdrant.retrieve = MagicMock(
         side_effect=lambda collection_name, ids, with_payload: (
-            [SimpleNamespace(id="ep1", payload={"content": "x"})]
+            # origin_class present (post-B0 payload) so the WS-3 stale-payload
+            # origin enrichment — a legitimate DB read — doesn't fire either;
+            # this test pins that NON-HEX ids skip the prefix lookup.
+            [SimpleNamespace(id="ep1", payload={"content": "x", "origin_class": "first_party"})]
             if collection_name == "episodic_memory"
             else []
         )
