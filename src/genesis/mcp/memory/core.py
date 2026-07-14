@@ -355,6 +355,7 @@ async def memory_recall(
             if immunity_shadow.item_is_blockable(
                 collection=r.collection,
                 source_pipeline=r.source_pipeline,
+                origin_class=r.origin_class,
             )
         )
         await immunity_shadow.record_would_block(
@@ -454,6 +455,7 @@ async def memory_recall(
             if immunity_shadow.item_is_blockable(
                 collection=d.get("collection"),
                 source_pipeline=d.get("source_pipeline"),
+                origin_class=d.get("origin_class"),
             ):
                 blockable += 1
     # WS-3 B1 gate 4 (injection): shadow-record that external content reached
@@ -612,6 +614,7 @@ async def memory_expand(
             if immunity_shadow.item_is_blockable(
                 collection=_collection,
                 source_pipeline=payload.get("source_pipeline"),
+                origin_class=payload.get("origin_class"),
             ):
                 blockable += 1
 
@@ -769,6 +772,7 @@ async def memory_proactive(
             if immunity_shadow.item_is_blockable(
                 collection=r.collection,
                 source_pipeline=r.source_pipeline,
+                origin_class=r.origin_class,
             ):
                 blockable += 1
         out.append(d)
@@ -847,6 +851,10 @@ async def memory_core_facts(
                     "room": payload.get("room", ""),
                     "confidence": payload.get("confidence"),
                     "activation_score": round(act.final_score, 3),
+                    # WS-3 provenance — consumed by the injection-gate check
+                    # below and honest output metadata for callers.
+                    "source_pipeline": payload.get("source_pipeline"),
+                    "origin_class": payload.get("origin_class"),
                 },
                 act.final_score,
             )
@@ -854,6 +862,35 @@ async def memory_core_facts(
 
     scored.sort(key=lambda x: x[1], reverse=True)
     top = scored[:limit]
+
+    # WS-3 B4 gate 4 (injection): core_facts is a query-less AMBIENT surface
+    # that scrolls episodic directly — it bypasses HybridRetriever, so the
+    # .recall()-AST enumeration lock never saw it (gap caught during the B4
+    # planning pass). Wrap external-origin items and shadow-record the
+    # would-block (observe-only — the item still reaches the prompt; the
+    # enforce drop for dispatched sessions is PR-3). Blockability keys on the
+    # STORED origin_class: episodic content is only external when its stored
+    # class says so — the collection fallback alone can never flag it here.
+    blockable = 0
+    for item, _ in top:
+        if immunity_shadow.item_is_blockable(
+            collection="episodic_memory",
+            source_pipeline=item.get("source_pipeline"),
+            origin_class=item.get("origin_class"),
+        ):
+            item["content"] = wrap_external_recall(
+                item["content"],
+                source_pipeline=item.get("source_pipeline"),
+            )
+            blockable += 1
+    await immunity_shadow.record_would_block(
+        gate="injection",
+        source_kind="recall_inject",
+        source_ref="mcp/memory/core.py::memory_core_facts",
+        process="server",
+        blockable_count=blockable,
+        db=memory_mod._db,
+    )
 
     # Track retrieval so activation scores reflect actual usage.
     # (Suppressed under the eval bench's frozen-snapshot mode — see

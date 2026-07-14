@@ -434,6 +434,12 @@ def _assemble_results(
                 transcript_path=_p.get("transcript_path"),
                 source_line_range=tuple(_line_range) if _line_range else None,
                 source_pipeline=_p.get("source_pipeline"),
+                # WS-3 stored provenance: read from ``payload`` (not ``_p``)
+                # so FTS5-only hits recover it too — their row dict carries
+                # ``origin_class`` from the search_ranked LEFT JOIN.
+                # ``source_pipeline`` stays Qdrant-only: it has no SQLite
+                # column for episodic and is NOT recoverable on the FTS path.
+                origin_class=payload.get("origin_class"),
                 memory_class=_p.get("memory_class", "fact"),
                 query_intent=intent.category,
                 intent_confidence=intent.confidence,
