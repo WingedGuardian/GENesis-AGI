@@ -93,7 +93,7 @@ def decide(
     conflict: dict | None,
     my_pid: int | None,
     my_starttime: int | None,
-    alive: callable[[int, int], bool] = proc_ident.is_alive,
+    alive: callable[[int, int], bool] | None = None,
 ) -> tuple[str, str]:
     """Pure newest-wins decision. Returns (action, reason).
 
@@ -101,6 +101,8 @@ def decide(
     for "older" is (starttime, pid) so a starttime tie (scripted spawns can
     land in the same jiffy) still picks exactly one loser.
     """
+    if alive is None:  # late-bound so tests (and callers) can substitute it
+        alive = proc_ident.is_alive
     if not isinstance(conflict, dict):
         return ALLOW, "no parseable conflict"
     if my_pid is None or my_starttime is None:
