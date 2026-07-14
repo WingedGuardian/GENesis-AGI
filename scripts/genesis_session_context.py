@@ -677,31 +677,114 @@ def _load_inflight_block() -> str:
         return ""  # Advisory — never block session start
 
 
-def _charter_emission_block(
-    session_id: str, source: str, *, sessions_dir: Path | None = None
-) -> str:
-    """Session-charter block for the foreground context (pure disk read).
+def _charter_db_path() -> Path:
+    """genesis.db location, GENESIS_REPO_ROOT-aware (same resolution as the
+    PreCompact hook so reader and writer always agree)."""
+    import os
 
-    Reads ~/.genesis/sessions/<session_id>/charter.json, written by the
-    PreCompact hook (scripts/genesis_precompact.py) at every compaction
-    boundary. Emitted on startup/resume/compact so a chartered session gets
-    its origin back in EVERY window — but NOT on clear: /clear is an explicit
-    fresh start, and re-asserting the old origin would fight the user.
+    root = os.environ.get("GENESIS_REPO_ROOT", "")
+    base = Path(root) if root else Path.home() / "genesis"
+    return base / "data" / "genesis.db"
 
-    Returns "" when there is no charter, the session_id is missing/unsafe,
-    or the charter is unreadable (fail-open — charter is advisory).
+
+def _load_charter_db(
+    session_id: str, db_path: Path | None
+) -> tuple[dict | None, list[dict]]:
+    """Charter row + open/in_progress ledger items from the canonical DB.
+
+    Read-only WAL-aware connection (mode=ro — never immutable=1, which would
+    miss un-checkpointed writes). Any failure — missing DB, missing table on
+    a not-yet-migrated install, lock — returns (None, []) so the caller falls
+    back to the legacy charter.json.
     """
     import json
 
+    try:
+        import aiosqlite
+
+        db_file = db_path or _charter_db_path()
+        if not db_file.exists():
+            return None, []
+
+        async def _run() -> tuple[dict | None, list[dict]]:
+            async with aiosqlite.connect(
+                f"file:{db_file}?mode=ro", uri=True, timeout=2
+            ) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    "SELECT * FROM session_charters WHERE session_id = ?",
+                    (session_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    return None, []
+                charter = dict(row)
+                try:
+                    charter["pointers"] = json.loads(charter.get("pointers") or "[]")
+                except (ValueError, TypeError):
+                    charter["pointers"] = []
+                cur = await db.execute(
+                    "SELECT id, text, status FROM session_ledger"
+                    " WHERE session_id = ? AND status IN ('open','in_progress')"
+                    " ORDER BY created_at LIMIT 6",
+                    (session_id,),
+                )
+                items = [dict(r) for r in await cur.fetchall()]
+                cur = await db.execute(
+                    "SELECT status, COUNT(*) FROM session_ledger"
+                    " WHERE session_id = ? GROUP BY status",
+                    (session_id,),
+                )
+                charter["_ledger_counts"] = {
+                    r[0]: r[1] for r in await cur.fetchall()
+                }
+                return charter, items
+
+        return asyncio.run(_run())
+    except Exception:
+        return None, []
+
+
+def _load_charter_file(session_id: str, sessions_dir: Path | None) -> dict | None:
+    """Legacy fallback: pre-0058 charter.json (still on disk for sessions the
+    one-off backfill has not imported, or when the DB is unreachable)."""
+    import json
+
+    base = sessions_dir or (Path.home() / ".genesis" / "sessions")
+    charter_file = base / session_id / "charter.json"
+    try:
+        return json.loads(charter_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _charter_emission_block(
+    session_id: str,
+    source: str,
+    *,
+    sessions_dir: Path | None = None,
+    db_path: Path | None = None,
+) -> str:
+    """Session-charter block for the foreground context.
+
+    DB-first (session_charters + open ledger items, migration 0058), falling
+    back to the legacy charter.json. Emitted on startup/resume/compact so a
+    chartered session gets its origin AND its open ledger back in EVERY
+    window — but NOT on clear: /clear is an explicit fresh start, and
+    re-asserting the old origin would fight the user.
+
+    Returns "" when there is no charter, the session_id is missing/unsafe,
+    or nothing is readable (fail-open — charter is advisory).
+    """
     if not session_id or source == "clear":
         return ""
     if "/" in session_id or ".." in session_id:
         return ""
-    base = sessions_dir or (Path.home() / ".genesis" / "sessions")
-    charter_file = base / session_id / "charter.json"
-    try:
-        charter = json.loads(charter_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    charter, ledger = _load_charter_db(session_id, db_path)
+    if charter is None:
+        charter = _load_charter_file(session_id, sessions_dir)
+        ledger = []
+    if charter is None:
         return ""
     origin = str(charter.get("origin_prompt") or "").strip()
     if not origin:
@@ -717,20 +800,33 @@ def _charter_emission_block(
         f" ({charter.get('origin_ts') or 'time unknown'}):**",
         origin_quoted,
     ]
-    mission = charter.get("mission")
+    mission = str(charter.get("mission") or "").strip()
     if mission:
-        lines += ["", f"**Mission:** {mission}"]
+        lines += ["", f"**Mission:** {mission[:200]}"]
     pointers = charter.get("pointers") or []
     if pointers:
         lines += ["", "**Pointers:**"]
-        lines += [f"- {p}" for p in pointers[:6]]
+        lines += [f"- {str(p)[:100]}" for p in pointers[:6]]
+    if ledger:
+        lines += ["", "**Ledger (open) — close via session_ledger_update:**"]
+        for item in ledger:
+            mark = "~" if item.get("status") == "in_progress" else " "
+            lines.append(f"- [{mark}] {str(item.get('text', ''))[:120]} (id: {item.get('id', '')})")
     count = charter.get("compaction_count", 0)
-    lines += [
-        "",
-        f"_Compactions: {count} · full charter:"
-        f" ~/.genesis/sessions/{session_id}/charter.md_",
-    ]
-    return "\n".join(lines)
+    counts = charter.get("_ledger_counts") or {}
+    footer = f"_Compactions: {count}"
+    if counts:
+        open_n = counts.get("open", 0) + counts.get("in_progress", 0)
+        closed_n = sum(counts.values()) - open_n
+        footer += f" · ledger: {open_n} open / {closed_n} closed"
+    footer += f" · full charter: ~/.genesis/sessions/{session_id}/charter.md_"
+    lines += ["", footer]
+    block = "\n".join(lines)
+    # ~600-token ceiling (char proxy): bounded by construction in the typical
+    # case; the guard only bites on pathological field contents.
+    if len(block) > 2800:
+        block = block[:2800] + "\n_…[truncated — full charter in charter.md]_"
+    return block
 
 
 if __name__ == "__main__":
