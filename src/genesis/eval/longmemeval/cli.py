@@ -23,6 +23,27 @@ logger = logging.getLogger("genesis.eval.longmemeval")
 DEFAULT_DATASET = Path.home() / "tmp" / "longmemeval" / "longmemeval_oracle.json"
 
 
+def require_results_db(path: Path) -> Path:
+    """Fail FAST if the default results DB doesn't exist yet.
+
+    ``get_db`` silently CREATES a missing DB — and a freshly-created one lacks
+    ``eval_runs`` (migration-only, not in create_all_tables), so a benchmark
+    run would burn its full API spend and then crash at persistence. The
+    classic trigger: running from a git worktree without ``GENESIS_REPO_ROOT``
+    pointing at the main tree, which resolves ``genesis_db_path()`` into the
+    worktree. (Bit the 2026-07-14 re-baseline: ~500 questions of spend, zero
+    rows persisted.)
+    """
+    if not Path(path).exists():
+        msg = (
+            f"results DB not found at {path} — running from a worktree without "
+            "GENESIS_REPO_ROOT? Set it to the main tree, pass --db-path, or "
+            "use --no-persist."
+        )
+        raise RuntimeError(msg)
+    return path
+
+
 def build_reranker():
     """Build a VoyageReranker (enabled iff API_KEY_VOYAGE is present)."""
     from genesis.memory.reranker import VoyageReranker
@@ -111,7 +132,7 @@ async def execute(
             db = await init_db(db_path)
             await MigrationRunner(db).run_pending()
         else:
-            db = await get_db(genesis_db_path())
+            db = await get_db(require_results_db(genesis_db_path()))
 
     try:
         return await run_longmemeval(
