@@ -180,7 +180,8 @@ async def search_ranked(
     # filtering. Keeping the column-qualified SELECT format consistent.
     sql = (
         "SELECT memory_fts.memory_id, memory_fts.content, "
-        "memory_fts.source_type, memory_fts.collection, memory_fts.rank "
+        "memory_fts.source_type, memory_fts.collection, memory_fts.rank, "
+        "memory_metadata.origin_class "
         "FROM memory_fts LEFT JOIN memory_metadata "
         "ON memory_fts.memory_id = memory_metadata.memory_id "
         "WHERE memory_fts MATCH ?"
@@ -224,6 +225,9 @@ async def search_ranked(
         {
             "memory_id": r[0], "content": r[1], "source_type": r[2],
             "collection": r[3], "rank": r[4],
+            # WS-3 stored provenance — from the (already-joined)
+            # memory_metadata row; NULL for pre-0054 rows.
+            "origin_class": r[5],
         }
         for r in rows
     ]

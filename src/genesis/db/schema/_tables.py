@@ -118,7 +118,8 @@ TABLES = {
             expires_at       TEXT,
             content_hash     TEXT,
             surfaced_at      TEXT,
-            surfaced_count   INTEGER NOT NULL DEFAULT 0
+            surfaced_count   INTEGER NOT NULL DEFAULT 0,
+            origin_class     TEXT
         )
     """,
     "execution_traces": """
@@ -483,7 +484,8 @@ TABLES = {
             cc_session_id    TEXT,
             thread_id        TEXT,
             rate_limited_at  TEXT,
-            rate_limit_resumes_at TEXT
+            rate_limit_resumes_at TEXT,
+            origin_class     TEXT
         )
     """,
     "inbox_items": """

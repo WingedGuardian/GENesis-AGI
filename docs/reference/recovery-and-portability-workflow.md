@@ -168,3 +168,43 @@ edits and untracked files byte-identical); the old database is set aside as
 
 Exit codes: `0` healthy · `1` residual issues remain (escalate) · `2` aborted
 (no writable capture, or no origin URL resolvable for a config restore).
+
+## Durable Alert Queue (F.3)
+
+Alerts used to die silently when their transport was down: the host
+`AlertDispatcher` logged to journald and returned False, and
+`scripts/backup.sh`'s `_send_telegram` dropped the message if `curl` failed.
+F.3 adds a **store-and-forward queue** so an alert raised while Telegram is
+unreachable is persisted and delivered on the next drain.
+
+**Per-side topology — each side drains its OWN queue** (never a shared mount,
+which would invert reliability and race on delivery):
+
+| Side | Queue dir | Enqueue | Drain |
+|---|---|---|---|
+| Host guardian | `<state_path>/alerts/queue/` | `AlertDispatcher.send` when ALL channels fail | top of `run_check` (the 30s tick) |
+| Container | `~/.genesis/alerts/queue/` | shell (`scripts/lib/alert_queue.sh`) + any Python caller | awareness tick (`runtime/init/alert_drain.py`) |
+
+The queue (`genesis.guardian.alert.queue`) is one schema-v1 JSON file per alert
+(`{schema, ts, severity, source, title, body, dedupe_key, meta}`), written
+atomically at 0600. It is deliberately dependency-free so shell scripts write the
+same format via `queue_alert <severity> <source> <title> <body> [dedupe]`. The
+container queue lives in a `queue/` **subdir** so it never collides with
+`tmp_watchgod`'s `tmp_warning` / `tmp_emergency` flag files in
+`~/.genesis/alerts/`.
+
+**Delivery contract.** `drain(root, send)` calls `send(entry)` oldest-first:
+`True` = terminal (delivered OR intentionally deduped → unlink); `False` =
+transient failure (channel still down → keep the entry and stop the batch, retry
+next tick). The container drainer maps the outreach result: `DELIVERED`/
+`REJECTED` → terminal (a `REJECTED` dedup is redundant, not a failure to retry —
+treating it otherwise would wedge the entry forever); `FAILED`/`HELD`/`PENDING`
+→ keep. `prune()` bounds the queue (200 files / 14 days).
+
+**What pages vs. what stays quiet.** `tmp_watchgod` pages only the **emergency
+(red)** tier, transition-only (once per red episode, gated on the shared
+`tmp_emergency` flag). The **warning (orange)** tier stays dashboard-only — it is
+already surfaced via `~/.genesis/watchgod_state.json` →
+`service_status.collect_cc_tmp_usage()` → the dashboard `cc_tmp` tile — so it
+never touches the queue. `backup.sh` failures page (a backup that did not run is
+an emergency).

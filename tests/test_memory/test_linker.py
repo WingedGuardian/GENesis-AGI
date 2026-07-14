@@ -108,3 +108,39 @@ async def test_auto_link_empty_results(linker):
         links = await linker.auto_link("mem-1", [0.1] * 1024)
 
     assert links == []
+
+
+@pytest.mark.asyncio()
+async def test_constructor_threshold_is_auto_link_default(qdrant, db):
+    """A constructor-level similarity_threshold becomes auto_link's default —
+    the prod-shaped seam for callers (MemoryStore.store) that never pass one."""
+    linker = MemoryLinker(qdrant_client=qdrant, db=db, similarity_threshold=0.4)
+    with patch("genesis.memory.linker.search", return_value=[
+        _hit("weak", 0.5),
+    ]), patch("genesis.memory.linker.memory_links") as mock_crud:
+        mock_crud.create = AsyncMock(return_value=("s", "t"))
+        links = await linker.auto_link("mem-1", [0.1] * 1024)
+    assert len(links) == 1  # 0.5 >= 0.4 constructor default (dropped at 0.75)
+
+    with patch("genesis.memory.linker.search", return_value=[
+        _hit("weak", 0.5),
+    ]), patch("genesis.memory.linker.memory_links") as mock_crud:
+        mock_crud.create = AsyncMock(return_value=("s", "t"))
+        links = await linker.auto_link(
+            "mem-1", [0.1] * 1024, similarity_threshold=0.6,
+        )
+    assert links == []  # explicit call kwarg still overrides the constructor
+
+
+def test_invalid_similarity_threshold_rejected(qdrant, db):
+    """NaN/out-of-range thresholds silently densify the graph (NaN makes
+    score < t always False) — the constructor must reject them."""
+    for bad in (float("nan"), -0.1, 1.5):
+        with pytest.raises(ValueError, match="similarity_threshold"):
+            MemoryLinker(qdrant_client=qdrant, db=db, similarity_threshold=bad)
+
+
+@pytest.mark.asyncio()
+async def test_invalid_call_level_threshold_rejected(linker):
+    with pytest.raises(ValueError, match="similarity_threshold"):
+        await linker.auto_link("mem-1", [0.1] * 1024, similarity_threshold=float("nan"))

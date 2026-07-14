@@ -140,48 +140,39 @@ def configure_global_settings(genesis_root: Path, dry_run: bool) -> None:
 
 
 def trigger_indexing(genesis_root: Path, dry_run: bool) -> None:
-    """Trigger code intelligence indexing in background (non-blocking).
+    """Queue a code-intelligence index request (non-blocking, idle-gated).
 
-    All indexing goes through scripts/lib/code_intel_index.sh — the single
-    entrypoint that enforces worktree-skip, a per-repo single-flight lock,
-    and resource caps. Raw indexer spawns are banned (three concurrent
-    uncapped index jobs once wedged the whole container by saturating its
-    disk-write throttle); a guardrail test enforces the ban.
-
-    Uses start_new_session=True + explicit log file to avoid inheriting
-    open pipes from the caller (e.g. bootstrap's `| tail -10` pipe),
-    which would cause SIGPIPE if the parent exits before the indexer finishes.
+    Writes an index-request marker (scripts/lib/index_marker.py); the
+    genesis-code-intel.timer runner reindexes when the box is idle. We do NOT
+    spawn an indexer here — fire-and-forget full-mode spawns at setup/commit
+    helped storm the container (D-state I/O), and a guardrail test bans raw
+    spawns. Worktrees are never indexed (Serena covers them live).
     """
-    import subprocess
-
     if dry_run:
-        print("\nCode intelligence: (dry run — skipping indexing)")
+        print("\nCode intelligence: (dry run — skipping index request)")
         return
 
     if (genesis_root / ".git").is_file():
-        # Linked git worktree — never indexed (each index builds a full
-        # separate graph for near-identical code; Serena covers worktrees).
-        print("\nCode intelligence: worktree detected — indexing skipped (use Serena here)")
+        print("\nCode intelligence: worktree detected — no index request (use Serena here)")
         return
 
-    entrypoint = genesis_root / "scripts" / "lib" / "code_intel_index.sh"
-    if not entrypoint.exists():
-        print("\nCode intelligence: index entrypoint missing — skipping")
+    marker_helper = genesis_root / "scripts" / "lib" / "index_marker.py"
+    if not marker_helper.exists():
+        print("\nCode intelligence: marker helper missing — skipping index request")
         return
 
-    log_path = Path.home() / ".genesis" / "code-intelligence-setup.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_file = open(log_path, "a")  # noqa: SIM115 — kept open for subprocess lifetime
+    import sys as _sys
 
-    subprocess.Popen(
-        ["bash", str(entrypoint), str(genesis_root), "both"],
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        close_fds=True,
-        start_new_session=True,
-    )
-    print("\nCode intelligence: indexing in background (locked + resource-capped)")
-    print(f"  Log: {log_path}")
+    lib = str((genesis_root / "scripts" / "lib").resolve())
+    if lib not in _sys.path:
+        _sys.path.insert(0, lib)
+    try:
+        import index_marker  # stdlib-only
+
+        index_marker.write_marker(str(genesis_root), tools="both", mode="fast")
+        print("\nCode intelligence: initial index queued (idle-gated runner)")
+    except Exception as exc:  # noqa: BLE001 — never fail setup on a queue write
+        print(f"\nCode intelligence: could not queue index request ({exc})")
 
 
 def main():

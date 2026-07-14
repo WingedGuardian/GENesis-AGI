@@ -223,6 +223,7 @@ class ResumeReviewer:
                     context_parts.append(f"[Knowledge: {r.source}]\n{wrapped}")
                     if immunity_shadow.item_is_blockable(
                         collection="knowledge_base", source_pipeline=sp,
+                        origin_class=getattr(r, "origin_class", None),
                     ):
                         blockable += 1
 
@@ -236,6 +237,7 @@ class ResumeReviewer:
                     context_parts.append(f"[Knowledge: {concept}]\n{body}")
                     if immunity_shadow.item_is_blockable(
                         collection="knowledge_base", source_pipeline=sp,
+                        origin_class=fts.get("origin_class"),
                     ):
                         blockable += 1
 

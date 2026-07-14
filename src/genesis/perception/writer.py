@@ -355,6 +355,13 @@ class ResultWriter:
 
         # Store user model deltas as observations for Phase 5 synthesis
         # GROUNDWORK(user-model-synthesis): Phase 5 reads these and updates user_model_cache
+        # WS-3 gate-2 substrate: run-level provenance aggregate — same
+        # semantics as the CLI-path writer (reflection_bridge/_output.py).
+        from genesis.db.crud import cc_sessions as cc_sessions_crud
+
+        run_origin = await cc_sessions_crud.reflection_window_origin(
+            db, end_iso=tick.timestamp,
+        )
         for delta in output.user_model_updates:
             # Confidence gate: LLM clusters at 0.80/0.85/0.90/0.95; gate at 0.90
             # filters ~60% of overconfident filler deltas.
@@ -387,4 +394,5 @@ class ResultWriter:
                 priority="medium",
                 created_at=tick.timestamp,
                 content_hash=delta_hash,
+                origin_class=run_origin,
             )

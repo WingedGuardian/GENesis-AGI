@@ -18,6 +18,17 @@ STATE_FILE="$HOME/.genesis/watchgod_state.json"
 LOG_FILE="$HOME/.genesis/logs/tmp_watchgod.log"
 ALERT_DIR="$HOME/.genesis/alerts"
 
+# Durable alert queue (F.3) — emergency-tier events page Telegram via the
+# container drainer. Guarded: if the lib is ever not co-located, degrade to a
+# no-op so `set -e` can never take the service down over an alert.
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$_SCRIPT_DIR/lib/alert_queue.sh" ]]; then
+    # shellcheck source=scripts/lib/alert_queue.sh
+    source "$_SCRIPT_DIR/lib/alert_queue.sh"
+else
+    queue_alert() { :; }
+fi
+
 # Defaults (overridden by config)
 CC_TMP_DIR="$HOME/.genesis/cc-tmp"
 CC_TMP_BUDGET_MB=500
@@ -181,8 +192,14 @@ clean_cc_red() {
     done < <(tmux list-sessions -F '#{session_name}:#{session_attached}' 2>/dev/null \
              | grep ':0$' | cut -d: -f1 || true)
 
-    # Emergency alert
+    # Emergency alert — queue a page ONLY on the transition INTO red (flag not
+    # yet set), so a sustained red episode does not re-page every 30s poll.
     mkdir -p "$ALERT_DIR"
+    if [[ ! -f "$ALERT_DIR/tmp_emergency" ]]; then
+        queue_alert emergency "watchgod:cc" "CC temp CRITICAL (RED)" \
+            "cc-tmp blew its budget (${CC_TMP_BUDGET_MB}MB) — nuclear cleanup ran to protect active CC sessions. Investigate what filled it." \
+            "watchgod:tmp_emergency"
+    fi
     touch "$ALERT_DIR/tmp_emergency"
     log WARN "Zone A RED — nuclear cleanup complete"
 }
@@ -278,7 +295,15 @@ clean_sys_red() {
             -mmin +60 -delete 2>/dev/null || true
     fi
 
+    # Emergency alert — transition-only (see clean_cc_red). Zones A/B share the
+    # tmp_emergency flag, so a red episode pages once regardless of which zone
+    # tripped first — intentional (one page per episode, not per zone).
     mkdir -p "$ALERT_DIR"
+    if [[ ! -f "$ALERT_DIR/tmp_emergency" ]]; then
+        queue_alert emergency "watchgod:sys" "System /tmp CRITICAL (RED)" \
+            "/tmp usage exceeded 85% — aggressive cleanup ran. Something is filling /tmp." \
+            "watchgod:tmp_emergency"
+    fi
     touch "$ALERT_DIR/tmp_emergency"
     log WARN "Zone B RED — aggressive cleanup complete"
 }

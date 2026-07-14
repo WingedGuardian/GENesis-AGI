@@ -9,6 +9,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Code-intelligence indexing can no longer storm the machine.** Keeping the
+  code graph fresh used to fire a full reindex on every commit, in the
+  background, with no coordination — and if disk cleanup had reclaimed the index
+  first, each "quick refresh" was secretly a full rebuild from scratch. Enough
+  of them at once saturated disk I/O and dragged the whole box to a crawl. Three
+  changes fix this at the root: (1) disk cleanup no longer deletes the code
+  index except as a genuine last resort (very low free space), so refreshes stay
+  incremental; (2) commits and setup now *queue* an index request instead of
+  spawning one — a small idle-gated job does the work only when the machine is
+  quiet, one at a time; and (3) whatever does run is watched live and
+  automatically paused when the system gets busy, so an index can never hold the
+  box hostage. Routine refreshes are now the cheap "fast" pass, with the full
+  pass reserved for a weekly idle window. Also fixes a latent bug where the
+  GitNexus refresh had been silently failing on every run due to an unsupported
+  flag.
+
 ### Added
 
 - **Sessions now keep a durable TODO ledger that survives compaction.** An
@@ -21,6 +39,28 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   session's origin, a living mission line, and pointers to its governing
   docs — moved from per-session JSON files into the database so all of this
   is queryable; the human-readable `charter.md` mirror stays.
+
+- **The memory benchmark can now measure whether Genesis's memory graph
+  actually helps.** A new `--graph` mode runs every benchmark arm twice — once
+  against a plain store and once against a store where memories link to
+  similar earlier memories exactly as they do in production — and follows
+  those links at recall time to pull in related memories the search itself
+  missed. Baseline and graph runs use fully separate stores, so the
+  comparison is honest (links can't quietly tint the baseline's ranking). Per
+  question, the results record how many links formed and how much extra gold
+  evidence the graph surfaced, and a graph run that formed no links says so
+  loudly instead of silently matching its baseline. The memory linker's
+  similarity threshold is also now configurable per instance instead of fixed.
+
+- **The memory benchmark now grades temporal questions fairly and explains
+  its misses.** The LongMemEval reader gets the question's date (the
+  benchmark's own convention — without it, "how many weeks ago…" questions
+  were unanswerable by construction), so temporal scores now measure memory,
+  not a missing calendar. New `--dump-dir` writes per-question diagnostics
+  (query, recalled memories, answer, verdict) for failure analysis, a new
+  evidence-coverage metric shows *how much* of the gold evidence was
+  retrieved (not just whether any was), and `--types` runs a single question
+  category — so a targeted slice no longer costs a full 500-question run.
 
 - **Claude Code sessions no longer forget what they were started for.** Long
   sessions compact their context many times, and each summary is biased toward

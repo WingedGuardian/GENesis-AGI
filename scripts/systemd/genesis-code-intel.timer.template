@@ -1,0 +1,14 @@
+[Unit]
+Description=Genesis Code-Intelligence Runner — every-5-min idle-gated schedule
+
+[Timer]
+# Every 5 minutes. Each tick is a cheap no-op unless a marker is pending AND the
+# box is idle, so a frequent cadence is fine — it just means "reindex soon after
+# things go quiet". RandomizedDelaySec de-correlates from other timers.
+OnCalendar=*:0/5
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=45
+
+[Install]
+WantedBy=timers.target

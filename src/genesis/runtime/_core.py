@@ -393,6 +393,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         if _full:
             self._run_init_step("cred_integrity", self._init_cred_integrity)
 
+        if _full:
+            self._run_init_step("alert_drain", self._init_alert_drain)
+
         self._run_init_step("router", self._init_router)
 
         self._run_init_step("perception", self._init_perception)

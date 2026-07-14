@@ -988,6 +988,7 @@ class AwarenessLoop:
         self._sentinel = None
         self._credential_bridge_fn = None
         self._cred_integrity_fn = None
+        self._alert_queue_drainer_fn = None
         self._autonomous_cli_policy_export_fn = None
         self._briefing_writer_fn = None
         self._findings_ingest_fn = None
@@ -1355,6 +1356,14 @@ class AwarenessLoop:
                     self._cred_integrity_fn()
                 except Exception:
                     logger.error("Credential integrity self-heal failed", exc_info=True)
+
+            # F.3: drain durable alert queue (shell/Python alerts → Telegram).
+            # Async; never breaks the tick.
+            if self._alert_queue_drainer_fn:
+                try:
+                    await self._alert_queue_drainer_fn()
+                except Exception:
+                    logger.error("Alert queue drain failed", exc_info=True)
 
             if self._autonomous_cli_policy_export_fn:
                 try:
@@ -1921,6 +1930,16 @@ class AwarenessLoop:
     def set_cred_integrity_fn(self, fn) -> None:
         """Inject the credential-file integrity check + self-heal (per tick)."""
         self._cred_integrity_fn = fn
+
+    def set_alert_queue_drainer(self, fn) -> None:
+        """Inject the async container alert-queue drainer (per tick).
+
+        ``fn`` is an awaitable that flushes ``~/.genesis/alerts/queue`` to
+        Telegram via the outreach pipeline (F.3). Wired independently of the
+        guardian, since shell-written alerts (watchgod/backup) are valuable
+        guardian-or-not.
+        """
+        self._alert_queue_drainer_fn = fn
 
     def set_autonomous_cli_policy_exporter(self, fn) -> None:
         """Inject shared-mount exporter for effective autonomous CLI policy."""

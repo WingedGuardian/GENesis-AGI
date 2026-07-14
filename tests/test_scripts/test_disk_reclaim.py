@@ -144,5 +144,47 @@ class TestMain:
         assert rc == 0
 
 
+class TestLastResortTier:
+    """The index DBs must survive normal disk pressure — deleting one is what
+    turns every later index into a full 0->100 rebuild that storms the box."""
+
+    def _run(self, argv, disk_pct, home):
+        with patch.object(_mod.sys, "argv", ["disk_reclaim.py", *argv]), \
+             patch.object(_mod, "_disk_pct", return_value=disk_pct), \
+             patch.dict(_mod.os.environ, {"GENESIS_HOME": str(home)}):
+            return _mod.main()
+
+    def test_index_caches_are_last_resort_tier(self):
+        tiers = {t.tier for t in _mod._CACHE_TARGETS
+                 if "index" in t.description or "gitnexus" in t.description.lower()}
+        assert tiers == {"last_resort"}, tiers
+
+    def test_held_below_last_resort_threshold(self, tmp_path):
+        # Medium gate (90) is crossed but last_resort (95) is not: DB survives.
+        lr = _make_cache(tmp_path, "lr1", "last_resort")
+        with patch.object(_mod, "_CACHE_TARGETS", [lr]):
+            self._run(["--apply", "--if-above", "90"], disk_pct=92.0,
+                      home=tmp_path / ".genesis")
+        assert lr.path.exists()  # NOT deleted at 92% — the whole point
+
+    def test_cleared_at_last_resort_threshold_drops_marker(self, tmp_path):
+        lr = _make_cache(tmp_path, "lr2", "last_resort")
+        home = tmp_path / ".genesis"
+        with patch.object(_mod, "_CACHE_TARGETS", [lr]):
+            self._run(["--apply", "--last-resort-above", "95"], disk_pct=96.0,
+                      home=home)
+        assert not lr.path.exists()  # cleared at 96%
+        markers = list((home / "index-requests").glob("*.json"))
+        assert markers, "clearing an index DB must queue an idle rebuild marker"
+
+    def test_dry_run_never_drops_marker(self, tmp_path):
+        lr = _make_cache(tmp_path, "lr3", "last_resort")
+        home = tmp_path / ".genesis"
+        with patch.object(_mod, "_CACHE_TARGETS", [lr]):
+            self._run(["--last-resort-above", "1"], disk_pct=96.0, home=home)
+        assert lr.path.exists()  # dry-run keeps it
+        assert not (home / "index-requests").exists()  # and drops no marker
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

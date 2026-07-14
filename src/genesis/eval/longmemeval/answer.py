@@ -12,6 +12,14 @@ answers. The reader prompt is question-type-aware:
   reader answer "I don't know" and tanked this category to ~0.05.)
 * ``temporal-reasoning``: add a step-by-step-using-the-dated-memories nudge so
   interval/date arithmetic is worked out rather than guessed.
+
+The prompt also carries the UPSTREAM date anchor: LongMemEval's own reading
+prompt includes ``Current Date: {question_date}`` between the history and the
+question (arXiv 2410.10813). Without it, relative temporal questions ("how many
+weeks ago...") are ill-posed for the reader — the harness's first full-500 run
+omitted it and scored temporal-reasoning 0.40 non-conformantly. The raw
+``question_date`` string is used verbatim (upstream convention) for
+comparability with published numbers.
 """
 
 from __future__ import annotations
@@ -59,15 +67,21 @@ def build_answer_prompt(
     memories: Sequence[str],
     *,
     question_type: str | None = None,
+    question_date: str | None = None,
 ) -> str:
-    """Assemble the reader prompt from the question and recalled memories."""
+    """Assemble the reader prompt from the question and recalled memories.
+
+    ``question_date`` (raw upstream format) is injected as the
+    ``Current Date:`` anchor per the upstream reading-prompt convention.
+    """
     block = (
         "\n".join(f"- {m}" for m in memories)
         if memories
         else ("(no relevant memories were retrieved)")
     )
     system = _system_for(question_type)
-    return f"{system}\n\nMEMORIES:\n{block}\n\nQUESTION: {question}\n\nANSWER:"
+    date_block = f"Current Date: {question_date}\n\n" if question_date else ""
+    return f"{system}\n\nMEMORIES:\n{block}\n\n{date_block}QUESTION: {question}\n\nANSWER:"
 
 
 @dataclass(frozen=True)
@@ -86,9 +100,15 @@ def answer_question(
     model: str = DEFAULT_MODEL,
     max_tokens: int = 256,
     question_type: str | None = None,
+    question_date: str | None = None,
 ) -> AnswerResult:
     """Produce a hypothesis answer from the recalled memories."""
-    prompt = build_answer_prompt(question, memories, question_type=question_type)
+    prompt = build_answer_prompt(
+        question,
+        memories,
+        question_type=question_type,
+        question_date=question_date,
+    )
     completion = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],

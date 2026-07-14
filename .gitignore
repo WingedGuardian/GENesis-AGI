@@ -122,6 +122,8 @@ config/interop_system_prompt.md
 scripts/cops_interop.sh
 
 .gitnexus
+# codebase-memory-mcp --persistence artifact (regenerable share DB, in-repo)
+.codebase-memory/
 
 # Personal skills (user-level data, lives at ~/.claude/skills/)
 .claude/skills/code-voice/

@@ -1,17 +1,22 @@
 """Orchestration + aggregation for the LongMemEval harness.
 
-Per question: build a fresh ephemeral store, ingest the haystack ONCE, then run
-each arm (query-mode x rerank) against the frozen store (recall write-backs are
-suppressed via ``GENESIS_MEMORY_WRITEBACKS_OFF`` so arms don't contaminate each
-other). Each arm's recalled memories feed the reader; the hypothesis is graded
-by the gpt-4o judge. Results aggregate per-arm into an ``EvalRunSummary`` (one
-persisted run per arm) with overall + per-question-type accuracy.
+Per question: baseline arms (query-mode x rerank) share ONE fresh ephemeral
+store ingested link-free; graph arms get a SECOND store ingested with
+``auto_link=True`` plus 1-hop link expansion at recall time (links shift
+ranking for every arm sharing a store — graph boost AND activation
+connectivity — so baselines never see a linked store). Recall write-backs are
+suppressed via ``GENESIS_MEMORY_WRITEBACKS_OFF`` so arms don't contaminate
+each other. Each arm's recalled memories feed the reader; the hypothesis is
+graded by the gpt-4o judge. Results aggregate per-arm into an
+``EvalRunSummary`` (one persisted run per arm) with overall +
+per-question-type accuracy. A store-block failure skips ONLY that block's
+arms — completed (paid, judged) results from the other block are kept, so the
+skip ledger never records an attempted arm as "NOT attempted".
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
@@ -37,6 +42,7 @@ from genesis.eval.types import (
     ScorerType,
     TaskCategory,
 )
+from genesis.memory.linker import DEFAULT_SIMILARITY_THRESHOLD
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -44,6 +50,8 @@ if TYPE_CHECKING:
     import aiosqlite
 
     from genesis.eval.longmemeval.dataset import LongMemEvalInstance
+    from genesis.eval.longmemeval.ingest import IngestResult
+    from genesis.eval.longmemeval.store import EphemeralStore
 
 logger = logging.getLogger("genesis.eval.longmemeval")
 
@@ -57,14 +65,22 @@ _WRITEBACKS_OFF_ENV = "GENESIS_MEMORY_WRITEBACKS_OFF"
 
 @dataclass(frozen=True)
 class Arm:
-    """One evaluation arm: a query mode crossed with rerank on/off."""
+    """One evaluation arm: a query mode x rerank on/off x graph on/off.
+
+    ``graph`` arms run against a SEPARATE ephemeral store ingested with
+    ``auto_link=True`` (see ``run_question``) and add 1-hop link expansion
+    after top-K recall.
+    """
 
     query_arm: QueryArm
     rerank: bool
+    graph: bool = False
 
     @property
     def label(self) -> str:
-        suffix = "+rerank" if self.rerank else ""
+        # Deterministic suffix order (rerank before graph): model_profile
+        # "longmemeval:<label>" and dump filenames must be stable across runs.
+        suffix = ("+rerank" if self.rerank else "") + ("+graph" if self.graph else "")
         return f"{self.query_arm.value}{suffix}"
 
 
@@ -78,6 +94,20 @@ def default_arms() -> list[Arm]:
     ]
 
 
+def select_arms(*, no_rerank: bool = False, graph: bool = False) -> list[Arm]:
+    """Build the CLI's arm list: default arms, optionally rerank-filtered,
+    optionally doubled with a ``+graph`` variant of every selected arm
+    (paired baseline-vs-graph comparison in one run)."""
+    from dataclasses import replace
+
+    arms = default_arms()
+    if no_rerank:
+        arms = [a for a in arms if not a.rerank]
+    if graph:
+        arms = [*arms, *(replace(a, graph=True) for a in arms)]
+    return arms
+
+
 @dataclass(frozen=True)
 class QuestionArmResult:
     question_id: str
@@ -86,6 +116,19 @@ class QuestionArmResult:
     hypothesis: str
     judged_correct: bool
     evidence_recalled: bool
+    #: |evidence ∩ recalled| / |evidence|; None when the question has no
+    #: evidence turns (abstention) — excluded from means, never counted as 0.
+    evidence_coverage: float | None = None
+    query: str = ""
+    recalled_ids: tuple[str, ...] = ()
+    #: Graph-arm diagnostics: links formed at ingest on this question's linked
+    #: store; neighbor ids merged by 1-hop expansion; evidence metrics over the
+    #: EXPANDED set (top-K ∪ expanded). All None/empty/0 on baseline arms —
+    #: top-K metrics above stay baseline-comparable.
+    links_created: int = 0
+    expanded_ids: tuple[str, ...] = ()
+    evidence_recalled_final: bool | None = None
+    evidence_coverage_final: float | None = None
     judge_raw: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
@@ -103,6 +146,7 @@ def build_run_summary(
     dataset: str,
     results: Sequence[QuestionArmResult],
     skipped_case_ids: Sequence[str] = (),
+    graph_arm: bool | None = None,
 ) -> EvalRunSummary:
     """Aggregate one arm's per-question results into a persistable summary.
 
@@ -126,6 +170,24 @@ def build_run_summary(
             fmean(1 if r.evidence_recalled else 0 for r in results),
             4,
         )
+    # Mean evidence COVERAGE (any-hit recall is blind to partial recall on
+    # multi-evidence questions — the key multi-session diagnostic).
+    coverages = [r.evidence_coverage for r in results if r.evidence_coverage is not None]
+    if coverages:
+        scores["evidence_coverage_mean"] = round(fmean(coverages), 4)
+    # Graph-arm means: post-expansion coverage + link/expansion volume — how
+    # much the graph ADDED beyond top-K (ranking lift vs coverage lift split).
+    finals = [r.evidence_coverage_final for r in results if r.evidence_coverage_final is not None]
+    if finals:
+        scores["evidence_coverage_final_mean"] = round(fmean(finals), 4)
+    # Explicit flag from the caller (which has the Arm); label-suffix fallback
+    # only for direct build_run_summary callers that predate the flag.
+    if graph_arm is None:
+        graph_arm = "+graph" in arm_label
+    graph_metadata: dict[str, float] = {}
+    if results and graph_arm:
+        graph_metadata["links_created_mean"] = round(fmean(r.links_created for r in results), 2)
+        graph_metadata["expanded_mean"] = round(fmean(len(r.expanded_ids) for r in results), 2)
 
     scored: list[ScoredOutput] = []
     for r in results:
@@ -177,7 +239,7 @@ def build_run_summary(
         skipped_cases=skipped,
         aggregate_score=round(passed / attempted, 4) if attempted else 0.0,
         scores=scores,
-        metadata={"arm": arm_label, "dataset": dataset, "skipped": skipped},
+        metadata={"arm": arm_label, "dataset": dataset, "skipped": skipped, **graph_metadata},
         results=scored,
     )
 
@@ -190,61 +252,259 @@ async def run_question(
     k: int,
     embedding_provider: object | None = None,
     reranker: object | None = None,
+    link_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
 ) -> list[QuestionArmResult]:
-    """Run every arm for one question against a fresh ephemeral store."""
+    """Run every arm for one question.
+
+    Baseline and graph arms use SEPARATE ephemeral stores: links shift ranking
+    for every arm sharing a store (graph boost AND activation connectivity,
+    ``activation.py`` link_count term), so a shared linked store would tint the
+    baselines and break comparability. The second ingest re-embeds through the
+    run-level embedding cache, so its marginal cost is in-memory upserts + one
+    local Qdrant search per turn.
+    """
     out: list[QuestionArmResult] = []
-    async with ephemeral_store(
-        embedding_provider=embedding_provider,
-        reranker=reranker,
-    ) as es:
-        ingest = await ingest_haystack(es.store, instance)
-        for arm in arms:
-            t0 = time.monotonic()
-            query = build_query(instance.question, arm.query_arm)
-            hits = await es.retriever.recall(
-                query,
-                source="episodic",
-                limit=k,
-                rerank=arm.rerank,
+    base_arms = [a for a in arms if not a.graph]
+    graph_arms = [a for a in arms if a.graph]
+    base_embedded: int | None = None
+
+    # Each store block fails INDEPENDENTLY: a graph-store failure must not
+    # discard already-completed (paid, judged) baseline results — that would
+    # record attempted arms as "NOT attempted" skips and make the same
+    # baseline arm label carry a different N in --graph vs plain runs.
+    if base_arms:
+        try:
+            async with ephemeral_store(
+                embedding_provider=embedding_provider,
+                reranker=reranker,
+            ) as es:
+                ingest = await ingest_haystack(es.store, instance)
+                base_embedded = await _embedded_count(es.db)
+                for arm in base_arms:
+                    out.append(await _run_arm(es, ingest, instance, arm, k=k, client=client))
+        except Exception:
+            logger.exception(
+                "question %s: baseline store block failed; skipping baseline arms",
+                instance.question_id,
             )
-            recalled_ids = {h.memory_id for h in hits}
-            evidence_recalled = bool(ingest.evidence_memory_ids & recalled_ids)
-            memories = [h.content for h in hits]
-            # answer_question / judge_answer use the SYNC OpenAI client, so run
-            # them in a worker thread — a blocking create() on the event loop
-            # would stall ALL concurrent questions and defeat `concurrency`.
-            ans = await asyncio.to_thread(
-                answer_question,
-                instance.question,
-                memories,
-                client=client,
-                question_type=instance.question_type,
-            )
-            verdict = await asyncio.to_thread(
-                lambda a=ans: judge_answer(
-                    instance.question_type,
-                    instance.question,
-                    instance.answer,
-                    a.hypothesis,
-                    abstention=instance.is_abstention,
-                    client=client,
-                ),
-            )
-            out.append(
-                QuestionArmResult(
-                    question_id=instance.question_id,
-                    question_type=instance.question_type,
-                    arm_label=arm.label,
-                    hypothesis=ans.hypothesis,
-                    judged_correct=verdict.label,
-                    evidence_recalled=evidence_recalled,
-                    judge_raw=verdict.raw,
-                    input_tokens=ans.input_tokens + verdict.input_tokens,
-                    output_tokens=ans.output_tokens + verdict.output_tokens,
-                    latency_ms=(time.monotonic() - t0) * 1000,
-                ),
+
+    if graph_arms:
+        try:
+            async with ephemeral_store(
+                embedding_provider=embedding_provider,
+                reranker=reranker,
+                with_linker=True,
+                link_threshold=link_threshold,
+            ) as es:
+                ingest = await ingest_haystack(es.store, instance, auto_link=True)
+                rows = await es.db.execute_fetchall("SELECT COUNT(*) FROM memory_links")
+                links_created = rows[0][0]
+                if links_created == 0:
+                    # No-silent-caps parity with the rerank warning: a link-free
+                    # store makes graph arms equal their baseline twins.
+                    logger.warning(
+                        "graph arm: store for %s formed zero links (threshold %.2f); "
+                        "graph arms will match their baseline twins on this question",
+                        instance.question_id,
+                        link_threshold,
+                    )
+                # Corpus-parity guard: a transient embedding failure routes a
+                # turn to pending_embeddings (FTS5-only) SILENTLY — if the two
+                # stores diverge, a graph-vs-baseline delta on this question
+                # measures embedding weather, not graph value. Warn loudly.
+                graph_embedded = await _embedded_count(es.db)
+                if base_embedded is not None and graph_embedded != base_embedded:
+                    logger.warning(
+                        "question %s: store corpora diverged (baseline %d vs graph %d "
+                        "embedded memories) — graph-vs-baseline delta unreliable here",
+                        instance.question_id,
+                        base_embedded,
+                        graph_embedded,
+                    )
+                for arm in graph_arms:
+                    out.append(
+                        await _run_arm(
+                            es,
+                            ingest,
+                            instance,
+                            arm,
+                            k=k,
+                            client=client,
+                            links_created=links_created,
+                        ),
+                    )
+        except Exception:
+            logger.exception(
+                "question %s: graph store block failed; skipping graph arms "
+                "(baseline results kept)",
+                instance.question_id,
             )
     return out
+
+
+async def _embedded_count(db: object) -> int:
+    """Count fully-embedded memories in an ephemeral store (parity check)."""
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM memory_metadata WHERE embedding_status = 'embedded'",
+    )
+    return rows[0][0]
+
+
+def _coverage(evidence_ids: set[str], ids: set[str]) -> tuple[bool, float | None]:
+    """(any-hit, |evidence ∩ ids| / |evidence|); coverage None when the
+    question has no evidence turns (abstention) — excluded from means."""
+    hit = bool(evidence_ids & ids)
+    cov = len(evidence_ids & ids) / len(evidence_ids) if evidence_ids else None
+    return hit, cov
+
+
+async def _expand_neighbors(db: object, seed_ids: list[str], *, k: int) -> list[tuple[str, str]]:
+    """1-hop expansion: (memory_id, content) for up to ``k`` linked neighbors.
+
+    Merges linked-but-unretrieved neighbors into the reader context (the prod
+    MCP layer only DECORATES results with neighbors; actually merging them is
+    what can lift multi-session coverage). Deliberately direct CRUD, not
+    graph.traverse — its process-global NetworkX cache is unsafe across the
+    concurrent ephemeral stores this runner creates. Dangling links (edge
+    rows whose neighbor memory no longer resolves) are skipped silently.
+    """
+    from genesis.db.crud import memory as memory_crud
+    from genesis.db.crud import memory_links as memory_links_crud
+
+    neighbors = await memory_links_crud.neighbors_of(db, seed_ids, limit=k)
+    expanded: list[tuple[str, str]] = []
+    for n in neighbors:
+        row = await memory_crud.get_by_id(db, n["memory_id"])
+        if row and row.get("content"):
+            expanded.append((n["memory_id"], row["content"]))
+    return expanded
+
+
+async def _run_arm(
+    es: EphemeralStore,
+    ingest: IngestResult,
+    instance: LongMemEvalInstance,
+    arm: Arm,
+    *,
+    k: int,
+    client: object,
+    links_created: int = 0,
+) -> QuestionArmResult:
+    """Recall (+ optional 1-hop graph expansion) -> answer -> judge, one arm.
+
+    ``links_created`` is a STORE-WIDE ingest count for this question's linked
+    store — it is stamped identically on every graph arm of the question (an
+    ingest metric, not a per-arm measurement).
+    """
+    t0 = time.monotonic()
+    query = build_query(instance.question, arm.query_arm)
+    hits = await es.retriever.recall(
+        query,
+        source="episodic",
+        limit=k,
+        rerank=arm.rerank,
+    )
+    recalled_ids = {h.memory_id for h in hits}
+    evidence_ids = ingest.evidence_memory_ids
+    memories = [h.content for h in hits]
+
+    expanded_ids: tuple[str, ...] = ()
+    evidence_recalled_final: bool | None = None
+    evidence_coverage_final: float | None = None
+    if arm.graph:
+        expanded = await _expand_neighbors(es.db, [h.memory_id for h in hits], k=k)
+        expanded_ids = tuple(mid for mid, _ in expanded)
+        memories = [*memories, *(content for _, content in expanded)]
+        evidence_recalled_final, evidence_coverage_final = _coverage(
+            evidence_ids,
+            recalled_ids | set(expanded_ids),
+        )
+
+    evidence_recalled, evidence_coverage = _coverage(evidence_ids, recalled_ids)
+    # answer_question / judge_answer use the SYNC OpenAI client, so run
+    # them in a worker thread — a blocking create() on the event loop
+    # would stall ALL concurrent questions and defeat `concurrency`.
+    ans = await asyncio.to_thread(
+        answer_question,
+        instance.question,
+        memories,
+        client=client,
+        question_type=instance.question_type,
+        question_date=instance.question_date,
+    )
+    verdict = await asyncio.to_thread(
+        lambda a=ans: judge_answer(
+            instance.question_type,
+            instance.question,
+            instance.answer,
+            a.hypothesis,
+            abstention=instance.is_abstention,
+            client=client,
+        ),
+    )
+    return QuestionArmResult(
+        question_id=instance.question_id,
+        question_type=instance.question_type,
+        arm_label=arm.label,
+        hypothesis=ans.hypothesis,
+        judged_correct=verdict.label,
+        evidence_recalled=evidence_recalled,
+        evidence_coverage=evidence_coverage,
+        query=query,
+        recalled_ids=tuple(h.memory_id for h in hits),
+        links_created=links_created if arm.graph else 0,
+        expanded_ids=expanded_ids,
+        evidence_recalled_final=evidence_recalled_final,
+        evidence_coverage_final=evidence_coverage_final,
+        judge_raw=verdict.raw,
+        input_tokens=ans.input_tokens + verdict.input_tokens,
+        output_tokens=ans.output_tokens + verdict.output_tokens,
+        latency_ms=(time.monotonic() - t0) * 1000,
+    )
+
+
+def write_dump_jsonl(
+    path: Path,
+    results: Sequence[QuestionArmResult],
+    *,
+    skipped_case_ids: Sequence[str] = (),
+) -> None:
+    """Write one arm's per-question diagnostics as JSONL (one line/question).
+
+    This is the failure-analysis artifact the summary rows can't provide:
+    which memories each question actually recalled, the exact query, the
+    hypothesis, and the judge verdict. Skipped (errored) questions get a
+    ``{"skipped": true}`` marker line so the file accounts for the full N.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as fh:
+        for r in results:
+            fh.write(
+                json.dumps(
+                    {
+                        "question_id": r.question_id,
+                        "question_type": r.question_type,
+                        "arm": r.arm_label,
+                        "query": r.query,
+                        "recalled_ids": list(r.recalled_ids),
+                        "evidence_recalled": r.evidence_recalled,
+                        "evidence_coverage": r.evidence_coverage,
+                        "links_created": r.links_created,
+                        "expanded_ids": list(r.expanded_ids),
+                        "evidence_recalled_final": r.evidence_recalled_final,
+                        "evidence_coverage_final": r.evidence_coverage_final,
+                        "hypothesis": r.hypothesis,
+                        "judged_correct": r.judged_correct,
+                        "judge_raw": r.judge_raw,
+                        "input_tokens": r.input_tokens,
+                        "output_tokens": r.output_tokens,
+                        "latency_ms": round(r.latency_ms, 1),
+                    },
+                )
+                + "\n",
+            )
+        for qid in skipped_case_ids:
+            fh.write(json.dumps({"question_id": qid, "skipped": True}) + "\n")
 
 
 async def run_longmemeval(
@@ -257,16 +517,30 @@ async def run_longmemeval(
     client: object | None = None,
     embedding_provider: object | None = None,
     reranker: object | None = None,
+    dump_dir: Path | None = None,
+    link_threshold: float | None = None,
 ) -> dict[str, EvalRunSummary]:
     """Run the full harness over ``instances``; return per-arm summaries.
 
     Forces ``GENESIS_MEMORY_WRITEBACKS_OFF`` for the duration of the run so
-    multi-arm recall against a shared per-question store cannot re-rank memories
-    across arms, and RESTORES the prior value afterwards so an in-process caller
-    (e.g. the test suite) isn't polluted. Persists one run per arm when ``db``
-    is provided.
+    multi-arm recall against the shared per-question stores (baseline and, in
+    graph mode, a second linked store) cannot re-rank memories across arms,
+    and RESTORES the prior value afterwards so an in-process caller (e.g. the
+    test suite) isn't polluted. Persists one run per arm when ``db`` is
+    provided. When ``dump_dir`` is set, writes one ``<arm>.jsonl``
+    per-question diagnostics file per arm and records its path in the
+    summary's metadata. Skips are attributed PER ARM: a store-block failure
+    inside ``run_question`` skips only that block's arms.
     """
+
+    if link_threshold is None:
+        link_threshold = DEFAULT_SIMILARITY_THRESHOLD
     arms = list(arms) if arms is not None else default_arms()
+    labels = [a.label for a in arms]
+    if len(labels) != len(set(labels)):
+        # Duplicate labels would double-persist identical eval_runs rows.
+        msg = f"duplicate arm labels: {sorted(labels)}"
+        raise ValueError(msg)
     client = client or build_client()
     prior_writebacks = os.environ.get(_WRITEBACKS_OFF_ENV)
     os.environ[_WRITEBACKS_OFF_ENV] = "1"
@@ -310,6 +584,7 @@ async def run_longmemeval(
                     k=k,
                     embedding_provider=embedding_provider,
                     reranker=reranker,
+                    link_threshold=link_threshold,
                 )
             except Exception:
                 logger.exception("question %s failed; skipping", inst.question_id)
@@ -324,51 +599,42 @@ async def run_longmemeval(
         else:
             os.environ[_WRITEBACKS_OFF_ENV] = prior_writebacks
         if owns_embedder:
-            await _close_embedder(embedding_provider)
+            from genesis.eval.longmemeval.store import close_embedder
+
+            await close_embedder(embedding_provider)
             if run_cache_dir is not None:
                 shutil.rmtree(run_cache_dir, ignore_errors=True)
 
-    # Regroup by arm; a question with no results errored out (skipped) and is
-    # recorded per-arm so the denominator reflects the requested N and provider
+    # Regroup by arm with PER-ARM skip attribution: a question is skipped for
+    # an arm iff that arm produced no result (a store-block failure inside
+    # run_question skips only that block's arms; completed arms keep their
+    # results). Denominators reflect the requested N per arm and provider
     # failures surface instead of silently shrinking the sample.
     by_arm: dict[str, list[QuestionArmResult]] = {a.label: [] for a in arms}
-    skipped_qids: list[str] = []
-    for inst, question_results in zip(instances, gathered, strict=True):
-        if not question_results:
-            skipped_qids.append(inst.question_id)
-            continue
+    for question_results in gathered:
         for r in question_results:
             by_arm.setdefault(r.arm_label, []).append(r)
 
     summaries: dict[str, EvalRunSummary] = {}
     for arm in arms:
+        arm_results = by_arm.get(arm.label, [])
+        answered = {r.question_id for r in arm_results}
+        arm_skipped = [i.question_id for i in instances if i.question_id not in answered]
         summary = build_run_summary(
             arm_label=arm.label,
-            skipped_case_ids=skipped_qids,
+            skipped_case_ids=arm_skipped,
             model=DEFAULT_MODEL,
             dataset=_DATASET,
-            results=by_arm.get(arm.label, []),
+            results=arm_results,
+            graph_arm=arm.graph,
         )
+        if dump_dir is not None:
+            dump_path = Path(dump_dir) / f"{arm.label}.jsonl"
+            write_dump_jsonl(dump_path, arm_results, skipped_case_ids=arm_skipped)
+            summary.metadata["dump_path"] = str(dump_path)
         summaries[arm.label] = summary
         if db is not None:
             from genesis.eval.db import insert_run
 
             await insert_run(db, summary)
     return summaries
-
-
-async def _close_embedder(embedder: object) -> None:
-    """Best-effort close of an embedder's httpx clients + diskcache.
-
-    ``EmbeddingProvider`` exposes no ``close()``; reach in defensively so a
-    future internal change degrades to a no-op rather than raising.
-    """
-    for backend in getattr(embedder, "backends", []) or []:
-        http_client = getattr(backend, "_client", None)
-        if http_client is not None and hasattr(http_client, "aclose"):
-            with contextlib.suppress(Exception):
-                await http_client.aclose()
-    cache = getattr(embedder, "_disk_cache", None)
-    if cache is not None and hasattr(cache, "close"):
-        with contextlib.suppress(Exception):
-            cache.close()

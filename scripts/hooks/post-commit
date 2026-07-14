@@ -30,19 +30,20 @@ if [[ -z "$COMMIT_SHA" || -z "$COMMIT_SUBJECT" ]]; then
     exit 0
 fi
 
-# ─── Code intelligence reindex (every commit, fire-and-forget) ────────────
-# Keeps codebase-memory-mcp and GitNexus indexes fresh after each commit —
-# via the single locked entrypoint ONLY. This hook fires for commits in
-# EVERY worktree (hooks live in the git common dir); the raw spawns that
-# used to live here piled three concurrent uncapped indexers onto one
-# worktree and wedged the container (D-state I/O storm). The entrypoint
-# enforces worktree-skip, a per-repo single-flight lock, and resource caps.
-# Fail-open: errors logged, never block the commit.
+# ─── Code intelligence reindex REQUEST (every commit) ─────────────────────
+# Drop an index-request marker instead of spawning an indexer. A fire-and-forget
+# full-mode index on every commit was the second index-storm's trigger (host
+# load 136, 70 D-state procs): with the index DB missing, each "incremental" was
+# a full 0->100 rebuild saturating the read throttle. The idle-gated runner
+# (genesis-code-intel.timer -> scripts/code_intel_runner.sh) consumes the marker
+# and reindexes politely when the box is idle. Worktrees are never indexed
+# (their .git is a FILE), so they write no marker. Fail-open: never block the
+# commit. Backgrounded so python3 startup never adds commit latency.
 _REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-if [[ -n "$_REPO_ROOT" && -f "$_REPO_ROOT/scripts/lib/code_intel_index.sh" ]]; then
+if [[ -n "$_REPO_ROOT" && -f "$_REPO_ROOT/scripts/lib/index_marker.py" && ! -f "$_REPO_ROOT/.git" ]]; then
     _CI_LOG="$GENESIS_HOME/code-intelligence-hook.log"
-    ( bash "$_REPO_ROOT/scripts/lib/code_intel_index.sh" "$_REPO_ROOT" both \
-        >> "$_CI_LOG" 2>&1 ) &
+    ( python3 "$_REPO_ROOT/scripts/lib/index_marker.py" write \
+        --repo "$_REPO_ROOT" --tools both --mode fast >> "$_CI_LOG" 2>&1 ) &
     disown 2>/dev/null || true
 fi
 

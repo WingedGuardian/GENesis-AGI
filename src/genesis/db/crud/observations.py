@@ -11,65 +11,69 @@ import aiosqlite
 logger = logging.getLogger(__name__)
 
 # Types that should NEVER expire — the observation IS the authoritative record.
-_PERMANENT_TYPES: frozenset[str] = frozenset({
-    "feedback_rule",             # Learned behavioral rules
-    "genesis_version_baseline",  # Single reference point, replaced on next version
-    "cc_version_baseline",       # Single reference point, replaced on next version
-    "execution_challenge",       # Task failure post-mortem — resolved manually
-})
+_PERMANENT_TYPES: frozenset[str] = frozenset(
+    {
+        "feedback_rule",  # Learned behavioral rules
+        "genesis_version_baseline",  # Single reference point, replaced on next version
+        "cc_version_baseline",  # Single reference point, replaced on next version
+        "execution_challenge",  # Task failure post-mortem — resolved manually
+    }
+)
 
 # Observation types that are Genesis-internal telemetry and should NOT surface
 # to the user in morning reports or the dashboard observations panel.
 # Everything else surfaces by default — new types are user-visible unless
 # explicitly excluded here.  Canonical source — imported by morning_report.py
 # and dashboard routes.
-INTERNAL_OBS_TYPES: frozenset[str] = frozenset({
-    # Reflection / awareness lifecycle
-    "awareness_tick",
-    "micro_reflection",
-    "light_reflection",
-    "deep_reflection",
-    "reflection_observation",
-    "reflection_summary",
-    "reflection_output",
-    "light_escalation_pending",
-    "light_escalation_resolved",
-    "light_reflection_candidate",
-    # Session/conversation telemetry — per-session pivots; consumed internally
-    # by L1 essential-knowledge (queried by type directly), never user-facing.
-    "conversation_pivot",
-    # Memory internals
-    "memory_operation_executed",
-    "memory_operation",
-    "memory_index",
-    "cc_memory_file",
-    "merged_observation",
-    # Version tracking internals
-    "version_current",
-    "version_change",
-    "genesis_version_change",
-    "cc_version_baseline",
-    "cc_version_available",
-    "genesis_version_baseline",
-    "genesis_update_available",
-    "genesis_update_failed",
-    # Build / project state
-    "build_state",
-    "project_context",
-    "model_downgrade",
-    # Triage telemetry
-    "triage_depth_3",
-    "triage_depth_4",
-    # Development internals
-    "bugfix_committed",
-    "interpretation_correction",
-    "scope_clarification",
-    "feedback_rule",
-    # CC silent-cap detection — per-empty telemetry rows. Internal: only the
-    # aggregate infrastructure_alert (raised by the awareness cap detector when
-    # a run of these accumulates) surfaces to the user.
-    "cc_cap_empty_event",
-})
+INTERNAL_OBS_TYPES: frozenset[str] = frozenset(
+    {
+        # Reflection / awareness lifecycle
+        "awareness_tick",
+        "micro_reflection",
+        "light_reflection",
+        "deep_reflection",
+        "reflection_observation",
+        "reflection_summary",
+        "reflection_output",
+        "light_escalation_pending",
+        "light_escalation_resolved",
+        "light_reflection_candidate",
+        # Session/conversation telemetry — per-session pivots; consumed internally
+        # by L1 essential-knowledge (queried by type directly), never user-facing.
+        "conversation_pivot",
+        # Memory internals
+        "memory_operation_executed",
+        "memory_operation",
+        "memory_index",
+        "cc_memory_file",
+        "merged_observation",
+        # Version tracking internals
+        "version_current",
+        "version_change",
+        "genesis_version_change",
+        "cc_version_baseline",
+        "cc_version_available",
+        "genesis_version_baseline",
+        "genesis_update_available",
+        "genesis_update_failed",
+        # Build / project state
+        "build_state",
+        "project_context",
+        "model_downgrade",
+        # Triage telemetry
+        "triage_depth_3",
+        "triage_depth_4",
+        # Development internals
+        "bugfix_committed",
+        "interpretation_correction",
+        "scope_clarification",
+        "feedback_rule",
+        # CC silent-cap detection — per-empty telemetry rows. Internal: only the
+        # aggregate infrastructure_alert (raised by the awareness cap detector when
+        # a run of these accumulates) surfaces to the user.
+        "cc_cap_empty_event",
+    }
+)
 
 # Default TTL for types not explicitly listed. Any new type that appears without
 # an entry in _TTL_BY_TYPE gets this default + a warning log so we notice and
@@ -136,6 +140,11 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "user_model_delta": timedelta(days=14),
     "capability_improvement": timedelta(days=14),
     "strategic_analysis": timedelta(days=14),
+    # process_reaper dry-run audit trail — the WOULD-KILL evidence an operator
+    # reviews before arming the reaper (set_operator_armed). Kept 14d (vs the 3d
+    # process_reaper_kill above) so a multi-day audit window survives, and made
+    # explicit here so it no longer logs the unknown-type warning every tick.
+    "process_reaper_would_kill": timedelta(days=14),
     # ── 30-day (intake signals, need processing time) ──────────────────
     "finding": timedelta(days=30),
     "bugfix_committed": timedelta(days=30),
@@ -191,7 +200,8 @@ def _compute_ttl(obs_type: str) -> timedelta | None:
     logger.warning(
         "Unknown observation type %r — assigning default TTL of %d days. "
         "Add it to _TTL_BY_TYPE for explicit categorization.",
-        obs_type, _DEFAULT_TTL.days,
+        obs_type,
+        _DEFAULT_TTL.days,
     )
     return _DEFAULT_TTL
 
@@ -211,6 +221,7 @@ async def create(
     expires_at: str | None = None,
     content_hash: str | None = None,
     skip_if_duplicate: bool = False,
+    origin_class: str | None = None,
 ) -> str | None:
     # Auto-compute content_hash if not provided
     if content_hash is None and content and content.strip():
@@ -222,7 +233,9 @@ async def create(
         and content_hash is not None
         and await exists_by_hash(db, source=source, content_hash=content_hash, unresolved_only=True)
     ):
-        logger.debug("Observation dedup: skipping duplicate (source=%s, hash=%s)", source, content_hash[:12])
+        logger.debug(
+            "Observation dedup: skipping duplicate (source=%s, hash=%s)", source, content_hash[:12]
+        )
         return None
 
     # Auto-TTL: compute expires_at if not explicitly provided
@@ -241,10 +254,22 @@ async def create(
     await db.execute(
         """INSERT INTO observations
            (id, person_id, source, type, category, content, priority,
-            speculative, created_at, expires_at, content_hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (id, person_id, source, type, category, content, priority,
-         speculative, created_at, expires_at, content_hash),
+            speculative, created_at, expires_at, content_hash, origin_class)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            id,
+            person_id,
+            source,
+            type,
+            category,
+            content,
+            priority,
+            speculative,
+            created_at,
+            expires_at,
+            content_hash,
+            origin_class,
+        ),
     )
     await db.commit()
     return id
@@ -263,20 +288,33 @@ async def upsert(
     category: str | None = None,
     speculative: int = 0,
     expires_at: str | None = None,
+    origin_class: str | None = None,
 ) -> str:
     """Idempotent write: insert or update on conflict."""
     await db.execute(
         """INSERT INTO observations
            (id, person_id, source, type, category, content, priority,
-            speculative, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            speculative, created_at, expires_at, origin_class)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              person_id = excluded.person_id,
              source = excluded.source, type = excluded.type, category = excluded.category,
              content = excluded.content, priority = excluded.priority,
-             speculative = excluded.speculative, expires_at = excluded.expires_at""",
-        (id, person_id, source, type, category, content, priority,
-         speculative, created_at, expires_at),
+             speculative = excluded.speculative, expires_at = excluded.expires_at,
+             origin_class = excluded.origin_class""",
+        (
+            id,
+            person_id,
+            source,
+            type,
+            category,
+            content,
+            priority,
+            speculative,
+            created_at,
+            expires_at,
+            origin_class,
+        ),
     )
     await db.commit()
     return id
@@ -743,9 +781,15 @@ async def get_standing(
     rows = await db.execute_fetchall(sql, params)
     return [
         {
-            "id": r[0], "source": r[1], "type": r[2], "category": r[3],
-            "content": r[4], "priority": r[5], "created_at": r[6],
-            "surfaced_at": r[7], "surfaced_count": r[8],
+            "id": r[0],
+            "source": r[1],
+            "type": r[2],
+            "category": r[3],
+            "content": r[4],
+            "priority": r[5],
+            "created_at": r[6],
+            "surfaced_at": r[7],
+            "surfaced_count": r[8],
         }
         for r in rows
     ]
@@ -788,9 +832,32 @@ async def count_unresolved_by_types(
         return 0
     placeholders = ",".join("?" for _ in types)
     rows = await db.execute_fetchall(
-        f"SELECT COUNT(*) FROM observations "
-        f"WHERE resolved = 0 AND type IN ({placeholders})",
+        f"SELECT COUNT(*) FROM observations WHERE resolved = 0 AND type IN ({placeholders})",
         tuple(types),
+    )
+    row = rows[0] if rows else None
+    return row[0] if row else 0
+
+
+async def count_external_by_ids(
+    db: aiosqlite.Connection,
+    ids: list[str],
+) -> int:
+    """Count observations among ``ids`` stored with external provenance.
+
+    Used by the gate-2 (identity) shadow emit to aggregate the origin of the
+    just-accepted user-model deltas: external iff ANY contributing delta row
+    carries ``origin_class='external_untrusted'``. NULL/legacy rows count as
+    first-party by omission — pre-substrate rows must not manufacture signal.
+    """
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM observations "
+        f"WHERE id IN ({marks}) "  # noqa: S608 -- placeholders bound
+        "AND origin_class = 'external_untrusted'",
+        ids,
     )
     row = rows[0] if rows else None
     return row[0] if row else 0

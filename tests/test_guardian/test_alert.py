@@ -17,7 +17,6 @@ from genesis.guardian.alert.telegram import CONFLICT_SENTINEL, TelegramAlertChan
 
 
 class TestAlert:
-
     def test_basic_alert(self) -> None:
         alert = Alert(
             severity=AlertSeverity.CRITICAL,
@@ -52,7 +51,6 @@ class TestAlert:
 
 
 class TestTelegramChannel:
-
     @pytest.fixture
     def channel(self) -> TelegramAlertChannel:
         return TelegramAlertChannel(
@@ -139,7 +137,6 @@ class TestTelegramChannel:
 
 
 class TestAlertDispatcher:
-
     @pytest.mark.asyncio
     async def test_dispatch_to_multiple_channels(self) -> None:
         ch1 = AsyncMock(spec=AlertChannel)
@@ -160,7 +157,7 @@ class TestAlertDispatcher:
         ch1 = AsyncMock(spec=AlertChannel)
         ch1.send.return_value = False  # fails
         ch2 = AsyncMock(spec=AlertChannel)
-        ch2.send.return_value = True   # succeeds
+        ch2.send.return_value = True  # succeeds
 
         dispatcher = AlertDispatcher([ch1, ch2])
         alert = Alert(severity=AlertSeverity.INFO, title="Test", body="Test")
@@ -223,6 +220,70 @@ class TestAlertDispatcher:
         assert "AsyncMock" in str(results) or len(results) == 1
 
 
+class TestAlertDispatcherQueueFallback:
+    """F.3: a total-delivery failure persists the alert to a durable queue."""
+
+    @pytest.mark.asyncio
+    async def test_all_channels_fail_enqueues(self, tmp_path) -> None:
+        from genesis.guardian.alert import queue as alert_queue
+
+        root = tmp_path / "queue"
+        ch = AsyncMock(spec=AlertChannel)
+        ch.send.return_value = False
+        dispatcher = AlertDispatcher([ch], fallback_queue_root=root)
+        alert = Alert(severity=AlertSeverity.CRITICAL, title="boom", body="down")
+
+        assert await dispatcher.send(alert) is False
+        entries = [e for _, e in alert_queue.list_queued(root)]
+        assert len(entries) == 1
+        assert entries[0]["title"] == "boom"
+        assert entries[0]["source"] == "guardian"
+
+    @pytest.mark.asyncio
+    async def test_no_channels_enqueues(self, tmp_path) -> None:
+        from genesis.guardian.alert import queue as alert_queue
+
+        root = tmp_path / "queue"
+        dispatcher = AlertDispatcher(fallback_queue_root=root)
+        alert = Alert(severity=AlertSeverity.WARNING, title="w", body="b")
+        assert await dispatcher.send(alert) is False
+        assert len(alert_queue.list_queued(root)) == 1
+
+    @pytest.mark.asyncio
+    async def test_success_does_not_enqueue(self, tmp_path) -> None:
+        from genesis.guardian.alert import queue as alert_queue
+
+        root = tmp_path / "queue"
+        ch = AsyncMock(spec=AlertChannel)
+        ch.send.return_value = True
+        dispatcher = AlertDispatcher([ch], fallback_queue_root=root)
+        alert = Alert(severity=AlertSeverity.INFO, title="ok", body="b")
+        assert await dispatcher.send(alert) is True
+        assert alert_queue.list_queued(root) == []
+
+    @pytest.mark.asyncio
+    async def test_replay_path_does_not_re_enqueue(self, tmp_path) -> None:
+        # The drain path passes allow_queue_fallback=False so a still-down
+        # channel never re-queues the entry it is replaying (double-queue trap).
+        from genesis.guardian.alert import queue as alert_queue
+
+        root = tmp_path / "queue"
+        ch = AsyncMock(spec=AlertChannel)
+        ch.send.return_value = False
+        dispatcher = AlertDispatcher([ch], fallback_queue_root=root)
+        alert = Alert(severity=AlertSeverity.CRITICAL, title="x", body="y")
+        assert await dispatcher.send(alert, allow_queue_fallback=False) is False
+        assert alert_queue.list_queued(root) == []
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_root_is_safe(self) -> None:
+        ch = AsyncMock(spec=AlertChannel)
+        ch.send.return_value = False
+        dispatcher = AlertDispatcher([ch])  # no fallback configured
+        alert = Alert(severity=AlertSeverity.WARNING, title="w", body="b")
+        assert await dispatcher.send(alert) is False  # no crash
+
+
 # ── Keyword-reply recovery-approval gate ─────────────────────────────────
 
 
@@ -246,7 +307,9 @@ class TestTelegramKeywordGate:
     @pytest.fixture
     def channel(self) -> TelegramAlertChannel:
         return TelegramAlertChannel(
-            bot_token="test-token", chat_id="12345", thread_id="67890",
+            bot_token="test-token",
+            chat_id="12345",
+            thread_id="67890",
         )
 
     # --- _send_message returns the message_id (the reply target) ---
@@ -257,7 +320,8 @@ class TestTelegramKeywordGate:
             assert channel._send_message("hi") == 4242
 
     def test_send_message_returns_none_when_not_ok(
-        self, channel: TelegramAlertChannel,
+        self,
+        channel: TelegramAlertChannel,
     ) -> None:
         resp = _urlopen_returning({"ok": False, "description": "bad request"})
         with patch.object(urllib.request, "urlopen", return_value=resp):
@@ -266,29 +330,38 @@ class TestTelegramKeywordGate:
     # --- _poll_for_keyword_sync: reply-to filter + keyword match + 409 sentinel ---
 
     def test_poll_matches_keyword_reply_to_gate(
-        self, channel: TelegramAlertChannel,
+        self,
+        channel: TelegramAlertChannel,
     ) -> None:
         """A keyword reply to OUR gate message is returned, upper-cased."""
-        updates = {"ok": True, "result": [
-            {"message": {"text": "approve", "reply_to_message": {"message_id": 100}}},
-        ]}
+        updates = {
+            "ok": True,
+            "result": [
+                {"message": {"text": "approve", "reply_to_message": {"message_id": 100}}},
+            ],
+        }
         with patch.object(urllib.request, "urlopen", return_value=_urlopen_returning(updates)):
             kw = channel._poll_for_keyword_sync(100, frozenset({"APPROVE", "DENY"}))
         assert kw == "APPROVE"
 
     def test_poll_ignores_reply_to_other_message(
-        self, channel: TelegramAlertChannel,
+        self,
+        channel: TelegramAlertChannel,
     ) -> None:
         """A keyword reply to a DIFFERENT message is not ours — ignore it."""
-        updates = {"ok": True, "result": [
-            {"message": {"text": "APPROVE", "reply_to_message": {"message_id": 999}}},
-        ]}
+        updates = {
+            "ok": True,
+            "result": [
+                {"message": {"text": "APPROVE", "reply_to_message": {"message_id": 999}}},
+            ],
+        }
         with patch.object(urllib.request, "urlopen", return_value=_urlopen_returning(updates)):
             kw = channel._poll_for_keyword_sync(100, frozenset({"APPROVE", "DENY"}))
         assert kw is None
 
     def test_poll_ignores_non_reply_keyword(
-        self, channel: TelegramAlertChannel,
+        self,
+        channel: TelegramAlertChannel,
     ) -> None:
         """A bare keyword that is NOT a reply (e.g. someone chatting) is ignored."""
         updates = {"ok": True, "result": [{"message": {"text": "APPROVE"}}]}
@@ -297,18 +370,23 @@ class TestTelegramKeywordGate:
         assert kw is None
 
     def test_poll_ignores_non_keyword_reply(
-        self, channel: TelegramAlertChannel,
+        self,
+        channel: TelegramAlertChannel,
     ) -> None:
         """A reply to the gate that isn't an allowed keyword is ignored."""
-        updates = {"ok": True, "result": [
-            {"message": {"text": "maybe later", "reply_to_message": {"message_id": 100}}},
-        ]}
+        updates = {
+            "ok": True,
+            "result": [
+                {"message": {"text": "maybe later", "reply_to_message": {"message_id": 100}}},
+            ],
+        }
         with patch.object(urllib.request, "urlopen", return_value=_urlopen_returning(updates)):
             kw = channel._poll_for_keyword_sync(100, frozenset({"APPROVE", "DENY"}))
         assert kw is None
 
     def test_poll_returns_conflict_sentinel_on_409(
-        self, channel: TelegramAlertChannel,
+        self,
+        channel: TelegramAlertChannel,
     ) -> None:
         """HTTP 409 → CONFLICT_SENTINEL (main bot alive on same token), not None."""
         err = urllib.error.HTTPError("url", 409, "Conflict", {}, None)

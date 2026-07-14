@@ -200,6 +200,23 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--db-path", default=None,
         help="results DB (default: production genesis.db; a fresh path is migrated)",
     )
+    lme_cmd.add_argument(
+        "--types", default=None,
+        help="comma-separated question types to run (filtered before --limit)",
+    )
+    lme_cmd.add_argument(
+        "--dump-dir", default=None,
+        help="write per-question diagnostics (one <arm>.jsonl per arm) here",
+    )
+    lme_cmd.add_argument(
+        "--graph", action="store_true",
+        help="ADD a +graph variant of every selected arm (linked store + expansion)",
+    )
+    lme_cmd.add_argument(
+        "--graph-link-threshold", type=float, default=None,
+        help="cosine threshold for auto-linking on the graph arm's store "
+        "(default: the prod linker default, 0.75)",
+    )
 
     eval_cmd.set_defaults(func=_run_eval_cli)
 
@@ -264,6 +281,10 @@ async def _cmd_longmemeval(args: argparse.Namespace) -> int:
         no_rerank=args.no_rerank,
         persist=not args.no_persist,
         db_path=Path(args.db_path) if args.db_path else None,
+        types=args.types,
+        dump_dir=Path(args.dump_dir) if args.dump_dir else None,
+        graph=args.graph,
+        graph_link_threshold=args.graph_link_threshold,
     )
     print_report(summaries)
     return 0
