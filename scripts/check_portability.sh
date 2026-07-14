@@ -65,7 +65,10 @@ if [ ${#existing[@]} -eq 0 ]; then
     exit 2
 fi
 
-SCAN_OUT="$(mktemp)"
+# ~/tmp per project convention — bare mktemp lands in $TMPDIR, which a CC
+# session points at the watchdog-policed cc-tmp.
+mkdir -p "$HOME/tmp"
+SCAN_OUT="$(mktemp -p "$HOME/tmp" genesis-portability-scan.XXXXXX)"
 trap 'rm -f "$SCAN_OUT"' EXIT
 
 status=0
