@@ -86,6 +86,11 @@ class QuestionArmResult:
     hypothesis: str
     judged_correct: bool
     evidence_recalled: bool
+    #: |evidence ∩ recalled| / |evidence|; None when the question has no
+    #: evidence turns (abstention) — excluded from means, never counted as 0.
+    evidence_coverage: float | None = None
+    query: str = ""
+    recalled_ids: tuple[str, ...] = ()
     judge_raw: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
@@ -126,6 +131,11 @@ def build_run_summary(
             fmean(1 if r.evidence_recalled else 0 for r in results),
             4,
         )
+    # Mean evidence COVERAGE (any-hit recall is blind to partial recall on
+    # multi-evidence questions — the key multi-session diagnostic).
+    coverages = [r.evidence_coverage for r in results if r.evidence_coverage is not None]
+    if coverages:
+        scores["evidence_coverage_mean"] = round(fmean(coverages), 4)
 
     scored: list[ScoredOutput] = []
     for r in results:
@@ -208,7 +218,11 @@ async def run_question(
                 rerank=arm.rerank,
             )
             recalled_ids = {h.memory_id for h in hits}
-            evidence_recalled = bool(ingest.evidence_memory_ids & recalled_ids)
+            evidence_ids = ingest.evidence_memory_ids
+            evidence_recalled = bool(evidence_ids & recalled_ids)
+            evidence_coverage = (
+                len(evidence_ids & recalled_ids) / len(evidence_ids) if evidence_ids else None
+            )
             memories = [h.content for h in hits]
             # answer_question / judge_answer use the SYNC OpenAI client, so run
             # them in a worker thread — a blocking create() on the event loop
@@ -219,6 +233,7 @@ async def run_question(
                 memories,
                 client=client,
                 question_type=instance.question_type,
+                question_date=instance.question_date,
             )
             verdict = await asyncio.to_thread(
                 lambda a=ans: judge_answer(
@@ -238,6 +253,9 @@ async def run_question(
                     hypothesis=ans.hypothesis,
                     judged_correct=verdict.label,
                     evidence_recalled=evidence_recalled,
+                    evidence_coverage=evidence_coverage,
+                    query=query,
+                    recalled_ids=tuple(h.memory_id for h in hits),
                     judge_raw=verdict.raw,
                     input_tokens=ans.input_tokens + verdict.input_tokens,
                     output_tokens=ans.output_tokens + verdict.output_tokens,
@@ -245,6 +263,46 @@ async def run_question(
                 ),
             )
     return out
+
+
+def write_dump_jsonl(
+    path: Path,
+    results: Sequence[QuestionArmResult],
+    *,
+    skipped_case_ids: Sequence[str] = (),
+) -> None:
+    """Write one arm's per-question diagnostics as JSONL (one line/question).
+
+    This is the failure-analysis artifact the summary rows can't provide:
+    which memories each question actually recalled, the exact query, the
+    hypothesis, and the judge verdict. Skipped (errored) questions get a
+    ``{"skipped": true}`` marker line so the file accounts for the full N.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as fh:
+        for r in results:
+            fh.write(
+                json.dumps(
+                    {
+                        "question_id": r.question_id,
+                        "question_type": r.question_type,
+                        "arm": r.arm_label,
+                        "query": r.query,
+                        "recalled_ids": list(r.recalled_ids),
+                        "evidence_recalled": r.evidence_recalled,
+                        "evidence_coverage": r.evidence_coverage,
+                        "hypothesis": r.hypothesis,
+                        "judged_correct": r.judged_correct,
+                        "judge_raw": r.judge_raw,
+                        "input_tokens": r.input_tokens,
+                        "output_tokens": r.output_tokens,
+                        "latency_ms": round(r.latency_ms, 1),
+                    },
+                )
+                + "\n",
+            )
+        for qid in skipped_case_ids:
+            fh.write(json.dumps({"question_id": qid, "skipped": True}) + "\n")
 
 
 async def run_longmemeval(
@@ -257,6 +315,7 @@ async def run_longmemeval(
     client: object | None = None,
     embedding_provider: object | None = None,
     reranker: object | None = None,
+    dump_dir: Path | None = None,
 ) -> dict[str, EvalRunSummary]:
     """Run the full harness over ``instances``; return per-arm summaries.
 
@@ -264,7 +323,9 @@ async def run_longmemeval(
     multi-arm recall against a shared per-question store cannot re-rank memories
     across arms, and RESTORES the prior value afterwards so an in-process caller
     (e.g. the test suite) isn't polluted. Persists one run per arm when ``db``
-    is provided.
+    is provided. When ``dump_dir`` is set, writes one ``<arm>.jsonl``
+    per-question diagnostics file per arm and records its path in the
+    summary's metadata.
     """
     arms = list(arms) if arms is not None else default_arms()
     client = client or build_client()
@@ -342,13 +403,18 @@ async def run_longmemeval(
 
     summaries: dict[str, EvalRunSummary] = {}
     for arm in arms:
+        arm_results = by_arm.get(arm.label, [])
         summary = build_run_summary(
             arm_label=arm.label,
             skipped_case_ids=skipped_qids,
             model=DEFAULT_MODEL,
             dataset=_DATASET,
-            results=by_arm.get(arm.label, []),
+            results=arm_results,
         )
+        if dump_dir is not None:
+            dump_path = Path(dump_dir) / f"{arm.label}.jsonl"
+            write_dump_jsonl(dump_path, arm_results, skipped_case_ids=skipped_qids)
+            summary.metadata["dump_path"] = str(dump_path)
         summaries[arm.label] = summary
         if db is not None:
             from genesis.eval.db import insert_run

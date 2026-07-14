@@ -94,6 +94,63 @@ def _instance(qid: str) -> LongMemEvalInstance:
     )
 
 
+class _PromptRecordingClient:
+    """Sync client that records every prompt and answers deterministically."""
+
+    def __init__(self):
+        self.prompts: list[str] = []
+        self._lock = threading.Lock()
+
+        chat = type("Chat", (), {})()
+        completions = type("Completions", (), {})()
+
+        def create(**kwargs):
+            with self._lock:
+                self.prompts.append(kwargs["messages"][0]["content"])
+            return _FakeCompletion("yes Business Administration")
+
+        completions.create = create
+        chat.completions = completions
+        self.chat = chat
+
+
+@pytest.mark.asyncio
+async def test_run_longmemeval_dumps_jsonl_and_anchors_date(tmp_path):
+    """--dump-dir writes one JSONL per arm with per-question diagnostics, and
+    the reader prompt carries the upstream 'Current Date:' anchor end-to-end."""
+    import json as _json
+
+    instances = [_instance("q1"), _instance("q2")]
+    client = _PromptRecordingClient()
+    summaries = await run_longmemeval(
+        instances,
+        db=None,
+        arms=[Arm(QueryArm.RAW, rerank=False)],
+        k=5,
+        concurrency=2,
+        client=client,
+        embedding_provider=_HashingEmbedder(),
+        dump_dir=tmp_path,
+    )
+    dump = tmp_path / "raw.jsonl"
+    assert dump.exists()
+    recs = [_json.loads(line) for line in dump.read_text().splitlines()]
+    assert len(recs) == 2
+    for rec in recs:
+        assert rec["arm"] == "raw"
+        assert rec["query"]
+        assert rec["recalled_ids"]
+        assert rec["evidence_coverage"] == 1.0  # single evidence turn, k=5
+        assert rec["hypothesis"]
+        assert "judged_correct" in rec
+    # dump path is recorded on the persisted summary metadata
+    assert summaries["raw"].metadata["dump_path"] == str(dump)
+    # reader prompts (not judge prompts) carry the upstream date anchor
+    reader_prompts = [p for p in client.prompts if "MEMORIES:" in p]
+    assert reader_prompts
+    assert all("Current Date: 2023/05/23 (Tue) 19:11" in p for p in reader_prompts)
+
+
 @pytest.mark.asyncio
 async def test_run_longmemeval_runs_questions_concurrently():
     instances = [_instance(f"q{i}") for i in range(4)]
