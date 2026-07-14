@@ -29,7 +29,7 @@ async def db(tmp_path):
             "  influenced_action INTEGER NOT NULL DEFAULT 0,"
             "  resolved INTEGER NOT NULL DEFAULT 0,"
             "  resolved_at TEXT, resolution_notes TEXT,"
-            "  created_at TEXT NOT NULL, expires_at TEXT, content_hash TEXT"
+            "  created_at TEXT NOT NULL, expires_at TEXT, content_hash TEXT, origin_class TEXT"
             ")"
         )
         await conn.commit()

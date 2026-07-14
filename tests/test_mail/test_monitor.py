@@ -122,7 +122,7 @@ async def db(tmp_path):
             CREATE TABLE IF NOT EXISTS observations (
                 id TEXT PRIMARY KEY, source TEXT, type TEXT,
                 category TEXT, content TEXT, priority TEXT,
-                created_at TEXT, content_hash TEXT, resolved INTEGER DEFAULT 0,
+                created_at TEXT, content_hash TEXT, origin_class TEXT, resolved INTEGER DEFAULT 0,
                 resolved_at TEXT, resolved_by TEXT,
                 person_id TEXT, speculative INTEGER DEFAULT 0,
                 expires_at TEXT, resolution_notes TEXT,

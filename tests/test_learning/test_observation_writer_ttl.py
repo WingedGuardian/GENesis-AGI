@@ -29,7 +29,8 @@ async def _build_db(path: str) -> aiosqlite.Connection:
             resolution_notes TEXT,
             created_at TEXT NOT NULL,
             expires_at TEXT,
-            content_hash TEXT
+            content_hash TEXT,
+            origin_class TEXT
         )
     """)
     await conn.commit()
