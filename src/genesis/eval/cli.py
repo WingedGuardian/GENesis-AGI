@@ -213,8 +213,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="ADD a +graph variant of every selected arm (linked store + expansion)",
     )
     lme_cmd.add_argument(
-        "--graph-link-threshold", type=float, default=0.75,
-        help="cosine threshold for auto-linking on the graph arm's store",
+        "--graph-link-threshold", type=float, default=None,
+        help="cosine threshold for auto-linking on the graph arm's store "
+        "(default: the prod linker default, 0.75)",
     )
 
     eval_cmd.set_defaults(func=_run_eval_cli)

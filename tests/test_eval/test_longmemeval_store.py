@@ -105,47 +105,57 @@ async def test_recall_surfaces_evidence_turn():
         assert result.evidence_memory_ids & ids
 
 
-def _linkable_instance() -> LongMemEvalInstance:
-    """Two near-identical turns → hashing-embedder cosine well above 0.75."""
-    base = (
-        "I spent the whole afternoon repairing the old wooden fence around the "
-        "garden before the storm arrived"
-    )
-    return LongMemEvalInstance(
-        question_id="q_link",
-        question_type="multi-session",
-        question="What did I repair before the storm?",
-        answer="the wooden fence",
-        question_date="2023/05/23 (Tue) 19:11",
-        haystack_dates=["2023/05/01 (Mon) 10:00", "2023/05/02 (Tue) 10:00"],
-        haystack_session_ids=["s1", "s2"],
-        haystack_sessions=[
-            [Turn("user", f"{base} yesterday.", True)],
-            [Turn("user", f"{base} today.", True)],
-        ],
-        answer_session_ids=["a1", "a2"],
-    )
-
-
 @pytest.mark.asyncio
 async def test_with_linker_ingest_creates_memory_links():
     """with_linker + auto_link wires the real MemoryLinker: near-identical
     turns link, the links land in the ephemeral SQLite, and es.db exposes it."""
+    from tests.test_eval.lme_fixtures import make_linkable_instance
+
     async with ephemeral_store(
         embedding_provider=_HashingEmbedder(),
         with_linker=True,
     ) as es:
-        await ingest_haystack(es.store, _linkable_instance(), auto_link=True)
-        cur = await es.db.execute("SELECT COUNT(*) FROM memory_links")
-        (n,) = await cur.fetchone()
-        assert n >= 1
+        await ingest_haystack(es.store, make_linkable_instance(), auto_link=True)
+        rows = await es.db.execute_fetchall("SELECT COUNT(*) FROM memory_links")
+        assert rows[0][0] >= 1
 
 
 @pytest.mark.asyncio
 async def test_default_store_has_no_linker_and_no_links():
     """Without with_linker, auto_link=True must stay a no-op (no silent links)."""
+    from tests.test_eval.lme_fixtures import make_linkable_instance
+
     async with ephemeral_store(embedding_provider=_HashingEmbedder()) as es:
-        await ingest_haystack(es.store, _linkable_instance(), auto_link=True)
-        cur = await es.db.execute("SELECT COUNT(*) FROM memory_links")
-        (n,) = await cur.fetchone()
-        assert n == 0
+        await ingest_haystack(es.store, make_linkable_instance(), auto_link=True)
+        rows = await es.db.execute_fetchall("SELECT COUNT(*) FROM memory_links")
+        assert rows[0][0] == 0
+
+
+@pytest.mark.asyncio
+async def test_expand_neighbors_skips_dangling_links():
+    """A memory_links edge whose neighbor no longer resolves must be skipped
+    silently — never crash expansion, never surface a ghost id."""
+    from genesis.db.crud import memory_links as memory_links_crud
+    from genesis.eval.longmemeval.runner import _expand_neighbors
+    from tests.test_eval.lme_fixtures import make_linkable_instance
+
+    async with ephemeral_store(
+        embedding_provider=_HashingEmbedder(),
+        with_linker=True,
+    ) as es:
+        result = await ingest_haystack(es.store, make_linkable_instance(), auto_link=True)
+        (seed_id, *_rest) = sorted(result.evidence_memory_ids)
+        # Fabricate a dangling edge: strongest link points at a ghost memory.
+        await memory_links_crud.create(
+            es.db,
+            source_id=seed_id,
+            target_id="ghost-no-such-memory",
+            link_type="supports",
+            strength=0.99,
+            created_at="2026-01-01",
+        )
+        expanded = await _expand_neighbors(es.db, [seed_id], k=5)
+        expanded_ids = {mid for mid, _ in expanded}
+        assert "ghost-no-such-memory" not in expanded_ids
+        # the real linked sibling still expands
+        assert expanded_ids & (result.evidence_memory_ids - {seed_id})

@@ -130,3 +130,17 @@ async def test_constructor_threshold_is_auto_link_default(qdrant, db):
             "mem-1", [0.1] * 1024, similarity_threshold=0.6,
         )
     assert links == []  # explicit call kwarg still overrides the constructor
+
+
+def test_invalid_similarity_threshold_rejected(qdrant, db):
+    """NaN/out-of-range thresholds silently densify the graph (NaN makes
+    score < t always False) — the constructor must reject them."""
+    for bad in (float("nan"), -0.1, 1.5):
+        with pytest.raises(ValueError, match="similarity_threshold"):
+            MemoryLinker(qdrant_client=qdrant, db=db, similarity_threshold=bad)
+
+
+@pytest.mark.asyncio()
+async def test_invalid_call_level_threshold_rejected(linker):
+    with pytest.raises(ValueError, match="similarity_threshold"):
+        await linker.auto_link("mem-1", [0.1] * 1024, similarity_threshold=float("nan"))

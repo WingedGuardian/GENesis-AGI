@@ -14,6 +14,20 @@ from genesis.qdrant.collections import search
 
 logger = logging.getLogger(__name__)
 
+#: The prod-default auto-link cosine threshold. Single source of truth —
+#: eval/CLI layers reference this instead of repeating the literal.
+DEFAULT_SIMILARITY_THRESHOLD = 0.75
+
+
+def _validated_threshold(value: float) -> float:
+    """Reject out-of-range/NaN thresholds — ``NaN`` makes ``score < t`` always
+    False, silently linking EVERYTHING up to max_links (graph densification)."""
+    if not 0.0 <= value <= 1.0:  # NaN fails this comparison too
+        msg = f"similarity_threshold must be in [0, 1], got {value!r}"
+        raise ValueError(msg)
+    return value
+
+
 # Valid typed link types from schema CHECK constraint
 _VALID_LINK_TYPES = frozenset(
     {
@@ -47,11 +61,11 @@ class MemoryLinker:
         *,
         qdrant_client: QdrantClient,
         db: aiosqlite.Connection,
-        similarity_threshold: float = 0.75,
+        similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     ) -> None:
         self._qdrant = qdrant_client
         self._db = db
-        self._similarity_threshold = similarity_threshold
+        self._similarity_threshold = _validated_threshold(similarity_threshold)
 
     async def auto_link(
         self,
@@ -65,6 +79,8 @@ class MemoryLinker:
         """Find similar memories and create links."""
         if similarity_threshold is None:
             similarity_threshold = self._similarity_threshold
+        else:
+            similarity_threshold = _validated_threshold(similarity_threshold)
         results = search(
             self._qdrant,
             collection=collection,
@@ -88,14 +104,26 @@ class MemoryLinker:
 
             link_type = "extends" if score >= 0.90 else "supports"
 
-            await memory_links.create(
-                self._db,
-                source_id=memory_id,
-                target_id=target_id,
-                link_type=link_type,
-                strength=score,
-                created_at=now,
-            )
+            try:
+                await memory_links.create(
+                    self._db,
+                    source_id=memory_id,
+                    target_id=target_id,
+                    link_type=link_type,
+                    strength=score,
+                    created_at=now,
+                )
+            except Exception:
+                # Duplicate PK / transient lock: one failed link must not abort
+                # the whole store() call (mirrors create_typed_links' guard).
+                logger.debug(
+                    "auto_link %s → %s (%s) already exists or failed",
+                    memory_id,
+                    target_id,
+                    link_type,
+                    exc_info=True,
+                )
+                continue
 
             links.append(
                 LinkRecord(

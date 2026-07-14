@@ -1,6 +1,8 @@
 """Ephemeral Genesis memory store for LongMemEval — zero production contact.
 
-Each question gets a throwaway store built entirely from scratch:
+Each question gets one or two throwaway stores built entirely from scratch
+(baseline arms share a link-free store; graph arms get a second store built
+``with_linker`` — see ``runner.run_question``):
   * an in-process ``QdrantClient(":memory:")`` (never the production Qdrant),
   * a fresh temp SQLite created by ``init_db`` under ``~/tmp`` (never the
     production ``genesis.db``),
@@ -21,8 +23,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from genesis.memory.linker import DEFAULT_SIMILARITY_THRESHOLD
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+
+    import aiosqlite
 
     from genesis.memory.retrieval import HybridRetriever
     from genesis.memory.store import MemoryStore
@@ -39,7 +45,7 @@ class EphemeralStore:
     store: MemoryStore
     retriever: HybridRetriever
     workdir: Path
-    db: object = None
+    db: aiosqlite.Connection | None = None
 
 
 def _default_tmp_root() -> Path:
@@ -56,7 +62,7 @@ async def ephemeral_store(
     reranker: object | None = None,
     tmp_root: str | Path | None = None,
     with_linker: bool = False,
-    link_threshold: float = 0.75,
+    link_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
 ) -> AsyncIterator[EphemeralStore]:
     """Build a fresh ephemeral store; tear down all temp state on exit.
 
@@ -120,4 +126,27 @@ async def ephemeral_store(
             await db.close()
         with contextlib.suppress(Exception):
             qdrant.close()
+        if embedding_provider is None:
+            # We constructed this embedder: close its httpx clients + diskcache
+            # BEFORE deleting the workdir its cache lives under. Injected
+            # embedders belong to the caller (run_longmemeval shares one per
+            # run and closes it itself).
+            await close_embedder(embedder)
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def close_embedder(embedder: object) -> None:
+    """Best-effort close of an embedder's httpx clients + diskcache.
+
+    ``EmbeddingProvider`` exposes no ``close()``; reach in defensively so a
+    future internal change degrades to a no-op rather than raising.
+    """
+    for backend in getattr(embedder, "backends", []) or []:
+        http_client = getattr(backend, "_client", None)
+        if http_client is not None and hasattr(http_client, "aclose"):
+            with contextlib.suppress(Exception):
+                await http_client.aclose()
+    cache = getattr(embedder, "_disk_cache", None)
+    if cache is not None and hasattr(cache, "close"):
+        with contextlib.suppress(Exception):
+            cache.close()

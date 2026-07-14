@@ -52,8 +52,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--graph-link-threshold",
         type=float,
-        default=0.75,
-        help="cosine threshold for auto-linking on the graph arm's store",
+        default=None,
+        help="cosine threshold for auto-linking on the graph arm's store "
+        "(default: the prod linker default, 0.75)",
     )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)

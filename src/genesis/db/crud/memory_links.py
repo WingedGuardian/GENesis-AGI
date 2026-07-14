@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
+
+logger = logging.getLogger(__name__)
 
 
 async def create(
@@ -123,12 +126,20 @@ async def inter_candidate_links(
     return [(row[0], row[1]) for row in rows]
 
 
+# Seed cap for neighbors_of: the query binds 2*len(seeds) (+ optional link
+# types) + 1 placeholders, so 450 keeps the worst case ~901 — under the 999
+# SQLITE_MAX_VARIABLE_NUMBER floor this file's IN-list convention targets.
+# (inter_candidate_links' 499 assumes its own 2n shape; don't borrow caps.)
+_NEIGHBOR_SEED_CAP = 450
+
+
 async def neighbors_of(
     db: aiosqlite.Connection,
     memory_ids: list[str],
     *,
     exclude: list[str] | tuple[str, ...] = (),
     limit: int = 10,
+    link_types: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """1-hop neighbors of *memory_ids* via ``memory_links``, strongest first.
 
@@ -136,31 +147,52 @@ async def neighbors_of(
     ``MAX(strength)`` — the PK is ``(source_id, target_id, link_type)`` (DLI-04),
     so a pair with multiple link types yields multiple rows, and several seeds
     can reach the same neighbor; a naive UNION would burn ``limit`` slots on
-    duplicates. Seeds themselves and ``exclude`` ids are never returned.
+    duplicates. Ties break on neighbor id (deterministic across runs). Seeds
+    and ``exclude`` ids are never returned: exclusion happens in PYTHON, not
+    SQL, so (a) the placeholder count stays bounded regardless of exclude
+    size, and (b) capping an oversized seed list can never re-admit a
+    truncated seed as a "neighbor".
+
+    ``link_types`` optionally restricts which edge types are followed —
+    callers expanding into LLM-visible context should exclude adversarial
+    types like ``contradicts`` (the LongMemEval graph arm only ever stores
+    supports/extends, so it passes None).
 
     Returns ``[{"memory_id": ..., "strength": ...}]``. Used by recall-time
-    graph expansion (LongMemEval graph arm; prod graph/entity recall wiring
-    reuses this as the canonical neighbor query).
+    graph expansion (LongMemEval graph arm; intended canonical home for the
+    committed prod graph/entity recall wiring).
     """
-    if not memory_ids:
+    if not memory_ids or limit <= 0:
         return []
-    if len(memory_ids) > 499:
-        memory_ids = memory_ids[:499]
+    seeds = memory_ids
+    if len(seeds) > _NEIGHBOR_SEED_CAP:
+        logger.warning(
+            "neighbors_of: %d seed ids truncated to %d (placeholder budget)",
+            len(seeds),
+            _NEIGHBOR_SEED_CAP,
+        )
+        seeds = seeds[:_NEIGHBOR_SEED_CAP]
+    # Drop the FULL original seed list (not just the capped slice) + exclude.
     dropped = {*memory_ids, *exclude}
-    ph = ",".join("?" * len(memory_ids))
-    drop_ph = ",".join("?" * len(dropped))
+    ph = ",".join("?" * len(seeds))
+    type_clause = ""
+    type_params: list[str] = []
+    if link_types:
+        type_ph = ",".join("?" * len(link_types))
+        type_clause = f" AND link_type IN ({type_ph})"
+        type_params = list(link_types)
     rows = await db.execute_fetchall(
         f"SELECT neighbor, MAX(strength) AS s FROM ("
         f"  SELECT target_id AS neighbor, strength FROM memory_links"
-        f"    WHERE source_id IN ({ph})"
+        f"    WHERE source_id IN ({ph}){type_clause}"
         f"  UNION ALL"
         f"  SELECT source_id AS neighbor, strength FROM memory_links"
-        f"    WHERE target_id IN ({ph})"
-        f") WHERE neighbor NOT IN ({drop_ph})"
-        f" GROUP BY neighbor ORDER BY s DESC LIMIT ?",
-        [*memory_ids, *memory_ids, *dropped, limit],
+        f"    WHERE target_id IN ({ph}){type_clause}"
+        f") GROUP BY neighbor ORDER BY s DESC, neighbor LIMIT ?",
+        [*seeds, *type_params, *seeds, *type_params, limit + len(dropped)],
     )
-    return [{"memory_id": row[0], "strength": row[1]} for row in rows]
+    out = [{"memory_id": row[0], "strength": row[1]} for row in rows if row[0] not in dropped]
+    return out[:limit]
 
 
 async def get_bidirectional(db: aiosqlite.Connection, memory_id: str) -> list[dict]:
