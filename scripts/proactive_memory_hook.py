@@ -1257,6 +1257,38 @@ def _enrich_with_metadata(results: list[dict]) -> None:
         pass  # Best-effort enrichment — never block the hook
 
 
+def _enforce_drop_filter(fused: list[dict]) -> tuple[list[dict], int]:
+    """WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): the proactive hook is THE
+    pushed feed — in a dispatched session (GENESIS_SESSION_ID env) under
+    enforce, blockable stored-external items are dropped before formatting.
+    Returns ``(kept, dropped_count)``; the caller counts dropped items into
+    the post-output emit (the enforce-mode row is the block ledger). Any
+    import/config error fails OPEN (all items kept, wrapped downstream).
+    """
+    try:
+        from genesis.security.immunity_shadow import should_enforce_drop
+
+        kept: list[dict] = []
+        dropped = 0
+        unsup = bool(os.environ.get("GENESIS_SESSION_ID"))
+        for r in fused:
+            if should_enforce_drop(
+                gate="injection",
+                collection=r.get("collection"),
+                source_pipeline=r.get("source_pipeline"),
+                origin_class=r.get("origin_class"),
+                pushed_surface=True,
+                unsupervised=unsup,
+            ):
+                dropped += 1
+            else:
+                kept.append(r)
+        return kept, dropped
+    except Exception as exc:
+        print(f"Enforce-drop check skipped: {exc}", file=sys.stderr)
+        return fused, 0
+
+
 def _format_results(results: list[dict]) -> str:
     """Format surfaced memories for injection with age, wing, and ID.
 
@@ -1753,33 +1785,7 @@ async def _run(prompt: str, session_id: str = "") -> None:
             shadow=_shadow,
         )
         fused = [r for r in fused if not _is_garbage(r.get("content", ""))]
-        # WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): the proactive hook is
-        # THE pushed feed — in a dispatched session (GENESIS_SESSION_ID env)
-        # under enforce, blockable stored-external items are dropped before
-        # formatting. Dropped items are still counted into the post-output
-        # emit (the enforce-mode row is the block ledger). Any import/config
-        # error fails OPEN (items kept, wrapped downstream as today).
-        _enforce_dropped = 0
-        try:
-            from genesis.security.immunity_shadow import should_enforce_drop
-
-            _kept: list[dict] = []
-            _unsup = bool(os.environ.get("GENESIS_SESSION_ID"))
-            for r in fused:
-                if should_enforce_drop(
-                    gate="injection",
-                    collection=r.get("collection"),
-                    source_pipeline=r.get("source_pipeline"),
-                    origin_class=r.get("origin_class"),
-                    pushed_surface=True,
-                    unsupervised=_unsup,
-                ):
-                    _enforce_dropped += 1
-                else:
-                    _kept.append(r)
-            fused = _kept
-        except Exception as exc:
-            print(f"Enforce-drop check skipped: {exc}", file=sys.stderr)
+        fused, _enforce_dropped = _enforce_drop_filter(fused)
         fused_count = len(fused)
 
         # Graph breadcrumbs: 1-hop sync SQL for top results (~5ms total).
