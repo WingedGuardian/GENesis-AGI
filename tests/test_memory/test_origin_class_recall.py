@@ -144,3 +144,26 @@ async def test_missing_stored_origin_is_none(mock_qdrant, mock_crud, mock_links,
     )
     assert results
     assert all(r.origin_class is None for r in results)
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_qdrant_payload_missing_coalesces_to_fts_row(mock_qdrant, mock_crud, mock_links, _):
+    """A Qdrant hit whose payload predates the 0054 backfill coalesces the
+    stored class from the joined FTS/SQLite row (Codex P2 on #1042)."""
+    retriever = _build_retriever()
+    mock_qdrant.search.return_value = [_qdrant_hit("dual-1", 0.9, origin_class=None)]
+    mock_crud.search_ranked = AsyncMock(
+        return_value=[_fts_row("dual-1", -5.0, origin_class="first_party")]
+    )
+    mock_crud.batch_created_at = AsyncMock(return_value={})
+    _link_mocks(mock_links)
+
+    results = await retriever.recall(
+        "test", source="episodic", limit=5, min_activation=0.0, rerank=False,
+    )
+    assert results
+    assert results[0].origin_class == "first_party"

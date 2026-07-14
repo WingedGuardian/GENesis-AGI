@@ -1245,10 +1245,12 @@ def _enrich_with_metadata(results: list[dict]) -> None:
                     if not r.get("_wing"):
                         r["_wing"] = meta[mid].get("wing")
                     r.setdefault("collection", meta[mid].get("collection"))
-                    # WS-3 stored provenance — fills paths that lack the
-                    # Qdrant payload / FTS join value (setdefault: never
-                    # overrides a value the search path already carried).
-                    r.setdefault("origin_class", meta[mid].get("origin_class"))
+                    # WS-3 stored provenance — fills paths whose search value
+                    # is missing OR None (Qdrant dicts always carry the key,
+                    # None for pre-backfill payloads, so setdefault would
+                    # refuse the fill). A real search-path value always wins.
+                    if r.get("origin_class") is None:
+                        r["origin_class"] = meta[mid].get("origin_class")
         finally:
             conn.close()
     except Exception:

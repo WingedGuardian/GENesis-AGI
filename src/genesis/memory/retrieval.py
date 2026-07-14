@@ -436,10 +436,15 @@ def _assemble_results(
                 source_pipeline=_p.get("source_pipeline"),
                 # WS-3 stored provenance: read from ``payload`` (not ``_p``)
                 # so FTS5-only hits recover it too — their row dict carries
-                # ``origin_class`` from the search_ranked LEFT JOIN.
-                # ``source_pipeline`` stays Qdrant-only: it has no SQLite
-                # column for episodic and is NOT recoverable on the FTS path.
-                origin_class=payload.get("origin_class"),
+                # ``origin_class`` from the search_ranked LEFT JOIN. COALESCE
+                # to the FTS row for a Qdrant hit whose payload predates the
+                # 0054 backfill — SQLite is authoritative when the payload
+                # key is absent/None. ``source_pipeline`` stays Qdrant-only:
+                # it has no SQLite column and is NOT recoverable on FTS.
+                origin_class=(
+                    payload.get("origin_class")
+                    or (fts_hit.get("origin_class") if fts_hit else None)
+                ),
                 memory_class=_p.get("memory_class", "fact"),
                 query_intent=intent.category,
                 intent_confidence=intent.confidence,

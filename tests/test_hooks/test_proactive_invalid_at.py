@@ -306,3 +306,24 @@ def test_enrich_with_metadata_stamps_origin_class(tmp_path, monkeypatch):
     preset = [{"memory_id": "alive", "content": "x", "origin_class": "first_party"}]
     hook._enrich_with_metadata(preset)
     assert preset[0]["origin_class"] == "first_party"
+
+
+def test_enrich_with_metadata_fills_none_valued_key(tmp_path, monkeypatch):
+    """Qdrant hook dicts always carry the key (None for pre-backfill
+    payloads) — the metadata fill must treat None as missing (Codex P2)."""
+    db = tmp_path / "m.db"
+    _build_db(str(db))
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "UPDATE memory_metadata SET origin_class = 'first_party' "
+            "WHERE memory_id = 'alive'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(hook, "_DB_PATH", db)
+
+    results = [{"memory_id": "alive", "content": "x", "origin_class": None}]
+    hook._enrich_with_metadata(results)
+    assert results[0]["origin_class"] == "first_party"
