@@ -42,11 +42,12 @@ def print_report(summaries: dict[str, EvalRunSummary]) -> None:
             f"\n[{arm_label}]  overall={s.aggregate_score}  "
             f"attempted={attempted}/{s.total_cases}{skip_note}",
         )
-        ev = s.scores.get("evidence_recall_rate")
-        if ev is not None:
-            print(f"    evidence_recall_rate: {ev}")
+        for metric in ("evidence_recall_rate", "evidence_coverage_mean"):
+            val = s.scores.get(metric)
+            if val is not None:
+                print(f"    {metric}: {val}")
         for qtype, acc in sorted(s.scores.items()):
-            if qtype == "evidence_recall_rate":
+            if qtype in ("evidence_recall_rate", "evidence_coverage_mean"):
                 continue
             print(f"    {qtype}: {acc}")
         cost = sum(r.cost_usd for r in s.results)

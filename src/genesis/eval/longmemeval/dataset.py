@@ -118,6 +118,9 @@ def filter_by_types(
     loudly instead of silently returning an empty slice.
     """
     wanted = {t.strip() for t in types_csv.split(",") if t.strip()}
+    if not wanted:
+        msg = "no question types given (empty --types would silently select nothing)"
+        raise ValueError(msg)
     unknown = wanted - QUESTION_TYPES
     if unknown:
         msg = f"unknown question type(s): {sorted(unknown)}; valid: {sorted(QUESTION_TYPES)}"

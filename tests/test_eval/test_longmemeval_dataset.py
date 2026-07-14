@@ -119,3 +119,10 @@ def test_filter_by_types_rejects_unknown_type(oracle_file):
     instances = load_oracle(oracle_file)
     with pytest.raises(ValueError, match="unknown question type"):
         filter_by_types(instances, "temporal-reasoning,not-a-type")
+
+
+def test_filter_by_types_rejects_empty_selection(oracle_file):
+    # an empty/whitespace csv would otherwise silently select nothing
+    instances = load_oracle(oracle_file)
+    with pytest.raises(ValueError, match="no question types"):
+        filter_by_types(instances, " , ")
