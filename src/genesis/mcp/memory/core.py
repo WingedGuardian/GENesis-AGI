@@ -899,6 +899,24 @@ async def memory_core_facts(
     scored.sort(key=lambda x: x[1], reverse=True)
     top = scored[:limit]
 
+    # Stored-origin enrichment: a point whose Qdrant payload predates the
+    # origin_class payload backfill carries None here, but SQLite
+    # memory_metadata has the backfilled value — without this, a stale payload
+    # would bypass both the enforce drop and the wrap below (the episodic
+    # collection can never flag via the fallback derivation). Best-effort: on
+    # any error items keep their payload values (fail-open, gate posture).
+    _missing = [item["memory_id"] for item, _ in top if item.get("origin_class") is None]
+    if _missing:
+        try:
+            from genesis.db.crud import memory as memory_crud
+
+            _by_id = await memory_crud.origin_class_by_ids(memory_mod._db, _missing)
+            for item, _ in top:
+                if item.get("origin_class") is None:
+                    item["origin_class"] = _by_id.get(item["memory_id"])
+        except Exception:
+            logger.debug("core_facts origin enrichment failed", exc_info=True)
+
     # WS-3 B4 gate 4 (injection): core_facts is a query-less AMBIENT surface
     # that scrolls episodic directly — it bypasses HybridRetriever, so the
     # .recall()-AST enumeration lock never saw it (gap caught during the B4

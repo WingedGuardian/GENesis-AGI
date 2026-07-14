@@ -654,10 +654,12 @@ verified: 3d5234b9 2026-07-13
   validator honesty guard): gate-4 drops `external_untrusted` from PUSHED feeds
   (proactive hook, `memory_proactive`, `memory_core_facts`) ONLY in dispatched
   UNSUPERVISED sessions under enforce — the discriminator is
-  `GENESIS_SESSION_ID` present AND `GENESIS_SESSION_SUPERVISED` absent
-  (`CCInvocation.supervised`, stamped by `_build_env`; the session id alone is
-  attribution and foreground conversations carry one too, so ConversationManager
-  marks its invocations supervised). Explicit queries
+  `GENESIS_CC_SESSION` present (stamped unconditionally on every CCInvoker
+  child) AND `GENESIS_SESSION_SUPERVISED` absent (`CCInvocation.supervised`,
+  set only by ConversationManager's owner-attended invocations).
+  `GENESIS_SESSION_ID` is attribution only — foreground conversations carry
+  one and some autonomy dispatches don't, so it is wrong in both directions
+  as a supervision signal. Explicit queries
   (`memory_recall`/`knowledge_recall`/`memory_expand`) and every foreground
   surface keep wrapped external in all modes (`should_enforce_drop`, fail-open);
   gate-3 refuses grant evidence/state writes with a blockable origin — and the

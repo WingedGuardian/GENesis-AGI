@@ -62,11 +62,18 @@ def _write(path: Path, data: dict) -> None:
 
 
 def _dispatched(monkeypatch) -> None:
+    """Headless CCInvoker dispatch: the unconditional CC marker, no supervised
+    flag. The attribution id is set here for realism but is NOT the signal."""
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
     monkeypatch.setenv("GENESIS_SESSION_ID", "redteam-session-0001")
+    monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
 
 
 def _foreground(monkeypatch) -> None:
+    """User-launched terminal CC session: no CCInvoker env markers at all."""
+    monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
     monkeypatch.delenv("GENESIS_SESSION_ID", raising=False)
+    monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
 
 
 def _rr(mid: str, origin: str | None, *, collection: str = "episodic_memory") -> RetrievalResult:
@@ -301,6 +308,84 @@ async def test_memory_core_facts_drops_external_dispatched_enforce(
         "SELECT gate, mode FROM immunity_shadow_events WHERE source_ref LIKE '%core_facts%'"
     )
     assert ("injection", "enforce") in [tuple(r) for r in rows]
+
+
+async def test_memory_core_facts_enriches_legacy_payload_from_sqlite(
+    config_dirs,
+    monkeypatch,
+    db,
+):
+    """Codex round-3 P1: a scrolled point whose Qdrant payload predates the
+    origin_class backfill (key absent) but whose SQLite memory_metadata says
+    external_untrusted must still be gated — enrichment happens BEFORE the
+    drop/wrap decision, so a stale payload can't bypass the gate."""
+    base, _ = config_dirs
+    _write(base, {"injection": {"mode": "enforce"}})
+    _dispatched(monkeypatch)
+
+    import genesis.mcp.memory_mcp as mod
+
+    await db.execute(
+        "INSERT INTO memory_metadata (memory_id, created_at, origin_class) VALUES (?, ?, ?)",
+        ("legacy-ext", "2026-01-01T00:00:00+00:00", "external_untrusted"),
+    )
+    await db.commit()
+
+    def _point(mid, origin, content):
+        payload = {
+            "content": content,
+            "source": "test",
+            "confidence": 0.9,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "retrieved_count": 1,
+            "memory_class": "fact",
+            "wing": "",
+            "room": "",
+            "source_pipeline": "conversation",
+        }
+        if origin is not None:
+            payload["origin_class"] = origin
+        return SimpleNamespace(id=mid, payload=payload)
+
+    qdrant = MagicMock()
+    qdrant.scroll.return_value = (
+        [
+            _point("legacy-ext", None, INJECTION_TEXT),  # pre-backfill payload
+            _point("fp-1", "first_party", "benign fact"),
+        ],
+        None,
+    )
+    old = (mod._store, mod._db, mod._qdrant, mod._retriever)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._qdrant = qdrant
+        mod._retriever = MagicMock()
+        tools = await _mcp_tools()
+        out = await tools["memory_core_facts"].fn(limit=10)
+    finally:
+        mod._store, mod._db, mod._qdrant, mod._retriever = old
+
+    ids = [d["memory_id"] for d in out]
+    assert "legacy-ext" not in ids, "SQLite-backfilled external must be dropped"
+    assert "fp-1" in ids
+
+    # Foreground under the same config: kept, but wrapped (enrichment feeds
+    # the wrap decision too).
+    _foreground(monkeypatch)
+    old = (mod._store, mod._db, mod._qdrant, mod._retriever)
+    try:
+        mod._store = MagicMock()
+        mod._db = db
+        mod._qdrant = qdrant
+        mod._retriever = MagicMock()
+        tools = await _mcp_tools()
+        out2 = await tools["memory_core_facts"].fn(limit=10)
+    finally:
+        mod._store, mod._db, mod._qdrant, mod._retriever = old
+    by_id = {d["memory_id"]: d for d in out2}
+    assert "legacy-ext" in by_id
+    assert "<external-content" in by_id["legacy-ext"]["content"]
 
 
 # ─── gate-4 WRAP-RETAINED: explicit queries keep external even under enforce ─
@@ -663,20 +748,34 @@ async def test_memory_expand_wraps_stored_external_episodic(config_dirs, monkeyp
 
 
 def _supervised_conversation(monkeypatch) -> None:
-    """Owner-attended foreground conversation: attribution id present (set by
-    observability.session_context for terminal/telegram chats) PLUS the
-    supervised marker stamped from CCInvocation.supervised."""
+    """Owner-attended interactive conversation (terminal/telegram
+    ConversationManager): CCInvoker child (CC marker) with the supervised
+    marker stamped from CCInvocation.supervised, plus the attribution id."""
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
     monkeypatch.setenv("GENESIS_SESSION_ID", "redteam-conv-0001")
     monkeypatch.setenv("GENESIS_SESSION_SUPERVISED", "1")
 
 
-async def test_session_id_alone_is_not_unsupervised(config_dirs, monkeypatch):
-    """GENESIS_SESSION_ID is attribution, not supervision: with the supervised
-    marker present the process must NOT read as dispatched."""
+async def test_dispatch_discriminator_matrix(config_dirs, monkeypatch):
+    """GENESIS_CC_SESSION (unconditional dispatch marker) minus the supervised
+    flag is the signal — GENESIS_SESSION_ID is attribution only. Codex
+    round-2: foreground conversations carry a session id (must not read
+    dispatched); round-3: autonomy research/step_dispatcher dispatches carry
+    NO session id (must still read dispatched)."""
+    # Owner-attended conversation: CC child, supervised → NOT dispatched.
     _supervised_conversation(monkeypatch)
     assert immunity_shadow.is_dispatched_session_env() is False
+    # Same CC child without the supervised marker → dispatched.
     monkeypatch.delenv("GENESIS_SESSION_SUPERVISED")
     assert immunity_shadow.is_dispatched_session_env() is True
+    # Round-3 case: headless dispatch with NO session-context id at all.
+    monkeypatch.delenv("GENESIS_SESSION_ID")
+    assert immunity_shadow.is_dispatched_session_env() is True
+    # Non-CCInvoker process with a stray session id (attribution only) →
+    # supervised (fail-open direction, documented).
+    monkeypatch.delenv("GENESIS_CC_SESSION")
+    monkeypatch.setenv("GENESIS_SESSION_ID", "attribution-only")
+    assert immunity_shadow.is_dispatched_session_env() is False
 
 
 async def test_memory_proactive_supervised_conversation_keeps_wrapped(config_dirs, monkeypatch, db):

@@ -103,25 +103,28 @@ def is_dispatched_session_env() -> bool:
     """True iff this process runs inside an UNSUPERVISED Genesis-dispatched CC session.
 
     Two env signals, both stamped by ``CCInvoker._build_env`` (inherited by the
-    session's MCP servers and hooks, popped when absent, read per call):
+    session's MCP servers and hooks, read per call):
 
-    - ``GENESIS_SESSION_ID`` — ATTRIBUTION only. Foreground conversations
-      (terminal/telegram ConversationManager) set a session id too, via
-      ``observability.session_context``, so its presence alone must never be
-      read as "unsupervised" (Codex P2 on #1048: enforce would have dropped
-      pushed external content from the owner's own chat).
+    - ``GENESIS_CC_SESSION`` — set UNCONDITIONALLY on every CCInvoker child.
+      This, not ``GENESIS_SESSION_ID``, is the dispatch marker: the session id
+      is pure attribution and is ABSENT on dispatch paths that never set
+      ``observability.session_context`` (autonomy step_dispatcher, executor
+      research — Codex round-3 on #1048), while foreground conversations DO
+      carry one (Codex round-2) — so the id is wrong in both directions.
     - ``GENESIS_SESSION_SUPERVISED`` — set from ``CCInvocation.supervised``,
-      True only for owner-attended interactive conversations.
+      True only for owner-attended interactive conversations
+      (terminal/telegram ConversationManager); popped otherwise.
 
-    Dispatched/unsupervised = session id present AND supervised marker absent.
-    Fail directions (documented): a dispatch path bypassing CCInvoker has no
-    session id → reads supervised → keeps wrapped external (fail-open); a new
-    foreground path missing the supervised flag drops pushed external there
-    (autoimmune direction — visible in the enforce ledger + auto-demote).
+    Dispatched/unsupervised = CC dispatch marker present AND supervised marker
+    absent. Fail directions (documented): a dispatch path bypassing CCInvoker
+    entirely has neither marker → reads supervised → keeps wrapped external
+    (fail-open); a new foreground path missing the supervised flag drops
+    pushed external there (autoimmune direction — visible in the enforce
+    ledger + auto-demote).
     """
     import os
 
-    return bool(os.environ.get("GENESIS_SESSION_ID")) and (
+    return os.environ.get("GENESIS_CC_SESSION") == "1" and (
         os.environ.get("GENESIS_SESSION_SUPERVISED") != "1"
     )
 

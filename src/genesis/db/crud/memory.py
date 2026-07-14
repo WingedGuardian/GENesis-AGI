@@ -33,14 +33,14 @@ def _prepare_fts5(query: str, *, boolean: bool = False) -> str | None:
     if boolean:
         # Preserve OR/AND keywords and parentheses for structured queries.
         # Strip everything else that could cause FTS5 syntax errors.
-        cleaned = re.sub(r'[^\w\s()]', " ", query, flags=re.UNICODE).strip()
+        cleaned = re.sub(r"[^\w\s()]", " ", query, flags=re.UNICODE).strip()
         # Safety: strip unbalanced parentheses rather than crash FTS5
         if cleaned.count("(") != cleaned.count(")"):
             cleaned = cleaned.replace("(", " ").replace(")", " ").strip()
     else:
         # Lowercase neutralizes accidental boolean operators (OR/AND).
         # Strip all non-alphanumeric to prevent FTS5 syntax errors.
-        cleaned = re.sub(r'[^\w\s]', " ", query.lower(), flags=re.UNICODE).strip()
+        cleaned = re.sub(r"[^\w\s]", " ", query.lower(), flags=re.UNICODE).strip()
     return cleaned or None
 
 
@@ -139,8 +139,7 @@ async def search(
     params.append(limit)
     rows = await db.execute_fetchall(sql, params)
     return [
-        {"memory_id": r[0], "content": r[1], "source_type": r[2], "collection": r[3]}
-        for r in rows
+        {"memory_id": r[0], "content": r[1], "source_type": r[2], "collection": r[3]} for r in rows
     ]
 
 
@@ -174,6 +173,7 @@ async def search_ranked(
     if as_of is None:
         from datetime import UTC
         from datetime import datetime as _dt
+
         as_of = _dt.now(UTC).isoformat()
 
     # The JOIN with memory_metadata is now always required for invalid_at
@@ -192,19 +192,13 @@ async def search_ranked(
         params.append(collection)
     # Always-on bitemporal filter: NULL invalid_at = valid forever; otherwise
     # the fact must still be valid at as_of.
-    sql += (
-        " AND (memory_metadata.invalid_at IS NULL "
-        "OR memory_metadata.invalid_at > ?)"
-    )
+    sql += " AND (memory_metadata.invalid_at IS NULL OR memory_metadata.invalid_at > ?)"
     params.append(as_of)
     # Dream cycle deprecation filter: exclude consolidated memories by default.
     # NULL deprecated (legacy rows pre-migration) = not deprecated.
     # Pass include_deprecated=True for audit/history queries.
     if not include_deprecated:
-        sql += (
-            " AND (memory_metadata.deprecated IS NULL "
-            "OR memory_metadata.deprecated = 0)"
-        )
+        sql += " AND (memory_metadata.deprecated IS NULL OR memory_metadata.deprecated = 0)"
     if exclude_subsystems:
         placeholders = ",".join("?" * len(exclude_subsystems))
         sql += (
@@ -214,17 +208,18 @@ async def search_ranked(
         params.extend(exclude_subsystems)
     elif include_only_subsystems:
         placeholders = ",".join("?" * len(include_only_subsystems))
-        sql += (
-            f" AND memory_metadata.source_subsystem IN ({placeholders})"
-        )
+        sql += f" AND memory_metadata.source_subsystem IN ({placeholders})"
         params.extend(include_only_subsystems)
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
     rows = await db.execute_fetchall(sql, params)
     return [
         {
-            "memory_id": r[0], "content": r[1], "source_type": r[2],
-            "collection": r[3], "rank": r[4],
+            "memory_id": r[0],
+            "content": r[1],
+            "source_type": r[2],
+            "collection": r[3],
+            "rank": r[4],
             # WS-3 stored provenance — from the (already-joined)
             # memory_metadata row; NULL for pre-0054 rows.
             "origin_class": r[5],
@@ -233,11 +228,27 @@ async def search_ranked(
     ]
 
 
+async def origin_class_by_ids(db: aiosqlite.Connection, ids: list[str]) -> dict[str, str | None]:
+    """memory_id → stored ``origin_class`` for the given ids (missing ids omitted).
+
+    Used by surfaces that read Qdrant payloads directly (memory_core_facts)
+    to recover the backfilled SQLite value when a point's payload predates
+    the origin_class payload backfill — a stale payload must not bypass the
+    WS-3 injection gate.
+    """
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    rows = await db.execute_fetchall(
+        f"SELECT memory_id, origin_class FROM memory_metadata WHERE memory_id IN ({marks})",  # noqa: S608 -- placeholders bound
+        ids,
+    )
+    return {r[0]: r[1] for r in rows}
+
+
 async def delete(db: aiosqlite.Connection, *, memory_id: str) -> bool:
     """Delete a memory entry from the FTS5 index."""
-    cursor = await db.execute(
-        "DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,)
-    )
+    cursor = await db.execute("DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,))
     await db.commit()
     return cursor.rowcount > 0
 
@@ -279,18 +290,27 @@ async def create_metadata(
     # "Friday" or date ranges) falls back to created_at; unparseable
     # invalid_at is dropped (NULL = valid forever) rather than stored as
     # a string that breaks the always-on filter.
-    resolved_valid_at = (
-        canonical_iso(valid_at) or canonical_iso(created_at) or created_at
-    )
+    resolved_valid_at = canonical_iso(valid_at) or canonical_iso(created_at) or created_at
     await db.execute(
         "INSERT OR IGNORE INTO memory_metadata "
         "(memory_id, created_at, collection, confidence, embedding_status, "
         "memory_class, wing, room, valid_at, invalid_at, source_subsystem, "
         "origin_class) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (memory_id, created_at, collection, confidence, embedding_status,
-         memory_class, wing, room, resolved_valid_at,
-         canonical_iso(invalid_at), source_subsystem, origin_class),
+        (
+            memory_id,
+            created_at,
+            collection,
+            confidence,
+            embedding_status,
+            memory_class,
+            wing,
+            room,
+            resolved_valid_at,
+            canonical_iso(invalid_at),
+            source_subsystem,
+            origin_class,
+        ),
     )
     await db.commit()
     return memory_id
@@ -380,12 +400,8 @@ async def count_fts_metadata_drift(db: aiosqlite.Connection) -> tuple[int, int]:
     # ``memory_fts.memory_id`` is UNINDEXED, so each per-row lookup scans the
     # whole FTS content table — pathologically slow at 20k+ rows and run under
     # the shared-connection lock. Comparing distinct-id set sizes avoids it.
-    fts_rows = await db.execute_fetchall(
-        "SELECT COUNT(DISTINCT memory_id) FROM memory_fts"
-    )
-    meta_rows = await db.execute_fetchall(
-        "SELECT COUNT(DISTINCT memory_id) FROM memory_metadata"
-    )
+    fts_rows = await db.execute_fetchall("SELECT COUNT(DISTINCT memory_id) FROM memory_fts")
+    meta_rows = await db.execute_fetchall("SELECT COUNT(DISTINCT memory_id) FROM memory_metadata")
     both_rows = await db.execute_fetchall(
         "SELECT COUNT(*) FROM ("
         "SELECT memory_id FROM memory_fts "
@@ -414,15 +430,12 @@ async def embedding_status_counts(db: aiosqlite.Connection) -> dict[str, int]:
     failure); ``failed`` (recovery gave up — permanently non-vector-searchable).
     """
     rows = await db.execute_fetchall(
-        "SELECT embedding_status, COUNT(*) FROM memory_metadata "
-        "GROUP BY embedding_status"
+        "SELECT embedding_status, COUNT(*) FROM memory_metadata GROUP BY embedding_status"
     )
     return {str(status): int(cnt) for status, cnt in rows}
 
 
-async def set_embedding_status(
-    db: aiosqlite.Connection, memory_id: str, status: str
-) -> bool:
+async def set_embedding_status(db: aiosqlite.Connection, memory_id: str, status: str) -> bool:
     """Set ``memory_metadata.embedding_status`` for a memory. Returns True if a row changed."""
     cursor = await db.execute(
         "UPDATE memory_metadata SET embedding_status = ? WHERE memory_id = ?",
@@ -480,8 +493,7 @@ async def batch_created_at(
         chunk = memory_ids[offset : offset + _CHUNK]
         ph = ",".join("?" * len(chunk))
         rows = await db.execute_fetchall(
-            f"SELECT memory_id, created_at FROM memory_metadata"
-            f" WHERE memory_id IN ({ph})",
+            f"SELECT memory_id, created_at FROM memory_metadata WHERE memory_id IN ({ph})",
             chunk,
         )
         for row in rows:
@@ -503,8 +515,7 @@ async def match_id_prefix(
     pre-validate the prefix shape (hex/dash).
     """
     rows = await db.execute_fetchall(
-        "SELECT memory_id FROM memory_metadata"
-        " WHERE memory_id LIKE ? || '%' LIMIT ?",
+        "SELECT memory_id FROM memory_metadata WHERE memory_id LIKE ? || '%' LIMIT ?",
         (prefix, limit),
     )
     return [str(r[0]) for r in rows]
@@ -512,9 +523,7 @@ async def match_id_prefix(
 
 async def delete_metadata(db: aiosqlite.Connection, *, memory_id: str) -> bool:
     """Delete a memory_metadata row. Returns True if deleted."""
-    cursor = await db.execute(
-        "DELETE FROM memory_metadata WHERE memory_id = ?", (memory_id,)
-    )
+    cursor = await db.execute("DELETE FROM memory_metadata WHERE memory_id = ?", (memory_id,))
     await db.commit()
     return cursor.rowcount > 0
 

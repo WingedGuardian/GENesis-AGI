@@ -35,14 +35,14 @@ async def _build_db(path: str) -> aiosqlite.Connection:
     """)
     rows = [
         # (memory_id, invalid_at, content) — all contain "row" for FTS match
-        ("alive",   None,                       "this row never expires"),
-        ("future",  "2099-01-01T00:00:00+00:00", "this row is valid until 2099"),
+        ("alive", None, "this row never expires"),
+        ("future", "2099-01-01T00:00:00+00:00", "this row is valid until 2099"),
         ("expired", "2020-01-01T00:00:00+00:00", "this row expired in 2020"),
     ]
     for mid, inv, content in rows:
         await conn.execute(
-            "INSERT INTO memory_metadata (memory_id, created_at, invalid_at) "
-            "VALUES (?, ?, ?)", (mid, "2020-01-01T00:00:00+00:00", inv),
+            "INSERT INTO memory_metadata (memory_id, created_at, invalid_at) VALUES (?, ?, ?)",
+            (mid, "2020-01-01T00:00:00+00:00", inv),
         )
         await conn.execute(
             "INSERT INTO memory_fts "
@@ -73,7 +73,9 @@ async def test_as_of_in_past_keeps_expired(tmp_path) -> None:
     conn = await _build_db(str(tmp_path / "t.db"))
     try:
         rows = await memory_crud.search_ranked(
-            conn, query="row", as_of="2019-01-01T00:00:00+00:00",
+            conn,
+            query="row",
+            as_of="2019-01-01T00:00:00+00:00",
         )
         ids = {r["memory_id"] for r in rows}
         # At 2019, all three were valid (expired was valid until 2020-01-01)
@@ -89,13 +91,13 @@ async def test_invalid_at_combines_with_subsystem_filter(tmp_path) -> None:
     try:
         # Tag 'future' as a subsystem write so it gets excluded too
         await conn.execute(
-            "UPDATE memory_metadata SET source_subsystem='reflection' "
-            "WHERE memory_id='future'"
+            "UPDATE memory_metadata SET source_subsystem='reflection' WHERE memory_id='future'"
         )
         await conn.commit()
 
         rows = await memory_crud.search_ranked(
-            conn, query="row",
+            conn,
+            query="row",
             exclude_subsystems=["ego", "triage", "reflection"],
         )
         ids = {r["memory_id"] for r in rows}
@@ -103,5 +105,24 @@ async def test_invalid_at_combines_with_subsystem_filter(tmp_path) -> None:
         # future: NULL invalid_at fine, but reflection → excluded
         # expired: invalid_at past → excluded
         assert ids == {"alive"}
+    finally:
+        await conn.close()
+
+
+async def test_origin_class_by_ids(tmp_path):
+    """WS-3 B4: batch memory_id → stored origin_class lookup (used by
+    memory_core_facts to recover backfilled values for stale Qdrant payloads)."""
+    conn = await _build_db(str(tmp_path / "o.db"))
+    try:
+        await conn.execute(
+            "UPDATE memory_metadata SET origin_class='external_untrusted' WHERE memory_id='alive'"
+        )
+        await conn.commit()
+
+        got = await memory_crud.origin_class_by_ids(conn, ["alive", "expired", "nope"])
+        assert got["alive"] == "external_untrusted"
+        assert got["expired"] is None  # row exists, origin NULL
+        assert "nope" not in got  # missing id omitted
+        assert await memory_crud.origin_class_by_ids(conn, []) == {}
     finally:
         await conn.close()
