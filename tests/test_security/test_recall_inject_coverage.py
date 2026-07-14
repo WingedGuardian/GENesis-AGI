@@ -78,12 +78,11 @@ KNOWN_RECALL_SITES: dict[str, tuple[str, str]] = {
         "pipeline-internal", "CRAG re-retrieve; results flow back through wrapped recall"),
 }
 
-# NOTE: memory_expand (mcp/memory/core.py) is ALSO a wrapped inject site, but it
-# retrieves via ``_qdrant.retrieve(...)`` (by-id), not ``.recall(...)``, so it is
-# not captured by this AST sweep. Its wrapping is verified by its own unit test.
-# Likewise the proactive_memory_hook.py script lives outside src/genesis and is
-# covered by tests/test_hooks/test_proactive_provenance.py. If a future change
-# routes either through ``.recall(...)``, this registry will demand it be listed.
+# NOTE: memory_expand and memory_core_facts (mcp/memory/core.py) are ALSO
+# wrapped inject sites, but they read Qdrant directly (by-id retrieve / scroll),
+# not via ``.recall(...)`` — they are captured by the KNOWN_QDRANT_READ_SITES
+# sweep below. The proactive_memory_hook.py script lives outside src/genesis and
+# is covered by tests/test_hooks/test_proactive_provenance.py.
 
 
 def _discover_recall_sites() -> dict[str, int]:
@@ -132,6 +131,9 @@ _GATE_VALID = {"gated", "deferred-with-reason"}
 _EXTRA_WRAPPED_SITES: dict[str, tuple[str, str]] = {
     "mcp/memory/core.py::memory_expand": (
         "gated", "by-id retrieve (not .recall); wraps + emits external hits"),
+    "mcp/memory/core.py::memory_core_facts": (
+        "gated", "episodic scroll (not .recall); wraps stored-external items "
+        "+ emits (B4 — caught by the qdrant-read sweep below)"),
     "scripts/proactive_memory_hook.py::_run": (
         "gated", "sync emit after stdout flush; lives outside src/genesis"),
 }
@@ -261,3 +263,135 @@ def test_every_recall_site_is_classified():
         "Registered recall site(s) no longer found (rename/removal?) — update "
         "KNOWN_RECALL_SITES:\n  " + "\n  ".join(sorted(stale))
     )
+
+
+# ── WS-3 B4: non-recall Qdrant content-read sweep ───────────────────────────
+# ``memory_core_facts`` scrolled episodic and injected full content into a
+# prompt while being INVISIBLE to the ``.recall()`` sweep above — the header\'s
+# "hand enumeration does not converge" applied to the sweep itself. This second
+# sweep closes that class mechanically: every direct Qdrant ``.scroll(...)`` /
+# ``.retrieve(...)`` call site under src/genesis must be classified here.
+#
+#   prompt-gated         — payload CONTENT reaches an LLM prompt; the site wraps
+#                          blockable items and emits the gate-4 shadow record.
+#   infra                — counters/vectors/tags/existence/ops only; no content
+#                          flows into any prompt.
+#   library              — shared Qdrant helper; its CALLERS carry the
+#                          classification.
+#   deferred-with-reason — content DOES reach an LLM but gating is explicitly
+#                          tracked work (rationale must name the follow-up
+#                          concern).
+_QDRANT_READ_VALID = {"prompt-gated", "infra", "library", "deferred-with-reason"}
+
+KNOWN_QDRANT_READ_SITES: dict[str, tuple[str, str]] = {
+    "eval/bench/isolation.py::_scroll_usage": (
+        "infra", "bench snapshot usage-payload copy between collections"),
+    "mcp/memory/core.py::_increment_retrieved": (
+        "infra", "retrieved_count writeback; reads the counter only"),
+    "mcp/memory/core.py::memory_core_facts": (
+        "prompt-gated", "episodic confidence-scroll into the caller prompt; "
+        "wraps stored-external items + emits gate 4 (B4)"),
+    "mcp/memory/core.py::memory_expand": (
+        "prompt-gated", "by-id full-payload expand; wraps + emits gate 4"),
+    "memory/dream_cycle.py::_get_vector": (
+        "infra", "vectors only (with_vectors, no content use)"),
+    "memory/dream_cycle.py::_rehydrate_cluster": (
+        "deferred-with-reason", "cluster member CONTENT feeds the consolidation "
+        "LLM and the synthesized canonical memory does not inherit member "
+        "origin_class — an origin-LAUNDERING path, not a session-inject path. "
+        "Origin-aware consolidation is a tracked WS-3 follow-up; today only a "
+        "handful of episodic rows are external and daily-slice runs shadow."),
+    "memory/health.py::_scan_duplicates": (
+        "infra", "duplicate-detection metric; content hashed, never prompted"),
+    "memory/intent.py::expand_query": (
+        "infra", "tag-index rebuild; with_payload=[tags] only"),
+    "qdrant/collections.py::batch_retrieve_vectors": (
+        "library", "shared helper; callers classified individually"),
+    "qdrant/collections.py::get_point": (
+        "library", "shared helper; callers classified individually"),
+    "qdrant/collections.py::scroll_points": (
+        "library", "shared helper; callers classified individually"),
+    "resilience/embedding_recovery.py::_point_exists": (
+        "infra", "existence check for recovery bookkeeping"),
+    "runtime/init/memory.py::_migrate_reference_vectors": (
+        "infra", "boot-time vector migration"),
+    "session_awareness/ranking.py::rank_candidates": (
+        "deferred-with-reason", "candidate CONTENT reaches the ambient "
+        "attention ARBITER prompt (judgment-only CC run, output = pick "
+        "indices). Origin-aware arbiter handling is a tracked WS-3 follow-up; "
+        "episodic-external volume is currently negligible."),
+    "surplus/extraction_calibration.py::run_calibration": (
+        "infra", "confidence/retrieved_count aggregation only"),
+}
+
+
+def _discover_qdrant_read_sites() -> dict[str, int]:
+    """{"relpath::func": lineno} for every ``X.scroll(...)``/``X.retrieve(...)``
+    call site under src/genesis. Attribute-name match — a non-Qdrant object
+    with a ``.retrieve``/``.scroll`` method would surface here too; classify it
+    (usually ``infra``) rather than narrowing the sweep."""
+    found: dict[str, int] = {}
+    for path in _SRC.rglob("*.py"):
+        try:
+            tree = ast.parse(path.read_text(), filename=str(path))
+        except SyntaxError:
+            continue
+        funcs = [
+            (n.lineno, getattr(n, "end_lineno", n.lineno), n.name)
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        rel = path.relative_to(_SRC).as_posix()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("scroll", "retrieve")
+            ):
+                best, enclosing = -1, "<module>"
+                for start, end, name in funcs:
+                    if start <= node.lineno <= (end or start) and start > best:
+                        best, enclosing = start, name
+                found.setdefault(f"{rel}::{enclosing}", node.lineno)
+    return found
+
+
+def test_qdrant_read_dispositions_valid():
+    for key, (disp, why) in KNOWN_QDRANT_READ_SITES.items():
+        assert disp in _QDRANT_READ_VALID, f"{key}: invalid disposition {disp!r}"
+        assert why.strip(), f"{key}: empty rationale"
+
+
+def test_every_qdrant_read_site_is_classified():
+    discovered = set(_discover_qdrant_read_sites())
+    registered = set(KNOWN_QDRANT_READ_SITES)
+
+    unregistered = discovered - registered
+    assert not unregistered, (
+        "New Qdrant .scroll()/.retrieve() call site(s) not classified:\n  "
+        + "\n  ".join(sorted(unregistered))
+        + "\n\nClassify each in KNOWN_QDRANT_READ_SITES: if payload CONTENT "
+        "reaches an LLM prompt, wrap blockable items + emit gate 4 and mark it "
+        "'prompt-gated'; otherwise 'infra'/'library', or 'deferred-with-reason' "
+        "naming the tracked concern."
+    )
+
+    stale = registered - discovered
+    assert not stale, (
+        "Registered Qdrant read site(s) no longer found (rename/removal?) — "
+        "update KNOWN_QDRANT_READ_SITES:\n  " + "\n  ".join(sorted(stale))
+    )
+
+
+def test_prompt_gated_qdrant_sites_emit():
+    """Every 'prompt-gated' Qdrant read site must call record_would_block[_sync]
+    — deleting/moving the emit fails CI."""
+    emitters = _functions_calling({"record_would_block", "record_would_block_sync"})
+    for key, (disp, _why) in KNOWN_QDRANT_READ_SITES.items():
+        if disp != "prompt-gated":
+            continue
+        assert key in emitters, (
+            f"{key} is classified 'prompt-gated' but its function does not call "
+            "immunity_shadow.record_would_block[_sync]. Re-wire the emit or "
+            "reclassify with a reason."
+        )

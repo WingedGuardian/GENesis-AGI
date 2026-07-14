@@ -121,6 +121,7 @@ class VoiceConversationHandler:
                             if immunity_shadow.item_is_blockable(
                                 collection=getattr(r, "collection", None),
                                 source_pipeline=source_pipeline,
+                                origin_class=getattr(r, "origin_class", None),
                             ):
                                 blockable += 1
                         else:

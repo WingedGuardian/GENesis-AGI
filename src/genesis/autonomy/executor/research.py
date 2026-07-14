@@ -248,6 +248,7 @@ class DeepResearcherImpl:
                     if immunity_shadow.item_is_blockable(
                         collection=getattr(r, "collection", None),
                         source_pipeline=getattr(r, "source_pipeline", None),
+                        origin_class=getattr(r, "origin_class", None),
                     ):
                         blockable += 1
                 lines.append(f"- {content}")

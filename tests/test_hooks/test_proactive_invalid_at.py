@@ -56,6 +56,7 @@ def _build_db(path: str) -> None:
                 valid_at         TEXT,
                 invalid_at       TEXT,
                 source_subsystem TEXT,
+                origin_class TEXT,
                 deprecated       INTEGER NOT NULL DEFAULT 0,
                 dream_cycle_run_id TEXT
             )
@@ -257,3 +258,72 @@ def test_expired_memory_ids_boundary_future_kept(tmp_path) -> None:
     )
     assert got == {"expired"}
     assert "alive" not in got
+
+
+# ── WS-3 B4: _search_fts5 carries stored origin_class ────────────────────────
+
+
+def test_search_fts5_carries_origin_class(tmp_path):
+    db = tmp_path / "m.db"
+    _build_db(str(db))
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "UPDATE memory_metadata SET origin_class = 'external_untrusted' "
+            "WHERE memory_id = 'alive'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    rows = hook._search_fts5(db, ["row"])
+    by_id = {r["memory_id"]: r for r in rows}
+    assert by_id["alive"]["origin_class"] == "external_untrusted"
+    # No stamped value -> NULL surfaces as None (fallback derivation decides).
+    assert by_id["future"]["origin_class"] is None
+
+
+def test_enrich_with_metadata_stamps_origin_class(tmp_path, monkeypatch):
+    """_enrich_with_metadata backfills origin_class for fused dicts that lack
+    it (e.g. wing-filter hits) without overriding a search-path value."""
+    db = tmp_path / "m.db"
+    _build_db(str(db))
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "UPDATE memory_metadata SET origin_class = 'external_untrusted' "
+            "WHERE memory_id = 'alive'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(hook, "_DB_PATH", db)
+
+    results = [{"memory_id": "alive", "content": "x"}]
+    hook._enrich_with_metadata(results)
+    assert results[0]["origin_class"] == "external_untrusted"
+
+    # setdefault semantics: an origin the search path already carried wins.
+    preset = [{"memory_id": "alive", "content": "x", "origin_class": "first_party"}]
+    hook._enrich_with_metadata(preset)
+    assert preset[0]["origin_class"] == "first_party"
+
+
+def test_enrich_with_metadata_fills_none_valued_key(tmp_path, monkeypatch):
+    """Qdrant hook dicts always carry the key (None for pre-backfill
+    payloads) — the metadata fill must treat None as missing (Codex P2)."""
+    db = tmp_path / "m.db"
+    _build_db(str(db))
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "UPDATE memory_metadata SET origin_class = 'first_party' "
+            "WHERE memory_id = 'alive'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(hook, "_DB_PATH", db)
+
+    results = [{"memory_id": "alive", "content": "x", "origin_class": None}]
+    hook._enrich_with_metadata(results)
+    assert results[0]["origin_class"] == "first_party"

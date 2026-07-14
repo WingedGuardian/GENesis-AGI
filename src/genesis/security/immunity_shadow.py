@@ -59,23 +59,41 @@ logger = logging.getLogger(__name__)
 _FIRST_PARTY_KB_PIPELINES = frozenset({"surplus", "reference_store", "extraction_job"})
 
 
-def item_is_blockable(*, collection: str | None, source_pipeline: str | None) -> bool:
+def item_is_blockable(
+    *,
+    collection: str | None,
+    source_pipeline: str | None,
+    origin_class: str | None = None,
+) -> bool:
     """True iff a recalled item would be blocked by the injection gate.
 
-    The AUTHORITATIVE external signal is the COLLECTION — ``knowledge_base`` ==
-    external-world, always known at recall time (unlike the per-item
-    source_pipeline, which drift recall overwrites with ``drift``). A KB item is
-    first-party (not blockable) ONLY when its source_pipeline is one that writes
-    first-party content INTO the KB (:data:`_FIRST_PARTY_KB_PIPELINES`) — never
-    because of a retrieval-mechanism tag. This keeps the never-block invariant
-    honest at the site AND counts drift-recalled external content.
+    STORED-FIRST (B4): when the item's stored ``origin_class`` (stamped at
+    store time, migration 0054; plumbed through recall by this PR) is
+    available, it is authoritative — ``immunity.is_blockable`` keys on it
+    directly. This is a deliberate semantic WIDENING vs the old re-derivation:
+    episodic ``external_untrusted`` rows (written by dispatched external
+    sessions, #1021) become observable/blockable, which is exactly what the
+    session-origin substrate built. It also FIXES the over-observe FP class:
+    a first-party item living in the KB via a non-whitelist pipeline no
+    longer counts blockable when its stored class says first_party.
 
-    NOTE (B4): this uses the recall dict's (collection, source_pipeline), not
-    the STORED origin_class (the retriever doesn't plumb it yet). Safe in shadow
-    (never blocks; conservative — over-observes only a first-party item stored
-    via a non-KB-content pipeline yet living in the KB); ENFORCE (B4) must gate
-    on the stored origin_class. Tracked as a B1 follow-up.
+    FALLBACK (stored value absent — pre-0054 row or a surface that doesn't
+    plumb it): the original (collection, source_pipeline) re-derivation. The
+    AUTHORITATIVE external signal there is the COLLECTION — ``knowledge_base``
+    == external-world, always known at recall time (unlike the per-item
+    source_pipeline, which drift recall overwrites with ``drift``). A KB item
+    is first-party (not blockable) ONLY when its source_pipeline is one that
+    writes first-party content INTO the KB
+    (:data:`_FIRST_PARTY_KB_PIPELINES`) — never because of a
+    retrieval-mechanism tag.
+
+    Either path keeps the never-block invariant honest: owner/first_party
+    stored classes are never blockable by construction
+    (``immunity.is_blockable``), and the fallback only ever flags
+    external-collection content.
     """
+    if origin_class is not None:
+        return immunity.is_blockable(origin_class)
     if not is_external(collection):
         return False
     return source_pipeline not in _FIRST_PARTY_KB_PIPELINES
