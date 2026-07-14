@@ -295,7 +295,8 @@ def _atomic_yaml_write(filename: str, data: dict) -> Path:
     _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     path = _USER_CONFIG_DIR / filename
     tmp_fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent), suffix=".yaml.tmp",
+        dir=str(path.parent),
+        suffix=".yaml.tmp",
     )
     try:
         with open(tmp_fd, "w") as f:
@@ -326,8 +327,12 @@ def _validate_tts(changes: dict) -> list[str]:
     errors: list[str] = []
     valid_providers = {"elevenlabs", "fish_audio", "cartesia"}
     valid_top_keys = {
-        "provider", "elevenlabs", "fish_audio", "cartesia",
-        "sanitization", "voice_gate",
+        "provider",
+        "elevenlabs",
+        "fish_audio",
+        "cartesia",
+        "sanitization",
+        "voice_gate",
     }
 
     for key in changes:
@@ -370,8 +375,11 @@ def _validate_resilience(changes: dict) -> list[str]:
     recovery = changes.get("recovery", {})
     if isinstance(recovery, dict):
         for field in (
-            "confirmation_probes", "confirmation_interval_s",
-            "drain_pace_s", "embedding_pace_per_min", "queue_overflow_threshold",
+            "confirmation_probes",
+            "confirmation_interval_s",
+            "drain_pace_s",
+            "embedding_pace_per_min",
+            "queue_overflow_threshold",
         ):
             _validate_positive_int(recovery, field, errors)
 
@@ -412,8 +420,7 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
     valid_models = VALID_MODEL_NAMES
     if "model" in section and section["model"] not in valid_models:
         errors.append(
-            f"inbox_monitor.model must be one of {sorted(valid_models)}, "
-            f"got '{section['model']}'"
+            f"inbox_monitor.model must be one of {sorted(valid_models)}, got '{section['model']}'"
         )
 
     valid_efforts = VALID_EFFORT_NAMES
@@ -566,6 +573,7 @@ def _validate_surplus(changes: dict) -> list[str]:
 
 def _validate_ego(changes: dict) -> list[str]:
     from genesis.ego.config import validate_ego_config
+
     return validate_ego_config(changes)
 
 
@@ -663,9 +671,7 @@ def _validate_cc_roster(changes: dict) -> list[str]:
                 model_defs.update(chg_models)
             if default not in model_defs:
                 avail = ", ".join(sorted(model_defs)) or "(none)"
-                errors.append(
-                    f"default '{default}' is not a roster model; available: {avail}"
-                )
+                errors.append(f"default '{default}' is not a roster model; available: {avail}")
             else:
                 entry = model_defs[default] or {}
                 native = bool(entry.get("native_subscription")) or default == "claude"
@@ -675,8 +681,7 @@ def _validate_cc_roster(changes: dict) -> list[str]:
                     auth_env = entry.get("auth_env")
                     if not (base_url and model_id and auth_env):
                         errors.append(
-                            f"default '{default}' is missing "
-                            "anthropic_base_url/model_id/auth_env"
+                            f"default '{default}' is missing anthropic_base_url/model_id/auth_env"
                         )
                     elif not os.environ.get(auth_env):
                         errors.append(
@@ -687,21 +692,15 @@ def _validate_cc_roster(changes: dict) -> list[str]:
     return errors
 
 
-# WS-3 gates whose enforce branch is NOT built (B4 ships autonomy+injection).
-_ENFORCE_NOT_IMPLEMENTED = frozenset({"procedure", "identity"})
-
-
 def _validate_ws3_immunity(changes: dict) -> list[str]:
     """Validate ws3_immunity kill-switch changes (see genesis.security.immunity)."""
-    from genesis.security.immunity import GATES, MODES
+    from genesis.security.immunity import ENFORCE_NOT_IMPLEMENTED, GATES, MODES
 
     errors: list[str] = []
     valid_top_keys = {"enabled", "auto_demote", "auto_demote_state", *GATES}
     for key, value in changes.items():
         if key not in valid_top_keys:
-            errors.append(
-                f"Unknown key '{key}'. Valid: {', '.join(sorted(valid_top_keys))}"
-            )
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(sorted(valid_top_keys))}")
         elif key == "enabled":
             if not isinstance(value, bool):
                 errors.append("'enabled' must be a boolean")
@@ -710,10 +709,9 @@ def _validate_ws3_immunity(changes: dict) -> list[str]:
                 errors.append(f"'{key}' must be a mapping like {{mode: shadow}}")
             elif value.get("mode") not in MODES:
                 errors.append(
-                    f"'{key}.mode' must be one of {', '.join(MODES)}; "
-                    f"got {value.get('mode')!r}"
+                    f"'{key}.mode' must be one of {', '.join(MODES)}; got {value.get('mode')!r}"
                 )
-            elif value.get("mode") == "enforce" and key in _ENFORCE_NOT_IMPLEMENTED:
+            elif value.get("mode") == "enforce" and key in ENFORCE_NOT_IMPLEMENTED:
                 # Honesty guard (B4): a gate with no enforce branch must not
                 # accept mode=enforce — the config would LIE (rows relabel +
                 # auto-demote arms while content still crosses). Remove each
@@ -760,7 +758,11 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
 
 
 def _validate_float_range(
-    d: dict, key: str, lo: float, hi: float, errors: list[str],
+    d: dict,
+    key: str,
+    lo: float,
+    hi: float,
+    errors: list[str],
 ) -> None:
     if key not in d:
         return
@@ -822,10 +824,7 @@ async def _impl_settings_get(domain: str) -> dict:
         if isinstance(wrapper, dict):
             wrapper.pop(field, None)
     local_file = _local_filename(entry.config_filename)
-    has_local = (
-        (_USER_CONFIG_DIR / local_file).is_file()
-        or (_CONFIG_DIR / local_file).is_file()
-    )
+    has_local = (_USER_CONFIG_DIR / local_file).is_file() or (_CONFIG_DIR / local_file).is_file()
     result = {
         "domain": domain,
         "config": config,
@@ -839,7 +838,9 @@ async def _impl_settings_get(domain: str) -> dict:
 
 
 async def _impl_settings_update(
-    domain: str, changes: dict, dry_run: bool = False,
+    domain: str,
+    changes: dict,
+    dry_run: bool = False,
 ) -> dict:
     entry = _DOMAIN_REGISTRY.get(domain)
     if entry is None:
@@ -895,7 +896,9 @@ async def _impl_settings_update(
         _atomic_yaml_write(local_file, new_local)
     except Exception:
         logger.error(
-            "Failed to write local settings for %s", domain, exc_info=True,
+            "Failed to write local settings for %s",
+            domain,
+            exc_info=True,
         )
         return {"domain": domain, "error": "Failed to write local config file"}
 
