@@ -50,7 +50,7 @@ def main() -> int:
     )
 
     async def _run() -> int:
-        imported = already = invalid = 0
+        imported = filled = already = invalid = 0
         async with aiosqlite.connect(str(db_path), timeout=5) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
@@ -82,10 +82,13 @@ def main() -> int:
                     if row is None:
                         print(f"  would import {session_id}")
                         imported += 1
+                    elif row.get("origin_prompt") is None:
+                        print(f"  would fill origin on stub {session_id}")
+                        filled += 1
                     else:
                         already += 1
                     continue
-                created = await crud.import_charter(
+                status = await crud.import_charter(
                     db,
                     session_id=session_id,
                     origin_prompt=str(origin_prompt),
@@ -97,9 +100,12 @@ def main() -> int:
                     created_at=charter.get("created_at"),
                     updated_at=charter.get("updated_at"),
                 )
-                if created:
+                if status == "imported":
                     imported += 1
                     print(f"  imported {session_id}")
+                elif status == "origin_filled":
+                    filled += 1
+                    print(f"  filled origin on stub {session_id}")
                 else:
                     already += 1
                 # Regenerate the mirror from the (possibly pre-existing) DB row
@@ -109,7 +115,10 @@ def main() -> int:
                     write_charter_md(sessions_dir, session_id, row, ledger)
 
         mode = "DRY RUN — " if args.dry_run else ""
-        print(f"{mode}imported {imported}, already-in-db {already}, invalid {invalid}")
+        print(
+            f"{mode}imported {imported}, origin-filled {filled},"
+            f" already-in-db {already}, invalid {invalid}"
+        )
         return 0
 
     return asyncio.run(_run())

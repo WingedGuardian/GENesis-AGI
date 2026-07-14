@@ -16,7 +16,7 @@ SID = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
 
 
 async def test_import_charter_roundtrip(db):
-    created = await crud.import_charter(
+    status = await crud.import_charter(
         db,
         session_id=SID,
         origin_prompt="Let's fix the flaky retry logic in the pipeline.",
@@ -27,7 +27,7 @@ async def test_import_charter_roundtrip(db):
         compaction_count=3,
         created_at="2026-07-13T00:00:00+00:00",
     )
-    assert created is True
+    assert status == "imported"
     row = await crud.get(db, SID)
     assert row["origin_prompt"] == "Let's fix the flaky retry logic in the pipeline."
     assert row["origin_ts"] == "2026-06-30T15:21:47.312Z"
@@ -38,27 +38,34 @@ async def test_import_charter_roundtrip(db):
 
 async def test_import_charter_never_overwrites(db):
     await crud.import_charter(db, session_id=SID, origin_prompt="first origin", origin_ts="t1")
-    created = await crud.import_charter(
+    status = await crud.import_charter(
         db, session_id=SID, origin_prompt="SECOND origin", origin_ts="t2"
     )
-    assert created is False
+    assert status == "skipped"
     row = await crud.get(db, SID)
     assert row["origin_prompt"] == "first origin"
     assert row["origin_ts"] == "t1"
 
 
-async def test_stub_then_mission_survives_import(db):
-    """An MCP write before the first compaction creates a stub; a later
-    backfill import must not clobber the living fields (INSERT OR IGNORE)."""
+async def test_stub_then_import_fills_origin_preserves_living(db):
+    """An MCP write before the backfill creates a stub; the import must fill
+    the missing origin (else the session loses injection until its next
+    compaction) while preserving the living fields (Codex P2, PR #1053)."""
     await crud.upsert_stub(db, SID)
     await crud.set_mission(db, SID, "early mission")
-    created = await crud.import_charter(
-        db, session_id=SID, origin_prompt="from backfill", origin_ts="t"
+    status = await crud.import_charter(
+        db,
+        session_id=SID,
+        origin_prompt="from backfill",
+        origin_ts="t",
+        transcript_path="/tmp/legacy.jsonl",
     )
-    assert created is False
+    assert status == "origin_filled"
     row = await crud.get(db, SID)
     assert row["mission"] == "early mission"
-    assert row["origin_prompt"] is None  # only the hook fills origin on stubs
+    assert row["origin_prompt"] == "from backfill"
+    assert row["origin_ts"] == "t"
+    assert row["transcript_path"] == "/tmp/legacy.jsonl"
 
 
 async def test_upsert_stub_idempotent(db):
@@ -111,6 +118,21 @@ async def test_resolve_ambiguous_prefix_unchanged(db):
     await crud.upsert_stub(db, "aaaabbbb-1111-2222-3333-444455556666")
     await crud.upsert_stub(db, "aaaabbbb-9999-8888-7777-666655554444")
     assert await crud.resolve_session_id(db, "aaaabbbb") == "aaaabbbb"
+
+
+async def test_resolve_prefix_via_cc_sessions_when_uncharted(db):
+    """Pre-first-compaction there is no charter row — the resolver must fall
+    back to cc_sessions.cc_session_id so a stub is never created under a
+    truncated id (Codex P2, PR #1053)."""
+    await db.execute(
+        "INSERT INTO cc_sessions (id, session_type, model, started_at,"
+        " last_activity_at, cc_session_id)"
+        " VALUES ('g-1', 'foreground', 'test-model',"
+        " '2026-07-13T00:00:00+00:00', '2026-07-13T00:00:00+00:00', ?)",
+        (SID,),
+    )
+    await db.commit()
+    assert await crud.resolve_session_id(db, SID[:8]) == SID
 
 
 # ─── Ledger lifecycle ─────────────────────────────────────────────────────────

@@ -84,7 +84,7 @@ def test_import_and_idempotent_rerun(monkeypatch, tmp_path, capsys):
     # Re-run: imports nothing, changes nothing
     assert _run(monkeypatch) == 0
     out = capsys.readouterr().out
-    assert "imported 0, already-in-db 2" in out
+    assert "imported 0, origin-filled 0, already-in-db 2" in out
 
 
 def test_rerun_preserves_db_edits(monkeypatch, tmp_path):
@@ -104,6 +104,28 @@ def test_rerun_preserves_db_edits(monkeypatch, tmp_path):
     assert _rows(db_path)["sid-a"]["mission"] == "edited via MCP"
 
 
+def test_stub_row_gets_origin_filled(monkeypatch, tmp_path, capsys):
+    """Legacy charter.json + a pre-backfill MCP stub row: the backfill must
+    fill the missing origin (Codex P2, PR #1053), preserving living fields."""
+    db_path, sessions_dir = _setup(tmp_path, monkeypatch)
+    _write_legacy(sessions_dir, "sid-stub")
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO session_charters (session_id, mission, pointers,"
+        " compaction_count, created_at)"
+        " VALUES ('sid-stub', 'mcp mission', '[]', 0, '2026-07-14T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    assert _run(monkeypatch) == 0
+    out = capsys.readouterr().out
+    assert "imported 0, origin-filled 1, already-in-db 0" in out
+    row = _rows(db_path)["sid-stub"]
+    assert row["origin_prompt"] == "origin for sid-stub"
+    assert row["mission"] == "mcp mission"
+
+
 def test_invalid_json_skipped_and_counted(monkeypatch, tmp_path, capsys):
     db_path, sessions_dir = _setup(tmp_path, monkeypatch)
     _write_legacy(sessions_dir, "sid-good")
@@ -116,7 +138,7 @@ def test_invalid_json_skipped_and_counted(monkeypatch, tmp_path, capsys):
 
     assert _run(monkeypatch) == 0
     out = capsys.readouterr().out
-    assert "imported 1, already-in-db 0, invalid 2" in out
+    assert "imported 1, origin-filled 0, already-in-db 0, invalid 2" in out
     rows = _rows(db_path)
     assert "sid-good" in rows
     assert "sid-bad" not in rows

@@ -3,11 +3,10 @@
 ``session_id`` throughout is the CC transcript session id (matches
 ``cc_sessions.cc_session_id``, NOT ``cc_sessions.id``).
 
-Immutability contract: ``origin_prompt``/``origin_ts`` are write-once. No
-function in this module ever includes them in an UPDATE SET — the only paths
-that write origin are ``import_charter`` (INSERT OR IGNORE — never overwrites
-an existing row) and the PreCompact hook's own ``WHERE origin_prompt IS
-NULL`` fill (scripts/genesis_precompact.py).
+Immutability contract: ``origin_prompt``/``origin_ts`` are write-once. Every
+origin write is scoped ``WHERE origin_prompt IS NULL`` — ``import_charter``
+(INSERT OR IGNORE + stub-fill) here, and the PreCompact hook's own fill
+(scripts/genesis_precompact.py). No general UPDATE ever lists origin columns.
 
 Callers pass the shared SerializedConnection: commit on every write, never
 rollback (a rollback on the shared connection would clobber concurrent
@@ -74,10 +73,18 @@ async def import_charter(
     compaction_count: int = 0,
     created_at: str | None = None,
     updated_at: str | None = None,
-) -> bool:
-    """Backfill entry point (charter.json → DB). INSERT OR IGNORE: returns
-    False when a row already exists — never overwrites DB state, so a re-run
-    after MCP edits changes nothing."""
+) -> str:
+    """Backfill entry point (charter.json → DB). Returns one of:
+
+    - "imported": no row existed — full INSERT.
+    - "origin_filled": a stub row existed with NULL origin (an MCP write
+      preceded the backfill) — origin_prompt/origin_ts (+ transcript_path)
+      filled via WHERE origin_prompt IS NULL, mission/pointers/ledger edits
+      preserved. Without this, a stubbed legacy session would lose its
+      charter injection until its next compaction (Codex P2, PR #1053).
+    - "skipped": row exists with origin already set — nothing changes, so a
+      re-run after MCP edits is a no-op.
+    """
     cursor = await db.execute(
         """INSERT OR IGNORE INTO session_charters
            (session_id, transcript_path, origin_prompt, origin_ts, mission,
@@ -95,11 +102,22 @@ async def import_charter(
             updated_at,
         ),
     )
+    if cursor.rowcount > 0:
+        await db.commit()
+        return "imported"
+    cursor = await db.execute(
+        """UPDATE session_charters SET origin_prompt = ?, origin_ts = ?,
+           transcript_path = COALESCE(transcript_path, ?), updated_at = ?
+           WHERE session_id = ? AND origin_prompt IS NULL""",
+        (origin_prompt, origin_ts, transcript_path, _now_iso(), session_id),
+    )
     await db.commit()
-    return cursor.rowcount > 0
+    return "origin_filled" if cursor.rowcount > 0 else "skipped"
 
 
 async def get(db: aiosqlite.Connection, session_id: str) -> dict | None:
+    """Charter row as a dict (pointers JSON-decoded), or None. Exact-id
+    lookup — resolve truncated ids via resolve_session_id first."""
     cursor = await db.execute("SELECT * FROM session_charters WHERE session_id = ?", (session_id,))
     row = await cursor.fetchone()
     return _decode_pointers(dict(row)) if row else None
@@ -108,10 +126,13 @@ async def get(db: aiosqlite.Connection, session_id: str) -> dict | None:
 async def resolve_session_id(db: aiosqlite.Connection, session_id: str) -> str:
     """Resolve a truncated session id to the full one by unique prefix match.
 
-    Full-length ids (>= 32 chars) pass through unchanged; ambiguous or
-    unmatched prefixes return the input unchanged (callers then report
-    not-found naturally). Mirrors the ~/.genesis/sessions prefix-scan idiom in
-    mcp/memory/__init__.py.
+    Full-length ids (>= 32 chars) pass through unchanged. Prefixes are
+    matched against session_charters first, then against
+    cc_sessions.cc_session_id — the latter covers sessions that have not
+    chartered yet (pre-first-compaction), so a stub is never created under a
+    truncated id that later diverges from the hook's full id (Codex P2,
+    PR #1053). Ambiguous or unmatched prefixes return the input unchanged;
+    WRITE callers must refuse to create rows for unresolved short ids.
     """
     sid = (session_id or "").strip()
     if len(sid) >= 32 or not sid:
@@ -123,6 +144,14 @@ async def resolve_session_id(db: aiosqlite.Connection, session_id: str) -> str:
     rows = await cursor.fetchall()
     if len(rows) == 1:
         return rows[0][0]
+    if not rows:
+        cursor = await db.execute(
+            "SELECT DISTINCT cc_session_id FROM cc_sessions WHERE cc_session_id LIKE ? LIMIT 2",
+            (sid + "%",),
+        )
+        rows = await cursor.fetchall()
+        if len(rows) == 1:
+            return rows[0][0]
     return sid
 
 
@@ -211,6 +240,7 @@ async def ledger_update(
 
 
 async def get_ledger_item(db: aiosqlite.Connection, item_id: str) -> dict | None:
+    """Single ledger row as a dict, or None for unknown ids."""
     cursor = await db.execute("SELECT * FROM session_ledger WHERE id = ?", (item_id,))
     row = await cursor.fetchone()
     return dict(row) if row else None
@@ -237,6 +267,7 @@ async def ledger_list(
 
 
 async def ledger_counts(db: aiosqlite.Connection, session_id: str) -> dict[str, int]:
+    """Per-status row counts for a session's ledger (absent statuses omitted)."""
     cursor = await db.execute(
         "SELECT status, COUNT(*) FROM session_ledger WHERE session_id = ? GROUP BY status",
         (session_id,),

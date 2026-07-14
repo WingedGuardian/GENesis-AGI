@@ -140,3 +140,34 @@ async def test_empty_session_id_rejected(db, sessions_dir):
         assert "error" in await tools._impl_session_charter("  ")
         assert "error" in await tools._impl_session_charter_update(" ", mission="m")
         assert "error" in await tools._impl_session_ledger_add("", "x")
+
+
+async def test_writes_refuse_unresolved_short_id(db, sessions_dir):
+    """A truncated id that resolves nowhere must NOT create a stub — rows
+    under a short prefix are orphaned when the hook writes the full id
+    (Codex P2, PR #1053)."""
+    with patch.object(tools, "_get_db", return_value=db):
+        res1 = await tools._impl_session_charter_update("deadbeef", mission="m")
+        res2 = await tools._impl_session_ledger_add("deadbeef", "x")
+    assert "did not resolve" in res1["error"]
+    assert "did not resolve" in res2["error"]
+    assert await crud.get(db, "deadbeef") is None  # no stub created
+
+
+async def test_prefix_resolves_via_cc_sessions_before_first_compaction(db, sessions_dir):
+    """Pre-compaction (no charter row), the [Session: xxxxxxxx] prefix must
+    resolve through cc_sessions.cc_session_id so the stub lands under the
+    FULL id the hook will later write."""
+    await db.execute(
+        "INSERT INTO cc_sessions (id, session_type, model, started_at,"
+        " last_activity_at, cc_session_id)"
+        " VALUES ('g-1', 'foreground', 'test-model',"
+        " '2026-07-13T00:00:00+00:00', '2026-07-13T00:00:00+00:00', ?)",
+        (SID,),
+    )
+    await db.commit()
+    with patch.object(tools, "_get_db", return_value=db):
+        res = await tools._impl_session_ledger_add(SID[:8], "captured via prefix")
+    assert res["session_id"] == SID
+    assert await crud.get(db, SID) is not None
+    assert await crud.get(db, SID[:8]) is None

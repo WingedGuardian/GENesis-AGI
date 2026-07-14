@@ -59,6 +59,24 @@ def _default_added_by() -> str:
     return "ambient" if os.environ.get("GENESIS_CC_SESSION") == "1" else "foreground"
 
 
+def _unresolved_short_id_error(sid: str) -> dict | None:
+    """Refuse WRITES under a truncated id that did not resolve.
+
+    A stub created under a short prefix would be orphaned the moment the
+    PreCompact hook writes the real full session id — mission/ledger rows
+    would never re-inject (Codex P2, PR #1053). Reads fail soft (not-found);
+    writes must fail loud here.
+    """
+    if len(sid) < 32:
+        return {
+            "error": f"Session id prefix '{sid}' did not resolve to a known "
+            "session. Pass the full session id (the [Clock | Session: x] tag "
+            "shows the first 8 chars; the full id is this conversation's "
+            "session UUID)."
+        }
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Implementation functions (testable without FastMCP)
 # ---------------------------------------------------------------------------
@@ -128,6 +146,8 @@ async def _impl_session_charter_update(
         from genesis.db.crud import session_charters as crud
 
         sid = await crud.resolve_session_id(db, session_id)
+        if err := _unresolved_short_id_error(sid):
+            return err
         # A stub row lets mission/pointers precede the first compaction; the
         # PreCompact hook fills origin later (WHERE origin_prompt IS NULL).
         await crud.upsert_stub(db, sid)
@@ -175,6 +195,8 @@ async def _impl_session_ledger_add(
         from genesis.db.crud import session_charters as crud
 
         sid = await crud.resolve_session_id(db, session_id)
+        if err := _unresolved_short_id_error(sid):
+            return err
         await crud.upsert_stub(db, sid)
         item_id = await crud.ledger_add(
             db,
