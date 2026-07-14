@@ -218,6 +218,7 @@ async def run_question(
                 instance.question,
                 memories,
                 client=client,
+                question_type=instance.question_type,
             )
             verdict = await asyncio.to_thread(
                 lambda a=ans: judge_answer(
