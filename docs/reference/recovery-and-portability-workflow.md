@@ -116,3 +116,55 @@ Two mechanisms make this observable and survivable without host access:
 You can mint the token proactively at install, or defer it entirely: the first
 auth-health alert is the cue, and the response becomes "mint + store from
 anywhere" instead of "SSH to the host and re-run `claude login`."
+
+## Git-Metadata Corruption Recovery (`scripts/git_repair.py`)
+
+A storage fault (the 2026-07-03 thin-pool outage) can leave the repo's *own*
+git metadata silently corrupt: an ext4 `data=ordered` journal replay preserves
+file **structure** while zeroing **unflushed data blocks**, so `.git/config`,
+`packed-refs`, and any loose objects being written read back as NUL — with **no
+git-level error**. This silently disables the guardian's `REVERT_CODE` recovery
+lever (it needs healthy local git). The F.1 detectors
+(`genesis.observability.git_health` on the container tick + the guardian's
+`git_watch` live probe) surface it and both alerts say **"run
+`scripts/git_repair.py`."** This is that tool.
+
+**Properties.** Stdlib-only, targets **system `python3`** (survives a broken
+venv), **dry-run by default** — `--apply` gates every mutation. It never touches
+the working tree or index in the automated rungs, and it **never swaps `.git`
+automatically** (the last resort only prints steps for a human).
+
+```bash
+# 1. See what's wrong + what it WOULD do — mutates nothing:
+python3 scripts/git_repair.py
+# 2. Repair (captures a recovery baseline first, then walks the ladder):
+python3 scripts/git_repair.py --apply
+# 3. If a-d cannot fix it, enable the guided last-resort re-clone (prints the
+#    .git-swap steps for you to run by hand; still never swaps automatically):
+python3 scripts/git_repair.py --apply --allow-reclone
+# Override the origin URL when .git/config is unrecoverable:
+python3 scripts/git_repair.py --apply --remote-url https://github.com/<owner>/<repo>.git
+```
+
+**Repair ladder** (re-diagnoses after each rung; stops when `fsck --full` is
+clean): (a) regenerate `.git/config` + a zeroed `.git/HEAD` from a template
+(origin URL resolved from existing config → `--remote-url` → `GENESIS_REPO_URL`
+→ the capture — never from a backup, which is circular); (b) **move** corrupt
+loose objects to `.git/RECOVERY-corrupt-objects/<ts>/` (they are mode 0444 — the
+tool moves, never overwrites); (c) `git fetch --refetch origin` (a *plain* fetch
+does **not** backfill a quarantined object — only `--refetch` does) + reflog tip
+repair; (d) `git repack -a -d` (only once the store is complete — repack
+hard-fails on a missing reachable object); (e) guided re-clone.
+
+**Re-clone caveat (the last resort).** Swapping `.git` orphans **every linked
+worktree** — their gitdir pointers reference `<main>/.git/worktrees/<name>`,
+which the fresh `.git` does not contain. The tool therefore refuses to swap
+automatically: with `--allow-reclone` it clones + `fsck`-verifies a fresh copy,
+enumerates the linked worktrees at risk, and prints the exact `mv`/`git reset
+--mixed HEAD`/`git worktree prune`+re-add steps for you to run after review. Your
+working tree is preserved (the swap + `git reset --mixed HEAD` leaves tracked
+edits and untracked files byte-identical); the old database is set aside as
+`.git-broken-<ts>` (moved *outside* the repo) so nothing is destroyed.
+
+Exit codes: `0` healthy · `1` residual issues remain (escalate) · `2` aborted
+(no writable capture, or no origin URL resolvable for a config restore).
