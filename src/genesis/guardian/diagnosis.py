@@ -32,7 +32,7 @@ from genesis.guardian.config import GuardianConfig
 logger = logging.getLogger(__name__)
 
 # Pre-flight memory thresholds.  Guardian must always attempt diagnosis
-# above the hard floor.  The systemd MemoryMax=30%-of-host-RAM cap on the Guardian
+# above the hard floor.  The systemd MemoryMax cap on the Guardian
 # service is the real safety boundary — Python-level checks are advisory.
 # Hard floor: refuse only at catastrophic levels (host is almost dead).
 # Warn floor: log warning but proceed (Guardian's job is to diagnose).
@@ -428,7 +428,7 @@ class DiagnosisEngine:
         except Exception as exc:
             logger.warning("Disk space preflight failed (non-fatal): %s", exc)
 
-        # Pre-flight: check host memory.  The systemd MemoryMax=30% of host RAM on the
+        # Pre-flight: check host memory.  The systemd MemoryMax cap on the
         # Guardian service is the real safety boundary — this Python check
         # is advisory.  Only refuse at catastrophic levels (< 2 GiB means
         # the host is almost dead, not just Genesis).
@@ -450,7 +450,7 @@ class DiagnosisEngine:
             if available_gib < _CC_PREFLIGHT_WARN_GiB:
                 logger.warning(
                     "Host memory low (%.1f GiB free < %.0f GiB) "
-                    "— proceeding with CC diagnosis (MemoryMax=30% of host RAM caps usage)",
+                    "— proceeding with CC diagnosis (the systemd MemoryMax cap bounds usage)",
                     available_gib, _CC_PREFLIGHT_WARN_GiB,
                 )
         else:

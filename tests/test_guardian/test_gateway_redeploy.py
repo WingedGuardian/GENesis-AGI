@@ -272,3 +272,37 @@ class TestRedeployRejects:
         assert _deploy_state(sandbox)["deployed_commit"] == "0ldc0de"
         assert "stop" not in _calls(sandbox)
         assert _no_spool_left(sandbox)
+
+
+@_needs_bash
+class TestRedeployUnitRefresh:
+    """The redeploy verb refreshes systemd unit files from the archived repo
+    config (copy-if-present) — so push-redeploys stop leaving host units frozen
+    at install time (they previously did: only the `update`/git-pull verb copied
+    units). An older archive that lacks the units must be a no-op (backward-compat;
+    the required-file gate deliberately does not demand them)."""
+
+    def _systemd_unit(self, sandbox: dict, name: str) -> Path:
+        return sandbox["home"] / ".config" / "systemd" / "user" / name
+
+    def test_units_present_in_archive_are_copied_and_reloaded(self, sandbox):
+        members = _good_members()
+        new_unit = b"[Service]\nMemoryMax=80%\nOOMScoreAdjust=0\n"
+        members["config/genesis-guardian.service"] = new_unit
+        tar = _make_tar(members)
+        sha = hashlib.sha256(tar).hexdigest()
+        res = _run(sandbox, f"redeploy abc1234 {sha}", stdin=tar)
+        assert res.returncode == 0, res.stderr
+        assert json.loads(res.stdout)["ok"] is True
+        installed = self._systemd_unit(sandbox, "genesis-guardian.service")
+        assert installed.exists(), "unit must be copied into the systemd user dir"
+        assert installed.read_bytes() == new_unit
+        assert "daemon-reload" in _calls(sandbox)
+
+    def test_archive_without_units_leaves_systemd_untouched(self, sandbox):
+        tar = _make_tar(_good_members())
+        sha = hashlib.sha256(tar).hexdigest()
+        res = _run(sandbox, f"redeploy abc1234 {sha}", stdin=tar)
+        assert res.returncode == 0, res.stderr
+        assert json.loads(res.stdout)["ok"] is True
+        assert not self._systemd_unit(sandbox, "genesis-guardian.service").exists()
