@@ -214,6 +214,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The neural monitor's Ego panel now shows real ego activity, not phantom tiles.**
+  The dashboard was rendering a few "ego" tiles that looked healthy but never
+  actually ran — leftovers from an earlier ego redesign that split the ego into
+  two cycles and made its compaction step non-LLM. They're gone, the Ego panel now
+  lists the three live ego call sites, and a couple of other stale tiles (triage,
+  bookmark enrichment) were removed too. A months-old leftover activity record can
+  no longer resurrect a removed tile as if it were live.
 - **Memories recovered after an embedding outage keep their wing/room/life_domain
   filters, and keyword-only results are no longer ranked as artificially fresh.**
   When the embedding provider was down, memories were stored keyword-only and

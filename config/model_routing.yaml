@@ -285,18 +285,11 @@ call_sites:
     retry_profile: background
     cc_model: Opus
     dispatch: cli
-  7_ego_cycle:
-    chain:
-    - openrouter-opus
-    default_paid: true
-    retry_profile: background
-    dispatch: cli
-    cc_model: Opus
-  8_ego_compaction:
-    chain:
-    - openrouter-haiku
-    - mistral-large-free
-    default_paid: true
+  # NOTE (2026-07-13): legacy ego sites 7_ego_cycle + 8_ego_compaction were
+  # REMOVED here. #26 ("Phase A — ephemeral sessions") split the ego into two
+  # (recording under 7_user_ego_cycle / 7_genesis_ego_cycle, both CC-dispatched)
+  # and made compaction deterministic (no LLM). Both YAML entries were orphaned —
+  # the backend snapshot emitted them as phantom "healthy but never active" tiles.
   9_fact_extraction:
     chain:
     - groq-free
