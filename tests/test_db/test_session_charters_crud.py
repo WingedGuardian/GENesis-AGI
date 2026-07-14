@@ -19,7 +19,7 @@ async def test_import_charter_roundtrip(db):
     created = await crud.import_charter(
         db,
         session_id=SID,
-        origin_prompt="Let's look at the inbox items.",
+        origin_prompt="Let's fix the flaky retry logic in the pipeline.",
         origin_ts="2026-06-30T15:21:47.312Z",
         transcript_path="/tmp/t.jsonl",
         mission="Ship the session manager",
@@ -29,7 +29,7 @@ async def test_import_charter_roundtrip(db):
     )
     assert created is True
     row = await crud.get(db, SID)
-    assert row["origin_prompt"] == "Let's look at the inbox items."
+    assert row["origin_prompt"] == "Let's fix the flaky retry logic in the pipeline."
     assert row["origin_ts"] == "2026-06-30T15:21:47.312Z"
     assert row["mission"] == "Ship the session manager"
     assert row["pointers"] == ["~/.genesis/output/spec.md"]
