@@ -145,8 +145,8 @@ class TestOrchestrator:
             res = await orch.search("q")
 
         urls = {r.url for r in res.results}
-        assert "https://tav.com" in urls
-        assert "https://exa.com" in urls
+        # exact set equality (not substring `in`) — both providers surface, deduped
+        assert urls == {"https://tav.com", "https://exa.com"}
         assert {"tavily", "exa"} <= set(res.sources_queried)
 
     @pytest.mark.asyncio
