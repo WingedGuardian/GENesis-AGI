@@ -33,6 +33,15 @@ set -euo pipefail
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/backup_backends.sh
 source "$_SCRIPT_DIR/lib/backup_backends.sh"
+# Durable alert queue (F.3): if a Telegram alert can't send, persist it so the
+# container drainer delivers it on recovery instead of losing it to a log line.
+# Guarded no-op fallback if the lib is ever not co-located.
+if [ -f "$_SCRIPT_DIR/lib/alert_queue.sh" ]; then
+    # shellcheck source=scripts/lib/alert_queue.sh
+    source "$_SCRIPT_DIR/lib/alert_queue.sh"
+else
+    queue_alert() { :; }
+fi
 
 # ── Status tracking ──────────────────────────────────────────────────
 _STATUS_FILE="$HOME/.genesis/backup_status.json"
@@ -98,7 +107,15 @@ _send_telegram() {
         "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -H "Content-Type: application/json" \
         -d "{\"chat_id\":\"${TELEGRAM_FORUM_CHAT_ID}\",\"text\":$(printf '%s' "$1" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"parse_mode\":\"Markdown\"}" \
-        > /dev/null 2>&1 || log "WARNING: Telegram alert failed to send"
+        > /dev/null 2>&1 || {
+        # Send failed (network/token) — don't lose the alert. Content-derived
+        # dedupe key so distinct backup alerts stay separate but identical
+        # repeats collapse to one queued entry.
+        local _dkey
+        _dkey="backup:$(printf '%s' "$1" | md5sum 2>/dev/null | cut -c1-12)"
+        log "WARNING: Telegram alert failed to send — queued for retry"
+        queue_alert emergency "backup" "Backup alert (Telegram send failed)" "$1" "$_dkey"
+    }
 }
 
 # Large intermediate files (the multi-hundred-MB SQLite .dump) must NOT land in the

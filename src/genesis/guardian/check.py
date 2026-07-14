@@ -99,7 +99,9 @@ def _setup_logging() -> None:
 
 def _build_dispatcher(config: GuardianConfig) -> AlertDispatcher:
     """Build the alert dispatcher with configured channels."""
-    dispatcher = AlertDispatcher()
+    dispatcher = AlertDispatcher(
+        fallback_queue_root=config.state_path / "alerts" / "queue",
+    )
 
     token = config.alert.telegram_bot_token
     chat_id = config.alert.telegram_chat_id
@@ -137,6 +139,52 @@ def _build_dispatcher(config: GuardianConfig) -> AlertDispatcher:
         logger.warning("No Telegram credentials — alerts will only go to journal")
 
     return dispatcher
+
+
+def _alert_from_queue_entry(entry: dict) -> Alert:
+    """Rebuild an ``Alert`` from a persisted queue entry (schema v1)."""
+    meta = entry.get("meta") or {}
+    try:
+        severity = AlertSeverity(entry.get("severity", "warning"))
+    except ValueError:
+        severity = AlertSeverity.WARNING
+    return Alert(
+        severity=severity,
+        title=entry.get("title", ""),
+        body=entry.get("body", ""),
+        approval_url=meta.get("approval_url"),
+        likely_cause=meta.get("likely_cause"),
+        proposed_action=meta.get("proposed_action"),
+    )
+
+
+async def _drain_host_alert_queue(
+    config: GuardianConfig, dispatcher: AlertDispatcher,
+) -> None:
+    """Replay queued host alerts through the dispatcher, then bound the queue.
+
+    Never raises — a drain failure must not stop the health check. The replay
+    send disables the queue fallback so a still-down channel does not
+    re-enqueue the entry it is replaying (see ``AlertDispatcher.send``).
+    """
+    from genesis.guardian.alert import queue as alert_queue
+
+    root = config.state_path / "alerts" / "queue"
+
+    async def _send(entry: dict) -> bool:
+        # Host has no dedup layer: dispatcher.send returns True iff a channel
+        # delivered → terminal (unlink); False → still down → keep + stop.
+        return await dispatcher.send(
+            _alert_from_queue_entry(entry), allow_queue_fallback=False,
+        )
+
+    try:
+        drained = await alert_queue.drain(root, _send)
+        if drained:
+            logger.info("Replayed %d queued host alert(s)", drained)
+        alert_queue.prune(root)
+    except Exception:
+        logger.warning("host alert-queue drain failed", exc_info=True)
 
 
 def _build_provisioning_adapter(config: GuardianConfig):
@@ -291,6 +339,11 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     snapshots = SnapshotManager(config)
     diagnosis_engine = DiagnosisEngine(config)
     recovery_engine = RecoveryEngine(config, sm, snapshots, dispatcher)
+
+    # F.3: drain any alerts queued while host→Telegram was down BEFORE running
+    # the cycle — a recovered channel flushes the backlog first, and new
+    # failures this tick re-enqueue behind it. Best-effort; never blocks a check.
+    await _drain_host_alert_queue(config, dispatcher)
 
     try:
         await _check_cycle(config, sm, dispatcher, snapshots, diagnosis_engine, recovery_engine)
