@@ -201,6 +201,15 @@ async def call_sites(
             )
             for row in await cursor.fetchall():
                 sid = row[0]
+                # Deprecated-and-removed sites must never be resurrected as
+                # live tiles by a stale historical last_run row (e.g.
+                # 7_ego_cycle last ran 2026-04, superseded by the #26 ego
+                # split). Removed from routing on purpose; a lingering row is
+                # history, not health. Distinct from GROUNDWORK wired=False,
+                # which legitimately idle-shows below.
+                _dep = _CALL_SITE_META.get(sid)
+                if _dep and _dep.get("status_reason") == "DEPRECATED_REMOVED":
+                    continue
                 run_data = {
                     "last_run_at": row[1],
                     "last_run_provider": row[2],
@@ -212,7 +221,12 @@ async def call_sites(
                 if sid in result:
                     result[sid].update(run_data)
                 else:
-                    result[sid] = {"status": "active", "routing": False, **run_data}
+                    # Non-YAML sites (CC-dispatched ego cycles, detached
+                    # records) enter ONLY here — apply their _CALL_SITE_META
+                    # (fetched above as _dep) so the tile carries
+                    # description/frequency/cost_policy like YAML sites do.
+                    # status/routing/run_data override any stale meta keys.
+                    result[sid] = {**(_dep or {}), "status": "active", "routing": False, **run_data}
         except sqlite3.Error:
             logger.debug("call_site_last_run query failed", exc_info=True)
 

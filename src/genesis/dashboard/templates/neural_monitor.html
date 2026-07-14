@@ -491,7 +491,6 @@ const SITE_META = {
     'cc_update_analysis': { name: 'CC Updates', category: 'processing' },
     'outreach_email_triage': { name: 'Email Filter', category: 'classification' },
     '13_morning_report': { name: 'Morning Rpt', category: 'content' },
-    'bookmark_enrichment': { name: 'Bookmark Enrich', category: 'content' },
     '40_knowledge_distillation': { name: 'Knowledge Distill', category: 'learning' },
     '41_resume_review_pass1': { name: 'Resume Review P1', category: 'memory' },
     '42_resume_review_pass2': { name: 'Resume Review P2', category: 'memory' },
@@ -502,11 +501,12 @@ const SITE_META = {
     '38_procedure_extraction': { name: 'Procedure', category: 'content' },
     'contingency_foreground': { name: 'CC Fallback (FG)', category: 'reasoning' },
     'contingency_micro': { name: 'CC Fallback (Micro)', category: 'processing' },
+    // Live ego call sites (legacy 7_ego_cycle split into two by #26; 40 = focus selector)
+    '7_user_ego_cycle': { name: 'User Ego', category: 'reasoning' },
+    '7_genesis_ego_cycle': { name: 'Genesis Ego', category: 'reasoning' },
+    '40_ego_focus_selection': { name: 'Ego Focus', category: 'classification' },
     // Groundwork / disabled
-    '2_triage': { name: 'Triage', category: 'classification' },
-    '7_ego_cycle': { name: 'Ego Cycle', category: 'reasoning' },
     '7_task_retrospective': { name: 'Task Retro', category: 'processing' },
-    '8_ego_compaction': { name: 'Ego Compact', category: 'processing' },
     '10_cognitive_state': { name: 'Cog State', category: 'reasoning' },
     '11_user_model_synthesis': { name: 'User Model', category: 'reasoning' },
     '17_executor_review': { name: 'Executor Review', category: 'assessment' },
@@ -1870,7 +1870,7 @@ const SUBSYSTEM_GROUPS = {
     ego: {
         name: 'Ego', domId: 'sub-ego',
         desc: 'Autonomous decision cycle \u2014 periodic thinking, proposals, adaptive cadence',
-        sites: ['7_ego_cycle', '8_ego_compaction'],
+        sites: ['7_genesis_ego_cycle', '7_user_ego_cycle', '40_ego_focus_selection'],
     },
     reflection: {
         name: 'Reflection', domId: 'sub-reflection',
@@ -1887,7 +1887,7 @@ const SUBSYSTEM_GROUPS = {
     surplus: {
         name: 'Surplus', domId: 'sub-surplus',
         desc: 'Idle-time tasks \u2014 brainstorms, code audits, infrastructure monitoring',
-        sites: ['12_surplus_brainstorm', '36_code_auditor', '37_infrastructure_monitor', 'bookmark_enrichment'],
+        sites: ['12_surplus_brainstorm', '36_code_auditor', '37_infrastructure_monitor'],
     },
     outreach: {
         name: 'Outreach', domId: 'sub-outreach',
@@ -1903,7 +1903,7 @@ const SUBSYSTEM_GROUPS = {
     learning: {
         name: 'Learning', domId: 'sub-learning',
         desc: 'Observation triage, calibration, outcome classification, skill refinement',
-        sites: ['2_triage', '29_retrospective_triage',
+        sites: ['29_retrospective_triage',
                 '30_triage_calibration', '31_outcome_classification', '32_delta_assessment',
                 '33_skill_refiner', '38_procedure_extraction', '40_knowledge_distillation'],
     },
