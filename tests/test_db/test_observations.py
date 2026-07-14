@@ -205,3 +205,38 @@ async def test_query_by_category(db):
     rows = await observations.query(db, category="recon")
     assert len(rows) == 1
     assert rows[0]["id"] == "ocat1"
+
+
+async def test_create_and_upsert_carry_origin_class(db):
+    from genesis.db.crud import observations as obs
+
+    await obs.create(
+        db, id="o-ext", source="reflection", type="user_model_delta",
+        content="{}", priority="medium", created_at="2026-01-01T00:00:00+00:00",
+        origin_class="external_untrusted",
+    )
+    cur = await db.execute("SELECT origin_class FROM observations WHERE id='o-ext'")
+    assert (await cur.fetchone())[0] == "external_untrusted"
+
+    await obs.upsert(
+        db, id="o-up", source="s", type="t", content="c", priority="low",
+        created_at="2026-01-01T00:00:00+00:00", origin_class="first_party",
+    )
+    await obs.upsert(
+        db, id="o-up", source="s", type="t", content="c2", priority="low",
+        created_at="2026-01-01T00:00:00+00:00", origin_class="external_untrusted",
+    )
+    cur = await db.execute("SELECT origin_class, content FROM observations WHERE id='o-up'")
+    row = await cur.fetchone()
+    assert row[0] == "external_untrusted" and row[1] == "c2"  # conflict path updates
+
+
+async def test_create_origin_class_defaults_null(db):
+    from genesis.db.crud import observations as obs
+
+    await obs.create(
+        db, id="o-null", source="s", type="t", content="c", priority="low",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    cur = await db.execute("SELECT origin_class FROM observations WHERE id='o-null'")
+    assert (await cur.fetchone())[0] is None
