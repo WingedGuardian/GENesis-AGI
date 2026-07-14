@@ -211,6 +211,7 @@ async def create(
     expires_at: str | None = None,
     content_hash: str | None = None,
     skip_if_duplicate: bool = False,
+    origin_class: str | None = None,
 ) -> str | None:
     # Auto-compute content_hash if not provided
     if content_hash is None and content and content.strip():
@@ -241,10 +242,10 @@ async def create(
     await db.execute(
         """INSERT INTO observations
            (id, person_id, source, type, category, content, priority,
-            speculative, created_at, expires_at, content_hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            speculative, created_at, expires_at, content_hash, origin_class)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, person_id, source, type, category, content, priority,
-         speculative, created_at, expires_at, content_hash),
+         speculative, created_at, expires_at, content_hash, origin_class),
     )
     await db.commit()
     return id
@@ -263,20 +264,22 @@ async def upsert(
     category: str | None = None,
     speculative: int = 0,
     expires_at: str | None = None,
+    origin_class: str | None = None,
 ) -> str:
     """Idempotent write: insert or update on conflict."""
     await db.execute(
         """INSERT INTO observations
            (id, person_id, source, type, category, content, priority,
-            speculative, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            speculative, created_at, expires_at, origin_class)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              person_id = excluded.person_id,
              source = excluded.source, type = excluded.type, category = excluded.category,
              content = excluded.content, priority = excluded.priority,
-             speculative = excluded.speculative, expires_at = excluded.expires_at""",
+             speculative = excluded.speculative, expires_at = excluded.expires_at,
+             origin_class = excluded.origin_class""",
         (id, person_id, source, type, category, content, priority,
-         speculative, created_at, expires_at),
+         speculative, created_at, expires_at, origin_class),
     )
     await db.commit()
     return id

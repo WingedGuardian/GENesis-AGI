@@ -210,7 +210,15 @@ async def _process_light_output(output, *, source: str, now: str, db) -> None:
         if gated:
             return
 
-        # Extract user_model_deltas
+        # Extract user_model_deltas. WS-3 gate-2 substrate: stamp each delta
+        # with the reflection run's provenance aggregate — external iff any
+        # external-origin session was active in the material window (run-level
+        # granularity; the reflection context carries no per-session refs, so
+        # per-delta tracing is not honestly buildable). Conservative
+        # over-tagging at run granularity, measured in shadow.
+        from genesis.db.crud import cc_sessions as cc_sessions_crud
+
+        run_origin = await cc_sessions_crud.reflection_window_origin(db, end_iso=now)
         for delta in data.get("user_model_updates", []):
             try:
                 conf = float(delta.get("confidence", 0))
@@ -237,6 +245,7 @@ async def _process_light_output(output, *, source: str, now: str, db) -> None:
                     priority="medium",
                     created_at=now,
                     content_hash=delta_hash,
+                    origin_class=run_origin,
                 )
             except (TypeError, ValueError, AttributeError):
                 logger.debug("Skipping malformed user_model_delta from CC output")

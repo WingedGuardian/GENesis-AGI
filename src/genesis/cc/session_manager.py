@@ -87,6 +87,7 @@ class SessionManager:
         skill_tags: list[str] | None = None,
         dispatch_mode: str | None = None,
         profile: str | None = None,
+        origin: str | None = None,
     ) -> dict:
         now = datetime.now(UTC).isoformat()
         sess_id = str(uuid.uuid4())
@@ -109,6 +110,12 @@ class SessionManager:
             last_activity_at=now,
             source_tag=source_tag,
             metadata=metadata,
+            # WS-3 gate-2 substrate: durable session provenance, derived from
+            # the DISPATCH PROFILE by the caller (never a tool scan — that
+            # coarseness is exactly what sank gate-1's shadow signal). None =
+            # first-party dispatch; foreground sessions also stay NULL
+            # (owner-supervised, read as first_party).
+            origin_class=origin,
         )
         sess = await cc_sessions.get_by_id(self._db, sess_id)
         for hook in self._on_start_hooks:
