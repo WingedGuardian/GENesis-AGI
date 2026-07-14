@@ -271,3 +271,63 @@ def test_guided_reclone_dry_run_does_not_clone(repos, tmp_path, capsys):
     gr.guided_reclone(work, str(origin), apply=False)
     out = capsys.readouterr().out
     assert "WOULD CLONE" in out
+
+
+# ─── origin reachability is a precondition, NOT a health check (Codex P2) ─────
+
+
+def test_healthy_repo_with_unreachable_origin_is_healthy(repos, tmp_path):
+    _origin, work = repos
+    # break origin reachability WITHOUT touching local .git integrity
+    _git(work, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    d = gr.diagnose(work)
+    assert d.origin_reachable is False
+    assert d.healthy  # local git is intact → healthy despite an unreachable origin
+    r = _run_tool(work, home=tmp_path)
+    assert r.returncode == 0
+    assert "HEALTHY" in r.stdout
+
+
+# ─── corrupt packed-refs repair (Codex P1) ───────────────────────────────────
+
+
+def test_diagnose_flags_corrupt_packed_refs(repos):
+    _origin, work = repos
+    _git(work, "pack-refs", "--all")  # move refs into packed-refs (prunes loose)
+    _zero(work / ".git" / "packed-refs")
+    d = gr.diagnose(work)
+    assert d.packed_refs_corrupt
+    assert not d.healthy
+
+
+def test_apply_repairs_zeroed_packed_refs(repos, tmp_path):
+    _origin, work = repos
+    _git(work, "pack-refs", "--all")
+    pr = work / ".git" / "packed-refs"
+    assert pr.is_file()
+    _zero(pr)
+    # sanity: git itself is now broken on this repo
+    assert (
+        subprocess.run(["git", "-C", str(work), "for-each-ref"], capture_output=True).returncode
+        != 0
+    )
+    r = _run_tool(work, "--apply", home=tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _fsck_clean(work)
+    # branch tip restored (from remote ref) + corrupt packed-refs quarantined
+    assert _git(work, "rev-parse", "--verify", "refs/heads/main").strip()
+    assert list((work / ".git" / "RECOVERY-corrupt-objects").glob("*/packed-refs"))
+
+
+def test_packed_refs_tip_restored_from_reflog_when_origin_down(repos, tmp_path):
+    """With packed-refs corrupt AND origin unreachable, the branch tip must still
+    be recoverable from the reflog (the offline path)."""
+    _origin, work = repos
+    want = _git(work, "rev-parse", "HEAD").strip()
+    _git(work, "pack-refs", "--all")
+    _git(work, "remote", "set-url", "origin", str(tmp_path / "gone.git"))  # origin down
+    _zero(work / ".git" / "packed-refs")
+    r = _run_tool(work, "--apply", home=tmp_path)
+    # tip restored from reflog even though refetch was impossible
+    assert _git(work, "rev-parse", "--verify", "refs/heads/main").strip() == want
+    assert r.returncode == 0, r.stdout + r.stderr

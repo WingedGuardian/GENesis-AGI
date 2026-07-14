@@ -116,6 +116,11 @@ class Check:
 class Diagnosis:
     checks: list[Check] = field(default_factory=list)
     corrupt_objects: list[Path] = field(default_factory=list)  # loose object paths
+    # origin reachability is a PRECONDITION for the refetch/reclone rungs, NOT
+    # part of the local-health verdict: a fsck-clean repo whose origin is briefly
+    # unreachable (or a moved file:// origin) is still HEALTHY and must exit 0.
+    origin_reachable: bool = False
+    packed_refs_corrupt: bool = False
 
     @property
     def healthy(self) -> bool:
@@ -129,6 +134,11 @@ class Diagnosis:
         for c in self.checks:
             mark = "OK  " if c.ok else "FAIL"
             lines.append(f"  [{mark}] {c.name}" + (f" — {c.detail}" if c.detail else ""))
+        # informational, never part of `healthy`
+        lines.append(
+            f"  [{'OK  ' if self.origin_reachable else 'INFO'}] origin reachable"
+            " (precondition for refetch/reclone, not a health check)"
+        )
         return "\n".join(lines)
 
 
@@ -151,6 +161,20 @@ def _scan_zeroed_loose(git_dir: Path) -> list[Path]:
             if data and not any(data):  # non-empty and all bytes zero
                 zeroed.append(obj)
     return zeroed
+
+
+def _packed_refs_corrupt(git_dir: Path) -> bool:
+    """True if ``.git/packed-refs`` is present but zeroed/truncated. A valid
+    packed-refs is plain text; the outage zeroed it to NUL, which makes
+    ``for-each-ref``/``fsck``/``ls-remote`` all abort with 'unterminated line in
+    .git/packed-refs'. NUL detection covers the zeroed case cleanly."""
+    pr = git_dir / "packed-refs"
+    if not pr.is_file() or pr.stat().st_size == 0:
+        return False
+    try:
+        return b"\x00" in pr.read_bytes()
+    except OSError:
+        return True
 
 
 def _fsck_corrupt_paths(fsck_stderr: str, git_dir: Path) -> list[Path]:
@@ -198,6 +222,15 @@ def diagnose(repo: Path) -> Diagnosis:
         head_ok = r.returncode == 0
     d.add("HEAD resolvable", head_ok, "" if head_ok else "HEAD zeroed or unresolvable")
 
+    # packed-refs intact — a corrupt packed-refs aborts for-each-ref/fsck/ls-remote
+    pr_corrupt = _packed_refs_corrupt(git_dir)
+    d.packed_refs_corrupt = pr_corrupt
+    d.add(
+        "packed-refs intact",
+        not pr_corrupt,
+        "" if not pr_corrupt else ".git/packed-refs zeroed/truncated (NUL bytes)",
+    )
+
     # refs readable
     r = _git(repo, "for-each-ref")
     d.add("refs readable", r.returncode == 0, "" if r.returncode == 0 else r.stderr.strip()[:120])
@@ -233,13 +266,10 @@ def diagnose(repo: Path) -> Diagnosis:
     corrupt = set(zeroed) | set(_fsck_corrupt_paths(r.stderr, git_dir))
     d.corrupt_objects = sorted(corrupt)
 
-    # origin reachability (needed for refetch/reclone)
+    # origin reachability — a PRECONDITION for refetch/reclone, recorded on its
+    # own field so it never drags a locally-healthy repo's verdict to unhealthy.
     r = _git(repo, "ls-remote", "--exit-code", "origin", "HEAD", timeout=_LSREMOTE_TIMEOUT_S)
-    d.add(
-        "origin reachable",
-        r.returncode == 0,
-        "" if r.returncode == 0 else "cannot reach origin (refetch/reclone unavailable)",
-    )
+    d.origin_reachable = r.returncode == 0
 
     return d
 
@@ -334,7 +364,9 @@ def _detect_branch(repo: Path, capture: Path | None) -> str:
 
 
 def restore_config(repo: Path, url: str, branch: str, *, apply: bool) -> None:
-    git_dir = repo / ".git"
+    """Regenerate ``.git/config`` from a template. Called ONLY when config is
+    genuinely unparseable — a healthy config is never overwritten (that would
+    lose custom settings: credential helpers, extra remotes, user options)."""
     cfg_text = (
         "[core]\n"
         "\trepositoryformatversion = 0\n"
@@ -351,22 +383,60 @@ def restore_config(repo: Path, url: str, branch: str, *, apply: bool) -> None:
     if not apply:
         _log(f"WOULD RESTORE .git/config (url={url}, branch={branch})")
     else:
-        (git_dir / "config").write_text(cfg_text)
+        (repo / ".git" / "config").write_text(cfg_text)
         _log(f"RESTORED .git/config (url={url}, branch={branch})")
 
-    # zeroed/unresolvable HEAD → generated one-liner symref
-    head = git_dir / "HEAD"
+
+def restore_head(repo: Path, branch: str, *, apply: bool) -> None:
+    """Regenerate a zeroed/invalid ``.git/HEAD`` *file* (a one-line symref).
+    Self-guards: a valid HEAD whose branch tip merely went missing is NOT a
+    HEAD-file problem (that is a branch-tip restore) and is left untouched —
+    ``rev-parse --symbolic-full-name`` resolves a symref even with no tip."""
+    head = repo / ".git" / "HEAD"
     head_bad = (
         (not head.is_file())
         or head.stat().st_size == 0
         or _git(repo, "rev-parse", "--symbolic-full-name", "HEAD").returncode != 0
     )
-    if head_bad:
-        if not apply:
-            _log(f"WOULD RESTORE .git/HEAD → ref: refs/heads/{branch}")
-        else:
-            head.write_text(f"ref: refs/heads/{branch}\n")
-            _log(f"RESTORED .git/HEAD → ref: refs/heads/{branch}")
+    if not head_bad:
+        return
+    if not apply:
+        _log(f"WOULD RESTORE .git/HEAD → ref: refs/heads/{branch}")
+    else:
+        head.write_text(f"ref: refs/heads/{branch}\n")
+        _log(f"RESTORED .git/HEAD → ref: refs/heads/{branch}")
+
+
+def restore_branch_tips(repo: Path, branch: str, *, apply: bool) -> None:
+    """Recreate a local branch tip that was lost with a quarantined packed-refs.
+    Prefers the remote-tracking ref (restored by the refetch); falls back to the
+    reflog's last recorded tip. Self-guards if the tip is already present."""
+    if _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0:
+        return
+    tip = ""
+    r = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}")
+    if r.returncode == 0 and r.stdout.strip():
+        tip = r.stdout.strip()
+    else:
+        log = repo / ".git" / "logs" / "refs" / "heads" / branch
+        if log.is_file():
+            lines = [ln for ln in log.read_text(errors="ignore").splitlines() if ln.strip()]
+            if lines:  # reflog line: "<old> <new> <who> <ts> <msg>"
+                parts = lines[-1].split()
+                if len(parts) >= 2 and _HEX40.fullmatch(parts[1]):
+                    tip = parts[1]
+    if not tip:
+        _log(f"could not restore refs/heads/{branch}: no remote-tracking ref or reflog tip")
+        return
+    if not apply:
+        _log(f"WOULD RESTORE refs/heads/{branch} → {tip[:12]}")
+        return
+    r = _git(repo, "update-ref", f"refs/heads/{branch}", tip)
+    _log(
+        f"RESTORED refs/heads/{branch} → {tip[:12]}"
+        if r.returncode == 0
+        else f"tip restore failed for {branch}: {r.stderr.strip()[:120]}"
+    )
 
 
 # ─── Rung b: quarantine ──────────────────────────────────────────────────────
@@ -396,6 +466,27 @@ def quarantine_objects(repo: Path, objs: list[Path], *, apply: bool) -> int:
         + (f" → {dest}" if apply else "")
     )
     return n
+
+
+def quarantine_packed_refs(repo: Path, *, apply: bool) -> None:
+    """MOVE a corrupt ``.git/packed-refs`` aside. Loose refs under .git/refs/
+    survive; branch tips that lived ONLY in packed-refs are then restored by the
+    refetch (origin refs) + reflog tip repair in rung c — the Phase-0 recipe. We
+    move (never delete) so the operator can inspect the original."""
+    pr = repo / ".git" / "packed-refs"
+    if not pr.is_file():
+        return
+    if not apply:
+        _log(f"WOULD QUARANTINE corrupt {pr} (refs restored via refetch/reflog)")
+        return
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    dest = repo / ".git" / "RECOVERY-corrupt-objects" / ts
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(pr), str(dest / "packed-refs"))
+        _log(f"QUARANTINED corrupt packed-refs → {dest} (refs restored via refetch/reflog)")
+    except OSError as exc:
+        _log(f"quarantine FAILED for {pr}: {exc}")
 
 
 # ─── Rung c: refetch + reflog tip repair ─────────────────────────────────────
@@ -500,6 +591,10 @@ def guided_reclone(repo: Path, url: str, *, apply: bool) -> None:
 # ─── Orchestration ───────────────────────────────────────────────────────────
 
 
+def _check_ok(d: Diagnosis, name: str) -> bool:
+    return any(c.name == name and c.ok for c in d.checks)
+
+
 def repair(repo: Path, *, apply: bool, remote_url: str | None, allow_reclone: bool) -> int:
     _log(f"git_repair starting on {repo} (mode={'APPLY' if apply else 'DRY-RUN'})")
 
@@ -534,11 +629,18 @@ def repair(repo: Path, *, apply: bool, remote_url: str | None, allow_reclone: bo
         return 1
 
     branch = _detect_branch(repo, capture)
+    packed_refs_was_corrupt = d.packed_refs_corrupt
 
-    # Rung a — config/HEAD
-    if not any(c.name == "config parses" and c.ok for c in d.checks) or not any(
-        c.name == "HEAD resolvable" and c.ok for c in d.checks
-    ):
+    # Rung a — structural metadata, in DEPENDENCY ORDER (a corrupt config or
+    # packed-refs makes for-each-ref/fsck/rev-parse abort, masking everything).
+    # a1: packed-refs FIRST — clears the 'unterminated line' abort so the rest of
+    #     the diagnosis reflects reality (branch tips may then read as missing).
+    if d.packed_refs_corrupt:
+        quarantine_packed_refs(repo, apply=True)
+        d = diagnose(repo)
+        _log("Post-packed-refs diagnosis:\n" + d.render())
+    # a2: config — ONLY when genuinely unparseable (never clobber a healthy one).
+    if not _check_ok(d, "config parses"):
         url = _resolve_url(repo, remote_url=remote_url, capture=capture)
         if not url:
             _log(
@@ -548,25 +650,35 @@ def repair(repo: Path, *, apply: bool, remote_url: str | None, allow_reclone: bo
             return 2
         restore_config(repo, url, branch, apply=True)
         d = diagnose(repo)
-        _log("Post-config diagnosis:\n" + d.render())
+    # a3: HEAD *file* (self-guards; a merely-missing tip is handled after refetch).
+    if not _check_ok(d, "HEAD resolvable"):
+        restore_head(repo, branch, apply=True)
+        d = diagnose(repo)
 
-    # Rung b — quarantine
+    # Rung b — quarantine corrupt loose objects
     if d.corrupt_objects:
         quarantine_objects(repo, d.corrupt_objects, apply=True)
         d = diagnose(repo)
 
     # Rung c — refetch (only if origin reachable; refetch() short-circuits so its
     # side effect fires only when the store is unhealthy AND origin is reachable)
-    if (
-        not d.healthy
-        and any(c.name == "origin reachable" and c.ok for c in d.checks)
-        and refetch(repo, apply=True)
-    ):
+    did_refetch = False
+    if not d.healthy and d.origin_reachable and refetch(repo, apply=True):
+        did_refetch = True
         d = diagnose(repo)
         _log("Post-refetch diagnosis:\n" + d.render())
 
-    # Rung d — repack (only once the store is complete again)
-    if any(c.name == "fsck --full clean" and c.ok for c in d.checks):
+    # Restore any branch tip lost with a quarantined packed-refs — from the
+    # remote-tracking ref (populated by the refetch) or the reflog. Self-guards.
+    if packed_refs_was_corrupt:
+        restore_branch_tips(repo, branch, apply=True)
+        d = diagnose(repo)
+        _log("Post-tip-restore diagnosis:\n" + d.render())
+
+    # Rung d — repack: consolidate ONLY after an actual refetch, and only once the
+    # store is complete again (repack hard-fails on a missing reachable object).
+    # Skipped on a config-only repair — there is nothing new to consolidate.
+    if did_refetch and _check_ok(d, "fsck --full clean"):
         repack(repo, apply=True)
         d = diagnose(repo)
 
@@ -594,16 +706,25 @@ def _dry_run_plan(
 ) -> None:
     """Show the ladder the tool WOULD walk, without mutating anything."""
     branch = _detect_branch(repo, capture)
-    if not all(c.ok for c in d.checks if c.name in ("config parses", "HEAD resolvable")):
+    if d.packed_refs_corrupt:
+        quarantine_packed_refs(repo, apply=False)
+    if not _check_ok(d, "config parses"):
         url = _resolve_url(repo, remote_url=remote_url, capture=capture)
         if url:
             restore_config(repo, url, branch, apply=False)
         else:
             _log("WOULD ABORT: no origin URL resolvable for config restore.")
+    if not _check_ok(d, "HEAD resolvable"):
+        restore_head(repo, branch, apply=False)
     if d.corrupt_objects:
         quarantine_objects(repo, d.corrupt_objects, apply=False)
-    refetch(repo, apply=False)
-    repack(repo, apply=False)
+    if d.origin_reachable:
+        refetch(repo, apply=False)
+        repack(repo, apply=False)
+    else:
+        _log("WOULD SKIP refetch/repack: origin unreachable")
+    if d.packed_refs_corrupt:
+        restore_branch_tips(repo, branch, apply=False)
     if allow_reclone:
         url = _resolve_url(repo, remote_url=remote_url, capture=capture)
         if url:
