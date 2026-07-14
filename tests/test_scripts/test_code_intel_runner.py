@@ -246,6 +246,59 @@ def test_runner_reconciles_orphaned_inflight(tmp_path):
     assert len(_markers(tmp_path)) == 1
 
 
+def test_uses_claimed_state_not_stale_list_snapshot(tmp_path):
+    """P2: a commit that coalesces the marker during the idle-sampling window
+    must be honored — the run uses the CLAIMED state, not the list snapshot.
+
+    Seed a gitnexus-only marker, then race a `both`/`full` coalesce into the
+    runner's ~1s real-iowait sampling window; the entrypoint must be invoked
+    with tools=both (the coalesced request), not the stale tools=gitnexus.
+    """
+    import threading
+    import time
+
+    home = tmp_path / ".genesis"
+    _seed_marker(tmp_path, tools="gitnexus", mode="fast")
+
+    def _coalesce():
+        time.sleep(0.4)  # well inside the runner's 1s iowait sample
+        subprocess.run(
+            [
+                "python3",
+                str(_MARKER_PY),
+                "write",
+                "--repo",
+                _REPO,
+                "--tools",
+                "cbm",
+                "--mode",
+                "full",
+            ],  # gitnexus ∪ cbm = both; full
+            env={**os.environ, "GENESIS_HOME": str(home)},
+            check=True,
+            capture_output=True,
+        )
+
+    t = threading.Thread(target=_coalesce)
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "GENESIS_HOME": str(home),
+        "CODE_INTEL_ENTRYPOINT": str(_fake_entrypoint(tmp_path, 0)),
+        "CODE_INTEL_FAKE_LOADAVG": "0",
+        "CODE_INTEL_FAKE_CLAUDE_CPU": "0",
+        # NOT faking iowait → real ~1s /proc/stat sampling = the race window;
+        # a high threshold so real iowait never trips the gate.
+        "CODE_INTEL_RUNNER_IDLE_IOWAIT": "100",
+    }
+    t.start()
+    subprocess.run(["bash", str(_RUNNER)], env=env, capture_output=True, text=True, timeout=60)
+    t.join()
+    log = (tmp_path / "entry.log").read_text()
+    assert "tools=both" in log, f"ran with stale list state, not claimed: {log}"
+    assert "mode=full" in log  # coalesced to full and escalation isn't needed
+
+
 def test_no_markers_is_quiet_noop(tmp_path):
     res = _run_runner(tmp_path, entry_rc=0)
     assert res.returncode == 0

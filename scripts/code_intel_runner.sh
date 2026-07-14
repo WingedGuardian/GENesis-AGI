@@ -110,8 +110,12 @@ if [ "${#_MARKERS[@]}" -eq 0 ]; then
 fi
 
 for line in "${_MARKERS[@]}"; do
-    IFS=$'\t' read -r hash repo tools mode _attempts age <<< "$line"
-    if [ -z "${hash:-}" ] || [ -z "${repo:-}" ]; then
+    # From the list snapshot we use ONLY hash + age (for the idle gate). repo/
+    # tools/mode are read from the CLAIM below, not here — a concurrent commit
+    # can coalesce the marker during the idle-sampling window, so the snapshot's
+    # tools/mode may be stale (e.g. a gitnexus-only marker that became "both").
+    IFS=$'\t' read -r hash _l_repo _l_tools _l_mode _l_attempts age <<< "$line"
+    if [ -z "${hash:-}" ]; then
         continue
     fi
 
@@ -119,21 +123,30 @@ for line in "${_MARKERS[@]}"; do
         continue
     fi
 
-    # Escalate a fast marker to full when the graph is due (and not backed off).
-    # "full" is a cbm-only concept — gitnexus analyze ignores mode (always
-    # incremental) — so a gitnexus-only marker must NOT escalate or it would
-    # stamp .last-full and falsely suppress cbm's genuinely-needed full pass.
+    # Move-aside claim FIRST (so a commit landing mid-index is never dropped),
+    # then act on the CLAIMED state — the authoritative snapshot for this run.
+    claimed="$(_marker claim --hash "$hash" 2>/dev/null)"
+    if [ -z "$claimed" ]; then
+        _log "could not claim marker $hash (already consumed?) — skipping"
+        continue
+    fi
+    IFS=$'\t' read -r repo tools mode _attempts <<< "$claimed"
+    if [ -z "${repo:-}" ]; then
+        _log "claimed marker $hash has no repo — restoring"
+        _marker restore --hash "$hash" >/dev/null
+        continue
+    fi
+
+    # Escalate a fast marker to full when the graph is due (and not backed off),
+    # using the CLAIMED tools/mode. "full" is a cbm-only concept — gitnexus
+    # analyze ignores mode (always incremental) — so a gitnexus-only marker must
+    # NOT escalate or it would stamp the shared .last-full and falsely suppress
+    # cbm's genuinely-needed full pass.
     run_mode="$mode"
     if [ "$mode" != "full" ] && { [ "$tools" = "cbm" ] || [ "$tools" = "both" ]; } \
         && _marker should-escalate --hash "$hash"; then
         run_mode="full"
         _log "escalating $repo to full (weekly/first full cbm index due)"
-    fi
-
-    # Move-aside claim so a commit landing mid-index is never dropped.
-    if ! _marker claim --hash "$hash" >/dev/null 2>&1; then
-        _log "could not claim marker $hash (already consumed?) — skipping"
-        continue
     fi
 
     _log "indexing $repo (tools=$tools mode=$run_mode)"
