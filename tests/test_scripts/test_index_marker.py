@@ -196,6 +196,29 @@ def test_stale_last_full_re_escalates(tmp_path, monkeypatch):
     assert im.should_escalate_full(h) is True
 
 
+def test_full_backoff_suppresses_escalation(tmp_path, monkeypatch):
+    _with_home(tmp_path, monkeypatch)
+    h = im.marker_hash("/tmp")
+    im.mark_full_backoff(h)  # a full just failed
+    assert im.should_escalate_full(h) is False  # fall back to fast for a while
+
+
+def test_stale_backoff_allows_re_escalation(tmp_path, monkeypatch):
+    _with_home(tmp_path, monkeypatch)
+    h = im.marker_hash("/tmp")
+    im.full_backoff_path(h).parent.mkdir(parents=True, exist_ok=True)
+    im.full_backoff_path(h).write_text(f"{time.time() - (im.FULL_BACKOFF_S + 60)}\n")
+    assert im.should_escalate_full(h) is True
+
+
+def test_stamp_full_clears_backoff(tmp_path, monkeypatch):
+    _with_home(tmp_path, monkeypatch)
+    h = im.marker_hash("/tmp")
+    im.mark_full_backoff(h)
+    im.stamp_full(h)  # a later full succeeded
+    assert not im.full_backoff_path(h).exists()
+
+
 # ── CLI surface (bash callers) ─────────────────────────────────────────────
 
 

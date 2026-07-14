@@ -43,6 +43,11 @@ from pathlib import Path
 MAX_ATTEMPTS = 5
 # A fast marker older than this with no recent full index escalates to full.
 FULL_INTERVAL_S = 7 * 24 * 3600
+# After a full escalation FAILS, back off full-escalation for this long so runs
+# fall back to cheap fast indexing (keeps the incremental graph fresh) instead
+# of re-escalating to a doomed full every tick. cbm 0.9 can't resume a killed
+# full, so a too-big/always-killed full must not thrash — it retries ~daily.
+FULL_BACKOFF_S = 24 * 3600
 VALID_TOOLS = ("cbm", "gitnexus", "both")
 VALID_MODES = ("fast", "moderate", "full")
 
@@ -248,18 +253,43 @@ def last_full_path(h: str) -> Path:
     return marker_dir() / f".last-full-{h}"
 
 
-def should_escalate_full(h: str) -> bool:
-    """True when no full index recorded, or the last one is older than FULL_INTERVAL_S."""
-    p = last_full_path(h)
+def full_backoff_path(h: str) -> Path:
+    return marker_dir() / f".full-backoff-{h}"
+
+
+def _age_or_none(p: Path) -> float | None:
     try:
-        ts = float(p.read_text().strip())
+        return time.time() - float(p.read_text().strip())
     except (OSError, ValueError):
-        return True
-    return (time.time() - ts) >= FULL_INTERVAL_S
+        return None
+
+
+def should_escalate_full(h: str) -> bool:
+    """Escalate a fast run to full only when it's both DUE and not backed off.
+
+    Due: no successful full recorded, or the last is older than FULL_INTERVAL_S.
+    Backed off: a full failed within FULL_BACKOFF_S — retry fast meanwhile so a
+    doomed full (too big for the wall cap, cbm can't resume) doesn't thrash.
+    """
+    last_full_age = _age_or_none(last_full_path(h))
+    due = last_full_age is None or last_full_age >= FULL_INTERVAL_S
+    if not due:
+        return False
+    backoff_age = _age_or_none(full_backoff_path(h))
+    backed_off = backoff_age is not None and backoff_age < FULL_BACKOFF_S
+    return not backed_off
 
 
 def stamp_full(h: str) -> None:
+    """Record a successful full index; clears any full-escalation backoff."""
     _atomic_write_text(last_full_path(h), f"{time.time()}\n")
+    with _suppress(OSError):
+        full_backoff_path(h).unlink()
+
+
+def mark_full_backoff(h: str) -> None:
+    """Record a failed full escalation so runs fall back to fast for a while."""
+    _atomic_write_text(full_backoff_path(h), f"{time.time()}\n")
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -294,7 +324,7 @@ def main(argv: list[str] | None = None) -> int:
         "list", help="TSV of pending markers: hash\\trepo\\ttools\\tmode\\tattempts\\tage_s"
     )
 
-    for name in ("claim", "consume", "should-escalate", "stamp-full"):
+    for name in ("claim", "consume", "should-escalate", "stamp-full", "mark-full-backoff"):
         sp = sub.add_parser(name)
         sp.add_argument("--hash", required=True)
 
@@ -335,6 +365,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if should_escalate_full(args.hash) else 1
     if args.cmd == "stamp-full":
         stamp_full(args.hash)
+        return 0
+    if args.cmd == "mark-full-backoff":
+        mark_full_backoff(args.hash)
         return 0
     return 2
 

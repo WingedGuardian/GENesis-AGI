@@ -386,6 +386,7 @@ def test_no_systemd_fallback_applies_rlimit(tmp_path):
 
 _ALLOWED = {
     Path("scripts/lib/code_intel_index.sh"),
+    Path("scripts/code_intel_runner.sh"),  # the sole entrypoint caller (queue consumer)
     Path("tests/test_scripts/test_code_intel_index.py"),
 }
 _SCAN_DIRS = ("scripts", "src", "tests", "config", ".claude")
@@ -445,14 +446,25 @@ def test_entrypoint_exists_and_is_executable():
     assert os.access(_ENTRYPOINT, os.X_OK)
 
 
-def test_all_wired_call_sites_reference_entrypoint():
-    """The five known spawn sites must reference the entrypoint (coverage
-    guardrail: don't trust the design's call-site list)."""
+def test_runner_is_the_sole_entrypoint_caller():
+    """After the queue conversion the idle-gated runner is the ONLY thing that
+    invokes the locked entrypoint; every former trigger just enqueues a marker."""
+    runner = _REPO_ROOT / "scripts" / "code_intel_runner.sh"
+    assert "code_intel_index.sh" in runner.read_text()
+
+
+def test_triggers_enqueue_markers_and_do_not_spawn():
+    """Coverage guardrail (don't trust the design's call-site list): every former
+    spawn site now writes an index-request marker and must NOT invoke the
+    entrypoint directly — a per-commit/setup spawn is what stormed the box."""
     for rel in (
         "scripts/setup_claude_config.py",
         "scripts/hooks/post-commit",
         "scripts/install.sh",
-        "scripts/bootstrap.sh",
         "src/genesis/surplus/jobs/gitnexus.py",
     ):
-        assert "code_intel_index.sh" in (_REPO_ROOT / rel).read_text(), rel
+        text = (_REPO_ROOT / rel).read_text()
+        assert "index_marker" in text, f"{rel} must enqueue a marker"
+        assert "code_intel_index.sh" not in text, (
+            f"{rel} must NOT spawn the entrypoint directly — enqueue a marker"
+        )
