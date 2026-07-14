@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from genesis.eval.longmemeval.client import load_secrets
 from genesis.eval.longmemeval.dataset import filter_by_types, load_oracle
-from genesis.eval.longmemeval.runner import default_arms, run_longmemeval
+from genesis.eval.longmemeval.runner import run_longmemeval, select_arms
 
 if TYPE_CHECKING:
     from genesis.eval.types import EvalRunSummary
@@ -21,6 +21,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger("genesis.eval.longmemeval")
 
 DEFAULT_DATASET = Path.home() / "tmp" / "longmemeval" / "longmemeval_oracle.json"
+
+
+def require_results_db(path: Path) -> Path:
+    """Fail FAST if the default results DB doesn't exist yet.
+
+    ``get_db`` silently CREATES a missing DB — and a freshly-created one lacks
+    ``eval_runs`` (migration-only, not in create_all_tables), so a benchmark
+    run would burn its full API spend and then crash at persistence. The
+    classic trigger: running from a git worktree without ``GENESIS_REPO_ROOT``
+    pointing at the main tree, which resolves ``genesis_db_path()`` into the
+    worktree. (Bit the 2026-07-14 re-baseline: ~500 questions of spend, zero
+    rows persisted.)
+    """
+    if not Path(path).exists():
+        msg = (
+            f"results DB not found at {path} — running from a worktree without "
+            "GENESIS_REPO_ROOT? Set it to the main tree, pass --db-path, or "
+            "use --no-persist."
+        )
+        raise RuntimeError(msg)
+    return path
 
 
 def build_reranker():
@@ -42,12 +63,22 @@ def print_report(summaries: dict[str, EvalRunSummary]) -> None:
             f"\n[{arm_label}]  overall={s.aggregate_score}  "
             f"attempted={attempted}/{s.total_cases}{skip_note}",
         )
-        for metric in ("evidence_recall_rate", "evidence_coverage_mean"):
+        headline = (
+            "evidence_recall_rate",
+            "evidence_coverage_mean",
+            "evidence_coverage_final_mean",
+        )
+        for metric in headline:
             val = s.scores.get(metric)
             if val is not None:
                 print(f"    {metric}: {val}")
+        # Graph-arm ingest/expansion volume lives in metadata, not scores.
+        for metric in ("links_created_mean", "expanded_mean"):
+            val = s.metadata.get(metric)
+            if val is not None:
+                print(f"    {metric}: {val}")
         for qtype, acc in sorted(s.scores.items()):
-            if qtype in ("evidence_recall_rate", "evidence_coverage_mean"):
+            if qtype in headline:
                 continue
             print(f"    {qtype}: {acc}")
         cost = sum(r.cost_usd for r in s.results)
@@ -65,12 +96,17 @@ async def execute(
     db_path: Path | None = None,
     types: str | None = None,
     dump_dir: Path | None = None,
+    graph: bool = False,
+    graph_link_threshold: float | None = None,
 ) -> dict[str, EvalRunSummary]:
     """Load the dataset, run the harness, persist (optionally), return summaries.
 
     ``types`` (comma-separated question types) filters BEFORE ``limit`` so
     ``--types temporal-reasoning --limit 20`` means "the first 20 temporal
     questions", not "temporal questions among the first 20".
+
+    ``graph`` ADDS a ``+graph`` variant of every selected arm (paired
+    baseline-vs-graph comparison in one run, one dump dir).
     """
     load_secrets()
     instances = load_oracle(dataset_path)
@@ -80,9 +116,7 @@ async def execute(
         instances = instances[:limit]
     logger.info("loaded %d questions from %s", len(instances), dataset_path)
 
-    arms = default_arms()
-    if no_rerank:
-        arms = [a for a in arms if not a.rerank]
+    arms = select_arms(no_rerank=no_rerank, graph=graph)
     reranker = None if no_rerank else build_reranker()
 
     db = None
@@ -98,7 +132,7 @@ async def execute(
             db = await init_db(db_path)
             await MigrationRunner(db).run_pending()
         else:
-            db = await get_db(genesis_db_path())
+            db = await get_db(require_results_db(genesis_db_path()))
 
     try:
         return await run_longmemeval(
@@ -109,6 +143,7 @@ async def execute(
             concurrency=concurrency,
             reranker=reranker,
             dump_dir=dump_dir,
+            link_threshold=graph_link_threshold,
         )
     finally:
         if db is not None:
