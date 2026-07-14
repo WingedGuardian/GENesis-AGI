@@ -232,6 +232,69 @@ async def test_update_status_batch_stamps_completed_at(db):
         assert row["resolution_notes"] == "bulk done"
 
 
+# ─── completed_at re-stamp semantics (idempotent terminal re-write) ──────────
+# completed_at feeds three GC/report windows (get_recently_resolved /
+# purge_completed / get_recently_completed). A notes-only status update passes
+# an already-terminal status back in; it must NOT reset completed_at (which
+# would silently move the row in those windows / reset the reaper clock). But a
+# GENUINE transition INTO a terminal state — e.g. the ego resolving a `failed`
+# follow-up to `completed` (ego/dispatch.py) — MUST stamp fresh.
+
+_OLD = "2025-01-01T00:00:00+00:00"
+
+
+async def _force_terminal(db, fid, status, completed_at=_OLD):
+    await db.execute(
+        "UPDATE follow_ups SET status = ?, completed_at = ? WHERE id = ?",
+        (status, completed_at, fid),
+    )
+    await db.commit()
+
+
+async def test_notes_only_rewrite_preserves_completed_at(db):
+    """Re-writing a completed row with the same status (notes-only) keeps completed_at."""
+    fid = await follow_ups.create(db, **_BASE)
+    await _force_terminal(db, fid, "completed")
+    await follow_ups.update_status(db, fid, "completed", resolution_notes="later note")
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["completed_at"] == _OLD  # preserved, NOT re-stamped
+    assert row["resolution_notes"] == "later note"
+
+
+async def test_failed_to_completed_stamps_fresh(db):
+    """A genuine failed→completed transition (ego resolution) stamps completed_at fresh."""
+    fid = await follow_ups.create(db, **_BASE)
+    await _force_terminal(db, fid, "failed")
+    await follow_ups.update_status(db, fid, "completed", resolution_notes="ego resolved")
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "completed"
+    # ISO-8601 sorts lexically: a fresh 2026+ stamp is strictly greater than the sentinel.
+    assert row["completed_at"] > _OLD  # fresh, NOT frozen at the failure time
+
+
+async def test_batch_notes_only_rewrite_preserves_completed_at(db):
+    """update_status_batch mirrors: idempotent terminal re-write preserves completed_at."""
+    ids = [await follow_ups.create(db, **_BASE) for _ in range(2)]
+    for fid in ids:
+        await _force_terminal(db, fid, "completed")
+    await follow_ups.update_status_batch(db, ids, "completed", resolution_notes="bulk note")
+    for fid in ids:
+        row = await follow_ups.get_by_id(db, fid)
+        assert row["completed_at"] == _OLD
+        assert row["resolution_notes"] == "bulk note"
+
+
+async def test_batch_failed_to_completed_stamps_fresh(db):
+    """update_status_batch: genuine failed→completed transition stamps fresh."""
+    ids = [await follow_ups.create(db, **_BASE) for _ in range(2)]
+    for fid in ids:
+        await _force_terminal(db, fid, "failed")
+    await follow_ups.update_status_batch(db, ids, "completed")
+    for fid in ids:
+        row = await follow_ups.get_by_id(db, fid)
+        assert row["completed_at"] > _OLD
+
+
 async def test_update_status_batch_rejects_invalid_status(db):
     fid = await follow_ups.create(db, **_BASE)
     with pytest.raises(ValueError):

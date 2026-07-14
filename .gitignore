@@ -1,6 +1,10 @@
 .assets
 .env
 secrets.env
+# Any secrets.env backup/variant (e.g. secrets.env.pre-*-bak-*) must never be
+# committable — only the tracked template is allowed.
+secrets.env.*
+!secrets.env.example
 secrets.json
 *.pyc
 dist/
@@ -24,6 +28,12 @@ botpy.log
 .worktrees/
 .claude/worktrees/
 .claude/.session-locks/
+# Local tooling artifacts written into the repo tree (keep the tree clean)
+.claude/database.db
+.claude/hookify.*.local.md
+.serena/
+# Malformed sqlite path artifacts (e.g. genesis.db?mode=ro used as a literal file)
+data/*mode=ro
 # Background sessions now live at ~/.genesis/background-sessions/ (outside repo)
 data/sqlite/*.db
 data/sqlite/*.db-journal

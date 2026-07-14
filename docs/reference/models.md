@@ -466,7 +466,7 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - Includes Llama 4 Scout, DeepSeek-R1, Gemma 4 31B, Qwen3-Coder 480B, Nemotron 3 Ultra 550B, various community models
 - Note: DeepSeek V4 Flash free variant removed as of June 2026; Kimi K2.6 and
   GLM-4.5-Air free variants removed June 2026; Nex-N2-Pro (`nex-agi/nex-n2-pro:free`)
-  removed June 2026
+  removed June 2026; Poolside Laguna XS 2 (`poolside/laguna-xs.2:free`) removed July 2026
 - Use as overflow when other free sources are exhausted, or as primary diversity source
 - Free models use `pricing.prompt == "0"` in API — detectable programmatically
 
@@ -558,6 +558,10 @@ Models requiring benchmark or free-tier verification before routing decisions:
   OpenRouter (`nvidia/nemotron-3-ultra-550b-a55b:free`). Largest free model
   available. Benchmark scores unverified — needs evaluation against existing
   heavy lifters for quality routing.
+- **Tencent Hy3 (free)** — `tencent/hy3:free`, 262k context, free on OpenRouter
+  (detected July 2026). New free model from a major provider (Tencent Hunyuan
+  line). Benchmark scores and capability profile unverified — evaluate before
+  routing; low priority given the roster already has ample free coverage.
 
 ---
 
@@ -658,7 +662,14 @@ High for adversarial review (#20) — without changing application code.
 ---
 
 ## Last Reviewed
-**2026-06-28** — OpenRouter free model count 27→26 (automated inventory:
+**2026-07-12** — OpenRouter free model count held at 26 (automated inventory:
+26 free, +1 new, −1 removed); removed Poolside Laguna XS 2
+(`poolside/laguna-xs.2:free`, delisted July 2026) — was never promoted to a
+tier or Pending Evaluation, so no roster entry to retire; noted the removal in
+OpenRouter Free Tier terms; detected new free model Tencent Hy3 (`tencent/hy3:free`,
+262k context) — added to Pending Evaluation as a low-priority candidate (major
+provider, benchmarks unverified, roster already well-covered on free tier).
+2026-06-28 — OpenRouter free model count 27→26 (automated inventory:
 26 free, +0 new, −1 removed); removed Nex-N2-Pro (`nex-agi/nex-n2-pro:free`,
 delisted June 2026) — was never promoted to a tier or Pending Evaluation, so
 no roster entry to retire; updated OpenRouter Free Tier count ~27→~26 and noted

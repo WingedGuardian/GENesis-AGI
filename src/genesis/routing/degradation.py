@@ -21,9 +21,14 @@ _L3_KEEP = {"3_micro_reflection", "21_embeddings", "22_tagging"}
 # pressure requires different shedding than provider outages.
 # MODERATE (yellow): suppress surplus + morning report (same as cloud L2)
 _TMP_MODERATE_SKIP = {"12_surplus_brainstorm", "13_morning_report"}
-# HIGH (orange): also suppress background reflections, ego, calibration, sweeps
+# HIGH (orange): also suppress background reflections, calibration, sweeps.
+# NOTE: the ego cycle (7_user/7_genesis_ego_cycle) is CC-dispatched (CCInvocation,
+# NOT route_call) and this skip is consulted ONLY inside router.route_call, so
+# tmp-pressure shedding never actually reached the ego cycle. The legacy
+# "7_ego_cycle" id was removed here 2026-07-13; wiring real ego tmp-shedding at
+# the CC dispatch layer is tracked as a separate tabled follow-up.
 _TMP_HIGH_SKIP = _TMP_MODERATE_SKIP | {
-    "5_deep_reflection", "6_strategic_reflection", "7_ego_cycle",
+    "5_deep_reflection", "6_strategic_reflection",
     "14_weekly_self_assessment", "16_quality_calibration",
     "28_observation_sweep", "judge", "crag_grade",
 }

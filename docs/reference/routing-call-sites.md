@@ -82,20 +82,19 @@ Shown as gray "Disabled" in the neural monitor.
 
 ### Routing Bypass (0)
 
-`8_memory_consolidation` was previously listed here. As of 2026-04-11 it has
-been renamed to `8_ego_compaction` and verified as a real route_call site
-(`src/genesis/ego/compaction.py:319` calls `router.route_call("8_ego_compaction", ...)`).
-It is not a routing bypass; it routes normally via the mistral-large-free
-chain. Zero live calls because its only caller (EgoCompactor) is in the ego
-subsystem, which is inert until beta per CLAUDE.md. This call site is
-ego-internal rolling-summary compaction — NOT Genesis-wide memory consolidation
-(dream cycle), which remains unbuilt.
+`8_memory_consolidation` was previously listed here. It was renamed to
+`8_ego_compaction` (2026-04-11), then **REMOVED FROM YAML 2026-07-13**: PR #26
+("Phase A — ephemeral sessions") replaced `CompactionEngine`'s LLM compaction
+with deterministic DB persistence + context assembly, so it no longer routes at
+all (its `call_site_id`/`router` args are accepted-and-ignored legacy params).
+It was ego-internal rolling-summary compaction — NOT Genesis-wide memory
+consolidation (dream cycle), which remains unbuilt.
 
 ### Never Wired — Ego/Executor (3)
 
 | Site | Intended Purpose | Recommendation |
 |------|-----------------|----------------|
-| `7_ego_cycle` | Ego cycle CLI reasoning | **Active** — persistent session with --resume |
+| `7_ego_cycle` | Ego cycle CLI reasoning | **REMOVED FROM YAML 2026-07-13** — legacy single ego cycle; #26 split it into `7_user_ego_cycle` + `7_genesis_ego_cycle` (both live, CC-dispatched). Meta retained as historical (`DEPRECATED_REMOVED`). |
 | `7_task_retrospective` | Task outcome root-cause analysis | **REMOVED FROM YAML 2026-05-10** — duplicate; executor went live with `43_task_retrospective` (`autonomy/executor/trace.py:24`). Meta entry retained as historical. |
 | `autonomous_executor_reasoning` | Executor non-tooling reasoning | **Keep** — wire when executor goes live |
 
@@ -140,8 +139,46 @@ see the linked commit / PR.
 | 2026-05-10 | `28_observation_sweep` confirmed functionally replaced by awareness loop; kept in YAML with clarifying comment. | ✅ Done |
 | 2026-05-10 | Confusable IDs renamed: `17_fresh_eyes_review` → `17_executor_review`, `23_fresh_eyes_review` → `23_outreach_review`, `email_triage` → `outreach_email_triage` (Tier 3 rename pass, PR #311). | ✅ Done |
 | 2026-05-10 | Confirmed `19_outreach_draft` and `contingency_deep_reflection` already absent from YAML / code (silent removal in earlier public-release squash). Stale "Cleanup Recommendations" rows referencing them dropped from this doc. | ✅ Done |
+| 2026-07-13 | Removed orphaned legacy ego sites `7_ego_cycle` + `8_ego_compaction` from YAML, `ESSENTIAL_CLOUD_SITES`, and `_TMP_HIGH_SKIP`; marked both `DEPRECATED_REMOVED` in `_call_site_meta.py`; snapshot builder now skips `DEPRECATED_REMOVED` sites even with a stale `last_run` row. Ego group refreshed to the live `7_user`/`7_genesis_ego_cycle` + `40_ego_focus_selection`; dead `2_triage`/`bookmark_enrichment` tiles dropped. | ✅ Done |
 
 ## Changelog
+
+### 2026-07-13 — Removed orphaned legacy ego call sites
+
+`7_ego_cycle` and `8_ego_compaction` were leftover `model_routing.yaml` entries
+from before PR #26 ("Phase A — ephemeral sessions"), which split the ego into
+`7_user_ego_cycle` (CEO/Opus) + `7_genesis_ego_cycle` (COO/Sonnet) and made
+compaction deterministic (no LLM). The backend snapshot kept emitting the two
+orphans as phantom "healthy but never active" tiles. This removes them at the
+root: dropped from YAML (56 → 54 call sites), from `ESSENTIAL_CLOUD_SITES` (a dead
+chain whose "uncovered" state could trigger a false ESSENTIAL degradation), and
+from `_TMP_HIGH_SKIP`; `_DEFAULT_CALL_SITE` repointed to a live id; and the
+snapshot builder now excludes `DEPRECATED_REMOVED` sites even when a stale
+historical `last_run` row exists (`7_ego_cycle` last ran ~2026-04). The neural
+monitor Ego group now lists the three live ego ids, and the dead `2_triage` /
+`bookmark_enrichment` tiles were dropped — closing the (b) grouping gap the
+2026-07-12 entry flagged below.
+
+### 2026-07-12 — Neural monitor "Other" group for ungrouped call sites
+
+The battleship grid (`neural_monitor.html` `SUBSYSTEM_GROUPS`) renders only call
+sites assigned to a subsystem group. Sites the backend snapshot emits but that
+aren't in any group — e.g. `40_ego_focus_selection`, `43_task_retrospective`,
+`44_task_premortem`, `45_intelligence_intake`, `46_infra_annotation`, `judge`,
+`crag_grade`, `attention_salience`, the `dream_cycle_*` sites, `voice_conversation`
+— rendered nowhere and were invisible. A new "Other" enrichment card, computed at
+render time from `Object.keys(callSites)` minus the grouped ids, surfaces them
+(clickable, opens the detail panel) and self-maintains as new sites are added.
+
+Two related grouping gaps are tracked separately, not fixed here: (a) `2_triage`
+and `bookmark_enrichment` remain in `SUBSYSTEM_GROUPS` but are no longer emitted by
+the snapshot, so they render as permanently-idle dead tiles; (b) the `ego` group
+still lists the legacy `7_ego_cycle` (last run ~79d ago) alongside `8_ego_compaction`,
+while the current ego call sites (`7_genesis_ego_cycle`, `7_user_ego_cycle`,
+`40_ego_focus_selection` — all active) are emitted and now surface under "Other"
+rather than the Ego group; the group's site list should be refreshed to the current
+ids. (Verified against the live `/api/genesis/health` snapshot, which emits from
+`call_site_last_run` + `_CALL_SITE_META`, not just `config/model_routing.yaml`.)
 
 ### 2026-05-10 — Confusable call-site ID rename (PR #311, Tier 3)
 

@@ -491,7 +491,6 @@ const SITE_META = {
     'cc_update_analysis': { name: 'CC Updates', category: 'processing' },
     'outreach_email_triage': { name: 'Email Filter', category: 'classification' },
     '13_morning_report': { name: 'Morning Rpt', category: 'content' },
-    'bookmark_enrichment': { name: 'Bookmark Enrich', category: 'content' },
     '40_knowledge_distillation': { name: 'Knowledge Distill', category: 'learning' },
     '41_resume_review_pass1': { name: 'Resume Review P1', category: 'memory' },
     '42_resume_review_pass2': { name: 'Resume Review P2', category: 'memory' },
@@ -502,11 +501,12 @@ const SITE_META = {
     '38_procedure_extraction': { name: 'Procedure', category: 'content' },
     'contingency_foreground': { name: 'CC Fallback (FG)', category: 'reasoning' },
     'contingency_micro': { name: 'CC Fallback (Micro)', category: 'processing' },
+    // Live ego call sites (legacy 7_ego_cycle split into two by #26; 40 = focus selector)
+    '7_user_ego_cycle': { name: 'User Ego', category: 'reasoning' },
+    '7_genesis_ego_cycle': { name: 'Genesis Ego', category: 'reasoning' },
+    '40_ego_focus_selection': { name: 'Ego Focus', category: 'classification' },
     // Groundwork / disabled
-    '2_triage': { name: 'Triage', category: 'classification' },
-    '7_ego_cycle': { name: 'Ego Cycle', category: 'reasoning' },
     '7_task_retrospective': { name: 'Task Retro', category: 'processing' },
-    '8_ego_compaction': { name: 'Ego Compact', category: 'processing' },
     '10_cognitive_state': { name: 'Cog State', category: 'reasoning' },
     '11_user_model_synthesis': { name: 'User Model', category: 'reasoning' },
     '17_executor_review': { name: 'Executor Review', category: 'assessment' },
@@ -1870,7 +1870,7 @@ const SUBSYSTEM_GROUPS = {
     ego: {
         name: 'Ego', domId: 'sub-ego',
         desc: 'Autonomous decision cycle \u2014 periodic thinking, proposals, adaptive cadence',
-        sites: ['7_ego_cycle', '8_ego_compaction'],
+        sites: ['7_genesis_ego_cycle', '7_user_ego_cycle', '40_ego_focus_selection'],
     },
     reflection: {
         name: 'Reflection', domId: 'sub-reflection',
@@ -1887,7 +1887,7 @@ const SUBSYSTEM_GROUPS = {
     surplus: {
         name: 'Surplus', domId: 'sub-surplus',
         desc: 'Idle-time tasks \u2014 brainstorms, code audits, infrastructure monitoring',
-        sites: ['12_surplus_brainstorm', '36_code_auditor', '37_infrastructure_monitor', 'bookmark_enrichment'],
+        sites: ['12_surplus_brainstorm', '36_code_auditor', '37_infrastructure_monitor'],
     },
     outreach: {
         name: 'Outreach', domId: 'sub-outreach',
@@ -1903,7 +1903,7 @@ const SUBSYSTEM_GROUPS = {
     learning: {
         name: 'Learning', domId: 'sub-learning',
         desc: 'Observation triage, calibration, outcome classification, skill refinement',
-        sites: ['2_triage', '29_retrospective_triage',
+        sites: ['29_retrospective_triage',
                 '30_triage_calibration', '31_outcome_classification', '32_delta_assessment',
                 '33_skill_refiner', '38_procedure_extraction', '40_knowledge_distillation'],
     },
@@ -2154,6 +2154,18 @@ function updateSubsystemGrid(data) {
             if (q.pending_embeddings) { enrichment.appendChild(sectionRow('Pending', String(q.pending_embeddings), 'color:#ffe600')); hasEnrichment = true; }
             if (q.failed_embeddings) { enrichment.appendChild(sectionRow('Failed', String(q.failed_embeddings), 'color:#ef4444')); hasEnrichment = true; }
 
+            // Permanent embedding backlog: memory_metadata rows stuck at
+            // embedding_status='failed' (keyword-only forever). Distinct from the
+            // transient queue 'Failed' above (pending_embeddings table, TTL-reaped)
+            // — this durable mirror survives the reaper and is what the awareness
+            // probe escalates on. Shown only when non-zero (baseline is 0).
+            const eb = mh.embedding_backlog || {};
+            if (eb.failed) {
+                const ebVal = eb.failed + ' no-vector (permanent)' + (eb.pending ? ' · ' + eb.pending + ' pending' : '');
+                enrichment.appendChild(sectionRow('Embed backlog', ebVal, 'color:#ef4444'));
+                hasEnrichment = true;
+            }
+
             if (mh.growth) {
                 const g = mh.growth;
                 if (g.last_7d !== undefined) { enrichment.appendChild(sectionRow('+7d', String(g.last_7d))); hasEnrichment = true; }
@@ -2286,6 +2298,53 @@ function updateSubsystemGrid(data) {
         }
 
         if (hasEnrichment) card.appendChild(enrichment);
+        enrichGrid.appendChild(card);
+    }
+
+    // ── "Other": call sites the backend emits that aren't assigned to any
+    // subsystem group above. The 7×7 battleship grid is a fixed hand-placed
+    // layout, so an ungrouped site would otherwise render nowhere and stay
+    // invisible. Computed from the live data, so it self-maintains as new
+    // sites are added; rendered as an enrichment card (no grid cell) to avoid
+    // disturbing the fixed layout.
+    const groupedIds = new Set();
+    for (const g of Object.values(SUBSYSTEM_GROUPS)) {
+        for (const s of g.sites) groupedIds.add(s);
+    }
+    const ungrouped = Object.keys(callSites).filter((id) => !groupedIds.has(id)).sort();
+    if (ungrouped.length > 0) {
+        const card = el('div', 'enrich-card');
+        card.id = 'enrich-other';
+        card.style.borderLeftColor = '#64748b';
+
+        const memberStatuses = ungrouped.map((id) => callSites[id].status || 'unknown');
+        const aggStatus = aggregateStatus(memberStatuses);
+        const activeCount = memberStatuses.filter((s) => s === 'healthy' || s === 'active').length;
+
+        const header = el('div', 'region-header');
+        const aggDot = el('span', 'agg-dot');
+        aggDot.style.background = statusDotColor(aggStatus);
+        header.appendChild(aggDot);
+        header.appendChild(el('h3', null, 'Other'));
+        header.appendChild(el('span', 'region-count', activeCount + '/' + ungrouped.length));
+        card.appendChild(header);
+
+        card.appendChild(el('div', 'region-desc', 'Ungrouped call sites not assigned to a subsystem'));
+
+        const enrichment = el('div', 'region-enrichment');
+        for (const siteId of ungrouped) {
+            const info = callSites[siteId] || {};
+            const st = info.status || 'unknown';
+            const row = el('div', 'cat-health');
+            row.style.cursor = 'pointer';
+            row.appendChild(el('span', 'cat-name', getMeta(siteId).name));
+            const dot = el('span', 'agg-dot');
+            dot.style.background = statusDotColor(st);
+            row.appendChild(dot);
+            row.addEventListener('click', () => showDetail({ id: siteId, status: st, data: info }));
+            enrichment.appendChild(row);
+        }
+        card.appendChild(enrichment);
         enrichGrid.appendChild(card);
     }
 }

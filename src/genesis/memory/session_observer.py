@@ -17,6 +17,7 @@ This processor:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -38,6 +39,11 @@ MAX_OBS_PER_LLM_CALL = 15  # Observations to batch per LLM call
 MAX_PROCESSING_TIME_S = 45.0  # Budget per tick (leave headroom under 60s)
 # Files older than this are cleaned up (stale sessions)
 STALE_FILE_AGE_S = 7 * 24 * 3600  # 7 days
+
+# A .processing file older than this cannot belong to a live tick (45s budget,
+# single-flight) — it was stranded by a crash/restart mid-tick and no future
+# tick would ever scan it. Adopted back at tick start.
+STALE_PROCESSING_AGE_S = 3600
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
@@ -241,6 +247,11 @@ async def process_pending_observations(
     result = ProcessingResult()
     start = time.monotonic()
 
+    # Adopt crash-stranded .processing files before scanning: the finally-
+    # restore below only covers files renamed by THIS run, so a mid-tick
+    # crash would otherwise strand its renamed files forever.
+    _recover_stale_processing_files()
+
     obs_files = _find_observation_files()
     if not obs_files:
         return result
@@ -253,10 +264,17 @@ async def process_pending_observations(
         processing_path = obs_file.with_suffix(".jsonl.processing")
         try:
             os.rename(obs_file, processing_path)
-            processing_files.append((obs_file, processing_path))
         except OSError:
             # File may have been removed or renamed by another process
             continue
+        # rename preserves the source mtime, so an hour-old backlog file
+        # would look "stale" to _recover_stale_processing_files the moment
+        # it's renamed. Stamp processing start so the guard measures
+        # time-since-rename. Best-effort: a missed stamp only matters if
+        # the single-flight invariant is ever broken.
+        with contextlib.suppress(OSError):
+            os.utime(processing_path)
+        processing_files.append((obs_file, processing_path))
 
     if not processing_files:
         _cleanup_stale_files(obs_files)
@@ -278,7 +296,6 @@ async def process_pending_observations(
 
     if not all_observations:
         # Clean up processing files (they were empty or unreadable)
-        import contextlib
         for _original, processing_path in processing_files:
             with contextlib.suppress(OSError):
                 processing_path.unlink(missing_ok=True)
@@ -360,20 +377,7 @@ async def process_pending_observations(
         # Restore any `.processing` files still on disk. On normal completion
         # these are the budget-exceeded/unread ones; on cancellation this
         # restores everything not yet consumed so it's reprocessed next tick.
-        for _original, processing_path in processing_files:
-            if processing_path.exists():
-                try:
-                    original = processing_path.with_suffix(".jsonl")
-                    if original.exists():
-                        # Original was recreated by hook — append our unprocessed
-                        # data to the new file.
-                        with open(original, "a") as dst, open(processing_path) as src:
-                            dst.write(src.read())
-                        processing_path.unlink(missing_ok=True)
-                    else:
-                        os.rename(processing_path, original)
-                except OSError:
-                    logger.warning("Failed to restore %s", processing_path, exc_info=True)
+        _restore_processing_files(processing_files)
 
     result.files_processed = len(all_observations)
     result.elapsed_s = time.monotonic() - start
@@ -385,6 +389,56 @@ async def process_pending_observations(
         )
 
     return result
+
+
+def _recover_stale_processing_files() -> None:
+    """Restore .processing files stranded by a crash/restart mid-tick.
+
+    Fail-open: scan errors are swallowed — recovery must never break the
+    tick. Freshness guard: a file younger than STALE_PROCESSING_AGE_S may
+    belong to the current (single-flight) run and is left alone.
+    """
+    sessions_dir = _sessions_dir()
+    if not sessions_dir.exists():
+        return
+    now = time.time()
+    stranded: list[tuple[Path, Path]] = []
+    for processing_path in sessions_dir.glob("*/tool_observations.jsonl.processing"):
+        try:
+            if (now - processing_path.stat().st_mtime) < STALE_PROCESSING_AGE_S:
+                continue
+        except OSError:
+            continue
+        original = processing_path.parent / "tool_observations.jsonl"
+        stranded.append((original, processing_path))
+    if stranded:
+        logger.info("Recovering %d crash-stranded .processing file(s)", len(stranded))
+        _restore_processing_files(stranded)
+
+
+def _restore_processing_files(processing_files: list[tuple[Path, Path]]) -> None:
+    """Restore leftover `.processing` files to their EXACT original path.
+
+    The original path MUST come from the rename tuple, never be re-derived
+    via `processing_path.with_suffix(".jsonl")`: with_suffix replaces only
+    the LAST suffix, so `tool_observations.jsonl.processing` became
+    `tool_observations.jsonl.jsonl` — a name `_find_observation_files` never
+    scans, silently orphaning every restored file (108 orphans found on
+    disk, 2026-07-13).
+    """
+    for original, processing_path in processing_files:
+        if processing_path.exists():
+            try:
+                if original.exists():
+                    # Original was recreated by hook — append our unprocessed
+                    # data to the new file.
+                    with open(original, "a") as dst, open(processing_path) as src:
+                        dst.write(src.read())
+                    processing_path.unlink(missing_ok=True)
+                else:
+                    os.rename(processing_path, original)
+            except OSError:
+                logger.warning("Failed to restore %s", processing_path, exc_info=True)
 
 
 def _cleanup_stale_files(files: list[Path]) -> None:

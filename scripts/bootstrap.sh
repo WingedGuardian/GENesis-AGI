@@ -489,6 +489,18 @@ for launcher in "$GENESIS_ROOT/.claude/hooks/genesis-hook" "$GENESIS_ROOT/.claud
 done
 echo
 
+# --- Install identity (stable per-install UUID) ---
+# Materialize ~/.genesis/install.json so the prepare-commit-msg hook can
+# stamp the Install: trailer from its first commit. Owned by
+# genesis.contribution.identity (create-on-first-access); non-fatal.
+echo "--- Ensuring install identity ---"
+if "$VENV_DIR/bin/python" -c "from genesis.contribution.identity import get_install_id; print(get_install_id()[:8])" 2>/dev/null; then
+    echo "  Install identity present"
+else
+    echo "  WARNING: could not materialize install identity (non-fatal)"
+fi
+echo
+
 # --- Git hooks (worktree safety, push guards) ---
 echo "--- Installing git hooks ---"
 HOOKS_SRC="$GENESIS_ROOT/scripts/hooks"

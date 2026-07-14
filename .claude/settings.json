@@ -86,7 +86,7 @@
                     {
                         "type": "command",
                         "command": "bash ${CLAUDE_PROJECT_DIR}/scripts/hooks/session_activity_touch.sh",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             }
@@ -305,6 +305,17 @@
                 ]
             }
         ],
+        "PreCompact": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_precompact.py",
+                        "timeout": 5
+                    }
+                ]
+            }
+        ],
         "PostToolUse": [
             {
                 "matcher": "Read|Edit|Write|Glob|Grep",
@@ -401,7 +412,7 @@
                     {
                         "type": "command",
                         "command": "bash ${CLAUDE_PROJECT_DIR}/scripts/hooks/session_activity_touch.sh",
-                        "timeout": 2000
+                        "timeout": 10
                     }
                 ]
             }

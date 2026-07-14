@@ -172,6 +172,35 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
              "openrouter-deepseek-v4 when the free NIM tier is down)",
     )
 
+    # -- eval longmemeval (external memory benchmark, WS-1 A4) --
+    lme_cmd = eval_sub.add_parser(
+        "longmemeval",
+        help="LongMemEval external memory benchmark (WS-1 A4)",
+        description=(
+            "Load each LongMemEval question's haystack into a fresh ephemeral "
+            "Genesis memory store (zero prod contact), recall + answer, and "
+            "grade with the standard gpt-4o judge. Reports per-arm (raw vs "
+            "keyword query x rerank) per-question-type accuracy."
+        ),
+    )
+    lme_cmd.add_argument(
+        "--dataset-path", default=None,
+        help="oracle JSON (default: ~/tmp/longmemeval/longmemeval_oracle.json)",
+    )
+    lme_cmd.add_argument("--limit", type=int, default=None, help="first N questions")
+    lme_cmd.add_argument("--k", type=int, default=10, help="recall top-K")
+    lme_cmd.add_argument("--concurrency", type=int, default=4)
+    lme_cmd.add_argument(
+        "--no-rerank", action="store_true", help="skip the Voyage rerank arms",
+    )
+    lme_cmd.add_argument(
+        "--no-persist", action="store_true", help="do not write eval_runs",
+    )
+    lme_cmd.add_argument(
+        "--db-path", default=None,
+        help="results DB (default: production genesis.db; a fresh path is migrated)",
+    )
+
     eval_cmd.set_defaults(func=_run_eval_cli)
 
 
@@ -211,12 +240,33 @@ def _run_eval_cli(args: argparse.Namespace) -> int:
         return asyncio.run(_cmd_gauntlet(args))
     elif args.eval_command == "bench":
         return asyncio.run(_cmd_bench(args))
+    elif args.eval_command == "longmemeval":
+        return asyncio.run(_cmd_longmemeval(args))
     else:
         print(
-            "usage: genesis eval {run|benchmark|results|compare|export|datasets|gauntlet|bench}",
+            "usage: genesis eval {run|benchmark|results|compare|export|datasets"
+            "|gauntlet|bench|longmemeval}",
             file=sys.stderr,
         )
         return 1
+
+
+async def _cmd_longmemeval(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from genesis.eval.longmemeval.cli import DEFAULT_DATASET, execute, print_report
+
+    summaries = await execute(
+        dataset_path=Path(args.dataset_path) if args.dataset_path else DEFAULT_DATASET,
+        limit=args.limit,
+        k=args.k,
+        concurrency=args.concurrency,
+        no_rerank=args.no_rerank,
+        persist=not args.no_persist,
+        db_path=Path(args.db_path) if args.db_path else None,
+    )
+    print_report(summaries)
+    return 0
 
 
 async def _cmd_run(args: argparse.Namespace) -> int:

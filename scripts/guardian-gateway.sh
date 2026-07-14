@@ -18,6 +18,9 @@
 #   test-approval   — E2E test the keyword-reply approval gate (no recovery)
 #   disk-status     — read-only storage-pool + snapshot JSON (Genesis's window
 #                     into host capacity: lvs data%/metadata%, VG free, snapshots)
+#   host-profile    — read-only host body-schema JSON (meminfo/nproc/kernel,
+#                     storage pool, incus version + container limits.*) for the
+#                     container's infra_profile host plane
 #   provision-status          — read-only Proxmox host capacity (audit token)
 #   provision-grow-disk <disk> <GiB> — EXECUTE a pre-approved VM disk grow +
 #                     absorb (execute-only: NO Telegram gate; caller approves)
@@ -543,6 +546,25 @@ PYEOF
             cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md" || true
         fi
 
+        # Refresh systemd units from the archived repo config (picks up
+        # MemoryMax, OOMScoreAdjust, TimeoutStartSec, etc.) — mirrors the `update`
+        # verb, which was the ONLY path that refreshed units, so push-redeploys
+        # (the path update.sh actually uses) left host units frozen at install
+        # time. Copy-if-present: an older client whose archive lacks the unit
+        # files simply leaves the installed units untouched — the redeploy
+        # required-file gate deliberately does NOT demand them (backward-compat).
+        # Best-effort/guarded so a cp or daemon-reload failure can never abort the
+        # redeploy under set -e and strand the Guardian with its timer stopped.
+        SYSTEMD_DIR="$HOME/.config/systemd/user"
+        mkdir -p "$SYSTEMD_DIR" 2>/dev/null || true
+        for unit in genesis-guardian.service genesis-guardian.timer \
+                    genesis-guardian-watchman.service genesis-guardian-watchman.timer; do
+            if [ -f "$INSTALL_DIR/config/$unit" ]; then
+                cp "$INSTALL_DIR/config/$unit" "$SYSTEMD_DIR/$unit" 2>/dev/null || true
+            fi
+        done
+        systemctl --user daemon-reload 2>/dev/null || true
+
         # Record deployed commit + the verified tree sha (separate file —
         # state.json is overwritten by Guardian ticks). Values are passed via
         # the environment (not string-interpolated into the heredoc), and the
@@ -789,6 +811,29 @@ PYEOF
         PYTHONPATH="$INSTALL_DIR/src" \
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
             timeout 30 "$VENV_PY" -m genesis.guardian --disk-status
+        ;;
+    host-profile)
+        # Read-only: print the host body-schema JSON (system identity, storage
+        # pool, virtualization stack + this container's limits.*). Consumed by
+        # the container's infra_profile host-plane collector. No mutation, no
+        # secrets, no sudo.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "host-profile", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        # Skew guard: sync-gateway redeploys THIS script independently of the
+        # src tree. An old checkout has no --host-profile branch — the flag
+        # would fall through main()'s if-chain into run_check(), i.e. a FULL
+        # guardian recovery cycle triggered by a routine read-only poll.
+        if [ ! -f "$INSTALL_DIR/src/genesis/guardian/host_profile.py" ]; then
+            echo '{"ok": false, "action": "host-profile", "error": "guardian src predates host-profile — run update to redeploy"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+            timeout 45 "$VENV_PY" -m genesis.guardian --host-profile
         ;;
     provision-status)
         # Read-only host capacity via the Proxmox AUDIT token (VM cores/RAM,

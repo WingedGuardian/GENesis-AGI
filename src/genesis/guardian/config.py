@@ -233,7 +233,7 @@ class ProvisioningConfig:
 
     enabled: bool = False
     provider: str = "proxmox"  # only "proxmox" implemented; ABC allows others
-    api_host: str = ""         # PVE host, e.g. 192.168.1.10 — empty = unconfigured
+    api_host: str = ""         # PVE host, e.g. 192.0.2.10 — empty = unconfigured
     api_port: int = 8006
     verify_tls: bool = True     # self-signed PVE → set false per-install (documented)
     node: str = ""             # PVE node name, e.g. "pve"
@@ -339,6 +339,11 @@ class GuardianConfig:
     @property
     def state_path(self) -> Path:
         return Path(self.state_dir).expanduser()
+
+    @property
+    def shared_path(self) -> Path:
+        """Host-side root of the container's ~/.genesis/shared mount."""
+        return self.state_path / self.briefing.shared_subdir
 
     @property
     def briefing_path(self) -> Path:

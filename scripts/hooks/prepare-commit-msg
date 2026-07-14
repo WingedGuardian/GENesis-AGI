@@ -1,0 +1,47 @@
+#!/bin/bash
+# Genesis prepare-commit-msg hook — stamp an install-identity trailer.
+#
+# Both Genesis installs commit under one git identity and one GitHub
+# account, so nothing in a merged PR says WHICH machine authored it.
+# This hook appends an `Install: <id8>` trailer to every commit message.
+# Squash merges on the public repo include commit bodies, and PR commits
+# stay queryable via the API after merge, so the trailer survives both
+# paths and makes cross-install provenance a lookup instead of forensics.
+#
+# The id is the first 8 chars of the stable per-install UUID from
+# ~/.genesis/install.json (owned by genesis.contribution.identity — a
+# local pseudonym, never an IP or hostname, so it is safe in public
+# commit messages). Resolution order:
+#   1. GENESIS_INSTALL_ID env (tests / explicit override)
+#   2. ~/.genesis/install.json (GENESIS_HOME honored)
+#   3. absent -> exit 0 silently (never block a commit over identity)
+
+MSG_FILE="$1"
+SOURCE="${2:-}"
+
+# Merge commits are local plumbing that never reaches a PR as-is; leave
+# them unstamped so pull/merge flows stay byte-identical to vanilla git.
+[ "$SOURCE" = "merge" ] && exit 0
+
+_resolve_id() {
+    if [ -n "${GENESIS_INSTALL_ID:-}" ]; then
+        printf '%s' "$GENESIS_INSTALL_ID"
+        return 0
+    fi
+    local install_json="${GENESIS_HOME:-$HOME/.genesis}/install.json"
+    [ -f "$install_json" ] || return 1
+    # install_id is a UUID — grab the first hyphen-group (8 hex chars).
+    sed -n 's/.*"install_id"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{8\}\)-.*/\1/p' \
+        "$install_json" | head -1
+}
+
+ID="$(_resolve_id)"
+[ -n "$ID" ] || exit 0
+
+# Already stamped (e.g. commit --amend) — don't double-add.
+grep -qE "^Install: " "$MSG_FILE" && exit 0
+
+git interpret-trailers --in-place --if-exists doNothing \
+    --trailer "Install: $ID" "$MSG_FILE" 2>/dev/null || true
+
+exit 0

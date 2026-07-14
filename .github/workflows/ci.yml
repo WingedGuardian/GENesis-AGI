@@ -51,6 +51,19 @@ jobs:
           #   diskcache 5.6.3 (CVE-2025-69872) — pickle-by-default RCE, no fixed
           #     release. Genesis's only diskcache use (memory/embeddings.py) is a
           #     JSON-only _SafeDisk subclass, so the vulnerable pickle path is unused.
+          #   fastmcp 2.14.7 (PYSEC-2026-2475/CVE-2025-64340, PYSEC-2026-2476/
+          #     CVE-2026-27124) — both fixed in 3.2.0, but the pin is deliberately
+          #     <3.0 (3.x breaks the API) and NEITHER path is reachable here:
+          #     2475 is a Windows-only command injection via `fastmcp install`
+          #     (advisory: "Does not affect macOS/Linux") — Genesis runs on Linux
+          #     and never calls `fastmcp install` (servers are instantiated
+          #     directly and run over stdio). 2476 is a confused-deputy specific
+          #     to FastMCP's OAuthProxy + GitHubProvider OAuth flow — Genesis uses
+          #     NO OAuthProxy/GitHubProvider/OAuth anywhere (grep-verified). Its
+          #     optional streamable-http transport (scripts/genesis_mcp_server.py)
+          #     is static Bearer-token auth (GENESIS_MCP_HTTP_TOKEN), not the
+          #     vulnerable OAuth flow. Revisit if Genesis ever adopts FastMCP
+          #     OAuthProxy/OAuth auth, or a Windows `fastmcp install` path.
           pip-audit \
             --ignore-vuln PYSEC-2026-390 \
             --ignore-vuln PYSEC-2026-388 \
@@ -59,7 +72,9 @@ jobs:
             --ignore-vuln CVE-2026-42271 \
             --ignore-vuln CVE-2026-47102 \
             --ignore-vuln CVE-2026-47101 \
-            --ignore-vuln CVE-2025-69872
+            --ignore-vuln CVE-2025-69872 \
+            --ignore-vuln PYSEC-2026-2475 \
+            --ignore-vuln PYSEC-2026-2476
 
   leak-detector:
     # Verify no user-specific content (IPs, timezones, personal paths, secrets)
@@ -151,6 +166,12 @@ jobs:
             exit 1
           fi
           echo "Portability scan: CLEAN"
+
+      - name: Portability scan (network-address classes)
+        run: |
+          set -euo pipefail
+          bash scripts/check_portability.sh
+          echo "Portability scan (address classes): CLEAN"
 
       - name: Email scan
         run: |

@@ -14,6 +14,8 @@ from genesis.memory.session_observer import (
     _infer_wing_from_files,
     _parse_notes,
     _read_observations,
+    _recover_stale_processing_files,
+    _restore_processing_files,
     process_pending_observations,
 )
 
@@ -213,8 +215,15 @@ class TestFindObservationFiles:
 
 
 @pytest.mark.asyncio
-async def test_process_pending_observations_no_files(monkeypatch):
+async def test_process_pending_observations_no_files(tmp_path, monkeypatch):
     """No observation files → immediate return with zero counts."""
+    # Isolate BOTH filesystem touchpoints: _find_observation_files AND the
+    # stale-recovery scan (_sessions_dir) — otherwise this unit test globs
+    # (and could rename) files under the real ~/.genesis/sessions.
+    monkeypatch.setattr(
+        "genesis.memory.session_observer._sessions_dir",
+        lambda: tmp_path,
+    )
     monkeypatch.setattr(
         "genesis.memory.session_observer._find_observation_files",
         lambda: [],
@@ -230,6 +239,11 @@ async def test_process_pending_observations_no_files(monkeypatch):
 @pytest.mark.asyncio
 async def test_process_pending_observations_stores_notes(tmp_path, monkeypatch):
     """Observations are read, LLM is called, notes are stored."""
+    # Keep the stale-recovery scan off the real ~/.genesis/sessions
+    monkeypatch.setattr(
+        "genesis.memory.session_observer._sessions_dir",
+        lambda: tmp_path,
+    )
     # Setup observation file in a realistic directory structure
     session_dir = tmp_path / "test-session"
     session_dir.mkdir()
@@ -282,3 +296,149 @@ async def test_process_pending_observations_stores_notes(tmp_path, monkeypatch):
     # then deleted after processing)
     assert not obs_file.exists()
     assert not obs_file.with_suffix(".jsonl.processing").exists()
+# ── restore path ────────────────────────────────────────────────────────
+
+
+class TestRestoreProcessingFiles:
+    """Leftover .processing files must return to their EXACT original path.
+
+    Regression guard for the with_suffix bug: Path.with_suffix replaces only
+    the LAST suffix, so deriving the original from the processing path turned
+    tool_observations.jsonl.processing into tool_observations.jsonl.jsonl —
+    a name the finder never scans, orphaning every restored file forever
+    (108 orphans found on disk, 2026-07-13).
+    """
+
+    def test_restores_to_exact_original_name(self, tmp_path):
+        original = tmp_path / "tool_observations.jsonl"
+        processing = tmp_path / "tool_observations.jsonl.processing"
+        processing.write_text('{"tool": "Read"}\n')
+
+        _restore_processing_files([(original, processing)])
+
+        assert original.exists()
+        assert original.read_text() == '{"tool": "Read"}\n'
+        assert not processing.exists()
+        assert not (tmp_path / "tool_observations.jsonl.jsonl").exists()
+
+    def test_appends_when_hook_recreated_original(self, tmp_path):
+        original = tmp_path / "tool_observations.jsonl"
+        original.write_text('{"tool": "Write"}\n')  # hook wrote while we processed
+        processing = tmp_path / "tool_observations.jsonl.processing"
+        processing.write_text('{"tool": "Read"}\n')
+
+        _restore_processing_files([(original, processing)])
+
+        assert original.read_text() == '{"tool": "Write"}\n{"tool": "Read"}\n'
+        assert not processing.exists()
+        assert not (tmp_path / "tool_observations.jsonl.jsonl").exists()
+
+    def test_already_consumed_processing_is_noop(self, tmp_path):
+        original = tmp_path / "tool_observations.jsonl"
+        processing = tmp_path / "tool_observations.jsonl.processing"
+
+        _restore_processing_files([(original, processing)])  # neither exists
+
+        assert not original.exists()
+        assert not processing.exists()
+class TestRecoverStaleProcessingFiles:
+    """Crash-stranded .processing files must be adopted back at tick start.
+
+    The restore in process_pending_observations only covers files renamed by
+    the CURRENT run — a server crash/restart mid-tick leaves a .processing
+    file no future tick would ever scan (found live: one stranded since
+    2026-05-13). Recovery: at tick start, restore any .processing older than
+    STALE_PROCESSING_AGE_S; a live tick never holds one that long (45s
+    budget, single-flight).
+    """
+
+    def test_stale_processing_is_recovered(self, tmp_path, monkeypatch):
+        import genesis.memory.session_observer as mod
+
+        monkeypatch.setattr(mod, "_sessions_dir", lambda: tmp_path)
+        session_dir = tmp_path / "sid-1"
+        session_dir.mkdir()
+        stale = session_dir / "tool_observations.jsonl.processing"
+        stale.write_text('{"tool": "Read"}\n')
+        import os as _os
+
+        old = stale.stat().st_mtime - (mod.STALE_PROCESSING_AGE_S + 60)
+        _os.utime(stale, (old, old))
+
+        _recover_stale_processing_files()
+
+        original = session_dir / "tool_observations.jsonl"
+        assert original.exists()
+        assert original.read_text() == '{"tool": "Read"}\n'
+        assert not stale.exists()
+
+    def test_fresh_processing_is_left_alone(self, tmp_path, monkeypatch):
+        import genesis.memory.session_observer as mod
+
+        monkeypatch.setattr(mod, "_sessions_dir", lambda: tmp_path)
+        session_dir = tmp_path / "sid-1"
+        session_dir.mkdir()
+        fresh = session_dir / "tool_observations.jsonl.processing"
+        fresh.write_text('{"tool": "Read"}\n')  # mtime = now (a live tick)
+
+        _recover_stale_processing_files()
+
+        assert fresh.exists()
+        assert not (session_dir / "tool_observations.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_rename_stamps_processing_start(self, tmp_path, monkeypatch):
+        """Renamed .processing files carry a fresh mtime, not the source's.
+
+        os.rename preserves st_mtime, so an hour-old backlog file would look
+        "stale" to _recover_stale_processing_files the instant it's renamed —
+        a recovery pass could then adopt a file mid-processing. Stamping at
+        rename makes the guard measure time-since-rename (Codex P2, PR #1044).
+        """
+        import os as _os
+        import time as _time
+
+        import genesis.memory.session_observer as mod
+
+        monkeypatch.setattr(mod, "_sessions_dir", lambda: tmp_path)
+        session_dir = tmp_path / "sid-1"
+        session_dir.mkdir()
+        obs_file = session_dir / "tool_observations.jsonl"
+        obs_file.write_text('{"tool": "Read"}\n')
+        old = obs_file.stat().st_mtime - (mod.STALE_PROCESSING_AGE_S + 60)
+        _os.utime(obs_file, (old, old))
+
+        monkeypatch.setattr(mod, "_find_observation_files", lambda: [obs_file])
+
+        captured = {}
+
+        def capture_read(path, limit=None):
+            captured["mtime"] = path.stat().st_mtime
+            return []
+
+        monkeypatch.setattr(mod, "_read_observations", capture_read)
+
+        await process_pending_observations(store=AsyncMock(), router=AsyncMock())
+
+        assert "mtime" in captured
+        assert _time.time() - captured["mtime"] < mod.STALE_PROCESSING_AGE_S
+
+    def test_stale_processing_merges_into_recreated_original(self, tmp_path, monkeypatch):
+        import genesis.memory.session_observer as mod
+
+        monkeypatch.setattr(mod, "_sessions_dir", lambda: tmp_path)
+        session_dir = tmp_path / "sid-1"
+        session_dir.mkdir()
+        original = session_dir / "tool_observations.jsonl"
+        original.write_text('{"tool": "Write"}\n')  # hook wrote since the crash
+        stale = session_dir / "tool_observations.jsonl.processing"
+        stale.write_text('{"tool": "Read"}\n')
+        import os as _os
+
+        old = stale.stat().st_mtime - (mod.STALE_PROCESSING_AGE_S + 60)
+        _os.utime(stale, (old, old))
+
+        _recover_stale_processing_files()
+
+        assert original.read_text() == '{"tool": "Write"}\n{"tool": "Read"}\n'
+        assert not stale.exists()

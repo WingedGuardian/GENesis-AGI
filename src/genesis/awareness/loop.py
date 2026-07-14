@@ -134,6 +134,164 @@ async def _check_wal_health(db) -> None:
         logger.debug("Failed to create WAL health alert observation", exc_info=True)
 
 
+# Embedding-backlog degradation: memories stuck at embedding_status='failed' —
+# the embedding recovery worker gave up, so they are permanently keyword-only
+# (no vector/semantic search) and invisible to every rate/per-run embedding
+# alert (the outage that created them is over). Baseline is 0 (verified live).
+# HYBRID surfacing: a real-but-modest pile records a NON-paging 'high'
+# observation (dashboard / morning report only); only a large pile — a serious
+# permanent-loss backlog (HIGH ~= 1.8% of a ~55k store) — escalates to
+# 'critical', which the critical-observations job pages to Telegram. The
+# always-on count also feeds the neural-monitor via memory_health(). The metric
+# fluctuates and partially self-heals, so band + cooldown + auto-resolve is the
+# right shape (mirrors the dead-letter accumulation alert). Thresholds are
+# tunable module constants. NOTE: 'pending' (self-healing) is context in the
+# alert text only; a sustained-pending stuck-worker signal is a separate
+# recovery-worker health concern, tracked as a follow-up, not alerted here.
+_EMBED_BACKLOG_LOW = 50            # below this: quiet (+ resolve any prior alert)
+_EMBED_BACKLOG_HIGH = 1000         # at/above this: 'critical' (pages); else 'high'
+_EMBED_BACKLOG_COOLDOWN_S = 3600   # one alert per band per hour max
+# Safe as 0.0/"" (unlike _check_wal_health): the band guard below means a fresh
+# boot never matches the empty band, so the first real backlog always alerts.
+_last_embed_backlog_alert_at: float = 0.0
+_last_embed_backlog_band: str = ""
+
+
+def _embed_backlog_band(failed: int) -> str:
+    """Bucket the failed-embedding count into a stable band (only meaningful at
+    or above ``_EMBED_BACKLOG_LOW``). The alert's content_hash keys on the band,
+    not the raw count, so per-tick count drift does not defeat dedup; the exact
+    count still appears in the content. A band change is escalation-worthy and
+    bypasses the cooldown."""
+    if failed < 200:
+        return "50-199"
+    if failed < _EMBED_BACKLOG_HIGH:
+        return "200-999"
+    if failed < 5000:
+        return "1000-4999"
+    return "5000+"
+
+
+async def _check_embedding_backlog(db) -> None:
+    """Alert when embedding_status='failed' memories accumulate.
+
+    Hybrid: a modest pile records a non-paging 'high' observation (dashboard
+    only); a large pile (>= HIGH) records a 'critical' one that pages Telegram
+    via the critical-observations job. Best-effort — the whole body is guarded
+    and never raises into the tick."""
+    global _last_embed_backlog_alert_at, _last_embed_backlog_band
+    if db is None:
+        return
+    try:
+        from genesis.db.crud.memory import embedding_status_counts
+
+        counts = await embedding_status_counts(db)
+        failed = counts.get("failed", 0)
+
+        if failed < _EMBED_BACKLOG_LOW:
+            # Under threshold — clear any standing alert and stop.
+            await _resolve_embedding_backlog(db)
+            return
+
+        band = _embed_backlog_band(failed)
+        now = time.monotonic()
+        # Same-band re-alerts respect the cooldown; a band change (worsening or
+        # improving transition) is escalation-worthy and bypasses it.
+        if (
+            now - _last_embed_backlog_alert_at < _EMBED_BACKLOG_COOLDOWN_S
+            and band == _last_embed_backlog_band
+        ):
+            return
+
+        priority = "critical" if failed >= _EMBED_BACKLOG_HIGH else "high"
+        pending = counts.get("pending", 0)
+        content_hash = hashlib.sha256(
+            f"embedding_backlog:{band}".encode()
+        ).hexdigest()
+        # Keep exactly ONE active alert = the current band. Resolve any
+        # stale other-band rows so a worsening (high->critical) OR a partial
+        # recovery (critical->high) transition leaves only the current-band
+        # row active, instead of a lingering peak-severity row until the
+        # backlog fully clears (< LOW). DB-based (not the in-memory band), so
+        # it is restart-safe; a no-op in steady state at a fixed band.
+        await db.execute(
+            "UPDATE observations SET resolved=1, resolved_at=?, "
+            "resolution_notes='superseded by a new embedding-backlog band' "
+            "WHERE source='embedding_backlog_monitor' "
+            "AND type='infrastructure_alert' AND resolved=0 "
+            "AND content_hash != ?",
+            (datetime.now(UTC).isoformat(), content_hash),
+        )
+        await db.commit()
+        created = await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="embedding_backlog_monitor",
+            type="infrastructure_alert",
+            content=(
+                f"{failed} memories are stuck at embedding_status='failed' — the "
+                f"embedding recovery worker gave up on them, so they are "
+                f"permanently keyword-only (no vector/semantic search) and "
+                f"invisible to the rate-based embedding-failure alert (the outage "
+                f"that created them is over). {pending} more are 'pending' and "
+                f"still self-healing. Recovery: these failed rows have no "
+                f"live pending_embeddings queue entry (it was reaped), so a "
+                f"plain failed->pending reset will NOT retry them (nothing "
+                f"auto-recovers a reaped failure) — re-enqueue the affected "
+                f"memories for embedding (a fresh pending_embeddings row "
+                f"each) after checking embedding-provider health."
+            ),
+            priority=priority,
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+        if created is None:
+            return  # An unresolved alert for this band already exists.
+        _last_embed_backlog_alert_at = now
+        _last_embed_backlog_band = band
+        logger.warning(
+            "Embedding backlog alert: %d failed memories (%s observation created)",
+            failed,
+            priority,
+        )
+    except Exception:
+        logger.debug("Failed embedding backlog check", exc_info=True)
+
+
+async def _resolve_embedding_backlog(db) -> None:
+    """Resolve outstanding embedding-backlog alerts once the failed count drops
+    back under ``_EMBED_BACKLOG_LOW``.
+
+    Unconditional (no in-memory "is an alert active?" guard) so it survives a
+    restart; the UPDATE is a cheap no-op when nothing matches. Resolving on a
+    non-zero count clears the cooldown globals so a genuine recovery -> re-spike
+    re-alerts cleanly."""
+    global _last_embed_backlog_alert_at, _last_embed_backlog_band
+    if db is None:
+        return
+    try:
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source="embedding_backlog_monitor",
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=(
+                f"auto-resolved: failed-embedding backlog back under "
+                f"{_EMBED_BACKLOG_LOW}"
+            ),
+        )
+        if resolved:
+            _last_embed_backlog_alert_at = 0.0
+            _last_embed_backlog_band = ""
+            logger.info(
+                "Auto-resolved %d embedding-backlog alert observation(s) on recovery",
+                resolved,
+            )
+    except Exception:
+        logger.debug("Failed to resolve embedding backlog alerts", exc_info=True)
+
+
 # nodatacow (chattr +C) drift detection: on btrfs, a CoW SQLite DB suffers WAL
 # write-amplification + chronic fragmentation. The install sets +C on data/;
 # this catches regressions (a restore/recreate that dropped the flag). Static
@@ -1146,6 +1304,11 @@ class AwarenessLoop:
                     # nodatacow drift check (btrfs-only, daily alert cooldown) —
                     # static condition, so the slow hourly cadence is plenty.
                     await _check_db_nodatacow(self._db)
+                    # Embedding-backlog degradation — count memories permanently
+                    # stuck at embedding_status='failed'. Slow-moving and self-
+                    # healing, so the hourly cadence fits; self-resolves when the
+                    # backlog clears. Best-effort (guarded internally).
+                    await _check_embedding_backlog(self._db)
                 await _check_wal_health(self._db)
 
             # Status file writes are handled by a dedicated loop in

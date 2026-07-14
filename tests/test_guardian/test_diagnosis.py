@@ -388,3 +388,69 @@ class TestResolveCCEnv:
         cc = _stub_claude(tmp_path, "null")
         engine = _engine_with_token(tmp_path, token=True)
         assert await engine._resolve_cc_env(cc) is None
+
+
+# ── Infrastructure body-schema integration ─────────────────────────────
+
+
+class TestInfraSectionIntegration:
+    """The infra_profile shared-mount doc is inlined into the CC prompt."""
+
+    def test_prompt_includes_infra_doc_when_present(self, tmp_path, monkeypatch) -> None:
+        from pathlib import Path
+
+        from genesis.guardian.diagnosis import _build_diagnosis_prompt
+
+        infra_dir = tmp_path / ".genesis" / "shared" / "infrastructure"
+        infra_dir.mkdir(parents=True)
+        (infra_dir / "INFRASTRUCTURE.md").write_text(
+            "# Infrastructure\n- memory.max: 16GiB\n- thin pool: vg0 (shared with host)\n",
+        )
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+        prompt = _build_diagnosis_prompt(_snap(container_status="Running"), "", "genesis")
+        assert "Infrastructure Body Schema" in prompt
+        assert "memory.max: 16GiB" in prompt
+
+    def test_prompt_truncates_large_infra_doc(self, tmp_path, monkeypatch) -> None:
+        from pathlib import Path
+
+        from genesis.guardian.diagnosis import _build_diagnosis_prompt
+
+        infra_dir = tmp_path / ".genesis" / "shared" / "infrastructure"
+        infra_dir.mkdir(parents=True)
+        (infra_dir / "INFRASTRUCTURE.md").write_text("A" * 20000)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+        prompt = _build_diagnosis_prompt(_snap(container_status="Running"), "", "genesis")
+        # The doc is 20000 A's; the inlined copy is capped at 4096 chars.
+        import re
+
+        longest_run = max(len(run) for run in re.findall(r"A+", prompt))
+        assert 100 <= longest_run <= 4096
+
+    def test_shared_dir_param_overrides_home(self, tmp_path) -> None:
+        """The engine passes config.shared_path (host-side STATE_DIR mount) —
+        verified live 2026-07-13 that ~/.genesis/shared does NOT exist on the
+        host, so the param, not Path.home(), must drive the reads."""
+        from genesis.guardian.diagnosis import _build_diagnosis_prompt
+
+        shared = tmp_path / "state" / "shared"
+        (shared / "infrastructure").mkdir(parents=True)
+        (shared / "infrastructure" / "INFRASTRUCTURE.md").write_text(
+            "- thin pool: vg0\n",
+        )
+        prompt = _build_diagnosis_prompt(
+            _snap(container_status="Running"), "", "genesis", shared_dir=shared,
+        )
+        assert "thin pool: vg0" in prompt
+
+    def test_prompt_without_infra_doc(self, tmp_path, monkeypatch) -> None:
+        from pathlib import Path
+
+        from genesis.guardian.diagnosis import _build_diagnosis_prompt
+
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        prompt = _build_diagnosis_prompt(_snap(container_status="Running"), "", "genesis")
+        assert "Infrastructure Body Schema" not in prompt
+        assert "Genesis Guardian" in prompt

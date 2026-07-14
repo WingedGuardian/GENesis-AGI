@@ -32,7 +32,7 @@ from genesis.guardian.config import GuardianConfig
 logger = logging.getLogger(__name__)
 
 # Pre-flight memory thresholds.  Guardian must always attempt diagnosis
-# above the hard floor.  The systemd MemoryMax=30%-of-host-RAM cap on the Guardian
+# above the hard floor.  The systemd MemoryMax cap on the Guardian
 # service is the real safety boundary — Python-level checks are advisory.
 # Hard floor: refuse only at catastrophic levels (host is almost dead).
 # Warn floor: log warning but proceed (Guardian's job is to diagnose).
@@ -144,8 +144,18 @@ def _build_diagnosis_prompt(
     signal_summary: str,
     container_name: str,
     briefing_context: str | None = None,
+    shared_dir: Path | None = None,
 ) -> str:
-    """Build the full prompt for the CC diagnostic instance."""
+    """Build the full prompt for the CC diagnostic instance.
+
+    ``shared_dir`` is the HOST-side mount of the container's
+    ``~/.genesis/shared`` (``config.shared_path`` — the guardian runs on the
+    host, where ``~/.genesis/shared`` does not exist; verified live
+    2026-07-13). Defaults to the container-side spelling only for legacy
+    callers/tests.
+    """
+    if shared_dir is None:
+        shared_dir = Path.home() / ".genesis" / "shared"
     briefing_section = ""
     if briefing_context:
         briefing_section = f"""
@@ -161,8 +171,7 @@ service baselines, metric norms, and recent history that may help your diagnosis
     sentinel_section = ""
     try:
         import json as _json
-        from pathlib import Path as _Path
-        sentinel_last = _Path.home() / ".genesis" / "shared" / "sentinel" / "last_run.json"
+        sentinel_last = shared_dir / "sentinel" / "last_run.json"
         if sentinel_last.exists():
             sdata = _json.loads(sentinel_last.read_text())
             sentinel_section = f"""
@@ -196,6 +205,35 @@ repeat the same actions. Either try something different or escalate.
 """
     except Exception:
         logger.debug("Failed to read essential knowledge for guardian", exc_info=True)
+
+    # Infrastructure body schema — Genesis's programmatically-maintained map of
+    # what it runs on (CPU/memory/storage stack/limits + operational gotchas),
+    # projected to the shared mount by infra_profile on every refresh. Truncated
+    # hard: the doc runs ~700 lines and the diagnostician needs the headline
+    # facts + annotations, not every sysctl.
+    infra_section = ""
+    try:
+        infra_doc = shared_dir / "infrastructure" / "INFRASTRUCTURE.md"
+        if infra_doc.exists():
+            raw_doc = infra_doc.read_text()
+            if len(raw_doc) > 4096:
+                # Truncate at a line boundary — a fact sliced mid-value
+                # ("limits.memory: 16") is worse than a shorter inline.
+                cut = raw_doc.rfind("\n", 0, 4096)
+                raw_doc = raw_doc[: cut if cut > 0 else 4096]
+            infra_text = raw_doc.strip()
+            if infra_text:
+                infra_section = f"""
+## Infrastructure Body Schema (from shared filesystem, truncated)
+
+Genesis maintains a programmatic profile of its own infrastructure. Use it to
+ground hypotheses (memory limits, storage stack, known gotchas) instead of
+re-deriving the machine's shape:
+
+{infra_text}
+"""
+    except Exception:
+        logger.debug("Failed to read infrastructure profile for guardian", exc_info=True)
 
     return f"""You are the Genesis Guardian — the system's last line of defense.
 Genesis appears to be down. You are running on the host VM with full tool access.
@@ -261,6 +299,7 @@ can cause catastrophic damage:
 {signal_summary}
 {briefing_section}
 {ek_section}
+{infra_section}
 {_FAILURE_INVENTORY}
 
 ## Available Commands
@@ -406,6 +445,7 @@ class DiagnosisEngine:
 
         prompt = _build_diagnosis_prompt(
             diagnostic, signal_summary, container_name, briefing_context,
+            shared_dir=self._config.shared_path,
         )
         cc_path = str(Path(self._config.cc.path).expanduser())
         work_dir = _ensure_work_dir(Path(self._config.cc.work_dir).expanduser())
@@ -428,7 +468,7 @@ class DiagnosisEngine:
         except Exception as exc:
             logger.warning("Disk space preflight failed (non-fatal): %s", exc)
 
-        # Pre-flight: check host memory.  The systemd MemoryMax=30% of host RAM on the
+        # Pre-flight: check host memory.  The systemd MemoryMax cap on the
         # Guardian service is the real safety boundary — this Python check
         # is advisory.  Only refuse at catastrophic levels (< 2 GiB means
         # the host is almost dead, not just Genesis).
@@ -450,7 +490,7 @@ class DiagnosisEngine:
             if available_gib < _CC_PREFLIGHT_WARN_GiB:
                 logger.warning(
                     "Host memory low (%.1f GiB free < %.0f GiB) "
-                    "— proceeding with CC diagnosis (MemoryMax=30% of host RAM caps usage)",
+                    "— proceeding with CC diagnosis (the systemd MemoryMax cap bounds usage)",
                     available_gib, _CC_PREFLIGHT_WARN_GiB,
                 )
         else:

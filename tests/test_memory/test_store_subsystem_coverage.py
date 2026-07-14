@@ -55,6 +55,9 @@ USER_CONTEXT_ALLOWLIST: dict[str, str] = {
         "user-authored ego correction (user content; ego must recall it)",
     "channels/voice/s2s_session.py::close":
         "voice conversation memory (user content)",
+    "eval/longmemeval/ingest.py::ingest_haystack":
+        "LongMemEval benchmark haystack ingest into an EPHEMERAL throwaway store "
+        "(first_party user-history content; never touches prod; not a subsystem)",
     "knowledge/ingest_upload.py::_store_as_is":
         "user-uploaded knowledge_base content (external-world, recallable)",
     "knowledge/orchestrator.py::_store_units":

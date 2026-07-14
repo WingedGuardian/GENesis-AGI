@@ -29,6 +29,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Claude Code sessions no longer forget what they were started for.** Long
+  sessions compact their context many times, and each summary is biased toward
+  recent work — after enough compactions a session can no longer connect
+  "what's next" to its original goal. Now the first compaction snapshots the
+  session's charter (the verbatim opening prompt) to disk, and every later
+  window gets it re-injected automatically. The origin survives any number of
+  compactions; `/clear` still means a genuinely fresh start. Charters live in
+  `~/.genesis/sessions/<session-id>/charter.md`.
+
+- **Genesis now notices when memories quietly lose semantic search.** When an
+  embedding permanently fails, that memory becomes keyword-only — findable by
+  exact words but invisible to meaning-based recall — and nothing flagged the
+  pile building up (the existing alert only caught embeddings failing *right
+  now*, not the backlog left behind). A new hourly check counts these
+  permanently-stuck memories: a modest pile shows on the dashboard, and a large
+  one (a real chunk of the store gone semantically dark) pages you on Telegram.
+  It clears itself once the memories are re-embedded.
+
 - **The recovery brain no longer drifts behind a version bump.** A nightly
   job re-aligns the host's Claude Code and Node.js to the pinned versions.
   Previously this happened only when you ran an update, so a pin bump could
@@ -121,6 +139,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   recall's own usage counters are suppressed for the run so benchmarking
   never distorts what your live Genesis considers important.
 
+- **`genesis eval longmemeval` — measure Genesis's memory on a public
+  benchmark.** Runs LongMemEval, an external long-term-memory QA benchmark:
+  each question's prior-conversation "haystack" is loaded into a throwaway
+  memory store built from scratch (so your real memory is never touched), then
+  Genesis recalls and answers, and the standard gpt-4o judge grades it — giving
+  a number you can compare to published results. It reports accuracy per
+  question type and across two query styles (the raw question vs. keyword
+  terms), so you can see how much question phrasing affects recall. One command
+  against the public dataset; nothing about your own data leaves the machine.
+
 - **The API Keys panel now shows how often each provider is causing fallbacks.**
   A provider that is misconfigured or failing — for example one whose key is
   missing yet is still wired in as the preferred choice on many call sites — used
@@ -204,6 +232,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The neural monitor's Ego panel now shows real ego activity, not phantom tiles.**
+  The dashboard was rendering a few "ego" tiles that looked healthy but never
+  actually ran — leftovers from an earlier ego redesign that split the ego into
+  two cycles and made its compaction step non-LLM. They're gone, the Ego panel now
+  lists the three live ego call sites, and a couple of other stale tiles (triage,
+  bookmark enrichment) were removed too. A months-old leftover activity record can
+  no longer resurrect a removed tile as if it were live.
 - **Memories recovered after an embedding outage keep their wing/room/life_domain
   filters, and keyword-only results are no longer ranked as artificially fresh.**
   When the embedding provider was down, memories were stored keyword-only and

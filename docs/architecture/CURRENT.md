@@ -348,7 +348,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 9037d45b 2026-07-07
+verified: 3d5234b9 2026-07-13
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -363,6 +363,10 @@ verified: 9037d45b 2026-07-07
   deployed script is NEWER than the host checkout.
 - Provisioning verbs are EXECUTE-ONLY — approval is the CALLER's
   responsibility (container obtains it via Telegram before invoking).
+- Read-only `host-profile` verb (`guardian/host_profile.py`) feeds the
+  `infra_profile` host plane; the CC diagnosis prompt inlines the shared-mount
+  `INFRASTRUCTURE.md` (truncated) so the diagnostician starts with the body
+  schema instead of re-deriving the machine's shape.
 - **sentinel/** is LIVE-wired but **shadow-only autonomy**: config mode
   `"live"` is NOT implemented (dispatcher warns + downgrades); every proposed
   action requires human approval. `InfrastructureMonitor` (call site 37, free
@@ -386,7 +390,10 @@ verified: 780cc8de 2026-07-10
   collectors). Tick → depth classification (MICRO/LIGHT/DEEP/STRATEGIC) →
   reflection dispatch. Also per-tick `_check_*` housekeeping: CC-slot RSS leak
   watch, subscription-cap detection, SQLite WAL hygiene, resilience-axis folds,
-  liveness heartbeat. It does NOT drive the ego cadence (ego has its own
+  liveness heartbeat, and (hourly) embedding-backlog degradation — counts
+  `memory_metadata.embedding_status='failed'` (permanently keyword-only rows the
+  rate alert misses), hybrid `high` (dashboard) / `critical` (Telegram) by band.
+  It does NOT drive the ego cadence (ego has its own
   scheduler). Trap: PEP 562 lazy `__init__` — don't eager-import `loop.py`.
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
   a CC bridge) run in-process via the router; DEEP/STRATEGIC go to the CC
@@ -424,6 +431,17 @@ verified: 780cc8de 2026-07-10
   retrieved_count** (retrieval connection is mode=ro; protects
   MEM-005/H-1 baselines). Fail-open at the hook boundary. Kill switch:
   `GENESIS_SESSION_AWARENESS_DISABLED=1`.
+- **Session charter** (session-manager stage 1): `scripts/genesis_precompact.py`
+  (PreCompact hook, both triggers, 5s fail-open timeout) persists a foreground
+  session's IMMUTABLE origin — the first typed user prompt, extracted from the
+  transcript head at the FIRST compaction boundary — to
+  `~/.genesis/sessions/<sid>/charter.json` (+ `charter.md` mirror,
+  `waypoints.jsonl` deterministic spine); `genesis_session_context.py`
+  re-injects it on every startup/resume/compact (NOT clear), so
+  recency-biased compaction can never erase what a session is for.
+  `origin_prompt`/`origin_ts` are write-once; `mission`/`pointers` are living
+  fields reserved for the ledger stage. Dispatched sessions
+  (GENESIS_CC_SESSION=1) are skipped — task_states is their continuity spine.
 
 ## 10. Learning & evaluation
 
@@ -535,7 +553,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, env.py, _config_overlay.py]
-verified: 613ff6ff 2026-07-12
+verified: 3d5234b9 2026-07-13
 ```
 
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
@@ -621,7 +639,8 @@ verified: 613ff6ff 2026-07-12
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **infra_profile/**: the infrastructure body schema — deterministic fact
-  collectors (container plane; host plane via a PR2 guardian verb, degrades to
+  collectors (container plane + host plane via the guardian `host-profile`
+  gateway verb; a missing guardian or un-redeployed gateway degrades to
   "not visible from this vantage") → per-section hashed `profile.json` +
   rendered `INFRASTRUCTURE.md` under `~/.genesis/infrastructure/`. **The
   facts/metrics split is load-bearing**: only `facts` are hashed; a hash change

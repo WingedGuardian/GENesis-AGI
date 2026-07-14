@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from typing import TYPE_CHECKING
 
 from genesis.providers.types import (
     CostTier,
@@ -17,6 +18,9 @@ from genesis.providers.types import (
     ProviderResult,
     ProviderStatus,
 )
+
+if TYPE_CHECKING:
+    from genesis.research.types import SearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -123,3 +127,38 @@ class TavilyAdapter:
                 latency_ms=latency,
                 provider_name=self.name,
             )
+
+    async def search(self, query: str, *, max_results: int = 10) -> list[SearchResult]:
+        """Return normalized SearchResult objects for the research orchestrator.
+
+        Wraps ``invoke()`` (which returns the raw Tavily dict) and maps each
+        ``results[]`` entry's title/url/content/score into a SearchResult tagged
+        ``source="tavily"``. Returns ``[]`` on any failure so a degraded provider
+        never breaks the fan-out — matching WebSearchAdapter/PerplexityAdapter.
+        Without this method the orchestrator fell back to ``invoke()`` and its
+        ``isinstance(result.data, list)`` guard silently dropped the dict.
+        """
+        from genesis.research.types import SearchResult
+
+        result = await self.invoke({"query": query, "max_results": max_results})
+        if not result.success or not isinstance(result.data, dict):
+            return []
+        out: list[SearchResult] = []
+        for entry in result.data.get("results", []):
+            url = entry.get("url")
+            if not url:
+                continue
+            try:
+                score = float(entry.get("score") or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+            out.append(
+                SearchResult(
+                    title=entry.get("title") or "",
+                    url=url,
+                    snippet=entry.get("content") or "",
+                    source=self.name,
+                    score=score,
+                )
+            )
+        return out

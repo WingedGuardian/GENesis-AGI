@@ -18,7 +18,7 @@ detect_container_lan_ip() {
 }
 
 # detect_container_lan_ipv6 — first global IPv6 NOT on a tailscale
-# interface (Tailscale's fd7a::/48 ULA shows up as scope global too).
+# interface (Tailscale's IPv6 ULA range shows up as scope global too).
 detect_container_lan_ipv6() {
     ip -6 -o addr show scope global 2>/dev/null \
         | awk '$2 !~ /^tailscale/ {print $4}' | cut -d/ -f1 | head -1 || true
