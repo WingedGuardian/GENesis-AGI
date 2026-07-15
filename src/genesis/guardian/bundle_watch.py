@@ -34,6 +34,7 @@ from genesis.guardian.alert.base import Alert, AlertSeverity
 # Reuse the identical atomic-copy discipline as the container-side publish /
 # credential mirror (same-dir tmp + os.replace, preserves mtime, forces 0600).
 from genesis.guardian.credential_bridge import _atomic_copy, _needs_copy
+from genesis.guardian.repo_bundle import is_valid_bundle_name
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +98,13 @@ def _archive_bundles(cfg, source_dir: Path, archive_dir: Path) -> None:
         logger.debug("bundle archive: no stamp at %s (incomplete/absent) — skipping", stamp_src)
         return
     bundle_name = stamp.get("bundle")
-    if not bundle_name:
-        logger.debug("bundle archive: stamp has no bundle name — skipping")
+    # The stamp is read from the CONTAINER-writable shared mount. Validate the
+    # bundle name is a plain basename (no ``..``/absolute) BEFORE building any path
+    # from it — otherwise a malformed/compromised stamp could make the host
+    # guardian read/write outside source_dir/archive_dir, defeating the host-only
+    # archive boundary (Codex P1). Absolute/traversal names → skip.
+    if not bundle_name or not is_valid_bundle_name(str(bundle_name)):
+        logger.debug("bundle archive: invalid/absent stamp bundle name %r — skipping", bundle_name)
         return
     bundle_src = source_dir / str(bundle_name)
     if not bundle_src.is_file():

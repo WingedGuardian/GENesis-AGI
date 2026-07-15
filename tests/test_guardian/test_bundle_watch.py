@@ -110,6 +110,33 @@ def test_archive_refuses_stampless_source(tmp_path):
     assert not archive.exists() or not list(archive.glob("genesis-*.bundle"))
 
 
+def test_archive_rejects_traversal_bundle_name(tmp_path):
+    """Codex P1: a malicious stamp (container-writable) naming an escape path must
+    NOT make the host guardian read/write outside the archive."""
+    config = _config(tmp_path)
+    source = _source_dir(config)
+    source.mkdir(parents=True)
+    for evil in ("../../evil.bundle", "/tmp/evil.bundle", "genesis-XYZ.bundle"):
+        (source / "BUNDLE_STAMP").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "head": "a" * 40,
+                    "bundle": evil,
+                    "size": 1,
+                    "sha256": "x",
+                    "created_at": "t",
+                    "last_verified_at": "t",
+                }
+            )
+        )
+        archive = config.state_path / "repo-archive"
+        bundle_watch._archive_bundles(config.repo_bundle, source, archive)
+        assert not (tmp_path / "evil.bundle").exists()
+        assert not (Path("/tmp/evil.bundle")).exists()
+        assert not archive.exists() or not list(archive.glob("*.bundle"))
+
+
 def test_archive_noop_on_absent_source(tmp_path):
     config = _config(tmp_path)
     archive = config.state_path / "repo-archive"

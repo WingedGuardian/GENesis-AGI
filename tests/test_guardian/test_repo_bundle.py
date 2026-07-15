@@ -184,6 +184,44 @@ async def test_insufficient_space_refuses(tmp_path, monkeypatch):
     assert result["reason"] == "insufficient_space"
 
 
+async def test_unchanged_rebuilds_when_bundle_corrupted(tmp_path):
+    """Codex P1: an unchanged HEAD must NOT advance freshness on existence alone —
+    a bundle corrupted after publish (digest mismatch) is rebuilt, not blessed."""
+    repo = tmp_path / "repo"
+    _make_repo(repo)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+
+    first = await publish_repo_bundle(repo=repo, shared_dir=shared)
+    bundle = _bundle_dir(shared) / first["bundle"]
+    bundle.write_bytes(b"CORRUPT")  # truncate/corrupt after publish
+
+    second = await publish_repo_bundle(repo=repo, shared_dir=shared)
+    assert second["action"] == "published"  # rebuilt, NOT verified_unchanged
+    rebuilt = _bundle_dir(shared) / second["bundle"]
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "bundle", "verify", str(rebuilt)],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def test_is_valid_bundle_name():
+    from genesis.guardian.repo_bundle import is_valid_bundle_name
+
+    assert is_valid_bundle_name("genesis-0123456789ab.bundle")
+    assert is_valid_bundle_name("genesis-0123456789abcdef01234567.bundle")
+    # Path-traversal / absolute / non-hex / wrong shape all rejected.
+    assert not is_valid_bundle_name("../genesis-0123456789ab.bundle")
+    assert not is_valid_bundle_name("/etc/passwd")
+    assert not is_valid_bundle_name("genesis-0123456789ab.bundle/../x")
+    assert not is_valid_bundle_name("genesis-ZZZZ.bundle")
+    assert not is_valid_bundle_name("evil.bundle")
+    assert not is_valid_bundle_name("")
+
+
 def test_cli_main_no_shared_mount(tmp_path, monkeypatch, capsys):
     """CLI entrypoint exits 0 and prints JSON when there's no shared mount."""
     monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "nope"))

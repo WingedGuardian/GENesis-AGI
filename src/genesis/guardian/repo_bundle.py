@@ -38,6 +38,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -56,6 +57,19 @@ _STAMP_NAME = "BUNDLE_STAMP"
 _BUNDLE_PREFIX = "genesis-"
 _BUNDLE_SUFFIX = ".bundle"
 _STAMP_SCHEMA = 1
+# A published bundle name is always ``genesis-<12+ hex>.bundle``. The stamp that
+# carries this name is read by the host guardian from the CONTAINER-writable
+# shared mount, so it must be validated as a plain basename before it is ever
+# used as a path component — a stamp with ``..``/absolute path would otherwise let
+# a compromised container escape the host-only archive boundary (see bundle_watch).
+_BUNDLE_NAME_RE = re.compile(r"genesis-[0-9a-f]{7,40}\.bundle\Z")
+
+
+def is_valid_bundle_name(name: str) -> bool:
+    """True iff ``name`` is a safe published-bundle basename (no path separators,
+    no ``..``, not absolute) — the guard for any path built from stamp data."""
+    return bool(_BUNDLE_NAME_RE.fullmatch(name))
+
 
 # `git bundle create --all` on this repo's ~59 MB store is <2 s / 18 MB (spike-
 # measured 2026-07-14); 1800 s is vast headroom that only trips on a genuinely
@@ -209,13 +223,24 @@ def _publish_core_sync(repo: Path, shared_base: Path, force: bool) -> dict:
     # host freshness alert) — do NOT rebuild the bundle. This decouples freshness
     # from commit activity: a quiet-commit period stays "fresh" as long as the
     # daily healthy check keeps advancing last_verified_at.
-    if not force and stamp and stamp.get("head") == head and stamp.get("bundle"):
+    if (
+        not force
+        and stamp
+        and stamp.get("head") == head
+        and is_valid_bundle_name(str(stamp.get("bundle", "")))
+    ):
         bundle_path = dest_dir / str(stamp["bundle"])
-        if bundle_path.exists():
+        # Do NOT advance freshness on existence alone — a bundle truncated or
+        # corrupted after publish would then read "verified" forever, silently
+        # breaking the offline re-clone in the exact scenario this exists for.
+        # Re-hash and compare to the recorded digest: a match proves the bytes are
+        # unchanged since the publish that ran `git bundle verify`, so it is still
+        # verifiable. A mismatch/miss falls through to rebuild (health gate passed).
+        if bundle_path.exists() and stamp.get("sha256") and _sha256(bundle_path) == stamp["sha256"]:
             stamp["last_verified_at"] = now
             _write_stamp(dest_dir, stamp)
             return {"action": "verified_unchanged", "head": head}
-        # Stamp claims a bundle that vanished → fall through and rebuild.
+        # Missing / corrupt / digest-mismatch → fall through and rebuild.
 
     # Free-space guard: refuse when free < 2x the object store (bundle is smaller
     # than .git, so this is generous; a full mount must not be half-filled).
