@@ -381,23 +381,19 @@ def _coverage(evidence_ids: set[str], ids: set[str]) -> tuple[bool, float | None
 async def _expand_neighbors(db: object, seed_ids: list[str], *, k: int) -> list[tuple[str, str]]:
     """1-hop expansion: (memory_id, content) for up to ``k`` linked neighbors.
 
-    Merges linked-but-unretrieved neighbors into the reader context (the prod
-    MCP layer only DECORATES results with neighbors; actually merging them is
-    what can lift multi-session coverage). Deliberately direct CRUD, not
-    graph.traverse — its process-global NetworkX cache is unsafe across the
-    concurrent ephemeral stores this runner creates. Dangling links (edge
-    rows whose neighbor memory no longer resolves) are skipped silently.
+    Thin adapter over the PRODUCTION primitive
+    ``genesis.memory.graph_expansion.expand_neighbors`` — the benchmark must
+    measure the shipped recall-expansion code, not a harness re-implementation.
+    The primitive is mode-independent (reads NO prod config; this harness
+    passes explicit args only): dangling links skipped, dedup +
+    MAX(strength) ordering, seeds never returned. No ``exclude_link_types``
+    passed — eval ingest only ever stores supports/extends edges, so prod's
+    configured ``contradicts`` exclusion is a no-op here by construction.
     """
-    from genesis.db.crud import memory as memory_crud
-    from genesis.db.crud import memory_links as memory_links_crud
+    from genesis.memory.graph_expansion import expand_neighbors
 
-    neighbors = await memory_links_crud.neighbors_of(db, seed_ids, limit=k)
-    expanded: list[tuple[str, str]] = []
-    for n in neighbors:
-        row = await memory_crud.get_by_id(db, n["memory_id"])
-        if row and row.get("content"):
-            expanded.append((n["memory_id"], row["content"]))
-    return expanded
+    expanded = await expand_neighbors(db, seed_ids, cap=k)
+    return [(r.memory_id, r.content) for r in expanded]
 
 
 async def _run_arm(
