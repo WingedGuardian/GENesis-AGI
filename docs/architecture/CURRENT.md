@@ -377,7 +377,7 @@ The loops that make Genesis think between conversations.
 ```yaml subsystem-map
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness]
-verified: 780cc8de 2026-07-10
+verified: f619ab4a 2026-07-14
 ```
 
 - **awareness/**: the 5-min heartbeat. ~23 signal collectors (the richer
@@ -386,7 +386,11 @@ verified: 780cc8de 2026-07-10
   collectors). Tick → depth classification (MICRO/LIGHT/DEEP/STRATEGIC) →
   reflection dispatch. Also per-tick `_check_*` housekeeping: CC-slot RSS leak
   watch, subscription-cap detection, SQLite WAL hygiene, resilience-axis folds,
-  liveness heartbeat, and (hourly) embedding-backlog degradation — counts
+  liveness heartbeat, duplicate-CC-executor paging (two live `claude` processes
+  on ONE transcript — hook layer `scripts/hooks/duplicate_session_guard.py`
+  writes `~/.genesis/session-owners/*.conflict`, this check pages `critical`
+  and GCs stale registry files; newest executor wins, older one's repo-mutating
+  tools are denied), and (hourly) embedding-backlog degradation — counts
   `memory_metadata.embedding_status='failed'` (permanently keyword-only rows the
   rate alert misses), hybrid `high` (dashboard) / `critical` (Telegram) by band.
   It does NOT drive the ego cadence (ego has its own
