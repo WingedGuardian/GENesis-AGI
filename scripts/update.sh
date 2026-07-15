@@ -1025,6 +1025,18 @@ if [ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]; then
     echo ""
 fi
 
+# ── Network resilience — re-run VISIBLY (same rationale as memory resilience:
+# bootstrap already applied it, but `tail -10` ate the output). The update path
+# is where an existing install retrofits the KeepConfiguration drop-in + the
+# networkd watchdog, and where a still-degraded networkd gets healed on the next
+# timer tick. Idempotent: already-applied → one no-op line.
+if [ -f "$SCRIPT_DIR/lib/network_resilience.sh" ]; then
+    # shellcheck source=lib/network_resilience.sh
+    . "$SCRIPT_DIR/lib/network_resilience.sh"
+    network_resilience_apply
+    echo ""
+fi
+
 # ── Verify Genesis is importable ──────────────────────────
 if ! "$VENV_DIR/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/dev/null; then
     _do_rollback "Genesis not importable after bootstrap"
