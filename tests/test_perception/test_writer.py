@@ -484,13 +484,15 @@ async def test_micro_cooldown_blocks_rapid_non_anomaly(db):
 
     writer = ResultWriter()
 
-    # Insert a recent micro_reflection with current timestamp
+    # Insert a recent micro_reflection with current timestamp.  _make_tick()
+    # (cpu_usage only) classifies as :genesis, so seed a matching category.
     now = datetime.now(UTC).isoformat()
     await observations.create(
         db,
         id="recent-micro",
         source="reflection",
         type="micro_reflection",
+        category="routine:genesis",
         content='{"summary": "prior"}',
         priority="low",
         created_at=now,
@@ -503,7 +505,7 @@ async def test_micro_cooldown_blocks_rapid_non_anomaly(db):
     )
     stored = await writer.write(output, Depth.MICRO, _make_tick(), db=db)
 
-    assert not stored, "Cooldown should block non-anomaly within 20 min"
+    assert not stored, "Cooldown should block same-relevance non-anomaly within 20 min"
 
 
 async def test_micro_cooldown_allows_anomaly(db):
@@ -803,3 +805,58 @@ async def test_write_micro_dedup_distinguishes_relevance(db):
     obs = await observations.query(db, source="reflection")
     cats = sorted(o["category"] for o in obs)
     assert cats == ["anomaly:genesis", "anomaly:user"]
+
+
+async def test_micro_cooldown_scoped_by_relevance(db):
+    """A recent :user micro must NOT block a :genesis micro (different ego
+    partition), but a recent same-relevance micro still hits the cooldown."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id="recent-user-micro",
+        source="reflection",
+        type="micro_reflection",
+        category="routine:user",
+        content='{"summary": "prior user-relevant"}',
+        priority="low",
+        created_at=now,
+    )
+
+    # genesis-driven micro on a mixed roster -> routine:genesis; the recent
+    # :user micro is a different partition and must not suppress it.
+    genesis_output = MicroOutput(
+        tags=["cpu"], salience=0.6, anomaly=False,
+        summary="Disk usage creeping upward.",
+        signals_examined=2,
+        driving_signals=["cpu_usage"],
+    )
+    stored_genesis = await writer.write(
+        genesis_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    assert stored_genesis is True, "cross-relevance cooldown must not block"
+
+    # a recent same-relevance (:genesis) micro DOES suppress the next one.
+    await observations.create(
+        db,
+        id="recent-genesis-micro",
+        source="reflection",
+        type="micro_reflection",
+        category="routine:genesis",
+        content='{"summary": "prior genesis-relevant"}',
+        priority="low",
+        created_at=now,
+    )
+    genesis_output2 = MicroOutput(
+        tags=["cpu2"], salience=0.7, anomaly=False,
+        summary="Disk usage still creeping.",
+        signals_examined=2,
+        driving_signals=["cpu_usage"],
+    )
+    stored_genesis2 = await writer.write(
+        genesis_output2, Depth.MICRO, _make_mixed_tick(), db=db)
+    assert stored_genesis2 is False, "same-relevance cooldown must still block"

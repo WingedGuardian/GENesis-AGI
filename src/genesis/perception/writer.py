@@ -131,12 +131,20 @@ class ResultWriter:
             logger.debug("Micro observation below salience threshold (%.2f), skipping", output.salience)
             return False
 
-        # Cooldown gate: skip if a micro_reflection was created within the last
-        # 20 minutes. Anomalies bypass — same pattern as light reflections (30 min).
+        base_category = "anomaly" if output.anomaly else "routine"
+        relevance = self._relevance_from_signals(tick, output.driving_signals)
+        category = f"{base_category}:{relevance}"
+
+        # Cooldown gate: skip if a micro_reflection of the SAME relevance was
+        # created within the last 20 minutes.  Scoped by relevance so a
+        # user-relevant micro does not suppress a genesis-relevant one (they
+        # feed different ego partitions).  Anomalies bypass — same pattern as
+        # light reflections (30 min).
         if not output.anomaly and await observations.exists_recent_by_type(
             db, source="reflection", type="micro_reflection", window_minutes=20,
+            category_like=f"%:{relevance}",
         ):
-            logger.debug("Micro reflection cooldown: skipping (recent exists within 20m)")
+            logger.debug("Micro reflection cooldown: skipping (recent %s exists within 20m)", category)
             return False
 
         # Low-information gate: skip observations with no actionable content.
@@ -155,10 +163,6 @@ class ResultWriter:
             "signals_examined": output.signals_examined,
             "driving_signals": output.driving_signals,
         }, sort_keys=True)
-        base_category = "anomaly" if output.anomaly else "routine"
-        relevance = self._relevance_from_signals(tick, output.driving_signals)
-        category = f"{base_category}:{relevance}"
-
         # Structural dedup: hash on salience band + anomaly flag + relevance
         # + signal names.  Tags are excluded — they are LLM-generated and vary
         # wildly across ticks even for identical underlying conditions (61

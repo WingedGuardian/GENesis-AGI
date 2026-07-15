@@ -558,23 +558,31 @@ async def exists_recent_by_type(
     source: str,
     type: str,
     window_minutes: int = 30,
+    category_like: str | None = None,
 ) -> bool:
     """Check if an unresolved observation of this source+type was created recently.
 
     Used as a cooldown gate to prevent near-duplicate observations from
     LLM reflections that produce different wording for the same system state.
+    When ``category_like`` is given, the check is scoped to categories matching
+    that SQL LIKE pattern (e.g. ``"%:genesis"``) so cooldowns can be relevance-
+    aware — a reflection about one ego partition does not suppress another.
 
     Uses Python-side ISO cutoff (not SQLite ``datetime('now')``) so the
     comparison works correctly with ISO 8601 timestamps stored in created_at.
     """
     cutoff = (datetime.now(UTC) - timedelta(minutes=window_minutes)).isoformat()
-    rows = await db.execute_fetchall(
+    query = (
         "SELECT 1 FROM observations "
         "WHERE source = ? AND type = ? AND resolved = 0 "
         "AND created_at > ? "
-        "LIMIT 1",
-        (source, type, cutoff),
     )
+    params: list = [source, type, cutoff]
+    if category_like is not None:
+        query += "AND category LIKE ? "
+        params.append(category_like)
+    query += "LIMIT 1"
+    rows = await db.execute_fetchall(query, tuple(params))
     return len(rows) > 0
 
 
