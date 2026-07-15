@@ -413,6 +413,16 @@ call_sites:
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
     retry_profile: background
+  # One-shot supervised wing backfill (scripts/wing_backfill.py) — batch
+  # classification of legacy general/uncategorized memories into wings.
+  # Same free background family as the dream-cycle classification sites.
+  wing_backfill:
+    chain:
+    - nvidia-nim-kimi
+    - nvidia-nim-deepseek
+    - groq-free
+    - openrouter-deepseek-v4-flash
+    retry_profile: background
   27_pre_execution_assessment:
     chain:
     - glm51

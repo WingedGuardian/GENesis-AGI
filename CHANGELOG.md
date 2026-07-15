@@ -11,6 +11,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Legacy memories join the wing system.** ~2.9K memories stored before
+  wing classification existed (most predating the user-work wings added in
+  May) sat in `general/uncategorized`, invisible to wing-filtered recall.
+  A new one-shot supervised backfill (`scripts/wing_backfill.py`) classifies
+  them in two stages — the deterministic taxonomy layers first, then an LLM
+  batch pass through a new `wing_backfill` routing call site for the rows
+  keywords can't reach — and writes wing/room/life-domain consistently to
+  both SQLite metadata and the Qdrant payload (with revert-on-failure so the
+  stores never diverge). Dry-run by default; the bulk write is gated on a
+  human-reviewed sample.
+
 - **Benchmark runs can now select exactly the arms they pay for.** The
   LongMemEval harness gained `--arms` (comma-separated labels, e.g.
   `--graph --arms raw,raw+graph`), so a paired baseline-vs-graph comparison
