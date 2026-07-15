@@ -24,6 +24,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A dashboard request during startup can no longer crash the server.** The
+  async-route bridge falls back to a throwaway event loop when the runtime
+  loop isn't available — but shared database connections are bound to the
+  runtime loop, so a health poll landing in that window raised cross-loop
+  errors that could take the whole process down (observed as exit code 2).
+  Both windows now degrade to a clean HTTP 503 instead: a configured-but-not-
+  yet-running loop never executes the handler at all, and the loop-less
+  fallback catches the cross-loop failure and logs it rather than crashing.
+
 - **Code-intelligence indexing can no longer storm the machine.** Keeping the
   code graph fresh used to fire a full reindex on every commit, in the
   background, with no coordination — and if disk cleanup had reclaimed the index
