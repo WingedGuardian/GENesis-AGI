@@ -105,6 +105,18 @@ def test_parse_tags_comma_string_and_empty():
     assert wb.parse_tags("") == []
 
 
+def test_parse_tags_space_separated_fts_format():
+    """The real FTS storage form (MemoryStore.store: ' '.join(tags))."""
+    assert wb.parse_tags("feedback_rule class:fact git ci") == [
+        "feedback_rule",
+        "class:fact",
+        "git",
+        "ci",
+    ]
+    # mixed whitespace/comma tolerated
+    assert wb.parse_tags("a  b,\tc") == ["a", "b", "c"]
+
+
 def test_default_room_known_and_unknown_wing():
     from genesis.memory.taxonomy import ROOMS
 
@@ -188,13 +200,13 @@ async def test_apply_updates_writes_both_stores(mem_db):
         "genesis.qdrant.collections.update_payload",
         side_effect=lambda *a, **k: calls.append(k),
     ):
-        applied, failed = await wb.apply_updates(
+        result = await wb.apply_updates(
             db,
             qdrant,
             {"m-embedded": _row("m-embedded", "embedded")},
             {"m-embedded": ("infrastructure", "deploy")},
         )
-    assert (applied, failed) == (1, 0)
+    assert result == {"embedded": 1, "metadata_only": 0, "failed": 0, "skipped": 0}
     cur = await db.execute("SELECT wing, room FROM memory_metadata WHERE memory_id = 'm-embedded'")
     assert await cur.fetchone() == ("infrastructure", "deploy")
     assert calls and calls[0]["payload"]["wing"] == "infrastructure"
@@ -205,13 +217,13 @@ async def test_apply_updates_writes_both_stores(mem_db):
 async def test_apply_updates_skips_qdrant_for_fts5_only(mem_db):
     db = await mem_db()
     with patch("genesis.qdrant.collections.update_payload") as up:
-        applied, failed = await wb.apply_updates(
+        result = await wb.apply_updates(
             db,
             MagicMock(),
             {"m-ftsonly": _row("m-ftsonly", "fts5_only")},
             {"m-ftsonly": ("memory", "retrieval")},
         )
-    assert (applied, failed) == (1, 0)
+    assert result == {"embedded": 0, "metadata_only": 1, "failed": 0, "skipped": 0}
     up.assert_not_called()
     cur = await db.execute("SELECT wing FROM memory_metadata WHERE memory_id = 'm-ftsonly'")
     assert await cur.fetchone() == ("memory",)
@@ -226,13 +238,13 @@ async def test_apply_updates_reverts_sqlite_on_qdrant_failure(mem_db):
         "genesis.qdrant.collections.update_payload",
         side_effect=RuntimeError("qdrant down"),
     ):
-        applied, failed = await wb.apply_updates(
+        result = await wb.apply_updates(
             db,
             MagicMock(),
             {"m-embedded": _row("m-embedded", "embedded")},
             {"m-embedded": ("channels", "telegram")},
         )
-    assert (applied, failed) == (0, 1)
+    assert result == {"embedded": 0, "metadata_only": 0, "failed": 1, "skipped": 0}
     cur = await db.execute("SELECT wing, room FROM memory_metadata WHERE memory_id = 'm-embedded'")
     assert await cur.fetchone() == ("general", "uncategorized")
     await db.close()
@@ -248,14 +260,14 @@ async def test_apply_updates_skips_row_reclassified_meanwhile(mem_db):
     )
     await db.commit()
     with patch("genesis.qdrant.collections.update_payload") as up:
-        applied, failed = await wb.apply_updates(
+        result = await wb.apply_updates(
             db,
             MagicMock(),
             {"m-embedded": _row("m-embedded", "embedded")},
             {"m-embedded": ("channels", "telegram")},
         )
     up.assert_not_called()  # Qdrant payload must not get the stale verdict
-    assert (applied, failed) == (0, 0)
+    assert result == {"embedded": 0, "metadata_only": 0, "failed": 0, "skipped": 1}
     cur = await db.execute("SELECT wing FROM memory_metadata WHERE memory_id = 'm-embedded'")
     assert await cur.fetchone() == ("routing",)
     await db.close()

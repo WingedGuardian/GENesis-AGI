@@ -20,6 +20,11 @@ Writes go to BOTH stores or neither (cross-store mirror discipline):
 on the Qdrant payload for embedded rows (``fts5_only`` rows have no point).
 On a Qdrant failure the SQLite row is reverted and the id logged.
 
+NOTE: ``fts5_only`` rows get their SQLite metadata classified but are NOT yet
+reachable by wing-filtered recall — retrieval's ``_filter_scope_fts_only``
+checks only ``life_domain:`` in the FTS tag string, never ``wing:``. Those
+rows are reported separately so the outcome is not overstated.
+
 Dry-run by default; ``--apply`` performs the writes. Idempotent: reclassified
 rows drop out of the backlog WHERE clause.
 
@@ -148,7 +153,13 @@ async def fetch_backlog(db, limit: int | None, sample: int | None) -> list[dict]
 
 
 def parse_tags(raw: str | None) -> list[str]:
-    """Best-effort tag parse — FTS stores JSON lists or comma strings."""
+    """Best-effort tag parse into individual tokens.
+
+    ``MemoryStore.store`` writes FTS tags as a SPACE-separated string
+    (``" ".join(resolved_tags)`` → e.g. ``"feedback_rule class:fact git ci"``),
+    so a comma-only split collapses the whole thing into one token and the
+    tag signal is lost. Split on whitespace or commas; also accept a JSON list.
+    """
     if not raw:
         return []
     try:
@@ -157,7 +168,7 @@ def parse_tags(raw: str | None) -> list[str]:
             return [str(t) for t in loaded]
     except (json.JSONDecodeError, TypeError):
         pass
-    return [t.strip() for t in raw.split(",") if t.strip()]
+    return [t for t in re.split(r"[,\s]+", raw.strip()) if t]
 
 
 def stage1_taxonomy(rows: list[dict]) -> tuple[dict[str, tuple[str, str]], list[dict]]:
@@ -222,8 +233,14 @@ async def apply_updates(
     qdrant,
     rows_by_id: dict[str, dict],
     classifications: dict[str, tuple[str, str]],
-) -> tuple[int, int]:
-    """Write wing/room to SQLite + Qdrant payload. Returns (applied, failed).
+) -> dict[str, int]:
+    """Write wing/room to SQLite + Qdrant payload.
+
+    Returns counts: ``embedded`` (written to BOTH stores → recall-reachable by
+    wing), ``metadata_only`` (fts5_only rows — SQLite metadata updated but NOT
+    yet reachable by wing-filtered recall: retrieval's ``_filter_scope_fts_only``
+    only checks ``life_domain:`` in the FTS tag string, never ``wing:``),
+    ``failed`` (Qdrant write failed → SQLite reverted), and ``skipped``.
 
     SQLite first, then Qdrant; a Qdrant failure reverts the SQLite row so the
     two stores never diverge (cross-store mirror discipline).
@@ -231,7 +248,7 @@ async def apply_updates(
     from genesis.memory.taxonomy import classify_life_domain
     from genesis.qdrant.collections import update_payload
 
-    applied = failed = skipped = 0
+    embedded = metadata_only = failed = skipped = 0
     for memory_id, (wing, room) in classifications.items():
         row = rows_by_id[memory_id]
         cursor = await db.execute(
@@ -285,10 +302,20 @@ async def apply_updates(
                     )
                 failed += 1
                 continue
-        applied += 1
+            embedded += 1
+        else:
+            # fts5_only (or otherwise no Qdrant point): metadata is updated,
+            # but wing-filtered recall can't reach these rows yet. Counted
+            # separately so the outcome isn't overstated.
+            metadata_only += 1
     if skipped:
         logger.info("%d rows skipped (left backlog mid-run)", skipped)
-    return applied, failed
+    return {
+        "embedded": embedded,
+        "metadata_only": metadata_only,
+        "failed": failed,
+        "skipped": skipped,
+    }
 
 
 def build_router(db):
@@ -364,11 +391,14 @@ async def main(args: argparse.Namespace) -> int:
         from genesis.env import qdrant_url
 
         qdrant = QdrantClient(url=qdrant_url(), timeout=10)
-        applied, failed = await apply_updates(db, qdrant, rows_by_id, classifications)
+        result = await apply_updates(db, qdrant, rows_by_id, classifications)
         print(
-            f"APPLIED: {applied} rows updated in both stores, {failed} reverted on Qdrant failure"
+            f"APPLIED: {result['embedded']} rows updated in BOTH stores "
+            f"(wing-filter-reachable); {result['metadata_only']} fts5_only rows "
+            f"updated in metadata ONLY (not yet wing-filter-reachable — see "
+            f"follow-up); {result['failed']} reverted on Qdrant failure"
         )
-        return 0 if failed == 0 else 1
+        return 0 if result["failed"] == 0 else 1
     finally:
         await db.close()
 

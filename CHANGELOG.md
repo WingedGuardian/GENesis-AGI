@@ -17,10 +17,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   A new one-shot supervised backfill (`scripts/wing_backfill.py`) classifies
   them in two stages — the deterministic taxonomy layers first, then an LLM
   batch pass through a new `wing_backfill` routing call site for the rows
-  keywords can't reach — and writes wing/room/life-domain consistently to
-  both SQLite metadata and the Qdrant payload (with revert-on-failure so the
-  stores never diverge). Dry-run by default; the bulk write is gated on a
-  human-reviewed sample.
+  keywords can't reach — and writes wing/room/life-domain to both SQLite
+  metadata and the Qdrant payload (with revert-on-failure so the stores never
+  diverge). Embedded rows become reachable by wing-filtered recall; fts5_only
+  rows get their metadata classified but remain wing-unreachable until the
+  retrieval-side gap is closed (reported separately, not overstated). Dry-run
+  by default; the bulk write is gated on a human-reviewed sample.
 
 - **Benchmark runs can now select exactly the arms they pay for.** The
   LongMemEval harness gained `--arms` (comma-separated labels, e.g.
