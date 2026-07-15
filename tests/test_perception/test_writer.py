@@ -769,3 +769,37 @@ async def test_write_micro_relevance_hallucinated_driving_signals_fall_back(db):
     obs = await observations.query(db, source="reflection")
     assert len(obs) == 1
     assert obs[0]["category"] == "routine:both"
+
+
+async def test_write_micro_dedup_distinguishes_relevance(db):
+    """Same roster/band/anomaly but different driving_signals -> different
+    relevance -> both persist (dedup must not collapse distinct partitions)."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    # anomaly=True bypasses the cooldown gate, isolating the dedup path.
+    user_output = MicroOutput(
+        tags=["user"],
+        salience=0.8,
+        anomaly=True,
+        summary="Task completion quality anomaly.",
+        signals_examined=2,
+        driving_signals=["task_completion_quality"],
+    )
+    genesis_output = MicroOutput(
+        tags=["genesis"],
+        salience=0.8,
+        anomaly=True,
+        summary="CPU usage anomaly.",
+        signals_examined=2,
+        driving_signals=["cpu_usage"],
+    )
+    stored_user = await writer.write(user_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    stored_genesis = await writer.write(genesis_output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    assert stored_user is True
+    assert stored_genesis is True
+    obs = await observations.query(db, source="reflection")
+    cats = sorted(o["category"] for o in obs)
+    assert cats == ["anomaly:genesis", "anomaly:user"]
