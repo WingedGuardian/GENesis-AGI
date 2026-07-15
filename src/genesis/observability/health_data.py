@@ -190,6 +190,7 @@ class HealthDataService:
             cc_sessions,
             conversation_activity,
             cost,
+            deploy_health,
             eval_staleness,
             infrastructure,
             mcp_status,
@@ -249,6 +250,9 @@ class HealthDataService:
             asyncio.to_thread(proactive_memory_metrics),
             # APPENDED last so the 16 existing positions are untouched (see unpack).
             self._recent_provider_fallbacks(),
+            # Deploy staleness — merged-vs-deployed drift (update.sh age, commits
+            # behind, missing units, host guardian). Does its own to_thread.
+            deploy_health(self._db),
             return_exceptions=True,
         )
         # Isolate any failed section uniformly: one raising sub-snapshot degrades
@@ -259,6 +263,7 @@ class HealthDataService:
             r_cost, r_awareness, r_outreach, r_mcp, r_provider_activity,
             r_memory_health, r_eval_staleness, r_vcr,
             r_services, r_conversation, r_proactive, r_provider_fallbacks,
+            r_deploy_health,
         ) = results
 
         # Surface infra probe healthy<->unhealthy transitions to the activity
@@ -298,6 +303,7 @@ class HealthDataService:
             "memory_health": r_memory_health,
             "provider_health": self._serialize_provider_health(),
             "eval_staleness": r_eval_staleness,
+            "deploy_health": r_deploy_health,
             "vcr": r_vcr,
         }
 

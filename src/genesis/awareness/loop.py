@@ -293,6 +293,192 @@ async def _resolve_embedding_backlog(db) -> None:
         logger.debug("Failed to resolve embedding backlog alerts", exc_info=True)
 
 
+# Deploy staleness (WS-B): merged ≠ deployed. A bare git-merge between
+# update.sh runs deploys code but silently skips tier-2 activation (systemd
+# unit installation, guardian host redeploy, CC/Node pins) — observed live
+# 2026-07-13: six days of manual merges left a shipped timer uninstalled and
+# the host guardian a week behind, with zero signal anywhere. The collectors
+# live in observability/snapshots/deploy_health.py (shared with the health
+# snapshot); this check is the alerting layer. Hybrid severity: any drift is
+# a non-paging 'high' (dashboard); 'critical' (pages Telegram) only when
+# SUSTAINED — the last successful update is ≥7 days old AND the repo is ≥20
+# commits behind, or a missing systemd unit has been alerted for >24h.
+# Slow-moving by nature → hourly cadence (the WAL-truncate block).
+_DEPLOY_STALE_DAYS = 7.0
+_DEPLOY_STALE_COMMITS = 20
+_DEPLOY_MISSING_UNIT_CRITICAL_S = 24 * 3600
+_DEPLOY_ALERT_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
+# The exact note written when a row is superseded by a state change. The >24h
+# missing-unit escalation anchors on the OLDEST row still carrying this note
+# (or unresolved) so escalating cannot reset its own clock; recovery rewrites
+# the note so retired anchors can never resurrect a future alert.
+_DEPLOY_SUPERSEDED_NOTE = "superseded by a new deploy-staleness alert state"
+_last_deploy_alert_at: float = 0.0
+_last_deploy_alert_key: str = ""
+
+
+async def _check_deploy_staleness(db) -> None:
+    """Alert when merged changes have not been DEPLOYED here (see block comment).
+
+    Best-effort — the whole body is guarded and never raises into the tick."""
+    global _last_deploy_alert_at, _last_deploy_alert_key
+    if db is None:
+        return
+    try:
+        # Submodule import (the package __init__ shadows the submodule name
+        # with the function of the same name) — resolved per call, so tests
+        # can monkeypatch the module attribute.
+        from genesis.observability.snapshots.deploy_health import deploy_health
+
+        snap = await deploy_health(db)
+        if snap.get("status") == "error":
+            return
+        findings = snap.get("findings") or []
+        if not findings:
+            await _resolve_deploy_staleness(db)
+            return
+
+        # Alert identity keys on the finding CLASSES, not the raw keys —
+        # per-run count drift (behind_upstream:52 -> :53) must not defeat
+        # dedup or churn out a new observation every hour.
+        classes = sorted({f.split(":", 1)[0] for f in findings})
+
+        update = snap.get("last_update") or {}
+        git_facts = snap.get("git") or {}
+        age_days = update.get("age_days")
+        behind = git_facts.get("commits_behind_upstream")
+        critical = (
+            age_days is not None
+            and behind is not None
+            and age_days >= _DEPLOY_STALE_DAYS
+            and behind >= _DEPLOY_STALE_COMMITS
+        )
+        if not critical and "missing_units" in classes:
+            # Escalate a missing unit that has been alerted for >24h. Anchor =
+            # oldest prior alert naming missing units that is either still
+            # unresolved or was superseded by a state change (NOT one resolved
+            # by genuine recovery) — restart-safe, and immune to the
+            # escalated row resetting the clock.
+            cur = await db.execute(
+                "SELECT MIN(created_at) FROM observations "
+                "WHERE source='deploy_staleness_monitor' "
+                "AND content LIKE '%missing_units%' "
+                "AND (resolved=0 OR resolution_notes=?)",
+                (_DEPLOY_SUPERSEDED_NOTE,),
+            )
+            row = await cur.fetchone()
+            if row and row[0]:
+                try:
+                    first = datetime.fromisoformat(row[0])
+                    if first.tzinfo is None:
+                        first = first.replace(tzinfo=UTC)
+                    age_s = (datetime.now(UTC) - first).total_seconds()
+                    critical = age_s >= _DEPLOY_MISSING_UNIT_CRITICAL_S
+                except ValueError:
+                    pass
+
+        priority = "critical" if critical else "high"
+        alert_key = ",".join(classes) + ":" + priority
+        now = time.monotonic()
+        if (
+            now - _last_deploy_alert_at < _DEPLOY_ALERT_COOLDOWN_S
+            and alert_key == _last_deploy_alert_key
+        ):
+            return
+
+        content_hash = hashlib.sha256(f"deploy_staleness:{alert_key}".encode()).hexdigest()
+        # Keep exactly ONE active alert = the current state (same rationale as
+        # the embedding-backlog band supersede above).
+        await db.execute(
+            "UPDATE observations SET resolved=1, resolved_at=?, resolution_notes=? "
+            "WHERE source='deploy_staleness_monitor' "
+            "AND type='infrastructure_alert' AND resolved=0 AND content_hash != ?",
+            (datetime.now(UTC).isoformat(), _DEPLOY_SUPERSEDED_NOTE, content_hash),
+        )
+        await db.commit()
+
+        missing_units = snap.get("missing_units") or []
+        tier2 = snap.get("tier2_pending") or []
+        host = snap.get("host_gateway") or {}
+        detail: list[str] = []
+        if age_days is not None:
+            detail.append(f"last successful update.sh: {age_days} days ago")
+        if behind is not None:
+            fetch_age = git_facts.get("fetch_age_hours")
+            detail.append(
+                f"{behind} commits behind upstream"
+                + (f" (as of last fetch, {fetch_age}h ago)" if fetch_age is not None else "")
+            )
+        if missing_units:
+            detail.append("missing systemd units: " + ", ".join(missing_units))
+        if tier2:
+            detail.append(f"{len(tier2)} update.sh-only file(s) changed since the last update")
+        if host.get("status") in ("drift", "unknown_commit"):
+            detail.append(
+                f"host guardian: {host.get('status')} "
+                f"(deployed_commit={host.get('deployed_commit')})"
+            )
+        created = await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="deploy_staleness_monitor",
+            type="infrastructure_alert",
+            content=(
+                "Merged changes are NOT fully deployed on this install — "
+                + "; ".join(detail)
+                + ". Bare git merges deploy code but skip tier-2 activation "
+                "(systemd units, guardian host redeploy, CC/Node pins). "
+                "Recovery: run scripts/update.sh from ~/genesis. "
+                f"[findings: {', '.join(findings)}]"
+            ),
+            priority=priority,
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+        if created is None:
+            return  # An unresolved alert for this exact state already exists.
+        _last_deploy_alert_at = now
+        _last_deploy_alert_key = alert_key
+        logger.warning("Deploy staleness alert (%s): %s", priority, ", ".join(findings))
+    except Exception:
+        logger.debug("Failed deploy staleness check", exc_info=True)
+
+
+async def _resolve_deploy_staleness(db) -> None:
+    """Resolve outstanding deploy-staleness alerts once no findings remain.
+
+    Also rewrites the superseded-row note so retired rows stop serving as
+    >24h escalation anchors — without this, a missing unit months from now
+    would inherit an ancient anchor and page instantly."""
+    global _last_deploy_alert_at, _last_deploy_alert_key
+    if db is None:
+        return
+    try:
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source="deploy_staleness_monitor",
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="auto-resolved: deploy staleness cleared",
+        )
+        await db.execute(
+            "UPDATE observations SET resolution_notes='deploy staleness cleared' "
+            "WHERE source='deploy_staleness_monitor' AND resolution_notes=?",
+            (_DEPLOY_SUPERSEDED_NOTE,),
+        )
+        await db.commit()
+        if resolved:
+            _last_deploy_alert_at = 0.0
+            _last_deploy_alert_key = ""
+            logger.info(
+                "Auto-resolved %d deploy-staleness alert observation(s) on recovery",
+                resolved,
+            )
+    except Exception:
+        logger.debug("Failed to resolve deploy staleness alerts", exc_info=True)
+
+
 # Duplicate CC executor: two live `claude` processes executing the SAME
 # conversation transcript (2026-07-13 incident: dropped SSH left a session
 # running headless; resume spawned a second executor over one transcript —
@@ -1494,6 +1680,11 @@ class AwarenessLoop:
                     # healing, so the hourly cadence fits; self-resolves when the
                     # backlog clears. Best-effort (guarded internally).
                     await _check_embedding_backlog(self._db)
+                    # Deploy staleness — merged-vs-deployed drift (update.sh age,
+                    # commits behind, missing units, host guardian). Day-scale
+                    # signal → hourly; self-resolves on recovery. Best-effort
+                    # (guarded internally); collectors never do network I/O.
+                    await _check_deploy_staleness(self._db)
                 await _check_wal_health(self._db)
                 # Duplicate CC executor — a twin lasts MINUTES, so this pages
                 # per-tick (hourly would miss the incident window entirely);
