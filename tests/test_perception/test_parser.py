@@ -224,3 +224,39 @@ def test_parse_micro_driving_signals_garbage_dropped_no_retry():
     assert result.success is True
     assert result.needs_retry is False
     assert result.output.driving_signals == []
+
+
+def test_parse_micro_driving_signals_whitespace_stripped():
+    from genesis.perception.parser import OutputParser
+
+    parser = OutputParser()
+    raw = json.dumps({
+        "tags": ["activity"],
+        "salience": 0.5,
+        "anomaly": False,
+        "summary": "User activity elevated.",
+        "signals_examined": 4,
+        "driving_signals": ["task_completion_quality ", "  cpu_usage"],
+    })
+    result = parser.parse(_response(raw), "Micro")
+
+    assert result.success is True
+    assert result.output.driving_signals == ["task_completion_quality", "cpu_usage"]
+
+
+def test_parse_micro_driving_signals_blank_items_dropped():
+    from genesis.perception.parser import OutputParser
+
+    parser = OutputParser()
+    raw = json.dumps({
+        "tags": ["activity"],
+        "salience": 0.5,
+        "anomaly": False,
+        "summary": "User activity elevated.",
+        "signals_examined": 4,
+        "driving_signals": ["task_completion_quality", "   ", ""],
+    })
+    result = parser.parse(_response(raw), "Micro")
+
+    assert result.success is True
+    assert result.output.driving_signals == ["task_completion_quality"]

@@ -93,8 +93,13 @@ class OutputParser:
         raw_driving = data.get("driving_signals", [])
         if isinstance(raw_driving, str):
             raw_driving = [raw_driving]
+        # Strip surrounding whitespace and drop blank items — LLMs routinely
+        # emit padded JSON strings, and the writer validates cited names by
+        # exact membership in the prompted roster.
         driving_signals = (
-            [str(s) for s in raw_driving] if isinstance(raw_driving, list) else []
+            [name for s in raw_driving if (name := str(s).strip())]
+            if isinstance(raw_driving, list)
+            else []
         )
 
         return ParseResult(
