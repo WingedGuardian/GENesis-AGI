@@ -153,3 +153,39 @@ async def test_origin_class_by_ids_chunks_past_bind_cap(tmp_path):
         assert "absent-1" not in got
     finally:
         await conn.close()
+
+
+async def test_hydrate_for_expansion(tmp_path):
+    """Batched neighbor hydration for graph expansion: one query returns
+    content + provenance + visibility fields, replacing an N+1 get_by_id loop."""
+    conn = await _build_db(str(tmp_path / "h.db"))
+    try:
+        await conn.execute(
+            "UPDATE memory_metadata SET origin_class='external_untrusted' WHERE memory_id='alive'"
+        )
+        # collection is read from the FTS row (parity with get_by_id), not metadata
+        await conn.execute(
+            "UPDATE memory_fts SET tags='foo,bar', collection='knowledge_base' "
+            "WHERE memory_id='alive'"
+        )
+        await conn.execute("UPDATE memory_metadata SET deprecated=1 WHERE memory_id='future'")
+        await conn.commit()
+
+        got = await memory_crud.hydrate_for_expansion(
+            conn, ["alive", "future", "expired", "absent"]
+        )
+        assert set(got) == {"alive", "future", "expired"}  # absent omitted
+        alive = got["alive"]
+        assert alive["content"] == "this row never expires"
+        assert alive["source_type"] == "memory"
+        assert alive["tags"] == "foo,bar"
+        assert alive["collection"] == "knowledge_base"
+        assert alive["origin_class"] == "external_untrusted"
+        assert alive["invalid_at"] is None
+        assert alive["deprecated"] == 0
+        # visibility fields surface for filtering
+        assert got["future"]["deprecated"] == 1
+        assert got["expired"]["invalid_at"] == "2020-01-01T00:00:00+00:00"
+        assert await memory_crud.hydrate_for_expansion(conn, []) == {}
+    finally:
+        await conn.close()
