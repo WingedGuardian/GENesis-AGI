@@ -179,6 +179,58 @@ def test_extract_origin_accepts_text_block_list(tmp_path):
     assert _pc._extract_origin(t)["origin_prompt"] == "what is in this screenshot?"
 
 
+def _bare_command_line(text: str = "/compact") -> dict:
+    """Bare slash-command record: plain string content, NO XML wrapper,
+    NO promptSource key (real shape verified on a live CC 2.1.201
+    transcript, 2026-07-14 — these pass every flag filter)."""
+    return {
+        "type": "user",
+        "isSidechain": False,
+        "userType": "external",
+        "entrypoint": "cli",
+        "message": {"role": "user", "content": text},
+        "timestamp": "2026-06-30T15:21:02.500Z",
+    }
+
+
+def test_extract_origin_skips_bare_slash_command(tmp_path):
+    """A session whose first user entry is a bare '/compact' record must
+    not charter the command as its origin."""
+    entries = [_bare_command_line(), _typed_line("the real first prompt")]
+    t = _write_transcript(tmp_path / "s.jsonl", entries)
+    assert _pc._extract_origin(t)["origin_prompt"] == "the real first prompt"
+
+
+def test_extract_origin_skips_interrupt_marker(tmp_path):
+    entries = [
+        _bare_command_line("[Request interrupted by user for tool use]"),
+        _typed_line("the real first prompt"),
+    ]
+    t = _write_transcript(tmp_path / "s.jsonl", entries)
+    assert _pc._extract_origin(t)["origin_prompt"] == "the real first prompt"
+
+
+def test_extract_origin_honors_prompt_source_marker(tmp_path):
+    """Modern CC marks genuine prompts promptSource='typed'; an entry
+    carrying any other value is never an origin, whatever its text."""
+    cmd = _bare_command_line("looks like a real prompt but is not")
+    cmd["promptSource"] = "command"
+    genuine = _typed_line("the real first prompt")
+    genuine["promptSource"] = "typed"
+    t = _write_transcript(tmp_path / "s.jsonl", [cmd, genuine])
+    assert _pc._extract_origin(t)["origin_prompt"] == "the real first prompt"
+
+
+def test_extract_origin_slash_prefix_prose_still_admitted(tmp_path):
+    """Only single-token slash commands are excluded — a genuine prompt
+    that merely starts with '/' survives."""
+    entries = [_typed_line("/etc/hosts keeps getting clobbered, take a look")]
+    t = _write_transcript(tmp_path / "s.jsonl", entries)
+    assert _pc._extract_origin(t)["origin_prompt"] == (
+        "/etc/hosts keeps getting clobbered, take a look"
+    )
+
+
 def test_extract_origin_none_when_no_typed_prompt(tmp_path):
     entries = [_attachment_line(), _tool_result_line(), _meta_caveat_line()]
     t = _write_transcript(tmp_path / "s.jsonl", entries)
