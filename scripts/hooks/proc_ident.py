@@ -63,6 +63,7 @@ def read_ppid(pid: int) -> int | None:
 
 
 def read_comm(pid: int) -> str | None:
+    """Process command name (/proc/<pid>/comm, ≤15 chars), or None."""
     try:
         with open(f"/proc/{pid}/comm", "rb") as f:
             return f.read().decode("utf-8", "replace").strip()

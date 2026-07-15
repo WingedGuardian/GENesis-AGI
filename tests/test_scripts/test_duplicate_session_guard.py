@@ -232,6 +232,37 @@ def test_register_conflict_bytes_deterministic_from_both_sides(owners, monkeypat
     assert first_json["executors"] == second_json["executors"]
 
 
+def test_register_third_executor_merges_conflict_and_only_newest_writes(owners, monkeypatch):
+    # A THIRD resume of the same transcript must not evict the second executor
+    # from the conflict record (decide() fails open for a live executor the
+    # file doesn't list, which would hand the second its writes back).
+    alive = {(100, 5), (200, 9), (300, 12)}
+    _identify_as(monkeypatch, 300, 12, alive)
+    owners.mkdir(parents=True)
+    (owners / f"{KEY}.json").write_text(json.dumps({"pid": 100, "starttime": 5, "session_id": "a"}))
+    (owners / f"{KEY}.conflict").write_text(json.dumps(_conflict((100, 5), (200, 9))))
+    assert guard._register(PAYLOAD) == 0
+    conflict = json.loads((owners / f"{KEY}.conflict").read_text())
+    assert [e["pid"] for e in conflict["executors"]] == [100, 200, 300]
+    # Newest-wins across all three: only pid 300 keeps its writes.
+    alive_fn = _alive_set(alive)
+    assert guard.decide(conflict, 100, 5, alive_fn)[0] == guard.DENY
+    assert guard.decide(conflict, 200, 9, alive_fn)[0] == guard.DENY
+    assert guard.decide(conflict, 300, 12, alive_fn)[0] == guard.ALLOW
+
+
+def test_register_conflict_merge_drops_dead_prior_entries(owners, monkeypatch):
+    # Dead executors in an existing conflict are not carried forward — the
+    # file stays a minimal record of the LIVE contention.
+    _identify_as(monkeypatch, 300, 12, {(100, 5), (300, 12)})  # (200, 9) died
+    owners.mkdir(parents=True)
+    (owners / f"{KEY}.json").write_text(json.dumps({"pid": 100, "starttime": 5, "session_id": "a"}))
+    (owners / f"{KEY}.conflict").write_text(json.dumps(_conflict((100, 5), (200, 9))))
+    assert guard._register(PAYLOAD) == 0
+    conflict = json.loads((owners / f"{KEY}.conflict").read_text())
+    assert [e["pid"] for e in conflict["executors"]] == [100, 300]
+
+
 def test_guard_fast_path_no_conflict(owners, monkeypatch):
     _identify_as(monkeypatch, 100, 5, {(100, 5)})
     assert guard._guard(PAYLOAD) == 0

@@ -14,11 +14,11 @@ Two modes, both registered in .claude/settings.json:
 --register (UserPromptSubmit + PostToolUse, every tool call):
     Maintain ~/.genesis/session-owners/<transcript-key>.json — who (pid,
     starttime) currently executes this transcript. If a DIFFERENT live claude
-    pid already owns it, write <transcript-key>.conflict naming both
-    executors (deterministic order) instead of silently stealing ownership.
-    Always exits 0.
+    pid already owns it, write <transcript-key>.conflict naming ALL live
+    executors (merged with any the file already records, deterministic order)
+    instead of silently stealing ownership. Always exits 0.
 
-guard mode, the default (PreToolUse on Write|Edit|NotebookEdit|Bash):
+guard mode, the default (PreToolUse on Write|Edit|MultiEdit|NotebookEdit|Bash):
     Fast path: no conflict file for this transcript -> allow (one stat).
     With a live conflict, NEWEST WINS: the older executor's repo-mutating
     tools are denied (exit 2) with recovery instructions; the newer executor
@@ -187,10 +187,33 @@ def _register(payload: dict) -> int:
 
     # A DIFFERENT live claude executes this transcript: record the conflict
     # (deterministic executor order -> racing writers produce identical bytes)
-    # and leave the owner file alone. The PreToolUse guard + awareness loop
-    # take it from here.
+    # and leave the owner file alone. Executors an existing conflict file
+    # already names are carried forward while still live — a THIRD resume must
+    # not evict the second from the record (decide() fails open for a live
+    # executor the file doesn't list, so eviction would restore its writes).
+    # The PreToolUse guard + awareness loop take it from here.
     other = _executor_entry(owner_pid, owner_starttime, str(owner.get("session_id", "") or ""))
-    executors = sorted([me, other], key=lambda e: (e["starttime"], e["pid"]))
+    merged: dict[tuple[int, int], dict] = {}
+    prior = _read_json(conflict_path)
+    prior_raw = prior.get("executors") if prior else None
+    if isinstance(prior_raw, list):
+        for entry in prior_raw:
+            if not isinstance(entry, dict):
+                continue
+            pid, starttime = entry.get("pid"), entry.get("starttime")
+            if (
+                isinstance(pid, int)
+                and isinstance(starttime, int)
+                and proc_ident.is_alive(pid, starttime)
+            ):
+                merged[(pid, starttime)] = _executor_entry(
+                    pid, starttime, str(entry.get("session_id", "") or "")
+                )
+    # me/other last: their identities are freshly verified, so they win a
+    # session_id disagreement with a stale prior entry.
+    merged[(owner_pid, owner_starttime)] = other
+    merged[(my_pid, my_starttime)] = me
+    executors = sorted(merged.values(), key=lambda e: (e["starttime"], e["pid"]))
     _write_json_atomic(
         conflict_path,
         {

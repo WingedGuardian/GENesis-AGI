@@ -112,7 +112,7 @@
                 ]
             },
             {
-                "matcher": "Write|Edit|NotebookEdit|Bash",
+                "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
                 "hooks": [
                     {
                         "type": "command",
