@@ -74,6 +74,19 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         needs_restart=False,  # read live per-call by genesis.security.immunity
         hidden_fields=frozenset({"auto_demote_state"}),
     ),
+    "session_ledger_shadow": SettingsDomain(
+        name="session_ledger_shadow",
+        description=(
+            "Ambient session-ledger extractor (session-manager PR-3) — "
+            "master `enabled` + `mode` off/shadow/live. Shadow logs "
+            "proposals only (live session_ledger never written); `live` is "
+            "reserved and coerced to shadow until the data-gated flip PR. "
+            "Read at worker startup — takes effect next compaction."
+        ),
+        config_filename="session_ledger_shadow.yaml",
+        readonly=False,
+        needs_restart=False,  # each worker run is a fresh process
+    ),
     "resilience": SettingsDomain(
         name="resilience",
         description="Resilience thresholds (flapping detection, recovery, CC rate limits)",
@@ -727,9 +740,29 @@ def _validate_ws3_immunity(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_session_ledger_shadow(changes: dict) -> list[str]:
+    """Validate ledger-shadow lever changes (see
+    genesis.session_awareness.ledger_shadow_config)."""
+    from genesis.session_awareness.ledger_shadow_config import MODES
+
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key not in ("enabled", "mode"):
+            errors.append(f"Unknown key '{key}'. Valid: enabled, mode")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif value not in MODES:
+            errors.append(
+                f"'mode' must be one of {', '.join(MODES)}; got {value!r}"
+            )
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "tts": _validate_tts,
     "ws3_immunity": _validate_ws3_immunity,
+    "session_ledger_shadow": _validate_session_ledger_shadow,
     "cc_roster": _validate_cc_roster,
     "resilience": _validate_resilience,
     "inbox_monitor": _validate_inbox_monitor,

@@ -11,6 +11,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now notices the agreements a session forgot to write down — in
+  shadow.** At every compaction boundary a detached worker re-reads the
+  conversation since the last checkpoint and proposes missed "yes, do that"
+  moments and direction pivots as session-ledger candidates. Proposals are
+  only LOGGED for now (the live ledger is never touched): each one carries a
+  verbatim quote that is deterministically checked against the transcript,
+  and a precision report compares proposals against what was actually
+  captured by hand — the safety net earns write access with data before it
+  gets it. Levers: the `session_ledger_shadow` settings domain (off/shadow)
+  and a `GENESIS_LEDGER_SHADOW_DISABLED=1` kill switch; a `--backfill` mode
+  replays past sessions for tuning. Also fixes a charter bug where a session
+  whose first message was a bare slash command (like `/compact`) could have
+  recorded that command as its permanent origin.
+
 - **Benchmark runs can now select exactly the arms they pay for.** The
   LongMemEval harness gained `--arms` (comma-separated labels, e.g.
   `--graph --arms raw,raw+graph`), so a paired baseline-vs-graph comparison

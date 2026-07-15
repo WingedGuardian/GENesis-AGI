@@ -10,6 +10,8 @@ worker. Locked design decisions (WS-C):
 - ONE timeout (90s subprocess). On expiry the whole PROCESS GROUP is
   SIGKILLed (``claude`` spawns MCP children; killing only the parent
   orphans them) — with the pgid>1 guard from ``cc/invoker.py``.
+  (Subprocess core extracted to ``headless.run_headless_json`` for the
+  ledger shadow extractor, session-manager PR-3 — behavior unchanged.)
 - Fail-closed strict-JSON parse mirroring ``attention/sampler.py``:
   unwrap the --output-format json envelope, strip code fences, first
   brace-balanced object, ints only, hard cap on picks.
@@ -20,11 +22,11 @@ worker. Locked design decisions (WS-C):
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 import re
-import signal
+
+from .headless import build_argv as _headless_argv
+from .headless import run_headless_json
 
 ARBITER_MODEL = "claude-haiku-4-5-20251001"
 ARBITER_TIMEOUT_S = 90.0  # smoke-tested p50 ~11-12.5s; 90s = hung-process guard
@@ -82,25 +84,12 @@ def build_prompt(theme: dict, entity_query: str, candidates: list[dict]) -> str:
 
 
 def build_argv(claude_path: str = "claude", no_mcp_config: str | None = None) -> list[str]:
-    """The pinned headless argv (mirrors guardian/diagnosis.py).
+    """The pinned headless argv, at the arbiter's pinned model.
 
-    No ``--effort``: Haiku doesn't take one. ``--strict-mcp-config`` +
-    the repo's no_mcp.json keep MCP servers out of the subprocess.
+    Delegates to ``headless.build_argv`` (the extracted shared runner).
+    No ``--effort``: Haiku doesn't take one.
     """
-    if no_mcp_config is None:
-        # Deferred: only resolved when the caller didn't pin a config.
-        from genesis.env import repo_root
-
-        no_mcp_config = str(repo_root() / "config" / "no_mcp.json")
-    return [
-        claude_path, "-p",
-        "--model", ARBITER_MODEL,
-        "--output-format", "json",
-        "--max-turns", "1",
-        "--dangerously-skip-permissions",
-        "--mcp-config", no_mcp_config,
-        "--strict-mcp-config",
-    ]
+    return _headless_argv(ARBITER_MODEL, claude_path, no_mcp_config)
 
 
 def parse_verdict(stdout_text: str, n_candidates: int) -> list[int] | None:
@@ -165,48 +154,27 @@ async def judge_candidates(
         return {"arbiter": "ok", "picks": [], "prompt_version": PROMPT_VERSION}
     try:
         prompt = build_prompt(theme, entity_query, candidates)
-        argv = build_argv(claude_path, no_mcp_config)
-        env = dict(os.environ)
-        env["GENESIS_CC_SESSION"] = "1"  # never re-enter Genesis hooks
-        # WS-3: never leak a session origin into the nested claude subprocess
-        # (mirrors CCInvoker._build_env's pop-if-absent invariant).
-        env.pop("GENESIS_SESSION_ORIGIN", None)
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            preexec_fn=os.setpgrp,
+        result = await run_headless_json(
+            prompt,
+            model=ARBITER_MODEL,
+            claude_path=claude_path,
+            no_mcp_config=no_mcp_config,
+            timeout_s=timeout_s,
         )
-        try:
-            stdout, _stderr = await asyncio.wait_for(
-                proc.communicate(prompt.encode()), timeout=timeout_s,
-            )
-        except TimeoutError:
-            # claude spawns MCP/helper children — group-kill is mandatory
-            # (cc/invoker.py pattern, incl. the pgid>1 safety guard).
-            try:
-                pgid = os.getpgid(proc.pid)
-                if pgid <= 1:
-                    raise ValueError(f"Refusing killpg with pgid={pgid}")
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, ValueError, TypeError):
-                proc.kill()
-            await proc.wait()
+        if result["status"] == "timeout":
             return {
                 "arbiter": "timeout",
                 "picks": [],
                 "prompt_version": PROMPT_VERSION,
             }
-        if proc.returncode != 0:
+        if result["status"] != "ok":
             return {
                 "arbiter": "failed",
                 "picks": [],
-                "reason": f"exit_{proc.returncode}",
+                "reason": str(result.get("reason", "unknown")),
                 "prompt_version": PROMPT_VERSION,
             }
-        picks = parse_verdict(stdout.decode(errors="replace"), len(candidates))
+        picks = parse_verdict(result["stdout"], len(candidates))
         if picks is None:
             return {
                 "arbiter": "failed",

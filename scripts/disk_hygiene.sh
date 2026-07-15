@@ -15,6 +15,8 @@
 #      (WS-3 B1 observe-only gate log; bounds the shadow store)
 #   7. Retention prune of capability_shadow_events (>45d) → scripts/prune_capability_shadow.py
 #      (WS-5 Discord observe-only gate log; bounds the shadow store)
+#   8. Retention prune of session_ledger_shadow_* (>45d) → scripts/prune_ledger_shadow.py
+#      (session-manager PR-3 ambient extractor shadow store; runs + events)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -86,6 +88,10 @@ main() {
     echo "--- capability shadow retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_capability_shadow.py" --days 45 \
         || echo "prune_capability_shadow exited $?"
+
+    echo "--- ledger shadow retention prune (>45d) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_ledger_shadow.py" --days 45 \
+        || echo "prune_ledger_shadow exited $?"
 
     echo "=== genesis-disk-hygiene done ==="
 }

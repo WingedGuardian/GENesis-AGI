@@ -9,7 +9,9 @@ against live ~/.claude/projects transcripts, 2026-07-13): typed prompts are
 type=="user" with plain-string content; tool results are content-lists of
 tool_result blocks; skill/hook injections carry isMeta; compaction summaries
 carry isCompactSummary + isVisibleInTranscriptOnly; subagent traffic carries
-isSidechain. There is NO promptSource field in real transcripts.
+isSidechain. promptSource exists only on modern (>=2.1.201) entries — "typed"/
+"queued" on genuine prompts, "system" on harness notifications, ABSENT on
+bare slash-command records and all pre-July-2026 entries (verified 2026-07-14).
 """
 
 from __future__ import annotations
@@ -19,6 +21,8 @@ import io
 import json
 import sqlite3
 from pathlib import Path
+
+import pytest
 
 # Load the hook scripts as modules (not packages — use importlib)
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts"
@@ -179,6 +183,58 @@ def test_extract_origin_accepts_text_block_list(tmp_path):
     assert _pc._extract_origin(t)["origin_prompt"] == "what is in this screenshot?"
 
 
+def _bare_command_line(text: str = "/compact") -> dict:
+    """Bare slash-command record: plain string content, NO XML wrapper,
+    NO promptSource key (real shape verified on a live CC 2.1.201
+    transcript, 2026-07-14 — these pass every flag filter)."""
+    return {
+        "type": "user",
+        "isSidechain": False,
+        "userType": "external",
+        "entrypoint": "cli",
+        "message": {"role": "user", "content": text},
+        "timestamp": "2026-06-30T15:21:02.500Z",
+    }
+
+
+def test_extract_origin_skips_bare_slash_command(tmp_path):
+    """A session whose first user entry is a bare '/compact' record must
+    not charter the command as its origin."""
+    entries = [_bare_command_line(), _typed_line("the real first prompt")]
+    t = _write_transcript(tmp_path / "s.jsonl", entries)
+    assert _pc._extract_origin(t)["origin_prompt"] == "the real first prompt"
+
+
+def test_extract_origin_skips_interrupt_marker(tmp_path):
+    entries = [
+        _bare_command_line("[Request interrupted by user for tool use]"),
+        _typed_line("the real first prompt"),
+    ]
+    t = _write_transcript(tmp_path / "s.jsonl", entries)
+    assert _pc._extract_origin(t)["origin_prompt"] == "the real first prompt"
+
+
+def test_extract_origin_honors_prompt_source_marker(tmp_path):
+    """Modern CC marks genuine prompts promptSource='typed'; an entry
+    carrying any other value is never an origin, whatever its text."""
+    cmd = _bare_command_line("looks like a real prompt but is not")
+    cmd["promptSource"] = "command"
+    genuine = _typed_line("the real first prompt")
+    genuine["promptSource"] = "typed"
+    t = _write_transcript(tmp_path / "s.jsonl", [cmd, genuine])
+    assert _pc._extract_origin(t)["origin_prompt"] == "the real first prompt"
+
+
+def test_extract_origin_slash_prefix_prose_still_admitted(tmp_path):
+    """Only single-token slash commands are excluded — a genuine prompt
+    that merely starts with '/' survives."""
+    entries = [_typed_line("/etc/hosts keeps getting clobbered, take a look")]
+    t = _write_transcript(tmp_path / "s.jsonl", entries)
+    assert _pc._extract_origin(t)["origin_prompt"] == (
+        "/etc/hosts keeps getting clobbered, take a look"
+    )
+
+
 def test_extract_origin_none_when_no_typed_prompt(tmp_path):
     entries = [_attachment_line(), _tool_result_line(), _meta_caveat_line()]
     t = _write_transcript(tmp_path / "s.jsonl", entries)
@@ -251,6 +307,87 @@ def _run_main(
     monkeypatch.setattr(_pc.sys, "stdin", io.StringIO(stdin_payload))
     _pc.main()
     return sessions_dir
+
+
+# ── ledger shadow worker spawn (PR-3) ────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def spawn_calls(monkeypatch, tmp_path) -> list[list[str]]:
+    """AUTOUSE: no test in this module may ever spawn a real worker.
+
+    Replaces subprocess.Popen in the hook module with an argv recorder and
+    points the worker err-log inside tmp (never the real home dir).
+    """
+    calls: list[list[str]] = []
+
+    class _FakeProc:
+        pid = 4242
+
+    def _fake_popen(argv, **kwargs):
+        calls.append(list(argv))
+        assert kwargs.get("start_new_session") is True
+        return _FakeProc()
+
+    monkeypatch.setattr(_pc.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(_pc, "_LEDGER_WORKER_ERR_LOG", tmp_path / "ledger_worker_err.log")
+    return calls
+
+
+def test_spawns_ledger_worker_after_waypoint(monkeypatch, tmp_path, spawn_calls):
+    t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
+    _run_main(monkeypatch, tmp_path, session_id="sid-sp", transcript=t, trigger="auto")
+    assert len(spawn_calls) == 1
+    argv = spawn_calls[0]
+    assert argv[1].endswith("ledger_shadow_worker.py")
+    assert argv[argv.index("--session-id") + 1] == "sid-sp"
+    assert argv[argv.index("--transcript") + 1] == str(t)
+    assert argv[argv.index("--end-byte") + 1] == str(t.stat().st_size)
+    assert argv[argv.index("--trigger") + 1] == "auto"
+    # worktree-safety: the hook passes its own home-anchored DB resolution
+    assert argv[argv.index("--db-path") + 1].endswith("data/genesis.db")
+
+
+def test_no_spawn_when_dispatched_session(monkeypatch, tmp_path, spawn_calls):
+    t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    # _run_main deletes the env var — replicate its harness minus that
+    sessions_dir = tmp_path / "sessions"
+    monkeypatch.setattr(_pc, "_SESSIONS_DIR", sessions_dir)
+    monkeypatch.setattr(
+        _pc.sys,
+        "stdin",
+        io.StringIO(json.dumps({"session_id": "sid-bg", "transcript_path": str(t)})),
+    )
+    _pc.main()
+    assert spawn_calls == []
+
+
+def test_no_spawn_on_kill_switch(monkeypatch, tmp_path, spawn_calls):
+    t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
+    monkeypatch.setenv("GENESIS_LEDGER_SHADOW_DISABLED", "1")
+    _run_main(monkeypatch, tmp_path, session_id="sid-ks", transcript=t)
+    assert spawn_calls == []
+    # the charter itself still landed — the switch only gates the spawn
+    assert _db_row(tmp_path, "sid-ks") is not None
+
+
+def test_no_spawn_when_charter_failed(monkeypatch, tmp_path, spawn_calls):
+    """DB-less run: _update_charter returns None → no waypoint, no spawn."""
+    t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
+    _run_main(monkeypatch, tmp_path, session_id="sid-nodb", transcript=t, with_db=False)
+    assert spawn_calls == []
+
+
+def test_spawn_failure_never_breaks_hook(monkeypatch, tmp_path):
+    def _boom(argv, **kwargs):
+        raise OSError("no fds left")
+
+    monkeypatch.setattr(_pc.subprocess, "Popen", _boom)
+    t = _write_transcript(tmp_path / "s.jsonl", _realistic_head())
+    _run_main(monkeypatch, tmp_path, session_id="sid-boom", transcript=t)
+    # fail-open: main() returned normally and the charter landed
+    assert _db_row(tmp_path, "sid-boom") is not None
 
 
 def test_first_compaction_creates_charter(monkeypatch, tmp_path):
