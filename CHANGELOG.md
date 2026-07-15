@@ -100,8 +100,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reversible), outside-world content is held back only from automatic,
   uninvited context in unsupervised background sessions — your explicit
   searches and everything in a normal foreground conversation keep working
-  exactly as before. If the guard ever fights legitimate activity, it stands
-  itself down and pages you.
+  exactly as before. Held back means fully out of the loop: a blocked item
+  also earns no retrieval credit, so it can't quietly climb the memory
+  ranking through the very sessions that refuse it. If the guard ever fights
+  legitimate activity, it stands itself down and pages you.
 
 - **Genesis now notices when memories quietly lose semantic search.** When an
   embedding permanently fails, that memory becomes keyword-only — findable by
