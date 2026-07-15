@@ -373,3 +373,164 @@ async def _run_locked(
         "n_proposals": len(events),
         "recorded": recorded,
     }
+
+
+# Backfill: historical sessions predate the waypoint/cursor spine, so
+# windows slice by TYPED-TURN COUNT, not bytes.
+BACKFILL_TURNS_PER_WINDOW = 20
+BACKFILL_MAX_WINDOWS = 10
+
+
+async def run_backfill(
+    session_id: str,
+    transcript_path: str,
+    *,
+    turns_per_window: int = BACKFILL_TURNS_PER_WINDOW,
+    max_windows: int = BACKFILL_MAX_WINDOWS,
+    claude_path: str = "claude",
+    db_path: Path | str | None = None,
+) -> dict:
+    """Replay a historical transcript through the extractor (decision 5b).
+
+    Slices the transcript's typed turns into windows of ``turns_per_window``
+    and runs each through the same prompt→parse→match pipeline, NEWEST
+    windows first-served (``max_windows`` cap bounds Haiku calls). Rows are
+    tagged ``trigger='backfill'`` (the report excludes them from precision
+    metrics by default — historical sessions have no foreground ground
+    truth) and the live cursor file is NEVER touched. The per-session flock
+    is still taken so a backfill can't race a live compaction run. Never
+    raises.
+    """
+    try:
+        return await _run_backfill(
+            session_id,
+            transcript_path,
+            turns_per_window=turns_per_window,
+            max_windows=max_windows,
+            claude_path=claude_path,
+            db_path=db_path or genesis_db_path(),
+        )
+    except Exception as exc:  # noqa: BLE001 — detached: record, never raise
+        return {"status": "failed", "detail": f"{type(exc).__name__}: {exc}"}
+
+
+async def _run_backfill(
+    session_id: str,
+    transcript_path: str,
+    *,
+    turns_per_window: int,
+    max_windows: int,
+    claude_path: str,
+    db_path: Path | str,
+) -> dict:
+    if os.environ.get("GENESIS_LEDGER_SHADOW_DISABLED") == "1":
+        return {"status": "skipped_disabled"}
+    if effective_mode() == "off":
+        return {"status": "skipped_off"}
+
+    transcript = Path(transcript_path)
+    try:
+        size = transcript.stat().st_size
+    except OSError as exc:
+        return {"status": "failed", "detail": f"transcript_unreadable: {exc}"}
+
+    session_dir = _sessions_root() / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    lock_fh = (session_dir / LOCK_FILENAME).open("w")
+    try:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return {"status": "lock_busy"}
+
+        all_turns = parse_delta(transcript, 0, size)
+        if not all_turns:
+            return {"status": "empty_delta", "windows": 0}
+        windows = [
+            all_turns[i : i + turns_per_window] for i in range(0, len(all_turns), turns_per_window)
+        ]
+        skipped = max(0, len(windows) - max_windows)
+        windows = windows[-max_windows:]  # newest windows within the call cap
+
+        ledger_items, prior_events = await _load_match_context(db_path, session_id)
+        priors = list(prior_events)
+        outcomes: list[str] = []
+        total_proposals = 0
+        for idx, window in enumerate(windows):
+            started_at = _now()
+            t0 = time.monotonic()
+            prompt, included, truncated = build_prompt(window)
+            result = await run_headless_json(
+                prompt,
+                model=EXTRACTOR_MODEL,
+                claude_path=claude_path,
+                timeout_s=EXTRACTOR_TIMEOUT_S,
+            )
+            verdict = (
+                parse_verdict(result["stdout"], len(included)) if result["status"] == "ok" else None
+            )
+            detail = f"backfill_window {idx + 1}/{len(windows)} (skipped_older={skipped})"
+            if verdict is None:
+                status = "timeout" if result["status"] == "timeout" else "failed"
+                reason = result.get("reason") or ("unparseable" if result["status"] == "ok" else "")
+                await _record_run(
+                    db_path,
+                    run_id=uuid.uuid4().hex,
+                    session_id=session_id,
+                    started_at=started_at,
+                    finished_at=_now(),
+                    start_byte=0,
+                    end_byte=size,
+                    trigger="backfill",
+                    status=status,
+                    n_user_turns=len(included),
+                    truncated=truncated,
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                    prompt_version=PROMPT_VERSION,
+                    model=EXTRACTOR_MODEL,
+                    detail=f"{detail}; {reason}".strip("; "),
+                )
+                outcomes.append(status)
+                continue
+            events = match_proposals(verdict, included, ledger_items, priors)
+            observed_at = _now()
+            for ev in events:
+                ev["id"] = uuid.uuid4().hex
+                ev["observed_at"] = observed_at
+            recorded = await _record_run(
+                db_path,
+                run_id=uuid.uuid4().hex,
+                session_id=session_id,
+                started_at=started_at,
+                finished_at=_now(),
+                start_byte=0,
+                end_byte=size,
+                trigger="backfill",
+                status="ok",
+                n_user_turns=len(included),
+                n_proposals=len(events),
+                truncated=truncated,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                prompt_version=PROMPT_VERSION,
+                model=EXTRACTOR_MODEL,
+                detail=detail,
+                events=events,
+            )
+            if recorded:
+                # cross-window dedup within this backfill
+                priors.extend({"id": e["id"], "kind": e["kind"], "text": e["text"]} for e in events)
+                total_proposals += len(events)
+            outcomes.append("ok" if recorded else "failed")
+        await _record_telemetry(
+            db_path,
+            "ok" if outcomes and all(o == "ok" for o in outcomes) else "failed",
+            f"backfill windows={len(windows)}|proposals={total_proposals}",
+        )
+        return {
+            "status": "ok",
+            "windows": len(windows),
+            "outcomes": outcomes,
+            "n_proposals": total_proposals,
+        }
+    finally:
+        lock_fh.close()

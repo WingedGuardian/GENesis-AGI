@@ -382,7 +382,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: b1851a70 2026-07-14
+verified: 94637bae 2026-07-14
 ```
 
 - **awareness/**: the 5-min heartbeat. ~23 signal collectors (the richer
@@ -453,6 +453,33 @@ verified: b1851a70 2026-07-14
   fail-open). Ledger statuses: open/in_progress/done/absorbed/dropped —
   `absorbed` + `evidence` is the repo-pulse (PR-4) seam. Dispatched sessions
   (GENESIS_CC_SESSION=1) are skipped — task_states is their continuity spine.
+- **Ambient ledger extractor** (session-manager stage 3) — **SHADOW**. At
+  each PreCompact snapshot the hook fire-and-forgets
+  `scripts/ledger_shadow_worker.py` (`--end-byte` stat'd at the boundary);
+  the detached worker (`session_awareness/ledger_worker.py`) reads the
+  transcript delta since its own cursor
+  (`~/.genesis/sessions/<sid>/ledger_shadow_cursor.json`, advanced ONLY on
+  recorded ok/empty_delta — failures re-cover their window), extracts
+  agreements/pivots via headless Haiku (`ledger_extractor.py`: DATA-framed
+  prompt, fail-closed parse, verbatim-quote verification), matches against
+  the live ledger (exact hash + SequenceMatcher ≥0.85 — the precision
+  signal) and prior shadow events (`duplicate_of`), and records rows to
+  `session_ledger_shadow_runs`/`_events` (migration 0059) — **the live
+  `session_ledger` is NEVER written until the data-gated flip PR**. Shared
+  subprocess core with the arbiter: `session_awareness/headless.py`;
+  canonical typed-prompt filter `session_awareness/transcript.py` (the
+  PreCompact hook keeps a parity-tested stdlib duplicate; honors
+  `promptSource` typed/queued, excludes bare slash-commands + markers).
+  Levers: settings domain `session_ledger_shadow` (off|shadow; `live`
+  reserved, coerced+warn) read at worker startup;
+  `GENESIS_LEDGER_SHADOW_DISABLED=1` hook-level kill. Per-session flock;
+  `--backfill` replays historical transcripts in typed-turn windows
+  (`trigger='backfill'`, cursor untouched). Measurement:
+  `scripts/ledger_shadow_report.py` (recomputed precision, FP adjudication,
+  FN windowing, leak invariant); retention 45d via
+  `scripts/prune_ledger_shadow.py` (disk-hygiene step 8). Telemetry:
+  `call_site_last_run` row `ambient_ledger_extractor` (deliberately not a
+  critical site).
 
 ## 10. Learning & evaluation
 

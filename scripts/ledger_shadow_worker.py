@@ -29,12 +29,38 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--transcript", required=True)
-    parser.add_argument("--end-byte", type=int, required=True)
+    parser.add_argument("--end-byte", type=int, default=None)
     parser.add_argument("--trigger", default="unknown")
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="replay the whole transcript in typed-turn windows "
+        "(trigger='backfill', cursor untouched; historical tuning data)",
+    )
+    parser.add_argument("--turns-per-window", type=int, default=None)
+    parser.add_argument("--max-windows", type=int, default=None)
     args = parser.parse_args()
 
-    from genesis.session_awareness.ledger_worker import run_ledger_worker
+    from genesis.session_awareness.ledger_worker import (
+        BACKFILL_MAX_WINDOWS,
+        BACKFILL_TURNS_PER_WINDOW,
+        run_backfill,
+        run_ledger_worker,
+    )
 
+    if args.backfill:
+        outcome = asyncio.run(
+            run_backfill(
+                args.session_id,
+                args.transcript,
+                turns_per_window=args.turns_per_window or BACKFILL_TURNS_PER_WINDOW,
+                max_windows=args.max_windows or BACKFILL_MAX_WINDOWS,
+            )
+        )
+        print(f"ledger_shadow_worker backfill: {outcome}")
+        return
+    if args.end_byte is None:
+        parser.error("--end-byte is required without --backfill")
     outcome = asyncio.run(
         run_ledger_worker(
             args.session_id,

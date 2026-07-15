@@ -349,6 +349,63 @@ async def test_cursor_beyond_eof_resets(tmp_path, sessions_root, shadow_mode, db
     assert _cursor(sessions_root)["last_byte"] == end
 
 
+# ── backfill mode ────────────────────────────────────────────────────────
+
+
+async def test_backfill_windows_newest_capped_cursor_untouched(
+    tmp_path, sessions_root, shadow_mode, db_path
+):
+    t = tmp_path / f"{SID}.jsonl"
+    entries = []
+    for i in range(45):
+        entries.append(_typed(f"please handle work item number {i} today", f"u-{i}"))
+    t.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    fake = _verdict_claude(tmp_path, [dict(AGREEMENT, quote="please handle work item")])
+    outcome = await lw.run_backfill(
+        SID, str(t), turns_per_window=20, max_windows=2, claude_path=fake, db_path=db_path
+    )
+    assert outcome["status"] == "ok"
+    assert outcome["windows"] == 2  # 45 turns → 3 windows → newest 2 kept
+    runs = await _runs(db_path)
+    assert len(runs) == 2
+    assert all(r["trigger"] == "backfill" for r in runs)
+    assert all("backfill_window" in (r["detail"] or "") for r in runs)
+    assert _cursor(sessions_root) is None  # NEVER touched by backfill
+
+
+async def test_backfill_cross_window_dedup(
+    tmp_path, sessions_root, shadow_mode, db_path, transcript
+):
+    """The same agreement proposed in two backfill windows dedups via
+    the accumulated priors (duplicate_of on the second)."""
+    fake = _verdict_claude(tmp_path, [AGREEMENT])
+    outcome = await lw.run_backfill(
+        SID,
+        str(transcript),
+        turns_per_window=1,
+        max_windows=2,
+        claude_path=fake,
+        db_path=db_path,
+    )
+    assert outcome["status"] == "ok"
+    events = await _events(db_path)
+    assert len(events) == 2
+    dups = [e["duplicate_of"] for e in events]
+    assert dups.count(None) == 1
+    assert dups.count(events[0]["id"]) == 1 or dups.count(events[1]["id"]) == 1
+
+
+async def test_backfill_respects_mode_off(
+    tmp_path, sessions_root, monkeypatch, db_path, transcript
+):
+    monkeypatch.setattr(lw, "effective_mode", lambda: "off")
+    outcome = await lw.run_backfill(
+        SID, str(transcript), claude_path="/nonexistent", db_path=db_path
+    )
+    assert outcome["status"] == "skipped_off"
+    assert await _runs(db_path) == []
+
+
 async def test_telemetry_row_recorded(tmp_path, sessions_root, shadow_mode, db_path, transcript):
     """The neural-monitor call_site_last_run row lands when the table exists."""
     async with aiosqlite.connect(str(db_path)) as db:
