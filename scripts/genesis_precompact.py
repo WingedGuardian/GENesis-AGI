@@ -43,6 +43,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -361,6 +362,48 @@ def _append_waypoint(session_dir: Path, trigger: str, transcript_path: str) -> N
         fh.write(json.dumps(waypoint) + "\n")
 
 
+_LEDGER_WORKER_ERR_LOG = Path.home() / ".genesis" / "session_awareness" / "ledger_worker_err.log"
+
+
+def _spawn_ledger_shadow_worker(session_id: str, transcript_path: str, trigger: str) -> None:
+    """Fire-and-forget the detached ledger shadow extractor (PR-3).
+
+    The worker reads the transcript delta since its own cursor, proposes
+    missed agreements/pivots via headless Haiku, and logs SHADOW rows —
+    the live ledger is never written (see session_awareness/ledger_worker).
+    Cost to this hook's 5s budget: one stat + one Popen, both fail-open.
+    ``--end-byte`` is stat'd HERE so post-compaction writes to the same
+    transcript never leak into the window the worker processes.
+    """
+    if os.environ.get("GENESIS_LEDGER_SHADOW_DISABLED") == "1":
+        return
+    try:
+        end_byte = os.stat(transcript_path).st_size
+        script = Path(__file__).resolve().parent / "ledger_shadow_worker.py"
+        _LEDGER_WORKER_ERR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _LEDGER_WORKER_ERR_LOG.open("ab") as err_fh:
+            subprocess.Popen(  # noqa: S603 — fixed argv, sys.executable
+                [
+                    sys.executable,
+                    str(script),
+                    "--session-id",
+                    session_id,
+                    "--transcript",
+                    transcript_path,
+                    "--end-byte",
+                    str(end_byte),
+                    "--trigger",
+                    trigger,
+                ],
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=err_fh,
+            )
+    except Exception as exc:  # noqa: BLE001 — fail-open: never break compaction
+        print(f"ledger shadow spawn failed (fail-open): {exc}", file=sys.stderr)
+
+
 def main() -> None:
     # Fail-open: this hook must NEVER block compaction. Any failure logs to
     # stderr and returns; the __main__ wrapper always exits 0.
@@ -391,6 +434,7 @@ def main() -> None:
         charter = _update_charter(session_dir, session_id, transcript_path)
         if charter is not None:
             _append_waypoint(session_dir, trigger, transcript_path)
+            _spawn_ledger_shadow_worker(session_id, transcript_path, trigger)
     except Exception as exc:  # noqa: BLE001 — fail-open boundary
         print(f"genesis_precompact failed (fail-open): {exc}", file=sys.stderr)
 
