@@ -46,7 +46,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis.env import genesis_home, repo_root
-from genesis.observability.git_health import check_git_cheap
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +182,11 @@ async def publish_repo_bundle(
 
         # HEALTH GATE — never overwrite the last good bundle with an attempt from
         # a degraded repo. check_git_cheap is ms-scale and already threaded.
+        # Imported lazily: this module is imported host-side (bundle_watch →
+        # repo_bundle) where the minimal guardian venv lacks genesis.observability's
+        # aiohttp chain — and the host never runs publish, so it never needs this.
+        from genesis.observability.git_health import check_git_cheap
+
         report = await check_git_cheap(repo)
         if not report.ok:
             logger.warning(

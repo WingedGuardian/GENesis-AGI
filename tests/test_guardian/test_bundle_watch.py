@@ -252,3 +252,29 @@ def test_bundle_archive_status_empty(tmp_path):
     assert status["ok"] is True
     assert status["count"] == 0
     assert status["stamp"] is None
+
+
+def test_import_is_host_guardian_venv_safe():
+    """Regression: bundle_watch + repo_bundle run in the MINIMAL host guardian
+    venv (no aiohttp). Importing them must NOT eagerly pull
+    genesis.observability (whose __init__ loads the aiohttp health chain) —
+    check_git_cheap is lazy-imported inside publish (a container-only path).
+
+    Run in a fresh subprocess so import-cache state from other tests can't mask a
+    regression. A live E2E on the host guardian caught this the hard way (2026-07-15):
+    the every-30s tick threw ModuleNotFoundError: aiohttp and the archive never ran.
+    """
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "import genesis.guardian.bundle_watch\n"
+        "import genesis.guardian.repo_bundle\n"
+        "bad = [m for m in ('genesis.observability.git_health', 'aiohttp') "
+        "if m in sys.modules]\n"
+        "assert not bad, f'host-unsafe eager imports: {bad}'\n"
+        "print('ok')\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
