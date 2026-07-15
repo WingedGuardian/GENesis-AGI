@@ -208,3 +208,51 @@ already surfaced via `~/.genesis/watchgod_state.json` →
 `service_status.collect_cc_tmp_usage()` → the dashboard `cc_tmp` tile — so it
 never touches the queue. `backup.sh` failures page (a backup that did not run is
 an emergency).
+
+## Offline Repo Bundle (F.4)
+
+`REVERT_CODE` needs a healthy local `.git`; snapshot rollback needs a healthy
+pool; `claude -p` and a GitHub re-clone need the network. The thin-pool outage
+could have taken all of those at once. F.4 adds the **offline lifeline**: a
+verified `git bundle` of the main repo, kept on the host outside the container's
+blast radius, so the repo can be re-cloned with zero network from a snapshot of
+its own history.
+
+**Per-side topology.**
+
+| Side | What runs | Where |
+|---|---|---|
+| Container | `guardian/repo_bundle.py` — daily publish (awareness tick, monotonic-guard) | writes `~/.genesis/shared/guardian/repo-bundle/genesis-<head>.bundle` + `BUNDLE_STAMP` |
+| Host guardian | `guardian/bundle_watch.py` — archive + freshness (`run_check` tick) | copies newest bundle → host-only `<state_path>/repo-archive/` (keep 3), WARNs when stale |
+
+**Publish is gated twice.** It runs only when `git_health.check_git_cheap` reports
+the repo healthy (never overwrite the last good bundle with an attempt from a
+degraded repo — run `scripts/git_repair.py` first) and only ships a bundle that
+passes `git bundle verify`. When `HEAD` is unchanged since the last publish it
+rewrites just the tiny stamp's `last_verified_at` (not the bundle), so a
+quiet-commit period stays "fresh". Freshness alerts key on `last_verified_at`, so
+a stale WARN means the awareness loop is not publishing OR the repo has been
+unhealthy for `stale_days` (3) — the latter complements `git_watch`'s direct
+corruption alert.
+
+**On-demand:** `python -m genesis.guardian.repo_bundle --force` (bypasses the
+HEAD-unchanged skip; the health + verify gates still apply). **Inspect from the
+container:** the read-only `bundle-status` gateway verb
+(`GuardianRemote.bundle_status()`) lists the archived bundles + newest stamp.
+
+**Rebuilding the repo from the host bundle** (on the host, if the container's git
+is unrecoverable):
+
+```bash
+# 1. Find the newest archived bundle:
+ls -t <state_path>/repo-archive/genesis-*.bundle | head -1
+# 2. Verify then clone it (no network needed):
+git bundle verify <bundle>
+git clone <bundle> genesis-recovered
+# 3. Re-point origin at the real remote to resume fetch/push:
+cd genesis-recovered
+git remote set-url origin <your public GENesis-AGI URL>
+```
+
+The clone checks out the exact `HEAD` the bundle captured (`--all` records HEAD +
+every branch/tag), so the working tree matches the container at publish time.

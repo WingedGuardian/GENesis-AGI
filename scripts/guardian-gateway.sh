@@ -21,6 +21,8 @@
 #   host-profile    — read-only host body-schema JSON (meminfo/nproc/kernel,
 #                     storage pool, incus version + container limits.*) for the
 #                     container's infra_profile host plane
+#   bundle-status   — read-only offline repo-bundle archive JSON (host-only
+#                     archived `git bundle` copies + newest stamp; F.4 lifeline)
 #   provision-status          — read-only Proxmox host capacity (audit token)
 #   provision-grow-disk <disk> <GiB> — EXECUTE a pre-approved VM disk grow +
 #                     absorb (execute-only: NO Telegram gate; caller approves)
@@ -834,6 +836,28 @@ PYEOF
         PYTHONPATH="$INSTALL_DIR/src" \
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
             timeout 45 "$VENV_PY" -m genesis.guardian --host-profile
+        ;;
+    bundle-status)
+        # Read-only: print the offline repo-bundle archive JSON (host-only
+        # archived `git bundle` copies + the newest stamp). The container's window
+        # onto its offline re-clone lifeline. No mutation, no secrets, no sudo.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "bundle-status", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        # Skew guard (see host-profile): sync-gateway redeploys THIS script
+        # independently of the src tree. An old checkout has no --bundle-status
+        # branch — the flag would fall through main()'s if-chain into run_check(),
+        # i.e. a FULL guardian recovery cycle triggered by a routine read-only poll.
+        if [ ! -f "$INSTALL_DIR/src/genesis/guardian/bundle_watch.py" ]; then
+            echo '{"ok": false, "action": "bundle-status", "error": "guardian src predates bundle-status — run update to redeploy"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+            timeout 30 "$VENV_PY" -m genesis.guardian --bundle-status
         ;;
     provision-status)
         # Read-only host capacity via the Proxmox AUDIT token (VM cores/RAM,

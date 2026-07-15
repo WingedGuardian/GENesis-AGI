@@ -630,6 +630,41 @@ async def _check_git_health_deep(db) -> None:
         logger.debug("Failed to create git deep-health observation", exc_info=True)
 
 
+# Daily offline git-bundle publish (F.4). Publishes a *verified* `git bundle` of
+# the main repo to the shared mount so the host guardian can archive it OUTSIDE
+# the container's blast radius — the offline re-clone lifeline for when both the
+# local git AND the network are gone. Monotonic >=24h guard (same rationale as the
+# deep fsck above: fires once on the first tick after any restart; no
+# IntervalTrigger reset-starvation). publish_repo_bundle is health-gated,
+# verify-gated, and does its own to_thread for the blocking git work, so this
+# never blocks the tick. None = "never run this boot".
+_BUNDLE_PUBLISH_INTERVAL_S = 24 * 3600
+_last_bundle_publish_at: float | None = None
+
+
+async def _publish_repo_bundle_if_due() -> None:
+    """Publish the offline repo-bundle lifeline at most once per ~24h (and once on
+    the first tick after a restart). Best-effort; never raises. The health gate
+    (skip when the repo is unhealthy) and verify gate live in publish_repo_bundle."""
+    global _last_bundle_publish_at
+    now = time.monotonic()
+    if (
+        _last_bundle_publish_at is not None
+        and now - _last_bundle_publish_at < _BUNDLE_PUBLISH_INTERVAL_S
+    ):
+        return
+    # Claim the slot BEFORE running so an error can't retry every tick.
+    _last_bundle_publish_at = now
+    try:
+        from genesis.guardian.repo_bundle import publish_repo_bundle
+
+        result = await publish_repo_bundle()
+        if result and result.get("action") == "published":
+            logger.info("Offline repo bundle published: %s", result.get("bundle"))
+    except Exception:
+        logger.debug("repo bundle publish failed", exc_info=True)
+
+
 # Per-CC-slot RSS alerting. Same monotonic-since-boot caveat as WAL above: use a
 # key-existence check (a missing key means "never alerted"), NEVER a default of
 # 0.0 — on a host booted <cooldown ago, `now - 0.0` is small and would wrongly
@@ -1435,6 +1470,12 @@ class AwarenessLoop:
             # thread. Loop-driven (not the learning scheduler) so it survives a
             # router-degraded startup.
             await _check_git_health_deep(self._db)
+            # Daily offline git-bundle publish (F.4) — a verified `git bundle` of
+            # the repo to the shared mount, health-gated, so the host guardian can
+            # archive an offline re-clone lifeline. Self-guards to ~daily and runs
+            # its blocking work in a thread. Loop-driven for the same
+            # degraded-startup coverage as the deep fsck above.
+            await _publish_repo_bundle_if_due()
 
             # SQLite WAL checkpoint — prevent unbounded WAL growth from
             # external scripts or concurrent writers. PASSIVE is non-blocking.
