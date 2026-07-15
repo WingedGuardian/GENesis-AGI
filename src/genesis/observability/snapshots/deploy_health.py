@@ -231,14 +231,12 @@ async def last_success_update(db: aiosqlite.Connection | None) -> dict:
     if db is None:
         return {"completed_at": None, "new_commit": None, "age_days": None}
     try:
-        cursor = await db.execute(
-            "SELECT completed_at, new_commit FROM update_history "
-            "WHERE status='success' ORDER BY completed_at DESC LIMIT 1"
-        )
-        row = await cursor.fetchone()
-        if not row or not row[0]:
+        from genesis.db.crud.update_history import last_successful_update
+
+        row = await last_successful_update(db)
+        if row is None:
             return {"completed_at": None, "new_commit": None, "age_days": None}
-        completed_at, new_commit = row[0], row[1]
+        completed_at, new_commit = row[0], (row[1] or None)
         age_days = None
         try:
             completed_dt = datetime.fromisoformat(completed_at)

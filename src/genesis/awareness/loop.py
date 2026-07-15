@@ -359,30 +359,28 @@ async def _check_deploy_staleness(db) -> None:
             # new missing unit months later would inherit this incident's
             # clock via MIN(created_at) and page instantly instead of after
             # 24h. Cheap no-op when nothing matches.
-            await db.execute(
-                "UPDATE observations SET resolution_notes='deploy staleness cleared' "
-                "WHERE source='deploy_staleness_monitor' "
-                "AND content LIKE '%missing_units%' AND resolution_notes=?",
-                (_DEPLOY_SUPERSEDED_NOTE,),
+            await observations.rewrite_resolution_notes(
+                db,
+                source="deploy_staleness_monitor",
+                from_notes=_DEPLOY_SUPERSEDED_NOTE,
+                to_notes="deploy staleness cleared",
+                content_like="%missing_units%",
             )
-            await db.commit()
         if not critical and "missing_units" in classes:
             # Escalate a missing unit that has been alerted for >24h. Anchor =
             # oldest prior alert naming missing units that is either still
             # unresolved or was superseded by a state change (NOT one resolved
             # by genuine recovery) — restart-safe, and immune to the
             # escalated row resetting the clock.
-            cur = await db.execute(
-                "SELECT MIN(created_at) FROM observations "
-                "WHERE source='deploy_staleness_monitor' "
-                "AND content LIKE '%missing_units%' "
-                "AND (resolved=0 OR resolution_notes=?)",
-                (_DEPLOY_SUPERSEDED_NOTE,),
+            anchor_created_at = await observations.oldest_created_at(
+                db,
+                source="deploy_staleness_monitor",
+                content_like="%missing_units%",
+                resolution_notes=_DEPLOY_SUPERSEDED_NOTE,
             )
-            row = await cur.fetchone()
-            if row and row[0]:
+            if anchor_created_at:
                 try:
-                    first = datetime.fromisoformat(row[0])
+                    first = datetime.fromisoformat(anchor_created_at)
                     if first.tzinfo is None:
                         first = first.replace(tzinfo=UTC)
                     age_s = (datetime.now(UTC) - first).total_seconds()
@@ -402,13 +400,14 @@ async def _check_deploy_staleness(db) -> None:
         content_hash = hashlib.sha256(f"deploy_staleness:{alert_key}".encode()).hexdigest()
         # Keep exactly ONE active alert = the current state (same rationale as
         # the embedding-backlog band supersede above).
-        await db.execute(
-            "UPDATE observations SET resolved=1, resolved_at=?, resolution_notes=? "
-            "WHERE source='deploy_staleness_monitor' "
-            "AND type='infrastructure_alert' AND resolved=0 AND content_hash != ?",
-            (datetime.now(UTC).isoformat(), _DEPLOY_SUPERSEDED_NOTE, content_hash),
+        await observations.supersede_except_hash(
+            db,
+            source="deploy_staleness_monitor",
+            type="infrastructure_alert",
+            keep_content_hash=content_hash,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=_DEPLOY_SUPERSEDED_NOTE,
         )
-        await db.commit()
 
         missing_units = snap.get("missing_units") or []
         tier2 = snap.get("tier2_pending") or []
@@ -475,12 +474,12 @@ async def _resolve_deploy_staleness(db) -> None:
             resolved_at=datetime.now(UTC).isoformat(),
             resolution_notes="auto-resolved: deploy staleness cleared",
         )
-        await db.execute(
-            "UPDATE observations SET resolution_notes='deploy staleness cleared' "
-            "WHERE source='deploy_staleness_monitor' AND resolution_notes=?",
-            (_DEPLOY_SUPERSEDED_NOTE,),
+        await observations.rewrite_resolution_notes(
+            db,
+            source="deploy_staleness_monitor",
+            from_notes=_DEPLOY_SUPERSEDED_NOTE,
+            to_notes="deploy staleness cleared",
         )
-        await db.commit()
         if resolved:
             _last_deploy_alert_at = 0.0
             _last_deploy_alert_key = ""
