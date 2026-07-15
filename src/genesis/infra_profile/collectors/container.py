@@ -161,26 +161,35 @@ def _oomd_user_slice_kill(etc_root: Path) -> bool:
 
 
 def _networkd_keep_configuration(etc_root: Path) -> bool:
-    """Whether a KeepConfiguration policy (any value other than "no") is set in
-    a systemd-networkd .network drop-in — the genesis-keep-config.conf that
-    scripts/lib/network_resilience.sh lays down so a networkd failure RETAINS
-    the address instead of dropping it (the 2026-07 eth0 wedge). Config-plane,
-    same last-assignment-wins semantics as _oomd_user_slice_kill; scans our
-    world-readable /etc drop-ins (the /run render is root-only)."""
+    """True when at least one systemd-networkd link has an effective
+    KeepConfiguration policy (any value other than "no") — the
+    genesis-keep-config.conf that scripts/lib/network_resilience.sh lays down so
+    a networkd failure RETAINS the address instead of dropping it (the 2026-07
+    eth0 wedge). Scoped the way systemd scopes drop-ins: last-assignment-wins
+    WITHIN each `.network.d` directory (a later zz-*.conf reverting to `auto`/
+    `no` disables that link), then OR'd across links — an unrelated drop-in on
+    a *different* interface can neither fake protection nor mask it. Config-
+    plane: scans our world-readable /etc drop-ins (the /run render is root-only).
+    Comments are full-line only (unit files have no inline comments)."""
     net_dir = etc_root / "systemd/network"
     if not net_dir.is_dir():
         return False
-    effective: str | None = None
-    for conf in sorted(net_dir.glob("*.network.d/*.conf")):
-        raw = _read(conf) or ""
-        for line in raw.splitlines():
-            stripped = line.strip()
-            if stripped.startswith(("#", ";")):
-                continue
-            key, sep, value = stripped.partition("=")
-            if sep and key.strip() == "KeepConfiguration":
-                effective = value.strip()
-    return effective is not None and effective.lower() != "no"
+    for dropin_dir in sorted(net_dir.glob("*.network.d")):
+        if not dropin_dir.is_dir():
+            continue
+        effective: str | None = None
+        for conf in sorted(dropin_dir.glob("*.conf")):
+            raw = _read(conf) or ""
+            for line in raw.splitlines():
+                stripped = line.strip()
+                if stripped.startswith(("#", ";")):
+                    continue
+                key, sep, value = stripped.partition("=")
+                if sep and key.strip() == "KeepConfiguration":
+                    effective = value.strip()
+        if effective is not None and effective.lower() != "no":
+            return True
+    return False
 
 
 def _read_watchdog_state(run_root: Path) -> dict | None:

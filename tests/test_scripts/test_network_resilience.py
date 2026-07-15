@@ -30,6 +30,7 @@ exec "$@"
 
 _SYSTEMCTL_STUB = """#!/bin/bash
 if [ "$1" = "is-active" ]; then exit "${NETWORKD_ACTIVE_RC:-0}"; fi
+if [ "$1" = "is-enabled" ]; then printf '%s' "${NETWORKD_ENABLED-enabled}"; exit 0; fi
 echo "$@" >> "$SYSTEMCTL_LOG"
 exit 0
 """
@@ -153,13 +154,28 @@ def test_no_networkctl_skips_cleanly(tmp_path):
     assert not _paths(env)["keepconf"].exists()
 
 
-def test_networkd_inactive_skips_cleanly(tmp_path):
+def test_networkd_disabled_and_inactive_skips_cleanly(tmp_path):
+    # Genuine other-manager host: networkd inactive AND not enabled -> skip.
     env = _stage(tmp_path)
-    env["NETWORKD_ACTIVE_RC"] = "1"  # systemd-networkd not the active manager
+    env["NETWORKD_ACTIVE_RC"] = "1"
+    env["NETWORKD_ENABLED"] = "disabled"
     result = _run_apply(env)
     assert result.returncode == 0
-    assert "not active" in result.stdout
+    assert "not active or enabled" in result.stdout
     assert not _paths(env)["keepconf"].exists()
+
+
+def test_networkd_inactive_but_enabled_still_installs_watchdog(tmp_path):
+    # The crashed-but-ours case: networkd is inactive (exactly what the watchdog
+    # heals) yet enabled — must NOT be skipped, or the machine that most needs
+    # the watchdog never gets it (Codex P2).
+    env = _stage(tmp_path)
+    env["NETWORKD_ACTIVE_RC"] = "1"
+    env["NETWORKD_ENABLED"] = "enabled"
+    result = _run_apply(env)
+    assert result.returncode == 0
+    assert "not active or enabled" not in result.stdout
+    assert _paths(env)["timer"].exists()
 
 
 def test_no_noninteractive_sudo_skips_with_remediation(tmp_path):
@@ -250,7 +266,7 @@ case "$1" in
     is-enabled) printf '%s' "${WD_ENABLED-enabled}" ;;
     is-active)  printf '%s' "${WD_ACTIVE-active}" ;;
     show)       printf '@%s' "${WD_START_EPOCH-0}" ;;
-    restart)    echo "restart $2" >> "$WD_RESTART_LOG" ;;
+    restart)    echo "restart $2" >> "$WD_RESTART_LOG"; exit "${WD_RESTART_RC:-0}" ;;
 esac
 exit 0
 """
@@ -384,6 +400,22 @@ def test_watchdog_rate_limit_suppresses_repeat_heal(tmp_path):
     st = _state(env)
     assert st["last_action"] == "ratelimited"
     assert st["last_trigger"] == "failed-link:eth0"  # trigger recorded even so
+
+
+def test_watchdog_failed_restart_not_recorded_as_healed(tmp_path):
+    # A restart that exits nonzero must NOT claim a heal or arm the rate limit
+    # (Codex P2): telemetry says restart-failed, heal_count stays 0, and no
+    # stamp is written so the next tick retries.
+    env = _stage_wd(tmp_path)
+    env["WD_ACTIVE"] = "inactive"
+    env["WD_RESTART_RC"] = "1"
+    result = _run_wd(env)
+    assert result.returncode != 0  # surfaces as a failed oneshot unit
+    assert _restarted(env)  # it DID attempt the restart
+    st = _state(env)
+    assert st["last_action"] == "restart-failed"
+    assert st["heal_count"] == 0
+    assert not Path(env["NETWD_STAMP_FILE"]).exists()  # rate limit not armed
 
 
 def test_watchdog_heal_count_accumulates_across_runs(tmp_path):

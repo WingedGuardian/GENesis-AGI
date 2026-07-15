@@ -146,10 +146,16 @@ network_resilience_apply() {
         echo "  Skipped: networkctl not present — not a systemd-networkd system."
         return 0
     fi
-    # networkd must be the active manager — skip NetworkManager/other stacks
-    # (their equivalent knobs differ; this fix is networkd-specific).
-    if ! systemctl is-active systemd-networkd >/dev/null 2>&1; then
-        echo "  Skipped: systemd-networkd not active — not the active network manager."
+    # systemd-networkd must be THIS box's manager — but "active" alone is too
+    # strict: a networkd that has crashed/stopped (exactly the state the
+    # watchdog exists to heal) is inactive yet still the manager. Treat it as
+    # ours if active OR enabled; skip only genuine NetworkManager/other stacks
+    # (networkd disabled/masked/absent). Part A self-degrades when networkd is
+    # down (networkctl discovery fails → skips); Part B still installs.
+    _netres_enabled_state="$(systemctl is-enabled systemd-networkd 2>/dev/null || true)"
+    if ! systemctl is-active systemd-networkd >/dev/null 2>&1 \
+        && [[ "$_netres_enabled_state" != "enabled" && "$_netres_enabled_state" != "enabled-runtime" ]]; then
+        echo "  Skipped: systemd-networkd not active or enabled — not this host's network manager."
         return 0
     fi
     if ! sudo -n true 2>/dev/null; then

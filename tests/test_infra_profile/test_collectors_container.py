@@ -211,9 +211,30 @@ async def test_network_keep_configuration_fact(tmp_path):
     result = await collect_network(etc_root=tmp_path)
     assert result.facts["networkd_keep_configuration"] is True
 
-    # last-assignment-wins across lexicographic drop-ins: a later zz-*.conf
-    # reverting to `no` disables the protection — the fact must not lie.
+    # last-assignment-wins WITHIN the link's own drop-in dir: a later zz-*.conf
+    # reverting to `no` disables THIS link's protection — the fact must not lie.
     d.joinpath("zz-off.conf").write_text("[Network]\nKeepConfiguration=no\n")
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["networkd_keep_configuration"] is False
+
+
+async def test_network_keep_configuration_scoped_per_network_file(tmp_path):
+    # Drop-ins are scoped per .network file, not globally: a `no` on one
+    # interface must not mask protection on another, and last-assignment-wins is
+    # evaluated within each dir independently (Codex P2 — cross-interface bleed).
+    net = tmp_path / "systemd/network"
+    (net / "10-eth0.network.d").mkdir(parents=True)
+    (net / "20-eth1.network.d").mkdir(parents=True)
+    # eth1 (later-sorting) explicitly off; eth0 protected -> overall True.
+    (net / "10-eth0.network.d/genesis-keep-config.conf").write_text(
+        "[Network]\nKeepConfiguration=true\n"
+    )
+    (net / "20-eth1.network.d/other.conf").write_text("[Network]\nKeepConfiguration=no\n")
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["networkd_keep_configuration"] is True
+
+    # remove the protected link -> only the `no` link remains -> False
+    (net / "10-eth0.network.d/genesis-keep-config.conf").unlink()
     result = await collect_network(etc_root=tmp_path)
     assert result.facts["networkd_keep_configuration"] is False
 

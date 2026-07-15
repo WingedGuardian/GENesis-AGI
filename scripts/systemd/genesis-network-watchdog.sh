@@ -147,11 +147,21 @@ main() {
     fi
 
     log "healing: restarting systemd-networkd (trigger=$trigger)"
-    "$SYSTEMCTL" restart systemd-networkd
-    local rc=$?
-    echo "$NETWD_NOW" >"$STAMP_FILE" 2>/dev/null || true
-    _write_state "healed" "$trigger"
-    return "$rc"
+    if "$SYSTEMCTL" restart systemd-networkd; then
+        # Only a SUCCESSFUL restart counts: stamp the rate-limit window and
+        # record the heal. A failed restart must NOT claim a heal in telemetry
+        # and must NOT arm the rate limit (so the next tick retries promptly).
+        echo "$NETWD_NOW" >"$STAMP_FILE" 2>/dev/null || true
+        _write_state "healed" "$trigger"
+        return 0
+    else
+        # $? here is the failed restart's exit code (after `fi` it would be the
+        # if-compound's 0). Don't stamp; leave the rate limit disarmed to retry.
+        local rc=$?
+        log "restart FAILED (rc=$rc, trigger=$trigger) — will retry next tick"
+        _write_state "restart-failed" "$trigger"
+        return "$rc"
+    fi
 }
 
 main "$@"
