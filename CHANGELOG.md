@@ -9,6 +9,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **The CC Sessions card now tells the truth, and clicking it shows why.**
+  The dashboard card used to show a DB-side "active" count that routinely
+  disagreed with the processes actually running, plus a bare "3/20" that
+  looked like a session count but was really the hourly rate budget. The card
+  now shows both counts side by side ("N live / M db", amber when they
+  diverge), labels the budget as a budget, and opens a per-session modal:
+  every session from the last 24 hours with its live process (slot, pid,
+  memory), its charter (mission, compactions, open ledger items), and
+  explicit badges wherever the database and reality disagree — including
+  live processes with no session row at all.
+
 ### Fixed
 
 - **Code-intelligence indexing can no longer storm the machine.** Keeping the
@@ -284,6 +297,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Background research sessions can now reach Genesis's discovery tools, and the
+  session queue no longer strands work after a restart.** Research-profile
+  background sessions were silently cut off from the recon tools (GitHub and
+  model-intelligence discovery, skill scanning, findings storage) — the discovery
+  engine they exist to drive — so a research session could investigate but never
+  record what it found there; they now load those tools. Separately, if a queued
+  background session was claimed moments before a restart, it could sit stuck
+  indefinitely; the queue now re-checks for stranded claims periodically, not just
+  once at boot. Two smaller hardening fixes ride along: read-only background
+  profiles can no longer edit follow-ups (only *create* was blocked before), and
+  the executor's plan reviewer no longer suppresses a genuine gap when a task's
+  requirements explicitly call for a specific timeout/retry/escalation behavior.
 - **The neural monitor's Ego panel now shows real ego activity, not phantom tiles.**
   The dashboard was rendering a few "ego" tiles that looked healthy but never
   actually ran — leftovers from an earlier ego redesign that split the ego into

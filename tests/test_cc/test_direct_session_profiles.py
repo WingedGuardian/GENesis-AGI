@@ -12,6 +12,7 @@ import pytest
 from genesis.cc.direct_session import (
     _BG_CC_TMP_ROOT,
     _PROFILE_ADDENDA,
+    _PROFILE_TO_MCP,
     PROFILES,
     VALID_PROFILES,
     DirectSessionRequest,
@@ -24,6 +25,7 @@ from genesis.cc.direct_session import (
 from genesis.cc.types import CCModel
 
 # --- Profile existence ---
+
 
 def test_valid_profiles_matches_profiles_dict():
     """VALID_PROFILES frozenset must match PROFILES keys."""
@@ -42,7 +44,9 @@ def test_all_expected_profiles_exist():
 # for observe via _NO_FILE_WRITE.
 
 _UNIVERSAL_BLOCKED = {
-    "Bash", "Edit", "NotebookEdit",
+    "Bash",
+    "Edit",
+    "NotebookEdit",
     "mcp__genesis-health__task_submit",
     "mcp__genesis-health__settings_update",
     "mcp__genesis-health__direct_session_run",
@@ -75,6 +79,7 @@ def test_research_blocks_universal():
 
 # --- Write tool scoping ---
 
+
 def test_observe_blocks_write():
     """Observe is read-only — Write is blocked."""
     assert "Write" in PROFILES["observe"]
@@ -91,6 +96,7 @@ def test_research_allows_write():
 
 
 # --- Observe: most restrictive ---
+
 
 def test_observe_blocks_browser_interaction():
     assert "mcp__genesis-health__browser_click" in PROFILES["observe"]
@@ -114,6 +120,7 @@ def test_observe_blocks_follow_ups():
 
 
 # --- Research: SQLite writes + follow-ups, no vector store / browser ---
+
 
 def test_research_blocks_vector_store_writes():
     """Vector store writes (memory_store/synthesize/extract) are universally blocked."""
@@ -144,6 +151,7 @@ def test_research_blocks_outreach_send():
 
 
 # --- Interact: most permissive — browser + memory + outreach ---
+
 
 def test_interact_allows_browser_interaction():
     assert "mcp__genesis-health__browser_click" not in PROFILES["interact"]
@@ -185,6 +193,7 @@ def test_interact_blocks_recon_writes():
 
 # --- Profile shape assertions ---
 
+
 def test_observe_is_most_restrictive():
     """Observe should block the most tools."""
     assert len(PROFILES["observe"]) >= len(PROFILES["research"])
@@ -200,6 +209,7 @@ def test_interact_and_research_share_universal_base():
 
 
 # --- Profile addendum correctness ---
+
 
 def test_interact_addendum_mentions_write_available():
     """Interact addendum must tell session Write is available."""
@@ -239,6 +249,7 @@ def test_all_addenda_include_mission_injection():
 
 
 # --- Model override for interact profile ---
+
 
 def _make_runner():
     """Construct a DirectSessionRunner with mock dependencies."""
@@ -315,6 +326,7 @@ _HERMETIC_ROSTER = {
 
 def _patch_roster(monkeypatch):
     from genesis.cc import roster
+
     monkeypatch.setattr(roster, "load_roster", lambda *a, **k: _HERMETIC_ROSTER)
     return roster
 
@@ -370,6 +382,7 @@ def test_keyless_roster_model_fails_loud(monkeypatch):
 
 
 # --- Mail profile: perimeter session restrictions ---
+
 
 def test_mail_profile_exists():
     assert "mail" in PROFILES
@@ -440,6 +453,7 @@ def test_mail_profile_does_not_upgrade_model():
 
 # --- Steward profile: Bash-enabled, gh-scoped, upstream-PR stewardship ---
 
+
 def test_steward_profile_exists():
     assert "steward" in PROFILES
     assert "steward" in VALID_PROFILES
@@ -484,6 +498,7 @@ def test_steward_does_not_upgrade_model():
 
 
 # --- Bash allowlist plumbing ---
+
 
 def test_steward_invocation_sets_gh_bash_allowlist():
     runner = _make_runner()
@@ -668,6 +683,7 @@ def test_load_profile_overlays_noop_when_absent(monkeypatch):
 
 # --- Per-session CC sandbox isolation (background dispatch) ---
 
+
 def test_bg_session_sandbox_is_off_cc_tmp():
     """A session's sandbox lives under ~/tmp/bg-cc-sessions, NOT the
     watchgod-policed ~/.genesis/cc-tmp."""
@@ -706,6 +722,7 @@ def test_build_invocation_sets_isolated_tmpdir():
 
 # --- WS-3 session-origin plumbing (per-profile provenance) ---
 
+
 def test_every_profile_has_an_origin_disposition():
     """Forcing function: a new profile cannot ship provenance-unclassified.
     Every profile routed by _PROFILE_TO_MCP must be classified external in
@@ -713,12 +730,9 @@ def test_every_profile_has_an_origin_disposition():
     from genesis.cc.direct_session import (
         _PROFILE_ORIGIN,
         _PROFILE_ORIGIN_FIRST_PARTY,
-        _PROFILE_TO_MCP,
     )
 
-    unclassified = (
-        set(_PROFILE_TO_MCP) - set(_PROFILE_ORIGIN) - set(_PROFILE_ORIGIN_FIRST_PARTY)
-    )
+    unclassified = set(_PROFILE_TO_MCP) - set(_PROFILE_ORIGIN) - set(_PROFILE_ORIGIN_FIRST_PARTY)
     assert not unclassified, (
         f"Profiles without a WS-3 origin disposition: {sorted(unclassified)}. "
         "Classify each in _PROFILE_ORIGIN (external_untrusted) or "
@@ -751,3 +765,44 @@ def test_observe_profile_invocation_has_no_origin():
     req = DirectSessionRequest(prompt="t", profile="observe", model=CCModel.HAIKU)
     inv = runner._build_invocation(req, "test-session")
     assert inv.origin is None
+
+
+# --- follow_up_update tool-level block (idx 32) ---
+# _NO_FOLLOW_UPS must block BOTH follow_up_create and follow_up_update in the
+# perimeter/read-leaning profiles. follow_up_update is a registered health MCP
+# tool (mcp/health/follow_up_tools.py) and was previously left callable.
+
+
+def test_observe_blocks_follow_up_update():
+    assert "mcp__genesis-health__follow_up_update" in PROFILES["observe"]
+
+
+def test_mail_blocks_follow_up_update():
+    assert "mcp__genesis-health__follow_up_update" in PROFILES["mail"]
+
+
+def test_community_responder_blocks_follow_up_update():
+    assert "mcp__genesis-health__follow_up_update" in PROFILES["community-responder"]
+
+
+def test_community_responder_blocks_follow_up_create():
+    assert "mcp__genesis-health__follow_up_create" in PROFILES["community-responder"]
+
+
+def test_research_allows_follow_up_update():
+    """research is a working profile — it may create AND update follow-ups."""
+    assert "mcp__genesis-health__follow_up_update" not in PROFILES["research"]
+
+
+def test_interact_allows_follow_up_update():
+    assert "mcp__genesis-health__follow_up_update" not in PROFILES["interact"]
+
+
+# --- research MCP profile mapping (idx 37) ---
+# research must map to its own MCP profile (which loads genesis-recon), not to
+# "reflection" (health + memory only). Recon is the discovery engine and was
+# unreachable in research sessions.
+
+
+def test_research_maps_to_research_mcp_profile():
+    assert _PROFILE_TO_MCP["research"] == "research"

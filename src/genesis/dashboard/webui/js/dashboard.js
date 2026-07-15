@@ -81,6 +81,12 @@
           filter: null,
           fetch: { state: "idle", lastSuccess: null, error: null },
         },
+        ccSessionsModal: {
+          open: false,
+          data: null,
+          filter: null,
+          fetch: { state: "idle", lastSuccess: null, error: null },
+        },
         outreachModal: {
           open: false,
           messages: [],
@@ -3908,6 +3914,21 @@
             }
           } catch {
             this.failModalFetch("surplusModal", "Surplus detail unavailable");
+          }
+        },
+
+        async fetchCcSessionsDetail() {
+          this.startModalFetch("ccSessionsModal");
+          try {
+            const resp = await fetchApi("/api/genesis/cc-sessions/detail");
+            if (resp?.ok) {
+              this.ccSessionsModal.data = await resp.json();
+              this.finishModalFetch("ccSessionsModal");
+            } else {
+              this.failModalFetch("ccSessionsModal", "CC session detail unavailable");
+            }
+          } catch {
+            this.failModalFetch("ccSessionsModal", "CC session detail unavailable");
           }
         },
 

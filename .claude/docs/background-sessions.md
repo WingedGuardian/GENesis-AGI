@@ -28,7 +28,9 @@ the next few minutes → sub-agent.
 Most profiles block: Bash, Edit, Write, task_submit, settings_update,
 direct_session_run, module_call. Use `interact` for workflows that operate
 external platforms (publishing, form filling) and need to communicate with the
-user. Use `research` for investigation that writes observations/follow-ups.
+user. Use `research` for investigation that writes observations/follow-ups;
+it also reaches the `genesis-recon` discovery tools (GitHub/model-intel/skill
+scanning, findings storage) — the only profile that does.
 Use `observe` for read-only investigation.
 
 **`steward` is the one built-in Bash-enabled profile** — its Bash is restricted
@@ -83,8 +85,8 @@ Background sessions have strict memory isolation:
 
 ## Key Parameters
 
-- **`timeout_s`** — default 900 (15min). Use 3600 for research tasks. The clock
-  runs the entire time, including during rate limit waits.
+- **`timeout_minutes`** — default 15, max 60. Use 60 for long research tasks.
+  The clock runs the entire time, including during rate limit waits.
 - **`model` / `effort`** — default Sonnet/High. Haiku for cheap bulk tasks.
 - **`profile`** — see table above. Choose the minimum profile that covers the task.
 
@@ -110,7 +112,7 @@ Background sessions share your account's Claude API rate limit with your
 foreground session.
 
 - Rate limit hits don't just block the background session — they block you too
-- Rate limit wait time counts against `timeout_s` — 5 min waiting = 5 min less work
+- Rate limit wait time counts against `timeout_minutes` — 5 min waiting = 5 min less work
 - Sessions that exhaust timeout during a wait fail with a Telegram failure notification
 - Memory writes committed before failure are preserved
 
@@ -151,8 +153,8 @@ For both types, include a descriptive `source` tag (e.g. `"research_session"`,
 direct_session_run(
     prompt="...",
     profile="research",      # observe | interact | research
-    timeout_s=3600,          # 900 default, 3600 for long research
-    model="claude-sonnet-4-6",
+    timeout_minutes=60,      # 15 default, up to 60 for long research
+    model="sonnet",          # sonnet | opus | haiku | fable
     effort="high",
 )
 ```
