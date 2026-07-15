@@ -1086,3 +1086,14 @@ def test_relevance_mixed_scope_keeps_only_in_scope():
         excluded_signals={"user_goal_staleness"},
     )
     assert rel == "genesis"
+
+
+def test_relevance_outreach_engagement_is_user_facing():
+    """outreach_engagement_data is user-world (matching _USER_WORLD_CATEGORIES'
+    treatment of outreach/marketing/networking): an outreach-driven micro must
+    classify :user so it is kept out of the Genesis/COO ego context."""
+    from genesis.perception.writer import ResultWriter
+
+    tick = _tick_with("outreach_engagement_data", "cpu_usage")
+    rel = ResultWriter._relevance_from_signals(tick, ["outreach_engagement_data"])
+    assert rel == "user"

@@ -18,6 +18,9 @@ USER_FACING_SIGNALS = frozenset(
         "stale_pending_items",
         "user_goal_staleness",
         "user_session_pattern",
+        # Outreach/marketing/networking is user-world (mirrors
+        # _USER_WORLD_CATEGORIES, which excludes it from the Genesis ego).
+        "outreach_engagement_data",
     }
 )
 
