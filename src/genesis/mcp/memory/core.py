@@ -7,6 +7,7 @@ import re
 from dataclasses import asdict
 from datetime import UTC, datetime
 
+from genesis.memory import graph_expansion
 from genesis.memory.activation import compute_activation
 from genesis.memory.graph import traverse as graph_traverse
 from genesis.memory.provenance import (
@@ -346,6 +347,16 @@ async def memory_recall(
         pass  # instrumentation must never break recall
 
     if compact:
+        # Graph expansion (benchmark-proven +12.6pp): merge 1-hop linked
+        # neighbors BEFORE the blockable count and preview loop below, so
+        # neighbors are counted/recorded/previewed identically to organic
+        # results. Shadow mode only emits metrics; live appends.
+        results = await graph_expansion.maybe_expand(
+            memory_mod._db,
+            results,
+            surface="compact",
+            recall_event_id=recall_event_id,
+        )
         # WS-3 B1 gate 4 (injection): the compact branch returns external
         # previews and RETURNS before the full-path wrap/emit below — record
         # here too so compact recalls are not undercounted (observe-only).
@@ -388,6 +399,9 @@ async def memory_recall(
                     source_doc=r.source,
                     origin_class=r.origin_class,
                 ),
+                # Expanded neighbors are linkage-reached, not query-ranked —
+                # flag them so callers can weigh (and memory_expand them).
+                **({"via_graph": True} if r.payload.get("graph_expansion") else {}),
             }
             for r in results
         ]
@@ -441,6 +455,27 @@ async def memory_recall(
             pipeline_used=pipeline_used,
             recall_event_id=recall_event_id,
         )
+    # Graph expansion (benchmark-proven +12.6pp): merge 1-hop linked neighbors
+    # of the recalled top-K — seeded from the retriever's results exactly like
+    # the LongMemEval graph arm. AFTER CRAG (additive: CRAG dedups/trims to
+    # limit and would evict neighbors) and BEFORE the label/wrap/count loops
+    # below, so neighbors get the identical provenance labeling + injection
+    # defenses with zero loop changes. Shadow mode only emits metrics.
+    try:
+        _expanded = await graph_expansion.maybe_expand(
+            memory_mod._db,
+            results,
+            surface="full",
+            recall_event_id=recall_event_id,
+        )
+        _existing_ids = {d.get("memory_id") for d in enriched if isinstance(d, dict)}
+        enriched.extend(
+            asdict(n) | {"via_graph": True}
+            for n in _expanded[len(results) :]
+            if n.memory_id not in _existing_ids  # CRAG may have re-added one
+        )
+    except Exception:
+        logger.warning("graph expansion merge failed — recall unaffected", exc_info=True)
     # Provenance pass (audit D12): label original + any CRAG-augmented items as
     # first-party vs external-world. Runs regardless of `corrective` so the
     # output contract is uniform.
@@ -776,7 +811,15 @@ async def memory_proactive(
     current_message: str,
     limit: int = 5,
 ) -> list[dict]:
-    """Cross-session context injection for prompts."""
+    """Cross-session context injection for prompts.
+
+    ``limit`` bounds the ORGANIC (query-ranked) results. When graph expansion
+    is live, up to ``proactive_max_neighbors`` (default 2, settings-capped)
+    linked neighbors may be appended beyond it, flagged ``via_graph`` — a
+    deliberate contract: the benchmark-proven lift comes from adding linked
+    context the ranked top-K missed, so trimming the total to ``limit`` would
+    displace the organic results expansion is meant to supplement.
+    """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._retriever is not None
@@ -813,6 +856,7 @@ async def memory_proactive(
     # can appear here and flow straight into prompt context — wrap external-world
     # items so the model treats them as data, not first-party instructions.
     out: list[dict] = []
+    kept: list = []  # RetrievalResults behind `out` — graph-expansion seeds
     blockable = 0
     dropped = 0
     for r in filtered:
@@ -850,6 +894,46 @@ async def memory_proactive(
         if _blockable:
             blockable += 1
         out.append(d)
+        kept.append(r)
+    # Graph expansion (benchmark-proven; tiny proactive cap): 1-hop neighbors
+    # of the DELIVERED set, run through the SAME memory_operation filter,
+    # enforce-drop, and blockable+wrap pipeline as organic items — expansion
+    # must never be a bypass around the gate-4 pushed-surface defenses. Merged
+    # BEFORE the emit below so neighbors are counted. Shadow only emits.
+    _expanded = await graph_expansion.maybe_expand(
+        memory_mod._db,
+        kept,
+        surface="proactive",
+    )
+    for nr in _expanded[len(kept) :]:
+        # Neighbor tags come from the FTS row as a STRING — substring check
+        # mirrors the organic list-membership filter above.
+        if "memory_operation" in (nr.payload.get("tags") or ""):
+            continue
+        if immunity_shadow.should_enforce_drop(
+            gate="injection",
+            collection=nr.collection,
+            source_pipeline=nr.source_pipeline,
+            origin_class=nr.origin_class,
+            pushed_surface=True,
+            unsupervised=_unsupervised,
+        ):
+            dropped += 1
+            continue
+        nd = asdict(nr) | {"via_graph": True}
+        _nb = immunity_shadow.item_is_blockable(
+            collection=nr.collection,
+            source_pipeline=nr.source_pipeline,
+            origin_class=nr.origin_class,
+        )
+        if _nb or is_external(nr.collection):
+            nd["content"] = wrap_external_recall(
+                nd.get("content", ""),
+                source_pipeline=nr.source_pipeline,
+            )
+        if _nb:
+            blockable += 1
+        out.append(nd)
     # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
     # proactive-recall prompt (observe-only). db=memory_mod._db when set, else
     # the emit self-resolves a short-lived connection. `enforced_drops` in the

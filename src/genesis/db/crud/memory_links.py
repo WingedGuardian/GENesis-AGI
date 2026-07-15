@@ -126,8 +126,9 @@ async def inter_candidate_links(
     return [(row[0], row[1]) for row in rows]
 
 
-# Seed cap for neighbors_of: the query binds 2*len(seeds) (+ optional link
-# types) + 1 placeholders, so 450 keeps the worst case ~901 — under the 999
+# Seed cap for neighbors_of: the query binds 2*len(seeds) (+ optional
+# include/exclude link types, a handful each) + 1 placeholders, so 450 keeps
+# the worst case ~901 — under the 999
 # SQLITE_MAX_VARIABLE_NUMBER floor this file's IN-list convention targets.
 # (inter_candidate_links' 499 assumes its own 2n shape; don't borrow caps.)
 _NEIGHBOR_SEED_CAP = 450
@@ -140,6 +141,7 @@ async def neighbors_of(
     exclude: list[str] | tuple[str, ...] = (),
     limit: int = 10,
     link_types: tuple[str, ...] | None = None,
+    exclude_link_types: tuple[str, ...] | list[str] = (),
 ) -> list[dict]:
     """1-hop neighbors of *memory_ids* via ``memory_links``, strongest first.
 
@@ -156,7 +158,11 @@ async def neighbors_of(
     ``link_types`` optionally restricts which edge types are followed —
     callers expanding into LLM-visible context should exclude adversarial
     types like ``contradicts`` (the LongMemEval graph arm only ever stores
-    supports/extends, so it passes None).
+    supports/extends, so it passes None). ``exclude_link_types`` is the
+    deny-list complement (prod recall expansion excludes ``contradicts`` via
+    config); both compose — followed = ``link_types`` minus
+    ``exclude_link_types``. Both filter IN SQL, inside both UNION branches,
+    so an excluded edge never consumes the ``LIMIT`` budget.
 
     Returns ``[{"memory_id": ..., "strength": ...}]``. Used by recall-time
     graph expansion (LongMemEval graph arm; intended canonical home for the
@@ -181,6 +187,11 @@ async def neighbors_of(
         type_ph = ",".join("?" * len(link_types))
         type_clause = f" AND link_type IN ({type_ph})"
         type_params = list(link_types)
+    if exclude_link_types:
+        # link_type is a PK member (NOT NULL) — NOT IN has no NULL trap here.
+        excl_ph = ",".join("?" * len(exclude_link_types))
+        type_clause += f" AND link_type NOT IN ({excl_ph})"
+        type_params = [*type_params, *exclude_link_types]
     rows = await db.execute_fetchall(
         f"SELECT neighbor, MAX(strength) AS s FROM ("
         f"  SELECT target_id AS neighbor, strength FROM memory_links"

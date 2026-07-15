@@ -23,6 +23,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   and 20+ commits behind, or a missing unit ignored for a day). The fix is
   always the same and the alert says so: run `scripts/update.sh`.
 
+- **Recall now follows memory links — the benchmark-proven +12.6pp mechanism
+  lands in production, shadow-first.** LongMemEval showed that appending
+  1-hop linked neighbors to recalled results lifts answer accuracy from 64.8%
+  to 77.4% (temporal reasoning +23pp, multi-session +17pp), but that expansion
+  only existed in the eval harness. It's now wired into every MCP recall
+  surface (full, compact previews, proactive injection), shipping in `shadow`
+  mode: expansion is computed and measured (`eval_events`) without changing
+  any output until the `memory_recall` settings domain flips
+  `graph_expansion.mode` to `live` — no restart needed, and `off` is the
+  instant kill switch. Expanded neighbors carry their stored provenance and
+  pass the exact same injection defenses (wrap/count/drop) as organic
+  results; `contradicts` links are never followed, and neighbors are flagged
+  `via_graph` so callers can weigh them. The benchmark harness now calls this
+  same production primitive, so future eval numbers measure shipped code.
+
 - **A resumed conversation can no longer run twice at once.** If an SSH drop
   leaves a Claude Code session executing headless and you resume that same
   conversation elsewhere, both processes used to write to the same transcript

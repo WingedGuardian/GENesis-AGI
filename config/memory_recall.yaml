@@ -1,0 +1,30 @@
+# Memory recall wiring — graph expansion + entity lane (shadow-first).
+#
+# Read LIVE per recall by genesis.memory.graph_expansion (no restart needed
+# for a mode change in a running process). User overrides land in
+# ~/.genesis/config/memory_recall.local.yaml via the dashboard/MCP settings
+# writer — edit that overlay, not this file.
+#
+# Benchmark provenance: 1-hop expansion at max_neighbors=10 measured +12.6pp
+# overall on LongMemEval (temporal +23pp, multi-session +17pp), 2026-07-14
+# graph-DB decision memo.
+
+enabled: true
+
+graph_expansion:
+  # off | shadow | live — shadow computes + emits eval_events metrics but
+  # never changes recall output; live appends linked neighbors after the
+  # organic results. Kill switch: mode off (or master enabled: false).
+  mode: shadow
+  # Neighbor cap for the full/compact MCP recall surfaces (eval parity: k=10).
+  max_neighbors: 10
+  # Proactive injection is token-budgeted — keep this tiny.
+  proactive_max_neighbors: 2
+  # Edge types never followed into LLM-visible context.
+  exclude_link_types:
+    - contradicts
+
+# Entity lane in hybrid recall (PR-2) — inert until that lands; ships off.
+# ("off" quoted: unquoted it parses as YAML-1.1 boolean False.)
+entity_lane:
+  mode: "off"
