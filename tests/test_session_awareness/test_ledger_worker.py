@@ -349,6 +349,26 @@ async def test_cursor_beyond_eof_resets(tmp_path, sessions_root, shadow_mode, db
     assert _cursor(sessions_root)["last_byte"] == end
 
 
+async def test_cursor_never_regresses_on_out_of_order_runs(
+    tmp_path, sessions_root, shadow_mode, db_path, transcript
+):
+    """Two compactions can spawn workers that complete out of order (the
+    flock serializes, but not in spawn order). A later-spawned worker with
+    a HIGHER end-byte finishing first must not have its cursor progress
+    clobbered by the earlier worker's smaller end-byte."""
+    fake = _verdict_claude(tmp_path, [])
+    end = transcript.stat().st_size
+    # worker B (spawned second, higher end-byte) completes first
+    await lw.run_ledger_worker(SID, str(transcript), end, claude_path=fake, db_path=db_path)
+    assert _cursor(sessions_root)["last_byte"] == end
+    # worker A (spawned first, lower end-byte) completes after
+    outcome = await lw.run_ledger_worker(
+        SID, str(transcript), end - 50, claude_path=fake, db_path=db_path
+    )
+    assert outcome["status"] == "empty_delta"
+    assert _cursor(sessions_root)["last_byte"] == end  # monotonic — never regresses
+
+
 # ── backfill mode ────────────────────────────────────────────────────────
 
 

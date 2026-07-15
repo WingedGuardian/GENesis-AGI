@@ -87,10 +87,16 @@ def _read_cursor(session_dir: Path) -> dict:
 
 
 def _advance_cursor(session_dir: Path, end_byte: int, prior: dict) -> None:
+    """Advance the cursor MONOTONICALLY. Workers serialize on the flock but
+    not in spawn order: a later-spawned worker with a higher end-byte can
+    finish first, and the earlier worker (its window now consumed) must not
+    clobber that progress back down — a regression re-sweeps covered bytes,
+    wasting a Haiku call and inflating the precision report's uniques.
+    ``prior`` was read under the lock, so max() against it is race-free."""
     _atomic_write_json(
         session_dir / CURSOR_FILENAME,
         {
-            "last_byte": end_byte,
+            "last_byte": max(int(prior.get("last_byte") or 0), end_byte),
             "last_run_ts": _now(),
             "runs": int(prior.get("runs") or 0) + 1,
         },
@@ -272,8 +278,11 @@ async def _run_locked(
         return {"status": "failed", "detail": "transcript_unreadable"}
 
     if start_byte > size:
-        # Shrunk/replaced transcript: never wedge permanently.
+        # Shrunk/replaced transcript: never wedge permanently. The stale
+        # byte must also leave the prior dict, or the monotonic advance
+        # would max() against it and wedge the cursor forever.
         start_byte = 0
+        cursor = dict(cursor, last_byte=0)
         detail_notes.append("cursor_beyond_eof_reset")
     end_byte = min(end_byte, size)
     if end_byte - start_byte > MAX_WINDOW_BYTES:
@@ -346,7 +355,6 @@ async def _run_locked(
     events = match_proposals(verdict, included, ledger_items, prior_events)
     observed_at = _now()
     for ev in events:
-        ev["id"] = uuid.uuid4().hex
         ev["observed_at"] = observed_at
 
     recorded = await _record_run(
@@ -495,7 +503,6 @@ async def _run_backfill(
             events = match_proposals(verdict, included, ledger_items, priors)
             observed_at = _now()
             for ev in events:
-                ev["id"] = uuid.uuid4().hex
                 ev["observed_at"] = observed_at
             recorded = await _record_run(
                 db_path,

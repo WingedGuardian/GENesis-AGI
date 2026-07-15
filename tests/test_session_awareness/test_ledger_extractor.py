@@ -244,5 +244,28 @@ def test_event_carries_turn_ref_and_quote_fields():
     assert ev["quote_verified"] is True
 
 
+def test_intra_batch_duplicates_deduped():
+    """Two near-identical agreements in ONE verdict must self-dedup —
+    otherwise a single chatty response inflates n_unique_agreements and
+    skews the precision report."""
+    turns = [_turn("yes")]
+    events = match_proposals(
+        {
+            "agreements": [
+                {"turn": 1, "text": "wire the rollback lever first", "quote": "yes"},
+                {"turn": 1, "text": "wire the rollback  lever FIRST", "quote": "yes"},
+            ],
+            "pivots": [],
+        },
+        turns,
+        [],
+        [],
+    )
+    assert len(events) == 2
+    assert events[0]["duplicate_of"] is None
+    assert events[0]["id"]
+    assert events[1]["duplicate_of"] == events[0]["id"]
+
+
 def test_content_hash_normalizes():
     assert content_hash("Ship  THE lever") == content_hash("ship the lever")

@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 from difflib import SequenceMatcher
 
 from genesis.db.crud.session_charters import MAX_LEDGER_TEXT_CHARS
@@ -234,16 +235,21 @@ def match_proposals(
       never a skip.
     - every proposal is also matched against PRIOR shadow events of the
       same kind (crash-recovery re-covers byte ranges; retried windows
-      must not double-count) → ``duplicate_of``.
+      must not double-count) AND against earlier proposals in THIS batch
+      (a single chatty verdict must self-dedup) → ``duplicate_of``. Event
+      ids are stamped here so intra-batch references resolve.
     - ``quote_verified`` via :func:`verify_quote` against the referenced
       turn (agreements; pivots carry no quote and stay 0).
     """
     events: list[dict] = []
     for kind, items in (("agreement", proposals["agreements"]), ("pivot", proposals["pivots"])):
-        priors = [e for e in prior_events if e.get("kind") == kind]
+        dedup_pool: list[tuple[str, str]] = [
+            (e["id"], e["text"]) for e in prior_events if e.get("kind") == kind and e.get("id")
+        ]
         for item in items:
             turn = included_turns[item["turn"] - 1]
             event: dict = {
+                "id": uuid.uuid4().hex,
                 "kind": kind,
                 "text": item["text"],
                 "turn_ref": turn.get("turn_ref") or None,
@@ -267,11 +273,10 @@ def match_proposals(
                 event["match_kind"] = kind_
                 event["matched_item_id"] = matched_id
                 event["match_score"] = score
-            dup_kind, dup_id, _ = _best_match(
-                item["text"], [(e["id"], e["text"]) for e in priors if e.get("id")]
-            )
+            dup_kind, dup_id, _ = _best_match(item["text"], dedup_pool)
             if dup_kind != "none":
                 event["duplicate_of"] = dup_id
+            dedup_pool.append((event["id"], event["text"]))
             events.append(event)
     return events
 
