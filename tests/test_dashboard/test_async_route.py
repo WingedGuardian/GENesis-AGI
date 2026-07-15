@@ -12,6 +12,7 @@ import asyncio
 import threading
 import time
 
+import pytest
 from flask import Flask
 
 from genesis.dashboard._blueprint import _async_route
@@ -121,6 +122,19 @@ def test_async_route_loopless_fallback_runtimeerror_returns_503():
         resp, status = cross_loop()
     assert status == 503
     assert resp.get_json()["status"] == "unavailable"
+
+
+def test_async_route_loopless_fallback_reraises_non_loop_runtimeerror():
+    """A genuine handler RuntimeError (not loop-binding) must propagate, not be
+    masked as 503 — otherwise embedded hosts hide real failures."""
+    app = Flask(__name__)  # GENESIS_EVENT_LOOP never set
+
+    @_async_route
+    async def real_bug():
+        raise RuntimeError("database gone")
+
+    with app.test_request_context("/"), pytest.raises(RuntimeError, match="database gone"):
+        real_bug()
 
 
 def test_async_route_loopless_fallback_still_runs_handlers():

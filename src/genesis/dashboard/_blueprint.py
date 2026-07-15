@@ -12,6 +12,28 @@ from flask import Blueprint
 
 logger = logging.getLogger("genesis.dashboard")
 
+# Substrings that identify an asyncio *loop-binding* RuntimeError — a coroutine
+# or shared async object (aiosqlite connection, asyncio.Lock) reached on a loop
+# other than the one it was created on, or with no running loop at all. These
+# are the failures the loop-less fallback should degrade to 503; any OTHER
+# RuntimeError (a real handler/dependency bug like RuntimeError("database gone"))
+# must keep propagating to normal 500 error handling.
+_LOOP_BINDING_SIGNATURES = (
+    "different event loop",
+    "different loop",
+    "no current event loop",
+    "no running event loop",
+    "event loop is closed",
+    "attached to a different",
+    "bound to a different",
+)
+
+
+def _is_loop_binding_error(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    return any(sig in msg for sig in _LOOP_BINDING_SIGNATURES)
+
+
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 
 blueprint = Blueprint(
@@ -97,13 +119,18 @@ def _async_route(f=None, *, timeout: float | None = None):
             loop = asyncio.new_event_loop()
             try:
                 return loop.run_until_complete(fn(*args, **kwargs))
-            except RuntimeError:
-                # The handler touched a shared async object bound to the
-                # (absent) runtime loop — aiosqlite raises "attached to a
-                # different loop" / "no current event loop". This used to
-                # propagate and could crash the server (observed exit 2 when
-                # a health poll landed during a broken startup). Degrade to
-                # 503 instead; the traceback still lands in the log.
+            except RuntimeError as exc:
+                # Only a loop-binding failure means "the handler touched a
+                # shared async object bound to the (absent) runtime loop" —
+                # aiosqlite raises "attached to a different loop" / "no current
+                # event loop". This used to propagate and could crash the server
+                # (observed exit 2 when a health poll landed during a broken
+                # startup). Degrade THAT to 503; re-raise every other
+                # RuntimeError so genuine handler/dependency bugs still surface
+                # as 500s (esp. under embedded hosting, where this fallback is
+                # the permanent request path).
+                if not _is_loop_binding_error(exc):
+                    raise
                 logger.exception(
                     "async route %s failed in loop-less fallback — returning 503",
                     getattr(fn, "__name__", "?"),
