@@ -26,6 +26,26 @@ async def db():
     await conn.close()
 
 
+async def test_migration_0060_idempotent_after_create_all_tables():
+    """The REAL boot path: init_db runs create_all_tables (which creates
+    data_migrations from _tables.py) BEFORE the migration runner. Migration
+    0060 must be idempotent against that — a bare CREATE would abort boot."""
+    from genesis.db.migrations.runner import MigrationRunner
+
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        await create_all_tables(conn)  # table now exists (fresh-install path)
+        results = await MigrationRunner(conn).run_pending()  # 0060 must not fail
+        failed = [r for r in results if not r.success]
+        assert failed == [], [(r.name, r.error) for r in failed]
+        cur = await conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='data_migrations'"
+        )
+        assert await cur.fetchone() is not None
+    finally:
+        await conn.close()
+
+
 # ── ledger CRUD ──────────────────────────────────────────────────────
 
 

@@ -18,9 +18,13 @@ import aiosqlite
 
 
 async def up(db: aiosqlite.Connection) -> None:
+    # IF NOT EXISTS: init_db() runs create_all_tables() (which creates this
+    # table from schema/_tables.py) BEFORE the migration runner, so on a fresh
+    # install the table already exists when 0060 runs. A bare CREATE would raise
+    # "table already exists" and abort boot. Same pattern as 0059.
     await db.execute(
         """
-        CREATE TABLE data_migrations (
+        CREATE TABLE IF NOT EXISTS data_migrations (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             status TEXT NOT NULL CHECK (
