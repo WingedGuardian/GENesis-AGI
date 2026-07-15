@@ -39,6 +39,7 @@ from __future__ import annotations
 import copy
 import logging
 import time
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import yaml
@@ -164,7 +165,10 @@ async def expand_neighbors(
     Neighbors score ``0.01 * strength`` (sorts after any organic result) and
     carry ``payload["graph_expansion"] = {"linked_from": [...], "strength": s}``
     plus the FTS ``tags`` string (surfaces apply their own tag filters).
-    Dangling links (edge rows whose neighbor no longer resolves) are skipped.
+    Dangling links (edge rows whose neighbor no longer resolves) are skipped,
+    as are neighbors normal recall would hide (bitemporally expired or
+    deprecated/superseded rows) — expansion widens recall, it never
+    resurfaces what the pipeline deliberately filters.
     """
     if not seed_ids or cap <= 0:
         return []
@@ -179,6 +183,25 @@ async def expand_neighbors(
         return []
 
     neighbor_ids = [n["memory_id"] for n in neighbors]
+    # Visibility parity with normal recall (Codex #1069 P2): `get_by_id`
+    # applies neither the bitemporal expiry nor the deprecated predicate that
+    # `search_ranked`/`_expired_candidate_ids` enforce — without this, live
+    # expansion would resurface superseded facts that recall deliberately
+    # hides. NULL invalid_at = valid forever; NULL deprecated = legacy row,
+    # not deprecated (same semantics as the recall pipeline).
+    _ph = ",".join("?" * len(neighbor_ids))
+    hidden_rows = await db.execute_fetchall(
+        f"SELECT memory_id FROM memory_metadata "  # noqa: S608 - literal fragments; values bound
+        f"WHERE memory_id IN ({_ph}) AND "
+        f"((invalid_at IS NOT NULL AND invalid_at <= ?) OR deprecated = 1)",
+        [*neighbor_ids, datetime.now(UTC).isoformat()],
+    )
+    hidden = {r[0] for r in hidden_rows}
+    if hidden:
+        neighbors = [n for n in neighbors if n["memory_id"] not in hidden]
+        if not neighbors:
+            return []
+        neighbor_ids = [n["memory_id"] for n in neighbors]
     origins = await memory_crud.origin_class_by_ids(db, neighbor_ids)
     # Which seed(s) reach each neighbor — one bounded query over the
     # seed∪neighbor id set (direction-agnostic pair list).

@@ -811,7 +811,15 @@ async def memory_proactive(
     current_message: str,
     limit: int = 5,
 ) -> list[dict]:
-    """Cross-session context injection for prompts."""
+    """Cross-session context injection for prompts.
+
+    ``limit`` bounds the ORGANIC (query-ranked) results. When graph expansion
+    is live, up to ``proactive_max_neighbors`` (default 2, settings-capped)
+    linked neighbors may be appended beyond it, flagged ``via_graph`` — a
+    deliberate contract: the benchmark-proven lift comes from adding linked
+    context the ranked top-K missed, so trimming the total to ``limit`` would
+    displace the organic results expansion is meant to supplement.
+    """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._retriever is not None

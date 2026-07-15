@@ -428,3 +428,38 @@ async def test_maybe_expand_malformed_config_values_never_raise(db, config_dirs)
     _write(base, {"graph_expansion": {"mode": "live", "max_neighbors": "ten"}})
     out = await graph_expansion.maybe_expand(db, results, surface="full")
     assert [r.memory_id for r in out] == ["seed-1"]
+
+
+async def test_expand_skips_expired_neighbor(db):
+    """Bitemporal parity with normal recall (Codex #1069 P2): a neighbor whose
+    invalid_at has passed must not resurface via expansion."""
+    await _seed_memory(db, "seed-1")
+    await _seed_memory(db, "nbr-live")
+    await _seed_memory(db, "nbr-expired")
+    await db.execute(
+        "UPDATE memory_metadata SET invalid_at = '2020-01-01T00:00:00+00:00' "
+        "WHERE memory_id = 'nbr-expired'",
+    )
+    await db.commit()
+    await _link(db, "seed-1", "nbr-expired", strength=0.9)
+    await _link(db, "seed-1", "nbr-live", strength=0.5)
+
+    out = await graph_expansion.expand_neighbors(db, ["seed-1"], cap=10)
+
+    assert [r.memory_id for r in out] == ["nbr-live"]
+
+
+async def test_expand_skips_deprecated_neighbor(db):
+    """Deprecated (superseded) memories are filtered by search_ranked — the
+    expansion path must not readmit them."""
+    await _seed_memory(db, "seed-1")
+    await _seed_memory(db, "nbr-dep")
+    await db.execute(
+        "UPDATE memory_metadata SET deprecated = 1 WHERE memory_id = 'nbr-dep'",
+    )
+    await db.commit()
+    await _link(db, "seed-1", "nbr-dep", strength=0.9)
+
+    out = await graph_expansion.expand_neighbors(db, ["seed-1"], cap=10)
+
+    assert out == []
