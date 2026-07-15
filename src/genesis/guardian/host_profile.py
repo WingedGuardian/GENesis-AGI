@@ -59,7 +59,7 @@ def _read_meminfo() -> dict:
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             key, _, rest = line.partition(":")
-            if key in ("MemTotal", "MemAvailable"):
+            if key in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"):
                 out[key] = int(rest.split()[0])  # kB
     except (OSError, ValueError, IndexError):
         pass
@@ -74,6 +74,12 @@ def _host_system() -> dict:
         section["mem_total_kb"] = mem["MemTotal"]
     if "MemAvailable" in mem:
         section["mem_available_kb"] = mem["MemAvailable"]
+    # Host swap is the container's pressure-relief valve (the container's own
+    # meminfo always shows 0): total is topology, free is a reading.
+    if "SwapTotal" in mem:
+        section["swap_total_kb"] = mem["SwapTotal"]
+    if "SwapFree" in mem:
+        section["swap_free_kb"] = mem["SwapFree"]
     section["nproc"] = os.cpu_count()
     uname = platform.uname()
     section["kernel_release"] = uname.release

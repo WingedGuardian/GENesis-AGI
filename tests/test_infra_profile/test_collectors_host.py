@@ -20,6 +20,8 @@ _LIVE_BLOB = {
     "host_system": {
         "mem_total_kb": 21508924,
         "mem_available_kb": 7394656,
+        "swap_total_kb": 7712764,
+        "swap_free_kb": 4508388,
         "nproc": 5,
         "kernel_release": "6.8.0-134-generic",
         "architecture": "x86_64",
@@ -126,6 +128,7 @@ async def test_live_blob_splits_facts_and_metrics() -> None:
     system = by_name["host_system"]
     assert system.facts == {
         "mem_total_kb": 21508924,
+        "swap_total_kb": 7712764,
         "nproc": 5,
         "kernel_release": "6.8.0-134-generic",
         "architecture": "x86_64",
@@ -136,6 +139,10 @@ async def test_live_blob_splits_facts_and_metrics() -> None:
     assert "loadavg" in system.metrics
     assert "mem_available_kb" in system.metrics
     assert "uptime_seconds" in system.metrics
+    # Host swap: total is topology (its disappearance = the wedge
+    # precondition, drift-worthy); free is a reading.
+    assert "swap_free_kb" in system.metrics
+    assert "swap_free_kb" not in system.facts
 
     pool = by_name["host_storage_pool"]
     assert pool.facts == {"detected": True, "pool_name": "default"}

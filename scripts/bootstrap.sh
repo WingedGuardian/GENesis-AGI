@@ -645,6 +645,18 @@ else
 fi
 echo
 
+# --- Memory resilience (systemd-oomd pressure-kill + swap invariant) ---
+# Guarded: a tree mid-update/partial checkout without the lib must degrade,
+# not abort bootstrap under set -e (the lib's own never-abort contract).
+if [[ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]]; then
+    # shellcheck source=lib/memory_resilience.sh
+    source "$SCRIPT_DIR/lib/memory_resilience.sh"
+    memory_resilience_apply
+else
+    echo "  WARNING: lib/memory_resilience.sh missing — skipping OOM-resilience setup"
+fi
+echo
+
 # --- Systemd service sync ---
 echo "--- Syncing systemd service files ---"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
