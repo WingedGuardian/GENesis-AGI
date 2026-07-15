@@ -120,7 +120,9 @@ async def execute(
     logger.info("loaded %d questions from %s", len(instances), dataset_path)
 
     arms = select_arms(no_rerank=no_rerank, graph=graph)
-    if arms_only:
+    if arms_only is not None:
+        # An empty string still reaches filter_arms and raises there — a paid
+        # run must never silently widen back to the full arm universe.
         arms = filter_arms(arms, arms_only)
     reranker = None if no_rerank else build_reranker()
 

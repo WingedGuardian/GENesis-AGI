@@ -304,6 +304,37 @@ def test_filter_arms_rejects_unknown_and_empty():
 
 
 @pytest.mark.asyncio
+async def test_execute_empty_arms_string_raises_not_widens(tmp_path):
+    """`--arms ""` (e.g. an unset shell var) must raise, NEVER silently fall
+    back to the full unfiltered universe — that would widen paid spend."""
+    import json as _json
+
+    from genesis.eval.longmemeval.cli import execute
+
+    dataset = tmp_path / "oracle.json"
+    dataset.write_text(
+        _json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "question_type": "single-session-user",
+                    "question": "q?",
+                    "answer": "a",
+                    "haystack_sessions": [],
+                },
+            ],
+        ),
+    )
+    with pytest.raises(ValueError, match="no arms selected"):
+        await execute(
+            dataset_path=dataset,
+            no_rerank=True,
+            persist=False,
+            arms_only="",
+        )
+
+
+@pytest.mark.asyncio
 async def test_duplicate_arm_labels_rejected():
     with pytest.raises(ValueError, match="duplicate arm labels"):
         await run_longmemeval(
