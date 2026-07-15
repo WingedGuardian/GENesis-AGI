@@ -410,3 +410,21 @@ async def test_maybe_expand_expansion_failure_never_raises(db, config_dirs, monk
     out = await graph_expansion.maybe_expand(db, results, surface="full")
 
     assert [r.memory_id for r in out] == ["seed-1"]
+
+
+async def test_maybe_expand_malformed_config_values_never_raise(db, config_dirs):
+    """Config extraction is inside the best-effort guard: a hand-edited
+    non-iterable exclude_link_types or non-int cap must degrade (results
+    unchanged), never crash the recall surface (compact/proactive have no
+    outer guard)."""
+    base, _ = config_dirs
+    await _seed_linked_pair(db)
+    results = [_result("seed-1")]
+
+    _write(base, {"graph_expansion": {"mode": "live", "exclude_link_types": 5}})
+    out = await graph_expansion.maybe_expand(db, results, surface="full")
+    assert [r.memory_id for r in out] == ["seed-1"]
+
+    _write(base, {"graph_expansion": {"mode": "live", "max_neighbors": "ten"}})
+    out = await graph_expansion.maybe_expand(db, results, surface="full")
+    assert [r.memory_id for r in out] == ["seed-1"]

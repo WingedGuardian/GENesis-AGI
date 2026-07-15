@@ -383,3 +383,30 @@ async def test_proactive_shadow_output_unchanged_and_emits(db, expansion_config,
         "SELECT event_type FROM eval_events WHERE event_type LIKE 'graph_expansion_%'",
     )
     assert [r[0] for r in rows] == ["graph_expansion_shadow"]
+
+
+async def test_full_live_dedups_neighbor_crag_already_added(
+    db, expansion_config, record_spy, monkeypatch,
+):
+    """CRAG's corrective augmentation can independently re-add an item that
+    is also a 1-hop neighbor — the expansion merge must not duplicate it in
+    the model-facing output."""
+    import genesis.memory.corrective as corrective_mod
+
+    expansion_config("live")
+    await _seed_neighbor(db, "seed-1", "nbr-1")
+
+    async def _fake_correct(*, results, **_k):
+        # CRAG re-adds the neighbor as its own augmentation
+        return [*results, {"memory_id": "nbr-1", "content": "crag copy of nbr-1"}]
+
+    monkeypatch.setattr(corrective_mod, "maybe_correct_recall", _fake_correct)
+    with _SwappedState(db, [_rr("seed-1")]):
+        tools = await _get_tools()
+        out = await tools["memory_recall"].fn(
+            query="q", compact=False, include_graph=False, corrective=True,
+        )
+
+    ids = [d["memory_id"] for d in out]
+    assert ids.count("nbr-1") == 1  # CRAG's copy kept, expansion did not duplicate
+    assert set(ids) == {"seed-1", "nbr-1"}

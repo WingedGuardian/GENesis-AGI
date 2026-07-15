@@ -251,15 +251,18 @@ async def maybe_expand(
     mode = _mode_from(cfg)
     if mode == "off":
         return results
-    section = cfg.get("graph_expansion")
-    if not isinstance(section, dict):
-        section = DEFAULTS["graph_expansion"]
-    cap_key = "proactive_max_neighbors" if surface == "proactive" else "max_neighbors"
-    cap = section.get(cap_key, DEFAULTS["graph_expansion"][cap_key])
-    exclude_types = tuple(section.get("exclude_link_types") or ())
-
     t0 = time.monotonic()
     try:
+        # Config value extraction stays INSIDE the guard: the overlay is a
+        # hand-editable file (settings_update validates, a text editor does
+        # not) — a malformed cap or exclude list must degrade like any other
+        # expansion failure, never crash a recall surface.
+        section = cfg.get("graph_expansion")
+        if not isinstance(section, dict):
+            section = DEFAULTS["graph_expansion"]
+        cap_key = "proactive_max_neighbors" if surface == "proactive" else "max_neighbors"
+        cap = section.get(cap_key, DEFAULTS["graph_expansion"][cap_key])
+        exclude_types = tuple(section.get("exclude_link_types") or ())
         seed_ids = [r.memory_id for r in results]
         neighbors = await expand_neighbors(
             db,
