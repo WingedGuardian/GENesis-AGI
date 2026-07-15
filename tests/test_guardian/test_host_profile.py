@@ -55,6 +55,10 @@ class TestHostSystem:
         assert section["hostname"]
         assert section["mem_total_kb"] > 0
         assert isinstance(section.get("loadavg", []), list)
+        # Every /proc/meminfo carries SwapTotal/SwapFree (0 when swapless) —
+        # the container-side collector files total as a fact, free as a metric.
+        assert isinstance(section["swap_total_kb"], int)
+        assert isinstance(section["swap_free_kb"], int)
 
 
 class TestGatherHostProfile:

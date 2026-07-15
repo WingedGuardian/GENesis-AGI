@@ -23,6 +23,11 @@ Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.local/bin:/usr/local/bin:
 MemoryMax=80%
 LimitNOFILE=65536
 OOMScoreAdjust=-500
+# systemd-oomd counterpart of OOMScoreAdjust: when the per-user manager's
+# pressure monitor picks a kill candidate, prefer the greedy CC/MCP tree over
+# the server. (Effective for the user@N monitor — same-UID cgroup owner — but
+# ignored by the root-owned user.slice monitor; see systemd.resource-control(5).)
+ManagedOOMPreference=avoid
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=yes

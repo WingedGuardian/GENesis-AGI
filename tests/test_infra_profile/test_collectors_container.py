@@ -93,6 +93,56 @@ async def test_memory_facts(proc_root, sys_root):
     assert "mem_available" not in result.facts
 
 
+async def test_memory_swap_max_tristate(proc_root, sys_root, tmp_path):
+    # "max" (healthy) survives as the string; "0" (the 2026-07 wedge state)
+    # as an int; an absent file (cgroup v1) as None. All three are facts —
+    # the 0/max flip is exactly the drift the body schema exists to catch.
+    cg = sys_root / "fs/cgroup"
+    cg.joinpath("memory.swap.max").write_text("max\n")
+    result = await collect_memory(proc_root=proc_root, sys_root=sys_root, etc_root=tmp_path)
+    assert result.facts["cgroup_memory_swap_max"] == "max"
+
+    cg.joinpath("memory.swap.max").write_text("0\n")
+    result = await collect_memory(proc_root=proc_root, sys_root=sys_root, etc_root=tmp_path)
+    assert result.facts["cgroup_memory_swap_max"] == 0
+
+    cg.joinpath("memory.swap.max").unlink()
+    result = await collect_memory(proc_root=proc_root, sys_root=sys_root, etc_root=tmp_path)
+    assert result.facts["cgroup_memory_swap_max"] is None
+
+
+async def test_oomd_policy_fact_from_dropins(proc_root, sys_root, tmp_path):
+    dropins = tmp_path / "systemd/system/user.slice.d"
+
+    # no drop-in dir at all -> unprotected
+    result = await collect_memory(proc_root=proc_root, sys_root=sys_root, etc_root=tmp_path)
+    assert result.facts["oomd_user_slice_kill"] is False
+
+    # a commented-out or auto policy does not count
+    dropins.mkdir(parents=True)
+    dropins.joinpath("genesis-oomd.conf").write_text(
+        "[Slice]\n# ManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressure=auto\n",
+    )
+    result = await collect_memory(proc_root=proc_root, sys_root=sys_root, etc_root=tmp_path)
+    assert result.facts["oomd_user_slice_kill"] is False
+
+    # the real policy (whitespace-tolerant) counts
+    dropins.joinpath("genesis-oomd.conf").write_text(
+        "[Slice]\nManagedOOMMemoryPressure = kill\nManagedOOMMemoryPressureLimit=60%\n",
+    )
+    result = await collect_memory(proc_root=proc_root, sys_root=sys_root, etc_root=tmp_path)
+    assert result.facts["oomd_user_slice_kill"] is True
+
+    # systemd applies drop-ins lexicographically, LAST assignment wins: an
+    # operator zz-override reverting to auto disables the policy — the fact
+    # must not report a protection that is no longer effective.
+    dropins.joinpath("zz-local.conf").write_text(
+        "[Slice]\nManagedOOMMemoryPressure=auto\n",
+    )
+    result = await collect_memory(proc_root=proc_root, sys_root=sys_root, etc_root=tmp_path)
+    assert result.facts["oomd_user_slice_kill"] is False
+
+
 async def test_storage_mounts_sorted_and_filtered(proc_root, sys_root):
     result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
     mounts = result.facts["mounts"]

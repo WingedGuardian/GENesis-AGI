@@ -31,6 +31,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   no longer forces the full four-arm spend. Unknown labels fail fast with
   the selectable universe listed — a paid run never silently widens.
 
+- **A memory spike now degrades gracefully instead of wedging the machine.**
+  On systems that ran out of memory with no swap and no userspace OOM killer,
+  one greedy process could drag the whole box into unrecoverable thrash —
+  load in the hundreds, SSH dead, everything down together. Installs now set
+  up systemd-oomd with pressure-percentage kill policies (adaptive to any
+  machine size, applied automatically on bootstrap and on your next update,
+  skipped cleanly where systemd/oomd/PSI aren't available), the Genesis
+  server marks itself `avoid` so the greedy session tree dies first, managed
+  container installs get swap enabled (`limits.memory.swap`), and setup warns
+  with exact remediation when swap is missing or disabled. The infrastructure
+  profile records the swap/oomd state as facts, so an unprotected install is
+  flagged in `INFRASTRUCTURE.md`. Runbook: `docs/reference/memory-resilience.md`.
+
 - **The CC Sessions card now tells the truth, and clicking it shows why.**
   The dashboard card used to show a DB-side "active" count that routinely
   disagreed with the processes actually running, plus a bare "3/20" that
