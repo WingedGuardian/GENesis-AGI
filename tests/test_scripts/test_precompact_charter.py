@@ -344,6 +344,8 @@ def test_spawns_ledger_worker_after_waypoint(monkeypatch, tmp_path, spawn_calls)
     assert argv[argv.index("--transcript") + 1] == str(t)
     assert argv[argv.index("--end-byte") + 1] == str(t.stat().st_size)
     assert argv[argv.index("--trigger") + 1] == "auto"
+    # worktree-safety: the hook passes its own home-anchored DB resolution
+    assert argv[argv.index("--db-path") + 1].endswith("data/genesis.db")
 
 
 def test_no_spawn_when_dispatched_session(monkeypatch, tmp_path, spawn_calls):

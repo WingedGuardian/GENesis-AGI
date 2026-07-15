@@ -266,6 +266,23 @@ async def ledger_list(
     return [dict(row) for row in await cursor.fetchall()]
 
 
+async def ledger_all(
+    db: aiosqlite.Connection,
+    *,
+    limit: int = 10000,
+) -> list[dict]:
+    """All ledger rows across sessions, oldest first (incl. added_by).
+
+    Read seam for the shadow precision report (leak-invariant check needs
+    the added_by column across every session). Assumes a Row factory.
+    """
+    lim = max(1, min(int(limit), 100000))
+    cursor = await db.execute(
+        "SELECT * FROM session_ledger ORDER BY created_at ASC LIMIT ?", (lim,)
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def ledger_counts(db: aiosqlite.Connection, session_id: str) -> dict[str, int]:
     """Per-status row counts for a session's ledger (absent statuses omitted)."""
     cursor = await db.execute(

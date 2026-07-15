@@ -32,6 +32,12 @@ def main() -> None:
     parser.add_argument("--end-byte", type=int, default=None)
     parser.add_argument("--trigger", default="unknown")
     parser.add_argument(
+        "--db-path",
+        default=None,
+        help="genesis.db path (the spawning hook passes its home-anchored "
+        "resolution; default falls back to genesis.env)",
+    )
+    parser.add_argument(
         "--backfill",
         action="store_true",
         help="replay the whole transcript in typed-turn windows "
@@ -55,6 +61,7 @@ def main() -> None:
                 args.transcript,
                 turns_per_window=args.turns_per_window or BACKFILL_TURNS_PER_WINDOW,
                 max_windows=args.max_windows or BACKFILL_MAX_WINDOWS,
+                db_path=args.db_path,
             )
         )
         print(f"ledger_shadow_worker backfill: {outcome}")
@@ -67,6 +74,7 @@ def main() -> None:
             args.transcript,
             args.end_byte,
             trigger=args.trigger,
+            db_path=args.db_path,
         )
     )
     if outcome.get("status") in ("failed", "timeout"):

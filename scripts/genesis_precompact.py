@@ -394,6 +394,12 @@ def _spawn_ledger_shadow_worker(session_id: str, transcript_path: str, trigger: 
                     str(end_byte),
                     "--trigger",
                     trigger,
+                    # The hook's home-anchored DB resolution is the source of
+                    # truth: a worktree session's worker must not fall back to
+                    # genesis.env's repo-anchored default (worktree/data/ is a
+                    # void — silent no-op coverage loss).
+                    "--db-path",
+                    str(_db_path()),
                 ],
                 start_new_session=True,
                 stdin=subprocess.DEVNULL,

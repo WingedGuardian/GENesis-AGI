@@ -214,6 +214,7 @@ def normalize(text: str) -> str:
 
 
 def content_hash(text: str) -> str:
+    """sha256 of the normalized text — the exact-match dedup key."""
     return hashlib.sha256(normalize(text).encode()).hexdigest()
 
 
@@ -267,13 +268,13 @@ def match_proposals(
                 event["quote_hash"] = hashlib.sha256(quote.encode()).hexdigest()
                 event["quote_verified"] = verify_quote(quote, turn)
             if kind == "agreement" and ledger_items:
-                kind_, matched_id, score = _best_match(
+                kind_, matched_id, score = best_match(
                     item["text"], [(li["id"], li["text"]) for li in ledger_items]
                 )
                 event["match_kind"] = kind_
                 event["matched_item_id"] = matched_id
                 event["match_score"] = score
-            dup_kind, dup_id, _ = _best_match(item["text"], dedup_pool)
+            dup_kind, dup_id, _ = best_match(item["text"], dedup_pool)
             if dup_kind != "none":
                 event["duplicate_of"] = dup_id
             dedup_pool.append((event["id"], event["text"]))
@@ -281,10 +282,14 @@ def match_proposals(
     return events
 
 
-def _best_match(
+def best_match(
     text: str, candidates: list[tuple[str, str]]
 ) -> tuple[str, str | None, float | None]:
-    """(match_kind, matched_id, score) of the best candidate, else none."""
+    """(match_kind, matched_id, score) of the best candidate, else none.
+
+    Public: the shadow report recomputes matching offline with exactly
+    this function so at-run-time and at-report-time semantics never drift.
+    """
     if not candidates:
         return "none", None, None
     norm = normalize(text)

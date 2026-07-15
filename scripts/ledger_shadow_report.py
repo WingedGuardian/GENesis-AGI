@@ -70,7 +70,7 @@ def build_report(
     include_backfill: bool = False,
 ) -> dict:
     """Pure comparator — everything the markdown renders, as data."""
-    from genesis.session_awareness.ledger_extractor import _best_match
+    from genesis.session_awareness.ledger_extractor import best_match
 
     live_runs = [r for r in runs if include_backfill or r["trigger"] != "backfill"]
     live_run_ids = {r["run_id"] for r in live_runs}
@@ -90,7 +90,7 @@ def build_report(
     fp: list[dict] = []
     for ev in agreements:
         rows = fg_by_session.get(ev["session_id"], [])
-        kind, matched_id, score = _best_match(ev["text"], [(r["id"], r["text"]) for r in rows])
+        kind, matched_id, score = best_match(ev["text"], [(r["id"], r["text"]) for r in rows])
         entry = dict(ev, recomputed_match=kind, recomputed_item=matched_id, recomputed_score=score)
         if kind != "none":
             entry["late_ratified"] = ev.get("match_kind") == "none"
@@ -116,7 +116,7 @@ def build_report(
         for row in rows:
             if (row.get("created_at") or "") > horizon:
                 continue  # not yet swept — charged to no run
-            kind, _, _ = _best_match(row["text"], [(e["id"], e["text"]) for e in proposals])
+            kind, _, _ = best_match(row["text"], [(e["id"], e["text"]) for e in proposals])
             if kind == "none":
                 fn.append(row)
 
@@ -170,6 +170,7 @@ def _fmt_rate(value: float | None) -> str:
 
 
 def render_md(report: dict, *, generated_at: str) -> str:
+    """Render the build_report dict as the adjudication markdown."""
     lines = [
         "# Ledger Shadow Precision Report",
         "",
@@ -238,21 +239,31 @@ def render_md(report: dict, *, generated_at: str) -> str:
 
 
 async def _load(db_path: str) -> tuple[list[dict], list[dict], list[dict]]:
+    """Read runs/events/ledger via the CRUD layer (RO connection).
+
+    Failures are LOUD (stderr): a silently-empty table would make the
+    leak-invariant check vacuously HELD and the metrics meaningless.
+    """
     import aiosqlite
+
+    from genesis.db.crud.session_charters import ledger_all
+    from genesis.db.crud.session_ledger_shadow import list_events, list_runs
 
     async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5) as db:
         db.row_factory = aiosqlite.Row
 
-        async def _all(sql: str) -> list[dict]:
+        async def _all(reader, label: str, **kwargs) -> list[dict]:
             try:
-                cur = await db.execute(sql)
-                return [dict(r) for r in await cur.fetchall()]
-            except Exception:
+                return await reader(db, **kwargs)
+            except Exception as exc:
+                print(f"ledger_shadow_report: {label} read failed: {exc}", file=sys.stderr)
                 return []
 
-        runs = await _all("SELECT * FROM session_ledger_shadow_runs ORDER BY started_at")
-        events = await _all("SELECT * FROM session_ledger_shadow_events ORDER BY observed_at")
-        ledger = await _all("SELECT * FROM session_ledger ORDER BY created_at")
+        runs = await _all(list_runs, "shadow runs", limit=1000)
+        events = await _all(list_events, "shadow events", limit=2000)
+        ledger = await _all(ledger_all, "session_ledger", limit=10000)
+        # list_runs returns newest-first; the comparator wants oldest-first
+        runs.sort(key=lambda r: r.get("started_at") or "")
         return runs, events, ledger
 
 

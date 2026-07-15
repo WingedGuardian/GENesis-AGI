@@ -533,8 +533,14 @@ async def _run_backfill(
             "ok" if outcomes and all(o == "ok" for o in outcomes) else "failed",
             f"backfill windows={len(windows)}|proposals={total_proposals}",
         )
+        if all(o == "ok" for o in outcomes):
+            status = "ok"
+        elif any(o == "ok" for o in outcomes):
+            status = "partial"
+        else:
+            status = "failed"
         return {
-            "status": "ok",
+            "status": status,
             "windows": len(windows),
             "outcomes": outcomes,
             "n_proposals": total_proposals,

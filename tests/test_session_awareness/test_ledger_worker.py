@@ -415,6 +415,36 @@ async def test_backfill_cross_window_dedup(
     assert dups.count(events[0]["id"]) == 1 or dups.count(events[1]["id"]) == 1
 
 
+async def test_backfill_partial_failure_reported_honestly(
+    tmp_path, sessions_root, shadow_mode, db_path
+):
+    """A backfill where some windows fail must not report top-level ok
+    (Codex P2): callers need to know the tuning data is incomplete."""
+    t = tmp_path / f"{SID}.jsonl"
+    entries = [_typed(f"please handle work item number {i} today", f"u-{i}") for i in range(4)]
+    t.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    # fake claude alternates: first call OK, second call garbage
+    fake = _fake_claude(
+        tmp_path,
+        f"""
+        import json, sys
+        from pathlib import Path
+        sys.stdin.read()
+        flag = Path({str(tmp_path / "called")!r})
+        if flag.exists():
+            print("garbage — unparseable")
+        else:
+            flag.write_text("1")
+            print(json.dumps({{"result": '{{"agreements": [], "pivots": []}}'}}))
+        """,
+    )
+    outcome = await lw.run_backfill(
+        SID, str(t), turns_per_window=2, max_windows=2, claude_path=fake, db_path=db_path
+    )
+    assert outcome["status"] == "partial"
+    assert sorted(outcome["outcomes"]) == ["failed", "ok"]
+
+
 async def test_backfill_respects_mode_off(
     tmp_path, sessions_root, monkeypatch, db_path, transcript
 ):
