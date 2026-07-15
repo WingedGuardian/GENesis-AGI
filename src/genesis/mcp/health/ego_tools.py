@@ -625,6 +625,10 @@ async def ego_proposal_resolve(
                     "reason": f"Invalid numbers: {proposal_numbers!r}",
                 }
 
+        # Dedupe positions (preserving order) so a repeated number can't
+        # double-run the post-resolution hooks.
+        indices = list(dict.fromkeys(indices))
+
         for idx in indices:
             if idx < 1 or idx > len(board):
                 results[f"#{idx}"] = "out of range"

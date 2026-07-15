@@ -215,6 +215,30 @@ class TestBoardAlignedNumbers:
         assert res["resolved"] == 0
         assert await _status(db_path, "a1") == "pending"
 
+    async def test_duplicate_numbers_resolve_once(self, db):
+        """A repeated position must not double-run the post-resolution hooks."""
+        conn, db_path = db
+        await _mk(
+            conn,
+            id="a1",
+            content="only",
+            batch="b",
+            created_at="2026-07-15T00:00:00+00:00",
+            action_type="goal_status_change",
+        )
+        spy = AsyncMock()
+        with (
+            _patch_path(db_path),
+            patch(
+                "genesis.ego.goal_actions.handle_goal_status_change_resolution",
+                spy,
+            ),
+        ):
+            res = await RESOLVE(action="approve", proposal_numbers="1,1")
+        assert res["resolved"] == 1
+        spy.assert_awaited_once()
+        assert await _status(db_path, "a1") == "approved"
+
     async def test_no_pending_returns_error(self, db):
         _conn, db_path = db
         with _patch_path(db_path):
