@@ -47,9 +47,11 @@ _VALID = {"wrapped", "first-party", "user-facing", "display", "pipeline-internal
 # file (relative to src/genesis) :: enclosing function  ->  (disposition, why)
 KNOWN_RECALL_SITES: dict[str, tuple[str, str]] = {
     "eval/longmemeval/runner.py::_run_arm": (
-        "first-party", "eval-harness recall against an EPHEMERAL store of "
+        "first-party",
+        "eval-harness recall against an EPHEMERAL store of "
         "first_party LongMemEval haystack; no production trust boundary "
-        "(extracted from run_question for the dual-store graph arm)"),
+        "(extracted from run_question for the dual-store graph arm)",
+    ),
     "mcp/memory/core.py::memory_recall": (
         "wrapped",
         "external items wrapped after label_result_dicts (full path)",
@@ -469,3 +471,109 @@ def test_prompt_gated_qdrant_sites_emit():
             "immunity_shadow.record_would_block[_sync]. Re-wire the emit or "
             "reclassify with a reason."
         )
+
+
+# ─── WS-3 B4 aftermath — stored-origin propagation locks ────────────────────
+# The #1048 review grind was ONE defect class, found leaf-by-leaf across 11
+# reviewer rounds: a gate-decision site consulting only the (collection,
+# source_pipeline) re-derivation while the STORED origin_class existed but was
+# not threaded — stored-external episodic items then crossed unwrapped /
+# uncounted, or provenance labels disagreed with wrap decisions. These two
+# locks turn the entire class into a PR-time failure instead of a
+# review-round discovery:
+#   1) every item_is_blockable / should_enforce_drop call passes
+#      origin_class= (stored-first, never collection-only re-derivation);
+#   2) every wrap_external_recall caller also consults item_is_blockable in
+#      the same function (the wrap decision is keyed stored-first).
+
+_ORIGIN_DECISION_ATTRS = {"item_is_blockable", "should_enforce_drop"}
+
+# Definitions + internal delegation live here (should_enforce_drop calls
+# item_is_blockable inside the module) — not consumer sites.
+_ORIGIN_LOCK_EXCLUDED_FILES = {"security/immunity_shadow.py"}
+
+# relpath::func -> reason, for a future wrap caller that legitimately never
+# consults blockability. EMPTY today — every current wrap caller is keyed
+# stored-first; add an entry only with a written rationale.
+WRAP_WITHOUT_BLOCKABLE_OK: dict[str, str] = {}
+
+
+def _call_name(node: ast.Call) -> str | None:
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    return None
+
+
+def _functions_calling_any(attrs: set[str]) -> set[str]:
+    """Like _functions_calling, but matches BOTH attribute calls
+    (module.func(...)) and bare-name calls (from-imported func(...))."""
+    found: set[str] = set()
+    for path in _SRC.rglob("*.py"):
+        try:
+            tree = ast.parse(path.read_text(), filename=str(path))
+        except SyntaxError:
+            continue
+        rel = path.relative_to(_SRC).as_posix()
+        funcs = [
+            (n.lineno, getattr(n, "end_lineno", n.lineno), n.name)
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _call_name(node) in attrs:
+                best, enclosing = -1, "<module>"
+                for start, end, name in funcs:
+                    if start <= node.lineno <= (end or start) and start > best:
+                        best, enclosing = start, name
+                found.add(f"{rel}::{enclosing}")
+    return found
+
+
+def test_gate_decision_calls_thread_stored_origin():
+    """Lock 1: no decision call may omit origin_class= — omitting it silently
+    falls back to (collection, source_pipeline) re-derivation, which is blind
+    to stored-external episodic rows (the exact #1048 defect class)."""
+    missing: set[str] = set()
+    for path in _SRC.rglob("*.py"):
+        try:
+            tree = ast.parse(path.read_text(), filename=str(path))
+        except SyntaxError:
+            continue
+        rel = path.relative_to(_SRC).as_posix()
+        if rel in _ORIGIN_LOCK_EXCLUDED_FILES:
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and _call_name(node) in _ORIGIN_DECISION_ATTRS
+                and "origin_class" not in {k.arg for k in node.keywords}
+            ):
+                missing.add(f"{rel}:{node.lineno} ({_call_name(node)})")
+    assert not missing, (
+        "Gate-decision call(s) omit origin_class= — thread the item's STORED "
+        "origin (enrich via origin_class_by_ids / RetrievalResult.origin_class "
+        "if the surface doesn't carry it yet); collection-only re-derivation "
+        f"cannot see stored-external episodic rows: {sorted(missing)}"
+    )
+
+
+def test_every_wrap_caller_consults_blockability():
+    """Lock 2: a function that wraps external recall content must key that
+    decision stored-first (call item_is_blockable), or be registered with a
+    written rationale — wrap-on-collection-alone is the #1048 defect class."""
+    wrap_callers = {
+        s
+        for s in _functions_calling_any({"wrap_external_recall"})
+        if s.split("::")[0] not in {"memory/provenance.py"}
+    }
+    blockable_callers = _functions_calling_any(_ORIGIN_DECISION_ATTRS)
+    unkeyed = wrap_callers - blockable_callers - set(WRAP_WITHOUT_BLOCKABLE_OK)
+    assert not unkeyed, (
+        "wrap_external_recall caller(s) never consult item_is_blockable — key "
+        "the wrap on stored-first blockability (see memory_core_facts for the "
+        f"reference pattern) or register with a rationale: {sorted(unkeyed)}"
+    )
+    stale = set(WRAP_WITHOUT_BLOCKABLE_OK) - wrap_callers
+    assert not stale, f"stale WRAP_WITHOUT_BLOCKABLE_OK entries: {sorted(stale)}"
