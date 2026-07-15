@@ -119,6 +119,38 @@ def _read_cgroup_memory_max(sys_root: Path) -> int | None:
         return None
 
 
+def _read_cgroup_memory_swap_max(sys_root: Path) -> int | str | None:
+    """Unlike memory.max (where "max" collapses to None = no limit), the
+    swap knob keeps its raw tri-state: "0" IS the incident state (memory
+    spikes thrash instead of swapping — the 2026-07 wedge series), "max"
+    is the healthy state, None means unreadable/cgroup-v1."""
+    raw = _read(sys_root / "fs/cgroup/memory.swap.max")
+    if raw is None or raw == "max":
+        return raw
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _oomd_user_slice_kill(etc_root: Path) -> bool:
+    """Whether a systemd-oomd pressure-kill policy is configured for
+    user.slice (ManagedOOMMemoryPressure=kill in any user.slice.d drop-in,
+    e.g. the genesis-oomd.conf that scripts/lib/memory_resilience.sh lays
+    down). Config-plane deliberately: the runtime signal candidate (the
+    /run/systemd/io.systemd.ManagedOOM socket) was probed live and predates
+    protection — it means "oomd installed", not "policy configured"."""
+    dropin_dir = etc_root / "systemd/system/user.slice.d"
+    if not dropin_dir.is_dir():
+        return False
+    for conf in sorted(dropin_dir.glob("*.conf")):
+        raw = _read(conf) or ""
+        for line in raw.splitlines():
+            if line.split("#", 1)[0].strip().replace(" ", "") == "ManagedOOMMemoryPressure=kill":
+                return True
+    return False
+
+
 def _detect_root_device(proc_root: Path) -> str | None:
     """Block device major:minor for the root filesystem (via mountinfo)."""
     raw = _read(proc_root / "self/mountinfo") or ""
@@ -224,12 +256,15 @@ async def collect_cpu(
 async def collect_memory(
     proc_root: Path = Path("/proc"),
     sys_root: Path = Path("/sys"),
+    etc_root: Path = Path("/etc"),
 ) -> SectionResult:
-    """Cgroup limit, swap/zram config, THP; availability as metrics."""
+    """Cgroup limit, swap/zram config, oomd policy, THP; availability as metrics."""
     facts: dict = {}
     metrics: dict = {}
 
     facts["cgroup_memory_max"] = _read_cgroup_memory_max(sys_root)
+    facts["cgroup_memory_swap_max"] = _read_cgroup_memory_swap_max(sys_root)
+    facts["oomd_user_slice_kill"] = _oomd_user_slice_kill(etc_root)
 
     meminfo = _read(proc_root / "meminfo") or ""
     mem: dict[str, int] = {}
@@ -300,7 +335,6 @@ async def collect_storage(
             if root_dev in devs:
                 facts["io_scheduler"] = _read(disk_dir / "queue/scheduler")
                 break
-
 
     # /tmp is a MEASUREMENT TARGET here (small tmpfs = known incident class),
     # not a temp-file location.

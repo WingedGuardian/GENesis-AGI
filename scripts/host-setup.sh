@@ -552,6 +552,20 @@ incus config set "$CONTAINER_NAME" boot.autostart true
 incus config set "$CONTAINER_NAME" boot.autostart.delay 5
 echo "  + boot.autostart enabled (container survives host reboots)"
 
+# Let the container's memory cgroup swap to host swap. Without this the
+# container gets memory.swap.max=0 and any memory spike becomes load-100
+# D-state thrash that wedges the box instead of degrading into swap pressure
+# (root cause of the 2026-07 incident series). Applied outside the creation
+# block so re-running host-setup retrofits existing containers too.
+incus config set "$CONTAINER_NAME" limits.memory.swap true
+echo "  + limits.memory.swap enabled (memory spikes degrade into swap, not thrash)"
+if [ -z "$(swapon --noheadings --show 2>/dev/null)" ]; then
+    echo "  WARNING: this host has NO swap — limits.memory.swap has nothing to swap to."
+    echo "           Add host swap (swapfile or LV); even a few GiB turns the container's"
+    echo "           OOM cliff into a ramp. Example: fallocate -l 4G /swap.img &&"
+    echo "           chmod 600 /swap.img && mkswap /swap.img && swapon /swap.img (+ fstab)."
+fi
+
 # ── Split-disk: ensure container home has adequate space ─────────────────────
 # If /home is on a separate larger disk but the Incus pool was initialized on
 # root (common when Incus was pre-installed before host-setup.sh ran, e.g. on

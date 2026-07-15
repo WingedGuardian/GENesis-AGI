@@ -645,6 +645,12 @@ else
 fi
 echo
 
+# --- Memory resilience (systemd-oomd pressure-kill + swap invariant) ---
+# shellcheck source=lib/memory_resilience.sh
+source "$SCRIPT_DIR/lib/memory_resilience.sh"
+memory_resilience_apply
+echo
+
 # --- Systemd service sync ---
 echo "--- Syncing systemd service files ---"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
