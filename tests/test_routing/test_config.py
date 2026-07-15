@@ -155,7 +155,9 @@ def test_load_full_yaml(monkeypatch):
     # compaction in #26; their model_routing.yaml entries were never cleaned up).
     # 2026-07-14: 54 → 55 after ambient_ledger_extractor added (session-manager
     # PR-3 shadow extractor neural-monitor registration).
-    assert len(cfg.call_sites) == 55
+    # 2026-07-15: 55 → 56 after wing_backfill added (one-shot legacy wing backfill).
+    assert len(cfg.call_sites) == 56
+    assert "wing_backfill" in cfg.call_sites  # legacy wing backfill (2026-07-15)
     assert "crag_grade" in cfg.call_sites  # W-CRAG runtime grader (2026-06-20)
     assert "38a_procedure_novelty_llm" in cfg.call_sites  # C2b cross-type dedup (2026-06-30)
     assert "attention_salience" in cfg.call_sites  # PR3b L1.5 salience gate (2026-07-01)
