@@ -492,6 +492,25 @@ _ORIGIN_DECISION_ATTRS = {"item_is_blockable", "should_enforce_drop"}
 # item_is_blockable inside the module) — not consumer sites.
 _ORIGIN_LOCK_EXCLUDED_FILES = {"security/immunity_shadow.py"}
 
+# Gated inject surfaces OUTSIDE src/genesis (Codex #1065 P2): the proactive
+# hook lazy-imports item_is_blockable for its would-block count — a future
+# edit dropping origin_class= there would reintroduce the exact regression
+# these locks exist for, invisibly to a src-only sweep.
+_EXTRA_SWEPT_FILES = ((_REPO_ROOT / "scripts" / "proactive_memory_hook.py"),)
+
+
+def _origin_swept_trees():
+    """Yield (relpath, ast tree) for src/genesis plus the extra gated files."""
+    paths = [(p, p.relative_to(_SRC).as_posix()) for p in _SRC.rglob("*.py")]
+    paths += [(p, p.relative_to(_REPO_ROOT).as_posix()) for p in _EXTRA_SWEPT_FILES]
+    for path, rel in paths:
+        try:
+            tree = ast.parse(path.read_text(), filename=str(path))
+        except (SyntaxError, OSError):
+            continue
+        yield rel, tree
+
+
 # relpath::func -> reason, for a future wrap caller that legitimately never
 # consults blockability. EMPTY today — every current wrap caller is keyed
 # stored-first; add an entry only with a written rationale.
@@ -508,14 +527,10 @@ def _call_name(node: ast.Call) -> str | None:
 
 def _functions_calling_any(attrs: set[str]) -> set[str]:
     """Like _functions_calling, but matches BOTH attribute calls
-    (module.func(...)) and bare-name calls (from-imported func(...))."""
+    (module.func(...)) and bare-name calls (from-imported func(...)),
+    sweeping src/genesis plus the extra gated files."""
     found: set[str] = set()
-    for path in _SRC.rglob("*.py"):
-        try:
-            tree = ast.parse(path.read_text(), filename=str(path))
-        except SyntaxError:
-            continue
-        rel = path.relative_to(_SRC).as_posix()
+    for rel, tree in _origin_swept_trees():
         funcs = [
             (n.lineno, getattr(n, "end_lineno", n.lineno), n.name)
             for n in ast.walk(tree)
@@ -536,12 +551,7 @@ def test_gate_decision_calls_thread_stored_origin():
     falls back to (collection, source_pipeline) re-derivation, which is blind
     to stored-external episodic rows (the exact #1048 defect class)."""
     missing: set[str] = set()
-    for path in _SRC.rglob("*.py"):
-        try:
-            tree = ast.parse(path.read_text(), filename=str(path))
-        except SyntaxError:
-            continue
-        rel = path.relative_to(_SRC).as_posix()
+    for rel, tree in _origin_swept_trees():
         if rel in _ORIGIN_LOCK_EXCLUDED_FILES:
             continue
         for node in ast.walk(tree):
