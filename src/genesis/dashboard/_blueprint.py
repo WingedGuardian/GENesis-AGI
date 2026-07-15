@@ -39,7 +39,11 @@ def _async_route(f=None, *, timeout: float | None = None):
     the coroutine even though it executes on the runtime thread.
 
     Falls back to a per-request ``new_event_loop()`` when no runtime loop
-    is configured (e.g. during unit tests).
+    is configured (e.g. during unit tests). When a runtime loop IS
+    configured but not (yet) running — the startup/shutdown window — the
+    route answers 503 instead: shared async objects are bound to that loop,
+    and running the handler anywhere else raises cross-loop errors that
+    historically could take the whole server down.
 
     ``timeout`` (seconds) optionally bounds how long the Flask worker thread
     waits for the coroutine. On expiry the route returns HTTP 503 instead of
@@ -74,10 +78,39 @@ def _async_route(f=None, *, timeout: float | None = None):
                         {"status": "unavailable", "error": "request timed out"}
                     ), 503
 
-            # Fallback for tests or pre-runtime contexts
+            if loop is not None:
+                # Runtime loop configured but not running (startup/shutdown
+                # window). Shared async objects (aiosqlite connections,
+                # asyncio locks) are bound to that loop — running the handler
+                # on a fresh loop would raise mid-request. Same idiom as
+                # voice_api / openclaw completions: answer 503 until ready.
+                logger.warning(
+                    "async route %s hit before runtime loop is running — returning 503",
+                    getattr(fn, "__name__", "?"),
+                )
+                return jsonify(
+                    {"status": "unavailable", "error": "runtime starting"}
+                ), 503
+
+            # Fallback for tests or pre-runtime contexts (no runtime loop
+            # configured at all)
             loop = asyncio.new_event_loop()
             try:
                 return loop.run_until_complete(fn(*args, **kwargs))
+            except RuntimeError:
+                # The handler touched a shared async object bound to the
+                # (absent) runtime loop — aiosqlite raises "attached to a
+                # different loop" / "no current event loop". This used to
+                # propagate and could crash the server (observed exit 2 when
+                # a health poll landed during a broken startup). Degrade to
+                # 503 instead; the traceback still lands in the log.
+                logger.exception(
+                    "async route %s failed in loop-less fallback — returning 503",
+                    getattr(fn, "__name__", "?"),
+                )
+                return jsonify(
+                    {"status": "unavailable", "error": "runtime not ready"}
+                ), 503
             finally:
                 loop.close()
 
