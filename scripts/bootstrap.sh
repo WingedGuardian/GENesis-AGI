@@ -767,6 +767,18 @@ else
 fi
 echo
 
+# --- Network resilience (KeepConfiguration + networkd watchdog) ---
+# Same guarded-source contract as memory resilience: a partial checkout without
+# the lib degrades to a warning, never aborts bootstrap under set -e.
+if [[ -f "$SCRIPT_DIR/lib/network_resilience.sh" ]]; then
+    # shellcheck source=lib/network_resilience.sh
+    source "$SCRIPT_DIR/lib/network_resilience.sh"
+    network_resilience_apply
+else
+    echo "  WARNING: lib/network_resilience.sh missing — skipping network-resilience setup"
+fi
+echo
+
 # --- Systemd service sync ---
 echo "--- Syncing systemd service files ---"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"

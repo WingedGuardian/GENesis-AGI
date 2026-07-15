@@ -23,6 +23,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   rows get their metadata classified but remain wing-unreachable until the
   retrieval-side gap is closed (reported separately, not overstated). Dry-run
   by default; the bulk write is gated on a human-reviewed sample.
+
+- **Genesis survives — and now auto-recovers from — a wedged network.** Under
+  heavy memory pressure the container's networking daemon can hit kernel
+  timeouts, drop its DHCP lease, and take the machine off the network until
+  someone restarts the daemon by hand. Fresh and updated installs now (1) pin
+  the address so a networking failure keeps the connection instead of dropping
+  it, and (2) run a lightweight watchdog that detects a wedged/inactive
+  networking daemon and restarts it automatically (address-preserving, so no
+  blip). Heal events are recorded and surfaced in the infrastructure profile,
+  so a recurring fault is visible instead of silent. Networking runs a
+  different manager (e.g. NetworkManager) or lacks sudo? It skips cleanly.
+  See `docs/reference/network-resilience.md`.
+
 - **Genesis now notices when merged code isn't actually deployed.** Pulling
   changes with a bare `git merge` between updates loads the new code on
   restart but silently skips everything only `update.sh` activates — new
