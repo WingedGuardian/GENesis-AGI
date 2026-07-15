@@ -215,15 +215,14 @@ async def _check_embedding_backlog(db) -> None:
         # row active, instead of a lingering peak-severity row until the
         # backlog fully clears (< LOW). DB-based (not the in-memory band), so
         # it is restart-safe; a no-op in steady state at a fixed band.
-        await db.execute(
-            "UPDATE observations SET resolved=1, resolved_at=?, "
-            "resolution_notes='superseded by a new embedding-backlog band' "
-            "WHERE source='embedding_backlog_monitor' "
-            "AND type='infrastructure_alert' AND resolved=0 "
-            "AND content_hash != ?",
-            (datetime.now(UTC).isoformat(), content_hash),
+        await observations.supersede_except_hash(
+            db,
+            source="embedding_backlog_monitor",
+            type="infrastructure_alert",
+            keep_content_hash=content_hash,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="superseded by a new embedding-backlog band",
         )
-        await db.commit()
         created = await observations.create(
             db,
             id=str(uuid.uuid4()),
