@@ -33,7 +33,8 @@ MEMRES_CGROUP_SWAP_MAX="${MEMRES_CGROUP_SWAP_MAX:-/sys/fs/cgroup/memory.swap.max
 
 # The pressure policy, mirrored from the config proven live on the reference
 # install (2026-07-13 incident fix). user.slice is the backstop at 60%; the
-# per-user manager (user@N.service) is the operative monitor — Ubuntu ships a
+# per-user manager (systemd's per-user instance units) is the operative
+# monitor — Ubuntu ships a
 # kill@50% default for it, and our drop-in guarantees `kill` on distros that
 # ship `auto` or nothing (limit then falls back to DefaultMemoryPressureLimit).
 # SwapUsedLimit only acts where oomd can see swap (bare/VM installs; inside a
@@ -43,16 +44,22 @@ _MEMRES_USER_SERVICE_CONF=$'[Service]\nManagedOOMMemoryPressure=kill'
 _MEMRES_OOMD_CONF=$'[OOM]\nSwapUsedLimit=90%\nDefaultMemoryPressureLimit=60%\nDefaultMemoryPressureDurationSec=20s'
 
 # _memres_install_dropin <abs-path> <content> — write-if-different via sudo.
-# Prints "changed" when it wrote. Never fails the caller.
+# Sets _MEMRES_CHANGED=1 when it wrote (a variable, NOT stdout — capturing
+# stdout as the change flag would let any future diagnostic echo masquerade
+# as "changed" and churn systemd on idempotent runs). A failed write WARNS
+# instead of falling through to "already in place". Never fails the caller.
 _memres_install_dropin() {
     local path="$1" content="$2"
     if [[ "$(sudo cat "$path" 2>/dev/null)" == "$content" ]]; then
         return 0
     fi
-    sudo mkdir -p "$(dirname "$path")" 2>/dev/null || return 0
-    if printf '%s\n' "$content" | sudo tee "$path" >/dev/null 2>&1; then
-        echo "changed"
+    if ! sudo mkdir -p "$(dirname "$path")" 2>/dev/null \
+        || ! printf '%s\n' "$content" | sudo tee "$path" >/dev/null 2>&1; then
+        echo "  WARNING: could not write $path (read-only /etc?) — oomd policy NOT applied."
+        _MEMRES_FAILED=1
+        return 0
     fi
+    _MEMRES_CHANGED=1
     return 0
 }
 
@@ -66,13 +73,12 @@ _memres_swap_check() {
     fi
 
     if [[ "$swap_max" == "0" ]]; then
+        echo "  WARNING: cgroup memory.swap.max is 0 — memory spikes will thrash instead of swapping."
         if systemd-detect-virt --container >/dev/null 2>&1; then
-            echo "  WARNING: cgroup memory.swap.max is 0 — memory spikes will thrash instead of swapping."
             echo "           Fix on the HOST (not from inside this container):"
             echo "             incus config set <container-name> limits.memory.swap true"
             echo "           and ensure the host itself has swap (swapon --show)."
         else
-            echo "  WARNING: cgroup memory.swap.max is 0 — memory spikes will thrash instead of swapping."
             echo "           Remove the swap.max=0 override (systemctl show -p MemorySwapMax) or re-enable swap."
         fi
         return 0
@@ -110,19 +116,26 @@ memory_resilience_apply() {
         return 0
     fi
 
-    local changed=""
-    [[ -n "$(_memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user.slice.d/genesis-oomd.conf" "$_MEMRES_USER_SLICE_CONF")" ]] && changed=1
-    [[ -n "$(_memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user@.service.d/genesis-oomd.conf" "$_MEMRES_USER_SERVICE_CONF")" ]] && changed=1
-    [[ -n "$(_memres_install_dropin "$MEMRES_ETC_ROOT/systemd/oomd.conf.d/genesis.conf" "$_MEMRES_OOMD_CONF")" ]] && changed=1
+    _MEMRES_CHANGED=""
+    _MEMRES_FAILED=""
+    _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user.slice.d/genesis-oomd.conf" "$_MEMRES_USER_SLICE_CONF"
+    _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user@.service.d/genesis-oomd.conf" "$_MEMRES_USER_SERVICE_CONF"
+    _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/oomd.conf.d/genesis.conf" "$_MEMRES_OOMD_CONF"
 
-    if [[ -n "$changed" ]]; then
+    if [[ -n "$_MEMRES_CHANGED" ]]; then
         # daemon-reload propagates the ManagedOOM* unit properties to oomd;
-        # the oomd restart picks up oomd.conf.d. Best-effort: a hiccup here
-        # must never abort bootstrap/update — the drop-ins are on disk and
-        # the next boot applies them regardless.
+        # the restart picks up oomd.conf.d (and starts oomd if stopped, so a
+        # separate `enable --now` would just double the start transition).
+        # Runs even on a partial apply — whatever DID land should take effect.
+        # Best-effort: a hiccup here must never abort bootstrap/update — the
+        # drop-ins are on disk and the next boot applies them regardless.
         sudo systemctl daemon-reload 2>/dev/null || true
-        sudo systemctl enable --now systemd-oomd 2>/dev/null || true
+        sudo systemctl enable systemd-oomd 2>/dev/null || true
         sudo systemctl restart systemd-oomd 2>/dev/null || true
+    fi
+    if [[ -n "$_MEMRES_FAILED" ]]; then
+        echo "  systemd-oomd policy NOT fully applied — see warnings above."
+    elif [[ -n "$_MEMRES_CHANGED" ]]; then
         echo "  systemd-oomd pressure-kill policy applied (user.slice kill @60% PSI; per-user manager kill)."
     else
         echo "  systemd-oomd pressure-kill policy already in place."

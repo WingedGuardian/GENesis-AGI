@@ -118,7 +118,7 @@ def test_fresh_apply_writes_dropins_and_reloads(tmp_path):
 
     calls = Path(env["SYSTEMCTL_LOG"]).read_text()
     assert "daemon-reload" in calls
-    assert "enable --now systemd-oomd" in calls
+    assert "enable systemd-oomd" in calls  # no --now: restart below does the single start
     assert "restart systemd-oomd" in calls
 
 
@@ -210,7 +210,40 @@ def test_container_vantage_ignores_missing_swap_device(tmp_path):
     assert "no swap device" not in result.stdout
 
 
+def test_failed_write_warns_instead_of_claiming_already_in_place(tmp_path):
+    env = _stage(tmp_path)
+    # Existing etc content differs AND the target dir is unwritable via the
+    # stub (make the etc root a read-only dir) -> tee fails.
+    etc = Path(env["MEMRES_ETC_ROOT"])
+    etc.mkdir()
+    etc.chmod(0o555)
+    try:
+        result = _run(env)
+    finally:
+        etc.chmod(0o755)
+    assert result.returncode == 0
+    assert "could not write" in result.stdout
+    assert "already in place" not in result.stdout
+
+
+def test_later_dropin_reverting_policy_not_detected_as_protected():
+    # Companion to the collector fact: the lib writes genesis-oomd.conf, but
+    # systemd applies drop-ins lexicographically with last-assignment-wins.
+    # This is covered collector-side (test_collectors_container) — here we
+    # only pin that the lib's own drop-in name sorts BEFORE a conventional
+    # zz-*.conf operator override, so operators can override us, not vice versa.
+    assert "genesis-oomd.conf" < "zz-local.conf"
+
+
 def test_bootstrap_wires_the_lib():
     text = BOOTSTRAP.read_text()
     assert 'source "$SCRIPT_DIR/lib/memory_resilience.sh"' in text
     assert "memory_resilience_apply" in text
+
+
+def test_update_sh_wires_the_lib_visibly():
+    # update.sh pipes bootstrap through `tail -10`, which eats the swap
+    # warning — the retrofit path re-runs the (idempotent) apply unpiped.
+    text = (REPO_ROOT / "scripts" / "update.sh").read_text()
+    assert 'lib/memory_resilience.sh' in text
+    assert text.count("memory_resilience_apply") >= 1

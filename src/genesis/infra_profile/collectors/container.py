@@ -143,12 +143,21 @@ def _oomd_user_slice_kill(etc_root: Path) -> bool:
     dropin_dir = etc_root / "systemd/system/user.slice.d"
     if not dropin_dir.is_dir():
         return False
+    # systemd semantics, not grep semantics: drop-ins apply in lexicographic
+    # order and the LAST assignment wins (a later zz-local.conf reverting to
+    # `auto` disables the policy — first-match would report a lie), and unit
+    # files have no inline comments (only full-line # / ; lines).
+    effective: str | None = None
     for conf in sorted(dropin_dir.glob("*.conf")):
         raw = _read(conf) or ""
         for line in raw.splitlines():
-            if line.split("#", 1)[0].strip().replace(" ", "") == "ManagedOOMMemoryPressure=kill":
-                return True
-    return False
+            stripped = line.strip()
+            if stripped.startswith(("#", ";")):
+                continue
+            key, sep, value = stripped.partition("=")
+            if sep and key.strip() == "ManagedOOMMemoryPressure":
+                effective = value.strip()
+    return effective == "kill"
 
 
 def _detect_root_device(proc_root: Path) -> str | None:

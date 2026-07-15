@@ -960,6 +960,17 @@ echo "--- Running bootstrap ---"
 echo "  Bootstrap complete"
 echo ""
 
+# ── Memory resilience — re-run VISIBLY. Bootstrap already applied it, but
+# its output is eaten by the `tail -10` above, and the update path is exactly
+# where an existing swapless install retrofits and must SEE the warn-only
+# swap-invariant output. Idempotent: already-applied → one no-op line.
+if [ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]; then
+    # shellcheck source=lib/memory_resilience.sh
+    . "$SCRIPT_DIR/lib/memory_resilience.sh"
+    memory_resilience_apply
+    echo ""
+fi
+
 # ── Verify Genesis is importable ──────────────────────────
 if ! "$VENV_DIR/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/dev/null; then
     _do_rollback "Genesis not importable after bootstrap"

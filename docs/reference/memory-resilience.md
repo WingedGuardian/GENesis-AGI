@@ -70,6 +70,13 @@ flags unprotected installs:
 
 ## Notes
 
+- This userspace layer is complementary to the **kernel-side** OOM tuning
+  Genesis already applies on guardian hosts
+  (`/etc/sysctl.d/99-genesis-oom-tuning.conf` via `install_guardian.sh` /
+  `host-setup.sh`: `vm.min_free_kbytes`, `vm.watermark_scale_factor`,
+  `vm.oom_kill_allocating_task`). The sysctls shape *kernel reclaim and the
+  kernel OOM killer*; systemd-oomd acts *earlier*, on pressure, in userspace.
+  Tune them as two layers of one defense, not competing knobs.
 - Inside a container, systemd-oomd's swap-based kills are inert (the
   container can't see swap devices); the **pressure** path is the active
   mechanism. The swap limit line matters on bare/VM installs.

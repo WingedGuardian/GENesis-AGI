@@ -133,6 +133,15 @@ async def test_oomd_policy_fact_from_dropins(proc_root, sys_root, tmp_path):
     result = await collect_memory(proc_root=proc_root, sys_root=sys_root, etc_root=tmp_path)
     assert result.facts["oomd_user_slice_kill"] is True
 
+    # systemd applies drop-ins lexicographically, LAST assignment wins: an
+    # operator zz-override reverting to auto disables the policy — the fact
+    # must not report a protection that is no longer effective.
+    dropins.joinpath("zz-local.conf").write_text(
+        "[Slice]\nManagedOOMMemoryPressure=auto\n",
+    )
+    result = await collect_memory(proc_root=proc_root, sys_root=sys_root, etc_root=tmp_path)
+    assert result.facts["oomd_user_slice_kill"] is False
+
 
 async def test_storage_mounts_sorted_and_filtered(proc_root, sys_root):
     result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
