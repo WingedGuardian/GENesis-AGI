@@ -597,6 +597,18 @@ _CALL_SITE_META: dict[str, dict] = {
         "cc_model": "Haiku",
         "model_tier": "cc",
     },
+    "ambient_ledger_extractor": {
+        # Manual cost_policy (empty chain by design, ambient_arbiter twin).
+        # Deliberately NOT in critical_sites: a shadow-only site failing is
+        # never red-worthy — the foreground ledger tools are the primary path.
+        "description": "Ambient session-ledger shadow extractor: proposes missed agreements/pivots from the transcript delta at each PreCompact boundary. Headless CC (pinned Haiku) spawned by the detached ledger shadow worker; shadow store only, never the live ledger.",
+        "category": "memory",
+        "frequency": "Per foreground compaction (~2-15/day)",
+        "cost_policy": "CC subscription (Haiku)",
+        "dispatch": "cli",
+        "cc_model": "Haiku",
+        "model_tier": "cc",
+    },
     "model_fusion": {
         # Non-routing, on-demand paid consult: the deliberate MCP tool POSTs
         # OpenRouter Fusion over raw httpx (NOT through the router), then records
