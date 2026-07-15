@@ -1662,6 +1662,24 @@ TABLES = {
             updated_at       TEXT
         )
     """,
+    # Data-migration framework ledger (WS-C). Kept in LOCKSTEP with migration
+    # 0060 (upgrade path); this is the fresh-install path. See
+    # db/data_migrations/ for the runner + contract.
+    "data_migrations": """
+        CREATE TABLE IF NOT EXISTS data_migrations (
+            id           TEXT PRIMARY KEY,
+            name         TEXT NOT NULL,
+            status       TEXT NOT NULL CHECK (
+                status IN ('pending','running','completed','failed','operator_pending')
+            ),
+            attempts     INTEGER NOT NULL DEFAULT 0,
+            started_at   TEXT,
+            completed_at TEXT,
+            error        TEXT,
+            summary      TEXT,
+            updated_at   TEXT NOT NULL
+        )
+    """,
     "session_ledger": """
         CREATE TABLE IF NOT EXISTS session_ledger (
             id          TEXT PRIMARY KEY,

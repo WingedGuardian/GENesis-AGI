@@ -515,6 +515,24 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             except Exception:
                 logger.warning("Boot session-reap kick failed", exc_info=True)
 
+        # Data migrations (WS-C): once-per-install backfills of NON-schema state
+        # (Qdrant payloads, entity graphs). POST-boot + background — unlike schema
+        # migrations these must NEVER abort startup, and can be long-running.
+        # tracked_task (fire-and-forget) mirrors the session-reap kick above. The
+        # runner is self-guarding (never raises) and idempotent; requires_operator
+        # migrations are skipped here and wait for a deliberate trigger.
+        if self._db is not None:
+            try:
+                from genesis.db.data_migrations.runner import run_data_migrations
+                from genesis.util.tasks import tracked_task
+
+                tracked_task(
+                    run_data_migrations(self._db),
+                    name="data_migrations",
+                )
+            except Exception:
+                logger.warning("Boot data-migration kick failed", exc_info=True)
+
         self._wire_job_retry_registry()
 
         critical_ok = all(

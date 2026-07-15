@@ -11,6 +11,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Data backfills now heal themselves on update.** Some upgrades need more than
+  a schema change — they need existing data reshaped (e.g. tagging every stored
+  memory's vector with its provenance class). Those backfills used to be
+  one-off scripts each install had to remember to run by hand, so an install
+  that skipped one silently drifted. Genesis now runs them automatically in the
+  background after startup, tracked in a ledger so each runs exactly once, never
+  blocks boot, and simply no-ops on an install that's already current — so a
+  lagging clone catches up on its next update with nothing to run manually. The
+  first one backfills provenance onto older memory vectors.
+
 - **Genesis now notices when merged code isn't actually deployed.** Pulling
   changes with a bare `git merge` between updates loads the new code on
   restart but silently skips everything only `update.sh` activates — new

@@ -600,18 +600,30 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, env.py, _config_overlay.py]
-verified: bca86011 2026-07-15
+verified: 95dee055 2026-07-15
 ```
 
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
-  schema paths coexist: base DDL (~113 CREATE TABLE; docs still say "60+")
-  plus versioned migrations 0001..0046 run ONCE at startup before any other
-  init step touches data; a failed migration ABORTS bootstrap. Migration
+  schema paths coexist: base DDL (`schema/_tables.py`, ~113 CREATE TABLE; docs
+  still say "60+") plus versioned `migrations/` 0001..0060 run ONCE at startup
+  before any other init step touches data; a failed migration ABORTS bootstrap.
+  EVERY table must be in BOTH paths (fresh-install DDL + its numbered
+  migration) — the `test_db/test_schema.py` allow-list enforces it. Migration
   atomicity is hand-rolled (BEGIN IMMEDIATE + a proxy that blocks stray
   commits/DDL autocommit) with a post-commit reconcile and SQLITE_LOCKED
   retry (2026-06-25 incident guard). No TABLES-vs-sqlite_master parity test
   exists.
+  **DATA migrations (WS-C, `db/data_migrations/`) are the OPPOSITE contract:**
+  non-schema backfills (Qdrant payloads, entity graphs) that run POST-boot as a
+  background `tracked_task` (kicked from `runtime/_core`), never abort boot, are
+  idempotent, and are claimed atomically via the `data_migrations` ledger (so
+  server + bridge-fallback can't double-run). `dNNNN_*.py` modules expose sync
+  `migrate()`+`verify()` (runner offloads via `to_thread`); `requires_operator`
+  ones sit `operator_pending` and never auto-run. Shared file-discovery with the
+  schema runner (`db/_migration_discovery.py`), deliberately NOT the atomic-txn
+  proxy. Seed `d0001` mirrors SQLite `origin_class` onto Qdrant — idempotent, so
+  a lagging install self-heals on next pull+restart with no control plane.
 - **runtime/**: sequential bootstrap (secrets → db → … → sentinel, ~27 steps);
   each step records ok/degraded/failed in the manifest — only db aborts.
   `~/.genesis/capabilities.json` + `bootstrap_manifest.json` are projected at
