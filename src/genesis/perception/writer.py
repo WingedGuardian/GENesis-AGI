@@ -73,18 +73,25 @@ class ResultWriter:
 
     @staticmethod
     def _relevance_from_signals(
-        tick: TickResult, driving_signals: list[str] | None = None,
+        tick: TickResult,
+        driving_signals: list[str] | None = None,
+        excluded_signals: set[str] | None = None,
     ) -> str:
         """Determine relevance tag: 'user', 'genesis', or 'both'.
 
-        Classifies from the signals the LLM cited as driving its assessment
-        (validated against the tick roster — hallucinated names are
-        discarded).  Falls back to the full roster when the LLM omitted the
-        field or nothing validated, which reproduces the pre-driving_signals
-        behavior (a mixed roster classifies as 'both').
+        Classifies from the signals the LLM cited as driving its assessment,
+        validated against the roster the LLM was actually SHOWN — i.e. the tick
+        roster minus ``excluded_signals`` (names filtered out of the Micro
+        prompt by feeds_depths).  A cited name that is out of Micro scope (or
+        otherwise hallucinated) is discarded, so it cannot flip relevance to a
+        signal the LLM never saw.  When nothing valid remains, falls back to
+        the full roster — the safe, Genesis-visible default (a mixed roster
+        classifies as 'both'), never over-excluding a genesis micro.
         """
-        roster = {s.name for s in tick.signals}
-        basis = [n for n in (driving_signals or []) if n in roster] or roster
+        full_roster = {s.name for s in tick.signals}
+        scoped = full_roster - (excluded_signals or set())
+        valid = [n for n in (driving_signals or []) if n in scoped]
+        basis = valid or full_roster
         has_user = any(n in _USER_FACING_SIGNALS for n in basis)
         has_genesis = any(n not in _USER_FACING_SIGNALS for n in basis)
         if has_user and has_genesis:
@@ -131,8 +138,11 @@ class ResultWriter:
             logger.debug("Micro observation below salience threshold (%.2f), skipping", output.salience)
             return False
 
+        from genesis.perception.context import micro_excluded_signals
+
+        excluded = await micro_excluded_signals(db)
         base_category = "anomaly" if output.anomaly else "routine"
-        relevance = self._relevance_from_signals(tick, output.driving_signals)
+        relevance = self._relevance_from_signals(tick, output.driving_signals, excluded)
         category = f"{base_category}:{relevance}"
 
         # Cooldown gate: skip if a recently-created micro shares this one's

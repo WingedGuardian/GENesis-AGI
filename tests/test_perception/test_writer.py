@@ -1031,3 +1031,58 @@ async def test_micro_cooldown_null_category_does_not_block_user(db):
     )
     stored = await writer.write(user_output, Depth.MICRO, _make_mixed_tick(), db=db)
     assert stored is True, "Genesis-visible NULL prior must not block a :user micro"
+
+
+def _tick_with(*names: str) -> TickResult:
+    return TickResult(
+        tick_id="tick-scope",
+        timestamp="2026-03-05T10:00:00+00:00",
+        source="scheduled",
+        signals=[
+            SignalReading(
+                name=n, value=0.5, source="test",
+                collected_at="2026-03-05T10:00:00+00:00",
+            )
+            for n in names
+        ],
+        scores=[],
+        classified_depth=Depth.MICRO,
+        trigger_reason="test",
+    )
+
+
+def test_relevance_discards_out_of_scope_driving_signal():
+    """An LLM citing an out-of-Micro-scope user signal it was never shown must
+    not flip relevance to :user — it is discarded and the safe :both fallback
+    (full roster) applies, so a genesis micro is not over-excluded."""
+    from genesis.perception.writer import ResultWriter
+
+    tick = _tick_with("user_goal_staleness", "cpu_usage")
+    rel = ResultWriter._relevance_from_signals(
+        tick, ["user_goal_staleness"], excluded_signals={"user_goal_staleness"},
+    )
+    assert rel == "both"  # NOT "user"
+
+
+def test_relevance_in_scope_driving_signal_still_classifies():
+    """A cited signal that IS in Micro scope still drives classification."""
+    from genesis.perception.writer import ResultWriter
+
+    tick = _tick_with("user_goal_staleness", "cpu_usage")
+    rel = ResultWriter._relevance_from_signals(
+        tick, ["cpu_usage"], excluded_signals={"user_goal_staleness"},
+    )
+    assert rel == "genesis"
+
+
+def test_relevance_mixed_scope_keeps_only_in_scope():
+    """When a citation mixes in-scope and out-of-scope names, only the
+    in-scope one counts."""
+    from genesis.perception.writer import ResultWriter
+
+    tick = _tick_with("user_goal_staleness", "cpu_usage")
+    rel = ResultWriter._relevance_from_signals(
+        tick, ["user_goal_staleness", "cpu_usage"],
+        excluded_signals={"user_goal_staleness"},
+    )
+    assert rel == "genesis"
