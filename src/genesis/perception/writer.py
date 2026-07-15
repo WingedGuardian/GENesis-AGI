@@ -176,17 +176,20 @@ class ResultWriter:
             "signals_examined": output.signals_examined,
             "driving_signals": output.driving_signals,
         }, sort_keys=True)
-        # Structural dedup: hash on salience band + anomaly flag + relevance
-        # + signal names.  Tags are excluded — they are LLM-generated and vary
-        # wildly across ticks even for identical underlying conditions (61
-        # distinct tag combos for 72 observations in one week of staleness
-        # noise).  Relevance IS included: two reflections with the same roster
-        # but different driving signals are genuinely distinct (user- vs
-        # genesis-relevant), so they must not dedup against each other and be
-        # dropped before reaching the ego partition.
+        # Structural dedup: hash on salience band + anomaly flag + ego
+        # visibility + signal names.  Tags are excluded — they are
+        # LLM-generated and vary wildly across ticks even for identical
+        # underlying conditions (61 distinct tag combos for 72 observations in
+        # one week of staleness noise).  Visibility (not exact relevance) is
+        # keyed to mirror the Genesis ego's partition: `:genesis` and `:both`
+        # share the Genesis-visible view, so structurally-identical ones dedup
+        # together (avoiding duplicate Genesis-visible micros on the
+        # cooldown-bypassing anomaly path), while `:user` stays a distinct
+        # partition so it can never drop a genesis/both micro.
+        visibility = "user" if relevance == "user" else "genesis"
         signal_names = ",".join(sorted(s.name for s in tick.signals))
         salience_band = round(output.salience, 1)
-        norm_key = f"micro:|{salience_band}|{output.anomaly}|{relevance}|{signal_names}"
+        norm_key = f"micro:|{salience_band}|{output.anomaly}|{visibility}|{signal_names}"
         chash = self._content_hash(norm_key)
 
         if await observations.exists_by_hash(db, source="reflection", content_hash=chash, unresolved_only=True):

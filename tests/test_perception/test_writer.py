@@ -920,3 +920,56 @@ async def test_micro_cooldown_both_not_blocked_by_user(db):
     )
     stored = await writer.write(both_output, Depth.MICRO, _make_mixed_tick(), db=db)
     assert stored is True, ":user must not block a Genesis-visible :both micro"
+
+
+async def test_micro_dedup_both_and_genesis_share_partition(db):
+    """Anomaly path (cooldown bypassed): structurally-identical :both and
+    :genesis micros share the Genesis-visible partition, so the second is a
+    duplicate and must be deduped (only one persists)."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    # both anomaly (bypass cooldown), same salience band + same mixed roster
+    both_output = MicroOutput(
+        tags=["mixed"], salience=0.8, anomaly=True,
+        summary="Everything moved.", signals_examined=2,
+        driving_signals=["task_completion_quality", "cpu_usage"],  # -> both
+    )
+    genesis_output = MicroOutput(
+        tags=["cpu"], salience=0.8, anomaly=True,
+        summary="CPU moved.", signals_examined=2,
+        driving_signals=["cpu_usage"],  # -> genesis
+    )
+    stored_both = await writer.write(both_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    stored_genesis = await writer.write(genesis_output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    assert stored_both is True
+    assert stored_genesis is False, ":genesis dups a recent Genesis-visible :both"
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
+
+
+async def test_micro_dedup_user_and_genesis_still_distinct(db):
+    """The P2#1 guarantee holds: :user and :genesis are different partitions
+    and must both persist (a :user must never drop a :genesis)."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    user_output = MicroOutput(
+        tags=["user"], salience=0.8, anomaly=True,
+        summary="Task quality moved.", signals_examined=2,
+        driving_signals=["task_completion_quality"],  # -> user
+    )
+    genesis_output = MicroOutput(
+        tags=["cpu"], salience=0.8, anomaly=True,
+        summary="CPU moved.", signals_examined=2,
+        driving_signals=["cpu_usage"],  # -> genesis
+    )
+    await writer.write(user_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    await writer.write(genesis_output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    obs = await observations.query(db, source="reflection")
+    cats = sorted(o["category"] for o in obs)
+    assert cats == ["anomaly:genesis", "anomaly:user"]
