@@ -55,6 +55,10 @@ def render_mcp_servers(
 # Module-level constant (immutable intent), consistent with _READONLY_DISALLOWED.
 _MCP_PROFILES: dict[str, list[str]] = {
     "reflection": ["genesis-health", "genesis-memory"],
+    # research bg sessions: reflection servers + genesis-recon (the discovery
+    # engine — GitHub/model-intel/skill scanning). Full read+write recon; the
+    # research disallow list already omits _NO_RECON_WRITES.
+    "research": ["genesis-health", "genesis-memory", "genesis-recon"],
     "user_reflection": ["genesis-memory"],  # User ego: memory only, no health tools
     "sentinel": ["genesis-health", "genesis-memory", "genesis-outreach"],
     "campaign": ["genesis-health", "genesis-memory", "genesis-outreach"],

@@ -106,3 +106,38 @@ def test_answer_question_passes_question_type_through():
     (call,) = client.calls
     prompt = call["messages"][0]["content"].lower()
     assert "don't know" not in prompt
+
+
+def test_prompt_includes_current_date_upstream_convention():
+    # Upstream LongMemEval's reading prompt includes the question date as
+    # "Current Date: {question_date}" (raw format) between the history and the
+    # question — conformance is required for comparability AND for temporal
+    # questions ("how many weeks ago...") to be well-posed at all.
+    p = build_answer_prompt(
+        "How many weeks ago did I leave my old job?",
+        ["[2023-04-11T09:15:00] [user] Today was my last day at the old company."],
+        question_type="temporal-reasoning",
+        question_date="2023/05/23 (Tue) 19:11",
+    )
+    assert "Current Date: 2023/05/23 (Tue) 19:11" in p
+    assert p.index("MEMORIES:") < p.index("Current Date:") < p.index("QUESTION:")
+
+
+def test_prompt_omits_date_line_when_absent():
+    p = build_answer_prompt("What degree did I graduate with?", ["m"])
+    assert "Current Date:" not in p
+    p = build_answer_prompt("What degree?", ["m"], question_date="")
+    assert "Current Date:" not in p
+
+
+def test_answer_question_threads_question_date():
+    client = _FakeClient("About six weeks ago.")
+    answer_question(
+        "How many weeks ago did I leave my old job?",
+        ["[2023-04-11T09:15:00] [user] last day"],
+        client=client,
+        question_type="temporal-reasoning",
+        question_date="2023/05/23 (Tue) 19:11",
+    )
+    (call,) = client.calls
+    assert "Current Date: 2023/05/23 (Tue) 19:11" in call["messages"][0]["content"]

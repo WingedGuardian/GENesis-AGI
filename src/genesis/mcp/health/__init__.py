@@ -83,6 +83,7 @@ from genesis.mcp.health import j9_eval as _j9_eval  # noqa: E402, F401
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
 from genesis.mcp.health import module_ops as _module_ops  # noqa: E402
 from genesis.mcp.health import provider as _provider  # noqa: E402
+from genesis.mcp.health import session_charter_tools as _session_charter_tools  # noqa: E402
 from genesis.mcp.health import session_control as _session_control  # noqa: E402
 from genesis.mcp.health import settings as _settings  # noqa: E402
 from genesis.mcp.health import status as _status  # noqa: E402
@@ -96,6 +97,7 @@ db_schema = _db_schema
 errors = _errors
 manifest = _manifest
 provider = _provider
+session_charter_tools = _session_charter_tools
 session_control = _session_control
 settings = _settings
 status = _status
@@ -112,6 +114,10 @@ _impl_subsystem_heartbeats = _manifest._impl_subsystem_heartbeats
 _impl_job_health = _manifest._impl_job_health
 _impl_session_set_model = _session_control._impl_session_set_model
 _impl_session_set_effort = _session_control._impl_session_set_effort
+_impl_session_charter = _session_charter_tools._impl_session_charter
+_impl_session_charter_update = _session_charter_tools._impl_session_charter_update
+_impl_session_ledger_add = _session_charter_tools._impl_session_ledger_add
+_impl_session_ledger_update = _session_charter_tools._impl_session_ledger_update
 _impl_settings_list = _settings._impl_settings_list
 _impl_settings_get = _settings._impl_settings_get
 _impl_settings_update = _settings._impl_settings_update
@@ -166,6 +172,11 @@ __all__ = [
     "_impl_job_health",
     "_impl_session_set_model",
     "_impl_session_set_effort",
+    "session_charter_tools",
+    "_impl_session_charter",
+    "_impl_session_charter_update",
+    "_impl_session_ledger_add",
+    "_impl_session_ledger_update",
     "_impl_settings_list",
     "_impl_settings_get",
     "_impl_settings_update",

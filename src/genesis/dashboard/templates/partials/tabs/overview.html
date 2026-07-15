@@ -86,26 +86,34 @@
           </div>
 
           <!-- CC Sessions -->
-          <div class="health-card" title="Active Claude Code sessions. Foreground = user conversation, Background = reflections/tasks.">
+          <div class="health-card" style="cursor: pointer;"
+               title="Active Claude Code sessions. live = slot-tagged claude processes (/proc); db = sessions marked active in the DB. Click for per-session detail."
+               @click="$store.genesisDashboard.ccSessionsModal.open = true; $store.genesisDashboard.fetchCcSessionsDetail()">
             <div class="health-card-header">
-              <div class="health-card-title">CC Sessions</div>
+              <div class="health-card-title">CC Sessions <span style="font-size: 0.6rem; opacity: 0.5;">click for details</span></div>
               <span class="status-chip"
                     :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.ccSemantic().state)"
                     x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.ccSemantic().state)} ${$store.genesisDashboard.ccSemantic().state}`"></span>
             </div>
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.cc_sessions">
-                <div>
-                  <span x-text="$store.genesisDashboard.health.cc_sessions.foreground?.active ?? '—'"
-                        :style="`color: ${($store.genesisDashboard.health.cc_sessions.foreground?.active || 0) > 0 ? '#4caf50' : '#888'}`"></span> fg
-                  /
-                  <span x-text="$store.genesisDashboard.health.cc_sessions.background?.active ?? '—'"
-                        :style="`color: ${($store.genesisDashboard.health.cc_sessions.background?.active || 0) > 0 ? '#4caf50' : '#888'}`"></span> bg
+                <div style="display: flex; gap: 0.5rem; align-items: baseline;"
+                     :style="`color: ${(($store.genesisDashboard.health.infrastructure?.cc_slots || []).length !== (($store.genesisDashboard.health.cc_sessions.foreground?.active || 0) + ($store.genesisDashboard.health.cc_sessions.background?.active || 0))) ? '#f0ad4e' : 'inherit'}`">
+                  <span title="Live claude processes (slot-tagged, from /proc)">
+                    <span x-text="($store.genesisDashboard.health.infrastructure?.cc_slots || []).length"></span> live
+                  </span>
+                  <span style="opacity: 0.4;">/</span>
+                  <span title="Sessions marked active in the DB">
+                    <span x-text="(($store.genesisDashboard.health.cc_sessions.foreground?.active || 0) + ($store.genesisDashboard.health.cc_sessions.background?.active || 0))"></span> db
+                  </span>
                 </div>
               </template>
             </div>
             <div class="health-card-detail"
-                 x-text="$store.genesisDashboard.health.cc_sessions?.background?.hourly_budget || ''"></div>
+                 x-text="($store.genesisDashboard.health.cc_sessions?.foreground?.active ?? '—') + ' fg / ' + ($store.genesisDashboard.health.cc_sessions?.background?.active ?? '—') + ' bg (db)'"></div>
+            <div class="health-card-detail"
+                 title="Sessions started this hour vs the hourly cap — a rate budget, not a live session count"
+                 x-text="$store.genesisDashboard.health.cc_sessions?.background?.hourly_budget ? 'budget ' + $store.genesisDashboard.health.cc_sessions.background.hourly_budget + ' this hr' : ''"></div>
             <template x-if="$store.genesisDashboard.health.cc_sessions?.hourly_burn_rate != null">
               <div class="health-card-detail" style="font-size: 0.72rem;"
                    x-text="$store.genesisDashboard.health.cc_sessions.hourly_burn_rate + ' sess/hr (max ' + ($store.genesisDashboard.health.cc_sessions.max_per_hour || 20) + ')'"></div>

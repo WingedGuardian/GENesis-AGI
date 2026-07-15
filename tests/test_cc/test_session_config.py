@@ -125,6 +125,27 @@ class TestBuildMcpConfig:
     def test_unknown_profile_returns_none(self, builder):
         assert builder.build_mcp_config("nonexistent") is None
 
+    def test_research_profile_includes_recon(self, builder):
+        """research MCP profile must load genesis-recon (the discovery engine).
+
+        idx 37: recon tools were unreachable in every background session
+        because no MCP profile loaded genesis-recon.
+        """
+        from genesis.cc.session_config import _MCP_PROFILES
+
+        assert "genesis-recon" in _MCP_PROFILES["research"]
+
+    def test_research_generates_config_with_recon(self, builder):
+        """research profile should produce health + memory + recon."""
+        import json
+
+        result = builder.build_mcp_config("research")
+        assert result is not None
+        with open(result) as f:
+            config = json.loads(f.read())
+        servers = set(config.get("mcpServers", {}).keys())
+        assert servers == {"genesis-health", "genesis-memory", "genesis-recon"}
+
 
 class TestGroundworkStubs:
     def test_hook_config_returns_none(self, builder):

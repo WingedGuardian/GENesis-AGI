@@ -44,7 +44,7 @@ async def db():
             "  person_id TEXT,"
             "  source TEXT, type TEXT, category TEXT,"
             "  content TEXT, priority TEXT, speculative INTEGER DEFAULT 0,"
-            "  created_at TEXT, expires_at TEXT, content_hash TEXT,"
+            "  created_at TEXT, expires_at TEXT, content_hash TEXT, origin_class TEXT,"
             "  resolved INTEGER DEFAULT 0,"
             "  resolved_at TEXT, resolution_notes TEXT"
             ")"

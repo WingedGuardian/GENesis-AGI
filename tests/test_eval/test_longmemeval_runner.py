@@ -25,12 +25,19 @@ def test_arm_label():
     assert Arm(QueryArm.KEYWORD, rerank=True).label == "keyword+rerank"
 
 
+def test_arm_label_graph_suffix_is_deterministic():
+    # rerank before graph, always — model_profile stability across runs
+    assert Arm(QueryArm.RAW, rerank=False, graph=True).label == "raw+graph"
+    assert Arm(QueryArm.RAW, rerank=True, graph=True).label == "raw+rerank+graph"
+    assert Arm(QueryArm.KEYWORD, rerank=True, graph=True).label == "keyword+rerank+graph"
+
+
 def test_default_arms_are_the_four_combinations():
     labels = {a.label for a in default_arms()}
     assert labels == {"raw", "raw+rerank", "keyword", "keyword+rerank"}
 
 
-def _r(qid, qtype, correct, evidence=True):  # noqa: FBT002
+def _r(qid, qtype, correct, evidence=True, coverage=None):  # noqa: FBT002
     return QuestionArmResult(
         question_id=qid,
         question_type=qtype,
@@ -38,6 +45,7 @@ def _r(qid, qtype, correct, evidence=True):  # noqa: FBT002
         hypothesis="h",
         judged_correct=correct,
         evidence_recalled=evidence,
+        evidence_coverage=coverage,
         judge_raw="yes" if correct else "no",
         input_tokens=10,
         output_tokens=2,
@@ -105,6 +113,131 @@ def test_build_run_summary_empty_results_is_safe():
     )
     assert summary.total_cases == 0
     assert summary.aggregate_score == 0.0
+
+
+def test_build_run_summary_reports_graph_means_when_present():
+    results = [
+        QuestionArmResult(
+            question_id="q1",
+            question_type="multi-session",
+            arm_label="raw+graph",
+            hypothesis="h",
+            judged_correct=True,
+            evidence_recalled=True,
+            evidence_coverage=0.5,
+            evidence_coverage_final=1.0,
+            links_created=6,
+            expanded_ids=("n1", "n2"),
+            judge_raw="yes",
+        ),
+        QuestionArmResult(
+            question_id="q2",
+            question_type="multi-session",
+            arm_label="raw+graph",
+            hypothesis="h",
+            judged_correct=False,
+            evidence_recalled=True,
+            evidence_coverage=1.0,
+            evidence_coverage_final=1.0,
+            links_created=2,
+            expanded_ids=(),
+            judge_raw="no",
+        ),
+    ]
+    summary = build_run_summary(
+        arm_label="raw+graph",
+        model="m",
+        dataset="longmemeval_oracle",
+        results=results,
+    )
+    assert summary.scores["evidence_coverage_final_mean"] == 1.0
+    assert summary.metadata["links_created_mean"] == 4.0
+    assert summary.metadata["expanded_mean"] == 1.0
+
+
+def test_build_run_summary_omits_graph_means_for_baseline_arms():
+    summary = build_run_summary(
+        arm_label="raw",
+        model="m",
+        dataset="longmemeval_oracle",
+        results=[_r("q1", "multi-session", True, coverage=0.5)],
+    )
+    assert "evidence_coverage_final_mean" not in summary.scores
+    assert "links_created_mean" not in summary.metadata
+
+
+def test_build_run_summary_reports_mean_evidence_coverage():
+    # coverage is |evidence ∩ recalled| / |evidence| per question; abstention
+    # questions (no evidence turns) carry None and are EXCLUDED from the mean,
+    # never counted as 0 — they have nothing to cover.
+    results = [
+        _r("q1", "multi-session", True, coverage=1.0),
+        _r("q2", "multi-session", False, coverage=0.5),
+        _r("q3_abs", "single-session-user", True, evidence=False, coverage=None),
+    ]
+    summary = build_run_summary(
+        arm_label="raw",
+        model="m",
+        dataset="longmemeval_oracle",
+        results=results,
+    )
+    assert summary.scores["evidence_coverage_mean"] == 0.75
+
+
+def test_build_run_summary_no_coverage_key_when_all_none():
+    results = [_r("q1_abs", "single-session-user", True, evidence=False, coverage=None)]
+    summary = build_run_summary(
+        arm_label="raw",
+        model="m",
+        dataset="longmemeval_oracle",
+        results=results,
+    )
+    assert "evidence_coverage_mean" not in summary.scores
+
+
+def test_write_dump_jsonl_round_trips_per_question_fields():
+    import json as _json
+
+    from genesis.eval.longmemeval.runner import write_dump_jsonl
+
+    results = [
+        QuestionArmResult(
+            question_id="q1",
+            question_type="temporal-reasoning",
+            arm_label="raw",
+            hypothesis="About six weeks.",
+            judged_correct=True,
+            evidence_recalled=True,
+            evidence_coverage=0.5,
+            query="how many weeks ago did I leave my old job",
+            recalled_ids=("m-1", "m-2"),
+            judge_raw="yes",
+            input_tokens=10,
+            output_tokens=2,
+            latency_ms=12.5,
+        ),
+    ]
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "raw.jsonl"
+        write_dump_jsonl(path, results, skipped_case_ids=["q9"])
+        lines = [_json.loads(line) for line in path.read_text().splitlines()]
+    assert len(lines) == 2
+    rec = lines[0]
+    assert rec["question_id"] == "q1"
+    assert rec["question_type"] == "temporal-reasoning"
+    assert rec["arm"] == "raw"
+    assert rec["query"] == "how many weeks ago did I leave my old job"
+    assert rec["recalled_ids"] == ["m-1", "m-2"]
+    assert rec["evidence_coverage"] == 0.5
+    assert rec["hypothesis"] == "About six weeks."
+    assert rec["judged_correct"] is True
+    assert rec["judge_raw"] == "yes"
+    skip_rec = lines[1]
+    assert skip_rec["question_id"] == "q9"
+    assert skip_rec["skipped"] is True
 
 
 def test_build_run_summary_skipped_do_not_tilt_accuracy():

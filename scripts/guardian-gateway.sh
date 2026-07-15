@@ -18,6 +18,9 @@
 #   test-approval   — E2E test the keyword-reply approval gate (no recovery)
 #   disk-status     — read-only storage-pool + snapshot JSON (Genesis's window
 #                     into host capacity: lvs data%/metadata%, VG free, snapshots)
+#   host-profile    — read-only host body-schema JSON (meminfo/nproc/kernel,
+#                     storage pool, incus version + container limits.*) for the
+#                     container's infra_profile host plane
 #   provision-status          — read-only Proxmox host capacity (audit token)
 #   provision-grow-disk <disk> <GiB> — EXECUTE a pre-approved VM disk grow +
 #                     absorb (execute-only: NO Telegram gate; caller approves)
@@ -808,6 +811,29 @@ PYEOF
         PYTHONPATH="$INSTALL_DIR/src" \
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
             timeout 30 "$VENV_PY" -m genesis.guardian --disk-status
+        ;;
+    host-profile)
+        # Read-only: print the host body-schema JSON (system identity, storage
+        # pool, virtualization stack + this container's limits.*). Consumed by
+        # the container's infra_profile host-plane collector. No mutation, no
+        # secrets, no sudo.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "host-profile", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        # Skew guard: sync-gateway redeploys THIS script independently of the
+        # src tree. An old checkout has no --host-profile branch — the flag
+        # would fall through main()'s if-chain into run_check(), i.e. a FULL
+        # guardian recovery cycle triggered by a routine read-only poll.
+        if [ ! -f "$INSTALL_DIR/src/genesis/guardian/host_profile.py" ]; then
+            echo '{"ok": false, "action": "host-profile", "error": "guardian src predates host-profile — run update to redeploy"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+            timeout 45 "$VENV_PY" -m genesis.guardian --host-profile
         ;;
     provision-status)
         # Read-only host capacity via the Proxmox AUDIT token (VM cores/RAM,

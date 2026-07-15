@@ -33,6 +33,35 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="results DB (default: production genesis.db); a fresh path is migrated",
     )
+    p.add_argument(
+        "--types",
+        default=None,
+        help="comma-separated question types to run (filtered before --limit)",
+    )
+    p.add_argument(
+        "--dump-dir",
+        type=Path,
+        default=None,
+        help="write per-question diagnostics (one <arm>.jsonl per arm) here",
+    )
+    p.add_argument(
+        "--graph",
+        action="store_true",
+        help="ADD a +graph variant of every selected arm (linked store + 1-hop expansion)",
+    )
+    p.add_argument(
+        "--graph-link-threshold",
+        type=float,
+        default=None,
+        help="cosine threshold for auto-linking on the graph arm's store "
+        "(default: the prod linker default, 0.75)",
+    )
+    p.add_argument(
+        "--arms",
+        default=None,
+        help="comma-separated arm labels to run (filters the selected "
+        "universe, e.g. --graph --arms raw,raw+graph); unknown labels error",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -52,6 +81,11 @@ def main(argv: list[str] | None = None) -> int:
             no_rerank=args.no_rerank,
             persist=not args.no_persist,
             db_path=args.db_path,
+            types=args.types,
+            dump_dir=args.dump_dir,
+            graph=args.graph,
+            graph_link_threshold=args.graph_link_threshold,
+            arms_only=args.arms,
         ),
     )
     print_report(summaries)

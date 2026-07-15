@@ -67,8 +67,9 @@ CRITICAL_CALL_SITES: frozenset[str] = frozenset(
         # moved to ephemeral sessions (ego/compaction.py: "no LLM compaction";
         # its call_site_id arg is a legacy-ignored param), so that site never
         # routes and never records a last_run row — a dead id in a red set would
-        # be misleading. (essential.py + _call_site_meta.py still mark it LIVE;
-        # pre-existing staleness, tracked as a separate follow-up.)
+        # be misleading. (8_ego_compaction + 7_ego_cycle were removed from
+        # model_routing.yaml + ESSENTIAL_CLOUD_SITES and marked DEPRECATED_REMOVED
+        # in _call_site_meta.py on 2026-07-13.)
         "7_genesis_ego_cycle",
         "7_user_ego_cycle",
         "40_ego_focus_selection",

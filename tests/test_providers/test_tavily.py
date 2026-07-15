@@ -143,3 +143,45 @@ class TestInvoke:
 
         assert isinstance(result, ProviderResult)
         assert result.success is False
+
+
+class TestSearch:
+    @pytest.mark.asyncio
+    async def test_search_returns_searchresults(self, adapter):
+        from genesis.research.types import SearchResult
+
+        mock_response = {
+            "query": "q",
+            "results": [
+                {"title": "T1", "url": "https://a.com", "content": "snippet one", "score": 0.9},
+                {"title": "T2", "url": "https://b.com", "content": "snippet two", "score": 0.5},
+            ],
+            "answer": "ans",
+        }
+        mock_client = AsyncMock()
+        mock_client.search = AsyncMock(return_value=mock_response)
+        with patch.dict("os.environ", ENV), \
+             patch("tavily.AsyncTavilyClient", return_value=mock_client):
+            results = await adapter.search("q", max_results=5)
+
+        assert all(isinstance(r, SearchResult) for r in results)
+        assert [r.url for r in results] == ["https://a.com", "https://b.com"]
+        assert results[0].title == "T1"
+        assert results[0].snippet == "snippet one"
+        assert results[0].source == "tavily"
+        assert results[0].score == 0.9
+
+    @pytest.mark.asyncio
+    async def test_search_passes_max_results(self, adapter):
+        mock_client = AsyncMock()
+        mock_client.search = AsyncMock(return_value={"results": []})
+        with patch.dict("os.environ", ENV), \
+             patch("tavily.AsyncTavilyClient", return_value=mock_client):
+            await adapter.search("q", max_results=8)
+        assert mock_client.search.call_args.kwargs["max_results"] == 8
+
+    @pytest.mark.asyncio
+    async def test_search_empty_on_missing_key(self, adapter):
+        with patch.dict("os.environ", {}, clear=True):
+            results = await adapter.search("q")
+        assert results == []

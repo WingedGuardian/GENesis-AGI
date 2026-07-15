@@ -23,6 +23,7 @@ async def _build_db(path: str) -> aiosqlite.Connection:
             valid_at TEXT,
             invalid_at TEXT,
             source_subsystem TEXT,
+            origin_class TEXT,
             deprecated INTEGER NOT NULL DEFAULT 0,
             dream_cycle_run_id TEXT
         )

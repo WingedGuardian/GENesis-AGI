@@ -673,7 +673,13 @@ async def init(rt: GenesisRuntime) -> None:
 
         async def _evolve_user_model() -> None:
             try:
-                result = await user_model_evolver.process_pending_deltas()
+                # WS-3 gate-2: collect the ids of deltas accepted THIS run so
+                # the identity-write emit below can aggregate their stored
+                # origin_class instead of hardcoding first_party.
+                accepted_delta_ids: list[str] = []
+                result = await user_model_evolver.process_pending_deltas(
+                    accepted_ids_out=accepted_delta_ids,
+                )
                 if result:
                     logger.info(
                         "User model evolved to v%d (%d evidence)",
@@ -720,28 +726,49 @@ async def init(rt: GenesisRuntime) -> None:
                                 evidence_count=result.evidence_count,
                                 narrative=narrative,
                             )
-                            # WS-3 B1 gate-2 (identity): shadow-record the
-                            # USER_KNOWLEDGE write. first_party BY AUTHORSHIP
-                            # (Genesis's own reflection-derived user-model
-                            # deltas) -> self-guards to NO row today. FLIP
-                            # BLOCKER (do not enforce past this): observation
-                            # rows carry no origin_class, so externally-planted
-                            # "facts about the user" in reflected transcripts
-                            # remain first_party until delta-level provenance
-                            # lands. Counts only, never content.
+                            # WS-3 gate-2 (identity): shadow-record the
+                            # USER_KNOWLEDGE write with REAL provenance — the
+                            # aggregate of the accepted deltas' stored
+                            # origin_class (run-level; stamped by the
+                            # reflection writers from the session-window
+                            # aggregate). External iff ANY contributing delta
+                            # is external. NULL/legacy deltas read as
+                            # first_party — pre-substrate rows must not
+                            # manufacture signal. Counts only, never content.
+                            # Gate-2 stays SHADOW: this substrate needs real
+                            # bake time before any enforce discussion.
                             from genesis.security import immunity_shadow
 
+                            ext_deltas = 0
+                            if accepted_delta_ids:
+                                try:
+                                    from genesis.db.crud import (
+                                        observations as obs_crud,
+                                    )
+
+                                    ext_deltas = await obs_crud.count_external_by_ids(
+                                        rt._db, accepted_delta_ids
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "gate-2 delta origin aggregate failed",
+                                        exc_info=True,
+                                    )
                             await immunity_shadow.record_would_block(
                                 gate="identity",
                                 source_kind="identity_write",
                                 source_ref=("runtime/init/learning.py::_evolve_user_model"),
                                 process="server",
-                                blockable_count=1,
-                                origin_class="first_party",
+                                blockable_count=max(ext_deltas, 1),
+                                origin_class=(
+                                    "external_untrusted" if ext_deltas else "first_party"
+                                ),
                                 db=rt._db,
                                 detail={
                                     "mode": "narrative" if narrative else "rules",
                                     "evidence_count": result.evidence_count,
+                                    "accepted_deltas": len(accepted_delta_ids),
+                                    "external_deltas": ext_deltas,
                                 },
                             )
                             try:

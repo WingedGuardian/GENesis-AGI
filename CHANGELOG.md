@@ -25,6 +25,76 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reattachable session instead of an orphan (opt out:
   `GENESIS_NO_TMUX_WRAP=1`).
 
+- **Benchmark runs can now select exactly the arms they pay for.** The
+  LongMemEval harness gained `--arms` (comma-separated labels, e.g.
+  `--graph --arms raw,raw+graph`), so a paired baseline-vs-graph comparison
+  no longer forces the full four-arm spend. Unknown labels fail fast with
+  the selectable universe listed — a paid run never silently widens.
+
+- **The CC Sessions card now tells the truth, and clicking it shows why.**
+  The dashboard card used to show a DB-side "active" count that routinely
+  disagreed with the processes actually running, plus a bare "3/20" that
+  looked like a session count but was really the hourly rate budget. The card
+  now shows both counts side by side ("N live / M db", amber when they
+  diverge), labels the budget as a budget, and opens a per-session modal:
+  every session from the last 24 hours with its live process (slot, pid,
+  memory), its charter (mission, compactions, open ledger items), and
+  explicit badges wherever the database and reality disagree — including
+  live processes with no session row at all.
+
+### Fixed
+
+- **Code-intelligence indexing can no longer storm the machine.** Keeping the
+  code graph fresh used to fire a full reindex on every commit, in the
+  background, with no coordination — and if disk cleanup had reclaimed the index
+  first, each "quick refresh" was secretly a full rebuild from scratch. Enough
+  of them at once saturated disk I/O and dragged the whole box to a crawl. Three
+  changes fix this at the root: (1) disk cleanup no longer deletes the code
+  index except as a genuine last resort (very low free space), so refreshes stay
+  incremental; (2) commits and setup now *queue* an index request instead of
+  spawning one — a small idle-gated job does the work only when the machine is
+  quiet, one at a time; and (3) whatever does run is watched live and
+  automatically paused when the system gets busy, so an index can never hold the
+  box hostage. Routine refreshes are now the cheap "fast" pass, with the full
+  pass reserved for a weekly idle window. Also fixes a latent bug where the
+  GitNexus refresh had been silently failing on every run due to an unsupported
+  flag.
+
+### Added
+
+- **Sessions now keep a durable TODO ledger that survives compaction.** An
+  agreement made mid-session ("yes, do that") used to live only in
+  conversation — one compaction summary could quietly drop it. Sessions can
+  now record agreements as ledger items the moment they happen; open items
+  re-inject into every post-compaction window (with a per-turn
+  `[Charter: … | open: N]` tag showing drift at a glance) until they're
+  closed as done, absorbed elsewhere, or consciously dropped. Charters — the
+  session's origin, a living mission line, and pointers to its governing
+  docs — moved from per-session JSON files into the database so all of this
+  is queryable; the human-readable `charter.md` mirror stays.
+
+- **The memory benchmark can now measure whether Genesis's memory graph
+  actually helps.** A new `--graph` mode runs every benchmark arm twice — once
+  against a plain store and once against a store where memories link to
+  similar earlier memories exactly as they do in production — and follows
+  those links at recall time to pull in related memories the search itself
+  missed. Baseline and graph runs use fully separate stores, so the
+  comparison is honest (links can't quietly tint the baseline's ranking). Per
+  question, the results record how many links formed and how much extra gold
+  evidence the graph surfaced, and a graph run that formed no links says so
+  loudly instead of silently matching its baseline. The memory linker's
+  similarity threshold is also now configurable per instance instead of fixed.
+
+- **The memory benchmark now grades temporal questions fairly and explains
+  its misses.** The LongMemEval reader gets the question's date (the
+  benchmark's own convention — without it, "how many weeks ago…" questions
+  were unanswerable by construction), so temporal scores now measure memory,
+  not a missing calendar. New `--dump-dir` writes per-question diagnostics
+  (query, recalled memories, answer, verdict) for failure analysis, a new
+  evidence-coverage metric shows *how much* of the gold evidence was
+  retrieved (not just whether any was), and `--types` runs a single question
+  category — so a targeted slice no longer costs a full 500-question run.
+
 - **Claude Code sessions no longer forget what they were started for.** Long
   sessions compact their context many times, and each summary is biased toward
   recent work — after enough compactions a session can no longer connect
@@ -228,6 +298,25 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Background research sessions can now reach Genesis's discovery tools, and the
+  session queue no longer strands work after a restart.** Research-profile
+  background sessions were silently cut off from the recon tools (GitHub and
+  model-intelligence discovery, skill scanning, findings storage) — the discovery
+  engine they exist to drive — so a research session could investigate but never
+  record what it found there; they now load those tools. Separately, if a queued
+  background session was claimed moments before a restart, it could sit stuck
+  indefinitely; the queue now re-checks for stranded claims periodically, not just
+  once at boot. Two smaller hardening fixes ride along: read-only background
+  profiles can no longer edit follow-ups (only *create* was blocked before), and
+  the executor's plan reviewer no longer suppresses a genuine gap when a task's
+  requirements explicitly call for a specific timeout/retry/escalation behavior.
+- **The neural monitor's Ego panel now shows real ego activity, not phantom tiles.**
+  The dashboard was rendering a few "ego" tiles that looked healthy but never
+  actually ran — leftovers from an earlier ego redesign that split the ego into
+  two cycles and made its compaction step non-LLM. They're gone, the Ego panel now
+  lists the three live ego call sites, and a couple of other stale tiles (triage,
+  bookmark enrichment) were removed too. A months-old leftover activity record can
+  no longer resurrect a removed tile as if it were live.
 - **Memories recovered after an embedding outage keep their wing/room/life_domain
   filters, and keyword-only results are no longer ranked as artificially fresh.**
   When the embedding provider was down, memories were stored keyword-only and

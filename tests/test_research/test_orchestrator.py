@@ -1,6 +1,7 @@
 """Tests for genesis.research.orchestrator."""
 
-from unittest.mock import AsyncMock
+import os
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -108,6 +109,45 @@ class TestOrchestrator:
         orch = ResearchOrchestrator(registry=reg)
         res = await orch.search("test", max_results=5)
         assert len(res.results) == 5
+
+    @pytest.mark.asyncio
+    async def test_real_adapters_surface_through_search(self):
+        """Regression: TavilyAdapter/ExaAdapter expose only invoke() returning a
+        DICT; before search() existed the orchestrator's isinstance(...,list)
+        guard silently dropped them (research ran with fewer sources). With
+        search() their results must flow through and dedup by URL."""
+        pytest.importorskip("tavily")
+        pytest.importorskip("exa_py")
+        from genesis.providers.exa_adapter import ExaAdapter
+        from genesis.providers.tavily_adapter import TavilyAdapter
+
+        tav_resp = {
+            "query": "q",
+            "results": [{"title": "TV", "url": "https://tav.com", "content": "c", "score": 0.7}],
+        }
+        tav_client = AsyncMock()
+        tav_client.search = AsyncMock(return_value=tav_resp)
+
+        exa_r = MagicMock(url="https://exa.com", title="EX", score=0.6, text="t", highlights=[])
+        exa_client = AsyncMock()
+        exa_client.search = AsyncMock(return_value=MagicMock(results=[exa_r]))
+
+        reg = ProviderRegistry()
+        reg.register(TavilyAdapter())
+        reg.register(ExaAdapter())
+        orch = ResearchOrchestrator(registry=reg)
+
+        with (
+            patch.dict(os.environ, {"API_KEY_TAVILY": "k", "API_KEY_EXA": "k"}),
+            patch("tavily.AsyncTavilyClient", return_value=tav_client),
+            patch("exa_py.AsyncExa", return_value=exa_client),
+        ):
+            res = await orch.search("q")
+
+        urls = {r.url for r in res.results}
+        # exact set equality (not substring `in`) — both providers surface, deduped
+        assert urls == {"https://tav.com", "https://exa.com"}
+        assert {"tavily", "exa"} <= set(res.sources_queried)
 
     @pytest.mark.asyncio
     async def test_search_and_synthesize_returns_results(self):

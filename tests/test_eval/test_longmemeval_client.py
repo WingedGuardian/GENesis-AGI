@@ -66,3 +66,19 @@ def test_candidate_secret_paths_includes_maintree_fallback():
 
     paths = client_mod._candidate_secret_paths()
     assert Path.home() / "genesis" / "secrets.env" in paths
+
+
+def test_require_results_db_fails_fast_on_missing_db(tmp_path):
+    """A missing default results DB must fail BEFORE the paid run — get_db
+    would silently create a fresh DB lacking eval_runs (migration-only) and
+    the benchmark would crash at persistence after burning its API spend."""
+    import pytest
+
+    from genesis.eval.longmemeval.cli import require_results_db
+
+    existing = tmp_path / "genesis.db"
+    existing.touch()
+    assert require_results_db(existing) == existing
+
+    with pytest.raises(RuntimeError, match="GENESIS_REPO_ROOT"):
+        require_results_db(tmp_path / "nope" / "genesis.db")

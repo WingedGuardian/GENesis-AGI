@@ -1660,3 +1660,81 @@ async def test_reference_store_forwards_session_origin(monkeypatch):
         assert captured["origin_class"] == "external_untrusted"
     finally:
         mod._store, mod._db, mod._qdrant, mod._retriever = old
+
+
+# ─── WS-3 B4: memory_core_facts wraps stored-external items + emits gate 4 ───
+
+
+async def test_memory_core_facts_wraps_external_and_emits(monkeypatch):
+    """core_facts scrolls episodic directly (bypasses HybridRetriever); B4
+    gates it: stored-external items are wrapped and shadow-recorded, first
+    party items untouched. Shadow-only — nothing is excluded."""
+    from types import SimpleNamespace
+
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+    from genesis.security import immunity_shadow
+
+    def _point(mid, origin_class, content):
+        payload = {
+            "content": content,
+            "source": "test",
+            "confidence": 0.9,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "retrieved_count": 1,
+            "memory_class": "fact",
+            "wing": "",
+            "room": "",
+            "source_pipeline": "conversation",
+        }
+        if origin_class is not None:
+            payload["origin_class"] = origin_class
+        return SimpleNamespace(id=mid, payload=payload)
+
+    emit = AsyncMock()
+    monkeypatch.setattr(immunity_shadow, "record_would_block", emit)
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        real_db.row_factory = aiosqlite.Row
+        from genesis.db.schema import create_all_tables
+        await create_all_tables(real_db)
+        await real_db.commit()
+
+        qdrant = MagicMock()
+        qdrant.scroll.return_value = (
+            [
+                _point("ext-1", "external_untrusted", "poisoned external text"),
+                _point("fp-1", "first_party", "own first party text"),
+                _point("old-1", None, "pre-0054 row with no stored class"),
+            ],
+            None,
+        )
+        qdrant.retrieve.return_value = []  # skip the retrieved_count writeback
+
+        old = (mod._store, mod._db, mod._qdrant, mod._retriever)
+        try:
+            mod._store = MagicMock()
+            mod._db = real_db
+            mod._qdrant = qdrant
+            mod._retriever = MagicMock()
+
+            tools = await _get_tools()
+            results = await tools["memory_core_facts"].fn(limit=10)
+        finally:
+            mod._store, mod._db, mod._qdrant, mod._retriever = old
+
+    by_id = {r["memory_id"]: r for r in results}
+    assert "<external-content" in by_id["ext-1"]["content"]
+    assert "poisoned external text" in by_id["ext-1"]["content"]
+    assert by_id["fp-1"]["content"] == "own first party text"
+    # No stored class + episodic collection -> fallback says not blockable.
+    assert by_id["old-1"]["content"] == "pre-0054 row with no stored class"
+    # Provenance rides the output dicts.
+    assert by_id["ext-1"]["origin_class"] == "external_untrusted"
+
+    emit.assert_awaited_once()
+    kwargs = emit.await_args.kwargs
+    assert kwargs["gate"] == "injection"
+    assert kwargs["source_ref"] == "mcp/memory/core.py::memory_core_facts"
+    assert kwargs["blockable_count"] == 1
