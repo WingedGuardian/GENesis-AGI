@@ -74,6 +74,20 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         needs_restart=False,  # read live per-call by genesis.security.immunity
         hidden_fields=frozenset({"auto_demote_state"}),
     ),
+    "memory_recall": SettingsDomain(
+        name="memory_recall",
+        description=(
+            "Memory recall wiring — 1-hop graph expansion over memory_links "
+            "(`graph_expansion.mode` off/shadow/live + neighbor caps) and the "
+            "entity lane (PR-2, off/shadow for now). Read live per recall by "
+            "genesis.memory.graph_expansion (no restart); shadow only emits "
+            "eval_events metrics, live appends linked neighbors after the "
+            "organic results."
+        ),
+        config_filename="memory_recall.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per-call by genesis.memory.graph_expansion
+    ),
     "session_ledger_shadow": SettingsDomain(
         name="session_ledger_shadow",
         description=(
@@ -764,15 +778,66 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
             if not isinstance(value, bool):
                 errors.append("'enabled' must be a boolean")
         elif value not in MODES:
-            errors.append(
-                f"'mode' must be one of {', '.join(MODES)}; got {value!r}"
-            )
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
+def _validate_memory_recall(changes: dict) -> list[str]:
+    """Validate memory_recall changes (see genesis.memory.graph_expansion).
+
+    Rejects anything ``load_recall_config`` would misread so a
+    ``settings_update`` can never land a config that only degrades-with-
+    warning at recall time. ``entity_lane.mode`` accepts off/shadow only —
+    ``live`` is reserved until the lane's live path ships (PR-2 flip
+    criteria) — while ``graph_expansion.mode`` accepts the full
+    ``graph_expansion.MODES``.
+    """
+    from genesis.memory.graph_expansion import MODES
+
+    errors: list[str] = []
+    _CAPS = ("max_neighbors", "proactive_max_neighbors")
+    section_modes = {
+        "graph_expansion": MODES,
+        "entity_lane": ("off", "shadow"),
+    }
+    for key, value in changes.items():
+        if key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key in section_modes:
+            if not isinstance(value, dict):
+                errors.append(f"'{key}' must be a mapping like {{mode: shadow}}")
+                continue
+            allowed = section_modes[key]
+            for sub_key, sub_value in value.items():
+                if sub_key == "mode":
+                    if sub_value not in allowed:
+                        errors.append(
+                            f"'{key}.mode' must be one of {', '.join(allowed)}; got {sub_value!r}"
+                        )
+                elif sub_key in _CAPS and key == "graph_expansion":
+                    if (
+                        not isinstance(sub_value, int)
+                        or isinstance(sub_value, bool)  # bool ⊂ int
+                        or not (0 <= sub_value <= 25)
+                    ):
+                        errors.append(f"'{key}.{sub_key}' must be an int in 0..25")
+                elif sub_key == "exclude_link_types" and key == "graph_expansion":
+                    if not isinstance(sub_value, list) or not all(
+                        isinstance(t, str) for t in sub_value
+                    ):
+                        errors.append(f"'{key}.exclude_link_types' must be a list of strings")
+                else:
+                    errors.append(f"Unknown key '{key}.{sub_key}'")
+        else:
+            errors.append(f"Unknown key '{key}'. Valid: enabled, graph_expansion, entity_lane")
     return errors
 
 
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "tts": _validate_tts,
     "ws3_immunity": _validate_ws3_immunity,
+    "memory_recall": _validate_memory_recall,
     "session_ledger_shadow": _validate_session_ledger_shadow,
     "cc_roster": _validate_cc_roster,
     "resilience": _validate_resilience,
