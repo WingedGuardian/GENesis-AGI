@@ -217,6 +217,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="cosine threshold for auto-linking on the graph arm's store "
         "(default: the prod linker default, 0.75)",
     )
+    lme_cmd.add_argument(
+        "--arms", default=None,
+        help="comma-separated arm labels to run (filters the selected "
+        "universe, e.g. --graph --arms raw,raw+graph); unknown labels error",
+    )
 
     eval_cmd.set_defaults(func=_run_eval_cli)
 
@@ -285,6 +290,7 @@ async def _cmd_longmemeval(args: argparse.Namespace) -> int:
         dump_dir=Path(args.dump_dir) if args.dump_dir else None,
         graph=args.graph,
         graph_link_threshold=args.graph_link_threshold,
+        arms_only=args.arms,
     )
     print_report(summaries)
     return 0

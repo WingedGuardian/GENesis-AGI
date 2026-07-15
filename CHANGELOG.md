@@ -11,6 +11,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Benchmark runs can now select exactly the arms they pay for.** The
+  LongMemEval harness gained `--arms` (comma-separated labels, e.g.
+  `--graph --arms raw,raw+graph`), so a paired baseline-vs-graph comparison
+  no longer forces the full four-arm spend. Unknown labels fail fast with
+  the selectable universe listed — a paid run never silently widens.
+
 - **The CC Sessions card now tells the truth, and clicking it shows why.**
   The dashboard card used to show a DB-side "active" count that routinely
   disagreed with the processes actually running, plus a bare "3/20" that

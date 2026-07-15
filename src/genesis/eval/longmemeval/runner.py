@@ -108,6 +108,26 @@ def select_arms(*, no_rerank: bool = False, graph: bool = False) -> list[Arm]:
     return arms
 
 
+def filter_arms(arms: list[Arm], only: str) -> list[Arm]:
+    """Keep only the arms whose label appears in the CSV ``only``.
+
+    Filters the already-selected universe (``select_arms`` output), preserving
+    its order. Raises ``ValueError`` on labels outside that universe (e.g. a
+    ``+graph`` label without ``--graph``) and on an empty selection — a paid
+    run must never silently fall back to more arms than asked for.
+    """
+    wanted = {label.strip() for label in only.split(",") if label.strip()}
+    if not wanted:
+        msg = "no arms selected: --arms was empty"
+        raise ValueError(msg)
+    available = [a.label for a in arms]
+    unknown = sorted(wanted - set(available))
+    if unknown:
+        msg = f"unknown arm labels {unknown}; selectable here: {available}"
+        raise ValueError(msg)
+    return [a for a in arms if a.label in wanted]
+
+
 @dataclass(frozen=True)
 class QuestionArmResult:
     question_id: str

@@ -56,6 +56,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="cosine threshold for auto-linking on the graph arm's store "
         "(default: the prod linker default, 0.75)",
     )
+    p.add_argument(
+        "--arms",
+        default=None,
+        help="comma-separated arm labels to run (filters the selected "
+        "universe, e.g. --graph --arms raw,raw+graph); unknown labels error",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -79,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
             dump_dir=args.dump_dir,
             graph=args.graph,
             graph_link_threshold=args.graph_link_threshold,
+            arms_only=args.arms,
         ),
     )
     print_report(summaries)

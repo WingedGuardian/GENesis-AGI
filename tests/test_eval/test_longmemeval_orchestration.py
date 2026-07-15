@@ -282,6 +282,27 @@ def test_select_arms_composition():
     assert len(select_arms(graph=True)) == 8
 
 
+def test_filter_arms_selects_by_label_preserving_order():
+    from genesis.eval.longmemeval.runner import filter_arms, select_arms
+
+    arms = select_arms(no_rerank=True, graph=True)
+    picked = filter_arms(arms, "raw,raw+graph")
+    assert [a.label for a in picked] == ["raw", "raw+graph"]
+    # whitespace tolerated; output keeps the arm-universe order, not CSV order
+    assert [a.label for a in filter_arms(arms, " keyword , raw ")] == ["raw", "keyword"]
+
+
+def test_filter_arms_rejects_unknown_and_empty():
+    from genesis.eval.longmemeval.runner import filter_arms, select_arms
+
+    arms = select_arms(no_rerank=True)  # raw, keyword only
+    # unknown label names the selectable universe (raw+graph needs --graph)
+    with pytest.raises(ValueError, match="raw\\+graph"):
+        filter_arms(arms, "raw+graph")
+    with pytest.raises(ValueError, match="no arms selected"):
+        filter_arms(arms, " , ")
+
+
 @pytest.mark.asyncio
 async def test_duplicate_arm_labels_rejected():
     with pytest.raises(ValueError, match="duplicate arm labels"):
