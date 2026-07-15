@@ -184,6 +184,22 @@ async def test_runner_skips_operator_gated(db, monkeypatch):
     assert await crud.get_status(db, "d0002") == "operator_pending"
 
 
+async def test_runner_rejects_duplicate_prefix(db, monkeypatch):
+    # Two files sharing d0001 would silently drop the second (INSERT OR IGNORE
+    # + completed-skip) — the runner must raise loudly instead.
+    from pathlib import Path
+
+    available = [
+        ("d0001", "d0001_a", Path("/fake/d0001_a.py")),
+        ("d0001", "d0001_b", Path("/fake/d0001_b.py")),
+    ]
+    monkeypatch.setattr(DataMigrationRunner, "_discover", lambda self: available)
+    with pytest.raises(RuntimeError, match="Duplicate data-migration prefix 'd0001'"):
+        await DataMigrationRunner(db).run_pending()
+    # run_data_migrations swallows it (never aborts boot) but logs.
+    assert await runner_mod.run_data_migrations(db) == []
+
+
 async def test_runner_redispatches_orphaned_running(db, monkeypatch):
     # A row left 'running' by a crashed prior boot must re-run.
     await crud.ensure_row(db, id="d0001", name="d0001_x", requires_operator=False)

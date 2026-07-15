@@ -43,6 +43,21 @@ class DataMigrationRunner:
         task) and never blocks the others."""
         available = self._discover()
 
+        # Pre-flight: two files sharing a dNNNN prefix would collide on the
+        # ledger PRIMARY KEY. Unlike the schema runner (whose plain INSERT
+        # surfaces the clash as a UNIQUE error mid-run), our ensure_row uses
+        # INSERT OR IGNORE, so a collision would SILENTLY drop the second
+        # migration forever (its id is marked completed by the first). Catch it
+        # loudly here instead. Mirrors db/migrations/runner.py's guard.
+        seen: dict[str, str] = {}
+        for mid, name, _path in available:
+            if mid in seen:
+                raise RuntimeError(
+                    f"Duplicate data-migration prefix '{mid}': '{seen[mid]}' and "
+                    f"'{name}'. Rename one to the next free prefix."
+                )
+            seen[mid] = name
+
         # Register any new migrations, then re-dispatch orphaned 'running' rows
         # (crash mid-run) before claiming — both idempotent.
         for mid, name, path in available:
