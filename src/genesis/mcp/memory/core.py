@@ -380,10 +380,13 @@ async def memory_recall(
                 "source_pipeline": r.source_pipeline or "",
                 # Provenance (audit D12): first-party memory vs external-world KB,
                 # so the model never treats ingested content as its own truth.
+                # Honors STORED origin so an external episodic preview is not
+                # labeled first-party.
                 "provenance": provenance_descriptor(
                     collection=r.collection,
                     source_pipeline=r.source_pipeline,
                     source_doc=r.source,
+                    origin_class=r.origin_class,
                 ),
             }
             for r in results
@@ -443,21 +446,28 @@ async def memory_recall(
     # output contract is uniform.
     label_result_dicts(enriched, default_collection="episodic_memory")
     # Injection defense (PR2): structurally delimit external-world content so
-    # the model treats it as data, not first-party instructions. Gate on the
-    # post-label collection so CRAG web-fallback items are covered too.
+    # the model treats it as data, not first-party instructions. Wrap keys on
+    # STORED origin first (an episodic item whose stored origin_class is
+    # external_untrusted must be wrapped too — collection alone misses it),
+    # falling back to the post-label collection so CRAG web-fallback items
+    # stay covered. The wrap is the compensating control on this explicit
+    # surface in every mode, enforce included.
     blockable = 0
     for d in enriched:
-        if isinstance(d, dict) and is_external(d.get("collection")):
+        if not isinstance(d, dict):
+            continue
+        _blockable = immunity_shadow.item_is_blockable(
+            collection=d.get("collection"),
+            source_pipeline=d.get("source_pipeline"),
+            origin_class=d.get("origin_class"),
+        )
+        if _blockable or is_external(d.get("collection")):
             d["content"] = wrap_external_recall(
                 d.get("content", ""),
                 source_pipeline=d.get("source_pipeline"),
             )
-            if immunity_shadow.item_is_blockable(
-                collection=d.get("collection"),
-                source_pipeline=d.get("source_pipeline"),
-                origin_class=d.get("origin_class"),
-            ):
-                blockable += 1
+        if _blockable:
+            blockable += 1
     # WS-3 B1 gate 4 (injection): shadow-record that external content reached
     # this action-capable prompt (observe-only — the item still reaches the model).
     await immunity_shadow.record_would_block(
@@ -575,11 +585,27 @@ async def memory_expand(
         except Exception:
             logger.debug("eval: recall_used emit failed", exc_info=True)
 
+    # Stored-origin enrichment (same stale-payload case as memory_core_facts):
+    # expand bypasses HybridRetriever, so a point whose Qdrant payload predates
+    # the origin_class backfill would wrap/label/count from None — recover the
+    # SQLite value first. Best-effort (fail-open, gate posture).
+    _no_origin = [str(p.id) for p in points if (p.payload or {}).get("origin_class") is None]
+    _origin_fill: dict[str, str | None] = {}
+    if _no_origin:
+        try:
+            from genesis.db.crud import memory as memory_crud
+
+            _origin_fill = await memory_crud.origin_class_by_ids(memory_mod._db, _no_origin)
+        except Exception:
+            logger.debug("memory_expand origin enrichment failed", exc_info=True)
+
     results = []
     blockable = 0
     for point in points:
         mid = str(point.id)
         payload = point.payload or {}
+        if payload.get("origin_class") is None and _origin_fill.get(mid):
+            payload["origin_class"] = _origin_fill[mid]
         _collection = point_collection.get(mid, "episodic_memory")
 
         d = {
@@ -595,28 +621,34 @@ async def memory_expand(
             "source_pipeline": payload.get("source_pipeline", ""),
             "source_session_id": payload.get("source_session_id"),
             "created_at": payload.get("created_at"),
-            # Provenance (audit D12): first-party memory vs external-world KB.
+            # Provenance (audit D12): first-party memory vs external-world KB,
+            # honoring STORED origin so external episodic rows don't read as
+            # first-party.
             "collection": _collection,
+            "origin_class": payload.get("origin_class"),
             "provenance": provenance_descriptor(
                 collection=_collection,
                 source_pipeline=payload.get("source_pipeline"),
                 source_doc=payload.get("source"),
+                origin_class=payload.get("origin_class"),
             ),
         }
 
         # Injection defense (PR2): wrap full external-world content pulled into
-        # context after a compact recall (the real full-payload surface).
-        if is_external(_collection):
+        # context after a compact recall (the real full-payload surface). Keys
+        # on STORED origin first — collection alone misses external episodic.
+        _blockable = immunity_shadow.item_is_blockable(
+            collection=_collection,
+            source_pipeline=payload.get("source_pipeline"),
+            origin_class=payload.get("origin_class"),
+        )
+        if _blockable or is_external(_collection):
             d["content"] = wrap_external_recall(
                 d["content"],
                 source_pipeline=payload.get("source_pipeline"),
             )
-            if immunity_shadow.item_is_blockable(
-                collection=_collection,
-                source_pipeline=payload.get("source_pipeline"),
-                origin_class=payload.get("origin_class"),
-            ):
-                blockable += 1
+        if _blockable:
+            blockable += 1
 
         # Graph enrichment
         try:
@@ -751,41 +783,87 @@ async def memory_proactive(
     # min_activation=0.0: use activation as a ranking signal, not a filter gate.
     # With confidence=0.5 (96% of memories) and retrieved_count=0 (80%),
     # even day-old memories fail a 0.3 threshold. Let RRF fusion rank instead.
+    _unsupervised = immunity_shadow.is_dispatched_session_env()
+    # skip_writeback: an item the enforce branch below will DROP must not gain
+    # retrieved_count/activation credit from this recall — otherwise blocked
+    # external content farms ranking energy from every dispatched session that
+    # matches it while never being delivered (Codex #1048 P2). Same predicate
+    # as the drop loop; fail-open (predicate error -> normal write-backs).
     results = await memory_mod._retriever.recall(
-        current_message, limit=limit * 2, min_activation=0.0, rerank=False
+        current_message,
+        limit=limit * 2,
+        min_activation=0.0,
+        rerank=False,
+        skip_writeback=lambda r: immunity_shadow.should_enforce_drop(
+            gate="injection",
+            collection=r.collection,
+            source_pipeline=r.source_pipeline,
+            origin_class=r.origin_class,
+            pushed_surface=True,
+            unsupervised=_unsupervised,
+        ),
     )
-    filtered = [r for r in results if "memory_operation" not in (r.payload.get("tags") or [])][
-        :limit
-    ]
+    # Keep the full candidate pool (recall fetched limit*2) UNSLICED — the
+    # enforce drop below removes items, and slicing to `limit` first would
+    # leave the result underfilled when the top slice is blockable-external
+    # while safe candidates sit just past it (Codex #1048 P2). We take the
+    # final `limit` AFTER dropping, backfilling from the deeper pool.
+    filtered = [r for r in results if "memory_operation" not in (r.payload.get("tags") or [])]
     # Injection defense (PR2): recall defaults to source="both", so KB content
     # can appear here and flow straight into prompt context — wrap external-world
     # items so the model treats them as data, not first-party instructions.
     out: list[dict] = []
     blockable = 0
+    dropped = 0
     for r in filtered:
+        if len(out) >= limit:
+            break
         d = asdict(r)
-        if is_external(r.collection):
+        # WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): memory_proactive is a
+        # query-less ambient feed — in a DISPATCHED session under enforce,
+        # blockable stored-external items are DROPPED (not returned at all).
+        # The emit below still records them: the enforce-mode row IS the
+        # block ledger. Foreground and shadow mode keep wrap-and-return.
+        if immunity_shadow.should_enforce_drop(
+            gate="injection",
+            collection=r.collection,
+            source_pipeline=r.source_pipeline,
+            origin_class=r.origin_class,
+            pushed_surface=True,
+            unsupervised=_unsupervised,
+        ):
+            dropped += 1
+            continue
+        # Kept items (shadow mode / foreground): wrap keys on STORED origin
+        # first — a kept external episodic row must stay delimited + counted,
+        # not just knowledge_base hits (Codex P1).
+        _blockable = immunity_shadow.item_is_blockable(
+            collection=r.collection,
+            source_pipeline=r.source_pipeline,
+            origin_class=r.origin_class,
+        )
+        if _blockable or is_external(r.collection):
             d["content"] = wrap_external_recall(
                 d.get("content", ""),
                 source_pipeline=r.source_pipeline,
             )
-            if immunity_shadow.item_is_blockable(
-                collection=r.collection,
-                source_pipeline=r.source_pipeline,
-                origin_class=r.origin_class,
-            ):
-                blockable += 1
+        if _blockable:
+            blockable += 1
         out.append(d)
     # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
     # proactive-recall prompt (observe-only). db=memory_mod._db when set, else
-    # the emit self-resolves a short-lived connection.
+    # the emit self-resolves a short-lived connection. `enforced_drops` in the
+    # detail is the auto-demote signal — wrap-only observations must never
+    # count toward demotion (Codex round-6: a normal explicit-recall session
+    # would otherwise flip the gate back to shadow).
     await immunity_shadow.record_would_block(
         gate="injection",
         source_kind="recall_inject",
         source_ref="mcp/memory/core.py::memory_proactive",
         process="server",
-        blockable_count=blockable,
+        blockable_count=blockable + dropped,
         db=memory_mod._db,
+        detail={"enforced_drops": dropped} if dropped else None,
     )
     return out
 
@@ -861,7 +939,28 @@ async def memory_core_facts(
         )
 
     scored.sort(key=lambda x: x[1], reverse=True)
-    top = scored[:limit]
+    # Keep the full scored pool (scroll fetched limit*3) — the enforce drop
+    # below can remove top-ranked blockable-external facts, and slicing to
+    # `limit` first would underfill the result when safe facts sit just past
+    # the top slice (Codex #1048 P2). We take the final `limit` AFTER dropping.
+
+    # Stored-origin enrichment: a point whose Qdrant payload predates the
+    # origin_class payload backfill carries None here, but SQLite
+    # memory_metadata has the backfilled value — without this, a stale payload
+    # would bypass both the enforce drop and the wrap below (the episodic
+    # collection can never flag via the fallback derivation). Best-effort: on
+    # any error items keep their payload values (fail-open, gate posture).
+    _missing = [item["memory_id"] for item, _ in scored if item.get("origin_class") is None]
+    if _missing:
+        try:
+            from genesis.db.crud import memory as memory_crud
+
+            _by_id = await memory_crud.origin_class_by_ids(memory_mod._db, _missing)
+            for item, _ in scored:
+                if item.get("origin_class") is None:
+                    item["origin_class"] = _by_id.get(item["memory_id"])
+        except Exception:
+            logger.debug("core_facts origin enrichment failed", exc_info=True)
 
     # WS-3 B4 gate 4 (injection): core_facts is a query-less AMBIENT surface
     # that scrolls episodic directly — it bypasses HybridRetriever, so the
@@ -872,7 +971,25 @@ async def memory_core_facts(
     # STORED origin_class: episodic content is only external when its stored
     # class says so — the collection fallback alone can never flag it here.
     blockable = 0
-    for item, _ in top:
+    dropped = 0
+    _unsupervised = immunity_shadow.is_dispatched_session_env()
+    _kept: list[tuple[dict, float]] = []
+    for item, score in scored:
+        if len(_kept) >= limit:
+            break
+        # WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): core_facts is a
+        # query-less ambient feed — dispatched session + enforce -> DROP the
+        # blockable item (still recorded below). Otherwise wrap-and-return.
+        if immunity_shadow.should_enforce_drop(
+            gate="injection",
+            collection="episodic_memory",
+            source_pipeline=item.get("source_pipeline"),
+            origin_class=item.get("origin_class"),
+            pushed_surface=True,
+            unsupervised=_unsupervised,
+        ):
+            dropped += 1
+            continue
         if immunity_shadow.item_is_blockable(
             collection="episodic_memory",
             source_pipeline=item.get("source_pipeline"),
@@ -883,13 +1000,18 @@ async def memory_core_facts(
                 source_pipeline=item.get("source_pipeline"),
             )
             blockable += 1
+        _kept.append((item, score))
+    top = _kept
+    # `enforced_drops` is the auto-demote signal — wrap-only observations
+    # never count toward demotion (Codex round-6).
     await immunity_shadow.record_would_block(
         gate="injection",
         source_kind="recall_inject",
         source_ref="mcp/memory/core.py::memory_core_facts",
         process="server",
-        blockable_count=blockable,
+        blockable_count=blockable + dropped,
         db=memory_mod._db,
+        detail={"enforced_drops": dropped} if dropped else None,
     )
 
     # Track retrieval so activation scores reflect actual usage.

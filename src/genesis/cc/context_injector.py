@@ -59,19 +59,22 @@ class ContextInjector:
         blockable = 0
         for r in results:
             content = r.content[:200]
-            # Injection defense (PR2): this path recalls source="episodic"
-            # (first-party) today, so the guard never fires — but wrap defensively
-            # so a future `source` widening can't silently inject unwrapped KB.
-            if is_external(getattr(r, "collection", "")):
+            # Injection defense (PR2): this path recalls source="episodic",
+            # which since #1021 CAN carry stored-external rows (dispatched
+            # sessions ingesting external content) — so wrap keys on STORED
+            # origin first, with the collection check kept for any future
+            # `source` widening into the KB.
+            _blockable = immunity_shadow.item_is_blockable(
+                collection=getattr(r, "collection", None),
+                source_pipeline=getattr(r, "source_pipeline", None),
+                origin_class=getattr(r, "origin_class", None),
+            )
+            if _blockable or is_external(getattr(r, "collection", "")):
                 content = wrap_external_recall(
                     content, source_pipeline=getattr(r, "source_pipeline", None),
                 )
-                if immunity_shadow.item_is_blockable(
-                    collection=getattr(r, "collection", None),
-                    source_pipeline=getattr(r, "source_pipeline", None),
-                    origin_class=getattr(r, "origin_class", None),
-                ):
-                    blockable += 1
+            if _blockable:
+                blockable += 1
             lines.append(
                 f"- **[{r.memory_type}]** (score: {r.score:.2f}) {content}"
             )

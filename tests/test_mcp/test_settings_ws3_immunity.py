@@ -54,7 +54,20 @@ def test_validate_accepts_master_off():
 
 
 def test_validate_accepts_gate_enforce():
-    assert _validate_ws3_immunity({"identity": {"mode": "enforce"}}) == []
+    # WS-3 B4 honesty guard: enforce is accepted ONLY for the gates whose
+    # enforce branch is built (autonomy + injection). procedure/identity have
+    # no enforce path, so accepting mode=enforce would let the config lie.
+    assert _validate_ws3_immunity({"injection": {"mode": "enforce"}}) == []
+    assert _validate_ws3_immunity({"autonomy": {"mode": "enforce"}}) == []
+
+
+def test_validate_rejects_enforce_for_unimplemented_gates():
+    for gate in ("procedure", "identity"):
+        errors = _validate_ws3_immunity({gate: {"mode": "enforce"}})
+        assert errors and "does not implement enforce" in errors[0]
+    # shadow / off remain valid for those gates.
+    assert _validate_ws3_immunity({"procedure": {"mode": "shadow"}}) == []
+    assert _validate_ws3_immunity({"identity": {"mode": "off"}}) == []
 
 
 def test_validate_accepts_auto_demote_state_passthrough():

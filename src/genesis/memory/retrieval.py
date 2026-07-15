@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import aiosqlite
@@ -30,6 +32,7 @@ logger = logging.getLogger(__name__)
 def _has_temporal_markers(query: str) -> bool:
     """Quick check for temporal language in a query."""
     from genesis.memory.temporal import has_temporal_markers
+
     return has_temporal_markers(query)
 
 
@@ -56,11 +59,11 @@ _KNOWN_SUBSYSTEMS: tuple[str, ...] = ("ego", "triage", "reflection", "autonomy")
 # ---------------------------------------------------------------------------
 # Graph-boosted retrieval constants (spec Part 1)
 # ---------------------------------------------------------------------------
-_BACKLINK_BOOST_COEF = 0.05     # log-scale boost per inbound link
-_ADJACENCY_BOOST = 1.05         # 5% bump for cluster-coherent results
-_ADJACENCY_MIN_INLINKS = 2      # need ≥2 top-K peers linking to you
-_ADJACENCY_TOP_K = 20           # adjacency check on top-K after backlink boost
-_FLOOR_RATIO = 0.85             # skip boosts for results below 85% of top score
+_BACKLINK_BOOST_COEF = 0.05  # log-scale boost per inbound link
+_ADJACENCY_BOOST = 1.05  # 5% bump for cluster-coherent results
+_ADJACENCY_MIN_INLINKS = 2  # need ≥2 top-K peers linking to you
+_ADJACENCY_TOP_K = 20  # adjacency check on top-K after backlink boost
+_FLOOR_RATIO = 0.85  # skip boosts for results below 85% of top score
 
 
 def _validate_subsystem_names(names: list[str], param: str) -> None:
@@ -107,10 +110,7 @@ def _resolve_subsystem_filter(
         only_subsystem="ego"              → ego writes only
     """
     if only_subsystem is not None and include_subsystem is not False:
-        msg = (
-            "include_subsystem and only_subsystem are mutually exclusive; "
-            "pass at most one"
-        )
+        msg = "include_subsystem and only_subsystem are mutually exclusive; pass at most one"
         raise ValueError(msg)
 
     if only_subsystem is not None:
@@ -410,11 +410,7 @@ def _assemble_results(
             )
         else:
             v_rank = None
-        f_rank = (
-            fts_ranked.index(mid) + 1
-            if mid in set(fts_ranked)
-            else None
-        )
+        f_rank = fts_ranked.index(mid) + 1 if mid in set(fts_ranked) else None
 
         # Extract provenance from Qdrant payload if available
         _p = payload if qdrant_hit else {}
@@ -477,9 +473,7 @@ def _entrenchment_metrics(
     """
     _entrenchment = _mean_retrieved = _mean_age_days = None
     try:
-        _ret_counts = [
-            float(retrieved_count_by_id.get(r.memory_id, 0)) for r in results
-        ]
+        _ret_counts = [float(retrieved_count_by_id.get(r.memory_id, 0)) for r in results]
         if _ret_counts:
             _entrenchment = _spearman_rank_corr(_ret_counts, _scores)
             _mean_retrieved = round(sum(_ret_counts) / len(_ret_counts), 2)
@@ -491,8 +485,10 @@ def _entrenchment_metrics(
                     continue
                 try:
                     _ages.append(
-                        (_now_dt - datetime.fromisoformat(
-                            _ca.replace("Z", "+00:00"))).total_seconds() / 86400.0
+                        (
+                            _now_dt - datetime.fromisoformat(_ca.replace("Z", "+00:00"))
+                        ).total_seconds()
+                        / 86400.0
                     )
                 except (ValueError, AttributeError):
                     continue
@@ -566,6 +562,7 @@ class HybridRetriever:
         rerank: bool = True,
         include_deprecated: bool = False,
         event_id_sink: list[str] | None = None,
+        skip_writeback: Callable[[RetrievalResult], bool] | None = None,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
 
@@ -577,6 +574,12 @@ class HybridRetriever:
             - ``source='episodic' | 'knowledge' | 'both'``: explicit
               override; intent inference is skipped for the source
               decision but still informs RRF biasing.
+
+        ``skip_writeback``: optional predicate over the assembled
+        ``RetrievalResult``s — items it returns True for are excluded from
+        the retrieved_count/activation write-backs (enforce-drop surfaces
+        pass their drop predicate so blocked items gain no retrieval
+        credit). Fail-open: a raising predicate restores full write-backs.
 
             Callers that want to force ``both`` regardless of intent
             should pass ``source='both'`` explicitly.
@@ -597,7 +600,8 @@ class HybridRetriever:
         # Resolve subsystem-filter API → primitives shared with drift_recall
         # and the underlying Qdrant + FTS5 calls.
         exclude_subsystems, include_only_subsystems = _resolve_subsystem_filter(
-            include_subsystem, only_subsystem,
+            include_subsystem,
+            only_subsystem,
         )
 
         # Classify intent up-front — used for both source-selection
@@ -635,12 +639,16 @@ class HybridRetriever:
 
         # 2b. Event-calendar search (temporal queries)
         event_memory_ids = await self._gather_event_candidates(
-            query, intent, candidate_limit,
+            query,
+            intent,
+            candidate_limit,
         )
 
         # 2c. Expand query via tag co-occurrence (opt-in, expensive index rebuild)
         fts_query = await self._expand_fts_query(
-            query, collections, expand_query_terms=expand_query_terms,
+            query,
+            collections,
+            expand_query_terms=expand_query_terms,
         )
 
         # 3. FTS5 text search (using expanded query)
@@ -661,7 +669,10 @@ class HybridRetriever:
 
         # 4b. Phase 1.5e: drop candidates past their bitemporal invalid_at.
         all_ids, event_memory_ids = await self._filter_expired_candidates(
-            all_ids, qdrant_by_id, fts_by_id, event_memory_ids,
+            all_ids,
+            qdrant_by_id,
+            fts_by_id,
+            event_memory_ids,
         )
         if not all_ids:
             return []
@@ -693,7 +704,10 @@ class HybridRetriever:
 
         # 6b. Build intent-biased ranked list (empty for GENERAL — no bias)
         intent_ranked = _build_intent_ranked(
-            intent, all_ids, qdrant_by_id, fts_by_id,
+            intent,
+            all_ids,
+            qdrant_by_id,
+            fts_by_id,
         )
 
         # 7. Fusion: RRF if we have vector results, otherwise FTS5 + activation only
@@ -723,9 +737,7 @@ class HybridRetriever:
         graph_boost_applied = await self._apply_graph_boost(fused, inbound_by_id)
 
         # 8. Filter by min_activation
-        candidates = [
-            mid for mid in fused if activation_by_id.get(mid, 0.0) >= min_activation
-        ]
+        candidates = [mid for mid in fused if activation_by_id.get(mid, 0.0) >= min_activation]
 
         # 8b. Diversity penalty — collapse echo clusters
         # If multiple candidates have near-identical content (Jaccard ≥ 0.80),
@@ -736,7 +748,10 @@ class HybridRetriever:
         # halved dedup artifact. ``fused`` (penalized) still drives ordering.
         raw_fused = dict(fused)
         candidates = _apply_diversity_penalty(
-            candidates, fused, qdrant_by_id, fts_by_id,
+            candidates,
+            fused,
+            qdrant_by_id,
+            fts_by_id,
         )
 
         # 9. Sort by fused score descending
@@ -744,16 +759,19 @@ class HybridRetriever:
 
         # 9b. Filter FTS5-only candidates by wing/room/life_domain
         candidates = _filter_scope_fts_only(
-            candidates, qdrant_by_id, fts_by_id,
-            wing=wing, room=room, life_domain=life_domain,
+            candidates,
+            qdrant_by_id,
+            fts_by_id,
+            wing=wing,
+            room=room,
+            life_domain=life_domain,
         )
 
         # 10. Take top limit
         top = candidates[:limit]
 
-        # 11/11b/11c. Retrieval write-backs (Qdrant counts, observation +
-        # knowledge_units sync) — each individually swallowed.
-        await self._record_retrievals(top, qdrant_by_id, fts_by_id, now_str)
+        # (11/11b/11c retrieval write-backs moved BELOW step 12b — they need
+        # the assembled results' stored origin_class for `skip_writeback`.)
 
         # 12. Build RetrievalResult objects
         results = _assemble_results(
@@ -770,6 +788,46 @@ class HybridRetriever:
             intent=intent,
         )
 
+        # 12b. Stored-origin backfill (WS-3): a vector-only hit whose Qdrant
+        # payload predates the origin_class payload backfill assembles with
+        # origin_class=None (the FTS coalesce can't help when there's no FTS
+        # row for it) — but memory_metadata has the value. Fill it here, at
+        # the retriever, so EVERY RetrievalResult consumer (MCP recall/
+        # proactive, voice, research, context injector) sees the stored origin
+        # and the injection gate can't be bypassed by a stale payload. In the
+        # steady state (payload backfill complete, store stamps at write) the
+        # id list is empty and no query runs. Best-effort: on error, results
+        # keep payload values.
+        _no_origin = [r.memory_id for r in results if r.origin_class is None]
+        if _no_origin:
+            try:
+                _origin_by_id = await memory_crud.origin_class_by_ids(self._db, _no_origin)
+                results = [
+                    dataclasses.replace(r, origin_class=_origin_by_id.get(r.memory_id))
+                    if r.origin_class is None and _origin_by_id.get(r.memory_id)
+                    else r
+                    for r in results
+                ]
+            except Exception:
+                logger.debug("origin_class backfill on recall failed", exc_info=True)
+
+        # 11/11b/11c. Retrieval write-backs (Qdrant counts, observation +
+        # knowledge_units sync) — each individually swallowed. Runs AFTER
+        # assembly + the 12b origin backfill so `skip_writeback` sees the
+        # STORED origin: an item the caller will enforce-drop must not gain
+        # retrieved_count/activation credit from the very recall that blocks
+        # it (Codex #1048 — blocked external content would otherwise farm
+        # ranking energy from dispatched sessions). With no predicate the
+        # write-back set is identical to the pre-move behavior (all of `top`).
+        _wb_ids = top
+        if skip_writeback is not None:
+            try:
+                _wb_ids = [r.memory_id for r in results if not skip_writeback(r)]
+            except Exception:
+                logger.debug("skip_writeback predicate failed open", exc_info=True)
+                _wb_ids = top
+        await self._record_retrievals(_wb_ids, qdrant_by_id, fts_by_id, now_str)
+
         # J-9 eval: log recall event for memory retrieval quality measurement
         from genesis.eval.j9_hooks import (
             emit_recall_diagnostics,
@@ -783,7 +841,11 @@ class HybridRetriever:
         _scores = [r.retrieval_score for r in results]
         # MEM-005: entrenchment signal (monitor-only) — see _entrenchment_metrics.
         _entrenchment, _mean_retrieved, _mean_age_days = _entrenchment_metrics(
-            results, _scores, retrieved_count_by_id, created_at_by_id, now_str,
+            results,
+            _scores,
+            retrieved_count_by_id,
+            created_at_by_id,
+            now_str,
         )
 
         recall_event_id = await emit_recall_fired(
@@ -834,7 +896,8 @@ class HybridRetriever:
     # guards, and early returns live in recall() itself.
 
     async def _embed_query(
-        self, query: str,
+        self,
+        query: str,
     ) -> tuple[list[float] | None, bool]:
         """Stage 1: embed the query, degrading to FTS5-only on failure.
 
@@ -845,8 +908,10 @@ class HybridRetriever:
         try:
             vector = await self._embeddings.embed(query)
             await record_last_run(
-                self._db, "21b_query_embedding",
-                provider="embedding", model_id="cloud-primary",
+                self._db,
+                "21b_query_embedding",
+                provider="embedding",
+                model_id="cloud-primary",
                 response_text=f"Query embed: {query[:60]}",
             )
         except EmbeddingUnavailableError:
@@ -903,7 +968,10 @@ class HybridRetriever:
         return qdrant_results, qdrant_by_id
 
     async def _gather_event_candidates(
-        self, query: str, intent: QueryIntent, candidate_limit: int,
+        self,
+        query: str,
+        intent: QueryIntent,
+        candidate_limit: int,
     ) -> list[str]:
         """Stage 2b: event-calendar search for temporal queries.
 
@@ -914,11 +982,15 @@ class HybridRetriever:
         if intent.category == "WHEN" or _has_temporal_markers(query):
             try:
                 from genesis.memory.temporal import parse_temporal_reference
+
                 time_range = parse_temporal_reference(query)
                 if time_range:
                     from genesis.db.crud import memory_events
+
                     event_memory_ids = await memory_events.get_memory_ids_in_range(
-                        self._db, time_range[0], time_range[1],
+                        self._db,
+                        time_range[0],
+                        time_range[1],
                         limit=candidate_limit,
                     )
             except Exception:
@@ -926,7 +998,11 @@ class HybridRetriever:
         return event_memory_ids
 
     async def _expand_fts_query(
-        self, query: str, collections: list[str], *, expand_query_terms: bool,
+        self,
+        query: str,
+        collections: list[str],
+        *,
+        expand_query_terms: bool,
     ) -> str:
         """Stage 2c: expand the FTS query via tag co-occurrence (degrades to
         the original query on failure)."""
@@ -934,7 +1010,10 @@ class HybridRetriever:
         if expand_query_terms:
             try:
                 fts_query = await expand_query(
-                    query, self._qdrant, collections, max_expansions=5,
+                    query,
+                    self._qdrant,
+                    collections,
+                    max_expansions=5,
                 )
             except Exception:
                 logger.warning("Query expansion failed, using original", exc_info=True)
@@ -1042,9 +1121,7 @@ class HybridRetriever:
         # ghosts with no metadata row keep the now_str fallback below.
         fts_only_ids = [mid for mid in all_ids if mid not in qdrant_by_id]
         meta_created_at = (
-            await memory_crud.batch_created_at(self._db, fts_only_ids)
-            if fts_only_ids
-            else {}
+            await memory_crud.batch_created_at(self._db, fts_only_ids) if fts_only_ids else {}
         )
 
         activation_by_id: dict[str, float] = {}
@@ -1109,8 +1186,10 @@ class HybridRetriever:
         """
         if rerank and self._reranker and self._reranker.enabled and fused:
             rerank_candidates = sorted(
-                fused, key=fused.get, reverse=True,  # type: ignore[arg-type]
-            )[:limit * 3]
+                fused,
+                key=fused.get,
+                reverse=True,  # type: ignore[arg-type]
+            )[: limit * 3]
             rerank_docs: list[dict[str, str]] = []
             for mid in rerank_candidates:
                 content = ""
@@ -1123,15 +1202,14 @@ class HybridRetriever:
                     rerank_docs.append({"id": mid, "text": content})
             if rerank_docs:
                 reranked = await self._reranker.rerank(
-                    query, rerank_docs, top_k=limit * 2,
+                    query,
+                    rerank_docs,
+                    top_k=limit * 2,
                 )
                 if reranked:
                     # Rebuild fused with only reranked candidates, using
                     # positional scores so graph boost floor-gating works.
-                    fused = {
-                        item["id"]: 1.0 / (1 + rank)
-                        for rank, item in enumerate(reranked)
-                    }
+                    fused = {item["id"]: 1.0 / (1 + rank) for rank, item in enumerate(reranked)}
         return fused
 
     async def _apply_graph_boost(
@@ -1167,7 +1245,8 @@ class HybridRetriever:
             if len(top_k) >= 3:
                 try:
                     edges = await memory_links.inter_candidate_links(
-                        self._db, top_k,
+                        self._db,
+                        top_k,
                     )
                     intra_inbound: dict[str, int] = {}
                     for src, tgt in edges:
@@ -1222,7 +1301,9 @@ class HybridRetriever:
                 except Exception:
                     logger.warning(
                         "Failed to update retrieved_count for %s in %s",
-                        mid, coll, exc_info=True,
+                        mid,
+                        coll,
+                        exc_info=True,
                     )
 
         # 11b. Sync observation retrieved_count in SQLite
@@ -1241,7 +1322,8 @@ class HybridRetriever:
             except Exception:
                 logger.warning(
                     "Failed to sync observation retrieved_count for %d obs",
-                    len(obs_ids), exc_info=True,
+                    len(obs_ids),
+                    exc_info=True,
                 )
 
         # 11c. Sync knowledge_units retrieved_count in SQLite
@@ -1260,11 +1342,14 @@ class HybridRetriever:
         if ku_qdrant_ids:
             try:
                 from genesis.db.crud import knowledge as knowledge_crud
+
                 await knowledge_crud.increment_retrieved_batch(
-                    self._db, ku_qdrant_ids,
+                    self._db,
+                    ku_qdrant_ids,
                 )
             except Exception:
                 logger.warning(
                     "Failed to sync knowledge retrieved_count for %d units",
-                    len(ku_qdrant_ids), exc_info=True,
+                    len(ku_qdrant_ids),
+                    exc_info=True,
                 )

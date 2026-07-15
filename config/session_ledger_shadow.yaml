@@ -1,0 +1,22 @@
+# Session-ledger ambient extractor (session-manager PR-3) — writable + LIVE.
+#
+# The detached worker spawned at each PreCompact boundary re-reads the merged
+# config (this file + ~/.genesis/config/session_ledger_shadow.local.yaml) at
+# startup, so a settings_update("session_ledger_shadow", {...}) or a hand
+# edit takes effect at the next compaction — no restart.
+#
+# Master switch: false stops the worker before any lock/DB/LLM work.
+enabled: true
+
+# Mode: off | shadow | live
+#   off    — the worker exits immediately (no run row, cursor untouched)
+#   shadow — extract agreements/pivots from the transcript delta via headless
+#            Haiku and LOG proposals to session_ledger_shadow_* only; the
+#            live session_ledger is NEVER written
+#   live   — RESERVED: coerced to shadow (with a warning) until the
+#            data-gated flip PR lands the live write path. The flip is
+#            user-approved, driven by shadow precision reports.
+#
+# Hook-level kill switch (separate lever): GENESIS_LEDGER_SHADOW_DISABLED=1
+# stops the PreCompact hook from spawning the worker at all.
+mode: shadow

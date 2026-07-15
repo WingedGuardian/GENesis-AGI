@@ -133,6 +133,9 @@ async def test_missing_stored_origin_is_none(mock_qdrant, mock_crud, mock_links,
         ]
     )
     mock_crud.batch_created_at = AsyncMock(return_value={})
+    # The 12b backfill queries metadata for the None rows and finds nothing
+    # (genuinely unstamped pre-0054 rows stay None).
+    mock_crud.origin_class_by_ids = AsyncMock(return_value={})
     _link_mocks(mock_links)
 
     results = await retriever.recall(
@@ -144,6 +147,38 @@ async def test_missing_stored_origin_is_none(mock_qdrant, mock_crud, mock_links,
     )
     assert results
     assert all(r.origin_class is None for r in results)
+    mock_crud.origin_class_by_ids.assert_awaited()
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_vector_only_stale_payload_backfills_from_metadata(
+    mock_qdrant, mock_crud, mock_links, _
+):
+    """Codex on #1048 (round 5): a VECTOR-ONLY hit whose Qdrant payload
+    predates the origin backfill has no FTS row to coalesce from — recall
+    must batch-recover the stored value from memory_metadata so the
+    injection gate can't be bypassed by a stale payload."""
+    retriever = _build_retriever()
+    mock_qdrant.search.return_value = [_qdrant_hit("stale-1", 0.9, origin_class=None)]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_crud.batch_created_at = AsyncMock(return_value={})
+    mock_crud.origin_class_by_ids = AsyncMock(return_value={"stale-1": "external_untrusted"})
+    _link_mocks(mock_links)
+
+    results = await retriever.recall(
+        "test",
+        source="episodic",
+        limit=5,
+        min_activation=0.0,
+        rerank=False,
+    )
+    assert results
+    assert results[0].origin_class == "external_untrusted"
+    mock_crud.origin_class_by_ids.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -163,7 +198,11 @@ async def test_qdrant_payload_missing_coalesces_to_fts_row(mock_qdrant, mock_cru
     _link_mocks(mock_links)
 
     results = await retriever.recall(
-        "test", source="episodic", limit=5, min_activation=0.0, rerank=False,
+        "test",
+        source="episodic",
+        limit=5,
+        min_activation=0.0,
+        rerank=False,
     )
     assert results
     assert results[0].origin_class == "first_party"

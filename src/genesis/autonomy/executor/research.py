@@ -240,17 +240,19 @@ class DeepResearcherImpl:
                 content = r.content[:200] if hasattr(r, "content") else str(r)[:200]
                 # Injection defense (PR2): recall defaults to source="both", so a
                 # KB hit can reach the triage prompt — wrap external-world content.
-                if is_external(getattr(r, "collection", "")):
+                # Keys on STORED origin first: external episodic rows must wrap too.
+                _blockable = immunity_shadow.item_is_blockable(
+                    collection=getattr(r, "collection", None),
+                    source_pipeline=getattr(r, "source_pipeline", None),
+                    origin_class=getattr(r, "origin_class", None),
+                )
+                if _blockable or is_external(getattr(r, "collection", "")):
                     content = wrap_external_recall(
                         content,
                         source_pipeline=getattr(r, "source_pipeline", None),
                     )
-                    if immunity_shadow.item_is_blockable(
-                        collection=getattr(r, "collection", None),
-                        source_pipeline=getattr(r, "source_pipeline", None),
-                        origin_class=getattr(r, "origin_class", None),
-                    ):
-                        blockable += 1
+                if _blockable:
+                    blockable += 1
                 lines.append(f"- {content}")
             # WS-3 B1 gate 4 (injection): the autonomous due-diligence path is the
             # highest-write-capability recall site — shadow-record external content

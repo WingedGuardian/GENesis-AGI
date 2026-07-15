@@ -25,6 +25,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reattachable session instead of an orphan (opt out:
   `GENESIS_NO_TMUX_WRAP=1`).
 
+- **Genesis now notices the agreements a session forgot to write down — in
+  shadow.** At every compaction boundary a detached worker re-reads the
+  conversation since the last checkpoint and proposes missed "yes, do that"
+  moments and direction pivots as session-ledger candidates. Proposals are
+  only LOGGED for now (the live ledger is never touched): each one carries a
+  verbatim quote that is deterministically checked against the transcript,
+  and a precision report compares proposals against what was actually
+  captured by hand — the safety net earns write access with data before it
+  gets it. Levers: the `session_ledger_shadow` settings domain (off/shadow)
+  and a `GENESIS_LEDGER_SHADOW_DISABLED=1` kill switch; a `--backfill` mode
+  replays past sessions for tuning. Also fixes a charter bug where a session
+  whose first message was a bare slash command (like `/compact`) could have
+  recorded that command as its permanent origin.
+
 - **Benchmark runs can now select exactly the arms they pay for.** The
   LongMemEval harness gained `--arms` (comma-separated labels, e.g.
   `--graph --arms raw,raw+graph`), so a paired baseline-vs-graph comparison
@@ -116,6 +130,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   window gets it re-injected automatically. The origin survives any number of
   compactions; `/clear` still means a genuinely fresh start. Charters live in
   `~/.genesis/sessions/<session-id>/charter.md`.
+
+- **Provenance-based content isolation is now enforce-ready (running in
+  observe-only mode).** Genesis already tags where every memory came from —
+  its own thinking, your messages, or the outside world (a webpage, an
+  ingested doc, an email). This work makes that tag follow the content all the
+  way through recall, so Genesis can tell, at the moment content is about to
+  enter a prompt, whether it is quoted outside material rather than a trusted
+  instruction. The stored tag decides everywhere: outside material that landed
+  in Genesis's own session memory (not just the knowledge base) is delimited
+  and labeled external on every recall surface — proactive hints, voice
+  responses, and the dashboard memory browser included — instead of reading as
+  first-party memory. The protection is armed but watching, not acting: it records
+  what it *would* block so the behavior can be verified against real traffic
+  before it's switched on. When switched on (a live setting, instantly
+  reversible), outside-world content is held back only from automatic,
+  uninvited context in unsupervised background sessions — your explicit
+  searches and everything in a normal foreground conversation keep working
+  exactly as before. Held back means fully out of the loop: a blocked item
+  also earns no retrieval credit, so it can't quietly climb the memory
+  ranking through the very sessions that refuse it. If the guard ever fights
+  legitimate activity, it stands itself down and pages you.
 
 - **Genesis now notices when memories quietly lose semantic search.** When an
   embedding permanently fails, that memory becomes keyword-only — findable by

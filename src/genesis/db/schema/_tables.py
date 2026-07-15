@@ -1677,6 +1677,47 @@ TABLES = {
             updated_at  TEXT
         )
     """,
+    "session_ledger_shadow_runs": """
+        CREATE TABLE IF NOT EXISTS session_ledger_shadow_runs (
+            run_id         TEXT PRIMARY KEY,
+            session_id     TEXT NOT NULL,
+            started_at     TEXT NOT NULL,
+            finished_at    TEXT,
+            start_byte     INTEGER NOT NULL,
+            end_byte       INTEGER NOT NULL,
+            trigger        TEXT NOT NULL,
+            status         TEXT NOT NULL
+                           CHECK(status IN ('ok','failed','timeout','lock_busy','empty_delta')),
+            truncated      INTEGER NOT NULL DEFAULT 0,
+            n_user_turns   INTEGER NOT NULL DEFAULT 0,
+            n_proposals    INTEGER NOT NULL DEFAULT 0,
+            latency_ms     INTEGER,
+            prompt_version TEXT,
+            model          TEXT,
+            mode           TEXT NOT NULL DEFAULT 'shadow',
+            detail         TEXT
+        )
+    """,
+    "session_ledger_shadow_events": """
+        CREATE TABLE IF NOT EXISTS session_ledger_shadow_events (
+            id              TEXT PRIMARY KEY,
+            run_id          TEXT NOT NULL,
+            observed_at     TEXT NOT NULL,
+            session_id      TEXT NOT NULL,
+            kind            TEXT NOT NULL CHECK(kind IN ('agreement','pivot')),
+            text            TEXT NOT NULL,
+            turn_ref        TEXT,
+            quote_preview   TEXT,
+            quote_hash      TEXT,
+            quote_verified  INTEGER NOT NULL DEFAULT 0,
+            match_kind      TEXT NOT NULL DEFAULT 'none'
+                            CHECK(match_kind IN ('exact','fuzzy','none')),
+            matched_item_id TEXT,
+            match_score     REAL,
+            duplicate_of    TEXT,
+            mode            TEXT NOT NULL DEFAULT 'shadow'
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1974,6 +2015,10 @@ INDEXES = [
     "ON otel_spans(start_unix_us) WHERE parent_span_id IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_session_ledger_session ON session_ledger(session_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_session_charters_updated_at ON session_charters(updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_slsr_session ON session_ledger_shadow_runs(session_id, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_slsr_started ON session_ledger_shadow_runs(started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_slse_session ON session_ledger_shadow_events(session_id, observed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_slse_observed ON session_ledger_shadow_events(observed_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

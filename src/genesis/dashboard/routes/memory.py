@@ -55,12 +55,15 @@ async def memory_search():
                 "source_session_id": r.source_session_id,
                 "source_pipeline": r.source_pipeline,
                 # Provenance (audit D12): let the UI distinguish/badge
-                # external-world KB from first-party memory.
+                # external-world KB from first-party memory. Honors STORED
+                # origin so external episodic rows badge external too.
                 "collection": r.collection,
+                "origin_class": r.origin_class,
                 "provenance": provenance_descriptor(
                     collection=r.collection,
                     source_pipeline=r.source_pipeline,
                     source_doc=r.source,
+                    origin_class=r.origin_class,
                 ),
             })
 

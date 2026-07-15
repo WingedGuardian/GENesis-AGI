@@ -153,7 +153,9 @@ def test_load_full_yaml(monkeypatch):
     # 2026-07-13: 56 → 54 after removing orphaned legacy ego sites 7_ego_cycle
     # + 8_ego_compaction (superseded by 7_user/7_genesis_ego_cycle + ephemeral
     # compaction in #26; their model_routing.yaml entries were never cleaned up).
-    assert len(cfg.call_sites) == 54
+    # 2026-07-14: 54 → 55 after ambient_ledger_extractor added (session-manager
+    # PR-3 shadow extractor neural-monitor registration).
+    assert len(cfg.call_sites) == 55
     assert "crag_grade" in cfg.call_sites  # W-CRAG runtime grader (2026-06-20)
     assert "38a_procedure_novelty_llm" in cfg.call_sites  # C2b cross-type dedup (2026-06-30)
     assert "attention_salience" in cfg.call_sites  # PR3b L1.5 salience gate (2026-07-01)
@@ -164,6 +166,12 @@ def test_load_full_yaml(monkeypatch):
     assert cfg.call_sites["ambient_arbiter"].dispatch == "cli"
     assert cfg.call_sites["ambient_arbiter"].chain == []
     assert cfg.call_sites["ambient_arbiter"].never_pays is True
+    # ambient_ledger_extractor: same shape (empty-chain cli, shadow-only —
+    # session-manager PR-3); the detached ledger shadow worker spawns CC
+    # directly (model pinned in session_awareness/ledger_extractor.py).
+    assert cfg.call_sites["ambient_ledger_extractor"].dispatch == "cli"
+    assert cfg.call_sites["ambient_ledger_extractor"].chain == []
+    assert cfg.call_sites["ambient_ledger_extractor"].never_pays is True
     assert "models_md_synthesis" not in cfg.call_sites  # removed 2026-05-24
     assert "2_triage" not in cfg.call_sites  # removed 2026-05-10
     assert "7_task_retrospective" not in cfg.call_sites  # removed 2026-05-10 (duplicate; live one is 43_task_retrospective)
