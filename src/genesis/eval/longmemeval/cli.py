@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from genesis.eval.longmemeval.client import load_secrets
 from genesis.eval.longmemeval.dataset import filter_by_types, load_oracle
-from genesis.eval.longmemeval.runner import run_longmemeval, select_arms
+from genesis.eval.longmemeval.runner import filter_arms, run_longmemeval, select_arms
 
 if TYPE_CHECKING:
     from genesis.eval.types import EvalRunSummary
@@ -98,6 +98,7 @@ async def execute(
     dump_dir: Path | None = None,
     graph: bool = False,
     graph_link_threshold: float | None = None,
+    arms_only: str | None = None,
 ) -> dict[str, EvalRunSummary]:
     """Load the dataset, run the harness, persist (optionally), return summaries.
 
@@ -106,7 +107,9 @@ async def execute(
     questions", not "temporal questions among the first 20".
 
     ``graph`` ADDS a ``+graph`` variant of every selected arm (paired
-    baseline-vs-graph comparison in one run, one dump dir).
+    baseline-vs-graph comparison in one run, one dump dir). ``arms_only``
+    (comma-separated labels) then filters that universe down — the budget
+    lever for single-arm or paired runs.
     """
     load_secrets()
     instances = load_oracle(dataset_path)
@@ -117,6 +120,10 @@ async def execute(
     logger.info("loaded %d questions from %s", len(instances), dataset_path)
 
     arms = select_arms(no_rerank=no_rerank, graph=graph)
+    if arms_only is not None:
+        # An empty string still reaches filter_arms and raises there — a paid
+        # run must never silently widen back to the full arm universe.
+        arms = filter_arms(arms, arms_only)
     reranker = None if no_rerank else build_reranker()
 
     db = None

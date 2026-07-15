@@ -282,6 +282,58 @@ def test_select_arms_composition():
     assert len(select_arms(graph=True)) == 8
 
 
+def test_filter_arms_selects_by_label_preserving_order():
+    from genesis.eval.longmemeval.runner import filter_arms, select_arms
+
+    arms = select_arms(no_rerank=True, graph=True)
+    picked = filter_arms(arms, "raw,raw+graph")
+    assert [a.label for a in picked] == ["raw", "raw+graph"]
+    # whitespace tolerated; output keeps the arm-universe order, not CSV order
+    assert [a.label for a in filter_arms(arms, " keyword , raw ")] == ["raw", "keyword"]
+
+
+def test_filter_arms_rejects_unknown_and_empty():
+    from genesis.eval.longmemeval.runner import filter_arms, select_arms
+
+    arms = select_arms(no_rerank=True)  # raw, keyword only
+    # unknown label names the selectable universe (raw+graph needs --graph)
+    with pytest.raises(ValueError, match="raw\\+graph"):
+        filter_arms(arms, "raw+graph")
+    with pytest.raises(ValueError, match="no arms selected"):
+        filter_arms(arms, " , ")
+
+
+@pytest.mark.asyncio
+async def test_execute_empty_arms_string_raises_not_widens(tmp_path):
+    """`--arms ""` (e.g. an unset shell var) must raise, NEVER silently fall
+    back to the full unfiltered universe — that would widen paid spend."""
+    import json as _json
+
+    from genesis.eval.longmemeval.cli import execute
+
+    dataset = tmp_path / "oracle.json"
+    dataset.write_text(
+        _json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "question_type": "single-session-user",
+                    "question": "q?",
+                    "answer": "a",
+                    "haystack_sessions": [],
+                },
+            ],
+        ),
+    )
+    with pytest.raises(ValueError, match="no arms selected"):
+        await execute(
+            dataset_path=dataset,
+            no_rerank=True,
+            persist=False,
+            arms_only="",
+        )
+
+
 @pytest.mark.asyncio
 async def test_duplicate_arm_labels_rejected():
     with pytest.raises(ValueError, match="duplicate arm labels"):
