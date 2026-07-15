@@ -11,6 +11,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now notices when merged code isn't actually deployed.** Pulling
+  changes with a bare `git merge` between updates loads the new code on
+  restart but silently skips everything only `update.sh` activates — new
+  systemd units, the host guardian redeploy, tool pins. One install ran six
+  days like that with a shipped timer never installed and zero signal
+  anywhere. The health snapshot now has a `deploy_health` section (days since
+  the last update, commits behind, missing units, host-guardian drift — no
+  network calls), and the awareness loop raises a dashboard alert on any
+  drift, escalating to a Telegram page only when it's sustained (a week stale
+  and 20+ commits behind, or a missing unit ignored for a day). The fix is
+  always the same and the alert says so: run `scripts/update.sh`.
+
 - **A resumed conversation can no longer run twice at once.** If an SSH drop
   leaves a Claude Code session executing headless and you resume that same
   conversation elsewhere, both processes used to write to the same transcript

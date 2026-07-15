@@ -382,7 +382,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 94637bae 2026-07-14
+verified: bca86011 2026-07-15
 ```
 
 - **awareness/**: the 5-min heartbeat. ~23 signal collectors (the richer
@@ -397,7 +397,12 @@ verified: 94637bae 2026-07-14
   and GCs stale registry files; newest executor wins, older one's repo-mutating
   tools are denied), and (hourly) embedding-backlog degradation — counts
   `memory_metadata.embedding_status='failed'` (permanently keyword-only rows the
-  rate alert misses), hybrid `high` (dashboard) / `critical` (Telegram) by band.
+  rate alert misses), hybrid `high` (dashboard) / `critical` (Telegram) by band —
+  plus (hourly) deploy staleness: merged-vs-deployed drift (update.sh age,
+  commits behind from local refs, missing systemd units, host-guardian
+  deployed_commit via `~/.genesis/host_gateway_state.json`; collectors in
+  `observability/snapshots/deploy_health.py`), `high` on any drift, `critical`
+  only sustained (≥7d AND ≥20 commits, or a missing unit alerted >24h).
   It does NOT drive the ego cadence (ego has its own
   scheduler). Trap: PEP 562 lazy `__init__` — don't eager-import `loop.py`.
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
@@ -595,7 +600,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, env.py, _config_overlay.py]
-verified: 859ec256 2026-07-14
+verified: bca86011 2026-07-15
 ```
 
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
@@ -623,7 +628,12 @@ verified: 859ec256 2026-07-14
   persist-queue overflow drops events but emits a rate-limited "dropped"
   meta-event (WS-17). Two health layers (async probes vs systemd shell-out);
   `/health` is a dashboard route, not an MCP tool; `job_health` state machine
-  is runtime-owned.
+  is runtime-owned. `snapshots/deploy_health.py` = merged-vs-deployed drift
+  (never does network I/O; host guardian state comes from
+  `~/.genesis/host_gateway_state.json`, written by `cc_align_host_sync` on
+  every gateway version probe — update.sh and the nightly cc-align timer);
+  its `GUARDIAN_HOST_PATHS` must stay in LOCKSTEP with update.sh
+  GUARDIAN_PATHS.
 - **security/**: prompt-injection defense + outbound scanning — sanitizer is
   LOG-ONLY for internal sources (perimeter EMAIL/INBOX can block);
   `output_scanner` = deterministic outbound secrets/IP scan; `skill_scan`
