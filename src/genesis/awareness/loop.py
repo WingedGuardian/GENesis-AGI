@@ -301,11 +301,11 @@ async def _resolve_embedding_backlog(db) -> None:
 # live in observability/snapshots/deploy_health.py (shared with the health
 # snapshot); this check is the alerting layer. Hybrid severity: any drift is
 # a non-paging 'high' (dashboard); 'critical' (pages Telegram) only when
-# SUSTAINED — the last successful update is ≥7 days old AND the repo is ≥20
-# commits behind, or a missing systemd unit has been alerted for >24h.
+# SUSTAINED — the 'stale_update' finding class (last successful update ≥7
+# days old AND ≥20 commits behind; thresholds live beside derive_findings in
+# deploy_health.py, the single producer of finding keys), or a missing
+# systemd unit that has been alerted for >24h.
 # Slow-moving by nature → hourly cadence (the WAL-truncate block).
-_DEPLOY_STALE_DAYS = 7.0
-_DEPLOY_STALE_COMMITS = 20
 _DEPLOY_MISSING_UNIT_CRITICAL_S = 24 * 3600
 _DEPLOY_ALERT_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
 # The exact note written when a row is superseded by a state change. The >24h
@@ -347,12 +347,25 @@ async def _check_deploy_staleness(db) -> None:
         git_facts = snap.get("git") or {}
         age_days = update.get("age_days")
         behind = git_facts.get("commits_behind_upstream")
-        critical = (
-            age_days is not None
-            and behind is not None
-            and age_days >= _DEPLOY_STALE_DAYS
-            and behind >= _DEPLOY_STALE_COMMITS
-        )
+        # The sustained condition is a finding CLASS (derive_findings owns the
+        # ≥7d AND ≥20-commits formula) — deriving it from raw facts here would
+        # re-open the gap where the facts say "critical" but no finding
+        # survived the gate, so nothing alerted at all.
+        critical = "stale_update" in classes
+        if "missing_units" not in classes:
+            # Partial recovery: the missing-units class cleared while OTHER
+            # drift persists. Retire any superseded missing-units anchors NOW
+            # (full recovery does this in _resolve_deploy_staleness) — else a
+            # new missing unit months later would inherit this incident's
+            # clock via MIN(created_at) and page instantly instead of after
+            # 24h. Cheap no-op when nothing matches.
+            await db.execute(
+                "UPDATE observations SET resolution_notes='deploy staleness cleared' "
+                "WHERE source='deploy_staleness_monitor' "
+                "AND content LIKE '%missing_units%' AND resolution_notes=?",
+                (_DEPLOY_SUPERSEDED_NOTE,),
+            )
+            await db.commit()
         if not critical and "missing_units" in classes:
             # Escalate a missing unit that has been alerted for >24h. Anchor =
             # oldest prior alert naming missing units that is either still

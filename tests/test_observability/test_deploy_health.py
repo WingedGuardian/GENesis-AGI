@@ -224,11 +224,13 @@ def test_derive_findings_keys_are_stable():
         tier2_pending=["scripts/update.sh"],
         host_gateway={"status": "drift"},
         commits_behind=60,
+        update_age_days=8.0,
     )
     assert findings == [
         "missing_units:a.service,b.timer",  # sorted -> deterministic
         "tier2_pending:1",
         "host_guardian_drift",
+        "stale_update:8.0d,60behind",
         "behind_upstream:60",
     ]
 
@@ -240,6 +242,32 @@ def test_derive_findings_quiet_when_healthy():
             tier2_pending=None,
             host_gateway={"status": "ok"},
             commits_behind=3,
+            update_age_days=0.5,
         )
         == []
     )
+
+
+def test_stale_update_fires_below_behind_threshold():
+    """Review BLOCKER regression guard: 7+ days stale and 20-49 commits behind
+    must produce a finding — previously the only behind-axis finding required
+    >50 commits, so this exact range (a genuinely stale install) alerted
+    NOTHING while the awareness formula was written against >=20."""
+    findings = derive_findings(
+        missing_units=[],
+        tier2_pending=None,
+        host_gateway={"status": "ok"},
+        commits_behind=25,
+        update_age_days=7.5,
+    )
+    assert findings == ["stale_update:7.5d,25behind"]
+
+
+def test_stale_update_requires_both_axes():
+    common = dict(missing_units=[], tier2_pending=None, host_gateway={"status": "ok"})
+    # Recently updated, even if well behind at last fetch: not stale.
+    assert derive_findings(**common, commits_behind=25, update_age_days=2.0) == []
+    # Old update but nearly caught up by bare merges: not the paging condition.
+    assert derive_findings(**common, commits_behind=5, update_age_days=30.0) == []
+    # Unknown age (no update_history yet): never fabricates staleness.
+    assert derive_findings(**common, commits_behind=25, update_age_days=None) == []

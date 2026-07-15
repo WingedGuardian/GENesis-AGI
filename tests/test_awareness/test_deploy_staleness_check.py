@@ -113,23 +113,50 @@ async def test_count_drift_does_not_churn_alert(db, monkeypatch):
     assert rows[0]["content_hash"] == first[0]["content_hash"]
 
 
-async def test_sustained_staleness_is_critical(db, monkeypatch):
-    _patch_snapshot(
-        monkeypatch,
-        _snap(["behind_upstream:25"], age_days=8.0, behind=25),
+def _real_findings(*, age_days, behind, missing_units=None, tier2=None, host_status="ok"):
+    """Drive the REAL derive_findings — regression guard for the review
+    BLOCKER where the awareness formula (≥7d AND ≥20 commits) was written
+    against facts the findings gate filtered out below its own separate
+    50-commit threshold, so a genuinely stale install alerted NOTHING."""
+    return dh_module.derive_findings(
+        missing_units=missing_units or [],
+        tier2_pending=tier2,
+        host_gateway={"status": host_status},
+        commits_behind=behind,
+        update_age_days=age_days,
     )
+
+
+async def test_sustained_staleness_is_critical_via_real_findings(db, monkeypatch):
+    # 25 behind is BELOW the standalone behind_upstream threshold (50) — the
+    # stale_update class must still carry it through the findings gate.
+    findings = _real_findings(age_days=8.0, behind=25)
+    assert findings == ["stale_update:8.0d,25behind"]
+    _patch_snapshot(monkeypatch, _snap(findings, age_days=8.0, behind=25))
     await loop._check_deploy_staleness(db)
     rows = await _rows(db)
     assert len(rows) == 1
     assert rows[0]["priority"] == "critical"
 
 
+async def test_recent_update_below_behind_threshold_is_quiet(db, monkeypatch):
+    # Fresh update + modestly behind: no finding classes, no alert.
+    assert _real_findings(age_days=1.0, behind=25) == []
+    _patch_snapshot(monkeypatch, _snap([], age_days=1.0, behind=25))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+
+
 async def test_escalation_supersedes_high_row(db, monkeypatch):
-    _patch_snapshot(monkeypatch, _snap(["behind_upstream:25"], age_days=1.0, behind=25))
+    _patch_snapshot(
+        monkeypatch, _snap(_real_findings(age_days=1.0, behind=60), age_days=1.0, behind=60)
+    )
     await loop._check_deploy_staleness(db)
     assert (await _rows(db))[0]["priority"] == "high"
     monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
-    _patch_snapshot(monkeypatch, _snap(["behind_upstream:25"], age_days=8.0, behind=25))
+    _patch_snapshot(
+        monkeypatch, _snap(_real_findings(age_days=8.0, behind=60), age_days=8.0, behind=60)
+    )
     await loop._check_deploy_staleness(db)
     active = await _rows(db)
     assert len(active) == 1
@@ -190,6 +217,35 @@ async def test_recovery_resolves_and_retires_anchors(db, monkeypatch):
         (SOURCE, loop._DEPLOY_SUPERSEDED_NOTE),
     )
     assert (await cur.fetchone())[0] == 0
+
+
+async def test_partial_recovery_retires_missing_unit_anchors(db, monkeypatch):
+    """Missing units clear while OTHER drift persists (so full recovery never
+    fires): the superseded missing-units anchor must still be retired, or a
+    new missing unit months later inherits this incident's clock and pages
+    instantly instead of after 24h."""
+    await db.execute(
+        "INSERT INTO observations (id, source, type, content, priority, created_at,"
+        " resolved, resolution_notes) VALUES ('old', ?, 'infrastructure_alert',"
+        " 'missing_units:x.timer', 'high', '2020-01-01T00:00:00+00:00', 1, ?)",
+        (SOURCE, loop._DEPLOY_SUPERSEDED_NOTE),
+    )
+    await db.commit()
+    # Current state: host drift only — missing_units is NOT among the classes.
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["host_guardian_drift"], age_days=1.0, behind=0, host_status="drift"),
+    )
+    await loop._check_deploy_staleness(db)
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM observations WHERE source=? AND resolution_notes=?",
+        (SOURCE, loop._DEPLOY_SUPERSEDED_NOTE),
+    )
+    assert (await cur.fetchone())[0] == 0  # anchor retired despite ongoing drift
+    # And the ongoing drift still alerted normally.
+    rows = await _rows(db)
+    assert len(rows) == 1
+    assert rows[0]["priority"] == "high"
 
 
 async def test_snapshot_error_is_quiet(db, monkeypatch):

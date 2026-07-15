@@ -257,18 +257,32 @@ async def last_success_update(db: aiosqlite.Connection | None) -> dict:
         return {"completed_at": None, "new_commit": None, "age_days": None}
 
 
+# Sustained-staleness thresholds (the awareness check's paging axis). A
+# finding-CLASS boundary, so they live here beside derive_findings — the
+# single producer of finding keys — not in the awareness layer: an alert
+# formula written against facts the findings gate can filter out first is
+# exactly the bug this placement prevents.
+STALE_UPDATE_DAYS = 7.0
+STALE_UPDATE_COMMITS = 20
+
+
 def derive_findings(
     *,
     missing_units: list[str] | None,
     tier2_pending: list[str] | None,
     host_gateway: dict,
     commits_behind: int | None,
+    update_age_days: float | None = None,
     behind_threshold: int = 50,
 ) -> list[str]:
     """Stable, order-deterministic finding keys — the alert/dedup contract.
 
     Keys (not prose) so the awareness check can hash them for observation
-    dedup and tests can assert exactly."""
+    dedup and tests can assert exactly. Two behind-related classes with
+    DIFFERENT thresholds: ``stale_update`` (≥STALE_UPDATE_DAYS old AND
+    ≥STALE_UPDATE_COMMITS behind — the sustained condition the awareness
+    check pages on) and ``behind_upstream`` (> behind_threshold regardless
+    of update age — a plain volume signal)."""
     findings: list[str] = []
     if missing_units:
         findings.append("missing_units:" + ",".join(sorted(missing_units)))
@@ -278,6 +292,13 @@ def derive_findings(
         findings.append("host_guardian_drift")
     elif host_gateway.get("status") == "unknown_commit":
         findings.append("host_guardian_unknown_commit")
+    if (
+        update_age_days is not None
+        and commits_behind is not None
+        and update_age_days >= STALE_UPDATE_DAYS
+        and commits_behind >= STALE_UPDATE_COMMITS
+    ):
+        findings.append(f"stale_update:{round(update_age_days, 1)}d,{commits_behind}behind")
     if commits_behind is not None and commits_behind > behind_threshold:
         findings.append(f"behind_upstream:{commits_behind}")
     return findings
@@ -315,6 +336,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             tier2_pending=tier2,
             host_gateway=collected["host_gateway"],
             commits_behind=collected["git"].get("commits_behind_upstream"),
+            update_age_days=update.get("age_days"),
         )
         return {
             "status": "attention" if findings else "healthy",
