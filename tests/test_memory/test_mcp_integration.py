@@ -208,12 +208,15 @@ async def test_memory_proactive_delegates(mock_deps, tools):
 
     results = await tools["memory_proactive"].fn(current_message="hello world", limit=3)
     assert len(results) == 1
-    memory_mcp._retriever.recall.assert_awaited_once_with(
-        "hello world",
-        limit=6,
-        min_activation=0.0,
-        rerank=False,
-    )
+    memory_mcp._retriever.recall.assert_awaited_once()
+    call = memory_mcp._retriever.recall.call_args
+    assert call.args == ("hello world",)
+    assert call.kwargs["limit"] == 6
+    assert call.kwargs["min_activation"] == 0.0
+    assert call.kwargs["rerank"] is False
+    # WS-3 B4: the enforce-drop write-back exclusion seam is always threaded
+    # (a no-op predicate outside dispatched+enforce).
+    assert callable(call.kwargs["skip_writeback"])
 
 
 @pytest.mark.asyncio

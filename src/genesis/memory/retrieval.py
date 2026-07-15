@@ -4,6 +4,7 @@ import dataclasses
 import logging
 import math
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import aiosqlite
@@ -561,6 +562,7 @@ class HybridRetriever:
         rerank: bool = True,
         include_deprecated: bool = False,
         event_id_sink: list[str] | None = None,
+        skip_writeback: Callable[[RetrievalResult], bool] | None = None,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
 
@@ -572,6 +574,12 @@ class HybridRetriever:
             - ``source='episodic' | 'knowledge' | 'both'``: explicit
               override; intent inference is skipped for the source
               decision but still informs RRF biasing.
+
+        ``skip_writeback``: optional predicate over the assembled
+        ``RetrievalResult``s — items it returns True for are excluded from
+        the retrieved_count/activation write-backs (enforce-drop surfaces
+        pass their drop predicate so blocked items gain no retrieval
+        credit). Fail-open: a raising predicate restores full write-backs.
 
             Callers that want to force ``both`` regardless of intent
             should pass ``source='both'`` explicitly.
@@ -762,9 +770,8 @@ class HybridRetriever:
         # 10. Take top limit
         top = candidates[:limit]
 
-        # 11/11b/11c. Retrieval write-backs (Qdrant counts, observation +
-        # knowledge_units sync) — each individually swallowed.
-        await self._record_retrievals(top, qdrant_by_id, fts_by_id, now_str)
+        # (11/11b/11c retrieval write-backs moved BELOW step 12b — they need
+        # the assembled results' stored origin_class for `skip_writeback`.)
 
         # 12. Build RetrievalResult objects
         results = _assemble_results(
@@ -803,6 +810,23 @@ class HybridRetriever:
                 ]
             except Exception:
                 logger.debug("origin_class backfill on recall failed", exc_info=True)
+
+        # 11/11b/11c. Retrieval write-backs (Qdrant counts, observation +
+        # knowledge_units sync) — each individually swallowed. Runs AFTER
+        # assembly + the 12b origin backfill so `skip_writeback` sees the
+        # STORED origin: an item the caller will enforce-drop must not gain
+        # retrieved_count/activation credit from the very recall that blocks
+        # it (Codex #1048 — blocked external content would otherwise farm
+        # ranking energy from dispatched sessions). With no predicate the
+        # write-back set is identical to the pre-move behavior (all of `top`).
+        _wb_ids = top
+        if skip_writeback is not None:
+            try:
+                _wb_ids = [r.memory_id for r in results if not skip_writeback(r)]
+            except Exception:
+                logger.debug("skip_writeback predicate failed open", exc_info=True)
+                _wb_ids = top
+        await self._record_retrievals(_wb_ids, qdrant_by_id, fts_by_id, now_str)
 
         # J-9 eval: log recall event for memory retrieval quality measurement
         from genesis.eval.j9_hooks import (

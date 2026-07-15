@@ -213,6 +213,14 @@ async def test_memory_proactive_drops_external_dispatched_enforce(
     # The drop is RECORDED: enforce-mode ledger row exists.
     rows = await db.execute_fetchall("SELECT gate, mode, would_block FROM immunity_shadow_events")
     assert ("injection", "enforce", 1) in [tuple(r) for r in rows]
+    # The drop is CREDIT-FREE: recall received a skip_writeback predicate
+    # that flags exactly the to-be-dropped item, so it never earns
+    # retrieved_count/activation from the recall that blocks it (Codex
+    # #1048 P2 — blocked content must not farm ranking energy).
+    pred = retriever.recall.call_args.kwargs.get("skip_writeback")
+    assert callable(pred), "memory_proactive must pass skip_writeback"
+    assert pred(_rr("x", "external_untrusted")) is True
+    assert pred(_rr("y", "first_party")) is False
 
 
 async def test_memory_proactive_foreground_keeps_wrapped_external(
@@ -244,6 +252,11 @@ async def test_memory_proactive_foreground_keeps_wrapped_external(
 
     assert [d["memory_id"] for d in out] == ["kb-1"]  # supervised: kept
     assert "<external-content" in out[0]["content"]  # ... but wrapped
+    # Foreground: nothing is dropped, so nothing loses retrieval credit —
+    # the skip_writeback predicate must be a no-op for every origin.
+    pred = retriever.recall.call_args.kwargs.get("skip_writeback")
+    assert callable(pred)
+    assert pred(_rr("x", "external_untrusted")) is False  # supervised: no drop
 
 
 async def test_memory_core_facts_drops_external_dispatched_enforce(

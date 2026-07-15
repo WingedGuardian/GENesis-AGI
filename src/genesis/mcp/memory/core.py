@@ -783,8 +783,25 @@ async def memory_proactive(
     # min_activation=0.0: use activation as a ranking signal, not a filter gate.
     # With confidence=0.5 (96% of memories) and retrieved_count=0 (80%),
     # even day-old memories fail a 0.3 threshold. Let RRF fusion rank instead.
+    _unsupervised = immunity_shadow.is_dispatched_session_env()
+    # skip_writeback: an item the enforce branch below will DROP must not gain
+    # retrieved_count/activation credit from this recall — otherwise blocked
+    # external content farms ranking energy from every dispatched session that
+    # matches it while never being delivered (Codex #1048 P2). Same predicate
+    # as the drop loop; fail-open (predicate error -> normal write-backs).
     results = await memory_mod._retriever.recall(
-        current_message, limit=limit * 2, min_activation=0.0, rerank=False
+        current_message,
+        limit=limit * 2,
+        min_activation=0.0,
+        rerank=False,
+        skip_writeback=lambda r: immunity_shadow.should_enforce_drop(
+            gate="injection",
+            collection=r.collection,
+            source_pipeline=r.source_pipeline,
+            origin_class=r.origin_class,
+            pushed_surface=True,
+            unsupervised=_unsupervised,
+        ),
     )
     # Keep the full candidate pool (recall fetched limit*2) UNSLICED — the
     # enforce drop below removes items, and slicing to `limit` first would
@@ -798,7 +815,6 @@ async def memory_proactive(
     out: list[dict] = []
     blockable = 0
     dropped = 0
-    _unsupervised = immunity_shadow.is_dispatched_session_env()
     for r in filtered:
         if len(out) >= limit:
             break
