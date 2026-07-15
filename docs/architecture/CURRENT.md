@@ -763,7 +763,12 @@ verified: 95dee055 2026-07-15
   state) + `oomd_user_slice_kill` (config-plane scan of user.slice.d drop-ins,
   laid down by `scripts/lib/memory_resilience.sh` from bootstrap/update) and
   host-plane `swap_total_kb`, so the annotation layer flags unprotected
-  installs (see docs/reference/memory-resilience.md).
+  installs (see docs/reference/memory-resilience.md). Network-resilience
+  invariants are first-class too: container `networkd_keep_configuration` +
+  `network_watchdog_installed` (config-plane facts from
+  `scripts/lib/network_resilience.sh`) plus a volatile `watchdog` heal-telemetry
+  metric from `/run/genesis-network-watchdog.json` (see
+  docs/reference/network-resilience.md).
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),

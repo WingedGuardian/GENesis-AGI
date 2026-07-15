@@ -160,6 +160,53 @@ def _oomd_user_slice_kill(etc_root: Path) -> bool:
     return effective == "kill"
 
 
+def _networkd_keep_configuration(etc_root: Path) -> bool:
+    """True when at least one systemd-networkd link has an effective
+    KeepConfiguration policy (any value other than "no") — the
+    genesis-keep-config.conf that scripts/lib/network_resilience.sh lays down so
+    a networkd failure RETAINS the address instead of dropping it (the 2026-07
+    eth0 wedge). Scoped the way systemd scopes drop-ins: last-assignment-wins
+    WITHIN each `.network.d` directory (a later zz-*.conf reverting to `auto`/
+    `no` disables that link), then OR'd across links — an unrelated drop-in on
+    a *different* interface can neither fake protection nor mask it. Config-
+    plane: scans our world-readable /etc drop-ins (the /run render is root-only).
+    Comments are full-line only (unit files have no inline comments)."""
+    net_dir = etc_root / "systemd/network"
+    if not net_dir.is_dir():
+        return False
+    for dropin_dir in sorted(net_dir.glob("*.network.d")):
+        if not dropin_dir.is_dir():
+            continue
+        effective: str | None = None
+        for conf in sorted(dropin_dir.glob("*.conf")):
+            raw = _read(conf) or ""
+            for line in raw.splitlines():
+                stripped = line.strip()
+                if stripped.startswith(("#", ";")):
+                    continue
+                key, sep, value = stripped.partition("=")
+                if sep and key.strip() == "KeepConfiguration":
+                    effective = value.strip()
+        if effective is not None and effective.lower() != "no":
+            return True
+    return False
+
+
+def _read_watchdog_state(run_root: Path) -> dict | None:
+    """Parse the network watchdog's /run telemetry (last_check / last_heal /
+    last_trigger / heal_count / last_action). Returns None when absent or
+    malformed — it is a METRIC, so a missing or garbage file just omits the key
+    rather than failing the section."""
+    raw = _read(run_root / "genesis-network-watchdog.json")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _detect_root_device(proc_root: Path) -> str | None:
     """Block device major:minor for the root filesystem (via mountinfo)."""
     raw = _read(proc_root / "self/mountinfo") or ""
@@ -395,8 +442,12 @@ async def collect_kernel(
 # ── network ──────────────────────────────────────────────────────────────
 
 
-async def collect_network(etc_root: Path = Path("/etc")) -> SectionResult:
-    """Interfaces/MTU/addresses, DNS, default route, tailscale presence.
+async def collect_network(
+    etc_root: Path = Path("/etc"),
+    run_root: Path = Path("/run"),
+) -> SectionResult:
+    """Interfaces/MTU/addresses, DNS, default route, tailscale presence, plus
+    the network-resilience posture (KeepConfiguration + watchdog).
 
     Addresses are FACTS by design: an IP change on this plane is a real
     identity event worth a drift observation, not noise.
@@ -445,6 +496,20 @@ async def collect_network(etc_root: Path = Path("/etc")) -> SectionResult:
                 metrics["default_gateway"] = default[0].get("gateway")
         except (ValueError, IndexError, TypeError):
             pass
+
+    # Resilience posture (config-plane facts — see docs/reference/network-
+    # resilience.md). Deterministic file reads, so they belong in facts: the
+    # annotation layer flags an install that lacks either protection.
+    facts["networkd_keep_configuration"] = _networkd_keep_configuration(etc_root)
+    facts["network_watchdog_installed"] = (
+        etc_root / "systemd/system/genesis-network-watchdog.timer"
+    ).exists()
+
+    # Watchdog heal telemetry is volatile (heal_count/timestamps move), so it is
+    # a METRIC — never hashed. Absent file → key omitted (no drift churn).
+    watchdog = _read_watchdog_state(run_root)
+    if watchdog is not None:
+        metrics["watchdog"] = watchdog
 
     return SectionResult(name="network", facts=facts, metrics=metrics)
 
