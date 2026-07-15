@@ -348,7 +348,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 3d5234b9 2026-07-13
+verified: 859ec256 2026-07-14
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -564,7 +564,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, env.py, _config_overlay.py]
-verified: 3d5234b9 2026-07-13
+verified: 859ec256 2026-07-14
 ```
 
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
@@ -663,7 +663,12 @@ verified: 3d5234b9 2026-07-13
   + the user-CLAUDE.md `container-specs` block (content owner:
   `infra_profile/claude_md.py`; update.sh invokes `--claude-md-block`).
   Distinct from `observability/snapshots/infrastructure.py` (dynamic health) —
-  don't merge them.
+  don't merge them. Memory-resilience invariants are first-class facts:
+  container `cgroup_memory_swap_max` (tri-state — "0" IS the 2026-07 wedge
+  state) + `oomd_user_slice_kill` (config-plane scan of user.slice.d drop-ins,
+  laid down by `scripts/lib/memory_resilience.sh` from bootstrap/update) and
+  host-plane `swap_total_kb`, so the annotation layer flags unprotected
+  installs (see docs/reference/memory-resilience.md).
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
