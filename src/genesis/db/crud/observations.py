@@ -584,7 +584,10 @@ async def exists_recent_by_type(
         query += "AND category LIKE ? "
         params.append(category_like)
     if category_not_like is not None:
-        query += "AND category NOT LIKE ? "
+        # NULL categories are treated as matching (i.e. NOT the excluded
+        # pattern) — this mirrors GenesisEgoContextBuilder, which counts a
+        # NULL-category observation as Genesis-visible via `category IS NULL`.
+        query += "AND (category IS NULL OR category NOT LIKE ?) "
         params.append(category_not_like)
     query += "LIMIT 1"
     rows = await db.execute_fetchall(query, tuple(params))

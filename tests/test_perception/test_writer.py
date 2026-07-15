@@ -973,3 +973,61 @@ async def test_micro_dedup_user_and_genesis_still_distinct(db):
     obs = await observations.query(db, source="reflection")
     cats = sorted(o["category"] for o in obs)
     assert cats == ["anomaly:genesis", "anomaly:user"]
+
+
+async def test_micro_cooldown_null_category_is_genesis_visible(db):
+    """A recent NULL-category micro is Genesis-visible (genesis_context
+    includes ``category IS NULL``), so it must suppress a subsequent genesis
+    micro -- the cooldown NOT-LIKE branch must treat NULL as visible."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id="recent-null-micro",
+        source="reflection",
+        type="micro_reflection",
+        content='{"summary": "prior, no category"}',
+        priority="low",
+        created_at=now,
+    )
+    genesis_output = MicroOutput(
+        tags=["cpu"], salience=0.6, anomaly=False,
+        summary="Disk usage creeping.",
+        signals_examined=2,
+        driving_signals=["cpu_usage"],
+    )
+    stored = await writer.write(genesis_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    assert stored is False, "NULL-category prior (Genesis-visible) must suppress a genesis micro"
+
+
+async def test_micro_cooldown_null_category_does_not_block_user(db):
+    """A NULL-category (Genesis-visible) prior must NOT block a :user micro."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id="recent-null-micro2",
+        source="reflection",
+        type="micro_reflection",
+        content='{"summary": "prior, no category"}',
+        priority="low",
+        created_at=now,
+    )
+    user_output = MicroOutput(
+        tags=["user"], salience=0.6, anomaly=False,
+        summary="Task quality shifted.",
+        signals_examined=2,
+        driving_signals=["task_completion_quality"],
+    )
+    stored = await writer.write(user_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    assert stored is True, "Genesis-visible NULL prior must not block a :user micro"
