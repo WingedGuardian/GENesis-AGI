@@ -674,6 +674,48 @@ verified: 859ec256 2026-07-14
   `scripts/prune_immunity_shadow.py` (disk-hygiene). The shadow log is readable
   via the `immunity_status` health MCP tool (gate-agnostic: per-gate live mode
   + per-site would-block counts — sizes the B4 enforce blast radius).
+  **B4: stored-origin recall + enforce for gates 3-4 (shipped shadow; flip is a
+  live `settings_update`).** Recall now plumbs the stored `origin_class`
+  (migration 0054) end-to-end — `RetrievalResult.origin_class` on both the
+  Qdrant and FTS5-only paths (the latter via a `search_ranked` column,
+  coalescing SQLite when a pre-backfill payload is None) — so
+  `item_is_blockable` is STORED-FIRST (widens to episodic-external rows; fixes
+  the first-party-in-KB over-observe). A second CI sweep
+  (`KNOWN_QDRANT_READ_SITES`) locks every direct Qdrant `.scroll`/`.retrieve`
+  content→prompt surface; it caught `memory_core_facts` (now gated). The
+  gate-2 L-tier substrate: `cc_sessions.origin_class` + `observations.origin_class`
+  (migration 0057), stamped at registration from the DISPATCH PROFILE (never a
+  tool scan); reflection `user_model_delta` writers carry a run-level window
+  aggregate (`cc_sessions.reflection_window_origin`), so the identity emit
+  derives real provenance instead of hardcoded first_party (gate-2 stays
+  shadow). Enforce (gates 3-4 only; procedure/identity rejected by the
+  validator honesty guard): gate-4 drops `external_untrusted` from PUSHED feeds
+  (`memory_proactive`, `memory_core_facts`; the proactive hook needs no filter —
+  dispatched sessions exit it at module import, total absence) ONLY in dispatched
+  UNSUPERVISED sessions under enforce — the discriminator is
+  `GENESIS_CC_SESSION` present (stamped unconditionally on every CCInvoker
+  child) AND `GENESIS_SESSION_SUPERVISED` absent (`CCInvocation.supervised`,
+  set only by ConversationManager's owner-attended invocations).
+  `GENESIS_SESSION_ID` is attribution only — foreground conversations carry
+  one and some autonomy dispatches don't, so it is wrong in both directions
+  as a supervision signal. Explicit queries
+  (`memory_recall`/`knowledge_recall`/`memory_expand`) and every foreground
+  surface keep wrapped external in all modes (`should_enforce_drop`, fail-open);
+  gate-3 refuses grant evidence/state writes with a blockable origin — and the
+  refusal is read-only (no `ensure_cell` before the guard: external provenance
+  can't even seed a NOT_DETERMINED cell). Wrap + provenance labels are
+  STORED-FIRST at every inject surface (review round): `wrap_external_recall`
+  and `provenance_descriptor(origin_class=…)` key on the stored origin with the
+  collection check as fallback, so external EPISODIC rows are delimited/labeled
+  external everywhere (MCP recall/expand/proactive, hook `Memory·external` tag,
+  context injector, voice, research executor, dashboard) — the wrap is the
+  compensating control on the explicit surfaces the enforce cut retains. Every
+  drop/refusal still records (the enforce-mode row IS the block ledger).
+  Auto-demote now pages a `critical` `infrastructure_alert` when a gate stands
+  down, and counts only ENFORCED INTERVENTIONS (`count_enforced_interventions`
+  — rows whose detail carries `refused`/`enforced_drops`), never wrap-only
+  observation rows, so a normal explicit-recall session can't flip the gate
+  back to shadow. Red-team acceptance: `test_redteam_enforce.py` (synthetic).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **infra_profile/**: the infrastructure body schema — deterministic fact

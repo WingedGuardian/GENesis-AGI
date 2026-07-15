@@ -244,6 +244,17 @@ class CCInvocation:
     # silently degrading to first_party would resurrect the exact origin-loss
     # gap this field closes).
     origin: str | None = None
+    # WS-3 B4 gate-4: True ONLY for owner-attended interactive conversations
+    # (terminal/telegram ConversationManager). CCInvoker._build_env stamps
+    # GENESIS_SESSION_SUPERVISED so immunity_shadow.is_dispatched_session_env
+    # excludes these from the pushed-surfaces enforce drop — GENESIS_SESSION_ID
+    # alone is an ATTRIBUTION id (foreground conversations set it too, via
+    # observability.session_context), not a supervision signal. Default False:
+    # headless/background dispatches are unsupervised; a new foreground path
+    # that forgets this flag fails toward dropping wrapped-external pushed
+    # content there (visible in the enforce ledger + auto-demote), never
+    # toward injecting into an unsupervised session.
+    supervised: bool = False
     # Applied LAST in CCInvoker._build_env, after every computed key — the
     # per-invocation escape hatch for env the invoker doesn't model (e.g. the
     # eval bench's CLAUDE_CONFIG_DIR cleanroom). Overrides win over inherited

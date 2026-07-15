@@ -203,6 +203,9 @@ class ConversationLoop:
                 skip_permissions=True,
                 append_system_prompt=True,
                 roster_eligible=True,
+                # WS-3 B4: owner-attended interactive conversation — spare it
+                # from the gate-4 pushed-surfaces enforce drop.
+                supervised=True,
                 **resume_overrides,
             )
 
@@ -490,6 +493,9 @@ class ConversationLoop:
                 append_system_prompt=True,
                 session_key=session_key,
                 roster_eligible=True,
+                # WS-3 B4: owner-attended interactive conversation — spare it
+                # from the gate-4 pushed-surfaces enforce drop.
+                supervised=True,
                 **resume_overrides,
             )
 
@@ -735,6 +741,8 @@ class ConversationLoop:
             append_system_prompt=True,
             session_key=session_key,  # cc-loop-01: keep /stop working on retry
             roster_eligible=True,  # fresh retry stays roster-routable (no resume)
+            # WS-3 B4: owner-attended interactive conversation (fresh retry).
+            supervised=True,
         )
 
     @staticmethod
