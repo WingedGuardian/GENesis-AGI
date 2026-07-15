@@ -12,6 +12,7 @@ import asyncio
 import threading
 import time
 
+import pytest
 from flask import Flask
 
 from genesis.dashboard._blueprint import _async_route
@@ -83,3 +84,68 @@ def test_async_route_timeout_allows_fast_handler():
             assert quick() == "fine"
     finally:
         loop.call_soon_threadsafe(loop.stop)
+def test_async_route_configured_but_stopped_loop_returns_503():
+    """A configured-but-not-running loop (startup window) -> 503, never a
+    fresh event loop running the handler against cross-loop state."""
+    loop = asyncio.new_event_loop()  # configured, NOT running
+    app = Flask(__name__)
+    app.config["GENESIS_EVENT_LOOP"] = loop
+
+    ran = []
+
+    @_async_route
+    async def handler():
+        ran.append(True)
+        return "should not run"
+
+    try:
+        with app.test_request_context("/"):
+            resp, status = handler()
+        assert status == 503
+        assert resp.get_json()["status"] == "unavailable"
+        assert not ran  # handler must not execute on any substitute loop
+    finally:
+        loop.close()
+
+
+def test_async_route_loopless_fallback_runtimeerror_returns_503():
+    """No loop configured + handler raising the cross-loop RuntimeError
+    (aiosqlite bound to a different loop) -> 503, not a propagated crash
+    (the pre-fix behavior took the server down with exit code 2)."""
+    app = Flask(__name__)  # GENESIS_EVENT_LOOP never set
+
+    @_async_route
+    async def cross_loop():
+        raise RuntimeError("Lock is bound to a different event loop")
+
+    with app.test_request_context("/"):
+        resp, status = cross_loop()
+    assert status == 503
+    assert resp.get_json()["status"] == "unavailable"
+
+
+def test_async_route_loopless_fallback_reraises_non_loop_runtimeerror():
+    """A genuine handler RuntimeError (not loop-binding) must propagate, not be
+    masked as 503 — otherwise embedded hosts hide real failures."""
+    app = Flask(__name__)  # GENESIS_EVENT_LOOP never set
+
+    @_async_route
+    async def real_bug():
+        raise RuntimeError("database gone")
+
+    with app.test_request_context("/"), pytest.raises(RuntimeError, match="database gone"):
+        real_bug()
+
+
+def test_async_route_loopless_fallback_still_runs_handlers():
+    """The loop-is-None fallback keeps executing plain handlers (unit-test
+    contract) — only RuntimeError degrades to 503."""
+    app = Flask(__name__)
+
+    @_async_route
+    async def plain():
+        await asyncio.sleep(0)
+        return "ok"
+
+    with app.test_request_context("/"):
+        assert plain() == "ok"

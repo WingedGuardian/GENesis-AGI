@@ -84,6 +84,36 @@ flags unprotected installs:
   ever kills `genesis-server` itself, the pressure limit is mis-tuned for
   that machine — raise the percentage or investigate what drove sustained
   PSI, and file the incident.
+
+## What a live fire drill proved (2026-07)
+
+The full stack was drilled on a production install (16 GiB container, 7.3 GiB
+host swap) with deliberate memory balloons. Findings worth knowing before you
+tune anything:
+
+- **The swap layer is what absorbs almost everything.** An idle 7.6 GiB
+  balloon was absorbed silently; a single 12 GiB *churning* balloon ran for
+  hours without wedging the machine — the exact stimulus class that
+  previously took the box down in minutes.
+- **At hard exhaustion, the KERNEL OOM killer fires first, and that's fine.**
+  A four-process churn storm (~13 GiB hot working set) exceeded RAM + swap
+  and was killed by the kernel within ~2 minutes (`memory.events` `oom_kill`
+  is the counter to check — inside a container you cannot see the host's
+  dmesg, and `journalctl -u systemd-oomd` staying empty does NOT mean nothing
+  fired). `genesis-server` survived on `OOMScoreAdjust=-500`.
+- **systemd-oomd thresholds against the *full* PSI metric** — the fraction of
+  time ALL tasks in the cgroup were stalled simultaneously (see
+  systemd.oomd(5)) — not the `some` line most dashboards show. A single
+  greedy process can push `some` past 60% while `full` stays in single
+  digits: oomd correctly stays quiet because everything else is still making
+  progress off swap. Its unique window — sustained all-tasks stall *without*
+  hard memory.max exhaustion — is narrow by design. Don't lower its
+  percentages chasing kills the kernel layer already delivers; that only buys
+  collateral kills during legitimate heavy bursts.
+- Net: the wedge fingerprint at the top of this doc is covered twice over —
+  swap turns the cliff into a ramp, and whichever of kernel-OOM (hard
+  exhaustion) or oomd (sustained all-stall) triggers first takes the greedy
+  tree while the server survives.
 - Quality-over-cost still applies: nothing here throttles or degrades
   Genesis under pressure; it only decides *what dies first* when the machine
   is already out of headroom.

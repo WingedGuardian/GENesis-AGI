@@ -38,7 +38,8 @@ def config_dirs(tmp_path, monkeypatch) -> tuple[Path, Path]:
 
     monkeypatch.setattr(immunity, "repo_root", lambda: repo_dir)
     monkeypatch.setattr(
-        "genesis._config_overlay._user_config_dir", lambda: user_dir,
+        "genesis._config_overlay._user_config_dir",
+        lambda: user_dir,
     )
     monkeypatch.setattr(immunity, "_user_config_dir", lambda: user_dir)
 
@@ -99,6 +100,23 @@ def test_invalid_mode_value_degrades_to_shadow(config_dirs):
     assert immunity.gate_mode("procedure") == "shadow"
 
 
+def test_enforce_clamped_for_gates_without_enforce_branch(config_dirs):
+    """Honesty clamp (Codex #1048 P2): a gate with no enforce branch must
+    NEVER report enforce at runtime — even from a stale local overlay a
+    previous version accepted, or a hand-edit. The validator only sees
+    settings_update deltas; gate_mode is the choke point that covers a value
+    already sitting on disk."""
+    base, overlay = config_dirs
+    # Simulate a stale overlay (or hand-edit) that bypassed the validator.
+    _write(overlay, {"procedure": {"mode": "enforce"}, "identity": {"mode": "enforce"}})
+    assert immunity.gate_mode("procedure") == "shadow"
+    assert immunity.gate_mode("identity") == "shadow"
+    # The gates that DO implement enforce still honor it.
+    _write(overlay, {"autonomy": {"mode": "enforce"}, "injection": {"mode": "enforce"}})
+    assert immunity.gate_mode("autonomy") == "enforce"
+    assert immunity.gate_mode("injection") == "enforce"
+
+
 # ─── live read (no cache) ───────────────────────────────────────────────────
 
 
@@ -106,11 +124,13 @@ def test_overlay_edit_takes_effect_without_reload(config_dirs):
     """gate_mode re-reads the merged config on EVERY call: rewriting the
     .local.yaml overlay mid-process flips the answer immediately."""
     base, overlay = config_dirs
-    _write(base, {"procedure": {"mode": "shadow"}})
-    assert immunity.gate_mode("procedure") == "shadow"
+    # Use autonomy — a gate that genuinely enforces — so this exercises the
+    # live-read seam, not the enforce honesty clamp (covered separately).
+    _write(base, {"autonomy": {"mode": "shadow"}})
+    assert immunity.gate_mode("autonomy") == "shadow"
 
-    _write(overlay, {"procedure": {"mode": "enforce"}})
-    assert immunity.gate_mode("procedure") == "enforce"  # same process, no reload
+    _write(overlay, {"autonomy": {"mode": "enforce"}})
+    assert immunity.gate_mode("autonomy") == "enforce"  # same process, no reload
 
 
 # ─── never-block invariant ──────────────────────────────────────────────────
@@ -138,20 +158,22 @@ def test_effective_origin_class_fails_closed():
 
 def test_record_demotion_writes_overlay_and_takes_effect(config_dirs):
     base, overlay = config_dirs
-    _write(base, {"identity": {"mode": "enforce"}})
-    assert immunity.gate_mode("identity") == "enforce"
+    # autonomy genuinely enforces, so this tests the demotion WRITE mechanism
+    # without colliding with the enforce honesty clamp.
+    _write(base, {"autonomy": {"mode": "enforce"}})
+    assert immunity.gate_mode("autonomy") == "enforce"
 
-    immunity.record_demotion("identity", "test spike")
+    immunity.record_demotion("autonomy", "test spike")
 
     written = yaml.safe_load(overlay.read_text())
-    assert written["identity"]["mode"] == "shadow"
-    state = written["auto_demote_state"]["identity"]
+    assert written["autonomy"]["mode"] == "shadow"
+    state = written["auto_demote_state"]["autonomy"]
     assert state["from_mode"] == "enforce"
     assert state["reason"] == "test spike"
     assert state["demoted_at"]  # ISO timestamp present
 
     # Effective on the very next call — overlay wins over the base enforce.
-    assert immunity.gate_mode("identity") == "shadow"
+    assert immunity.gate_mode("autonomy") == "shadow"
 
 
 def test_record_demotion_preserves_existing_overlay_keys(config_dirs):
@@ -190,12 +212,13 @@ def test_record_demotion_carries_repo_sibling_overlay_keys(config_dirs):
     base, user_overlay = config_dirs
     assert not user_overlay.exists()
     sibling = base.with_suffix(".local.yaml")
-    _write(sibling, {"procedure": {"mode": "enforce"}})
-    assert immunity.gate_mode("procedure") == "enforce"
+    # autonomy genuinely enforces (untouched carry gate); demote injection.
+    _write(sibling, {"autonomy": {"mode": "enforce"}})
+    assert immunity.gate_mode("autonomy") == "enforce"
 
-    immunity.record_demotion("identity", "spike")
+    immunity.record_demotion("injection", "spike")
 
     written = yaml.safe_load(user_overlay.read_text())
-    assert written["procedure"]["mode"] == "enforce"  # carried over
-    assert written["identity"]["mode"] == "shadow"
-    assert immunity.gate_mode("procedure") == "enforce"  # still applies
+    assert written["autonomy"]["mode"] == "enforce"  # carried over
+    assert written["injection"]["mode"] == "shadow"
+    assert immunity.gate_mode("autonomy") == "enforce"  # still applies

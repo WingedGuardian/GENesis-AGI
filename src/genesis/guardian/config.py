@@ -215,6 +215,25 @@ class GitHealthConfig:
 
 
 @dataclass
+class RepoBundleConfig:
+    """Offline git-bundle lifeline (F.4).
+
+    The container publishes a verified ``git bundle`` of the main repo to the
+    shared mount DAILY (health-gated); the guardian archives the newest bundle to
+    a host-only directory the container cannot reach and WARNs when the archived
+    bundle goes stale. This is the offline re-clone path for when both the
+    container's local git AND the network are gone.
+    """
+
+    enabled: bool = True
+    keep: int = 3  # host-side archived bundle copies (never below 1)
+    # WARN if the newest verified bundle is older than this (daily cadence → 3
+    # missed healthy publishes means the loop or the repo is broken).
+    stale_days: float = 3.0
+    realert_hours: float = 24.0  # re-alert cadence while stale persists
+
+
+@dataclass
 class ProvisioningConfig:
     """Hypervisor provisioning (rung 5 of the escalation ladder).
 
@@ -286,6 +305,7 @@ class GuardianConfig:
     storage_pool: StoragePoolConfig = field(default_factory=StoragePoolConfig)
     cred_integrity: CredIntegrityConfig = field(default_factory=CredIntegrityConfig)
     git_health: GitHealthConfig = field(default_factory=GitHealthConfig)
+    repo_bundle: RepoBundleConfig = field(default_factory=RepoBundleConfig)
     provisioning: ProvisioningConfig = field(default_factory=ProvisioningConfig)
 
     @property
@@ -549,6 +569,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         storage_pool=_build_sub(StoragePoolConfig, raw, "storage_pool"),
         cred_integrity=_build_sub(CredIntegrityConfig, raw, "cred_integrity"),
         git_health=_build_sub(GitHealthConfig, raw, "git_health"),
+        repo_bundle=_build_sub(RepoBundleConfig, raw, "repo_bundle"),
         provisioning=_build_sub(ProvisioningConfig, raw, "provisioning"),
     )
 

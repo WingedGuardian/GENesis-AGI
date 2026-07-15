@@ -99,6 +99,76 @@ def item_is_blockable(
     return source_pipeline not in _FIRST_PARTY_KB_PIPELINES
 
 
+def is_dispatched_session_env() -> bool:
+    """True iff this process runs inside an UNSUPERVISED Genesis-dispatched CC session.
+
+    Two env signals, both stamped by ``CCInvoker._build_env`` (inherited by the
+    session's MCP servers and hooks, read per call):
+
+    - ``GENESIS_CC_SESSION`` — set UNCONDITIONALLY on every CCInvoker child.
+      This, not ``GENESIS_SESSION_ID``, is the dispatch marker: the session id
+      is pure attribution and is ABSENT on dispatch paths that never set
+      ``observability.session_context`` (autonomy step_dispatcher, executor
+      research — Codex round-3 on #1048), while foreground conversations DO
+      carry one (Codex round-2) — so the id is wrong in both directions.
+    - ``GENESIS_SESSION_SUPERVISED`` — set from ``CCInvocation.supervised``,
+      True only for owner-attended interactive conversations
+      (terminal/telegram ConversationManager); popped otherwise.
+
+    Dispatched/unsupervised = CC dispatch marker present AND supervised marker
+    absent. Fail directions (documented): a dispatch path bypassing CCInvoker
+    entirely has neither marker → reads supervised → keeps wrapped external
+    (fail-open); a new foreground path missing the supervised flag drops
+    pushed external there (autoimmune direction — visible in the enforce
+    ledger + auto-demote).
+    """
+    import os
+
+    return os.environ.get("GENESIS_CC_SESSION") == "1" and (
+        os.environ.get("GENESIS_SESSION_SUPERVISED") != "1"
+    )
+
+
+def should_enforce_drop(
+    *,
+    gate: str,
+    collection: str | None,
+    source_pipeline: str | None,
+    origin_class: str | None,
+    pushed_surface: bool,
+    unsupervised: bool,
+) -> bool:
+    """THE gate-4 enforce decision — pushed-surfaces cut (B4, user-decided).
+
+    Drop ``external_untrusted`` content ONLY when ALL hold:
+    - the gate is in ``enforce`` mode (live per-call YAML read),
+    - the surface is PUSHED (automatic/uninvited feed — proactive hook,
+      ambient/query-less MCP selection), never an explicit query,
+    - the consuming session is UNSUPERVISED (dispatched CC child), and
+    - the item is blockable per the stored-first classifier
+      (owner/first_party never blockable, by construction).
+
+    Explicit recalls (memory_recall/knowledge_recall/memory_expand) and every
+    foreground surface keep returning WRAPPED external content in every mode.
+    Fail-OPEN on any error — a provenance lookup must never break recall; the
+    worst failure direction is "kept wrapped external", never a lost block
+    ledger row (the caller still emits).
+    """
+    try:
+        if not (pushed_surface and unsupervised):
+            return False
+        if immunity.gate_mode(gate) != "enforce":
+            return False
+        return item_is_blockable(
+            collection=collection,
+            source_pipeline=source_pipeline,
+            origin_class=origin_class,
+        )
+    except Exception:
+        logger.debug("should_enforce_drop failed open", exc_info=True)
+        return False
+
+
 def _build_row(
     *,
     gate: str,
@@ -248,10 +318,16 @@ async def recent_summary(*, since: str | None = None, db=None) -> list[dict]:
 
 
 async def _maybe_auto_demote(db, *, gate: str, mode: str, process: str | None) -> None:
-    """Demote *gate* enforce→shadow if would-blocks breach the configured
-    threshold. DORMANT in shadow: only acts from the server process AND only
-    when the gate is already ``enforce`` (B4). Never mutates config from a
-    hook subprocess."""
+    """Demote *gate* enforce→shadow if ENFORCED INTERVENTIONS (drops/refusals)
+    breach the configured threshold. DORMANT in shadow: only acts from the
+    server process AND only when the gate is already ``enforce`` (B4). Never
+    mutates config from a hook subprocess.
+
+    Counts only rows where the gate actually withheld something (detail
+    ``refused``/``enforced_drops`` markers) — NEVER wrap-only observation rows
+    (Codex round-6 on #1048: explicit recalls of wrapped KB content emit
+    ledger rows under enforce too, and counting those would let a normal
+    research session flip the gate back to shadow within the hour)."""
     if process != "server" or mode != "enforce":
         return
     cfg = immunity.load_immunity_config().get("auto_demote", {})
@@ -260,6 +336,34 @@ async def _maybe_auto_demote(db, *, gate: str, mode: str, process: str | None) -
     window = int(cfg.get("window_minutes", 60))
     threshold = int(cfg.get("would_block_threshold", 5))
     since = (datetime.now(UTC) - timedelta(minutes=window)).isoformat()
-    n = await crud.count_would_block(db, gate=gate, since=since)
+    n = await crud.count_enforced_interventions(db, gate=gate, since=since)
     if n >= threshold:
-        immunity.record_demotion(gate, f"auto-demote: {n} would-blocks in {window}m >= {threshold}")
+        reason = f"auto-demote: {n} enforced drops/refusals in {window}m >= {threshold}"
+        immunity.record_demotion(gate, reason)
+        # B4: page-worthy — an auto-demotion means the gate fought legitimate
+        # flow (a mis-STORED origin bug post-PR-1, or an external-content
+        # surge). critical priority rides the existing critical-obs → Telegram
+        # batch (B3's pattern). Best-effort: never break the emit path.
+        try:
+            import hashlib
+            import uuid as _uuid
+
+            from genesis.db.crud import observations as _obs
+
+            await _obs.create(
+                db,
+                id=str(_uuid.uuid4()),
+                source="ws3_auto_demote",
+                type="infrastructure_alert",
+                content=(
+                    f"WS-3 gate '{gate}' AUTO-DEMOTED enforce->shadow: {reason}. "
+                    "Content is crossing again (observe-only). Investigate the "
+                    "would-block ledger before re-enforcing."
+                ),
+                priority="critical",
+                created_at=datetime.now(UTC).isoformat(),
+                content_hash=hashlib.sha256(f"ws3_auto_demote:{gate}".encode()).hexdigest(),
+                skip_if_duplicate=True,
+            )
+        except Exception:
+            logger.warning("auto-demote alert write failed", exc_info=True)

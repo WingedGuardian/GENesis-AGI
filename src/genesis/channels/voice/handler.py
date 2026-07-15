@@ -108,8 +108,16 @@ class VoiceConversationHandler:
                 for r in results[:5]:
                     content = getattr(r, "content", str(r))
                     if isinstance(content, str) and content.strip():
-                        external = is_external(getattr(r, "collection", ""))
                         source_pipeline = getattr(r, "source_pipeline", None)
+                        # Wrap/label keys on STORED origin first — an episodic
+                        # row stored external_untrusted must not read as
+                        # first-party in either the spoken or LLM view.
+                        _blockable = immunity_shadow.item_is_blockable(
+                            collection=getattr(r, "collection", None),
+                            source_pipeline=source_pipeline,
+                            origin_class=getattr(r, "origin_class", None),
+                        )
+                        external = _blockable or is_external(getattr(r, "collection", ""))
                         prefix = "[external-world knowledge] " if external else ""
                         spoken_snippets.append(f"- {prefix}{content[:300]}")
                         if external:
@@ -118,11 +126,7 @@ class VoiceConversationHandler:
                                     content[:300], source_pipeline=source_pipeline,
                                 )
                             )
-                            if immunity_shadow.item_is_blockable(
-                                collection=getattr(r, "collection", None),
-                                source_pipeline=source_pipeline,
-                                origin_class=getattr(r, "origin_class", None),
-                            ):
+                            if _blockable:
                                 blockable += 1
                         else:
                             llm_snippets.append(f"- {content[:300]}")

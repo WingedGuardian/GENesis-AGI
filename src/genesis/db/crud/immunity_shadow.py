@@ -154,11 +154,34 @@ async def count_would_block(
     gate: str,
     since: str,
 ) -> int:
-    """Would-block rows for *gate* at/after ISO ``since`` — the auto-demote
-    signal (B4). would_block=0 rows and other gates are excluded."""
+    """Would-block rows for *gate* at/after ISO ``since`` (observability)."""
     cursor = await db.execute(
         "SELECT COUNT(*) FROM immunity_shadow_events "
         "WHERE gate = ? AND would_block = 1 AND observed_at >= ?",
+        (gate, since),
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else 0
+
+
+async def count_enforced_interventions(
+    db: aiosqlite.Connection,
+    *,
+    gate: str,
+    since: str,
+) -> int:
+    """Rows for *gate* where the gate ACTED — dropped items or refused writes —
+    at/after ISO ``since``. THE auto-demote signal (B4, Codex round-6 on
+    #1048): wrap-only observation rows (allowed external content that was
+    delimited and returned, e.g. an explicit memory_recall of KB) must NEVER
+    count toward demotion, or normal research usage would flip the gate back
+    to shadow. Detail markers: ``refused`` (gate-3 evidence/state refusals),
+    ``enforced_drops`` (gate-4 pushed-surface drops)."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM immunity_shadow_events "
+        "WHERE gate = ? AND mode = 'enforce' AND observed_at >= ? "
+        "AND (json_extract(detail, '$.refused') = 1 "
+        "     OR COALESCE(json_extract(detail, '$.enforced_drops'), 0) > 0)",
         (gate, since),
     )
     row = await cursor.fetchone()

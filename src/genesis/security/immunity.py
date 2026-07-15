@@ -58,6 +58,11 @@ logger = logging.getLogger(__name__)
 
 GATES = ("procedure", "identity", "autonomy", "injection")
 MODES = ("off", "shadow", "enforce")
+# Gates whose enforce BRANCH is not built (B4 ships autonomy + injection only).
+# The single source of truth for the honesty guarantee — `gate_mode` clamps a
+# stale/hand-edited `enforce` here down to `shadow`, and `settings.py` imports
+# this to reject `enforce` at update time. Remove a gate when its enforce lands.
+ENFORCE_NOT_IMPLEMENTED = frozenset({"procedure", "identity"})
 
 _CONFIG_NAME = "ws3_immunity.yaml"
 
@@ -127,7 +132,20 @@ def gate_mode(gate: str) -> str:
     if mode not in MODES:
         logger.warning(
             "ws3_immunity gate %s has invalid mode %r — degrading to shadow",
-            gate, mode,
+            gate,
+            mode,
+        )
+        return "shadow"
+    if mode == "enforce" and gate in ENFORCE_NOT_IMPLEMENTED:
+        # Honesty clamp (B4): a gate with no enforce branch must NEVER report
+        # enforce, even if a stale local overlay (from a version that predated
+        # the validator guard) or a hand-edit set it — otherwise rows would
+        # relabel + auto-demote would arm while content still crosses. The
+        # runtime read is the choke point the validator alone can't cover.
+        logger.warning(
+            "ws3_immunity gate %s set to enforce but has no enforce branch — "
+            "clamping to shadow (honesty guard)",
+            gate,
         )
         return "shadow"
     return mode
@@ -201,7 +219,9 @@ def record_demotion(gate: str, reason: str) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=".ws3_immunity.", suffix=".tmp",
+        dir=str(path.parent),
+        prefix=".ws3_immunity.",
+        suffix=".tmp",
     )
     try:
         with os.fdopen(fd, "w") as fh:
@@ -213,5 +233,8 @@ def record_demotion(gate: str, reason: str) -> None:
         raise
     logger.warning(
         "ws3_immunity AUTO-DEMOTE: gate %s %s -> shadow (%s) — state: %s",
-        gate, previous, reason, json.dumps(state[gate]),
+        gate,
+        previous,
+        reason,
+        json.dumps(state[gate]),
     )

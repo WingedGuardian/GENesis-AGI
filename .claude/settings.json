@@ -89,6 +89,15 @@
                         "timeout": 10
                     }
                 ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/duplicate_session_guard.py --register",
+                        "timeout": 10
+                    }
+                ]
             }
         ],
         "PreToolUse": [
@@ -98,6 +107,16 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook procedure_advisor.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/duplicate_session_guard.py",
                         "timeout": 10
                     }
                 ]
@@ -412,6 +431,15 @@
                     {
                         "type": "command",
                         "command": "bash ${CLAUDE_PROJECT_DIR}/scripts/hooks/session_activity_touch.sh",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/duplicate_session_guard.py --register",
                         "timeout": 10
                     }
                 ]

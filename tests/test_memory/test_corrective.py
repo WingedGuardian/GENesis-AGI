@@ -17,6 +17,7 @@ from genesis.memory.corrective import (
     _bucket,
     _norm,
     _parse_grade,
+    _retrieval_to_dict,
     maybe_correct_recall,
 )
 
@@ -413,3 +414,30 @@ async def test_shape_normalization_both(retriever):
         router=router,
     )
     assert [r["unit_id"] for r in out_kb] == ["u1"]
+
+
+class TestRetrievalToDict:
+    def test_carries_stored_origin_class(self):
+        """WS-3 (Codex #1048): the CRAG dict must copy the top-level stored
+        origin_class so a CRAG-augmented external EPISODIC hit is still
+        wrapped + counted at the MCP return pass (collection alone reads
+        first-party for episodic)."""
+        rr = MagicMock()
+        rr.memory_id = "m-ext"
+        rr.content = "external forum text"
+        rr.score = 0.4
+        rr.payload = {"tags": []}
+        rr.collection = "episodic_memory"
+        rr.source_pipeline = "conversation"
+        rr.origin_class = "external_untrusted"
+
+        d = _retrieval_to_dict(rr)
+        assert d["origin_class"] == "external_untrusted"
+        assert d["collection"] == "episodic_memory"
+
+    def test_origin_class_absent_defaults_none(self):
+        rr = MagicMock(spec=["memory_id", "content", "score"])
+        rr.memory_id = "m1"
+        rr.content = "x"
+        rr.score = 0.1
+        assert _retrieval_to_dict(rr)["origin_class"] is None
