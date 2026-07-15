@@ -860,3 +860,63 @@ async def test_micro_cooldown_scoped_by_relevance(db):
     stored_genesis2 = await writer.write(
         genesis_output2, Depth.MICRO, _make_mixed_tick(), db=db)
     assert stored_genesis2 is False, "same-relevance cooldown must still block"
+
+
+async def test_micro_cooldown_both_suppresses_genesis(db):
+    """A recent :both micro shares the Genesis-visible partition, so it must
+    suppress a subsequent :genesis micro (P2: :both overlaps :genesis)."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id="recent-both-micro",
+        source="reflection",
+        type="micro_reflection",
+        category="routine:both",
+        content='{"summary": "prior both-relevant"}',
+        priority="low",
+        created_at=now,
+    )
+    genesis_output = MicroOutput(
+        tags=["cpu"], salience=0.6, anomaly=False,
+        summary="Disk usage creeping.",
+        signals_examined=2,
+        driving_signals=["cpu_usage"],
+    )
+    stored = await writer.write(genesis_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    assert stored is False, ":both must suppress a Genesis-visible :genesis micro"
+
+
+async def test_micro_cooldown_both_not_blocked_by_user(db):
+    """A recent :user micro (Genesis-invisible) must NOT block a :both micro
+    (Genesis-visible) — no cross-partition starvation."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id="recent-user-micro2",
+        source="reflection",
+        type="micro_reflection",
+        category="routine:user",
+        content='{"summary": "prior user"}',
+        priority="low",
+        created_at=now,
+    )
+    both_output = MicroOutput(
+        tags=["mixed"], salience=0.6, anomaly=False,
+        summary="User activity and disk both moved.",
+        signals_examined=2,
+        driving_signals=["task_completion_quality", "cpu_usage"],
+    )
+    stored = await writer.write(both_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    assert stored is True, ":user must not block a Genesis-visible :both micro"

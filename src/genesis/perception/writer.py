@@ -135,17 +135,30 @@ class ResultWriter:
         relevance = self._relevance_from_signals(tick, output.driving_signals)
         category = f"{base_category}:{relevance}"
 
-        # Cooldown gate: skip if a micro_reflection of the SAME relevance was
-        # created within the last 20 minutes.  Scoped by relevance so a
-        # user-relevant micro does not suppress a genesis-relevant one (they
-        # feed different ego partitions).  Anomalies bypass — same pattern as
-        # light reflections (30 min).
-        if not output.anomaly and await observations.exists_recent_by_type(
-            db, source="reflection", type="micro_reflection", window_minutes=20,
-            category_like=f"%:{relevance}",
-        ):
-            logger.debug("Micro reflection cooldown: skipping (recent %s exists within 20m)", category)
-            return False
+        # Cooldown gate: skip if a recently-created micro shares this one's
+        # ego-visibility partition, mirroring the Genesis ego's own filter
+        # (`category NOT LIKE '%:user'`).  A user-relevant micro is invisible
+        # to the Genesis ego and must not suppress a genesis/both micro (and
+        # vice-versa); `:both` overlaps the Genesis-visible set, so it both
+        # suppresses and is suppressed by `:genesis`.  Anomalies bypass — same
+        # pattern as light reflections (30 min).
+        if not output.anomaly:
+            if relevance == "user":
+                recent = await observations.exists_recent_by_type(
+                    db, source="reflection", type="micro_reflection",
+                    window_minutes=20, category_like="%:user",
+                )
+            else:
+                recent = await observations.exists_recent_by_type(
+                    db, source="reflection", type="micro_reflection",
+                    window_minutes=20, category_not_like="%:user",
+                )
+            if recent:
+                logger.debug(
+                    "Micro reflection cooldown: skipping (recent %s-visible exists within 20m)",
+                    "user" if relevance == "user" else "genesis",
+                )
+                return False
 
         # Low-information gate: skip observations with no actionable content.
         # The normalization fix (observation_writer) is the primary dedup fix;
