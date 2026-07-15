@@ -247,13 +247,15 @@ async def test_apply_updates_skips_row_reclassified_meanwhile(mem_db):
         " WHERE memory_id = 'm-embedded'"
     )
     await db.commit()
-    with patch("genesis.qdrant.collections.update_payload"):
-        await wb.apply_updates(
+    with patch("genesis.qdrant.collections.update_payload") as up:
+        applied, failed = await wb.apply_updates(
             db,
             MagicMock(),
             {"m-embedded": _row("m-embedded", "embedded")},
             {"m-embedded": ("channels", "telegram")},
         )
+    up.assert_not_called()  # Qdrant payload must not get the stale verdict
+    assert (applied, failed) == (0, 0)
     cur = await db.execute("SELECT wing FROM memory_metadata WHERE memory_id = 'm-embedded'")
     assert await cur.fetchone() == ("routing",)
     await db.close()

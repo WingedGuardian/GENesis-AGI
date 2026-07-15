@@ -231,10 +231,10 @@ async def apply_updates(
     from genesis.memory.taxonomy import classify_life_domain
     from genesis.qdrant.collections import update_payload
 
-    applied = failed = 0
+    applied = failed = skipped = 0
     for memory_id, (wing, room) in classifications.items():
         row = rows_by_id[memory_id]
-        await db.execute(
+        cursor = await db.execute(
             "UPDATE memory_metadata SET wing = ?, room = ? "
             "WHERE memory_id = ? "
             "AND (wing IS NULL OR wing = '' OR wing = 'general') "
@@ -242,6 +242,13 @@ async def apply_updates(
             (wing, room, memory_id),
         )
         await db.commit()
+        if cursor.rowcount == 0:
+            # Row left the backlog between read and write (reclassified or
+            # deprecated by another writer) — do NOT touch its Qdrant payload;
+            # writing our stale verdict there would diverge the two stores.
+            logger.info("skipping %s — no longer in backlog", memory_id)
+            skipped += 1
+            continue
         if row["embedding_status"] == "embedded":
             try:
                 update_payload(
@@ -259,15 +266,28 @@ async def apply_updates(
                     "Qdrant payload update failed for %s — reverting SQLite row",
                     memory_id,
                 )
-                await db.execute(
-                    "UPDATE memory_metadata SET wing = 'general', "
-                    "room = 'uncategorized' WHERE memory_id = ?",
-                    (memory_id,),
-                )
-                await db.commit()
+                try:
+                    await db.execute(
+                        "UPDATE memory_metadata SET wing = 'general', "
+                        "room = 'uncategorized' WHERE memory_id = ?",
+                        (memory_id,),
+                    )
+                    await db.commit()
+                except Exception:
+                    # Double failure (DB locked while Qdrant is down): SQLite
+                    # keeps the new wing and drops out of the backlog, so a
+                    # re-run would never repair the Qdrant side. Log the id
+                    # loudly for manual reconciliation.
+                    logger.exception(
+                        "REVERT FAILED for %s — stores diverged, reconcile "
+                        "manually (SQLite has new wing, Qdrant does not)",
+                        memory_id,
+                    )
                 failed += 1
                 continue
         applied += 1
+    if skipped:
+        logger.info("%d rows skipped (left backlog mid-run)", skipped)
     return applied, failed
 
 
