@@ -169,3 +169,14 @@ def test_identity_fallback_when_no_override(tmp_path):
     ctx = _make_context(depth="Micro", tick_number=0)
     prompt = builder.build("Micro", ctx)
     assert "signal classifier" in prompt
+
+
+def test_driving_signals_in_all_micro_templates():
+    """Every micro template (rotation 0/1/2) asks for driving_signals."""
+    from genesis.perception.prompts import PromptBuilder
+
+    builder = PromptBuilder()
+    for tick_number in (0, 1, 2):
+        ctx = _make_context(depth="Micro", tick_number=tick_number)
+        prompt = builder.build("Micro", ctx)
+        assert '"driving_signals"' in prompt, f"template rotation {tick_number}"

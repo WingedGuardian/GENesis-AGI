@@ -86,6 +86,17 @@ class OutputParser:
                 error="; ".join(errors),
             )
 
+        # driving_signals is OPTIONAL (cheap micro models may omit it) and
+        # LLM-typed defensively: list -> str items, bare str -> [str], other
+        # shapes -> [].  The writer validates names against the tick roster
+        # and falls back to full-roster classification when empty.
+        raw_driving = data.get("driving_signals", [])
+        if isinstance(raw_driving, str):
+            raw_driving = [raw_driving]
+        driving_signals = (
+            [str(s) for s in raw_driving] if isinstance(raw_driving, list) else []
+        )
+
         return ParseResult(
             success=True,
             output=MicroOutput(
@@ -94,6 +105,7 @@ class OutputParser:
                 anomaly=bool(data["anomaly"]),
                 summary=str(data["summary"]),
                 signals_examined=int(data["signals_examined"]),
+                driving_signals=driving_signals,
             ),
         )
 

@@ -57,6 +57,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Genesis's inner monologue now knows who each thought is about.** Every
+  ambient micro-reflection used to be tagged as relevant to "both" the user
+  and Genesis — the tag was computed from which sensors *ran* (all of them,
+  every tick) instead of what the reflection was actually *about* — so the
+  filter that keeps user-activity noise out of Genesis's self-management
+  context never excluded anything. Micro-reflections now report which
+  signals drove them, and the relevance tag is computed from that (with the
+  old behavior as a safe fallback when the model omits the field). User-ego
+  context is unaffected by design: it never ingested these reflections in
+  the first place.
+
 - **Code-intelligence indexing can no longer storm the machine.** Keeping the
   code graph fresh used to fire a full reindex on every commit, in the
   background, with no coordination — and if disk cleanup had reclaimed the index

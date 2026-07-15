@@ -19,6 +19,7 @@ from typing import Any
 
 import aiosqlite
 
+from genesis.awareness.types import USER_FACING_SIGNALS
 from genesis.ego.domain_classifier import is_genesis_internal as _is_genesis_internal
 from genesis.ego.types import NEUTRAL_STATUS
 
@@ -487,15 +488,9 @@ class UserEgoContextBuilder:
         return "\n".join(lines)
 
     # Signals that track user activity — used to filter awareness tick
-    # signals for the user ego's activity pulse section.
-    _USER_FACING_SIGNALS = frozenset({
-        "conversations_since_reflection",
-        "task_completion_quality",
-        "recon_findings_pending",
-        "stale_pending_items",
-        "user_goal_staleness",
-        "user_session_pattern",
-    })
+    # signals for the user ego's activity pulse section.  Shared source of
+    # truth with the perception writer (genesis.awareness.types).
+    _USER_FACING_SIGNALS = USER_FACING_SIGNALS
 
     # Human-readable interpretations for user-facing signal ranges.
     _SIGNAL_INTERPRETATIONS: dict[str, list[tuple[float, str]]] = {

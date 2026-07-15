@@ -5,6 +5,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+# Signals that track user activity/outcomes (vs Genesis infrastructure).
+# Single source of truth for user-vs-genesis audience attribution — consumed
+# by the perception writer (relevance tagging on micro reflections) and the
+# user ego's activity-pulse section. Keep in sync with the collectors'
+# signal_name values (bare names, no namespace prefix).
+USER_FACING_SIGNALS = frozenset(
+    {
+        "conversations_since_reflection",
+        "task_completion_quality",
+        "recon_findings_pending",
+        "stale_pending_items",
+        "user_goal_staleness",
+        "user_session_pattern",
+    }
+)
+
 
 class Depth(StrEnum):
     """Reflection depth levels. Values match DB seed data in signal_weights.feeds_depths."""

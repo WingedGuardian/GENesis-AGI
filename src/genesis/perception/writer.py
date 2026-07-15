@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import aiosqlite
 
-from genesis.awareness.types import Depth, TickResult
+from genesis.awareness.types import USER_FACING_SIGNALS, Depth, TickResult
 from genesis.db.crud import observations
 from genesis.db.crud import surplus as surplus_crud
 from genesis.observability.events import GenesisEventBus
@@ -25,16 +25,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Signals that track user activity/outcomes (vs Genesis infrastructure).
-# Used to determine relevance tagging on micro reflections.
-_USER_FACING_SIGNALS = frozenset({
-    "conversations_since_reflection",
-    "task_completion_quality",
-    "recon_findings_pending",
-    "stale_pending_items",
-    "user_goal_staleness",
-    "user_session_pattern",
-})
+# User-vs-genesis audience attribution for relevance tagging.  Single source
+# of truth lives in genesis.awareness.types (shared with the user ego's
+# activity pulse); aliased here for module-local readability.
+_USER_FACING_SIGNALS = USER_FACING_SIGNALS
 
 # Light reflection focus_area → relevance mapping
 _LIGHT_FOCUS_RELEVANCE: dict[str, str] = {
@@ -78,10 +72,21 @@ class ResultWriter:
         return hashlib.sha256(content.encode()).hexdigest()
 
     @staticmethod
-    def _relevance_from_signals(tick: TickResult) -> str:
-        """Determine relevance tag from tick signals: 'user', 'genesis', or 'both'."""
-        has_user = any(s.name in _USER_FACING_SIGNALS for s in tick.signals)
-        has_genesis = any(s.name not in _USER_FACING_SIGNALS for s in tick.signals)
+    def _relevance_from_signals(
+        tick: TickResult, driving_signals: list[str] | None = None,
+    ) -> str:
+        """Determine relevance tag: 'user', 'genesis', or 'both'.
+
+        Classifies from the signals the LLM cited as driving its assessment
+        (validated against the tick roster — hallucinated names are
+        discarded).  Falls back to the full roster when the LLM omitted the
+        field or nothing validated, which reproduces the pre-driving_signals
+        behavior (a mixed roster classifies as 'both').
+        """
+        roster = {s.name for s in tick.signals}
+        basis = [n for n in (driving_signals or []) if n in roster] or roster
+        has_user = any(n in _USER_FACING_SIGNALS for n in basis)
+        has_genesis = any(n not in _USER_FACING_SIGNALS for n in basis)
         if has_user and has_genesis:
             return "both"
         if has_user:
@@ -148,9 +153,10 @@ class ResultWriter:
             "anomaly": output.anomaly,
             "summary": output.summary,
             "signals_examined": output.signals_examined,
+            "driving_signals": output.driving_signals,
         }, sort_keys=True)
         base_category = "anomaly" if output.anomaly else "routine"
-        relevance = self._relevance_from_signals(tick)
+        relevance = self._relevance_from_signals(tick, output.driving_signals)
         category = f"{base_category}:{relevance}"
 
         # Structural dedup: hash on salience band + anomaly flag + signal

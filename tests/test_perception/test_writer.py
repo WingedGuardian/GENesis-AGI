@@ -25,6 +25,28 @@ def _make_tick() -> TickResult:
     )
 
 
+def _make_mixed_tick() -> TickResult:
+    """Tick whose roster mixes a user-facing and a genesis-infra signal."""
+    return TickResult(
+        tick_id="tick-mixed",
+        timestamp="2026-03-05T10:00:00+00:00",
+        source="scheduled",
+        signals=[
+            SignalReading(
+                name="task_completion_quality", value=0.9, source="genesis",
+                collected_at="2026-03-05T10:00:00+00:00",
+            ),
+            SignalReading(
+                name="cpu_usage", value=0.3, source="system",
+                collected_at="2026-03-05T10:00:00+00:00",
+            ),
+        ],
+        scores=[],
+        classified_depth=Depth.MICRO,
+        trigger_reason="threshold_exceeded",
+    )
+
+
 async def test_write_micro_creates_observation(db):
     from genesis.db.crud import observations
     from genesis.perception.writer import ResultWriter
@@ -640,3 +662,110 @@ async def test_write_micro_dedup_ignores_tag_variation(db):
 
     obs = await observations.query(db, source="reflection")
     assert len(obs) == 1, f"Expected 1 (tag variation should dedup), got {len(obs)}"
+
+
+# ── Relevance from driving_signals (idx 17) ─────────────────────────────
+
+
+async def test_write_micro_relevance_user_from_driving_signals(db):
+    """Mixed roster, but the LLM says only the user signal drove it → :user."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output = MicroOutput(
+        tags=["user_activity"],
+        salience=0.7,
+        anomaly=False,
+        summary="Task completion quality shifted noticeably.",
+        signals_examined=2,
+        driving_signals=["task_completion_quality"],
+    )
+    await writer.write(output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
+    assert obs[0]["category"] == "routine:user"
+
+
+async def test_write_micro_relevance_genesis_from_driving_signals(db):
+    """Mixed roster, driving signal is genesis-infra → :genesis."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output = MicroOutput(
+        tags=["cpu"],
+        salience=0.7,
+        anomaly=False,
+        summary="CPU trending up across ticks.",
+        signals_examined=2,
+        driving_signals=["cpu_usage"],
+    )
+    await writer.write(output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
+    assert obs[0]["category"] == "routine:genesis"
+
+
+async def test_write_micro_relevance_mixed_driving_signals_both(db):
+    """Driving signals span both audiences → :both."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output = MicroOutput(
+        tags=["mixed"],
+        salience=0.7,
+        anomaly=False,
+        summary="User activity and CPU both moved.",
+        signals_examined=2,
+        driving_signals=["task_completion_quality", "cpu_usage"],
+    )
+    await writer.write(output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
+    assert obs[0]["category"] == "routine:both"
+
+
+async def test_write_micro_relevance_empty_driving_signals_falls_back(db):
+    """LLM omitted driving_signals → full-roster fallback (pre-fix behavior)."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output = MicroOutput(
+        tags=["idle"],
+        salience=0.7,
+        anomaly=False,
+        summary="Broad routine sweep.",
+        signals_examined=2,
+    )
+    await writer.write(output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
+    assert obs[0]["category"] == "routine:both"
+
+
+async def test_write_micro_relevance_hallucinated_driving_signals_fall_back(db):
+    """Names not in the tick roster are discarded → full-roster fallback."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output = MicroOutput(
+        tags=["ghost"],
+        salience=0.7,
+        anomaly=False,
+        summary="Phantom signal cited.",
+        signals_examined=2,
+        driving_signals=["signal_that_does_not_exist"],
+    )
+    await writer.write(output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
+    assert obs[0]["category"] == "routine:both"

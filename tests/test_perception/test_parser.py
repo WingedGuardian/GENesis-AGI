@@ -151,3 +151,76 @@ def test_parse_light_dict_patterns_coerced_to_str():
         assert isinstance(p, str), f"Pattern should be str, got {type(p)}: {p}"
     assert "declining_activity" in result.output.patterns[0]
     assert result.output.patterns[1] == "normal_string_pattern"
+
+
+def test_parse_micro_driving_signals_absent_defaults_empty():
+    from genesis.perception.parser import OutputParser
+
+    parser = OutputParser()
+    raw = json.dumps({
+        "tags": ["idle"],
+        "salience": 0.2,
+        "anomaly": False,
+        "summary": "All systems normal.",
+        "signals_examined": 9,
+    })
+    result = parser.parse(_response(raw), "Micro")
+
+    assert result.success is True
+    assert result.needs_retry is False
+    assert result.output.driving_signals == []
+
+
+def test_parse_micro_driving_signals_list_coerced_to_str():
+    from genesis.perception.parser import OutputParser
+
+    parser = OutputParser()
+    raw = json.dumps({
+        "tags": ["activity"],
+        "salience": 0.5,
+        "anomaly": False,
+        "summary": "User activity elevated.",
+        "signals_examined": 4,
+        "driving_signals": ["task_completion_quality", 42],
+    })
+    result = parser.parse(_response(raw), "Micro")
+
+    assert result.success is True
+    assert result.output.driving_signals == ["task_completion_quality", "42"]
+
+
+def test_parse_micro_driving_signals_bare_string_wrapped():
+    from genesis.perception.parser import OutputParser
+
+    parser = OutputParser()
+    raw = json.dumps({
+        "tags": ["activity"],
+        "salience": 0.5,
+        "anomaly": False,
+        "summary": "User activity elevated.",
+        "signals_examined": 4,
+        "driving_signals": "task_completion_quality",
+    })
+    result = parser.parse(_response(raw), "Micro")
+
+    assert result.success is True
+    assert result.output.driving_signals == ["task_completion_quality"]
+
+
+def test_parse_micro_driving_signals_garbage_dropped_no_retry():
+    from genesis.perception.parser import OutputParser
+
+    parser = OutputParser()
+    raw = json.dumps({
+        "tags": ["activity"],
+        "salience": 0.5,
+        "anomaly": False,
+        "summary": "User activity elevated.",
+        "signals_examined": 4,
+        "driving_signals": {"not": "a list"},
+    })
+    result = parser.parse(_response(raw), "Micro")
+
+    assert result.success is True
+    assert result.needs_retry is False
+    assert result.output.driving_signals == []
