@@ -11,6 +11,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Data backfills now heal themselves on update.** Some upgrades need more than
+  a schema change — they need existing data reshaped (e.g. tagging every stored
+  memory's vector with its provenance class). Those backfills used to be
+  one-off scripts each install had to remember to run by hand, so an install
+  that skipped one silently drifted. Genesis now runs them automatically in the
+  background after startup, tracked in a ledger so each runs exactly once, never
+  blocks boot, and simply no-ops on an install that's already current — so a
+  lagging clone catches up on its next update with nothing to run manually. The
+  first one backfills provenance onto older memory vectors.
+
 - **Legacy memories join the wing system.** ~2.9K memories stored before
   wing classification existed (most predating the user-work wings added in
   May) sat in `general/uncategorized`, invisible to wing-filtered recall.

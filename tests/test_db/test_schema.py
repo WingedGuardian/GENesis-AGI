@@ -69,6 +69,7 @@ EXPECTED_TABLES = [
     "session_ledger",  # session-manager PR-2a: per-session TODO ledger rows
     "session_ledger_shadow_events",  # session-manager PR-3: ambient proposal shadow
     "session_ledger_shadow_runs",  # session-manager PR-3: extractor run telemetry
+    "data_migrations",  # WS-C: data-migration framework ledger
 ]
 
 

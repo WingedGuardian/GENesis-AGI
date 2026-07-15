@@ -230,14 +230,11 @@ class MigrationRunner:
 
     async def get_available(self) -> list[tuple[str, str, Path]]:
         """Return ordered list of (id, name, path) for all migration files."""
-        migrations = []
-        for path in sorted(_MIGRATIONS_DIR.iterdir()):
-            m = _MIGRATION_PATTERN.match(path.name)
-            if m:
-                mid = m.group(1)
-                name = path.stem  # e.g., "0001_add_update_history"
-                migrations.append((mid, name, path))
-        return migrations
+        # Shared file-discovery with the data-migration runner (only the
+        # filename pattern differs; execution semantics are deliberately not).
+        from genesis.db._migration_discovery import discover_numbered_modules
+
+        return discover_numbered_modules(_MIGRATIONS_DIR, _MIGRATION_PATTERN)
 
     async def get_pending(self) -> list[tuple[str, str, Path]]:
         """Return ordered list of migrations not yet applied."""

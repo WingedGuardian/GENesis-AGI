@@ -124,6 +124,26 @@ def update_payload(
     )
 
 
+def set_payload_batch(
+    client: QdrantClient,
+    *,
+    collection: str,
+    point_ids: list[str],
+    payload: dict,
+) -> None:
+    """MERGE ``payload`` onto many points in one call (vectors untouched).
+
+    Batched form of ``update_payload`` for backfills. ``set_payload`` merges
+    (does not replace) the point's existing payload."""
+    if not point_ids:
+        return
+    client.set_payload(
+        collection_name=collection,
+        payload=payload,
+        points=point_ids,
+    )
+
+
 def search(
     client: QdrantClient,
     *,
