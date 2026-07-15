@@ -8,6 +8,7 @@ from genesis.infra_profile.collectors.container import (
     collect_cpu,
     collect_kernel,
     collect_memory,
+    collect_network,
     collect_os,
     collect_storage,
 )
@@ -180,4 +181,86 @@ async def test_collector_determinism(proc_root, sys_root):
 
     first = await collect_storage(proc_root=proc_root, sys_root=sys_root)
     second = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert section_hash(first.facts) == section_hash(second.facts)
+
+
+# ── network resilience facts (KeepConfiguration + watchdog) ──────────────────
+
+
+def _keepconf_dir(etc_root):
+    d = etc_root / "systemd/network/10-netplan-eth0.network.d"
+    d.mkdir(parents=True)
+    return d
+
+
+async def test_network_keep_configuration_fact(tmp_path):
+    # no drop-in dir at all -> unprotected
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["networkd_keep_configuration"] is False
+
+    # KeepConfiguration=no does NOT count as protection
+    d = _keepconf_dir(tmp_path)
+    d.joinpath("genesis-keep-config.conf").write_text("[Network]\nKeepConfiguration=no\n")
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["networkd_keep_configuration"] is False
+
+    # =true (any non-"no" value) counts, whitespace-tolerant, comments ignored
+    d.joinpath("genesis-keep-config.conf").write_text(
+        "[Network]\n# KeepConfiguration=no\nKeepConfiguration = true\n"
+    )
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["networkd_keep_configuration"] is True
+
+    # last-assignment-wins across lexicographic drop-ins: a later zz-*.conf
+    # reverting to `no` disables the protection — the fact must not lie.
+    d.joinpath("zz-off.conf").write_text("[Network]\nKeepConfiguration=no\n")
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["networkd_keep_configuration"] is False
+
+
+async def test_network_watchdog_installed_fact(tmp_path):
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["network_watchdog_installed"] is False
+
+    timer = tmp_path / "systemd/system/genesis-network-watchdog.timer"
+    timer.parent.mkdir(parents=True)
+    timer.write_text("[Timer]\nOnUnitActiveSec=2min\n")
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["network_watchdog_installed"] is True
+
+
+async def test_network_watchdog_metrics_from_run_state(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+
+    # absent telemetry file -> no metric key (no drift churn)
+    result = await collect_network(etc_root=tmp_path, run_root=run)
+    assert "watchdog" not in result.metrics
+
+    # valid telemetry -> parsed into METRICS, never facts
+    (run / "genesis-network-watchdog.json").write_text(
+        '{"last_check": 100, "last_heal": 90, "last_trigger": "failed-link:eth0",'
+        ' "heal_count": 2, "last_action": "healed"}'
+    )
+    result = await collect_network(etc_root=tmp_path, run_root=run)
+    assert result.metrics["watchdog"]["heal_count"] == 2
+    assert result.metrics["watchdog"]["last_trigger"] == "failed-link:eth0"
+    assert "watchdog" not in result.facts
+
+    # malformed JSON -> key omitted, section does not fail
+    (run / "genesis-network-watchdog.json").write_text("{not json")
+    result = await collect_network(etc_root=tmp_path, run_root=run)
+    assert "watchdog" not in result.metrics
+    assert result.status == STATUS_OK
+
+
+async def test_network_resilience_facts_are_deterministic(tmp_path):
+    """The new facts must not churn the section hash across identical reads."""
+    from genesis.infra_profile.hashing import section_hash
+
+    d = _keepconf_dir(tmp_path)
+    d.joinpath("genesis-keep-config.conf").write_text("[Network]\nKeepConfiguration=true\n")
+    first = await collect_network(etc_root=tmp_path)
+    second = await collect_network(etc_root=tmp_path)
+    assert first.facts["networkd_keep_configuration"] is True
     assert section_hash(first.facts) == section_hash(second.facts)
