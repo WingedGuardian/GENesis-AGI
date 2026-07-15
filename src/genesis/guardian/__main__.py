@@ -7,6 +7,7 @@ Usage:
     python -m genesis.guardian --test-approval  # E2E test the keyword-reply gate
     python -m genesis.guardian --disk-status  # print storage-pool JSON (read-only)
     python -m genesis.guardian --host-profile  # host body-schema JSON (read-only)
+    python -m genesis.guardian --bundle-status # offline repo-bundle archive JSON (read-only)
     python -m genesis.guardian --provision-status              # host capacity (read-only)
     python -m genesis.guardian --provision-grow-disk <disk> <GiB>  # EXECUTE (pre-approved)
     python -m genesis.guardian --provision-grow-memory <MiB>       # EXECUTE (pre-approved)
@@ -50,6 +51,9 @@ def main() -> None:
 
     if "--host-profile" in sys.argv:
         sys.exit(asyncio.run(_host_profile()))
+
+    if "--bundle-status" in sys.argv:
+        sys.exit(_bundle_status())
 
     if "--provision-status" in sys.argv:
         sys.exit(asyncio.run(_provision_status()))
@@ -190,6 +194,27 @@ async def _host_profile() -> int:
         result = await gather_host_profile(load_config())
     except Exception as exc:  # noqa: BLE001 — the verb contract is JSON-always
         result = {"ok": False, "action": "host-profile", "error": repr(exc)}
+    print(json.dumps(result))
+    return 0 if result.get("ok") else 1
+
+
+def _bundle_status() -> int:
+    """Print the offline-bundle archive status as JSON (read-only).
+
+    Consumed by the `bundle-status` gateway verb → the container's programmatic
+    window onto the host-only offline re-clone lifeline (archived bundles + the
+    newest stamp). No mutation, no secrets, no sudo. Emits JSON even on failure so
+    the client never has to guess.
+    """
+    import json
+
+    from genesis.guardian.bundle_watch import bundle_archive_status
+    from genesis.guardian.config import load_config
+
+    try:
+        result = bundle_archive_status(load_config())
+    except Exception as exc:  # noqa: BLE001 — the verb contract is JSON-always
+        result = {"ok": False, "action": "bundle-status", "error": repr(exc)}
     print(json.dumps(result))
     return 0 if result.get("ok") else 1
 

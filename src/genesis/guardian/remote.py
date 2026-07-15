@@ -290,6 +290,17 @@ class GuardianRemote:
         ok, out = await self._ssh_command("host-profile", timeout=_HOST_PROFILE_TIMEOUT)
         return self._as_json(ok, out, "host-profile")
 
+    async def bundle_status(self) -> dict:
+        """Read-only offline repo-bundle archive status (F.4).
+
+        Lists the host-only archived ``git bundle`` copies + the newest stamp so
+        the container can confirm its offline re-clone lifeline exists and how
+        fresh it is. A pre-redeploy gateway answers ``denied`` (its unknown-verb
+        default) → ``{"ok": False, "error": "denied"}``. No approval, no mutation.
+        """
+        ok, out = await self._ssh_command("bundle-status", timeout=_STATUS_TIMEOUT)
+        return self._as_json(ok, out, "bundle-status")
+
     async def request_grow_disk(self, disk: str, add_gib: int) -> dict:
         """EXECUTE a pre-approved VM disk grow + absorb into the thin pool."""
         if not _DISK_RE.fullmatch(disk):

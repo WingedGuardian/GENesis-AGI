@@ -386,6 +386,10 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # that zeroed .git and disabled REVERT_CODE; a live incus-exec probe, since
         # the container's own awareness check may be dead exactly when it matters.
         await _check_container_git_and_alert(config, dispatcher)
+        # Offline git-bundle lifeline (F.4) — archive the newest container-
+        # published bundle to a host-only dir + WARN if the archived bundle goes
+        # stale. Host-side file ops only, independent of the container verdict.
+        await _check_repo_bundle_and_alert(config, dispatcher)
     finally:
         # Always save state, even on error
         sm.save_state(state_path)
@@ -588,6 +592,20 @@ async def _check_container_git_and_alert(
         await check_container_git_and_alert(config, dispatcher)
     except Exception:
         logger.warning("git-health watch failed", exc_info=True)
+
+
+async def _check_repo_bundle_and_alert(
+    config: GuardianConfig, dispatcher: AlertDispatcher,
+) -> None:
+    """Guardian-side offline-bundle archive + freshness watch (delegates to
+    bundle_watch). Pure host-side file ops — archives the newest container-
+    published bundle to a host-only dir and WARNs when it goes stale. Never
+    raises into the tick."""
+    try:
+        from genesis.guardian.bundle_watch import check_repo_bundle_and_alert
+        await check_repo_bundle_and_alert(config, dispatcher)
+    except Exception:
+        logger.warning("repo-bundle watch failed", exc_info=True)
 
 
 async def _check_storage_pool_and_alert(
