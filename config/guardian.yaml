@@ -117,6 +117,15 @@ git_health:
   realert_hours: 6         # re-alert cadence while unhealthy persists
   check_timeout_s: 30
 
+# F.4 offline git-bundle lifeline. The container publishes a verified `git bundle`
+# of the repo to the shared mount DAILY (health-gated); the guardian archives the
+# newest bundle host-side (container-unreachable) and WARNs when it goes stale.
+repo_bundle:
+  enabled: true
+  keep: 3                  # host-side archived bundle copies (never below 1)
+  stale_days: 3            # WARN if the newest verified bundle is older (daily cadence)
+  realert_hours: 24        # re-alert cadence while stale persists
+
 recovery:
   verification_delay_s: 30
   max_escalations: 3

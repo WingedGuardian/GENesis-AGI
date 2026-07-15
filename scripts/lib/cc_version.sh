@@ -356,6 +356,33 @@ cc_align_host_sync() {
         | grep -oE '"cc_version": "[0-9]+\.[0-9]+\.[0-9]+' \
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
 
+    # ── Persist the probe for the deploy-staleness check ──
+    # observability/snapshots/deploy_health.py reads deployed_commit from this
+    # state file so the health path never SSHes. Both writers (update.sh and
+    # the nightly cc-align timer) funnel through here. Atomic tmp+mv; a failed
+    # parse (gateway emitted non-JSON) or unreachable probe (early return
+    # above) never clobbers the last-known-good state.
+    local _state_file="$HOME/.genesis/host_gateway_state.json"
+    local _state_tmp="${_state_file}.tmp.$$"
+    if GENESIS_HOST_VER_RAW="$host_ver_raw" python3 - "$_state_tmp" 2>/dev/null <<'PYEOF'
+import json
+import os
+import sys
+from datetime import UTC, datetime
+
+payload = {
+    "checked_at": datetime.now(UTC).isoformat(),
+    "version": json.loads(os.environ["GENESIS_HOST_VER_RAW"]),
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(payload, f, indent=2)
+PYEOF
+    then
+        mv -f "$_state_tmp" "$_state_file" 2>/dev/null || rm -f "$_state_tmp"
+    else
+        rm -f "$_state_tmp"
+    fi
+
     # ── Node.js major sync (prerequisite for CC) ──
     if printf '%s' "${NODE_MAJOR:-}" | grep -qE '^[0-9]{1,2}$'; then
         if [ "$host_node_major" = "$NODE_MAJOR" ]; then

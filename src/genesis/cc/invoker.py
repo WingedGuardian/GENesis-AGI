@@ -353,6 +353,14 @@ class CCInvoker:
             env["GENESIS_SESSION_ORIGIN"] = inv.origin
         else:
             env.pop("GENESIS_SESSION_ORIGIN", None)
+        # WS-3 B4 gate-4: supervision marker. GENESIS_SESSION_ID above is pure
+        # attribution (foreground conversations carry one too), so the enforce
+        # drop needs this SEPARATE signal to spare owner-attended surfaces.
+        # POP when unset so a stale value can never leak from this process.
+        if inv and inv.supervised:
+            env["GENESIS_SESSION_SUPERVISED"] = "1"
+        else:
+            env.pop("GENESIS_SESSION_SUPERVISED", None)
         # Propagate the active trace context so the CC PostToolUse span hook can
         # stitch this session's tool spans under the dispatching operation's
         # trace (cross-process). Absent when no span is active → hook no-ops.

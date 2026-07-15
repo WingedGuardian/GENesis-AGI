@@ -651,6 +651,87 @@ async def resolve_by_content_hash(
     return cursor.rowcount
 
 
+async def supersede_except_hash(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    type: str,
+    keep_content_hash: str,
+    resolved_at: str,
+    resolution_notes: str,
+) -> int:
+    """Resolve every unresolved source+type row EXCEPT the given content_hash.
+
+    The "exactly one active alert = the current state" pattern (embedding
+    backlog, deploy staleness): the caller is about to create/keep the
+    current-state row and retires any other-state siblings so a state
+    transition never leaves a stale peak-severity row standing.
+
+    Returns the number of rows superseded.
+    """
+    cursor = await db.execute(
+        "UPDATE observations SET resolved = 1, resolved_at = ?, "
+        "resolution_notes = ? "
+        "WHERE source = ? AND type = ? AND resolved = 0 AND content_hash != ?",
+        (resolved_at, resolution_notes, source, type, keep_content_hash),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def oldest_created_at(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    content_like: str,
+    resolution_notes: str,
+) -> str | None:
+    """MIN(created_at) over rows of a source whose content matches
+    ``content_like`` (SQL LIKE pattern) and that are either unresolved or
+    carry exactly ``resolution_notes``.
+
+    The deploy-staleness >24h escalation anchor: superseded-by-state-change
+    rows keep anchoring (so escalating can't reset its own clock) while
+    genuinely-recovered rows (different notes) never do.
+    """
+    cursor = await db.execute(
+        "SELECT MIN(created_at) FROM observations "
+        "WHERE source = ? AND content LIKE ? "
+        "AND (resolved = 0 OR resolution_notes = ?)",
+        (source, content_like, resolution_notes),
+    )
+    row = await cursor.fetchone()
+    return row[0] if row and row[0] else None
+
+
+async def rewrite_resolution_notes(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    from_notes: str,
+    to_notes: str,
+    content_like: str | None = None,
+) -> int:
+    """Rewrite ``resolution_notes`` on a source's rows (optionally content-
+    filtered) — retiring rows from note-keyed roles such as the escalation
+    anchor above. Returns the number of rows rewritten.
+    """
+    if content_like is None:
+        cursor = await db.execute(
+            "UPDATE observations SET resolution_notes = ? "
+            "WHERE source = ? AND resolution_notes = ?",
+            (to_notes, source, from_notes),
+        )
+    else:
+        cursor = await db.execute(
+            "UPDATE observations SET resolution_notes = ? "
+            "WHERE source = ? AND resolution_notes = ? AND content LIKE ?",
+            (to_notes, source, from_notes, content_like),
+        )
+    await db.commit()
+    return cursor.rowcount
+
+
 # -- Surfacing ----------------------------------------------------------------
 
 

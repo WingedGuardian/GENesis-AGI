@@ -731,6 +731,20 @@ call_sites:
       and the router never dispatches this site. The detached ambient worker
       spawns CC directly and reports each run via record_last_run; registered
       here for neural-monitor visibility and central declaration.
+  ambient_ledger_extractor:
+    chain: []
+    dispatch: cli
+    cc_model: Haiku
+    never_pays: true
+    description: >-
+      Ambient session-ledger shadow extractor (session-manager PR-3):
+      extracts missed agreements/pivots from the transcript delta at each
+      PreCompact boundary (headless CC, model PINNED in
+      session_awareness/ledger_extractor.py). SHADOW-ONLY: proposals land in
+      session_ledger_shadow_*, never the live ledger. Empty chain BY DESIGN
+      (no API fallback; a failed run is recorded, never retried elsewhere);
+      the detached worker spawns CC directly and reports via
+      record_last_run_detached. Registered for neural-monitor visibility.
 retry:
   # max_total_s: aggregate wall-clock ceiling (seconds) across a single
   # route_call's retries x chain length. A safety net against pathological

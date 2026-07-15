@@ -17,6 +17,7 @@ import logging
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -214,15 +215,14 @@ async def _check_embedding_backlog(db) -> None:
         # row active, instead of a lingering peak-severity row until the
         # backlog fully clears (< LOW). DB-based (not the in-memory band), so
         # it is restart-safe; a no-op in steady state at a fixed band.
-        await db.execute(
-            "UPDATE observations SET resolved=1, resolved_at=?, "
-            "resolution_notes='superseded by a new embedding-backlog band' "
-            "WHERE source='embedding_backlog_monitor' "
-            "AND type='infrastructure_alert' AND resolved=0 "
-            "AND content_hash != ?",
-            (datetime.now(UTC).isoformat(), content_hash),
+        await observations.supersede_except_hash(
+            db,
+            source="embedding_backlog_monitor",
+            type="infrastructure_alert",
+            keep_content_hash=content_hash,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="superseded by a new embedding-backlog band",
         )
-        await db.commit()
         created = await observations.create(
             db,
             id=str(uuid.uuid4()),
@@ -290,6 +290,346 @@ async def _resolve_embedding_backlog(db) -> None:
             )
     except Exception:
         logger.debug("Failed to resolve embedding backlog alerts", exc_info=True)
+
+
+# Deploy staleness (WS-B): merged ≠ deployed. A bare git-merge between
+# update.sh runs deploys code but silently skips tier-2 activation (systemd
+# unit installation, guardian host redeploy, CC/Node pins) — observed live
+# 2026-07-13: six days of manual merges left a shipped timer uninstalled and
+# the host guardian a week behind, with zero signal anywhere. The collectors
+# live in observability/snapshots/deploy_health.py (shared with the health
+# snapshot); this check is the alerting layer. Hybrid severity: any drift is
+# a non-paging 'high' (dashboard); 'critical' (pages Telegram) only when
+# SUSTAINED — the 'stale_update' finding class (last successful update ≥7
+# days old AND ≥20 commits behind; thresholds live beside derive_findings in
+# deploy_health.py, the single producer of finding keys), or a missing
+# systemd unit that has been alerted for >24h.
+# Slow-moving by nature → hourly cadence (the WAL-truncate block).
+_DEPLOY_MISSING_UNIT_CRITICAL_S = 24 * 3600
+_DEPLOY_ALERT_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
+# The exact note written when a row is superseded by a state change. The >24h
+# missing-unit escalation anchors on the OLDEST row still carrying this note
+# (or unresolved) so escalating cannot reset its own clock; recovery rewrites
+# the note so retired anchors can never resurrect a future alert.
+_DEPLOY_SUPERSEDED_NOTE = "superseded by a new deploy-staleness alert state"
+_last_deploy_alert_at: float = 0.0
+_last_deploy_alert_key: str = ""
+
+
+async def _check_deploy_staleness(db) -> None:
+    """Alert when merged changes have not been DEPLOYED here (see block comment).
+
+    Best-effort — the whole body is guarded and never raises into the tick."""
+    global _last_deploy_alert_at, _last_deploy_alert_key
+    if db is None:
+        return
+    try:
+        # Submodule import (the package __init__ shadows the submodule name
+        # with the function of the same name) — resolved per call, so tests
+        # can monkeypatch the module attribute.
+        from genesis.observability.snapshots.deploy_health import deploy_health
+
+        snap = await deploy_health(db)
+        if snap.get("status") == "error":
+            return
+        findings = snap.get("findings") or []
+        if not findings:
+            await _resolve_deploy_staleness(db)
+            return
+
+        # Alert identity keys on the finding CLASSES, not the raw keys —
+        # per-run count drift (behind_upstream:52 -> :53) must not defeat
+        # dedup or churn out a new observation every hour.
+        classes = sorted({f.split(":", 1)[0] for f in findings})
+
+        update = snap.get("last_update") or {}
+        git_facts = snap.get("git") or {}
+        age_days = update.get("age_days")
+        behind = git_facts.get("commits_behind_upstream")
+        # The sustained condition is a finding CLASS (derive_findings owns the
+        # ≥7d AND ≥20-commits formula) — deriving it from raw facts here would
+        # re-open the gap where the facts say "critical" but no finding
+        # survived the gate, so nothing alerted at all.
+        critical = "stale_update" in classes
+        if "missing_units" not in classes:
+            # Partial recovery: the missing-units class cleared while OTHER
+            # drift persists. Retire any superseded missing-units anchors NOW
+            # (full recovery does this in _resolve_deploy_staleness) — else a
+            # new missing unit months later would inherit this incident's
+            # clock via MIN(created_at) and page instantly instead of after
+            # 24h. Cheap no-op when nothing matches.
+            await observations.rewrite_resolution_notes(
+                db,
+                source="deploy_staleness_monitor",
+                from_notes=_DEPLOY_SUPERSEDED_NOTE,
+                to_notes="deploy staleness cleared",
+                content_like="%missing_units%",
+            )
+        if not critical and "missing_units" in classes:
+            # Escalate a missing unit that has been alerted for >24h. Anchor =
+            # oldest prior alert naming missing units that is either still
+            # unresolved or was superseded by a state change (NOT one resolved
+            # by genuine recovery) — restart-safe, and immune to the
+            # escalated row resetting the clock.
+            anchor_created_at = await observations.oldest_created_at(
+                db,
+                source="deploy_staleness_monitor",
+                content_like="%missing_units%",
+                resolution_notes=_DEPLOY_SUPERSEDED_NOTE,
+            )
+            if anchor_created_at:
+                try:
+                    first = datetime.fromisoformat(anchor_created_at)
+                    if first.tzinfo is None:
+                        first = first.replace(tzinfo=UTC)
+                    age_s = (datetime.now(UTC) - first).total_seconds()
+                    critical = age_s >= _DEPLOY_MISSING_UNIT_CRITICAL_S
+                except ValueError:
+                    pass
+
+        priority = "critical" if critical else "high"
+        alert_key = ",".join(classes) + ":" + priority
+        now = time.monotonic()
+        if (
+            now - _last_deploy_alert_at < _DEPLOY_ALERT_COOLDOWN_S
+            and alert_key == _last_deploy_alert_key
+        ):
+            return
+
+        content_hash = hashlib.sha256(f"deploy_staleness:{alert_key}".encode()).hexdigest()
+        # Keep exactly ONE active alert = the current state (same rationale as
+        # the embedding-backlog band supersede above).
+        await observations.supersede_except_hash(
+            db,
+            source="deploy_staleness_monitor",
+            type="infrastructure_alert",
+            keep_content_hash=content_hash,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=_DEPLOY_SUPERSEDED_NOTE,
+        )
+
+        missing_units = snap.get("missing_units") or []
+        tier2 = snap.get("tier2_pending") or []
+        host = snap.get("host_gateway") or {}
+        detail: list[str] = []
+        if age_days is not None:
+            detail.append(f"last successful update.sh: {age_days} days ago")
+        if behind is not None:
+            fetch_age = git_facts.get("fetch_age_hours")
+            detail.append(
+                f"{behind} commits behind upstream"
+                + (f" (as of last fetch, {fetch_age}h ago)" if fetch_age is not None else "")
+            )
+        if missing_units:
+            detail.append("missing systemd units: " + ", ".join(missing_units))
+        if tier2:
+            detail.append(f"{len(tier2)} update.sh-only file(s) changed since the last update")
+        if host.get("status") in ("drift", "unknown_commit"):
+            detail.append(
+                f"host guardian: {host.get('status')} "
+                f"(deployed_commit={host.get('deployed_commit')})"
+            )
+        created = await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="deploy_staleness_monitor",
+            type="infrastructure_alert",
+            content=(
+                "Merged changes are NOT fully deployed on this install — "
+                + "; ".join(detail)
+                + ". Bare git merges deploy code but skip tier-2 activation "
+                "(systemd units, guardian host redeploy, CC/Node pins). "
+                "Recovery: run scripts/update.sh from ~/genesis. "
+                f"[findings: {', '.join(findings)}]"
+            ),
+            priority=priority,
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+        if created is None:
+            return  # An unresolved alert for this exact state already exists.
+        _last_deploy_alert_at = now
+        _last_deploy_alert_key = alert_key
+        logger.warning("Deploy staleness alert (%s): %s", priority, ", ".join(findings))
+    except Exception:
+        logger.debug("Failed deploy staleness check", exc_info=True)
+
+
+async def _resolve_deploy_staleness(db) -> None:
+    """Resolve outstanding deploy-staleness alerts once no findings remain.
+
+    Also rewrites the superseded-row note so retired rows stop serving as
+    >24h escalation anchors — without this, a missing unit months from now
+    would inherit an ancient anchor and page instantly."""
+    global _last_deploy_alert_at, _last_deploy_alert_key
+    if db is None:
+        return
+    try:
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source="deploy_staleness_monitor",
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="auto-resolved: deploy staleness cleared",
+        )
+        await observations.rewrite_resolution_notes(
+            db,
+            source="deploy_staleness_monitor",
+            from_notes=_DEPLOY_SUPERSEDED_NOTE,
+            to_notes="deploy staleness cleared",
+        )
+        if resolved:
+            _last_deploy_alert_at = 0.0
+            _last_deploy_alert_key = ""
+            logger.info(
+                "Auto-resolved %d deploy-staleness alert observation(s) on recovery",
+                resolved,
+            )
+    except Exception:
+        logger.debug("Failed to resolve deploy staleness alerts", exc_info=True)
+
+
+# Duplicate CC executor: two live `claude` processes executing the SAME
+# conversation transcript (2026-07-13 incident: dropped SSH left a session
+# running headless; resume spawned a second executor over one transcript —
+# both mutated the same worktree). The hook layer
+# (scripts/hooks/duplicate_session_guard.py) detects the collision and writes
+# `~/.genesis/session-owners/<key>.conflict`, then denies the OLDER
+# executor's repo-mutating tools (newest wins). This check is the paging +
+# hygiene layer: a live conflict raises a 'critical' observation (the
+# critical-observations job pages Telegram ≤5 min — a twin lasts minutes, so
+# it runs EVERY tick, not in the hourly block), and stale registry files are
+# GC'd. Best-effort — the whole body is guarded and never raises into the
+# tick.
+_SESSION_OWNERS_DIR = Path.home() / ".genesis" / "session-owners"
+_OWNER_FILE_GC_AGE_S = 7 * 24 * 3600  # dead-pid owner files older than this
+
+
+def _live_conflict_pids(conflict: dict) -> list[int]:
+    """Pids from a conflict file whose (pid, starttime) are BOTH still live.
+
+    Returns [] unless at least two executors are alive — one survivor means
+    the twin resolved itself and the file is stale.
+    """
+    from genesis.runtime.init.process_reaper import proc_starttime_ticks
+
+    raw = conflict.get("executors")
+    if not isinstance(raw, list):
+        return []
+    live: list[int] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return []
+        pid, starttime = entry.get("pid"), entry.get("starttime")
+        if not isinstance(pid, int) or not isinstance(starttime, int):
+            return []
+        if proc_starttime_ticks(pid) == starttime:
+            live.append(pid)
+    return live if len(live) >= 2 else []
+
+
+async def _check_duplicate_cc_executor(db, *, gc_owner_files: bool = False) -> None:
+    """Page on live duplicate-executor conflicts; GC stale registry files."""
+    if db is None:
+        return
+    try:
+        from genesis.runtime.init.process_reaper import proc_starttime_ticks
+
+        if not _SESSION_OWNERS_DIR.is_dir():
+            return
+        now = time.time()
+        any_live = False
+        for conflict_path in _SESSION_OWNERS_DIR.glob("*.conflict"):
+            try:
+                conflict = json.loads(conflict_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue  # torn/garbage — the guard treats it as no-conflict too
+            live = _live_conflict_pids(conflict) if isinstance(conflict, dict) else []
+            if not live:
+                # Twin resolved (or never real): remove the conflict AND its
+                # override — a stale override would silently waive the NEXT
+                # genuine twin on this transcript.
+                with contextlib.suppress(OSError):
+                    conflict_path.unlink()
+                with contextlib.suppress(OSError):
+                    conflict_path.with_suffix(".override").unlink()
+                continue
+
+            any_live = True
+            transcript = str(conflict.get("transcript_path", "unknown"))
+            key = conflict_path.stem
+            content_hash = hashlib.sha256(f"duplicate_cc_executor:{key}".encode()).hexdigest()
+            await observations.create(
+                db,
+                id=str(uuid.uuid4()),
+                source="duplicate_session_monitor",
+                type="infrastructure_alert",
+                content=(
+                    f"Two live `claude` processes (pids {live}) are executing "
+                    f"the SAME conversation ({transcript}). Newest-wins is in "
+                    f"force: the older pid's Bash/Write/Edit calls are being "
+                    f"denied by the duplicate-session guard, but it may still "
+                    f"read, call MCP tools, and burn tokens. Likely cause: a "
+                    f"dropped SSH left the older process running headless and "
+                    f"the conversation was resumed elsewhere. Resolution: kill "
+                    f"the older pid after checking `git status` for its "
+                    f"uncommitted work; intentional dual-session override: "
+                    f"touch ~/.genesis/session-owners/{key}.override"
+                ),
+                priority="critical",
+                created_at=datetime.now(UTC).isoformat(),
+                content_hash=content_hash,
+                skip_if_duplicate=True,
+            )
+
+        if not any_live:
+            await _resolve_duplicate_cc_executor(db)
+
+        if gc_owner_files:
+            # Owner files for dead executors: every transcript that ever ran
+            # gets one; without GC the directory grows forever (reaper
+            # _gc_markers precedent). Age-gate on updated_at so a file being
+            # written right now is never collected.
+            for owner_path in _SESSION_OWNERS_DIR.glob("*.json"):
+                try:
+                    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(owner, dict):
+                    continue
+                pid, starttime = owner.get("pid"), owner.get("starttime")
+                updated_at = owner.get("updated_at")
+                if not isinstance(pid, int) or not isinstance(starttime, int):
+                    continue
+                if not isinstance(updated_at, (int, float)):
+                    continue
+                if now - updated_at < _OWNER_FILE_GC_AGE_S:
+                    continue
+                if proc_starttime_ticks(pid) == starttime:
+                    continue  # executor still alive — keep
+                with contextlib.suppress(OSError):
+                    owner_path.unlink()
+    except Exception:
+        logger.debug("Failed duplicate-executor check", exc_info=True)
+
+
+async def _resolve_duplicate_cc_executor(db) -> None:
+    """Resolve outstanding duplicate-executor alerts once no live conflict
+    remains. Unconditional DB-side resolve (restart-safe, no-op when nothing
+    matches) — mirrors _resolve_embedding_backlog."""
+    try:
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source="duplicate_session_monitor",
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="auto-resolved: no live duplicate-executor conflict",
+        )
+        if resolved:
+            logger.info("Auto-resolved %d duplicate-executor alert observation(s)", resolved)
+    except Exception:
+        logger.debug("Failed to resolve duplicate-executor alerts", exc_info=True)
 
 
 # nodatacow (chattr +C) drift detection: on btrfs, a CoW SQLite DB suffers WAL
@@ -485,6 +825,41 @@ async def _check_git_health_deep(db) -> None:
         logger.error("git deep-health alert: %s", failures)
     except Exception:
         logger.debug("Failed to create git deep-health observation", exc_info=True)
+
+
+# Daily offline git-bundle publish (F.4). Publishes a *verified* `git bundle` of
+# the main repo to the shared mount so the host guardian can archive it OUTSIDE
+# the container's blast radius — the offline re-clone lifeline for when both the
+# local git AND the network are gone. Monotonic >=24h guard (same rationale as the
+# deep fsck above: fires once on the first tick after any restart; no
+# IntervalTrigger reset-starvation). publish_repo_bundle is health-gated,
+# verify-gated, and does its own to_thread for the blocking git work, so this
+# never blocks the tick. None = "never run this boot".
+_BUNDLE_PUBLISH_INTERVAL_S = 24 * 3600
+_last_bundle_publish_at: float | None = None
+
+
+async def _publish_repo_bundle_if_due() -> None:
+    """Publish the offline repo-bundle lifeline at most once per ~24h (and once on
+    the first tick after a restart). Best-effort; never raises. The health gate
+    (skip when the repo is unhealthy) and verify gate live in publish_repo_bundle."""
+    global _last_bundle_publish_at
+    now = time.monotonic()
+    if (
+        _last_bundle_publish_at is not None
+        and now - _last_bundle_publish_at < _BUNDLE_PUBLISH_INTERVAL_S
+    ):
+        return
+    # Claim the slot BEFORE running so an error can't retry every tick.
+    _last_bundle_publish_at = now
+    try:
+        from genesis.guardian.repo_bundle import publish_repo_bundle
+
+        result = await publish_repo_bundle()
+        if result and result.get("action") == "published":
+            logger.info("Offline repo bundle published: %s", result.get("bundle"))
+    except Exception:
+        logger.debug("repo bundle publish failed", exc_info=True)
 
 
 # Per-CC-slot RSS alerting. Same monotonic-since-boot caveat as WAL above: use a
@@ -1292,6 +1667,12 @@ class AwarenessLoop:
             # thread. Loop-driven (not the learning scheduler) so it survives a
             # router-degraded startup.
             await _check_git_health_deep(self._db)
+            # Daily offline git-bundle publish (F.4) — a verified `git bundle` of
+            # the repo to the shared mount, health-gated, so the host guardian can
+            # archive an offline re-clone lifeline. Self-guards to ~daily and runs
+            # its blocking work in a thread. Loop-driven for the same
+            # degraded-startup coverage as the deep fsck above.
+            await _publish_repo_bundle_if_due()
 
             # SQLite WAL checkpoint — prevent unbounded WAL growth from
             # external scripts or concurrent writers. PASSIVE is non-blocking.
@@ -1310,7 +1691,20 @@ class AwarenessLoop:
                     # healing, so the hourly cadence fits; self-resolves when the
                     # backlog clears. Best-effort (guarded internally).
                     await _check_embedding_backlog(self._db)
+                    # Deploy staleness — merged-vs-deployed drift (update.sh age,
+                    # commits behind, missing units, host guardian). Day-scale
+                    # signal → hourly; self-resolves on recovery. Best-effort
+                    # (guarded internally); collectors never do network I/O.
+                    await _check_deploy_staleness(self._db)
                 await _check_wal_health(self._db)
+                # Duplicate CC executor — a twin lasts MINUTES, so this pages
+                # per-tick (hourly would miss the incident window entirely);
+                # the scan is a small-dir glob + a few /proc stats. Owner-file
+                # GC is the slow-moving part — hourly is plenty.
+                await _check_duplicate_cc_executor(
+                    self._db,
+                    gc_owner_files=(self._tick_count % _WAL_TRUNCATE_EVERY_N_TICKS == 0),
+                )
 
             # Status file writes are handled by a dedicated loop in
             # runtime/init/memory.py (status-writer-loop). Decoupled from

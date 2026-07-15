@@ -59,6 +59,10 @@ def _split(name: str, raw: dict[str, Any], fact_keys: frozenset[str]) -> Section
 _SYSTEM_FACTS = frozenset(
     {
         "mem_total_kb",
+        # Host swap total: topology (the container's pressure-relief valve —
+        # its disappearance is exactly the 2026-07 wedge precondition, worth
+        # a drift observation). swap_free_kb stays a metric.
+        "swap_total_kb",
         "nproc",
         "kernel_release",
         "architecture",

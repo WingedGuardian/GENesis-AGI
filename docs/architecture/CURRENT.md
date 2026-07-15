@@ -348,7 +348,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 3d5234b9 2026-07-13
+verified: 859ec256 2026-07-14
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -382,7 +382,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: b1851a70 2026-07-14
+verified: bca86011 2026-07-15
 ```
 
 - **awareness/**: the 5-min heartbeat. ~23 signal collectors (the richer
@@ -391,9 +391,18 @@ verified: b1851a70 2026-07-14
   collectors). Tick → depth classification (MICRO/LIGHT/DEEP/STRATEGIC) →
   reflection dispatch. Also per-tick `_check_*` housekeeping: CC-slot RSS leak
   watch, subscription-cap detection, SQLite WAL hygiene, resilience-axis folds,
-  liveness heartbeat, and (hourly) embedding-backlog degradation — counts
+  liveness heartbeat, duplicate-CC-executor paging (two live `claude` processes
+  on ONE transcript — hook layer `scripts/hooks/duplicate_session_guard.py`
+  writes `~/.genesis/session-owners/*.conflict`, this check pages `critical`
+  and GCs stale registry files; newest executor wins, older one's repo-mutating
+  tools are denied), and (hourly) embedding-backlog degradation — counts
   `memory_metadata.embedding_status='failed'` (permanently keyword-only rows the
-  rate alert misses), hybrid `high` (dashboard) / `critical` (Telegram) by band.
+  rate alert misses), hybrid `high` (dashboard) / `critical` (Telegram) by band —
+  plus (hourly) deploy staleness: merged-vs-deployed drift (update.sh age,
+  commits behind from local refs, missing systemd units, host-guardian
+  deployed_commit via `~/.genesis/host_gateway_state.json`; collectors in
+  `observability/snapshots/deploy_health.py`), `high` on any drift, `critical`
+  only sustained (≥7d AND ≥20 commits, or a missing unit alerted >24h).
   It does NOT drive the ego cadence (ego has its own
   scheduler). Trap: PEP 562 lazy `__init__` — don't eager-import `loop.py`.
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
@@ -453,6 +462,33 @@ verified: b1851a70 2026-07-14
   fail-open). Ledger statuses: open/in_progress/done/absorbed/dropped —
   `absorbed` + `evidence` is the repo-pulse (PR-4) seam. Dispatched sessions
   (GENESIS_CC_SESSION=1) are skipped — task_states is their continuity spine.
+- **Ambient ledger extractor** (session-manager stage 3) — **SHADOW**. At
+  each PreCompact snapshot the hook fire-and-forgets
+  `scripts/ledger_shadow_worker.py` (`--end-byte` stat'd at the boundary);
+  the detached worker (`session_awareness/ledger_worker.py`) reads the
+  transcript delta since its own cursor
+  (`~/.genesis/sessions/<sid>/ledger_shadow_cursor.json`, advanced ONLY on
+  recorded ok/empty_delta — failures re-cover their window), extracts
+  agreements/pivots via headless Haiku (`ledger_extractor.py`: DATA-framed
+  prompt, fail-closed parse, verbatim-quote verification), matches against
+  the live ledger (exact hash + SequenceMatcher ≥0.85 — the precision
+  signal) and prior shadow events (`duplicate_of`), and records rows to
+  `session_ledger_shadow_runs`/`_events` (migration 0059) — **the live
+  `session_ledger` is NEVER written until the data-gated flip PR**. Shared
+  subprocess core with the arbiter: `session_awareness/headless.py`;
+  canonical typed-prompt filter `session_awareness/transcript.py` (the
+  PreCompact hook keeps a parity-tested stdlib duplicate; honors
+  `promptSource` typed/queued, excludes bare slash-commands + markers).
+  Levers: settings domain `session_ledger_shadow` (off|shadow; `live`
+  reserved, coerced+warn) read at worker startup;
+  `GENESIS_LEDGER_SHADOW_DISABLED=1` hook-level kill. Per-session flock;
+  `--backfill` replays historical transcripts in typed-turn windows
+  (`trigger='backfill'`, cursor untouched). Measurement:
+  `scripts/ledger_shadow_report.py` (recomputed precision, FP adjudication,
+  FN windowing, leak invariant); retention 45d via
+  `scripts/prune_ledger_shadow.py` (disk-hygiene step 8). Telemetry:
+  `call_site_last_run` row `ambient_ledger_extractor` (deliberately not a
+  critical site).
 
 ## 10. Learning & evaluation
 
@@ -564,7 +600,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, env.py, _config_overlay.py]
-verified: 3d5234b9 2026-07-13
+verified: bca86011 2026-07-15
 ```
 
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
@@ -592,7 +628,12 @@ verified: 3d5234b9 2026-07-13
   persist-queue overflow drops events but emits a rate-limited "dropped"
   meta-event (WS-17). Two health layers (async probes vs systemd shell-out);
   `/health` is a dashboard route, not an MCP tool; `job_health` state machine
-  is runtime-owned.
+  is runtime-owned. `snapshots/deploy_health.py` = merged-vs-deployed drift
+  (never does network I/O; host guardian state comes from
+  `~/.genesis/host_gateway_state.json`, written by `cc_align_host_sync` on
+  every gateway version probe — update.sh and the nightly cc-align timer);
+  its `GUARDIAN_HOST_PATHS` must stay in LOCKSTEP with update.sh
+  GUARDIAN_PATHS.
 - **security/**: prompt-injection defense + outbound scanning — sanitizer is
   LOG-ONLY for internal sources (perimeter EMAIL/INBOX can block);
   `output_scanner` = deterministic outbound secrets/IP scan; `skill_scan`
@@ -647,6 +688,48 @@ verified: 3d5234b9 2026-07-13
   `scripts/prune_immunity_shadow.py` (disk-hygiene). The shadow log is readable
   via the `immunity_status` health MCP tool (gate-agnostic: per-gate live mode
   + per-site would-block counts — sizes the B4 enforce blast radius).
+  **B4: stored-origin recall + enforce for gates 3-4 (shipped shadow; flip is a
+  live `settings_update`).** Recall now plumbs the stored `origin_class`
+  (migration 0054) end-to-end — `RetrievalResult.origin_class` on both the
+  Qdrant and FTS5-only paths (the latter via a `search_ranked` column,
+  coalescing SQLite when a pre-backfill payload is None) — so
+  `item_is_blockable` is STORED-FIRST (widens to episodic-external rows; fixes
+  the first-party-in-KB over-observe). A second CI sweep
+  (`KNOWN_QDRANT_READ_SITES`) locks every direct Qdrant `.scroll`/`.retrieve`
+  content→prompt surface; it caught `memory_core_facts` (now gated). The
+  gate-2 L-tier substrate: `cc_sessions.origin_class` + `observations.origin_class`
+  (migration 0057), stamped at registration from the DISPATCH PROFILE (never a
+  tool scan); reflection `user_model_delta` writers carry a run-level window
+  aggregate (`cc_sessions.reflection_window_origin`), so the identity emit
+  derives real provenance instead of hardcoded first_party (gate-2 stays
+  shadow). Enforce (gates 3-4 only; procedure/identity rejected by the
+  validator honesty guard): gate-4 drops `external_untrusted` from PUSHED feeds
+  (`memory_proactive`, `memory_core_facts`; the proactive hook needs no filter —
+  dispatched sessions exit it at module import, total absence) ONLY in dispatched
+  UNSUPERVISED sessions under enforce — the discriminator is
+  `GENESIS_CC_SESSION` present (stamped unconditionally on every CCInvoker
+  child) AND `GENESIS_SESSION_SUPERVISED` absent (`CCInvocation.supervised`,
+  set only by ConversationManager's owner-attended invocations).
+  `GENESIS_SESSION_ID` is attribution only — foreground conversations carry
+  one and some autonomy dispatches don't, so it is wrong in both directions
+  as a supervision signal. Explicit queries
+  (`memory_recall`/`knowledge_recall`/`memory_expand`) and every foreground
+  surface keep wrapped external in all modes (`should_enforce_drop`, fail-open);
+  gate-3 refuses grant evidence/state writes with a blockable origin — and the
+  refusal is read-only (no `ensure_cell` before the guard: external provenance
+  can't even seed a NOT_DETERMINED cell). Wrap + provenance labels are
+  STORED-FIRST at every inject surface (review round): `wrap_external_recall`
+  and `provenance_descriptor(origin_class=…)` key on the stored origin with the
+  collection check as fallback, so external EPISODIC rows are delimited/labeled
+  external everywhere (MCP recall/expand/proactive, hook `Memory·external` tag,
+  context injector, voice, research executor, dashboard) — the wrap is the
+  compensating control on the explicit surfaces the enforce cut retains. Every
+  drop/refusal still records (the enforce-mode row IS the block ledger).
+  Auto-demote now pages a `critical` `infrastructure_alert` when a gate stands
+  down, and counts only ENFORCED INTERVENTIONS (`count_enforced_interventions`
+  — rows whose detail carries `refused`/`enforced_drops`), never wrap-only
+  observation rows, so a normal explicit-recall session can't flip the gate
+  back to shadow. Red-team acceptance: `test_redteam_enforce.py` (synthetic).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
   CASCADE) behind the `codebase_navigate` MCP tool.
 - **infra_profile/**: the infrastructure body schema — deterministic fact
@@ -663,7 +746,12 @@ verified: 3d5234b9 2026-07-13
   + the user-CLAUDE.md `container-specs` block (content owner:
   `infra_profile/claude_md.py`; update.sh invokes `--claude-md-block`).
   Distinct from `observability/snapshots/infrastructure.py` (dynamic health) —
-  don't merge them.
+  don't merge them. Memory-resilience invariants are first-class facts:
+  container `cgroup_memory_swap_max` (tri-state — "0" IS the 2026-07 wedge
+  state) + `oomd_user_slice_kill` (config-plane scan of user.slice.d drop-ins,
+  laid down by `scripts/lib/memory_resilience.sh` from bootstrap/update) and
+  host-plane `swap_total_kb`, so the annotation layer flags unprotected
+  installs (see docs/reference/memory-resilience.md).
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),

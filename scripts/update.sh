@@ -309,6 +309,19 @@ _sync_deploy_targets() {
                 fi
                 rm -f "$GUARDIAN_ARCHIVE" 2>/dev/null || true
                 unset -f _redeploy_ssh
+                # A redeploy just changed the host's deployed_commit — re-probe
+                # so the pin sync AND the host_gateway_state.json persistence
+                # (both inside cc_align_host_sync below) see post-redeploy
+                # reality. Without this the state file keeps the PRE-redeploy
+                # payload and deploy_health reports host_guardian_drift until
+                # the nightly align timer re-probes. Best-effort: an empty
+                # re-probe keeps the original payload rather than degrading
+                # the pin sync.
+                _post_redeploy_raw="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                    "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
+                if [ -n "$_post_redeploy_raw" ]; then
+                    HOST_VER_RAW="$_post_redeploy_raw"
+                fi
             else
                 echo "--- Guardian in sync (host ${HOST_DEPLOYED_COMMIT:-unknown} @ HEAD $DEPLOY_HASH) — skipping host redeploy ---"
             fi
@@ -882,7 +895,48 @@ fi
 NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 
-if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
+# BEGIN tier2-baseline-check (extracted by tests/test_scripts/test_update_tier2_baseline.py)
+# Tier-2 pending vs the RECORDED baseline: bare merges may have advanced HEAD
+# past the last update.sh run without activating tier-2 (units, hooks, pins).
+# "No new commits from THIS pull" is then the wrong shortcut — the deploy-
+# staleness alert explicitly advertises "run scripts/update.sh" as the
+# recovery, so a no-op pull must still fall through to full activation
+# (bootstrap + migrations + restart + a fresh update_history baseline) when
+# update.sh-only paths changed since the last recorded success. Returns 0
+# (pending) when the diff is non-empty OR errors (fail toward the full run);
+# baseline unknown/unresolvable (pre-first-update install, rewritten history)
+# returns 1 — shortcut as before, the awareness alert still covers it. Keep
+# the path list in LOCKSTEP with TIER2_PATHS in
+# src/genesis/observability/snapshots/deploy_health.py.
+_tier2_pending_since_baseline() {
+    local _baseline=""
+    if [ -f "$GENESIS_ROOT/data/genesis.db" ] && [ -x "$VENV_DIR/bin/python" ]; then
+        _baseline=$(GH_DB_PATH="$GENESIS_ROOT/data/genesis.db" \
+            "$VENV_DIR/bin/python" - 2>/dev/null <<'PYEOF' || true
+import os
+import sqlite3
+
+conn = sqlite3.connect(f"file:{os.environ['GH_DB_PATH']}?mode=ro", uri=True)
+row = conn.execute(
+    "SELECT new_commit FROM update_history WHERE status='success' "
+    "ORDER BY datetime(completed_at) DESC LIMIT 1"
+).fetchone()
+print((row[0] or "").strip() if row else "")
+PYEOF
+        )
+    fi
+    [ -n "$_baseline" ] || return 1
+    git -C "$GENESIS_ROOT" cat-file -e "${_baseline}^{commit}" 2>/dev/null || return 1
+    ! git -C "$GENESIS_ROOT" diff --quiet "$_baseline" HEAD -- \
+        scripts/systemd scripts/bootstrap.sh scripts/update.sh \
+        scripts/lib/cc_version.sh scripts/hooks pyproject.toml 2>/dev/null
+}
+# END tier2-baseline-check
+
+if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]] && _tier2_pending_since_baseline; then
+    echo "  No new commits, but update.sh-only paths changed since the last recorded"
+    echo "  update — running full activation (bootstrap + migrations + restart)."
+elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     echo "  Already up to date ($NEW_COMMIT)."
     # Clean up unnecessary rollback tag and disarm trap
     trap - ERR
@@ -959,6 +1013,17 @@ echo "--- Running bootstrap ---"
 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
 echo "  Bootstrap complete"
 echo ""
+
+# ── Memory resilience — re-run VISIBLY. Bootstrap already applied it, but
+# its output is eaten by the `tail -10` above, and the update path is exactly
+# where an existing swapless install retrofits and must SEE the warn-only
+# swap-invariant output. Idempotent: already-applied → one no-op line.
+if [ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]; then
+    # shellcheck source=lib/memory_resilience.sh
+    . "$SCRIPT_DIR/lib/memory_resilience.sh"
+    memory_resilience_apply
+    echo ""
+fi
 
 # ── Verify Genesis is importable ──────────────────────────
 if ! "$VENV_DIR/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/dev/null; then

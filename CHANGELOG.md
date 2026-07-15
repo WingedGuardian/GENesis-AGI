@@ -23,12 +23,64 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   rows get their metadata classified but remain wing-unreachable until the
   retrieval-side gap is closed (reported separately, not overstated). Dry-run
   by default; the bulk write is gated on a human-reviewed sample.
+- **Genesis now notices when merged code isn't actually deployed.** Pulling
+  changes with a bare `git merge` between updates loads the new code on
+  restart but silently skips everything only `update.sh` activates — new
+  systemd units, the host guardian redeploy, tool pins. One install ran six
+  days like that with a shipped timer never installed and zero signal
+  anywhere. The health snapshot now has a `deploy_health` section (days since
+  the last update, commits behind, missing units, host-guardian drift — no
+  network calls), and the awareness loop raises a dashboard alert on any
+  drift, escalating to a Telegram page only when it's sustained (a week stale
+  and 20+ commits behind, or a missing unit ignored for a day). The fix is
+  always the same and the alert says so: run `scripts/update.sh`.
+
+- **A resumed conversation can no longer run twice at once.** If an SSH drop
+  leaves a Claude Code session executing headless and you resume that same
+  conversation elsewhere, both processes used to write to the same transcript
+  and the same files simultaneously (Claude Code itself raises no warning).
+  Now Genesis tracks which process owns each conversation: the newer session
+  wins, the orphan's file-changing tools are blocked with instructions, the
+  resuming session is told about the orphan at startup, and you get paged on
+  Telegram within minutes. Intentional dual-sessions have a documented
+  override. Bootstrap also hardens the root cause: sshd detects dead SSH
+  clients in ~60s (instead of hours), and interactive `claude` launches are
+  wrapped in a uniquely-named tmux session so a dropped connection leaves a
+  reattachable session instead of an orphan (opt out:
+  `GENESIS_NO_TMUX_WRAP=1`).
+
+- **Genesis now notices the agreements a session forgot to write down — in
+  shadow.** At every compaction boundary a detached worker re-reads the
+  conversation since the last checkpoint and proposes missed "yes, do that"
+  moments and direction pivots as session-ledger candidates. Proposals are
+  only LOGGED for now (the live ledger is never touched): each one carries a
+  verbatim quote that is deterministically checked against the transcript,
+  and a precision report compares proposals against what was actually
+  captured by hand — the safety net earns write access with data before it
+  gets it. Levers: the `session_ledger_shadow` settings domain (off/shadow)
+  and a `GENESIS_LEDGER_SHADOW_DISABLED=1` kill switch; a `--backfill` mode
+  replays past sessions for tuning. Also fixes a charter bug where a session
+  whose first message was a bare slash command (like `/compact`) could have
+  recorded that command as its permanent origin.
 
 - **Benchmark runs can now select exactly the arms they pay for.** The
   LongMemEval harness gained `--arms` (comma-separated labels, e.g.
   `--graph --arms raw,raw+graph`), so a paired baseline-vs-graph comparison
   no longer forces the full four-arm spend. Unknown labels fail fast with
   the selectable universe listed — a paid run never silently widens.
+
+- **A memory spike now degrades gracefully instead of wedging the machine.**
+  On systems that ran out of memory with no swap and no userspace OOM killer,
+  one greedy process could drag the whole box into unrecoverable thrash —
+  load in the hundreds, SSH dead, everything down together. Installs now set
+  up systemd-oomd with pressure-percentage kill policies (adaptive to any
+  machine size, applied automatically on bootstrap and on your next update,
+  skipped cleanly where systemd/oomd/PSI aren't available), the Genesis
+  server marks itself `avoid` so the greedy session tree dies first, managed
+  container installs get swap enabled (`limits.memory.swap`), and setup warns
+  with exact remediation when swap is missing or disabled. The infrastructure
+  profile records the swap/oomd state as facts, so an unprotected install is
+  flagged in `INFRASTRUCTURE.md`. Runbook: `docs/reference/memory-resilience.md`.
 
 - **The CC Sessions card now tells the truth, and clicking it shows why.**
   The dashboard card used to show a DB-side "active" count that routinely
@@ -42,6 +94,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   live processes with no session row at all.
 
 ### Fixed
+
+- **A dashboard request during startup can no longer crash the server.** The
+  async-route bridge falls back to a throwaway event loop when the runtime
+  loop isn't available — but shared database connections are bound to the
+  runtime loop, so a health poll landing in that window raised cross-loop
+  errors that could take the whole process down (observed as exit code 2).
+  Both windows now degrade to a clean HTTP 503 instead: a configured-but-not-
+  yet-running loop never executes the handler at all, and the loop-less
+  fallback catches the cross-loop failure and logs it rather than crashing.
 
 - **Code-intelligence indexing can no longer storm the machine.** Keeping the
   code graph fresh used to fire a full reindex on every commit, in the
@@ -102,6 +163,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   window gets it re-injected automatically. The origin survives any number of
   compactions; `/clear` still means a genuinely fresh start. Charters live in
   `~/.genesis/sessions/<session-id>/charter.md`.
+
+- **Provenance-based content isolation is now enforce-ready (running in
+  observe-only mode).** Genesis already tags where every memory came from —
+  its own thinking, your messages, or the outside world (a webpage, an
+  ingested doc, an email). This work makes that tag follow the content all the
+  way through recall, so Genesis can tell, at the moment content is about to
+  enter a prompt, whether it is quoted outside material rather than a trusted
+  instruction. The stored tag decides everywhere: outside material that landed
+  in Genesis's own session memory (not just the knowledge base) is delimited
+  and labeled external on every recall surface — proactive hints, voice
+  responses, and the dashboard memory browser included — instead of reading as
+  first-party memory. The protection is armed but watching, not acting: it records
+  what it *would* block so the behavior can be verified against real traffic
+  before it's switched on. When switched on (a live setting, instantly
+  reversible), outside-world content is held back only from automatic,
+  uninvited context in unsupervised background sessions — your explicit
+  searches and everything in a normal foreground conversation keep working
+  exactly as before. Held back means fully out of the loop: a blocked item
+  also earns no retrieval credit, so it can't quietly climb the memory
+  ranking through the very sessions that refuse it. If the guard ever fights
+  legitimate activity, it stands itself down and pages you.
 
 - **Genesis now notices when memories quietly lose semantic search.** When an
   embedding permanently fails, that memory becomes keyword-only — findable by

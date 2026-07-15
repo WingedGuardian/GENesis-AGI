@@ -1223,7 +1223,9 @@ def _enrich_with_metadata(results: list[dict]) -> None:
     ids = [
         r.get("memory_id", "")
         for r in results
-        if r.get("memory_id", "") and not r["memory_id"].startswith("code:")
+        if r.get("memory_id", "")
+        and not r["memory_id"].startswith("code:")
+        and not r.get("_enriched")
     ]
     if not ids:
         return
@@ -1251,6 +1253,10 @@ def _enrich_with_metadata(results: list[dict]) -> None:
                     # refuse the fill). A real search-path value always wins.
                     if r.get("origin_class") is None:
                         r["origin_class"] = meta[mid].get("origin_class")
+                    # Called both before the enforce filter and inside
+                    # _format_results — the marker keeps the second pass from
+                    # re-querying rows this pass already resolved.
+                    r["_enriched"] = True
         finally:
             conn.close()
     except Exception:
@@ -1305,6 +1311,12 @@ def _format_results(results: list[dict]) -> str:
             # external-world info, not its own first-party memory (audit D12).
             from genesis.memory.provenance import short_source
             parts = [f"KB·{short_source(r.get('source_pipeline'))}"]
+        elif r.get("origin_class") == "external_untrusted":
+            # Stored-external EPISODIC row (written by a dispatched session
+            # ingesting external content, #1021): kept under shadow/foreground,
+            # but it must not render as first-party `[Memory]` — same
+            # external-world tier as KB hits, episodic collection.
+            parts = ["Memory·external"]
         else:
             parts = ["Memory"]
         if age != "?" and not is_kb:
@@ -1735,6 +1747,15 @@ async def _run(prompt: str, session_id: str = "") -> None:
     fts_only_fallback = len(vector_results) == 0 and len(fts_results) > 0
 
     # Fuse results (with wing boost, code index, and knowledge base)
+    # WS-3 B4 gate-4 (pushed-surfaces cut) — DISPOSITION, not a filter:
+    # dispatched sessions NEVER execute this hook (module-level
+    # GENESIS_CC_SESSION exit at the top of this file), so the pushed-feed
+    # protection here is total absence — stronger than any per-item drop.
+    # Every process that reaches this point is a user-launched foreground
+    # terminal session (supervised by definition), which keeps wrapped/labeled
+    # external content in every mode per the cut. If that early exit is ever
+    # narrowed, this surface re-enters the enforce-drop set — see the registry
+    # disposition in tests/test_security/test_recall_inject_coverage.py.
     fused: list[dict] = []
     fused_count = 0
     # H-1 PR2a: shadow-project the novelty gate. suppress_ids feeds the shadow
@@ -1818,8 +1839,8 @@ async def _run(prompt: str, session_id: str = "") -> None:
     if fused:
         await _increment_retrieved(fused)
 
-    # Post-output: WS-3 B1 gate 4 (injection) shadow-record. External-world hits
-    # in this proactive injection reach the CC-session prompt (action-capable).
+    # Post-output: WS-3 gate 4 (injection) record. External-world hits in this
+    # proactive injection reach the CC-session prompt (action-capable).
     # Fire-and-forget AFTER flush — never delays the injection, never crashes the
     # hook; skipped live if the gate is off (master kill switch / per-gate off).
     if fused:

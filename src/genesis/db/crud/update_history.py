@@ -23,3 +23,20 @@ async def last_successful_deploy_commit(db: aiosqlite.Connection) -> str | None:
     )
     row = await cur.fetchone()
     return str(row[0]).strip() if row and row[0] else None
+
+
+async def last_successful_update(db: aiosqlite.Connection) -> tuple[str, str] | None:
+    """``(completed_at, new_commit)`` of the most recent successful update.
+
+    None when the table is empty (pre-first-update install). Ordered by
+    ``datetime(completed_at)`` — the deploy-staleness age axis cares about
+    when the update FINISHED, and datetime() compares mixed-offset ISO
+    timestamps by true instant."""
+    cur = await db.execute(
+        "SELECT completed_at, new_commit FROM update_history "
+        "WHERE status = 'success' ORDER BY datetime(completed_at) DESC LIMIT 1"
+    )
+    row = await cur.fetchone()
+    if not row or not row[0]:
+        return None
+    return str(row[0]), str(row[1] or "")

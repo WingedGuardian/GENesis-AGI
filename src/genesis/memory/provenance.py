@@ -70,6 +70,11 @@ ORIGIN_OWNER = "owner"
 ORIGIN_FIRST_PARTY = "first_party"
 ORIGIN_EXTERNAL_UNTRUSTED = "external_untrusted"
 ORIGIN_CLASSES = frozenset({ORIGIN_OWNER, ORIGIN_FIRST_PARTY, ORIGIN_EXTERNAL_UNTRUSTED})
+# The only stored origins that are NEVER external — mirrors
+# ``immunity.is_blockable`` (owner/first_party → not blockable; every other
+# value, incl. unknown/corrupt, → blockable/external). Kept here (not imported
+# from security.immunity) so provenance stays dependency-light and cycle-free.
+_SAFE_ORIGINS = frozenset({ORIGIN_OWNER, ORIGIN_FIRST_PARTY})
 
 #: Env var CCInvoker stamps on dispatched CC sessions (and their MCP server
 #: children) carrying the session-level WS-3 origin. See
@@ -320,13 +325,31 @@ def provenance_descriptor(
     collection: str | None,
     source_pipeline: str | None = None,
     source_doc: str | None = None,
+    origin_class: str | None = None,
 ) -> str:
     """One-line provenance label for a recalled item.
 
     External → ``"external-world knowledge (source: <friendly>[, doc: <doc>])"``.
     First-party → ``"first-party memory"``.
+
+    ``origin_class`` is the item's STORED origin when the caller has it: an
+    episodic row stored as ``external_untrusted`` (e.g. written by a dispatched
+    session ingesting external content) labels external even though its
+    collection is not the KB — the label must never claim first-party for
+    content the immunity layer classifies as external.
+
+    The label must AGREE with the wrap/drop decision the recall paths make,
+    which is ``item_is_blockable(...) OR is_external(collection)`` — otherwise
+    compact-recall/dashboard provenance would disagree with the wrapper
+    (Codex #1048 P2). So label external when EITHER the stored origin is
+    blockable (any non-null value that is not an explicit safe owner/first_party
+    class — mirroring the gate's fail-closed normalizer, so a corrupt/unknown
+    class reads external, not silently first-party) OR the collection is the
+    external-world KB. A NULL origin defers entirely to the collection
+    discriminator (the fallback ``item_is_blockable`` itself uses).
     """
-    if not is_external(collection):
+    _origin_external = origin_class is not None and origin_class not in _SAFE_ORIGINS
+    if not (_origin_external or is_external(collection)):
         return _FIRST_PARTY
     friendly = _match(_PIPELINE_FRIENDLY, source_pipeline, "external source")
     if source_doc and source_doc not in _PLACEHOLDER_DOCS:
@@ -364,6 +387,7 @@ def label_result_dicts(
             collection=coll,
             source_pipeline=sp,
             source_doc=d.get("source_doc") or d.get("source") or payload.get("source"),
+            origin_class=d.get("origin_class") or payload.get("origin_class"),
         )
     return dicts
 

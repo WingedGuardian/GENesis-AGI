@@ -12,6 +12,7 @@ from genesis.observability.snapshots.call_sites import call_sites
 from genesis.observability.snapshots.cc_sessions import cc_sessions
 from genesis.observability.snapshots.conversation import conversation_activity
 from genesis.observability.snapshots.cost import cost
+from genesis.observability.snapshots.deploy_health import deploy_health
 from genesis.observability.snapshots.eval_staleness import eval_staleness
 from genesis.observability.snapshots.infrastructure import (
     infrastructure,
@@ -33,6 +34,7 @@ __all__ = [
     "cc_sessions",
     "conversation_activity",
     "cost",
+    "deploy_health",
     "eval_staleness",
     "infrastructure",
     "mcp_status",

@@ -47,36 +47,64 @@ _VALID = {"wrapped", "first-party", "user-facing", "display", "pipeline-internal
 # file (relative to src/genesis) :: enclosing function  ->  (disposition, why)
 KNOWN_RECALL_SITES: dict[str, tuple[str, str]] = {
     "eval/longmemeval/runner.py::_run_arm": (
-        "first-party", "eval-harness recall against an EPHEMERAL store of "
+        "first-party",
+        "eval-harness recall against an EPHEMERAL store of "
         "first_party LongMemEval haystack; no production trust boundary "
-        "(extracted from run_question for the dual-store graph arm)"),
+        "(extracted from run_question for the dual-store graph arm)",
+    ),
     "mcp/memory/core.py::memory_recall": (
-        "wrapped", "external items wrapped after label_result_dicts (full path)"),
+        "wrapped",
+        "external items wrapped after label_result_dicts (full path)",
+    ),
     "mcp/memory/core.py::memory_proactive": (
-        "wrapped", "source=both default; external items wrapped in the return"),
+        "wrapped",
+        "source=both default; external items wrapped in the return",
+    ),
     "mcp/memory/knowledge.py::knowledge_recall": (
-        "wrapped", "all hits external-world; content wrapped (vector + FTS body)"),
+        "wrapped",
+        "all hits external-world; content wrapped (vector + FTS body)",
+    ),
     "knowledge/applications/resume_review.py::_query_knowledge_base": (
-        "wrapped", "source=knowledge; both vector and FTS body wrapped"),
+        "wrapped",
+        "source=knowledge; both vector and FTS body wrapped",
+    ),
     "autonomy/executor/research.py::_memory_recall": (
-        "wrapped", "source=both default; external items wrapped before triage prompt"),
+        "wrapped",
+        "source=both default; external items wrapped before triage prompt",
+    ),
     "cc/context_injector.py::inject": (
-        "wrapped", "episodic today; defensive is_external guard future-proofs widening"),
+        "wrapped",
+        "episodic today; defensive is_external guard future-proofs widening",
+    ),
     "autonomy/executor/resources.py::_search_observations": (
-        "first-party", "source=episodic (past task executions)"),
+        "first-party",
+        "source=episodic (past task executions)",
+    ),
     "autonomy/executor/resources.py::_search_past_executions": (
-        "first-party", "source=episodic (past task executions)"),
+        "first-party",
+        "source=episodic (past task executions)",
+    ),
     "ego/context.py::_user_corrections_section": (
-        "first-party", "source=episodic, D12-pinned to first-party user corrections"),
+        "first-party",
+        "source=episodic, D12-pinned to first-party user corrections",
+    ),
     "mcp/memory/knowledge.py::reference_lookup": (
-        "first-party", "source=episodic; takes unit_id/score only, not content"),
+        "first-party",
+        "source=episodic; takes unit_id/score only, not content",
+    ),
     "channels/voice/handler.py::handle": (
-        "wrapped", "full LLM path wraps external content into the system prompt; "
-        "the spoken (raw_snippets) rendering keeps a soft label (can't speak XML)"),
+        "wrapped",
+        "full LLM path wraps external content into the system prompt; "
+        "the spoken (raw_snippets) rendering keeps a soft label (can't speak XML)",
+    ),
     "dashboard/routes/memory.py::memory_search": (
-        "display", "human HTTP display, not an LLM prompt (stored-XSS threat class)"),
+        "display",
+        "human HTTP display, not an LLM prompt (stored-XSS threat class)",
+    ),
     "memory/corrective.py::_augment": (
-        "pipeline-internal", "CRAG re-retrieve; results flow back through wrapped recall"),
+        "pipeline-internal",
+        "CRAG re-retrieve; results flow back through wrapped recall",
+    ),
 }
 
 # NOTE: memory_expand and memory_core_facts (mcp/memory/core.py) are ALSO
@@ -131,12 +159,23 @@ _GATE_VALID = {"gated", "deferred-with-reason"}
 # They are enumerated explicitly so the gate set is complete.
 _EXTRA_WRAPPED_SITES: dict[str, tuple[str, str]] = {
     "mcp/memory/core.py::memory_expand": (
-        "gated", "by-id retrieve (not .recall); wraps + emits external hits"),
+        "gated",
+        "by-id retrieve (not .recall); wraps + emits external hits",
+    ),
     "mcp/memory/core.py::memory_core_facts": (
-        "gated", "episodic scroll (not .recall); wraps stored-external items "
-        "+ emits (B4 — caught by the qdrant-read sweep below)"),
+        "gated",
+        "episodic scroll (not .recall); wraps stored-external items "
+        "+ emits (B4 — caught by the qdrant-read sweep below)",
+    ),
     "scripts/proactive_memory_hook.py::_run": (
-        "gated", "sync emit after stdout flush; lives outside src/genesis"),
+        "gated",
+        "sync emit after stdout flush; lives outside src/genesis. B4 "
+        "pushed-feed cut: dispatched sessions never RUN this hook (module-"
+        "level GENESIS_CC_SESSION exit) — protection is total absence, not a "
+        "per-item drop; only user-launched foreground terminal sessions reach "
+        "it (wrap/label only). If that exit is ever narrowed, this surface "
+        "re-enters the enforce-drop set.",
+    ),
 }
 
 # file::func -> (gate disposition, why). All wrapped sites are gated now
@@ -144,19 +183,33 @@ _EXTRA_WRAPPED_SITES: dict[str, tuple[str, str]] = {
 # hatch for a future site that legitimately should not gate.
 INJECTION_GATE_SITES: dict[str, tuple[str, str]] = {
     "mcp/memory/core.py::memory_recall": (
-        "gated", "emits on BOTH the full (enriched) and compact-preview branches"),
+        "gated",
+        "emits on BOTH the full (enriched) and compact-preview branches",
+    ),
     "mcp/memory/core.py::memory_proactive": (
-        "gated", "source=both default; emits per-call blockable count"),
+        "gated",
+        "source=both default; emits per-call blockable count",
+    ),
     "mcp/memory/knowledge.py::knowledge_recall": (
-        "gated", "every hit external-world; emits per-call blockable count"),
+        "gated",
+        "every hit external-world; emits per-call blockable count",
+    ),
     "knowledge/applications/resume_review.py::_query_knowledge_base": (
-        "gated", "source=knowledge; emits (user-facing but enumeration-complete)"),
+        "gated",
+        "source=knowledge; emits (user-facing but enumeration-complete)",
+    ),
     "autonomy/executor/research.py::_memory_recall": (
-        "gated", "highest write-capability path; emits"),
+        "gated",
+        "highest write-capability path; emits",
+    ),
     "cc/context_injector.py::inject": (
-        "gated", "episodic today -> 0 rows; emit wired for a future source widening"),
+        "gated",
+        "episodic today -> 0 rows; emit wired for a future source widening",
+    ),
     "channels/voice/handler.py::handle": (
-        "gated", "wraps external into the LLM system prompt; emits"),
+        "gated",
+        "wraps external into the LLM system prompt; emits",
+    ),
     **_EXTRA_WRAPPED_SITES,
 }
 
@@ -168,6 +221,7 @@ INJECTION_GATE_SITES: dict[str, tuple[str, str]] = {
 # origin_class / wrap_external_recall model, so they are a DIFFERENT gate
 # class (quarantine tool output), not part of the provenance-based recall
 # gate this registry enforces. Tracked as a separate WS-3 follow-up.
+
 
 def _functions_calling(attrs: set[str]) -> set[str]:
     """Return {"relpath::func"} for every function under src that calls a method
@@ -286,43 +340,64 @@ _QDRANT_READ_VALID = {"prompt-gated", "infra", "library", "deferred-with-reason"
 
 KNOWN_QDRANT_READ_SITES: dict[str, tuple[str, str]] = {
     "eval/bench/isolation.py::_scroll_usage": (
-        "infra", "bench snapshot usage-payload copy between collections"),
+        "infra",
+        "bench snapshot usage-payload copy between collections",
+    ),
     "mcp/memory/core.py::_increment_retrieved": (
-        "infra", "retrieved_count writeback; reads the counter only"),
+        "infra",
+        "retrieved_count writeback; reads the counter only",
+    ),
     "mcp/memory/core.py::memory_core_facts": (
-        "prompt-gated", "episodic confidence-scroll into the caller prompt; "
-        "wraps stored-external items + emits gate 4 (B4)"),
+        "prompt-gated",
+        "episodic confidence-scroll into the caller prompt; "
+        "wraps stored-external items + emits gate 4 (B4)",
+    ),
     "mcp/memory/core.py::memory_expand": (
-        "prompt-gated", "by-id full-payload expand; wraps + emits gate 4"),
-    "memory/dream_cycle.py::_get_vector": (
-        "infra", "vectors only (with_vectors, no content use)"),
+        "prompt-gated",
+        "by-id full-payload expand; wraps + emits gate 4",
+    ),
+    "memory/dream_cycle.py::_get_vector": ("infra", "vectors only (with_vectors, no content use)"),
     "memory/dream_cycle.py::_rehydrate_cluster": (
-        "deferred-with-reason", "cluster member CONTENT feeds the consolidation "
+        "deferred-with-reason",
+        "cluster member CONTENT feeds the consolidation "
         "LLM and the synthesized canonical memory does not inherit member "
         "origin_class — an origin-LAUNDERING path, not a session-inject path. "
         "Origin-aware consolidation is a tracked WS-3 follow-up; today only a "
-        "handful of episodic rows are external and daily-slice runs shadow."),
+        "handful of episodic rows are external and daily-slice runs shadow.",
+    ),
     "memory/health.py::_scan_duplicates": (
-        "infra", "duplicate-detection metric; content hashed, never prompted"),
-    "memory/intent.py::expand_query": (
-        "infra", "tag-index rebuild; with_payload=[tags] only"),
+        "infra",
+        "duplicate-detection metric; content hashed, never prompted",
+    ),
+    "memory/intent.py::expand_query": ("infra", "tag-index rebuild; with_payload=[tags] only"),
     "qdrant/collections.py::batch_retrieve_vectors": (
-        "library", "shared helper; callers classified individually"),
+        "library",
+        "shared helper; callers classified individually",
+    ),
     "qdrant/collections.py::get_point": (
-        "library", "shared helper; callers classified individually"),
+        "library",
+        "shared helper; callers classified individually",
+    ),
     "qdrant/collections.py::scroll_points": (
-        "library", "shared helper; callers classified individually"),
+        "library",
+        "shared helper; callers classified individually",
+    ),
     "resilience/embedding_recovery.py::_point_exists": (
-        "infra", "existence check for recovery bookkeeping"),
-    "runtime/init/memory.py::_migrate_reference_vectors": (
-        "infra", "boot-time vector migration"),
+        "infra",
+        "existence check for recovery bookkeeping",
+    ),
+    "runtime/init/memory.py::_migrate_reference_vectors": ("infra", "boot-time vector migration"),
     "session_awareness/ranking.py::rank_candidates": (
-        "deferred-with-reason", "candidate CONTENT reaches the ambient "
+        "deferred-with-reason",
+        "candidate CONTENT reaches the ambient "
         "attention ARBITER prompt (judgment-only CC run, output = pick "
         "indices). Origin-aware arbiter handling is a tracked WS-3 follow-up; "
-        "episodic-external volume is currently negligible."),
+        "episodic-external volume is currently negligible.",
+    ),
     "surplus/extraction_calibration.py::run_calibration": (
-        "infra", "confidence/retrieved_count aggregation only"),
+        "infra",
+        "confidence/retrieved_count aggregation only",
+    ),
 }
 
 
@@ -396,3 +471,119 @@ def test_prompt_gated_qdrant_sites_emit():
             "immunity_shadow.record_would_block[_sync]. Re-wire the emit or "
             "reclassify with a reason."
         )
+
+
+# ─── WS-3 B4 aftermath — stored-origin propagation locks ────────────────────
+# The #1048 review grind was ONE defect class, found leaf-by-leaf across 11
+# reviewer rounds: a gate-decision site consulting only the (collection,
+# source_pipeline) re-derivation while the STORED origin_class existed but was
+# not threaded — stored-external episodic items then crossed unwrapped /
+# uncounted, or provenance labels disagreed with wrap decisions. These two
+# locks turn the entire class into a PR-time failure instead of a
+# review-round discovery:
+#   1) every item_is_blockable / should_enforce_drop call passes
+#      origin_class= (stored-first, never collection-only re-derivation);
+#   2) every wrap_external_recall caller also consults item_is_blockable in
+#      the same function (the wrap decision is keyed stored-first).
+
+_ORIGIN_DECISION_ATTRS = {"item_is_blockable", "should_enforce_drop"}
+
+# Definitions + internal delegation live here (should_enforce_drop calls
+# item_is_blockable inside the module) — not consumer sites.
+_ORIGIN_LOCK_EXCLUDED_FILES = {"security/immunity_shadow.py"}
+
+# Gated inject surfaces OUTSIDE src/genesis (Codex #1065 P2): the proactive
+# hook lazy-imports item_is_blockable for its would-block count — a future
+# edit dropping origin_class= there would reintroduce the exact regression
+# these locks exist for, invisibly to a src-only sweep.
+_EXTRA_SWEPT_FILES = ((_REPO_ROOT / "scripts" / "proactive_memory_hook.py"),)
+
+
+def _origin_swept_trees():
+    """Yield (relpath, ast tree) for src/genesis plus the extra gated files."""
+    paths = [(p, p.relative_to(_SRC).as_posix()) for p in _SRC.rglob("*.py")]
+    paths += [(p, p.relative_to(_REPO_ROOT).as_posix()) for p in _EXTRA_SWEPT_FILES]
+    for path, rel in paths:
+        try:
+            tree = ast.parse(path.read_text(), filename=str(path))
+        except (SyntaxError, OSError):
+            continue
+        yield rel, tree
+
+
+# relpath::func -> reason, for a future wrap caller that legitimately never
+# consults blockability. EMPTY today — every current wrap caller is keyed
+# stored-first; add an entry only with a written rationale.
+WRAP_WITHOUT_BLOCKABLE_OK: dict[str, str] = {}
+
+
+def _call_name(node: ast.Call) -> str | None:
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    return None
+
+
+def _functions_calling_any(attrs: set[str]) -> set[str]:
+    """Like _functions_calling, but matches BOTH attribute calls
+    (module.func(...)) and bare-name calls (from-imported func(...)),
+    sweeping src/genesis plus the extra gated files."""
+    found: set[str] = set()
+    for rel, tree in _origin_swept_trees():
+        funcs = [
+            (n.lineno, getattr(n, "end_lineno", n.lineno), n.name)
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _call_name(node) in attrs:
+                best, enclosing = -1, "<module>"
+                for start, end, name in funcs:
+                    if start <= node.lineno <= (end or start) and start > best:
+                        best, enclosing = start, name
+                found.add(f"{rel}::{enclosing}")
+    return found
+
+
+def test_gate_decision_calls_thread_stored_origin():
+    """Lock 1: no decision call may omit origin_class= — omitting it silently
+    falls back to (collection, source_pipeline) re-derivation, which is blind
+    to stored-external episodic rows (the exact #1048 defect class)."""
+    missing: set[str] = set()
+    for rel, tree in _origin_swept_trees():
+        if rel in _ORIGIN_LOCK_EXCLUDED_FILES:
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and _call_name(node) in _ORIGIN_DECISION_ATTRS
+                and "origin_class" not in {k.arg for k in node.keywords}
+            ):
+                missing.add(f"{rel}:{node.lineno} ({_call_name(node)})")
+    assert not missing, (
+        "Gate-decision call(s) omit origin_class= — thread the item's STORED "
+        "origin (enrich via origin_class_by_ids / RetrievalResult.origin_class "
+        "if the surface doesn't carry it yet); collection-only re-derivation "
+        f"cannot see stored-external episodic rows: {sorted(missing)}"
+    )
+
+
+def test_every_wrap_caller_consults_blockability():
+    """Lock 2: a function that wraps external recall content must key that
+    decision stored-first (call item_is_blockable), or be registered with a
+    written rationale — wrap-on-collection-alone is the #1048 defect class."""
+    wrap_callers = {
+        s
+        for s in _functions_calling_any({"wrap_external_recall"})
+        if s.split("::")[0] not in {"memory/provenance.py"}
+    }
+    blockable_callers = _functions_calling_any(_ORIGIN_DECISION_ATTRS)
+    unkeyed = wrap_callers - blockable_callers - set(WRAP_WITHOUT_BLOCKABLE_OK)
+    assert not unkeyed, (
+        "wrap_external_recall caller(s) never consult item_is_blockable — key "
+        "the wrap on stored-first blockability (see memory_core_facts for the "
+        f"reference pattern) or register with a rationale: {sorted(unkeyed)}"
+    )
+    stale = set(WRAP_WITHOUT_BLOCKABLE_OK) - wrap_callers
+    assert not stale, f"stale WRAP_WITHOUT_BLOCKABLE_OK entries: {sorted(stale)}"

@@ -54,6 +54,31 @@ def test_format_results_episodic_keeps_plain_memory_tag(monkeypatch):
     ])
     assert out.startswith("[Memory")
     assert "KB·" not in out
+    assert "Memory·external" not in out
+
+
+def test_format_results_stored_external_episodic_labels_external(monkeypatch):
+    # WS-3 B4 (Codex P1): a KEPT episodic row whose STORED origin_class is
+    # external_untrusted (shadow mode / foreground) must not render as plain
+    # first-party ``[Memory]`` — the label is the wrap-equivalent on this
+    # line-oriented surface.
+    monkeypatch.setattr(hook, "_enrich_with_metadata", lambda results: None)
+    out = hook._format_results([
+        {
+            "memory_id": "ep-ext-1", "content": "dispatched-session external text",
+            "collection": "episodic_memory", "origin_class": "external_untrusted",
+            "_wing": "research", "_created_at": "", "memory_class": "fact",
+        },
+        {
+            "memory_id": "ep-fp-1", "content": "my own note",
+            "collection": "episodic_memory", "origin_class": "first_party",
+            "_wing": "memory", "_created_at": "", "memory_class": "fact",
+        },
+    ])
+    lines = out.splitlines()
+    assert "Memory·external" in lines[0]
+    assert "dispatched-session external text" in lines[0]
+    assert "Memory·external" not in lines[1]  # first-party stays plain
 
 
 # ── PR2: strip leaked boundary markers; stop blunt-dropping wrapped hits ─────

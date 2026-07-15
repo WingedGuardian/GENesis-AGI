@@ -111,8 +111,14 @@ def _read_uptime() -> float:
         return float(f.read().split()[0])
 
 
-def _proc_age_secs(pid: int, uptime_secs: float, clock_ticks: int) -> float | None:
-    """Age of ``pid`` in seconds from ``/proc/<pid>/stat`` field 22, or None."""
+def proc_starttime_ticks(pid: int) -> int | None:
+    """starttime of ``pid`` (clock ticks since boot, stat field 22), or None.
+
+    ``(pid, starttime)`` is a reuse-proof process identity: starttime never
+    changes for a live process, so a matching pair proves the pid was not
+    recycled. Hook-world twin of this parse: scripts/hooks/proc_ident.py
+    (hooks cannot import genesis.*) — keep the parsing rules in sync.
+    """
     stat_path = Path(f"/proc/{pid}/stat")
     if not stat_path.exists():
         return None
@@ -128,8 +134,15 @@ def _proc_age_secs(pid: int, uptime_secs: float, clock_ticks: int) -> float | No
     if len(parts) < 20:
         return None
     try:
-        start_ticks = int(parts[19])
+        return int(parts[19])
     except ValueError:
+        return None
+
+
+def _proc_age_secs(pid: int, uptime_secs: float, clock_ticks: int) -> float | None:
+    """Age of ``pid`` in seconds from ``/proc/<pid>/stat`` field 22, or None."""
+    start_ticks = proc_starttime_ticks(pid)
+    if start_ticks is None:
         return None
     return uptime_secs - (start_ticks / clock_ticks)
 
