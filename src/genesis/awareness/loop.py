@@ -17,6 +17,7 @@ import logging
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -290,6 +291,148 @@ async def _resolve_embedding_backlog(db) -> None:
             )
     except Exception:
         logger.debug("Failed to resolve embedding backlog alerts", exc_info=True)
+
+
+# Duplicate CC executor: two live `claude` processes executing the SAME
+# conversation transcript (2026-07-13 incident: dropped SSH left a session
+# running headless; resume spawned a second executor over one transcript —
+# both mutated the same worktree). The hook layer
+# (scripts/hooks/duplicate_session_guard.py) detects the collision and writes
+# `~/.genesis/session-owners/<key>.conflict`, then denies the OLDER
+# executor's repo-mutating tools (newest wins). This check is the paging +
+# hygiene layer: a live conflict raises a 'critical' observation (the
+# critical-observations job pages Telegram ≤5 min — a twin lasts minutes, so
+# it runs EVERY tick, not in the hourly block), and stale registry files are
+# GC'd. Best-effort — the whole body is guarded and never raises into the
+# tick.
+_SESSION_OWNERS_DIR = Path.home() / ".genesis" / "session-owners"
+_OWNER_FILE_GC_AGE_S = 7 * 24 * 3600  # dead-pid owner files older than this
+
+
+def _live_conflict_pids(conflict: dict) -> list[int]:
+    """Pids from a conflict file whose (pid, starttime) are BOTH still live.
+
+    Returns [] unless at least two executors are alive — one survivor means
+    the twin resolved itself and the file is stale.
+    """
+    from genesis.runtime.init.process_reaper import proc_starttime_ticks
+
+    raw = conflict.get("executors")
+    if not isinstance(raw, list):
+        return []
+    live: list[int] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return []
+        pid, starttime = entry.get("pid"), entry.get("starttime")
+        if not isinstance(pid, int) or not isinstance(starttime, int):
+            return []
+        if proc_starttime_ticks(pid) == starttime:
+            live.append(pid)
+    return live if len(live) >= 2 else []
+
+
+async def _check_duplicate_cc_executor(db, *, gc_owner_files: bool = False) -> None:
+    """Page on live duplicate-executor conflicts; GC stale registry files."""
+    if db is None:
+        return
+    try:
+        from genesis.runtime.init.process_reaper import proc_starttime_ticks
+
+        if not _SESSION_OWNERS_DIR.is_dir():
+            return
+        now = time.time()
+        any_live = False
+        for conflict_path in _SESSION_OWNERS_DIR.glob("*.conflict"):
+            try:
+                conflict = json.loads(conflict_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue  # torn/garbage — the guard treats it as no-conflict too
+            live = _live_conflict_pids(conflict) if isinstance(conflict, dict) else []
+            if not live:
+                # Twin resolved (or never real): remove the conflict AND its
+                # override — a stale override would silently waive the NEXT
+                # genuine twin on this transcript.
+                with contextlib.suppress(OSError):
+                    conflict_path.unlink()
+                with contextlib.suppress(OSError):
+                    conflict_path.with_suffix(".override").unlink()
+                continue
+
+            any_live = True
+            transcript = str(conflict.get("transcript_path", "unknown"))
+            key = conflict_path.stem
+            content_hash = hashlib.sha256(f"duplicate_cc_executor:{key}".encode()).hexdigest()
+            await observations.create(
+                db,
+                id=str(uuid.uuid4()),
+                source="duplicate_session_monitor",
+                type="infrastructure_alert",
+                content=(
+                    f"Two live `claude` processes (pids {live}) are executing "
+                    f"the SAME conversation ({transcript}). Newest-wins is in "
+                    f"force: the older pid's Bash/Write/Edit calls are being "
+                    f"denied by the duplicate-session guard, but it may still "
+                    f"read, call MCP tools, and burn tokens. Likely cause: a "
+                    f"dropped SSH left the older process running headless and "
+                    f"the conversation was resumed elsewhere. Resolution: kill "
+                    f"the older pid after checking `git status` for its "
+                    f"uncommitted work; intentional dual-session override: "
+                    f"touch ~/.genesis/session-owners/{key}.override"
+                ),
+                priority="critical",
+                created_at=datetime.now(UTC).isoformat(),
+                content_hash=content_hash,
+                skip_if_duplicate=True,
+            )
+
+        if not any_live:
+            await _resolve_duplicate_cc_executor(db)
+
+        if gc_owner_files:
+            # Owner files for dead executors: every transcript that ever ran
+            # gets one; without GC the directory grows forever (reaper
+            # _gc_markers precedent). Age-gate on updated_at so a file being
+            # written right now is never collected.
+            for owner_path in _SESSION_OWNERS_DIR.glob("*.json"):
+                try:
+                    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(owner, dict):
+                    continue
+                pid, starttime = owner.get("pid"), owner.get("starttime")
+                updated_at = owner.get("updated_at")
+                if not isinstance(pid, int) or not isinstance(starttime, int):
+                    continue
+                if not isinstance(updated_at, (int, float)):
+                    continue
+                if now - updated_at < _OWNER_FILE_GC_AGE_S:
+                    continue
+                if proc_starttime_ticks(pid) == starttime:
+                    continue  # executor still alive — keep
+                with contextlib.suppress(OSError):
+                    owner_path.unlink()
+    except Exception:
+        logger.debug("Failed duplicate-executor check", exc_info=True)
+
+
+async def _resolve_duplicate_cc_executor(db) -> None:
+    """Resolve outstanding duplicate-executor alerts once no live conflict
+    remains. Unconditional DB-side resolve (restart-safe, no-op when nothing
+    matches) — mirrors _resolve_embedding_backlog."""
+    try:
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source="duplicate_session_monitor",
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="auto-resolved: no live duplicate-executor conflict",
+        )
+        if resolved:
+            logger.info("Auto-resolved %d duplicate-executor alert observation(s)", resolved)
+    except Exception:
+        logger.debug("Failed to resolve duplicate-executor alerts", exc_info=True)
 
 
 # nodatacow (chattr +C) drift detection: on btrfs, a CoW SQLite DB suffers WAL
@@ -1311,6 +1454,14 @@ class AwarenessLoop:
                     # backlog clears. Best-effort (guarded internally).
                     await _check_embedding_backlog(self._db)
                 await _check_wal_health(self._db)
+                # Duplicate CC executor — a twin lasts MINUTES, so this pages
+                # per-tick (hourly would miss the incident window entirely);
+                # the scan is a small-dir glob + a few /proc stats. Owner-file
+                # GC is the slow-moving part — hourly is plenty.
+                await _check_duplicate_cc_executor(
+                    self._db,
+                    gc_owner_files=(self._tick_count % _WAL_TRUNCATE_EVERY_N_TICKS == 0),
+                )
 
             # Status file writes are handled by a dedicated loop in
             # runtime/init/memory.py (status-writer-loop). Decoupled from

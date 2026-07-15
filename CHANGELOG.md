@@ -11,6 +11,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **A resumed conversation can no longer run twice at once.** If an SSH drop
+  leaves a Claude Code session executing headless and you resume that same
+  conversation elsewhere, both processes used to write to the same transcript
+  and the same files simultaneously (Claude Code itself raises no warning).
+  Now Genesis tracks which process owns each conversation: the newer session
+  wins, the orphan's file-changing tools are blocked with instructions, the
+  resuming session is told about the orphan at startup, and you get paged on
+  Telegram within minutes. Intentional dual-sessions have a documented
+  override. Bootstrap also hardens the root cause: sshd detects dead SSH
+  clients in ~60s (instead of hours), and interactive `claude` launches are
+  wrapped in a uniquely-named tmux session so a dropped connection leaves a
+  reattachable session instead of an orphan (opt out:
+  `GENESIS_NO_TMUX_WRAP=1`).
+
 - **Genesis now notices the agreements a session forgot to write down — in
   shadow.** At every compaction boundary a detached worker re-reads the
   conversation since the last checkpoint and proposes missed "yes, do that"

@@ -645,6 +645,116 @@ else
 fi
 echo
 
+# --- sshd dead-client detection ---
+# A dropped SSH connection must HUP its session promptly. With
+# ClientAliveInterval 0 (Ubuntu default) a half-open TCP connection keeps the
+# pty — and any foreground `claude` on it — alive for the kernel TCP timeout
+# (~2h), executing headless. Incident 2026-07-13: the orphaned session kept
+# mutating a worktree while the user's resume ran a second executor over the
+# same conversation. 15s x 4 -> a dead client is detected in ~60s.
+# OpenSSH is FIRST-value-wins and Ubuntu includes sshd_config.d/*.conf
+# alphabetically BEFORE the main config, so the file is named 00- to sort
+# ahead of any distro drop-in that might also set these keywords.
+echo "--- sshd dead-client detection (ClientAlive) ---"
+SSHD_DROP_IN="/etc/ssh/sshd_config.d/00-genesis-clientalive.conf"
+SSHD_CONTENT=$'# Genesis: detect dead SSH clients fast so an orphaned foreground session\n# cannot keep executing headless (see duplicate-session guard).\nClientAliveInterval 15\nClientAliveCountMax 4'
+# sshd lives in /usr/sbin, which minimal/non-login shells may not have on
+# PATH — check both so the hardening never silently skips on a real install.
+if ! command -v sshd >/dev/null 2>&1 && [[ ! -x /usr/sbin/sshd ]]; then
+    echo "  sshd not installed — skipping"
+elif [[ "$(sudo cat "$SSHD_DROP_IN" 2>/dev/null)" == "$SSHD_CONTENT" ]] \
+    && sudo sshd -T 2>/dev/null | grep -qi '^clientaliveinterval 15$'; then
+    echo "  ClientAlive already configured and effective (15s x 4)"
+else
+    sudo mkdir -p /etc/ssh/sshd_config.d/
+    printf '%s\n' "$SSHD_CONTENT" | sudo tee "$SSHD_DROP_IN" >/dev/null
+    if sudo sshd -t 2>/dev/null; then
+        sudo systemctl reload ssh 2>/dev/null || sudo systemctl reload sshd 2>/dev/null || true
+        # Verify the EFFECTIVE value — another drop-in sorting earlier would
+        # silently win (first-value-wins), leaving dead-client detection off.
+        SSHD_EFFECTIVE=$(sudo sshd -T 2>/dev/null | grep -i '^clientaliveinterval ' | awk '{print $2}')
+        if [[ "$SSHD_EFFECTIVE" == "15" ]]; then
+            echo "  ClientAlive configured (15s x 4 -> dead client HUP'd in ~60s)"
+        else
+            echo "  WARNING: effective ClientAliveInterval is '$SSHD_EFFECTIVE', not 15 —"
+            echo "  another sshd config sets it first (OpenSSH is first-value-wins)."
+            echo "  Check: grep -ri clientalive /etc/ssh/sshd_config /etc/ssh/sshd_config.d/"
+        fi
+    else
+        sudo rm -f "$SSHD_DROP_IN"
+        echo "  WARNING: sshd -t rejected the config — drop-in removed, sshd untouched"
+    fi
+fi
+echo
+
+# --- tmux-first interactive claude ---
+# Interactive `claude` on a bare SSH tty is one dropped connection away from
+# the headless-orphan incident above. This ~/.bashrc block wraps interactive
+# launches in a uniquely-named tmux session: a dropped SSH then leaves a
+# detached tmux (reattach = the SAME process finishes its turn safely; no
+# resume-fork, no second executor). Opt out per-shell with
+# GENESIS_NO_TMUX_WRAP=1. Non-tty and print-mode (-p) invocations are never
+# wrapped. Exit status of the wrapped claude is NOT propagated (tmux's own
+# status is returned) — irrelevant for interactive use, and scripts hit the
+# unwrapped branches.
+echo "--- tmux-first interactive claude (bashrc) ---"
+BASHRC="$HOME/.bashrc"
+read -r -d '' TMUX_WRAP_BLOCK <<'WRAPEOF' || true
+# >>> genesis tmux-wrap >>>
+# Managed by Genesis bootstrap.sh — edits inside this block are overwritten.
+# Wraps interactive `claude` in a uniquely-named tmux session so a dropped
+# SSH leaves a detached tmux (same process, reattachable) instead of a
+# headless orphan executing the turn. Opt out: GENESIS_NO_TMUX_WRAP=1.
+claude() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            -p|--print|--version|-v|--help|-h) command claude "$@"; return $? ;;
+        esac
+    done
+    if [ -t 0 ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ -z "${GENESIS_NO_TMUX_WRAP:-}" ] \
+        && command -v tmux >/dev/null 2>&1; then
+        local session="cc-manual-$(date +%s)-$$"
+        printf 'genesis: tmux session %s (after a drop: tmux attach -t %s | opt out: GENESIS_NO_TMUX_WRAP=1)\n' "$session" "$session" >&2
+        tmux new-session -s "$session" -- claude "$@"
+    else
+        command claude "$@"
+    fi
+}
+# <<< genesis tmux-wrap <<<
+WRAPEOF
+touch "$BASHRC"
+if grep -qF "# >>> genesis tmux-wrap >>>" "$BASHRC" 2>/dev/null; then
+    # Replace the existing block in place (idempotent update path).
+    GENESIS_TMUX_WRAP_BLOCK="$TMUX_WRAP_BLOCK" python3 - "$BASHRC" <<'PYEOF'
+import os
+import sys
+
+path = sys.argv[1]
+begin = "# >>> genesis tmux-wrap >>>"
+end = "# <<< genesis tmux-wrap <<<"
+block = os.environ["GENESIS_TMUX_WRAP_BLOCK"]
+lines = open(path).read().splitlines()
+out, skipping = [], False
+for line in lines:
+    if line.strip() == begin:
+        skipping = True
+        continue
+    if line.strip() == end:
+        skipping = False
+        continue
+    if not skipping:
+        out.append(line)
+text = "\n".join(out).rstrip("\n")
+open(path, "w").write(text + "\n\n" + block + "\n")
+PYEOF
+    echo "  tmux-wrap block refreshed in ~/.bashrc"
+else
+    printf '\n%s\n' "$TMUX_WRAP_BLOCK" >> "$BASHRC"
+    echo "  tmux-wrap block installed in ~/.bashrc"
+fi
+echo
+
 # --- Memory resilience (systemd-oomd pressure-kill + swap invariant) ---
 # Guarded: a tree mid-update/partial checkout without the lib must degrade,
 # not abort bootstrap under set -e (the lib's own never-abort contract).
