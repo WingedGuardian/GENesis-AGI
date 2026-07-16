@@ -341,9 +341,13 @@ verified: 7968d85a 2026-07-16
   cycle, close/priority-increase/delete — keeps the recommend-only proposal
   path (`goal_actions.py`). The approval gates (proposal + autonomous-CLI) are
   untouched: the ego skips proposal CREATION only for its own additive
-  artifacts. Autonomous goal CREATION (caps + ego-prompt wiring) is a staged
-  follow-on (PR-3), not yet built — `ego_goal_create(origin=…)` exists but no
-  autonomous path calls it.
+  artifacts. **Dormant until PR-3**, which must wire BOTH halves: (1) a
+  trusted genesis-ego creation path — the `ego_goal_create` MCP tool has NO
+  origin argument (Codex P1: caller input must never stamp provenance); only
+  the CRUD accepts `origin`, for trusted code — and (2) a genesis-cycle goal
+  review: today's staleness scan (`cadence._check_stale_goals`) is
+  user-ego-only, so no scheduled path reaches the direct-apply branch yet
+  (Codex P2).
 - **identity/**: SOUL/USER/VOICE/STEERING CAPS-markdown + `IdentityLoader`
   (wired via perception). `cc/session_config` reads SOUL+VOICE directly, not
   via the loader. **USER.md auto-synthesis is PERMANENTLY DISABLED** — the

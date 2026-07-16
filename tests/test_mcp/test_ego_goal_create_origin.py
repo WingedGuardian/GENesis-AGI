@@ -32,7 +32,7 @@ async def _origin_of(conn, goal_id: str) -> str:
 
 
 class TestEgoGoalCreateOrigin:
-    async def test_default_origin_is_user(self, db):
+    async def test_tool_always_stamps_user(self, db):
         conn, db_path = db
         from genesis.mcp.health.ego_tools import _impl_ego_goal_create as ego_goal_create
 
@@ -43,26 +43,41 @@ class TestEgoGoalCreateOrigin:
         assert result["origin"] == "user"
         assert await _origin_of(conn, result["goal_id"]) == "user"
 
-    async def test_genesis_ego_origin_stamped(self, db):
-        conn, db_path = db
-        from genesis.mcp.health.ego_tools import _impl_ego_goal_create as ego_goal_create
-
-        with patch("genesis.mcp.health.ego_tools._get_db_path", return_value=db_path):
-            result = await ego_goal_create(title="An ego goal", origin="genesis_ego")
-
-        assert result["status"] == "created"
-        assert result["origin"] == "genesis_ego"
-        assert await _origin_of(conn, result["goal_id"]) == "genesis_ego"
-
-    async def test_invalid_origin_rejected(self, db):
+    async def test_tool_surface_has_no_origin_argument(self, db):
+        """Codex P1 (PR #1086): the MCP tool is reachable by any caller, so
+        provenance must never be caller input. Passing origin must be a
+        TypeError on both the impl and the registered tool schema —
+        'genesis_ego' can only be stamped by trusted code via the CRUD."""
         _conn, db_path = db
-        from genesis.mcp.health.ego_tools import _impl_ego_goal_create as ego_goal_create
+        from genesis.mcp.health.ego_tools import _impl_ego_goal_create
 
-        with patch("genesis.mcp.health.ego_tools._get_db_path", return_value=db_path):
-            result = await ego_goal_create(title="Bad", origin="admin")
+        with (
+            patch("genesis.mcp.health.ego_tools._get_db_path", return_value=db_path),
+            pytest.raises(TypeError),
+        ):
+            await _impl_ego_goal_create(title="sneaky", origin="genesis_ego")
 
-        assert result["status"] == "error"
-        assert "origin" in result["reason"].lower()
+    async def test_registered_tool_schema_excludes_origin(self):
+        """The @mcp.tool wrapper (what remote callers see) must not expose an
+        origin parameter either."""
+        import inspect
+
+        from genesis.mcp.health import ego_tools
+
+        tool = ego_tools.ego_goal_create
+        fn = getattr(tool, "fn", tool)  # FunctionTool wraps the coroutine
+        assert "origin" not in inspect.signature(fn).parameters
+
+    async def test_crud_invalid_origin_hits_check_constraint(self, db):
+        """The CRUD trusted path is still constrained: the schema CHECK
+        rejects unknown origins outright."""
+        import sqlite3
+
+        conn, _db_path = db
+        with pytest.raises(sqlite3.IntegrityError):
+            await user_goals.create(
+                conn, title="bad", category="project", origin="admin"
+            )
 
 
 class TestOriginImmutable:
