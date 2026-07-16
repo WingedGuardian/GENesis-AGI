@@ -3,6 +3,14 @@
 Manual-approval state machine: request → pending → approved/rejected.
 Handles Telegram inline-button approvals, quote-reply resolution,
 batch-approve, and re-ask cadence.
+
+MANDATORY SUBSYSTEM — NON-NEGOTIABLE. This gate is the hard trust boundary that
+requires explicit user approval before any autonomous background Claude Code
+session runs. It must never be removed, bypassed, auto-approved, or
+default-disabled — see the standing directive on ``AutonomousCliPolicy``
+(cli_policy.py), CLAUDE.md ("## Traps"), and CC memory ``cli_gate_not_negotiable``.
+Fix approval friction AROUND the gate (invalidation lifecycle, re-ask cadence,
+approval-key stability), never by loosening it.
 """
 
 from __future__ import annotations
@@ -203,6 +211,11 @@ class AutonomousCliApprovalGate:
         """
         policy = self._policy()
         if not policy.manual_approval_required:
+            # NON-NEGOTIABLE GATE: reachable ONLY when a config/test explicitly
+            # sets manual_approval_required=False. The shipped default is True
+            # and must stay True — never flip the default, and never add a code
+            # path that reaches this branch implicitly. See AutonomousCliPolicy
+            # (cli_policy.py) and CC memory `cli_gate_not_negotiable`.
             return ("approved", None, "manual approval disabled by config")
 
         # Serialize per (subsystem, policy_id) — prevents duplicate rows

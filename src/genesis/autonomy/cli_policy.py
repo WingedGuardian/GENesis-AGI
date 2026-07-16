@@ -41,8 +41,31 @@ def _env_int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class AutonomousCliPolicy:
+    # ══════════════════════════════════════════════════════════════════════
+    # MANDATORY SUBSYSTEM — NON-NEGOTIABLE. DO NOT WEAKEN OR PROPOSE REMOVING.
+    #
+    # The autonomous-CLI approval gate (`manual_approval_required` +
+    # `AutonomousCliApprovalGate`) is a hard trust boundary: EVERY autonomous
+    # background Claude Code session must be rooted in an explicit user
+    # approval. This is the architectural guarantee behind earned autonomy —
+    # "user-dispatched and user-approved" is the definition of sanctioned
+    # background work.
+    #
+    # `manual_approval_required` defaults True and must STAY True. Never
+    # remove, bypass, auto-approve, default-off, or "temporarily" disable this
+    # gate — not as a feature, not to reduce approval churn, not as defence-
+    # in-depth cleanup. Approval-friction complaints (churn, re-ask storms,
+    # invalidation, key stability) are lifecycle-hygiene bugs to fix AROUND the
+    # gate, never an argument against the gate itself. A chain rooted in one
+    # explicit user approval is fine (e.g. /task submission covers its executor
+    # steps); the root approval must always exist and be the user's.
+    #
+    # Standing user directive (2026-07-07, reaffirmed 2026-07-15), not a
+    # reviewable trade-off. See CLAUDE.md ("## Traps") and CC memory
+    # `cli_gate_not_negotiable`.
+    # ══════════════════════════════════════════════════════════════════════
     autonomous_cli_fallback_enabled: bool = True
-    manual_approval_required: bool = True
+    manual_approval_required: bool = True  # MANDATORY — must stay True (see above)
     reask_interval_hours: int = 24
     approval_channel: str = "telegram"
     shared_export_enabled: bool = True

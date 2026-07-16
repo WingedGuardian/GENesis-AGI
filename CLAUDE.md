@@ -312,6 +312,14 @@ When a user shares a file path or URL in conversation:
 - **Ego** (`src/genesis/ego/`) — Live. Two egos: user (CEO/Opus) and
   Genesis (COO/Sonnet). Review cadence manager and budget controls
   before adding call sites.
+- **Autonomous-CLI approval gate is MANDATORY & non-negotiable.** The gate
+  (`autonomy/cli_policy.py` `manual_approval_required` +
+  `AutonomousCliApprovalGate`) requires explicit user approval before ANY
+  autonomous background Claude Code session runs. Never remove, bypass,
+  auto-approve, or default-off it — and never *propose* doing so. Approval
+  friction is a lifecycle-hygiene bug to fix around the gate (re-ask cadence,
+  key stability), never a reason to weaken it. Same for ego-proposal approvals.
+  Standing user directive.
 - **GROUNDWORK tags** — `# GROUNDWORK(id): why` is intentional. Never delete.
 - **IntervalTrigger** — Resets on restart. Use `CronTrigger` for intervals >1h.
 
