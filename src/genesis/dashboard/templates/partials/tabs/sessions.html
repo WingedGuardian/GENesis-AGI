@@ -230,6 +230,18 @@
                             <span style="flex: 1; min-width: 200px;"
                                   :title="(a.rationale || '') + (a.resolution_ref ? ' · resolved: ' + a.resolution_ref : '')"
                                   x-text="'“' + (a.item_text || a.item_id).slice(0, 44) + '” ↔ PR #' + a.pr_number + (a.confidence != null ? ' @' + a.confidence : '')"></span>
+                            <template x-if="a.status === 'proposed'">
+                              <span style="display: flex; gap: 0.3rem;">
+                                <button style="font-size: 0.7rem; padding: 0.1rem 0.5rem; border-radius: 4px; border: 1px solid rgba(76,175,80,0.4); background: rgba(76,175,80,0.12); color: #4caf50; cursor: pointer;"
+                                        :disabled="$store.genesisDashboard.sessionsTab.resolvingId === a.id"
+                                        title="Absorb the ledger item with this PR as evidence and count the match as confirmed"
+                                        @click="$store.genesisDashboard.resolvePulseAnnotation(a, 'confirmed')">confirm</button>
+                                <button style="font-size: 0.7rem; padding: 0.1rem 0.5rem; border-radius: 4px; border: 1px solid rgba(217,83,79,0.4); background: rgba(217,83,79,0.12); color: #d9534f; cursor: pointer;"
+                                        :disabled="$store.genesisDashboard.sessionsTab.resolvingId === a.id"
+                                        title="Not a real match — the ledger item stays open"
+                                        @click="$store.genesisDashboard.resolvePulseAnnotation(a, 'rejected')">reject</button>
+                              </span>
+                            </template>
                           </div>
                         </template>
                       </div>

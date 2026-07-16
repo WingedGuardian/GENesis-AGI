@@ -23,7 +23,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
-from flask import jsonify
+from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
 
@@ -333,6 +333,71 @@ async def _collect_session_detail(
         "waypoints": _load_waypoints(cc_session_id, sessions_dir),
         "pulse": await _pulse_lookup(db, cc_session_id),
     }
+
+
+@blueprint.route("/api/genesis/cc-sessions/pulse/<annotation_id>/resolve", methods=["POST"])
+@_async_route
+async def cc_sessions_pulse_resolve(annotation_id: str):
+    """Resolve a proposed pulse annotation from the cockpit (comms resolve-
+    proposal contract: 400 bad status / 404 unknown / 503 unbootstrapped).
+
+    Confirm carries the SAME semantics as the injected in-session hint —
+    absorb the ledger item with PR evidence, then mark the annotation
+    confirmed — so both resolution paths teach the precision metric the same
+    lesson. Reject touches only the annotation; the ledger item stays open.
+    """
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt.db is None:
+        return jsonify({"error": "not bootstrapped"}), 503
+
+    data = request.get_json(silent=True) or {}
+    status = str(data.get("status", "")).strip().lower()
+    if status not in ("confirmed", "rejected"):
+        return jsonify({"error": "status must be 'confirmed' or 'rejected'"}), 400
+
+    payload, code = await _resolve_pulse(rt.db, annotation_id, status)
+    return jsonify(payload), code
+
+
+async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int]:
+    """Resolve core (extracted so tests exercise it on the fixture loop)."""
+    from genesis.db.crud.repo_pulse import resolve_annotation
+    from genesis.db.crud.session_charters import get_ledger_item, ledger_update
+
+    try:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM repo_pulse_annotations WHERE id = ?", (annotation_id,)
+        )
+        row = await cursor.fetchone()
+        if row is None or row["status"] != "proposed":
+            return {"error": "unknown or already-resolved annotation"}, 404
+        absorbed = False
+        if status == "confirmed":
+            item = await get_ledger_item(db, row["item_id"])
+            if item is not None and item.get("status") in ("open", "in_progress"):
+                absorbed = await ledger_update(
+                    db,
+                    row["item_id"],
+                    status="absorbed",
+                    evidence=f"PR #{row['pr_number']}: {row['pr_title'] or ''} "
+                    f"[pulse confirm via dashboard]",
+                )
+        ok = await resolve_annotation(
+            db,
+            annotation_id,
+            status=status,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_ref="dashboard",
+        )
+    except (sqlite3.Error, aiosqlite.Error) as exc:
+        logger.error("pulse resolve failed: %s", exc)
+        return {"error": "pulse store unavailable"}, 503
+    if not ok:
+        return {"error": "unknown or already-resolved annotation"}, 404
+    return {"ok": True, "status": status, "item_absorbed": absorbed}, 200
 
 
 @blueprint.route("/api/genesis/cc-sessions/<cc_session_id>/charter")

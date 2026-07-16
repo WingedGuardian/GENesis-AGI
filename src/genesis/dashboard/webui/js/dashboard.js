@@ -3976,6 +3976,23 @@
           this.fetchSessionCharter(id);
         },
 
+        async resolvePulseAnnotation(a, status) {
+          if (status === "rejected" && !confirm("Reject this pulse proposal? It counts against fuzzy precision.")) return;
+          this.sessionsTab.resolvingId = a.id;
+          try {
+            const resp = await fetchApi(`/api/genesis/cc-sessions/pulse/${encodeURIComponent(a.id)}/resolve`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ status }),
+            });
+            if (resp?.ok && this.sessionsTab.selectedId) {
+              await this.fetchSessionCharter(this.sessionsTab.selectedId, { silent: true });
+              this.fetchSessionsTab();
+            }
+          } catch { /* panel refresh shows the truth either way */ }
+          this.sessionsTab.resolvingId = null;
+        },
+
         async fetchSessionCharter(ccSessionId, opts = {}) {
           try {
             const resp = await fetchApi(`/api/genesis/cc-sessions/${encodeURIComponent(ccSessionId)}/charter`);

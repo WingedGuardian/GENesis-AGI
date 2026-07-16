@@ -392,3 +392,118 @@ async def test_cockpit_pulse_degrades_without_tables(db, tmp_path):
     pulse_crud._tables_verified = False
     assert detail["pulse"] == {"available": False, "annotations": [], "health": None}
     assert detail["charter"]["origin_prompt"] == "the origin"  # rest unaffected
+
+
+# ── Pulse confirm/reject endpoint (PR-4b commit 5) ───────────────────────────
+
+
+def _mock_rt(db):
+    rt = MagicMock()
+    rt.is_bootstrapped = True
+    rt.db = db
+    return rt
+
+
+async def _seed_pulse_proposal(db, *, ann_id="a1", item_id="l0", status="proposed"):
+    await db.execute(
+        "INSERT INTO repo_pulse_runs (run_id, started_at, trigger, status)"
+        " VALUES ('r1', '2026-07-14T00:00:00+00:00', 'manual', 'ok')"
+    )
+    await db.execute(
+        "INSERT INTO repo_pulse_annotations (id, run_id, observed_at, tier,"
+        " item_id, item_session_id, item_text, pr_number, pr_title, status, confidence)"
+        " VALUES (?, 'r1', '2026-07-14T00:00:00+00:00', 'fuzzy', ?,"
+        " 'cc-abc', 'item 0', 1081, 'feat: thing', ?, 0.9)",
+        (ann_id, item_id, status),
+    )
+    await db.commit()
+
+
+async def _ann_status(db, ann_id="a1"):
+    cur = await db.execute("SELECT status FROM repo_pulse_annotations WHERE id = ?", (ann_id,))
+    return (await cur.fetchone())[0]
+
+
+async def _ledger_row(db, item_id="l0"):
+    cur = await db.execute("SELECT * FROM session_ledger WHERE id = ?", (item_id,))
+    return dict(await cur.fetchone())
+
+
+def test_pulse_resolve_route_registered(app):
+    rules = {rule.rule for rule in app.url_map.iter_rules()}
+    assert "/api/genesis/cc-sessions/pulse/<annotation_id>/resolve" in rules
+
+
+def test_pulse_resolve_503_and_400(client, db):
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = False
+    mock_rt.db = None
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        assert client.post(
+            "/api/genesis/cc-sessions/pulse/a1/resolve", json={"status": "confirmed"}
+        ).status_code == 503
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = _mock_rt(db)
+        assert client.post(
+            "/api/genesis/cc-sessions/pulse/a1/resolve", json={"status": "approved"}
+        ).status_code == 400
+        assert client.post(
+            "/api/genesis/cc-sessions/pulse/a1/resolve", json={}
+        ).status_code == 400
+
+
+async def test_pulse_confirm_absorbs_item_with_pr_evidence(db):
+    """Dashboard confirm == the injected in-session hint: absorb the item
+    with PR evidence, then mark the annotation confirmed — both resolution
+    paths teach the precision metric the same lesson."""
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+
+    await _seed_charter_tables(db, with_rows=True)
+    await _seed_pulse_proposal(db)
+    payload, code = await _resolve_pulse(db, "a1", "confirmed")
+    assert code == 200
+    assert payload["ok"] is True and payload["item_absorbed"] is True
+    assert await _ann_status(db) == "confirmed"
+    row = await _ledger_row(db)
+    assert row["status"] == "absorbed"
+    assert "PR #1081" in row["evidence"]
+
+
+async def test_pulse_reject_leaves_ledger_untouched(db):
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+
+    await _seed_charter_tables(db, with_rows=True)
+    await _seed_pulse_proposal(db)
+    payload, code = await _resolve_pulse(db, "a1", "rejected")
+    assert code == 200
+    assert await _ann_status(db) == "rejected"
+    row = await _ledger_row(db)
+    assert row["status"] == "open"
+    assert row["evidence"] is None
+
+
+async def test_pulse_resolve_404_unknown_and_terminal(db):
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+
+    await _seed_charter_tables(db, with_rows=True)
+    await _seed_pulse_proposal(db, ann_id="a-done", status="applied")
+    assert (await _resolve_pulse(db, "nope", "confirmed"))[1] == 404
+    assert (await _resolve_pulse(db, "a-done", "confirmed"))[1] == 404
+    assert await _ann_status(db, "a-done") == "applied"  # terminal rows never flip
+
+
+async def test_pulse_confirm_on_closed_item_still_confirms_annotation(db):
+    """Item already done/absorbed in-session: confirm records the metric
+    without re-touching the ledger."""
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+
+    await _seed_charter_tables(db, with_rows=True)
+    await db.execute("UPDATE session_ledger SET status = 'done' WHERE id = 'l0'")
+    await db.commit()
+    await _seed_pulse_proposal(db)
+    payload, code = await _resolve_pulse(db, "a1", "confirmed")
+    assert code == 200
+    assert payload["item_absorbed"] is False
+    assert await _ann_status(db) == "confirmed"
+    assert (await _ledger_row(db))["status"] == "done"
