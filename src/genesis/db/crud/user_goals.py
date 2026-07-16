@@ -216,6 +216,7 @@ async def find_similar(
     threshold: float = 0.6,
     statuses: tuple[str, ...] = ("active",),
     origin: str | None = None,
+    limit: int = 50,
 ) -> dict | None:
     """Find an existing goal with a similar title (simple word overlap).
 
@@ -227,7 +228,9 @@ async def find_similar(
     recreating it; achieved/abandoned are deliberately never matched — a
     finished title stays re-openable. ``origin`` scopes by provenance
     (the extraction path passes "user" so conversation-derived signals
-    never reinforce ego-owned goals).
+    never reinforce ego-owned goals). ``limit`` bounds the scan (newest
+    first) — dedupe callers that must see the whole live set pass a high
+    value; the default preserves the original 50-newest behavior.
     """
     placeholders = ", ".join("?" for _ in statuses)
     params: list[object] = list(statuses)
@@ -237,8 +240,8 @@ async def find_similar(
         params.append(origin)
     cursor = await db.execute(
         f"SELECT * FROM user_goals WHERE status IN ({placeholders}) "  # noqa: S608
-        f"{origin_clause}ORDER BY created_at DESC LIMIT 50",
-        params,
+        f"{origin_clause}ORDER BY created_at DESC LIMIT ?",
+        [*params, limit],
     )
     goals = [dict(r) for r in await cursor.fetchall()]
     if not goals:

@@ -140,7 +140,10 @@ class TestSection:
         full = await _builder(db).build()
         assert "## Confidence Calibration" in full
         # rendered before the output contract (highest salience for the confidence field)
-        assert full.index("Confidence Calibration") < full.index("Output Contract")
+        # Heading-anchored: plain substrings collide with body text that
+        # *mentions* other sections (e.g. the own-goals affordance line says
+        # "see Output Contract").
+        assert full.index("## Confidence Calibration") < full.index("## Output Contract")
 
     @pytest.mark.asyncio
     async def test_null_flag_stays_on(self, db, monkeypatch):

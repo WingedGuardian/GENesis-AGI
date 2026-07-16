@@ -572,6 +572,9 @@ class EgoSession:
                     continue
                 duplicate = await goals_crud.find_similar(
                     self._db, title, statuses=("active", "paused"),
+                    # Shadow-duplicate protection must see the WHOLE live
+                    # goal set, not the 50 newest (Codex P2, PR #1094).
+                    limit=1000,
                 )
                 if duplicate:
                     logger.info(
@@ -2850,8 +2853,8 @@ def _validate_output(data: dict) -> dict | None:
         cleaned: list[dict] = []
         if isinstance(raw, list):
             from genesis.ego.goal_actions import (
-                VALID_GOAL_CATEGORIES,
                 VALID_GOAL_TYPES,
+                VALID_OWN_GOAL_CATEGORIES,
             )
 
             for entry in raw:
@@ -2860,7 +2863,10 @@ def _validate_output(data: dict) -> dict | None:
                 title = entry.get("title")
                 if not isinstance(title, str) or not title.strip():
                     continue
-                if entry.get("category") not in VALID_GOAL_CATEGORIES:
+                # Operational lanes only — career/financial/relationship are
+                # user-life categories, out of the genesis ego's jurisdiction
+                # even for its own goals.
+                if entry.get("category") not in VALID_OWN_GOAL_CATEGORIES:
                     continue
                 # 'critical' is reserved for the user's goals — an own goal
                 # never outranks a user directive by construction.

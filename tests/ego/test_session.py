@@ -1136,6 +1136,9 @@ class TestValidateOwnGoalKeys:
             {"title": "No category"},                      # dropped
             {"category": "project"},                       # dropped (no title)
             {"title": "Bad category", "category": "career-ops"},  # dropped
+            # valid USER-goal category, but a user-life lane — out of the
+            # ego's jurisdiction even for its own goals (Codex P2 #1094)
+            {"title": "Own career goal", "category": "career"},    # dropped
             "not a dict",                                  # dropped
         ]))
         cleaned = out["own_goal_creations"]
