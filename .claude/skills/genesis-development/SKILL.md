@@ -305,6 +305,13 @@ Verify before any commit:
   for your changes. NEVER run the full test suite locally — CI handles that.
   Check CI via `gh pr checks`. Bare `pytest` without a file path is banned.
 - **Commit continuously**: after every logical unit of work. Uncommitted = lost.
+- **PR closes a ledger item → cite `Ledger: <item-id>` in the PR body** (the
+  32-hex `session_ledger` row id, own line, e.g. `Ledger: 71337fab…`). The
+  repo-pulse worker auto-absorbs the row with PR evidence at the next session
+  boundary — deterministic, reversible via `session_ledger_update`. A bare id
+  mention WITHOUT the `Ledger:` marker is context, not completion (the pulse
+  only proposes it). Find ids via `session_charter` or the charter injection
+  block.
 
 ## Host-Deploy Gate (merged ≠ deployed)
 

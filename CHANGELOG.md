@@ -11,6 +11,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Your session TODO ledger now notices when a merged PR ships an item.** N
+  parallel sessions each carry open ledger rows, and until now closing them
+  meant remembering to do it by hand — work shipped in one session left stale
+  "open" items in another. At session boundaries Genesis now checks recently
+  merged PRs against every open ledger item: a PR that explicitly cites
+  `Ledger: <item-id>` in its body closes the item automatically (with the PR
+  recorded as evidence, and reversible); anything less certain — a bare id
+  mention, or an AI-judged title/description match — becomes a small
+  "looks shipped by PR #N — confirm or ignore" note in the session's charter
+  block, never a silent close. Levers: settings domain `repo_pulse`
+  (off / propose_only / live) and the `GENESIS_REPO_PULSE_DISABLED=1` kill
+  switch.
+
 - **Genesis now remembers how its background jobs actually ran, not just a
   running tally.** Until now each scheduled job kept only a single cumulative
   row, so a job that failed for a week and then recovered looked identical to

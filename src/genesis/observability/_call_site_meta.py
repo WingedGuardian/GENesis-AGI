@@ -609,6 +609,18 @@ _CALL_SITE_META: dict[str, dict] = {
         "cc_model": "Haiku",
         "model_tier": "cc",
     },
+    "repo_pulse": {
+        # Manual cost_policy (empty chain by design, ambient_arbiter twin).
+        # Deliberately NOT in critical_sites: a pulse run failing is never
+        # red-worthy — it self-heals by re-covering its window next boundary.
+        "description": "Repo-pulse fuzzy matcher: one headless CC (pinned Haiku) call per pulse run scoring open-ledger-item x merged-PR matches. Spawned by the detached repo-pulse worker at SessionStart boundaries; proposal-only in every mode (the exact marker tier is deterministic and never routes).",
+        "category": "memory",
+        "frequency": "Per debounced session boundary (<=2/hour, realistically <10/day)",
+        "cost_policy": "CC subscription (Haiku)",
+        "dispatch": "cli",
+        "cc_model": "Haiku",
+        "model_tier": "cc",
+    },
     "model_fusion": {
         # Non-routing, on-demand paid consult: the deliberate MCP tool POSTs
         # OpenRouter Fusion over raw httpx (NOT through the router), then records

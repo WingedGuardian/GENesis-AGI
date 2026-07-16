@@ -745,6 +745,19 @@ call_sites:
       (no API fallback; a failed run is recorded, never retried elsewhere);
       the detached worker spawns CC directly and reports via
       record_last_run_detached. Registered for neural-monitor visibility.
+  repo_pulse:
+    chain: []
+    dispatch: cli
+    cc_model: Haiku
+    never_pays: true
+    description: >-
+      Repo-pulse fuzzy matcher (session-manager PR-4a): one headless CC call
+      per pulse run scoring open-ledger-item x merged-PR matches (model
+      PINNED in session_awareness/repo_pulse.py). Proposal-only in every
+      mode — the exact marker tier is deterministic and never routes. Empty
+      chain BY DESIGN (no API fallback; a failed run re-covers its window
+      next boundary); the detached worker spawns CC directly and reports via
+      record_last_run_detached. Registered for neural-monitor visibility.
 retry:
   # max_total_s: aggregate wall-clock ceiling (seconds) across a single
   # route_call's retries x chain length. A safety net against pathological

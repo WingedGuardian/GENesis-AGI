@@ -291,6 +291,12 @@ crystallizes or pivots. You are the first line of defense; ambient
 extraction (session-manager PR-3) is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
 
+**PR-body convention:** a PR that completes a ledger item cites
+`Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
+the repo-pulse worker auto-absorbs the row with PR evidence at the next
+session boundary. A bare id without the marker reads as context, not
+completion (proposal only).
+
 ## Knowledge Ingestion (Conversational Path)
 
 When a user shares a file path or URL in conversation:
