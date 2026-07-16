@@ -37,13 +37,15 @@ async def _impl_health_errors(
             items = await dl_crud.query_pending(_service._db)
             for item in items:
                 if item.get("created_at", "") >= cutoff:
-                    errors.append({
-                        "type": "dead_letter",
-                        "provider": item.get("target_provider", "unknown"),
-                        "reason": item.get("failure_reason", ""),
-                        "operation": item.get("operation_type", ""),
-                        "timestamp": item.get("created_at", ""),
-                    })
+                    errors.append(
+                        {
+                            "type": "dead_letter",
+                            "provider": item.get("target_provider", "unknown"),
+                            "reason": item.get("failure_reason", ""),
+                            "operation": item.get("operation_type", ""),
+                            "timestamp": item.get("created_at", ""),
+                        }
+                    )
         except Exception:
             logger.error("Failed to query dead letter errors", exc_info=True)
 
@@ -54,16 +56,19 @@ async def _impl_health_errors(
             try:
                 cb = _service._breakers.get(name)
                 if cb.state == ProviderState.OPEN:
-                    errors.append({
-                        "type": "circuit_breaker_open",
-                        "provider": name,
-                        "reason": "Circuit breaker tripped",
-                        "failures": cb.consecutive_failures,
-                    })
+                    errors.append(
+                        {
+                            "type": "circuit_breaker_open",
+                            "provider": name,
+                            "reason": "Circuit breaker tripped",
+                            "failures": cb.consecutive_failures,
+                        }
+                    )
             except Exception:
                 logger.error(
                     "Circuit breaker state check failed for provider %s",
-                    name, exc_info=True,
+                    name,
+                    exc_info=True,
                 )
 
     from datetime import timedelta as _td
@@ -82,21 +87,25 @@ async def _impl_health_errors(
                 limit=50,
             )
             for sev in ("error", "critical"):
-                db_rows.extend(await events_crud.query(
-                    _service._db,
-                    severity=sev,
-                    since=cutoff,
-                    limit=50,
-                ))
+                db_rows.extend(
+                    await events_crud.query(
+                        _service._db,
+                        severity=sev,
+                        since=cutoff,
+                        limit=50,
+                    )
+                )
             for row in db_rows:
-                errors.append({
-                    "type": "event_bus",
-                    "subsystem": row.get("subsystem", ""),
-                    "event_type": row.get("event_type", ""),
-                    "severity": row.get("severity", ""),
-                    "message": row.get("message", ""),
-                    "timestamp": row.get("timestamp", ""),
-                })
+                errors.append(
+                    {
+                        "type": "event_bus",
+                        "subsystem": row.get("subsystem", ""),
+                        "event_type": row.get("event_type", ""),
+                        "severity": row.get("severity", ""),
+                        "message": row.get("message", ""),
+                        "timestamp": row.get("timestamp", ""),
+                    }
+                )
             db_events_loaded = True
         except Exception:
             logger.error("Event log query failed", exc_info=True)
@@ -106,14 +115,16 @@ async def _impl_health_errors(
 
         for event in _event_bus.recent_events(min_severity=Severity.WARNING, limit=50):
             if event.timestamp >= cutoff:
-                errors.append({
-                    "type": "event_bus",
-                    "subsystem": event.subsystem.value,
-                    "event_type": event.event_type,
-                    "severity": event.severity.value,
-                    "message": event.message,
-                    "timestamp": event.timestamp,
-                })
+                errors.append(
+                    {
+                        "type": "event_bus",
+                        "subsystem": event.subsystem.value,
+                        "event_type": event.event_type,
+                        "severity": event.severity.value,
+                        "message": event.message,
+                        "timestamp": event.timestamp,
+                    }
+                )
 
     if pattern_group and errors:
         grouped: dict[str, dict] = {}
@@ -171,16 +182,31 @@ def _backups_enabled() -> bool:
         return True
 
 
-async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
+async def _compute_alerts() -> tuple[list[dict], set[str]]:
+    """Pure alert computation — recompute the firing alert set from live health.
+
+    Returns ``(alerts, current_ids)`` and carries NO ``_alert_history`` state.
+    Two consumers: ``_impl_health_alerts`` (adds the in-memory one-generation
+    resolved rendering, unchanged read contract) and the awareness-tick writer
+    (persists the DURABLE open-set into ``alert_events`` — WS-2 M10). Keeping this
+    a pure function is what lets a single designated writer own persistence
+    without the multi-caller / cross-process double-write the read path would
+    otherwise cause.
+    """
     import genesis.mcp.health_mcp as health_mcp_mod
 
     _service = health_mcp_mod._service
     _activity_tracker = health_mcp_mod._activity_tracker
     _job_retry_registry = health_mcp_mod._job_retry_registry
-    _alert_history = health_mcp_mod._alert_history
 
     if _service is None:
-        return [{"id": "service:health_data_uninitialized", "severity": "CRITICAL", "message": "HealthDataService not initialized"}]
+        return [
+            {
+                "id": "service:health_data_uninitialized",
+                "severity": "CRITICAL",
+                "message": "HealthDataService not initialized",
+            }
+        ], set()
 
     snap = await _service.snapshot()
     alerts: list[dict] = []
@@ -218,19 +244,23 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             # The Sentinel has no remediation path for external providers;
             # circuit breakers auto-reset. Emit WARNING (→ Tier 3, reflexes
             # only) instead of CRITICAL (→ Tier 2, wakes Sentinel).
-            alerts.append({
-                "id": alert_id,
-                "severity": "WARNING",
-                "message": f"Call site {site_id} is DOWN (all providers exhausted)",
-            })
+            alerts.append(
+                {
+                    "id": alert_id,
+                    "severity": "WARNING",
+                    "message": f"Call site {site_id} is DOWN (all providers exhausted)",
+                }
+            )
             current_ids.add(alert_id)
         elif status_val == "degraded":
-            alerts.append({
-                "id": alert_id,
-                "severity": "WARNING",
-                "message": f"Call site {site_id} is degraded (using fallback provider)",
-                "active_provider": site_info.get("active_provider"),
-            })
+            alerts.append(
+                {
+                    "id": alert_id,
+                    "severity": "WARNING",
+                    "message": f"Call site {site_id} is degraded (using fallback provider)",
+                    "active_provider": site_info.get("active_provider"),
+                }
+            )
             current_ids.add(alert_id)
 
     queues = snap.get("queues", {})
@@ -246,8 +276,12 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
     # broken drain still surfaces. `deferred_work`/`deferred_worklist` stay in the
     # snapshot for honest display but are not depth-alarmed here.
     _QUEUE_DEPTH_FIELDS = {
-        "pending_embeddings", "dead_letters", "deferred_recovery",
-        "deferred_processing", "deferred_stuck", "failed_embeddings",
+        "pending_embeddings",
+        "dead_letters",
+        "deferred_recovery",
+        "deferred_processing",
+        "deferred_stuck",
+        "failed_embeddings",
         "discarded_count",
     }
     for queue_name, depth in queues.items():
@@ -255,22 +289,26 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             continue
         if isinstance(depth, int) and depth > 100:
             alert_id = f"queue:{queue_name}"
-            alerts.append({
-                "id": alert_id,
-                "severity": "WARNING",
-                "message": f"Queue {queue_name} depth is {depth} (>100)",
-            })
+            alerts.append(
+                {
+                    "id": alert_id,
+                    "severity": "WARNING",
+                    "message": f"Queue {queue_name} depth is {depth} (>100)",
+                }
+            )
             current_ids.add(alert_id)
 
     cc = snap.get("cc_sessions", {})
     bg = cc.get("background", {})
     if bg.get("status") in ("throttled", "rate_limited"):
         alert_id = "cc:budget"
-        alerts.append({
-            "id": alert_id,
-            "severity": "WARNING",
-            "message": f"CC sessions {bg['status']} (budget: {bg.get('hourly_budget', '?')})",
-        })
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "WARNING",
+                "message": f"CC sessions {bg['status']} (budget: {bg.get('hourly_budget', '?')})",
+            }
+        )
         current_ids.add(alert_id)
 
     # CC rate-limit / unavailability alert.
@@ -305,43 +343,51 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             )
         else:
             alert_id = "cc:quota_exhausted"
-            alerts.append({
-                "id": alert_id,
-                "severity": "WARNING",
-                "message": f"CC {cc_realtime.lower().replace('_', ' ')} — contingency mode active",
-            })
+            alerts.append(
+                {
+                    "id": alert_id,
+                    "severity": "WARNING",
+                    "message": f"CC {cc_realtime.lower().replace('_', ' ')} — contingency mode active",
+                }
+            )
             current_ids.add(alert_id)
 
     awareness = snap.get("awareness", {})
     tick_age = awareness.get("time_since_last_tick_seconds")
     if tick_age is not None and tick_age > 360:
         alert_id = "awareness:tick_overdue"
-        alerts.append({
-            "id": alert_id,
-            "severity": "CRITICAL",
-            "message": f"Awareness tick overdue by {int(tick_age)}s (>360s threshold)",
-        })
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "CRITICAL",
+                "message": f"Awareness tick overdue by {int(tick_age)}s (>360s threshold)",
+            }
+        )
         current_ids.add(alert_id)
 
     dl_age = snap.get("queues", {}).get("dead_letter_oldest_age_seconds")
     if dl_age is not None and dl_age > 3600:
         alert_id = "queue:stale_dead_letters"
-        alerts.append({
-            "id": alert_id,
-            "severity": "WARNING",
-            "message": f"Dead letter queue has items {int(dl_age)}s old (>1h threshold)",
-        })
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "WARNING",
+                "message": f"Dead letter queue has items {int(dl_age)}s old (>1h threshold)",
+            }
+        )
         current_ids.add(alert_id)
 
     disk = snap.get("infrastructure", {}).get("disk", {})
     free_pct = disk.get("free_pct")
     if free_pct is not None and free_pct < 15:
         alert_id = "infra:disk_low"
-        alerts.append({
-            "id": alert_id,
-            "severity": "CRITICAL" if free_pct < 10 else "WARNING",
-            "message": f"Disk space low: {free_pct}% free ({disk.get('free_gb', '?')}GB)",
-        })
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "CRITICAL" if free_pct < 10 else "WARNING",
+                "message": f"Disk space low: {free_pct}% free ({disk.get('free_gb', '?')}GB)",
+            }
+        )
         current_ids.add(alert_id)
 
     container_mem = snap.get("infrastructure", {}).get("container_memory", {})
@@ -355,22 +401,26 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         # both the Telegram alert AND the voice chime earlier. anon_pct is
         # non-reclaimable memory, so >85% is genuine pressure (the box idles
         # ~76-79%). 6h dedup prevents repeat spam.
-        alerts.append({
-            "id": alert_id,
-            "severity": "CRITICAL",
-            "message": f"Container memory at {anon_pct}% anon+kernel ({container_mem.get('current_gb', '?')}/{container_mem.get('limit_gb', '?')}GB total)",
-        })
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "CRITICAL",
+                "message": f"Container memory at {anon_pct}% anon+kernel ({container_mem.get('current_gb', '?')}/{container_mem.get('limit_gb', '?')}GB total)",
+            }
+        )
         current_ids.add(alert_id)
 
     qdrant_cols = snap.get("infrastructure", {}).get("qdrant_collections", {})
     missing_cols = qdrant_cols.get("missing", [])
     if missing_cols:
         alert_id = "infra:qdrant_collections_missing"
-        alerts.append({
-            "id": alert_id,
-            "severity": "CRITICAL",
-            "message": f"Qdrant collections missing: {', '.join(missing_cols)} — memory operations will fail",
-        })
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "CRITICAL",
+                "message": f"Qdrant collections missing: {', '.join(missing_cols)} — memory operations will fail",
+            }
+        )
         current_ids.add(alert_id)
 
     services = snap.get("services", {})
@@ -378,32 +428,38 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
     if genesis_svc.get("active_state") not in ("active", "unknown"):
         svc_label = genesis_svc.get("service_unit", "genesis-server.service")
         alert_id = "service:genesis_down"
-        alerts.append({
-            "id": alert_id,
-            "severity": "CRITICAL",
-            "message": f"{svc_label} is {genesis_svc.get('active_state', 'unknown')}",
-        })
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "CRITICAL",
+                "message": f"{svc_label} is {genesis_svc.get('active_state', 'unknown')}",
+            }
+        )
         current_ids.add(alert_id)
 
     watchdog_timer = services.get("watchdog_timer", {})
     if watchdog_timer.get("active_state") not in ("active", "unknown"):
         alert_id = "service:watchdog_blind"
-        alerts.append({
-            "id": alert_id,
-            "severity": "WARNING",
-            "message": "genesis-watchdog.timer is inactive — infrastructure monitoring is blind",
-        })
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "WARNING",
+                "message": "genesis-watchdog.timer is inactive — infrastructure monitoring is blind",
+            }
+        )
         current_ids.add(alert_id)
 
     watchdog_state = services.get("watchdog", {})
     wd_failures = watchdog_state.get("consecutive_failures", 0)
     if wd_failures > 3:
         alert_id = "service:watchdog_failing"
-        alerts.append({
-            "id": alert_id,
-            "severity": "WARNING",
-            "message": f"Watchdog triggered {wd_failures} consecutive restarts (reason: {watchdog_state.get('last_reason', 'unknown')})",
-        })
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "WARNING",
+                "message": f"Watchdog triggered {wd_failures} consecutive restarts (reason: {watchdog_state.get('last_reason', 'unknown')})",
+            }
+        )
         current_ids.add(alert_id)
 
     # Guardian heartbeat — the host-side safety net
@@ -423,18 +479,17 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
     guardian_status = guardian_info.get("status", "unknown")
     if guardian_status == "down":
         staleness = guardian_info.get("staleness_s")
-        stale_part = (
-            f" (stale {int(staleness)}s)" if isinstance(staleness, int | float) else ""
-        )
+        stale_part = f" (stale {int(staleness)}s)" if isinstance(staleness, int | float) else ""
         alert_id = "guardian:heartbeat_stale"
-        alerts.append({
-            "id": alert_id,
-            "severity": "CRITICAL",
-            "message": (
-                f"Guardian heartbeat not updating{stale_part} — "
-                f"host-side safety net is blind"
-            ),
-        })
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "CRITICAL",
+                "message": (
+                    f"Guardian heartbeat not updating{stale_part} — host-side safety net is blind"
+                ),
+            }
+        )
         current_ids.add(alert_id)
 
     ollama = snap.get("infrastructure", {}).get("ollama", {})
@@ -442,11 +497,13 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
     if missing_models:
         alert_id = "infra:ollama_model_mismatch"
         names = ", ".join(f"{m['provider']}:{m['model']}" for m in missing_models)
-        alerts.append({
-            "id": alert_id,
-            "severity": "WARNING",
-            "message": f"Ollama missing configured models: {names}",
-        })
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "WARNING",
+                "message": f"Ollama missing configured models: {names}",
+            }
+        )
         current_ids.add(alert_id)
 
     if _activity_tracker is not None:
@@ -457,14 +514,16 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             and emb_summary.get("error_rate", 0) > 0.5
         ):
             alert_id = "provider:embedding_failing"
-            alerts.append({
-                "id": alert_id,
-                "severity": "CRITICAL",
-                "message": (
-                    f"Embedding provider error rate: {emb_summary['error_rate']:.0%} "
-                    f"({emb_summary['errors']}/{emb_summary['calls']} calls failed)"
-                ),
-            })
+            alerts.append(
+                {
+                    "id": alert_id,
+                    "severity": "CRITICAL",
+                    "message": (
+                        f"Embedding provider error rate: {emb_summary['error_rate']:.0%} "
+                        f"({emb_summary['errors']}/{emb_summary['calls']} calls failed)"
+                    ),
+                }
+            )
             current_ids.add(alert_id)
 
         qdrant_summary = _activity_tracker.summary("qdrant.search")
@@ -482,14 +541,16 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             _qdrant_rate = qdrant_summary.get("error_rate", 0)
             _qdrant_errors = qdrant_summary.get("errors", 0)
             _qdrant_calls = qdrant_summary.get("calls", 0)
-            alerts.append({
-                "id": alert_id,
-                "severity": "CRITICAL",
-                "message": (
-                    f"Qdrant search {_qdrant_rate:.0%} failure rate "
-                    f"({_qdrant_errors}/{_qdrant_calls} calls failed)"
-                ),
-            })
+            alerts.append(
+                {
+                    "id": alert_id,
+                    "severity": "CRITICAL",
+                    "message": (
+                        f"Qdrant search {_qdrant_rate:.0%} failure rate "
+                        f"({_qdrant_errors}/{_qdrant_calls} calls failed)"
+                    ),
+                }
+            )
             current_ids.add(alert_id)
 
     # ── Credit exhaustion detection ─────────────────────────────────
@@ -505,6 +566,7 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             routing_config = None
             try:
                 from genesis.runtime import GenesisRuntime
+
                 rt = GenesisRuntime.instance()
                 routing_config = getattr(rt, "_routing_config", None)
             except Exception:
@@ -535,14 +597,8 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 # no provider config and are skipped. (Pre-fix this lookup was
                 # single-hop on the raw ``llm.<name>`` string, so it ALWAYS missed
                 # -> every provider read "dormant" -> the detector was 100% dead.)
-                prov_name = (
-                    prov[4:]
-                    if isinstance(prov, str) and prov.startswith("llm.")
-                    else prov
-                )
-                provider_cfg = (
-                    routing_config.providers.get(prov_name) if routing_config else None
-                )
+                prov_name = prov[4:] if isinstance(prov, str) and prov.startswith("llm.") else prov
+                provider_cfg = routing_config.providers.get(prov_name) if routing_config else None
                 if provider_cfg is None:
                     continue  # not a routed LLM provider (embeddings/mcp.*/qdrant.*)
                 prov_crit = crit_map.get(provider_cfg.provider_type, {})
@@ -586,16 +642,18 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 # seam for a future user-gated auto-credit-top-up; see
                 # remediation_map.UNMAPPED_BY_DESIGN["provider:credit_exhaustion:"].
                 alert_id = f"provider:credit_exhaustion:{prov_name}"
-                alerts.append({
-                    "id": alert_id,
-                    "severity": "WARNING",
-                    "message": (
-                        f"Suspected credit/quota exhaustion for {prov_name}: "
-                        f"was {1 - baseline_error_rate:.0%} success over 7d, "
-                        f"now {recent_error_rate:.0%} errors in last hour "
-                        f"({recent_errors}/{recent_calls} calls)"
-                    ),
-                })
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "WARNING",
+                        "message": (
+                            f"Suspected credit/quota exhaustion for {prov_name}: "
+                            f"was {1 - baseline_error_rate:.0%} success over 7d, "
+                            f"now {recent_error_rate:.0%} errors in last hour "
+                            f"({recent_errors}/{recent_calls} calls)"
+                        ),
+                    }
+                )
                 current_ids.add(alert_id)
         except Exception:
             logger.debug("Credit exhaustion detection failed", exc_info=True)
@@ -624,9 +682,7 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 CRITICAL_CALL_SITES,
             )
 
-            cs_cutoff = (
-                datetime.now(UTC) - _td3(hours=CALLSITE_DOWN_RECENCY_HOURS)
-            ).isoformat()
+            cs_cutoff = (datetime.now(UTC) - _td3(hours=CALLSITE_DOWN_RECENCY_HOURS)).isoformat()
             cs_cursor = await _service._db.execute(
                 "SELECT call_site_id, last_run_at, provider_used "
                 "FROM call_site_last_run WHERE success = 0 AND last_run_at >= ?",
@@ -636,16 +692,18 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 site_id, last_run_at, provider_used = cs_row
                 is_critical = site_id in CRITICAL_CALL_SITES
                 alert_id = f"callsite:down:{site_id}"
-                alerts.append({
-                    "id": alert_id,
-                    "severity": "CRITICAL" if is_critical else "WARNING",
-                    "message": (
-                        f"Call site '{site_id}' last run failed "
-                        f"(provider {provider_used or 'unknown'}, last attempt "
-                        f"{str(last_run_at)[:19]})"
-                        + (" -- CRITICAL site" if is_critical else "")
-                    ),
-                })
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "CRITICAL" if is_critical else "WARNING",
+                        "message": (
+                            f"Call site '{site_id}' last run failed "
+                            f"(provider {provider_used or 'unknown'}, last attempt "
+                            f"{str(last_run_at)[:19]})"
+                            + (" -- CRITICAL site" if is_critical else "")
+                        ),
+                    }
+                )
                 current_ids.add(alert_id)
         except Exception:
             # call_site_last_run is a core table (migration 0015) -- a failure
@@ -656,11 +714,13 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         for job_name in _job_retry_registry.list_registered():
             if _job_retry_registry.is_quarantined(job_name):
                 alert_id = f"job:quarantined:{job_name}"
-                alerts.append({
-                    "id": alert_id,
-                    "severity": "WARNING",
-                    "message": f"Job {job_name} is quarantined (max retries exhausted, auto-unquarantine in ≤24h)",
-                })
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "WARNING",
+                        "message": f"Job {job_name} is quarantined (max retries exhausted, auto-unquarantine in ≤24h)",
+                    }
+                )
                 current_ids.add(alert_id)
 
     # ── Silently-stale jobs ──────────────────────────────────────────
@@ -681,16 +741,18 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 _service._db, threshold_days=JOB_STALE_GAP_DAYS
             ):
                 alert_id = f"job_stale:{row['job_name']}"
-                alerts.append({
-                    "id": alert_id,
-                    "severity": "WARNING",
-                    "message": (
-                        f"Scheduled job '{row['job_name']}' has run since but not "
-                        f"succeeded in {row['gap_days']:.0f} days (last success "
-                        f"{str(row['last_success'])[:10]}) — silently failing "
-                        f"(its failure counter resets on restart)"
-                    ),
-                })
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "WARNING",
+                        "message": (
+                            f"Scheduled job '{row['job_name']}' has run since but not "
+                            f"succeeded in {row['gap_days']:.0f} days (last success "
+                            f"{str(row['last_success'])[:10]}) — silently failing "
+                            f"(its failure counter resets on restart)"
+                        ),
+                    }
+                )
                 current_ids.add(alert_id)
         except Exception:
             # job_health is a core table that always exists — a failure here is
@@ -713,11 +775,13 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 behind = data.get("commits_behind", "?")
                 tag = data.get("target_tag", "unknown")
                 alert_id = "genesis:update_available"
-                alerts.append({
-                    "id": alert_id,
-                    "severity": "INFO",
-                    "message": f"New Genesis version available: {tag} ({behind} commits behind) — update from dashboard",
-                })
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "INFO",
+                        "message": f"New Genesis version available: {tag} ({behind} commits behind) — update from dashboard",
+                    }
+                )
                 current_ids.add(alert_id)
 
             # Check for update failure
@@ -730,14 +794,16 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             if row:
                 data = json.loads(row[0] if isinstance(row, tuple) else row["content"])
                 alert_id = "genesis:update_failed"
-                alerts.append({
-                    "id": alert_id,
-                    "severity": "CRITICAL",
-                    "message": (
-                        f"Genesis update to {data.get('new_tag', '?')} failed, "
-                        f"rolled back to {data.get('rollback_tag', '?')}"
-                    ),
-                })
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "CRITICAL",
+                        "message": (
+                            f"Genesis update to {data.get('new_tag', '?')} failed, "
+                            f"rolled back to {data.get('rollback_tag', '?')}"
+                        ),
+                    }
+                )
                 current_ids.add(alert_id)
         except Exception:
             logger.error("Genesis update alert check failed", exc_info=True)
@@ -763,11 +829,13 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 alert_id = "backup:last_failed"
                 reason = backup_data.get("failure_reason") or "check backup log"
                 ts = backup_data.get("timestamp", "unknown")
-                alerts.append({
-                    "id": alert_id,
-                    "severity": "CRITICAL",
-                    "message": f"Last backup failed at {ts}: {reason}",
-                })
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "CRITICAL",
+                        "message": f"Last backup failed at {ts}: {reason}",
+                    }
+                )
                 current_ids.add(alert_id)
             else:
                 # Check staleness — backup succeeded but too long ago
@@ -775,19 +843,18 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 if ts:
                     try:
                         last = datetime.fromisoformat(ts)
-                        age_h = (
-                            datetime.now(UTC) - last
-                        ).total_seconds() / 3600
+                        age_h = (datetime.now(UTC) - last).total_seconds() / 3600
                         if age_h > 8:  # 6h schedule + 2h grace
                             alert_id = "backup:overdue"
-                            alerts.append({
-                                "id": alert_id,
-                                "severity": "CRITICAL",
-                                "message": (
-                                    f"Backup overdue — last success "
-                                    f"was {age_h:.0f}h ago"
-                                ),
-                            })
+                            alerts.append(
+                                {
+                                    "id": alert_id,
+                                    "severity": "CRITICAL",
+                                    "message": (
+                                        f"Backup overdue — last success was {age_h:.0f}h ago"
+                                    ),
+                                }
+                            )
                             current_ids.add(alert_id)
                     except (ValueError, TypeError):
                         pass
@@ -795,25 +862,29 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 t2_status = backup_data.get("tier2_status", "unknown")
                 if t2_status in ("not_configured", "no_smbclient"):
                     alert_id = "backup:tier2_unconfigured"
-                    alerts.append({
-                        "id": alert_id,
-                        "severity": "WARNING",
-                        "message": (
-                            "Large backup targets not configured — "
-                            "Qdrant/SQL snapshots are local-only"
-                        ),
-                    })
+                    alerts.append(
+                        {
+                            "id": alert_id,
+                            "severity": "WARNING",
+                            "message": (
+                                "Large backup targets not configured — "
+                                "Qdrant/SQL snapshots are local-only"
+                            ),
+                        }
+                    )
                     current_ids.add(alert_id)
         except (json.JSONDecodeError, OSError):
             pass
     else:
         # No status file = backups never configured or never ran
         alert_id = "backup:not_configured"
-        alerts.append({
-            "id": alert_id,
-            "severity": "CRITICAL",
-            "message": "Backups not configured — no backup status file found",
-        })
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "CRITICAL",
+                "message": "Backups not configured — no backup status file found",
+            }
+        )
         current_ids.add(alert_id)
 
     # Credential-file integrity — the container self-heal writes this status;
@@ -833,23 +904,21 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             # escalates to a terminal status (restored / restore_failed) next
             # tick, so alerting on it would defeat the debounce's whole purpose.
             corrupt = {
-                n: t for n, t in targets.items()
-                if t.get("status") in ("corrupt", "restore_failed")
+                n: t for n, t in targets.items() if t.get("status") in ("corrupt", "restore_failed")
             }
-            restored = {
-                n: t for n, t in targets.items() if t.get("status") == "restored"
-            }
+            restored = {n: t for n, t in targets.items() if t.get("status") == "restored"}
             if corrupt:
                 detail = "; ".join(
-                    f"{n} ({t.get('detail', t.get('status'))})"
-                    for n, t in sorted(corrupt.items())
+                    f"{n} ({t.get('detail', t.get('status'))})" for n, t in sorted(corrupt.items())
                 )
                 alert_id = "creds:corrupt"
-                alerts.append({
-                    "id": alert_id,
-                    "severity": "CRITICAL",
-                    "message": f"Credential file corruption: {detail}",
-                })
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "CRITICAL",
+                        "message": f"Credential file corruption: {detail}",
+                    }
+                )
                 current_ids.add(alert_id)
             if restored:
                 detail = "; ".join(
@@ -857,17 +926,35 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                     for n, t in sorted(restored.items())
                 )
                 alert_id = "creds:restored"
-                alerts.append({
-                    "id": alert_id,
-                    "severity": "CRITICAL",
-                    "message": (
-                        f"Credential files auto-restored: {detail} — "
-                        "rotate any that changed since the backup"
-                    ),
-                })
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "CRITICAL",
+                        "message": (
+                            f"Credential files auto-restored: {detail} — "
+                            "rotate any that changed since the backup"
+                        ),
+                    }
+                )
                 current_ids.add(alert_id)
         except (json.JSONDecodeError, OSError):
             pass
+
+    return alerts, current_ids
+
+
+async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
+    """Live alert list + the in-memory one-generation resolved rendering.
+
+    Read path — contract unchanged for all existing callers (sentinel, morning
+    report, dashboard, the health_alerts MCP tool). Durable persistence is NOT
+    done here (that would multi-write across the runtime + health-MCP processes);
+    it lives in the single awareness-tick ``alert_events`` writer (WS-2 M10).
+    """
+    import genesis.mcp.health_mcp as health_mcp_mod
+
+    alerts, current_ids = await _compute_alerts()
+    _alert_history = health_mcp_mod._alert_history
 
     now = datetime.now(UTC).isoformat()
     for old_id in list(_alert_history.keys()):
@@ -880,11 +967,13 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
 
     if not active_only:
         for resolved_id, resolved_at in _alert_history.items():
-            alerts.append({
-                "id": resolved_id,
-                "severity": "RESOLVED",
-                "message": f"Previously active alert resolved at {resolved_at}",
-            })
+            alerts.append(
+                {
+                    "id": resolved_id,
+                    "severity": "RESOLVED",
+                    "message": f"Previously active alert resolved at {resolved_at}",
+                }
+            )
 
     health_mcp_mod._alert_history = {aid: now for aid in current_ids}
 
