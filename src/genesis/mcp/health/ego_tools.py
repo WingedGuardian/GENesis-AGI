@@ -398,23 +398,145 @@ async def ego_goal_progress(
     }
 
 
+async def _resolve_one_proposal(
+    db,
+    prop: dict,
+    status: str,
+    reason: str,
+) -> str:
+    """Resolve a single proposal (given its row dict) and run every
+    post-resolution hook.
+
+    Shared by both the by-id and by-number paths of ``ego_proposal_resolve``
+    so neither path can silently skip a hook. Returns a short result string
+    for the caller's details map.
+    """
+    from genesis.db.crud import ego as ego_crud
+
+    # Re-validate withdrawn proposals → directive so the ego reconsiders.
+    if prop.get("status") == "withdrawn":
+        if status == "approved":
+            directive_id = await ego_crud.create_directive(
+                db,
+                content=(
+                    f"User approved withdrawn proposal: "
+                    f"{(prop.get('content') or '')[:200]}. "
+                    f"Re-propose this or explain why it's no longer valid."
+                ),
+                priority="high",
+                ego_target="user_ego",
+                source="user",
+            )
+            return f"withdrawn → directive ({directive_id})"
+        return "already withdrawn"
+
+    if prop.get("status") != "pending":
+        return f"already {prop.get('status')}"
+
+    updated = await ego_crud.resolve_proposal(
+        db,
+        prop["id"],
+        status=status,
+        user_response=reason or None,
+    )
+    if not updated:
+        return "not updated"
+
+    # Post-resolution hooks — best-effort, each isolated so one failure never
+    # blocks the others or the resolution itself.
+    # Autonomy earn-back: promote on approval / cooldown on reject.
+    try:
+        from genesis.ego.earnback import handle_earnback_resolution
+        from genesis.runtime import GenesisRuntime
+
+        _rt = GenesisRuntime.instance()
+        await handle_earnback_resolution(
+            db, prop, status, getattr(_rt, "_autonomy_manager", None),
+        )
+    except Exception:
+        logger.debug("earnback resolution hook failed", exc_info=True)
+    # Goal status change: apply pause/deprioritize on approval.
+    try:
+        from genesis.ego.goal_actions import (
+            handle_goal_status_change_resolution,
+        )
+
+        await handle_goal_status_change_resolution(db, prop, status)
+    except Exception:
+        logger.debug("goal status-change hook failed", exc_info=True)
+    # Cell promotion (WS-8 PR-D).
+    try:
+        from genesis.ego.cell_promotion import (
+            handle_cell_promotion_resolution,
+        )
+
+        await handle_cell_promotion_resolution(db, prop, status)
+    except Exception:
+        logger.debug("cell promotion hook failed", exc_info=True)
+    # Cognitive variant promotion (Evo PR-B).
+    try:
+        from genesis.ego.cognitive_variant import (
+            handle_cognitive_variant_resolution,
+        )
+
+        await handle_cognitive_variant_resolution(db, prop, status)
+    except Exception:
+        logger.debug("cognitive-variant hook failed", exc_info=True)
+    # J-9 regression (informational): mark executed on approval.
+    try:
+        from genesis.ego.j9_regression_actions import (
+            handle_j9_regression_resolution,
+        )
+
+        await handle_j9_regression_resolution(db, prop, status)
+    except Exception:
+        logger.debug("j9 regression hook failed", exc_info=True)
+    # Gauntlet regression (informational): mark executed on approval.
+    try:
+        from genesis.ego.gauntlet_regression_actions import (
+            handle_gauntlet_regression_resolution,
+        )
+
+        await handle_gauntlet_regression_resolution(db, prop, status)
+    except Exception:
+        logger.debug("gauntlet regression hook failed", exc_info=True)
+
+    return status
+
+
 @mcp.tool()
 async def ego_proposal_resolve(
     action: str,
     proposal_numbers: str = "all",
     reason: str = "",
+    proposal_ids: str = "",
 ) -> dict:
     """Resolve pending ego proposals from a conversation.
 
-    Use when the user expresses approval or rejection of proposals
-    in natural language. This is the conversational alternative to
-    the automated parser.
+    Use when the user expresses approval or rejection of proposals in natural
+    language. This is the conversational alternative to the automated parser.
+
+    Two ways to target proposals:
+
+    - ``proposal_ids`` (PREFERRED, precise): comma-separated proposal IDs (the
+      ``ID:`` shown on the proposal board). Resolves exactly those proposals
+      regardless of which batch/digest they belong to — the only safe way to
+      act on a specific or older proposal. Use this whenever the board shows an
+      ID.
+    - ``proposal_numbers`` (positional): comma-separated 1-based numbers, or
+      "all". These index the SAME pending board the user sees (all pending
+      proposals, newest first) — NOT a single batch. Position 1 is the first
+      item on that board.
+
+    If ``proposal_ids`` is provided it takes precedence and ``proposal_numbers``
+    is ignored.
 
     Args:
         action: "approve" or "reject"
-        proposal_numbers: Comma-separated 1-based numbers (e.g., "1,3"),
-            or "all" to resolve all pending in the most recent batch
-        reason: Optional reason (used for rejections)
+        proposal_numbers: 1-based positions on the pending board, or "all".
+        reason: Optional reason (recorded as user_response; used for rejections).
+        proposal_ids: Comma-separated proposal IDs for precise,
+            batch-independent targeting.
     """
     if action not in ("approve", "reject"):
         return {
@@ -428,30 +550,60 @@ async def ego_proposal_resolve(
     status = "approved" if action == "approve" else "rejected"
     db_path = _get_db_path()
     results: dict[str, str] = {}
-    batch_id = None
+    previews: dict[str, str] = {}
 
     async with get_raw_db(db_path) as db:
 
-        # Find most recent pending batch (prefer user_ego_cycle)
-        pending = await ego_crud.list_pending_proposals(
-            db, ego_source="user_ego_cycle",
+        # ── By-ID path (precise, batch-independent) ──────────────────────
+        if proposal_ids.strip():
+            ids = [s.strip() for s in proposal_ids.split(",") if s.strip()]
+            for pid in ids:
+                prop = await ego_crud.get_proposal(db, pid)
+                if not prop:
+                    results[pid] = "not found"
+                    continue
+                previews[pid] = (prop.get("content") or "")[:100]
+                results[pid] = await _resolve_one_proposal(
+                    db, prop, status, reason,
+                )
+            resolved = sum(
+                1 for v in results.values() if v in ("approved", "rejected")
+            )
+            return {
+                "status": "ok",
+                "action": action,
+                "mode": "by_id",
+                "resolved": resolved,
+                "details": results,
+                "resolved_preview": previews,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+
+        # ── By-number path (indexes the pending board the user sees) ─────
+        # Same query the proposal board is built from (conversation.py): all
+        # pending proposals, newest first, capped at 10 — so a position here
+        # matches the number shown to the user, not a position within one
+        # batch (the source of prior wrong-target resolutions).
+        # Scope to the user ego (with the pre-migration NULL fallback),
+        # exactly like the Telegram parser and UserEgoContextBuilder:
+        # Genesis-ego proposals are a separate surface and must not be
+        # resolved from the user proposal board. proposal_ids stays
+        # unscoped for precise cross-ego access.
+        board = await ego_crud.list_proposals(
+            db, status="pending", limit=10, ego_source="user_ego_cycle",
         )
-        if not pending:
-            pending = await ego_crud.list_pending_proposals(db)
+        if not board:
+            board = await ego_crud.list_proposals(db, status="pending", limit=10)
 
-        if pending:
-            batch_id = pending[-1].get("batch_id")
-
-        # If no pending, check for recently withdrawn (re-validate path)
-        if not batch_id:
+        if not board:
+            # No pending — check for recently withdrawn (re-validate path).
             recent = await ego_crud.list_proposals(db, status="withdrawn", limit=5)
             if recent:
-                # Create a directive so the ego reconsiders
                 top = recent[0]
                 directive_id = await ego_crud.create_directive(
                     db,
                     content=(
-                        f"User tried to approve but all proposals were withdrawn. "
+                        f"User tried to {action} but all proposals were withdrawn. "
                         f"Most recent: {(top.get('content') or '')[:200]}. "
                         f"Re-propose if still valid."
                     ),
@@ -466,13 +618,9 @@ async def ego_proposal_resolve(
                 }
             return {"status": "error", "reason": "No pending proposals found"}
 
-        batch = await ego_crud.list_proposals_by_batch(db, batch_id)
-        if not batch:
-            return {"status": "error", "reason": f"Empty batch {batch_id}"}
-
-        # Determine which proposals to resolve
+        # Determine which board positions to resolve.
         if proposal_numbers.strip().lower() == "all":
-            indices = list(range(1, len(batch) + 1))
+            indices = list(range(1, len(board) + 1))
         else:
             try:
                 indices = [
@@ -486,105 +634,30 @@ async def ego_proposal_resolve(
                     "reason": f"Invalid numbers: {proposal_numbers!r}",
                 }
 
+        # Dedupe positions (preserving order) so a repeated number can't
+        # double-run the post-resolution hooks.
+        indices = list(dict.fromkeys(indices))
+
         for idx in indices:
-            if idx < 1 or idx > len(batch):
+            if idx < 1 or idx > len(board):
                 results[f"#{idx}"] = "out of range"
                 continue
-            prop = batch[idx - 1]
-
-            # Re-validate withdrawn proposals → create directive
-            if prop.get("status") == "withdrawn":
-                directive_id = await ego_crud.create_directive(
-                    db,
-                    content=(
-                        f"User approved withdrawn proposal: "
-                        f"{(prop.get('content') or '')[:200]}. "
-                        f"Re-propose this or explain why it's no longer valid."
-                    ),
-                    priority="high",
-                    ego_target="user_ego",
-                    source="user",
-                )
-                results[prop["id"]] = f"withdrawn → directive ({directive_id})"
-                continue
-
-            if prop.get("status") != "pending":
-                results[prop["id"]] = f"already {prop.get('status')}"
-                continue
-
-            updated = await ego_crud.resolve_proposal(
-                db,
-                prop["id"],
-                status=status,
-                user_response=reason or None,
+            prop = board[idx - 1]
+            previews[prop["id"]] = f"#{idx}: " + (prop.get("content") or "")[:90]
+            results[prop["id"]] = await _resolve_one_proposal(
+                db, prop, status, reason,
             )
-            results[prop["id"]] = status if updated else "not updated"
-            if updated:
-                # Autonomy earn-back: promote on approval / cooldown on reject.
-                try:
-                    from genesis.ego.earnback import handle_earnback_resolution
-                    from genesis.runtime import GenesisRuntime
 
-                    _rt = GenesisRuntime.instance()
-                    await handle_earnback_resolution(
-                        db, prop, status, getattr(_rt, "_autonomy_manager", None),
-                    )
-                except Exception:
-                    logger.debug("earnback resolution hook failed", exc_info=True)
-                # Goal status change: apply pause/deprioritize on approval.
-                try:
-                    from genesis.ego.goal_actions import (
-                        handle_goal_status_change_resolution,
-                    )
-
-                    await handle_goal_status_change_resolution(db, prop, status)
-                except Exception:
-                    logger.debug(
-                        "goal status-change hook failed", exc_info=True,
-                    )
-                # Cell promotion (WS-8 PR-D).
-                try:
-                    from genesis.ego.cell_promotion import (
-                        handle_cell_promotion_resolution,
-                    )
-
-                    await handle_cell_promotion_resolution(db, prop, status)
-                except Exception:
-                    logger.debug("cell promotion hook failed", exc_info=True)
-                # Cognitive variant promotion (Evo PR-B).
-                try:
-                    from genesis.ego.cognitive_variant import (
-                        handle_cognitive_variant_resolution,
-                    )
-
-                    await handle_cognitive_variant_resolution(db, prop, status)
-                except Exception:
-                    logger.debug("cognitive-variant hook failed", exc_info=True)
-                # J-9 regression (informational): mark executed on approval.
-                try:
-                    from genesis.ego.j9_regression_actions import (
-                        handle_j9_regression_resolution,
-                    )
-
-                    await handle_j9_regression_resolution(db, prop, status)
-                except Exception:
-                    logger.debug("j9 regression hook failed", exc_info=True)
-                # Gauntlet regression (informational): mark executed on approval.
-                try:
-                    from genesis.ego.gauntlet_regression_actions import (
-                        handle_gauntlet_regression_resolution,
-                    )
-
-                    await handle_gauntlet_regression_resolution(db, prop, status)
-                except Exception:
-                    logger.debug("gauntlet regression hook failed", exc_info=True)
-
-    resolved = sum(1 for v in results.values() if v in ("approved", "rejected"))
-    return {
-        "status": "ok",
-        "action": action,
-        "resolved": resolved,
-        "details": results,
-        "batch_id": batch_id,
-        "timestamp": datetime.now(UTC).isoformat(),
-    }
+        resolved = sum(
+            1 for v in results.values() if v in ("approved", "rejected")
+        )
+        return {
+            "status": "ok",
+            "action": action,
+            "mode": "by_number",
+            "resolved": resolved,
+            "details": results,
+            "resolved_preview": previews,
+            "board_size": len(board),
+            "timestamp": datetime.now(UTC).isoformat(),
+        }

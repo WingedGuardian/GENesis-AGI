@@ -143,6 +143,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   onto ~5.3K older vectors so vector-based wing recall returns them too.
   Dry-run by default; the bulk re-sync is gated on a human-reviewed sample.
 
+- **Genesis's database keeps more in memory and stops over-syncing.** The main
+  shared SQLite connection held only SQLite's tiny ~2 MiB default page cache and
+  fsynced on every single commit (`synchronous=FULL`), even though the
+  standalone connection helper already used the lighter, equally safe `NORMAL`
+  mode under WAL. Both connection paths now hold a 256 MiB page cache, and the
+  main connection matches `NORMAL` — fewer disk syncs and less page re-fetching
+  under load, with no durability loss beyond what WAL already implies.
+
 - **Genesis's inner monologue now knows who each thought is about.** Every
   ambient micro-reflection used to be tagged as relevant to "both" the user
   and Genesis — the tag was computed from which sensors *ran* (all of them,

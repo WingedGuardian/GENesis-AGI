@@ -348,7 +348,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 859ec256 2026-07-14
+verified: 4e483381 2026-07-15
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -367,6 +367,13 @@ verified: 859ec256 2026-07-14
   `infra_profile` host plane; the CC diagnosis prompt inlines the shared-mount
   `INFRASTRUCTURE.md` (truncated) so the diagnostician starts with the body
   schema instead of re-deriving the machine's shape.
+- **Out-of-band tiered alerts** run every tick through the guardian's OWN
+  Telegram (survives a dead/thrashing container): storage-pool data%/metadata%
+  (`pool.py`) and **RAM** (`memory_watch.py`, E-rest) — the latter over two
+  axes worst-of, container cgroup (via incus-exec, best-effort) + host-VM
+  `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
+  `decide_alert` hysteresis. Read-only `disk-status`/`ram-status` verbs expose
+  the same measurement to the container.
 - **sentinel/** is LIVE-wired but **shadow-only autonomy**: config mode
   `"live"` is NOT implemented (dispatcher warns + downgrades); every proposed
   action requires human approval. `InfrastructureMonitor` (call site 37, free

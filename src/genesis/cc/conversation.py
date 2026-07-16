@@ -1037,9 +1037,16 @@ class ConversationLoop:
             # Fetch pending proposals
             from genesis.db.crud import ego as ego_crud
 
+            # User-ego scoped (with pre-migration NULL fallback) so
+            # Genesis-ego proposals stay off the user board — matches the
+            # resolver (ego_proposal_resolve) and UserEgoContextBuilder.
             pending = await ego_crud.list_proposals(
-                self._db, status="pending", limit=10,
+                self._db, status="pending", limit=10, ego_source="user_ego_cycle",
             )
+            if not pending:
+                pending = await ego_crud.list_proposals(
+                    self._db, status="pending", limit=10,
+                )
 
             lines = ["\n\n## You Are in the Ego Proposals Topic\n"]
             lines.append(
@@ -1084,17 +1091,23 @@ class ConversationLoop:
 
             lines.append(
                 "\n### To resolve a proposal:\n"
-                "Use the `ego_proposal_resolve` MCP tool:\n"
-                "- Approve all: `ego_proposal_resolve(action=\"approve\")`\n"
-                "- Approve specific: `ego_proposal_resolve(action=\"approve\", "
-                "proposal_numbers=\"1\")`\n"
+                "Use the `ego_proposal_resolve` MCP tool. PREFER `proposal_ids` "
+                "(the `ID:` shown under each item above) — it targets exactly that "
+                "proposal regardless of batch/digest, so it can never resolve the "
+                "wrong one:\n"
+                "- Approve specific (preferred): `ego_proposal_resolve(action=\"approve\", "
+                "proposal_ids=\"<id>\")`\n"
                 "- Reject with reason: `ego_proposal_resolve(action=\"reject\", "
-                "proposal_numbers=\"2\", reason=\"not relevant right now\")`\n"
+                "proposal_ids=\"<id>\", reason=\"not relevant right now\")`\n"
+                "- Approve all pending: `ego_proposal_resolve(action=\"approve\")`\n"
+                "- Positional numbers (`proposal_numbers=\"1\"`) index THIS board "
+                "(top to bottom); use only when no ID is available.\n"
                 "\n### Important:\n"
                 "- Match user intent to the proposals visible in the thread above.\n"
                 "  If the user says 'this one', they mean the most recently presented\n"
-                "  proposal. 'The older ones' means proposals listed under the\n"
-                "  '📋 N older proposal(s)' header in the digest.\n"
+                "  proposal — resolve it by its `ID:`. 'The older ones' means\n"
+                "  proposals listed under the '📋 N older proposal(s)' header in the\n"
+                "  digest.\n"
                 "- If the user gives guidance or corrections (not just approve/reject),\n"
                 "  store it via `memory_store` MCP so the ego sees it in future cycles.\n"
                 "- Always confirm what you did: 'Approved proposal 1: [content]'\n"

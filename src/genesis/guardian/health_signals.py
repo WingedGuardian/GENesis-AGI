@@ -455,56 +455,64 @@ async def check_tick_regularity(config: GuardianConfig) -> SuspiciousResult:
         )
 
 
-async def check_memory_pressure(config: GuardianConfig) -> SuspiciousResult:
-    """Check container memory usage via cgroup v2.
+async def measure_container_mem_pct(config: GuardianConfig) -> tuple[float | None, str]:
+    """Measure container anon+kernel memory as a % of the cgroup memory.max.
 
-    Uses anon+kernel from memory.stat (non-reclaimable) for threshold
-    decisions instead of memory.current (which includes reclaimable page cache).
+    Uses anon+kernel from memory.stat (non-reclaimable) rather than
+    memory.current (which includes reclaimable page cache). Returns
+    ``(pct, detail)``; ``pct`` is None when the value is not measurable
+    (incus-exec failed, or no memory limit is set) — callers must treat None as
+    "no signal", never as 0/healthy. Shared by the suspicious-check
+    (:func:`check_memory_pressure`) and the guardian's tiered RAM alert
+    (:mod:`genesis.guardian.memory_watch`), so the measurement has one home.
+
+    May raise on a malformed memory.max (non-int, non-"max"); callers wrap it.
+    """
+    # Read memory.stat for anon+kernel (non-reclaimable memory)
+    rc, stdout, stderr = await _run_subprocess(
+        "incus", "exec", config.container_name, "--",
+        "cat", "/sys/fs/cgroup/memory.stat",
+        timeout=config.probes.probe_timeout_s,
+    )
+    if rc != 0:
+        return None, f"cgroup stat read failed: {stderr[:200]}"
+    # Parse anon and kernel values from memory.stat
+    stats: dict[str, int] = {}
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] in ("anon", "kernel"):
+            stats[parts[0]] = int(parts[1])
+    anon_kernel = stats.get("anon", 0) + stats.get("kernel", 0)
+
+    rc2, stdout2, stderr2 = await _run_subprocess(
+        "incus", "exec", config.container_name, "--",
+        "cat", "/sys/fs/cgroup/memory.max",
+        timeout=config.probes.probe_timeout_s,
+    )
+    if rc2 != 0:
+        return None, f"cgroup max read failed: {stderr2[:200]}"
+
+    max_mem = stdout2.strip()
+    if max_mem == "max":
+        return None, "no memory limit set"
+
+    max_bytes = int(max_mem)
+    pct = (anon_kernel / max_bytes) * 100 if max_bytes > 0 else 0.0
+    detail = f"{pct:.1f}% anon+kernel ({anon_kernel // (1024*1024)}M / {max_bytes // (1024*1024)}M)"
+    return pct, detail
+
+
+async def check_memory_pressure(config: GuardianConfig) -> SuspiciousResult:
+    """Check container memory usage via cgroup v2 ('healthy but suspicious').
+
+    Thin wrapper over :func:`measure_container_mem_pct` — an unmeasurable value
+    (None) is reported ok=True (no signal is not a warning).
     """
     name = "memory_pressure"
     t0 = datetime.now(UTC)
     try:
-        # Read memory.stat for anon+kernel (non-reclaimable memory)
-        rc, stdout, stderr = await _run_subprocess(
-            "incus", "exec", config.container_name, "--",
-            "cat", "/sys/fs/cgroup/memory.stat",
-            timeout=config.probes.probe_timeout_s,
-        )
-        if rc != 0:
-            return SuspiciousResult(
-                name=name, ok=True, detail=f"cgroup stat read failed: {stderr[:200]}",
-                collected_at=t0.isoformat(),
-            )
-        # Parse anon and kernel values from memory.stat
-        stats: dict[str, int] = {}
-        for line in stdout.splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[0] in ("anon", "kernel"):
-                stats[parts[0]] = int(parts[1])
-        anon_kernel = stats.get("anon", 0) + stats.get("kernel", 0)
-
-        rc2, stdout2, stderr2 = await _run_subprocess(
-            "incus", "exec", config.container_name, "--",
-            "cat", "/sys/fs/cgroup/memory.max",
-            timeout=config.probes.probe_timeout_s,
-        )
-        if rc2 != 0:
-            return SuspiciousResult(
-                name=name, ok=True, detail=f"cgroup max read failed: {stderr2[:200]}",
-                collected_at=t0.isoformat(),
-            )
-
-        max_mem = stdout2.strip()
-        if max_mem == "max":
-            return SuspiciousResult(
-                name=name, ok=True, detail="no memory limit set",
-                collected_at=t0.isoformat(),
-            )
-
-        max_bytes = int(max_mem)
-        pct = (anon_kernel / max_bytes) * 100 if max_bytes > 0 else 0
-        ok = pct < config.suspicious.memory_warning_pct
-        detail = f"{pct:.1f}% anon+kernel ({anon_kernel // (1024*1024)}M / {max_bytes // (1024*1024)}M)"
+        pct, detail = await measure_container_mem_pct(config)
+        ok = pct is None or pct < config.suspicious.memory_warning_pct
         return SuspiciousResult(
             name=name, ok=ok, detail=detail, collected_at=t0.isoformat(),
         )

@@ -90,6 +90,21 @@ storage_pool:
   pool_used_crit_pct: 92
   realert_hours: 6
 
+# Guardian-side RAM tiered alert (E-rest PR-E1). The container's own RAM alert
+# (infra:container_memory_high) dies exactly when it thrashes/OOMs; the guardian
+# pages out-of-band over TWO axes, worst-of: container cgroup anon+kernel (via
+# incus-exec — best-effort) and host-VM used% (the guardian's own /proc/meminfo —
+# the reliable axis, no exec). Host tiers sit higher (the host idles busier).
+memory_tiers:
+  enabled: true
+  container_warn_pct: 75
+  container_high_pct: 85
+  container_crit_pct: 92
+  host_warn_pct: 80
+  host_high_pct: 88
+  host_crit_pct: 94
+  realert_hours: 6
+
 # Credential-file integrity backstop (G.1). The container self-heals corrupt
 # credential files first (its awareness tick); the guardian validates the same
 # files via read-only `incus exec`, WARNs on first sight, and STEPS IN (restores
