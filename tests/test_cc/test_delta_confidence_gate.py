@@ -15,6 +15,7 @@ import pytest
 from genesis.awareness.types import Depth, TickResult
 from genesis.cc.reflection_bridge._output import store_reflection_output
 from genesis.cc.types import CCOutput
+from genesis.db.crud import observations
 from genesis.perception.types import MIN_DELTA_CONFIDENCE
 
 pytestmark = pytest.mark.asyncio
@@ -53,10 +54,8 @@ async def test_gate_boundary_admits_085_drops_below(db):
     ]
     await store_reflection_output(Depth.LIGHT, _tick(now), _output(deltas), db=db)
 
-    rows = await db.execute_fetchall(
-        "SELECT content FROM observations WHERE type='user_model_delta'",
-    )
-    stored = {json.loads(r[0])["field"] for r in rows}
+    rows = await observations.query(db, type="user_model_delta")
+    stored = {json.loads(r["content"])["field"] for r in rows}
     assert stored == {"at_boundary"}
 
 
