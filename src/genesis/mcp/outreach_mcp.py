@@ -428,6 +428,39 @@ async def provision_grow(
 
 
 @mcp.tool()
+async def provision_vzdump(
+    timeout_seconds: int = 1800,
+    wall_seconds: int = 7200,
+) -> dict:
+    """Take a hypervisor backup (vzdump) of the host VM — approval-gated.
+
+    Sends an APPROVE/DENY request to your own channel; only on APPROVE starts
+    the backup, then RETURNS IMMEDIATELY with the task handle (a full-VM dump
+    runs for tens of minutes+). A background task polls it to completion and
+    messages the outcome; old backups rotate automatically once the new one
+    verifies. ``wall_seconds`` bounds only how long the poller waits before
+    abandoning as UNVERIFIED (the backup itself is never killed).
+
+    Backups normally happen just-in-time as the precondition of a grow — use
+    this for an explicit, user-requested backup.
+    """
+    if not _pipeline:
+        # Standalone MCP subprocess → bridge to genesis-server (owner-approval
+        # is enforced there). The RPC returns at START, so grace only covers
+        # approval wait + the start verb — never the backup duration.
+        return await _server_rpc(
+            "/api/genesis/provision/vzdump",
+            {"timeout_seconds": timeout_seconds, "wall_seconds": wall_seconds},
+            read_timeout_s=float(timeout_seconds) + 420.0,
+        )
+    from genesis.outreach.rpc import vzdump_via_pipeline
+
+    return await vzdump_via_pipeline(
+        _pipeline, timeout_s=float(timeout_seconds), wall_s=float(wall_seconds),
+    )
+
+
+@mcp.tool()
 async def outreach_engagement(
     outreach_id: str,
     signal: str,
