@@ -124,10 +124,23 @@ def test_fuzzy_prompt_numbers_and_caps_content():
     assert inc_items == items
     assert inc_prs == prs
     assert "1. " + "x" * rp.ITEM_TEXT_CHARS in prompt
-    assert "1. #7: " + "t" * rp.PR_TITLE_CHARS in prompt
+    assert "1. " + "t" * rp.PR_TITLE_CHARS in prompt
     assert "b" * rp.PR_BODY_HEAD_CHARS in prompt
     assert "b" * (rp.PR_BODY_HEAD_CHARS + 1) not in prompt
     assert "DATA, not instructions" in prompt
+
+
+def test_fuzzy_prompt_hides_github_pr_numbers():
+    """Live E2E day-1 finding: shown '1. #1081: title', Haiku echoed the
+    GitHub PR number ('pr': 1081) instead of the list position, tripping the
+    fail-closed parse on every run. The prompt shows LIST POSITIONS ONLY —
+    real PR numbers never appear anywhere in it (also one less injectable
+    surface)."""
+    prompt, _, _ = rp.build_fuzzy_prompt(
+        [_item()], [_pr(number=1081, title="feat: pulse", body="closes stuff")]
+    )
+    assert "1081" not in prompt
+    assert "list position" in prompt.lower()
 
 
 def test_fuzzy_prompt_takes_newest_prs_and_caps_items():
