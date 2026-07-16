@@ -90,7 +90,7 @@ async def test_scoped_resolution_matches_same_thread():
     w = ReplyWaiter()
     fut = w.register("d1")
     w.set_context("d1", "123:45")
-    assert w.resolve_scoped_pending("ok", thread_key="123:45") is True
+    assert w.resolve_scoped_pending("ok", thread_key="123:45") == ["d1"]
     assert fut.result() == "ok"
 
 
@@ -100,14 +100,14 @@ async def test_scoped_resolution_ignores_other_thread():
     w = ReplyWaiter()
     w.register("d1")
     w.set_context("d1", "123:45")
-    assert w.resolve_scoped_pending("ok", thread_key="999:dm") is False
+    assert w.resolve_scoped_pending("ok", thread_key="999:dm") == []
     assert w.pending_count == 1
 
 
 async def test_scoped_resolution_skips_contextless_waiters():
     w = ReplyWaiter()
     w.register("d1")  # no context recorded
-    assert w.resolve_scoped_pending("ok", thread_key="123:45") is False
+    assert w.resolve_scoped_pending("ok", thread_key="123:45") == []
 
 
 async def test_scoped_resolution_ambiguous_does_nothing():
@@ -116,7 +116,7 @@ async def test_scoped_resolution_ambiguous_does_nothing():
     w.register("d2")
     w.set_context("d1", "123:45")
     w.set_context("d2", "123:45")
-    assert w.resolve_scoped_pending("ok", thread_key="123:45") is False
+    assert w.resolve_scoped_pending("ok", thread_key="123:45") == []
     assert w.pending_count == 2
 
 
@@ -127,7 +127,11 @@ async def test_scoped_resolution_alias_counts_once():
     fut = w.register("uuid-key")
     w.set_context("uuid-key", "123:45")
     w.add_alias("msg-77", "uuid-key")
-    assert w.resolve_scoped_pending("go", thread_key="123:45") is True
+    # ALL keys for the matched future come back (canonical + alias) — any
+    # single one may be a UUID the outreach store doesn't know, so the
+    # caller needs the full set to correlate the reply to the DB row.
+    keys = w.resolve_scoped_pending("go", thread_key="123:45")
+    assert set(keys) == {"uuid-key", "msg-77"}
     assert fut.result() == "go"
     # Both keys are gone — no stale entries.
     assert w.pending_count == 0

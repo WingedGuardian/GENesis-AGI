@@ -90,7 +90,7 @@ class ReplyWaiter:
         if future and not future.done():
             future.cancel()
 
-    def resolve_scoped_pending(self, reply_text: str, *, thread_key: str) -> bool:
+    def resolve_scoped_pending(self, reply_text: str, *, thread_key: str) -> list[str]:
         """Resolve a pending waiter with a standalone (non-quote-reply)
         message — but ONLY within the message's own chat+topic.
 
@@ -99,6 +99,12 @@ class ReplyWaiter:
         future is eligible; zero or several (ambiguous) resolve nothing.
         Contextless waiters are never eligible — guessing the destination
         is exactly the bug that got the unscoped version disabled.
+
+        Returns the resolved waiter's registry keys (canonical + aliases —
+        e.g. a pre-generated UUID and the Telegram message_id) so the
+        caller can correlate the reply back to the delivered outreach
+        record; empty list when nothing was resolved. Any single key may
+        be an alias, so callers should try each against the store.
         """
         eligible: dict[asyncio.Future[str], str] = {}
         for did, future in self._waiters.items():
@@ -108,21 +114,28 @@ class ReplyWaiter:
                 continue
             eligible.setdefault(future, did)  # aliases share one future
         if len(eligible) != 1:
-            return False
+            return []
         future, delivery_id = next(iter(eligible.items()))
-        self._pop_future(future)
+        keys = self._pop_future(future)
         future.set_result(reply_text)
         logger.info(
             "Resolved pending reply waiter %s via standalone message in %s",
             delivery_id, thread_key,
         )
-        return True
+        return keys
 
-    def _pop_future(self, future: asyncio.Future[str]) -> None:
-        """Drop every key (canonical + aliases) mapped to *future*."""
-        for key in [k for k, f in self._waiters.items() if f is future]:
+    def _pop_future(self, future: asyncio.Future[str]) -> list[str]:
+        """Drop every key (canonical + aliases) mapped to *future*.
+
+        Returns the dropped keys so callers can correlate the resolved
+        waiter back to a delivered message (registry keys are the only
+        link — they live in memory only).
+        """
+        keys = [k for k, f in self._waiters.items() if f is future]
+        for key in keys:
             self._waiters.pop(key, None)
             self._contexts.pop(key, None)
+        return keys
 
     def resolve_any_pending(self, reply_text: str) -> bool:
         """UNSCOPED single-pending resolution — kept for API compatibility

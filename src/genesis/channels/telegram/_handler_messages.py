@@ -1298,15 +1298,45 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
     if ctx.reply_waiter and msg.text:
         thread_key = f"{msg.chat.id}:{getattr(msg, 'message_thread_id', None) or 'dm'}"
         try:
-            if ctx.reply_waiter.resolve_scoped_pending(
+            resolved_keys = ctx.reply_waiter.resolve_scoped_pending(
                 msg.text, thread_key=thread_key,
-            ):
-                log.info(
-                    "Standalone message resolved scoped waiter in %s", thread_key,
-                )
-                return
+            )
         except Exception:
+            resolved_keys = []
             log.warning("Scoped waiter resolution failed", exc_info=True)
+        if resolved_keys:
+            log.info(
+                "Standalone message resolved scoped waiter in %s", thread_key,
+            )
+            # Persist the reply on the outreach record, mirroring the
+            # quote-reply path above — without this write-back the row never
+            # learns it was answered (the waiter keys are the only
+            # correlation, and they live in memory only). Any key may be a
+            # UUID alias rather than the stored Telegram message_id, so try
+            # each. Best-effort: a write-back failure never blocks the
+            # already-resolved waiter.
+            if ctx.engagement_tracker and ctx.db:
+                try:
+                    from genesis.db.crud.outreach import find_by_delivery_id
+
+                    for key in resolved_keys:
+                        outreach_record = await find_by_delivery_id(ctx.db, key)
+                        if outreach_record:
+                            await ctx.engagement_tracker.record_reply(
+                                outreach_record["id"],
+                                msg.text,
+                            )
+                            log.info(
+                                "Engagement recorded for outreach %s (standalone reply)",
+                                outreach_record["id"],
+                            )
+                            break
+                except Exception:
+                    log.warning(
+                        "Failed to record engagement for standalone reply",
+                        exc_info=True,
+                    )
+            return
 
     # Record implicit engagement: user is active after receiving outreach
     if ctx.engagement_tracker and ctx.db:

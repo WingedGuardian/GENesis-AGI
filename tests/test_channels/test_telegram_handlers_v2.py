@@ -480,7 +480,7 @@ def handlers_with_waiter(mock_loop, mock_adapter, dedupe):
     waiter.resolve = MagicMock(return_value=True)
     # Scoped standalone resolution defaults to "nothing pending here" so
     # unrelated messages continue to normal CC flow.
-    waiter.resolve_scoped_pending = MagicMock(return_value=False)
+    waiter.resolve_scoped_pending = MagicMock(return_value=[])
     return make_handlers_v2(
         mock_loop,
         allowed_users={123},
@@ -532,7 +532,7 @@ async def test_standalone_message_resolves_scoped_waiter(
     consumed (no CC invocation) — the scoped replacement for the disabled
     resolve_any_pending."""
     handlers, waiter = handlers_with_waiter
-    waiter.resolve_scoped_pending = MagicMock(return_value=True)
+    waiter.resolve_scoped_pending = MagicMock(return_value=["uuid-abc", "77"])
     update = _make_update(text="ok", message_id=201)
     update.message.reply_to_message = None
     ctx = _make_context()
@@ -541,6 +541,74 @@ async def test_standalone_message_resolves_scoped_waiter(
 
     waiter.resolve_scoped_pending.assert_called_once()
     assert waiter.resolve_scoped_pending.call_args.kwargs["thread_key"]
+    mock_loop.handle_message_streaming.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_standalone_resolution_records_engagement(mock_loop, mock_adapter, dedupe):
+    """A standalone reply that resolves a scoped waiter is persisted on the
+    outreach record via record_reply — the write-back that makes the reply
+    visible to the DB (only quote-replies had it before). Alias keys that
+    miss the store fall through to the key that matches."""
+    waiter = MagicMock()
+    waiter.resolve_scoped_pending = MagicMock(return_value=["uuid-abc", "77"])
+    tracker = MagicMock()
+    tracker.record_reply = AsyncMock(return_value=True)
+    handlers = make_handlers_v2(
+        mock_loop,
+        allowed_users={123},
+        whisper_model="base",
+        adapter=mock_adapter,
+        db=mock_loop._db,
+        dedupe=dedupe,
+        reply_waiter=waiter,
+        engagement_tracker=tracker,
+    )
+    update = _make_update(text="sounds good", message_id=202)
+    update.message.reply_to_message = None
+    ctx = _make_context()
+
+    async def fake_find(db, delivery_id):
+        # The UUID alias is unknown to the store; the message_id matches.
+        return {"id": "outreach-1"} if delivery_id == "77" else None
+
+    with patch(
+        "genesis.db.crud.outreach.find_by_delivery_id", side_effect=fake_find,
+    ):
+        await handlers["text"](update, ctx)
+
+    tracker.record_reply.assert_awaited_once_with("outreach-1", "sounds good")
+    mock_loop.handle_message_streaming.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_standalone_writeback_failure_still_consumes(mock_loop, mock_adapter, dedupe):
+    """A write-back failure never blocks the already-resolved waiter — the
+    message stays consumed (no CC invocation), errors are swallowed."""
+    waiter = MagicMock()
+    waiter.resolve_scoped_pending = MagicMock(return_value=["77"])
+    tracker = MagicMock()
+    tracker.record_reply = AsyncMock(side_effect=RuntimeError("db down"))
+    handlers = make_handlers_v2(
+        mock_loop,
+        allowed_users={123},
+        whisper_model="base",
+        adapter=mock_adapter,
+        db=mock_loop._db,
+        dedupe=dedupe,
+        reply_waiter=waiter,
+        engagement_tracker=tracker,
+    )
+    update = _make_update(text="ok", message_id=203)
+    update.message.reply_to_message = None
+    ctx = _make_context()
+
+    with patch(
+        "genesis.db.crud.outreach.find_by_delivery_id",
+        new_callable=AsyncMock, return_value={"id": "outreach-2"},
+    ):
+        await handlers["text"](update, ctx)
+
     mock_loop.handle_message_streaming.assert_not_called()
 
 
