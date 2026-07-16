@@ -21,6 +21,7 @@ provisioning verbs.
 from __future__ import annotations
 
 import logging
+import os
 
 from genesis.guardian._subprocess import run_subprocess
 from genesis.guardian.config import GuardianConfig
@@ -215,7 +216,10 @@ async def set_container_limits(
                 "error": "cannot read host MemTotal from /proc/meminfo",
             }
 
-        # ── memory ──
+        # ── VALIDATE BOTH AXES UP FRONT (no mutation until every check passes,
+        # so a valid-memory + invalid-cpu request never leaves a partial set) ──
+        host_cores = os.cpu_count() or 1
+        new_mem_b: int | None = None
         if new_mem_mib is not None:
             new_mem_b = new_mem_mib * _MIB
             reserve_b = _host_reserve_bytes(mem_total_b)
@@ -242,6 +246,33 @@ async def set_container_limits(
                     "error": f"memory {new_mem_mib}MiB ({new_mem_b} B) exceeds host "
                     f"cap MemTotal−reserve ({cap_b} B) — would starve the host",
                 }
+
+        if new_cpu is not None:
+            rc, out, _ = await run("incus", "config", "get", c, "limits.cpu", timeout=15.0)
+            cur_cpu_raw = out.strip() if rc == 0 else ""
+            # An unset/empty limits.cpu means ALL host cores (unlimited); a numeric
+            # cap below that would REDUCE the container — so treat unset as
+            # host_cores for the grow-only comparison (Codex P2: cpu was not
+            # grow-only, a cpu=4 request could lower an existing cpu=8 cap).
+            cur_cpu = int(cur_cpu_raw) if cur_cpu_raw.isdigit() else host_cores
+            steps.append(f"cpu current={cur_cpu_raw!r} (eff {cur_cpu}), host cores={host_cores}")
+            if new_cpu < 1 or new_cpu > host_cores:
+                return {
+                    "ok": False,
+                    "action": action,
+                    "steps": steps,
+                    "error": f"cpu {new_cpu} out of range 1..{host_cores} (host cores)",
+                }
+            if new_cpu <= cur_cpu:
+                return {
+                    "ok": False,
+                    "action": action,
+                    "steps": steps,
+                    "error": f"grow-only: cpu {new_cpu} not greater than current {cur_cpu}",
+                }
+
+        # ── APPLY (all validations passed; both are live cgroup writes) ──
+        if new_mem_mib is not None:
             rc, out, err = await run(
                 "incus",
                 "config",
@@ -259,21 +290,7 @@ async def set_container_limits(
                 }
             steps.append(f"set limits.memory={new_mem_mib}MiB")
 
-        # ── cpu ──
         if new_cpu is not None:
-            try:
-                import os
-
-                host_cores = os.cpu_count() or 1
-            except Exception:
-                host_cores = 1
-            if new_cpu < 1 or new_cpu > host_cores:
-                return {
-                    "ok": False,
-                    "action": action,
-                    "steps": steps,
-                    "error": f"cpu {new_cpu} out of range 1..{host_cores} (host cores)",
-                }
             rc, out, err = await run(
                 "incus",
                 "config",

@@ -167,3 +167,46 @@ async def test_set_limits_meminfo_unreadable():
         res = await set_container_limits(_cfg(), 20480, None, run=run)
     assert res["ok"] is False
     assert "MemTotal" in res["error"]
+
+
+class _CpuAwareRun:
+    """Fake run that answers limits.cpu / limits.memory gets distinctly."""
+
+    def __init__(self, cur_cpu: str, cur_mem: str = "16GiB"):
+        self.cur_cpu = cur_cpu
+        self.cur_mem = cur_mem
+        self.calls: list[str] = []
+
+    async def __call__(self, *argv, timeout=None, stdin_data=None):
+        j = " ".join(argv)
+        self.calls.append(j)
+        if "get" in j and "limits.cpu" in j:
+            return (0, self.cur_cpu, "")
+        if "get" in j and "limits.memory" in j:
+            return (0, self.cur_mem, "")
+        return (0, "", "")
+
+
+async def test_set_limits_cpu_grow_only():
+    """Codex P2: cpu must be grow-only — a cpu=4 request must NOT lower cpu=8."""
+    run = _CpuAwareRun(cur_cpu="8")
+    with patch.object(grow_capacity, "_read_meminfo",
+                      return_value={"MemTotal": 64 * 1024 * 1024}), \
+         patch("os.cpu_count", return_value=16):
+        res = await set_container_limits(_cfg(), None, 4, run=run)
+    assert res["ok"] is False
+    assert "grow-only" in res["error"]
+    assert not any("config set" in c for c in run.calls)  # never mutated
+
+
+async def test_set_limits_invalid_cpu_does_not_set_memory():
+    """Codex P2: a valid-memory + invalid-cpu request must not partially set mem."""
+    run = _CpuAwareRun(cur_cpu="2")
+    with patch.object(grow_capacity, "_read_meminfo",
+                      return_value={"MemTotal": 64 * 1024 * 1024}), \
+         patch("os.cpu_count", return_value=4):
+        res = await set_container_limits(_cfg(), 20480, 99, run=run)  # cpu 99 > 4 cores
+    assert res["ok"] is False
+    assert "out of range" in res["error"]
+    # up-front validation means NO memory set was issued
+    assert not any("config set" in c and "limits.memory" in c for c in run.calls)
