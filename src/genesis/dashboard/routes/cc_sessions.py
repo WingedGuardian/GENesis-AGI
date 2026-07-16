@@ -276,15 +276,12 @@ async def _collect_session_detail(
     """Assemble the cockpit payload for one CC session, or None (→ 404) when
     neither a cc_sessions row nor a charter exists for the id."""
     from genesis.db.crud import session_charters as charter_crud
+    from genesis.db.crud.cc_sessions import list_by_cc_session_id
 
     now = now or datetime.now(UTC)
     db.row_factory = aiosqlite.Row
 
-    cursor = await db.execute(
-        "SELECT * FROM cc_sessions WHERE cc_session_id = ? ORDER BY datetime(started_at) DESC",
-        (cc_session_id,),
-    )
-    rows = [dict(r) for r in await cursor.fetchall()]
+    rows = await list_by_cc_session_id(db, cc_session_id)
     session = None
     if rows:
         newest = rows[0]
@@ -363,15 +360,12 @@ async def cc_sessions_pulse_resolve(annotation_id: str):
 
 async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int]:
     """Resolve core (extracted so tests exercise it on the fixture loop)."""
-    from genesis.db.crud.repo_pulse import resolve_annotation
+    from genesis.db.crud.repo_pulse import get_annotation, resolve_annotation
     from genesis.db.crud.session_charters import get_ledger_item, ledger_update
 
     try:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM repo_pulse_annotations WHERE id = ?", (annotation_id,)
-        )
-        row = await cursor.fetchone()
+        row = await get_annotation(db, annotation_id)
         if row is None or row["status"] != "proposed":
             return {"error": "unknown or already-resolved annotation"}, 404
         absorbed = False

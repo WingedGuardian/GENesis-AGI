@@ -152,6 +152,15 @@ async def record_run(
     return True
 
 
+async def get_annotation(db: aiosqlite.Connection, annotation_id: str) -> dict | None:
+    """Single annotation row as a dict, or None (also pre-migration)."""
+    if not await _tables_available(db):
+        return None
+    cursor = await db.execute("SELECT * FROM repo_pulse_annotations WHERE id = ?", (annotation_id,))
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
 async def tables_available(db: aiosqlite.Connection) -> bool:
     """Public existence check for callers that must verify storage BEFORE
     taking a side effect elsewhere (the worker gates live-ledger absorbs on
