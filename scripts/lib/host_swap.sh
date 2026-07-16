@@ -58,6 +58,9 @@ _hostswap_size_mib() {
 # Fixed /dev/zram0 (modprobe creates it by default) means NO command
 # substitution inside ExecStart — no systemd `$`-escaping hazard. The
 # swaps early-exit keeps restarts idempotent (a second swapon would fail);
+# the hot_add read creates the device when the module ships ZERO static
+# devices (Ubuntu 6.8 does — live-E2E finding 2026-07-16; reading
+# /sys/class/zram-control/hot_add allocates the lowest free device);
 # the mounts guard refuses to touch a zram0 that carries someone's
 # FILESYSTEM (a zram-backed mount never shows in /proc/swaps — resetting it
 # would destroy data); the --reset before configure clears any stale
@@ -74,7 +77,7 @@ _hostswap_unit_content() {
         '[Service]' \
         'Type=oneshot' \
         'RemainAfterExit=yes' \
-        "ExecStart=/bin/sh -c 'grep -q \"^/dev/zram\" /proc/swaps && exit 0; grep -q \"^/dev/zram0 \" /proc/mounts && exit 1; modprobe zram; zramctl --reset /dev/zram0 2>/dev/null; zramctl /dev/zram0 --size ${size_mib}MiB --algorithm zstd 2>/dev/null || { zramctl --reset /dev/zram0 2>/dev/null; zramctl /dev/zram0 --size ${size_mib}MiB; }; mkswap /dev/zram0 && swapon -p 100 /dev/zram0'" \
+        "ExecStart=/bin/sh -c 'grep -q \"^/dev/zram\" /proc/swaps && exit 0; grep -q \"^/dev/zram0 \" /proc/mounts && exit 1; modprobe zram; test -b /dev/zram0 || cat /sys/class/zram-control/hot_add >/dev/null; zramctl --reset /dev/zram0 2>/dev/null; zramctl /dev/zram0 --size ${size_mib}MiB --algorithm zstd 2>/dev/null || { zramctl --reset /dev/zram0 2>/dev/null; zramctl /dev/zram0 --size ${size_mib}MiB; }; mkswap /dev/zram0 && swapon -p 100 /dev/zram0'" \
         "ExecStop=/bin/sh -c 'swapoff /dev/zram0 2>/dev/null; zramctl --reset /dev/zram0 2>/dev/null; true'" \
         '' \
         '[Install]' \
