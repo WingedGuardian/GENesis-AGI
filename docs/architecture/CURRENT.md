@@ -348,7 +348,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 4e483381 2026-07-15
+verified: 8bd0a52b 2026-07-15
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -362,7 +362,13 @@ verified: 4e483381 2026-07-15
   skill). Known wart: the watchdog's stale-alert wording inverts when the
   deployed script is NEWER than the host checkout.
 - Provisioning verbs are EXECUTE-ONLY — approval is the CALLER's
-  responsibility (container obtains it via Telegram before invoking).
+  responsibility (container obtains it via Telegram before invoking). Two
+  families: Proxmox VM grows (`provision-grow-disk/-memory`, hypervisor API) and
+  LOCAL container-capacity grows (`grow-root`, `set-container-limits` in
+  `guardian/grow_capacity.py` — incus resizes the thin LV+fs / cgroup caps ONLINE,
+  grow-only, spike-proven). Both flow through `provision_grow(kind=disk|memory|
+  root|limits)` → owner-approval → the execute verb. The limits verb closes the
+  VM↔container coupling (a grown VM's RAM/cores reach the container).
 - Read-only `host-profile` verb (`guardian/host_profile.py`) feeds the
   `infra_profile` host plane; the CC diagnosis prompt inlines the shared-mount
   `INFRASTRUCTURE.md` (truncated) so the diagnostician starts with the body
