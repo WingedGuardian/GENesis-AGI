@@ -307,7 +307,12 @@ def _configure_provisioning(argv: list[str]) -> int:
                                    "api_port": p.api_port, "node": p.node, "vmid": p.vmid,
                                    "target_disk": p.target_disk, "storage": p.storage,
                                    "verify_tls": p.verify_tls,
-                                   "require_recent_backup": p.require_recent_backup}})
+                                   "require_recent_backup": p.require_recent_backup,
+                                   "backup_storage": p.backup_storage,
+                                   "backup_keep_last": p.backup_keep_last,
+                                   "max_backups_per_week": p.max_backups_per_week,
+                                   "backup_size_multiplier": p.backup_size_multiplier,
+                                   "vzdump_timeout_s": p.vzdump_timeout_s}})
 
 
 async def _provision_status() -> int:
