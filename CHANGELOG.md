@@ -11,6 +11,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Replying to Genesis without quote-replying now counts.** When Genesis
+  asked you something on Telegram and you answered with a plain message
+  (no quote-reply), your answer reached the waiting conversation but the
+  outreach record never learned it was answered — it would later be marked
+  "ignored" or "ambivalent" as if you'd said nothing. Only 3 of 1,021
+  outreach records ever carried a real reply signal because of this. A
+  standalone reply that resolves a pending question is now recorded on the
+  outreach record exactly like a quote-reply, so Genesis's picture of what
+  you actually respond to stops being systematically wrong.
+
 - **Genesis resumes learning about you.** The stream of "user model deltas" —
   the small observations reflections make about your preferences, constraints,
   and working style — had been effectively dead since the v3 release: the
