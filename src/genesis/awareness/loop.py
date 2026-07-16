@@ -191,6 +191,18 @@ _EMBED_BACKLOG_COOLDOWN_S = 3600  # one alert per band per hour max
 _last_embed_backlog_alert_at: float = 0.0
 _last_embed_backlog_band: str = ""
 
+# WS-2 M7 — user-model-delta stream staleness. The reflection user-impact path
+# writes deltas to observations(type='user_model_delta'); the stream flatlined
+# ~Mar–Jul 2026 (only 2 deltas ever under the v3 pipeline). Diagnosis
+# (2026-07-15): the 0.90 per-delta confidence gate in reflection_bridge/_output.py
+# sits above the light-reflection model's median output confidence, so almost
+# nothing passes — a THRESHOLD throttle, not a plumbing bug. The behavioral fix
+# (revisit the gate/prompt/model) is a separate PR; this only UN-BLINDS the
+# silence so a future recurrence is caught in days, not months.
+_USER_MODEL_STALE_DAYS = 14
+_USER_MODEL_STALE_COOLDOWN_S = 86400  # at most one alert per day while stale
+_last_user_model_stale_alert_at: float = 0.0
+
 
 def _embed_backlog_band(failed: int) -> str:
     """Bucket the failed-embedding count into a stable band (only meaningful at
@@ -321,6 +333,99 @@ async def _resolve_embedding_backlog(db) -> None:
             )
     except Exception:
         logger.debug("Failed to resolve embedding backlog alerts", exc_info=True)
+
+
+async def _check_user_model_staleness(db) -> None:
+    """WS-2 M7: alert (non-paging 'high') when the user_model_delta stream is silent >14d.
+
+    Surfaced via the established infrastructure_alert observation idiom (dashboard
+    + morning report), NOT alert_events — alert_events has no reader UI in PR-0, so
+    routing the alarm only there would be built-but-blind. Auto-resolves when a
+    fresh delta lands. Best-effort; the whole body never raises into the tick."""
+    global _last_user_model_stale_alert_at
+    if db is None:
+        return
+    try:
+        async with db.execute(
+            "SELECT MAX(created_at) FROM observations WHERE type = 'user_model_delta'"
+        ) as cur:
+            row = await cur.fetchone()
+        last = row[0] if row and row[0] else None
+
+        now_dt = datetime.now(UTC)
+        age_days: int | None = None
+        if last is not None:
+            try:
+                age_days = (now_dt - datetime.fromisoformat(last)).days
+            except (ValueError, TypeError):
+                age_days = None
+
+        is_stale = last is None or (age_days is not None and age_days >= _USER_MODEL_STALE_DAYS)
+        if not is_stale:
+            await _resolve_user_model_staleness(db)
+            return
+
+        now = time.monotonic()
+        if (
+            _last_user_model_stale_alert_at
+            and now - _last_user_model_stale_alert_at < _USER_MODEL_STALE_COOLDOWN_S
+        ):
+            return
+
+        detail = (
+            "no user_model_delta has ever been recorded under the current pipeline"
+            if last is None
+            else f"the last user_model_delta was {age_days}d ago ({last})"
+        )
+        content_hash = hashlib.sha256(b"user_model_staleness").hexdigest()
+        created = await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="user_model_staleness_monitor",
+            type="infrastructure_alert",
+            content=(
+                f"The user-model learning stream is stale: {detail}. Reflection "
+                f"user-impact deltas (observations type='user_model_delta') feed the "
+                f"user-model evolution job, so a silent stream means Genesis has stopped "
+                f"updating its model of the user. Likely throttle (diagnosed 2026-07-15): "
+                f"the 0.90 per-delta confidence gate in reflection_bridge/_output.py sits "
+                f"above the light-reflection model's median output confidence, so almost "
+                f"no delta passes — a behavioral fix tracked separately."
+            ),
+            priority="high",
+            created_at=now_dt.isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+        if created is None:
+            return  # An unresolved staleness alert already exists.
+        _last_user_model_stale_alert_at = now
+        logger.warning("User-model staleness alert: %s", detail)
+    except Exception:
+        logger.debug("Failed user-model staleness check", exc_info=True)
+
+
+async def _resolve_user_model_staleness(db) -> None:
+    """Resolve a standing user-model staleness alert once a fresh delta lands.
+
+    Unconditional (no in-memory guard) so it survives restart; a cheap no-op when
+    nothing matches. Clears the cooldown so a recovery -> re-staleness re-alerts."""
+    global _last_user_model_stale_alert_at
+    if db is None:
+        return
+    try:
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source="user_model_staleness_monitor",
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="auto-resolved: a fresh user_model_delta arrived within the window",
+        )
+        if resolved:
+            _last_user_model_stale_alert_at = 0.0
+            logger.info("Auto-resolved %d user-model staleness alert(s)", resolved)
+    except Exception:
+        logger.debug("Failed to resolve user-model staleness alerts", exc_info=True)
 
 
 # Deploy staleness (WS-B): merged ≠ deployed. A bare git-merge between
@@ -1801,6 +1906,10 @@ class AwarenessLoop:
                     # signal → hourly; self-resolves on recovery. Best-effort
                     # (guarded internally); collectors never do network I/O.
                     await _check_deploy_staleness(self._db)
+                    # User-model-delta stream staleness (WS-2 M7) — a >14d silent
+                    # stream means Genesis stopped updating its model of the user.
+                    # Slow (14d) signal → hourly; self-resolves on a fresh delta.
+                    await _check_user_model_staleness(self._db)
                 await _check_wal_health(self._db)
                 # WS-2 M10: persist the alert/incident open-set to alert_events.
                 # Every tick (5 min), not hourly — a short-lived alert that fires
