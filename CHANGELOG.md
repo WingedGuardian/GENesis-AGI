@@ -143,6 +143,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   onto ~5.3K older vectors so vector-based wing recall returns them too.
   Dry-run by default; the bulk re-sync is gated on a human-reviewed sample.
 
+- **Enabling container swap no longer waits for a restart to take effect.**
+  Host setup lets the container's memory cgroup spill into host swap under
+  pressure, so a memory spike degrades into swapping instead of thrashing the
+  whole box into a wedge. But that setting only took effect the next time the
+  container *started*, so retrofitting an already-running install looked done
+  while swap stayed off until a reboot — leaving the box exposed to the exact
+  OOM wedge the setting exists to prevent. Setup now activates it live on the
+  running container, so the protection is real immediately.
+
 - **Genesis's database keeps more in memory and stops over-syncing.** The main
   shared SQLite connection held only SQLite's tiny ~2 MiB default page cache and
   fsynced on every single commit (`synchronous=FULL`), even though the
