@@ -313,6 +313,60 @@ Verify before any commit:
   only proposes it). Find ids via `session_charter` or the charter injection
   block.
 
+## Generalizability Gate — build for ANY install, not this one
+
+Genesis is a public, cloneable system. Every change must work on ANY user's
+install, not just the machine it was written on. Standing user directive.
+
+**Hardware/scale adaptivity.** Other installs have different RAM, disk, CPU
+count, and workload scale. Never hardcode absolute resource numbers or scale
+assumptions:
+
+- Memory/disk caps: percentage-of-available or config-derived, never fixed
+  GB (precedent: #1029 percentage-based memory caps). Concurrency: derive
+  from `os.cpu_count()`/config, never a literal core count.
+- Hard minimums are allowed but must be EXPLICIT (documented in install
+  docs/config comments), not implicit assumptions that fail mysteriously.
+- Workload scale varies (PR velocity, table sizes, transcript sizes):
+  enumerate with pagination/bounds and LOUD truncation markers, never
+  silent caps (precedent: repo-pulse `limit_hit`).
+- Optional dependencies (Ollama, GPU, individual API keys) must degrade
+  gracefully behind detection/config — presence is never assumed
+  (precedent: Ollama-optional, `API_KEY_VOYAGE`-gated reranker).
+
+**No install-specific values in code.** IPs, hostnames, usernames, absolute
+`/home/<user>` paths, GitHub slugs, timezones: these belong in generated
+local config (`~/.genesis/config/genesis.yaml`, written by
+`setup-local-config.sh`) or config overlays — never in committed code,
+defaults, or tests. Resolve repo paths via `genesis.env.repo_root()` /
+`genesis_db_path()` (GENESIS_REPO_ROOT-aware); resolve GitHub slugs LIVE
+(`gh repo view --json nameWithOwner`) — a configured slug can name a
+real-but-wrong repo and return plausible stale data. Shipped config defaults
+must work on a fresh install with ZERO overlay.
+
+**Deploy-path answer required — "how does this reach other installs?"**
+Every PR must have an answer for both an EXISTING install and a FRESH clone.
+Merged-but-undeployable-elsewhere is a bug. The standard paths:
+
+| Change type | Deploy path |
+|---|---|
+| Runtime code | `git pull` + server restart (update.sh does both) |
+| DB schema | additive idempotent migration — applies at restart |
+| One-off data fix / backfill | data-migration framework (post-boot, idempotent) — NEVER a hand-run script only this install executed |
+| Config default | repo config file (+ optional local overlay); works with no overlay |
+| systemd unit / timer | registered in bootstrap.sh AND the update path — never hand-`systemctl enable`d only here |
+| Hooks / MCP servers | land at next CC session start (note the mid-window in the PR) |
+| Guardian / host VM | `update.sh` redeploy (Host-Deploy Gate below) |
+
+**When a change CANNOT deploy through the standard paths** (one-time host
+action: packages, sudoers, cgroup settings, firmware), it must ship one of:
+(a) a gated self-heal that reconciles on a recurring tick (precedent: the
+guardian's swap reconcile — checks every tick, repairs config + live state,
+opt-out flag), or (b) an explicit, documented operator step in CHANGELOG +
+install docs. Silent "works here because I hand-fixed it" divergence is the
+failure mode this gate exists to kill — it bites hardest on guardian/host
+changes.
+
 ## Host-Deploy Gate (merged ≠ deployed)
 
 A merged PR that touches host-deployed paths is **NOT done at merge**. The
@@ -372,6 +426,14 @@ outlives its incident is a bug.
    findings"** — a clean PR returns `[]`. The merge-gate hook only blocks
    ERROR/[P1]/HARD BLOCK, so unread P2s pass silently (2026-07-10: 8 real
    P2s on the entity-layer PRs were merged past this exact way).
+8. **A CONFLICTING PR silently suppresses the whole CI suite.** When a PR
+   has a merge conflict with main, GitHub cannot build the merge ref, so
+   `pull_request`-triggered workflows (the entire ci.yml suite) never run —
+   while CodeQL still passes on the head SHA, making the check list LOOK
+   green. A thin check list (only Analyze/CodeQL) means CHECK
+   `gh pr view N --json mergeable` — `CONFLICTING` needs a rebase before any
+   CI verdict exists at all (2026-07-16: #1089 sat conflict-suppressed
+   through three pushes; main had moved under it via concurrent sessions).
 
 ## Reference Router
 

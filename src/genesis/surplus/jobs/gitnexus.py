@@ -21,9 +21,15 @@ logger = logging.getLogger(__name__)
 
 
 # `gitnexus analyze` injects a `<!-- gitnexus:start --> … <!-- gitnexus:end -->`
-# block into BOTH CLAUDE.md and AGENTS.md, with no per-file flag. We keep it in
-# AGENTS.md (read by cross-tool agents — Codex/Cursor/etc.) but strip it from
-# CLAUDE.md so Claude Code's instructions file stays clean.
+# block into BOTH CLAUDE.md and AGENTS.md. PRIMARY control is now the
+# committed `.gitnexusrc` (`skipAgentsMd` + `skipSkills`), which stops the
+# injection at the source for EVERY analyze path (scheduled runner, MCP
+# staleness reindex) on every install via plain git pull. This job is the
+# SAFETY NET for rc-unaware GitNexus versions: it strips marker blocks from
+# both files. AGENTS.md is hand-curated (markerless GitNexus section, no
+# behavioral mandates — the injected "MUST run impact analysis" rules
+# contradict the project's no-mandatory-pre-edit-gate principle), so a
+# stripped re-injection never removes curated content.
 _GITNEXUS_BLOCK_RE = re.compile(
     r"\n*<!-- gitnexus:start -->.*?<!-- gitnexus:end -->[^\n]*\n?",
     re.DOTALL,
@@ -58,6 +64,7 @@ async def run_gitnexus_reindex() -> None:
     """
     try:
         from genesis.runtime import GenesisRuntime
+
         if GenesisRuntime.instance().paused:
             logger.debug("GitNexus reindex request skipped (Genesis paused)")
             return
@@ -92,23 +99,26 @@ async def run_gitnexus_reindex() -> None:
         logger.exception("GitNexus reindex request failed")
         with contextlib.suppress(Exception):
             GenesisRuntime.instance().record_job_failure(
-                "gitnexus_reindex", str(exc),
+                "gitnexus_reindex",
+                str(exc),
             )
 
 
 async def run_gitnexus_strip() -> None:
-    """Strip GitNexus's auto-injected block from CLAUDE.md (hourly + on startup).
+    """Strip GitNexus marker blocks from CLAUDE.md AND AGENTS.md (hourly + startup).
 
-    ``gitnexus analyze`` re-injects the block into CLAUDE.md on EVERY reindex,
-    including the out-of-band staleness reindex run by GitNexus's own MCP
-    server — which never triggers ``run_gitnexus_reindex``'s post-strip. This
-    decoupled job keeps CLAUDE.md clean regardless of what reindexed; AGENTS.md
-    intentionally keeps the block (read by cross-tool agents). Idempotent no-op
-    when the block is absent.
+    Safety net behind the committed ``.gitnexusrc`` (``skipAgentsMd`` +
+    ``skipSkills``), which disables the injection at the source for every
+    analyze path — including the out-of-band staleness reindex run by
+    GitNexus's own MCP server. An rc-unaware GitNexus version that injects
+    anyway gets cleaned here within the hour; AGENTS.md's curated GitNexus
+    section carries no markers, so stripping never touches it. Idempotent
+    no-op when no marker block is present.
     """
     try:
-        if _strip_gitnexus_block(Path.home() / "genesis" / "CLAUDE.md"):
-            logger.info("Stripped GitNexus block from CLAUDE.md (kept in AGENTS.md)")
+        for name in ("CLAUDE.md", "AGENTS.md"):
+            if _strip_gitnexus_block(Path.home() / "genesis" / name):
+                logger.info("Stripped GitNexus marker block from %s", name)
         record_success("gitnexus_strip")
     except Exception as exc:
         logger.warning("GitNexus strip failed", exc_info=True)

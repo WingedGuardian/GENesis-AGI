@@ -28,8 +28,11 @@ def _make_scheduler(db, *, idle=True, lmstudio_up=False):
         idle_detector.mark_active()
     compute = ComputeAvailability(lmstudio_url="http://fake:1234/v1/models")
     return SurplusScheduler(
-        db=db, queue=SurplusQueue(db), idle_detector=idle_detector,
-        compute_availability=compute, executor=StubExecutor(),
+        db=db,
+        queue=SurplusQueue(db),
+        idle_detector=idle_detector,
+        compute_availability=compute,
+        executor=StubExecutor(),
     ), compute
 
 
@@ -44,6 +47,7 @@ async def test_restart_safe_hourly_returns_crontrigger_not_interval():
 async def test_restart_safe_hourly_subdaily_is_stepped_and_daily_differs():
     """4h -> every-4-hours step; >=24h -> a single daily fire (the _recently_completed
     cooldown is the real cadence gate). Assert on trigger fields, not the __str__ repr."""
+
     def _field(trig, name):
         return next(str(f) for f in trig.fields if f.name == name)
 
@@ -72,8 +76,10 @@ async def test_long_interval_jobs_use_restart_safe_crontriggers(db):
         sched._scheduler.shutdown(wait=False)
 
 
-async def test_run_gitnexus_strip_cleans_claude_md(db, tmp_path, monkeypatch):
-    """run_gitnexus_strip removes the GitNexus block from CLAUDE.md, not AGENTS.md."""
+async def test_run_gitnexus_strip_cleans_both_files(db, tmp_path, monkeypatch):
+    """run_gitnexus_strip removes marker blocks from CLAUDE.md AND AGENTS.md
+    (safety net behind .gitnexusrc; AGENTS.md is hand-curated markerless, so
+    only a re-injected block is ever removed)."""
     from pathlib import Path as _P
 
     sched, _ = _make_scheduler(db)  # build before patching Path.home
@@ -90,7 +96,9 @@ async def test_run_gitnexus_strip_cleans_claude_md(db, tmp_path, monkeypatch):
     claude = (genesis_dir / "CLAUDE.md").read_text()
     assert "gitnexus:start" not in claude, "block stripped from CLAUDE.md"
     assert "# Real instructions" in claude, "real content preserved"
-    assert "gitnexus:start" in (genesis_dir / "AGENTS.md").read_text(), "AGENTS.md kept"
+    agents = (genesis_dir / "AGENTS.md").read_text()
+    assert "gitnexus:start" not in agents, "block stripped from AGENTS.md too"
+    assert "# Agents" in agents, "curated content preserved"
 
 
 async def test_dispatch_skips_when_not_idle(db):
@@ -112,8 +120,13 @@ async def test_dispatch_reaps_old_terminal_rows(db):
     sched, compute = _make_scheduler(db, idle=False)  # not idle → returns early after reap
     old = (datetime.now(UTC) - timedelta(days=40)).isoformat()
     await surplus_tasks.create(
-        db, id="ancient", task_type="brainstorm_self", compute_tier="free_api",
-        priority=0.5, drive_alignment="curiosity", created_at=old,
+        db,
+        id="ancient",
+        task_type="brainstorm_self",
+        compute_tier="free_api",
+        priority=0.5,
+        drive_alignment="curiosity",
+        created_at=old,
     )
     await surplus_tasks.mark_completed(db, "ancient", completed_at=old)
     with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):
@@ -182,9 +195,7 @@ async def test_dispatch_handles_executor_error(db):
 # Verified-correctness verdict (measurement-only quality judge — producer side)
 # --------------------------------------------------------------------------- #
 async def _completed_verdict(db) -> str | None:
-    cur = await db.execute(
-        "SELECT outcome_quality FROM surplus_tasks WHERE status='completed'"
-    )
+    cur = await db.execute("SELECT outcome_quality FROM surplus_tasks WHERE status='completed'")
     row = await cur.fetchone()
     return row[0]
 
@@ -202,16 +213,28 @@ async def _dispatch_with_judge(db, task_type, judge_return):
     sched, compute = _make_scheduler(db, idle=True)
     await sched._queue.enqueue(task_type, ComputeTier.FREE_API, 0.8, "curiosity")
     benign = IntakeStats(
-        findings_count=1, routed_knowledge=1, routed_observation=0, routed_discard=0,
+        findings_count=1,
+        routed_knowledge=1,
+        routed_observation=0,
+        routed_discard=0,
     )
     judge = AsyncMock(return_value=judge_return)
-    with patch.object(
-        compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False,
-    ), patch(
-        "genesis.surplus.intake.run_intake",
-        new_callable=AsyncMock, return_value=benign,
-    ), patch(
-        "genesis.surplus.quality_judge.run_quality_judge", judge,
+    with (
+        patch.object(
+            compute,
+            "_ping_lmstudio",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        patch(
+            "genesis.surplus.intake.run_intake",
+            new_callable=AsyncMock,
+            return_value=benign,
+        ),
+        patch(
+            "genesis.surplus.quality_judge.run_quality_judge",
+            judge,
+        ),
     ):
         assert await sched.dispatch_once() is True
     cur = await db.execute(
@@ -224,7 +247,9 @@ async def _dispatch_with_judge(db, task_type, judge_return):
 async def test_dispatch_records_useful_when_judge_passes(db):
     detail = '{"judge_score": 0.82, "rationale": "solid"}'
     row, judge = await _dispatch_with_judge(
-        db, TaskType.BRAINSTORM_USER, ("useful", 0.82, detail),
+        db,
+        TaskType.BRAINSTORM_USER,
+        ("useful", 0.82, detail),
     )
     assert row["outcome_quality"] == "useful"
     assert row["judge_score"] == 0.82
@@ -234,7 +259,9 @@ async def test_dispatch_records_useful_when_judge_passes(db):
 
 async def test_dispatch_records_hollow_when_judge_fails(db):
     row, _ = await _dispatch_with_judge(
-        db, TaskType.CODE_AUDIT, ("hollow", 0.30, '{"judge_score": 0.30}'),
+        db,
+        TaskType.CODE_AUDIT,
+        ("hollow", 0.30, '{"judge_score": 0.30}'),
     )
     assert row["outcome_quality"] == "hollow"
     assert row["judge_score"] == 0.30
@@ -243,7 +270,9 @@ async def test_dispatch_records_hollow_when_judge_fails(db):
 async def test_dispatch_judge_outage_stays_null(db):
     # Judge unavailable → (None, None, None) → positive-only, no false hollow.
     row, _ = await _dispatch_with_judge(
-        db, TaskType.WING_AUDIT, (None, None, None),
+        db,
+        TaskType.WING_AUDIT,
+        (None, None, None),
     )
     assert row["outcome_quality"] is None
     assert row["judge_score"] is None
@@ -258,22 +287,33 @@ async def test_code_audit_skips_generic_intake(db):
 
     sched, compute = _make_scheduler(db, idle=True)
     await sched._queue.enqueue(
-        TaskType.CODE_AUDIT, ComputeTier.FREE_API, 0.8, "curiosity",
+        TaskType.CODE_AUDIT,
+        ComputeTier.FREE_API,
+        0.8,
+        "curiosity",
     )
     intake_mock = AsyncMock(return_value=IntakeStats(findings_count=1))
-    with patch.object(
-        compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False,
-    ), patch(
-        "genesis.surplus.intake.run_intake", intake_mock,
-    ), patch(
-        "genesis.surplus.quality_judge.run_quality_judge",
-        new_callable=AsyncMock, return_value=(None, None, None),
+    with (
+        patch.object(
+            compute,
+            "_ping_lmstudio",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        patch(
+            "genesis.surplus.intake.run_intake",
+            intake_mock,
+        ),
+        patch(
+            "genesis.surplus.quality_judge.run_quality_judge",
+            new_callable=AsyncMock,
+            return_value=(None, None, None),
+        ),
     ):
         assert await sched.dispatch_once() is True
     intake_mock.assert_not_awaited()
     cur = await db.execute(
-        "SELECT status, result_staging_id FROM surplus_tasks "
-        "WHERE status='completed'"
+        "SELECT status, result_staging_id FROM surplus_tasks WHERE status='completed'"
     )
     row = await cur.fetchone()
     assert row is not None
@@ -283,7 +323,9 @@ async def test_code_audit_skips_generic_intake(db):
 async def test_dispatch_non_insight_type_skips_judge(db):
     # An action / non-insight type must NOT invoke the judge (cost) and stays NULL.
     row, judge = await _dispatch_with_judge(
-        db, TaskType.CODE_INDEX, ("hollow", 0.1, "{}"),
+        db,
+        TaskType.CODE_INDEX,
+        ("hollow", 0.1, "{}"),
     )
     assert row["outcome_quality"] is None
     judge.assert_not_awaited()
@@ -292,7 +334,9 @@ async def test_dispatch_non_insight_type_skips_judge(db):
 async def test_dispatch_pipeline_intermediate_skips_judge(db):
     # Pipeline-intermediate output feeds the next step, not the KB; excluded.
     row, judge = await _dispatch_with_judge(
-        db, TaskType.RESEARCH_QUERY_GEN, ("hollow", 0.1, "{}"),
+        db,
+        TaskType.RESEARCH_QUERY_GEN,
+        ("hollow", 0.1, "{}"),
     )
     assert row["outcome_quality"] is None
     judge.assert_not_awaited()
@@ -305,7 +349,10 @@ async def test_dispatch_short_content_skips_judge(db):
 
     sched, compute = _make_scheduler(db, idle=True)
     await sched._queue.enqueue(
-        TaskType.BRAINSTORM_USER, ComputeTier.FREE_API, 0.8, "curiosity",
+        TaskType.BRAINSTORM_USER,
+        ComputeTier.FREE_API,
+        0.8,
+        "curiosity",
     )
 
     async def _short(task):
@@ -317,9 +364,15 @@ async def test_dispatch_short_content_skips_judge(db):
 
     sched._executor.execute = _short
     judge = AsyncMock(return_value=("hollow", 0.1, "{}"))
-    with patch.object(
-        compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False,
-    ), patch("genesis.surplus.quality_judge.run_quality_judge", judge):
+    with (
+        patch.object(
+            compute,
+            "_ping_lmstudio",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        patch("genesis.surplus.quality_judge.run_quality_judge", judge),
+    ):
         await sched.dispatch_once()
     judge.assert_not_awaited()
     assert await _completed_verdict(db) is None
@@ -332,7 +385,10 @@ async def test_dispatch_empty_insights_stays_null(db):
 
     sched, compute = _make_scheduler(db, idle=True)
     await sched._queue.enqueue(
-        TaskType.BRAINSTORM_SELF, ComputeTier.FREE_API, 0.8, "curiosity",
+        TaskType.BRAINSTORM_SELF,
+        ComputeTier.FREE_API,
+        0.8,
+        "curiosity",
     )
 
     async def _nominal(task):
@@ -344,7 +400,10 @@ async def test_dispatch_empty_insights_stays_null(db):
 
     sched._executor.execute = _nominal
     with patch.object(
-        compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False,
+        compute,
+        "_ping_lmstudio",
+        new_callable=AsyncMock,
+        return_value=False,
     ):
         await sched.dispatch_once()
     assert await _completed_verdict(db) is None
@@ -360,8 +419,10 @@ async def test_brainstorm_check_schedules_sessions(db):
 
 async def test_start_and_stop(db):
     sched, compute = _make_scheduler(db, idle=True)
-    with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False), \
-         patch.object(sched, "run_gitnexus_strip", new_callable=AsyncMock):
+    with (
+        patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False),
+        patch.object(sched, "run_gitnexus_strip", new_callable=AsyncMock),
+    ):
         await sched.start()
     assert sched._scheduler.running is True
     # Verify jobs were registered
@@ -419,12 +480,15 @@ async def test_dispatch_drains_expired_tasks(db):
     with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):
         await sched.dispatch_once()
     # Expired task should be drained
-    cursor = await db.execute("SELECT COUNT(*) FROM surplus_tasks WHERE id = 'old-task-1' AND status = 'pending'")
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM surplus_tasks WHERE id = 'old-task-1' AND status = 'pending'"
+    )
     row = await cursor.fetchone()
     assert row[0] == 0
 
 
 # ── DB integrity check (C1) ─────────────────────────────────────────────
+
 
 async def test_alarm_db_integrity_writes_observation_and_emits(db):
     """Corruption detail is persisted as a critical observation AND emitted."""
@@ -457,9 +521,7 @@ async def test_run_db_integrity_check_healthy_db_no_alarm(db):
     await sched.run_db_integrity_check()
 
     sched._event_bus.emit.assert_not_called()
-    cur = await db.execute(
-        "SELECT COUNT(*) FROM observations WHERE type = 'db_integrity_failure'"
-    )
+    cur = await db.execute("SELECT COUNT(*) FROM observations WHERE type = 'db_integrity_failure'")
     assert (await cur.fetchone())[0] == 0
 
 
@@ -482,6 +544,7 @@ async def test_start_registers_db_integrity_check(db):
 def _fake_runtime(db):
     """Runtime stand-in for the drain wrapper: healthy deps, no flags set."""
     from unittest.mock import MagicMock
+
     rt = MagicMock()
     rt.paused = False
     rt.heavy_workload = None  # MagicMock auto-attrs are truthy — must be explicit
@@ -495,8 +558,12 @@ def _fake_runtime(db):
 
 
 _DRAIN_REPORT = {
-    "run_id": "t", "dry_run": True, "drained": 2, "would_merge": 2,
-    "stale_skipped": 0, "errors": [],
+    "run_id": "t",
+    "dry_run": True,
+    "drained": 2,
+    "would_merge": 2,
+    "stale_skipped": 0,
+    "errors": [],
 }
 _RT_CLS = "genesis.runtime.GenesisRuntime"
 _DRAIN_FN = "genesis.memory.dream_cycle.run_synthesis_drain"
@@ -507,8 +574,10 @@ async def test_drain_wrapper_happy_path_shadow(db):
     observation, and clears its own heavy_workload flag."""
     sched, _ = _make_scheduler(db)
     rt = _fake_runtime(db)
-    with patch(_RT_CLS) as rt_cls, \
-         patch(_DRAIN_FN, new_callable=AsyncMock, return_value=dict(_DRAIN_REPORT)) as drain:
+    with (
+        patch(_RT_CLS) as rt_cls,
+        patch(_DRAIN_FN, new_callable=AsyncMock, return_value=dict(_DRAIN_REPORT)) as drain,
+    ):
         rt_cls.instance.return_value = rt
         await sched.run_dream_synthesis_drain()
 
@@ -531,8 +600,7 @@ async def test_drain_wrapper_paused_skips(db):
     sched, _ = _make_scheduler(db)
     rt = _fake_runtime(db)
     rt.paused = True
-    with patch(_RT_CLS) as rt_cls, \
-         patch(_DRAIN_FN, new_callable=AsyncMock) as drain:
+    with patch(_RT_CLS) as rt_cls, patch(_DRAIN_FN, new_callable=AsyncMock) as drain:
         rt_cls.instance.return_value = rt
         await sched.run_dream_synthesis_drain()
     drain.assert_not_awaited()
@@ -545,8 +613,7 @@ async def test_drain_wrapper_heavy_workload_skips(db):
     rt = _fake_runtime(db)
     rt.heavy_workload = "dream_cycle"
     rt._heavy_workload = "dream_cycle"
-    with patch(_RT_CLS) as rt_cls, \
-         patch(_DRAIN_FN, new_callable=AsyncMock) as drain:
+    with patch(_RT_CLS) as rt_cls, patch(_DRAIN_FN, new_callable=AsyncMock) as drain:
         rt_cls.instance.return_value = rt
         await sched.run_dream_synthesis_drain()
     drain.assert_not_awaited()
@@ -561,8 +628,7 @@ async def test_drain_wrapper_missing_deps_skip_before_job_start(db):
     sched, _ = _make_scheduler(db)
     rt = _fake_runtime(db)
     rt.db = None
-    with patch(_RT_CLS) as rt_cls, \
-         patch(_DRAIN_FN, new_callable=AsyncMock) as drain:
+    with patch(_RT_CLS) as rt_cls, patch(_DRAIN_FN, new_callable=AsyncMock) as drain:
         rt_cls.instance.return_value = rt
         await sched.run_dream_synthesis_drain()
     drain.assert_not_awaited()
@@ -572,8 +638,10 @@ async def test_drain_wrapper_missing_deps_skip_before_job_start(db):
 async def test_drain_wrapper_failure_records_and_clears_flag(db):
     sched, _ = _make_scheduler(db)
     rt = _fake_runtime(db)
-    with patch(_RT_CLS) as rt_cls, \
-         patch(_DRAIN_FN, new_callable=AsyncMock, side_effect=RuntimeError("boom")):
+    with (
+        patch(_RT_CLS) as rt_cls,
+        patch(_DRAIN_FN, new_callable=AsyncMock, side_effect=RuntimeError("boom")),
+    ):
         rt_cls.instance.return_value = rt
         await sched.run_dream_synthesis_drain()
     rt.record_job_failure.assert_called_once()
@@ -591,8 +659,10 @@ async def test_drain_wrapper_finally_is_owner_guarded(db):
         rt._heavy_workload = "dream_cycle"  # weekly job took the flag
         return dict(_DRAIN_REPORT)
 
-    with patch(_RT_CLS) as rt_cls, \
-         patch(_DRAIN_FN, new_callable=AsyncMock, side_effect=_drain_then_flag_stolen):
+    with (
+        patch(_RT_CLS) as rt_cls,
+        patch(_DRAIN_FN, new_callable=AsyncMock, side_effect=_drain_then_flag_stolen),
+    ):
         rt_cls.instance.return_value = rt
         await sched.run_dream_synthesis_drain()
     assert rt._heavy_workload == "dream_cycle"  # not clobbered
@@ -604,14 +674,21 @@ async def test_start_reclaims_orphaned_running_tasks_immediately(db):
     (Single-worker: nothing can legitimately be running before start().)"""
     recent = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
     await surplus_tasks.create(
-        db, id="st-orphan", task_type="brainstorm", compute_tier="slm",
-        priority=0.5, drive_alignment="curiosity", created_at="2026-03-04T00:00:00Z",
+        db,
+        id="st-orphan",
+        task_type="brainstorm",
+        compute_tier="slm",
+        priority=0.5,
+        drive_alignment="curiosity",
+        created_at="2026-03-04T00:00:00Z",
     )
     await surplus_tasks.mark_running(db, "st-orphan", started_at=recent)
 
     sched, compute = _make_scheduler(db, idle=True)
-    with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False), \
-         patch.object(sched, "run_gitnexus_strip", new_callable=AsyncMock):
+    with (
+        patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False),
+        patch.object(sched, "run_gitnexus_strip", new_callable=AsyncMock),
+    ):
         await sched.start()
     try:
         row = await surplus_tasks.get_by_id(db, "st-orphan")

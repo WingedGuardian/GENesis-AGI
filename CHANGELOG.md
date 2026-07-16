@@ -21,6 +21,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   outreach record exactly like a quote-reply, so Genesis's picture of what
   you actually respond to stops being systematically wrong.
 
+- **GitNexus stops rewriting your instruction files.** Every reindex used to
+  inject a block of "MUST run impact analysis before every edit"-style
+  mandates into CLAUDE.md and AGENTS.md (contradicting the project's own
+  advisory-tools principle) and regenerate its skill files, leaving the
+  working tree dirty enough to block deploy pulls. Injection is now disabled
+  at the source via a committed `.gitnexusrc` (`skipAgentsMd` + `skipSkills`)
+  that reaches every install with a plain pull; AGENTS.md is hand-curated
+  (useful GitNexus pointers kept, mandates gone), and the hourly strip job
+  stays as a safety net for rc-unaware GitNexus versions — now covering both
+  files.
+
 - **Genesis resumes learning about you.** The stream of "user model deltas" —
   the small observations reflections make about your preferences, constraints,
   and working style — had been effectively dead since the v3 release: the

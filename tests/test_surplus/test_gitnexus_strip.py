@@ -55,3 +55,35 @@ def test_idempotent(tmp_path: Path) -> None:
 
 def test_missing_file_returns_false(tmp_path: Path) -> None:
     assert _strip_gitnexus_block(tmp_path / "nope.md") is False
+
+
+def test_curated_agents_md_survives_strip(tmp_path: Path) -> None:
+    """AGENTS.md is hand-curated with a MARKERLESS GitNexus section; the
+    safety-net strip removes only a re-injected marker block, never the
+    curated content. Also locks the shipped file's markerless invariant."""
+    curated = (
+        "# Agent Instructions\n\n"
+        "## GitNexus — Code Intelligence (advisory)\n\n"
+        "none is a mandatory pre-edit gate\n"
+    )
+    f = tmp_path / "AGENTS.md"
+    f.write_text(curated + "\n" + _BLOCK)  # rc-unaware version re-injected
+    assert _strip_gitnexus_block(f) is True
+    out = f.read_text()
+    assert "gitnexus:start" not in out
+    assert "mandatory pre-edit gate" in out  # curated section intact
+
+
+def test_shipped_agents_md_and_rc_invariants() -> None:
+    """The committed AGENTS.md must stay markerless (else the strip job would
+    eat curated content) and free of MUST-mandates; .gitnexusrc must keep the
+    at-the-source skips enabled."""
+    import json
+
+    repo = Path(__file__).resolve().parents[2]
+    agents = (repo / "AGENTS.md").read_text()
+    assert "gitnexus:start" not in agents
+    assert "MUST run impact analysis" not in agents
+    rc = json.loads((repo / ".gitnexusrc").read_text())
+    assert rc.get("skipAgentsMd") is True
+    assert rc.get("skipSkills") is True
