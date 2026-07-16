@@ -171,6 +171,34 @@ class StoragePoolConfig:
 
 
 @dataclass
+class MemoryTiersConfig:
+    """Host-side RAM monitoring thresholds (container cgroup + host-VM).
+
+    Complements the container's own `infra:container_memory_high` alert, which
+    dies exactly when the container thrashes/OOMs. The guardian — outside the
+    blast radius — pages out-of-band. TWO axes, worst-of:
+
+    - Container RAM: anon+kernel % of the container's memory.max (via incus-exec;
+      best-effort — the exec can itself stall under severe pressure).
+    - Host-VM RAM: 100 - MemAvailable/MemTotal on the guardian's own host (no
+      incus-exec -> the RELIABLE signal when the container read stalls).
+    """
+
+    enabled: bool = True
+    # Container cgroup anon+kernel % of memory.max.
+    container_warn_pct: float = 75.0
+    container_high_pct: float = 85.0
+    container_crit_pct: float = 92.0
+    # Host-VM used % (100 - MemAvailable/MemTotal). Host runs more services than
+    # the container cgroup and idles higher, so its tiers sit a little higher.
+    host_warn_pct: float = 80.0
+    host_high_pct: float = 88.0
+    host_crit_pct: float = 94.0
+    # Re-alert cadence while a tier is sustained. Tier increases alert immediately.
+    realert_hours: float = 6.0
+
+
+@dataclass
 class CredIntegrityConfig:
     """Guardian-side credential-file integrity watch (G.1 escalation ladder).
 
@@ -303,6 +331,7 @@ class GuardianConfig:
     snapshots: SnapshotConfig = field(default_factory=SnapshotConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     storage_pool: StoragePoolConfig = field(default_factory=StoragePoolConfig)
+    memory_tiers: MemoryTiersConfig = field(default_factory=MemoryTiersConfig)
     cred_integrity: CredIntegrityConfig = field(default_factory=CredIntegrityConfig)
     git_health: GitHealthConfig = field(default_factory=GitHealthConfig)
     repo_bundle: RepoBundleConfig = field(default_factory=RepoBundleConfig)
@@ -567,6 +596,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         snapshots=_build_sub(SnapshotConfig, raw, "snapshots"),
         recovery=_build_sub(RecoveryConfig, raw, "recovery"),
         storage_pool=_build_sub(StoragePoolConfig, raw, "storage_pool"),
+        memory_tiers=_build_sub(MemoryTiersConfig, raw, "memory_tiers"),
         cred_integrity=_build_sub(CredIntegrityConfig, raw, "cred_integrity"),
         git_health=_build_sub(GitHealthConfig, raw, "git_health"),
         repo_bundle=_build_sub(RepoBundleConfig, raw, "repo_bundle"),

@@ -378,6 +378,12 @@ async def run_check(config: GuardianConfig | None = None) -> None:
             config, dispatcher,
             genesis_down=(sm.current_state == GuardianState.CONFIRMED_DEAD),
         )
+        # Guardian-side RAM tiered alert (E-rest PR-E1). The container's own RAM
+        # alert (infra:container_memory_high) dies exactly when it thrashes; the
+        # guardian pages out-of-band over two axes (container cgroup + host-VM),
+        # worst-of. Host /proc read + one best-effort incus-exec — the host axis
+        # still fires when the container read stalls.
+        await _check_memory_and_alert(config, dispatcher)
         # Credential-file integrity backstop. The container self-heals first; the
         # guardian WARNs on first sight and steps in only after the grace window —
         # covering the window a degraded/dead server's awareness loop can't.
@@ -606,6 +612,20 @@ async def _check_repo_bundle_and_alert(
         await check_repo_bundle_and_alert(config, dispatcher)
     except Exception:
         logger.warning("repo-bundle watch failed", exc_info=True)
+
+
+async def _check_memory_and_alert(
+    config: GuardianConfig,
+    dispatcher: AlertDispatcher,
+) -> None:
+    """Guardian-side RAM tiered alert (delegates to memory_watch). Out-of-band
+    backstop for the container's own RAM alert, which dies under the exact
+    pressure it detects. Never raises into the tick."""
+    try:
+        from genesis.guardian.memory_watch import check_memory_and_alert
+        await check_memory_and_alert(config, dispatcher)
+    except Exception:
+        logger.warning("RAM watch failed", exc_info=True)
 
 
 async def _check_storage_pool_and_alert(

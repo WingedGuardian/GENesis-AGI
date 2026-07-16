@@ -301,6 +301,17 @@ class GuardianRemote:
         ok, out = await self._ssh_command("bundle-status", timeout=_STATUS_TIMEOUT)
         return self._as_json(ok, out, "bundle-status")
 
+    async def ram_status(self) -> dict:
+        """Read-only RAM view (E-rest PR-E1) — what the guardian's out-of-band
+        RAM alert sees: container cgroup + host-VM axes and the worst-of tier.
+
+        Returns the gateway's JSON verbatim on success. A pre-redeploy gateway
+        answers ``denied`` (its unknown-verb default) -> ``{"ok": False,
+        "error": "denied"}``. No approval, no mutation.
+        """
+        ok, out = await self._ssh_command("ram-status", timeout=_STATUS_TIMEOUT)
+        return self._as_json(ok, out, "ram-status")
+
     async def request_grow_disk(self, disk: str, add_gib: int) -> dict:
         """EXECUTE a pre-approved VM disk grow + absorb into the thin pool."""
         if not _DISK_RE.fullmatch(disk):

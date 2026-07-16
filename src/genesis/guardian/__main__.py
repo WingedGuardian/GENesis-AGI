@@ -6,6 +6,7 @@ Usage:
     python -m genesis.guardian --check-only  # one-shot health check (no recovery)
     python -m genesis.guardian --test-approval  # E2E test the keyword-reply gate
     python -m genesis.guardian --disk-status  # print storage-pool JSON (read-only)
+    python -m genesis.guardian --ram-status   # print RAM tier JSON (read-only)
     python -m genesis.guardian --host-profile  # host body-schema JSON (read-only)
     python -m genesis.guardian --bundle-status # offline repo-bundle archive JSON (read-only)
     python -m genesis.guardian --provision-status              # host capacity (read-only)
@@ -47,6 +48,10 @@ def main() -> None:
 
     if "--disk-status" in sys.argv:
         asyncio.run(_disk_status())
+        return
+
+    if "--ram-status" in sys.argv:
+        asyncio.run(_ram_status())
         return
 
     if "--host-profile" in sys.argv:
@@ -176,6 +181,21 @@ async def _disk_status() -> None:
         "tier": tier,
         "snapshots": snapshots,
     }))
+
+
+async def _ram_status() -> None:
+    """Print the guardian's RAM view as JSON (read-only).
+
+    Genesis's programmatic window into what the guardian's out-of-band RAM
+    alert sees — both axes (container cgroup + host-VM) and the worst-of tier.
+    Consumed by the `ram-status` gateway verb.
+    """
+    import json
+
+    from genesis.guardian.config import load_config
+    from genesis.guardian.memory_watch import memory_status_snapshot
+
+    print(json.dumps(await memory_status_snapshot(load_config())))
 
 
 async def _host_profile() -> int:
