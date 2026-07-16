@@ -77,3 +77,45 @@ async def coordinate_grow_memory(remote, ask: AskFn, *, new_mib: int) -> dict:
     if not _approved(reply):
         return {"ok": False, "stage": "denied", "reply": reply}
     return await remote.request_grow_memory(new_mib)
+
+
+async def coordinate_grow_root(remote, ask: AskFn, *, new_gb: int) -> dict:
+    """Ask the user -> on APPROVE run the host container-root grow execute verb.
+
+    Local incus op (not Proxmox): incus resizes the thin LV + filesystem online,
+    no restart. The host verb enforces grow-only + a pool-headroom guard.
+    """
+    proposal = (
+        f"\U0001f527 Grow the CONTAINER root volume to {new_gb}GB total.\n"
+        "incus resizes the thin LV + filesystem online (no restart). Grow-only, "
+        "refused if the thin pool is near-full.\n"
+        "Reply APPROVE to execute or DENY to cancel."
+    )
+    reply = await ask(proposal)
+    if not _approved(reply):
+        return {"ok": False, "stage": "denied", "reply": reply}
+    return await remote.request_grow_root(new_gb)
+
+
+async def coordinate_set_container_limits(
+    remote, ask: AskFn, *, mem_mib: int | None = None, cpu: int | None = None,
+) -> dict:
+    """Ask the user -> on APPROVE raise the container cgroup caps (grow-only, live).
+
+    The VM<->container coupling: after a Proxmox VM grow, this makes the grown
+    RAM/cores reach the container. The host verb caps memory below MemTotal-reserve.
+    """
+    parts = []
+    if mem_mib is not None:
+        parts.append(f"memory->{mem_mib}MiB")
+    if cpu is not None:
+        parts.append(f"cpu->{cpu}")
+    proposal = (
+        f"\U0001f527 Raise container cgroup limits ({', '.join(parts)}) - grow-only, "
+        "applied live (no restart).\n"
+        "Reply APPROVE to execute or DENY to cancel."
+    )
+    reply = await ask(proposal)
+    if not _approved(reply):
+        return {"ok": False, "stage": "denied", "reply": reply}
+    return await remote.request_set_container_limits(mem_mib, cpu)

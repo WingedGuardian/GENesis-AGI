@@ -13,6 +13,8 @@ Usage:
     python -m genesis.guardian --provision-grow-disk <disk> <GiB>  # EXECUTE (pre-approved)
     python -m genesis.guardian --provision-grow-memory <MiB>       # EXECUTE (pre-approved)
     python -m genesis.guardian --storage-expand               # absorb a grown disk
+    python -m genesis.guardian --grow-root <GB>               # EXECUTE (pre-approved) grow container root
+    python -m genesis.guardian --set-container-limits <mem_mib|-> <cpu|->  # EXECUTE (pre-approved) raise cgroup caps
 
 The provisioning grow/expand verbs are EXECUTE-ONLY: they run the shared
 execute-core (fresh due-diligence re-check + rate cap + one attempt + ledger),
@@ -71,6 +73,12 @@ def main() -> None:
 
     if "--storage-expand" in sys.argv:
         sys.exit(asyncio.run(_storage_expand()))
+
+    if "--grow-root" in sys.argv:
+        sys.exit(asyncio.run(_grow_root(sys.argv)))
+
+    if "--set-container-limits" in sys.argv:
+        sys.exit(asyncio.run(_set_container_limits(sys.argv)))
 
     if "--configure-provisioning" in sys.argv:
         sys.exit(_configure_provisioning(sys.argv))
@@ -391,6 +399,48 @@ async def _storage_expand() -> int:
     result = await expand_storage(load_config())
     result.setdefault("action", "storage-expand")
     return _emit(result)
+
+
+async def _grow_root(argv: list[str]) -> int:
+    """EXECUTE (pre-approved) a container root-volume grow to <GB> total."""
+    import re
+
+    from genesis.guardian.config import load_config
+    from genesis.guardian.grow_capacity import grow_root
+
+    args = _args_after(argv, "--grow-root", 1)
+    if not args or not re.fullmatch(r"[1-9][0-9]{0,3}", args[0]):
+        return _emit({"ok": False, "action": "grow-root",
+                      "error": "usage: --grow-root <GB total, 1-9999>"})
+    return _emit(await grow_root(load_config(), int(args[0])))
+
+
+async def _set_container_limits(argv: list[str]) -> int:
+    """EXECUTE (pre-approved) a container cgroup limit raise (grow-only).
+
+    Args: <mem_mib> <cpu>; use '-' for an axis to leave it unchanged."""
+    import re
+
+    from genesis.guardian.config import load_config
+    from genesis.guardian.grow_capacity import set_container_limits
+
+    args = _args_after(argv, "--set-container-limits", 2)
+    if not args:
+        return _emit({"ok": False, "action": "set-container-limits",
+                      "error": "usage: --set-container-limits <mem_mib|-> <cpu|->"})
+    mem_s, cpu_s = args
+    if mem_s != "-" and not re.fullmatch(r"[1-9][0-9]{2,6}", mem_s):
+        return _emit({"ok": False, "action": "set-container-limits",
+                      "error": f"invalid mem_mib {mem_s!r} (100-9999999 or -)"})
+    if cpu_s != "-" and not re.fullmatch(r"[1-9][0-9]{0,2}", cpu_s):
+        return _emit({"ok": False, "action": "set-container-limits",
+                      "error": f"invalid cpu {cpu_s!r} (1-999 or -)"})
+    if mem_s == "-" and cpu_s == "-":
+        return _emit({"ok": False, "action": "set-container-limits",
+                      "error": "nothing to do (both axes '-')"})
+    mem_mib = None if mem_s == "-" else int(mem_s)
+    cpu = None if cpu_s == "-" else int(cpu_s)
+    return _emit(await set_container_limits(load_config(), mem_mib, cpu))
 
 
 async def _check_only() -> None:

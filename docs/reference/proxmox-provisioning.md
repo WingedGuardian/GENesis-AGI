@@ -212,6 +212,14 @@ curl -sk -X PUT -H "Authorization: $AUD" "$H/nodes/<NODE>/qemu/<VMID>/config" -d
   it **takes effect only after a VM reboot** (hotplug is off on this install).
   The provision token deliberately lacks `VM.PowerMgmt` — power stays
   human/approved. Schedule the stop/start as a downtime window.
+- **Grow the CONTAINER (local, no Proxmox token):** `provision_grow`
+  (`kind="root"`) grows the container root volume to `<gib>` GB total — incus
+  resizes the thin LV + filesystem ONLINE, no restart (`guardian/grow_capacity.py`,
+  grow-only, refused if the thin pool is near-full). `provision_grow`
+  (`kind="limits"`) raises the container cgroup caps (`<mib>` MiB / `<cpu>` cores,
+  grow-only, applied live, memory hard-capped below host `MemTotal−reserve`). The
+  **Phase-C RAM completion**: after a `kind="memory"` VM grow + reboot, run
+  `kind="limits"` so the grown RAM actually reaches the container.
 - **Rate cap / ledger:** executed mutations are recorded in
   `<state_dir>/provisioning/ledger.json`; the gate refuses once
   `max_actions_per_week` is reached. Autonomous pool-crit re-proposals are

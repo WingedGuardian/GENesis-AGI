@@ -11,7 +11,8 @@ enforces this restriction, not our code.
 Gateway allowlist: restart-timer, pause, resume, status, reset-state, version,
 update, sync-gateway, redeploy, update-cc, update-node, test-approval,
 disk-status, host-profile, reharden-key, ping, provision-status,
-provision-grow-disk, provision-grow-memory, storage-expand.
+provision-grow-disk, provision-grow-memory, storage-expand, grow-root,
+set-container-limits.
 """
 
 from __future__ import annotations
@@ -41,6 +42,8 @@ _HOST_PROFILE_TIMEOUT = 50.0  # gateway: timeout 45 (pool lvs + incus probes)
 _GROW_DISK_TIMEOUT = 660.0   # gateway: timeout 600 (PVE resize + storage-expand)
 _GROW_MEM_TIMEOUT = 180.0    # gateway: timeout 120 (config PUT + pending check)
 _EXPAND_TIMEOUT = 660.0      # gateway: timeout 600 (pvresize + autoextend profile)
+_GROW_ROOT_TIMEOUT = 330.0   # gateway: timeout 300 (incus LV + fs online resize)
+_SET_LIMITS_TIMEOUT = 70.0   # gateway: timeout 60 (incus config set + verify)
 
 
 class GuardianRemote:
@@ -339,3 +342,33 @@ class GuardianRemote:
         """Absorb an already-grown virtual disk into the LVM-thin pool."""
         ok, out = await self._ssh_command("storage-expand", timeout=_EXPAND_TIMEOUT)
         return self._as_json(ok, out, "storage-expand")
+
+    async def request_grow_root(self, new_gb: int) -> dict:
+        """EXECUTE a pre-approved container root grow to <new_gb> GB total."""
+        if not 1 <= new_gb <= 9999:
+            return {"ok": False, "action": "grow-root",
+                    "error": f"invalid GB {new_gb} (1-9999)"}
+        ok, out = await self._ssh_command(
+            f"grow-root {new_gb}", timeout=_GROW_ROOT_TIMEOUT,
+        )
+        return self._as_json(ok, out, "grow-root")
+
+    async def request_set_container_limits(
+        self, mem_mib: int | None, cpu: int | None,
+    ) -> dict:
+        """EXECUTE a pre-approved cgroup limit raise (grow-only). None = unchanged."""
+        if mem_mib is not None and not 100 <= mem_mib <= 9999999:
+            return {"ok": False, "action": "set-container-limits",
+                    "error": f"invalid mem_mib {mem_mib} (100-9999999)"}
+        if cpu is not None and not 1 <= cpu <= 999:
+            return {"ok": False, "action": "set-container-limits",
+                    "error": f"invalid cpu {cpu} (1-999)"}
+        if mem_mib is None and cpu is None:
+            return {"ok": False, "action": "set-container-limits",
+                    "error": "nothing to do (both axes None)"}
+        mem_tok = str(mem_mib) if mem_mib is not None else "-"
+        cpu_tok = str(cpu) if cpu is not None else "-"
+        ok, out = await self._ssh_command(
+            f"set-container-limits {mem_tok} {cpu_tok}", timeout=_SET_LIMITS_TIMEOUT,
+        )
+        return self._as_json(ok, out, "set-container-limits")
