@@ -268,31 +268,6 @@ class TestLocalDrilldownCollections:
     """
 
     @staticmethod
-    def _wing_cursor(rows):
-        """Async context-manager cursor for the wing post-filter query."""
-
-        class _Cursor:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *exc):
-                return False
-
-            def __aiter__(self):
-                async def gen():
-                    for r in rows:
-                        yield r
-
-                return gen()
-
-        return _Cursor()
-
-    def _db_with_wing_rows(self, rows):
-        db = MagicMock()
-        db.execute = MagicMock(return_value=self._wing_cursor(rows))
-        return db
-
-    @staticmethod
     def _failing_embeddings():
         embeddings = AsyncMock()
         embeddings.embed = AsyncMock(side_effect=Exception("no embeddings"))
@@ -301,16 +276,18 @@ class TestLocalDrilldownCollections:
     @pytest.mark.asyncio
     async def test_fts_drilldown_searches_all_source_collections(self):
         """With source='both'-style collections, FTS must hit each one."""
-        # Both ids pass the wing post-filter
-        db = self._db_with_wing_rows([("ep1",), ("kb1",)])
+        # Both ids carry the requested wing (projected by search_ranked)
+        db = MagicMock()
         seen_collections: list[str | None] = []
 
         async def fake_search_ranked(db_, *, query, limit,
                                      collection=None, **kw):
             seen_collections.append(collection)
             if collection == "knowledge_base":
-                return [{"memory_id": "kb1", "content": "kb", "rank": -1.0}]
-            return [{"memory_id": "ep1", "content": "ep", "rank": -2.0}]
+                return [{"memory_id": "kb1", "content": "kb", "rank": -1.0,
+                         "wing": "memory"}]
+            return [{"memory_id": "ep1", "content": "ep", "rank": -2.0,
+                     "wing": "memory"}]
 
         with patch(
             "genesis.memory.drift.memory_crud.search_ranked",
@@ -337,13 +314,14 @@ class TestLocalDrilldownCollections:
     @pytest.mark.asyncio
     async def test_fts_drilldown_episodic_only_unchanged(self):
         """Default episodic source still searches exactly one collection."""
-        db = self._db_with_wing_rows([("ep1",)])
+        db = MagicMock()
         seen_collections: list[str | None] = []
 
         async def fake_search_ranked(db_, *, query, limit,
                                      collection=None, **kw):
             seen_collections.append(collection)
-            return [{"memory_id": "ep1", "content": "ep", "rank": -2.0}]
+            return [{"memory_id": "ep1", "content": "ep", "rank": -2.0,
+                     "wing": "memory"}]
 
         with patch(
             "genesis.memory.drift.memory_crud.search_ranked",
@@ -371,17 +349,20 @@ class TestLocalDrilldownCollections:
         hit of the first collection above the second's regardless of
         relevance. Ranks are comparable — same memory_fts table, same query.
         """
-        # Wing filter passes all three (single shared cursor is fine — the
-        # filter must also PRESERVE the rank-merged order, not rescramble it)
-        db = self._db_with_wing_rows([("ep1",), ("ep2",), ("kb1",)])
+        # Wing filter passes all three (wing projected by search_ranked) — the
+        # filter must also PRESERVE the rank-merged order, not rescramble it
+        db = MagicMock()
         rows_by_collection = {
             "episodic_memory": [
-                {"memory_id": "ep1", "content": "e1", "rank": -5.0},
-                {"memory_id": "ep2", "content": "e2", "rank": -3.0},
+                {"memory_id": "ep1", "content": "e1", "rank": -5.0,
+                 "wing": "memory"},
+                {"memory_id": "ep2", "content": "e2", "rank": -3.0,
+                 "wing": "memory"},
             ],
             # kb1 outranks both episodic hits (more negative = better)
             "knowledge_base": [
-                {"memory_id": "kb1", "content": "k1", "rank": -9.0},
+                {"memory_id": "kb1", "content": "k1", "rank": -9.0,
+                 "wing": "memory"},
             ],
         }
 
@@ -406,4 +387,40 @@ class TestLocalDrilldownCollections:
 
         assert ids == ["kb1", "ep1", "ep2"], (
             f"expected rank-merged order [kb1, ep1, ep2], got {ids!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fts_drilldown_filters_nonmatching_wing(self):
+        """Rows whose authoritative wing (projected by search_ranked) differs
+        from the requested wing are dropped; NULL wing is dropped too."""
+        db = MagicMock()
+
+        async def fake_search_ranked(db_, *, query, limit,
+                                     collection=None, **kw):
+            return [
+                {"memory_id": "keep", "content": "k", "rank": -5.0,
+                 "wing": "memory"},
+                {"memory_id": "drop", "content": "d", "rank": -4.0,
+                 "wing": "routing"},
+                {"memory_id": "null", "content": "n", "rank": -3.0,
+                 "wing": None},
+            ]
+
+        with patch(
+            "genesis.memory.drift.memory_crud.search_ranked",
+            new=AsyncMock(side_effect=fake_search_ranked),
+        ):
+            ids = await _local_drilldown(
+                "test query",
+                db=db,
+                qdrant_client=MagicMock(),
+                embedding_provider=self._failing_embeddings(),
+                source_collections=["episodic_memory"],
+                wing="memory",
+                room=None,
+                global_ids=[],
+            )
+
+        assert ids == ["keep"], (
+            f"only the wing='memory' row should survive, got {ids!r}"
         )
