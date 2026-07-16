@@ -168,6 +168,8 @@ def test_fresh_apply_installs_unit_and_enables(tmp_path):
     assert "--size 4096MiB --algorithm zstd" in content
     assert "|| { zramctl --reset /dev/zram0" in content  # fallback chain
     assert "swapon -p 100 /dev/zram0" in content
+    # P1 belt: never reset a zram0 carrying someone's filesystem.
+    assert 'grep -q \"^/dev/zram0 \" /proc/mounts && exit 1' in content
     assert "$" not in content  # NO command substitution → no systemd escaping
     log = _log(tmp_path)
     assert "daemon-reload" in log
@@ -200,6 +202,11 @@ def test_verify_reports_active_device(tmp_path):
 def test_idempotent_rerun_no_systemd_churn(tmp_path):
     env = _sandbox(tmp_path)
     _run(env)
+    # Simulate the unit having started the device (the real steady state) —
+    # the P2 retry-enable branch only fires when zram is INACTIVE.
+    (tmp_path / "swaps").write_text(
+        "Filename Type Size Used Priority\n/dev/zram0 partition 4194304 0 100\n"
+    )
     # Mutating verbs only — the read-only `is-enabled` mask-check runs per
     # apply by design and must not count as churn.
     def _churn():
@@ -277,8 +284,33 @@ def test_skip_foreign_zram_not_shadowed(tmp_path):
     env = _sandbox(tmp_path, swaps="/dev/zram0 partition 8388608 0 100\n")
     res = _run(env)
     assert res.returncode == 0
-    assert "external zram swap already active" in res.stdout
+    assert "external zram device already configured" in res.stdout
     assert not _unit(tmp_path).exists()
+
+
+def test_skip_foreign_nonswap_zram_not_destroyed(tmp_path):
+    """Codex P1: a zram-backed MOUNT never appears in /proc/swaps — the guard
+    must also see a configured device via zramctl, or the unit's reset would
+    destroy it."""
+    busy_zramctl = "#!/bin/bash\nif [ \"$1\" = \"--noheadings\" ]; then echo \"/dev/zram0 lzo-rle 512M\"; fi\nexit 0\n"
+    env = _sandbox(tmp_path, zramctl=busy_zramctl)  # swaps stays empty
+    res = _run(env)
+    assert res.returncode == 0
+    assert "external zram device already configured" in res.stdout
+    assert not _unit(tmp_path).exists()
+
+
+def test_unchanged_unit_inactive_retries_enable(tmp_path):
+    """Codex P2: an unchanged unit with NO active zram (failed first enable, or
+    an operator disable-without-mask) must retry enable --now — mask is the
+    only durable opt-out."""
+    env = _sandbox(tmp_path)
+    _run(env)  # install; stubbed systemctl never actually starts the device
+    enables_before = _log(tmp_path).count("enable --now")
+    res = _run(env)  # unchanged unit, swaps still empty → retry branch
+    assert res.returncode == 0
+    assert "re-enabled (was inactive)" in res.stdout
+    assert _log(tmp_path).count("enable --now") == enables_before + 1
 
 
 def test_skip_without_sudo(tmp_path):

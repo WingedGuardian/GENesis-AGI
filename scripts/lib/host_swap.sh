@@ -57,9 +57,12 @@ _hostswap_size_mib() {
 # _hostswap_unit_content <size_mib> — render the self-contained unit.
 # Fixed /dev/zram0 (modprobe creates it by default) means NO command
 # substitution inside ExecStart — no systemd `$`-escaping hazard. The
-# early-exit keeps restarts idempotent (a second swapon would fail); the
-# --reset before configure clears any stale half-configured state; the
-# fallback chain drops --algorithm zstd on kernels without it.
+# swaps early-exit keeps restarts idempotent (a second swapon would fail);
+# the mounts guard refuses to touch a zram0 that carries someone's
+# FILESYSTEM (a zram-backed mount never shows in /proc/swaps — resetting it
+# would destroy data); the --reset before configure clears any stale
+# half-configured state; the fallback chain drops --algorithm zstd on
+# kernels without it.
 _hostswap_unit_content() {
     local size_mib="$1"
     printf '%s\n' \
@@ -71,7 +74,7 @@ _hostswap_unit_content() {
         '[Service]' \
         'Type=oneshot' \
         'RemainAfterExit=yes' \
-        "ExecStart=/bin/sh -c 'grep -q \"^/dev/zram\" /proc/swaps && exit 0; modprobe zram; zramctl --reset /dev/zram0 2>/dev/null; zramctl /dev/zram0 --size ${size_mib}MiB --algorithm zstd 2>/dev/null || { zramctl --reset /dev/zram0 2>/dev/null; zramctl /dev/zram0 --size ${size_mib}MiB; }; mkswap /dev/zram0 && swapon -p 100 /dev/zram0'" \
+        "ExecStart=/bin/sh -c 'grep -q \"^/dev/zram\" /proc/swaps && exit 0; grep -q \"^/dev/zram0 \" /proc/mounts && exit 1; modprobe zram; zramctl --reset /dev/zram0 2>/dev/null; zramctl /dev/zram0 --size ${size_mib}MiB --algorithm zstd 2>/dev/null || { zramctl --reset /dev/zram0 2>/dev/null; zramctl /dev/zram0 --size ${size_mib}MiB; }; mkswap /dev/zram0 && swapon -p 100 /dev/zram0'" \
         "ExecStop=/bin/sh -c 'swapoff /dev/zram0 2>/dev/null; zramctl --reset /dev/zram0 2>/dev/null; true'" \
         '' \
         '[Install]' \
@@ -125,13 +128,17 @@ host_swap_apply() {
         return 0
     fi
     local unit_path="$HOSTSWAP_ETC_ROOT/systemd/system/$_HOSTSWAP_UNIT_NAME"
-    # Never shadow an EXTERNAL zram setup (zram-generator, Fedora defaults,
-    # an operator's own unit): zram swap already active but OUR unit was
-    # never installed → leave it alone.
-    if grep -q '^/dev/zram' "$HOSTSWAP_PROC_SWAPS" 2>/dev/null \
-        && [[ ! -f "$unit_path" ]]; then
-        echo "  Skipped: external zram swap already active — not shadowing it."
-        return 0
+    # Never shadow or DESTROY an external zram consumer (zram-generator,
+    # Fedora defaults, a zram-backed mount, an operator's own unit): any
+    # configured zram device — swap OR non-swap (a zram mount never appears
+    # in /proc/swaps, but our unit's reset would wipe it) — while OUR unit
+    # was never installed → leave it alone.
+    if [[ ! -f "$unit_path" ]]; then
+        if grep -q '^/dev/zram' "$HOSTSWAP_PROC_SWAPS" 2>/dev/null \
+            || [[ -n "$(zramctl --noheadings 2>/dev/null || true)" ]]; then
+            echo "  Skipped: external zram device already configured — not touching it."
+            return 0
+        fi
     fi
     if ! sudo -n true 2>/dev/null; then
         echo "  Skipped: sudo unavailable non-interactively. To apply manually:"
@@ -164,6 +171,15 @@ host_swap_apply() {
         sudo systemctl daemon-reload 2>/dev/null || true
         sudo systemctl enable --now "$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
         echo "  + zram swap unit installed (size ${size_mib}MiB, priority 100)."
+    elif ! grep -q '^/dev/zram' "$HOSTSWAP_PROC_SWAPS" 2>/dev/null; then
+        # Unchanged unit but no active zram swap: a previous enable failed, or
+        # an operator `disable`d without masking. The durable opt-out is MASK
+        # (guarded above) — a merely-disabled unit gets re-enabled, and a
+        # transient enable failure retries on the next apply instead of
+        # sticking forever. (No churn on healthy hosts: an active device
+        # skips this branch.)
+        sudo systemctl enable --now "$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
+        echo "  zram swap unit already in place (size ${size_mib}MiB) — re-enabled (was inactive)."
     else
         echo "  zram swap unit already in place (size ${size_mib}MiB)."
     fi
